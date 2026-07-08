@@ -94,11 +94,11 @@ impl Style {
     /// Secondary / dimmed text.
     pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9A, 0x9A, 0xA6);
     /// **Emphasis** text — one rung brighter than [`TEXT`](Self::TEXT) (Carbon
-    /// white). The single embedded face (Droid Sans Mono, [`crate::fonts`]) has
-    /// no bold cut, so a *bold* / heading run cannot render heavier glyphs; the
-    /// honest token cue for weight on the dark ground is this brighter tone, the
-    /// mirror of [`TEXT_DIM`](Self::TEXT_DIM)'s dimmer one. Markdown preview
-    /// (EDTB-7) paints bold spans + heading titles with it.
+    /// white). The shared font installer embeds Inter for proportional UI and
+    /// Intel One Mono for monospace surfaces; the honest token cue for emphasis
+    /// on the dark ground is this brighter tone, the mirror of
+    /// [`TEXT_DIM`](Self::TEXT_DIM)'s dimmer one. Markdown preview (EDTB-7)
+    /// paints bold spans + heading titles with it.
     pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
 
     /// Interactive / brand accent (Quasar azure).
@@ -112,6 +112,20 @@ impl Style {
     pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54);
     /// Status — success / ok.
     pub const OK: Color32 = Color32::from_rgb(0x4F, 0xD0, 0x8A);
+
+    // ── Carbon semantic status tokens ──────────────────────────────────────
+    // NOTIF-1 / Q25-Q28: one shared severity language for pips, Chat alert
+    // cards, and any future segment rollup. These are semantic aliases over the
+    // existing Carbon-compatible status palette, so downstream surfaces stop
+    // re-deciding that "red means critical" with local DANGER/WARN/ACCENT calls.
+    /// Carbon **support-error** — red alert / action-needed severity.
+    pub const SUPPORT_ERROR: Color32 = Self::DANGER;
+    /// Carbon **support-warning** — amber warning severity.
+    pub const SUPPORT_WARNING: Color32 = Self::WARN;
+    /// Carbon **support-success** — green success / resolved severity.
+    pub const SUPPORT_SUCCESS: Color32 = Self::OK;
+    /// Carbon **support-info** — blue informational severity.
+    pub const SUPPORT_INFO: Color32 = Self::ACCENT;
     /// Editorial — a **spelling** miss: the red wavy underline the editor draws
     /// under a misspelled word (EDTB-6, `mde-editor-egui`). Its own token — a
     /// deeper, more saturated Carbon red-60 — so a spell squiggle reads distinct
@@ -178,17 +192,17 @@ impl Style {
 
     // ── Type scale (point sizes) ────────────────────────────────────────────
     /// Small / caption text.
-    pub const SMALL: f32 = 12.0;
+    pub const SMALL: f32 = 10.0;
     /// Body text.
-    pub const BODY: f32 = 14.0;
+    pub const BODY: f32 = 12.0;
     /// Sub-heading (Carbon productive-heading-04) — between [`BODY`](Self::BODY)
     /// and [`HEADING`](Self::HEADING); the markdown-preview H3 rung (EDTB-7).
-    pub const TITLE: f32 = 18.0;
+    pub const TITLE: f32 = 16.0;
     /// Section heading.
-    pub const HEADING: f32 = 22.0;
+    pub const HEADING: f32 = 20.0;
     /// Display heading (Carbon productive-heading-06) — the largest type rung,
     /// the markdown-preview H1 title size (EDTB-7).
-    pub const DISPLAY: f32 = 28.0;
+    pub const DISPLAY: f32 = 26.0;
 
     /// The point size for a markdown/rich-text heading `level` on the shared
     /// type ramp: H1 → [`DISPLAY`](Self::DISPLAY), H2 → [`HEADING`](Self::HEADING),
@@ -220,7 +234,8 @@ impl Style {
     /// metrics (hit-target size + spacing) grow under [`Density::Touch`], so the shell
     /// can flip Tablet↔Laptop by re-installing at the new density.
     pub fn install_with_density(ctx: &Context, density: Density) {
-        // Droid Sans Mono is the default font set for every surface (governance §4).
+        // Inter is the proportional platform face; Intel One Mono stays reserved
+        // for fixed-width surfaces that require monospace glyphs.
         crate::fonts::install(ctx);
 
         let mut v = egui::Visuals::dark();
@@ -707,6 +722,20 @@ mod tests {
         assert_eq!(Style::GRADE_C, Style::ACCENT_SYSTEM);
         assert_eq!(Style::GRADE_D, Style::WARN);
         assert_eq!(Style::GRADE_F, Style::DANGER);
+    }
+
+    #[test]
+    fn carbon_support_tokens_map_the_notification_taxonomy() {
+        // NOTIF-1: Red = alert/action-needed, Amber = warning, Blue = info, and
+        // success stays the existing OK green. These are semantic aliases, not a
+        // second palette.
+        assert_eq!(Style::SUPPORT_ERROR, Style::DANGER);
+        assert_eq!(Style::SUPPORT_WARNING, Style::WARN);
+        assert_eq!(Style::SUPPORT_SUCCESS, Style::OK);
+        assert_eq!(Style::SUPPORT_INFO, Style::ACCENT);
+        assert_ne!(Style::SUPPORT_ERROR, Style::SUPPORT_WARNING);
+        assert_ne!(Style::SUPPORT_WARNING, Style::SUPPORT_INFO);
+        assert_ne!(Style::SUPPORT_INFO, Style::SUPPORT_SUCCESS);
     }
 
     #[test]

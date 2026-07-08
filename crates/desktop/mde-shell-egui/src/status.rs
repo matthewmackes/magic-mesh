@@ -16,7 +16,7 @@ use mde_theme::brand::icons::IconId;
 use serde::Deserialize;
 
 use crate::chrome::NodeGrades;
-use crate::dock::{Surface, icon_texture};
+use crate::dock::{icon_texture, Surface};
 
 const REFRESH: Duration = Duration::from_secs(2);
 const TOPIC_PREFIX: &str = "state/notify/segment/";
@@ -182,6 +182,13 @@ impl StatusState {
     pub const fn segments(&self) -> &StatusSegments {
         &self.segments
     }
+
+    /// Test seam for shell-level integration without touching the real Bus.
+    #[cfg(test)]
+    pub(crate) fn set_segments_for_test(&mut self, segments: StatusSegments) {
+        self.segments = segments;
+        self.last_poll = Some(Instant::now());
+    }
 }
 
 fn read_segments(persist: &Persist) -> StatusSegments {
@@ -208,6 +215,17 @@ fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
         Some("info" | "notice" | "debug") => Style::SUPPORT_INFO,
         Some("success" | "ok") => Style::SUPPORT_SUCCESS,
         _ => Style::TEXT_DIM,
+    }
+}
+
+fn severity_label(rollup: Option<&SegmentRollup>) -> &'static str {
+    match rollup.map(|r| r.severity.as_str()) {
+        Some("critical" | "error" | "fatal" | "urgent") => "critical",
+        Some("warning" | "warn" | "high") => "warning",
+        Some("info" | "notice" | "debug") => "info",
+        Some("success" | "ok") => "ok",
+        Some(_) => "unknown",
+        None => "unknown",
     }
 }
 
@@ -292,6 +310,7 @@ impl CriticalEdgeCue {
             .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 let rect = ui.ctx().screen_rect();
+                install_critical_edge_accessibility(ui.ctx(), &active.key, rect);
                 ui.set_min_size(rect.size());
                 let painter = ui.painter();
                 for (i, edge) in edge_rects(rect, width).into_iter().enumerate() {
@@ -315,6 +334,16 @@ impl CriticalEdgeCue {
 /// Stable id for NOTIF-6's foreground all-edges cue.
 pub fn critical_edge_cue_id() -> egui::Id {
     egui::Id::new("notif-critical-edge-cue")
+}
+
+/// Stable id for NOTIF-11's polite status live region.
+pub fn status_live_region_id() -> egui::Id {
+    egui::Id::new("notif-status-live-region")
+}
+
+/// Stable id for NOTIF-11's assertive critical alert node.
+pub fn critical_edge_live_region_id() -> egui::Id {
+    egui::Id::new("notif-critical-edge-live-region")
 }
 
 fn critical_edge_key(segments: &StatusSegments, local_host: &str) -> Option<CriticalEdgeKey> {
@@ -342,7 +371,11 @@ fn edge_cue_intensity(elapsed: f32) -> f32 {
         return 0.0;
     }
     let phase = (elapsed / EDGE_PULSE_HALF_CYCLE_SECONDS).floor() as i32;
-    if phase.rem_euclid(2) == 0 { 1.0 } else { 0.35 }
+    if phase.rem_euclid(2) == 0 {
+        1.0
+    } else {
+        0.35
+    }
 }
 
 fn edge_rects(rect: egui::Rect, width: f32) -> [egui::Rect; 4] {
@@ -366,6 +399,7 @@ fn edge_rects(rect: egui::Rect, width: f32) -> [egui::Rect; 4] {
     ]
 }
 
+#[cfg(test)]
 fn local_grade_color(grades: &NodeGrades) -> egui::Color32 {
     grades
         .rows
@@ -395,7 +429,102 @@ fn local_grade_label(grades: &NodeGrades) -> String {
     )
 }
 
+fn segment_label(segment: StatusSegment) -> &'static str {
+    match segment {
+        StatusSegment::Device => "Device",
+        StatusSegment::Mesh => "Mesh",
+        StatusSegment::Power => "Power",
+        StatusSegment::Alerts => "Alerts",
+    }
+}
+
+fn segment_accessibility_value(segment: StatusSegment, rollup: Option<&SegmentRollup>) -> String {
+    let state = severity_label(rollup);
+    rollup.map_or_else(
+        || format!("{} status unknown", segment_label(segment)),
+        |r| {
+            format!(
+                "{} {state}: {} from {} on {}",
+                segment_label(segment),
+                r.summary,
+                r.source,
+                r.host
+            )
+        },
+    )
+}
+
+fn status_live_summary(grades: &NodeGrades, segments: &StatusSegments) -> String {
+    let mut parts = vec![format!("Local grade {}", local_grade_label(grades))];
+    for segment in StatusSegment::ALL {
+        parts.push(segment_accessibility_value(segment, segments.get(segment)));
+    }
+    parts.join(". ")
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+fn install_status_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    grades: &NodeGrades,
+    segments: &StatusSegments,
+) {
+    let summary = status_live_summary(grades, segments);
+    let _ = ctx.accesskit_node_builder(status_live_region_id(), |node| {
+        node.set_role(egui::accesskit::Role::Status);
+        node.set_live(egui::accesskit::Live::Polite);
+        node.set_label("Notification status");
+        node.set_value(summary);
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
+fn install_segment_accessibility(
+    ctx: &egui::Context,
+    segment: StatusSegment,
+    rollup: Option<&SegmentRollup>,
+    rect: egui::Rect,
+) {
+    let value = segment_accessibility_value(segment, rollup);
+    let _ = ctx.accesskit_node_builder(segment_pip_id(segment), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(format!("{} status", segment_label(segment)));
+        node.set_value(value);
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+fn install_critical_edge_accessibility(
+    ctx: &egui::Context,
+    key: &CriticalEdgeKey,
+    rect: egui::Rect,
+) {
+    let value = format!(
+        "Critical {} alert from {} on {}",
+        segment_label(key.segment),
+        key.source,
+        key.host
+    );
+    let _ = ctx.accesskit_node_builder(critical_edge_live_region_id(), |node| {
+        node.set_role(egui::accesskit::Role::Alert);
+        node.set_live(egui::accesskit::Live::Assertive);
+        node.set_label("Critical alert");
+        node.set_value(value);
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
 /// Stable id for the local grade pip.
+#[cfg(test)]
 pub fn local_grade_pip_id() -> egui::Id {
     egui::Id::new("notif-status-local-grade-pip")
 }
@@ -406,6 +535,7 @@ pub fn segment_pip_id(segment: StatusSegment) -> egui::Id {
 }
 
 /// Stable id for NOTIF-4's expansion chevron.
+#[cfg(test)]
 pub fn status_chevron_id() -> egui::Id {
     egui::Id::new("notif-status-chevron")
 }
@@ -443,7 +573,35 @@ pub struct StatusPanelOutcome {
     pub route_system: bool,
 }
 
+/// Render the notification/status micro-icons inside the bottom rail.
+pub fn notification_rail(
+    ui: &egui::Ui,
+    active: &mut Surface,
+    grades: &NodeGrades,
+    segments: &StatusSegments,
+    rect: egui::Rect,
+    expanded: bool,
+) -> StatusBarOutcome {
+    install_status_accessibility(ui.ctx(), rect, grades, segments);
+    let mut out = StatusBarOutcome::default();
+    let rail_h = rect.height();
+    let mut x = rect.left();
+    for segment in StatusSegment::ALL {
+        let pip_rect =
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(rail_h, rail_h))
+                .shrink(2.0);
+        if segment_pip(ui, segment, segments.get(segment), pip_rect) {
+            *active = segment.route();
+            out.routed = true;
+        }
+        x += rail_h;
+    }
+    let _ = expanded;
+    out
+}
+
 /// Render one dock row containing `[local grade] + [Device · Mesh · Power · Alerts]`.
+#[cfg(test)]
 pub fn status_bar(
     ui: &egui::Ui,
     active: &mut Surface,
@@ -452,6 +610,7 @@ pub fn status_bar(
     rect: egui::Rect,
     expanded: bool,
 ) -> StatusBarOutcome {
+    install_status_accessibility(ui.ctx(), rect, grades, segments);
     let painter = ui.painter().clone();
     painter.rect_stroke(
         rect,
@@ -464,6 +623,13 @@ pub fn status_bar(
         egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.center().x, rect.bottom()))
             .shrink(Style::SP_XS);
     let resp = ui.interact(grade_rect, local_grade_pip_id(), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Local grade {}", local_grade_label(grades)),
+        )
+    });
     if resp.hovered() {
         painter.rect_filled(grade_rect, Style::RADIUS, Style::SURFACE_HI);
     }
@@ -525,6 +691,7 @@ fn segment_pip(
     rollup: Option<&SegmentRollup>,
     rect: egui::Rect,
 ) -> bool {
+    install_segment_accessibility(ui.ctx(), segment, rollup, rect);
     let resp = ui.interact(rect, segment_pip_id(segment), egui::Sense::click());
     let painter = ui.painter().clone();
     if resp.hovered() {
@@ -867,6 +1034,17 @@ mod tests {
         }
     }
 
+    fn accesskit_nodes(
+        out: &egui::FullOutput,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone()
+    }
+
     #[test]
     fn segment_severity_maps_to_carbon_support_tokens() {
         let rollup = |severity: &str| SegmentRollup {
@@ -900,6 +1078,71 @@ mod tests {
         assert_eq!(local_grade_label(&grade(20, true)), "?");
         assert_eq!(local_grade_color(&grade(20, true)), Style::TEXT_DIM);
         assert_eq!(local_grade_label(&NodeGrades::default()), "?");
+    }
+
+    #[test]
+    fn status_bar_exports_accesskit_live_region_and_named_pips() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut active = Surface::Workbench;
+        let grades = grade(95, false);
+        let segments = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            mesh: Some(rollup("mesh", "warning", "lh-1", "remote-pip-chat", 12)),
+            seen: true,
+            ..StatusSegments::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(240.0, 160.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                status_bar(
+                    ui,
+                    &mut active,
+                    &grades,
+                    &segments,
+                    egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(48.0, 48.0)),
+                    false,
+                );
+            });
+        });
+        let nodes = accesskit_nodes(&out);
+        let status = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Notification status"))
+            .expect("status live region node");
+        assert_eq!(status.role(), egui::accesskit::Role::Status);
+        assert_eq!(status.live(), Some(egui::accesskit::Live::Polite));
+        let value = status.value().expect("status summary");
+        assert!(value.contains("Local grade A"));
+        assert!(value.contains("Alerts critical"));
+        assert!(value.contains("Mesh warning"));
+
+        let alert_pip = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Alerts status"))
+            .expect("alerts pip node");
+        assert_eq!(alert_pip.role(), egui::accesskit::Role::Button);
+        assert!(
+            alert_pip
+                .value()
+                .is_some_and(|value| value.contains("Alerts critical")),
+            "alert pip carries its severity summary"
+        );
     }
 
     #[test]
@@ -1148,6 +1391,47 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "a live own-seat critical paints a real no-text edge overlay"
+        );
+    }
+
+    #[test]
+    fn critical_edge_cue_exports_an_assertive_accesskit_alert() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let live = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        let mut cue = CriticalEdgeCue::default();
+        cue.update(&live, "eagle", false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| cue.show(ctx));
+        let nodes = accesskit_nodes(&out);
+        let alert = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Critical alert"))
+            .expect("critical alert live-region node");
+        assert_eq!(alert.role(), egui::accesskit::Role::Alert);
+        assert_eq!(alert.live(), Some(egui::accesskit::Live::Assertive));
+        assert!(
+            alert
+                .value()
+                .is_some_and(|value| value.contains("Critical Alerts alert")),
+            "critical live region names the affected segment"
         );
     }
 }

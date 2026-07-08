@@ -1,6 +1,6 @@
 //! `brand::icons` — the monochrome Quasar line-art icon set (QBRAND-2).
 //!
-//! The 34 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
+//! The 37 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
 //! NAVBAR-W10-1 tray set) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
@@ -57,8 +57,8 @@ macro_rules! quasar_svg {
 
 /// Identifier for every glyph in the Quasar brand set.
 ///
-/// The product marks, the 16 dock/surface glyphs, the 3 node-role badges and
-/// the 12 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible
+/// The product marks, the 18 dock/surface glyphs, the 3 node-role badges and
+/// the 14 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible
 /// rasterized at 16px) — one variant per SVG in `assets/brand/quasar/`;
 /// [`IconId::svg`] resolves the embedded source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,6 +89,8 @@ pub enum IconId {
     Voice,
     /// The Browser surface glyph.
     Browser,
+    /// The Bookmarks manager surface glyph.
+    Bookmarks,
     /// The Terminal surface glyph.
     Terminal,
     /// The Editor (code editor) surface glyph.
@@ -118,6 +120,10 @@ pub enum IconId {
     /// Tray: active VDI session — a monitor carrying a two-node link mark
     /// (the Desktop monitor + a connection, per NAVBAR-W10 W2/W10).
     Sessions,
+    /// Tray: Start / Advanced menu — the Win10-style left rail menu glyph.
+    Start,
+    /// Tray: dock pin — holds the left launcher rail open.
+    Pin,
     /// Tray: the overflow-flyout `^` chevron (NAVBAR-W10 W10/W13).
     ChevronUp,
     /// Tray: speaker with sound-wave arcs (volume).
@@ -148,7 +154,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 37] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -160,6 +166,7 @@ impl IconId {
         Self::Files,
         Self::Voice,
         Self::Browser,
+        Self::Bookmarks,
         Self::Terminal,
         Self::Editor,
         Self::Chat,
@@ -173,6 +180,8 @@ impl IconId {
         Self::Lighthouse,
         Self::Signal,
         Self::Sessions,
+        Self::Start,
+        Self::Pin,
         Self::ChevronUp,
         Self::Volume,
         Self::VolumeMuted,
@@ -187,9 +196,11 @@ impl IconId {
 
     /// The tray glyph subset (NAVBAR-W10-1) — every glyph the 40px taskbar's
     /// tray renders at 16px, for targeted iteration in the tray and its tests.
-    pub const TRAY: [Self; 12] = [
+    pub const TRAY: [Self; 14] = [
         Self::Signal,
         Self::Sessions,
+        Self::Start,
+        Self::Pin,
         Self::ChevronUp,
         Self::Volume,
         Self::VolumeMuted,
@@ -220,6 +231,7 @@ impl IconId {
             Self::Files => quasar_svg!("surface-files.svg"),
             Self::Voice => quasar_svg!("surface-voice.svg"),
             Self::Browser => quasar_svg!("surface-browser.svg"),
+            Self::Bookmarks => quasar_svg!("surface-bookmarks.svg"),
             Self::Terminal => quasar_svg!("surface-terminal.svg"),
             Self::Editor => quasar_svg!("surface-editor.svg"),
             Self::Chat => quasar_svg!("surface-chat.svg"),
@@ -233,6 +245,8 @@ impl IconId {
             Self::Lighthouse => quasar_svg!("role-lighthouse.svg"),
             Self::Signal => quasar_svg!("tray-signal.svg"),
             Self::Sessions => quasar_svg!("tray-sessions.svg"),
+            Self::Start => quasar_svg!("tray-start.svg"),
+            Self::Pin => quasar_svg!("tray-pin.svg"),
             Self::ChevronUp => quasar_svg!("tray-chevron-up.svg"),
             Self::Volume => quasar_svg!("tray-volume.svg"),
             Self::VolumeMuted => quasar_svg!("tray-volume-muted.svg"),
@@ -263,6 +277,7 @@ impl IconId {
             Self::Files => "surface-files",
             Self::Voice => "surface-voice",
             Self::Browser => "surface-browser",
+            Self::Bookmarks => "surface-bookmarks",
             Self::Terminal => "surface-terminal",
             Self::Editor => "surface-editor",
             Self::Chat => "surface-chat",
@@ -276,6 +291,8 @@ impl IconId {
             Self::Lighthouse => "role-lighthouse",
             Self::Signal => "tray-signal",
             Self::Sessions => "tray-sessions",
+            Self::Start => "tray-start",
+            Self::Pin => "tray-pin",
             Self::ChevronUp => "tray-chevron-up",
             Self::Volume => "tray-volume",
             Self::VolumeMuted => "tray-volume-muted",
@@ -544,7 +561,7 @@ mod tests {
         // (24px covers the flyout/hi-DPI step) — every glyph must come back
         // square, correctly sized and with real ink through the same
         // icon_image loader the shell uses.
-        assert_eq!(IconId::TRAY.len(), 12, "tray subset size");
+        assert_eq!(IconId::TRAY.len(), 14, "tray subset size");
         for id in IconId::TRAY {
             for size in [16_u32, 24] {
                 let img = icon_image(id, size, TINT)
@@ -595,8 +612,8 @@ mod tests {
 
     #[test]
     fn ids_names_and_sources_are_distinct_and_exhaustive() {
-        // Guards a copy-paste slip in the two match tables: 34 ids, 34 unique
-        // names, 34 unique embedded sources, all valid-looking SVG.
+        // Guards a copy-paste slip in the two match tables: 36 ids, 36 unique
+        // names, 36 unique embedded sources, all valid-looking SVG.
         let mut names: Vec<&str> = IconId::ALL.iter().map(|id| id.name()).collect();
         names.sort_unstable();
         names.dedup();

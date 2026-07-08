@@ -34,7 +34,7 @@ live-helper = ["mde-web-preview-client/live-helper"]
 # it provides run_client (the eframe Wayland-client runner), the shared Style, the
 # Motion table, and re-exports egui/eframe so the shell shares one toolkit
 # resolution.
-mde-egui = { path = "../../shared/mde-egui" }
+mde-egui = { path = "../../shared/mde-egui", features = ["accesskit"] }
 
 # QBRAND-1 — the single brand/build-identity source. `main.rs` routes
 # `--version` through `mde_theme::brand::build::full()` (and the chrome/splash +
@@ -76,6 +76,11 @@ png = "0.18"
 # workers already vendor; a leaf registry crate, no tier edge (§6).
 base64 = "0.22"
 
+# KDC-MESH-4 — the Phones hub renders an in-shell QR matrix for the enroll+pair
+# payload. `qrcode` is a pure encoder; the shell paints its boolean matrix through
+# egui rectangles, so no image stack or QR scanner dependency is pulled in.
+qrcode = { version = "0.14", default-features = false }
+
 # The chrome bar's live Peers + Status fold the world-readable mesh-status
 # snapshot, reusing the render-agnostic LIGHTHOUSE-7 model
 # (`lighthouse_health_from_snapshot` / `LighthouseHealth`) so the bar's health
@@ -92,6 +97,7 @@ mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-feature
 # desktop-shell tier (§6) — the same toolkit resolution (`mde-egui`) flows through.
 mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
+mde-bookmarks-egui = { path = "../mde-bookmarks-egui" }
 mde-voice-egui = { path = "../mde-voice-egui" }
 # EDITOR-9 — the render-agnostic `mde-files` core (consumed WITHOUT its Cosmic-era
 # GUI, like mde-files-egui does), for the `EditorLaunchWatch` that drains the Files
@@ -173,6 +179,12 @@ zbus = { version = "5", default-features = false, features = ["tokio", "blocking
 # desktop-shell tier (§6), sharing the one `mde-egui` toolkit resolution; it does
 # NOT reach the workspace-excluded Servo helper crate — only the shared wire seam.
 mde-web-preview-client = { path = "../mde-web-preview-client" }
+
+# BROWSER-DD-2 — live omnibox suggestions from the mesh-hosted SearXNG service.
+# The UI drives it on a short-lived blocking thread so egui never stalls, and the
+# parsing/throttle logic is unit-tested without live egress. rustls keeps the shell
+# off the system OpenSSL surface while matching the workspace's reqwest 0.12 users.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 # The Browser-surface render tests drive a real session over the client's

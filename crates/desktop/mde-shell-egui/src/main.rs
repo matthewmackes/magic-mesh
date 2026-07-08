@@ -47,15 +47,16 @@ mod power_settings;
 mod provisioning;
 mod services_flow;
 mod session;
+mod session_rail;
 mod spawn_lighthouse_flow;
 mod splash;
+mod status;
 mod storage;
 mod surface_card;
 mod system;
 mod thisnode;
 mod timers;
 mod toast_bridge;
-mod tray;
 mod vdi;
 mod web;
 mod workbench;
@@ -65,6 +66,7 @@ use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
+use mde_bookmarks_egui::{bookmarks_panel, real_manager, Manager as BookmarksManager};
 use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
 use mde_files::editor_open::EditorLaunchWatch;
 use mde_files_egui::{files_panel, FileBrowser};
@@ -142,12 +144,19 @@ struct Shell {
     spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState,
     /// The live mesh-status fold — peers + mesh health folded from the
     /// world-readable snapshot, polled on the shared cadence (self-gating in
-    /// `render`). The dock's status quads render their Peers / Status / Signal
-    /// dots from this ONE poll's product (VDOCK-3 — no second poll).
+    /// `render`). The dock grade band still reads this ONE poll's product.
     chrome: chrome::ChromeState,
+    /// NOTIF-3 — daemon-owned notification segment rollups for the compact dock
+    /// status strip. Missing daemon state renders as dim, not green.
+    notify_status: status::StatusState,
+    /// NOTIF-6 — ambient own-seat critical edge cue. Driven from the same daemon
+    /// segment snapshot as the dock pips, with no text toast.
+    critical_edge: status::CriticalEdgeCue,
+    /// Local hostname used to decide whether a critical belongs to this seat.
+    local_host: String,
     /// VDOCK-1/2/3/4 — the left vertical dock's state: the auto-hide half (the
     /// Super-tap reveal latch + the pin), the app picker's `active` surface, the
-    /// bottom status-quad inputs, and the system-quad power menu + pending request.
+    /// bottom status-strip inputs, and the system-quad power menu + pending request.
     /// `dock::dock` reads + drives it each frame; the Super-tap reveal toggles it on
     /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
     /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
@@ -188,6 +197,10 @@ struct Shell {
     /// the target to `vdi`; its seen-set fold auto-pops the Chooser when a new
     /// source is discovered (design lock 1).
     chooser: chooser::ChooserState,
+    /// NAVBAR-U3 — local projection of the broker VDI session log for the bottom
+    /// rail. Falls back to the pending `VdiState` request until the broker log has
+    /// a matching session for this seat.
+    session_rail: session_rail::SessionRailState,
     /// The Instances surface — this workstation's local cloud-hypervisor VMs via
     /// the `mde-kvm` broker (E12-7). Create / boot / shutdown drive mde-kvm's real
     /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
@@ -211,8 +224,8 @@ struct Shell {
     phones_hub: phones_hub::PhonesHubState,
     /// The System surface — this seat's host controls, folded from the ONE
     /// `mde-seat` `Seat` (lock 1): mixer / Bluetooth / displays / power & battery /
-    /// backlight / hotkeys. Its cached snapshot also feeds the dock's status quads'
-    /// read-only BT / Volume / Battery cells (VDOCK-3). Absent backends
+    /// backlight / hotkeys. Its cached snapshot feeds the System surface and
+    /// remains available to dock status/panel work. Absent backends
     /// render honestly (§7).
     system: system::SystemState,
     /// The Storage surface — GParted-authentic disk/partition management (E12-21).
@@ -228,10 +241,11 @@ struct Shell {
     /// + menu/toolbar chrome in `mde_egui` dark tokens, with the brand shrunk to a
     /// title strip + an ⓘ dialog. A pure consumer — it drives no worker.
     device_manager: device_manager::DeviceManagerState,
-    /// The KIRON chyron bridge (KIRON-2) — the shell's one `ToastHost` plus its
+    /// The KIRON alert/OSD bridge (KIRON-2) — the shell's one `ToastHost` plus its
     /// `event/toast/show` Bus subscription, suppression posture, and the single
-    /// notification-sound seam. Driven every frame; its lower-third band + OSD
-    /// float above whatever surface (or fullscreen guest) is in view.
+    /// notification-sound seam. Driven every frame; only its centered OSD pill
+    /// floats above whatever surface (or fullscreen guest) is in view; notification
+    /// visuals live in Chat.
     toasts: toast_bridge::ToastBridge,
     /// The hotkey dispatcher (E12-19) — the fixed `mde_seat` table on the shell
     /// input path (lock 8/9). Carries only the leader latch; each frame it folds the
@@ -252,6 +266,11 @@ struct Shell {
     /// until the gated `live-helper` spawn attaches one; the panel shows its honest
     /// gated EmptyState until then, exactly like the VDI Desktop surface.
     web: web::WebState,
+    /// The Bookmarks manager surface (BOOKMARKS-4), mounted in-shell so Browser
+    /// users can reach folders/tags/search/dead-link workflows without leaving the
+    /// platform chrome. Persistence and mesh sync remain owned by the bookmarks
+    /// worker; this is the existing egui manager over the CRDT model.
+    bookmarks: BookmarksManager,
     /// The Terminal surface (TERM-16) — the production `TerminalSurface` (the
     /// TERM-4/5/8 `TabbedTerminal`: tabs / splits / broadcast / a shell on any mesh
     /// peer) over a real local PTY, built once by `mde_term_egui::real_terminal()`.
@@ -334,6 +353,9 @@ impl Shell {
             services: services_flow::ServicesFlowState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
+            notify_status: status::StatusState::default(),
+            critical_edge: status::CriticalEdgeCue::default(),
+            local_host: local_hostname(),
             vdock: dock::DockState::default(),
             console: console::ConsoleState::default(),
             music: MusicApp::new_with_ctx(ctx),
@@ -342,6 +364,7 @@ impl Shell {
             voice: VoiceApp::new_with_ctx(ctx),
             vdi: vdi::VdiState::default(),
             chooser: chooser::ChooserState::default(),
+            session_rail: session_rail::SessionRailState::new(),
             instances: instances::InstancesState::default(),
             infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
@@ -354,6 +377,7 @@ impl Shell {
             formfactor: formfactor::FormfactorPublisher::default(),
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
+            bookmarks: real_manager(),
             terminal: real_terminal(),
             editor: real_editor(),
             editor_launch: EditorLaunchWatch::from_env(),
@@ -432,6 +456,16 @@ impl Shell {
                 self.nav.surface = Surface::Workbench;
                 self.nav.plane = plane;
             }
+        }
+    }
+
+    /// NAVBAR-6 — Win10-style `Super`+`1`…`9`/`0` jumps into the dock's canonical
+    /// visible launcher order. `Super+0` is the tenth slot; out-of-range slots are
+    /// ignored honestly instead of wrapping to a different surface.
+    fn apply_nav_slot(&mut self, slot: hotkeys::NavSlot) {
+        if let Some(surface) = Surface::ALL.get(slot.index()).copied() {
+            self.nav.expanded = true;
+            self.nav.surface = surface;
         }
     }
 
@@ -651,6 +685,16 @@ impl Shell {
                 ui.push_id("shell-web", |ui| {
                     web::web_panel(ui, web);
                 });
+                if self.web.take_bookmarks_manager_request() {
+                    self.nav.surface = Surface::Bookmarks;
+                }
+                // First-class tabs: the Browser panel owns the visible `+` button;
+                // the live-helper shell arm owns the real helper spawn.
+                #[cfg(feature = "live-helper")]
+                {
+                    let seat_present = self.system.snapshot().is_some();
+                    self.web.drain_live_tab_requests(seat_present);
+                }
                 // Respawn-on-reload: a crashed tab's Reload asked to restart. Under
                 // `live-helper` the shell swaps in a fresh live session; the default
                 // build drains the flag honestly (no live tab exists, so it is inert
@@ -662,6 +706,12 @@ impl Shell {
                 }
                 #[cfg(not(feature = "live-helper"))]
                 let _ = restart_requested;
+            }
+            Surface::Bookmarks => {
+                let bookmarks = &mut self.bookmarks;
+                ui.push_id("shell-bookmarks", |ui| {
+                    bookmarks_panel(ui, bookmarks);
+                });
             }
             Surface::Terminal => {
                 // The Terminator-class terminal (TERM-16) over a real local PTY —
@@ -714,7 +764,7 @@ impl Shell {
                 // persisting the rail selection itself. Scoped under its own
                 // `push_id` like every mounted surface so its egui ids can't collide
                 // in the shell's one `Context`. The snapshot is refreshed in
-                // `render` (it also feeds the dock's status quads), so the panel
+                // `render` (it also feeds dock status), so the panel
                 // only renders here. The System panel drives Displays + Power live
                 // (E12-18); its per-VM power rows reuse the Instances broker (§6),
                 // so it takes a `&mut` to that roster — two disjoint field borrows
@@ -793,7 +843,7 @@ impl Boot {
                 self.splash.complete(splash::Milestone::Surfaces);
             } else if !self.splash.is_complete(splash::Milestone::MeshSnapshot) {
                 // The shell's FIRST mesh-status snapshot poll — the same
-                // world-readable fold the dock's status quads render on their
+                // world-readable fold the dock grade/status chrome renders on its
                 // cadence, so the first dock frame opens with live status dots
                 // instead of cold dim ones whenever a snapshot exists.
                 if let Some(shell) = self.shell.as_mut() {
@@ -973,7 +1023,7 @@ impl Shell {
             .sync_pairing_agent(self.nav.expanded && self.nav.surface == Surface::System);
 
         // The top chrome strip is retired; its snapshot poll survives as the dock
-        // status quads' mesh fold. ONE self-gating poll per frame (it also keeps the
+        // dock grade/status mesh fold. ONE self-gating poll per frame (it also keeps the
         // repaint heartbeat alive for the quad status dots) — the quads read the
         // product, no second poll.
         self.chrome.poll(ctx);
@@ -1015,7 +1065,11 @@ impl Shell {
             // SURFACE-11 (lock 16): the same flip re-installs the interaction density —
             // Tablet grows hit targets + spacing (touch), Laptop reverts to the compact
             // pointer metrics. Keyed off the real SURFACE-9 signal, mesh-wide.
-            Style::install_with_density(ctx, Density::for_formfactor(formfactor));
+            let density = Density::for_formfactor(formfactor);
+            Style::install_with_density(ctx, density);
+            // NAVBAR-8: the bottom rail consumes the same shell density instead of
+            // growing its own compact/expanded toggle.
+            self.vdock.set_density(density);
         }
 
         // SURFACE-11 (lock 16): a swipe from the left/bottom edge reveals the shell body
@@ -1042,6 +1096,11 @@ impl Shell {
                 self.apply_hotkey(action);
             }
         }
+        if let Some(slot) = self.hotkeys.take_nav_slot() {
+            if !self.curtain.engaged() {
+                self.apply_nav_slot(slot);
+            }
+        }
         // VDOCK-1 (lock 13) — a clean Super *tap* (press+release with no leader
         // chord used in between) toggles the vertical dock. Always DRAINED so the
         // router's latch never backs up; but, like every chord above, swallowed
@@ -1050,19 +1109,20 @@ impl Shell {
             self.vdock.toggle();
         }
 
-        // The KIRON chyron (KIRON-2) — driven last so its lower-third band + OSD
-        // float (Foreground order) above the chrome, the surface, and any
+        // The KIRON alert/OSD bridge (KIRON-2) — driven late so its centered OSD
+        // pill floats (Foreground order) above the chrome, the surface, and any
         // fullscreen guest. Refresh the suppression posture (lock 10) first: a
         // fullscreen VDI guest in front is a per-session focus mute, and the seat's
-        // audio-mute hushes a non-critical's sound. (DND has no shell toggle yet —
-        // NOTIFY-CHAT owns it; a Critical breaks through regardless.)
+        // audio-mute hushes a non-critical's sound. DND is owned by Chat's
+        // notification lane and mutes ambient pushes.
         let focus_mute =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
         let muted = self.system.snapshot().is_some_and(seat_master_muted);
-        self.toasts.set_suppression(false, focus_mute, muted);
+        let dnd = dnd_active();
+        self.toasts.set_suppression(dnd, focus_mute, muted);
         if let Some(nav) = self.toasts.drive(ctx) {
-            // A clicked chyron action navigates — THIS is where the verb executes
-            // (KIRON-1 deliberately only reported it). Any target expands the shell.
+            // Legacy action navigation is retained as a safe no-op path while Chat
+            // owns visible notification actions. Any target expands the shell.
             // CURTAIN-1 (lock 10): never past the lock — the curtain's layer already
             // blocks the click; this gate is the belt to that suspender.
             if !self.curtain.engaged() {
@@ -1097,6 +1157,16 @@ impl Shell {
             self.system.snapshot(),
             self.chrome.summary(),
         );
+
+        // NOTIF-6 — no-text critical edge cue. Drawn after the curtain so an
+        // own-seat critical can still light the edges with the dock hidden/covered;
+        // the cue only acknowledges itself and never routes past the lock.
+        self.critical_edge.update(
+            self.notify_status.segments(),
+            &self.local_host,
+            dnd || focus_mute,
+        );
+        self.critical_edge.show(ctx);
     }
 
     /// Mount the shell's **dock chrome** for this frame (VDOCK) — the left
@@ -1112,21 +1182,55 @@ impl Shell {
         // the ONE source of truth every other nav path (hotkeys, chyron, self-test,
         // chooser) writes. So MIRROR the live surface INTO the dock before `dock()`
         // (the picker then highlights whatever is showing), feed the bottom status
-        // quads their live inputs (VDOCK-3), then read the picker's selection
+        // status strip its live inputs, then read the picker's selection
         // straight back OUT so a picker-cell click routes the body.
         self.vdock.set_active(self.nav.surface);
+        self.vdock
+            .set_transfer_active_count(self.files.transfers_counts().active);
         // CONSOLE-1 — mirror the Console panel's open state in first, so the
         // Start cell's active tint follows the real panel (the set_active idiom).
         self.vdock.set_console_open(self.console.is_open());
+        self.notify_status.poll(ctx);
+        let mut rail_sessions = self.session_rail.entries(&self.local_host);
+        let has_visible_desktop_session = !rail_sessions.is_empty();
+        if rail_sessions.is_empty() {
+            rail_sessions = self
+                .vdi
+                .requested_summary()
+                .map(|(name, protocol)| vec![dock::SessionRailEntry::new(name, protocol)])
+                .unwrap_or_default();
+        }
         self.vdock.set_status_inputs(
             self.chrome.summary().clone(),
             self.system.snapshot().cloned(),
             self.chat.total_unread(),
             self.vdi.requested_target().is_some(),
+            rail_sessions,
             self.chrome.grades().clone(),
+            self.notify_status.segments().clone(),
         );
-        let bar_clicked = dock::dock(ctx, &mut self.vdock);
+        let desktop_sources = self.chooser.rail_sources();
+        let bar_clicked = dock::dock(ctx, &mut self.vdock)
+            | dock::notification_rail_with_sources(ctx, &mut self.vdock, &desktop_sources);
         self.nav.surface = self.vdock.active();
+        if let Some(id) = self.vdock.take_desktop_source_pick() {
+            if let Some(request) = self.chooser.connect_source_id(&id) {
+                self.vdi.request_connect(request);
+            }
+            self.nav.surface = Surface::Desktop;
+        }
+        if let Some(id) = self.vdock.take_desktop_session_focus() {
+            let _ = self.session_rail.focus_session(&id);
+            self.nav.surface = Surface::Desktop;
+        }
+        if self.vdock.take_desktop_reconnect() {
+            if desktop_reconnect_should_query_recents(has_visible_desktop_session) {
+                if let Some(request) = self.chooser.connect_last_recent() {
+                    self.vdi.request_connect(request);
+                }
+            }
+            self.nav.surface = Surface::Desktop;
+        }
         // VDOCK-4 — drain the system-quad's pending request: Lock drops the
         // in-process curtain (exactly like Super+L), a Power verb drives the seat
         // honorer (its typed-armed consent is the operator's; a refusal is an
@@ -1288,6 +1392,27 @@ fn seat_master_muted(snap: &SeatSnapshot) -> bool {
     matches!(&snap.mixer, Probe::Present(status) if status.master.muted)
 }
 
+fn dnd_active() -> bool {
+    mde_bus::client_data_dir().is_some_and(|root| mde_bus::dnd::load_default(&root).active)
+}
+
+const fn desktop_reconnect_should_query_recents(has_visible_desktop_session: bool) -> bool {
+    !has_visible_desktop_session
+}
+
+fn local_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "local".to_string())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // QBRAND-1 — `--version` prints the single baked build-identity line (version
     // · git hash · date · channel), shared verbatim with `mackesd --version` and
@@ -1328,8 +1453,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dock, editor_panel, files_panel, media_header, media_panel, real_editor, real_media,
-        real_terminal, reserved_dock_gutter, splash, terminal_panel, Boot, Nav, Plane, Surface,
+        chat, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
+        media_header, media_panel, real_editor, real_media, real_terminal, reserved_dock_gutter,
+        splash, status, terminal_panel, Boot, Nav, Plane, Shell, Surface,
+    };
+    use mde_bus::hooks::config::Priority;
+    use mde_bus::persist::Persist;
+    use mde_chat::{
+        AlertAction, AlertActionKind, Contact, Conversation, Message, MessageKind, NodeRole,
+        Roster, Severity,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -1343,6 +1475,18 @@ mod tests {
         );
         assert_eq!(n.surface, Surface::Workbench);
         assert_eq!(n.plane, Plane::ThisNode);
+    }
+
+    #[test]
+    fn visible_desktop_sessions_focus_instead_of_reconnecting_recents() {
+        assert!(
+            !desktop_reconnect_should_query_recents(true),
+            "a broker-visible desktop session should be focused by the Desktop cell"
+        );
+        assert!(
+            desktop_reconnect_should_query_recents(false),
+            "without a visible session the Desktop cell should fall back to last recent"
+        );
     }
 
     // ── DOCK-OVERLAP: the vertical dock reserves a gutter so it never overlaps ──
@@ -1456,6 +1600,214 @@ mod tests {
             "surfaces must build on a later frame, behind the splash"
         );
         assert!(!boot.splash.dismissed(), "dismissed before init completed");
+    }
+
+    #[test]
+    fn shell_mounts_the_critical_edge_cue_from_own_seat_rollups() {
+        // NOTIF-6 integration: the shell owns the cue, feeds it the daemon segment
+        // snapshot, and mounts the no-text foreground edge overlay even with the
+        // dock hidden. The status module's unit tests cover pulse/ack/mute details;
+        // this guards the "implemented but never mounted" failure mode.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.local_host = "eagle".to_string();
+        shell
+            .notify_status
+            .set_segments_for_test(status::StatusSegments {
+                alerts: Some(status::SegmentRollup {
+                    segment: "alerts".to_string(),
+                    severity: "critical".to_string(),
+                    source: "thermal".to_string(),
+                    summary: "thermal critical".to_string(),
+                    host: "eagle".to_string(),
+                    critical_policy: "own-seat-light-show".to_string(),
+                    ts_unix_ms: 42,
+                }),
+                seen: true,
+                ..status::StatusSegments::default()
+            });
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| shell.render(ctx));
+
+        assert!(
+            shell.critical_edge.visible(),
+            "the own-seat critical keeps the shell edge cue visible"
+        );
+        assert!(
+            ctx.read_response(egui::Id::new(("notif-critical-edge", 0)))
+                .is_some(),
+            "the shell mounted the foreground edge-cue hit region"
+        );
+        assert!(
+            ctx.read_response(status::critical_edge_cue_id()).is_some(),
+            "the edge-cue Area itself is registered"
+        );
+    }
+
+    #[test]
+    fn notif13_fixture_mounts_status_chat_edge_and_accesskit_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus_root = tmp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("fixture bus");
+
+        let mut roster = Roster::new("eagle");
+        roster.upsert(Contact::new("eagle", NodeRole::Workstation));
+        persist
+            .write(
+                "state/chat/roster",
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&roster).unwrap()),
+            )
+            .unwrap();
+        let mut alert_fields = std::collections::BTreeMap::new();
+        alert_fields.insert("summary".to_string(), "thermal critical".to_string());
+        let alert = Message::new(
+            "eagle",
+            42,
+            MessageKind::Alert {
+                severity: Severity::Critical,
+                flag: "thermal".to_string(),
+                fields: alert_fields,
+                action_verb: None,
+                actions: vec![
+                    AlertAction {
+                        id: "ack".to_string(),
+                        label: "Ack".to_string(),
+                        verb: None,
+                        kind: AlertActionKind::Ack,
+                    },
+                    AlertAction {
+                        id: "restart".to_string(),
+                        label: "Restart".to_string(),
+                        verb: Some("action/systemd/restart".to_string()),
+                        kind: AlertActionKind::Safe,
+                    },
+                ],
+            },
+        );
+        let mut conv = Conversation::new("alert:eagle");
+        let alert_id = alert.id.clone();
+        conv.insert(alert);
+        let msgs: Vec<_> = conv.messages().iter().cloned().collect();
+        persist
+            .write(
+                "state/chat/conversation/alert:eagle",
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&msgs).unwrap()),
+            )
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.local_host = "eagle".to_string();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Chat;
+        shell.vdock.toggle();
+        shell.vdock.open_status_panel_for_test();
+        shell.chat = chat::ChatState::with_bus_root(bus_root);
+        shell.chat.select_notifications_for_test();
+        shell
+            .notify_status
+            .set_segments_for_test(status::StatusSegments {
+                device: Some(status::SegmentRollup {
+                    segment: "device".to_string(),
+                    severity: "warning".to_string(),
+                    source: "service".to_string(),
+                    summary: "sshd.service failed".to_string(),
+                    host: "eagle".to_string(),
+                    critical_policy: "remote-pip-chat".to_string(),
+                    ts_unix_ms: 40,
+                }),
+                alerts: Some(status::SegmentRollup {
+                    segment: "alerts".to_string(),
+                    severity: "critical".to_string(),
+                    source: "thermal".to_string(),
+                    summary: "thermal critical".to_string(),
+                    host: "eagle".to_string(),
+                    critical_policy: "own-seat-light-show".to_string(),
+                    ts_unix_ms: 42,
+                }),
+                seen: true,
+                ..status::StatusSegments::default()
+            });
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.render(ctx));
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "fixture shell frame painted nothing");
+        assert!(
+            ctx.read_response(status::segment_pip_id(status::StatusSegment::Alerts))
+                .is_some(),
+            "Alerts pip registered from daemon segment rollup"
+        );
+        assert!(
+            ctx.read_response(status::status_panel_id()).is_some(),
+            "status expansion panel mounted"
+        );
+        assert!(
+            ctx.read_response(status::critical_edge_cue_id()).is_some(),
+            "own-seat critical edge cue mounted"
+        );
+        assert!(
+            shell.critical_edge.visible(),
+            "own-seat critical remains live after the fixture frame"
+        );
+        assert!(
+            shell.chat.notification_count_for_test() > 0,
+            "Chat read-model folded the fixture alert"
+        );
+        assert!(
+            ctx.read_response(chat::alert_action_button_id(alert_id.as_str(), "ack"))
+                .is_some(),
+            "typed Ack action button mounted"
+        );
+        assert!(
+            ctx.read_response(chat::alert_action_button_id(alert_id.as_str(), "restart"))
+                .is_some(),
+            "typed safe action button mounted"
+        );
+        assert!(
+            ctx.read_response(chat::notification_dnd_toggle_id())
+                .is_some(),
+            "DND toggle mounted in the Chat Notifications lane"
+        );
+
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        assert!(
+            nodes.iter().any(|node| {
+                node.label() == Some("Notification status")
+                    && node.role() == egui::accesskit::Role::Status
+                    && node.live() == Some(egui::accesskit::Live::Polite)
+            }),
+            "status live region exported"
+        );
+        assert!(
+            nodes.iter().any(|node| {
+                node.label() == Some("Critical alert")
+                    && node.role() == egui::accesskit::Role::Alert
+                    && node.live() == Some(egui::accesskit::Live::Assertive)
+            }),
+            "critical live region exported"
+        );
     }
 
     /// Mount the shell's **vertical dock** chrome (VDOCK, the sole chrome) exactly

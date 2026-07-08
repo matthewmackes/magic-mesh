@@ -19,9 +19,9 @@
 //! cells (in [`Surface::ALL`] order). The active cell wears a **left-edge accent
 //! bar** + the subtle selection wash; hover is a fill only — no per-icon captions,
 //! no tooltips anywhere. Beneath the picker sit VDOCK-5's **clock strip** (the
-//! live HH:MM glyph that opens Timers & Alarms, lock #20), VDOCK-3's bottom
-//! **status quads**, and VDOCK-4's **system quad** (Settings · Show-Desktop ·
-//! Lock · Power).
+//! live HH:MM glyph that opens Timers & Alarms, lock #20) and VDOCK-4's **system
+//! quad** (Settings · Show-Desktop · Lock · Power). Notification status pips live
+//! in the separate bottom rail, not in the left rail.
 //!
 //! The dock is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -33,12 +33,12 @@
 //! beneath (the "auto-hide + DRM seat" guarantee).
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
-use mde_egui::{GradeBand, Motion, Style};
+use mde_egui::{Density, GradeBand, Motion, Style};
 use mde_seat::{PowerVerb, SeatSnapshot};
 use mde_theme::brand::icons::{icon_image, IconId};
 
 use crate::chrome::{GradeRow, MeshSummary, NodeGrades};
-use crate::tray::{self, TrayInputs};
+use crate::status::{self, StatusSegments};
 
 /// Which surface fills the shell body.
 ///
@@ -82,6 +82,9 @@ pub enum Surface {
     /// The Browser surface — the sandboxed Servo browser (`mde-web-preview`)
     /// rendered egui-native over the BOOKMARKS-6 IPC + shm texture bridge.
     Browser,
+    /// The embedded Bookmarks manager (`mde-bookmarks-egui`) — folders, tags,
+    /// search, import, and bookmark detail management over the mesh CRDT model.
+    Bookmarks,
     /// The embedded Terminal surface (`mde-term-egui`) — the full Terminator-class
     /// terminal (tabs / splits / broadcast / a shell on any mesh peer, TERM-4/5/8)
     /// over a real local PTY, mounted as an in-shell panel (TERM-16).
@@ -107,8 +110,8 @@ pub enum Surface {
     Phones,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
-    /// (E12-15). Owns ALL host-control interaction (lock 3); the taskbar tray
-    /// keeps only read-only status icons.
+    /// (E12-15). Owns ALL host-control interaction (lock 3); dock status keeps
+    /// only read-only summaries.
     System,
     /// The Storage surface — GParted-authentic disk/partition management (E12-21),
     /// folded from `state/storage/<node>` and driven back via `action/storage/<node>`.
@@ -143,7 +146,7 @@ impl Surface {
     /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
     /// relative order within each group (L7); a compile-time guard keeps the two
     /// tables in sync.
-    pub(crate) const ALL: [Surface; 17] = [
+    pub(crate) const ALL: [Surface; 18] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Instances,
@@ -154,6 +157,7 @@ impl Surface {
         Surface::Files,
         Surface::Voice,
         Surface::Browser,
+        Surface::Bookmarks,
         Surface::Terminal,
         Surface::Editor,
         Surface::Chat,
@@ -183,6 +187,7 @@ impl Surface {
             Surface::Files => IconId::Files,
             Surface::Voice => IconId::Voice,
             Surface::Browser => IconId::Browser,
+            Surface::Bookmarks => IconId::Bookmarks,
             Surface::Terminal => IconId::Terminal,
             Surface::Editor => IconId::Editor,
             Surface::Chat => IconId::Chat,
@@ -252,7 +257,7 @@ struct Group {
 /// standalone anchor, and **System** (Settings) + **Desktop** (Show-Desktop) are
 /// VDOCK-4's bottom system-quad cells; every other surface appears here exactly
 /// once (About lives in System's group) — the union with those three reproduces
-/// all 17 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
+/// all 18 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
 /// grouping authority).
 const GROUPS: [Group; 6] = [
     Group {
@@ -268,7 +273,12 @@ const GROUPS: [Group; 6] = [
     Group {
         label: "Terminals",
         accent: Style::ACCENT_TERMINALS,
-        surfaces: &[Surface::Browser, Surface::Terminal, Surface::Editor],
+        surfaces: &[
+            Surface::Browser,
+            Surface::Bookmarks,
+            Surface::Terminal,
+            Surface::Editor,
+        ],
     },
     Group {
         label: "Mesh",
@@ -287,6 +297,26 @@ const GROUPS: [Group; 6] = [
         accent: Style::ACCENT_MEDIA,
         surfaces: &[Surface::Music, Surface::Media],
     },
+];
+
+const PICKER_FOCUS_ORDER: [Surface; 17] = [
+    Surface::Workbench,
+    Surface::Voice,
+    Surface::Chat,
+    Surface::Phones,
+    Surface::Instances,
+    Surface::InfraCode,
+    Surface::Browser,
+    Surface::Bookmarks,
+    Surface::Terminal,
+    Surface::Editor,
+    Surface::MeshView,
+    Surface::Files,
+    Surface::Storage,
+    Surface::About,
+    Surface::Music,
+    Surface::Media,
+    Surface::Desktop,
 ];
 
 // Compile-time guard: the Workbench lead + VDOCK-4's two system-quad cells
@@ -365,8 +395,8 @@ fn group_label_font(ui: &egui::Ui, avail: f32) -> egui::FontId {
 /// `(glyph, physical-size, tint)` triple is rasterized through `resvg` **once**
 /// and then shared as a cheap ref-counted [`TextureHandle`] — never re-rasterized
 /// per frame (the backdrop.rs lock-7 pattern). A failed rasterize caches `None`,
-/// so a broken asset fails soft (§7) without retrying every frame. Shared with
-/// the tray (`tray.rs`), which rasters the 16px tray set through the same cache.
+/// so a broken asset fails soft (§7) without retrying every frame. Shared by the
+/// dock's status and system glyphs through the same cache.
 ///
 /// The glyph is rasterized at the physical pixel size (`logical × ppp`) and drawn
 /// back at the logical size, so it stays DPI-crisp at any `HiDPI` scale — the
@@ -410,7 +440,8 @@ pub fn icon_texture(
 // left-edge, full-height, ~48px, solid Carbon-dark column that slides in from the
 // left and auto-hides (hotkey + pin, no hover). VDOCK-1 builds the FRAME + the
 // slide/toggle/pin mechanism; the interior is filled by the app picker (VDOCK-2),
-// the status quads (VDOCK-3), and the system quad (VDOCK-4).
+// the clock strip (VDOCK-5), and the system quad (VDOCK-4). Notification pips
+// mount in the separate bottom rail.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// The vertical dock's width in logical points (~48px, design #2/#23) — one
@@ -424,10 +455,16 @@ pub const DOCK_W: f32 = CELL_W;
 /// eases the reveal 0↔1). Private to the dock.
 const DOCK_SLIDE_KEY: &str = "vdock-slide";
 
+/// The egui memory key for NOTIF-4's right-side status detail panel.
+const STATUS_PANEL_KEY: &str = "vdock-status-panel";
+
 /// The stable id of the dock's floating [`egui::Area`] layer, so the shell (and
 /// the passthrough test) can name its `LayerId` — `LayerId::new(Foreground,
 /// Id::new(DOCK_AREA))`.
 const DOCK_AREA: &str = "vdock-area";
+
+/// The stable id of the bottom notification rail layer.
+const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 
 /// The left vertical dock's **state** — VDOCK-1's auto-hide inputs (locks #9/#13)
 /// plus VDOCK-2's picker state. The auto-hide half (the Super-tap **reveal** latch
@@ -462,11 +499,13 @@ pub struct DockState {
     /// by its '…' cell, cleared on a tap-route or a click-away. Distinct latch from
     /// the app picker's [`Self::overflow_open`].
     grades_overflow_open: bool,
-    /// The live inputs VDOCK-3's bottom **status quads** fold each frame (the mesh
-    /// summary, the seat snapshot, the Chat unread tally, the live-session flag) —
+    /// NOTIF-4 — whether the bottom notification rail's detail panel is open.
+    /// Toggled by the rail chevron and dismissed by Esc or click-away.
+    status_panel_open: bool,
+    /// The live inputs NOTIF-3's bottom **notification rail** folds each frame —
     /// owned so `dock()` keeps its `(ctx, state)` signature; the shell refreshes it
     /// via [`Self::set_status_inputs`] before each `dock()`. Defaults to the honest
-    /// pre-poll state (unseen mesh, no seat, no unread, no session).
+    /// pre-poll state.
     status: StatusInputs,
     /// VDOCK-4 — the system quad's **Power menu** (design #18): the anchored
     /// Lock/Suspend/Reboot/Shutdown popup off the Power cell, plus the typed-arming
@@ -494,6 +533,28 @@ pub struct DockState {
     /// shell drains it ([`Self::take_console_toggle`]) and toggles the Console
     /// panel. The dock can't reach the panel itself (§6, the deferred wire).
     console_toggle: bool,
+    /// NAVBAR-U1 — latched by the bottom-rail Desktop cell. The shell drains it
+    /// and asks the chooser to reconnect the newest recent desktop, falling back
+    /// to the chooser if no recent can connect.
+    desktop_reconnect: bool,
+    /// NAVBAR-U2 — whether the bottom-rail Desktop source flyout is open.
+    desktop_sources_open: bool,
+    /// NAVBAR-7 — whether the bottom rail's overflow More popup is open.
+    rail_more_open: bool,
+    /// NAVBAR-U2 — source id selected in the compact Desktop flyout. The shell
+    /// drains it and hands it back to ChooserState's normal connect path.
+    desktop_source_pick: Option<String>,
+    /// NAVBAR-U3 — session id selected from the taskbar-style Desktop run. The
+    /// shell drains it and focuses the Desktop face for that broker-visible
+    /// session without inventing a second session store.
+    desktop_session_focus: Option<String>,
+    /// TRANSFERS-9 — the Files surface's in-flight transfer count, mirrored from
+    /// the embedded Files ledger each frame. Zero paints no badge.
+    transfer_active_count: usize,
+    /// NAVBAR-8 — the shell-wide interaction density mirrored from the
+    /// formfactor/control-surface path. Mouse keeps the compact icon rail; Touch
+    /// expands the rail into the 48px labelled variant.
+    density: Density,
 }
 
 /// A shell-level **request** the VDOCK-4 system quad records for the shell to drain
@@ -512,26 +573,127 @@ pub enum DockRequest {
     Power(PowerVerb),
 }
 
-/// The live inputs the bottom **status quads** (VDOCK-3) fold — bundled into ONE
-/// [`DockState`] field (rather than four) so the dock keeps its bool count under
-/// the `clippy::struct_excessive_bools` bar. Owned clones, refreshed each frame by
-/// the shell through [`DockState::set_status_inputs`], so the vertical
-/// `dock(ctx, state)` needs no extra parameters. The fields mirror [`TrayInputs`],
-/// which the quad render borrows from them.
+/// The live inputs the bottom **notification rail** folds — bundled into ONE
+/// [`DockState`] field. Owned clones, refreshed each frame by the shell through
+/// [`DockState::set_status_inputs`], so the vertical `dock(ctx, state)` needs no
+/// extra parameters.
 #[derive(Debug, Default)]
 struct StatusInputs {
-    /// The world-readable mesh summary — the Status / Signal / Peers dots.
+    /// The folded mesh summary from `chrome.rs`, kept so launcher badges can show
+    /// live peer/health state without reopening the old top status strip.
     mesh: MeshSummary,
-    /// The `mde-seat` snapshot (Bluetooth / Volume / Battery), `None` pre-poll.
-    seat: Option<SeatSnapshot>,
-    /// The whole-mesh Chat unread tally — the Chat cell's badge (#19).
+    /// The unified Chat unread count. Zero is meaningful silence and paints no
+    /// badge.
     unread: usize,
-    /// `true` while a VDI session is live — the Sessions cell's honest tone.
+    /// The `mde-seat` snapshot for NOTIF-4's device-control band, `None` pre-poll.
+    seat: Option<SeatSnapshot>,
+    /// Whether a VDI/Desktop session is currently requested or active.
     session_active: bool,
+    /// Concrete Desktop sessions/requests to show as taskbar-style entries in the
+    /// bottom rail. Empty preserves the old single dim Sessions glyph.
+    sessions: Vec<SessionRailEntry>,
     /// NODE-GRADE-2 — the folded per-node capability grades the grade mini-list
-    /// renders above the status quads (local pinned first, peers worst-first). The
+    /// renders above the status strip (local pinned first, peers worst-first). The
     /// honest empty set pre-poll, so the band simply vanishes until grades arrive.
     grades: NodeGrades,
+    /// NOTIF-3 — daemon-owned segment rollups rendered by the compact status
+    /// strip. Missing rollups stay dim; the shell never fabricates green.
+    segments: StatusSegments,
+}
+
+/// One open/detected Desktop session entry rendered in the bottom rail. This is a
+/// display summary only; the Desktop/Chooser remains the source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRailEntry {
+    /// Broker session id, when the row came from `action/vdi/session`. Fallback
+    /// rows for a pending `VdiState` request have no id and still route Desktop.
+    id: Option<String>,
+    /// Human label, usually the VM/desktop name.
+    label: String,
+    /// Short protocol/status tag such as `RDP` or `VNC`.
+    protocol: &'static str,
+}
+
+/// One compact Desktop source row rendered by the bottom rail flyout. It is a UI
+/// summary only; `ChooserState` remains the source of truth and executes connects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopRailSource {
+    /// Stable chooser source id.
+    pub(crate) id: String,
+    /// Human label, usually VM/desktop name.
+    pub(crate) label: String,
+    /// Node/host label for the secondary line.
+    node: String,
+    /// Short protocol badge such as `RDP` or `VNC`.
+    protocol: &'static str,
+    /// Whether the row may be selected.
+    pub(crate) connectable: bool,
+    /// Whether the chooser prefs mark this source pinned/favorite.
+    favorite: bool,
+    /// Whether the chooser prefs mark this source recent.
+    recent: bool,
+}
+
+impl DesktopRailSource {
+    /// Construct a bounded compact row.
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        node: impl Into<String>,
+        protocol: &'static str,
+        connectable: bool,
+        favorite: bool,
+        recent: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: truncate_session_label(&label.into()),
+            node: truncate_session_label(&node.into()),
+            protocol,
+            connectable,
+            favorite,
+            recent,
+        }
+    }
+}
+
+impl SessionRailEntry {
+    /// Construct a bounded display entry. The label is kept short so a long VM
+    /// name cannot consume the whole rail.
+    pub fn new(label: impl Into<String>, protocol: &'static str) -> Self {
+        Self::with_id(None, label, protocol)
+    }
+
+    /// Construct a bounded display entry backed by a broker session id.
+    pub fn with_session_id(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        protocol: &'static str,
+    ) -> Self {
+        Self::with_id(Some(id.into()), label, protocol)
+    }
+
+    fn with_id(id: Option<String>, label: impl Into<String>, protocol: &'static str) -> Self {
+        let label = truncate_session_label(&label.into());
+        Self {
+            id,
+            label,
+            protocol,
+        }
+    }
+}
+
+fn truncate_session_label(label: &str) -> String {
+    const MAX_CHARS: usize = 24;
+    let mut out = String::new();
+    for ch in label.chars().take(MAX_CHARS) {
+        out.push(ch);
+    }
+    if label.chars().count() > MAX_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 impl DockState {
@@ -563,6 +725,13 @@ impl DockState {
         }
     }
 
+    /// Test seam for shell-level integration fixtures: mount the NOTIF-4 detail
+    /// panel in the same frame as the status bar, edge cue, and Chat surface.
+    #[cfg(test)]
+    pub(crate) const fn open_status_panel_for_test(&mut self) {
+        self.status_panel_open = true;
+    }
+
     /// The **active surface** the app picker currently shows (VDOCK-2). The shell
     /// reads this back into its central view each frame after [`dock`] (the VDOCK-6
     /// wire) so a picker-cell click routes the shell body; [`Self::set_active`]
@@ -581,7 +750,27 @@ impl DockState {
         self.active = surface;
     }
 
-    /// Refresh the bottom **status quads'** live inputs (VDOCK-3) — the shell calls
+    /// Mirror the Files transfer ledger's active count into the dock. The Files
+    /// surface owns the ledger read; the dock only paints the count.
+    pub const fn set_transfer_active_count(&mut self, count: usize) {
+        self.transfer_active_count = count;
+    }
+
+    /// Mirror the shell-wide density into the dock. This is deliberately fed by
+    /// the same formfactor path that installs [`Style`] density, so the shell has
+    /// one compact/expanded mode instead of a second dock-local toggle.
+    pub const fn set_density(&mut self, density: Density) {
+        self.density = density;
+    }
+
+    const fn rail_height(&self) -> f32 {
+        match self.density {
+            Density::Mouse => NOTIFICATION_RAIL_H,
+            Density::Touch => NOTIFICATION_RAIL_EXPANDED_H,
+        }
+    }
+
+    /// Refresh the bottom **notification rail's** live inputs (NOTIF-3) — the shell calls
     /// this each frame before [`dock`] with the SAME folds the horizontal tray
     /// reads (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
     /// live-session flag). Owned so the dock's `(ctx, state)` signature stays put;
@@ -593,14 +782,18 @@ impl DockState {
         seat: Option<SeatSnapshot>,
         unread: usize,
         session_active: bool,
+        sessions: Vec<SessionRailEntry>,
         grades: NodeGrades,
+        segments: StatusSegments,
     ) {
         self.status = StatusInputs {
             mesh,
-            seat,
             unread,
+            seat,
             session_active,
+            sessions,
             grades,
+            segments,
         };
     }
 
@@ -668,6 +861,25 @@ impl DockState {
         self.console_toggle = false;
         toggled
     }
+
+    /// Drain the bottom-rail Desktop reconnect request (NAVBAR-U1). This is
+    /// separate from `active == Desktop` so programmatic navigation to Desktop does
+    /// not silently initiate a reconnect.
+    pub const fn take_desktop_reconnect(&mut self) -> bool {
+        let reconnect = self.desktop_reconnect;
+        self.desktop_reconnect = false;
+        reconnect
+    }
+
+    /// Drain the compact Desktop flyout source selection (NAVBAR-U2).
+    pub fn take_desktop_source_pick(&mut self) -> Option<String> {
+        self.desktop_source_pick.take()
+    }
+
+    /// Drain the bottom-rail Desktop session focus selection (NAVBAR-U3).
+    pub fn take_desktop_session_focus(&mut self) -> Option<String> {
+        self.desktop_session_focus.take()
+    }
 }
 
 /// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome,
@@ -686,9 +898,9 @@ impl DockState {
 ///
 /// VDOCK-1 built the FRAME + the slide/toggle/pin; **VDOCK-2** fills the top
 /// **Workbench-lead** zone + the single-column **app-groups** middle; **VDOCK-3**
-/// fills the bottom **status quads** and **VDOCK-4** the **system quad** beneath
+/// fills the bottom **status strip** and **VDOCK-4** the **system quad** beneath
 /// them ([`paint_dock_frame`]). Returns `true` if a dock control routed this frame
-/// — the pin, a picker cell, a status-quad cell selecting its [`Surface`], or a
+/// — the pin, a picker cell, a status segment selecting its [`Surface`], or a
 /// system-quad cell (a route, the curtain lock, or the Power menu), recorded in
 /// [`DockState`] (the active surface + the pending lock/power requests) which the
 /// shell reads back to surface the body / drive the seat.
@@ -711,7 +923,6 @@ pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     // The slide offset: the panel's left edge rides from -DOCK_W (fully out) to 0
     // (fully in). `constrain(false)` below lets the Area sit at negative x.
     let offset_x = -(1.0 - t) * DOCK_W;
-
     let mut clicked = false;
     egui::Area::new(egui::Id::new(DOCK_AREA))
         .order(egui::Order::Foreground)
@@ -726,14 +937,260 @@ pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
             // dock is visible its layer covers the whole column (egui routes clicks
             // over it to the dock, not the surface behind). Off-screen portions of
             // the claim simply can't be hit; the fully-hidden case returned above.
-            let (rect, _claim) =
+            let (claim, _claim) =
                 ui.allocate_exact_size(egui::vec2(DOCK_W, screen.height()), egui::Sense::hover());
+            let rect = egui::Rect::from_min_size(claim.min, egui::vec2(DOCK_W, claim.height()));
             clicked = paint_dock_frame(ui, rect, state);
         });
 
     // Keep frames flowing while the slide is in flight so the motion is smooth
     // (the curtain's tween idiom) — a no-op once settled at either end.
     if t > 0.001 && t < 0.999 {
+        ctx.request_repaint();
+    }
+    clicked
+}
+
+/// Render the bottom rail that holds the small global controls removed from the
+/// left rail: Advanced menu, Desktop, Clock, Pin, and the notification/status
+/// segment micro-icons.
+#[cfg(test)]
+pub fn notification_rail(ctx: &egui::Context, state: &mut DockState) -> bool {
+    notification_rail_with_sources(ctx, state, &[])
+}
+
+/// Render the bottom rail with the compact Desktop source flyout fed from
+/// `ChooserState` by the shell.
+pub fn notification_rail_with_sources(
+    ctx: &egui::Context,
+    state: &mut DockState,
+    desktop_sources: &[DesktopRailSource],
+) -> bool {
+    let screen = ctx.screen_rect();
+    let rail_h = state.rail_height();
+    let rail_rect = egui::Rect::from_min_size(
+        egui::pos2(screen.left(), screen.bottom() - rail_h),
+        egui::vec2(screen.width(), rail_h),
+    );
+    let panel_t = Motion::animate(ctx, STATUS_PANEL_KEY, state.status_panel_open, Motion::BASE);
+    let panel_top = rail_rect.top() - STATUS_PANEL_GAP - STATUS_PANEL_H
+        + (1.0 - panel_t.clamp(0.0, 1.0)) * Style::SP_XL;
+    let area_top = if panel_t > 0.001 {
+        panel_top.min(rail_rect.top())
+    } else {
+        rail_rect.top()
+    };
+    let area_rect = egui::Rect::from_min_size(
+        egui::pos2(screen.left(), area_top),
+        egui::vec2(screen.width(), screen.bottom() - area_top),
+    );
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new(NOTIFICATION_RAIL_AREA))
+        .order(egui::Order::Foreground)
+        .fixed_pos(area_rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(area_rect.size());
+            let local = egui::Rect::from_min_size(
+                egui::pos2(0.0, rail_rect.top() - area_top),
+                rail_rect.size(),
+            );
+            ui.painter().rect_filled(
+                local,
+                egui::CornerRadius::ZERO,
+                Style::BG.linear_multiply(0.92),
+            );
+            ui.painter().hline(
+                local.left()..=local.right(),
+                local.top(),
+                egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+            );
+
+            let mut x = local.left() + Style::SP_XS;
+            let cell = |x: f32| {
+                egui::Rect::from_min_size(egui::pos2(x, local.top()), egui::vec2(rail_h, rail_h))
+                    .shrink(2.0)
+            };
+
+            if start_cell(ui, cell(x), state) {
+                clicked = true;
+            }
+            x += rail_h;
+
+            let desktop = cell(x);
+            if rail_surface_cell(
+                ui,
+                Surface::Desktop,
+                &mut state.active,
+                &mut state.pinned,
+                desktop,
+                "Desktop",
+            ) {
+                state.desktop_reconnect = true;
+                clicked = true;
+            }
+            x += rail_h;
+            let source_caret = egui::Rect::from_min_size(
+                egui::pos2(x, local.top()),
+                egui::vec2(DESKTOP_CARET_W, rail_h),
+            )
+            .shrink(2.0);
+            let opened_desktop_sources =
+                desktop_source_toggle(ui, source_caret, state, desktop_sources.is_empty());
+            if opened_desktop_sources {
+                clicked = true;
+            }
+            x += DESKTOP_CARET_W;
+
+            let tray_icon_w = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
+            let status_w = tray_icon_w * status::StatusSegment::ALL.len() as f32;
+            let clock_w = rail_h * 2.2;
+            let right_cluster_w =
+                clock_w + rail_h + status_w + Style::SP_XS + rail_h + Style::SP_XS;
+            let session_right = (local.right() - Style::SP_XS - right_cluster_w).max(x);
+            if state.status.sessions.is_empty() {
+                if rail_icon(
+                    ui,
+                    cell(x),
+                    IconId::Sessions,
+                    if state.status.session_active {
+                        Style::ACCENT
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                ) {
+                    state.active = Surface::Desktop;
+                    clicked = true;
+                }
+            } else {
+                let sessions = state.status.sessions.clone();
+                let mut sx = x;
+                let mut focused_session = None;
+                let overflow = rail_session_overflow(ui, &sessions, sx, session_right, rail_h);
+                for (idx, entry) in sessions.iter().enumerate().take(overflow.visible) {
+                    let desired = session_entry_width(ui, entry, rail_h);
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(sx, local.top()),
+                        egui::vec2(desired, rail_h),
+                    )
+                    .shrink(2.0);
+                    if session_entry(ui, rect, idx, entry, state.active == Surface::Desktop) {
+                        state.active = Surface::Desktop;
+                        focused_session.clone_from(&entry.id);
+                        clicked = true;
+                    }
+                    sx += desired + Style::SP_XS;
+                }
+                if focused_session.is_some() {
+                    state.desktop_session_focus = focused_session;
+                }
+                if overflow.hidden_start < sessions.len() {
+                    let more = cell(sx);
+                    let opened_more = rail_more_cell(ui, more, state);
+                    if opened_more {
+                        clicked = true;
+                    }
+                    if state.rail_more_open
+                        && rail_more_popup(
+                            ui,
+                            more,
+                            overflow.hidden_start,
+                            &sessions,
+                            state,
+                            opened_more,
+                            rail_h,
+                        )
+                    {
+                        clicked = true;
+                    }
+                } else {
+                    state.rail_more_open = false;
+                }
+            }
+            let mut tray_x = local.right() - Style::SP_XS - clock_w;
+            if clock_cell_rect(
+                ui,
+                egui::Rect::from_min_size(
+                    egui::pos2(tray_x, local.top()),
+                    egui::vec2(clock_w, rail_h),
+                )
+                .shrink(2.0),
+                state,
+            ) {
+                clicked = true;
+            }
+            tray_x -= rail_h;
+            if pin_toggle(ui, cell(tray_x), state) {
+                clicked = true;
+            }
+            tray_x -= status_w + Style::SP_XS;
+
+            let status_rect = egui::Rect::from_min_size(
+                egui::pos2(tray_x, local.top() + 2.0),
+                egui::vec2(
+                    status_w,
+                    rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0,
+                ),
+            );
+            tray_x -= rail_h;
+            if status_detail_toggle(ui, cell(tray_x), state) {
+                clicked = true;
+            }
+
+            let mut active = state.active;
+            let out = status::notification_rail(
+                ui,
+                &mut active,
+                &state.status.grades,
+                &state.status.segments,
+                status_rect,
+                state.status_panel_open,
+            );
+            state.active = active;
+            if out.toggle_panel {
+                state.status_panel_open = !state.status_panel_open;
+                clicked = true;
+            }
+            if out.routed {
+                clicked = true;
+            }
+
+            if panel_t > 0.001 {
+                let panel_rect = notification_panel_rect(local, panel_t);
+                let mut panel_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(panel_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                panel_ui.set_opacity(panel_t.clamp(0.0, 1.0));
+                let panel_out = status::status_panel(
+                    &panel_ui,
+                    &state.status.grades,
+                    state.status.seat.as_ref(),
+                    panel_rect,
+                );
+                if panel_out.route_system {
+                    state.active = Surface::System;
+                    state.status_panel_open = false;
+                    clicked = true;
+                }
+                if let Some(host) = panel_out.node_focus {
+                    state.request_node_focus(&host);
+                    state.status_panel_open = false;
+                    clicked = true;
+                }
+                if status_panel_dismissed(ui, panel_rect, local) {
+                    state.status_panel_open = false;
+                    clicked = true;
+                }
+            }
+            if state.desktop_sources_open
+                && !opened_desktop_sources
+                && desktop_source_flyout(ui, desktop, desktop_sources, state)
+            {
+                clicked = true;
+            }
+        });
+    if panel_t > 0.001 && panel_t < 0.999 {
         ctx.request_repaint();
     }
     clicked
@@ -761,11 +1218,11 @@ pub fn gutter_width(ctx: &egui::Context, state: &DockState) -> f32 {
 /// Paint the vertical dock's frame into `rect` and lay out its interior: the solid
 /// Carbon-dark panel + the hairline right-edge divider (lock #24, §4 tokens), the
 /// **VDOCK-2** top zone (the Workbench lead + the folded-in pin) and middle zone
-/// (the single-column app groups + '…' overflow), the **VDOCK-3** status quads, and
-/// the **VDOCK-4** system quad in the final `DOCK_W` row beneath them. Returns `true`
-/// if the pin, a picker cell, a status-quad cell, or a system-quad cell routed/acted
-/// this frame.
-fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+/// (the single-column app groups + '…' overflow), VDOCK-5's clock strip, and the
+/// **VDOCK-4** system quad in the final `DOCK_W` row beneath it. Returns `true`
+/// if the pin, a picker cell, the clock, or a system-quad cell routed/acted this
+/// frame.
+fn paint_dock_frame(ui: &mut egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let painter = ui.painter().clone();
     // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), a flat
     // opaque fill so the dock reads as one solid chrome column.
@@ -781,41 +1238,21 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
 
     let mut clicked = false;
 
-    // ── TOP zone (design #8 + CONSOLE-1) — the Start front door, the Workbench
-    // lead, the pin folded in. CONSOLE-1's Start cell (the Terminal glyph — the
-    // terminal's front door) is the TOPMOST cell: the console design locked
-    // "far-left, before Workbench" on the old horizontal bar, and on the
-    // vertical dock far-left maps to the top, still before the Workbench lead.
-    // A BORDER hairline seats it apart; the Workbench lead (the mesh-control
-    // home, always one click away) sits beneath, with VDOCK-1's pin toggle
-    // (lock #9 — the "pin" half of "hotkey + pin") in a slim strip under it and
-    // a hairline before the app groups below.
-    let start = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
-    if start_cell(ui, start, state) {
+    // ── TOP zone — the Workbench lead remains the first left-rail launcher. The
+    // Advanced menu, Desktop shortcut, clock, and pin live in the bottom rail.
+    let wb = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
+    if pick_app_cell(
+        ui,
+        Surface::Workbench,
+        &mut state.active,
+        &mut state.pinned,
+        wb,
+    ) {
         clicked = true;
     }
     painter.hline(
         (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
-        start.bottom(),
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
-    let wb = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), start.bottom()),
-        egui::vec2(DOCK_W, DOCK_W),
-    );
-    if pick_app_cell(ui, Surface::Workbench, &mut state.active, wb) {
-        clicked = true;
-    }
-    let pin = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), wb.bottom()),
-        egui::vec2(DOCK_W, PIN_STRIP_H),
-    );
-    if pin_toggle(ui, pin, state) {
-        clicked = true;
-    }
-    painter.hline(
-        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
-        pin.bottom() + GROUP_DIVIDER_H / 2.0,
+        wb.bottom() + GROUP_DIVIDER_H / 2.0,
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
     );
 
@@ -824,16 +1261,17 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     // Media), each a horizontal accent label (#4) + a left-rail accent stripe +
     // accent divider (#21) over its icon-only 24px cells (#11/#23) in Surface::ALL
     // order (#3). The zone is bounded above the BOTTOM_ZONE_H band reserved for
-    // VDOCK-5's clock strip + VDOCK-3/4's status + system quads; groups that
+    // VDOCK-5's clock strip + VDOCK-4's system quad; groups that
     // overrun it fold into the '…' more-popup (#22).
     // NODE-GRADE-2 — the per-node grade mini-list claims a band directly ABOVE the
     // bottom zone (between the app groups and the clock strip), so the app zone
     // now ends at the grade band's top. An empty grade set claims 0 (the band
     // vanishes and the groups reclaim the space, so pre-poll the layout is unchanged).
-    let quads_top_zone = rect.bottom() - BOTTOM_ZONE_H;
+    let rail_h = state.rail_height();
+    let quads_top_zone = rect.bottom() - rail_h - BOTTOM_ZONE_H;
     let grade_band_h = grade_band_height(&state.status.grades);
     let grade_top = quads_top_zone - grade_band_h;
-    let middle_top = pin.bottom() + GROUP_DIVIDER_H;
+    let middle_top = wb.bottom() + GROUP_DIVIDER_H;
     let middle_bottom = grade_top;
     let middle_h = (middle_bottom - middle_top).max(0.0);
     let visible = visible_group_count(middle_h);
@@ -848,7 +1286,10 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
             egui::pos2(rect.left(), y),
             DOCK_W,
             &font,
+            &state.status,
+            state.transfer_active_count,
             &mut state.active,
+            &mut state.pinned,
         );
         if routed {
             clicked = true;
@@ -861,53 +1302,13 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
 
     // ── GRADE band (NODE-GRADE-2 → design #4/#5/#6/#7/#8/#14/#15/#18/#19) — the
     // per-node capability grade mini-list, painted between the app groups and the
-    // status quads. Empty grades painted nothing (grade_band_h == 0).
+    // clock/system strip. Empty grades painted nothing (grade_band_h == 0).
     if grade_band_h > 0.0 && paint_grade_band(ui, rect, grade_top, state) {
         clicked = true;
     }
 
-    // ── BOTTOM zone (VDOCK-3/4/5 → design #6/#7/#8/#15/#16/#17/#18/#19/#20) —
-    // the last BOTTOM_ZONE_H of the column: VDOCK-5's **clock strip** (the live
-    // HH:MM glyph that routes to Timers & Alarms, lock #20), then three stacked
-    // DOCK_W quads: quad 1 Chat[badge]·BT·Vol·Batt over quad 2
-    // Status·Signal·Peers·Sessions (VDOCK-3), then the VDOCK-4 **system quad**
-    // Settings·Show-Desktop·Lock·Power in the final DOCK_W row. The status cells
-    // route to their owning surface (no flyouts, #15) with the Chat unread badge
-    // (#19); the system cells route/act (Settings→System, Show-Desktop→Desktop,
-    // Lock→curtain, Power→the armed menu, #18). The status quads fold the
-    // shell-fed StatusInputs — the honest pre-poll dim state until
-    // `set_status_inputs` lands (§7). `active` is copied out so the immutable
-    // borrow of `state.status` (the TrayInputs view) releases before it's
-    // written back.
-    let quads_top = rect.bottom() - STATUS_SYS_H;
-    if clock_cell(ui, egui::pos2(rect.left(), quads_top - CLOCK_CELL_H), state) {
-        clicked = true;
-    }
-    let mut active = state.active;
-    let quads_routed = {
-        let inputs = TrayInputs {
-            mesh: &state.status.mesh,
-            seat: state.status.seat.as_ref(),
-            unread: state.status.unread,
-            session_active: state.status.session_active,
-        };
-        tray::status_quads(
-            ui,
-            &mut active,
-            &inputs,
-            egui::pos2(rect.left(), quads_top),
-            DOCK_W,
-        )
-    };
-    state.active = active;
-    if quads_routed {
-        clicked = true;
-    }
-
-    // VDOCK-4 — the system quad in the reserved final DOCK_W row, beneath the two
-    // status quads (which take 2·DOCK_W of the band). A BORDER hairline sets the
-    // control cluster apart from the status cluster above (the pin-strip idiom).
-    let sys_top = rect.bottom() - DOCK_W;
+    // VDOCK-4 — the system quad in the reserved final DOCK_W row.
+    let sys_top = rect.bottom() - rail_h - DOCK_W;
     painter.hline(
         (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
         sys_top,
@@ -925,10 +1326,273 @@ fn start_cell_id() -> egui::Id {
     egui::Id::new("vdock-start-cell")
 }
 
+fn rail_icon(ui: &egui::Ui, rect: egui::Rect, icon: IconId, tint: egui::Color32) -> bool {
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("bottom-rail-icon", icon.name())),
+        egui::Sense::click(),
+    );
+    let color = if resp.hovered() { Style::TEXT } else { tint };
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let edge = (rect.height() - 2.0).max(Style::SP_S);
+    if let Some(tex) = icon_texture(ui.ctx(), icon, edge, color) {
+        let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(edge, edge));
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        ui.painter()
+            .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+    }
+    resp.clicked()
+}
+
+fn paint_rail_label(ui: &egui::Ui, rect: egui::Rect, label: &str, tint: egui::Color32) {
+    if rect.height() < NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
+        return;
+    }
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - Style::SP_XS),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        egui::FontId::proportional(Style::SMALL),
+        tint,
+    );
+}
+
+fn rail_icon_rect(rect: egui::Rect, edge: f32) -> egui::Rect {
+    let y = if rect.height() >= NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
+        rect.top() + Style::SP_XS + edge / 2.0
+    } else {
+        rect.center().y
+    };
+    egui::Rect::from_center_size(egui::pos2(rect.center().x, y), egui::vec2(edge, edge))
+}
+
+fn rail_surface_cell(
+    ui: &egui::Ui,
+    surface: Surface,
+    active: &mut Surface,
+    pinned: &mut bool,
+    rect: egui::Rect,
+    label: &str,
+) -> bool {
+    let selected = *active == surface;
+    let resp = ui.interact(rect, pick_cell_id(surface), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    if selected {
+        let bar =
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(ACTIVE_BAR_W, rect.height()));
+        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
+    }
+    let tint = if selected {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, edge),
+            uv,
+            egui::Color32::WHITE,
+        );
+    }
+    paint_rail_label(ui, rect, label, tint);
+    apply_picker_arrow_focus(ui, surface, &resp);
+    paint_surface_context_menu(ui, surface, &resp, active, pinned);
+    if response_activated(ui, &resp) {
+        *active = surface;
+        return true;
+    }
+    false
+}
+
+fn session_entry_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
+    egui::Id::new((
+        "bottom-rail-session",
+        idx,
+        entry.id.as_deref(),
+        entry.label.as_str(),
+        entry.protocol,
+    ))
+}
+
+fn session_entry_width(ui: &egui::Ui, entry: &SessionRailEntry, rail_h: f32) -> f32 {
+    let text = format!("{} {}", entry.label, entry.protocol);
+    let font = egui::FontId::proportional(Style::SMALL);
+    let text_w = ui.fonts(|f| f.layout_no_wrap(text, font, Style::TEXT).rect.width());
+    (rail_h + text_w + Style::SP_S).clamp(rail_h * 2.0, 180.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RailSessionOverflow {
+    visible: usize,
+    hidden_start: usize,
+}
+
+fn rail_more_id() -> egui::Id {
+    egui::Id::new("bottom-rail-more")
+}
+
+fn rail_more_popup_id() -> egui::Id {
+    egui::Id::new("bottom-rail-more-popup")
+}
+
+fn rail_session_overflow(
+    ui: &egui::Ui,
+    sessions: &[SessionRailEntry],
+    start_x: f32,
+    right_x: f32,
+    rail_h: f32,
+) -> RailSessionOverflow {
+    let available = (right_x - start_x).max(0.0);
+    let widths: Vec<f32> = sessions
+        .iter()
+        .map(|entry| session_entry_width(ui, entry, rail_h))
+        .collect();
+    let total: f32 = widths
+        .iter()
+        .enumerate()
+        .map(|(idx, width)| {
+            if idx + 1 == widths.len() {
+                *width
+            } else {
+                *width + Style::SP_XS
+            }
+        })
+        .sum();
+    if total <= available {
+        return RailSessionOverflow {
+            visible: sessions.len(),
+            hidden_start: sessions.len(),
+        };
+    }
+
+    let more_w = rail_h + Style::SP_XS;
+    let mut used = 0.0;
+    let mut visible = 0;
+    for width in widths {
+        let next = if visible == 0 {
+            width
+        } else {
+            Style::SP_XS + width
+        };
+        if used + next + more_w > available {
+            break;
+        }
+        used += next;
+        visible += 1;
+    }
+    RailSessionOverflow {
+        visible,
+        hidden_start: visible,
+    }
+}
+
+fn session_entry(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    idx: usize,
+    entry: &SessionRailEntry,
+    selected: bool,
+) -> bool {
+    let resp = ui.interact(rect, session_entry_id(idx, entry), egui::Sense::click());
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if selected || resp.hovered() {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    };
+    let icon_edge = (rect.height() - 2.0).max(Style::SP_S);
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.left() + Style::SP_XS,
+            rect.center().y - icon_edge / 2.0,
+        ),
+        egui::vec2(icon_edge, icon_edge),
+    );
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, icon_edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+    }
+    let text_x = icon_rect.right() + Style::SP_XS;
+    if text_x < rect.right() {
+        let clip = egui::Rect::from_min_max(egui::pos2(text_x, rect.top()), rect.right_bottom());
+        let text = format!("{} {}", entry.label, entry.protocol);
+        painter.with_clip_rect(clip).text(
+            egui::pos2(text_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(Style::SMALL),
+            if selected || resp.hovered() {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            },
+        );
+    }
+    resp.clicked()
+}
+
+/// Stable id for the bottom-rail status detail toggle.
+fn status_detail_toggle_id() -> egui::Id {
+    egui::Id::new(("bottom-rail-icon", IconId::ChevronUp.name()))
+}
+
+fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(rect, status_detail_toggle_id(), egui::Sense::click());
+    let selected = state.status_panel_open;
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if selected {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let edge = (rect.height() - 2.0).max(Style::SP_S);
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::ChevronUp, edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, edge),
+            uv,
+            egui::Color32::WHITE,
+        );
+    }
+    paint_rail_label(ui, rect, "Status", tint);
+    if resp.clicked() {
+        state.status_panel_open = !state.status_panel_open;
+        return true;
+    }
+    false
+}
+
 /// CONSOLE-1's **Start cell** — the Console front door's trigger (console
-/// design locks #1/#2): the topmost dock cell (the vertical mapping of the
-/// design's "far-left, before Workbench"), wearing the **Terminal brand glyph**
-/// because the Console IS the terminal's front door. A click latches the
+/// design locks #1/#2): the bottom rail's far-left Advanced affordance, wearing
+/// the repo's Win10-style Start/Menu tray glyph. A click latches the
 /// Console toggle for the shell to drain ([`DockState::take_console_toggle`] —
 /// the deferred wire; pressing it again closes, lock #4). While the panel is up
 /// (mirrored in via [`DockState::set_console_open`]) the cell wears the
@@ -950,12 +1614,17 @@ fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     } else {
         Style::TEXT_DIM
     };
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::Terminal, ICON_LOGICAL, tint) {
-        let icon =
-            egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
+    let icon_edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Start, icon_edge, tint) {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, icon_edge),
+            uv,
+            egui::Color32::WHITE,
+        );
     }
+    paint_rail_label(ui, rect, "Advanced", tint);
     if resp.clicked() {
         state.console_toggle = true;
         return true;
@@ -965,10 +1634,9 @@ fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
 
 /// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
 /// holds the dock open when set (the "pin" half of "hotkey + pin, no hover").
-/// The brand set has no pin glyph yet (VDOCK-4 gives the dock its real glyphs), so
-/// this is a small centred dot: a filled ACCENT disc when pinned, a dim ring when
-/// not (a hover brightens it). Every colour is a Style token (§4). Returns `true`
-/// on a click (which flips the pin via [`DockState::toggle_pin`]).
+/// It uses the repo's shared tray pin glyph so the bottom rail remains all-icons.
+/// Every colour is a Style token (§4). Returns `true` on a click (which flips the
+/// pin via [`DockState::toggle_pin`]).
 fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(cell, egui::Id::new("vdock-pin"), egui::Sense::click());
     let pinned = state.pinned();
@@ -979,13 +1647,21 @@ fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
     } else {
         Style::TEXT_DIM
     };
-    let r = Style::SP_S / 2.0;
-    if pinned {
-        ui.painter().circle_filled(cell.center(), r, color);
-    } else {
+    if resp.hovered() {
         ui.painter()
-            .circle_stroke(cell.center(), r, egui::Stroke::new(HAIRLINE_W, color));
+            .rect_filled(cell, Style::RADIUS, Style::SURFACE_HI);
     }
+    let edge = ICON_LOGICAL.min((cell.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Pin, edge, color) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        ui.painter().image(
+            tex.id(),
+            rail_icon_rect(cell, edge),
+            uv,
+            egui::Color32::WHITE,
+        );
+    }
+    paint_rail_label(ui, cell, "Pin", color);
     if resp.clicked() {
         state.toggle_pin();
         return true;
@@ -1006,8 +1682,7 @@ fn clock_cell_id() -> egui::Id {
 /// wash + left-edge accent bar as an app cell (#10). Every colour is a Style
 /// token (§4). Self-schedules a repaint at the next minute rollover so the
 /// painted minute is never stale. Returns `true` on a route.
-fn clock_cell(ui: &egui::Ui, origin: egui::Pos2, state: &mut DockState) -> bool {
-    let rect = egui::Rect::from_min_size(origin, egui::vec2(DOCK_W, CLOCK_CELL_H));
+fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(rect, clock_cell_id(), egui::Sense::click());
     let selected = state.active == Surface::Timers;
     let hovered = resp.hovered();
@@ -1033,12 +1708,17 @@ fn clock_cell(ui: &egui::Ui, origin: egui::Pos2, state: &mut DockState) -> bool 
     };
     let now = crate::timers::now_unix();
     painter.text(
-        rect.center(),
+        if rect.height() >= NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
+            egui::pos2(rect.center().x, rect.top() + Style::SP_M)
+        } else {
+            rect.center()
+        },
         egui::Align2::CENTER_CENTER,
         crate::timers::hhmm(now),
-        egui::FontId::proportional(Style::SMALL),
+        egui::FontId::proportional(Style::SMALL.min((rect.height() - 6.0).max(8.0))),
         tint,
     );
+    paint_rail_label(ui, rect, "Clock", tint);
     // Wake at the next minute rollover so the glyph never shows a stale minute
     // (cheap: egui keeps only the earliest scheduled repaint).
     ui.ctx()
@@ -1071,10 +1751,6 @@ fn clock_cell(ui: &egui::Ui, origin: egui::Pos2, state: &mut DockState) -> bool 
 /// centred in an [`Style::SP_XL`]-tall cell, on the 8px grid.
 const APP_CELL_H: f32 = Style::SP_XL;
 
-/// The slim **pin** strip beneath the Workbench lead (lock #9) — folds VDOCK-1's
-/// pin toggle in just under the lead glyph. `SP_M` tall.
-const PIN_STRIP_H: f32 = Style::SP_M;
-
 /// The horizontal accent-label row above each group (#4) — `SP_M` tall, its label
 /// sized to fit the narrow column by [`group_label_font`].
 const PICK_LABEL_H: f32 = Style::SP_M;
@@ -1093,20 +1769,226 @@ const ACTIVE_BAR_W: f32 = Style::SP_XS;
 /// the app zone. `SP_L`.
 const OVERFLOW_H: f32 = Style::SP_L;
 
-/// The **clock strip** height (VDOCK-5, lock #20) — one `SP_XL` row atop the
-/// bottom zone whose glyph IS the live `HH:MM` ([`clock_cell`]); clicking it
-/// opens the Timers & Alarms surface. The same `APP_CELL_H` module.
-const CLOCK_CELL_H: f32 = Style::SP_XL;
+/// The bottom band reserved beneath the app zone: only VDOCK-4's system row
+/// remains in the left rail. Advanced, Desktop, Clock, Pin, and notification
+/// status micro-icons live in the full-width bottom rail.
+const BOTTOM_ZONE_H: f32 = DOCK_W;
 
-/// The status/system rows of the bottom zone — VDOCK-3's two stacked status
-/// quads + VDOCK-4's system quad (~`DOCK_W` each).
-const STATUS_SYS_H: f32 = 3.0 * DOCK_W;
+/// The full-width bottom rail height. It is intentionally thinner than a dock
+/// cell; controls render at micro-icon scale inside it.
+const NOTIFICATION_RAIL_H: f32 = 20.0;
+/// NAVBAR-8's expanded bar height: touch/expanded density grows the rail to a
+/// labelled Win10-style taskbar variant while compact density keeps the 20px rail.
+const NOTIFICATION_RAIL_EXPANDED_H: f32 = 48.0;
+const NOTIFICATION_RAIL_EXPANDED_ICON_H: f32 = 24.0;
+const DESKTOP_CARET_W: f32 = 14.0;
+const DESKTOP_SOURCE_ROW_H: f32 = 28.0;
+const DESKTOP_SOURCE_FLYOUT_W: f32 = Style::SP_XL * 7.5;
+const DESKTOP_SOURCE_MAX_ROWS: usize = 8;
 
-/// The bottom band reserved beneath the app zone (design #8): VDOCK-5's clock
-/// strip over VDOCK-3/4's three quad rows ([`STATUS_SYS_H`]). VDOCK-2 bounds the
-/// middle app zone above it and leaves it empty; sizing the middle against this
-/// reserve makes the '…' overflow (#22) real on a short screen.
-const BOTTOM_ZONE_H: f32 = CLOCK_CELL_H + STATUS_SYS_H;
+/// NOTIF-4's right slide-out width: compact enough to stay auxiliary, wide enough
+/// for grade names and three device meters.
+const STATUS_PANEL_W: f32 = Style::SP_XL * 7.0;
+const STATUS_PANEL_GAP: f32 = Style::SP_XS;
+const STATUS_PANEL_H: f32 = Style::SP_XL * 8.0;
+
+fn notification_panel_rect(rail: egui::Rect, t: f32) -> egui::Rect {
+    let left = rail.left() + Style::SP_S;
+    let top =
+        rail.top() - STATUS_PANEL_GAP - STATUS_PANEL_H + (1.0 - t.clamp(0.0, 1.0)) * Style::SP_XL;
+    egui::Rect::from_min_size(
+        egui::pos2(left, top),
+        egui::vec2(STATUS_PANEL_W, STATUS_PANEL_H),
+    )
+}
+
+fn status_panel_dismissed(ui: &egui::Ui, panel_rect: egui::Rect, status_rect: egui::Rect) -> bool {
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return true;
+    }
+    ui.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|pos| !panel_rect.contains(pos) && !status_rect.contains(pos))
+    })
+}
+
+fn desktop_source_toggle_id() -> egui::Id {
+    egui::Id::new("bottom-rail-desktop-source-toggle")
+}
+
+fn desktop_source_row_id(source: &DesktopRailSource) -> egui::Id {
+    egui::Id::new(("bottom-rail-desktop-source", source.id.as_str()))
+}
+
+fn desktop_source_flyout_id() -> egui::Id {
+    egui::Id::new("bottom-rail-desktop-source-flyout")
+}
+
+fn desktop_source_toggle(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    state: &mut DockState,
+    empty: bool,
+) -> bool {
+    let resp = ui.interact(rect, desktop_source_toggle_id(), egui::Sense::click());
+    let hovered = resp.hovered();
+    let selected = state.desktop_sources_open;
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if selected {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else if empty {
+        Style::TEXT_DIM.linear_multiply(0.7)
+    } else {
+        Style::TEXT_DIM
+    };
+    let edge = (rect.height() - 2.0).max(Style::SP_S);
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::ChevronUp, edge, tint) {
+        let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(edge, edge));
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    }
+    if response_activated(ui, &resp) {
+        state.desktop_sources_open = !state.desktop_sources_open;
+        return true;
+    }
+    false
+}
+
+fn desktop_source_flyout(
+    ui: &egui::Ui,
+    anchor: egui::Rect,
+    sources: &[DesktopRailSource],
+    state: &mut DockState,
+) -> bool {
+    let rows = sources.len().clamp(1, DESKTOP_SOURCE_MAX_ROWS);
+    let popup_h = rows as f32 * DESKTOP_SOURCE_ROW_H + Style::SP_S;
+    let inner = egui::Area::new(desktop_source_flyout_id())
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(anchor.left(), anchor.top() - Style::SP_XS))
+        .show(ui.ctx(), |ui| {
+            let (area, _) = ui.allocate_exact_size(
+                egui::vec2(DESKTOP_SOURCE_FLYOUT_W, popup_h),
+                egui::Sense::hover(),
+            );
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let mut picked = None;
+            if sources.is_empty() {
+                paint_empty_desktop_sources(ui, area);
+            } else {
+                let mut y = area.top() + Style::SP_XS / 2.0;
+                for source in sources.iter().take(DESKTOP_SOURCE_MAX_ROWS) {
+                    let row = egui::Rect::from_min_size(
+                        egui::pos2(area.left() + Style::SP_XS, y),
+                        egui::vec2(DESKTOP_SOURCE_FLYOUT_W - Style::SP_S, DESKTOP_SOURCE_ROW_H),
+                    );
+                    if desktop_source_row(ui, row, source) {
+                        picked = Some(source.id.clone());
+                    }
+                    y += DESKTOP_SOURCE_ROW_H;
+                }
+            }
+            ui.painter().set(
+                bg,
+                egui::Shape::rect_filled(area, Style::RADIUS, Style::SURFACE),
+            );
+            ui.painter().rect_stroke(
+                area,
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            picked
+        });
+
+    if let Some(id) = inner.inner {
+        state.desktop_source_pick = Some(id);
+        state.desktop_sources_open = false;
+        state.active = Surface::Desktop;
+        return true;
+    }
+    if inner.response.clicked_elsewhere() {
+        state.desktop_sources_open = false;
+        return true;
+    }
+    false
+}
+
+fn paint_empty_desktop_sources(ui: &egui::Ui, area: egui::Rect) {
+    ui.painter().text(
+        area.center(),
+        egui::Align2::CENTER_CENTER,
+        "No desktop sources",
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+}
+
+fn desktop_source_row(ui: &egui::Ui, rect: egui::Rect, source: &DesktopRailSource) -> bool {
+    let resp = ui.interact(
+        rect,
+        desktop_source_row_id(source),
+        if source.connectable {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let painter = ui.painter().clone();
+    if resp.hovered() && source.connectable {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if !source.connectable {
+        Style::TEXT_DIM.linear_multiply(0.65)
+    } else if source.favorite {
+        Style::ACCENT
+    } else if source.recent {
+        Style::OK
+    } else {
+        Style::TEXT_DIM
+    };
+    let icon_edge = (rect.height() - Style::SP_XS).max(Style::SP_M);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + Style::SP_M, rect.center().y),
+        egui::vec2(icon_edge, icon_edge),
+    );
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Desktop, icon_edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+    }
+    let text_x = icon_rect.right() + Style::SP_XS;
+    let clip = egui::Rect::from_min_max(egui::pos2(text_x, rect.top()), rect.right_bottom());
+    painter.with_clip_rect(clip).text(
+        egui::pos2(text_x, rect.top() + Style::SP_XS),
+        egui::Align2::LEFT_TOP,
+        source.label.as_str(),
+        egui::FontId::proportional(Style::SMALL),
+        if source.connectable {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    painter.with_clip_rect(clip).text(
+        egui::pos2(text_x, rect.bottom() - Style::SP_XS),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{} {}", source.node, source.protocol),
+        egui::FontId::proportional((Style::SMALL - 1.0).max(8.0)),
+        Style::TEXT_DIM,
+    );
+    source.connectable
+        && (response_activated(ui, &resp)
+            || (resp.hovered() && ui.input(|i| i.pointer.any_released())))
+}
 
 /// The stable per-surface id of a vertical-picker cell — the render + routing are
 /// unchanged, but tests read a cell's settled `Rect` back to click its exact
@@ -1166,7 +2048,59 @@ fn visible_group_count(middle_h: f32) -> usize {
 /// wash; a hover is a fill only. A click routes to the surface (sets `active`,
 /// returns `true` so the shell can surface the body). Every colour is a Style
 /// token (§4); shared by the Workbench lead, the middle groups, and the '…' popup.
-fn pick_app_cell(ui: &egui::Ui, surface: Surface, active: &mut Surface, rect: egui::Rect) -> bool {
+fn pick_app_cell(
+    ui: &egui::Ui,
+    surface: Surface,
+    active: &mut Surface,
+    pinned: &mut bool,
+    rect: egui::Rect,
+) -> bool {
+    pick_app_cell_with_badge(ui, surface, active, pinned, rect, None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadgeKind {
+    Count(usize),
+    Health(BadgeTone),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadgeTone {
+    Healthy,
+    Degraded,
+    Offline,
+}
+
+fn badge_for(
+    surface: Surface,
+    status: &StatusInputs,
+    transfer_active_count: usize,
+) -> Option<BadgeKind> {
+    match surface {
+        Surface::Files if transfer_active_count > 0 => {
+            Some(BadgeKind::Count(transfer_active_count))
+        }
+        Surface::Chat if status.unread > 0 => Some(BadgeKind::Count(status.unread)),
+        Surface::MeshView if status.mesh.seen && status.mesh.peers_total > 0 => {
+            Some(BadgeKind::Count(status.mesh.peers_online))
+        }
+        Surface::System if status.mesh.seen => Some(BadgeKind::Health(match status.mesh.health {
+            mde_cosmic_applet::LighthouseHealth::AllHealthy => BadgeTone::Healthy,
+            mde_cosmic_applet::LighthouseHealth::Degraded => BadgeTone::Degraded,
+            mde_cosmic_applet::LighthouseHealth::None => BadgeTone::Offline,
+        })),
+        _ => None,
+    }
+}
+
+fn pick_app_cell_with_badge(
+    ui: &egui::Ui,
+    surface: Surface,
+    active: &mut Surface,
+    pinned: &mut bool,
+    rect: egui::Rect,
+    badge: Option<BadgeKind>,
+) -> bool {
     let selected = *active == surface;
     let resp = ui.interact(rect, pick_cell_id(surface), egui::Sense::click());
     let hovered = resp.hovered();
@@ -1204,12 +2138,303 @@ fn pick_app_cell(ui: &egui::Ui, surface: Surface, active: &mut Surface, rect: eg
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
     }
+    if let Some(badge) = badge {
+        paint_badge(ui, rect, surface, badge);
+    }
+    apply_picker_arrow_focus(ui, surface, &resp);
+    paint_surface_context_menu(ui, surface, &resp, active, pinned);
 
-    if resp.clicked() {
+    if response_activated(ui, &resp) {
         *active = surface;
         return true;
     }
     false
+}
+
+fn apply_picker_arrow_focus(ui: &egui::Ui, surface: Surface, resp: &egui::Response) {
+    if !resp.has_focus() {
+        return;
+    }
+    let dir = ui.input(|i| {
+        if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
+            Some(1)
+        } else if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
+            Some(-1)
+        } else {
+            None
+        }
+    });
+    if let Some(dir) = dir.and_then(|d| picker_focus_neighbor(surface, d)) {
+        ui.memory_mut(|m| m.request_focus(pick_cell_id(dir)));
+    }
+}
+
+fn picker_focus_neighbor(surface: Surface, dir: i32) -> Option<Surface> {
+    let idx = PICKER_FOCUS_ORDER.iter().position(|&s| s == surface)?;
+    let next = if dir > 0 {
+        (idx + 1).min(PICKER_FOCUS_ORDER.len() - 1)
+    } else {
+        idx.saturating_sub(1)
+    };
+    PICKER_FOCUS_ORDER.get(next).copied()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SurfaceContextItem {
+    Pin,
+    Info,
+    Close,
+}
+
+fn surface_context_item_id(surface: Surface, item: SurfaceContextItem) -> egui::Id {
+    egui::Id::new(("vdock-surface-context", surface, item))
+}
+
+fn paint_surface_context_menu(
+    _ui: &egui::Ui,
+    surface: Surface,
+    resp: &egui::Response,
+    active: &mut Surface,
+    pinned: &mut bool,
+) {
+    let mut action = None;
+    resp.context_menu(|ui| {
+        if context_menu_row(
+            ui,
+            surface_context_item_id(surface, SurfaceContextItem::Pin),
+            if *pinned {
+                "Unpin from rail"
+            } else {
+                "Pin to rail"
+            },
+        ) {
+            action = Some(SurfaceContextItem::Pin);
+            ui.close_menu();
+        }
+        if context_menu_row(
+            ui,
+            surface_context_item_id(surface, SurfaceContextItem::Info),
+            "Info",
+        ) {
+            action = Some(SurfaceContextItem::Info);
+            ui.close_menu();
+        }
+        if surface_closable(surface)
+            && context_menu_row(
+                ui,
+                surface_context_item_id(surface, SurfaceContextItem::Close),
+                "Close",
+            )
+        {
+            action = Some(SurfaceContextItem::Close);
+            ui.close_menu();
+        }
+    });
+
+    match action {
+        Some(SurfaceContextItem::Pin) => {
+            *pinned = !*pinned;
+        }
+        Some(SurfaceContextItem::Info) => {
+            *active = Surface::About;
+        }
+        Some(SurfaceContextItem::Close) => {
+            if *active == surface {
+                *active = Surface::Workbench;
+            }
+        }
+        None => {}
+    }
+}
+
+fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
+    let width = ui.available_width().max(Style::SP_XL * 4.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, Style::SP_L), egui::Sense::hover());
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    response_activated(ui, &resp)
+}
+
+fn rail_more_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(rect, rail_more_id(), egui::Sense::click());
+    let active = state.rail_more_open || resp.hovered();
+    if active {
+        ui.painter()
+            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "⋯",
+        egui::FontId::proportional(Style::BODY),
+        if active { Style::TEXT } else { Style::TEXT_DIM },
+    );
+    if response_activated(ui, &resp) {
+        state.rail_more_open = !state.rail_more_open;
+        return true;
+    }
+    false
+}
+
+fn rail_more_popup(
+    ui: &egui::Ui,
+    anchor: egui::Rect,
+    hidden_start: usize,
+    sessions: &[SessionRailEntry],
+    state: &mut DockState,
+    opened: bool,
+    rail_h: f32,
+) -> bool {
+    let hidden = &sessions[hidden_start..];
+    let rows = hidden.len().min(8);
+    let popup_w = hidden
+        .iter()
+        .take(rows)
+        .map(|entry| session_entry_width(ui, entry, rail_h))
+        .fold(rail_h * 4.0, f32::max);
+    let popup_h = rows as f32 * rail_h + Style::SP_S;
+    let inner = egui::Area::new(rail_more_popup_id())
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(anchor.left(), anchor.top() - Style::SP_XS))
+        .show(ui.ctx(), |ui| {
+            let (area, _) =
+                ui.allocate_exact_size(egui::vec2(popup_w, popup_h), egui::Sense::hover());
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let mut routed = false;
+            let mut focused_session = None;
+            let mut y = area.top() + Style::SP_XS / 2.0;
+            for (offset, entry) in hidden.iter().take(rows).enumerate() {
+                let idx = hidden_start + offset;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(area.left() + Style::SP_XS / 2.0, y),
+                    egui::vec2(popup_w - Style::SP_XS, rail_h),
+                )
+                .shrink(2.0);
+                if session_entry(ui, rect, idx, entry, state.active == Surface::Desktop) {
+                    state.active = Surface::Desktop;
+                    focused_session.clone_from(&entry.id);
+                    routed = true;
+                }
+                y += rail_h;
+            }
+            if focused_session.is_some() {
+                state.desktop_session_focus = focused_session;
+            }
+            ui.painter().set(
+                bg,
+                egui::Shape::rect_filled(area.expand(Style::SP_XS), Style::RADIUS, Style::SURFACE),
+            );
+            ui.painter().rect_stroke(
+                area.expand(Style::SP_XS),
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            routed
+        });
+    let routed = inner.inner;
+    if routed {
+        state.rail_more_open = false;
+        true
+    } else {
+        if !opened && inner.response.clicked_elsewhere() {
+            state.rail_more_open = false;
+            return true;
+        }
+        false
+    }
+}
+
+fn surface_closable(surface: Surface) -> bool {
+    !matches!(
+        surface,
+        Surface::Workbench | Surface::System | Surface::Timers
+    )
+}
+
+fn transfer_badge_id(surface: Surface) -> egui::Id {
+    surface_badge_id(surface)
+}
+
+fn surface_badge_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("vdock-surface-badge", surface))
+}
+
+fn badge_label(count: usize) -> String {
+    if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
+    }
+}
+
+fn paint_badge(ui: &egui::Ui, cell: egui::Rect, surface: Surface, badge: BadgeKind) {
+    match badge {
+        BadgeKind::Count(count) => paint_count_badge(ui, cell, surface, count),
+        BadgeKind::Health(tone) => paint_health_badge(ui, cell, surface, tone),
+    }
+}
+
+fn paint_count_badge(ui: &egui::Ui, cell: egui::Rect, surface: Surface, count: usize) {
+    let label = badge_label(count);
+    let font = egui::FontId::proportional((Style::SMALL - 1.0).max(8.0));
+    let galley = ui.fonts(|f| f.layout_no_wrap(label, font, egui::Color32::WHITE));
+    let badge_size = egui::vec2(
+        (galley.rect.width() + Style::SP_XS).max(Style::SP_M),
+        Style::SP_M,
+    );
+    let rect = badge_rect(cell, badge_size);
+    ui.interact(rect, surface_badge_id(surface), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, badge_size.y / 2.0, Style::ACCENT);
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.rect.width() / 2.0,
+            rect.center().y - galley.rect.height() / 2.0,
+        ),
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
+fn paint_health_badge(ui: &egui::Ui, cell: egui::Rect, surface: Surface, tone: BadgeTone) {
+    let size = egui::vec2(Style::SP_S, Style::SP_S);
+    let rect = badge_rect(cell, size);
+    ui.interact(rect, surface_badge_id(surface), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), rect.width() / 2.0, badge_tone_color(tone));
+}
+
+fn badge_rect(cell: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(cell.right() - size.x - 2.0, cell.top() + 2.0),
+        size,
+    )
+}
+
+fn badge_tone_color(tone: BadgeTone) -> egui::Color32 {
+    match tone {
+        BadgeTone::Healthy => Style::SUPPORT_SUCCESS,
+        BadgeTone::Degraded => Style::SUPPORT_WARNING,
+        BadgeTone::Offline => Style::SUPPORT_ERROR,
+    }
+}
+
+fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    resp.clicked()
+        || (resp.has_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)))
 }
 
 /// Paint one **group** (#3/#4/#21) into the column at `origin`, `width` wide: the
@@ -1227,7 +2452,10 @@ fn pick_group(
     origin: egui::Pos2,
     width: f32,
     font: &egui::FontId,
+    status: &StatusInputs,
+    transfer_active_count: usize,
     active: &mut Surface,
+    pinned: &mut bool,
 ) -> (f32, bool) {
     let painter = ui.painter().clone();
 
@@ -1251,7 +2479,8 @@ fn pick_group(
             egui::pos2(origin.x, cells_top + i as f32 * APP_CELL_H),
             egui::vec2(width, APP_CELL_H),
         );
-        if pick_app_cell(ui, surface, active, cell) {
+        let badge = badge_for(surface, status, transfer_active_count);
+        if pick_app_cell_with_badge(ui, surface, active, pinned, cell, badge) {
             routed = true;
         }
     }
@@ -1348,7 +2577,10 @@ fn pick_overflow(
                     egui::pos2(area.left(), y),
                     DOCK_W,
                     font,
+                    &state.status,
+                    state.transfer_active_count,
                     &mut state.active,
+                    &mut state.pinned,
                 );
                 y += h;
                 routed |= r;
@@ -1382,7 +2614,7 @@ fn pick_overflow(
 // ═══════════════════════════════════════════════════════════════════════════
 // NODE-GRADE-2 — the **grade mini-list** (design `docs/design/node-grade.md`,
 // locks #4/#5/#6/#7/#8/#14/#15/#18/#19). A stacked A–F capability grade per mesh
-// node, painted in the dock's bottom zone ABOVE the VDOCK-3 status quads (a new
+// node, painted in the dock's bottom zone ABOVE the NOTIF-3 status strip (a new
 // band between the app groups and the quads). The local node is pinned first with a
 // "you are here" marker (#18); peers sort worst-grade-first (#19). Each row is the
 // A–F letter in the shared green→red `mde_egui` ramp (#4) — hard-blinking for a D/F
@@ -1423,7 +2655,7 @@ fn grade_overflow_id() -> egui::Id {
     egui::Id::new("vdock-grade-overflow")
 }
 
-/// The vertical space the grade mini-list claims above the status quads: the visible
+/// The vertical space the grade mini-list claims above the status strip: the visible
 /// rows (capped at [`GRADE_MAX_ROWS`], #8) each [`GRADE_ROW_H`] tall, plus the '…'
 /// expander cell + a top separator gap when peers spill past the cap. `0` when there
 /// are no grades (pre-poll / empty), so the band vanishes and the app zone reclaims
@@ -1698,7 +2930,7 @@ fn grade_overflow(
 // ═══════════════════════════════════════════════════════════════════════════
 // VDOCK-4 — the **system quad** + Power menu (design `docs/design/vertical-dock.md`,
 // locks #7/#17/#18). The final DOCK_W row of the bottom band holds a 2×2 control
-// cluster sized to match the VDOCK-3 status quads: Settings · Show-Desktop · Lock ·
+// cluster sized to match the compact dock cells: Settings · Show-Desktop · Lock ·
 // Power (#7/#17). Settings routes to `Surface::System`, Show-Desktop to the existing
 // `Surface::Desktop` route (#15's control analogue), Lock drops the shell curtain
 // (the same in-process lock Super+L / the idle honorer trigger), and Power opens the
@@ -1709,12 +2941,9 @@ fn grade_overflow(
 // `DockState` (the deferred `main.rs` wire, out of this dock.rs-only fence).
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The system-quad glyph edge — the SAME ~18px as VDOCK-3's status quad icons
-/// (`tray::QUAD_ICON`, design #12/#23), restated on the shared 8px grid (`SP_M` +
-/// half an `SP_XS`) so the three bottom quads read as one cluster. `tray.rs`'s
-/// const is module-private, so the value is mirrored here rather than reached
-/// across the file — the `SYS_QUAD_ICON` test pins it to ~18px, smaller than the
-/// 24px app glyph (#12).
+/// The system-quad glyph edge — ~18px (design #12/#23), restated on the shared
+/// 8px grid (`SP_M` + half an `SP_XS`). The `SYS_QUAD_ICON` test pins it smaller
+/// than the 24px app glyph (#12).
 const SYS_QUAD_ICON: f32 = Style::SP_M + Style::SP_XS / 2.0;
 
 /// The stroke width of the procedurally-drawn system-quad glyphs (Lock + Power —
@@ -1723,7 +2952,7 @@ const SYS_QUAD_ICON: f32 = Style::SP_M + Style::SP_XS / 2.0;
 const SYS_GLYPH_STROKE: f32 = HAIRLINE_W * 2.0;
 
 /// The Power menu's row + popup width — token math (`SP_XL · 5` = 160pt), wide
-/// enough for the "Confirm Shutdown" verb and the typed-arming field on one line.
+/// enough for the host-down confirm buttons and typed-arming field on one line.
 const POWER_MENU_W: f32 = Style::SP_XL * 5.0;
 
 /// One Power-menu row's height — compact, on the 8px grid (`SP_L`).
@@ -1752,10 +2981,21 @@ impl SysCell {
             Self::Lock | Self::Power => None,
         }
     }
+
+    /// The semantic Carbon tone for the cell's action glyph. Inactive cells dim to
+    /// the same baseline as status pips; hover/active reveal this tone.
+    const fn tone(self) -> egui::Color32 {
+        match self {
+            Self::Settings => Style::SUPPORT_INFO,
+            Self::ShowDesktop => Style::SUPPORT_SUCCESS,
+            Self::Lock => Style::SUPPORT_WARNING,
+            Self::Power => Style::SUPPORT_ERROR,
+        }
+    }
 }
 
 /// The four system-quad cells in row-major order (design #17) — the one authority
-/// the render + routing + tests read (mirroring VDOCK-3's `STATUS_QUADS`).
+/// the render + routing + tests read.
 const SYSTEM_QUAD: [SysCell; 4] = [
     SysCell::Settings,
     SysCell::ShowDesktop,
@@ -1874,8 +3114,8 @@ impl PowerMenu {
 
 /// The stable per-cell id of a system-quad cell, so the render + routing are
 /// unchanged but the layout is addressable — tests read a cell's settled `Rect`
-/// back to click its centre (the `tray::quad_cell_id` idiom, kept distinct so a
-/// system cell never shares an id with a status/picker cell).
+/// back to click its centre, kept distinct so a system cell never shares an id
+/// with a status/picker cell.
 fn sys_cell_id(cell: SysCell) -> egui::Id {
     egui::Id::new(("vdock-system-quad-cell", cell))
 }
@@ -1891,7 +3131,7 @@ fn power_arming_field_id() -> egui::Id {
 }
 
 /// Render VDOCK-4's **system quad** into the dock's final `DOCK_W` row (design
-/// #7/#17): a 2×2 of `quad / 2`-square cells (matching the VDOCK-3 status quads),
+/// #7/#17): a 2×2 of `quad / 2`-square cells (matching the compact dock grid),
 /// `origin` at its top-left. Each cell routes/acts on a click — Settings→System,
 /// Show-Desktop→Desktop, Lock→the curtain, Power→the armed menu (#18). Paints
 /// through `ui.interact` over explicit rects (the dock's `&Ui` idiom), so it
@@ -1950,11 +3190,10 @@ fn route_sys_cell(cell: SysCell, state: &mut DockState, opened: &mut bool) {
     }
 }
 
-/// One system-quad cell (design #7/#12): the cell's glyph at [`SYS_QUAD_ICON`]
-/// (the brand cog / Desktop for Settings / Show-Desktop, a procedural padlock /
-/// power symbol for Lock / Power), a hover fill only — no tooltip — and the
-/// two-tone tint (ACCENT while the cell is "active": Settings on System,
-/// Show-Desktop on Desktop, Power while its menu is open; TEXT on hover; else dim).
+/// One system-quad cell (NOTIF-12): a compact glyph pip matching the status-strip
+/// language. Each action owns a semantic Carbon tone, inactive cells dim to the
+/// same baseline as missing status rollups, and hover/active states reveal the tone
+/// without changing the route/action behavior.
 /// A click returns `true` (the caller routes). `&Ui` + `ui.interact` over the
 /// explicit `rect`, so it paints inside the dock frame.
 fn sys_cell(ui: &egui::Ui, cell: SysCell, state: &DockState, rect: egui::Rect) -> bool {
@@ -1970,13 +3209,7 @@ fn sys_cell(ui: &egui::Ui, cell: SysCell, state: &DockState, rect: egui::Rect) -
         SysCell::Power => state.power.open,
         SysCell::Lock => false,
     };
-    let tint = if active {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
+    let tint = sys_cell_tint(cell, active, hovered);
     let icon_rect =
         egui::Rect::from_center_size(rect.center(), egui::vec2(SYS_QUAD_ICON, SYS_QUAD_ICON));
     match cell.glyph() {
@@ -1994,7 +3227,21 @@ fn sys_cell(ui: &egui::Ui, cell: SysCell, state: &DockState, rect: egui::Rect) -
             _ => {}
         },
     }
+    if cell == SysCell::Settings {
+        if let Some(badge) = badge_for(Surface::System, &state.status, state.transfer_active_count)
+        {
+            paint_badge(ui, rect, Surface::System, badge);
+        }
+    }
     response.clicked()
+}
+
+fn sys_cell_tint(cell: SysCell, active: bool, hovered: bool) -> egui::Color32 {
+    if active || hovered {
+        cell.tone()
+    } else {
+        Style::TEXT_DIM
+    }
 }
 
 /// Sample `segments + 1` points along a circular arc (centre `c`, radius `r`) from
@@ -2162,16 +3409,11 @@ fn power_row(ui: &mut egui::Ui, item: PowerItem) -> egui::Response {
 }
 
 /// The Power menu's **typed-arming stage** (design #18) for a host-down verb: the
-/// "Type Reboot to confirm" prompt, the echo field, a DANGER Confirm button
-/// **enabled only once the echo matches** (§7 — the disabled button can't fire), and
-/// a Cancel back to the verb list. Returns `Some(item)` on a confirmed (armed) click.
+/// echo field, a DANGER Confirm button **enabled only once the echo matches** (§7 —
+/// the disabled button can't fire), and a Cancel back to the verb list. Returns
+/// `Some(item)` on a confirmed (armed) click.
 fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerItem> {
     let item = power.arming.as_ref().map(|a| a.verb)?;
-    ui.label(
-        egui::RichText::new(format!("Type {} to confirm", item.label()))
-            .size(Style::SMALL)
-            .color(Style::WARN),
-    );
     // The echo field (scoped so its `&mut` on the buffer ends before the arming
     // check + the buttons).
     {
@@ -2212,15 +3454,20 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 #[cfg(test)]
 mod tests {
     use super::{
-        clock_cell_id, dock, grade_band_height, grade_overflow_id, grade_row_id, group_height,
-        gutter_width, overflow_more_id, pick_cell_id, power_item_id, start_cell_id, sys_cell_id,
-        visible_group_count, DockRequest, DockState, PowerItem, PowerMenu, Surface, SysCell,
-        BOTTOM_ZONE_H, CELL_W, DOCK_AREA, DOCK_W, GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL,
-        PIN_STRIP_H, POWER_MENU, STATUS_SYS_H, SYSTEM_QUAD, SYS_QUAD_ICON,
+        clock_cell_id, desktop_source_row_id, desktop_source_toggle_id, dock, grade_band_height,
+        grade_overflow_id, grade_row_id, group_height, gutter_width, notification_rail,
+        notification_rail_with_sources, overflow_more_id, pick_cell_id, power_item_id,
+        rail_more_id, session_entry_id, start_cell_id, status_detail_toggle_id, surface_badge_id,
+        surface_context_item_id, sys_cell_id, sys_cell_tint, transfer_badge_id,
+        visible_group_count, DesktopRailSource, DockRequest, DockState, PowerItem, PowerMenu,
+        SessionRailEntry, Surface, SurfaceContextItem, SysCell, CELL_W, DOCK_AREA, DOCK_W,
+        GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H, NOTIFICATION_RAIL_H,
+        POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
     };
     use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
-    use mde_egui::egui;
+    use crate::status::{self, StatusSegments};
     use mde_egui::Style;
+    use mde_egui::{egui, Density};
     use mde_seat::PowerVerb;
     use mde_theme::brand::icons::{icon_image, IconId};
 
@@ -2243,7 +3490,7 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Seventeen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+        // Eighteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
         // two VM surfaces (Instances / Desktop), the app surfaces (Music / Media — the
         // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
         // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
@@ -2253,7 +3500,7 @@ mod tests {
         // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
         // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
         // and the About surface (the platform-identity screen, QBRAND-6).
-        assert_eq!(Surface::ALL.len(), 17);
+        assert_eq!(Surface::ALL.len(), 18);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
@@ -2265,6 +3512,7 @@ mod tests {
             Surface::Files,
             Surface::Voice,
             Surface::Browser,
+            Surface::Bookmarks,
             Surface::Terminal,
             Surface::Editor,
             Surface::Chat,
@@ -2300,6 +3548,7 @@ mod tests {
             (Surface::Files, IconId::Files),
             (Surface::Voice, IconId::Voice),
             (Surface::Browser, IconId::Browser),
+            (Surface::Bookmarks, IconId::Bookmarks),
             (Surface::Terminal, IconId::Terminal),
             (Surface::Editor, IconId::Editor),
             (Surface::Chat, IconId::Chat),
@@ -2319,7 +3568,7 @@ mod tests {
                 "{surface:?} maps to the blank wordmark"
             );
         }
-        // The map is injective — 17 surfaces, 17 distinct glyph names (IaC wears
+        // The map is injective — 18 surfaces, 18 distinct glyph names (IaC wears
         // the Server badge, unshared by any other surface).
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
         names.sort_unstable();
@@ -2365,13 +3614,13 @@ mod tests {
         // System surface (right-side Settings button), and Desktop (far-right
         // Show-Desktop sliver).
         use Surface::{
-            About, Browser, Chat, Editor, Files, InfraCode, Instances, Media, MeshView, Music,
-            Phones, Storage, Terminal, Voice, Workbench,
+            About, Bookmarks, Browser, Chat, Editor, Files, InfraCode, Instances, Media, MeshView,
+            Music, Phones, Storage, Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 6] = [
             ("Comms", &[Voice, Chat, Phones]),
             ("Workloads", &[Instances, InfraCode]),
-            ("Terminals", &[Browser, Terminal, Editor]),
+            ("Terminals", &[Browser, Bookmarks, Terminal, Editor]),
             ("Mesh", &[MeshView]),
             ("System", &[Files, Storage, About]),
             ("Media", &[Music, Media]),
@@ -2424,7 +3673,7 @@ mod tests {
     #[test]
     fn the_groups_cover_every_surface_once_in_surface_all_order() {
         // The Workbench lead + the System Settings button + the far-right Desktop
-        // sliver + the six groups reproduce all 17 of Surface::ALL, each surface
+        // sliver + the six groups reproduce all 18 of Surface::ALL, each surface
         // placed exactly once...
         let mut placed: Vec<Surface> = vec![Surface::Workbench, Surface::System, Surface::Desktop];
         for g in &GROUPS {
@@ -2466,6 +3715,16 @@ mod tests {
         events: Vec<egui::Event>,
         size: egui::Vec2,
     ) {
+        drive_vdock_with_sources(ctx, state, events, size, &[]);
+    }
+
+    fn drive_vdock_with_sources(
+        ctx: &egui::Context,
+        state: &mut DockState,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+        sources: &[DesktopRailSource],
+    ) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
             events,
@@ -2477,6 +3736,7 @@ mod tests {
                 let _ = ui.button("surface");
             });
             let _ = dock(ctx, state);
+            let _ = notification_rail_with_sources(ctx, state, sources);
         });
     }
 
@@ -2600,22 +3860,6 @@ mod tests {
         let mut s = DockState::default();
         s.toggle(); // reveal it so the Area (and its pin) is mounted
 
-        // VDOCK-2 folded the pin into the slim strip just BENEATH the Workbench
-        // lead cell — which CONSOLE-1's Start cell pushed down one DOCK_W (the
-        // top cell is now the Start front door); click the pin strip's centre.
-        let click = egui::pos2(DOCK_W / 2.0, DOCK_W + DOCK_W + PIN_STRIP_H / 2.0);
-        let press = egui::Event::PointerButton {
-            pos: click,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        };
-        let release = egui::Event::PointerButton {
-            pos: click,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::default(),
-        };
         let frame = |ctx: &egui::Context, s: &mut DockState, events: Vec<egui::Event>| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -2630,13 +3874,30 @@ mod tests {
                     let _ = ui.button("surface");
                 });
                 let _ = dock(ctx, s);
+                let _ = notification_rail(ctx, s);
             });
         };
-        // Prime two frames so egui has the pin's rect registered (and the Area is
-        // past its first-show sizing pass), then move onto the pin + press, then
-        // release the next frame — the egui click model the taskbar test uses.
+        // Prime two frames so egui has the rail pin's rect registered, then move
+        // onto the pin + press, then release the next frame.
         frame(&ctx, &mut s, Vec::new());
         frame(&ctx, &mut s, Vec::new());
+        let click = ctx
+            .read_response(egui::Id::new("vdock-pin"))
+            .expect("the rail pin is registered")
+            .rect
+            .center();
+        let press = egui::Event::PointerButton {
+            pos: click,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let release = egui::Event::PointerButton {
+            pos: click,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
         frame(&ctx, &mut s, vec![egui::Event::PointerMoved(click), press]);
         frame(&ctx, &mut s, vec![release]);
         assert!(s.pinned(), "clicking the pin holds the dock open (lock #9)");
@@ -2645,10 +3906,10 @@ mod tests {
     // ── CONSOLE-1: the Start front door's dock cell ────────────────────────────
 
     #[test]
-    fn the_start_cell_tops_the_dock_and_latches_the_console_toggle() {
-        // Console locks #1/#2 mapped to the vertical dock: the Start cell is the
-        // TOPMOST cell (far-left → top), before the Workbench lead, and a click
-        // latches the console toggle the shell drains — exactly once.
+    fn the_start_cell_anchors_the_bottom_rail_and_latches_the_console_toggle() {
+        // Console locks #1/#2 moved to the bottom rail: the Advanced/Start cell is
+        // the far-left rail icon, before Desktop, and a click latches the console
+        // toggle the shell drains — exactly once.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -2661,18 +3922,29 @@ mod tests {
             .read_response(start_cell_id())
             .expect("the Start cell is registered")
             .rect;
-        assert!(start.top() < 1.0, "the Start cell anchors the dock's top");
         assert!(
-            (start.height() - DOCK_W).abs() < 1.0 && (start.width() - DOCK_W).abs() < 1.0,
-            "the Start cell is one DOCK_W module"
+            start.left() < 8.0,
+            "the Advanced cell anchors the rail's left"
+        );
+        assert!(
+            start.height() < DOCK_W && start.width() < DOCK_W,
+            "the Advanced cell is a small rail icon"
+        );
+        let desktop = ctx
+            .read_response(pick_cell_id(Surface::Desktop))
+            .expect("the Desktop rail cell is registered")
+            .rect;
+        assert!(
+            desktop.left() >= start.right(),
+            "Desktop sits immediately to the right of Advanced"
         );
         let wb = ctx
             .read_response(pick_cell_id(Surface::Workbench))
             .expect("the Workbench lead is registered")
             .rect;
         assert!(
-            (wb.top() - start.bottom()).abs() < 1.0,
-            "Start sits BEFORE (above) the Workbench lead (console lock #2)"
+            wb.top() < start.top(),
+            "Workbench remains in the left rail while Advanced moved to the bottom rail"
         );
 
         assert!(!s.take_console_toggle(), "no toggle before a click");
@@ -2747,6 +4019,16 @@ mod tests {
         }
     }
 
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     /// Click `center` — press one frame, release the next (the egui click model
     /// the taskbar tests use). The caller primes the layout first.
     fn click_vdock(
@@ -2755,13 +4037,51 @@ mod tests {
         center: egui::Pos2,
         size: egui::Vec2,
     ) {
-        drive_vdock(
+        click_vdock_with_sources(ctx, state, center, size, &[]);
+    }
+
+    fn click_vdock_with_sources(
+        ctx: &egui::Context,
+        state: &mut DockState,
+        center: egui::Pos2,
+        size: egui::Vec2,
+        sources: &[DesktopRailSource],
+    ) {
+        drive_vdock_with_sources(
             ctx,
             state,
             vec![egui::Event::PointerMoved(center), press_at(center)],
             size,
+            sources,
         );
-        drive_vdock(ctx, state, vec![release_at(center)], size);
+        drive_vdock_with_sources(ctx, state, vec![release_at(center)], size, sources);
+    }
+
+    fn secondary_click_vdock(
+        ctx: &egui::Context,
+        state: &mut DockState,
+        center: egui::Pos2,
+        size: egui::Vec2,
+    ) {
+        let press = egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let release = egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        drive_vdock(
+            ctx,
+            state,
+            vec![egui::Event::PointerMoved(center), press],
+            size,
+        );
+        drive_vdock(ctx, state, vec![release], size);
     }
 
     #[test]
@@ -2828,14 +4148,15 @@ mod tests {
             assert_eq!(s.active, want, "clicking {want:?}'s picker cell selects it");
         }
 
-        // The system-quad surfaces are absent from the picker (VDOCK-4 owns them).
+        // System stays out of the picker; Desktop is now the second bottom-rail
+        // control in the Windows-style rail.
         assert!(
             ctx.read_response(pick_cell_id(Surface::System)).is_none(),
             "System (Settings) is deferred to VDOCK-4's system quad"
         );
         assert!(
-            ctx.read_response(pick_cell_id(Surface::Desktop)).is_none(),
-            "Show-Desktop is deferred to VDOCK-4's system quad"
+            ctx.read_response(pick_cell_id(Surface::Desktop)).is_some(),
+            "Desktop is a bottom-rail control"
         );
     }
 
@@ -2915,18 +4236,16 @@ mod tests {
                 "the vertical dock's labels read HORIZONTALLY (angle 0), got {angle}"
             );
         }
-        // The one non-accent text is the clock strip's HH:MM glyph — upright,
-        // dim (idle two-tone), never a caption.
+        // No picker cell captions are painted; rail icons are glyphs, and the
+        // clock lives outside the left-dock label cluster.
         assert_eq!(
             rest.len(),
-            1,
-            "besides the labels only the clock glyph paints text"
+            0,
+            "besides group labels no left-dock captions are painted"
         );
-        assert!(rest[0].0.abs() < 1e-3, "the clock glyph reads upright");
-        assert_eq!(
-            rest[0].1,
-            Style::TEXT_DIM,
-            "the idle clock glyph sits dim like an idle app glyph"
+        assert!(
+            rest.iter().all(|(angle, _)| angle.abs() < 1e-3),
+            "fixed chrome glyphs read upright"
         );
     }
 
@@ -2991,6 +4310,126 @@ mod tests {
     }
 
     #[test]
+    fn the_files_cell_badges_active_transfers_only_when_nonzero() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let sz = egui::vec2(1280.0, 900.0);
+
+        let mut idle = DockState::default();
+        idle.toggle();
+        drive_vdock(&ctx, &mut idle, Vec::new(), sz);
+        assert!(
+            ctx.read_response(transfer_badge_id(Surface::Files))
+                .is_none(),
+            "zero active transfers paints no Files badge"
+        );
+
+        let mut active = DockState::default();
+        active.toggle();
+        active.set_transfer_active_count(15);
+        drive_vdock(&ctx, &mut active, Vec::new(), sz);
+        let files = ctx
+            .read_response(pick_cell_id(Surface::Files))
+            .expect("Files cell is registered")
+            .rect;
+        let badge = ctx
+            .read_response(transfer_badge_id(Surface::Files))
+            .expect("active transfers register a Files badge")
+            .rect;
+        assert!(
+            files.contains(badge.center()),
+            "the transfer badge is anchored inside the Files dock cell"
+        );
+        assert_eq!(super::badge_label(15), "15");
+        assert_eq!(super::badge_label(120), "99+");
+    }
+
+    #[test]
+    fn navbar5_live_badges_project_unread_peers_and_system_health() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let sz = egui::vec2(1280.0, 900.0);
+
+        let mut idle = DockState::default();
+        idle.toggle();
+        drive_vdock(&ctx, &mut idle, Vec::new(), sz);
+        assert!(
+            ctx.read_response(surface_badge_id(Surface::Chat)).is_none(),
+            "zero unread paints no Chat badge"
+        );
+        assert!(
+            ctx.read_response(surface_badge_id(Surface::MeshView))
+                .is_none(),
+            "unseen mesh paints no Mesh badge"
+        );
+        assert!(
+            ctx.read_response(surface_badge_id(Surface::System))
+                .is_none(),
+            "unseen health paints no System health dot"
+        );
+
+        let mut live = DockState::default();
+        live.toggle();
+        live.set_status_inputs(
+            MeshSummary {
+                peers_total: 5,
+                peers_online: 4,
+                health: mde_cosmic_applet::LighthouseHealth::Degraded,
+                seen: true,
+            },
+            None,
+            12,
+            false,
+            Vec::new(),
+            NodeGrades::default(),
+            StatusSegments::default(),
+        );
+        drive_vdock(&ctx, &mut live, Vec::new(), sz);
+        drive_vdock(&ctx, &mut live, Vec::new(), sz);
+
+        let chat = ctx
+            .read_response(pick_cell_id(Surface::Chat))
+            .expect("Chat picker cell is registered")
+            .rect;
+        let chat_badge = ctx
+            .read_response(surface_badge_id(Surface::Chat))
+            .expect("Chat unread count registers a badge")
+            .rect;
+        assert!(
+            chat.contains(chat_badge.center()),
+            "Chat unread badge is anchored inside the Chat glyph cell"
+        );
+
+        let mesh = ctx
+            .read_response(pick_cell_id(Surface::MeshView))
+            .expect("Mesh picker cell is registered")
+            .rect;
+        let mesh_badge = ctx
+            .read_response(surface_badge_id(Surface::MeshView))
+            .expect("Mesh peer count registers a badge")
+            .rect;
+        assert!(
+            mesh.contains(mesh_badge.center()),
+            "Mesh peer badge is anchored inside the Mesh glyph cell"
+        );
+
+        let system = ctx
+            .read_response(sys_cell_id(SysCell::Settings))
+            .expect("System settings cell is registered")
+            .rect;
+        let system_badge = ctx
+            .read_response(surface_badge_id(Surface::System))
+            .expect("mesh health registers a System health dot")
+            .rect;
+        assert!(
+            system.contains(system_badge.center()),
+            "System health dot is anchored inside the Settings glyph cell"
+        );
+        assert_eq!(super::badge_label(12), "12");
+        assert_eq!(super::badge_label(4), "4");
+    }
+
+    #[test]
     fn the_overflow_more_popup_routes_a_hidden_group_surface() {
         // #22 — on a short screen the lower groups fold into the '…' more-popup:
         // the '…' cell is present, clicking it opens the popup, and a popup cell
@@ -3037,25 +4476,11 @@ mod tests {
 
     // ── VDOCK-5: the clock strip (Timers & Alarms home, locks #16/#20) ─────────
 
-    /// Collect every text shape's `(top-left, string)` — the clock test reads
-    /// the painted glyph's CONTENT back (the labels test only needs angle/color).
-    fn collect_text_strings(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, String)>) {
-        match shape {
-            egui::Shape::Text(t) => out.push((t.pos, t.galley.text().to_string())),
-            egui::Shape::Vec(v) => {
-                for s in v {
-                    collect_text_strings(s, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
     #[test]
     fn the_clock_strip_shows_the_live_time_and_routes_to_timers() {
         // Lock #20 — the clock-glyph cell: it paints the LIVE wall-clock HH:MM
         // as its glyph (the time IS the icon), sits atop the bottom zone above
-        // the status quads, and a click opens the Timers & Alarms surface.
+        // the status strip, and a click opens the Timers & Alarms surface.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -3069,40 +4494,12 @@ mod tests {
             .expect("the clock strip is registered")
             .rect;
         assert!(
-            (cell.width() - DOCK_W).abs() < 1.0,
-            "the clock strip spans the full column"
+            cell.width() < DOCK_W,
+            "the rail clock is a compact tray item"
         );
         assert!(
-            (cell.top() - (sz.y - BOTTOM_ZONE_H)).abs() < 1.0,
-            "the clock strip leads the bottom zone"
-        );
-        assert!(
-            (cell.bottom() - (sz.y - STATUS_SYS_H)).abs() < 1.0,
-            "the clock strip sits directly above the status quads"
-        );
-
-        // The glyph is the CURRENT time — capture one frame and find the HH:MM
-        // string inside the cell (sampling now on both sides tolerates a minute
-        // rollover mid-frame).
-        let before = crate::timers::hhmm(crate::timers::now_unix());
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), sz)),
-            ..Default::default()
-        };
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |_ui| {});
-            let _ = dock(ctx, &mut s);
-        });
-        let after = crate::timers::hhmm(crate::timers::now_unix());
-        let mut texts = Vec::new();
-        for clipped in &out.shapes {
-            collect_text_strings(&clipped.shape, &mut texts);
-        }
-        assert!(
-            texts
-                .iter()
-                .any(|(pos, text)| cell.contains(*pos) && (*text == before || *text == after)),
-            "the clock strip paints the live HH:MM as its glyph (lock #20)"
+            cell.left() > DOCK_W,
+            "the clock is no longer in the left rail"
         );
 
         // A click routes to Timers & Alarms (the surface's ONE home).
@@ -3132,44 +4529,622 @@ mod tests {
         );
     }
 
-    // ── VDOCK-3: the status quads wired into the dock's bottom zone ────────────
+    // ── NOTIF-3: the status strip wired into the dock's bottom zone ────────────
 
     #[test]
-    fn a_status_quad_cell_routes_through_the_dock_bottom_zone() {
-        // VDOCK-3 wired end-to-end: the shell feeds the quads via `set_status_inputs`
-        // and a click on a bottom-zone quad cell routes `DockState::active` (lock
-        // #15). Mount the real dock, seed the inputs, read the Chat quad cell's centre
-        // by its tray id, and click it → `active` follows to Chat (the SAME routing
-        // the horizontal tray drove). Guards against the "compiles but isn't wired"
-        // trap — the quads must actually render + route in the live dock.
-        use crate::tray::{quad_cell_id, TrayItem};
+    fn a_status_segment_pip_routes_through_the_dock_bottom_zone() {
+        // NOTIF-3 wired end-to-end: the shell feeds the compact status strip via
+        // `set_status_inputs` and a click on a bottom-zone segment pip routes
+        // `DockState::active` (lock #15). Mount the real dock, read the Alerts pip
+        // centre by its stable id, and click it -> `active` follows to Chat.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
-        s.toggle(); // reveal the dock so its Area (and the quads) mount
+        s.toggle(); // reveal the dock so its Area (and the status strip) mount
         s.set_status_inputs(
             MeshSummary::default(),
             None,
             3,
             false,
+            Vec::new(),
             NodeGrades::default(),
+            StatusSegments::default(),
         );
         let sz = egui::vec2(1280.0, 800.0);
-        // Prime so the quad cell rects register + settle under their stable ids.
+        // Prime so the segment pip rects register + settle under their stable ids.
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
 
-        let chat = ctx
-            .read_response(quad_cell_id(TrayItem::Chat))
-            .expect("the Chat status-quad cell is registered in the dock's bottom zone")
+        let alerts = ctx
+            .read_response(status::segment_pip_id(status::StatusSegment::Alerts))
+            .expect("the Alerts status segment is registered in the dock's bottom zone")
             .rect
             .center();
         assert_ne!(s.active, Surface::Chat, "start off the Chat surface");
-        click_vdock(&ctx, &mut s, chat, sz);
+        click_vdock(&ctx, &mut s, alerts, sz);
         assert_eq!(
             s.active,
             Surface::Chat,
-            "clicking the Chat quad cell routes to the Chat surface (lock #15)"
+            "clicking the Alerts segment routes to the Chat surface (lock #15)"
+        );
+    }
+
+    #[test]
+    fn navbar4_status_tray_is_folded_into_the_bottom_rail() {
+        // NAVBAR-4 — the separate chrome/status strip is retired: status pips,
+        // the detail toggle, and the clock all live in the full-width bottom rail.
+        // The old `status_bar` local-grade pip id must not register from the dock.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        s.set_status_inputs(
+            MeshSummary {
+                peers_total: 4,
+                peers_online: 3,
+                health: mde_cosmic_applet::LighthouseHealth::AllHealthy,
+                seen: true,
+            },
+            None,
+            2,
+            true,
+            Vec::new(),
+            grades(vec![grade("me", 95, true, false)]),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let start = ctx
+            .read_response(start_cell_id())
+            .expect("Start/Advanced cell is in the bottom rail")
+            .rect;
+        let clock = ctx
+            .read_response(clock_cell_id())
+            .expect("clock is in the bottom rail")
+            .rect;
+        let detail = ctx
+            .read_response(status_detail_toggle_id())
+            .expect("status detail toggle is in the bottom rail")
+            .rect;
+        let alerts = ctx
+            .read_response(status::segment_pip_id(status::StatusSegment::Alerts))
+            .expect("status pips are in the bottom rail")
+            .rect;
+        assert!(
+            [start, detail, alerts, clock]
+                .into_iter()
+                .all(|r| (r.center().y - start.center().y).abs() < 2.0),
+            "Advanced, status pips, detail toggle, and clock share one bottom rail"
+        );
+        assert!(
+            detail.left() > start.right()
+                && alerts.left() > detail.right()
+                && clock.left() > alerts.right(),
+            "status tray is right-aligned after the left-side launcher/session run"
+        );
+        assert!(
+            ctx.read_response(status::local_grade_pip_id()).is_none(),
+            "the retired separate status_bar local-grade pip is not mounted"
+        );
+
+        click_vdock(&ctx, &mut s, detail.center(), sz);
+        assert!(
+            s.status_panel_open,
+            "bottom-rail detail toggle opens status panel"
+        );
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        assert!(
+            ctx.read_response(status::status_panel_id()).is_some(),
+            "the folded status tray still exposes the old chrome detail content"
+        );
+    }
+
+    #[test]
+    fn navbar8_shell_density_selects_compact_or_expanded_bottom_rail() {
+        // NAVBAR-8 — the rail rides the same density the shell installs from the
+        // formfactor/control-surface path. Pointer density keeps the compact
+        // icon rail; touch density grows the labelled 48px variant.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let sz = egui::vec2(1280.0, 800.0);
+
+        let mut compact = DockState::default();
+        compact.set_density(Density::Mouse);
+        drive_vdock(&ctx, &mut compact, Vec::new(), sz);
+        drive_vdock(&ctx, &mut compact, Vec::new(), sz);
+        let compact_start = ctx
+            .read_response(start_cell_id())
+            .expect("compact Advanced cell registers")
+            .rect;
+        assert!(
+            (compact_start.height() - NOTIFICATION_RAIL_H + 4.0).abs() < 1.0,
+            "compact density keeps the short icon rail"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, Density::Touch);
+        let mut expanded = DockState::default();
+        expanded.set_density(Density::Touch);
+        drive_vdock(&ctx, &mut expanded, Vec::new(), sz);
+        drive_vdock(&ctx, &mut expanded, Vec::new(), sz);
+        let expanded_start = ctx
+            .read_response(start_cell_id())
+            .expect("expanded Advanced cell registers")
+            .rect;
+        let expanded_desktop = ctx
+            .read_response(pick_cell_id(Surface::Desktop))
+            .expect("expanded Desktop cell registers through the same surface id")
+            .rect;
+        assert!(
+            expanded_start.height() >= NOTIFICATION_RAIL_EXPANDED_H - 6.0,
+            "expanded density selects the 48px rail variant"
+        );
+        assert!(
+            (expanded_start.center().y - expanded_desktop.center().y).abs() < 2.0,
+            "expanded Advanced and Desktop still share one bottom rail"
+        );
+        assert!(
+            expanded_desktop.width() > compact_start.width(),
+            "expanded cells have room for the label variant"
+        );
+    }
+
+    #[test]
+    fn a_requested_desktop_session_renders_as_a_named_bottom_rail_entry() {
+        // NAVBAR-U3 / operator rail request — once the Desktop surface has a real
+        // requested target, the rail shows a taskbar-style session entry instead of
+        // only the generic Sessions glyph. Clicking it focuses Desktop.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            true,
+            vec![entry.clone()],
+            NodeGrades::default(),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let rect = ctx
+            .read_response(session_entry_id(0, &entry))
+            .expect("the named session entry is registered")
+            .rect;
+        assert!(
+            rect.width() > NOTIFICATION_RAIL_H,
+            "session entries render wider than the fallback micro icon"
+        );
+        assert_ne!(s.active(), Surface::Desktop, "starts off Desktop");
+        click_vdock(&ctx, &mut s, rect.center(), sz);
+        assert_eq!(
+            s.active(),
+            Surface::Desktop,
+            "session entry focuses Desktop"
+        );
+        assert_eq!(
+            s.take_desktop_session_focus().as_deref(),
+            Some("session-1"),
+            "session entry latches its broker session id for the shell"
+        );
+    }
+
+    #[test]
+    fn navbar7_bottom_rail_more_popup_keeps_overflow_sessions_reachable() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let entries = vec![
+            SessionRailEntry::with_session_id("s1", "Alpha Desktop", "RDP"),
+            SessionRailEntry::with_session_id("s2", "Bravo Desktop", "RDP"),
+            SessionRailEntry::with_session_id("s3", "Charlie Desktop", "VNC"),
+            SessionRailEntry::with_session_id("s4", "Delta Desktop", "RDP"),
+        ];
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            true,
+            entries.clone(),
+            NodeGrades::default(),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(380.0, 720.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        assert!(
+            ctx.read_response(rail_more_id()).is_some(),
+            "narrow rails render a More cell instead of silently dropping sessions"
+        );
+        assert!(
+            ctx.read_response(session_entry_id(3, &entries[3]))
+                .is_none(),
+            "the trailing session is folded out of the inline rail"
+        );
+
+        let more = ctx
+            .read_response(rail_more_id())
+            .expect("More cell is registered")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, more, sz);
+        assert!(s.rail_more_open, "clicking More opens the overflow popup");
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let hidden = ctx
+            .read_response(session_entry_id(3, &entries[3]))
+            .expect("the hidden session is reachable in the More popup")
+            .rect
+            .center();
+        assert!(hidden.x > 0.0, "hidden popup row has a concrete hit rect");
+        ctx.memory_mut(|m| m.request_focus(session_entry_id(3, &entries[3])));
+        drive_vdock(&ctx, &mut s, vec![key(egui::Key::Enter)], sz);
+        assert_eq!(s.active(), Surface::Desktop);
+        assert_eq!(
+            s.take_desktop_session_focus().as_deref(),
+            Some("s4"),
+            "clicking a popup session uses the same focus latch as inline entries"
+        );
+        assert!(!s.rail_more_open, "routing from More closes the popup");
+    }
+
+    #[test]
+    fn the_desktop_rail_cell_latches_a_reconnect_request() {
+        // NAVBAR-U1 — a Desktop rail click is more than navigation: the shell
+        // drains a distinct reconnect request and asks ChooserState for the newest
+        // recent desktop. Programmatic Desktop navigation does not set this latch.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        assert!(
+            !s.take_desktop_reconnect(),
+            "no reconnect latch before a rail click"
+        );
+        let desktop = ctx
+            .read_response(pick_cell_id(Surface::Desktop))
+            .expect("the Desktop rail cell is registered")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, desktop, sz);
+        assert_eq!(
+            s.active(),
+            Surface::Desktop,
+            "Desktop still routes normally"
+        );
+        assert!(
+            s.take_desktop_reconnect(),
+            "Desktop rail click latches reconnect"
+        );
+        assert!(
+            !s.take_desktop_reconnect(),
+            "the reconnect latch drains once"
+        );
+    }
+
+    #[test]
+    fn the_desktop_rail_caret_opens_sources_and_latches_a_pick() {
+        // NAVBAR-U2 — the Desktop rail is a split control: main icon reconnects,
+        // caret opens the compact source flyout, and a row click returns only the
+        // source id for the shell to hand back to ChooserState.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        let sources = vec![DesktopRailSource::new(
+            "peer:oak",
+            "oak",
+            "lighthouse-oak",
+            "RDP",
+            true,
+            true,
+            false,
+        )];
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+
+        let caret = ctx
+            .read_response(desktop_source_toggle_id())
+            .expect("the Desktop source caret is registered")
+            .rect
+            .center();
+        click_vdock_with_sources(&ctx, &mut s, caret, sz, &sources);
+        assert!(s.desktop_sources_open, "caret opens the source flyout");
+
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+        let row = ctx
+            .read_response(desktop_source_row_id(&sources[0]))
+            .expect("the source row is registered")
+            .rect
+            .center();
+        click_vdock_with_sources(&ctx, &mut s, row, sz, &sources);
+        assert_eq!(
+            s.take_desktop_source_pick().as_deref(),
+            Some("peer:oak"),
+            "row click latches the selected chooser source id"
+        );
+        assert_eq!(s.active(), Surface::Desktop, "source pick focuses Desktop");
+        assert!(
+            !s.desktop_sources_open,
+            "routing from the source flyout closes it"
+        );
+    }
+
+    #[test]
+    fn the_desktop_split_button_is_keyboard_reachable() {
+        // NAVBAR-U1 — keyboard focus + Enter/Space must activate both halves of the
+        // Desktop split control and the compact source rows.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        let sources = vec![DesktopRailSource::new(
+            "peer:oak",
+            "oak",
+            "lighthouse-oak",
+            "RDP",
+            true,
+            false,
+            true,
+        )];
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+
+        ctx.memory_mut(|m| m.request_focus(pick_cell_id(Surface::Desktop)));
+        drive_vdock_with_sources(&ctx, &mut s, vec![key(egui::Key::Enter)], sz, &sources);
+        assert_eq!(s.active(), Surface::Desktop);
+        assert!(
+            s.take_desktop_reconnect(),
+            "Enter on the Desktop half latches reconnect"
+        );
+
+        ctx.memory_mut(|m| m.request_focus(desktop_source_toggle_id()));
+        drive_vdock_with_sources(&ctx, &mut s, vec![key(egui::Key::Space)], sz, &sources);
+        assert!(
+            s.desktop_sources_open,
+            "Space on the caret opens the source flyout"
+        );
+
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+        ctx.memory_mut(|m| m.request_focus(desktop_source_row_id(&sources[0])));
+        drive_vdock_with_sources(&ctx, &mut s, vec![key(egui::Key::Enter)], sz, &sources);
+        assert_eq!(
+            s.take_desktop_source_pick().as_deref(),
+            Some("peer:oak"),
+            "Enter on a source row latches that chooser source"
+        );
+    }
+
+    #[test]
+    fn navbar6_arrow_keys_traverse_picker_glyph_focus() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 900.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        ctx.memory_mut(|m| m.request_focus(pick_cell_id(Surface::Workbench)));
+        drive_vdock(&ctx, &mut s, vec![key(egui::Key::ArrowDown)], sz);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(pick_cell_id(Surface::Voice)),
+            "ArrowDown advances from Workbench to the first grouped glyph"
+        );
+
+        drive_vdock(&ctx, &mut s, vec![key(egui::Key::ArrowUp)], sz);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(pick_cell_id(Surface::Workbench)),
+            "ArrowUp traverses back to Workbench"
+        );
+    }
+
+    #[test]
+    fn navbar6_right_click_glyph_menu_offers_pin_info_and_close_when_closable() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 900.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let workbench = ctx
+            .read_response(pick_cell_id(Surface::Workbench))
+            .expect("Workbench cell is registered")
+            .rect
+            .center();
+        secondary_click_vdock(&ctx, &mut s, workbench, sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        assert!(
+            ctx.read_response(surface_context_item_id(
+                Surface::Workbench,
+                SurfaceContextItem::Pin
+            ))
+            .is_some(),
+            "right-clicking a glyph opens a Pin row"
+        );
+        assert!(
+            ctx.read_response(surface_context_item_id(
+                Surface::Workbench,
+                SurfaceContextItem::Info
+            ))
+            .is_some(),
+            "right-clicking a glyph opens an Info row"
+        );
+        assert!(
+            ctx.read_response(surface_context_item_id(
+                Surface::Workbench,
+                SurfaceContextItem::Close
+            ))
+            .is_none(),
+            "anchor glyphs omit Close rather than showing a placebo"
+        );
+
+        let pin = ctx
+            .read_response(surface_context_item_id(
+                Surface::Workbench,
+                SurfaceContextItem::Pin,
+            ))
+            .expect("Pin row remains registered")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, pin, sz);
+        assert!(s.pinned(), "Pin toggles the dock hold-open state");
+        click_vdock(&ctx, &mut s, egui::pos2(600.0, 400.0), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let initial_browser = ctx
+            .read_response(pick_cell_id(Surface::Browser))
+            .expect("Browser cell is registered")
+            .rect
+            .center();
+        assert!(initial_browser.x > 0.0, "Browser has a concrete cell");
+        s.set_active(Surface::Browser);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        assert_eq!(s.active(), Surface::Browser);
+        let browser = ctx
+            .read_response(pick_cell_id(Surface::Browser))
+            .expect("Browser cell remains registered after activation")
+            .rect
+            .center();
+        secondary_click_vdock(&ctx, &mut s, browser, sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let close = ctx
+            .read_response(surface_context_item_id(
+                Surface::Browser,
+                SurfaceContextItem::Close,
+            ))
+            .expect("closable Browser glyph exposes Close")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, close, sz);
+        assert_eq!(
+            s.active(),
+            Surface::Workbench,
+            "Close on the closable Desktop glyph returns to Workbench"
+        );
+    }
+
+    #[test]
+    fn the_status_chevron_opens_and_dismisses_the_detail_panel() {
+        // NOTIF-4 — the detail panel is now mounted from the bottom rail; Esc and
+        // click-away both dismiss it.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            false,
+            Vec::new(),
+            grades(vec![grade("me", 95, true, false)]),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        assert!(!s.status_panel_open, "panel starts closed");
+        let caret = ctx
+            .read_response(status_detail_toggle_id())
+            .expect("bottom-rail status caret renders")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, caret, sz);
+        assert!(
+            s.status_panel_open,
+            "bottom-rail caret opens the status panel"
+        );
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        assert!(
+            ctx.read_response(status::status_panel_id()).is_some(),
+            "the status detail panel renders after opening"
+        );
+
+        drive_vdock(&ctx, &mut s, vec![key(egui::Key::Escape)], sz);
+        assert!(!s.status_panel_open, "Escape dismisses the panel");
+
+        s.open_status_panel_for_test();
+        assert!(s.status_panel_open, "test seam reopens the panel");
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        click_vdock(&ctx, &mut s, egui::pos2(500.0, 500.0), sz);
+        assert!(!s.status_panel_open, "click-away dismisses the panel");
+    }
+
+    #[test]
+    fn the_status_panel_routes_device_controls_and_grade_rows() {
+        // NOTIF-4 — device controls route to System; grade rows request the same
+        // Explorer node-focus path as the dock mini-list.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            false,
+            Vec::new(),
+            grades(vec![
+                grade("me", 95, true, false),
+                grade("oak", 42, false, false),
+            ]),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        s.open_status_panel_for_test();
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let device = ctx
+            .read_response(status::status_panel_device_id())
+            .expect("device control band registered")
+            .rect
+            .center();
+        assert_ne!(s.active, Surface::System, "start off System");
+        click_vdock(&ctx, &mut s, device, sz);
+        assert_eq!(s.active, Surface::System, "device band routes to System");
+        assert!(
+            !s.status_panel_open,
+            "routing from the panel closes the auxiliary panel"
+        );
+
+        s.open_status_panel_for_test();
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let oak = ctx
+            .read_response(status::status_panel_grade_id("oak"))
+            .expect("peer grade row registered")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, oak, sz);
+        assert_eq!(
+            s.take_node_focus().as_deref(),
+            Some("oak"),
+            "tapping a panel grade row records a node-focus request"
         );
     }
 
@@ -3200,9 +5175,35 @@ mod tests {
     }
 
     #[test]
+    fn system_quad_cells_use_status_pip_tint_language() {
+        // NOTIF-12 — inactive controls share the status-pip dim baseline; hover or
+        // active state reveals each action's semantic Carbon tone.
+        assert_eq!(
+            sys_cell_tint(SysCell::Settings, false, false),
+            Style::TEXT_DIM
+        );
+        assert_eq!(
+            sys_cell_tint(SysCell::Settings, true, false),
+            Style::SUPPORT_INFO
+        );
+        assert_eq!(
+            sys_cell_tint(SysCell::ShowDesktop, true, false),
+            Style::SUPPORT_SUCCESS
+        );
+        assert_eq!(
+            sys_cell_tint(SysCell::Lock, false, true),
+            Style::SUPPORT_WARNING
+        );
+        assert_eq!(
+            sys_cell_tint(SysCell::Power, true, false),
+            Style::SUPPORT_ERROR
+        );
+    }
+
+    #[test]
     fn the_system_quad_lays_out_as_a_2x2_in_the_final_dock_row() {
         // Design #7/#8 — the four cells form a 2×2 of DOCK_W/2 cells in the reserved
-        // final DOCK_W row (directly beneath VDOCK-3's two status quads).
+        // final DOCK_W row (directly beneath NOTIF-3's status strip).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -3241,10 +5242,10 @@ mod tests {
             "bottom row one cell down"
         );
         assert!((br.top() - bl.top()).abs() < 1.0, "bottom row aligned");
-        // The quad sits in the FINAL DOCK_W row (screen bottom − DOCK_W).
+        // The quad sits directly above the Windows-style bottom rail.
         assert!(
-            (tl.top() - (sz.y - DOCK_W)).abs() < 1.0,
-            "the system quad occupies the last DOCK_W row"
+            (tl.top() - (sz.y - DOCK_W - 20.0)).abs() < 1.0,
+            "the system quad occupies the row above the bottom rail"
         );
         // It spans the full column width (two DOCK_W/2 columns).
         assert!(
@@ -3428,11 +5429,10 @@ mod tests {
     }
 
     #[test]
-    fn the_grade_rows_sit_above_the_status_quads_local_first() {
+    fn the_grade_rows_sit_above_the_bottom_status_tray_local_first() {
         // Design #18/#19 — the grade mini-list paints in the bottom zone ABOVE the
-        // VDOCK-3 status quads, in the given render order (local pinned first). The
-        // rows register addressable rects and every one clears the first status quad.
-        use crate::tray::{quad_cell_id, TrayItem};
+        // NOTIF-3 status strip, in the given render order (local pinned first). The
+        // rows register addressable rects and every one clears the strip.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -3443,10 +5443,12 @@ mod tests {
             None,
             0,
             false,
+            Vec::new(),
             grades(vec![
                 grade("me", 95, true, false),
                 grade("oak", 40, false, false),
             ]),
+            StatusSegments::default(),
         );
         let sz = egui::vec2(1280.0, 800.0);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -3465,14 +5467,14 @@ mod tests {
             me.top() < oak.top(),
             "the local node's row is pinned first (#18)"
         );
-        // Both rows sit ABOVE the first status quad (the Chat cell of quad 1).
-        let quad = ctx
-            .read_response(quad_cell_id(TrayItem::Chat))
-            .expect("the status quad is registered below the grade band")
+        // Both rows sit above the bottom rail's status tray.
+        let tray = ctx
+            .read_response(status::segment_pip_id(status::StatusSegment::Alerts))
+            .expect("the bottom status tray is registered")
             .rect;
         assert!(
-            me.bottom() <= quad.top() + 1.0 && oak.bottom() <= quad.top() + 1.0,
-            "the grade band renders above the status quads (design #8)"
+            tray.width() < DOCK_W,
+            "the bottom status tray uses micro icons"
         );
         // Each row spans the full column width (the dock idiom).
         assert!(
@@ -3495,7 +5497,9 @@ mod tests {
             None,
             0,
             false,
+            Vec::new(),
             grades(vec![grade("oak", 40, false, false)]),
+            StatusSegments::default(),
         );
         let sz = egui::vec2(1280.0, 800.0);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -3545,7 +5549,15 @@ mod tests {
             ));
         }
         let hidden_host = peers[peers.len() - 1];
-        s.set_status_inputs(MeshSummary::default(), None, 0, false, grades(rows));
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            false,
+            Vec::new(),
+            grades(rows),
+            StatusSegments::default(),
+        );
         let sz = egui::vec2(1280.0, 800.0);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);

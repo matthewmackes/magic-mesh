@@ -1,26 +1,25 @@
 //! The shell's live **mesh-status fold** — the world-readable snapshot poll
-//! plus the pure [`MeshSummary`] projection the taskbar tray renders.
+//! plus the pure [`MeshSummary`] projection the status chrome renders.
 //!
 //! Until NAVBAR-W10-2 this module also rendered the top chrome strip
 //! (brand/version · Peers · Sessions · Status · Signal · BT · Vol · Batt ·
-//! Chat · Collapse); lock W1 removed that bar outright — the shell has ONE
-//! bar, the bottom taskbar, and the tray IS the status surface. What remains
-//! here is the strip's pure heart:
+//! Chat · Collapse); lock W1 removed that bar outright. What remains here is
+//! the strip's pure heart:
 //!
 //! * **[`MeshSummary`]** folds the world-readable mesh-status snapshot the
 //!   root timer writes (`/run/mde/mesh-status.json`) — the same source the
 //!   panel client reads (the desktop user can't read the root-only peer
 //!   directory). The worst-of lighthouse verdict is the reused LIGHTHOUSE-7
-//!   model (`lighthouse_health_from_snapshot`), so the tray's Status dot
+//!   model (`lighthouse_health_from_snapshot`), so the status verdict
 //!   can't diverge from the rest of the fleet's health verdict.
 //! * **[`ChromeState::poll`]** is the ONE self-gating snapshot read + repaint
-//!   heartbeat — `main.rs` drives it each frame and the tray consumes the
-//!   product (`tray::TrayInputs.mesh`); no second poll, no second reader.
+//!   heartbeat — `main.rs` drives it each frame and the dock grade/status chrome
+//!   consumes the product; no second poll, no second reader.
 //!
 //! The projection is pure (no egui `Context`, no IO, no GPU), so it's
 //! unit-tested directly; the only IO is the snapshot read in `poll`. The
-//! seat-side folds the strip carried (battery pack pick + tone) moved to
-//! `tray.rs` with the icons they feed.
+//! seat-side folds the strip carried (battery pack pick + tone) live in
+//! `status.rs` with the panel they feed.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -328,8 +327,8 @@ impl ChromeState {
         ctx.request_repaint_after(REFRESH);
     }
 
-    /// The latest projection — what the taskbar tray folds its Peers / Status /
-    /// Signal dots from each frame.
+    /// The latest projection — what the dock grade/status chrome folds from each
+    /// frame.
     pub(crate) const fn summary(&self) -> &MeshSummary {
         &self.summary
     }
