@@ -357,18 +357,54 @@ live_smoke() {
     return 1
   fi
   printf '%s\n' "$out"
-  bad_peers="$(printf '%s\n' "$out" | awk '
-    $1 == "PEER" || $1 == "fleet" || $1 ~ /^http/ || $1 == "Filesystem" || $1 == "tmpfs" || $1 ~ /^\// { next }
-    NF >= 4 && ($2 != "online" || $3 != "healthy") {
-      printf "%s%s=%s/%s", sep, $1, $2, $3
-      sep = ","
-    }
-  ')"
+  bad_peers="$(peer_health_blockers "$out")"
   if [ -n "$bad_peers" ]; then
     record_gate live-smoke fail "peer-health:$bad_peers"
     return 1
   fi
   record_gate live-smoke pass "live-mesh"
+}
+
+peer_health_blockers() {
+  printf '%s\n' "$1" | awk '
+    $1 == "PEER" || $1 == "fleet" || $1 ~ /^http/ || $1 == "Filesystem" || $1 == "tmpfs" || $1 ~ /^\// { next }
+    NF >= 4 && ($2 != "online" || $3 != "healthy") {
+      printf "%s%s=%s/%s", sep, $1, $2, $3
+      sep = ","
+    }
+  '
+}
+
+live_blockers() {
+  log "Live blocker diagnostics"
+  local bad_peers out
+  if ! out="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@165.227.188.238 'mackesd peers')"; then
+    printf '%s\n' "$out"
+    echo "live_blockers: unable to query live peers from lighthouse 165.227.188.238"
+    return 1
+  fi
+
+  printf '%s\n' "$out"
+  bad_peers="$(peer_health_blockers "$out")"
+  if [ -z "$bad_peers" ]; then
+    echo "live_blockers: none"
+    return 0
+  fi
+
+  echo "live_blockers: peer-health:$bad_peers"
+  if printf '%s\n' "$bad_peers" | grep -q 'UNIT-EAGLE='; then
+    need sshpass
+    echo "eagle_diagnostics:"
+    sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
+      'echo "  host=$(hostname)";
+       echo "  rpm=$(rpm -q magic-mesh 2>/dev/null || true)";
+       echo "  services=$(systemctl is-active mackesd nebula syncthing 2>/dev/null | paste -sd, -)";
+       echo "  power:";
+       upower -d 2>/dev/null | awk "/native-path:|online:|state:|warning-level:|percentage:|time to empty:/ { gsub(/^[ \t]+/, \"\"); print \"    \" \$0 }" || true;
+       echo "  recent_mackesd_warnings:";
+       journalctl -u mackesd --since "15 min ago" -p warning --no-pager 2>/dev/null | tail -20 | sed "s/^/    /" || true' || true
+  fi
+  return 1
 }
 
 audit_do_node() {
@@ -602,10 +638,11 @@ case "${1:-cycle}" in
   l4|lighthouse-replace) run_l4 ;;
   eagle) promote_eagle ;;
   live-smoke) live_smoke ;;
+  live-blockers) live_blockers ;;
   live-audit) live_audit ;;
   media-verify) shift; media_verify "$@" ;;
   fd-soak|live-fd-soak) live_fd_soak ;;
   do) promote_do ;;
   cycle) cycle ;;
-  *) die "usage: $0 {status|statrep|inventory|adopt-build|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-audit|media-verify|fd-soak|do|cycle}" ;;
+  *) die "usage: $0 {status|statrep|inventory|adopt-build|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-blockers|live-audit|media-verify|fd-soak|do|cycle}" ;;
 esac
