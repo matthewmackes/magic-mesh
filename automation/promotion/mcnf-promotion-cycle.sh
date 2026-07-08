@@ -292,6 +292,14 @@ build_rpm() {
   record_gate build pass "farm-rpm"
 }
 
+adopt_existing_candidate() {
+  RPM="$(latest_rpm)"
+  [ -n "$RPM" ] && [ -f "$RPM" ] || die "no RPM candidate to adopt"
+  rpm -qp "$RPM" >/dev/null || die "candidate is not a readable RPM: $RPM"
+  log "Adopt existing candidate RPM=$RPM sha256=$(rpm_sha256 "$RPM")"
+  record_gate build pass "adopted-existing-rpm"
+}
+
 run_l1() {
   RPM="$(latest_rpm)"; [ -f "$RPM" ] || die "no RPM; run build first"
   log "L1 install gate"
@@ -578,6 +586,7 @@ cycle() {
 case "${1:-cycle}" in
   status|statrep) status_report ;;
   inventory) inventory ;;
+  adopt-build|adopt-candidate) adopt_existing_candidate ;;
   check-limits) check_limits ;;
   build|l0) build_rpm ;;
   l1) run_l1 ;;
@@ -591,5 +600,5 @@ case "${1:-cycle}" in
   fd-soak|live-fd-soak) live_fd_soak ;;
   do) promote_do ;;
   cycle) cycle ;;
-  *) die "usage: $0 {status|statrep|inventory|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-audit|media-verify|fd-soak|do|cycle}" ;;
+  *) die "usage: $0 {status|statrep|inventory|adopt-build|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-audit|media-verify|fd-soak|do|cycle}" ;;
 esac
