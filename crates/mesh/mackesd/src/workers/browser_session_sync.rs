@@ -1,11 +1,13 @@
 //! BROWSER-DD-7 — Browser session-sync owner.
 //!
-//! The Browser shell publishes `action/browser/session-sync` snapshots for the
-//! state it owns. This worker is the mesh-side owner for that stream: it drains
-//! the Bus, validates the snapshot shape, persists the latest snapshot locally,
-//! and mirrors the same JSON into the Syncthing-backed workgroup root. The file
-//! body remains the exact Browser snapshot shape so the startup-restore parser can
-//! consume it directly; no wrapper envelope is inserted between sync and restore.
+//! The Browser shell publishes `action/browser/session-sync` snapshots and
+//! `action/browser/send-tab` handoffs for the state it owns. This worker is the
+//! mesh-side owner for those streams: it drains the Bus, validates the Browser
+//! payload shapes, persists the latest restore snapshot locally, mirrors the same
+//! JSON into the Syncthing-backed workgroup root, and materializes send-tab
+//! handoffs into a replicated outbox. Snapshot file bodies remain the exact
+//! Browser snapshot shape so the startup-restore parser can consume them directly;
+//! no wrapper envelope is inserted between sync and restore.
 
 #![cfg(feature = "async-services")]
 
@@ -22,6 +24,9 @@ use super::{ShutdownToken, Worker};
 /// Browser-owned session snapshot action topic.
 pub const ACTION_TOPIC: &str = "action/browser/session-sync";
 
+/// Browser-owned send-tab action topic.
+pub const SEND_TAB_TOPIC: &str = "action/browser/send-tab";
+
 /// Retained-latest status topic for this node.
 pub const STATE_PREFIX: &str = "state/browser-session-sync/";
 
@@ -30,6 +35,9 @@ pub const SESSION_SYNC_SUBDIR: &str = "browser-session-sync";
 
 /// Latest snapshot filename. Its body is the Browser snapshot JSON itself.
 pub const LATEST_FILE: &str = "latest.json";
+
+/// Share/local subdirectory holding durable send-tab handoff outbox records.
+pub const SEND_TAB_OUTBOX_SUBDIR: &str = "browser-send-tab";
 
 /// Default poll cadence. The Browser dedupes snapshots before publish; the worker
 /// can poll frequently without a file-write storm.
@@ -60,6 +68,7 @@ pub struct BrowserSessionSyncWorker {
     local_root: PathBuf,
     share_root: PathBuf,
     cursor: Option<String>,
+    send_tab_cursor: Option<String>,
     last_host: Option<String>,
     last_snapshot_ms: Option<u64>,
     last_mirror_ms: Option<u64>,
@@ -79,6 +88,7 @@ impl BrowserSessionSyncWorker {
             local_root,
             share_root,
             cursor: None,
+            send_tab_cursor: None,
             last_host: None,
             last_snapshot_ms: None,
             last_mirror_ms: None,
@@ -154,6 +164,31 @@ impl BrowserSessionSyncWorker {
         }
     }
 
+    fn drain_send_tabs(&mut self, persist: &Persist) {
+        let msgs = match persist.list_since(SEND_TAB_TOPIC, self.send_tab_cursor.as_deref()) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::debug!(target: "mackesd::browser_session_sync", error = %e, "send-tab list_since failed");
+                return;
+            }
+        };
+        for msg in msgs {
+            self.send_tab_cursor = Some(msg.ulid.clone());
+            let body = msg.body.unwrap_or_default();
+            match parse_send_tab(&body, &msg.ulid) {
+                Ok(handoff) => self.apply_send_tab(handoff),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mackesd::browser_session_sync",
+                        ulid = %msg.ulid,
+                        error = %e,
+                        "discarding malformed browser send-tab handoff"
+                    );
+                }
+            }
+        }
+    }
+
     fn apply_snapshot(&mut self, snapshot: BrowserSessionSnapshot, persist: &Persist) {
         let path = latest_path(&self.local_root, &snapshot.host);
         if let Err(e) = write_atomic(&path, &snapshot.body) {
@@ -197,6 +232,42 @@ impl BrowserSessionSyncWorker {
         self.last_mirror_ms = Some(self.now_ms());
     }
 
+    fn apply_send_tab(&mut self, handoff: BrowserSendTabHandoff) {
+        let path = send_tab_path(
+            &self.local_root,
+            &handoff.target,
+            &handoff.source_host,
+            &handoff.id,
+        );
+        if let Err(e) = write_atomic(&path, &handoff.body) {
+            tracing::warn!(
+                target: "mackesd::browser_session_sync",
+                path = %path.display(),
+                error = %e,
+                "failed to persist local browser send-tab handoff"
+            );
+            return;
+        }
+        self.mirror_send_tab_outbox();
+    }
+
+    fn mirror_send_tab_outbox(&self) {
+        if !self.share_writable() {
+            return;
+        }
+        for (rel, body) in local_outbox_entries(&self.local_root) {
+            let dst = self.share_root.join(SEND_TAB_OUTBOX_SUBDIR).join(rel);
+            if let Err(e) = write_atomic(&dst, &body) {
+                tracing::debug!(
+                    target: "mackesd::browser_session_sync",
+                    path = %dst.display(),
+                    error = %e,
+                    "browser send-tab outbox mirror skipped"
+                );
+            }
+        }
+    }
+
     fn publish_status(&self, persist: &Persist) {
         let status = SessionSyncStatus {
             node: self.node.clone(),
@@ -236,6 +307,7 @@ impl Worker for BrowserSessionSyncWorker {
             }
         };
         self.mirror_pending();
+        self.mirror_send_tab_outbox();
         self.publish_status(&persist);
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await;
@@ -243,13 +315,16 @@ impl Worker for BrowserSessionSyncWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     self.drain_snapshots(&persist);
+                    self.drain_send_tabs(&persist);
                     self.mirror_pending();
+                    self.mirror_send_tab_outbox();
                     self.publish_status(&persist);
                 }
                 () = shutdown.wait() => break,
             }
         }
         self.mirror_pending();
+        self.mirror_send_tab_outbox();
         self.publish_status(&persist);
         Ok(())
     }
@@ -258,6 +333,14 @@ impl Worker for BrowserSessionSyncWorker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BrowserSessionSnapshot {
     host: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserSendTabHandoff {
+    id: String,
+    target: String,
+    source_host: String,
     body: String,
 }
 
@@ -287,6 +370,55 @@ fn parse_snapshot(body: &str) -> Result<BrowserSessionSnapshot, String> {
     Ok(BrowserSessionSnapshot { host, body })
 }
 
+fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("send-tab JSON: {e}"))?;
+    if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_send_tab") {
+        return Err("wrong op".to_owned());
+    }
+    let target = v
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|target| matches!(*target, "node" | "phone"))
+        .ok_or_else(|| "missing supported target".to_owned())?;
+    let source_host = v
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "missing host".to_owned())?;
+    if !v
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        return Err("missing url".to_owned());
+    }
+    if !v
+        .get("engine")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|engine| matches!(engine, "servo" | "cef"))
+    {
+        return Err("missing supported engine".to_owned());
+    }
+    let source_host = sanitize_host(source_host);
+    if source_host.is_empty() {
+        return Err("host has no safe path characters".to_owned());
+    }
+    let id = sanitize_host(id);
+    if id.is_empty() {
+        return Err("id has no safe path characters".to_owned());
+    }
+    let body = serde_json::to_string_pretty(&v).map_err(|e| format!("send-tab encode: {e}"))?;
+    Ok(BrowserSendTabHandoff {
+        id,
+        target: target.to_owned(),
+        source_host,
+        body,
+    })
+}
+
 fn sanitize_host(host: &str) -> String {
     host.chars()
         .filter_map(|c| {
@@ -307,6 +439,54 @@ pub fn latest_path(root: &Path, host: &str) -> PathBuf {
     root.join(SESSION_SYNC_SUBDIR)
         .join(sanitize_host(host))
         .join(LATEST_FILE)
+}
+
+/// Return the durable send-tab outbox path for a target class, source host, and id.
+#[must_use]
+pub fn send_tab_path(root: &Path, target: &str, source_host: &str, id: &str) -> PathBuf {
+    root.join(SEND_TAB_OUTBOX_SUBDIR)
+        .join(sanitize_host(target))
+        .join(sanitize_host(source_host))
+        .join(format!("{}.json", sanitize_host(id)))
+}
+
+fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, String)> {
+    let base = root.join(SEND_TAB_OUTBOX_SUBDIR);
+    let Ok(targets) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for target in targets.filter_map(Result::ok) {
+        let target_path = target.path();
+        if !target_path.is_dir() {
+            continue;
+        }
+        let Ok(hosts) = std::fs::read_dir(&target_path) else {
+            continue;
+        };
+        for host in hosts.filter_map(Result::ok) {
+            let host_path = host.path();
+            if !host_path.is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&host_path) else {
+                continue;
+            };
+            for file in files.filter_map(Result::ok) {
+                let path = file.path();
+                if path.extension().is_none_or(|ext| ext != "json") {
+                    continue;
+                }
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if let Ok(rel) = path.strip_prefix(&base) {
+                    out.push((rel.to_path_buf(), body));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
@@ -356,6 +536,20 @@ mod tests {
         .to_string()
     }
 
+    fn send_tab(target: &str, host: &str, url: &str) -> String {
+        serde_json::json!({
+            "op": "browser_send_tab",
+            "target": target,
+            "engine": "cef",
+            "url": url,
+            "title": "Example",
+            "preview": "Example",
+            "source": "browser",
+            "host": host
+        })
+        .to_string()
+    }
+
     #[test]
     fn parse_snapshot_preserves_the_startup_restore_shape() {
         let parsed = parse_snapshot(&snapshot("work station/1", "https://example.test/")).unwrap();
@@ -375,6 +569,39 @@ mod tests {
         );
         assert!(
             parse_snapshot(r#"{"op":"browser_session_sync","settings":{},"host":"h"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_send_tab_preserves_the_browser_handoff_shape() {
+        let parsed = parse_send_tab(
+            &send_tab("phone", "work station/1", "https://example.test/"),
+            "01ABC",
+        )
+        .unwrap();
+        assert_eq!(parsed.id, "01ABC");
+        assert_eq!(parsed.target, "phone");
+        assert_eq!(parsed.source_host, "work-station1");
+        let v: serde_json::Value = serde_json::from_str(&parsed.body).unwrap();
+        assert_eq!(v["op"], "browser_send_tab");
+        assert_eq!(v["target"], "phone");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://example.test/");
+    }
+
+    #[test]
+    fn parse_send_tab_rejects_unrouteable_handoffs() {
+        assert!(parse_send_tab("{}", "01").is_err());
+        assert!(
+            parse_send_tab(&send_tab("email", "node-a", "https://example.test/"), "01").is_err()
+        );
+        assert!(parse_send_tab(&send_tab("node", "node-a", ""), "01").is_err());
+        assert!(
+            parse_send_tab(
+                r#"{"op":"browser_send_tab","target":"node","engine":"webkit","url":"https://example.test/","host":"node-a"}"#,
+                "01"
+            )
+            .is_err()
         );
     }
 
@@ -436,5 +663,61 @@ mod tests {
         worker.mirror_pending();
         assert!(latest_path(share.path(), "node-a").is_file());
         assert!(!worker.pending_local);
+    }
+
+    #[test]
+    fn apply_send_tab_writes_local_and_mirrors_when_share_is_up() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let gate = Arc::new(AtomicBool::new(true));
+        let mut worker = BrowserSessionSyncWorker::new(
+            "node-a".to_owned(),
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        )
+        .with_share_gate(gate);
+        let handoff = parse_send_tab(
+            &send_tab("node", "node-a", "https://mesh.test/"),
+            "01Handoff",
+        )
+        .unwrap();
+
+        worker.apply_send_tab(handoff);
+
+        let local_body =
+            std::fs::read_to_string(send_tab_path(local.path(), "node", "node-a", "01Handoff"))
+                .unwrap();
+        let share_body =
+            std::fs::read_to_string(send_tab_path(share.path(), "node", "node-a", "01Handoff"))
+                .unwrap();
+        assert_eq!(local_body, share_body);
+        let v: serde_json::Value = serde_json::from_str(&share_body).unwrap();
+        assert_eq!(v["url"], "https://mesh.test/");
+    }
+
+    #[test]
+    fn send_tab_outbox_mirrors_pending_local_entries_when_share_returns() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let gate = Arc::new(AtomicBool::new(false));
+        let mut worker = BrowserSessionSyncWorker::new(
+            "node-a".to_owned(),
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        )
+        .with_share_gate(gate.clone());
+        let handoff = parse_send_tab(
+            &send_tab("phone", "node-a", "https://mesh.test/"),
+            "01Phone",
+        )
+        .unwrap();
+
+        worker.apply_send_tab(handoff);
+
+        assert!(send_tab_path(local.path(), "phone", "node-a", "01Phone").is_file());
+        assert!(!send_tab_path(share.path(), "phone", "node-a", "01Phone").exists());
+        gate.store(true, Ordering::SeqCst);
+        worker.mirror_send_tab_outbox();
+        assert!(send_tab_path(share.path(), "phone", "node-a", "01Phone").is_file());
     }
 }
