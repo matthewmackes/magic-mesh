@@ -431,6 +431,31 @@ assets = [
     # the `target/` prefix to the active target dir). Its confined SELinux domain +
     # Servo runtime-lib Requires ship below.
     { source = "target/release/mde-web-preview",     dest = "/usr/bin/mde-web-preview",     mode = "755" },
+    # BROWSER-DD-1 - the Chromium/CEF compatibility helper scaffold. Like
+    # mde-web-preview, this is a workspace-excluded helper built standalone by
+    # build-rpm-fedora43.sh into the active CARGO_TARGET_DIR before generate-rpm.
+    # It is intentionally honest-gated at runtime until the pinned CEF bundle is
+    # installed under MDE_CEF_ROOT or /opt/mde/cef; shipping the binary now lets the
+    # Browser Engine menu's CEF selection resolve to a real helper path instead of
+    # an absent-binary gate. Not in the server variant (headless roles have no
+    # browser surface).
+    { source = "target/release/mde-web-cef",         dest = "/usr/bin/mde-web-cef",         mode = "755" },
+    { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
+    # BROWSER-DD-1 - pinned Chromium/CEF runtime provisioning. The 311 MB CEF
+    # binary payload is fetched/verified by the first-boot service, not embedded
+    # directly in the RPM; the manifest pins the official Linux64 minimal tarball
+    # and the helper activates /opt/mde/cef. Role-gated to Workstation rank so
+    # Lighthouse installs do not spend disk/network on a browser runtime.
+    { source = "install-helpers/install-cef-runtime.sh", dest = "/usr/libexec/mackesd/install-cef-runtime", mode = "755" },
+    { source = "packaging/browser/cef-linux64-minimal.env", dest = "/usr/share/magic-mesh/browser/cef-linux64-minimal.env", mode = "644" },
+    { source = "packaging/systemd/mde-cef-runtime-setup.service", dest = "/usr/lib/systemd/system/mde-cef-runtime-setup.service", mode = "644" },
+    # BROWSER-DD-4 - optional Widevine CDM provisioning for the CEF engine. The
+    # CDM is NOT embedded in the RPM; the shipped manifest is an operator-pinned
+    # first-run fetch contract and exits with a clean configuration gate until a
+    # licensed URL + sha256 are supplied. Non-DRM browsing remains available.
+    { source = "install-helpers/install-widevine-cdm.sh", dest = "/usr/libexec/mackesd/install-widevine-cdm", mode = "755" },
+    { source = "packaging/browser/widevine-linux64.env", dest = "/usr/share/magic-mesh/browser/widevine-linux64.env", mode = "644" },
+    { source = "packaging/systemd/mde-widevine-cdm-setup.service", dest = "/usr/lib/systemd/system/mde-widevine-cdm-setup.service", mode = "644" },
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four Cosmic-era GUIs that
@@ -792,6 +817,10 @@ wireplumber = "*"
 pipewire-alsa = "*"
 bluez = "*"
 upower = "*"
+# BROWSER-DD-1 - the pinned CEF runtime is distributed as `.tar.bz2`; the
+# Workstation-only first-boot installer extracts it with `tar -xjf`, which needs
+# the external bzip2 helper on Fedora minimal images.
+bzip2 = "*"
 # DDC/CI external-monitor brightness (lock 13) shells `ddcutil` over i2c-dev;
 # i2c-tools carries the i2c-dev tooling/module wiring. A monitor that rejects
 # DDC renders an honest "not controllable" state (§7), so these back a real

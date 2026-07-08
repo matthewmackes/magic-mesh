@@ -122,6 +122,16 @@ else
     echo "  graphics/text -devel headers installed above; point at a LAN mirror on"
     echo "  an airgapped builder. (A headless RPM has no browser: use --server.)"
     exit 1; }
+  # BROWSER-DD-1 - the Chromium/CEF helper is another workspace-excluded browser
+  # root. This first slice is a lean scaffold with the shared BOOKMARKS-6 wire
+  # protocol and an honest CEF_MISSING runtime gate; build it now so the full RPM
+  # installs /usr/bin/mde-web-cef and the shell Engine -> CEF selection resolves
+  # to the real helper path once a pinned CEF bundle is present. The same crate
+  # also emits mde-web-cef-renderer, the native bridge process shipped under
+  # /usr/libexec/mackesd for the Chrome-engine handoff.
+  echo "[f43] building the Chromium/CEF browser helper + renderer bridge (mde-web-cef)"
+  cargo build --release --locked \
+      --manifest-path crates/desktop/mde-web-cef/Cargo.toml
   # E12-3 DRM + BOOKMARKS-6 live path — re-link the ONE shell binary with the
   # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat, and
   # `live-helper` so the Browser surface really spawns the sandboxed

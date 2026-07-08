@@ -26,7 +26,12 @@ resolver = "2"
 # Follow-up (design Q52): unify the workspace on rusqlite 0.37 so this crate can
 # rejoin the single-workspace build. Build it standalone:
 #   cargo build --manifest-path crates/desktop/mde-web-preview/Cargo.toml
-exclude = ["crates/desktop/mde-web-preview"]
+#
+# mde-web-cef (BROWSER-DD-1, the Chromium/CEF helper) is likewise EXCLUDED: CEF
+# ships as a vendored native runtime on the farm, not as part of the main daemon
+# lockfile. Build it standalone while the runtime lane comes up:
+#   cargo build --manifest-path crates/desktop/mde-web-cef/Cargo.toml
+exclude = ["crates/desktop/mde-web-preview", "crates/desktop/mde-web-cef"]
 members = [
     "crates/platform/mde-bus",
     "crates/platform/mde-role",
