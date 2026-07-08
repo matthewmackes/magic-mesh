@@ -119,6 +119,11 @@ the surface and from each other where they add distinct workers.
 
 ## Risks
 
+- **Runtime proof gap (BUG-VIDEO-1):** MEDIA model/surface units can be green while
+  the shipped Workstation build still uses `FakeMpv` or paints a placeholder player
+  stage. Treat `docs/gpu_encoder.md` and `docs/finalize_validation.md` as the
+  required GPU/media validation companion: real libmpv decode must produce visible
+  changing frames before this surface is production-complete.
 - **libmpv airgap add** (Q1): verify the binding + system lib are buildable early
   (MEDIA-1); fall back to a narrower path with an honest note rather than silently drop
   formats.
