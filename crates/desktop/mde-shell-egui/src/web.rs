@@ -227,6 +227,10 @@ struct Tab {
     last_activity: Instant,
     /// Whether this inactive tab has been shell-suspended after the idle timeout.
     idle_suspended: bool,
+    /// Whether the painted page canvas owns keyboard/text input. This is tracked
+    /// per tab instead of relying only on egui response focus, which can be lost
+    /// when chrome widgets rebuild between frames.
+    page_focused: bool,
     /// The body texture — allocated on the first frame, then updated in place with
     /// [`TextureHandle::set`] on each subsequent paint-ready (egui reuses the
     /// allocation, so a live page is not a per-frame upload churn).
@@ -914,6 +918,7 @@ impl WebState {
             reader_mode: false,
             last_activity: Instant::now(),
             idle_suspended: false,
+            page_focused: false,
             texture: None,
             last_frame: None,
         });
@@ -5421,15 +5426,34 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     // page only after the image has focus, so address-bar/chrome typing does not
     // leak into the helper.
     let ppp = ui.ctx().pixels_per_point();
-    let browser_focused = resp.has_focus() || resp.clicked() || resp.dragged();
+    let mut page_focused = state
+        .tabs
+        .get(active)
+        .is_some_and(|tab| tab.page_focused)
+        || resp.has_focus()
+        || resp.clicked()
+        || resp.dragged();
     for event in ui.input(|i| i.events.clone()) {
-        if let Some(event) = browser_input_event(&event, image_rect, browser_focused) {
+        if let egui::Event::PointerButton { pos, pressed, .. } = &event {
+            if *pressed {
+                if image_rect.contains(*pos) {
+                    page_focused = true;
+                    resp.request_focus();
+                } else if !rect.contains(*pos) {
+                    page_focused = false;
+                }
+            }
+        }
+        if let Some(event) = browser_input_event(&event, image_rect, page_focused) {
             if let Some(tab) = state.tabs.get_mut(active) {
                 tab.last_activity = Instant::now();
                 tab.idle_suspended = false;
                 tab.session.send_input(&event, ppp);
             }
         }
+    }
+    if let Some(tab) = state.tabs.get_mut(active) {
+        tab.page_focused = page_focused;
     }
 }
 
@@ -7912,6 +7936,10 @@ mod tests {
             },
         ];
         assert!(run_panel_on_ctx(&ctx, &mut state, click_input));
+        assert!(
+            state.tabs[0].page_focused,
+            "clicking the rendered page must latch page keyboard focus"
+        );
         let mut key_input = body_input();
         key_input.events = vec![
             egui::Event::Key {
@@ -8705,6 +8733,7 @@ mod tests {
             reader_mode: false,
             last_activity: Instant::now(),
             idle_suspended: false,
+            page_focused: false,
             texture: None,
             last_frame: None,
         });
