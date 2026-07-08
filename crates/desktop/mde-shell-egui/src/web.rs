@@ -3076,6 +3076,27 @@ impl BrowserSendTabTarget {
             Self::Phone => "Phone",
         }
     }
+
+    fn destination(self) -> Option<(String, String)> {
+        match self {
+            Self::Node => {
+                let host = local_hostname();
+                Some((host.clone(), host))
+            }
+            Self::Phone => std::env::var("MDE_BROWSER_SEND_PHONE_TARGET")
+                .ok()
+                .map(|id| id.trim().to_owned())
+                .filter(|id| !id.is_empty())
+                .map(|id| {
+                    let label = std::env::var("MDE_BROWSER_SEND_PHONE_LABEL")
+                        .ok()
+                        .map(|label| label.trim().to_owned())
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or_else(|| id.clone());
+                    (id, label)
+                }),
+        }
+    }
 }
 
 /// Build the browser-owned platform share handoff. The receiving surfaces are
@@ -3116,7 +3137,7 @@ fn browser_send_tab_body(
 ) -> String {
     let title = title.trim();
     let preview = if title.is_empty() { url } else { title };
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "op": "browser_send_tab",
         "target": target.wire(),
         "engine": engine.wire(),
@@ -3125,8 +3146,14 @@ fn browser_send_tab_body(
         "preview": preview,
         "source": "browser",
         "host": local_hostname(),
-    })
-    .to_string()
+    });
+    if let Some((id, label)) = target.destination() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("target_id".to_owned(), serde_json::json!(id));
+            obj.insert("target_label".to_owned(), serde_json::json!(label));
+        }
+    }
+    body.to_string()
 }
 
 fn publish_browser_send_tab(
@@ -9080,6 +9107,8 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(v["target"], "node");
+        assert_eq!(v["target_id"], local_hostname());
+        assert_eq!(v["target_label"], local_hostname());
         assert_eq!(v["engine"], "servo");
         assert_eq!(v["title"], "");
         assert_eq!(v["preview"], "https://example.com/");
@@ -9442,6 +9471,10 @@ mod tests {
                 assert_eq!(v["source"], "browser");
                 assert_eq!(v["engine"], "cef");
                 assert_eq!(v["url"], "https://example.test/");
+                if v["target"] == "node" {
+                    assert_eq!(v["target_id"], local_hostname());
+                    assert_eq!(v["target_label"], local_hostname());
+                }
                 v["target"].as_str().expect("target").to_owned()
             })
             .collect();

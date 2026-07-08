@@ -236,6 +236,7 @@ impl BrowserSessionSyncWorker {
         let path = send_tab_path(
             &self.local_root,
             &handoff.target,
+            &handoff.target_id,
             &handoff.source_host,
             &handoff.id,
         );
@@ -340,6 +341,7 @@ struct BrowserSessionSnapshot {
 struct BrowserSendTabHandoff {
     id: String,
     target: String,
+    target_id: String,
     source_host: String,
     body: String,
 }
@@ -388,6 +390,12 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
         .map(str::trim)
         .filter(|host| !host.is_empty())
         .ok_or_else(|| "missing host".to_owned())?;
+    let target_id = v
+        .get("target_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|target_id| !target_id.is_empty())
+        .unwrap_or(target);
     if !v
         .get("url")
         .and_then(serde_json::Value::as_str)
@@ -406,6 +414,10 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
     if source_host.is_empty() {
         return Err("host has no safe path characters".to_owned());
     }
+    let target_id = sanitize_host(target_id);
+    if target_id.is_empty() {
+        return Err("target_id has no safe path characters".to_owned());
+    }
     let id = sanitize_host(id);
     if id.is_empty() {
         return Err("id has no safe path characters".to_owned());
@@ -414,6 +426,7 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
     Ok(BrowserSendTabHandoff {
         id,
         target: target.to_owned(),
+        target_id,
         source_host,
         body,
     })
@@ -443,9 +456,16 @@ pub fn latest_path(root: &Path, host: &str) -> PathBuf {
 
 /// Return the durable send-tab outbox path for a target class, source host, and id.
 #[must_use]
-pub fn send_tab_path(root: &Path, target: &str, source_host: &str, id: &str) -> PathBuf {
+pub fn send_tab_path(
+    root: &Path,
+    target: &str,
+    target_id: &str,
+    source_host: &str,
+    id: &str,
+) -> PathBuf {
     root.join(SEND_TAB_OUTBOX_SUBDIR)
         .join(sanitize_host(target))
+        .join(sanitize_host(target_id))
         .join(sanitize_host(source_host))
         .join(format!("{}.json", sanitize_host(id)))
 }
@@ -461,27 +481,36 @@ fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, String)> {
         if !target_path.is_dir() {
             continue;
         }
-        let Ok(hosts) = std::fs::read_dir(&target_path) else {
+        let Ok(target_ids) = std::fs::read_dir(&target_path) else {
             continue;
         };
-        for host in hosts.filter_map(Result::ok) {
-            let host_path = host.path();
-            if !host_path.is_dir() {
+        for target_id in target_ids.filter_map(Result::ok) {
+            let target_id_path = target_id.path();
+            if !target_id_path.is_dir() {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&host_path) else {
+            let Ok(hosts) = std::fs::read_dir(&target_id_path) else {
                 continue;
             };
-            for file in files.filter_map(Result::ok) {
-                let path = file.path();
-                if path.extension().is_none_or(|ext| ext != "json") {
+            for host in hosts.filter_map(Result::ok) {
+                let host_path = host.path();
+                if !host_path.is_dir() {
                     continue;
                 }
-                let Ok(body) = std::fs::read_to_string(&path) else {
+                let Ok(files) = std::fs::read_dir(&host_path) else {
                     continue;
                 };
-                if let Ok(rel) = path.strip_prefix(&base) {
-                    out.push((rel.to_path_buf(), body));
+                for file in files.filter_map(Result::ok) {
+                    let path = file.path();
+                    if path.extension().is_none_or(|ext| ext != "json") {
+                        continue;
+                    }
+                    let Ok(body) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    if let Ok(rel) = path.strip_prefix(&base) {
+                        out.push((rel.to_path_buf(), body));
+                    }
                 }
             }
         }
@@ -550,6 +579,13 @@ mod tests {
         .to_string()
     }
 
+    fn send_tab_with_target_id(target: &str, target_id: &str, host: &str, url: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&send_tab(target, host, url)).unwrap();
+        v["target_id"] = serde_json::json!(target_id);
+        v["target_label"] = serde_json::json!(target_id);
+        v.to_string()
+    }
+
     #[test]
     fn parse_snapshot_preserves_the_startup_restore_shape() {
         let parsed = parse_snapshot(&snapshot("work station/1", "https://example.test/")).unwrap();
@@ -581,12 +617,24 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.id, "01ABC");
         assert_eq!(parsed.target, "phone");
+        assert_eq!(parsed.target_id, "phone");
         assert_eq!(parsed.source_host, "work-station1");
         let v: serde_json::Value = serde_json::from_str(&parsed.body).unwrap();
         assert_eq!(v["op"], "browser_send_tab");
         assert_eq!(v["target"], "phone");
         assert_eq!(v["engine"], "cef");
         assert_eq!(v["url"], "https://example.test/");
+    }
+
+    #[test]
+    fn parse_send_tab_uses_concrete_target_id_when_present() {
+        let parsed = parse_send_tab(
+            &send_tab_with_target_id("node", "eagle seat/1", "node-a", "https://example.test/"),
+            "01ABC",
+        )
+        .unwrap();
+        assert_eq!(parsed.target, "node");
+        assert_eq!(parsed.target_id, "eagle-seat1");
     }
 
     #[test]
@@ -684,12 +732,22 @@ mod tests {
 
         worker.apply_send_tab(handoff);
 
-        let local_body =
-            std::fs::read_to_string(send_tab_path(local.path(), "node", "node-a", "01Handoff"))
-                .unwrap();
-        let share_body =
-            std::fs::read_to_string(send_tab_path(share.path(), "node", "node-a", "01Handoff"))
-                .unwrap();
+        let local_body = std::fs::read_to_string(send_tab_path(
+            local.path(),
+            "node",
+            "node",
+            "node-a",
+            "01Handoff",
+        ))
+        .unwrap();
+        let share_body = std::fs::read_to_string(send_tab_path(
+            share.path(),
+            "node",
+            "node",
+            "node-a",
+            "01Handoff",
+        ))
+        .unwrap();
         assert_eq!(local_body, share_body);
         let v: serde_json::Value = serde_json::from_str(&share_body).unwrap();
         assert_eq!(v["url"], "https://mesh.test/");
@@ -707,17 +765,17 @@ mod tests {
         )
         .with_share_gate(gate.clone());
         let handoff = parse_send_tab(
-            &send_tab("phone", "node-a", "https://mesh.test/"),
+            &send_tab_with_target_id("phone", "pixel-8", "node-a", "https://mesh.test/"),
             "01Phone",
         )
         .unwrap();
 
         worker.apply_send_tab(handoff);
 
-        assert!(send_tab_path(local.path(), "phone", "node-a", "01Phone").is_file());
-        assert!(!send_tab_path(share.path(), "phone", "node-a", "01Phone").exists());
+        assert!(send_tab_path(local.path(), "phone", "pixel-8", "node-a", "01Phone").is_file());
+        assert!(!send_tab_path(share.path(), "phone", "pixel-8", "node-a", "01Phone").exists());
         gate.store(true, Ordering::SeqCst);
         worker.mirror_send_tab_outbox();
-        assert!(send_tab_path(share.path(), "phone", "node-a", "01Phone").is_file());
+        assert!(send_tab_path(share.path(), "phone", "pixel-8", "node-a", "01Phone").is_file());
     }
 }
