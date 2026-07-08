@@ -508,6 +508,7 @@ const fn plural_u32(count: u32) -> &'static str {
 }
 
 const DOWNLOADS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const SEND_TAB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_TAB_SUSPEND_AFTER: Duration = Duration::from_secs(30 * 60);
 
 const fn download_state_rank(state: TransferState) -> u8 {
@@ -638,6 +639,9 @@ pub(crate) struct WebState {
     /// probes the local durable root first, then the Syncthing-backed workgroup
     /// root; tests inject temp roots without touching operator state.
     session_restore_roots: Vec<PathBuf>,
+    /// Last time the Browser scanned the daemon-owned send-tab outbox for concrete
+    /// node-addressed records.
+    incoming_send_tab_last_poll: Option<Instant>,
     /// Whether the compact download manager drawer is visible.
     downloads_open: bool,
     /// Last time the browser refreshed its ledger view.
@@ -710,6 +714,7 @@ impl Default for WebState {
             last_session_sync_body: None,
             startup_restore_attempted: false,
             session_restore_roots: default_session_restore_roots(),
+            incoming_send_tab_last_poll: None,
             downloads_open: false,
             downloads_last_poll: None,
             download_notice: None,
@@ -1036,6 +1041,49 @@ impl WebState {
             }
         }
         None
+    }
+
+    fn drain_incoming_send_tabs(&mut self) -> usize {
+        let host = local_hostname();
+        let sanitized_host = sanitize_session_host(&host);
+        let mut opened = 0;
+        let mut seen = BTreeSet::new();
+        for root in self.session_restore_roots.clone() {
+            let inbox = send_tab_inbox_dir(&root, &host);
+            for path in incoming_send_tab_files(&root, &host) {
+                let key = path
+                    .strip_prefix(&inbox)
+                    .map(|rel| rel.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                if !seen.insert(key) {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                match browser_send_tab_open_intent(&body, &sanitized_host) {
+                    Ok((engine, url)) => {
+                        self.request_new_tab_with_url(engine, url);
+                        let _ = std::fs::remove_file(&path);
+                        opened += 1;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+        opened
+    }
+
+    fn poll_incoming_send_tabs(&mut self) {
+        if self
+            .incoming_send_tab_last_poll
+            .is_some_and(|last| last.elapsed() < SEND_TAB_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.incoming_send_tab_last_poll = Some(Instant::now());
+        self.drain_incoming_send_tabs();
     }
 
     fn request_bookmarks_manager(&mut self) {
@@ -2040,6 +2088,7 @@ impl WebState {
             return;
         }
         self.restore_startup_session_once();
+        self.drain_incoming_send_tabs();
         if !self.open_requested.is_empty() {
             self.spawn_attempted = true;
             self.drain_live_tab_requests(seat_present);
@@ -2177,6 +2226,7 @@ impl WebState {
 pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.poll_suggestions();
     state.poll_downloads();
+    state.poll_incoming_send_tabs();
     state.suspend_idle_tabs(Instant::now());
 
     // 1. Poll every tab so background tabs keep receiving — and so ONE tab's crash
@@ -2758,6 +2808,10 @@ const SESSION_SYNC_SUBDIR: &str = "browser-session-sync";
 /// JSON itself, so startup restore can feed it straight into the parser.
 const SESSION_SYNC_LATEST_FILE: &str = "latest.json";
 
+/// Daemon-owned send-tab outbox subdirectory. Must match
+/// `mackesd::workers::browser_session_sync::SEND_TAB_OUTBOX_SUBDIR`.
+const SEND_TAB_OUTBOX_SUBDIR: &str = "browser-send-tab";
+
 /// Browser idle-tab suspension handoff for deeper engine/process orchestration.
 const ACTION_BROWSER_TAB_SUSPEND: &str = "action/browser/tab-suspend";
 
@@ -2943,6 +2997,12 @@ fn session_sync_latest_path(root: &Path, host: &str) -> PathBuf {
         .join(SESSION_SYNC_LATEST_FILE)
 }
 
+fn send_tab_inbox_dir(root: &Path, host: &str) -> PathBuf {
+    root.join(SEND_TAB_OUTBOX_SUBDIR)
+        .join("node")
+        .join(sanitize_session_host(host))
+}
+
 fn sanitize_session_host(host: &str) -> String {
     host.chars()
         .filter_map(|c| {
@@ -2955,6 +3015,63 @@ fn sanitize_session_host(host: &str) -> String {
             }
         })
         .collect()
+}
+
+fn browser_send_tab_open_intent(body: &str, host: &str) -> Result<(BrowserEngine, String), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("send-tab JSON: {err}"))?;
+    if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_send_tab") {
+        return Err("send-tab has the wrong op".to_owned());
+    }
+    if v.get("target").and_then(serde_json::Value::as_str) != Some("node") {
+        return Err("send-tab is not node-addressed".to_owned());
+    }
+    let target_id = v
+        .get("target_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|target_id| !target_id.is_empty())
+        .ok_or_else(|| "send-tab is missing target_id".to_owned())?;
+    if sanitize_session_host(target_id) != sanitize_session_host(host) {
+        return Err("send-tab is for a different node".to_owned());
+    }
+    let engine = v
+        .get("engine")
+        .and_then(serde_json::Value::as_str)
+        .and_then(BrowserEngine::from_wire)
+        .ok_or_else(|| "send-tab has an unsupported engine".to_owned())?;
+    let url = v
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "send-tab is missing url".to_owned())?;
+    Ok((engine, url.to_owned()))
+}
+
+fn incoming_send_tab_files(root: &Path, host: &str) -> Vec<PathBuf> {
+    let inbox = send_tab_inbox_dir(root, host);
+    let Ok(sources) = std::fs::read_dir(&inbox) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for source in sources.filter_map(Result::ok) {
+        let source_path = source.path();
+        if !source_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&source_path) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 fn speed_dial_from_settings(settings: &serde_json::Value) -> Option<Vec<SpeedDialEntry>> {
@@ -9289,6 +9406,135 @@ mod tests {
             session_sync_latest_path(Path::new("/mesh"), "work station/1"),
             PathBuf::from("/mesh/browser-session-sync/work-station1/latest.json")
         );
+        assert_eq!(
+            send_tab_inbox_dir(Path::new("/mesh"), "work station/1"),
+            PathBuf::from("/mesh/browser-send-tab/node/work-station1")
+        );
+    }
+
+    #[test]
+    fn browser_send_tab_outbox_enqueues_local_node_tabs_and_unlinks_records() {
+        let root = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let path = send_tab_inbox_dir(root.path(), &host)
+            .join("source-node")
+            .join("01Send.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "op": "browser_send_tab",
+                "target": "node",
+                "target_id": host,
+                "target_label": host,
+                "engine": "cef",
+                "url": "https://handoff.mesh/",
+                "title": "Handoff",
+                "preview": "Handoff",
+                "source": "browser",
+                "host": "source-node"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut state =
+            WebState::default().with_session_restore_roots(vec![root.path().to_path_buf()]);
+
+        assert_eq!(state.drain_incoming_send_tabs(), 1);
+
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Cef,
+                url: "https://handoff.mesh/".to_owned(),
+            })
+        );
+        assert!(
+            !path.exists(),
+            "consumed send-tab records are unlinked so they do not replay"
+        );
+    }
+
+    #[test]
+    fn browser_send_tab_outbox_rejects_phone_and_other_node_records() {
+        let root = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let local_dir = send_tab_inbox_dir(root.path(), &host).join("source-node");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::write(
+            local_dir.join("phone.json"),
+            serde_json::json!({
+                "op": "browser_send_tab",
+                "target": "phone",
+                "target_id": host,
+                "engine": "cef",
+                "url": "https://phone.mesh/"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            local_dir.join("other.json"),
+            serde_json::json!({
+                "op": "browser_send_tab",
+                "target": "node",
+                "target_id": "other-node",
+                "engine": "servo",
+                "url": "https://other.mesh/"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut state =
+            WebState::default().with_session_restore_roots(vec![root.path().to_path_buf()]);
+
+        assert_eq!(state.drain_incoming_send_tabs(), 0);
+        assert_eq!(state.take_open_request(), None);
+        assert!(local_dir.join("phone.json").exists());
+        assert!(local_dir.join("other.json").exists());
+    }
+
+    #[test]
+    fn browser_send_tab_outbox_dedupes_local_and_shared_records() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let body = serde_json::json!({
+            "op": "browser_send_tab",
+            "target": "node",
+            "target_id": host,
+            "engine": "servo",
+            "url": "https://dedupe.mesh/",
+            "host": "source-node"
+        })
+        .to_string();
+        let local_path = send_tab_inbox_dir(local.path(), &host)
+            .join("source-node")
+            .join("01Same.json");
+        let share_path = send_tab_inbox_dir(share.path(), &host)
+            .join("source-node")
+            .join("01Same.json");
+        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(share_path.parent().unwrap()).unwrap();
+        std::fs::write(&local_path, &body).unwrap();
+        std::fs::write(&share_path, &body).unwrap();
+        let mut state = WebState::default().with_session_restore_roots(vec![
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        ]);
+
+        assert_eq!(state.drain_incoming_send_tabs(), 1);
+
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Servo,
+                url: "https://dedupe.mesh/".to_owned(),
+            })
+        );
+        assert_eq!(state.take_open_request(), None);
+        assert!(!local_path.exists());
+        assert!(!share_path.exists());
     }
 
     #[test]
