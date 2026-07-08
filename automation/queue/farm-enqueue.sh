@@ -6,7 +6,15 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; LIB="$HERE/../lib"; REPO="$(cd "$HERE/../.." && pwd)"
 . "$HERE/etcd-lib.sh"
 KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
-NODES="${MCNF_BUILD_NODES:-172.20.0.52 172.20.0.50 172.20.0.51}"
+default_nodes() {
+  # shellcheck source=../../install-helpers/farm-topology.sh
+  . "$REPO/install-helpers/farm-topology.sh"
+  local i
+  for i in "${!FARM_OCTETS[@]}"; do
+    printf '%s 172.20.0.%s\n' "${FARM_CAPS[$i]}" "${FARM_OCTETS[$i]}"
+  done | sort -rn | awk '{print $2}' | paste -sd' ' -
+}
+NODES="${MCNF_BUILD_NODES:-$(default_nodes)}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)
 
 echo "==> sync tree to build nodes"

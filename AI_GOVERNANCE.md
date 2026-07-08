@@ -272,13 +272,21 @@ plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 
 ## §10 — Build & development environment (canonical — do not rediscover)
 
-*(Carried forward unchanged from E11.)* **§10.0 MANDATE: work the farm, scale out,
-never grind solo** — heavy/decomposable work is offloaded to the build farm and
-run in parallel across the farm nodes; a slow/fuzzy success signal is never a
-reason to serialize or defer (see `no-flinch`). Mechanics (build slots, per-node
-concurrency caps, worktree-isolated parallel mutating agents) and the full
-toolchain live in [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) —
-**read it before building.** Load-bearing facts: two build surfaces (local dev
+*(Carried forward unchanged from E11.)* **§10.0 MANDATE: all AIs work the farm,
+scale out, never grind solo** — every AI/agent operating this repo must use the
+build farm for build/test/gate work whenever the task is not a tiny local
+syntax/probe check. **This is a standing directive for all AI surfaces and
+subagents: prefer farm execution, parallelize independent gates, and document any
+local-only exception in the handoff.** Heavy or decomposable work is offloaded to
+the build farm and run in parallel across farm nodes by default; a slow/fuzzy
+success signal is never a reason to serialize or defer (see `no-flinch`). Keep
+independent checks on separate hosts/slots, avoid containerized fixtures when a
+direct farm-host fixture works, and treat farm/test hosts as safe for destructive
+reboot/recovery operations unless a worklist item explicitly says otherwise.
+Mechanics (build slots, per-node concurrency caps, worktree-isolated parallel
+mutating agents) and the full toolchain live in
+[`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before
+building.** Load-bearing facts: two build surfaces (local dev
 host + the Fedora farm VMs); Rust pin `1.94.0` / MSRV `1.85`; the
 `opus-devel`-in-CRB EL9 trap; the farm is IaC (`infra/tofu/` + `infra/ansible/`);
 the **GitOps reconciler on a timer** is the canonical build lane (no AI in the

@@ -5,7 +5,7 @@
 # `mackes_mesh_ed25519`, shared sccache). Every farm-aware tool + doc + skill must
 # READ this file (source it) or CITE it as the authority — never hardcode the node
 # list anywhere else, or it drifts. It DID drift: the 4th dom0 (XEN-194 → build VM
-# mcnf-build-53 / .170) sat IDLE for a whole session under a stale 3-node topology
+# mcnf-build-xen-194 / .170) sat IDLE for a whole session under a stale 3-node topology
 # until the operator caught it (2026-07-01). This file + its `table`/`check`
 # commands are the fix: one roster, verified live each run.
 #
@@ -19,22 +19,22 @@
 #   ./farm-topology.sh octets   # print the 4 build-VM octets, space-separated
 #
 # Canonical roster (build-VM octet / dom0 / dom0 IP / vCPU / heavy-build cap):
-#   .50   XEN-HOME-SERVICES  172.20.0.9      4c   cap 2
-#   .90   KVM-XCP1           172.20.145.193  4c   cap 2
-#   .130  XEN-BIGBOY         172.20.145.165  12c  cap 3   (BigBoy — the long-pole node)
-#   .170  XEN-194            172.20.145.194  4c   cap 2   (the 4th dom0)
+#   .50   XEN-HOME-SERVICES  172.20.0.9      4c   cap 2   mcnf-build-home-services
+#   .90   KVM-XCP1           172.20.145.193  4c   cap 2   mcnf-build-kvm-xcp1
+#   .130  XEN-BIGBOY         172.20.145.165  12c  cap 3   mcnf-build-52 (BigBoy)
+#   .170  XEN-194            172.20.145.194  4c   cap 2   mcnf-build-xen-194
 #   => 9 heavy build slots total (2 + 2 + 3 + 2)
 #
-# Build-VM names are legacy and do NOT equal the IP octet: mcnf-build-51 = .90,
-# mcnf-build-52 = .130, mcnf-build-53 = .170 (per-dom0 lane, docs/BUILD-ENVIRONMENT.md §3).
+# Build-VM IPs follow per-dom0 lanes; names are descriptive except BigBoy, which
+# intentionally keeps mcnf-build-52 as the long-pole build host.
 
 # --- the canonical arrays (parallel; index 0..3) ---
 FARM_OCTETS=(50 90 130 170)
 FARM_NAMES=(
-  "XEN-HOME-SERVICES/mcnf-build-50"
-  "KVM-XCP1/mcnf-build-51"
+  "XEN-HOME-SERVICES/mcnf-build-home-services"
+  "KVM-XCP1/mcnf-build-kvm-xcp1"
   "XEN-BIGBOY/mcnf-build-52"
-  "XEN-194/mcnf-build-53"
+  "XEN-194/mcnf-build-xen-194"
 )
 FARM_DOM0_IPS=(172.20.0.9 172.20.145.193 172.20.145.165 172.20.145.194)
 FARM_CAPS=(2 2 3 2)

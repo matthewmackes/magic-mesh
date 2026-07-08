@@ -17,8 +17,8 @@
 # Canonical dom0/build-VM roster (4 dom0s / 9 heavy slots): install-helpers/farm-topology.sh.
 #   172.20.145.192  the dev/orchestration host (this box; local builds + podman)
 #   172.20.0.9      XEN-HOME-SERVICES  → build VM 172.20.0.50
-#   172.20.145.193  KVM-XCP1           → build VM 172.20.0.51
-#   172.20.145.165  XEN-BIGBOY         → build VM 172.20.0.52
+#   172.20.145.193  KVM-XCP1           → build VM 172.20.0.90
+#   172.20.145.165  XEN-BIGBOY         → build VM 172.20.0.130
 #   172.20.145.194  XEN-194 (4th dom0) → build VM 172.20.0.170
 #
 # Usage:
@@ -40,9 +40,19 @@ KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 CONF="${MCNF_FARM_CONF:-$HOME/.config/mcnf-farm.conf}"
 
 # Default fleet; a conf file (one `dom0_ip|label|buildvm_ip` per line) overrides.
-# 4 dom0s (incl. XEN-194/.170, the 4th); canonical roster: install-helpers/farm-topology.sh.
-FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.51\n172.20.145.165|XEN-BIGBOY|172.20.0.52\n172.20.145.194|XEN-194|172.20.0.170'
-fleet() { [ -f "$CONF" ] && grep -vE '^\s*(#|$)' "$CONF" || printf '%s\n' "$FLEET_DEFAULT"; }
+# Otherwise derive from the canonical topology so this ops entrypoint cannot drift
+# back to legacy name-octet IPs like .51/.52.
+# shellcheck source=farm-topology.sh
+. "$HERE/farm-topology.sh"
+
+fleet_default() {
+  local i label
+  for i in "${!FARM_OCTETS[@]}"; do
+    label="${FARM_NAMES[$i]%%/*}"
+    printf '%s|%s|172.20.0.%s\n' "${FARM_DOM0_IPS[$i]}" "$label" "${FARM_OCTETS[$i]}"
+  done
+}
+fleet() { [ -f "$CONF" ] && grep -vE '^\s*(#|$)' "$CONF" || fleet_default; }
 
 SSHK=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)
 log()  { echo "==> farm: $*"; }
@@ -97,7 +107,12 @@ cmd_doctor() {
 }
 
 cmd_build() { "$HERE/xcp-build.sh" cargo "$@"; }
-cmd_ssh()   { local t="$1"; "${SSHK[@]}" -tt "$( [[ $t == 172.20.0.5* ]] && echo mm || echo root )@$t"; }
+is_build_vm() { fleet | awk -F'|' -v t="$1" '$3==t{found=1} END{exit !found}'; }
+cmd_ssh() {
+  local t="$1" user=root
+  is_build_vm "$t" && user=mm
+  "${SSHK[@]}" -tt "$user@$t"
+}
 
 cmd_up() {
   log "bringing the full farm online"

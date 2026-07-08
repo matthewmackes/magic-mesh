@@ -13,10 +13,10 @@
 #
 # Real farm topology is the SINGLE CANONICAL SOURCE in farm-topology.sh (4 dom0s /
 # 4 build VMs / 9 heavy slots; NOT the stale .50/.51/.52 — see BUILD-ENVIRONMENT.md §3):
-#   .50  XEN-HOME-SERVICES / mcnf-build-50   4 vCPU  cap 2
-#   .90  KVM-XCP1          / mcnf-build-51   4 vCPU  cap 2
+#   .50  XEN-HOME-SERVICES / mcnf-build-home-services  4 vCPU  cap 2
+#   .90  KVM-XCP1          / mcnf-build-kvm-xcp1       4 vCPU  cap 2
 #   .130 XEN-BIGBOY        / mcnf-build-52  12 vCPU  cap 3   (BigBoy — long-pole node)
-#   .170 XEN-194           / mcnf-build-53   4 vCPU  cap 2   (the 4th dom0)  => 9 slots total
+#   .170 XEN-194           / mcnf-build-xen-194         4 vCPU  cap 2   (the 4th dom0)  => 9 slots total
 #
 # A node that is unreachable is reported down (0 free) and the tick continues — the
 # coordinator never stalls on one node (park-don't-stall ethos, DRAIN-5).

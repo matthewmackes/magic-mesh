@@ -36,9 +36,9 @@ locals {
     "xen-home-services" = {
       provider_alias = "xhs"
       network_uuid   = "420c5872-dd49-af7f-fe4f-d5e2502429f8"
-      ip_base        = "172.20.0.50" # lane .50–.80 (small-0 keeps the legacy mcnf-build-50 IP)
+      ip_base        = "172.20.0.50" # lane .50–.80
       big_name       = "mcnf-build-big-50"
-      small_name     = "mcnf-build-50"
+      small_name     = "mcnf-build-home-services"
       big_vcpus      = 3 # ~whole 4-core host, 1 core for dom0
       big_mem_gib    = 18
     }
@@ -47,7 +47,7 @@ locals {
       network_uuid   = "85bc2d18-849b-4d9a-df9d-ab92ef1e58b8"
       ip_base        = "172.20.0.90" # lane .90–.120
       big_name       = "mcnf-build-big-51"
-      small_name     = "mcnf-build-51"
+      small_name     = "mcnf-build-kvm-xcp1"
       big_vcpus      = 3
       big_mem_gib    = 18
     }
@@ -65,7 +65,7 @@ locals {
       network_uuid   = "1d940eba-09fb-71e9-e6e5-a7ab5f7259ce" # eth0 (172.20.145.194)
       ip_base        = "172.20.0.170"                         # lane .170–.200
       big_name       = "mcnf-build-big-53"
-      small_name     = "mcnf-build-53"
+      small_name     = "mcnf-build-xen-194"
       big_vcpus      = 3 # ~whole 4-core host, 1 core for dom0
       big_mem_gib    = 11
     }
@@ -77,35 +77,36 @@ locals {
   ip_last_octet = { for dk, d in local.dom0 : dk => tonumber(element(split(".", d.ip_base), 3)) }
 
   # ADOPTED BASELINE (the 0-destroy floor): the three live, already-provisioned
-  # build VMs (mcnf-build-50/51/52 — the small-0 of each dom0). They are present
+  # build VMs (descriptive names on .50/.90/.170, BigBoy kept as mcnf-build-52).
+  # They are present
   # in the shape model UNCONDITIONALLY (even with the default shape={}), keyed by
   # the small-0 key "<dom0>-0", so that:
   #   (a) the `moved {}` blocks have a live target — a plan with shape={} is
   #       0-add/0-change/0-destroy (the adopted VMs are RELOCATED, not destroyed),
   #   (b) `provision_build_ready` / xcp-build still find them by the legacy names.
-  # The `vcpus`/`mem_gib` match the adopted resources verbatim (4 vCPU; .50/.51 =
-  # 16 GiB, .52 = 24 GiB) so no in-place change is proposed either.
+  # The `vcpus`/`mem_gib` match the adopted resources verbatim so no in-place
+  # change is proposed either.
   adopted_build_vms = {
     "xen-home-services-0" = {
       dom0_key = "xen-home-services"
-      name     = "mcnf-build-50"
+      name     = "mcnf-build-home-services"
       ip_cidr  = "172.20.0.50/16"
       vcpus    = 4
-      mem_gib  = 16
+      mem_gib  = 12
     }
     "kvm-xcp1-0" = {
       dom0_key = "kvm-xcp1"
-      name     = "mcnf-build-51"
-      ip_cidr  = "172.20.0.51/16"
+      name     = "mcnf-build-kvm-xcp1"
+      ip_cidr  = "172.20.0.90/16"
       vcpus    = 4
-      mem_gib  = 16
+      mem_gib  = 12
     }
     "xen-bigboy-0" = {
       dom0_key = "xen-bigboy"
       name     = "mcnf-build-52"
       ip_cidr  = "172.20.0.130/16"
-      vcpus    = 4
-      mem_gib  = 24
+      vcpus    = 12
+      mem_gib  = 20
     }
     # XEN-194 (added 2026-06-29): a live VM provisioned via xe (4 vCPU / 11 GiB @
     # .170). NOT yet in tofu state — adopt at deploy with
@@ -113,7 +114,7 @@ locals {
     # it's net-new to tofu, not a renamed resource).
     "xen-194-0" = {
       dom0_key = "xen-194"
-      name     = "mcnf-build-53"
+      name     = "mcnf-build-xen-194"
       ip_cidr  = "172.20.0.170/16"
       vcpus    = 4
       mem_gib  = 11
@@ -241,8 +242,8 @@ resource "xenserver_vm" "build_x194" {
 
 # --- moved {} — the load-bearing 0-destroy migration (CONTRADICTION-2) -------
 # Map each old hardcoded address to its new for_each key in the matching
-# per-alias resource. The live adopted VMs (mcnf-build-50/51/52) are the small-0
-# of their dom0, so they relocate to the "<dom0>-0" key. With these in place a
+# per-alias resource. The live adopted VMs are the small-0 of their dom0, so they
+# relocate to the "<dom0>-0" key. With these in place a
 # `tofu plan` against the live state RELOCATES the resources (0-add/0-change/
 # 0-destroy) instead of destroy+recreate. Removing a moved block re-introduces the
 # destroy — keep all three.

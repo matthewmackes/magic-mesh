@@ -20,7 +20,7 @@
 #   xcp-build.sh route <cargo args>   print the shape-routed host + reason (dry; no sync/build)
 #   xcp-build.sh --route-test         run the routing self-test (offline; no farm contact)
 #
-# Env overrides: MCNF_BUILD_HOST (172.20.0.52), MCNF_BUILD_USER (mm),
+# Env overrides: MCNF_BUILD_HOST (for example 172.20.0.130), MCNF_BUILD_USER (mm),
 #   MCNF_BUILD_SLOT (unset) — an isolated remote workspace+target on the SAME host
 #   so multiple concurrent jobs run without colliding (scale workloads per node:
 #   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
@@ -38,18 +38,11 @@
 # fails to route. The chosen host + reason are always logged.
 set -euo pipefail
 
-# The FA-6 fallback build node: the always-on standalone BigBoy build VM at
-# 172.20.0.52 (the pre-autoscale fixed `mcnf-build-52` host), per the operator
-# directive "worklist work → BIGBOY, testing → the two other Xen hosts"
-# (2026-06-22). Routing degrades to THIS host whenever shape routing can't resolve
-# an elastic VM (autoscaler paused / no matching shape / topology unreadable), so
-# a build never fails to route. It must be a FIXED, always-present, non-elastic
-# build VM (works even when the autoscaler has provisioned NOTHING). That is
-# `mcnf-build-50` at **172.20.0.50** — NOT the autoscaler's elastic BigBoy `big`
-# VM (.130). Corrected 2026-06-25 from a stale `.52`: per docs/BUILD-ENVIRONMENT.md
-# §3 there is no live `.52` (the VM *named* mcnf-build-52 is at .130) — probing .52
-# gives "No route to host", so the old fallback could never route (a silent
-# work-stops landmine). Override with MCNF_BUILD_HOST (an explicit host always wins).
+# The FA-6 fallback build node is the always-on home-services build VM at
+# 172.20.0.50. Shape routing sends big/release jobs to BigBoy at 172.20.0.130
+# when the topology resolves; this fallback exists only for topology/autoscaler
+# failures so a build still has a reachable fixed host. Override with
+# MCNF_BUILD_HOST (an explicit host always wins).
 DEFAULT_BUILD_HOST="172.20.0.50"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"

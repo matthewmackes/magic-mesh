@@ -8,7 +8,16 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; . "$HERE/etcd-lib.sh"
 KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
-NODES="${MCNF_BUILD_NODES:-172.20.0.52 172.20.0.50 172.20.0.51}"
+REPO="$(cd "$HERE/../.." && pwd)"
+default_nodes() {
+  # shellcheck source=../../install-helpers/farm-topology.sh
+  . "$REPO/install-helpers/farm-topology.sh"
+  local i
+  for i in "${!FARM_OCTETS[@]}"; do
+    printf '%s 172.20.0.%s\n' "${FARM_CAPS[$i]}" "${FARM_OCTETS[$i]}"
+  done | sort -rn | awk '{print $2}' | paste -sd' ' -
+}
+NODES="${MCNF_BUILD_NODES:-$(default_nodes)}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)
 
 depth() { etcd_range_keys "/farm/queue/" | grep -c . ; }
@@ -21,7 +30,7 @@ cmd_status() {
   for n in $NODES; do
     local up="down" ag="-"
     timeout 4 bash -c "cat </dev/null >/dev/tcp/$n/22" 2>/dev/null && {
-      up="up"; ag=$("${SSH[@]}" -n "mm@$n" 'systemctl is-active mcnf-farm-agent 2>/dev/null || (pgrep -f farm-agent.sh >/dev/null && echo running || echo stopped)' 2>/dev/null)
+      up="up"; ag=$("${SSH[@]}" -n "mm@$n" 'if systemctl is-active --quiet mcnf-farm-agent 2>/dev/null; then echo active; elif pgrep -f farm-agent.sh >/dev/null; then echo running; else echo stopped; fi' 2>/dev/null)
     }
     printf '  %-15s ssh=%-5s agent=%s\n' "$n" "$up" "$ag"
   done

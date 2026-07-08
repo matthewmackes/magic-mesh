@@ -2,14 +2,14 @@
 
 The no-fixed-center replacement for the XO-backed Xen IaC: the `xenserver`
 provider talks **XAPI directly** to a pool master, so there is no central Xen
-Orchestra to lose. The farm spans **3 standalone pools**, so this uses **3 aliased
+Orchestra to lose. The farm spans **4 standalone pools**, so this uses **4 aliased
 providers** (one per dom0). **This supersedes the `xenorchestra` config in `../`**
 (now deprecated — do not `apply` it; both managing the same VMs would conflict).
 
-**CUTOVER DONE (2026-06-22):** all three live build VMs imported here —
-`mcnf-build-50` (.9), `-51` (.193), `-52` (.165) — farm-wide `tofu plan` =
-**`0 add / 0 destroy`** (only the benign per-VM metadata residual). The VMs stayed
-`running` throughout (import is non-mutating). The farm is now XAPI-managed, no XO.
+**CUTOVER DONE (2026-06-22; roster reconciled 2026-07-06):** the live adopted
+build VMs are `.50` `mcnf-build-home-services`, `.90` `mcnf-build-kvm-xcp1`,
+`.130` `mcnf-build-52` (BigBoy), and `.170` `mcnf-build-xen-194`. The farm is
+XAPI-managed, no XO.
 
 ## Status
 
@@ -30,7 +30,7 @@ Orchestra in the path — the no-fixed-center hypothesis for the Xen IaC holds.
   needs (`xenserver_vm`, `xenserver_sr{,_nfs,_smb}`, `xenserver_vdi`,
   `xenserver_network_vlan`, `xenserver_snapshot`, `xenserver_pool`) but its long-term
   stability is unproven here.
-- **Import parity** of the live `.50/.51/.52` build VMs is the real gate before any
+- **Import parity** of the live `.50/.90/.130/.170` build VMs is the real gate before any
   cutover of `infra/tofu/` — not yet attempted (next increment).
 
 ## Use
@@ -46,7 +46,8 @@ repo — only `TF_VAR_xapi_password` from the off-repo `0600` file.
 
 ## Import-parity (PROVEN 2026-06-22 — the cutover gate)
 
-Imported the live `mcnf-build-51` (uuid `7a6753c7…`) into a throwaway
+Imported the live KVM-XCP1 build VM (then `mcnf-build-51`, now
+`mcnf-build-kvm-xcp1`) into a throwaway
 `xenserver_vm` and planned: **`0 to add, 0 to destroy`** — no recreate, no disk/
 CPU/memory/boot/network change. The only residual is two metadata fields the 0.2.x
 provider can't round-trip (`check_ip_timeout`, computed `default_ip`); an apply is a
@@ -75,7 +76,6 @@ resource "xenserver_vm" "build" {
 ## Next steps (DATACENTER-1)
 
 1. ~~Resource path (create/destroy).~~ **DONE.**  2. ~~Import-parity clean plan.~~ **DONE.**
-3. **Full cutover** (remaining): the live farm spans **3 standalone pools** (.9/.193/.165),
-   and the `xenserver` provider is **single-pool** — so the new config needs **3 aliased
-   providers** (one per dom0 XAPI endpoint), a `xenserver_vm` per pool (recipe above),
-   import all 3, confirm clean, then promote over `../` (retire `xenorchestra`).
+3. **Full cutover hygiene** (remaining): keep the four imported/adopted build VMs
+   at 0-destroy parity, then retire the deprecated `../` `xenorchestra` root once
+   its state is removed.

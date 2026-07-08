@@ -17,12 +17,26 @@
 set -uo pipefail
 
 KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
-# Highest-capacity first (XEN-BIGBOY .52 → small .50/.51) so big jobs get big iron.
-NODES="${MCNF_BUILD_NODES:-172.20.0.52 172.20.0.50 172.20.0.51}"
 STATE="${MCNF_FARM_STATE:-$(cd "$(dirname "$0")/../.." && pwd)/automation/.state}"
 RESULTS="$STATE/results"; LOGS="$STATE/logs"; LOCKS="$STATE/locks"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+TOPOLOGY="$REPO/install-helpers/farm-topology.sh"
 mkdir -p "$RESULTS" "$LOGS" "$LOCKS"
+
+default_nodes() {
+  if [ -f "$TOPOLOGY" ]; then
+    # shellcheck source=../../install-helpers/farm-topology.sh
+    . "$TOPOLOGY"
+    local i
+    for i in "${!FARM_OCTETS[@]}"; do
+      printf '%s 172.20.0.%s\n' "${FARM_CAPS[$i]}" "${FARM_OCTETS[$i]}"
+    done | sort -rn | awk '{print $2}' | paste -sd' ' -
+  else
+    printf '%s\n' "172.20.0.130 172.20.0.50 172.20.0.90 172.20.0.170"
+  fi
+}
+# Highest-capacity first (XEN-BIGBOY .130 → small .50/.90/.170) so big jobs get big iron.
+NODES="${MCNF_BUILD_NODES:-$(default_nodes)}"
 
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)
 log() { echo "==> dispatch: $*" >&2; }

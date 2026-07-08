@@ -12,9 +12,22 @@ There are **two build surfaces**, both real and both supported:
    workspace incl. the cosmic/iced GUI in ~seconds-to-a-minute. Best for tight
    edit→build→verify loops. **Caveat: gcc 11.5 rejects `mold`** → use the gold
    override (below).
-2. **The build farm** (three Fedora VMs across the three dom0s — real IPs `172.20.0.50` / `.90` / `.130`; the VM names `mcnf-build-50/51/52` are legacy and do **not** equal the IP octet, see §3) — fully
+2. **The build farm** (four Fedora VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — fully
    OpenTofu/Ansible-managed (see "Build farm" §). Best for offloaded/parallel
    builds, the release gates, and RPM cuts. gcc 15 there, so `mold` works as-is.
+
+**AI directive:** all AI agents must use the build farm for build/test/gate work
+unless the command is only a tiny local syntax/probe check. Parallelize
+independent verification across `.50` / `.90` / `.130` / `.170` using explicit
+`MCNF_BUILD_HOST` + `MCNF_BUILD_SLOT`; put the long pole on BigBoy (`.130`).
+Avoid containers when a direct farm-host fixture is enough. Farm/test hosts are
+safe for destructive reboot/recovery operations unless the task explicitly says
+otherwise.
+
+**Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
+testing. Use the other two available bench seats for bench verification. Those
+seats have encrypted disks and require a key at boot, so do not reboot them
+unless a reboot is genuinely required for the test or recovery path.
 
 ---
 
@@ -88,12 +101,12 @@ user). Secrets are **off-repo** — see "Credentials" below.
 | Host | IP | OS | Cores / RAM | Role |
 |---|---|---|---|---|
 | `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | Orchestration + **local builds** + podman; runs XO + tofu/ansible/packer; this is where Claude Code + `/root/magic-mesh` live |
-| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-50` (172.20.0.50, 4 vCPU/16 GiB); local SR is `ext` ("Local storage") |
-| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-51` (172.20.0.90, 4 vCPU/16 GiB) |
-| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **12 vCPU/~20 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
-| `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c / — | hypervisor — build VM `mcnf-build-53` (172.20.0.170, 4 vCPU/16 GiB); the **4th dom0** (added after the 3-dom0 table was first written; confirmed live 2026-07-01) |
+| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-home-services` (172.20.0.50, 4 vCPU/12 GiB); local SR is `ext` ("Local storage") |
+| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-kvm-xcp1` (172.20.0.90, 4 vCPU/12 GiB) |
+| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **12 vCPU/20 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
+| `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c / — | hypervisor — build VM `mcnf-build-xen-194` (172.20.0.170, 4 vCPU/11 GiB); the **4th dom0** (added after the 3-dom0 table was first written; confirmed live 2026-07-01) |
 
-> ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/main.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. The VM **names** `mcnf-build-50/51/52/53` are legacy and do **not** equal the IP octet — `mcnf-build-51` is **172.20.0.90**, `mcnf-build-52` is **172.20.0.130**, `mcnf-build-53` is **172.20.0.170**. The real farm is **4 build VMs: .50 / .90 / .130 / .170** (there are no live `.51`/`.52` IPs — probing them gives "No route to host"). **⚠️ Under-tracked elsewhere:** the ansible `[dom0s]` inventory lists all 4 (incl. `xen-194 172.20.145.194`), but `infra/tofu/variables.tf`'s `shape`/`small_count` validation only accepts the 3 keys `xen-home-services|kvm-xcp1|xen-bigboy` — **the tofu autoscaler cannot yet target XEN-194** (a real IaC gap). The `/ship` + `/polish` skill topology tables also still show 3 nodes (`.50/.90/.130`) and should be corrected (operator-gated — skill config). **Full heavy-slot capacity is 2+2+3+2 = 9** (not 7).
+> ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. The real farm is **4 build VMs: .50 / .90 / .130 / .170** (there are no live `.51`/`.52` IPs — probing them gives "No route to host"). The non-BigBoy build hostnames are descriptive (`mcnf-build-home-services`, `mcnf-build-kvm-xcp1`, `mcnf-build-xen-194`); BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2 = 9** (not 7).
 
 > **Standing rule (operator 2026-06-30): BigBoy takes the longest / most-complex build.** The single heaviest job always routes to **XEN-BIGBOY** (`172.20.0.130`, 12 vCPU / ~20 GiB — the high-capacity node): a full `cargo --workspace` build/test/clippy, the biggest egui crates (`mde-shell-egui`/`mde-workbench`), a cold cosmic/iced/wgpu compile, or the RPM release build (`MCNF_BUILD_SHAPE=big` / an explicit `MCNF_BUILD_HOST=172.20.0.130`). The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs. This composes with the per-node concurrency cap: spread the *count* to honor caps, but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI build on a small node while BigBoy runs a trivial one.
 
