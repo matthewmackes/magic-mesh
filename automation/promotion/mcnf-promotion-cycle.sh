@@ -105,6 +105,22 @@ worklist_active_breakdown() {
     "$(worklist_marker_count '◐')"
 }
 
+worklist_next_candidates() {
+  local limit="${1:-8}"
+  awk -v limit="$limit" '
+    /^[[:space:]]*- \[[ >]\][[:space:]]+\*\*[A-Za-z0-9._-]+[: ]/ {
+      line = $0
+      sub(/^[[:space:]]*- \[[ >]\][[:space:]]+\*\*/, "", line)
+      sub(/\*\*.*/, "", line)
+      print line
+      count++
+      if (count >= limit) {
+        exit
+      }
+    }
+  ' "$ROOT/docs/WORKLIST.md"
+}
+
 json_value() {
   local line="$1" key="$2"
   printf '%s\n' "$line" | sed -n "s/.*\"$key\":\"\\([^\"]*\\)\".*/\\1/p"
@@ -538,14 +554,17 @@ declaration_status() {
 }
 
 status_report() {
-  local rpm version sha open_count active_breakdown
+  local rpm version sha open_count active_breakdown next_work
   rpm="$(latest_rpm || true)"
   open_count="$(worklist_open_count)"
   active_breakdown="$(worklist_active_breakdown)"
+  next_work="$(worklist_next_candidates "${MCNF_STATUS_NEXT_WORK:-8}" | sed 's/^/    - /')"
   cat <<EOF
 MCNF promotion status
   worklist_open_or_in_progress: $open_count
   worklist_active_breakdown: $active_breakdown
+  worklist_next_unblocked:
+${next_work:-    - none}
   release_declaration: $(declaration_status)
 EOF
   if [ -n "$rpm" ] && [ -f "$rpm" ]; then
