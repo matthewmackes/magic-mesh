@@ -20,6 +20,7 @@ EAGLE="${MCNF_EAGLE_HOST:-172.20.146.13}"
 EAGLE_USER="${MCNF_EAGLE_USER:-mm}"
 EAGLE_PASS_FILE="${MCNF_EAGLE_PASS_FILE:-/root/.mcnf-xapi-cred}"
 SSH_KEY="${MCNF_SSH_KEY:-/root/.ssh/id_ed25519}"
+DECLARATION_FILE="${MCNF_RELEASE_DECLARATION:-$ROOT/docs/ops/production-release-declaration.md}"
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -28,6 +29,47 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 latest_rpm() {
   if [ -n "$RPM" ]; then printf '%s\n' "$RPM"; return; fi
   ls -t "$ARTIFACTS"/*.rpm 2>/dev/null | head -1
+}
+
+rpm_sha256() {
+  local rpm="$1"
+  [ -f "$rpm" ] || return 0
+  sha256sum "$rpm" 2>/dev/null | awk '{print $1}'
+}
+
+worklist_open_count() {
+  awk '
+    /^[[:space:]]*- \[[^]]+\]/ {
+      marker = substr($0, index($0, "[") + 1, index($0, "]") - index($0, "[") - 1)
+      if (marker == " " || marker == ">" || marker == "!" || marker == "→" || marker == "~" || marker == "◐") {
+        count++
+      }
+    }
+    END { print count + 0 }
+  ' "$ROOT/docs/WORKLIST.md"
+}
+
+worklist_marker_count() {
+  local want="$1"
+  awk -v want="$want" '
+    /^[[:space:]]*- \[[^]]+\]/ {
+      marker = substr($0, index($0, "[") + 1, index($0, "]") - index($0, "[") - 1)
+      if (marker == want) {
+        count++
+      }
+    }
+    END { print count + 0 }
+  ' "$ROOT/docs/WORKLIST.md"
+}
+
+worklist_active_breakdown() {
+  printf 'open=%s in_progress=%s blocked=%s delegated=%s partial=%s review=%s\n' \
+    "$(worklist_marker_count ' ')" \
+    "$(worklist_marker_count '>')" \
+    "$(worklist_marker_count '!')" \
+    "$(worklist_marker_count '→')" \
+    "$(worklist_marker_count '~')" \
+    "$(worklist_marker_count '◐')"
 }
 
 do_active_count() {
@@ -70,7 +112,7 @@ publish_promote() {
   command -v sshpass >/dev/null 2>&1 || return 0
   [ -f "$EAGLE_PASS_FILE" ] || return 0
   qbody="$(printf '%q' "$body")"
-  sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
+  timeout 20 sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
     "command -v mde-bus >/dev/null 2>&1 && mde-bus publish event/dc/promote/$stage --body-flag $qbody" >/dev/null 2>&1 || true
 }
 
@@ -92,7 +134,7 @@ publish_lighthouse_version() {
   command -v sshpass >/dev/null 2>&1 || return 0
   [ -f "$EAGLE_PASS_FILE" ] || return 0
   qbody="$(printf '%q' "$body")"
-  sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
+  timeout 20 sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
     "command -v mde-bus >/dev/null 2>&1 && mde-bus publish event/dc/promote/lighthouse-$safe_stage --body-flag $qbody" >/dev/null 2>&1 || true
 }
 
@@ -106,6 +148,20 @@ node_hostname() {
   local ip="$1"
   ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$ip" \
     "hostname" 2>/dev/null || true
+}
+
+remote_diag() {
+  local target="$1" prefix="${2:-ssh}"
+  case "$prefix" in
+    sshpass)
+      sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$target" \
+        "rpm -q magic-mesh || true; ps -eo pid,ppid,stat,etime,cmd | grep -E 'dnf|rpm' | grep -v grep || true; sudo tail -80 /var/log/dnf.log /var/log/dnf.rpm.log 2>/dev/null || true" || true
+      ;;
+    *)
+      ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$target" \
+        "rpm -q magic-mesh || true; ps -eo pid,ppid,stat,etime,cmd | grep -E 'dnf|rpm' | grep -v grep || true; tail -80 /var/log/dnf.log /var/log/dnf.rpm.log 2>/dev/null || true" || true
+      ;;
+  esac
 }
 
 eagle_version() {
@@ -176,8 +232,12 @@ promote_eagle() {
   log "Promote to Eagle ($EAGLE)"
   publish_promote build "$(rpm_version_token "$RPM")" ready "candidate"
   sshpass -f "$EAGLE_PASS_FILE" scp -o StrictHostKeyChecking=accept-new "$RPM" "$EAGLE_USER@$EAGLE:/tmp/mcnf-promote.rpm"
-  sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
-    "sudo -S -p '' dnf install -y /tmp/mcnf-promote.rpm && sudo systemctl restart mackesd && sleep 10 && rpm -q magic-mesh && systemctl is-active mackesd nebula syncthing" <"$EAGLE_PASS_FILE"
+  if ! timeout 900 sshpass -f "$EAGLE_PASS_FILE" ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new "$EAGLE_USER@$EAGLE" \
+    "sudo -S -p '' dnf install -y /tmp/mcnf-promote.rpm && sudo rpm -Uvh --replacepkgs /tmp/mcnf-promote.rpm && sudo systemctl restart mackesd && sleep 10 && rpm -q magic-mesh && systemctl is-active mackesd nebula syncthing" <"$EAGLE_PASS_FILE"; then
+    log "Eagle promotion failed or timed out; diagnostics follow"
+    remote_diag "$EAGLE" sshpass
+    return 1
+  fi
   publish_promote eagle "$(rpm_version_token "$RPM")" ready "$EAGLE"
 }
 
@@ -187,7 +247,7 @@ live_smoke() {
     'ETCDCTL_API=3 etcdctl --endpoints=http://10.42.0.1:2379 endpoint health --cluster &&
      mackesd peers &&
      df -h /run | awk "NR==2" &&
-     test "$(journalctl -u mackesd --since "70 sec ago" | grep -c ABRT)" = 0'
+     test "$(journalctl -u mackesd --since "70 sec ago" | grep -Eic "SIGABRT|ABRT|dumped|coredump")" = 0'
 }
 
 audit_do_node() {
@@ -201,6 +261,15 @@ audit_do_node() {
      echo "LIZARD_ACTIVE=$(systemctl is-active lizardfs-master lizardfs-chunkserver 2>/dev/null | paste -sd, - || true)";
      echo "LIZARD_ENABLED=$(systemctl is-enabled lizardfs-master lizardfs-chunkserver 2>/dev/null | paste -sd, - || true)";
      echo "FUSE_MOUNTS=$(findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null | paste -sd "|" - || true)";
+     stop_usec="$(systemctl show mackesd -p TimeoutStopUSec --value)";
+     stop_mode="$(systemctl show mackesd -p TimeoutStopFailureMode --value)";
+     echo "STOP_POLICY=${stop_usec},${stop_mode}";
+     test "$stop_usec" = "1min 30s";
+     test "$stop_mode" = "terminate";
+     test -f /usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf;
+     if [ -f /etc/systemd/system/mackesd.service.d/watchdog.conf ]; then
+       ! grep -Eq "TimeoutStop(FailureMode=abort|USec=20s|Sec=20)" /etc/systemd/system/mackesd.service.d/watchdog.conf;
+     fi;
      test "$(systemctl is-active mackesd nebula etcd syncthing | grep -vc active)" = 0;
      test -z "$(findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null)";
      ! systemctl is-enabled qnm-shared lizardfs-master lizardfs-chunkserver >/dev/null 2>&1'
@@ -217,6 +286,15 @@ audit_eagle() {
      echo "LIZARD_ACTIVE=$(systemctl is-active lizardfs-master lizardfs-chunkserver 2>/dev/null | paste -sd, - || true)";
      echo "LIZARD_ENABLED=$(systemctl is-enabled lizardfs-master lizardfs-chunkserver 2>/dev/null | paste -sd, - || true)";
      echo "FUSE_MOUNTS=$(findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null | paste -sd "|" - || true)";
+     stop_usec="$(systemctl show mackesd -p TimeoutStopUSec --value)";
+     stop_mode="$(systemctl show mackesd -p TimeoutStopFailureMode --value)";
+     echo "STOP_POLICY=${stop_usec},${stop_mode}";
+     test "$stop_usec" = "1min 30s";
+     test "$stop_mode" = "terminate";
+     test -f /usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf;
+     if [ -f /etc/systemd/system/mackesd.service.d/watchdog.conf ]; then
+       ! grep -Eq "TimeoutStop(FailureMode=abort|USec=20s|Sec=20)" /etc/systemd/system/mackesd.service.d/watchdog.conf;
+     fi;
      test "$(systemctl is-active mackesd nebula syncthing | grep -vc active)" = 0;
      test -z "$(findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null)";
      ! systemctl is-enabled qnm-shared lizardfs-master lizardfs-chunkserver >/dev/null 2>&1'
@@ -238,16 +316,111 @@ live_audit() {
 media_verify() {
   log "MEDIA-LIGHTHOUSE live verification"
   check_limits
-  local host="${MCNF_MEDIA_VERIFY_HOST:-}"
+  local host="${MCNF_MEDIA_VERIFY_HOST:-}" extra_args=""
   if [ -z "$host" ]; then
     host="$(do_lighthouse_ips | head -1)"
   fi
   [ -n "$host" ] || die "no lighthouse available for media verification"
   log "MEDIA verifier host: $host"
+  if [ "$#" -gt 0 ]; then
+    extra_args="$(printf '%q ' "$@")"
+  fi
   scp -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     "$ROOT/automation/media/verify-media-lighthouse.sh" "root@$host:/tmp/verify-media-lighthouse.sh"
   ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$host" \
-    "chmod 700 /tmp/verify-media-lighthouse.sh && MCNF_MEDIA_ENV_FILE=/etc/mackesd/media-spaces.env /tmp/verify-media-lighthouse.sh $(printf '%q ' "$@")"
+    "chmod 700 /tmp/verify-media-lighthouse.sh && MCNF_MEDIA_ENV_FILE=/etc/mackesd/media-spaces.env /tmp/verify-media-lighthouse.sh $extra_args"
+}
+
+media_verify_for_cycle() {
+  if [ "${MCNF_MEDIA_MUTATE_PLAYLIST:-0}" = 1 ]; then
+    media_verify --mutate-playlist
+  else
+    media_verify
+  fi
+}
+
+live_fd_soak() {
+  log "Live fd/EMFILE soak"
+  "$ROOT/automation/promotion/live-fd-soak.sh"
+}
+
+declaration_status() {
+  if [ ! -f "$DECLARATION_FILE" ]; then
+    printf 'missing (%s)\n' "$DECLARATION_FILE"
+    return 0
+  fi
+  if rg -qi 'operator.*declare|production release.*complete|release complete' "$DECLARATION_FILE" 2>/dev/null; then
+    printf 'present (%s)\n' "$DECLARATION_FILE"
+  else
+    printf 'present-but-unrecognized (%s)\n' "$DECLARATION_FILE"
+  fi
+}
+
+status_report() {
+  local rpm version sha open_count active_breakdown
+  rpm="$(latest_rpm || true)"
+  open_count="$(worklist_open_count)"
+  active_breakdown="$(worklist_active_breakdown)"
+  cat <<EOF
+MCNF promotion status
+  worklist_open_or_in_progress: $open_count
+  worklist_active_breakdown: $active_breakdown
+  release_declaration: $(declaration_status)
+EOF
+  if [ -n "$rpm" ] && [ -f "$rpm" ]; then
+    version="$(rpm_version_token "$rpm")"
+    sha="$(rpm_sha256 "$rpm")"
+    cat <<EOF
+  candidate_rpm: $rpm
+  candidate_version: $version
+  candidate_sha256: $sha
+EOF
+  else
+    echo "  candidate_rpm: missing"
+  fi
+
+  if command -v doctl >/dev/null 2>&1; then
+    local limit active free lh
+    if limit="$(do_limit 2>/dev/null)" && active="$(do_active_count 2>/dev/null)"; then
+      free=$((limit - active))
+      lh="$(do_lighthouse_count 2>/dev/null || true)"
+      cat <<EOF
+  do_account: active=$active limit=$limit free=$free tagged_lighthouses=${lh:-0} max_active=$DO_MAX_ACTIVE min_free=$DO_MIN_FREE
+EOF
+      if [ "$active" -gt "$DO_MAX_ACTIVE" ] || [ "$free" -lt "$DO_MIN_FREE" ]; then
+        echo "  do_account_gate: red"
+      else
+        echo "  do_account_gate: green"
+      fi
+      local ip
+      for ip in $(do_lighthouse_ips 2>/dev/null || true); do
+        echo "  lighthouse[$ip]: version=$(node_version "$ip") host=$(node_hostname "$ip")"
+      done
+    else
+      echo "  do_account: unavailable"
+    fi
+  else
+    echo "  do_account: doctl missing"
+  fi
+
+  if command -v sshpass >/dev/null 2>&1 && [ -f "$EAGLE_PASS_FILE" ]; then
+    echo "  eagle[$EAGLE]: version=$(eagle_version)"
+  else
+    echo "  eagle[$EAGLE]: unavailable (sshpass or password file missing)"
+  fi
+
+  if [ -x "$ROOT/install-helpers/farm-topology.sh" ]; then
+    echo "  farm:"
+    "$ROOT/install-helpers/farm-topology.sh" table 2>/dev/null | sed 's/^/    /' || echo "    unavailable"
+  fi
+
+  cat <<EOF
+  required_before_complete:
+    - worklist_open_or_in_progress must be 0
+    - all current gates must pass for the final candidate
+    - live lighthouse/Eagle audit, media verification, and fd soak must pass after the final candidate
+    - operator must create the production release declaration
+EOF
 }
 
 promote_do() {
@@ -259,12 +432,17 @@ promote_do() {
   for ip in $(do_lighthouse_ips); do
     log "DO lighthouse $ip"
     scp -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$RPM" "root@$ip:/tmp/mcnf-promote.rpm"
-    ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$ip" \
+    if ! timeout 900 ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$ip" \
       'dnf install -y /tmp/mcnf-promote.rpm &&
+       rpm -Uvh --replacepkgs /tmp/mcnf-promote.rpm &&
        systemctl restart mackesd &&
        sleep 10 &&
        rpm -q magic-mesh &&
-       systemctl is-active mackesd nebula etcd syncthing'
+       systemctl is-active mackesd nebula etcd syncthing'; then
+      log "DO lighthouse $ip promotion failed or timed out; diagnostics follow"
+      remote_diag "$ip" ssh
+      return 1
+    fi
     publish_lighthouse_version "$ip" "$(node_version "$ip")" ready "$(node_hostname "$ip")"
   done
   publish_promote "do" "$(rpm_version_token "$RPM")" ready "$DO_TAG"
@@ -282,9 +460,12 @@ cycle() {
   promote_do
   live_smoke
   live_audit
+  media_verify_for_cycle
+  live_fd_soak
 }
 
 case "${1:-cycle}" in
+  status|statrep) status_report ;;
   inventory) inventory ;;
   check-limits) check_limits ;;
   build|l0) build_rpm ;;
@@ -296,7 +477,8 @@ case "${1:-cycle}" in
   live-smoke) live_smoke ;;
   live-audit) live_audit ;;
   media-verify) shift; media_verify "$@" ;;
+  fd-soak|live-fd-soak) live_fd_soak ;;
   do) promote_do ;;
   cycle) cycle ;;
-  *) die "usage: $0 {inventory|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-audit|media-verify|do|cycle}" ;;
+  *) die "usage: $0 {status|statrep|inventory|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-audit|media-verify|fd-soak|do|cycle}" ;;
 esac
