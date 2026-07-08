@@ -68,7 +68,7 @@ materialize_secret() {
 
 resolved_ipv4_count() {
   local host="$1"
-  getent ahostsv4 "$host" 2>/dev/null \
+  (getent ahostsv4 "$host" 2>/dev/null || true) \
     | awk '{print $1}' \
     | sort -u \
     | sed '/^$/d' \
