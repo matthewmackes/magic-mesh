@@ -7824,6 +7824,32 @@ fn run_serve(
                 .push("browser_policy".into());
         }
 
+        // BROWSER-DD-7 — the browser session-sync owner. The shell publishes
+        // deduped `action/browser/session-sync` snapshots for tabs/settings/
+        // downloads/speed-dial; this worker validates those restore-compatible
+        // JSON bodies, persists the latest local copy, and mirrors it into the
+        // Syncthing-backed workgroup root at
+        // browser-session-sync/<host>/latest.json. The file body stays the exact
+        // Browser snapshot shape so startup restore consumes it directly. A
+        // Workstation-tier browser feature; it idles on headless boxes with no
+        // Browser publishes and never writes into a missing canonical share.
+        if mackesd_core::worker_role::runs("browser_session_sync", role_rank) {
+            let local_root =
+                mackesd_core::workers::browser_session_sync::resolve_local_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_session_sync::BrowserSessionSyncWorker::new(
+                    node_id.clone(),
+                    local_root,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_session_sync".into());
+        }
+
         // CHOOSER-1 — the desktop-source discovery aggregator (design
         // `desktop-chooser.md` §Architecture, locks 5/14): collects every
         // desktop source — mesh-peer advertised (the replicated peers plane's

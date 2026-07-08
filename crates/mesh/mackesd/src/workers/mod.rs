@@ -181,6 +181,12 @@ pub mod adfilter;
 // Publishes state/browser-policy/<node> for the Workbench fleet view. No external
 // transport to fake — file I/O against the same share the adfilter worker uses.
 pub mod browser_policy;
+// BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
+// action/browser/session-sync snapshots, validates the restore-compatible JSON
+// shape, persists the latest local copy, and mirrors it to the Syncthing-backed
+// workgroup root as browser-session-sync/<host>/latest.json. No external
+// transport to fake — Syncthing replicates the file plane.
+pub mod browser_session_sync;
 pub mod heartbeat;
 // OV-7.a (v2.6) — Health reconciler. Reads each known peer's
 // QNM-Shared heartbeat.json on a 5 s tick, applies the

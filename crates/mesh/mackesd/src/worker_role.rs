@@ -180,6 +180,12 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // so Workstation-tier; it idles gracefully on a headless box (no browser, no
     // action/browser/* requests) while still replicating the policy doc.
     ("browser_policy", 1),
+    // BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
+    // action/browser/session-sync snapshots into a local durable latest snapshot
+    // and mirrors them to the Syncthing share for follow-me/startup restore. A
+    // desktop/browser feature, so Workstation-tier; idles gracefully on a headless
+    // box with no Browser publishes.
+    ("browser_session_sync", 1),
     // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
     // (the seated user browses peers), so Workstation-tier; it idles gracefully
     // with no mount requests on a headless box.
@@ -457,6 +463,9 @@ mod tests {
         // +1 browser_policy (BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY
         // worker: reads the synced fleet policy doc + enforces at the browser
         // launch seam, Workstation-tier: a seated-user desktop-governance feature).
+        // +1 browser_session_sync (BROWSER-DD-7 — Browser follow-me/startup-restore
+        // session snapshots mirrored onto the Syncthing file plane,
+        // Workstation-tier browser feature).
         // +1 storage (BUG-STORAGE-1 — the E12-20 universal per-node topology mirror,
         // pinned at rank 0 so it is a deliberate census entry on every role instead
         // of riding the silent unknown-worker default that hid it from role-workers).
@@ -487,8 +496,8 @@ mod tests {
         // 44 → 45).
         // +1 transfers (TRANSFERS-1 — the Workstation-tier transfers queue/ledger/
         // verb spine, sibling of pty_broker/mesh_mount. Split 30/15 → 30/16, len
-        // 45 → 46).
-        assert_eq!(WORKER_TIERS.len(), 46);
+        // 45 → 46). +1 browser_session_sync shifts split 30/16 → 30/17, len 46 → 47.
+        assert_eq!(WORKER_TIERS.len(), 47);
     }
 
     #[test]
@@ -516,8 +525,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            16,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3)"
+            17,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_session_sync (BROWSER-DD-7) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -770,11 +779,12 @@ mod tests {
         // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
         // NODE-GRADE-1 universal node_grade self-grade + the KDC-MESH-3 universal
         // kdc_host + the CHAT-FIX-1 universal chat worker + the DEVMGR-8 universal
-        // device_control executor at rank 0); Workstation adds the 16 fleet + desktop
-        // workers (incl. the TRANSFERS-1 transfers worker) for the full 46 (the
-        // retired Server tier folded into Workstation in the 2-role model).
+        // device_control executor at rank 0); Workstation adds the 17 fleet + desktop
+        // workers (incl. the TRANSFERS-1 transfers worker and BROWSER-DD-7
+        // browser_session_sync owner) for the full 47 (the retired Server tier
+        // folded into Workstation in the 2-role model).
         assert_eq!(lh.len(), 30);
-        assert_eq!(ws.len(), 46);
+        assert_eq!(ws.len(), 47);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
