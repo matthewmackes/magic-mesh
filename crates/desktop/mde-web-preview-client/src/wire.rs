@@ -376,6 +376,9 @@ pub enum ControlMsg {
     Load(String),
     /// Reload the current page.
     Reload,
+    /// Stop the current page load, when the active helper exposes a real cancel
+    /// hook.
+    Stop,
     /// Go back one history entry.
     Back,
     /// Go forward one history entry.
@@ -404,6 +407,42 @@ pub enum ControlMsg {
     /// (BOOKMARKS-7). JS-off safe: it is a plain `display:none` stylesheet, not a
     /// script. Empty CSS clears any prior injection.
     CosmeticFilters(String),
+    /// Set the page zoom percentage. `100` is normal size.
+    SetZoom {
+        /// Percent zoom, clamped by the shell before send.
+        percent: u16,
+    },
+    /// Find text on the current page.
+    FindInPage {
+        /// Search query.
+        query: String,
+        /// Search backwards instead of forwards.
+        backwards: bool,
+    },
+    /// Clear the current page-find highlight/selection where the helper supports it.
+    ClearFind,
+    /// Set whether page audio is muted for the tab.
+    SetAudioMuted {
+        /// `true` to mute audio, `false` to unmute.
+        muted: bool,
+    },
+    /// Set whether the helper should force a dark page treatment for this tab.
+    SetForceDark {
+        /// `true` to install forced-dark styling, `false` to clear it.
+        enabled: bool,
+    },
+    /// Set whether the helper should apply a reader-mode page treatment.
+    SetReaderMode {
+        /// `true` to install reader styling, `false` to clear it.
+        enabled: bool,
+    },
+    /// Ask the helper to print the current page.
+    PrintPage,
+    /// Ask the helper to save the current page as a PDF at `path`.
+    SavePdf {
+        /// Absolute output path owned by the shell.
+        path: String,
+    },
 }
 
 impl ControlMsg {
@@ -417,6 +456,7 @@ impl ControlMsg {
                 put_str(&mut out, url);
             }
             Self::Reload => out.push(1),
+            Self::Stop => out.push(8),
             Self::Back => out.push(2),
             Self::Forward => out.push(3),
             Self::Resize { width, height } => {
@@ -436,6 +476,33 @@ impl ControlMsg {
             Self::CosmeticFilters(css) => {
                 out.push(7);
                 put_str(&mut out, css);
+            }
+            Self::SetZoom { percent } => {
+                out.push(9);
+                put_u16(&mut out, *percent);
+            }
+            Self::FindInPage { query, backwards } => {
+                out.push(10);
+                put_str(&mut out, query);
+                out.push(u8::from(*backwards));
+            }
+            Self::ClearFind => out.push(11),
+            Self::SetAudioMuted { muted } => {
+                out.push(12);
+                out.push(u8::from(*muted));
+            }
+            Self::SetForceDark { enabled } => {
+                out.push(13);
+                out.push(u8::from(*enabled));
+            }
+            Self::SetReaderMode { enabled } => {
+                out.push(14);
+                out.push(u8::from(*enabled));
+            }
+            Self::PrintPage => out.push(15),
+            Self::SavePdf { path } => {
+                out.push(16);
+                put_str(&mut out, path);
             }
         }
         out
@@ -463,6 +530,18 @@ impl ControlMsg {
                 allow: c.bool()?,
             },
             7 => Self::CosmeticFilters(c.string()?),
+            8 => Self::Stop,
+            9 => Self::SetZoom { percent: c.u16()? },
+            10 => Self::FindInPage {
+                query: c.string()?,
+                backwards: c.bool()?,
+            },
+            11 => Self::ClearFind,
+            12 => Self::SetAudioMuted { muted: c.bool()? },
+            13 => Self::SetForceDark { enabled: c.bool()? },
+            14 => Self::SetReaderMode { enabled: c.bool()? },
+            15 => Self::PrintPage,
+            16 => Self::SavePdf { path: c.string()? },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -515,6 +594,13 @@ pub enum EventMsg {
         /// `mde_adblock::ResourceType`.
         resource: u8,
     },
+    /// A helper completed, or failed, a save-as-PDF request.
+    PdfSaved {
+        /// The requested output path.
+        path: String,
+        /// Whether the engine reported a successful PDF write.
+        ok: bool,
+    },
 }
 
 impl EventMsg {
@@ -554,6 +640,11 @@ impl EventMsg {
                 put_str(&mut out, url);
                 out.push(*resource);
             }
+            Self::PdfSaved { path, ok } => {
+                out.push(6);
+                put_str(&mut out, path);
+                out.push(u8::from(*ok));
+            }
         }
         out
     }
@@ -582,6 +673,10 @@ impl EventMsg {
                 id: c.u64()?,
                 url: c.string()?,
                 resource: c.u8()?,
+            },
+            6 => Self::PdfSaved {
+                path: c.string()?,
+                ok: c.bool()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -729,6 +824,7 @@ mod tests {
     fn control_messages_round_trip() {
         round_control(&ControlMsg::Load("https://example.test/a?b=1".to_owned()));
         round_control(&ControlMsg::Reload);
+        round_control(&ControlMsg::Stop);
         round_control(&ControlMsg::Back);
         round_control(&ControlMsg::Forward);
         round_control(&ControlMsg::Resize {
@@ -766,6 +862,26 @@ mod tests {
             ".ad, #banner { display: none !important; }".to_owned(),
         ));
         round_control(&ControlMsg::CosmeticFilters(String::new()));
+        round_control(&ControlMsg::SetZoom { percent: 125 });
+        round_control(&ControlMsg::FindInPage {
+            query: "mesh".to_owned(),
+            backwards: false,
+        });
+        round_control(&ControlMsg::FindInPage {
+            query: "mesh".to_owned(),
+            backwards: true,
+        });
+        round_control(&ControlMsg::ClearFind);
+        round_control(&ControlMsg::SetAudioMuted { muted: true });
+        round_control(&ControlMsg::SetAudioMuted { muted: false });
+        round_control(&ControlMsg::SetForceDark { enabled: true });
+        round_control(&ControlMsg::SetForceDark { enabled: false });
+        round_control(&ControlMsg::SetReaderMode { enabled: true });
+        round_control(&ControlMsg::SetReaderMode { enabled: false });
+        round_control(&ControlMsg::PrintPage);
+        round_control(&ControlMsg::SavePdf {
+            path: "/tmp/mde-page.pdf".to_owned(),
+        });
     }
 
     #[test]
@@ -786,6 +902,14 @@ mod tests {
             id: 42,
             url: "https://doubleclick.net/pixel.gif".to_owned(),
             resource: 4,
+        });
+        round_event(&EventMsg::PdfSaved {
+            path: "/tmp/mde-page.pdf".to_owned(),
+            ok: true,
+        });
+        round_event(&EventMsg::PdfSaved {
+            path: "/tmp/mde-page.pdf".to_owned(),
+            ok: false,
         });
     }
 
