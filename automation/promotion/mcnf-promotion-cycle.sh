@@ -119,8 +119,29 @@ latest_gate_evidence() {
     | tail -1
 }
 
+missing_gate_list() {
+  local sha="$1"; shift
+  local stage missing="" sep=""
+  for stage in "$@"; do
+    if ! latest_gate_evidence "$stage" "$sha" >/dev/null; then
+      missing="${missing}${sep}${stage}"
+      sep=","
+    fi
+  done
+  printf '%s\n' "${missing:-none}"
+}
+
 status_gate_evidence() {
-  local sha="$1" stage line result gate_ts detail
+  local sha="$1" stage line result gate_ts detail farm_missing post_missing
+  farm_missing="$(missing_gate_list "$sha" build l1 l2 l3 l4 eagle do)"
+  post_missing="$(missing_gate_list "$sha" live-smoke live-audit media-verify fd-soak)"
+  if [ "$farm_missing" = none ] && [ "$post_missing" = none ]; then
+    echo "  candidate_gate_evidence: green"
+  else
+    echo "  candidate_gate_evidence: red"
+  fi
+  echo "  candidate_gate_missing_farm: $farm_missing"
+  echo "  candidate_gate_missing_postroll: $post_missing"
   echo "  promotion_evidence_log: $PROMOTION_EVIDENCE_LOG"
   echo "  promotion_evidence:"
   for stage in build l1 l2 l3 l4 eagle do live-smoke live-audit media-verify fd-soak; do
