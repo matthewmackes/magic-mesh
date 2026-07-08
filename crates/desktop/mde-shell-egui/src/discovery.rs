@@ -1,5 +1,5 @@
-//! The shell's **broker-session wire path** — the `SessionRequest::Open` mirror
-//! every desktop connect publishes through (E12-5b's surviving half).
+//! The shell's **broker-session wire path** — the `SessionRequest` mirror every
+//! desktop connect publishes through (E12-5b's surviving half).
 //!
 //! E12-5b landed two things: a flat remote-desktop picker list and the wire
 //! contract its Connect emitted. The picker face is **superseded by the Desktop
@@ -15,14 +15,13 @@
 //! `mde-bus`, never the `mackesd` daemon crate (whose `SessionRequest` is gated
 //! behind the heavy `async-services` feature: tokio / zbus / etcd). So, exactly
 //! as [`crate::datacenter`]'s `Lifecycle` mirrors the VM-lifecycle action, the
-//! local [`ConnectRequest`] serialises to the identical `action/vdi/session`
+//! local [`SessionRequest`] serialises to the identical `action/vdi/session`
 //! body the broker's `parse_request` decodes — reusing the contract, not
 //! inventing a parallel one (a round-trip test pins the shape).
 //!
-//! The live cross-peer serving is **gated** downstream in the broker (its
-//! `MeshSessionStore` returns a typed gated error); publishing the `Open`
-//! request is the reachable near half of the flow, so these paths are real
-//! callers — never a placeholder (§7).
+//! The broker's roaming-session store is live and Syncthing-backed; the shell
+//! publishes `open` plus live transport lifecycle (`active` / `disconnect` /
+//! `close`) through this one path so the rail and broker fold the same roster.
 
 use std::path::Path;
 
@@ -32,22 +31,18 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 /// The broker's session-lifecycle topic — the exact wire topic
-/// `mackesd::workers::session_broker::ACTION_TOPIC` drains. We publish the `Open`
-/// verb here; the leader-gated broker folds it into the roaming-session roster.
+/// `mackesd::workers::session_broker::ACTION_TOPIC` drains. The leader-gated
+/// broker folds these verbs into the roaming-session roster.
 const ACTION_TOPIC: &str = "action/vdi/session";
 
-// ─────────────────────────── the Open request (wire mirror) ───────────────────────────
+// ───────────────────────── session lifecycle wire mirror ─────────────────────────
 
-/// The shell's local mirror of the broker's `SessionRequest::Open` — the ONE
-/// session verb the shell emits. See the module doc for why this is a wire
-/// mirror rather than a direct dependency on the daemon's type (§6). The
-/// remaining verbs (`Active` / `Disconnect` / `Close`) are the broker's own
-/// lifecycle transitions, not the shell's to publish, so only `Open` is
-/// mirrored — exactly as `datacenter::Lifecycle` mirrors only the verbs the
-/// Fleet view emits.
+/// The shell's local mirror of the broker's `SessionRequest` verbs it emits.
+/// See the module doc for why this is a wire mirror rather than a direct
+/// dependency on the daemon's type (§6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
-enum ConnectRequest {
+enum SessionRequest {
     /// Open a new session for `vm_id` on `serving_peer`, driven by `client_peer`
     /// (this node's shell). Serialises to the `SessionRequest::Open` body shape.
     Open {
@@ -63,15 +58,40 @@ enum ConnectRequest {
         /// The peer whose shell drives the desktop — this node.
         client_peer: String,
     },
+    /// Mark a brokered desktop session live after the transport connects.
+    Active {
+        /// The session id minted by the matching `Open`.
+        id: String,
+    },
+    /// Mark a live brokered desktop session disconnected after the transport ends.
+    Disconnect {
+        /// The session id minted by the matching `Open`.
+        id: String,
+    },
+    /// Close a brokered desktop session when the operator abandons it.
+    Close {
+        /// The session id minted by the matching `Open`.
+        id: String,
+    },
 }
 
-impl ConnectRequest {
+impl SessionRequest {
     /// Serialise to the `action/vdi/session` request body. A fixed derive-backed
     /// shape ⇒ serialisation can't realistically fail; an empty body (never
     /// produced here) would simply be rejected by the broker's parser.
     fn to_body(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+}
+
+/// The minted `Open` body plus its session id, so callers can attach the same id
+/// to subsequent live transport lifecycle messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenPublication {
+    /// The broker roster key.
+    pub(crate) id: String,
+    /// The exact wire body published to `action/vdi/session`.
+    pub(crate) body: String,
 }
 
 /// Mint the opaque session id the broker keys the roster on. Production uses a
@@ -142,15 +162,76 @@ pub(crate) fn publish_open(
     vm_id: &str,
     client_peer: &str,
 ) -> String {
-    let body = ConnectRequest::Open {
-        id: mint_session_id(vm_id, now_ms()),
+    publish_open_record(bus_root, last_error, serving_peer, vm_id, client_peer).body
+}
+
+/// Build + publish `Open`, returning both the body and minted session id.
+pub(crate) fn publish_open_record(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    serving_peer: &str,
+    vm_id: &str,
+    client_peer: &str,
+) -> OpenPublication {
+    let id = mint_session_id(vm_id, now_ms());
+    let body = SessionRequest::Open {
+        id: id.clone(),
         serving_peer: serving_peer.to_string(),
         vm_id: vm_id.to_string(),
         client_peer: client_peer.to_string(),
     }
     .to_body();
     publish(bus_root, last_error, &body);
+    OpenPublication { id, body }
+}
+
+fn publish_lifecycle(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    request: SessionRequest,
+) -> String {
+    let body = request.to_body();
+    publish(bus_root, last_error, &body);
     body
+}
+
+/// Publish the `Active` lifecycle transition for a brokered desktop session.
+pub(crate) fn publish_active(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    id: &str,
+) -> String {
+    publish_lifecycle(
+        bus_root,
+        last_error,
+        SessionRequest::Active { id: id.to_string() },
+    )
+}
+
+/// Publish the `Disconnect` lifecycle transition for a brokered desktop session.
+pub(crate) fn publish_disconnect(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    id: &str,
+) -> String {
+    publish_lifecycle(
+        bus_root,
+        last_error,
+        SessionRequest::Disconnect { id: id.to_string() },
+    )
+}
+
+/// Publish the `Close` lifecycle transition for a brokered desktop session.
+pub(crate) fn publish_close(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    id: &str,
+) -> String {
+    publish_lifecycle(
+        bus_root,
+        last_error,
+        SessionRequest::Close { id: id.to_string() },
+    )
 }
 
 /// NOTIFY-CHAT-4 — the Chat surface's per-contact **Remote Control** reuses this
@@ -176,7 +257,7 @@ mod tests {
         // Pin the wire contract: internally `op`-tagged, snake_case — byte-for-byte
         // what the broker's `#[serde(tag = "op", rename_all = "snake_case")]`
         // `SessionRequest` expects, so this mirror can't silently drift from it.
-        let body = ConnectRequest::Open {
+        let body = SessionRequest::Open {
             id: mint_session_id("vm-y", 42),
             serving_peer: "peer-x".to_string(),
             vm_id: "vm-y".to_string(),
@@ -186,6 +267,31 @@ mod tests {
         assert_eq!(
             body,
             r#"{"op":"open","id":"vdi-42-vm-y","serving_peer":"peer-x","vm_id":"vm-y","client_peer":"me"}"#
+        );
+    }
+
+    #[test]
+    fn lifecycle_requests_serialise_to_the_broker_shapes() {
+        assert_eq!(
+            SessionRequest::Active {
+                id: "vdi-1-web".to_string()
+            }
+            .to_body(),
+            r#"{"op":"active","id":"vdi-1-web"}"#
+        );
+        assert_eq!(
+            SessionRequest::Disconnect {
+                id: "vdi-1-web".to_string()
+            }
+            .to_body(),
+            r#"{"op":"disconnect","id":"vdi-1-web"}"#
+        );
+        assert_eq!(
+            SessionRequest::Close {
+                id: "vdi-1-web".to_string()
+            }
+            .to_body(),
+            r#"{"op":"close","id":"vdi-1-web"}"#
         );
     }
 
@@ -210,6 +316,44 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("No mesh Bus")),
             "no Bus dir surfaces an error, not a panic"
+        );
+    }
+
+    #[test]
+    fn publish_open_record_returns_the_minted_session_id() {
+        let mut last_error = None;
+        let publication =
+            publish_open_record(None, &mut last_error, "node-b", "db1", "client-node");
+        let v: serde_json::Value = serde_json::from_str(&publication.body).unwrap_or_default();
+        assert_eq!(Some(publication.id.as_str()), v["id"].as_str());
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("No mesh Bus")),
+            "no Bus dir surfaces an error, not a panic"
+        );
+    }
+
+    #[test]
+    fn publish_lifecycle_verbs_return_the_broker_body() {
+        let mut last_error = None;
+        assert_eq!(
+            publish_active(None, &mut last_error, "vdi-7-oak"),
+            r#"{"op":"active","id":"vdi-7-oak"}"#
+        );
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("No mesh Bus")),
+            "no Bus dir surfaces an error, not a panic"
+        );
+        assert_eq!(
+            publish_disconnect(None, &mut last_error, "vdi-7-oak"),
+            r#"{"op":"disconnect","id":"vdi-7-oak"}"#
+        );
+        assert_eq!(
+            publish_close(None, &mut last_error, "vdi-7-oak"),
+            r#"{"op":"close","id":"vdi-7-oak"}"#
         );
     }
 

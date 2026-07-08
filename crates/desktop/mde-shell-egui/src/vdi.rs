@@ -24,6 +24,8 @@ use mde_vdi_vnc::VncSession;
 
 use crate::auth::DesktopAuth;
 
+use std::path::PathBuf;
+
 #[cfg(feature = "live-vdi")]
 use {
     mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
@@ -135,6 +137,27 @@ impl RequestedTarget {
     }
 }
 
+/// Broker lifecycle metadata attached to a mesh-brokered desktop connect. The
+/// Chooser mints this with the broker `Open`; the live transport publishes
+/// `active` / `disconnect` / `close` against the same id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrokerSessionLifecycle {
+    /// The broker roster key.
+    pub(crate) id: String,
+    /// The local Bus root that accepts `action/vdi/session` lifecycle writes.
+    pub(crate) bus_root: Option<PathBuf>,
+}
+
+impl BrokerSessionLifecycle {
+    /// Attach the minted broker id to the Bus root used for its `Open`.
+    pub(crate) fn new(id: impl Into<String>, bus_root: Option<PathBuf>) -> Self {
+        Self {
+            id: id.into(),
+            bus_root,
+        }
+    }
+}
+
 /// The desktop protocol a connect routes to — the VDI tier's *routable* set. The
 /// Chooser's wire [`crate::chooser::Protocol`] additionally carries an `Unknown`
 /// badge for a tag this build can't render; only a routable protocol reaches a
@@ -241,6 +264,9 @@ pub(crate) struct ConnectRequest {
     /// secret is redacted from `Debug` ([`DesktopAuth`]), so this request is
     /// log-safe.
     pub auth: DesktopAuth,
+    /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
+    /// off-mesh endpoints leave this empty.
+    pub broker_session: Option<BrokerSessionLifecycle>,
 }
 
 impl ConnectRequest {
@@ -259,7 +285,14 @@ impl ConnectRequest {
             display,
             monitors,
             auth,
+            broker_session: None,
         }
+    }
+
+    /// Attach the broker session lifecycle id minted by discovery.
+    pub(crate) fn with_broker_session(mut self, broker: BrokerSessionLifecycle) -> Self {
+        self.broker_session = Some(broker);
+        self
     }
 }
 
@@ -429,6 +462,9 @@ pub(crate) struct VdiState {
     /// frame arrives.
     #[cfg(feature = "live-vdi")]
     live_status: Option<String>,
+    /// Broker lifecycle currently marked active by the live transport.
+    #[cfg(feature = "live-vdi")]
+    active_broker_session: Option<BrokerSessionLifecycle>,
 }
 
 impl VdiState {
@@ -462,6 +498,7 @@ impl VdiState {
         #[cfg(feature = "live-vdi")]
         {
             self.live_status = None;
+            self.publish_broker_close_if_active();
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
             }
@@ -496,6 +533,7 @@ impl VdiState {
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
             }
+            self.publish_broker_close_if_active();
             self.live_status = None;
             self.texture = None;
             self.incoming = None;
@@ -508,21 +546,89 @@ impl VdiState {
         let Some(live) = self.live_rdp.as_ref() else {
             return;
         };
+        let mut publish_active = false;
+        let mut publish_disconnect = false;
         while let Ok(event) = live.event_rx.try_recv() {
             match event {
                 LiveRdpEvent::Connected(target) => {
                     self.live_status = Some(format!("Live RDP connected to {target}"));
+                    publish_active = true;
                 }
                 LiveRdpEvent::Frame(frame) => {
                     self.incoming = Some(frame);
                 }
                 LiveRdpEvent::Error(reason) => {
                     self.live_status = Some(reason);
+                    publish_disconnect = true;
                 }
                 LiveRdpEvent::Ended(reason) => {
                     self.live_status = Some(format!("RDP session ended: {reason}"));
+                    publish_disconnect = true;
                 }
             }
+        }
+        if publish_active {
+            self.publish_broker_active();
+        }
+        if publish_disconnect {
+            self.publish_broker_disconnect_if_active();
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn publish_broker_active(&mut self) {
+        if self.active_broker_session.is_some() {
+            return;
+        }
+        let Some(broker) = self
+            .requested
+            .as_ref()
+            .and_then(|request| request.broker_session.clone())
+        else {
+            return;
+        };
+        let mut last_error = None;
+        crate::discovery::publish_active(
+            broker.bus_root.as_deref(),
+            &mut last_error,
+            broker.id.as_str(),
+        );
+        if let Some(reason) = last_error {
+            self.live_status = Some(format!("Broker lifecycle gated: {reason}"));
+        } else {
+            self.active_broker_session = Some(broker);
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn publish_broker_disconnect_if_active(&mut self) {
+        let Some(broker) = self.active_broker_session.take() else {
+            return;
+        };
+        let mut last_error = None;
+        crate::discovery::publish_disconnect(
+            broker.bus_root.as_deref(),
+            &mut last_error,
+            broker.id.as_str(),
+        );
+        if let Some(reason) = last_error {
+            self.live_status = Some(format!("Broker lifecycle gated: {reason}"));
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn publish_broker_close_if_active(&mut self) {
+        let Some(broker) = self.active_broker_session.take() else {
+            return;
+        };
+        let mut last_error = None;
+        crate::discovery::publish_close(
+            broker.bus_root.as_deref(),
+            &mut last_error,
+            broker.id.as_str(),
+        );
+        if let Some(reason) = last_error {
+            self.live_status = Some(format!("Broker lifecycle gated: {reason}"));
         }
     }
 }

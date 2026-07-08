@@ -61,7 +61,8 @@ use crate::auth::{
 };
 use crate::dock::DesktopRailSource;
 use crate::vdi::{
-    ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol,
+    BrokerSessionLifecycle, ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan,
+    RequestedTarget, VdiProtocol,
 };
 use chooser_prefs::{unix_millis, ChooserPrefs, ManualEntry};
 
@@ -2064,17 +2065,24 @@ impl ChooserState {
         // The resolved auth mode, stated honestly on the note (§7) — SSO vs a
         // sealed credential. `summary()` is log-safe: it never carries the secret.
         let auth_summary = auth.summary();
+        let mut broker_session = None;
         if source.origin.is_mesh_brokered() {
             // A peer seat's roster row has `name == node`, so `name` is the
             // broker's vm_id handle for seats AND VMs (the same handle the
             // E12-5b picker and Chat's Remote Control publish).
-            crate::discovery::publish_open(
+            let publication = crate::discovery::publish_open_record(
                 self.bus_root.as_deref(),
                 &mut self.last_error,
                 &source.node,
                 &source.name,
                 &self.client_peer,
             );
+            if self.last_error.is_none() {
+                broker_session = Some(BrokerSessionLifecycle::new(
+                    publication.id,
+                    self.bus_root.clone(),
+                ));
+            }
             self.note = Some(format!(
                 "Requested {} from {} via {} ({} \u{00B7} {}) — brokering over the mesh; \
                  authenticating with {auth_summary}.",
@@ -2119,14 +2127,18 @@ impl ChooserState {
                 note.push_str(" The Spice client lands in CHOOSER-5 — no session is faked.");
             }
         }
-        self.connect = Some(ConnectRequest::new(
+        let mut request = ConnectRequest::new(
             RequestedTarget::new(source.node.clone(), source.name.clone())
                 .with_endpoint(source.endpoint_for(protocol)),
             protocol,
             display,
             monitors,
             auth,
-        ));
+        );
+        if let Some(broker_session) = broker_session {
+            request = request.with_broker_session(broker_session);
+        }
+        self.connect = Some(request);
         // CHOOSER-9 — a genuine connect makes this desktop "recently used"; the
         // record roams so the operator's recents follow them to any seat.
         self.prefs
@@ -3739,7 +3751,38 @@ mod tests {
         assert_eq!(node, "client-node");
         // The broker publish had no Bus root → the honest inline error (mesh peer),
         // and the note names SSO, never a credential.
+        assert!(
+            req.broker_session.is_none(),
+            "no lifecycle handle is attached when the Open publish had no Bus"
+        );
         assert!(state.note.as_deref().is_some_and(|n| n.contains("SSO")));
+    }
+
+    #[test]
+    fn a_mesh_peer_connect_keeps_the_published_broker_session_id() {
+        let dir = temp_bus_dir("vdi-open");
+        let mut state = state_with_bus(
+            Some(roster(vec![source("peer:oak", "oak", &[Protocol::Rdp])])),
+            Some(dir.clone()),
+        );
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        state.confirm_connect(&sources);
+        let req = state.take_connect().expect("SSO connects straight through");
+        let broker = req
+            .broker_session
+            .as_ref()
+            .expect("successful broker Open attaches lifecycle metadata");
+        let persist = mde_bus::persist::Persist::open(dir.clone()).expect("open bus");
+        let msgs = persist
+            .list_since("action/vdi/session", None)
+            .expect("list");
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().expect("body");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["op"], "open");
+        assert_eq!(v["id"], broker.id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
