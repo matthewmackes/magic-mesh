@@ -121,6 +121,15 @@ worklist_next_candidates() {
   ' "$ROOT/docs/WORKLIST.md"
 }
 
+worklist_farm_job_count() {
+  local farm_jobs="$ROOT/automation/lib/farm-jobs.sh"
+  if [ ! -x "$farm_jobs" ]; then
+    printf 'unavailable\n'
+    return 0
+  fi
+  "$farm_jobs" active 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' '
+}
+
 json_value() {
   local line="$1" key="$2"
   printf '%s\n' "$line" | sed -n "s/.*\"$key\":\"\\([^\"]*\\)\".*/\\1/p"
@@ -554,15 +563,17 @@ declaration_status() {
 }
 
 status_report() {
-  local rpm version sha open_count active_breakdown next_work
+  local rpm version sha open_count active_breakdown next_work farm_jobs
   rpm="$(latest_rpm || true)"
   open_count="$(worklist_open_count)"
   active_breakdown="$(worklist_active_breakdown)"
   next_work="$(worklist_next_candidates "${MCNF_STATUS_NEXT_WORK:-8}" | sed 's/^/    - /')"
+  farm_jobs="$(worklist_farm_job_count)"
   cat <<EOF
 MCNF promotion status
   worklist_open_or_in_progress: $open_count
   worklist_active_breakdown: $active_breakdown
+  worklist_farm_jobs_active: $farm_jobs
   worklist_next_unblocked:
 ${next_work:-    - none}
   release_declaration: $(declaration_status)
