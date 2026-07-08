@@ -130,6 +130,22 @@ worklist_farm_job_count() {
   "$farm_jobs" active 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' '
 }
 
+worklist_farm_job_breakdown() {
+  local farm_jobs="$ROOT/automation/lib/farm-jobs.sh"
+  if [ ! -x "$farm_jobs" ]; then
+    printf 'unavailable\n'
+    return 0
+  fi
+  "$farm_jobs" list 2>/dev/null | awk -F'\t' '
+    $2 == "open" || $2 == "prog" { active++ }
+    $2 == "blocked" { blocked++ }
+    NF { total++ }
+    END {
+      printf "active=%d blocked=%d total=%d", active + 0, blocked + 0, total + 0
+    }
+  '
+}
+
 json_value() {
   local line="$1" key="$2"
   printf '%s\n' "$line" | sed -n "s/.*\"$key\":\"\\([^\"]*\\)\".*/\\1/p"
@@ -563,17 +579,19 @@ declaration_status() {
 }
 
 status_report() {
-  local rpm version sha open_count active_breakdown next_work farm_jobs
+  local rpm version sha open_count active_breakdown next_work farm_jobs farm_job_breakdown
   rpm="$(latest_rpm || true)"
   open_count="$(worklist_open_count)"
   active_breakdown="$(worklist_active_breakdown)"
   next_work="$(worklist_next_candidates "${MCNF_STATUS_NEXT_WORK:-8}" | sed 's/^/    - /')"
   farm_jobs="$(worklist_farm_job_count)"
+  farm_job_breakdown="$(worklist_farm_job_breakdown)"
   cat <<EOF
 MCNF promotion status
   worklist_open_or_in_progress: $open_count
   worklist_active_breakdown: $active_breakdown
   worklist_farm_jobs_active: $farm_jobs
+  worklist_farm_jobs: $farm_job_breakdown
   worklist_next_unblocked:
 ${next_work:-    - none}
   release_declaration: $(declaration_status)
