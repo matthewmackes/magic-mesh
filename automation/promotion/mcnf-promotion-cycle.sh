@@ -121,9 +121,10 @@ latest_gate_evidence() {
 
 missing_gate_list() {
   local sha="$1"; shift
-  local stage missing="" sep=""
+  local stage missing="" sep="" line
   for stage in "$@"; do
-    if ! latest_gate_evidence "$stage" "$sha" >/dev/null; then
+    line="$(latest_gate_evidence "$stage" "$sha" || true)"
+    if [ -z "$line" ] || [ "$(json_value "$line" result)" != pass ]; then
       missing="${missing}${sep}${stage}"
       sep=","
     fi
@@ -337,11 +338,21 @@ promote_eagle() {
 
 live_smoke() {
   log "Live mesh smoke"
-  ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@165.227.188.238 \
+  local out
+  if ! out="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@165.227.188.238 \
     'ETCDCTL_API=3 etcdctl --endpoints=http://10.42.0.1:2379 endpoint health --cluster &&
      mackesd peers &&
      df -h /run | awk "NR==2" &&
-     test "$(journalctl -u mackesd --since "70 sec ago" | grep -Eic "SIGABRT|ABRT|dumped|coredump")" = 0'
+     test "$(journalctl -u mackesd --since "70 sec ago" | grep -Eic "SIGABRT|ABRT|dumped|coredump")" = 0')"; then
+    printf '%s\n' "$out"
+    record_gate live-smoke fail "live-mesh-command"
+    return 1
+  fi
+  printf '%s\n' "$out"
+  if printf '%s\n' "$out" | grep -Eq '\b(degraded|critical|unreachable|offline)\b'; then
+    record_gate live-smoke fail "peer-health"
+    return 1
+  fi
   record_gate live-smoke pass "live-mesh"
 }
 
