@@ -5426,10 +5426,7 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     // page only after the image has focus, so address-bar/chrome typing does not
     // leak into the helper.
     let ppp = ui.ctx().pixels_per_point();
-    let mut page_focused = state
-        .tabs
-        .get(active)
-        .is_some_and(|tab| tab.page_focused)
+    let mut page_focused = state.tabs.get(active).is_some_and(|tab| tab.page_focused)
         || resp.has_focus()
         || resp.clicked()
         || resp.dragged();
