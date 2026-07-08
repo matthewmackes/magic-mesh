@@ -22,6 +22,40 @@ use ulid::Ulid;
 
 use crate::alert::Severity;
 
+/// A typed inline action carried by a folded alert card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertActionKind {
+    /// A non-destructive verb that may fire immediately.
+    Safe,
+    /// A destructive verb; the UI must send an armed confirmation before the
+    /// worker executes it.
+    Destructive,
+    /// Mark this alert handled for the local seat.
+    Ack,
+    /// Temporarily hush this alert for the local seat.
+    Snooze,
+}
+
+/// One configured action button for a folded alert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertAction {
+    /// Stable action id inside this alert.
+    pub id: String,
+    /// Button label.
+    pub label: String,
+    /// The Bus verb this action drives, when it drives an external verb.
+    #[serde(default)]
+    pub verb: Option<String>,
+    /// The action semantics, including destructive arming.
+    #[serde(default = "default_alert_action_kind")]
+    pub kind: AlertActionKind,
+}
+
+const fn default_alert_action_kind() -> AlertActionKind {
+    AlertActionKind::Safe
+}
+
 /// A stable, sortable message id: a **ULID minted from the injected message
 /// timestamp** (lock 8/22 ordering).
 ///
@@ -107,6 +141,9 @@ pub enum MessageKind {
         /// An optional inline action verb the card offers (e.g.
         /// `action/shell/goto`), `None` when the alert is informational only.
         action_verb: Option<String>,
+        /// Typed, configurable inline actions for the alert.
+        #[serde(default)]
+        actions: Vec<AlertAction>,
     },
     /// A file offered to the conversation via the mesh transfer (lock 15, reuses
     /// `mde-files` Send-To). The bytes never live here — only the offer.
@@ -335,6 +372,7 @@ mod tests {
                 flag: "firewall".into(),
                 fields,
                 action_verb: Some("action/shell/goto".into()),
+                actions: Vec::new(),
             },
             MessageKind::File {
                 name: "iso.img".into(),

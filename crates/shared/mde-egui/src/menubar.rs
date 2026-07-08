@@ -505,7 +505,12 @@ fn render_item<Id: Clone>(ui: &mut Ui, item: &Item<Id>, picked: &mut Option<Id>)
         Some(false) => format!("\u{2003}{}", item.label),
         None => item.label.clone(),
     };
-    let mut button = Button::new(label);
+    let color = if item.enabled {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let mut button = Button::new(RichText::new(label).color(color));
     if let Some(hint) = &item.shortcut {
         button = button.shortcut_text(hint);
     }
@@ -583,8 +588,8 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
 #[allow(clippy::float_cmp, clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::{
-        display_title, mnemonic_key, motion_secs, resolve_mnemonics, ChipTone, Entry, Item, Menu,
-        MenuBar, MenuBarModel, StatusChip, BAR_HEIGHT,
+        BAR_HEIGHT, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip, display_title,
+        mnemonic_key, motion_secs, resolve_mnemonics,
     };
     use crate::{Motion, Style};
 
@@ -767,7 +772,7 @@ mod tests {
 
     #[test]
     fn menu_bar_renders_headless_and_is_idle_without_a_click() {
-        use egui::{pos2, vec2, Rect};
+        use egui::{Rect, pos2, vec2};
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let menus = sample_menus();

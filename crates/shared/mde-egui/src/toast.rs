@@ -1,4 +1,4 @@
-//! `toast` — the **KIRON** lower-third "chyron" toast pattern (governance §4/§6;
+//! `toast` — the **KIRON** transient feedback state machine (governance §4/§6;
 //! `docs/design/kiron-toast-pattern.md`, KIRON-1).
 //!
 //! "Kiron" = *chyron*, the TV-news lower-third. This is the ONE canonical
@@ -17,8 +17,8 @@
 //!   level channel. Time is **injected** ([`ToastHost::tick`] takes the elapsed
 //!   delta) — the model never reads a wall clock, so it is unit-tested without a GPU
 //!   or a clock.
-//! - [`ToastHost::chyron`] / [`ToastHost::osd`] — the two renders over `Style` +
-//!   `Motion`: a lower-third alert band and a center-bottom level bar.
+//! - [`ToastHost::chyron`] / [`ToastHost::osd`] — the legacy alert-band renderer
+//!   plus the active Carbon OSD pill over `Style` + `Motion`.
 //!
 //! **Out of scope here (KIRON-2, shell-side):** the `event/toast/show` Bus lane, the
 //! notification sound, DND / focus-mute suppression, and executing an action's verb.
@@ -36,7 +36,7 @@ use crate::{Motion, Style};
 pub const DWELL_INFO: Duration = Duration::from_secs(4);
 /// Default on-screen dwell for a [`Severity::Warning`] chyron — worth reading.
 pub const DWELL_WARNING: Duration = Duration::from_secs(7);
-/// Dwell for the center-bottom OSD level bar — a quick hardware-feedback flash.
+/// Dwell for the centered OSD pill — a quick hardware-feedback flash.
 pub const DWELL_OSD: Duration = Duration::from_millis(1500);
 
 // Stable egui ids for the two floating areas + their motion animations. String
@@ -65,9 +65,9 @@ impl Severity {
     #[must_use]
     pub const fn color(self) -> Color32 {
         match self {
-            Self::Info => Style::ACCENT,
-            Self::Warning => Style::WARN,
-            Self::Critical => Style::DANGER,
+            Self::Info => Style::SUPPORT_INFO,
+            Self::Warning => Style::SUPPORT_WARNING,
+            Self::Critical => Style::SUPPORT_ERROR,
         }
     }
 
@@ -133,7 +133,7 @@ impl OsdLevel {
 pub enum Tier {
     /// A lower-third alert chyron at the given severity.
     Alert(Severity),
-    /// A center-bottom hardware-level OSD (volume / brightness), replace-in-place.
+    /// A centered hardware-level OSD (volume / brightness), replace-in-place.
     Osd(OsdLevel),
 }
 
@@ -217,7 +217,7 @@ impl Toast {
     }
 
     /// A hardware-level OSD toast (volume / brightness). Carries no host/flag/
-    /// headline — it renders as the center-bottom level bar, not a chyron.
+    /// headline — it renders as the centered pill, not a chyron.
     #[must_use]
     pub const fn osd(level: OsdLevel) -> Self {
         Self {
@@ -342,7 +342,7 @@ impl ToastHost {
         }
     }
 
-    /// Flash the center-bottom OSD level bar, **replacing** any current one in
+    /// Flash the centered OSD pill, **replacing** any current one in
     /// place. Independent of the alert queue (a direct hardware-feedback path).
     pub fn flash_osd(&mut self, level: OsdLevel) {
         self.osd = Some(ActiveOsd {
@@ -494,7 +494,7 @@ impl ToastHost {
         }
     }
 
-    /// Paint the center-bottom OSD level bar for the current flash (a quick rise on
+    /// Paint the centered OSD pill for the current flash (a quick rise on
     /// [`Motion::FAST`]). Instant + interaction-free — no queue, no dismissal.
     pub fn osd(&mut self, ctx: &Context) {
         let present = self.osd.is_some();
@@ -689,20 +689,23 @@ fn paint_chyron_controls(
     out
 }
 
-/// Paint the center-bottom OSD level bar (icon glyph + level track).
+/// Paint the centered Carbon OSD pill (glyph + level track + percent).
 fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
     let screen = ui.ctx().screen_rect();
-    let width = Style::SP_XL * 8.0;
-    let height = Style::SP_XL;
+    let width = Style::SP_XL * 7.5;
+    let height = Style::SP_XL * 1.35;
     let rise = (1.0 - t) * Style::SP_M;
-    let center = pos2(
-        screen.center().x,
-        Style::SP_XL.mul_add(-2.0, screen.bottom() + rise),
-    );
+    let center = pos2(screen.center().x, screen.center().y + rise);
     let rect = Rect::from_center_size(center, vec2(width, height));
 
     let painter = ui.painter().clone();
     painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
     painter.text(
         pos2(rect.left() + Style::SP_M, rect.center().y),
         Align2::LEFT_CENTER,
@@ -713,11 +716,11 @@ fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
 
     let track = Rect::from_min_max(
         pos2(
-            rect.left() + Style::SP_XL + Style::SP_M,
+            rect.left() + Style::SP_XL + Style::SP_L,
             rect.center().y - Style::SP_XS / 2.0,
         ),
         pos2(
-            rect.right() - Style::SP_M,
+            rect.right() - Style::SP_XL - Style::SP_M,
             rect.center().y + Style::SP_XS / 2.0,
         ),
     );
@@ -737,6 +740,13 @@ fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
         Style::ACCENT
     };
     painter.rect_filled(fill, Style::RADIUS, fill_color);
+    painter.text(
+        pos2(rect.right() - Style::SP_M, rect.center().y),
+        Align2::RIGHT_CENTER,
+        format!("{:.0}%", fraction * 100.0),
+        FontId::new(Style::SMALL, FontFamily::Monospace),
+        Style::TEXT,
+    );
 }
 
 #[cfg(test)]
@@ -766,6 +776,13 @@ mod tests {
         assert!(DWELL_INFO < DWELL_WARNING);
         assert!(Severity::Info < Severity::Warning);
         assert!(Severity::Warning < Severity::Critical);
+    }
+
+    #[test]
+    fn severity_colors_use_carbon_support_tokens() {
+        assert_eq!(Severity::Info.color(), Style::SUPPORT_INFO);
+        assert_eq!(Severity::Warning.color(), Style::SUPPORT_WARNING);
+        assert_eq!(Severity::Critical.color(), Style::SUPPORT_ERROR);
     }
 
     // ── queue: enqueue / show / advance ───────────────────────────────────────
@@ -1016,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn osd_tessellates_a_real_level_bar_when_present() {
+    fn osd_tessellates_a_real_centered_pill_when_present() {
         let ctx = headless_ctx();
         let mut host = ToastHost::new();
         host.flash_osd(OsdLevel::new(OsdKind::Volume, 0.65));
@@ -1024,7 +1041,7 @@ mod tests {
         let prims = frame(&ctx, |ctx| host.osd(ctx));
         assert!(
             !prims.is_empty(),
-            "the OSD level bar produced no geometry when flashing"
+            "the centered OSD pill produced no geometry when flashing"
         );
     }
 }

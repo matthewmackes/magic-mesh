@@ -16,9 +16,8 @@
 //!    egui's built-in `animate_bool` (E12 lock 10 — no bespoke motion engine, no
 //!    motion lint gate).
 //!
-//! **Accessibility is deferred** (E12 lock 11): the `accesskit` eframe feature is
-//! intentionally not enabled. egui/eframe keep an accesskit path to wire in a
-//! post-stabilization a11y epic; until then this harness ships without it.
+//! **Accessibility is opt-in**: the `accesskit` feature enables egui/eframe's
+//! AccessKit tree generation for shell surfaces that need screen-reader semantics.
 //!
 //! The crate has **zero retired-toolkit (Cosmic/iced) dependencies** — it depends
 //! only on `egui`/`eframe`. Both are re-exported so every surface resolves to the one
@@ -61,7 +60,7 @@ pub use gestures::{
 pub use menubar::{
     resolve_mnemonics, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip,
 };
-pub use motion::Motion;
+pub use motion::{Motion, StatusMotion};
 pub use runner::run_client;
 pub use style::{Density, GradeBand, Style};
 pub use toast::{

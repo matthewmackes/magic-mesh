@@ -441,9 +441,11 @@ mod tests {
         // All Fleet + one room per severity level.
         assert_eq!(descriptors.len(), 4);
         assert_eq!(descriptors[0].id, SYS_ALL_FLEET_ID);
-        assert!(descriptors
-            .iter()
-            .any(|d| d.id == severity_room_id(Severity::Critical)));
+        assert!(
+            descriptors
+                .iter()
+                .any(|d| d.id == severity_room_id(Severity::Critical))
+        );
         let mut all_fleet = Room::from_descriptor(descriptors[0].clone());
         assert_eq!(all_fleet.descriptor.kind, RoomKind::System);
         // Anyone self-joins; nobody — not even a would-be creator — dissolves it.

@@ -35,14 +35,14 @@ use std::{
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::{
-    Contact, Conversation, Message, MessageKind, NotifyPrefs, Presence, RoomDescriptor, RoomKind,
-    Roster, Severity,
+    AlertAction, AlertActionKind, Contact, Conversation, Message, MessageKind, NotifyPrefs,
+    Presence, RoomDescriptor, RoomKind, Roster, Severity,
 };
-use mde_egui::Style;
 use mde_egui::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
+use mde_egui::Style;
 
 use crate::discovery::request_host_desktop;
-use crate::toast_bridge::{TOAST_TOPIC, resolve_action};
+use crate::toast_bridge::{resolve_action, TOAST_TOPIC};
 
 /// Poll cadence — matches the chat worker's own 2s tick so the roster and open
 /// conversation stay live without a cold-start wait.
@@ -57,6 +57,10 @@ const ROOMS_TOPIC: &str = "state/chat/rooms";
 /// per-contact / per-room mute toggles read the TRUE persisted policy, not a
 /// local guess — latest-wins.
 const NOTIFY_TOPIC: &str = "state/chat/notify";
+/// Prefix for local alert acknowledgements written by the chat worker.
+const ALERT_ACK_PREFIX: &str = "state/chat/alert-ack/";
+/// Prefix for local alert snoozes written by the chat worker.
+const ALERT_SNOOZE_PREFIX: &str = "state/chat/alert-snooze/";
 /// Prefix for the per-conversation read-model the worker republishes each change.
 const CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The UI's outbound verb — a chat message to send.
@@ -76,6 +80,9 @@ const ACTION_CHAT_PRESENCE: &str = "action/chat/presence";
 const ACTION_CHAT_MUTE: &str = "action/chat/mute";
 /// The UI's notification-policy verb for fields outside the mute target matrix.
 const ACTION_CHAT_NOTIFY_PREFS: &str = "action/chat/notify-prefs";
+/// The UI's typed alert action verb. The chat worker validates the action kind
+/// and forwards safe/armed verbs to the real mackesd action lane.
+const ACTION_CHAT_ALERT_ACTION: &str = "action/chat/alert-action";
 /// The voice worker's dial verb (lock 15 — Call hands off to `mde-voice`). Chat is
 /// the launch point; a running SIP agent draining this is integration-gated.
 const ACTION_VOICE_DIAL: &str = "action/voice/dial";
@@ -208,9 +215,9 @@ const fn presence_color(p: Presence) -> Color32 {
 /// Map a folded-alert [`Severity`] to its `Style` color (§4).
 const fn severity_color(s: Severity) -> Color32 {
     match s {
-        Severity::Critical => Style::DANGER,
-        Severity::Warning => Style::WARN,
-        Severity::Info => Style::ACCENT,
+        Severity::Critical => Style::SUPPORT_ERROR,
+        Severity::Warning => Style::SUPPORT_WARNING,
+        Severity::Info => Style::SUPPORT_INFO,
     }
 }
 
@@ -318,6 +325,11 @@ pub(crate) struct ChatState {
     /// host first seen is watermarked at its current length so pre-existing
     /// backfilled history isn't flagged unread (unread = new since you looked).
     seen: BTreeMap<String, usize>,
+    /// Alert ids acknowledged on this seat; they stay in host history but leave
+    /// the aggregate Notifications lane until a new live alert arrives.
+    acked_alerts: BTreeSet<String>,
+    /// Alert ids snoozed on this seat; same local lane suppression as ack.
+    snoozed_alerts: BTreeSet<String>,
     /// View → feed filter (MENU-2): show folded system alerts in the timeline.
     show_alerts: bool,
     /// View → feed filter: show clipboard clips in the timeline.
@@ -347,6 +359,8 @@ impl Default for ChatState {
             new_room: String::new(),
             attach_path: String::new(),
             seen: BTreeMap::new(),
+            acked_alerts: BTreeSet::new(),
+            snoozed_alerts: BTreeSet::new(),
             show_alerts: true,
             show_clips: true,
             show_messages: true,
@@ -357,6 +371,15 @@ impl Default for ChatState {
 }
 
 impl ChatState {
+    /// Test seam for shell-level fixture integration.
+    #[cfg(test)]
+    pub(crate) fn with_bus_root(bus_root: PathBuf) -> Self {
+        Self {
+            bus_root: Some(bus_root),
+            ..Self::default()
+        }
+    }
+
     /// Poll the bus on the shared cadence and keep the repaint heartbeat alive.
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
@@ -383,6 +406,8 @@ impl ChatState {
         if let Some(prefs) = latest_json::<NotifyPrefs>(&persist, NOTIFY_TOPIC) {
             self.notify = Some(prefs);
         }
+        self.acked_alerts = latest_topic_suffixes(&persist, ALERT_ACK_PREFIX);
+        self.snoozed_alerts = latest_topic_suffixes(&persist, ALERT_SNOOZE_PREFIX);
         let Some(roster) = &self.roster else {
             return;
         };
@@ -454,6 +479,10 @@ impl ChatState {
                 conv.messages()
                     .iter()
                     .filter(|m| matches!(m.kind, MessageKind::Alert { .. }))
+                    .filter(|m| {
+                        !self.acked_alerts.contains(m.id.as_str())
+                            && !self.snoozed_alerts.contains(m.id.as_str())
+                    })
                     .map(|msg| NotificationItem {
                         host: host.as_str(),
                         msg,
@@ -468,6 +497,21 @@ impl ChatState {
                 .then_with(|| b.msg.id.as_str().cmp(a.msg.id.as_str()))
         });
         items
+    }
+
+    /// Test seam for shell-level integration fixtures: prove the aggregate
+    /// Notifications lane has folded live contact alert messages without relying
+    /// on first-seen unread watermarks.
+    #[cfg(test)]
+    pub(crate) fn notification_count_for_test(&self) -> usize {
+        self.notification_items().len()
+    }
+
+    /// Test seam for shell-level integration fixtures that need the aggregate
+    /// Notifications pane mounted in the rendered frame.
+    #[cfg(test)]
+    pub(crate) fn select_notifications_for_test(&mut self) {
+        self.selected = Some(Selection::Notifications);
     }
 
     /// Session-only unread count for the aggregate Notifications lane.
@@ -992,11 +1036,15 @@ impl ChatState {
         ui.add_space(Style::SP_XS);
         ui.horizontal_wrapped(|ui| {
             let mut dnd = self.dnd_active();
-            if ui
+            let dnd_resp = ui
                 .checkbox(&mut dnd, "Do Not Disturb")
-                .on_hover_text("Mute notification surfaces; the feed and Alerts pip still fill")
-                .changed()
-            {
+                .on_hover_text("Mute notification surfaces; the feed and Alerts pip still fill");
+            let _stable = ui.interact(
+                dnd_resp.rect,
+                notification_dnd_toggle_id(),
+                egui::Sense::hover(),
+            );
+            if dnd_resp.changed() {
                 self.set_dnd(dnd);
             }
 
@@ -1862,13 +1910,13 @@ mod menubar {
     #[cfg(test)]
     #[allow(clippy::panic)]
     mod tests {
-        use super::super::{ChatState, Selection, alert_key, dm_key};
+        use super::super::{alert_key, dm_key, ChatState, Selection};
         use super::{
-            MenuAction, PresenceChoice, build_menus, build_status, can_send, presence_tone,
+            build_menus, build_status, can_send, presence_tone, MenuAction, PresenceChoice,
         };
         use mde_chat::{Contact, Conversation, Message, NodeRole, Presence, Roster};
-        use mde_egui::ChipTone;
         use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
 
         /// A roster with self ("eagle") + an online peer ("nyc3") and one unread
         /// message from that peer — the smallest live-looking state.
@@ -2069,8 +2117,8 @@ mod menubar {
 
         #[test]
         fn menu_bar_renders_headless() {
+            use mde_egui::egui::{self, pos2, vec2, Rect};
             use mde_egui::Style;
-            use mde_egui::egui::{self, Rect, pos2, vec2};
             let ctx = egui::Context::default();
             Style::install(&ctx);
             let state = ChatState::default();
@@ -2147,6 +2195,19 @@ fn latest_json<T: serde::de::DeserializeOwned>(persist: &Persist, topic: &str) -
     serde_json::from_str::<T>(body).ok()
 }
 
+fn latest_topic_suffixes(persist: &Persist, prefix: &str) -> BTreeSet<String> {
+    persist
+        .list_topics()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|topic| {
+            let suffix = topic.strip_prefix(prefix)?;
+            (!suffix.is_empty() && latest_json::<serde_json::Value>(persist, &topic).is_some())
+                .then(|| suffix.to_string())
+        })
+        .collect()
+}
+
 /// Render a conversation's messages with a muted **day separator** whenever the
 /// civil (UTC) date changes — the authentic chat idiom — each row carrying its own
 /// HH:MM timestamp ([`message_row`]). Shared by the contact + room panes so both
@@ -2218,8 +2279,8 @@ fn fmt_date(ts_unix_ms: i64) -> String {
 /// Civil `(year, month, day)` from a day-count since the Unix epoch
 /// (1970-01-01), proleptic Gregorian. Howard Hinnant's `civil_from_days` — the
 /// one piece of calendar math the DRM seat needs with no time crate on the deps.
-/// Crate-visible: the taskbar tray's stacked clock (`tray::clock_lines`) folds
-/// its date line through this same fn, so the shell has ONE calendar (§6).
+/// Crate-visible: the shell chrome folds date lines through this same fn, so the
+/// shell has ONE calendar (§6).
 /// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form here.)
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
@@ -2328,6 +2389,7 @@ fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&Path>) {
             flag,
             fields,
             action_verb,
+            actions,
         } => {
             let title = fields
                 .get("summary")
@@ -2353,6 +2415,7 @@ fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&Path>) {
                     });
                 }
             });
+            alert_action_buttons(ui, bus_root, msg, actions);
         }
         // File offer — name + size and a download affordance. The bytes already
         // replicated into this node's mesh inbox (the sender's Send-To); "Save"
@@ -2408,6 +2471,7 @@ fn notification_row(ui: &mut egui::Ui, item: NotificationItem<'_>, bus_root: Opt
         flag,
         fields,
         action_verb,
+        actions,
     } = &item.msg.kind
     else {
         return;
@@ -2460,7 +2524,46 @@ fn notification_row(ui: &mut egui::Ui, item: NotificationItem<'_>, bus_root: Opt
                 });
             });
         }
+        alert_action_buttons(ui, bus_root, item.msg, actions);
     });
+}
+
+fn alert_action_buttons(
+    ui: &mut egui::Ui,
+    bus_root: Option<&Path>,
+    msg: &Message,
+    actions: &[AlertAction],
+) {
+    if actions.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        mde_egui::muted_note(ui, "actions");
+        for action in actions {
+            let mut label = action.label.clone();
+            let armed = action.kind == AlertActionKind::Destructive;
+            if armed {
+                label = format!("Arm {label}");
+            }
+            let id = alert_action_button_id(msg.id.as_str(), action.id.as_str());
+            let resp = ui.push_id(id, |ui| ui.button(label)).inner;
+            let _stable = ui.interact(resp.rect, id, egui::Sense::hover());
+            if resp.clicked() {
+                publish_alert_action(bus_root, msg, action, armed);
+            }
+        }
+    });
+}
+
+/// Stable ID for typed alert action buttons so integration tests can prove the
+/// action surface mounted without depending on button text layout.
+pub(crate) fn alert_action_button_id(message_id: &str, action_id: &str) -> egui::Id {
+    egui::Id::new(("chat-alert-action", message_id, action_id))
+}
+
+/// Stable ID for the aggregate Notifications lane DND toggle.
+pub(crate) fn notification_dnd_toggle_id() -> egui::Id {
+    egui::Id::new("chat-notifications-dnd-toggle")
 }
 
 /// Unique folded-alert source flags present in the aggregate Notifications lane.
@@ -2528,6 +2631,20 @@ fn mute_button(ui: &mut egui::Ui, bus_root: Option<&Path>, target: &str, id: &st
 fn publish_mute(bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
     let body = serde_json::json!({ "target": target, "id": id, "muted": muted }).to_string();
     publish(bus_root, ACTION_CHAT_MUTE, &body);
+}
+
+fn publish_alert_action(bus_root: Option<&Path>, msg: &Message, action: &AlertAction, armed: bool) {
+    let body = serde_json::json!({
+        "message_id": msg.id.as_str(),
+        "sender": msg.sender,
+        "action_id": action.id,
+        "label": action.label,
+        "kind": action.kind,
+        "verb": action.verb,
+        "armed": armed,
+    })
+    .to_string();
+    publish(bus_root, ACTION_CHAT_ALERT_ACTION, &body);
 }
 
 fn now_unix_ms() -> i64 {
@@ -2625,8 +2742,9 @@ mod tests {
         assert_eq!(presence_color(Presence::Dnd), Style::DANGER);
         assert_eq!(presence_color(Presence::Away), Style::WARN);
         assert_eq!(presence_color(Presence::Offline), Style::TEXT_DIM);
-        assert_eq!(severity_color(Severity::Critical), Style::DANGER);
-        assert_eq!(severity_color(Severity::Info), Style::ACCENT);
+        assert_eq!(severity_color(Severity::Critical), Style::SUPPORT_ERROR);
+        assert_eq!(severity_color(Severity::Warning), Style::SUPPORT_WARNING);
+        assert_eq!(severity_color(Severity::Info), Style::SUPPORT_INFO);
     }
 
     #[test]
@@ -2661,7 +2779,7 @@ mod tests {
     /// Proves the surface actually draws over real model state (no demo data).
     #[test]
     fn surface_mounts_and_tessellates_over_real_state() {
-        use mde_egui::egui::{Rect, pos2, vec2};
+        use mde_egui::egui::{pos2, vec2, Rect};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2743,7 +2861,7 @@ mod tests {
     /// same CPU paint path the DRM runner drives.
     #[test]
     fn every_message_kind_renders_its_action() {
-        use mde_egui::egui::{Rect, pos2, vec2};
+        use mde_egui::egui::{pos2, vec2, Rect};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2774,6 +2892,7 @@ mod tests {
                 flag: "storage".into(),
                 fields,
                 action_verb: Some("action/shell/goto/system".into()),
+                actions: Vec::new(),
             },
         ));
         conv.insert(Message::new(
@@ -2893,7 +3012,7 @@ mod tests {
     /// rooms surface and open without a live display (no demo data).
     #[test]
     fn room_surfaces_in_the_roster_and_its_pane_tessellates() {
-        use mde_egui::egui::{Rect, pos2, vec2};
+        use mde_egui::egui::{pos2, vec2, Rect};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2966,7 +3085,7 @@ mod tests {
     /// message. A non-positive time renders blank (never a fabricated "00:00").
     #[test]
     fn message_row_renders_a_timestamp() {
-        use mde_egui::egui::{Rect, pos2, vec2};
+        use mde_egui::egui::{pos2, vec2, Rect};
 
         // A known epoch: 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC.
         assert_eq!(fmt_hh_mm(1_700_000_000_000), "22:13");
@@ -3065,6 +3184,7 @@ mod tests {
                 flag: "security".into(),
                 fields: security_fields,
                 action_verb: None,
+                actions: Vec::new(),
             },
         ));
         let mut fra1 = Conversation::new("fra1");
@@ -3076,6 +3196,7 @@ mod tests {
                 flag: "compute".into(),
                 fields: BTreeMap::new(),
                 action_verb: None,
+                actions: Vec::new(),
             },
         ));
         fra1.insert(Message::text("fra1", 30, "human line"));
@@ -3088,6 +3209,7 @@ mod tests {
                 flag: "security".into(),
                 fields: BTreeMap::new(),
                 action_verb: None,
+                actions: Vec::new(),
             },
         ));
         state.convos.insert("nyc3".into(), nyc3);
@@ -3112,8 +3234,55 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_notification_leaves_the_lane_and_new_live_alert_reappears() {
+        let mut state = ChatState::default();
+        let mut first = Message::new(
+            "nyc3",
+            20,
+            MessageKind::Alert {
+                severity: Severity::Critical,
+                flag: "security".into(),
+                fields: BTreeMap::new(),
+                action_verb: None,
+                actions: Vec::new(),
+            },
+        );
+        first.id = mde_chat::MessageId::new("alert-old");
+        let mut second = Message::new(
+            "nyc3",
+            30,
+            MessageKind::Alert {
+                severity: Severity::Critical,
+                flag: "security".into(),
+                fields: BTreeMap::new(),
+                action_verb: None,
+                actions: Vec::new(),
+            },
+        );
+        second.id = mde_chat::MessageId::new("alert-new");
+
+        let mut conv = Conversation::new("nyc3");
+        conv.insert(first);
+        state.convos.insert("nyc3".into(), conv);
+        assert_eq!(state.notification_items().len(), 1);
+
+        state.acked_alerts.insert("alert-old".into());
+        assert_eq!(
+            state.notification_items().len(),
+            0,
+            "ack clears the aggregate Notifications lane"
+        );
+
+        let conv = state.convos.get_mut("nyc3").expect("conversation");
+        conv.insert(second);
+        let items = state.notification_items();
+        assert_eq!(items.len(), 1, "a newer live alert re-raises the lane");
+        assert_eq!(items[0].msg.id.as_str(), "alert-new");
+    }
+
+    #[test]
     fn notifications_lane_renders_and_opening_it_clears_session_unread() {
-        use mde_egui::egui::{Rect, pos2, vec2};
+        use mde_egui::egui::{pos2, vec2, Rect};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -3134,6 +3303,7 @@ mod tests {
                 flag: "storage".into(),
                 fields,
                 action_verb: None,
+                actions: Vec::new(),
             },
         ));
         state.convos.insert("nyc3".into(), conv);
@@ -3205,6 +3375,40 @@ mod tests {
         assert!(!mde_bus::dnd::load_default(&bus_root).active);
     }
 
+    #[test]
+    fn alert_action_helper_publishes_typed_worker_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus_root = tmp.path().join("bus");
+        let msg = Message::new(
+            "nyc3",
+            20,
+            MessageKind::Alert {
+                severity: Severity::Critical,
+                flag: "system".into(),
+                fields: BTreeMap::new(),
+                action_verb: None,
+                actions: Vec::new(),
+            },
+        );
+        let action = AlertAction {
+            id: "restart".into(),
+            label: "Restart".into(),
+            verb: Some("action/systemd/restart".into()),
+            kind: AlertActionKind::Safe,
+        };
+        publish_alert_action(Some(&bus_root), &msg, &action, false);
+
+        let persist = Persist::open(bus_root).expect("bus");
+        let msgs = persist
+            .list_since(ACTION_CHAT_ALERT_ACTION, None)
+            .expect("alert action");
+        let body = msgs.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(body.contains(r#""action_id":"restart""#));
+        assert!(body.contains(r#""kind":"safe""#));
+        assert!(body.contains(r#""verb":"action/systemd/restart""#));
+        assert!(body.contains(r#""armed":false"#));
+    }
+
     // ── MENU-2: the View feed filters + Unread Only ────────────────────────────
 
     /// The three feed-filter bands classify every message kind: alerts, clips,
@@ -3217,6 +3421,7 @@ mod tests {
             flag: "x".into(),
             fields: BTreeMap::new(),
             action_verb: None,
+            actions: Vec::new(),
         };
         let clip = MessageKind::Clipboard {
             preview: "p".into(),

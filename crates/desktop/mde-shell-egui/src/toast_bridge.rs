@@ -1,22 +1,21 @@
-//! `toast_bridge` — the shell side of the **KIRON** chyron pattern (KIRON-2;
+//! `toast_bridge` — the shell side of the **KIRON** alert/OSD lanes (KIRON-2;
 //! `docs/design/kiron-toast-pattern.md`, locks 7/8/10).
 //!
-//! KIRON-1 built the pure `mde_egui::toast::ToastHost` (queue + dwell + the two
-//! renders). This module is the shell's owner of that one host: it
+//! KIRON-1 built the pure `mde_egui::toast::ToastHost` (queue + dwell + OSD
+//! render). This module is the shell's owner of that one host: it
 //!
 //! * subscribes the typed Bus lane [`TOAST_TOPIC`] (`event/toast/show`) so any
-//!   node / worker — `mackesd`, a remote peer — can raise a chyron fleet-wide
+//!   node / worker — `mackesd`, a remote peer — can raise an alert fleet-wide
 //!   (lock 7), decoding each body into an alert [`Toast`];
 //! * drives the host once per frame ([`ToastBridge::drive`]): `tick` the real
-//!   frame delta, drain the lane, then paint the lower-third chyron + the
-//!   center-bottom OSD;
+//!   frame delta, drain the lane, then paint the centered OSD;
 //! * fires **one** severity-scaled notification sound on a new alert (lock 8),
 //!   the single sound authority — no double-beeps;
 //! * applies **suppression** (lock 10): DND / a per-VM-session focus mute silence
-//!   an Info/Warning chyron *and* its sound, audio-mute silences a non-critical's
+//!   an Info/Warning ambient alert *and* its sound, audio-mute silences a non-critical's
 //!   sound, but a **Critical always breaks through**; and
-//! * resolves a clicked action verb to shell navigation — KIRON-1 only *reported*
-//!   the verb; this is where it executes ([`resolve_action`]).
+//! * keeps the action-verb grammar centralized for Chat inline notification actions
+//!   ([`resolve_action`]).
 //!
 //! The wire body is a JSON boundary (local serde structs, not a `mackesd`
 //! dependency — §6 mesh/desktop boundary), the same pattern the Fleet plane and
@@ -34,7 +33,7 @@ use serde::Deserialize;
 use crate::dock::Surface;
 use crate::workbench::Plane;
 
-/// The typed Bus lane any node / worker raises a chyron on (lock 7). Flat — the
+/// The typed Bus lane any node / worker raises an alert on (lock 7). Flat — the
 /// originating host rides the body's `source_host`, never the topic.
 pub(crate) const TOAST_TOPIC: &str = "event/toast/show";
 
@@ -130,20 +129,20 @@ const fn alert_severity(toast: &Toast) -> Option<Severity> {
 /// The live suppression posture (lock 10), refreshed by the shell each frame.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Suppress {
-    /// Do-Not-Disturb — silences an Info/Warning chyron + its sound.
+    /// Do-Not-Disturb — silences an Info/Warning ambient alert + its sound.
     dnd: bool,
     /// A per-VM-session focus / gaming mute (a fullscreen guest is in front) —
-    /// silences an Info/Warning chyron + its sound.
+    /// silences an Info/Warning ambient alert + its sound.
     focus_mute: bool,
     /// The seat's audio output is muted — additionally silences a non-critical's
-    /// notification sound (the chyron still shows).
+    /// notification sound.
     muted: bool,
 }
 
 impl Suppress {
-    /// Whether an alert of this severity's **chyron** is suppressed. A Critical
+    /// Whether an alert of this severity's ambient push is suppressed. A Critical
     /// always breaks through (safety over immersion — lock 10).
-    const fn hides_chyron(self, severity: Severity) -> bool {
+    const fn hides_ambient_push(self, severity: Severity) -> bool {
         !matches!(severity, Severity::Critical) && (self.dnd || self.focus_mute)
     }
 
@@ -181,8 +180,8 @@ impl Chime for SystemChime {
     }
 }
 
-/// What a clicked chyron action resolves to — where KIRON-2 executes the verb the
-/// KIRON-1 render only reported.
+/// What an alert action resolves to — Chat inline notification cards use this
+/// single grammar when they execute a typed action verb.
 pub(crate) enum Navigate {
     /// Switch the shell to this dock surface.
     Surface(Surface),
@@ -190,7 +189,7 @@ pub(crate) enum Navigate {
     Plane(Plane),
 }
 
-/// Resolve an opaque chyron action `verb` to shell navigation. The verb grammar is
+/// Resolve an opaque alert action `verb` to shell navigation. The verb grammar is
 /// `shell/goto/<surface>` or `shell/plane/<plane>`; an unknown verb is a no-op
 /// (`None`) — a forward-compatible emitter never breaks the shell.
 ///
@@ -223,6 +222,8 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),
         "voice" => Some(Surface::Voice),
+        "browser" => Some(Surface::Browser),
+        "bookmarks" | "bookmark-manager" => Some(Surface::Bookmarks),
         // The ONE notification interface (NOTIFY-CHAT-6) — the retired
         // `notifications` / `clipboard` verbs now resolve here so a forward emitter's
         // old `shell/goto/notifications` still reaches a live surface.
@@ -300,13 +301,14 @@ impl ToastBridge {
     /// Raise a locally-generated alert directly, applying the SAME suppression +
     /// single-sound policy (locks 8/10) as a Bus-borne alert. The one local-raise
     /// seam so a surface (e.g. the System panel's refused-Bluetooth-write error)
-    /// never opens a second toast channel — it hands its [`Toast`] here and the one
-    /// [`ToastHost`] renders it.
+    /// never opens a second toast channel — it hands its [`Toast`] here so the one
+    /// notification sound/suppression policy handles it. Chat is the visual alert
+    /// home; this bridge does not mount notification popups.
     pub(crate) fn raise(&mut self, toast: Toast) {
         self.admit(toast);
     }
 
-    /// Flash the center-bottom OSD level bar (volume / brightness), replacing any
+    /// Flash the centered OSD pill (volume / brightness), replacing any
     /// current one in place. This is the emitter KIRON-2 left waiting on the OSD tier
     /// (KIRON-3): the seat's volume/brightness hotkeys (E12-19) call it directly —
     /// the OSD is an instant hardware-feedback channel, never the Bus alert lane
@@ -317,18 +319,15 @@ impl ToastBridge {
     }
 
     /// The per-frame drive: advance the countdowns by the real frame delta, drain
-    /// any new `event/toast/show`, then paint the OSD tier + the lower-third chyron.
-    /// Returns the navigation a clicked action verb resolved to, if any — the shell
-    /// applies it (this is where the verb executes).
+    /// any new `event/toast/show`, then paint the OSD tier. Notification-class
+    /// alerts are logged/folded into Chat, not mounted as shell popups.
     pub(crate) fn drive(&mut self, ctx: &egui::Context) -> Option<Navigate> {
         self.tick(ctx);
         self.drain();
-        // The center-bottom OSD tier is a separate, instant channel (KIRON-3 wires
-        // its first in-shell emitter — the seat volume hotkey); painting it here
-        // keeps the channel live and ready.
+        // The centered OSD tier is a separate, instant channel; painting it here
+        // keeps hardware feedback live without notification clutter.
         self.host.osd(ctx);
-        let clicked = self.host.chyron(ctx).action;
-        clicked.as_deref().and_then(resolve_action)
+        None
     }
 
     /// Advance the host's countdowns by the elapsed frame delta and keep the
@@ -374,8 +373,9 @@ impl ToastBridge {
         }
     }
 
-    /// Apply suppression (lock 10) then enqueue + ring (lock 8). A suppressed
-    /// Info/Warning never reaches the queue nor rings; a Critical always does both.
+    /// Apply suppression (lock 10) then ring (lock 8). A suppressed Info/Warning
+    /// never rings; a Critical always does. Notification-class visuals belong to
+    /// Chat, so alert toasts are deliberately not enqueued into the popup host.
     /// Split from the Bus read so the whole policy is unit-tested without a spool.
     fn admit(&mut self, toast: Toast) {
         let Some(severity) = alert_severity(&toast) else {
@@ -384,10 +384,9 @@ impl ToastBridge {
             self.host.enqueue(toast);
             return;
         };
-        if self.suppress.hides_chyron(severity) {
+        if self.suppress.hides_ambient_push(severity) {
             return;
         }
-        self.host.enqueue(toast);
         if !self.suppress.hushes_sound(severity) {
             self.chime.ring(severity);
         }
@@ -480,7 +479,10 @@ mod tests {
         assert!(rec.0.borrow().is_empty());
 
         b.admit(decode(&body("critical", "lh1", "intrusion")).unwrap());
-        assert!(b.host.has_critical(), "a Critical breaks through DND");
+        assert!(
+            b.host.is_idle(),
+            "a Critical no longer opens a notification popup"
+        );
         assert_eq!(*rec.0.borrow(), vec![Severity::Critical], "and still rings");
     }
 
@@ -495,24 +497,21 @@ mod tests {
     }
 
     #[test]
-    fn audio_mute_hushes_the_sound_but_still_shows_the_chyron() {
+    fn audio_mute_hushes_the_sound_and_no_popup_is_opened() {
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
         b.set_suppression(false, false, true);
         b.admit(decode(&body("warning", "a", "build failed")).unwrap());
-        assert!(!b.host.is_idle(), "the chyron still shows under audio-mute");
+        assert!(b.host.is_idle(), "notification popups stay retired");
         assert!(rec.0.borrow().is_empty(), "but no sound fired");
     }
 
     #[test]
-    fn a_plain_alert_shows_and_rings_exactly_once() {
+    fn a_plain_alert_rings_exactly_once_without_opening_a_popup() {
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
         b.admit(decode(&body("info", "nyc3", "hi")).unwrap());
-        assert_eq!(
-            b.host.current().map(|t| t.source_host.clone()),
-            Some("nyc3".into())
-        );
+        assert!(b.host.is_idle(), "the shell bridge did not enqueue a popup");
         assert_eq!(*rec.0.borrow(), vec![Severity::Info], "one beep, no double");
     }
 
@@ -533,6 +532,14 @@ mod tests {
         assert!(matches!(
             resolve_action("shell/goto/clipboard"),
             Some(Navigate::Surface(Surface::Chat))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/browser"),
+            Some(Navigate::Surface(Surface::Browser))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/bookmarks"),
+            Some(Navigate::Surface(Surface::Bookmarks))
         ));
         assert!(matches!(
             resolve_action("shell/plane/fleet"),
@@ -566,8 +573,8 @@ mod tests {
             focus_mute: false,
             muted: false,
         };
-        assert!(dnd.hides_chyron(Severity::Info));
-        assert!(!dnd.hides_chyron(Severity::Critical));
+        assert!(dnd.hides_ambient_push(Severity::Info));
+        assert!(!dnd.hides_ambient_push(Severity::Critical));
         assert!(dnd.hushes_sound(Severity::Warning));
         assert!(!dnd.hushes_sound(Severity::Critical));
     }
@@ -579,22 +586,22 @@ mod tests {
         use mde_egui::{OsdKind, OsdLevel};
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
-        // A pending Critical alert must be untouched by an OSD flash (separate tier).
+        // A Critical alert rings but does not mount a popup; OSD remains separate.
         b.admit(decode(&body("critical", "lh1", "intrusion")).unwrap());
         b.flash_osd(OsdLevel::new(OsdKind::Volume, 0.4));
         assert!(b.host.osd_active(), "the volume hotkey lit the OSD tier");
         assert!(
-            b.host.has_critical(),
-            "the OSD flash left the alert queue alone"
+            b.host.current().is_none(),
+            "the OSD flash did not resurrect alert popups"
         );
         // The OSD is a direct channel — it never rings the notification chime.
         assert_eq!(*rec.0.borrow(), vec![Severity::Critical]);
     }
 
-    // ── the drain wiring renders a real band (mount-tessellate, §7) ────────────
+    // ── alert popups are retired; OSD remains render-mounted (§7) ─────────────
 
     #[test]
-    fn a_queued_toast_tessellates_a_real_band_through_the_bridge() {
+    fn an_alert_does_not_tessellate_a_notification_popup_through_the_bridge() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let rec = Recorder::default();
@@ -608,16 +615,41 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0))),
             ..Default::default()
         };
-        // Warm one frame (a fresh floating Area lays out invisibly first), then
-        // tessellate the steady-state paint — the same two-frame path KIRON-1 uses.
         let _ = ctx.run(input(), |ctx| {
             let _ = b.drive(ctx);
         });
         let out = ctx.run(input(), |ctx| {
             let nav = b.drive(ctx);
-            assert!(nav.is_none(), "no verb was clicked in a headless frame");
+            assert!(nav.is_none(), "alert actions now execute from Chat");
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "the bridged chyron produced no geometry");
+        assert!(prims.is_empty(), "an alert popup still produced geometry");
+        assert_eq!(*rec.0.borrow(), vec![Severity::Info]);
+        assert!(b.host.is_idle());
+    }
+
+    #[test]
+    fn the_osd_pill_still_tessellates_through_the_bridge() {
+        use mde_egui::{OsdKind, OsdLevel};
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let rec = Recorder::default();
+        let mut b = bridge_with(&rec);
+        b.flash_osd(OsdLevel::new(OsdKind::Brightness, 0.7));
+
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            let _ = b.drive(ctx);
+        });
+        let out = ctx.run(input(), |ctx| {
+            let _ = b.drive(ctx);
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "the OSD pill produced no geometry");
+        assert!(rec.0.borrow().is_empty(), "OSD does not ring notifications");
     }
 }

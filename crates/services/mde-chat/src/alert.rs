@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Message, MessageKind};
+use crate::message::{AlertAction, AlertActionKind, Message, MessageKind};
 
 /// Alert severity — the color + mute axis (lock 16).
 ///
@@ -82,6 +82,8 @@ pub fn alert_flag(topic: &str) -> &'static str {
         "security"
     } else if t.starts_with("event/firewall") {
         "firewall"
+    } else if t.starts_with("event/notify/browser") {
+        "browser"
     } else if t.starts_with("compute/event") {
         "compute"
     } else if t.contains("presence") {
@@ -95,7 +97,59 @@ pub fn alert_flag(topic: &str) -> &'static str {
 
 /// The payload keys that get their own dedicated slot on the folded
 /// [`MessageKind::Alert`] and so are *not* duplicated into its `fields` map.
-const RESERVED_KEYS: [&str; 3] = ["severity", "priority", "action"];
+const RESERVED_KEYS: [&str; 4] = ["severity", "priority", "action", "actions"];
+
+fn parse_action_kind(v: &serde_json::Value) -> AlertActionKind {
+    v.get("kind")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| v.get("type").and_then(serde_json::Value::as_str))
+        .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "destructive" | "danger" | "armed" => AlertActionKind::Destructive,
+            "ack" | "acknowledge" => AlertActionKind::Ack,
+            "snooze" => AlertActionKind::Snooze,
+            _ => AlertActionKind::Safe,
+        })
+        .unwrap_or(AlertActionKind::Safe)
+}
+
+fn parse_actions(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec<AlertAction> {
+    let mut actions = Vec::new();
+    if let Some(values) = obj
+        .and_then(|o| o.get("actions"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for (idx, value) in values.iter().enumerate() {
+            let Some(action) = value.as_object() else {
+                continue;
+            };
+            let label = action
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Action")
+                .trim();
+            if label.is_empty() {
+                continue;
+            }
+            let id = action
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map_or_else(|| format!("action-{idx}"), str::to_string);
+            let verb = action
+                .get("verb")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            actions.push(AlertAction {
+                id,
+                label: label.to_string(),
+                verb,
+                kind: parse_action_kind(value),
+            });
+        }
+    }
+    actions
+}
 
 /// **The alert-fold** (lock 11): turn one Bus alert into a [`Message`] from the
 /// originating host `origin_host`.
@@ -126,6 +180,17 @@ pub fn fold_alert(bus_topic: &str, payload_json: &str, origin_host: &str) -> Mes
         str_field("priority").as_deref(),
     );
     let action_verb = str_field("action");
+    let mut actions = parse_actions(obj);
+    if actions.is_empty() {
+        if let Some(verb) = &action_verb {
+            actions.push(AlertAction {
+                id: "open".to_string(),
+                label: "Open".to_string(),
+                verb: Some(verb.clone()),
+                kind: AlertActionKind::Safe,
+            });
+        }
+    }
 
     // Every remaining string field becomes part of the card body, ordered.
     let mut fields: BTreeMap<String, String> = BTreeMap::new();
@@ -157,6 +222,7 @@ pub fn fold_alert(bus_topic: &str, payload_json: &str, origin_host: &str) -> Mes
             flag: alert_flag(bus_topic).to_string(),
             fields,
             action_verb,
+            actions,
         },
     )
 }
@@ -195,6 +261,7 @@ mod tests {
         assert_eq!(alert_flag("event/security/alert"), "security");
         assert_eq!(alert_flag("fleet/sec"), "security");
         assert_eq!(alert_flag("event/firewall/host-a"), "firewall");
+        assert_eq!(alert_flag("event/notify/browser"), "browser");
         assert_eq!(alert_flag("compute/event/node2"), "compute");
         assert_eq!(alert_flag("peer/x/presence"), "presence");
         assert_eq!(alert_flag("fdo/firefox"), "desktop");
@@ -225,6 +292,7 @@ mod tests {
             flag,
             fields,
             action_verb,
+            actions,
         } = &msg.kind
         else {
             unreachable!("expected an Alert kind, got {}", msg.kind.tag());
@@ -232,6 +300,10 @@ mod tests {
         assert_eq!(*severity, Severity::Critical);
         assert_eq!(flag, "security", "flag derived from the topic");
         assert_eq!(action_verb.as_deref(), Some("action/shell/goto"));
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].label, "Open");
+        assert_eq!(actions[0].verb.as_deref(), Some("action/shell/goto"));
+        assert_eq!(actions[0].kind, AlertActionKind::Safe);
         assert_eq!(
             fields.get("alert").map(String::as_str),
             Some("nebula.cert.revoked")
@@ -244,6 +316,34 @@ mod tests {
         // Reserved keys are not duplicated into fields.
         assert!(!fields.contains_key("severity"));
         assert!(!fields.contains_key("action"));
+    }
+
+    #[test]
+    fn folds_configured_typed_action_set() {
+        let payload = r#"{
+            "severity": "critical",
+            "summary": "unit failed",
+            "host": "eagle",
+            "actions": [
+                {"id":"restart","label":"Restart","verb":"action/systemd/restart","kind":"safe"},
+                {"id":"poweroff","label":"Power Off","verb":"action/power/off","kind":"destructive"},
+                {"id":"ack","label":"Ack","kind":"ack"},
+                {"id":"later","label":"Snooze","kind":"snooze"}
+            ]
+        }"#;
+        let msg = fold_alert("event/notify/service", payload, "eagle");
+        let MessageKind::Alert {
+            fields, actions, ..
+        } = &msg.kind
+        else {
+            unreachable!("expected Alert");
+        };
+        assert_eq!(actions.len(), 4);
+        assert_eq!(actions[0].kind, AlertActionKind::Safe);
+        assert_eq!(actions[1].kind, AlertActionKind::Destructive);
+        assert_eq!(actions[2].kind, AlertActionKind::Ack);
+        assert_eq!(actions[3].kind, AlertActionKind::Snooze);
+        assert!(!fields.contains_key("actions"));
     }
 
     #[test]
