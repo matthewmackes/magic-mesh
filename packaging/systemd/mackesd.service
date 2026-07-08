@@ -49,8 +49,13 @@ ExecStart=/usr/bin/mackesd serve
 # so a fixed role brings the daemon up without manual intervention.
 Restart=on-failure
 RestartSec=3
-# ENT-6 acceptance: kill -9 -> restarted within seconds.
-TimeoutStopSec=20
+# REL-2 — DO lighthouses can take longer than 20s to drain the long-running
+# reconcile sidecar and child processes during an in-place RPM promotion.
+# Fedora's global service.d/10-timeout-abort.conf turns a stop timeout into
+# SIGABRT+coredump, which made a healthy post-promotion daemon fail live-smoke.
+# Give graceful shutdown room and fall back to terminate/kill, never abort.
+TimeoutStopSec=90
+TimeoutStopFailureMode=terminate
 
 # EFF-15 — the CA-backup passphrase is an OPTIONAL systemd-encrypted credential
 # (ENT-11/C8): TPM/host-bound, invisible to `systemctl show` + /proc/<pid>/environ.
@@ -129,6 +134,7 @@ RestrictSUIDSGID=true
 # (0700, same as StateDirectory) without pulling in any mount dependency, on every
 # role. The leading '-' tolerates a pre-existing dir.
 ExecStartPre=-/usr/bin/install -d -m 0700 /var/lib/mackesd
+LimitNOFILE=65536
 TasksMax=4096
 MemoryAccounting=true
 

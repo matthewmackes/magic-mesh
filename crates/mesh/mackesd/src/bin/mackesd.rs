@@ -304,8 +304,7 @@ enum Cmd {
     /// deployment rank is at least `--min-rank`, else exits non-zero (systemd
     /// then *skips* the unit rather than failing it) after logging the conflict
     /// to the journal. The role-gated units use it so a forbidden service
-    /// refuses to start: `mde-session`/`greetd` require rank 2 (Workstation),
-    /// `ansible-pull.timer` requires rank 1 (Server+).
+    /// refuses to start: desktop units require rank 1 (Workstation).
     RoleGate {
         /// Minimum deployment rank the calling unit requires (0/1/2).
         #[arg(long = "min-rank", value_name = "RANK")]
@@ -11423,7 +11422,10 @@ fn provision_caddy_if_lighthouse(role: mde_role::Role) {
         return;
     }
     println!("CONNECT-4: provisioning Caddy public ingress (lighthouse role)");
-    match std::process::Command::new("/usr/libexec/mackesd/setup-caddy").status() {
+    match std::process::Command::new("timeout")
+        .args(["360", "/usr/libexec/mackesd/setup-caddy"])
+        .status()
+    {
         Ok(s) if s.success() => println!("CONNECT-4: Caddy ingress ready"),
         Ok(s) => eprintln!(
             "provision: setup-caddy exited {:?} — public web ingress deferred; \

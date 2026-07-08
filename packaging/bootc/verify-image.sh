@@ -39,8 +39,8 @@ done
     && ok "seat unit installed" || bad "seat unit missing"
 [ -f /usr/lib/systemd/system-preset/45-mcnf-quasar.preset ] \
     && ok "seat preset installed" || bad "seat preset missing"
-grep -q '"workstation"' /usr/lib/systemd/system/mde-shell-egui.service \
-    && ok "role gate present in seat unit" || bad "role gate missing from seat unit"
+grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "typed role gate present in seat unit" || bad "typed role gate missing from seat unit"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \

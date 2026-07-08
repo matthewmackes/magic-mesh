@@ -13,7 +13,7 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   Restart=on-failure — kill -9 recovers in seconds; in-daemon worker
   restarts are the supervisor's bounded-backoff + circuit-breaker job).
   `mde-musicd.service` is a user unit (`default.target`) whose
-  `ExecCondition=mackesd role-gate --min-rank 2` skips it cleanly on
+  `ExecCondition=mackesd role-gate --min-rank 1` skips it cleanly on
   Servers/Lighthouses (SVC-7/Q70 — desktop services are Workstation
   surfaces; the voice-agent autostart carries the same gate inline)
 

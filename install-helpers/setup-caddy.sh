@@ -36,7 +36,7 @@ log() { echo "==> setup-caddy: $*"; }
 # 1. Install Caddy if absent. Fedora ships `caddy` in the default repos.
 if ! command -v caddy >/dev/null 2>&1; then
   log "installing caddy"
-  dnf install -y caddy
+  timeout 300 dnf install -y --setopt=install_weak_deps=False caddy
 else
   log "caddy already installed ($(caddy version 2>/dev/null | head -1))"
 fi
@@ -73,10 +73,10 @@ fi
 
 # 5. Enable + start so ingress is boot-durable.
 if [ "$DO_START" = "1" ]; then
-  systemctl enable caddy.service >/dev/null 2>&1 || true
-  systemctl reload caddy.service 2>/dev/null || systemctl restart caddy.service || {
+  timeout 60 systemctl enable caddy.service >/dev/null 2>&1 || true
+  timeout 60 systemctl reload caddy.service 2>/dev/null || timeout 60 systemctl restart caddy.service || {
     log "WARN: could not (re)start caddy.service — check 'journalctl -u caddy'"; }
-  log "caddy.service: $(systemctl is-active caddy.service 2>/dev/null || echo inactive)"
+  log "caddy.service: $(timeout 20 systemctl is-active caddy.service 2>/dev/null || echo inactive)"
 fi
 
 log "done — mackesd will render public sites into $FRAGMENT_DIR/mcnf-ingress.caddy"

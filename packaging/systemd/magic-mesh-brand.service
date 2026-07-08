@@ -14,7 +14,7 @@ Type=oneshot
 RemainAfterExit=yes
 # Workstation-role gate: a non-zero ExecCondition SKIPS the unit (not failed),
 # so Server/Lighthouse never brand themselves.
-ExecCondition=/bin/sh -c 'grep -Eq "role[[:space:]]*=[[:space:]]*\"workstation\"" /var/lib/mde/role.toml'
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
 ExecStart=/usr/libexec/mackesd/magic-mesh-brand apply
 
 [Install]

@@ -1,0 +1,12 @@
+[Unit]
+Description=MCNF SELinux policy setup (non-blocking postinstall)
+Documentation=https://github.com/matthewmackes/magic-mesh
+ConditionPathExists=/usr/libexec/mackesd/setup-selinux-policy
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+ExecStart=/usr/libexec/mackesd/setup-selinux-policy
+
+[Install]
+WantedBy=multi-user.target

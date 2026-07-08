@@ -48,7 +48,8 @@ pub struct PlannedUnit {
 ///   timer (a unit test pins that superset relationship).
 /// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell, the
 ///   voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
-///   worker's tier), and the one-way Carbon desktop branding.
+///   worker's tier), the Chromium/CEF + optional Widevine runtime setup gates,
+///   and the one-way Carbon desktop branding.
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
@@ -61,6 +62,8 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("mde-shell-egui.service", 1),
     ("kamailio-mde.service", 1),
     ("rtpengine-mde.service", 1),
+    ("mde-cef-runtime-setup.service", 1),
+    ("mde-widevine-cdm-setup.service", 1),
     ("magic-mesh-brand.service", 1),
 ];
 
@@ -216,6 +219,8 @@ mod tests {
             "mde-shell-egui.service",
             "kamailio-mde.service",
             "rtpengine-mde.service",
+            "mde-cef-runtime-setup.service",
+            "mde-widevine-cdm-setup.service",
             "magic-mesh-brand.service",
         ] {
             assert_eq!(
@@ -265,6 +270,14 @@ mod tests {
         let manifest: toml::Value =
             toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+        assert_eq!(
+            rpm["requires"]["bzip2"].as_str(),
+            Some("*"),
+            "the full RPM must require bzip2 so the CEF .tar.bz2 runtime extracts on fresh Workstations"
+        );
         let base_assets = rpm["assets"].as_array().expect("base assets array");
         assert!(
             base_assets.iter().any(|asset| {
@@ -275,11 +288,14 @@ mod tests {
             "base RPM must ship the DRM-seat unit"
         );
         assert!(
-            rpm["post_install_script"]
-                .as_str()
-                .expect("base post install script")
-                .contains("systemctl enable mde-shell-egui.service"),
+            post_install.contains("systemctl enable mde-shell-egui.service"),
             "base RPM post-install must enable the self-gated seat unit"
+        );
+        assert!(
+            post_install.contains("/etc/systemd/system/mde-shell.service")
+                && post_install.contains("grep -q '/usr/bin/mde-shell-egui'")
+                && post_install.contains("systemctl disable --now mde-shell.service"),
+            "base RPM post-install must remove the known legacy local DRM-seat launcher so it cannot race mde-shell-egui.service"
         );
 
         let server_assets = rpm["variants"]["server"]["assets"]
@@ -290,6 +306,452 @@ mod tests {
                 asset["dest"].as_str() != Some("/usr/lib/systemd/system/mde-shell-egui.service")
             }),
             "headless server RPM must not ship a seat unit without the shell binary"
+        );
+    }
+
+    #[test]
+    fn base_rpm_recommends_workstation_media_helpers() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+
+        assert_eq!(
+            rpm["recommends"]["libcanberra-gtk3"].as_str(),
+            Some("*"),
+            "the full RPM should pull canberra-gtk-play for shell notification sounds"
+        );
+        assert_eq!(
+            rpm["recommends"]["playerctl"].as_str(),
+            Some("*"),
+            "the full RPM should pull playerctl for phone-originated MPRIS media keys"
+        );
+        let base_recommends = rpm["recommends"].as_table().expect("base recommends table");
+        for package in [
+            "libvirt-daemon-driver-qemu",
+            "libvirt-daemon-config-network",
+        ] {
+            assert!(
+                !base_recommends.contains_key(package),
+                "the base RPM must not weak-pull {package}; it can drag swtpm SELinux scriptlets into lighthouse installs"
+            );
+        }
+        let server_recommends = rpm["variants"]["server"]["recommends"]
+            .as_table()
+            .expect("server recommends table");
+        for package in [
+            "libvirt-daemon-driver-qemu",
+            "libvirt-daemon-config-network",
+        ] {
+            assert_eq!(
+                server_recommends
+                    .get(package)
+                    .and_then(|value| value.as_str()),
+                Some("*"),
+                "the server variant should still weak-pull {package} for compute hosts"
+            );
+        }
+        assert!(
+            !server_recommends.contains_key("libcanberra-gtk3"),
+            "the headless server variant should not pull the desktop notification sound player"
+        );
+        assert!(
+            !server_recommends.contains_key("playerctl"),
+            "the headless server variant should not pull the desktop media-key helper"
+        );
+    }
+
+    #[test]
+    fn postinstall_bounds_optional_helper_runtime() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let script = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+        let assets = rpm["assets"].as_array().expect("base assets array");
+
+        for guarded in [
+            "timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf",
+            "timeout 60 gtk-update-icon-cache -q -f /usr/share/icons/hicolor",
+            "timeout 60 update-desktop-database -q",
+        ] {
+            assert!(
+                script.contains(guarded),
+                "postinstall helper must be timeout-bounded: {guarded}"
+            );
+        }
+        assert!(
+            script.contains(
+                "systemctl enable magic-mesh-selinux-policy.service mde-web-preview-selinux.service"
+            ),
+            "SELinux policy loaders must be enabled without starting inside dnf %post"
+        );
+        assert!(
+            !script.contains("systemctl enable --now --no-block magic-mesh-selinux-policy.service"),
+            "SELinux policy loaders must not start from dnf %post"
+        );
+        assert!(
+            !script.contains("/usr/libexec/mackesd/setup-selinux-policy >/dev/null"),
+            "setup-selinux-policy must not run synchronously from dnf %post"
+        );
+        assert!(
+            !script.contains("/usr/libexec/mackesd/setup-selinux-web-preview >/dev/null"),
+            "setup-selinux-web-preview must not run synchronously from dnf %post"
+        );
+        for unit in [
+            "/usr/lib/systemd/system/magic-mesh-selinux-policy.service",
+            "/usr/lib/systemd/system/mde-web-preview-selinux.service",
+        ] {
+            assert!(
+                assets
+                    .iter()
+                    .any(|asset| asset["dest"].as_str() == Some(unit)),
+                "base RPM must ship the async SELinux loader unit {unit}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_rpm_ships_browser_helpers_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+
+        for (source, dest) in [
+            ("target/release/mde-web-preview", "/usr/bin/mde-web-preview"),
+            ("target/release/mde-web-cef", "/usr/bin/mde-web-cef"),
+            (
+                "target/release/mde-web-cef-renderer",
+                "/usr/libexec/mackesd/mde-web-cef-renderer",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some("755")
+                }),
+                "full Workstation RPM must ship browser helper {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship browser helper {dest}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_rpm_ships_cef_runtime_provisioning_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/install-cef-runtime.sh",
+                "/usr/libexec/mackesd/install-cef-runtime",
+                "755",
+            ),
+            (
+                "packaging/browser/cef-linux64-minimal.env",
+                "/usr/share/magic-mesh/browser/cef-linux64-minimal.env",
+                "644",
+            ),
+            (
+                "packaging/systemd/mde-cef-runtime-setup.service",
+                "/usr/lib/systemd/system/mde-cef-runtime-setup.service",
+                "644",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some(mode)
+                }),
+                "full Workstation RPM must ship CEF runtime provisioning asset {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship CEF runtime provisioning asset {dest}"
+            );
+        }
+
+        assert!(
+            post_install.contains("mde-cef-runtime-setup.service"),
+            "base RPM post-install must enable the deferred CEF runtime setup service"
+        );
+
+        let service =
+            include_str!("../../../../../packaging/systemd/mde-cef-runtime-setup.service");
+        for needle in [
+            "ConditionPathExists=/usr/bin/mde-web-cef",
+            "ConditionPathExists=!/opt/mde/cef/Release/libcef.so",
+            "ExecCondition=/usr/bin/mackesd role-gate --min-rank 1",
+            "ExecStart=/usr/libexec/mackesd/install-cef-runtime",
+        ] {
+            assert!(
+                service.contains(needle),
+                "CEF runtime setup unit must contain {needle}"
+            );
+        }
+
+        let installer = include_str!("../../../../../install-helpers/install-cef-runtime.sh");
+        assert!(
+            installer.contains("/usr/share/magic-mesh/browser/cef-linux64-minimal.env")
+                && installer.contains("/var/cache/magic-mesh/cef")
+                && installer.contains("need_cmd bzip2"),
+            "installed CEF runtime installer must use installed manifest/cache paths"
+        );
+    }
+
+    #[test]
+    fn full_rpm_ships_widevine_provisioning_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/install-widevine-cdm.sh",
+                "/usr/libexec/mackesd/install-widevine-cdm",
+                "755",
+            ),
+            (
+                "packaging/browser/widevine-linux64.env",
+                "/usr/share/magic-mesh/browser/widevine-linux64.env",
+                "644",
+            ),
+            (
+                "packaging/systemd/mde-widevine-cdm-setup.service",
+                "/usr/lib/systemd/system/mde-widevine-cdm-setup.service",
+                "644",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some(mode)
+                }),
+                "full Workstation RPM must ship Widevine provisioning asset {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship Widevine provisioning asset {dest}"
+            );
+        }
+
+        assert!(
+            post_install.contains("mde-widevine-cdm-setup.service"),
+            "base RPM post-install must enable the deferred Widevine CDM setup service"
+        );
+
+        let service =
+            include_str!("../../../../../packaging/systemd/mde-widevine-cdm-setup.service");
+        for needle in [
+            "ConditionPathExists=/usr/bin/mde-web-cef",
+            "ConditionPathExists=!/opt/mde/widevine/libwidevinecdm.so",
+            "SuccessExitStatus=78",
+            "ExecCondition=/usr/bin/mackesd role-gate --min-rank 1",
+            "ExecStart=/usr/libexec/mackesd/install-widevine-cdm",
+        ] {
+            assert!(
+                service.contains(needle),
+                "Widevine setup unit must contain {needle}"
+            );
+        }
+
+        let installer = include_str!("../../../../../install-helpers/install-widevine-cdm.sh");
+        assert!(
+            installer.contains("/usr/share/magic-mesh/browser/widevine-linux64.env")
+                && installer.contains("/var/cache/magic-mesh/widevine")
+                && installer.contains("operator must provide WIDEVINE_URL and WIDEVINE_SHA256"),
+            "installed Widevine installer must use installed manifest/cache paths and an honest config gate"
+        );
+    }
+
+    #[test]
+    fn fedora_rpm_builder_builds_workspace_excluded_browser_helpers() {
+        let script = include_str!("../../../../../install-helpers/build-rpm-fedora43.sh");
+        let farm_script = include_str!("../../../../../install-helpers/xcp-build.sh");
+        for manifest in [
+            "crates/desktop/mde-web-preview/Cargo.toml",
+            "crates/desktop/mde-web-cef/Cargo.toml",
+        ] {
+            assert!(
+                script.contains(&format!("--manifest-path {manifest}")),
+                "full Fedora RPM builder must build excluded helper {manifest} before generate-rpm"
+            );
+            assert!(
+                farm_script.contains(&format!(
+                    "CARGO_TARGET_DIR=\\\"\\$PWD/target\\\" cargo build --release --locked --manifest-path {manifest}"
+                )),
+                "farm RPM builder must build excluded helper {manifest} into target/release before generate-rpm"
+            );
+        }
+        assert!(
+            script.contains("building the Chromium/CEF browser helper + renderer bridge"),
+            "the CEF helper build step should be named in the RPM build log"
+        );
+        assert!(
+            include_str!("../../Cargo.toml").contains("mde-web-cef-renderer"),
+            "the CEF renderer bridge must be built by the helper crate and shipped by the full RPM"
+        );
+    }
+
+    #[test]
+    fn lighthouse_caddy_provisioning_is_timeout_bounded() {
+        let helper = include_str!("../../../../../install-helpers/setup-caddy.sh");
+        let cli = include_str!("../bin/mackesd.rs");
+
+        assert!(
+            helper.contains("timeout 300 dnf install -y --setopt=install_weak_deps=False caddy"),
+            "setup-caddy must not let caddy dnf install hold lighthouse enrollment forever"
+        );
+        assert!(
+            helper.contains("timeout 60 systemctl enable caddy.service"),
+            "setup-caddy must bound caddy service enablement"
+        );
+        assert!(
+            cli.contains(".args([\"360\", \"/usr/libexec/mackesd/setup-caddy\"])"),
+            "mackesd found/join must bound setup-caddy as a best-effort ingress step"
+        );
+    }
+
+    #[test]
+    fn workstation_units_use_the_typed_rank_one_role_gate() {
+        for (name, unit) in [
+            (
+                "mde-shell-egui.service",
+                include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service"),
+            ),
+            (
+                "magic-mesh-brand.service",
+                include_str!("../../../../../packaging/systemd/magic-mesh-brand.service"),
+            ),
+            (
+                "mde-musicd.service",
+                include_str!("../../../../../packaging/systemd/mde-musicd.service"),
+            ),
+        ] {
+            assert!(
+                unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1"),
+                "{name} must gate on the current Workstation rank"
+            );
+            assert!(
+                !unit.contains("grep -Eq"),
+                "{name} must not use shell-grep role parsing"
+            );
+            assert!(
+                !unit.contains("--min-rank 2"),
+                "{name} must not reference the retired rank-2 Workstation tier"
+            );
+        }
+    }
+
+    #[test]
+    fn drm_seat_unit_starts_on_rpm_and_bootc_boot_targets() {
+        let unit = include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service");
+
+        assert!(
+            unit.contains("WantedBy=multi-user.target graphical.target"),
+            "the DRM seat unit must be wanted by multi-user.target for RPM-installed seats and graphical.target for bootc seats"
+        );
+    }
+
+    #[test]
+    fn mackesd_unit_raises_the_process_fd_budget() {
+        let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
+
+        assert!(
+            unit.contains("LimitNOFILE=65536"),
+            "mackesd must raise nofile above the default 1024 so worker fds cannot exhaust the process"
+        );
+    }
+
+    #[test]
+    fn mackesd_unit_does_not_abort_on_slow_stop() {
+        let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
+        let dropin =
+            include_str!("../../../../../packaging/systemd/mackesd.service.d/90-stop-policy.conf");
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+
+        assert!(
+            unit.contains("TimeoutStopSec=90"),
+            "mackesd must have enough stop time to drain live lighthouse workers during promotion"
+        );
+        assert!(
+            unit.contains("TimeoutStopFailureMode=terminate"),
+            "mackesd must override Fedora's global abort-on-timeout drop-in so promotion restarts do not create SIGABRT coredumps"
+        );
+        assert!(
+            dropin.contains("TimeoutStopSec=90")
+                && dropin.contains("TimeoutStopFailureMode=terminate"),
+            "mackesd must ship a per-service drop-in because Fedora's global service.d drop-in overrides the base unit file"
+        );
+        for assets in [
+            rpm["assets"].as_array().expect("base assets array"),
+            rpm["variants"]["server"]["assets"]
+                .as_array()
+                .expect("server assets array"),
+        ] {
+            assert!(
+                assets.iter().any(|asset| {
+                    asset["dest"].as_str()
+                        == Some("/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf")
+                }),
+                "each RPM shape must ship the mackesd per-service stop-policy drop-in"
+            );
+        }
+    }
+
+    #[test]
+    fn postinstall_removes_stale_local_abort_watchdog_dropin() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let script = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+
+        assert!(
+            script.contains("/etc/systemd/system/mackesd.service.d/watchdog.conf"),
+            "postinstall must inspect the legacy local watchdog drop-in"
+        );
+        assert!(
+            script.contains("TimeoutStop(FailureMode=abort|USec=20s|Sec=20)"),
+            "postinstall must only match the stale 20s/abort stop policy"
+        );
+        assert!(
+            script.contains("rm -f /etc/systemd/system/mackesd.service.d/watchdog.conf"),
+            "postinstall must remove the stale local drop-in so the packaged REL-2 stop policy wins"
         );
     }
 
@@ -344,11 +806,11 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the 4 Workstation units.
+        // Lighthouse masks exactly the 6 Workstation units.
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            4,
-            "lighthouse masks the rank-1 shell + voice + brand units"
+            6,
+            "lighthouse masks the rank-1 shell + voice + browser runtime/CDM + brand units"
         );
     }
 

@@ -9,7 +9,7 @@ Wants=pipewire.service
 Type=simple
 # SVC-7 — desktop services are Workstation-rank surfaces; a Server or
 # Lighthouse box skips this unit cleanly (exit 0 condition failure).
-ExecCondition=/usr/bin/mackesd role-gate --min-rank 2
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
 # SVC-7-fix (2026-06-15) — `mde-musicd` requires a subcommand; the bare invocation
 # exited 2 (printed help) so the daemon never started. `serve` runs the Bus
 # control responder (action/music/<verb> → reply/<ulid>), the daemon's loop.

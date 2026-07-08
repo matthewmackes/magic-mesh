@@ -431,7 +431,7 @@ assets = [
     # the `target/` prefix to the active target dir). Its confined SELinux domain +
     # Servo runtime-lib Requires ship below.
     { source = "target/release/mde-web-preview",     dest = "/usr/bin/mde-web-preview",     mode = "755" },
-    # BROWSER-DD-1 - the Chromium/CEF compatibility helper scaffold. Like
+    # BROWSER-DD-1 — the Chromium/CEF compatibility helper scaffold. Like
     # mde-web-preview, this is a workspace-excluded helper built standalone by
     # build-rpm-fedora43.sh into the active CARGO_TARGET_DIR before generate-rpm.
     # It is intentionally honest-gated at runtime until the pinned CEF bundle is
@@ -441,7 +441,7 @@ assets = [
     # browser surface).
     { source = "target/release/mde-web-cef",         dest = "/usr/bin/mde-web-cef",         mode = "755" },
     { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
-    # BROWSER-DD-1 - pinned Chromium/CEF runtime provisioning. The 311 MB CEF
+    # BROWSER-DD-1 — pinned Chromium/CEF runtime provisioning. The 311 MB CEF
     # binary payload is fetched/verified by the first-boot service, not embedded
     # directly in the RPM; the manifest pins the official Linux64 minimal tarball
     # and the helper activates /opt/mde/cef. Role-gated to Workstation rank so
@@ -449,7 +449,7 @@ assets = [
     { source = "install-helpers/install-cef-runtime.sh", dest = "/usr/libexec/mackesd/install-cef-runtime", mode = "755" },
     { source = "packaging/browser/cef-linux64-minimal.env", dest = "/usr/share/magic-mesh/browser/cef-linux64-minimal.env", mode = "644" },
     { source = "packaging/systemd/mde-cef-runtime-setup.service", dest = "/usr/lib/systemd/system/mde-cef-runtime-setup.service", mode = "644" },
-    # BROWSER-DD-4 - optional Widevine CDM provisioning for the CEF engine. The
+    # BROWSER-DD-4 — optional Widevine CDM provisioning for the CEF engine. The
     # CDM is NOT embedded in the RPM; the shipped manifest is an operator-pinned
     # first-run fetch contract and exits with a clean configuration gate until a
     # licensed URL + sha256 are supplied. Non-DRM browsing remains available.
@@ -474,6 +474,7 @@ assets = [
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     # ONBOARD-9 — the service manager: a health watchdog (recovery) + a
     # failure-notification handler. mesh-health.timer drives the watchdog;
     # mesh-alert@.service is fired by OnFailure= on mackesd/nebula; the
@@ -638,6 +639,7 @@ assets = [
     # split by precondition so a missing optional type only skips that module.
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
+    { source = "packaging/systemd/magic-mesh-selinux-policy.service", dest = "/usr/lib/systemd/system/magic-mesh-selinux-policy.service", mode = "644" },
     # BOOKMARKS-9 — the confined ENFORCING SELinux domain for the Servo browser
     # helper (mde_web_preview_t). The .te/.fc source ships + the loader compiles it
     # into a loadable module and installs it (%post below). Defense-in-depth over
@@ -646,6 +648,7 @@ assets = [
     { source = "packaging/selinux/mde-web-preview.te", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.te", mode = "644" },
     { source = "packaging/selinux/mde-web-preview.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.fc", mode = "644" },
     { source = "install-helpers/setup-selinux-web-preview.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-preview", mode = "755" },
+    { source = "packaging/systemd/mde-web-preview-selinux.service", dest = "/usr/lib/systemd/system/mde-web-preview-selinux.service", mode = "644" },
     # BOOKMARKS-9 — the bundled ad-filter SEED lists (the offline fallback the
     # mde-adblock engine compiles before a node's first upstream sync). These are
     # the SAME bytes `mde-adblock` `include_str!`s into the shipped shell binary
@@ -709,6 +712,14 @@ if [ -f /etc/systemd/system/qnm-shared.service ] || [ -f /usr/lib/systemd/system
   rmdir /etc/systemd/system/qnm-shared.service.d 2>/dev/null || :
 fi
 rm -f /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
+# REL-2 — early live lighthouses may carry a local watchdog drop-in that
+# shortens mackesd stop time to 20s and forces abort-on-timeout. That overrides
+# the packaged unit during RPM upgrades, so remove only that stale policy before
+# restart/promotion validation. The base unit still owns the live watchdog.
+if [ -f /etc/systemd/system/mackesd.service.d/watchdog.conf ] && \
+   grep -Eq 'TimeoutStop(FailureMode=abort|USec=20s|Sec=20)' /etc/systemd/system/mackesd.service.d/watchdog.conf; then
+  rm -f /etc/systemd/system/mackesd.service.d/watchdog.conf || :
+fi
 rmdir /etc/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
 # Service manager (ONBOARD-9): the daemon, the overlay, and the health
@@ -743,17 +754,23 @@ systemctl enable magic-setup.service >/dev/null 2>&1 || :
 # SEAT-BOOT-1 — the DRM shell seat launcher. It is enabled everywhere in the
 # base RPM but only starts on role="workstation"; `mackesd onboard
 # role-provision` masks it on Lighthouse as a hard-off guard.
+# Early Quasar live seats may carry a hand-written /etc/systemd/system/mde-shell.service
+# from pre-RPM testing. It also starts mde-shell-egui on tty1 and can race the
+# packaged, role-gated mde-shell-egui.service. Remove only that known legacy
+# launcher; leave any unrelated admin-created mde-shell.service untouched.
+if [ -f /etc/systemd/system/mde-shell.service ] && \
+   grep -q '/usr/bin/mde-shell-egui' /etc/systemd/system/mde-shell.service; then
+  systemctl disable --now mde-shell.service >/dev/null 2>&1 || :
+  rm -f /etc/systemd/system/mde-shell.service \
+        /etc/systemd/system/graphical.target.wants/mde-shell.service \
+        /etc/systemd/system/multi-user.target.wants/mde-shell.service || :
+fi
 systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
-# SELINUX-1 — load the local SELinux policy module so the node runs clean under
-# Enforcing (no AVC flood from mackesd's podman transition / libvirt /proc scans;
-# no repeating "SELinux security alert" toasts). Self-skips if SELinux is off.
-/usr/libexec/mackesd/setup-selinux-policy >/dev/null 2>&1 || :
-# BOOKMARKS-9 — compile + load the confined ENFORCING domain for the Servo
-# browser helper (mde_web_preview_t), then relabel /usr/bin/mde-web-preview.
-# Defense-in-depth over the helper's in-process OS sandbox; self-skips where
-# SELinux is disabled (the platform standard set just above) or the policy
-# toolchain is absent (never a fake success — the OS sandbox stays operative).
-/usr/libexec/mackesd/setup-selinux-web-preview >/dev/null 2>&1 || :
+# SELINUX-1 / BOOKMARKS-9 — policy loading can block in semodule on some fresh
+# VM images. Do NOT run it from dnf's %post, even with --no-block: starting the
+# oneshots can still race the open RPM transaction. Enable only; policy loading
+# is deferred to boot or an explicit post-install retry outside dnf.
+systemctl enable magic-mesh-selinux-policy.service mde-web-preview-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service >/dev/null 2>&1 || :
 # MUSIC-DAEMON-AUTOSTART — enable the mde-musicd USER service for every user so
 # the music library has its action/music/* responder in the desktop session
 # (the GUI talks to it over the bus). It self-gates on Workstation rank
@@ -761,10 +778,10 @@ systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
 # globally is safe: a headless Server/Lighthouse has no session to start it in.
 systemctl --global enable mde-musicd.service >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
-systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
+timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
-gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
-update-desktop-database -q >/dev/null 2>&1 || :
+timeout 60 gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
+timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
@@ -817,7 +834,7 @@ wireplumber = "*"
 pipewire-alsa = "*"
 bluez = "*"
 upower = "*"
-# BROWSER-DD-1 - the pinned CEF runtime is distributed as `.tar.bz2`; the
+# BROWSER-DD-1 — the pinned CEF runtime is distributed as `.tar.bz2`; the
 # Workstation-only first-boot installer extracts it with `tar -xjf`, which needs
 # the external bzip2 helper on Fedora minimal images.
 bzip2 = "*"
@@ -914,6 +931,18 @@ libxkbcommon = "*"
 # (weak deps on), and `--setopt=install_weak_deps=False` opts out.
 [package.metadata.generate-rpm.recommends]
 ansible-core = "*"
+# KIRON / NOTIF-7 — `mde-shell-egui`'s single notification-sound seam shells
+# `canberra-gtk-play` for freedesktop event sounds. Fedora provides that binary
+# from libcanberra-gtk3. Keep it weak: a fresh Workstation gets audible
+# notifications by default, while an opt-out/minimal install degrades to honest
+# silence and a headless server variant does not carry a shell seat.
+libcanberra-gtk3 = "*"
+# KDC-MESH-6 — paired phones send `kdeconnect.mpris` media transport commands;
+# the kdc_host worker maps the allowlisted action set to MPRIS through playerctl.
+# Weak for the same reason as libcanberra-gtk3: a Workstation gets media-key
+# control by default, while a minimal install degrades honestly and the headless
+# server variant stays free of desktop-seat helpers.
+playerctl = "*"
 # AUD6-6 — the shipped (disabled, operator-enabled per EFF-43)
 # kamailio-mde/rtpengine-mde units ExecStart these external binaries;
 # without them `systemctl start kamailio-mde` fails silently. Weak deps
@@ -924,10 +953,9 @@ rtpengine = "*"
 # weak (may be absent from some repos) so a default install pulls it but its
 # absence never blocks the install (the entry just no-ops if missing).
 cosmic-disks = "*"
-# AUD6-14 — the kickstart enables libvirtd; back it with a weak dep so
-# a bare-Fedora spin actually has the daemon the services line names.
-libvirt-daemon-driver-qemu = "*"
-libvirt-daemon-config-network = "*"
+# AUD6-14 / BUG-BROWSER-7 — do not weak-pull the libvirt stack from the base
+# RPM. On fresh lighthouse installs it drags swtpm, whose SELinux scriptlet can
+# stall the dnf transaction. Server/compute installs keep the weak dep below.
 # AUD7-8 (NET-INTROSPECT) — the relay/direct path classifier shells `ssh-keygen`
 # (debug-SSH keys) + `ssh` (the loopback `list-hostmap -json` query). Without
 # openssh-clients the feature silently degrades to "overlay" (no crash); a weak
@@ -1017,6 +1045,7 @@ assets = [
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     # PKG-3 — the self-gating daemon unit + the health/alert watchdog.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
     { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },
     { source = "packaging/systemd/mesh-alert@.service",  dest = "/usr/lib/systemd/system/mesh-alert@.service",  mode = "644" },
