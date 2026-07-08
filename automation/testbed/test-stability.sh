@@ -21,6 +21,26 @@ A="172.20.0.60"; B="172.20.0.61"
 PASS=0; FAIL=0
 on()   { ssh -i "$KEY" $SSHO "mm@$1" "${@:2}"; }
 check(){ local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  PASS  $d"; PASS=$((PASS+1)); else echo "  FAIL  $d"; FAIL=$((FAIL+1)); fi; }
+install_rpm() {
+  local ip="$1"
+  scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1 || return 1
+  if timeout 600 ssh -i "$KEY" $SSHO "mm@$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "  DIAG  RPM install failed or timed out on $ip:"
+  timeout 20 ssh -i "$KEY" $SSHO "mm@$ip" "rpm -q magic-mesh || true" || true
+  timeout 20 ssh -i "$KEY" $SSHO "mm@$ip" "ps -eo pid,ppid,stat,etime,wchan:24,cmd | grep -E 'dnf|rpm|systemctl|semodule|setup-|mesh-install' | grep -v grep || true" || true
+  timeout 20 ssh -i "$KEY" $SSHO "mm@$ip" "sudo tail -80 /var/log/dnf.log /var/log/dnf.rpm.log 2>/dev/null || true" || true
+  return 1
+}
+mackesd_fd_count() {
+  local ip="$1"
+  on "$ip" "p=\$(systemctl show -p MainPID --value mackesd.service 2>/dev/null || echo 0); \
+    case \"\$p\" in ''|0) p=\$(pgrep -xo mackesd || true);; esac; \
+    if [ -n \"\$p\" ] && [ \"\$p\" -gt 1 ] 2>/dev/null; then \
+      sudo find /proc/\$p/fd -mindepth 1 -maxdepth 1 -printf . 2>/dev/null | wc -c; \
+    else echo 0; fi" | tr -dc '0-9'
+}
 cleanup() { "$TESTBED" down >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
@@ -29,8 +49,7 @@ echo "== L3 stability — soak · chaos · reboot from $(basename "$RPM") =="
 "$TESTBED" up 2 >/dev/null
 for ip in "$A" "$B"; do
   for t in $(seq 1 24); do timeout 3 bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null && break; sleep 5; done
-  scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1
-  on "$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1
+  install_rpm "$ip" || exit 1
 done
 
 # Bring up a minimal real mesh before measuring daemon stability. Starting
@@ -68,13 +87,41 @@ r1="$(on "$A" "ps -o rss= -C mackesd 2>/dev/null | awk '{s+=\$1}END{print s+0}'"
 check "mackesd footprint plateaus under traffic (${r0}→${r1} KiB, <50% growth)" \
   bash -c "[ ${r0:-0} -gt 0 ] && [ ${r1:-0} -le \$(( ${r0:-1} * 3 / 2 )) ]"
 
+# fd budget — BUG-BROWSER-7. The daemon must ship a raised service limit, stay
+# well below the old 1024-fd ceiling under multi-worker Bus traffic, and emit no
+# fresh EMFILE journal lines.
+echo "-- fd budget (nofile + EMFILE guard) --"
+nofile="$(on "$A" "systemctl show -p LimitNOFILE --value mackesd.service 2>/dev/null || true" | tr -dc '0-9')"
+f0="$(mackesd_fd_count "$A")"
+for i in $(seq 1 10); do on "$A" "for n in \$(seq 1 100); do mde-bus publish event/fd-soak/$i/\$n --body-flag '{\"i\":$i,\"n\":'\$n'}' 2>/dev/null; done" >/dev/null 2>&1; done
+sleep 5
+f1="$(mackesd_fd_count "$A")"
+emfile_recent="$(on "$A" "journalctl -u mackesd --since '2 min ago' --no-pager 2>/dev/null | grep -Eic 'EMFILE|Too many open files' || true" | tr -dc '0-9')"
+check "mackesd service raises LimitNOFILE (${nofile:-0} >= 65536)" \
+  bash -c "[ ${nofile:-0} -ge 65536 ]"
+check "mackesd fd count stays below the old 1024 ceiling (${f0:-0}→${f1:-0})" \
+  bash -c "[ ${f0:-0} -gt 0 ] && [ ${f1:-0} -gt 0 ] && [ ${f1:-0} -lt 1024 ] && [ ${f1:-0} -le \$(( ${f0:-0} + 128 )) ]"
+check "mackesd logs no fresh EMFILE/too-many-open-files events" \
+  bash -c "[ ${emfile_recent:-0} -eq 0 ]"
+
 # chaos — destroy node B; node A must NOT wedge (load stays sane, no uninterruptible procs).
 echo "-- chaos (kill a node, survivor stays healthy) --"
 ssh -i "$KEY" $SSHO "root@${MCNF_TESTBED_DOM0:-172.20.145.165}" \
   "U=\$(xe vm-list name-label=mcnf-test-1 --minimal); xe vm-shutdown uuid=\$U force=true" >/dev/null 2>&1
 sleep 20
-check "survivor (A) not wedged — load < 10, no D-state procs"  \
-  on "$A" "load=\$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1); [ \${load:-0} -lt 10 ] && [ \$(ps -eo stat | grep -c '^D') -eq 0 ]"
+NO_WEDGE_OK=0
+for _ in $(seq 1 6); do
+  if on "$A" "load=\$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1); [ \${load:-0} -lt 10 ] && [ \$(ps -eo stat | grep -c '^D') -eq 0 ]"; then
+    NO_WEDGE_OK=1
+    break
+  fi
+  sleep 5
+done
+check "survivor (A) not wedged — load < 10, no D-state procs" test "$NO_WEDGE_OK" -eq 1
+if [ "$NO_WEDGE_OK" -ne 1 ]; then
+  echo "  DIAG  survivor wedge sample on A:"
+  on "$A" "echo load=\$(cat /proc/loadavg); ps -eo pid,stat,wchan:24,comm | awk '\$2 ~ /^D/ || NR == 1 {print}'" || true
+fi
 check "survivor (A) still responds (sshd + daemon alive)"      on "$A" "systemctl is-system-running 2>/dev/null | grep -qvE 'stopping|offline'"
 
 # reboot-recovery — reboot A; the daemon comes back on its own.

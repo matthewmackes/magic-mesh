@@ -6,14 +6,16 @@
 # literal. Seal them once with:
 #   printf %s '<access-key>' | automation/secrets/mcnf-secret.sh put sccache-access-key
 #   printf %s '<secret-key>' | automation/secrets/mcnf-secret.sh put sccache-secret-key
-# An explicit -e minio_access_key=… / -e minio_secret_key=… still overrides (a
-# pre-store bootstrap). The values never land in the repo or the play output.
+# Pass the endpoint explicitly with -e minio_endpoint=http://<control-ip>:9000.
+# There is deliberately no baked LAN default; a missing endpoint fails loud so a
+# newly founded mesh cannot inherit the old hand-built .192 control host.
+# Explicit -e minio_access_key=... / -e minio_secret_key=... still overrides the
+# store for emergency bootstrap. The values never land in the repo or play output.
 ---
 - name: Shared sccache (S3/minio) on build VMs
   hosts: build_vms
   vars:
     sccache_version: "0.8.2"
-    minio_endpoint: "http://172.20.145.192:9000"
     sccache_bucket: "sccache"
     mcnf_secret_bin: "{{ playbook_dir }}/../../automation/secrets/mcnf-secret.sh"
     # Unseal from the store on the controller unless overridden by -e. `pipe` runs
@@ -21,14 +23,16 @@
     minio_access_key: "{{ lookup('pipe', mcnf_secret_bin ~ ' get sccache-access-key') }}"
     minio_secret_key: "{{ lookup('pipe', mcnf_secret_bin ~ ' get sccache-secret-key') }}"
   tasks:
-    - name: Require the minio creds (from the secret store or -e, never committed)
+    - name: Require the minio endpoint and creds (from the mesh config/store or -e, never committed)
       ansible.builtin.assert:
         that:
+          - minio_endpoint | default('') | length > 0
           - minio_access_key | default('') | length > 0
           - minio_secret_key | default('') | length > 0
         fail_msg: >-
-          no minio creds: seal them (mcnf-secret.sh put sccache-access-key /
-          sccache-secret-key) or pass -e minio_access_key=… -e minio_secret_key=…
+          no minio endpoint/creds: pass -e minio_endpoint=http://<control-ip>:9000
+          and seal creds with mcnf-secret.sh put sccache-access-key /
+          sccache-secret-key, or pass -e minio_access_key=... -e minio_secret_key=...
       no_log: true
 
     - name: sccache binary present?

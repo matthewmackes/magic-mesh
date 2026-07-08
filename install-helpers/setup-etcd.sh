@@ -70,6 +70,9 @@ fi
 command -v etcdctl >/dev/null 2>&1 || dnf install -y etcd >/dev/null 2>&1 || true
 
 mkdir -p "$(dirname "$ENDPOINTS_FILE")" "$(dirname "$ENV_FILE")"
+# The endpoints file is not secret and uid-1000 operator CLIs need to read it.
+# Keep /etc/mackesd non-listable while allowing traversal to this known path.
+chmod 0711 "$(dirname "$ENDPOINTS_FILE")"
 
 # Compose the client-endpoints list (self for members, anchors for clients).
 compose_endpoints() {

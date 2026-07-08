@@ -49,7 +49,7 @@ echo "MCNF nightly internal tests — $(ts)" | tee "$REPORT"
 RPM="$(ls -t "$ARTIFACTS"/*.rpm 2>/dev/null | head -1)"
 if [ -z "$RPM" ]; then
   echo "no RPM — cutting one on the farm" | tee -a "$REPORT"
-  MCNF_BUILD_HOST=172.20.0.52 "$REPO/install-helpers/xcp-build.sh" rpm >>"$REPORT" 2>&1 || true
+  MCNF_BUILD_SHAPE=big "$REPO/install-helpers/xcp-build.sh" rpm >>"$REPORT" 2>&1 || true
   RPM="$(ls -t "$ARTIFACTS"/*.rpm 2>/dev/null | head -1)"
 fi
 [ -n "$RPM" ] || { echo "FATAL: no RPM to test" | tee -a "$REPORT"; exit 1; }

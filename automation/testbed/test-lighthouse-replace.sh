@@ -54,8 +54,13 @@ wait_ssh() {
 install_rpm() {
   local ip="$1"
   wait_ssh "$ip"
-  scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1
-  on "$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1
+  scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1 || return 1
+  if timeout 600 ssh -i "$KEY" $SSHO "mm@$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "  DIAG  RPM install failed or timed out on $ip:"
+  on "$ip" "rpm -q magic-mesh || true; ps -eo pid,ppid,stat,etime,cmd | grep -E 'dnf|rpm' | grep -v grep || true; sudo tail -80 /var/log/dnf.log /var/log/dnf.rpm.log 2>/dev/null || true" || true
+  return 1
 }
 
 join_node() {
@@ -97,7 +102,19 @@ setup_etcd_init() {
 
 setup_etcd_join() {
   local ip="$1" overlay="$2" anchors="$3"
-  on "$ip" "sudo /usr/libexec/mackesd/setup-etcd --join 10.42.0.1 --listen '$overlay' --anchors '$anchors'"
+  local out ok=0
+  out="$(on "$ip" "sudo /usr/libexec/mackesd/setup-etcd --join 10.42.0.1 --listen '$overlay' --anchors '$anchors' 2>&1" | tr -d '\r' || true)"
+  for _ in $(seq 1 12); do
+    on "$ip" "ETCDCTL_API=3 etcdctl --endpoints=http://$overlay:2379 endpoint health 2>/dev/null | grep -q healthy" && ok=1 && break
+    sleep 5
+  done
+  if [ "$ok" -ne 1 ]; then
+    echo "  DIAG  setup-etcd join output for $ip/$overlay:"
+    printf '%s\n' "$out" | sed -n '1,100p'
+    echo "  DIAG  etcd state on $ip:"
+    on "$ip" "systemctl --no-pager -l status etcd 2>&1 | sed -n '1,120p'; sudo cat /etc/etcd/etcd.env 2>&1; ls -l /etc/mackesd/etcd-endpoints 2>&1; cat /etc/mackesd/etcd-endpoints 2>&1" || true
+    return 1
+  fi
 }
 
 restart_mackesd() {
@@ -112,10 +129,18 @@ healthy_endpoints() {
 
 no_wedge() {
   local ip="$1"
-  on "$ip" "load=\$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1);
-            [ \${load:-0} -lt 10 ] &&
-            [ \$(ps -eo stat | grep -c '^D') -eq 0 ] &&
-            test -z \"\$(findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null)\""
+  for _ in $(seq 1 6); do
+    if on "$ip" "load=\$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1);
+              [ \${load:-0} -lt 10 ] &&
+              [ \$(ps -eo stat | grep -c '^D') -eq 0 ] &&
+              test -z \"\$(findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null)\""; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "  DIAG  survivor wedge sample on $ip:"
+  on "$ip" "echo load=\$(cat /proc/loadavg); findmnt -rn -t fuse,fuse.lizardfs -o TARGET,SOURCE 2>/dev/null || true; ps -eo pid,stat,wchan:24,comm | awk '\$2 ~ /^D/ || NR == 1 {print}'" || true
+  return 1
 }
 
 destroy_vm() {

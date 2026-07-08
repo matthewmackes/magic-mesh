@@ -1,7 +1,8 @@
 # MCNF Promotion Pipeline
 
 Order: Build RPM on the farm → L1 clean install → L2 mini-mesh feature test →
-L3 stability → L4 staged lighthouse replacement → Eagle → live DO lighthouses.
+L3 stability → L4 staged lighthouse replacement → Eagle → live DO lighthouses →
+live audit → MEDIA-LIGHTHOUSE verify → fd/EMFILE soak.
 The loop repeats until the worklist is clear, all gates are green, and the
 operator declares the release complete.
 
@@ -26,9 +27,13 @@ Safety:
 - `live-audit` is the post-promotion substrate guard: it verifies the promoted
   DO lighthouses and Eagle are on the candidate package, core services are
   active, `qnm-shared`/LizardFS are not enabled, and no FUSE/LizardFS mounts are
-  present. It also publishes actual installed versions for Eagle and each live
-  lighthouse to `event/dc/promote/*`, so the version matrix shows host-level
-  drift instead of only the target DO version.
+  present. It also proves the effective `mackesd` stop policy resolved by
+  systemd is `TimeoutStopUSec=1min 30s` and
+  `TimeoutStopFailureMode=terminate`, with the packaged
+  `mackesd.service.d/90-stop-policy.conf` present and no stale local
+  `20s`/`abort` watchdog override. It publishes actual installed versions for
+  Eagle and each live lighthouse to `event/dc/promote/*`, so the version matrix
+  shows host-level drift instead of only the target DO version.
 - `media-verify` is the MEDIA-LIGHTHOUSE live gate. It rechecks DO limits, then
   verifies `music.mesh`, `music-writer.mesh`, and the shared Navidrome account.
   Add `--mutate-playlist` only when a temporary playlist write/read/delete proof
@@ -39,6 +44,8 @@ Safety:
 Useful stages:
 
 ```bash
+automation/promotion/mcnf-promotion-cycle.sh status
+automation/promotion/mcnf-promotion-cycle.sh statrep
 automation/promotion/mcnf-promotion-cycle.sh inventory
 automation/promotion/mcnf-promotion-cycle.sh build
 automation/promotion/mcnf-promotion-cycle.sh l1
@@ -51,9 +58,53 @@ automation/promotion/mcnf-promotion-cycle.sh live-smoke
 automation/promotion/mcnf-promotion-cycle.sh live-audit
 automation/promotion/mcnf-promotion-cycle.sh media-verify
 automation/promotion/mcnf-promotion-cycle.sh media-verify --mutate-playlist
+automation/promotion/mcnf-promotion-cycle.sh fd-soak
 ```
 
-2026-07-06 production-candidate evidence: `magic-mesh-11.4.8-1.x86_64`
-passed L1/L2/L3/L4, promoted to Eagle and both DO lighthouses, passed live
-smoke, and passed `live-audit`. The production release still requires operator
-bug hunting and an explicit release declaration.
+`status`/`statrep` is read-only and is the first command to run before deciding
+whether another promotion cycle is needed. It reports the latest candidate RPM
+and sha256, current worklist open/in-progress count, DO account headroom, live
+lighthouse/Eagle installed versions, farm utilization, and the release
+declaration marker. Completion is deliberately strict: the status report must
+show zero open worklist items, current gates green on the final candidate, live
+audit/media/soak green after that candidate, and an operator-authored
+`docs/ops/production-release-declaration.md`.
+
+`cycle` now runs the live media verification and fd soak after `live-audit`; the
+soak defaults to one hour through `automation/promotion/live-fd-soak.sh`. Set
+`MCNF_MEDIA_MUTATE_PLAYLIST=1` to include the temporary playlist write/read/delete
+proof during a full production cycle.
+
+2026-07-07 production-candidate evidence: latest rebuilt
+`magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230
+bytes, built 13:19 EDT, sha256
+`7e780ab7aee218116865a08b667cf04e7042a6b34d68759f80c3a3439489e251`)
+carries the Inter platform font, the bottom Windows-style notification rail, the
+session rail, the bounded Caddy/SELinux install behavior, the fd-budget guards,
+the packaged `mackesd` stop-policy drop-in, and the `%post` cleanup for stale
+local `mde-shell.service` Quasar units. It passed L1 clean install (6 passed),
+L2 mini-mesh (15 passed), L3 stability/fd budget (14 passed), and L4 staged
+lighthouse replacement (33 passed). It promoted to Eagle and both DO lighthouses
+by force-replacing the same NEVRA package, then passed post-roll `live-smoke`,
+`live-audit`, and the one-hour fd/EMFILE soak. Eagle needed the expected
+seat-owner correction after the RPM
+replacement stopped Quasar: Cosmic was terminated, `mde-shell-egui.service` was
+started, `/dev/dri/card1` and `/dev/tty1` were owned by `/usr/bin/mde-shell-egui`,
+and the stale local `/etc/systemd/system/mde-shell.service` stayed absent. The
+soak (`automation/promotion/live-fd-soak.sh`, start
+`2026-07-07 17:56:29 UTC`, duration `3600s`) finished at elapsed `3603s` with
+all promoted services active, `LimitNOFILE=65536`, EMFILE `0`, and final fd
+counts `142` (`104.131.64.207`), `140` (`165.227.188.238`), and `171` (Eagle).
+(`music.mesh=2`, `music-writer.mesh=1`, Subsonic ping ok, temporary playlist
+create/read/delete ok). The production release still requires operator bug
+hunting and an explicit release declaration.
+
+2026-07-07 browser stop/compact-chrome bench evidence: a later
+`magic-mesh-12.0.0-1.x86_64` candidate was rebuilt on BigBoy for the Browser
+Stop control and compact Chromium-style chrome (`/root/mcnf-release-artifacts`,
+112643918 bytes, built 21:41:57 EDT, sha256
+`defb01d677ac56af2fff312e43d17984a2fb19cd9d13e3b66cd3a46ca641a734`). It passed
+L1 clean install (6 passed), L2 mini-mesh (15 passed), L3 stability/fd budget
+(14 passed), and L4 staged lighthouse replacement (33 passed) on the farm
+testbed. Eagle was excluded from this bench pass by the operator's 2026-07-07
+directive, and the encrypted bench seats were not rebooted.

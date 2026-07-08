@@ -39,13 +39,21 @@ line="$("$TESTBED" up 1 | tail -1)"; ip="$(echo "$line" | awk '{print $2}')"
 [ -n "$ip" ] || { echo "testbed didn't come up" >&2; exit 1; }
 echo "test VM @ $ip"
 RUN() { ssh -i "$KEY" $SSHO "mm@$ip" "$@"; }
+INSTALL() {
+  if timeout 600 ssh -i "$KEY" $SSHO "mm@$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "  DIAG  RPM install failed or timed out on $ip:"
+  RUN "rpm -q magic-mesh || true; ps -eo pid,ppid,stat,etime,cmd | grep -E 'dnf|rpm' | grep -v grep || true; sudo tail -80 /var/log/dnf.log /var/log/dnf.rpm.log 2>/dev/null || true" || true
+  return 1
+}
 
 scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1
 PKG="$(rpm -qp --qf '%{NAME}' "$RPM" 2>/dev/null)"
 echo "package: $PKG"
 
 # --- the install + acceptance checks ---
-check "RPM installs cleanly (dnf install)"        RUN "sudo dnf install -y /tmp/mm.rpm"
+check "RPM installs cleanly (dnf install)"        INSTALL
 check "package is registered ($PKG)"              RUN "rpm -q $PKG"
 check "the daemon binary installed"               RUN "command -v mackesd || rpm -ql $PKG | grep -q /mackesd"
 check "the daemon runs (--version / --help)"      RUN "mackesd --version 2>/dev/null || mackesd --help 2>/dev/null | head -1"

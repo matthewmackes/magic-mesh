@@ -25,25 +25,18 @@
 #      build VM BUILD-READY (toolchain-on-first-provision, below), and between jobs
 #      farm-vm-snapshot.sh snapshot-reverts each VM to its clean baseline (L3).
 #
-#      BUILD-READINESS — toolchain-on-first-provision + snapshot baseline:
-#      MDE-VM-golden is a BASE template with NO Rust toolchain — a fresh clone has
-#      cargo/rustc MISSING and CANNOT build. So after a successful apply, for each
-#      build VM the autoscaler KEPT this tick, provision_build_ready (gated behind
-#      the SAME apply gate) checks whether the VM already carries a `clean` baseline
-#      snapshot (the one the inter-job reset reverts to). If it does, the VM is
-#      build-ready and we SKIP — the toolchain cost is paid ONCE per VM, not per
-#      tick, and the existing inter-job revert keeps it clean. If NOT (freshly
-#      provisioned, no clean snapshot), we run infra/ansible/build-vm-toolchain.yml
-#      against that VM's IP to install rust 1.94 + dev libs + mold, THEN take the
-#      `clean` baseline snapshot so every future tick reverts to a TOOLCHAINED
-#      baseline. Any failure (ansible missing / VM unreachable / playbook or
-#      snapshot failure) WARNs loudly + skips that VM for the next tick to retry —
-#      it NEVER crashes the tick or strands a running build. Plan-only / FA_APPLY=0
-#      / --dry-run installs NOTHING (no ansible, no snapshot) — only the gated apply
-#      path provisions.
-#        FOLLOW-UP (faster): bake the toolchain INTO MDE-VM-golden so every clone is
-#        instantly build-ready (zero per-VM toolchain cost on first provision). Then
-#        provision_build_ready collapses to just taking the baseline snapshot.
+#      BUILD-READINESS — baked-template preferred, first-provision fallback:
+#      DAR-34's canonical target is that MDE-VM-golden already carries Rust 1.94,
+#      dev libs, mold, and sccache (created by bake-build-golden.sh). For that
+#      path, provision_build_ready only has to take the `clean` baseline snapshot
+#      that inter-job reset later reverts to. Older/bare templates are still
+#      tolerated: if a kept VM has no clean snapshot and cargo/rustc are missing,
+#      provision_build_ready runs infra/ansible/build-vm-toolchain.yml against
+#      that VM's IP, then takes the same baseline snapshot. Any failure (ansible
+#      missing / VM unreachable / playbook or snapshot failure) WARNs loudly +
+#      skips that VM for the next tick to retry — it NEVER crashes the tick or
+#      strands a running build. Plan-only / FA_APPLY=0 / --dry-run installs
+#      NOTHING (no ansible, no snapshot) — only the gated apply path provisions.
 #   4. DEGRADE GRACEFULLY (REQUIRED — the CURRENT live state): XO is presently
 #      UNREACHABLE (ws://172.20.145.192:8080 connection-refused) and tofu has no
 #      state. The reconciler DETECTS XO-unreachable / no-state, keeps the last-good
@@ -178,17 +171,16 @@ ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
 # Per dom0 we probe BOTH:
 #   - the elastic lane the autoscaler provisions (ip_base + the +10 small steps,
 #     cold facts from infra/tofu/main.tf local.dom0 — a 4-wide small pool),
-#   - AND the legacy fixed build VM (xcp-build.sh's DEFAULT_BUILD_HOST .52 on
-#     BigBoy, .50/.51 historically), so the probe sees real builds in the CURRENT
-#     live state too (XO down → nothing elastic provisioned → jobs route to .52).
+#   - AND the adopted baseline build VMs (.50/.90/.130), so the probe sees real
+#     builds in the CURRENT live state too.
 # Unreachable IPs cost ~one probe-timeout each and contribute 0. Kept here as a
 # small explicit list rather than re-deriving the +10 scheme so the probe stays a
 # few cheap TCP checks; xcp-build.sh::topology_from_tfvars owns the authoritative
 # IP math for ROUTING (this is only a liveness probe, so a superset is safe).
 declare -A DOM0_IPS=(
-  ["xen-bigboy"]="172.20.0.130 172.20.0.140 172.20.0.150 172.20.0.160 172.20.0.52"
+  ["xen-bigboy"]="172.20.0.130 172.20.0.140 172.20.0.150 172.20.0.160"
   ["xen-home-services"]="172.20.0.50 172.20.0.60 172.20.0.70 172.20.0.80"
-  ["kvm-xcp1"]="172.20.0.90 172.20.0.100 172.20.0.110 172.20.0.120 172.20.0.51"
+  ["kvm-xcp1"]="172.20.0.90 172.20.0.100 172.20.0.110 172.20.0.120"
 )
 # dom0 → its hypervisor (dom0) host, for the inter-job snapshot-revert (the dom0
 # runs `xe`). Cold facts from install-helpers/farm.sh's fleet + main.tf pool names.
@@ -206,8 +198,8 @@ declare -A DOM0_BIG_NAME=(
 )
 declare -A DOM0_SMALL_NAME=(
   ["xen-bigboy"]="mcnf-build-52"
-  ["xen-home-services"]="mcnf-build-50"
-  ["kvm-xcp1"]="mcnf-build-51"
+  ["xen-home-services"]="mcnf-build-home-services"
+  ["kvm-xcp1"]="mcnf-build-kvm-xcp1"
 )
 # dom0 → the autoscaler flag that carries its queue spec.
 declare -A DOM0_FLAG=(
@@ -930,16 +922,17 @@ for_each_kept_vm() {
   done
 }
 
-# --- 4) BUILD-READINESS: toolchain-on-first-provision + snapshot baseline ------
-# MDE-VM-golden is a BASE template (no Rust toolchain) — a fresh clone CANNOT build.
-# For each VM the autoscaler KEPT this tick, make it build-ready ONCE: if it already
-# carries a `clean` baseline snapshot (taken only post-toolchain) it's ready → SKIP;
-# else install the toolchain (infra/ansible/build-vm-toolchain.yml) and take the
-# `clean` snapshot so every future tick's inter-job reset reverts to a TOOLCHAINED
-# baseline. Per-VM isolated + degrade-don't-crash: ansible missing / unreachable VM
-# / playbook or snapshot failure → WARN + skip that VM (next tick retries), NEVER
-# abort the tick or strand a build. Runs ONLY on the gated apply path — provision_
-# enabled "$GATE" makes plan-only/--dry-run a hard no-op (no ansible, no snapshot).
+# --- 4) BUILD-READINESS: baked-template baseline + fallback provisioning --------
+# MDE-VM-golden should be baked with Rust+sccache by install-helpers/
+# bake-build-golden.sh (DAR-34). For each VM the autoscaler KEPT this tick, make
+# it build-ready ONCE: if it already carries a `clean` baseline snapshot, it's
+# ready → SKIP; otherwise verify/provision the toolchain as needed and take the
+# `clean` snapshot so every future tick's inter-job reset reverts to a
+# TOOLCHAINED baseline. Per-VM isolated + degrade-don't-crash: ansible missing /
+# unreachable VM / playbook or snapshot failure → WARN + skip that VM (next tick
+# retries), NEVER abort the tick or strand a build. Runs ONLY on the gated apply
+# path — provision_enabled "$GATE" makes plan-only/--dry-run a hard no-op (no
+# ansible, no snapshot).
 provision_build_ready() {
   local gate="$1"
   provision_enabled "$gate" || { log "provision_build_ready: skipped (${gate}) — no toolchain/snapshot on a non-apply tick"; return 0; }

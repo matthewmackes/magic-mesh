@@ -21,6 +21,16 @@ A="172.20.0.60"; B="172.20.0.61"   # farm-testbed assigns these to mcnf-test-0/1
 PASS=0; FAIL=0
 on()  { ssh -i "$KEY" $SSHO "mm@$1" "${@:2}"; }
 feat(){ local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  PASS  $d"; PASS=$((PASS+1)); else echo "  FAIL  $d"; FAIL=$((FAIL+1)); fi; }
+install_rpm() {
+  local ip="$1"
+  scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1 || return 1
+  if timeout 600 ssh -i "$KEY" $SSHO "mm@$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "  DIAG  RPM install failed or timed out on $ip:"
+  on "$ip" "rpm -q magic-mesh || true; ps -eo pid,ppid,stat,etime,cmd | grep -E 'dnf|rpm' | grep -v grep || true; sudo tail -80 /var/log/dnf.log /var/log/dnf.rpm.log 2>/dev/null || true" || true
+  return 1
+}
 
 cleanup() { "$TESTBED" down >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -29,8 +39,7 @@ echo "== L2 feature acceptance — 2-node mini-mesh from $(basename "$RPM") =="
 "$TESTBED" up 2 >/dev/null
 for ip in "$A" "$B"; do
   for t in $(seq 1 24); do timeout 3 bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null && break; sleep 5; done
-  scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1
-  on "$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1
+  install_rpm "$ip" || exit 1
 done
 
 # Onboarding sequence: found/add-peer/join are one-shot CLIs; `mackesd serve`
@@ -100,17 +109,27 @@ for t in $(seq 1 20); do
   sleep 3
 done
 feat "etcd peer directory has both nodes"          on "$A" "ETCDCTL_API=3 etcdctl --endpoints=http://10.42.0.1:2379 get --prefix /mesh/peers/ --print-value-only 2>/dev/null | grep -cE '10\\.42' | grep -qE '^[2-9][0-9]*$'"
-if ! on "$A" "test \$(mackesd peers 2>/dev/null | grep -cE '10\\.42') -ge 2" >/dev/null 2>&1; then
+CLI_DIR_OK=0
+for t in $(seq 1 20); do
+  if on "$A" "test \$(mackesd peers 2>/dev/null | grep -cE '10\\.42') -ge 2" >/dev/null 2>&1; then
+    CLI_DIR_OK=1
+    break
+  fi
+  sleep 3
+done
+if [ "$CLI_DIR_OK" -ne 1 ]; then
   echo "  DIAG  mackesd peers output on A:"
   on "$A" "mackesd peers 2>&1 | sed -n '1,30p'" || true
   echo "  DIAG  mackesd peers --json output on A:"
   on "$A" "mackesd peers --json 2>&1 | sed -n '1,20p'" || true
+  echo "  DIAG  etcd endpoint file on A:"
+  on "$A" "ls -l /etc/mackesd/etcd-endpoints 2>&1; cat /etc/mackesd/etcd-endpoints 2>&1" || true
   echo "  DIAG  mackesd peers did not return both overlay rows; etcd keys on A:"
   on "$A" "ETCDCTL_API=3 etcdctl --endpoints=http://10.42.0.1:2379 get --prefix /mesh/peers/ 2>/dev/null | sed -n '1,20p'" || true
   echo "  DIAG  recent heartbeat/etcd logs on A:"
   on "$A" "sudo journalctl -u mackesd --since '90 sec ago' --no-pager | grep -Ei 'heartbeat|peer-record|etcd|directory|error|warn' | tail -40" || true
 fi
-feat "the directory sees both nodes"               on "$A" "test \$(mackesd peers 2>/dev/null | grep -cE '10\\.42') -ge 2"
+feat "the directory sees both nodes"               test "$CLI_DIR_OK" -eq 1
 
 outcome="pass"; [ "$FAIL" -eq 0 ] || outcome="fail"
 echo "== L2 feature: $PASS passed, $FAIL failed → $outcome =="

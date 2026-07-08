@@ -20,7 +20,7 @@
 # Usage:
 #   farm-vm-snapshot.sh snapshot mcnf-build-52 --xcp-host 172.20.145.165
 #   farm-vm-snapshot.sh reset    mcnf-build-52 --xcp-host 172.20.145.165
-#   MCNF_XCP_HOST=172.20.0.9 farm-vm-snapshot.sh reset mcnf-build-50
+#   MCNF_XCP_HOST=172.20.0.9 farm-vm-snapshot.sh reset mcnf-build-home-services
 #
 # Env: MCNF_FARM_KEY (default ~/.ssh/mackes_mesh_ed25519), MCNF_XCP_HOST,
 #      MCNF_XCP_USER (default root).

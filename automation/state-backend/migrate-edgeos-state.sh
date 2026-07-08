@@ -14,6 +14,8 @@
 #   2. the target etcd key /tofu/state/edgeos is EMPTY (nothing to clobber).
 #   3. the state backend answers on the control IP (DAR-7/DAR-11 ran).
 # Parity gate (after migrate): `tofu plan` is 0-add / 0-change / 0-destroy.
+# The EdgeOS credential is unsealed through automation/lib/tofu-env.sh into a
+# tmpfs 0600 file for this process; no password is logged or committed.
 #
 # Usage:
 #   migrate-edgeos-state.sh --control-ip <overlay-ip> [--migrate]
@@ -29,7 +31,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --control-ip) CONTROL_IP="$2"; shift 2;;
   --migrate)    DO_MIGRATE=1; shift;;
   --check)      DO_MIGRATE=0; shift;;
-  -h|--help)    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  -h|--help)    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
   *) echo "migrate-edgeos-state: unknown arg: $1" >&2; exit 1;;
 esac; done
 
@@ -72,23 +74,26 @@ code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
 "$HERE/gen-backend-config.sh" --control-ip "$CONTROL_IP" --roots edgeos
 CFG="$EDGEOS_DIR/edgeos.backend.hcl"
 
-MIGRATE_CMD="$TOFU -chdir=$EDGEOS_DIR init -input=false -migrate-state -backend-config=$CFG"
-PLAN_CMD="$TOFU -chdir=$EDGEOS_DIR plan -input=false -detailed-exitcode"
+TOFU_ENV="$REPO/automation/lib/tofu-env.sh"
+[ -r "$TOFU_ENV" ] || die "missing $TOFU_ENV"
+EDGEOS_ENV_PREFIX=". '$TOFU_ENV'; tofu_env_load edgeos >/dev/null"
+MIGRATE_CMD="$TOFU -chdir='$EDGEOS_DIR' init -input=false -migrate-state -backend-config='$CFG'"
+PLAN_CMD="$TOFU -chdir='$EDGEOS_DIR' plan -input=false -detailed-exitcode"
 
 if [ "$DO_MIGRATE" -eq 0 ]; then
   log "CHECK mode (prechecks passed). To migrate, re-run with --migrate."
-  log "  would run: $MIGRATE_CMD"
+  log "  would run: source automation/lib/tofu-env.sh; tofu_env_load edgeos; $MIGRATE_CMD"
   log "  parity gate: $PLAN_CMD  (must be 0-add/0-change/0-destroy)"
   exit 0
 fi
 
 # --migrate: actually move state, then assert parity.
-log "MIGRATE: $MIGRATE_CMD"
-eval "$MIGRATE_CMD"
+log "MIGRATE: unseal edgeos cred, then $MIGRATE_CMD"
+bash -lc "$EDGEOS_ENV_PREFIX; $MIGRATE_CMD"
 
 log "PARITY GATE: $PLAN_CMD"
 set +e
-eval "$PLAN_CMD"
+bash -lc "$EDGEOS_ENV_PREFIX; $PLAN_CMD"
 rc=$?
 set -e
 # tofu -detailed-exitcode: 0 = no changes (parity OK), 2 = changes, 1 = error.
