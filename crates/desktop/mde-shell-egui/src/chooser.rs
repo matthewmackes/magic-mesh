@@ -3784,6 +3784,30 @@ mod tests {
     }
 
     #[test]
+    fn a_mesh_peer_carries_the_overlay_endpoint_into_the_vdi_request() {
+        let mut oak = source("peer:oak", "oak", &[Protocol::Rdp]);
+        oak.host = "10.42.0.7".to_string();
+        oak.protocols = vec![ProtocolOffer {
+            protocol: Protocol::Rdp,
+            port: Some(3389),
+        }];
+        let mut state =
+            state_with_store(Some(roster(vec![oak])), Box::new(RecordingStore::default()));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        state.confirm_connect(&sources);
+        let req = state.take_connect().expect("SSO connects straight through");
+        assert_eq!(
+            req.target
+                .endpoint
+                .as_ref()
+                .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),
+            Some(("10.42.0.7", 3389)),
+            "worker-published overlay host + RDP port must reach live-vdi"
+        );
+    }
+
+    #[test]
     fn a_mesh_peer_can_carry_a_remembered_guest_credential_for_live_rdp() {
         let dir = temp_bus_dir("vdi-open-guest");
         let store = RecordingStore::default();
