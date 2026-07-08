@@ -27,7 +27,7 @@
 //! panel or by hand), the live file diverges from the marker and the worker backs
 //! off — the user's choice wins.
 //!
-//! Role-gated to the Workstation tier (rank 2) like the other desktop workers
+//! Role-gated to the Workstation tier (rank 1) like the other desktop workers
 //! (`remmina-sync`, `clipboard_sync`): a headless Lighthouse/Server has no seated
 //! user to configure, so the worker isn't spawned there.
 

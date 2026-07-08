@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::job::TransferJob;
+use super::sync_pair::SyncPair;
 
 /// The typed verb set (Q14). `Submit` carries the whole client-minted job; the
 /// lifecycle verbs carry a job id.
@@ -37,6 +38,10 @@ pub enum TransferVerb {
     Pause(String),
     /// `transfer.resume(id)` — re-arm a Paused job.
     Resume(String),
+    /// Save or update a recurring rsync sync pair.
+    SaveSyncPair(SyncPair),
+    /// Remove a recurring sync pair by id.
+    RemoveSyncPair(String),
     /// `transfer.list` — a pure read (served directly off the ledger, not inboxed).
     List,
 }
@@ -50,6 +55,8 @@ impl TransferVerb {
             Self::Cancel(_) => "cancel",
             Self::Pause(_) => "pause",
             Self::Resume(_) => "resume",
+            Self::SaveSyncPair(_) => "save-sync-pair",
+            Self::RemoveSyncPair(_) => "remove-sync-pair",
             Self::List => "list",
         }
     }
@@ -156,6 +163,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<TransferVerb>(&json).unwrap(),
             TransferVerb::List
+        );
+
+        let pair = SyncPair::new("docs", "/src/", "/dst/", 30, TransferPolicy::default());
+        let json = serde_json::to_string(&TransferVerb::SaveSyncPair(pair.clone())).unwrap();
+        assert!(json.contains("\"verb\":\"save_sync_pair\""));
+        assert_eq!(
+            serde_json::from_str::<TransferVerb>(&json).unwrap(),
+            TransferVerb::SaveSyncPair(pair)
         );
     }
 

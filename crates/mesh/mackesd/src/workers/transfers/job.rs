@@ -212,6 +212,13 @@ pub struct TransferJob {
     /// design's progress-parsing risk note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
+    /// Integrity verification result when [`TransferPolicy::verify`] was enabled.
+    ///
+    /// `None` means verification was not requested or has not reached completion.
+    /// A verified transfer carries the destination fingerprint. A mismatch is
+    /// terminal and leaves the job in [`TransferState::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<IntegrityStatus>,
     /// Wall-clock ms when the job was submitted (the FIFO order key).
     pub created_ms: u64,
     /// Wall-clock ms of the last state change.
@@ -239,6 +246,7 @@ impl TransferJob {
             state: TransferState::Queued,
             error: None,
             progress: None,
+            integrity: None,
             created_ms: now,
             updated_ms: now,
         }
@@ -252,6 +260,9 @@ impl TransferJob {
         if state != TransferState::Failed {
             self.error = None;
         }
+        if !state.is_terminal() {
+            self.integrity = None;
+        }
     }
 
     /// Move to `Failed` with an honest reason (§7).
@@ -259,6 +270,36 @@ impl TransferJob {
         self.error = Some(error.into());
         self.set_state(TransferState::Failed);
     }
+}
+
+/// The durable result of a requested integrity verification (TRANSFERS-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum IntegrityStatus {
+    /// Source and destination matched by size and SHA-256.
+    Verified {
+        /// The verified byte count.
+        size_bytes: u64,
+        /// The verified SHA-256 digest as lowercase hex.
+        sha256: String,
+    },
+    /// Verification failed; the job is terminal `Failed`.
+    Mismatch {
+        /// Source size when it could be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_size: Option<u64>,
+        /// Destination size when it could be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest_size: Option<u64>,
+        /// Source SHA-256 when it could be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_sha256: Option<String>,
+        /// Destination SHA-256 when it could be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest_sha256: Option<String>,
+        /// Human-readable mismatch reason.
+        error: String,
+    },
 }
 
 /// `<created_ms>-<seq>-<rand hex>` — the sort key that makes the queue deterministic
@@ -300,6 +341,7 @@ mod tests {
         assert_eq!(j.state, TransferState::Queued);
         assert!(j.error.is_none());
         assert!(j.progress.is_none());
+        assert!(j.integrity.is_none());
         assert!(j.id.contains('-'), "id is <ms>-<rand>: {}", j.id);
         assert_eq!(j.created_ms, j.updated_ms);
     }
@@ -331,9 +373,17 @@ mod tests {
         j.fail("the http lane is not yet wired");
         assert_eq!(j.state, TransferState::Failed);
         assert_eq!(j.error.as_deref(), Some("the http lane is not yet wired"));
+        j.integrity = Some(IntegrityStatus::Mismatch {
+            source_size: None,
+            dest_size: None,
+            source_sha256: None,
+            dest_sha256: None,
+            error: "verify failed".into(),
+        });
         // Re-queueing drops the stale reason (§7 — no lingering fake failure).
         j.set_state(TransferState::Queued);
         assert!(j.error.is_none());
+        assert!(j.integrity.is_none());
     }
 
     #[test]

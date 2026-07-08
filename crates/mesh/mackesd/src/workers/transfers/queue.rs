@@ -10,11 +10,13 @@
 
 #![cfg(feature = "async-services")]
 
-use std::io;
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
-use super::job::{TransferJob, TransferState, Transition};
-use super::lane::LaneOutcome;
+use sha2::{Digest, Sha256};
+
+use super::job::{IntegrityStatus, TransferJob, TransferState, Transition};
+use super::lane::{LaneOutcome, node_dest_dir, node_dest_dir_with_root};
 use super::ledger::Ledger;
 
 /// Why a control verb could not be applied to a job (the honest, typed refusal the
@@ -224,6 +226,15 @@ impl TransferQueue {
     /// # Errors
     /// A ledger write failure.
     pub fn complete(&self, id: &str, outcome: &LaneOutcome) -> io::Result<()> {
+        self.complete_with_verifier(id, outcome, verify_local_integrity)
+    }
+
+    fn complete_with_verifier(
+        &self,
+        id: &str,
+        outcome: &LaneOutcome,
+        verifier: impl Fn(&TransferJob) -> Result<IntegrityStatus, IntegrityStatus>,
+    ) -> io::Result<()> {
         let Some(mut job) = self.ledger.get(id) else {
             return Ok(());
         };
@@ -231,6 +242,18 @@ impl TransferQueue {
             return Ok(());
         }
         match outcome {
+            LaneOutcome::Done if job.policy.verify => match verifier(&job) {
+                Ok(verified) => {
+                    job.integrity = Some(verified);
+                    job.progress = Some(100);
+                    job.set_state(TransferState::Done);
+                }
+                Err(mismatch) => {
+                    let error = integrity_error(&mismatch);
+                    job.integrity = Some(mismatch);
+                    job.fail(error);
+                }
+            },
             LaneOutcome::Done => {
                 job.progress = Some(100);
                 job.set_state(TransferState::Done);
@@ -239,6 +262,157 @@ impl TransferQueue {
         }
         self.ledger.upsert(&job)
     }
+
+    #[cfg(test)]
+    fn complete_with_mesh_root_for_test(
+        &self,
+        id: &str,
+        outcome: &LaneOutcome,
+        mesh_root: &Path,
+    ) -> io::Result<()> {
+        self.complete_with_verifier(id, outcome, |job| {
+            verify_local_integrity_with_mesh_root(job, Some(mesh_root))
+        })
+    }
+
+    /// Persist live lane progress for a Running job.
+    ///
+    /// Percentages are capped at 99 here; only terminal completion writes 100.
+    pub fn set_progress(&self, id: &str, pct: u8) -> io::Result<()> {
+        let Some(mut job) = self.ledger.get(id) else {
+            return Ok(());
+        };
+        if job.state != TransferState::Running {
+            return Ok(());
+        }
+        let pct = pct.min(99);
+        if job.progress.is_some_and(|prev| prev >= pct) {
+            return Ok(());
+        }
+        job.progress = Some(pct);
+        self.ledger.upsert(&job)
+    }
+}
+
+fn verify_local_integrity(job: &TransferJob) -> Result<IntegrityStatus, IntegrityStatus> {
+    verify_local_integrity_with_mesh_root(job, None)
+}
+
+fn verify_local_integrity_with_mesh_root(
+    job: &TransferJob,
+    mesh_root: Option<&Path>,
+) -> Result<IntegrityStatus, IntegrityStatus> {
+    let source = local_path_with_mesh_root(&job.source, mesh_root);
+    let dest = local_path_with_mesh_root(&job.dest, mesh_root)
+        .and_then(|dest| resolve_dest_fingerprint_path(&source, dest));
+    let (Some(source), Some(dest)) = (source, dest) else {
+        return Err(IntegrityStatus::Mismatch {
+            source_size: None,
+            dest_size: None,
+            source_sha256: None,
+            dest_sha256: None,
+            error: format!(
+                "integrity verify needs local filesystem source and destination for `{}` jobs",
+                job.method
+            ),
+        });
+    };
+    let source_fp = fingerprint(&source);
+    let dest_fp = fingerprint(&dest);
+    match (source_fp, dest_fp) {
+        (Ok(source_fp), Ok(dest_fp)) if source_fp == dest_fp => Ok(IntegrityStatus::Verified {
+            size_bytes: dest_fp.size_bytes,
+            sha256: dest_fp.sha256,
+        }),
+        (Ok(source_fp), Ok(dest_fp)) => Err(IntegrityStatus::Mismatch {
+            source_size: Some(source_fp.size_bytes),
+            dest_size: Some(dest_fp.size_bytes),
+            source_sha256: Some(source_fp.sha256),
+            dest_sha256: Some(dest_fp.sha256),
+            error: "source and destination fingerprints differ".into(),
+        }),
+        (source_fp, dest_fp) => Err(IntegrityStatus::Mismatch {
+            source_size: source_fp.as_ref().ok().map(|fp| fp.size_bytes),
+            dest_size: dest_fp.as_ref().ok().map(|fp| fp.size_bytes),
+            source_sha256: source_fp.as_ref().ok().map(|fp| fp.sha256.clone()),
+            dest_sha256: dest_fp.as_ref().ok().map(|fp| fp.sha256.clone()),
+            error: format!(
+                "could not fingerprint transfer endpoints: source={}, dest={}",
+                source_fp.err().unwrap_or_else(|| "ok".into()),
+                dest_fp.err().unwrap_or_else(|| "ok".into())
+            ),
+        }),
+    }
+}
+
+fn integrity_error(status: &IntegrityStatus) -> String {
+    match status {
+        IntegrityStatus::Verified { .. } => "integrity verified".into(),
+        IntegrityStatus::Mismatch { error, .. } => format!("integrity verify failed: {error}"),
+    }
+}
+
+fn local_path_with_mesh_root(raw: &str, mesh_root: Option<&Path>) -> Option<PathBuf> {
+    let s = raw.trim();
+    if s.starts_with("node:") || s == "mesh-share:" || s == "mesh-share" {
+        return match mesh_root {
+            Some(root) => node_dest_dir_with_root(s, root),
+            None => node_dest_dir(s),
+        };
+    }
+    if s.is_empty()
+        || s.contains("://")
+        || (s.contains(':') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../"))
+    {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+fn resolve_dest_fingerprint_path(source: &Option<PathBuf>, dest: PathBuf) -> Option<PathBuf> {
+    if dest.is_dir() {
+        let file_name = source.as_ref()?.file_name()?;
+        return Some(dest.join(file_name));
+    }
+    Some(dest)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    size_bytes: u64,
+    sha256: String,
+}
+
+fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        size_bytes = size_bytes.saturating_add(n as u64);
+        hasher.update(&buf[..n]);
+    }
+    Ok(Fingerprint {
+        size_bytes,
+        sha256: hex_lower(&hasher.finalize()),
+    })
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -254,6 +428,18 @@ mod tests {
 
     fn job(source: &str) -> TransferJob {
         TransferJob::new(source, "/dest", Method::Rsync, TransferPolicy::default())
+    }
+
+    fn verify_job(source: &Path, dest: &Path) -> TransferJob {
+        TransferJob::new(
+            source.display().to_string(),
+            dest.display().to_string(),
+            Method::Rsync,
+            TransferPolicy {
+                bwlimit: None,
+                verify: true,
+            },
+        )
     }
 
     #[test]
@@ -376,5 +562,178 @@ mod tests {
             TransferState::Queued
         );
         assert_eq!(restarted.running_count(), 0);
+    }
+
+    #[test]
+    fn progress_updates_only_running_jobs_and_never_sets_terminal_100() {
+        let (_tmp, q) = q(1);
+        let id = q.submit(job("/progress")).unwrap();
+        q.set_progress(&id, 20).unwrap();
+        assert_eq!(
+            q.get(&id).unwrap().progress,
+            None,
+            "queued jobs do not receive lane progress"
+        );
+        let running = q.claim_next().unwrap();
+        q.set_progress(&running.id, 20).unwrap();
+        q.set_progress(&running.id, 10).unwrap();
+        q.set_progress(&running.id, 100).unwrap();
+        assert_eq!(
+            q.get(&running.id).unwrap().progress,
+            Some(99),
+            "progress is monotonic and leaves 100 for terminal completion"
+        );
+        q.complete(&running.id, &LaneOutcome::Done).unwrap();
+        assert_eq!(q.get(&running.id).unwrap().progress, Some(100));
+    }
+
+    #[test]
+    fn verify_policy_marks_matching_local_fingerprints_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.bin");
+        let dest = tmp.path().join("dest.bin");
+        std::fs::write(&source, b"same bytes").unwrap();
+        std::fs::write(&dest, b"same bytes").unwrap();
+        let queue = TransferQueue::open(tmp.path().join("store").as_path(), 1).unwrap();
+        let id = queue.submit(verify_job(&source, &dest)).unwrap();
+        let running = queue.claim_next().unwrap();
+        queue.complete(&running.id, &LaneOutcome::Done).unwrap();
+        let done = queue.get(&id).unwrap();
+        assert_eq!(done.state, TransferState::Done);
+        assert_eq!(done.progress, Some(100));
+        assert!(matches!(
+            done.integrity,
+            Some(IntegrityStatus::Verified {
+                size_bytes: 10,
+                sha256: _
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_policy_resolves_directory_destination_to_source_basename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("song.wav");
+        let library = tmp.path().join("music-library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(&source, b"same track").unwrap();
+        std::fs::write(library.join("song.wav"), b"same track").unwrap();
+        let queue = TransferQueue::open(tmp.path().join("store").as_path(), 1).unwrap();
+        let id = queue
+            .submit(TransferJob::new(
+                source.display().to_string(),
+                library.display().to_string(),
+                Method::Music,
+                TransferPolicy {
+                    bwlimit: None,
+                    verify: true,
+                },
+            ))
+            .unwrap();
+        let running = queue.claim_next().unwrap();
+        queue.complete(&running.id, &LaneOutcome::Done).unwrap();
+        let done = queue.get(&id).unwrap();
+        assert_eq!(done.state, TransferState::Done);
+        assert!(matches!(
+            done.integrity,
+            Some(IntegrityStatus::Verified {
+                size_bytes: 10,
+                sha256: _
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_policy_resolves_node_destination_to_staged_mesh_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("vm.iso");
+        let mesh_root = tmp.path().join("mesh-share");
+        let staged = mesh_root.join(".transfers/node/oak/vm.iso");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"same node payload").unwrap();
+        std::fs::write(&staged, b"same node payload").unwrap();
+        let queue = TransferQueue::open(tmp.path().join("store").as_path(), 1).unwrap();
+        let id = queue
+            .submit(TransferJob::new(
+                source.display().to_string(),
+                "node:oak",
+                Method::Node,
+                TransferPolicy {
+                    bwlimit: None,
+                    verify: true,
+                },
+            ))
+            .unwrap();
+        let running = queue.claim_next().unwrap();
+        queue
+            .complete_with_mesh_root_for_test(&running.id, &LaneOutcome::Done, &mesh_root)
+            .unwrap();
+        let done = queue.get(&id).unwrap();
+        assert_eq!(done.state, TransferState::Done);
+        assert!(matches!(
+            done.integrity,
+            Some(IntegrityStatus::Verified {
+                size_bytes: 17,
+                sha256: _
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_policy_fails_corrupted_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.bin");
+        let dest = tmp.path().join("dest.bin");
+        std::fs::write(&source, b"expected bytes").unwrap();
+        std::fs::write(&dest, b"corrupted bytes").unwrap();
+        let queue = TransferQueue::open(tmp.path().join("store").as_path(), 1).unwrap();
+        let id = queue.submit(verify_job(&source, &dest)).unwrap();
+        let running = queue.claim_next().unwrap();
+        queue.complete(&running.id, &LaneOutcome::Done).unwrap();
+        let failed = queue.get(&id).unwrap();
+        assert_eq!(failed.state, TransferState::Failed);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("integrity verify failed")
+        );
+        assert!(matches!(
+            failed.integrity,
+            Some(IntegrityStatus::Mismatch {
+                source_size: Some(14),
+                dest_size: Some(15),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_policy_fails_unsupported_remote_source_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest.bin");
+        std::fs::write(&dest, b"downloaded").unwrap();
+        let queue = TransferQueue::open(tmp.path().join("store").as_path(), 1).unwrap();
+        let id = queue
+            .submit(TransferJob::new(
+                "https://example.invalid/file.bin",
+                dest.display().to_string(),
+                Method::Http,
+                TransferPolicy {
+                    bwlimit: None,
+                    verify: true,
+                },
+            ))
+            .unwrap();
+        let running = queue.claim_next().unwrap();
+        queue.complete(&running.id, &LaneOutcome::Done).unwrap();
+        let failed = queue.get(&id).unwrap();
+        assert_eq!(failed.state, TransferState::Failed);
+        assert!(matches!(
+            failed.integrity,
+            Some(IntegrityStatus::Mismatch { error, .. })
+            if error.contains("local filesystem source and destination")
+        ));
     }
 }

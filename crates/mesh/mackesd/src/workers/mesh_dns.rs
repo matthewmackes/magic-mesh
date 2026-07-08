@@ -39,6 +39,12 @@ pub const MESH_SUFFIX: &str = "mesh";
 /// record.
 pub const MUSIC_FQDN: &str = "music.mesh";
 
+/// MEDIA-LIGHTHOUSE — deterministic single-writer alias for Navidrome state that
+/// is instance-local (notably playlists). `music.mesh` stays active-active for
+/// browse/stream reads; `music-writer.mesh` points at one stable media lighthouse
+/// so writes do not split across per-instance SQLite databases.
+pub const MUSIC_WRITER_FQDN: &str = "music-writer.mesh";
+
 /// `/etc/hosts` managed-block markers (the resolvectl-absent path).
 pub const HOSTS_BEGIN: &str = "# >>> mde mesh-dns (managed) >>>";
 /// Closing sentinel for the managed `/etc/hosts` block.
@@ -94,6 +100,36 @@ pub fn build_music_records(media_overlay_ips: &[String]) -> Vec<MeshHost> {
     out.sort_by(|a, b| a.overlay_ip.cmp(&b.overlay_ip));
     out.dedup();
     out
+}
+
+/// MEDIA-LIGHTHOUSE — choose one deterministic Navidrome writer endpoint from the
+/// media-lighthouse set. The lowest overlay IP wins so every node derives the
+/// same `music-writer.mesh` record from the replicated directory without a new
+/// election surface. Empty IPs are skipped and duplicates collapse.
+#[must_use]
+pub fn build_music_writer_record(media_overlay_ips: &[String]) -> Vec<MeshHost> {
+    let mut ips: Vec<String> = media_overlay_ips
+        .iter()
+        .filter(|ip| !ip.is_empty())
+        .cloned()
+        .collect();
+    ips.sort_by(|a, b| {
+        match (
+            a.parse::<std::net::Ipv4Addr>(),
+            b.parse::<std::net::Ipv4Addr>(),
+        ) {
+            (Ok(a), Ok(b)) => a.cmp(&b),
+            _ => a.cmp(b),
+        }
+    });
+    ips.dedup();
+    let Some(overlay_ip) = ips.into_iter().next() else {
+        return Vec::new();
+    };
+    vec![MeshHost {
+        fqdn: MUSIC_WRITER_FQDN.to_string(),
+        overlay_ip,
+    }]
 }
 
 /// Render the managed `/etc/hosts` block content (the lines BETWEEN
@@ -201,18 +237,24 @@ impl MeshDnsWorker {
     fn sync(&self) {
         let dir = self.directory();
         // The flat <host>.mesh join, plus the MEDIA-5 active-active
-        // music.mesh set — both derived from the SAME directory snapshot and
+        // music.mesh set and deterministic music-writer.mesh alias — all derived
+        // from the SAME directory snapshot and
         // merged into one record list so they share the existing /etc/hosts +
         // resolved emit path (no new writer surface).
         let mut records = build_records(&directory_records(&dir));
-        let music = build_music_records(&media_overlay_ips(&dir));
+        let media_ips = media_overlay_ips(&dir);
+        let music = build_music_records(&media_ips);
         let music_count = music.len();
         records.extend(music);
+        let writer = build_music_writer_record(&media_ips);
+        let writer_count = writer.len();
+        records.extend(writer);
         tracing::debug!(
             target: "mackesd::mesh_dns",
             workgroup_root = %self.workgroup_root.display(),
             records = records.len(),
             music_records = music_count,
+            music_writer_records = writer_count,
             "mesh_dns sync tick",
         );
         // Preferred: per-link systemd-resolved domain (FDO interop).
@@ -400,10 +442,26 @@ mod tests {
     }
 
     #[test]
+    fn music_writer_record_chooses_one_stable_media_ip() {
+        // MEDIA-LIGHTHOUSE — playlist writes go to one deterministic alias while
+        // reads keep the active-active `music.mesh` record set.
+        let recs = build_music_writer_record(&[
+            "10.42.0.5".into(),
+            "10.42.0.2".into(),
+            String::new(),
+            "10.42.0.5".into(),
+        ]);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].fqdn, MUSIC_WRITER_FQDN);
+        assert_eq!(recs[0].overlay_ip, "10.42.0.2");
+    }
+
+    #[test]
     fn no_media_lighthouses_means_no_music_record() {
         // §7 — the name is served only where the service exists: zero media
         // nodes → an empty set → no `music.mesh` line in the hosts block.
         assert!(build_music_records(&[]).is_empty());
+        assert!(build_music_writer_record(&[]).is_empty());
         let merged = merge_hosts("127.0.0.1 localhost\n", &build_music_records(&[]));
         assert_eq!(merged, "127.0.0.1 localhost\n");
     }
@@ -427,7 +485,7 @@ mod tests {
         // End-to-end through the worker: a replicated media-lighthouse record
         // lands `music.mesh -> its overlay IP` in the hosts file, alongside its
         // own `<host>.mesh` record — both via the existing merge path.
-        use mackes_mesh_types::peers::{peers_dir, write_peer_record, PeerRecord};
+        use mackes_mesh_types::peers::{PeerRecord, peers_dir, write_peer_record};
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wg");
         let pdir = peers_dir(&root);
@@ -457,6 +515,10 @@ mod tests {
         assert!(
             written.contains("10.42.0.42\tmusic.mesh"),
             "music.mesh is now a served active-active record: {written}"
+        );
+        assert!(
+            written.contains("10.42.0.42\tmusic-writer.mesh"),
+            "music-writer.mesh points at the deterministic writer: {written}"
         );
         // Idempotent — a second tick is a fixed point (no churn).
         w.sync();

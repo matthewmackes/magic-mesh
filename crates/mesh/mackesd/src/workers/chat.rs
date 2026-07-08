@@ -55,8 +55,8 @@ use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_chat::{
-    Contact, Conversation, Message, MessageId, MessageKind, NodeRole, NotifyPrefs, Presence, Room,
-    RoomDescriptor, RoomKind, Roster, Severity, fold_alert, severity_room_id, sign,
+    AlertActionKind, Contact, Conversation, Message, MessageId, MessageKind, NodeRole, NotifyPrefs,
+    Presence, Room, RoomDescriptor, RoomKind, Roster, Severity, fold_alert, severity_room_id, sign,
     system_room_descriptors,
 };
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,8 @@ pub const ACTION_CHAT_PRESENCE: &str = "action/chat/presence";
 pub const ACTION_CHAT_MUTE: &str = "action/chat/mute";
 /// Update global notification preferences that are not target mutes.
 pub const ACTION_CHAT_NOTIFY_PREFS: &str = "action/chat/notify-prefs";
+/// The UI's typed inline alert-action verb.
+pub const ACTION_CHAT_ALERT_ACTION: &str = "action/chat/alert-action";
 /// The signed-envelope delivery lane (fast path; the log is the durable copy).
 pub const EVENT_CHAT_MESSAGE: &str = "event/chat/message";
 /// The presence roster mirror the UI reads.
@@ -92,6 +94,10 @@ pub const STATE_CHAT_ROOMS: &str = "state/chat/rooms";
 /// Its mute toggles reflect the true persisted [`NotifyPrefs`]. Seat-local: a
 /// read-model for the local UI, never gossiped to peers.
 pub const STATE_CHAT_NOTIFY: &str = "state/chat/notify";
+/// Prefix for local ack state written when an alert card is acknowledged.
+pub const STATE_CHAT_ALERT_ACK_PREFIX: &str = "state/chat/alert-ack/";
+/// Prefix for local snooze state written when an alert card is snoozed.
+pub const STATE_CHAT_ALERT_SNOOZE_PREFIX: &str = "state/chat/alert-snooze/";
 /// Prefix for the per-conversation read-model the UI renders.
 pub const STATE_CHAT_CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The KIRON chyron lane (`docs/design/kiron-toast-pattern.md`, lock 7).
@@ -329,6 +335,27 @@ struct NotifyPrefsRequest {
     /// Least-severe alert that may ring (`info`, `warning`, or `critical`).
     #[serde(default)]
     threshold: Option<Severity>,
+}
+
+/// The UI's `action/chat/alert-action` request body.
+#[derive(Debug, Clone, Deserialize)]
+struct AlertActionRequest {
+    /// Alert message id the action came from.
+    message_id: String,
+    /// Origin host/contact for the alert.
+    sender: String,
+    /// Stable action id in the message.
+    action_id: String,
+    /// Operator-facing label.
+    label: String,
+    /// Action semantics.
+    kind: AlertActionKind,
+    /// Optional Bus verb to drive.
+    #[serde(default)]
+    verb: Option<String>,
+    /// Destructive actions execute only when armed.
+    #[serde(default)]
+    armed: bool,
 }
 
 /// A one-line headline for a **chat-message** chyron (NOTIFY-CHAT-5, KIRON lock
@@ -893,6 +920,7 @@ impl ChatWorker {
         self.drain_room_ops(persist, state);
         self.drain_mutes(persist, state);
         self.drain_notify_prefs(persist, state);
+        self.drain_alert_actions(persist, state);
         self.drain_inbound(persist, state, dnd);
         self.drain_alerts(persist, state, dnd);
         self.publish_roster(persist, state);
@@ -1012,6 +1040,52 @@ impl ChatWorker {
                 }
             }
             state.notify_dirty = true;
+        }
+    }
+
+    /// Drain typed inline alert actions from Chat. Safe actions fire immediately;
+    /// destructive actions require an armed request from the UI; ack/snooze write
+    /// explicit local state so the append-only alert history remains intact.
+    fn drain_alert_actions(&self, persist: &Persist, state: &mut ChatState) {
+        for m in take_new(persist, &mut state.cursors, ACTION_CHAT_ALERT_ACTION) {
+            let Some(req) = Self::parse_action_body::<AlertActionRequest>(&m, "alert-action")
+            else {
+                continue;
+            };
+            match req.kind {
+                AlertActionKind::Safe => {
+                    if let Some(verb) = req.verb.as_deref() {
+                        publish_alert_action_result(persist, &req, "fired");
+                        publish(persist, verb, &alert_action_body(&req));
+                    }
+                }
+                AlertActionKind::Destructive => {
+                    if req.armed {
+                        if let Some(verb) = req.verb.as_deref() {
+                            publish_alert_action_result(persist, &req, "fired");
+                            publish(persist, verb, &alert_action_body(&req));
+                        }
+                    } else {
+                        publish_alert_action_result(persist, &req, "refused_unarmed");
+                    }
+                }
+                AlertActionKind::Ack => {
+                    publish_alert_action_result(persist, &req, "acked");
+                    publish(
+                        persist,
+                        &format!("{STATE_CHAT_ALERT_ACK_PREFIX}{}", req.message_id),
+                        &alert_action_body(&req),
+                    );
+                }
+                AlertActionKind::Snooze => {
+                    publish_alert_action_result(persist, &req, "snoozed");
+                    publish(
+                        persist,
+                        &format!("{STATE_CHAT_ALERT_SNOOZE_PREFIX}{}", req.message_id),
+                        &alert_action_body(&req),
+                    );
+                }
+            }
         }
     }
 
@@ -1389,6 +1463,32 @@ fn publish_notify(persist: &Persist, state: &mut ChatState) {
     if let Ok(body) = serde_json::to_string(&state.notify) {
         publish(persist, STATE_CHAT_NOTIFY, &body);
     }
+}
+
+fn alert_action_body(req: &AlertActionRequest) -> String {
+    serde_json::json!({
+        "message_id": req.message_id,
+        "sender": req.sender,
+        "action_id": req.action_id,
+        "label": req.label,
+        "kind": req.kind,
+    })
+    .to_string()
+}
+
+fn publish_alert_action_result(persist: &Persist, req: &AlertActionRequest, status: &str) {
+    let body = serde_json::json!({
+        "message_id": req.message_id,
+        "sender": req.sender,
+        "action_id": req.action_id,
+        "status": status,
+    })
+    .to_string();
+    publish(
+        persist,
+        &format!("state/chat/alert-action/{}", req.message_id),
+        &body,
+    );
 }
 
 /// In-process Bus publish (best-effort). Writing to the local Persist store is
@@ -2526,6 +2626,114 @@ mod tests {
             state.convos.get(&alert_key("fra1")).map(Conversation::len),
             Some(1),
             "source-muted alerts are still logged in the feed"
+        );
+    }
+
+    #[test]
+    fn alert_action_drain_fires_safe_gates_destructive_and_records_ack_snooze() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut w = worker(root);
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed action cursors
+
+        persist
+            .write(
+                ACTION_CHAT_ALERT_ACTION,
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"message_id":"m1","sender":"nyc3","action_id":"restart","label":"Restart","kind":"safe","verb":"action/systemd/restart"}"#,
+                ),
+            )
+            .unwrap();
+        persist
+            .write(
+                ACTION_CHAT_ALERT_ACTION,
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"message_id":"m2","sender":"nyc3","action_id":"poweroff","label":"Power Off","kind":"destructive","verb":"action/power/off","armed":false}"#,
+                ),
+            )
+            .unwrap();
+        persist
+            .write(
+                ACTION_CHAT_ALERT_ACTION,
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"message_id":"m3","sender":"nyc3","action_id":"ack","label":"Ack","kind":"ack"}"#,
+                ),
+            )
+            .unwrap();
+        persist
+            .write(
+                ACTION_CHAT_ALERT_ACTION,
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"message_id":"m4","sender":"nyc3","action_id":"later","label":"Snooze","kind":"snooze"}"#,
+                ),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+
+        assert_eq!(
+            persist
+                .list_since("action/systemd/restart", None)
+                .unwrap()
+                .len(),
+            1,
+            "safe action fired its configured verb"
+        );
+        assert_eq!(
+            persist.list_since("action/power/off", None).unwrap().len(),
+            0,
+            "unarmed destructive action was refused"
+        );
+        let refused = persist
+            .list_since("state/chat/alert-action/m2", None)
+            .unwrap();
+        assert!(
+            refused
+                .last()
+                .and_then(|m| m.body.as_deref())
+                .is_some_and(|body| body.contains("refused_unarmed"))
+        );
+        assert_eq!(
+            persist
+                .list_since(&format!("{STATE_CHAT_ALERT_ACK_PREFIX}m3"), None)
+                .unwrap()
+                .len(),
+            1,
+            "ack wrote local ack state"
+        );
+        assert_eq!(
+            persist
+                .list_since(&format!("{STATE_CHAT_ALERT_SNOOZE_PREFIX}m4"), None)
+                .unwrap()
+                .len(),
+            1,
+            "snooze wrote local snooze state"
+        );
+
+        persist
+            .write(
+                ACTION_CHAT_ALERT_ACTION,
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"message_id":"m5","sender":"nyc3","action_id":"poweroff","label":"Power Off","kind":"destructive","verb":"action/power/off","armed":true}"#,
+                ),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 300);
+        assert_eq!(
+            persist.list_since("action/power/off", None).unwrap().len(),
+            1,
+            "armed destructive action fired"
         );
     }
 

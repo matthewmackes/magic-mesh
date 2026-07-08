@@ -76,8 +76,9 @@ use mde_kdc_host::sftp::{SftpMount, SshfsMount};
 use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
-use mde_kdc_proto::plugins::notification::{notification_packet, NotificationBody};
-use serde_json::{json, Value};
+use mde_kdc_proto::plugins::mpris::{MprisBody, MprisKind};
+use mde_kdc_proto::plugins::notification::{NotificationBody, notification_packet};
+use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
@@ -86,7 +87,7 @@ use super::{ShutdownToken, Worker};
 // is a read-only consumer of the public `verbs` surface — the openstack worker
 // itself (its state, its responder) is never touched.
 use crate::workers::openstack::verbs::{
-    cloud_action_topic, CloudInstance, CloudReply, LifecycleAction,
+    CloudInstance, CloudReply, LifecycleAction, cloud_action_topic,
 };
 
 /// The Connect verbs served over `action/connect/<verb>` (E2.2 — replacing
@@ -1073,8 +1074,8 @@ fn local_announce() -> Announce {
     // right after the handshake (observed: a paired phone reconnecting every
     // ~30s, never persistent, no features). But advertising packets we DON'T
     // handle is the false advertising the KDC-PLUGINS epic removes — so
-    // `mpris{,.request}` and `notification.request` (no inbound handler:
-    // media control + notification-pull are not implemented) are dropped.
+    // `mpris.request` state-pull and `notification.request` (no inbound handler
+    // for player-state reports / notification-pull yet) are dropped.
     // `incoming` = packets we accept + act on; `outgoing` = packets we send.
     let incoming_capabilities = [
         // Liveness — surfaced to the Alert Center.
@@ -1105,6 +1106,9 @@ fn local_announce() -> Announce {
         // KDC-MESH-8 — a connectivity-report request; answered with THIS host's
         // connectivity summary (#12).
         "kdeconnect.connectivity_report.request",
+        // KDC-MESH-6 — phone media transport keys, mapped to the host's active
+        // MPRIS player through playerctl. State reports remain future work.
+        "kdeconnect.mpris",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -1372,6 +1376,25 @@ async fn run_host(
                             "direction": "phone_rings_desktop",
                             "phone": peer.as_str(),
                         }));
+                    }
+                    // KDC-MESH-6 — Media transport controls from the phone. The
+                    // raw MPRIS action is parsed through the protocol body and then
+                    // mapped to a fixed playerctl allowlist; state-report bodies
+                    // are ignored until the player-state path lands.
+                    if packet.kind == "kdeconnect.mpris" {
+                        if let Ok(body) =
+                            mde_kdc_proto::plugins::from_packet_body::<MprisBody>(packet)
+                        {
+                            if let Some(command) =
+                                apply_mpris_media_command(&PlayerctlMediaControl, &body)
+                            {
+                                audit_kdc_action(json!({
+                                    "action": "kdc_media_control",
+                                    "phone": peer.as_str(),
+                                    "command": command,
+                                }));
+                            }
+                        }
                     }
                     // KDC-MESH-8 — Telephony alert (#12): a phone call/SMS state event
                     // (ringing / missed / talking) surfaces on THIS host's desktop
@@ -1846,6 +1869,62 @@ fn ring_local_device() {
         }
     }
     info!("kdc-host: find-my-device ring requested (no audio player available)");
+}
+
+// ───────────────────────── KDC-MESH-6: MPRIS media keys ───────────────────
+//
+// A paired phone sends `kdeconnect.mpris` command bodies for transport controls.
+// The desktop-side standard control surface is MPRIS, so this worker shells the
+// narrow, allowlisted action set through `playerctl` and never executes the raw
+// phone-provided string.
+
+/// Injectable runner for phone-originated media transport commands.
+trait MediaControl {
+    /// Run one `playerctl` subcommand. Returns whether a helper accepted the
+    /// request; a missing helper is an honest no-op for the caller.
+    fn run_playerctl(&self, subcommand: &'static str) -> bool;
+}
+
+/// Production media-control runner.
+struct PlayerctlMediaControl;
+
+impl MediaControl for PlayerctlMediaControl {
+    fn run_playerctl(&self, subcommand: &'static str) -> bool {
+        use std::process::{Command, Stdio};
+        Command::new("playerctl")
+            .arg(subcommand)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+}
+
+/// Map KDE Connect's MPRIS action token to an allowlisted `playerctl` command.
+fn playerctl_command_for_mpris_action(action: &str) -> Option<&'static str> {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "play" => Some("play"),
+        "pause" => Some("pause"),
+        "playpause" | "play-pause" | "toggle" => Some("play-pause"),
+        "next" => Some("next"),
+        "previous" | "prev" => Some("previous"),
+        "stop" => Some("stop"),
+        _ => None,
+    }
+}
+
+/// Apply one inbound MPRIS command body. Returns the allowlisted command that was
+/// attempted so the caller can audit the action without logging arbitrary input.
+fn apply_mpris_media_command<C: MediaControl>(
+    control: &C,
+    body: &MprisBody,
+) -> Option<&'static str> {
+    if body.kind() != MprisKind::Command {
+        return None;
+    }
+    let command = playerctl_command_for_mpris_action(&body.action)?;
+    let _accepted = control.run_playerctl(command);
+    Some(command)
 }
 
 // ───────────────────────── KDC-PLUGINS: Clipboard ────────────────────────
@@ -3013,6 +3092,7 @@ impl Worker for KdcHostWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
 
     #[test]
@@ -3056,6 +3136,72 @@ mod tests {
         assert_eq!(
             fanout_action_for_packet("kdeconnect.notification", &json!({ "ticker": "x" })),
             None
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingMediaControl {
+        calls: StdMutex<Vec<&'static str>>,
+    }
+
+    impl MediaControl for RecordingMediaControl {
+        fn run_playerctl(&self, subcommand: &'static str) -> bool {
+            self.calls.lock().unwrap().push(subcommand);
+            true
+        }
+    }
+
+    #[test]
+    fn local_announce_advertises_mpris_only_after_the_handler_exists() {
+        let announce = local_announce();
+        assert!(
+            announce
+                .incoming_capabilities
+                .iter()
+                .any(|cap| cap == "kdeconnect.mpris"),
+            "phone media transport keys must be advertised once handled"
+        );
+        assert!(
+            !announce
+                .incoming_capabilities
+                .iter()
+                .any(|cap| cap == "kdeconnect.mpris.request"),
+            "state-pull remains unadvertised until player state reports are implemented"
+        );
+    }
+
+    #[test]
+    fn mpris_media_command_maps_only_allowlisted_transport_actions() {
+        let control = RecordingMediaControl::default();
+        let body = MprisBody {
+            action: "Next".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(apply_mpris_media_command(&control, &body), Some("next"));
+        assert_eq!(*control.calls.lock().unwrap(), vec!["next"]);
+
+        let state_report = MprisBody {
+            player: "mde-music".into(),
+            is_playing: true,
+            ..Default::default()
+        };
+        assert_eq!(apply_mpris_media_command(&control, &state_report), None);
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            vec!["next"],
+            "state reports must not execute media commands"
+        );
+
+        let raw_shell = MprisBody {
+            action: "next; rm -rf /".into(),
+            ..Default::default()
+        };
+        assert_eq!(apply_mpris_media_command(&control, &raw_shell), None);
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            vec!["next"],
+            "unknown/raw actions must be dropped rather than executed"
         );
     }
 

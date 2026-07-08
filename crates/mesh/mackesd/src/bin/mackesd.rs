@@ -1228,6 +1228,12 @@ enum TransferCmd {
         #[arg(long)]
         json: bool,
     },
+    /// List auto-discovered transfer destinations from the mesh node-state plane.
+    Destinations {
+        /// Emit destination rows as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Cancel a job (`transfer.cancel`) — removes it + frees any slot it held.
     Cancel {
         /// The job id (from `submit` / `list`).
@@ -2137,9 +2143,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::DiscoverMdns => {
             use mackesd_core::surrounding_hosts::{
-                arp_neigh_map, classify, collect_mdns, enrich_hosts, hosts_from_mdns,
+                HostSignals, arp_neigh_map, classify, collect_mdns, enrich_hosts, hosts_from_mdns,
                 load_system_oui, refine_unknown_with_http, refine_unknown_with_nmap_os,
-                reverse_dns, HostSignals,
+                reverse_dns,
             };
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2184,7 +2190,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::SurroundingTrust { key, state } => {
-            use mackesd_core::surrounding_hosts::{set_host_trust, TrustState};
+            use mackesd_core::surrounding_hosts::{TrustState, set_host_trust};
             let ts = match state.to_ascii_lowercase().as_str() {
                 "trusted" => TrustState::Trusted,
                 "blocked" => TrustState::Blocked,
@@ -2241,7 +2247,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::CaptivePortalCheck => {
-            use mackesd_core::surrounding_hosts::{detect_captive_portal, CAPTIVE_PROBE_URL};
+            use mackesd_core::surrounding_hosts::{CAPTIVE_PROBE_URL, detect_captive_portal};
             if let Some(portal) = detect_captive_portal(CAPTIVE_PROBE_URL) {
                 if portal.is_empty() {
                     eprintln!("CAPTIVE-PORTAL: detected (splash intercept; no redirect URL)");
@@ -2254,8 +2260,8 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::VoipRtt => {
             use mackesd_core::voip_rtt::{
-                own_nebula_ip, publish_link_rtt, rtt_topic, sample_link_rtt, VITELITY_PROXY_HOST,
-                VITELITY_PROXY_PORT,
+                VITELITY_PROXY_HOST, VITELITY_PROXY_PORT, own_nebula_ip, publish_link_rtt,
+                rtt_topic, sample_link_rtt,
             };
             let peer = own_nebula_ip().unwrap_or_default();
             let sample = sample_link_rtt(&peer);
@@ -2289,7 +2295,7 @@ fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "unknown".to_string())
             });
-            use mackes_mesh_types::cap_tags::{read_tags, write_tags, CapabilityTag, NodeTags};
+            use mackes_mesh_types::cap_tags::{CapabilityTag, NodeTags, read_tags, write_tags};
             if let Some(spec) = set {
                 let mut tags = NodeTags::default();
                 for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
@@ -2327,7 +2333,7 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::HopAdvertise { subnets, exit } => {
-            use mackesd_core::nebula_topology::{write_advert, HopAdvert, EXIT_ROUTE};
+            use mackesd_core::nebula_topology::{EXIT_ROUTE, HopAdvert, write_advert};
             let root = mackesd_core::default_qnm_shared_root();
             let host = local_hostname();
             let overlay_ip = local_overlay_ip().ok_or_else(|| {
@@ -2364,7 +2370,7 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::VpnImport { name, kind, file } => {
-            use mackesd_core::nebula_topology::{write_vpn_profile, VpnKind, VpnProfile};
+            use mackesd_core::nebula_topology::{VpnKind, VpnProfile, write_vpn_profile};
             let root = mackesd_core::default_qnm_shared_root();
             let kind = match kind.to_ascii_lowercase().as_str() {
                 "wireguard" | "wg" => VpnKind::Wireguard,
@@ -2726,7 +2732,9 @@ fn main() -> anyhow::Result<()> {
                         println!("  no-op — stays LAN-only ({reason}); retry available");
                     }
                     Err(e) => {
-                        eprintln!("  spawn-lighthouse failed (live provisioning is integration-gated): {e}");
+                        eprintln!(
+                            "  spawn-lighthouse failed (live provisioning is integration-gated): {e}"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -3085,7 +3093,7 @@ fn main() -> anyhow::Result<()> {
                 nse_dir,
             } => {
                 use mackesd_core::card::probe::HostSource;
-                use mackesd_core::probe_nmap::{scan, Profile};
+                use mackesd_core::probe_nmap::{Profile, scan};
                 let src = match source.as_str() {
                     "lan" => HostSource::Lan,
                     "arbitrary" => HostSource::Arbitrary,
@@ -3159,7 +3167,7 @@ fn main() -> anyhow::Result<()> {
             // DdnsService rooted at the shared workgroup root and call the SAME
             // `ipc::ddns::build_reply` verb the bus responder serves, printing the
             // JSON reply. One config, two front-ends (CLI + GUI).
-            use mackesd_core::ipc::ddns::{build_reply, DdnsService};
+            use mackesd_core::ipc::ddns::{DdnsService, build_reply};
             let (verb, body, root): (&str, Option<String>, PathBuf) = match action {
                 DdnsCmd::GetConfig { workgroup_root } => (
                     "get-config",
@@ -3852,8 +3860,8 @@ fn main() -> anyhow::Result<()> {
                 // Long-running path: spawn the worker, install a
                 // SIGTERM/SIGINT handler that flips the shutdown
                 // flag, then block until the worker exits.
-                use std::sync::atomic::{AtomicBool, Ordering};
                 use std::sync::Arc;
+                use std::sync::atomic::{AtomicBool, Ordering};
                 let shutdown = Arc::new(AtomicBool::new(false));
                 install_signal_handlers(Arc::clone(&shutdown))?;
                 let handle = mackesd_core::worker::spawn_reconcile_worker(
@@ -3952,7 +3960,7 @@ fn main() -> anyhow::Result<()> {
                     if new.len() < 8 {
                         anyhow::bail!("set-passphrase: at least 8 characters (SEC-2)");
                     }
-                    use mackesd_core::ca::rotation_gate::{verify, GateCheck};
+                    use mackesd_core::ca::rotation_gate::{GateCheck, verify};
                     if verify(&root, "") != GateCheck::NotSet {
                         let current =
                             std::env::var("MDE_CA_PASSPHRASE_CURRENT").unwrap_or_default();
@@ -5170,7 +5178,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Tags { json } => {
             // PLANES-3/W82 — the fleet tag census: for each v1 tag, the
             // roster nodes that carry it (read from the cap-tags store).
-            use mackes_mesh_types::cap_tags::{read_tags, CapabilityTag};
+            use mackes_mesh_types::cap_tags::{CapabilityTag, read_tags};
             let root = mackesd_core::default_qnm_shared_root();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5426,7 +5434,7 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 };
                 use mackesd_core::image_build::{
-                    build_image, now_ms, BuildInputs, SubprocessBuild,
+                    BuildInputs, SubprocessBuild, build_image, now_ms,
                 };
                 let runner = SubprocessBuild::new(BuildInputs::default());
                 match build_image(
@@ -6268,15 +6276,15 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile,
-        heartbeat::HeartbeatWorker, job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker,
-        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
-        sshd_overlay_bind::SshdOverlayBindWorker, validation_suite,
-        voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
+        RestartPolicy, Spawn, Supervisor, device_control, firewall_preset::FirewallPresetWorker,
+        fleet_reconcile, heartbeat::HeartbeatWorker, job_exec, lifecycle_exec,
+        mdns_relay::MdnsRelayWorker, mesh_dns, mesh_router::MeshRouterWorker, netstate_apply,
+        presence_watch, ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
+        validation_suite, voice_config::VoiceConfigWorker,
     };
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::RwLock;
     let workgroup_root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
     let node_id = node_id.unwrap_or_else(default_node_id);
@@ -10470,7 +10478,7 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
 /// (keyed by the shared mesh age identity) — the operational put-path the readers
 /// (`media_registry`, VPN, DR) always assumed but no CLI exposed.
 fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
-    use mackesd_core::ipc::secret_store::{age_key_path, repo_root, SecretStore};
+    use mackesd_core::ipc::secret_store::{SecretStore, age_key_path, repo_root};
     let workgroup_root = mackesd_core::default_qnm_shared_root();
     let store_for = |local: bool| -> SecretStore {
         if local {
@@ -10525,7 +10533,8 @@ fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
 /// store the daemon uses, so the CLI and the daemon share one queue.
 fn cmd_transfer(cmd: TransferCmd) -> anyhow::Result<()> {
     use mackesd_core::workers::transfers::{
-        default_store_root, write_verb, Ledger, Method, TransferJob, TransferPolicy, TransferVerb,
+        Ledger, Method, TransferJob, TransferPolicy, TransferVerb, default_store_root,
+        discover_destinations, write_verb,
     };
 
     let store_root = default_store_root();
@@ -10577,6 +10586,27 @@ fn cmd_transfer(cmd: TransferCmd) -> anyhow::Result<()> {
                 }
             }
         }
+        TransferCmd::Destinations { json } => {
+            let workgroup_root = mackesd_core::default_qnm_shared_root();
+            let self_host = std::env::var("HOSTNAME").ok();
+            let destinations = discover_destinations(&workgroup_root, self_host.as_deref());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&destinations)?);
+            } else if destinations.is_empty() {
+                println!("no transfer destinations discovered");
+            } else {
+                println!("{:<18} {:<14} {:<16} DEST", "ID", "KIND", "METHOD");
+                for d in &destinations {
+                    println!(
+                        "{:<18} {:<14} {:<16} {}",
+                        d.id,
+                        format!("{:?}", d.kind).to_ascii_lowercase(),
+                        d.method,
+                        d.dest
+                    );
+                }
+            }
+        }
         TransferCmd::Cancel { id } => {
             dispatch_transfer_lifecycle(
                 &store_root,
@@ -10614,7 +10644,7 @@ fn dispatch_transfer_lifecycle(
     verb: mackesd_core::workers::transfers::TransferVerb,
     name: &str,
 ) -> anyhow::Result<()> {
-    use mackesd_core::workers::transfers::{write_verb, Ledger};
+    use mackesd_core::workers::transfers::{Ledger, write_verb};
     let ledger = Ledger::open(store_root)
         .with_context(|| format!("opening the transfers ledger at {}", store_root.display()))?;
     if ledger.get(id).is_none() {
@@ -10628,7 +10658,7 @@ fn dispatch_transfer_lifecycle(
 
 fn cmd_mesh_ssh_key(cmd: MeshSshKeyCmd) -> anyhow::Result<()> {
     use mackesd_core::ipc::mesh_ssh_key::{MeshKeyProvisioner, ProvisionOutcome, SshdReload};
-    use mackesd_core::ipc::secret_store::{repo_root, SecretStore};
+    use mackesd_core::ipc::secret_store::{SecretStore, repo_root};
 
     let (args, verb) = match &cmd {
         MeshSshKeyCmd::Provision(a) => (a, "provision"),
@@ -10885,7 +10915,7 @@ fn cmd_found(
     enroll_port: Option<u16>,
     with_backoffice: Option<&str>,
 ) -> anyhow::Result<()> {
-    use mackesd_core::nebula_enroll_endpoint::{generate_endpoint_identity, DEFAULT_ENROLL_PORT};
+    use mackesd_core::nebula_enroll_endpoint::{DEFAULT_ENROLL_PORT, generate_endpoint_identity};
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
 
     let parsed: mde_role::Role = role
@@ -10943,7 +10973,9 @@ fn cmd_found(
     if let Err(e) =
         mackesd_core::lighthouse_addr::write_external_addr(&format!("{ip}:{}", 4242_u16))
     {
-        eprintln!("found: could not persist external-addr ({e}) — set it with `mackesd set-external-addr`");
+        eprintln!(
+            "found: could not persist external-addr ({e}) — set it with `mackesd set-external-addr`"
+        );
     }
 
     // mesh-init: pin role, mint CA, self-sign, write the founding bundle,
@@ -11301,7 +11333,9 @@ fn cmd_join(
                 if let Err(e) =
                     mackesd_core::lighthouse_addr::write_external_addr(&format!("{ip}:4242"))
                 {
-                    eprintln!("join: could not persist external-addr ({e}) — set it with `mackesd set-external-addr`");
+                    eprintln!(
+                        "join: could not persist external-addr ({e}) — set it with `mackesd set-external-addr`"
+                    );
                 }
             }
             Err(e) => eprintln!(
@@ -11388,7 +11422,9 @@ fn lighthouse_join_etcd(bundle: &mackesd_core::ca::bundle::NebulaBundle, self_na
                     .status();
                 match st {
                     Ok(s) if s.success() => {
-                        println!("etcd: joined the quorum as a voter (member added + local etcd started)");
+                        println!(
+                            "etcd: joined the quorum as a voter (member added + local etcd started)"
+                        );
                     }
                     _ => eprintln!(
                         "etcd: member added but `setup-etcd --join` failed — start the local \
@@ -11455,7 +11491,7 @@ fn provision_caddy_if_lighthouse(role: mde_role::Role) {
 /// warning until the operator provisions it by hand per the unit
 /// comment).
 fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
-    use mackesd_core::ca::backup_provision::{provision, ProvisionOutcome};
+    use mackesd_core::ca::backup_provision::{ProvisionOutcome, provision};
     match provision(role) {
         Ok(ProvisionOutcome::Provisioned { sealed_bytes }) => {
             // Log presence/length only — NEVER the passphrase value.
@@ -11603,7 +11639,7 @@ mod found_backoffice_tests {
     //! a bogus tier is caught by [`normalize_backoffice_tier`]) and that the flag
     //! is purely ADDITIVE — `found` without it parses byte-for-byte the same
     //! (the regression that found is unchanged when the flag is absent).
-    use super::{normalize_backoffice_tier, Cli, Cmd};
+    use super::{Cli, Cmd, normalize_backoffice_tier};
     use clap::Parser;
 
     /// Extract the `with_backoffice` field from a parsed `found` (panics if the

@@ -59,10 +59,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
-use crate::workers::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
+use crate::workers::proc::{DEFAULT_CMD_TIMEOUT, output_with_timeout};
 
 use super::fs_tools::{
     self, CapabilityRefusal, FsToolRunner, LiveFsTools, ResizeDirection, ResizeTarget,
@@ -1137,11 +1138,7 @@ pub fn parent_disk(dev: &str) -> String {
             let is_part = tail.len() > 1
                 && tail[1..].bytes().all(|b| b.is_ascii_digit())
                 && head.bytes().last().is_some_and(|b| b.is_ascii_digit());
-            if is_part {
-                head
-            } else {
-                base
-            }
+            if is_part { head } else { base }
         })
     } else {
         base.trim_end_matches(|c: char| c.is_ascii_digit())
@@ -2194,6 +2191,21 @@ fn val_str(v: Option<&zbus::zvariant::OwnedValue>) -> Option<String> {
     match v.map(std::ops::Deref::deref)? {
         Value::Str(s) => Some(s.as_str().to_string()),
         Value::ObjectPath(p) => Some(p.as_str().to_string()),
+        Value::Array(a) => {
+            let bytes = a
+                .inner()
+                .iter()
+                .map(|v| match v {
+                    Value::U8(b) => Some(*b),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(
+                String::from_utf8_lossy(bytes.strip_suffix(&[0]).unwrap_or(&bytes))
+                    .trim()
+                    .to_string(),
+            )
+        }
         _ => None,
     }
     .filter(|s| !s.is_empty())
@@ -2337,8 +2349,18 @@ impl ProgressState {
 
 // ───────────────────────────── worker ─────────────────────────────
 
+fn resolve_default_bus_root(
+    env_root: Option<std::ffi::OsString>,
+    data_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = env_root.filter(|root| !root.is_empty()) {
+        return Some(PathBuf::from(root));
+    }
+    Some(data_dir?.join("mde").join("bus"))
+}
+
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    resolve_default_bus_root(std::env::var_os("MDE_BUS_ROOT"), dirs::data_dir())
 }
 
 fn now_ms() -> u64 {
@@ -2351,10 +2373,16 @@ fn now_ms() -> u64 {
 /// Publish a JSON body to `topic` via the `mde-bus` CLI — the same fire-and-reap
 /// path `container`/`vm_lifecycle` use. Best-effort: a missing `mde-bus` binary
 /// (pre-RPM dev box) is swallowed.
-fn publish_json<T: serde::Serialize>(topic: &str, body: &T) {
+fn publish_json<T: serde::Serialize>(bus_root: Option<&Path>, topic: &str, body: &T) {
     let Ok(json) = serde_json::to_string(body) else {
         return;
     };
+    if let Some(root) = bus_root {
+        if let Ok(persist) = Persist::open(root.to_path_buf()) {
+            let _ = persist.write(topic, Priority::Default, None, Some(&json));
+            return;
+        }
+    }
     let mut cmd = Command::new("mde-bus");
     cmd.args(["publish", topic, "--body-flag", &json]);
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
@@ -2489,7 +2517,7 @@ impl StorageWorker {
 
     /// Publish the topology mirror to `state/storage/<node>` (honest backend
     /// state).
-    async fn publish_state(&self) {
+    async fn publish_state(&self, bus_root: Option<&Path>) {
         let (backend, topology) = match self.enumerate().await {
             Ok(topo) => (BackendStatus::Available, topo),
             Err(reason) => (BackendStatus::Unavailable { reason }, Topology::default()),
@@ -2500,7 +2528,7 @@ impl StorageWorker {
             topology,
             published_at_ms: now_ms(),
         };
-        publish_json(&state_topic(&self.node_id), &state);
+        publish_json(bus_root, &state_topic(&self.node_id), &state);
     }
 
     /// Handle one Apply verb: re-enumerate live, check arming, run the queue, and
@@ -2511,6 +2539,7 @@ impl StorageWorker {
         armed_device: &str,
         staged: &Topology,
         queue: &StorageQueue,
+        bus_root: Option<&Path>,
     ) -> bool {
         let live = match self.enumerate().await {
             Ok(t) => t,
@@ -2541,6 +2570,7 @@ impl StorageWorker {
         // per-op progress to the Bus as each op resolves.
         let interlocks = Arc::clone(&self.interlocks);
         let executor = Arc::clone(&self.executor);
+        let progress_bus_root = bus_root.map(Path::to_path_buf);
         let staged = staged.clone();
         let queue = queue.clone();
         let live_for_apply = live;
@@ -2562,7 +2592,7 @@ impl StorageWorker {
                             state,
                             published_at_ms: now_ms(),
                         };
-                        publish_json(&topic, &progress);
+                        publish_json(progress_bus_root.as_deref(), &topic, &progress);
                     }
                 },
             )
@@ -2599,7 +2629,10 @@ impl StorageWorker {
                     staged,
                     queue,
                 } => {
-                    if self.handle_apply(&armed_device, &staged, &queue).await {
+                    if self
+                        .handle_apply(&armed_device, &staged, &queue, Some(bus_root))
+                        .await
+                    {
                         changed = true;
                     }
                 }
@@ -2610,7 +2643,12 @@ impl StorageWorker {
     }
 
     /// Republish the mirror when forced (an op applied) or the heartbeat elapsed.
-    async fn publish_snapshot(&self, last_at: &mut Option<Instant>, force: bool) {
+    async fn publish_snapshot(
+        &self,
+        bus_root: Option<&Path>,
+        last_at: &mut Option<Instant>,
+        force: bool,
+    ) {
         let now = Instant::now();
         let due = force
             || last_at
@@ -2619,7 +2657,7 @@ impl StorageWorker {
         if !due {
             return;
         }
-        self.publish_state().await;
+        self.publish_state(bus_root).await;
         *last_at = Some(now);
     }
 }
@@ -2643,7 +2681,8 @@ impl Worker for StorageWorker {
         let bus_root = self.bus_root();
         // Publish an immediate mirror so a panel doesn't wait a heartbeat.
         let mut last_pub: Option<Instant> = None;
-        self.publish_snapshot(&mut last_pub, true).await;
+        self.publish_snapshot(bus_root.as_deref(), &mut last_pub, true)
+            .await;
         // Skip any Apply backlog so a restart doesn't re-run stale destructive ops.
         let mut cursor = bus_root
             .as_deref()
@@ -2662,7 +2701,7 @@ impl Worker for StorageWorker {
                     } else {
                         false
                     };
-                    self.publish_snapshot(&mut last_pub, changed).await;
+                    self.publish_snapshot(bus_root.as_deref(), &mut last_pub, changed).await;
                     // The virtual sub-worker shells qemu-img/podman (blocking, bounded
                     // by EFF-20), so run its tick off the runtime thread.
                     if let Some(root) = &bus_root {
@@ -2861,14 +2900,16 @@ mod tests {
         ));
         // Grow beyond current is ok (fits in 90 GiB free); grow that doesn't move
         // up is InvalidResize.
-        assert!(validate_op(
-            &StorageOp::Grow {
-                partition: "/dev/sdb1".into(),
-                new_size_mib: 20 * 1024
-            },
-            &topo
-        )
-        .is_ok());
+        assert!(
+            validate_op(
+                &StorageOp::Grow {
+                    partition: "/dev/sdb1".into(),
+                    new_size_mib: 20 * 1024
+                },
+                &topo
+            )
+            .is_ok()
+        );
         assert!(matches!(
             validate_op(
                 &StorageOp::Grow {
@@ -2891,14 +2932,16 @@ mod tests {
             Err(OpInvalid::InvalidResize { .. })
         ));
         // A valid shrink.
-        assert!(validate_op(
-            &StorageOp::Shrink {
-                partition: "/dev/sdb1".into(),
-                new_size_mib: 5 * 1024
-            },
-            &topo
-        )
-        .is_ok());
+        assert!(
+            validate_op(
+                &StorageOp::Shrink {
+                    partition: "/dev/sdb1".into(),
+                    new_size_mib: 5 * 1024
+                },
+                &topo
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3443,16 +3486,18 @@ mod tests {
         ));
         // btrfs + mounted → ok.
         btrfs.devices[0].partitions[0].mountpoint = Some("/mnt/b".into());
-        assert!(validate_op(
-            &StorageOp::SubvolumeSnapshot {
-                partition: "/dev/sdb1".into(),
-                source: "home".into(),
-                dest: "home-snap".into(),
-                readonly: true,
-            },
-            &btrfs
-        )
-        .is_ok());
+        assert!(
+            validate_op(
+                &StorageOp::SubvolumeSnapshot {
+                    partition: "/dev/sdb1".into(),
+                    source: "home".into(),
+                    dest: "home-snap".into(),
+                    readonly: true,
+                },
+                &btrfs
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3767,6 +3812,31 @@ mod tests {
     }
 
     #[test]
+    fn default_bus_root_prefers_service_environment() {
+        assert_eq!(
+            resolve_default_bus_root(
+                Some("/run/mde-bus".into()),
+                Some(PathBuf::from("/root/.local/share"))
+            ),
+            Some(PathBuf::from("/run/mde-bus"))
+        );
+        assert_eq!(
+            resolve_default_bus_root(None, Some(PathBuf::from("/root/.local/share"))),
+            Some(PathBuf::from("/root/.local/share/mde/bus"))
+        );
+    }
+
+    #[test]
+    fn udisks_byte_array_device_paths_decode_as_strings() {
+        let value = zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::Array(
+            zbus::zvariant::Array::from(b"/dev/nvme0n1\0".to_vec()),
+        ))
+        .expect("owned byte-array value");
+
+        assert_eq!(val_str(Some(&value)).as_deref(), Some("/dev/nvme0n1"));
+    }
+
+    #[test]
     fn worker_name_matches_module() {
         let w = StorageWorker::new("node".into());
         assert_eq!(w.name(), "storage");
@@ -3803,13 +3873,28 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_backend_publishes_typed_state() {
-        // enumerate() → Unavailable must not panic the mirror publish.
+        // enumerate() → Unavailable must still publish an honest mirror through
+        // the injected Bus root. This pins BUG-STORAGE-1's live failure mode:
+        // worker spawn was visible, but a best-effort `mde-bus` subprocess could
+        // silently leave `state/storage/<node>` absent.
         let dir = tempfile::tempdir().unwrap();
         let w = StorageWorker::new("node".into())
             .with_udisks(Arc::new(FakeUDisks(Err("no udisks2".into()))))
             .with_bus_root(dir.path().to_path_buf());
-        // Directly exercise publish_state (no bus binary needed — publish is
-        // best-effort fire-and-reap).
-        w.publish_state().await;
+        w.publish_state(Some(dir.path())).await;
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open test bus");
+        let msg = persist
+            .list_since(&state_topic("node"), None)
+            .expect("read storage mirror")
+            .into_iter()
+            .next()
+            .expect("storage mirror was published");
+        let body = msg.body.expect("storage mirror body");
+        let state: StorageState = serde_json::from_str(&body).expect("storage state json");
+        assert_eq!(state.host, "node");
+        let BackendStatus::Unavailable { reason } = state.backend else {
+            panic!("expected unavailable backend");
+        };
+        assert!(reason.contains("no udisks2"), "{reason}");
     }
 }

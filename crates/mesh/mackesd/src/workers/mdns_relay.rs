@@ -28,8 +28,8 @@
 
 #![cfg(feature = "async-services")]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
@@ -49,6 +49,11 @@ pub const RELAY_ORIGIN_TXT: &str = "mde-relay-origin";
 
 /// Idle sleep between browse-drain passes when no events are pending.
 const IDLE_SLEEP: Duration = Duration::from_millis(500);
+
+/// BUG-BROWSER-7: cap inbound peer-service registrations so a noisy/flapping
+/// announce lane cannot grow mdns-sd registrations and their sockets without
+/// bound. Duplicates are still accepted as no-ops through the `registered` set.
+const MAX_REPUBLISHED_SERVICES: usize = 512;
 
 /// Service types relayed by default (v1.x §9 lock — media + discovery).
 pub const RELAYED_TYPES: &[&str] = &[
@@ -184,6 +189,33 @@ fn service_key(ann: &MdnsAnnounce) -> String {
     format!("{}|{}|{}", ann.peer, ann.service_type, ann.service)
 }
 
+/// Whether a peer announce should create a new local mDNS registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepublishDecision {
+    /// First sighting of this peer/type/instance and still under the cap.
+    Register,
+    /// Already registered; nothing to do, but this is not pressure.
+    Duplicate,
+    /// New unique service would exceed the process cap.
+    AtCap,
+}
+
+fn remember_republish_candidate(
+    registered: &mut std::collections::HashSet<String>,
+    ann: &MdnsAnnounce,
+    max: usize,
+) -> RepublishDecision {
+    let key = service_key(ann);
+    if registered.contains(&key) {
+        return RepublishDecision::Duplicate;
+    }
+    if registered.len() >= max {
+        return RepublishDecision::AtCap;
+    }
+    registered.insert(key);
+    RepublishDecision::Register
+}
+
 /// Build the `ServiceInfo` to register a peer's service on the LOCAL LAN:
 /// advertised at the peer's **mesh IP** (so LAN clients connect over the
 /// overlay), peer-suffixed instance name, carrying the [`RELAY_ORIGIN_TXT`] tag
@@ -275,11 +307,26 @@ fn run_relay_blocking(stop: &AtomicBool) {
                     if ann.peer == own_ip {
                         continue; // anti-loop: our own announce
                     }
-                    if registered.insert(service_key(&ann)) {
-                        if let Some(info) = build_republish_info(&ann) {
-                            if let Err(e) = daemon.register(info) {
-                                tracing::warn!(error = %e, service = %ann.service, "mdns_relay: republish failed");
+                    match remember_republish_candidate(
+                        &mut registered,
+                        &ann,
+                        MAX_REPUBLISHED_SERVICES,
+                    ) {
+                        RepublishDecision::Register => {
+                            if let Some(info) = build_republish_info(&ann) {
+                                if let Err(e) = daemon.register(info) {
+                                    tracing::warn!(error = %e, service = %ann.service, "mdns_relay: republish failed");
+                                }
                             }
+                        }
+                        RepublishDecision::Duplicate => {}
+                        RepublishDecision::AtCap => {
+                            tracing::warn!(
+                                cap = MAX_REPUBLISHED_SERVICES,
+                                service = %ann.service,
+                                peer = %ann.peer,
+                                "mdns_relay: republish cap reached; skipping peer service"
+                            );
                         }
                     }
                 }
@@ -443,6 +490,29 @@ mod tests {
     }
 
     #[test]
+    fn republish_candidates_are_capped_but_duplicates_remain_noops() {
+        let mut registered = std::collections::HashSet::new();
+        let a = ann("10.42.0.9", "Jellyfin", "_jellyfin._tcp", 8096);
+        let b = ann("10.42.0.8", "Cast", "_googlecast._tcp", 8009);
+
+        assert_eq!(
+            remember_republish_candidate(&mut registered, &a, 1),
+            RepublishDecision::Register
+        );
+        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            remember_republish_candidate(&mut registered, &a, 1),
+            RepublishDecision::Duplicate
+        );
+        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            remember_republish_candidate(&mut registered, &b, 1),
+            RepublishDecision::AtCap
+        );
+        assert_eq!(registered.len(), 1);
+    }
+
+    #[test]
     fn build_republish_info_advertises_peer_mesh_ip_and_origin_tag() {
         let a = ann("10.42.0.9", "Jellyfin", "_jellyfin._tcp", 8096);
         let info = build_republish_info(&a).expect("valid mesh IP");
@@ -454,10 +524,11 @@ mod tests {
             Some("10.42.0.9")
         );
         // advertised at the peer's mesh IP, not our LAN address.
-        assert!(info
-            .get_addresses()
-            .iter()
-            .any(|ip| ip.to_string() == "10.42.0.9"));
+        assert!(
+            info.get_addresses()
+                .iter()
+                .any(|ip| ip.to_string() == "10.42.0.9")
+        );
     }
 
     #[test]

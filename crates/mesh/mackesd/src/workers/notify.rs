@@ -55,14 +55,14 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::Severity;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{ShutdownToken, Worker};
 
@@ -72,6 +72,12 @@ use super::{ShutdownToken, Worker};
 /// [`super::chat::ALERT_LANE_PREFIXES`]) into the `alert:<host>` conversation the
 /// Chat surface renders.
 pub const NOTIFY_TOPIC_PREFIX: &str = "event/notify/";
+/// Prefix for daemon-owned status rollups consumed by the shell pips.
+pub const NOTIFY_SEGMENT_TOPIC_PREFIX: &str = "state/notify/segment/";
+/// Criticals on the affected local seat fire the edge cue.
+pub const CRITICAL_POLICY_OWN_SEAT: &str = "own-seat-light-show";
+/// Remote criticals stay pull-first: pip + Chat.
+pub const CRITICAL_POLICY_REMOTE: &str = "remote-pip-chat";
 
 /// Base poll cadence. Peer + journal checks run every tick; the heavier probes
 /// run on slow multiples ([`SERVICE_EVERY`] / [`DISK_EVERY`] / [`UPDATES_EVERY`])
@@ -113,6 +119,10 @@ pub enum NotifySource {
     Disk,
     /// Journal entries at WARN-or-above (coalesced).
     Journal,
+    /// OpenStack/cloud notifications emitted by the cloud worker.
+    Cloud,
+    /// A node capability grade entered D/F.
+    NodeGrade,
 }
 
 impl NotifySource {
@@ -125,6 +135,8 @@ impl NotifySource {
             Self::Service => "service",
             Self::Disk => "disk",
             Self::Journal => "journal",
+            Self::Cloud => "cloud",
+            Self::NodeGrade => "node-grade",
         }
     }
 
@@ -132,6 +144,49 @@ impl NotifySource {
     #[must_use]
     pub fn topic(self) -> String {
         format!("{NOTIFY_TOPIC_PREFIX}{}", self.key())
+    }
+
+    /// The status segment this source contributes to.
+    #[must_use]
+    pub const fn segment(self) -> NotifySegment {
+        match self {
+            Self::Peer => NotifySegment::Mesh,
+            Self::Updates => NotifySegment::Power,
+            Self::Service | Self::Disk => NotifySegment::Device,
+            Self::Journal | Self::Cloud | Self::NodeGrade => NotifySegment::Alerts,
+        }
+    }
+}
+
+/// The four status segments the shell renders as pips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NotifySegment {
+    /// Device/seat health.
+    Device,
+    /// Mesh peer/connectivity health.
+    Mesh,
+    /// Power/update posture.
+    Power,
+    /// General alert firehose.
+    Alerts,
+}
+
+impl NotifySegment {
+    /// Stable wire key.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Mesh => "mesh",
+            Self::Power => "power",
+            Self::Alerts => "alerts",
+        }
+    }
+
+    /// Bus topic for this segment's latest rollup.
+    #[must_use]
+    pub fn topic(self) -> String {
+        format!("{NOTIFY_SEGMENT_TOPIC_PREFIX}{}", self.key())
     }
 }
 
@@ -144,6 +199,8 @@ pub struct Notification {
     pub source: NotifySource,
     /// The one-line human message the Chat card shows.
     pub summary: String,
+    /// The affected host, when different from the worker's own host.
+    pub host: Option<String>,
 }
 
 impl Notification {
@@ -152,12 +209,61 @@ impl Notification {
             severity,
             source,
             summary: summary.into(),
+            host: None,
         }
+    }
+
+    fn for_host(
+        severity: Severity,
+        source: NotifySource,
+        host: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity,
+            source,
+            summary: summary.into(),
+            host: Some(host.into()),
+        }
+    }
+
+    fn host<'a>(&'a self, self_host: &'a str) -> &'a str {
+        self.host.as_deref().unwrap_or(self_host)
     }
 
     /// The coalescing fingerprint: same source + same text ⇒ same notification.
     fn fingerprint(&self) -> String {
-        format!("{}:{}", self.source.key(), self.summary)
+        format!(
+            "{}:{}:{}",
+            self.source.key(),
+            self.host.as_deref().unwrap_or(""),
+            self.summary
+        )
+    }
+}
+
+const fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Info => 1,
+        Severity::Warning => 2,
+        Severity::Critical => 3,
+    }
+}
+
+fn node_grade_severity(grade: &str) -> Option<Severity> {
+    match grade {
+        "F" => Some(Severity::Critical),
+        "D" => Some(Severity::Warning),
+        _ => None,
+    }
+}
+
+fn severity_from_tag(tag: &str) -> Option<Severity> {
+    match tag.trim().to_ascii_lowercase().as_str() {
+        "critical" | "crit" | "error" | "fatal" | "urgent" => Some(Severity::Critical),
+        "warning" | "warn" | "high" => Some(Severity::Warning),
+        "info" | "notice" | "debug" => Some(Severity::Info),
+        _ => None,
     }
 }
 
@@ -170,6 +276,31 @@ struct NotifyBody<'a> {
     source: &'a str,
     summary: &'a str,
     host: &'a str,
+    ts_unix_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GradeRow {
+    host: String,
+    grade: String,
+    score: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalNotifyBody {
+    severity: String,
+    summary: String,
+    host: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SegmentRollupBody<'a> {
+    segment: &'a str,
+    severity: &'a str,
+    source: &'a str,
+    summary: &'a str,
+    host: &'a str,
+    critical_policy: &'a str,
     ts_unix_ms: i64,
 }
 
@@ -430,8 +561,14 @@ struct SourceState {
     /// The journal `--since` cursor (unix seconds) — `None` before the first poll
     /// (which seeds it to now, so old warnings aren't replayed).
     journal_since: Option<i64>,
+    /// Last alarm grade seen per host; C-or-better clears a host.
+    known_node_grade_alarms: BTreeMap<String, String>,
+    /// Cursors for external `event/notify/*` lanes owned by other workers.
+    external_cursors: BTreeMap<String, Option<String>>,
     /// The bounded, coalescing emit log.
     log: NotifyLog,
+    /// Current worst notification driving each status segment.
+    rollups: BTreeMap<NotifySegment, Notification>,
 }
 
 /// The mackesd `notify` worker (CHAT-FIX-2). Runs on every node (rank 0).
@@ -486,6 +623,7 @@ impl NotifyWorker {
         // Peers + journal every tick (both cheap + edge-triggered).
         pending.extend(self.check_peers(state));
         pending.extend(self.check_journal(state, now_ms));
+        pending.extend(self.check_node_grades(state));
 
         if tick % SERVICE_EVERY == 0 {
             pending.extend(self.check_services(state));
@@ -501,8 +639,10 @@ impl NotifyWorker {
         for n in pending {
             if state.log.admit(&n, now_ms) {
                 self.emit(persist, &n, now_ms);
+                self.update_segment_rollup(persist, state, &n, now_ms);
             }
         }
+        self.fold_external_notify_lane(persist, state, NotifySource::Cloud, now_ms);
     }
 
     /// Diff the replicated peer directory (the same source the chat/mesh mirror
@@ -633,6 +773,80 @@ impl NotifyWorker {
         }
     }
 
+    /// Scan the existing node-grade mirror and alert on transitions into D/F.
+    fn check_node_grades(&self, state: &mut SourceState) -> Vec<Notification> {
+        let dir = self.workgroup_root.join("node-grade");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut fresh = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(row) = serde_json::from_str::<GradeRow>(&body) else {
+                continue;
+            };
+            let grade = row.grade.trim().to_ascii_uppercase();
+            let Some(severity) = node_grade_severity(&grade) else {
+                state.known_node_grade_alarms.remove(&row.host);
+                continue;
+            };
+            let changed = state.known_node_grade_alarms.get(&row.host) != Some(&grade);
+            if changed {
+                state
+                    .known_node_grade_alarms
+                    .insert(row.host.clone(), grade.clone());
+                fresh.push(Notification::for_host(
+                    severity,
+                    NotifySource::NodeGrade,
+                    row.host.clone(),
+                    format!(
+                        "node {} dropped to grade {grade} (score {})",
+                        row.host, row.score
+                    ),
+                ));
+            }
+        }
+        fresh
+    }
+
+    fn fold_external_notify_lane(
+        &self,
+        persist: &Persist,
+        state: &mut SourceState,
+        source: NotifySource,
+        now_ms: i64,
+    ) {
+        let topic = source.topic();
+        let cursor = state.external_cursors.get(&topic).cloned().flatten();
+        let msgs = persist
+            .list_since(&topic, cursor.as_deref())
+            .unwrap_or_default();
+        if let Some(last) = msgs.last() {
+            state
+                .external_cursors
+                .insert(topic.clone(), Some(last.ulid.clone()));
+        }
+        for msg in msgs {
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(external) = serde_json::from_str::<ExternalNotifyBody>(body) else {
+                continue;
+            };
+            let Some(severity) = severity_from_tag(&external.severity) else {
+                continue;
+            };
+            let n = Notification::for_host(severity, source, external.host, external.summary);
+            self.update_segment_rollup(persist, state, &n, now_ms);
+        }
+    }
+
     /// Serialize + publish one notification on its `event/notify/<source>` lane —
     /// the alert-shaped body the [`super::chat`] worker folds into `alert:<self>`.
     fn emit(&self, persist: &Persist, n: &Notification, now_ms: i64) {
@@ -640,7 +854,7 @@ impl NotifyWorker {
             severity: n.severity.tag(),
             source: n.source.key(),
             summary: &n.summary,
-            host: &self.self_host,
+            host: n.host(&self.self_host),
             ts_unix_ms: now_ms,
         };
         let Ok(json) = serde_json::to_string(&body) else {
@@ -649,6 +863,47 @@ impl NotifyWorker {
         let topic = n.source.topic();
         if let Err(e) = persist.write(&topic, Priority::Default, None, Some(&json)) {
             tracing::debug!(target: "mackesd::notify", %topic, error = %e, "notify publish failed");
+        }
+    }
+
+    fn update_segment_rollup(
+        &self,
+        persist: &Persist,
+        state: &mut SourceState,
+        n: &Notification,
+        now_ms: i64,
+    ) {
+        let segment = n.source.segment();
+        let should_replace = state
+            .rollups
+            .get(&segment)
+            .is_none_or(|current| severity_rank(n.severity) >= severity_rank(current.severity));
+        if !should_replace {
+            return;
+        }
+        state.rollups.insert(segment, n.clone());
+        let affected_host = n.host(&self.self_host);
+        let critical_policy = if n.severity == Severity::Critical && affected_host == self.self_host
+        {
+            CRITICAL_POLICY_OWN_SEAT
+        } else {
+            CRITICAL_POLICY_REMOTE
+        };
+        let body = SegmentRollupBody {
+            segment: segment.key(),
+            severity: n.severity.tag(),
+            source: n.source.key(),
+            summary: &n.summary,
+            host: affected_host,
+            critical_policy,
+            ts_unix_ms: now_ms,
+        };
+        let Ok(json) = serde_json::to_string(&body) else {
+            return;
+        };
+        let topic = segment.topic();
+        if let Err(e) = persist.write(&topic, Priority::Default, None, Some(&json)) {
+            tracing::debug!(target: "mackesd::notify", %topic, error = %e, "segment rollup publish failed");
         }
     }
 
@@ -666,6 +921,7 @@ impl NotifyWorker {
             NotifySource::Service,
             NotifySource::Disk,
             NotifySource::Journal,
+            NotifySource::NodeGrade,
         ] {
             let body = NotifyBody {
                 severity: Severity::Info.tag(),
@@ -800,6 +1056,21 @@ mod tests {
         let dir = mackes_mesh_types::peers::peers_dir(root);
         let rec = mackes_mesh_types::peers::PeerRecord::now(host, None, "ok");
         mackes_mesh_types::peers::write_peer_record(&dir, &rec).unwrap();
+    }
+
+    fn write_grade(root: &Path, host: &str, grade: &str, score: u8) {
+        let dir = root.join("node-grade");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = serde_json::json!({
+            "host": host,
+            "grade": grade,
+            "score": score,
+            "factors": {},
+            "trend": "steady",
+            "published_at_ms": 1,
+        })
+        .to_string();
+        std::fs::write(dir.join(format!("{host}.json")), body).unwrap();
     }
 
     // ── pure parsers ────────────────────────────────────────────────────
@@ -996,7 +1267,7 @@ mod tests {
 
         // Service (sshd failed): reported the first time it's seen (tick 0).
         assert!(count_notify_msgs(&persist, NotifySource::Service) >= 2); // prime + real
-                                                                          // Disk 97% → Critical; SMART FAILED → Critical (both on the disk lane).
+        // Disk 97% → Critical; SMART FAILED → Critical (both on the disk lane).
         assert!(count_notify_msgs(&persist, NotifySource::Disk) >= 2);
         // Updates available.
         assert!(count_notify_msgs(&persist, NotifySource::Updates) >= 2);
@@ -1010,6 +1281,144 @@ mod tests {
         let bodies: String = disk.iter().filter_map(|m| m.body.clone()).collect();
         assert!(bodies.contains("97% full") || bodies.contains("SMART"));
         assert!(bodies.contains("\"severity\":\"critical\""));
+    }
+
+    #[test]
+    fn notifications_publish_worst_severity_segment_rollups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let persist = persist_at(root);
+        let probe = MapProbe::default()
+            .program(
+                "systemctl",
+                0,
+                "sshd.service loaded failed failed OpenSSH\n",
+            )
+            .program(
+                "df",
+                0,
+                "Filesystem 1k Used Avail Capacity Mount\n/dev/sda1 100 99 1 99% /\n",
+            )
+            .absent("smartctl")
+            .absent("dnf")
+            .absent("journalctl");
+        let w = worker_with(root, probe);
+        let mut st = SourceState::default();
+        w.tick_once(&persist, &mut st, SERVICE_EVERY * DISK_EVERY, 100_000);
+
+        let device = persist
+            .list_since(&NotifySegment::Device.topic(), None)
+            .unwrap();
+        let latest = device.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(latest.contains(r#""segment":"device""#));
+        assert!(latest.contains(r#""source":"disk""#));
+        assert!(latest.contains(r#""severity":"critical""#));
+        assert!(latest.contains(r#""critical_policy":"own-seat-light-show""#));
+
+        let lower = Notification::new(Severity::Warning, NotifySource::Service, "later warning");
+        w.update_segment_rollup(&persist, &mut st, &lower, 200_000);
+        let device_after = persist
+            .list_since(&NotifySegment::Device.topic(), None)
+            .unwrap();
+        assert_eq!(
+            device_after.len(),
+            device.len(),
+            "a lower-severity source cannot overwrite the active critical rollup"
+        );
+    }
+
+    #[test]
+    fn node_grade_d_f_is_folded_into_alerts_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let persist = persist_at(root);
+        write_grade(root, "nyc3", "D", 62);
+        let w = worker_with(root, MapProbe::default());
+        let mut st = SourceState::default();
+
+        w.tick_once(&persist, &mut st, 1, 100_000);
+        let lane = persist
+            .list_since(&NotifySource::NodeGrade.topic(), None)
+            .unwrap();
+        let body = lane.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(body.contains(r#""severity":"warning""#));
+        assert!(body.contains("grade D"));
+        let rollups = persist
+            .list_since(&NotifySegment::Alerts.topic(), None)
+            .unwrap();
+        let rollup = rollups.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(rollup.contains(r#""segment":"alerts""#));
+        assert!(rollup.contains(r#""source":"node-grade""#));
+
+        w.tick_once(&persist, &mut st, 2, 130_000);
+        assert_eq!(
+            persist
+                .list_since(&NotifySource::NodeGrade.topic(), None)
+                .unwrap()
+                .len(),
+            lane.len(),
+            "same D grade is edge-triggered, not spammed"
+        );
+
+        write_grade(root, "nyc3", "C", 74);
+        w.tick_once(&persist, &mut st, 3, 160_000);
+        write_grade(root, "nyc3", "F", 40);
+        w.tick_once(&persist, &mut st, 4, 190_000);
+        let lane = persist
+            .list_since(&NotifySource::NodeGrade.topic(), None)
+            .unwrap();
+        let body = lane.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(body.contains(r#""severity":"critical""#));
+        assert!(body.contains("grade F"));
+        let rollups = persist
+            .list_since(&NotifySegment::Alerts.topic(), None)
+            .unwrap();
+        let rollup = rollups.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(rollup.contains(r#""host":"nyc3""#));
+        assert!(rollup.contains(r#""critical_policy":"remote-pip-chat""#));
+    }
+
+    #[test]
+    fn cloud_notify_lane_folds_into_alerts_segment_without_reemitting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let persist = persist_at(root);
+        let cloud_body = serde_json::json!({
+            "severity": "critical",
+            "source": "cloud",
+            "summary": "nova-api went down",
+            "host": "cloud-1",
+            "service": "nova-api",
+            "ts_unix_ms": 1000,
+        })
+        .to_string();
+        persist
+            .write(
+                &NotifySource::Cloud.topic(),
+                Priority::Default,
+                None,
+                Some(&cloud_body),
+            )
+            .unwrap();
+        let w = worker_with(root, MapProbe::default());
+        let mut st = SourceState::default();
+        w.tick_once(&persist, &mut st, 1, 100_000);
+
+        let cloud_lane = persist
+            .list_since(&NotifySource::Cloud.topic(), None)
+            .unwrap();
+        assert_eq!(
+            cloud_lane.len(),
+            1,
+            "notify folds the external cloud lane but does not duplicate its Chat event"
+        );
+        let rollups = persist
+            .list_since(&NotifySegment::Alerts.topic(), None)
+            .unwrap();
+        let rollup = rollups.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(rollup.contains(r#""source":"cloud""#));
+        assert!(rollup.contains(r#""host":"cloud-1""#));
+        assert!(rollup.contains(r#""critical_policy":"remote-pip-chat""#));
     }
 
     #[test]
