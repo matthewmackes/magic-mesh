@@ -109,6 +109,16 @@
 //! mirroring status.rs's OWN shape of one live summary node plus per-item
 //! value-bearing-but-not-individually-live nodes, not eight independent
 //! announcers all firing on the same clock).
+//!
+//! **WIN7-5 update:** the right pane's content is no longer rendered
+//! "exactly as it always has" — the paragraph above describing that as
+//! WIN7-5's still-open job is now superseded; see `console.rs`'s own module
+//! doc for the redesign itself (its presentation, not this module's). This
+//! module's OWN embedding contract is unchanged by that redesign: the same
+//! [`console::console_content`] call at the same right-pane rect, the same
+//! [`ConsoleState::set_open`] mirror, the same self-closure propagation —
+//! WIN7-5 changed what `console_content` draws inside the rect this module
+//! hands it, not the seam between the two modules.
 
 use std::time::Duration;
 

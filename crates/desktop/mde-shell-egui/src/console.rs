@@ -2,12 +2,14 @@
 //! `docs/design/console-frontdoor.md`, CONSOLE-1).
 //!
 //! A Carbon-styled taxonomy of **operational terminal ops**: the **left rail**
-//! is the category jump-index (clicking a category jump-scrolls the list, lock
-//! #49) over the `user@host · version` footer (lock #43); the **right pane** is
-//! the pinned Terminal + Monitor pair (lock #31) above the grouped entry list —
-//! each row an icon + label + one-line description + a subtle Fedora/Quasar
-//! provenance tag (locks #33/#38). Full arrow-key nav with the EXPLORER-18
-//! focus-ring posture (locks #40/#48).
+//! leads with the `user@host · version` identity block (lock #43), then the
+//! category jump-index (clicking a category jump-scrolls the list, lock #49),
+//! then the Power section anchored at the rail's true bottom edge (lock #11 —
+//! see the WIN7-5 update below for why identity moved to the top); the
+//! **right pane** is the pinned Terminal + Monitor pair (lock #31) above the
+//! grouped entry list — each row an icon + label + one-line description + a
+//! subtle Fedora/Quasar provenance tag (locks #33/#38). Full arrow-key nav
+//! with the EXPLORER-18 focus-ring posture (locks #40/#48).
 //!
 //! **WIN7-2 update:** this module used to mount its own floating `egui::Area`
 //! (slide/Esc/click-away, toggled straight off the dock's Start cell). The
@@ -25,6 +27,66 @@
 //! link, a spawned tab, a fired power verb, Esc) still calls [`ConsoleState::close`]
 //! exactly as before; `start_menu` detects that self-closure and dismisses the
 //! whole Start Menu with it (see `start_menu`'s module doc).
+//!
+//! **WIN7-5 update:** this content's PRESENTATION is now genuinely redesigned
+//! for its Start Menu home (lock #10) — WIN7-2's straight embed above is
+//! superseded; `ConsoleState`'s data/actions and the CONSOLE-2 activation
+//! seam are completely UNCHANGED (same 7 groups, same Power semantics/typed-
+//! arming, same Custom persistence) — only HOW this content draws changed.
+//! Two real problems this unit found (not assumed) in WIN7-2's straight
+//! embed: (1) the rail positioned its Power section by subtracting from the
+//! bottom (`footer_top - POWER_H`) with nothing accounting for the space
+//! ABOVE it, leaving an unaccounted ~168pt dead gap between the jump-index
+//! and Power — closed to one deliberate, named, tested [`RAIL_SECTION_GAP`];
+//! (2) the identity block (`user@host` + version) sat in a bottom FOOTER
+//! underneath Power, backwards from the authentic Win7/Win10 Start Menu
+//! shape (the signed-in user leads the rail; Power alone anchors the TRUE
+//! bottom, lock #11) — relocated to the top, and the old "Console" /
+//! "Operations" title block it displaces is dropped outright rather than
+//! relocated, since the tile pane beside it (`start_menu.rs`) carries no
+//! equivalent self-title either (a screen reader still gets this pane's
+//! identity from `start_menu.rs`'s own "Console" `Role::Group` landmark).
+//! The jump-index rows (lock #49) are now icon+label+"N entries" mini-rows
+//! at [`JUMP_ROW_H`] — deliberately the SAME height as `start_menu::TILE_H`,
+//! so the rail's nav rows line up with the tile grid beside it — reusing
+//! each group's own first entry's icon as a representative glyph (no new
+//! data: `ConsoleGroup` gained no field) in the SAME icon+label shape
+//! [`entry_row`] already uses, just condensed, so the rail reads as a
+//! smaller sibling of the list it jump-scrolls rather than a bare text menu
+//! bolted beside it. The Custom row wears the SAME `Provenance::Quasar`
+//! accent every operator-owned entry already tags itself with, at rest,
+//! flagging "this one's yours" the way its own entries already do. The list
+//! pane's own group headings ([`heading`]) were investigated and found to
+//! ALREADY match `start_menu.rs`'s `tile_group_heading` byte-for-byte (both
+//! the uppercased-SMALL/TEXT_DIM/`SP_XS`-left-inset recipe) — left
+//! deliberately untouched, already coherent with the tile pane. Considered
+//! and REJECTED: `dock.rs`'s own app-picker group-heading treatment
+//! (per-group categorical accent colour, centred, non-uppercased) — its six
+//! named hues (Comms/Workloads/Terminals/Mesh/System/Media) are already
+//! claimed by a DIFFERENT taxonomy than this module's seven operational
+//! groups (System/Network/Packages/Storage/Mesh/Containers&VMs/Shells);
+//! reusing them here would blur what a categorical accent means everywhere
+//! else it appears, and minting seven new hues would violate this shell's
+//! one-categorical-palette convention (`Style`'s own test coverage). Also
+//! considered and rejected: threading `nav.surface` in so a jump/entry row
+//! could show dock.rs's "currently active surface" fill+bar+tint ladder —
+//! new cross-module plumbing this module doesn't have today, well beyond a
+//! presentation redesign of what's already there. Accesskit (lock #14):
+//! every raw-painted interactive row this unit touches now exports its own
+//! `Button` node (see the "accesskit" section near the bottom of this file)
+//! — WIN7-2 shipped this whole module's embedding with only the Start
+//! Menu's PANEL-level landmarks covering it; individual rows were
+//! explicitly flagged as not-yet-covered. A new `Live::Polite` region also
+//! announces the honest-gate notice (§7) when it fires — previously
+//! visual-only, so a screen-reader user pressing a gated command heard
+//! nothing explaining why. Left deliberately untouched: `RAIL_W`/`LIST_W`/
+//! `PANEL_W`/`PANEL_H` (so `start_menu.rs`'s already-tested overall
+//! footprint is unaffected), the Power section's own internal sizing/arming
+//! logic (safety-critical, left alone beyond adding accesskit), and the
+//! list pane's entry-row visual language (already dense/coherent — this
+//! unit's redesign budget went to the rail, which genuinely needed it).
+//! WIN7-7 remains the later crate-wide full accesskit sweep; this unit does
+//! not claim to close every gap, only the rows it rewrote the rendering of.
 //!
 //! **The launch (CONSOLE-5, §6/§7):** activating a command entry opens a
 //! **named terminal tab running it** through the CONSOLE-2 `spawn_tab` seam on
@@ -99,14 +161,51 @@ const ROW_H: f32 = Style::SP_XL + Style::SP_S;
 /// A group heading row's height (`SP_L`).
 const HEADING_H: f32 = Style::SP_L;
 
-/// One rail category row's height (`SP_L`).
+/// One Power-section action row's height (`SP_L`). WIN7-5 — previously also
+/// the jump-index row height; the jump-index now uses its own
+/// [`JUMP_ROW_H`], so this constant's scope narrowed to `power_section`'s
+/// four action rows (and the arming stage sharing the same box).
 const RAIL_ROW_H: f32 = Style::SP_L;
 
-/// The rail's title block height ("Console" + the "Operations" subtitle).
-const TITLE_H: f32 = Style::SP_XL + Style::SP_M;
+/// WIN7-5 — the rail's identity block height: the `user@host` + platform
+/// version lines (lock #43). The same two-line recipe this rail always used
+/// for that pair (previously painted as a bottom FOOTER, underneath Power);
+/// this unit relocates the block to the TOP of the rail (see the module
+/// doc's WIN7-5 section) so it leads the rail the way a real Win7/Win10
+/// Start Menu's own signed-in-user block does, freeing the true bottom edge
+/// for Power alone (lock #11). The old "Console" / "Operations" title block
+/// this replaced is gone outright, not relocated — see the module doc for
+/// why.
+const IDENTITY_H: f32 = Style::SP_XL + Style::SP_S;
 
-/// The rail footer's height — the `user@host` + version lines (lock #43).
-const FOOTER_H: f32 = Style::SP_XL + Style::SP_S;
+/// WIN7-5 — one jump-index row's height: deliberately the SAME value as
+/// `start_menu::TILE_H` (restated here, the established per-module idiom —
+/// `console.rs` sits lower in this crate's module graph than
+/// `start_menu.rs`, which embeds this module, so it cannot import that
+/// constant without a cycle). The rail's nav rows now line up in height
+/// with the left pane's own tiles: one visual rhythm across the whole
+/// Start Menu, not two unrelated panels that happen to share a border.
+const JUMP_ROW_H: f32 = Style::SP_XL + Style::SP_M;
+
+/// WIN7-5 — the deliberate breathing room between the jump-index and the
+/// Power section (lock #11's "anchored bottom," made a real, intentional
+/// gap rather than the ~168pt UNaccounted void the WIN7-2 straight-embed
+/// migration left here — `IDENTITY_H` + 8×`JUMP_ROW_H` + `POWER_H` leaves
+/// exactly one `SP_XL` of the rail's `PANEL_H` unclaimed; this constant is
+/// that leftover given a name, a place (`rail`'s layout), and a test
+/// (below), instead of being an accident). `#[cfg(test)]`: nothing in the
+/// render path reads this value back — `rail`/`power_section` position
+/// Power by bottom-relative math (`rail.bottom() - POWER_H`, the robust
+/// anchor, never "wherever the jump-index above it happens to end") — so
+/// this is verification-only data (the `start_menu.rs`
+/// `TILE_GRID_CONTENT_H` `#[cfg(test)]`-on-a-top-level-item idiom).
+#[cfg(test)]
+const RAIL_SECTION_GAP: f32 = Style::SP_XL;
+
+/// The Custom group's fixed rail-jump-row / list-heading label — named once
+/// so the rail's jump row (WIN7-5) and the list's own heading (CONSOLE-4)
+/// can never drift into two different strings for the same group.
+const CUSTOM_GROUP_LABEL: &str = "Custom";
 
 /// The honest-gate notice strip reserved beneath the entry list (§7) — always
 /// reserved so a raised notice never shifts the scrolled list.
@@ -745,9 +844,12 @@ pub struct ConsoleState {
     /// Per-row `$PATH` presence, parallel to the flat list — refreshed on each
     /// open (cheap stats), so a just-installed tool ungreys on the next open.
     present: Vec<bool>,
-    /// The footer's `user@host` (lock #43), resolved once.
+    /// The rail identity block's `user@host` (lock #43 — WIN7-5 relocated
+    /// the block from a bottom footer to the rail's top; see the module
+    /// doc), resolved once.
     identity: String,
-    /// The footer's platform version line (lock #43), baked once.
+    /// The rail identity block's platform version line (lock #43), baked
+    /// once.
     version: String,
     /// CONSOLE-4 — a host-down verb mid typed-arming (lock #36); `None` while
     /// the Power section shows its plain rows.
@@ -1044,9 +1146,12 @@ fn shell_lc(cmd: &str) -> Vec<String> {
     vec!["bash".to_owned(), "-lc".to_owned(), cmd.to_owned()]
 }
 
-/// The footer's `user@host` (lock #43): `$USER` / `$LOGNAME` → `operator` (the
-/// backdrop's identity precedence), at this node's hostname (the shared shell
-/// resolution — no second hostname idiom).
+/// The rail identity block's `user@host` (lock #43): `$USER` / `$LOGNAME` →
+/// `operator` (the backdrop's identity precedence), at this node's hostname
+/// (the shared shell resolution — no second hostname idiom). Unchanged by
+/// WIN7-5's relocation of the block itself from a bottom footer to the top of
+/// the rail — only where the resulting string is painted moved, not how it's
+/// built.
 fn identity_line() -> String {
     let user = ["USER", "LOGNAME"]
         .iter()
@@ -1180,93 +1285,147 @@ fn handle_keys(ui: &egui::Ui, state: &mut ConsoleState) {
     }
 }
 
-/// The left rail (lock #5): the "Console / Operations" title (lock #39), the
-/// category jump-index (lock #49), the CONSOLE-4 Power section (lock #28), and
-/// the `user@host · version` footer (lock #43).
+/// The left rail (lock #5, redesigned WIN7-5): the `user@host` / version
+/// identity block leading the rail (lock #43 — relocated from a bottom
+/// footer, see the module doc), the category jump-index (lock #49) as
+/// icon+label+count mini-rows, and the CONSOLE-4 Power section (lock #28)
+/// anchored to the rail's true bottom edge (lock #11).
 fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
     let painter = ui.painter().clone();
     let rail = egui::Rect::from_min_size(rect.min, egui::vec2(RAIL_W, rect.height()));
 
-    // Title block: the menu is titled "Console" / "Operations" (lock #39).
+    // The identity block (WIN7-5): user@host over the platform version, now
+    // the rail's OPENING line rather than a trailing footnote — the
+    // authentic Win7/Win10 Start Menu shape (the signed-in user leads the
+    // rail; Power alone anchors the bottom, lock #11). `user@host` reads one
+    // rung brighter (TEXT_STRONG) than plain body text since it now leads
+    // the rail instead of trailing it.
     painter.text(
-        egui::pos2(rail.left() + Style::SP_S, rail.top() + Style::SP_S),
-        egui::Align2::LEFT_TOP,
-        "Console",
-        egui::FontId::proportional(Style::BODY),
-        Style::TEXT,
-    );
-    painter.text(
-        egui::pos2(
-            rail.left() + Style::SP_S,
-            rail.top() + Style::SP_S + Style::SP_L,
-        ),
-        egui::Align2::LEFT_TOP,
-        "Operations",
-        egui::FontId::proportional(Style::SMALL),
-        Style::TEXT_DIM,
-    );
-
-    // The category jump-index (lock #49): one row per group — plus the Custom
-    // group's (CONSOLE-4, jump target GROUPS.len()); a click asks the list to
-    // jump-scroll to that group's heading.
-    let mut y = rail.top() + TITLE_H;
-    let jump_labels = GROUPS
-        .iter()
-        .map(|g| g.label)
-        .chain(std::iter::once("Custom"));
-    for (i, label) in jump_labels.enumerate() {
-        let row =
-            egui::Rect::from_min_size(egui::pos2(rail.left(), y), egui::vec2(RAIL_W, RAIL_ROW_H));
-        let resp = ui.interact(row, console_rail_id(label), egui::Sense::click());
-        if resp.hovered() {
-            painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
-        }
-        let color = if resp.hovered() {
-            Style::TEXT
-        } else {
-            Style::TEXT_DIM
-        };
-        painter.text(
-            egui::pos2(row.left() + Style::SP_S, row.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(Style::SMALL),
-            color,
-        );
-        if resp.clicked() {
-            state.jump = Some(i);
-        }
-        y += RAIL_ROW_H;
-    }
-
-    // CONSOLE-4 — the Power section (lock #28), seated above the footer.
-    let footer_top = rail.bottom() - FOOTER_H;
-    power_section(ui, &rail, footer_top - POWER_H, state);
-
-    // The footer (lock #43): user@host over the platform version, in the Win10
-    // corner.
-    painter.hline(
-        (rail.left() + Style::SP_XS)..=(rail.right() - Style::SP_XS),
-        footer_top,
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
-    painter.text(
-        egui::pos2(rail.left() + Style::SP_S, footer_top + Style::SP_XS),
+        egui::pos2(rail.left() + Style::SP_S, rail.top() + Style::SP_XS),
         egui::Align2::LEFT_TOP,
         &state.identity,
-        egui::FontId::proportional(Style::SMALL),
-        Style::TEXT,
+        egui::FontId::proportional(Style::BODY),
+        Style::TEXT_STRONG,
     );
     painter.text(
         egui::pos2(
             rail.left() + Style::SP_S,
-            footer_top + Style::SP_XS + Style::SP_M,
+            rail.top() + Style::SP_XS + Style::SP_M,
         ),
         egui::Align2::LEFT_TOP,
         &state.version,
         egui::FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
     );
+
+    // The category jump-index (lock #49): one row per domain group plus
+    // Custom (CONSOLE-4, jump target GROUPS.len()), each now an
+    // icon+label+"N entries" mini-row — deliberately the SAME icon+label
+    // shape `entry_row` below already uses (a smaller sibling of the rows
+    // it jump-scrolls to, not a bare text menu) at `JUMP_ROW_H`, the SAME
+    // height as the tile grid's own tiles (see `JUMP_ROW_H`'s doc). A click
+    // still just asks the list to jump-scroll — `state.jump`'s index space
+    // is UNCHANGED (0..GROUPS.len() for the real groups, GROUPS.len() for
+    // Custom), so `list_pane`'s consumption of it below needed no change at
+    // all.
+    let mut y = rail.top() + IDENTITY_H;
+    for (i, group) in GROUPS
+        .iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(rail.left(), y), egui::vec2(RAIL_W, JUMP_ROW_H));
+        let (label, icon, count) = group.map_or(
+            (
+                CUSTOM_GROUP_LABEL,
+                IconId::Terminal,
+                state.custom.entries.len(),
+            ),
+            |g| {
+                let icon = g.entries.first().map_or(IconId::Settings, |e| e.icon);
+                (g.label, icon, g.entries.len())
+            },
+        );
+        let resp = ui.interact(row, console_rail_id(label), egui::Sense::click());
+        let hovered = resp.hovered();
+        if hovered {
+            painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
+        }
+        // The Custom row wears the SAME Quasar accent every operator-owned
+        // entry already tags itself with (`Provenance::Quasar`), at rest —
+        // not just on hover — flagging "this category is yours" at a
+        // glance; every domain group stays the neutral TEXT/TEXT_DIM pair
+        // the rest of this rail (and the tile grid beside it) already uses.
+        // The caption always reads dim regardless, matching `entry_row`'s
+        // own desc-line-is-always-TEXT_DIM convention below.
+        let is_custom = group.is_none();
+        let label_color = if is_custom {
+            Provenance::Quasar.color()
+        } else if hovered {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        };
+        if let Some(tex) = icon_texture(ui.ctx(), icon, ENTRY_ICON, label_color) {
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(row.left() + Style::SP_S + ENTRY_ICON / 2.0, row.center().y),
+                egui::vec2(ENTRY_ICON, ENTRY_ICON),
+            );
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+        }
+        let text_left = row.left() + Style::SP_S + ENTRY_ICON + Style::SP_XS;
+        painter.text(
+            egui::pos2(text_left, row.top() + Style::SP_XS),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(Style::BODY),
+            label_color,
+        );
+        let caption = jump_caption(count);
+        painter.text(
+            egui::pos2(text_left, row.bottom() - Style::SP_XS),
+            egui::Align2::LEFT_BOTTOM,
+            &caption,
+            egui::FontId::proportional(Style::SMALL),
+            Style::TEXT_DIM,
+        );
+        install_row_accessibility(
+            ui.ctx(),
+            console_jump_accesskit_id(label),
+            label,
+            caption,
+            row,
+        );
+        if resp.clicked() {
+            state.jump = Some(i);
+        }
+        y += JUMP_ROW_H;
+    }
+
+    // CONSOLE-4 — the Power section (lock #28), anchored to the rail's TRUE
+    // bottom edge via bottom-relative math (never "whatever falls out of
+    // the jump-index above it" — the WIN7-2-era straight embed left an
+    // unaccounted ~168pt dead gap here; see the module doc's WIN7-5
+    // section and `RAIL_SECTION_GAP`'s own doc). `power_section`'s own
+    // hairline at its top edge, right after the deliberate gap above,
+    // marks the boundary as intentional — a visibly separate, more careful
+    // zone, reinforcing what the DANGER-tinted host-down rows inside it
+    // already say.
+    power_section(ui, &rail, rail.bottom() - POWER_H, state);
+}
+
+/// The jump-index row's dim caption (WIN7-5): how many entries the category
+/// holds right now — `GROUPS`' own const-known count for a domain group,
+/// [`ConsoleState::custom`]'s live length for Custom (so it tracks an
+/// operator add/remove without a stale reading, never a fixed number baked
+/// in at open time). Pure + separately tested (the `start_menu.rs`
+/// `tile_display_text` idiom) so the plural-vs-singular wording is verified
+/// without a GPU.
+fn jump_caption(count: usize) -> String {
+    format!("{count} entr{}", if count == 1 { "y" } else { "ies" })
 }
 
 /// CONSOLE-4 — the rail's **Power section** (lock #28): a micro-heading over
@@ -1323,6 +1482,23 @@ fn power_section(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut Con
             action.label(),
             egui::FontId::proportional(Style::SMALL),
             color,
+        );
+        // WIN7-5, lock #14 — a screen-reader user needs to know a Reboot/
+        // Shut Down press only ARMS a confirmation rather than firing at
+        // once (Lock/Suspend act immediately); the visual-only DANGER tint
+        // above carried that distinction for sighted users alone before
+        // this unit.
+        let value = if action.typed_armed() {
+            "Requires a typed confirmation before it fires"
+        } else {
+            "Fires immediately"
+        };
+        install_row_accessibility(
+            ui.ctx(),
+            console_power_accesskit_id(action),
+            action.label(),
+            value,
+            row,
         );
         if resp.clicked() {
             pressed = Some(action);
@@ -1385,6 +1561,18 @@ fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mu
             Style::TEXT_DIM
         },
     );
+    let confirm_value = if armed {
+        format!("Ready \u{2014} fires {}", action.label())
+    } else {
+        "Disabled until the typed echo matches the action name".to_owned()
+    };
+    install_row_accessibility(
+        ui.ctx(),
+        console_confirm_accesskit_id(),
+        format!("Confirm {}", action.label()),
+        confirm_value,
+        confirm,
+    );
     let cancel_resp = ui.interact(cancel, console_cancel_id(), egui::Sense::click());
     if cancel_resp.hovered() {
         painter.rect_filled(cancel, Style::RADIUS, Style::SURFACE_HI);
@@ -1395,6 +1583,13 @@ fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mu
         "Cancel",
         egui::FontId::proportional(Style::SMALL),
         Style::TEXT,
+    );
+    install_row_accessibility(
+        ui.ctx(),
+        console_cancel_accesskit_id(),
+        "Cancel",
+        format!("Cancel the {} confirmation", action.label()),
+        cancel,
     );
     if armed && confirm_resp.clicked() {
         let _ = state.confirm_armed();
@@ -1453,7 +1648,7 @@ fn list_pane(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
             // command entries at the flat tail (their launch rides the same
             // CONSOLE-2 seam, so activation honest-gates), then the in-UI add
             // form. The rail's Custom cell jumps here (target GROUPS.len()).
-            let head = heading(ui, "Custom");
+            let head = heading(ui, CUSTOM_GROUP_LABEL);
             if state.jump == Some(GROUPS.len()) {
                 ui.scroll_to_rect(head, Some(egui::Align::Min));
                 state.jump = None;
@@ -1484,6 +1679,11 @@ fn list_pane(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
 
     // The honest-gate notice strip (§7): the typed reason a gated activation
     // did not run — always reserved so the list never shifts under a notice.
+    // WIN7-5 — also exports a `Live::Polite` accesskit region (lock #14)
+    // while it's showing: before this unit the notice was visual-only, so a
+    // screen-reader user pressing a greyed command heard nothing explaining
+    // why nothing happened. The `install_tiles_live_summary` honesty
+    // convention restated: no node at all while there's nothing to say.
     if let Some(gate) = &state.gate {
         let strip = egui::Rect::from_min_max(
             egui::pos2(rect.left() + RAIL_W + Style::SP_S, rect.bottom() - NOTICE_H),
@@ -1498,6 +1698,15 @@ fn list_pane(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
             egui::FontId::proportional(Style::SMALL),
             Style::WARN,
         );
+        let _ = ui
+            .ctx()
+            .accesskit_node_builder(console_gate_live_region_id(), |node| {
+                node.set_role(egui::accesskit::Role::Status);
+                node.set_live(egui::accesskit::Live::Polite);
+                node.set_label("Console notice");
+                node.set_value(gate.text());
+                node.set_bounds(accesskit_rect(strip));
+            });
     }
 }
 
@@ -1596,6 +1805,19 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
     } else {
         format!("{} \u{2014} not installed", entry.desc)
     };
+    // WIN7-5, lock #14 — the row's own accesskit `Button` node: label is the
+    // entry's fixed identity, value is the SAME `desc` string (borrowed here,
+    // moved into the paint call right below) already on screen — never a
+    // second, independently-worded description that could drift from what's
+    // painted. `entry_row`'s rows were explicitly NOT covered by WIN7-2's
+    // panel-level-only accesskit pass; this is that coverage.
+    install_row_accessibility(
+        ui.ctx(),
+        console_entry_accesskit_id(flat),
+        entry.label,
+        desc.as_str(),
+        rect,
+    );
     painter.text(
         egui::pos2(text_left, rect.bottom() - Style::SP_XS),
         egui::Align2::LEFT_BOTTOM,
@@ -1692,6 +1914,18 @@ fn custom_row(
         egui::FontId::proportional(Style::SMALL),
         Provenance::Quasar.color(),
     );
+    // WIN7-5, lock #14 — reuses the SAME flat-index accesskit id space
+    // `entry_row` above does (they already share `console_entry_id` for
+    // interaction; the "N of a unified activation ring" identity carries
+    // over to accesskit too): label = the operator's own name, value = the
+    // command it runs, exactly what's painted above.
+    install_row_accessibility(
+        ui.ctx(),
+        console_entry_accesskit_id(flat),
+        entry.name.as_str(),
+        entry.command.as_str(),
+        rect,
+    );
 
     // The remove cross — its own hit target at the row's lower right.
     let cross = egui::Rect::from_center_size(
@@ -1709,6 +1943,13 @@ fn custom_row(
         } else {
             Style::TEXT_DIM
         },
+    );
+    install_row_accessibility(
+        ui.ctx(),
+        console_custom_remove_accesskit_id(index),
+        format!("Remove {}", entry.name),
+        entry.command.as_str(),
+        cross,
     );
 
     (resp.clicked(), cross_resp.clicked())
@@ -1752,16 +1993,128 @@ fn custom_add_form(ui: &mut egui::Ui, state: &mut ConsoleState) -> bool {
             Style::TEXT_DIM
         },
     );
+    let add_value = if can_add {
+        "Ready to add this entry"
+    } else {
+        "Enter a name and a command first"
+    };
+    install_row_accessibility(
+        ui.ctx(),
+        console_custom_add_accesskit_id(),
+        "Add entry",
+        add_value,
+        add_rect,
+    );
     can_add && resp.clicked()
+}
+
+// ── accesskit (lock #14, WIN7-5) ─────────────────────────────────────────────
+//
+// WIN7-2 shipped this module embedded in the Start Menu with only the OUTER
+// panel-level accesskit landmarks covering it (`start_menu.rs`'s
+// `install_accessibility` exports a `Role::Group` "Console" landmark for the
+// whole pane) — every row inside was explicitly flagged as not-yet-covered.
+// This unit's redesign is the point every RAW-PAINTED (`ui.interact` + manual
+// `Painter` calls, not a real egui widget) interactive row this file draws
+// gains its own node: the rail's jump-index rows, entry/custom rows, the
+// Power section's action rows, and the arming stage's Confirm/Cancel. The
+// real egui `TextEdit` widgets this module already uses (the arming echo
+// field, the Custom add-form's two drafts) get accesskit nodes automatically
+// from egui's own widget machinery once the `accesskit` feature is enabled —
+// they need no manual call here. WIN7-7 remains the crate-wide full sweep;
+// this is only the coverage for the rows this unit rewrote the rendering of.
+
+/// Convert an egui rect to an accesskit one (the `status.rs` / `start_menu.rs`
+/// helper, restated module-locally — the established per-module-copy idiom).
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+/// Install one raw-painted row's accesskit `Button` node: role + a fixed
+/// identity label + the row's CURRENT value + bounds + the `Click` action —
+/// the SAME shape `status.rs`'s `install_segment_accessibility` /
+/// `start_menu.rs`'s `install_tile_accessibility` already use, restated here.
+/// Shared by every interactive row in this module (see this section's own
+/// banner comment above) so the role/label/value/bounds/action shape can
+/// never drift between the rail, the list, and the Power section.
+fn install_row_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    rect: egui::Rect,
+) {
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label.into());
+        node.set_value(value.into());
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+/// Stable accesskit id for one jump-index row (WIN7-5). Deliberately distinct
+/// from [`console_rail_id`] (the SAME `tile_id`/`tile_accesskit_id` split
+/// `start_menu.rs` already establishes for its tiles) — interaction ids and
+/// accesskit ids stay separate namespaces even when both key off the same
+/// label.
+fn console_jump_accesskit_id(label: &str) -> egui::Id {
+    egui::Id::new(("console-jump-accesskit", label))
+}
+
+/// Stable accesskit id for one entry row — a static [`entry_row`] or a
+/// [`custom_row`] — keyed by the SAME flat index [`console_entry_id`]
+/// already unifies both kinds of row under.
+fn console_entry_accesskit_id(flat: usize) -> egui::Id {
+    egui::Id::new(("console-entry-accesskit", flat))
+}
+
+/// Stable accesskit id for a Custom row's remove cross (WIN7-5).
+fn console_custom_remove_accesskit_id(index: usize) -> egui::Id {
+    egui::Id::new(("console-custom-remove-accesskit", index))
+}
+
+/// Stable accesskit id for one Power action row (WIN7-5).
+fn console_power_accesskit_id(action: PowerAction) -> egui::Id {
+    egui::Id::new(("console-power-accesskit", action.label()))
+}
+
+/// Stable accesskit id for the arming stage's Confirm row (WIN7-5).
+fn console_confirm_accesskit_id() -> egui::Id {
+    egui::Id::new("console-arming-confirm-accesskit")
+}
+
+/// Stable accesskit id for the arming stage's Cancel row (WIN7-5).
+fn console_cancel_accesskit_id() -> egui::Id {
+    egui::Id::new("console-arming-cancel-accesskit")
+}
+
+/// Stable accesskit id for the Custom add-form's Add row (WIN7-5).
+fn console_custom_add_accesskit_id() -> egui::Id {
+    egui::Id::new("console-custom-add-accesskit")
+}
+
+/// Stable accesskit id for the honest-gate notice's live region (WIN7-5,
+/// lock #14 — §7's gate notice was visual-only before this unit; a
+/// screen-reader user pressing a greyed-out entry had no way to learn WHY
+/// nothing happened).
+fn console_gate_live_region_id() -> egui::Id {
+    egui::Id::new("console-gate-live-region")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         console_confirm_id, console_content, console_entry_id, console_heading_id,
-        console_power_id, console_rail_id, entry_at, identity_line, launch_argv, static_rows,
-        tool_present, tool_present_in, total_rows, ConsoleRequest, ConsoleState, CustomEntry,
-        EntryKind, GateReason, PowerAction, GROUPS, PANEL_H, PANEL_W, PINNED,
+        console_power_id, console_rail_id, entry_at, identity_line, jump_caption, launch_argv,
+        static_rows, tool_present, tool_present_in, total_rows, ConsoleRequest, ConsoleState,
+        CustomEntry, EntryKind, GateReason, PowerAction, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H,
+        PANEL_W, PINNED, POWER_H, RAIL_SECTION_GAP,
     };
     use crate::dock::Surface;
     use crate::workbench::Plane;
@@ -2414,5 +2767,369 @@ mod tests {
         );
         assert!(s.gate.is_none(), "a launched custom entry raises no gate");
         assert!(!s.is_open(), "launching a custom entry closes the panel");
+    }
+
+    // ── WIN7-5: the redesigned right pane (locks #10/#11/#14) ────────────────
+
+    #[test]
+    fn jump_caption_reads_singular_for_exactly_one_and_plural_otherwise() {
+        assert_eq!(jump_caption(0), "0 entries");
+        assert_eq!(jump_caption(1), "1 entry");
+        assert_eq!(jump_caption(4), "4 entries");
+    }
+
+    #[test]
+    fn the_power_section_is_flush_with_the_panes_true_bottom_edge() {
+        // Lock #11 — Power anchors the right pane's TRUE bottom, not
+        // "wherever the jump-index above it happens to end" (the WIN7-2-era
+        // straight-embed bug this unit fixed — see the module doc). The
+        // test harness (`drive`, above) mounts `console_content`'s rect
+        // flush with the screen bottom, so the pane's real bottom edge is
+        // exactly `SZ.y`.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = ConsoleState::default();
+        s.toggle();
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        let shutdown = ctx
+            .read_response(console_power_id(PowerAction::ShutDown))
+            .expect("the Shut Down power row is registered")
+            .rect;
+        assert!(
+            (shutdown.bottom() - SZ.y).abs() < 0.5,
+            "the last Power row must sit flush with the pane's true bottom \
+             edge: got {} vs {}",
+            shutdown.bottom(),
+            SZ.y,
+        );
+    }
+
+    #[test]
+    fn the_gap_between_the_jump_index_and_power_is_small_not_the_old_dead_void() {
+        // The WIN7-2-era straight embed left an unaccounted ~168pt dead gap
+        // between the jump-index and the Power section (a big blank void
+        // with nothing marking it as deliberate) — this pins the fix as a
+        // real, regression-tested invariant instead of trusting it stays
+        // fixed by eye. `RAIL_SECTION_GAP` (32pt) replaces it.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = ConsoleState::default();
+        s.toggle();
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        let last_jump_row = ctx
+            .read_response(console_rail_id(CUSTOM_GROUP_LABEL))
+            .expect("the Custom jump row is registered")
+            .rect;
+        let power_section_top = SZ.y - POWER_H;
+        let gap = power_section_top - last_jump_row.bottom();
+        assert!(
+            gap >= 0.0,
+            "the jump-index must not overlap the Power section: gap {gap}"
+        );
+        assert!(
+            gap <= RAIL_SECTION_GAP + 0.5,
+            "the gap between the jump-index and Power must be the one \
+             deliberate RAIL_SECTION_GAP, not a large accidental void: got {gap}"
+        );
+    }
+
+    #[test]
+    fn clicking_any_jump_row_scrolls_that_same_groups_heading_up_the_list() {
+        // Generalizes the pre-existing Shells-only jump-scroll proof: the
+        // WIN7-5 rewrite touches every jump row's paint path, so this
+        // re-proves the click-to-scroll-target mapping wasn't disturbed for
+        // OTHER groups too, not just the one already covered. A
+        // representative spread (first, middle, last group) rather than all
+        // seven, to keep the test focused.
+        for label in ["Network", "Storage", "Shells"] {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let mut s = ConsoleState::default();
+            s.toggle();
+            drive(&ctx, &mut s, Vec::new(), SZ);
+            drive(&ctx, &mut s, Vec::new(), SZ);
+
+            let before = ctx
+                .read_response(console_heading_id(label))
+                .unwrap_or_else(|| panic!("{label} heading is registered"))
+                .rect
+                .top();
+            let rail_row = ctx
+                .read_response(console_rail_id(label))
+                .unwrap_or_else(|| panic!("{label} rail cell is registered"))
+                .rect;
+            click(&ctx, &mut s, rail_row.center(), SZ);
+            for _ in 0..6 {
+                drive(&ctx, &mut s, Vec::new(), SZ);
+            }
+            let after = ctx
+                .read_response(console_heading_id(label))
+                .unwrap_or_else(|| panic!("{label} heading is still registered"))
+                .rect
+                .top();
+            assert!(
+                after < before - Style::SP_XL,
+                "{label}: the jump must scroll ITS OWN group up the pane \
+                 (before {before}, after {after})"
+            );
+        }
+    }
+
+    #[test]
+    fn every_jump_row_reports_its_real_group_size_and_tracks_custom_live() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = ConsoleState::default();
+        s.toggle();
+        let out = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+
+        for group in &GROUPS {
+            let node = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.label() == Some(group.label))
+                .unwrap_or_else(|| panic!("{} jump row exports no accesskit node", group.label));
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            let expected = jump_caption(group.entries.len());
+            assert_eq!(
+                node.value(),
+                Some(expected.as_str()),
+                "{}'s jump row must report its real entry count",
+                group.label
+            );
+        }
+
+        // Custom starts empty on a fresh store...
+        let custom = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some(CUSTOM_GROUP_LABEL))
+            .expect("the Custom jump row exports an accesskit node");
+        assert_eq!(custom.value(), Some("0 entries"));
+    }
+
+    #[test]
+    fn adding_a_custom_entry_updates_the_customs_jump_row_count_live() {
+        // Not a fixed number baked in at open time — `state.custom`'s real,
+        // live length, re-read every frame.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("console-custom.json");
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = ConsoleState::with_store(Some(store));
+        s.draft_name = "Fleet status".to_owned();
+        s.draft_command = "meshctl fleet status".to_owned();
+        assert!(s.add_custom());
+        s.toggle();
+        let out = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+        let custom = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some(CUSTOM_GROUP_LABEL))
+            .expect("the Custom jump row exports an accesskit node");
+        assert_eq!(custom.value(), Some("1 entry"));
+    }
+
+    #[test]
+    fn every_row_this_unit_touched_exports_a_clickable_button_accesskit_node() {
+        // Lock #14 — WIN7-2 shipped this whole module's embedding with only
+        // panel-level accesskit landmarks (`start_menu.rs`'s
+        // `install_accessibility`); individual rows were explicitly flagged
+        // as not-yet-covered. Proves every raw-painted interactive row this
+        // unit rewrote now exports a real Button node: the eight jump rows,
+        // the pinned Terminal entry row, and the four Power action rows.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = ConsoleState::default();
+        s.toggle();
+        let out = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+
+        let mut expect_labels: Vec<&str> = GROUPS.iter().map(|g| g.label).collect();
+        expect_labels.push(CUSTOM_GROUP_LABEL);
+        expect_labels.push("Terminal");
+        expect_labels.push(PowerAction::Lock.label());
+        expect_labels.push(PowerAction::Suspend.label());
+        expect_labels.push(PowerAction::Reboot.label());
+        expect_labels.push(PowerAction::ShutDown.label());
+
+        for label in expect_labels {
+            let node = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.label() == Some(label))
+                .unwrap_or_else(|| panic!("{label} exports no accesskit node"));
+            assert_eq!(node.role(), egui::accesskit::Role::Button, "{label}'s role");
+        }
+    }
+
+    #[test]
+    fn a_custom_rows_accesskit_carries_its_real_name_and_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("console-custom.json");
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = ConsoleState::with_store(Some(store));
+        s.draft_name = "Fleet status".to_owned();
+        s.draft_command = "meshctl fleet status".to_owned();
+        assert!(s.add_custom());
+        s.toggle();
+        let out = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+
+        let row = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Fleet status"))
+            .expect("the custom row exports an accesskit node");
+        assert_eq!(row.role(), egui::accesskit::Role::Button);
+        assert_eq!(row.value(), Some("meshctl fleet status"));
+
+        let remove = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Remove Fleet status"))
+            .expect("the remove cross exports an accesskit node");
+        assert_eq!(remove.role(), egui::accesskit::Role::Button);
+    }
+
+    #[test]
+    fn the_gate_notice_exports_a_live_polite_region_only_while_showing() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = ConsoleState::default();
+        s.toggle();
+        let out0 = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes0 = out0
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+        assert!(
+            !nodes0
+                .iter()
+                .any(|(_, n)| n.label() == Some("Console notice")),
+            "no gate has fired yet — no live region should export"
+        );
+
+        // Force the pinned Monitor (btop) ABSENT, activate it, and confirm
+        // the resulting gate notice (§7) is now announced — it was
+        // visual-only before this unit, so a screen-reader user pressing a
+        // greyed row heard nothing explaining why.
+        s.force_presence(1, false);
+        drive(&ctx, &mut s, vec![key(egui::Key::ArrowDown)], SZ);
+        let out1 = drive(&ctx, &mut s, vec![key(egui::Key::Enter)], SZ);
+        assert!(s.gate.is_some(), "the gate should have fired");
+        let nodes1 = out1
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+        let notice = nodes1
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Console notice"))
+            .expect("the gate notice must export a live region while showing");
+        assert_eq!(notice.role(), egui::accesskit::Role::Status);
+        assert_eq!(notice.live(), Some(egui::accesskit::Live::Polite));
+        assert!(
+            notice.value().unwrap_or_default().contains("Monitor"),
+            "the announced text must name the gated entry: {:?}",
+            notice.value()
+        );
+    }
+
+    #[test]
+    fn the_confirm_and_cancel_rows_report_their_armed_state_via_accesskit_value() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        s.power_press(PowerAction::Reboot);
+        let out0 = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes0 = out0
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+        let confirm0 = nodes0
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Confirm Reboot"))
+            .expect("the Confirm row exports an accesskit node while arming");
+        assert_eq!(confirm0.role(), egui::accesskit::Role::Button);
+        assert!(
+            confirm0.value().unwrap_or_default().contains("Disabled"),
+            "a disarmed Confirm's value must say so: {:?}",
+            confirm0.value()
+        );
+        let cancel0 = nodes0
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Cancel"))
+            .expect("the Cancel row exports an accesskit node");
+        assert_eq!(cancel0.role(), egui::accesskit::Role::Button);
+
+        // Arm the echo — the Confirm row's value flips to "ready."
+        s.arming.as_mut().expect("arming set").echo = "Reboot".to_owned();
+        let out1 = drive(&ctx, &mut s, Vec::new(), SZ);
+        let nodes1 = out1
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone();
+        let confirm1 = nodes1
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Confirm Reboot"))
+            .expect("the Confirm row still exports a node once armed");
+        assert!(
+            confirm1.value().unwrap_or_default().contains("Ready"),
+            "an armed Confirm's value must say so: {:?}",
+            confirm1.value()
+        );
     }
 }
