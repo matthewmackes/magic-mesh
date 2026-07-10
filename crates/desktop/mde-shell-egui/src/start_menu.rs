@@ -1619,6 +1619,26 @@ mod tests {
     }
 
     #[test]
+    fn the_consoles_jump_row_height_matches_this_panes_own_tile_height() {
+        // WIN7-5's `console::JUMP_ROW_H` doc comment claims it is
+        // "deliberately the SAME value as `start_menu::TILE_H`" so the
+        // rail's nav rows line up with this pane's own tiles (one visual
+        // rhythm across the whole Start Menu). `console.rs` cannot import
+        // `TILE_H` itself (it sits lower in the module graph than
+        // `start_menu.rs`, which embeds it — a cycle), so the claim was
+        // only ever prose on two independently-edited constants; pin it
+        // here, the module that CAN see both, rather than trusting it
+        // stays true by eye across a future edit to either one.
+        assert!(
+            (console::JUMP_ROW_H - super::TILE_H).abs() < f32::EPSILON,
+            "console::JUMP_ROW_H ({}) must match start_menu::TILE_H ({}) so \
+             the rail's jump rows visually line up with the tile grid beside them",
+            console::JUMP_ROW_H,
+            super::TILE_H,
+        );
+    }
+
+    #[test]
     fn all_17_tiles_render_at_one_uniform_size_and_stay_within_the_left_pane() {
         // Lock #6 — one uniform tile size for all 17, no variants — proven
         // on REAL rendered rects (the addressable-cell idiom via

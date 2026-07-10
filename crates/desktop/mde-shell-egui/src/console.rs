@@ -137,7 +137,8 @@ use crate::workbench::Plane;
 
 // ── geometry (all §4 token math, the dock's 8px grid) ───────────────────────
 
-/// The left rail's width (categories + footer) — `SP_XL · 5` (160pt).
+/// The left rail's width (identity + categories + Power, WIN7-5's top-to-
+/// bottom order — see the module doc) — `SP_XL · 5` (160pt).
 const RAIL_W: f32 = Style::SP_XL * 5.0;
 
 /// The right entry-list pane's width — `SP_XL · 11` (352pt), wide enough for a
@@ -185,7 +186,12 @@ const IDENTITY_H: f32 = Style::SP_XL + Style::SP_S;
 /// constant without a cycle). The rail's nav rows now line up in height
 /// with the left pane's own tiles: one visual rhythm across the whole
 /// Start Menu, not two unrelated panels that happen to share a border.
-const JUMP_ROW_H: f32 = Style::SP_XL + Style::SP_M;
+/// `pub(crate)` (not private) so `start_menu.rs`'s own test suite can pin
+/// this cross-module "same value" claim as a real regression check instead
+/// of trusting two independently-edited constants to stay in lockstep by
+/// eye (the `PANEL_W`/`PANEL_H` cross-module-reuse idiom, restated here for
+/// a test-only read rather than a render-path one).
+pub(crate) const JUMP_ROW_H: f32 = Style::SP_XL + Style::SP_M;
 
 /// WIN7-5 — the deliberate breathing room between the jump-index and the
 /// Power section (lock #11's "anchored bottom," made a real, intentional
@@ -2354,7 +2360,12 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_identity_reads_user_at_host() {
+    fn the_identity_line_reads_user_at_host() {
+        // Named for `identity_line()` itself, not its on-screen position —
+        // WIN7-5 relocated the rendered identity block from a bottom footer
+        // to the rail's top (see the module doc + `IDENTITY_H`'s own doc),
+        // so a "footer" name here would now describe a spot this text no
+        // longer occupies. The format this test checks is position-agnostic.
         let line = identity_line();
         assert!(line.contains('@'), "identity must read user@host: {line}");
         assert!(!line.starts_with('@') && !line.ends_with('@'));
@@ -2510,42 +2521,15 @@ mod tests {
     }
 
     // ── the rail jump-index (lock #49) ───────────────────────────────────────
-
-    #[test]
-    fn a_rail_category_click_jump_scrolls_the_list_to_its_group() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut s = ConsoleState::default();
-        s.toggle();
-        drive(&ctx, &mut s, Vec::new(), SZ);
-        drive(&ctx, &mut s, Vec::new(), SZ);
-
-        // The Shells heading starts far down the (scrolling) list.
-        let before = ctx
-            .read_response(console_heading_id("Shells"))
-            .expect("the Shells heading is registered")
-            .rect
-            .top();
-
-        // Click the rail's "Shells" jump cell, then let the scroll settle.
-        let rail_row = ctx
-            .read_response(console_rail_id("Shells"))
-            .expect("the Shells rail cell is registered")
-            .rect;
-        click(&ctx, &mut s, rail_row.center(), SZ);
-        for _ in 0..6 {
-            drive(&ctx, &mut s, Vec::new(), SZ);
-        }
-        let after = ctx
-            .read_response(console_heading_id("Shells"))
-            .expect("the Shells heading is still registered")
-            .rect
-            .top();
-        assert!(
-            after < before - Style::SP_XL,
-            "the jump must scroll the Shells group up the pane (before {before}, after {after})"
-        );
-    }
+    //
+    // The original single-group ("Shells") jump-scroll proof that used to live
+    // here was folded into WIN7-5's
+    // `clicking_any_jump_row_scrolls_that_same_groups_heading_up_the_list`
+    // below (── WIN7-5 section), which parametrizes over a representative
+    // spread of groups INCLUDING Shells — the exact same case, so the
+    // original added no coverage beyond what that generalized test already
+    // proves. A cross-unit polish pass removed the now-redundant duplicate
+    // rather than leave both.
 
     // ── CONSOLE-4: the Power section (locks #28/#36 — real seams, typed-armed) ──
 
@@ -2837,12 +2821,12 @@ mod tests {
 
     #[test]
     fn clicking_any_jump_row_scrolls_that_same_groups_heading_up_the_list() {
-        // Generalizes the pre-existing Shells-only jump-scroll proof: the
-        // WIN7-5 rewrite touches every jump row's paint path, so this
-        // re-proves the click-to-scroll-target mapping wasn't disturbed for
-        // OTHER groups too, not just the one already covered. A
-        // representative spread (first, middle, last group) rather than all
-        // seven, to keep the test focused.
+        // Supersedes the original Shells-only jump-scroll proof (folded in
+        // here, see the section banner above): the WIN7-5 rewrite touches
+        // every jump row's paint path, so this proves the click-to-
+        // scroll-target mapping wasn't disturbed for OTHER groups too, not
+        // just Shells. A representative spread (first, middle, last group)
+        // rather than all seven, to keep the test focused.
         for label in ["Network", "Storage", "Shells"] {
             let ctx = egui::Context::default();
             Style::install(&ctx);
