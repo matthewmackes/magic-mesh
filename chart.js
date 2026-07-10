@@ -1,1 +1,0 @@
-Redirecting to /chart.js@4.5.1/dist/chart.min.js?version=3.8.0
