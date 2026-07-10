@@ -58,6 +58,14 @@ name = "hello_video_plane"
 path = "examples/hello_video_plane.rs"
 required-features = ["drm"]
 
+# QC-23 Tier 1 PRIME-import liveness acceptance surface — round-trips a locally
+# GBM-allocated buffer through buffer_to_prime_fd/prime_fd_to_buffer/
+# add_planar_framebuffer with no QEMU involved; only built with the `drm` feature.
+[[example]]
+name = "hello_prime_import"
+path = "examples/hello_prime_import.rs"
+required-features = ["drm"]
+
 # E12-2: this crate carries the bare-seat FFI backend (DRM/GBM/EGL/GL/libinput),
 # which inherently needs `unsafe`. The workspace FORBIDS unsafe; mirror the workspace
 # lints here but DENY (overridable) rather than forbid it, so the FFI `drm` module can

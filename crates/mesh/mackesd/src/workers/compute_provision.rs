@@ -329,11 +329,14 @@ pub fn build_cloud_init_user_data(
 /// precise flag set is HW-bench-tunable (VIRT-12); this assembles a
 /// coherent baseline: name, memory, vcpus, the pool-backed qcow2
 /// disk, optional install ISO, default NAT NIC, generic os-variant, a
-/// virtio sound device + QEMU's native PipeWire audiodev (E12-9 local
-/// audio — mirrors `vm_lifecycle.rs::build_domain_xml`'s device on the
-/// other create path, see `docs/design/e12-9-10-libvirt-rescope.md`),
-/// the NoCloud seed, and — when `attach_meshfs` — the libvirt-managed
-/// virtiofs filesystem + shared memory backing it requires.
+/// virtio video model with 3D acceleration on (QC-23 Tier 0 — mirrors
+/// `vm_lifecycle.rs::build_domain_xml`'s `<acceleration accel3d='yes'/>`,
+/// see `docs/design/qc23-virtio-gpu-zerocopy-rescope.md`), a virtio sound
+/// device + QEMU's native PipeWire audiodev (E12-9 local audio — mirrors
+/// `vm_lifecycle.rs::build_domain_xml`'s device on the other create path,
+/// see `docs/design/e12-9-10-libvirt-rescope.md`), the NoCloud seed, and —
+/// when `attach_meshfs` — the libvirt-managed virtiofs filesystem + shared
+/// memory backing it requires.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_virt_install_args(
@@ -363,6 +366,19 @@ pub fn build_virt_install_args(
         "detect=on,name=generic".into(),
         "--graphics".into(),
         "spice".into(),
+        // QC-23 Tier 0 (docs/design/qc23-virtio-gpu-zerocopy-rescope.md §5): a
+        // real guest-3D (virgl/venus) win, independent of the delivery
+        // mechanism — compatible with the `--graphics spice` line above
+        // unchanged (§3.2). Verified against a local `virt-install --dry-run
+        // --print-xml` probe: `model.type=virtio,model.acceleration.accel3d=yes`
+        // is the exact suboption spelling that emits
+        // `<video><model type='virtio'><acceleration accel3d='yes'/></model></video>`,
+        // mirroring `vm_lifecycle.rs::build_domain_xml`'s domain-XML addition on
+        // the other create path. There was previously no `--video` flag here at
+        // all (§1.4), leaving `virt-install`/libvirt to pick its own default
+        // video model — this both fixes that gap and turns 3D on.
+        "--video".into(),
+        "model.type=virtio,model.acceleration.accel3d=yes".into(),
         // E12-9 local audio (Option A — docs/design/e12-9-10-libvirt-rescope.md):
         // every mesh-desktop-flow VM gets the same local-audio device the
         // Datacenter-UI-flow's build_domain_xml gives its VMs. Minimal
@@ -1125,6 +1141,9 @@ mod tests {
         // virt_install_args_always_include_pipewire_audio_device below).
         assert!(args.contains(&"--sound".to_string()));
         assert!(args.contains(&"--audio".to_string()));
+        // QC-23 Tier 0: accel3d video is unconditional (asserted precisely in
+        // virt_install_args_always_include_accel3d_video below).
+        assert!(args.contains(&"--video".to_string()));
     }
 
     #[test]
@@ -1153,6 +1172,39 @@ mod tests {
         assert_eq!(args[sound_pos + 1], "model=virtio");
         let audio_pos = args.iter().position(|a| a == "--audio").expect("--audio");
         assert_eq!(args[audio_pos + 1], "id=1,type=pipewire");
+    }
+
+    #[test]
+    fn virt_install_args_always_include_accel3d_video() {
+        // QC-23 Tier 0 (docs/design/qc23-virtio-gpu-zerocopy-rescope.md §5): every
+        // VM this path creates gets a virtio video model with 3D acceleration on,
+        // unconditionally — mirrors build_domain_xml's <acceleration
+        // accel3d='yes'/> on the other create path. Previously this builder had
+        // no --video flag at all (§1.4), leaving virt-install to pick its own
+        // default video model.
+        let req = sample_req(false, None);
+        let args = build_virt_install_args(
+            &req,
+            "vm-01",
+            "/var/lib/mde-vms/vm-01.qcow2",
+            "/tmp/ud",
+            "/tmp/md",
+            false,
+            "/mnt/mesh-storage",
+        );
+        assert!(args.contains(&"--video".to_string()));
+        assert!(args.contains(&"model.type=virtio,model.acceleration.accel3d=yes".to_string()));
+        // --video immediately precedes its value, same shape as every other
+        // flag/value pair this builder emits (--sound/--audio above).
+        let video_pos = args.iter().position(|a| a == "--video").expect("--video");
+        assert_eq!(
+            args[video_pos + 1],
+            "model.type=virtio,model.acceleration.accel3d=yes"
+        );
+        // --video sits alongside --graphics spice, not in place of it (§3.2:
+        // accel3d is compatible with SPICE, not a replacement delivery mechanism).
+        assert!(args.contains(&"--graphics".to_string()));
+        assert!(args.contains(&"spice".to_string()));
     }
 
     #[test]

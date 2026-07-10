@@ -34,8 +34,9 @@ use std::sync::Arc;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 
+use drm::buffer;
 use drm::control::{
-    connector, crtc, plane, property, Device as ControlDevice, Mode, ModeTypeFlags,
+    connector, crtc, plane, property, Device as ControlDevice, FbCmd2Flags, Mode, ModeTypeFlags,
 };
 use drm::Device as BasicDevice;
 
@@ -1391,9 +1392,183 @@ pub fn probe_primary_video_plane(
     Ok((set, path))
 }
 
+// ── QC-23 Tier 1: PRIME-import liveness check (hardware-gated, no QEMU) ───────
+//
+// `docs/design/qc23-virtio-gpu-zerocopy-rescope.md` §5 Tier 1. The shell-side half
+// of a real dmabuf importer (Option B, §3.5) is `prime_fd_to_buffer` (fd → GEM
+// handle) → `add_planar_framebuffer` (GEM handle → KMS framebuffer); this codebase
+// has never actually exercised either call. The hard, still-unsolved half (§3.3) is
+// getting a dmabuf fd OUT of QEMU in the first place — this check is entirely
+// independent of that. It round-trips a **locally-allocated** GBM buffer through
+// this project's own export/import primitives (`buffer_to_prime_fd` →
+// `prime_fd_to_buffer`) with no QEMU involvement at all, proving the *shell-side*
+// half of the mechanism actually works on real hardware. Mirrors
+// `probe_primary_video_plane`'s own precedent above: a harmless liveness probe
+// (built, then immediately torn down) rather than a real QEMU-sourced frame.
+
+/// A single-plane [`buffer::PlanarBuffer`] built from a **re-imported** GEM handle.
+/// `prime_fd_to_buffer` only returns a bare handle — unlike a `gbm::BufferObject`
+/// (which already implements `PlanarBuffer` directly for its OWN handle, e.g. the
+/// scanout buffers [`run_drm`] already builds), a handle re-imported from a raw fd
+/// carries no size/format/pitch of its own, so whatever protocol handed over the fd
+/// must supply that metadata out-of-band. Here it comes from the same
+/// locally-allocated buffer whose fd [`probe_prime_import_liveness`] round-trips (a
+/// real cross-process handoff — the still-blocked §3.3 half — would carry it some
+/// other way, e.g. the virtio-gpu resource's own create parameters). Single-plane
+/// only (planes 1-3 empty): every format this project's virtio-gpu path would
+/// actually scan out (XRGB8888 et al.) is single-plane; multi-planar YUV formats
+/// are out of scope here (§3.5's own shader-risk note already flags them as a
+/// separate, format-dependent follow-on).
+#[derive(Debug, Clone, Copy)]
+struct ReimportedGemBuffer {
+    /// Buffer width, px (from the original local allocation).
+    width: u32,
+    /// Buffer height, px (from the original local allocation).
+    height: u32,
+    /// Pixel format (from the original local allocation).
+    format: gbm::Format,
+    /// Explicit modifier, or `None` to let `add_planar_framebuffer` omit
+    /// [`FbCmd2Flags::MODIFIERS`] (see [`explicit_modifier`]).
+    modifier: Option<gbm::Modifier>,
+    /// Bytes per scanline (from the original local allocation).
+    pitch: u32,
+    /// The freshly re-imported GEM handle — NOT the original buffer's own handle.
+    handle: buffer::Handle,
+}
+
+impl buffer::PlanarBuffer for ReimportedGemBuffer {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn format(&self) -> gbm::Format {
+        self.format
+    }
+
+    fn modifier(&self) -> Option<gbm::Modifier> {
+        self.modifier
+    }
+
+    fn pitches(&self) -> [u32; 4] {
+        [self.pitch, 0, 0, 0]
+    }
+
+    fn handles(&self) -> [Option<buffer::Handle>; 4] {
+        [Some(self.handle), None, None, None]
+    }
+
+    fn offsets(&self) -> [u32; 4] {
+        [0, 0, 0, 0]
+    }
+}
+
+/// `Some(modifier)` unless `modifier` is GBM's driver-implicit/unspecified
+/// sentinel (`DrmModifier::Invalid`) — mirrors the exact filter
+/// `drm::control::Device::add_planar_framebuffer`'s own implementation applies to
+/// a [`buffer::PlanarBuffer::modifier`] before asserting it against
+/// [`FbCmd2Flags::MODIFIERS`] (`drm` 0.14.1 `src/control/mod.rs:356-360`), so
+/// [`probe_prime_import_liveness`] doesn't have to duplicate that invariant
+/// inline — get it wrong and `add_planar_framebuffer` panics instead of
+/// returning a clean `Result`. `DrmModifier` (aka [`gbm::Modifier`]) has no
+/// `PartialEq` impl, so this matches the same `drm`-crate source's own idiom
+/// (`!matches!(modifier, DrmModifier::Invalid)`) rather than `!=`.
+fn explicit_modifier(modifier: gbm::Modifier) -> Option<gbm::Modifier> {
+    if matches!(modifier, gbm::Modifier::Invalid) {
+        None
+    } else {
+        Some(modifier)
+    }
+}
+
+/// The outcome of [`probe_prime_import_liveness`]: proof the re-imported prime fd
+/// was accepted as a real KMS framebuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimeImportLiveness {
+    /// The (immediately torn down) framebuffer's KMS object id — evidence
+    /// `add_planar_framebuffer` accepted the re-imported handle.
+    pub framebuffer_id: u32,
+}
+
+/// QC-23 Tier 1 (`docs/design/qc23-virtio-gpu-zerocopy-rescope.md` §5): round-trip
+/// a **locally-allocated** GBM buffer through this project's own PRIME import
+/// primitives, with no QEMU involvement at all.
+///
+/// Allocates a small scanout-capable GBM buffer, exports its dmabuf fd
+/// (`buffer_to_prime_fd`), re-imports that fd as a fresh GEM handle
+/// (`prime_fd_to_buffer` — the same call a real QEMU-delivered dmabuf fd would go
+/// through), wraps it in a [`ReimportedGemBuffer`] carrying the metadata a real
+/// handoff would need to supply out-of-band, and builds a KMS framebuffer from it
+/// (`add_planar_framebuffer`) — then immediately tears it down
+/// (`destroy_framebuffer`). This is a liveness probe, not a real present — it
+/// never touches a plane/CRTC at all (plane selection + `set_plane` is already
+/// proven by MEDIA-2's [`probe_primary_video_plane`] above; this proves only the
+/// import primitives Option B (§3.5) still needed exercising), mirroring
+/// `probe_primary_video_plane`'s own choice of a harmless `clear()` over a real
+/// frame.
+///
+/// # Errors
+/// [`DrmError::NoDrmMaster`] on a headless host (no seat to probe at all — the
+/// same degrade every other live check in this module uses), or the other
+/// [`DrmError`] variants when the GBM/KMS calls themselves fail.
+pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
+    let (_node, file) = open_primary_node()?;
+    let card = Card(file);
+    let gbm = gbm::Device::new(card).map_err(|e| DrmError::Gbm(format!("gbm device: {e}")))?;
+
+    // A small scanout-capable buffer — its pixel content is never read or
+    // written; this proves the *handle* plumbing, not a rendered frame.
+    let bo = gbm
+        .create_buffer_object::<()>(
+            64,
+            64,
+            gbm::Format::Xrgb8888,
+            gbm::BufferObjectFlags::SCANOUT,
+        )
+        .map_err(|e| DrmError::Gbm(format!("create_buffer_object: {e}")))?;
+    let (width, height) = (bo.width(), bo.height());
+    let pitch = bo.stride();
+    let modifier = explicit_modifier(bo.modifier());
+
+    // Export → re-import: the exact round trip the shell side of a real
+    // cross-process dmabuf handoff (QEMU → here, once §3.3 is solved) would need,
+    // exercised here against a buffer this same process already owns.
+    let local_handle = buffer::Buffer::handle(&bo);
+    let fd = gbm
+        .buffer_to_prime_fd(local_handle, 0)
+        .map_err(|e| DrmError::Present(format!("buffer_to_prime_fd: {e}")))?;
+    let reimported_handle = gbm
+        .prime_fd_to_buffer(fd.as_fd())
+        .map_err(|e| DrmError::Present(format!("prime_fd_to_buffer: {e}")))?;
+
+    let planar = ReimportedGemBuffer {
+        width,
+        height,
+        format: gbm::Format::Xrgb8888,
+        modifier,
+        pitch,
+        handle: reimported_handle,
+    };
+    let flags = if modifier.is_some() {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    };
+    let fb = gbm
+        .add_planar_framebuffer(&planar, flags)
+        .map_err(|e| DrmError::Present(format!("add_planar_framebuffer: {e}")))?;
+    let framebuffer_id = u32::from(fb);
+    let _ = gbm.destroy_framebuffer(fb);
+
+    Ok(PrimeImportLiveness { framebuffer_id })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{open_primary_node, DrmError};
+    use super::{
+        explicit_modifier, open_primary_node, probe_prime_import_liveness, DrmError,
+        ReimportedGemBuffer,
+    };
+    use drm::buffer::{Handle as GemHandle, PlanarBuffer};
 
     #[test]
     fn headless_degrades_cleanly() {
@@ -1401,6 +1576,56 @@ mod tests {
         // master (the farm/CI case) it must return the clean NoDrmMaster fallback
         // the shell relies on. On a dev box with a GPU it may instead return Ok.
         match open_primary_node() {
+            Ok(_) => {}
+            Err(DrmError::NoDrmMaster(_)) => {}
+            Err(other) => panic!("expected a clean NoDrmMaster fallback, got {other:?}"),
+        }
+    }
+
+    // ── QC-23 Tier 1: PRIME-import liveness ──
+
+    #[test]
+    fn reimported_gem_buffer_maps_a_single_plane() {
+        // Pure mapping check — no hardware: a synthetic handle stands in for
+        // whatever prime_fd_to_buffer would really return on a live seat.
+        let handle = drm::control::from_u32::<GemHandle>(7).expect("nonzero handle");
+        let planar = ReimportedGemBuffer {
+            width: 64,
+            height: 64,
+            format: gbm::Format::Xrgb8888,
+            modifier: Some(gbm::Modifier::Linear),
+            pitch: 256,
+            handle,
+        };
+        assert_eq!(planar.size(), (64, 64));
+        assert_eq!(planar.format(), gbm::Format::Xrgb8888);
+        assert_eq!(planar.pitches(), [256, 0, 0, 0]);
+        assert_eq!(planar.offsets(), [0, 0, 0, 0]);
+        let handles = planar.handles();
+        assert_eq!(handles[0], Some(handle));
+        assert!(handles[1..].iter().all(Option::is_none));
+        assert!(matches!(planar.modifier(), Some(gbm::Modifier::Linear)));
+    }
+
+    #[test]
+    fn explicit_modifier_filters_the_invalid_sentinel() {
+        // The Invalid sentinel (GBM's "driver picked an implicit modifier, don't
+        // ask" value) must map to None, or add_planar_framebuffer's own
+        // has_modifier/modifier.is_some() assert would panic instead of a clean
+        // Result — see explicit_modifier's doc comment.
+        assert!(explicit_modifier(gbm::Modifier::Invalid).is_none());
+        assert!(matches!(
+            explicit_modifier(gbm::Modifier::Linear),
+            Some(gbm::Modifier::Linear)
+        ));
+    }
+
+    #[test]
+    fn prime_import_liveness_degrades_cleanly() {
+        // Same total/never-panic contract as headless_degrades_cleanly above: a
+        // headless host (the farm/CI case) must return the clean NoDrmMaster
+        // fallback; a dev box with a GPU may instead return Ok.
+        match probe_prime_import_liveness() {
             Ok(_) => {}
             Err(DrmError::NoDrmMaster(_)) => {}
             Err(other) => panic!("expected a clean NoDrmMaster fallback, got {other:?}"),

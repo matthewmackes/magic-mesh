@@ -3637,6 +3637,68 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   `docs/WORKLIST.md` **E12-7** is a zombie entry describing the
   QC-15-deleted `mde-kvm`/cloud-hypervisor stack and should be marked
   superseded-by-QC-23 in a future reconciliation pass.
+  **Progress (2026-07-10 accel3d + PRIME-import liveness slice):**
+  implements the design doc's two Tier 0/Tier 1 recommendations above —
+  both real, both still decoupled from the blocked importer. **(1) Tier 0
+  `accel3d='yes'`:** `vm_lifecycle.rs::build_domain_xml`'s `<video>` stanza
+  now nests `<model type='virtio'><acceleration accel3d='yes'/></model>`,
+  unconditionally, alongside the unchanged `<graphics type='spice'>`
+  stanza. `compute_provision.rs::build_virt_install_args` — which per §1.4
+  had **no `--video` flag at all** — now always adds `--video
+  model.type=virtio,model.acceleration.accel3d=yes`; that exact suboption
+  spelling was verified (not guessed) against the real `virt-install`
+  binary present in this dev environment via `virt-install --video=?`
+  (confirms `model.acceleration.accel3d` is a real suboption path) and a
+  `--dry-run --print-xml` probe, which emitted byte-identical
+  `<video><model type="virtio"><acceleration accel3d="yes"/></model></video>`
+  XML to the domain-XML side, then was discarded (no domain left defined).
+  **(2) Tier 1 PRIME-import liveness:** `mde-egui/src/drm.rs` adds
+  `probe_prime_import_liveness` (mirrors `probe_primary_video_plane`'s own
+  shape/posture exactly): allocates a 64×64 scanout-capable GBM buffer,
+  exports its dmabuf fd via `drm::control::Device::buffer_to_prime_fd`,
+  re-imports that fd as a fresh GEM handle via `prime_fd_to_buffer` — the
+  same call a real QEMU-delivered dmabuf fd would go through — wraps it in
+  a new `ReimportedGemBuffer` (a small `drm::buffer::PlanarBuffer` impl;
+  `prime_fd_to_buffer` returns a bare handle with no size/format/pitch of
+  its own, unlike a live `gbm::BufferObject`, so the metadata a real
+  handoff would carry out-of-band is supplied from the original local
+  allocation here), and builds + immediately tears down a KMS framebuffer
+  via `add_planar_framebuffer`. Never touches a plane/CRTC — plane
+  selection is already MEDIA-2's job; this exercises only the import
+  primitives Option B (design doc §3.5) still needed exercising. Per
+  `AI_GOVERNANCE.md` §7, wired to a real caller: re-exported from
+  `mde-egui`'s crate root behind `feature = "drm"` and driven by a new
+  `hello_prime_import` example (the `hello_video_plane` mold). **Both
+  pieces matched the design doc's own size estimate — neither grew beyond
+  "small, decoupled, real progress"; no new crate dependencies were added.**
+  Farm evidence: `.90` `cargo test -p mackesd --lib vm_lifecycle` passed
+  44/44 (incl. new `domain_xml_includes_virtio_gpu_accel3d`); `.90` `cargo
+  test -p mackesd --lib compute_provision` passed 32/32 (incl. new
+  `virt_install_args_always_include_accel3d_video`); `.90` `cargo test -p
+  mde-egui --lib --features drm` passed 136/136 (incl. new
+  `reimported_gem_buffer_maps_a_single_plane`,
+  `explicit_modifier_filters_the_invalid_sentinel`,
+  `prime_import_liveness_degrades_cleanly` — a `cargo clean -p mde-egui`
+  was needed first to clear a stale rlib left by an earlier session sharing
+  this build slot, the same class of issue as the project's known
+  stale-rlib gotcha); `.90` `cargo build -p mde-egui --example
+  hello_prime_import --features drm` compiled, and run directly on that
+  (headless) build VM printed the same honest `no usable DRM master:
+  /dev/dri/card0: Permission denied` fallback as the existing
+  `hello_video_plane`/`hello_drm` examples, byte-for-byte the same failure
+  mode — the farm can compile this path, never live-run it (unchanged
+  constraint). Local `rustup run 1.94.0 rustfmt --edition 2021 --check`
+  passed on all five touched files. `cargo clippy` on both crates showed
+  zero new warnings anywhere in the touched line ranges (checked by exact
+  line-number grep against each diff — the only warnings present are
+  pre-existing, in code neither piece touched).
+  **Still blocked, unchanged by this slice:** getting a dmabuf handle out
+  of QEMU's process at all (§3.3) — neither piece touches delivery; SPICE
+  is still the only working console path, `accel3d` only speeds up guest
+  rendering SPICE then re-encodes, and the liveness check proves the
+  shell-side import primitives work on real hardware without ever
+  producing or consuming a QEMU-sourced handle. The Acceptance list below
+  is unchanged — nothing here checks off a box.
   **Acceptance**:
     - [ ] a libvirt/QEMU VM is launched with the selected local display backend
       (virtio-gpu/virgl/venus or the chosen replacement) and produces a

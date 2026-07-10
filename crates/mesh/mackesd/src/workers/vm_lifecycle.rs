@@ -773,6 +773,17 @@ pub fn build_pci_hostdev_xml(addr: &PciAddress) -> String {
 /// separate hot-attach op ([`LifecycleAction::AttachUsb`]), not part of the
 /// initial device set.
 ///
+/// **Video 3D acceleration (QC-23 Tier 0, unconditional):** the virtio video
+/// model always carries `<acceleration accel3d='yes'/>`
+/// (`docs/design/qc23-virtio-gpu-zerocopy-rescope.md` §5) — a real guest-3D
+/// (virgl/venus) performance win, compatible with the existing
+/// `<graphics type='spice'>` stanza unchanged (§3.2: 3D acceleration is
+/// independent of the delivery mechanism). This does **not** make display
+/// delivery zero-copy — the SPICE CPU-copy path (§1.1) is unaffected — and it
+/// does not by itself confirm the host's QEMU build was compiled with
+/// `--enable-virglrenderer` (§3.2's flagged-open, unverified item; cheap to
+/// check on a real box, not assumed here).
+///
 /// **On the mixer tag (E12-9, deliberately NOT wired here):** the `<output>`'s
 /// `streamName='vm-{name}'` is the doc-recommended connecting tissue toward
 /// `mde-seat/src/mixer.rs`'s `mde.vm.name`-keyed `classify_origin` (the
@@ -834,7 +845,9 @@ pub fn build_domain_xml(spec: &VmSpec, disk_path: &str) -> String {
          \x20     <listen type='address' address='127.0.0.1'/>\n\
          \x20   </graphics>\n\
          \x20   <video>\n\
-         \x20     <model type='virtio'/>\n\
+         \x20     <model type='virtio'>\n\
+         \x20       <acceleration accel3d='yes'/>\n\
+         \x20     </model>\n\
          \x20   </video>\n\
          \x20   <memballoon model='virtio'/>\n\
          \x20   <sound model='virtio'/>\n\
@@ -1811,6 +1824,36 @@ mod tests {
         assert!(xml.contains("<source network='mesh-net'/>"));
         assert!(xml.contains("org.qemu.guest_agent.0"));
         assert!(xml.trim_end().ends_with("</domain>"));
+    }
+
+    #[test]
+    fn domain_xml_includes_virtio_gpu_accel3d() {
+        // QC-23 Tier 0 (docs/design/qc23-virtio-gpu-zerocopy-rescope.md §5):
+        // every VM's virtio video model carries 3D acceleration, unconditionally
+        // — no opt-in flag, same posture as the E12-9 audio device above.
+        let spec = VmSpec {
+            name: "web1".into(),
+            vcpus: 2,
+            ram_mb: 2048,
+            disk_gb: 20,
+            image_path: None,
+            network: None,
+            pci_passthrough: Vec::new(),
+        };
+        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/web1.qcow2");
+        assert!(xml.contains("<model type='virtio'>"));
+        assert!(xml.contains("<acceleration accel3d='yes'/>"));
+        // The accelerated model is nested inside <video>...</video>, which itself
+        // lands inside <devices>...</devices> (not floating loose or duplicated
+        // outside the device list).
+        let video_start = xml.find("<video>").expect("video open");
+        let video_end = xml.find("</video>").expect("video close");
+        let accel_pos = xml.find("<acceleration").expect("acceleration present");
+        assert!(accel_pos > video_start && accel_pos < video_end);
+        assert_eq!(xml.matches("<acceleration").count(), 1);
+        // The existing SPICE graphics stanza is unchanged alongside it (§3.2:
+        // accel3d is compatible with SPICE, not a replacement delivery mechanism).
+        assert!(xml.contains("<graphics type='spice' autoport='yes'>"));
     }
 
     #[test]

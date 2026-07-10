@@ -75,7 +75,10 @@ pub use video_plane::{
 pub use widgets::{field, muted_note, status_dot};
 
 #[cfg(feature = "drm")]
-pub use drm::{probe_primary_video_plane, probe_video_plane, run_drm, DrmVideoScanout};
+pub use drm::{
+    probe_primary_video_plane, probe_prime_import_liveness, probe_video_plane, run_drm,
+    DrmVideoScanout, PrimeImportLiveness,
+};
 
 // Re-export the toolkit so surfaces depend on `mde-egui` alone and share one
 // egui/eframe resolution.
