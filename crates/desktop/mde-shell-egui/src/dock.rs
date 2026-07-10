@@ -1,6 +1,10 @@
 //! The shell **dock** — the left **vertical dock** ([`dock`], design
-//! `docs/design/vertical-dock.md`): the shell's ONE chrome (VDOCK, the sole
-//! surface launcher after VDOCK-6b ripped out the old horizontal taskbar).
+//! `docs/design/vertical-dock.md`) plus the full-width **bottom taskbar**
+//! ([`notification_rail_with_sources`], design `docs/design/
+//! win7-desktop-survey.md`, WIN7-1): together the shell's ONE chrome (VDOCK, the
+//! sole surface launcher after VDOCK-6b ripped out the old horizontal taskbar;
+//! NAVBAR/NOTIF/CONSOLE-1 then built the *new* bottom rail that WIN7-1 formalizes
+//! as a true Win7-style taskbar).
 //!
 //! Under E12 "Quasar" the mesh-control surfaces are **panels in the one shell**,
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
@@ -18,10 +22,12 @@
 //! horizontal accent label + a left-rail accent stripe over its 24px brand glyph
 //! cells (in [`Surface::ALL`] order). The active cell wears a **left-edge accent
 //! bar** + the subtle selection wash; hover is a fill only — no per-icon captions,
-//! no tooltips anywhere. Beneath the picker sit VDOCK-5's **clock strip** (the
-//! live HH:MM glyph that opens Timers & Alarms, lock #20) and VDOCK-4's **system
-//! quad** (Settings · Show-Desktop · Lock · Power). Notification status pips live
-//! in the separate bottom rail, not in the left rail.
+//! no tooltips anywhere. Beneath the picker sits only VDOCK-4's **system quad**
+//! (Settings · Show-Desktop · Lock · Power) — the Start cell, the session rail,
+//! the clock, the auto-hide pin, and the notification status pips all live in the
+//! separate full-width **bottom taskbar** (WIN7-1 lock #3's Start · sessions ·
+//! tray · clock order, with the pin trailing after the clock), never in this left
+//! rail.
 //!
 //! The dock is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -429,12 +435,14 @@ pub fn icon_texture(
 // VDOCK-1 — the left **vertical dock** frame + auto-hide (design
 // `docs/design/vertical-dock.md`, locks #1/#9/#13/#14/#23/#24).
 //
-// The shell's sole chrome (VDOCK-6b removed the old horizontal taskbar): a
-// left-edge, full-height, ~48px, solid Carbon-dark column that slides in from the
-// left and auto-hides (hotkey + pin, no hover). VDOCK-1 builds the FRAME + the
-// slide/toggle/pin mechanism; the interior is filled by the app picker (VDOCK-2),
-// the clock strip (VDOCK-5), and the system quad (VDOCK-4). Notification pips
-// mount in the separate bottom rail.
+// The shell's left-edge chrome (VDOCK-6b removed the old horizontal taskbar,
+// then NAVBAR/NOTIF/CONSOLE-1 rebuilt a *new* bottom rail this module also owns —
+// see [`notification_rail_with_sources`], WIN7-1's bottom taskbar): a left-edge,
+// full-height, ~48px, solid Carbon-dark column that slides in from the left and
+// auto-hides (hotkey + pin, no hover). VDOCK-1 builds the FRAME + the
+// slide/toggle/pin mechanism; the interior is filled by the app picker (VDOCK-2)
+// and the system quad (VDOCK-4). The Start cell, clock, auto-hide pin, and
+// notification pips all mount in the separate bottom taskbar, not here.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// The vertical dock's width in logical points (~48px, design #2/#23) — one
@@ -889,14 +897,17 @@ impl DockState {
 /// dock can never steal focus/input while hidden (the design's "auto-hide + DRM
 /// seat" risk; proven by the passthrough test).
 ///
-/// VDOCK-1 built the FRAME + the slide/toggle/pin; **VDOCK-2** fills the top
-/// **Workbench-lead** zone + the single-column **app-groups** middle; **VDOCK-3**
-/// fills the bottom **status strip** and **VDOCK-4** the **system quad** beneath
-/// them ([`paint_dock_frame`]). Returns `true` if a dock control routed this frame
-/// — the pin, a picker cell, a status segment selecting its [`Surface`], or a
-/// system-quad cell (a route, the curtain lock, or the Power menu), recorded in
-/// [`DockState`] (the active surface + the pending lock/power requests) which the
-/// shell reads back to surface the body / drive the seat.
+/// VDOCK-1 built the FRAME + the slide/toggle mechanism; **VDOCK-2** fills the
+/// top **Workbench-lead** zone + the single-column **app-groups** middle; the
+/// NODE-GRADE-2 grade band sits above **VDOCK-4**'s **system quad** in the final
+/// row ([`paint_dock_frame`]). Returns `true` if a dock control routed this frame
+/// — a picker cell, a grade row (a node-focus request), or a system-quad cell (a
+/// route, the curtain lock, or the Power menu), recorded in [`DockState`] (the
+/// active surface + the pending lock/power/node-focus requests) which the shell
+/// reads back to surface the body / drive the seat. The auto-hide **pin**, the
+/// **Start** cell, the session rail, the status tray, and the **clock** are NOT
+/// part of this function — they render in the separate full-width bottom
+/// taskbar ([`notification_rail_with_sources`], WIN7-1).
 pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     let shown = state.shown();
     // Slide-in-from-left over the shared Motion table (lock #14): `t` eases
@@ -944,16 +955,27 @@ pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     clicked
 }
 
-/// Render the bottom rail that holds the small global controls removed from the
-/// left rail: Advanced menu, Desktop, Clock, Pin, and the notification/status
-/// segment micro-icons.
+/// Render the bottom **taskbar** (WIN7-1) — test-only convenience over
+/// [`notification_rail_with_sources`] for callers with no live Desktop sources.
 #[cfg(test)]
 pub fn notification_rail(ctx: &egui::Context, state: &mut DockState) -> bool {
     notification_rail_with_sources(ctx, state, &[])
 }
 
-/// Render the bottom rail with the compact Desktop source flyout fed from
-/// `ChooserState` by the shell.
+/// Render the shell's full-width **bottom taskbar** (design
+/// `docs/design/win7-desktop-survey.md`, WIN7-1 lock #3), fed the compact Desktop
+/// source flyout from `ChooserState` by the shell. Left → right: the **Start**
+/// cell ([`start_cell`]) · the **running sessions** run (the Desktop rail cell +
+/// source caret, then [`SessionRailEntry`]/[`DesktopRailSource`] entries or the
+/// dim fallback glyph, NAVBAR-U1/U2/U3) · the **tray** (the status-detail
+/// chevron + [`status::notification_rail`]'s segment pips, unchanged
+/// click-through-to-Chat behavior) · the **clock** ([`clock_cell_rect`]) · the
+/// auto-hide **pin** trailing last (this shell's own dock-hold-open control, not
+/// a Win7 taskbar concept, so it rides past the four-part contract rather than
+/// interrupting it). Compact (`Density::Mouse`, [`NOTIFICATION_RAIL_H`]) is this
+/// taskbar's default, deliberately denser than the shell's other Carbon-baseline
+/// chrome (lock #12); `Density::Touch` grows it to the labelled
+/// [`NOTIFICATION_RAIL_EXPANDED_H`] variant.
 pub fn notification_rail_with_sources(
     ctx: &egui::Context,
     state: &mut DockState,
@@ -1034,11 +1056,15 @@ pub fn notification_rail_with_sources(
             }
             x += DESKTOP_CARET_W;
 
+            // Lock #3 (WIN7-1): Start · sessions · tray · clock, left to right — the
+            // auto-hide pin is this shell's own dock-hold-open control (not a Win7
+            // taskbar concept), so it trails past the clock as an extra rather than
+            // interrupting the four-part contract (painted below, right to left).
             let tray_icon_w = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
             let status_w = tray_icon_w * status::StatusSegment::ALL.len() as f32;
             let clock_w = rail_h * 2.2;
             let right_cluster_w =
-                clock_w + rail_h + status_w + Style::SP_XS + rail_h + Style::SP_XS;
+                rail_h + clock_w + status_w + Style::SP_XS + rail_h + Style::SP_XS;
             let session_right = (local.right() - Style::SP_XS - right_cluster_w).max(x);
             if state.status.sessions.is_empty() {
                 if rail_icon(
@@ -1099,7 +1125,14 @@ pub fn notification_rail_with_sources(
                     state.rail_more_open = false;
                 }
             }
-            let mut tray_x = local.right() - Style::SP_XS - clock_w;
+            // The pin is the taskbar's rightmost control (trailing the clock, see
+            // the lock #3 note above) — this shell's own auto-hide affordance, not
+            // one of the four locked taskbar segments.
+            let mut tray_x = local.right() - Style::SP_XS - rail_h;
+            if pin_toggle(ui, cell(tray_x), state) {
+                clicked = true;
+            }
+            tray_x -= clock_w;
             if clock_cell_rect(
                 ui,
                 egui::Rect::from_min_size(
@@ -1109,10 +1142,6 @@ pub fn notification_rail_with_sources(
                 .shrink(2.0),
                 state,
             ) {
-                clicked = true;
-            }
-            tray_x -= rail_h;
-            if pin_toggle(ui, cell(tray_x), state) {
                 clicked = true;
             }
             tray_x -= status_w + Style::SP_XS;
@@ -1210,11 +1239,12 @@ pub fn gutter_width(ctx: &egui::Context, state: &DockState) -> f32 {
 
 /// Paint the vertical dock's frame into `rect` and lay out its interior: the solid
 /// Carbon-dark panel + the hairline right-edge divider (lock #24, §4 tokens), the
-/// **VDOCK-2** top zone (the Workbench lead + the folded-in pin) and middle zone
-/// (the single-column app groups + '…' overflow), VDOCK-5's clock strip, and the
-/// **VDOCK-4** system quad in the final `DOCK_W` row beneath it. Returns `true`
-/// if the pin, a picker cell, the clock, or a system-quad cell routed/acted this
-/// frame.
+/// **VDOCK-2** top zone (the Workbench lead) and middle zone (the single-column
+/// app groups + '…' overflow), the NODE-GRADE-2 grade band, and the **VDOCK-4**
+/// system quad in the final `DOCK_W` row beneath it. The pin and the clock are
+/// NOT painted here — both live in the bottom taskbar
+/// ([`notification_rail_with_sources`], WIN7-1). Returns `true` if a picker cell,
+/// a grade row, or a system-quad cell routed/acted this frame.
 fn paint_dock_frame(ui: &mut egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let painter = ui.painter().clone();
     // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), a flat
@@ -1232,7 +1262,7 @@ fn paint_dock_frame(ui: &mut egui::Ui, rect: egui::Rect, state: &mut DockState) 
     let mut clicked = false;
 
     // ── TOP zone — the Workbench lead remains the first left-rail launcher. The
-    // Advanced menu, Desktop shortcut, clock, and pin live in the bottom rail.
+    // Start cell, Desktop shortcut, clock, and pin live in the bottom taskbar.
     let wb = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
     if pick_app_cell(
         ui,
@@ -1584,13 +1614,15 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
 }
 
 /// CONSOLE-1's **Start cell** — the Console front door's trigger (console
-/// design locks #1/#2): the bottom rail's far-left Advanced affordance, wearing
-/// the repo's Win10-style Start/Menu tray glyph. A click latches the
-/// Console toggle for the shell to drain ([`DockState::take_console_toggle`] —
-/// the deferred wire; pressing it again closes, lock #4). While the panel is up
-/// (mirrored in via [`DockState::set_console_open`]) the cell wears the
-/// selection wash + ACCENT tint, the sys-cell "menu open" idiom. Every colour
-/// is a Style token (§4). Returns `true` on a click.
+/// design locks #1/#2; relabelled "Start" per WIN7-1, still opening the SAME
+/// Console panel — WIN7-2 is what turns this into the real two-pane Start Menu,
+/// not this unit): the bottom taskbar's far-left affordance, wearing the repo's
+/// Win10-style Start/Menu tray glyph. A click latches the Console toggle for the
+/// shell to drain ([`DockState::take_console_toggle`] — the deferred wire;
+/// pressing it again closes, lock #4). While the panel is up (mirrored in via
+/// [`DockState::set_console_open`]) the cell wears the selection wash + ACCENT
+/// tint, the sys-cell "menu open" idiom. Every colour is a Style token (§4).
+/// Returns `true` on a click.
 fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(rect, start_cell_id(), egui::Sense::click());
     let hovered = resp.hovered();
@@ -1617,7 +1649,7 @@ fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
             egui::Color32::WHITE,
         );
     }
-    paint_rail_label(ui, rect, "Advanced", tint);
+    paint_rail_label(ui, rect, "Start", tint);
     if resp.clicked() {
         state.console_toggle = true;
         return true;
@@ -1763,15 +1795,28 @@ const ACTIVE_BAR_W: f32 = Style::SP_XS;
 const OVERFLOW_H: f32 = Style::SP_L;
 
 /// The bottom band reserved beneath the app zone: only VDOCK-4's system row
-/// remains in the left rail. Advanced, Desktop, Clock, Pin, and notification
-/// status micro-icons live in the full-width bottom rail.
+/// remains in the left rail. Start, Desktop, Clock, Pin, and notification status
+/// micro-icons live in the full-width bottom taskbar.
 const BOTTOM_ZONE_H: f32 = DOCK_W;
 
-/// The full-width bottom rail height. It is intentionally thinner than a dock
-/// cell; controls render at micro-icon scale inside it.
-const NOTIFICATION_RAIL_H: f32 = 20.0;
+/// The full-width bottom taskbar's height in its default (`Density::Mouse`)
+/// mode — WIN7-1 lock #12's "denser than baseline" pass: on the same
+/// [`Style::SP_XS`] grid [`SYS_QUAD_ICON`] already uses, trimmed 2px tighter than
+/// the pre-WIN7-1 20px so this now-primary chrome stays visibly denser than the
+/// shell's other Carbon-baseline controls (the 48px [`DOCK_W`] column, the 32px
+/// `APP_CELL_H` picker cells) and gives the surface above it a little more
+/// screen real estate. Intentionally thinner than a dock cell; controls render
+/// at micro-icon scale inside it. This sits below [`Density::min_hit_target`]'s
+/// general 24pt pointer convention — a deliberate, pre-existing exception this
+/// module already made for this specific micro-icon tray (not a new one), now
+/// taken one notch further; revisit with a real visual pass if it reads too
+/// cramped on a live seat.
+const NOTIFICATION_RAIL_H: f32 = Style::SP_M + Style::SP_XS / 2.0;
 /// NAVBAR-8's expanded bar height: touch/expanded density grows the rail to a
-/// labelled Win10-style taskbar variant while compact density keeps the 20px rail.
+/// labelled Win10-style taskbar variant while compact density keeps the denser
+/// [`NOTIFICATION_RAIL_H`] rail. Deliberately left at the standard [`DOCK_W`]
+/// scale (unlike the compact rail) — `Density::Touch` exists specifically for
+/// larger touch targets, so WIN7-1's density pass does not shrink it.
 const NOTIFICATION_RAIL_EXPANDED_H: f32 = 48.0;
 const NOTIFICATION_RAIL_EXPANDED_ICON_H: f32 = 24.0;
 const DESKTOP_CARET_W: f32 = 14.0;
@@ -3898,9 +3943,11 @@ mod tests {
 
     #[test]
     fn the_start_cell_anchors_the_bottom_rail_and_latches_the_console_toggle() {
-        // Console locks #1/#2 moved to the bottom rail: the Advanced/Start cell is
-        // the far-left rail icon, before Desktop, and a click latches the console
-        // toggle the shell drains — exactly once.
+        // Console locks #1/#2 moved to the bottom rail: the Start cell is the
+        // far-left rail icon, before Desktop, and a click latches the console
+        // toggle the shell drains — exactly once (WIN7-1 relabels the rail text
+        // "Advanced" → "Start" but does NOT change this click behavior — WIN7-2
+        // is what turns it into the real two-pane Start Menu).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -3913,13 +3960,10 @@ mod tests {
             .read_response(start_cell_id())
             .expect("the Start cell is registered")
             .rect;
-        assert!(
-            start.left() < 8.0,
-            "the Advanced cell anchors the rail's left"
-        );
+        assert!(start.left() < 8.0, "the Start cell anchors the rail's left");
         assert!(
             start.height() < DOCK_W && start.width() < DOCK_W,
-            "the Advanced cell is a small rail icon"
+            "the Start cell is a small rail icon"
         );
         let desktop = ctx
             .read_response(pick_cell_id(Surface::Desktop))
@@ -3927,7 +3971,7 @@ mod tests {
             .rect;
         assert!(
             desktop.left() >= start.right(),
-            "Desktop sits immediately to the right of Advanced"
+            "Desktop sits immediately to the right of Start"
         );
         let wb = ctx
             .read_response(pick_cell_id(Surface::Workbench))
@@ -3935,7 +3979,7 @@ mod tests {
             .rect;
         assert!(
             wb.top() < start.top(),
-            "Workbench remains in the left rail while Advanced moved to the bottom rail"
+            "Workbench remains in the left rail while Start lives in the bottom taskbar"
         );
 
         assert!(!s.take_console_toggle(), "no toggle before a click");
@@ -4563,8 +4607,10 @@ mod tests {
     #[test]
     fn navbar4_status_tray_is_folded_into_the_bottom_rail() {
         // NAVBAR-4 — the separate chrome/status strip is retired: status pips,
-        // the detail toggle, and the clock all live in the full-width bottom rail.
-        // The old `status_bar` local-grade pip id must not register from the dock.
+        // the detail toggle, and the clock all live in the full-width bottom
+        // taskbar. The old `status_bar` local-grade pip id must not register from
+        // the dock. WIN7-1 lock #3 adds the pin check: the auto-hide pin trails
+        // the clock rather than interrupting Start · sessions · tray · clock.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -4589,7 +4635,7 @@ mod tests {
 
         let start = ctx
             .read_response(start_cell_id())
-            .expect("Start/Advanced cell is in the bottom rail")
+            .expect("Start cell is in the bottom rail")
             .rect;
         let clock = ctx
             .read_response(clock_cell_id())
@@ -4603,17 +4649,26 @@ mod tests {
             .read_response(status::segment_pip_id(status::StatusSegment::Alerts))
             .expect("status pips are in the bottom rail")
             .rect;
+        let pin = ctx
+            .read_response(egui::Id::new("vdock-pin"))
+            .expect("pin is in the bottom rail")
+            .rect;
         assert!(
-            [start, detail, alerts, clock]
+            [start, detail, alerts, clock, pin]
                 .into_iter()
                 .all(|r| (r.center().y - start.center().y).abs() < 2.0),
-            "Advanced, status pips, detail toggle, and clock share one bottom rail"
+            "Start, status pips, detail toggle, clock, and pin share one bottom rail"
         );
         assert!(
             detail.left() > start.right()
                 && alerts.left() > detail.right()
                 && clock.left() > alerts.right(),
             "status tray is right-aligned after the left-side launcher/session run"
+        );
+        assert!(
+            pin.left() >= clock.right() - 1.0,
+            "WIN7-1 lock #3: the auto-hide pin trails the clock rather than \
+             interrupting Start · sessions · tray · clock"
         );
         assert!(
             ctx.read_response(status::local_grade_pip_id()).is_none(),
@@ -4632,6 +4687,115 @@ mod tests {
         );
     }
 
+    // ── WIN7-1: the bottom rail is now explicitly the Win7-style taskbar ───────
+    // (design `docs/design/win7-desktop-survey.md`) — pure relocation + a density
+    // pass over content that NAVBAR/NOTIF/CONSOLE-1 already folded into one rail;
+    // these tests pin the locked lock #3 order + the lock #12 density trim as
+    // their own explicit contract, on top of the pre-existing coverage above.
+
+    #[test]
+    fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
+        // Lock #3: Start · running sessions · tray · clock, left to right. Extends
+        // navbar4_status_tray_is_folded_into_the_bottom_rail with a real session
+        // entry between Start and the tray, and pins the exact four-segment order
+        // end to end (not just "everything shares a row").
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            true,
+            vec![entry.clone()],
+            NodeGrades::default(),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let start = ctx
+            .read_response(start_cell_id())
+            .expect("Start cell registered")
+            .rect;
+        let session = ctx
+            .read_response(session_entry_id(0, &entry))
+            .expect("session entry registered")
+            .rect;
+        let tray = ctx
+            .read_response(status::segment_pip_id(status::StatusSegment::Alerts))
+            .expect("tray pip registered")
+            .rect;
+        let clock = ctx
+            .read_response(clock_cell_id())
+            .expect("clock registered")
+            .rect;
+        let pin = ctx
+            .read_response(egui::Id::new("vdock-pin"))
+            .expect("pin registered")
+            .rect;
+
+        assert!(
+            start.right() <= session.left() + 1.0,
+            "Start sits left of the running-sessions run"
+        );
+        assert!(
+            session.right() <= tray.left() + 1.0,
+            "sessions sit left of the tray"
+        );
+        assert!(
+            tray.right() <= clock.left() + 1.0,
+            "the tray sits left of the clock"
+        );
+        assert!(
+            clock.right() <= pin.left() + 1.0,
+            "the auto-hide pin trails the clock rather than interrupting the \
+             locked Start · sessions · tray · clock order"
+        );
+        for (label, r) in [
+            ("session", session),
+            ("tray", tray),
+            ("clock", clock),
+            ("pin", pin),
+        ] {
+            assert!(
+                (r.center().y - start.center().y).abs() < 2.0,
+                "{label} shares the Start cell's row"
+            );
+        }
+    }
+
+    #[test]
+    fn win7_1_the_default_taskbar_is_denser_than_the_shells_other_carbon_chrome() {
+        // Lock #12 — the relocated Win7 taskbar's default (Density::Mouse) chrome
+        // is deliberately tighter than the shell's other Carbon-baseline chrome:
+        // the 48px DOCK_W left-dock column and the 32px single-column picker
+        // cells. Pins the exact post-WIN7-1 value so a future change is a
+        // conscious edit here, not a silent drift.
+        assert!(
+            (NOTIFICATION_RAIL_H - 18.0).abs() < f32::EPSILON,
+            "WIN7-1 trims the compact taskbar 2px denser than its pre-WIN7-1 20px"
+        );
+        assert!(
+            NOTIFICATION_RAIL_H < DOCK_W,
+            "the taskbar's default chrome is denser than the left dock column"
+        );
+        assert!(
+            NOTIFICATION_RAIL_H < super::APP_CELL_H,
+            "the taskbar's default chrome is denser than a standard picker cell"
+        );
+        // Density::Touch is untouched — touch targets stay at the standard scale
+        // (the whole point of Density::Touch is BIGGER touch targets, so WIN7-1's
+        // density pass deliberately does not shrink it).
+        assert!(
+            (NOTIFICATION_RAIL_EXPANDED_H - 48.0).abs() < f32::EPSILON,
+            "the expanded/touch rail height is unchanged by the density pass"
+        );
+    }
+
     #[test]
     fn navbar8_shell_density_selects_compact_or_expanded_bottom_rail() {
         // NAVBAR-8 — the rail rides the same density the shell installs from the
@@ -4647,7 +4811,7 @@ mod tests {
         drive_vdock(&ctx, &mut compact, Vec::new(), sz);
         let compact_start = ctx
             .read_response(start_cell_id())
-            .expect("compact Advanced cell registers")
+            .expect("compact Start cell registers")
             .rect;
         assert!(
             (compact_start.height() - NOTIFICATION_RAIL_H + 4.0).abs() < 1.0,
@@ -4662,7 +4826,7 @@ mod tests {
         drive_vdock(&ctx, &mut expanded, Vec::new(), sz);
         let expanded_start = ctx
             .read_response(start_cell_id())
-            .expect("expanded Advanced cell registers")
+            .expect("expanded Start cell registers")
             .rect;
         let expanded_desktop = ctx
             .read_response(pick_cell_id(Surface::Desktop))
@@ -4674,7 +4838,7 @@ mod tests {
         );
         assert!(
             (expanded_start.center().y - expanded_desktop.center().y).abs() < 2.0,
-            "expanded Advanced and Desktop still share one bottom rail"
+            "expanded Start and Desktop still share one bottom rail"
         );
         assert!(
             expanded_desktop.width() > compact_start.width(),
@@ -5233,9 +5397,10 @@ mod tests {
             "bottom row one cell down"
         );
         assert!((br.top() - bl.top()).abs() < 1.0, "bottom row aligned");
-        // The quad sits directly above the Windows-style bottom rail.
+        // The quad sits directly above the Windows-style bottom taskbar (the
+        // default DockState is Density::Mouse, so the compact rail height applies).
         assert!(
-            (tl.top() - (sz.y - DOCK_W - 20.0)).abs() < 1.0,
+            (tl.top() - (sz.y - DOCK_W - NOTIFICATION_RAIL_H)).abs() < 1.0,
             "the system quad occupies the row above the bottom rail"
         );
         // It spans the full column width (two DOCK_W/2 columns).
