@@ -545,11 +545,17 @@ pub fn run_windowless_tab(
         return Err(CefBrowserError::CreateReturnedNull);
     }
     notify_browser_view_ready(browser);
+    // Best-effort earliest injection, ahead of the poll loop below (§
+    // `webrtc_block_script` doc comment covers why this cannot be airtight).
+    poll_webrtc_block(browser);
 
     let mut first_paint = None;
     let started = Instant::now();
     let mut rbuf = Vec::new();
     let mut last_passkey_poll = Instant::now()
+        .checked_sub(Duration::from_millis(250))
+        .unwrap_or_else(Instant::now);
+    let mut last_webrtc_block_poll = Instant::now()
         .checked_sub(Duration::from_millis(250))
         .unwrap_or_else(Instant::now);
     loop {
@@ -577,6 +583,10 @@ pub fn run_windowless_tab(
         if last_passkey_poll.elapsed() >= Duration::from_millis(250) {
             poll_passkey_bridge(browser);
             last_passkey_poll = Instant::now();
+        }
+        if last_webrtc_block_poll.elapsed() >= Duration::from_millis(250) {
+            poll_webrtc_block(browser);
+            last_webrtc_block_poll = Instant::now();
         }
         if first_paint.is_none() && started.elapsed() > Duration::from_secs(15) {
             abi.shutdown();
@@ -2151,6 +2161,13 @@ fn poll_passkey_bridge(browser: *mut c_void) {
     execute_java_script(frame, &passkey_bridge_script());
 }
 
+fn poll_webrtc_block(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, webrtc_block_script());
+}
+
 fn complete_passkey(browser: *mut c_void, body: &str) {
     let Some(frame) = main_frame(browser) else {
         return;
@@ -2511,6 +2528,34 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
         body_cap = CEF_PAGE_SCRAPE_BEACON_MAX_BYTES,
         prefix = CEF_PAGE_SCRAPE_BEACON_PREFIX,
     )
+}
+
+/// Best-effort renderer-level removal of the JS-reachable WebRTC surface.
+///
+/// `chromium_privacy_switches()` (`cef_init.rs`) cannot fully disable WebRTC
+/// at the command-line level: `--disable-webrtc` is not a real Chromium
+/// switch (verified against the live `content_switches.cc`/
+/// `chrome_switches.cc` upstream — Chromium silently no-ops unrecognized `--`
+/// switches rather than erroring), and the only genuine kill switch is the
+/// build-time GN flag `enable_webrtc=false`, unavailable on this crate's
+/// vendored prebuilt CEF binary. This deletes the JS constructors/entry
+/// points instead, matching the CEF community's own recommended technique
+/// (remove the interfaces from the renderer's global scope at script-inject
+/// time) and this codebase's existing shim-injection pattern
+/// (`passkey_bridge_script`). Applied unconditionally on every
+/// `run_windowless_tab` poll tick (see `poll_webrtc_block`) — this is a
+/// baseline privacy default, not a per-tab, user-toggleable feature.
+///
+/// This is defense-in-depth, not an airtight guarantee: this ABI has no
+/// `OnContextCreated`-equivalent early-injection hook, so a page's own inline
+/// script can still run before the first poll tick lands, and a fresh
+/// document commit (e.g. an in-page navigation) gets an unpatched JS context
+/// until the next tick re-applies this. `--force-webrtc-ip-handling-policy=
+/// disable_non_proxied_udp` (kept in `chromium_privacy_switches()`, verified
+/// real) is the second layer: even a same-tick `RTCPeerConnection` that gets
+/// past this script still cannot leak a raw local IP over non-proxied UDP.
+const fn webrtc_block_script() -> &'static str {
+    "(function(){try{delete window.RTCPeerConnection;}catch(_e){}try{delete window.webkitRTCPeerConnection;}catch(_e){}try{delete window.RTCDataChannel;}catch(_e){}try{delete window.RTCSessionDescription;}catch(_e){}try{delete window.RTCIceCandidate;}catch(_e){}try{if(window.MediaDevices&&MediaDevices.prototype){delete MediaDevices.prototype.getUserMedia;delete MediaDevices.prototype.getDisplayMedia;}}catch(_e){}try{if(navigator.mediaDevices){delete navigator.mediaDevices.getUserMedia;delete navigator.mediaDevices.getDisplayMedia;}}catch(_e){}try{delete navigator.getUserMedia;}catch(_e){}try{delete navigator.webkitGetUserMedia;}catch(_e){}try{delete navigator.mozGetUserMedia;}catch(_e){}})();"
 }
 
 fn passkey_bridge_script() -> String {
@@ -3481,6 +3526,34 @@ mod tests {
         .expect("passkey beacon");
         assert_eq!(body, r#"{"ceremony":"get"}"#);
         assert_eq!(decode_passkey_beacon("https://example.test/"), None);
+    }
+
+    #[test]
+    fn webrtc_block_script_removes_the_reachable_webrtc_surface() {
+        // `--disable-webrtc` (cef_init.rs) is confirmed non-functional (see
+        // its doc comment); this renderer-level shim is the real mitigation,
+        // so pin exactly which JS-reachable entry points it removes.
+        let script = webrtc_block_script();
+        assert!(script.contains("delete window.RTCPeerConnection"));
+        assert!(script.contains("delete window.webkitRTCPeerConnection"));
+        assert!(script.contains("delete window.RTCDataChannel"));
+        assert!(script.contains("delete window.RTCSessionDescription"));
+        assert!(script.contains("delete window.RTCIceCandidate"));
+        assert!(script.contains("MediaDevices.prototype.getUserMedia"));
+        assert!(script.contains("MediaDevices.prototype.getDisplayMedia"));
+        assert!(script.contains("navigator.mediaDevices.getUserMedia"));
+        assert!(script.contains("navigator.mediaDevices.getDisplayMedia"));
+        assert!(script.contains("delete navigator.getUserMedia"));
+        assert!(script.contains("delete navigator.webkitGetUserMedia"));
+        assert!(script.contains("delete navigator.mozGetUserMedia"));
+        assert!(
+            !script.contains("<script"),
+            "webrtc block runs as a direct IIFE, not injected markup"
+        );
+        // Every deletion is individually try/catch-guarded so one already-gone
+        // global (e.g. re-running after the page itself deleted something)
+        // cannot abort the rest of the shim.
+        assert_eq!(script.matches("catch(_e){}").count(), 10);
     }
 
     #[test]

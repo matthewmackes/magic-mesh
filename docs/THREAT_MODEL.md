@@ -16,10 +16,13 @@ This file has grown to cover MCNF's other privileged, security-relevant
 numbered section using the same shape (trust boundary → attack surface →
 mitigations → accepted residual risks → out of scope): **§6, phone-to-desktop
 remote-input injection** (KDC-MESH-6: `workers/seat_remote_input.rs` +
-`install-helpers/seat-remote-input.py`) and **§7, WebAuthn / passkey
-ceremonies** (BROWSER-DD-6: `workers/browser_passkeys.rs`). Each section is
-the security contract for that worker; change its trust model and update its
-section.
+`install-helpers/seat-remote-input.py`), **§7, WebAuthn / passkey
+ceremonies** (BROWSER-DD-6: `workers/browser_passkeys.rs`), and **§8, the
+CEF/Chromium engine's own privacy hardening** (BROWSER-DD-1:
+`crates/desktop/mde-web-cef`) — narrower in scope than §1-5 (which describe
+the confinement `sandbox.rs` gives the **Servo** engine specifically; CEF has
+no equivalent sandbox module, per §7.4 point 4). Each section is the security
+contract for that worker; change its trust model and update its section.
 
 ---
 
@@ -503,3 +506,106 @@ phone-as-authenticator (a separate future owner per the worker's own doc
 comment); any change to Servo's or CEF's native credential UI (there isn't
 one in this pipeline — §7.4); cross-mesh credential export/backup UX (the
 sealed store mirrors silently by design, not for manual export).
+
+---
+
+## 8. CEF/Chromium engine — WebRTC privacy hardening (BROWSER-DD-1)
+
+Scope: `crates/desktop/mde-web-cef`'s `chromium_privacy_switches()`
+(`cef_init.rs`) and its renderer-level companion in `cef_browser.rs`. This is
+narrower than §1-5: it is not a full CEF confinement audit — §7.4 point 4
+already flags that CEF has no sandbox module equivalent to Servo's
+`sandbox.rs`, and that remains true and unaudited here. This section
+documents one specific, verified privacy-hardening finding and its fix.
+
+### 8.1 The finding (2026-07-10)
+
+`chromium_privacy_switches()` shipped `--disable-webrtc` as part of its
+privacy/telemetry-hardening bundle, applied to every CEF browser launch. This
+switch **is not real** — verified directly against the live Chromium source
+this pinned CEF (`149.0.6+g0d0eeb6+chromium-149.0.7827.201`, per
+`packaging/browser/cef-linux64-minimal.env`) is built on:
+
+- `content/public/common/content_switches.cc` and
+  `chrome/common/chrome_switches.cc` (fetched from
+  `chromium.googlesource.com`) define every WebRTC-related switch Chromium
+  actually reads — `kDisableWebRtcEncryption`, `kForceWebRtcIPHandlingPolicy`,
+  `kWebRtcMaxCaptureFramerate`, `kWebRtcLocalEventLogging` — and **no**
+  `disable-webrtc`/`kDisableWebRtc` constant anywhere in either file.
+- Chromium's `base::CommandLine` never validates switches against a registry:
+  an unrecognized `--` switch is simply never read by any consuming code —
+  not errored, not warned, not logged. So the switch shipped as inert.
+- A live Google Chrome Enterprise support-forum thread has an administrator
+  independently reporting this exact flag being ignored in a managed
+  deployment (<https://support.google.com/chrome/a/thread/5939360>).
+- A chromium-dev mailing-list thread has Chromium engineers confirming the
+  only real way to disable WebRTC is the build-time GN flag
+  `enable_webrtc=false` (used by e.g. Chromecast-audio builds) — not
+  available here, since this crate links a prebuilt vendored CEF binary
+  rather than building Chromium from source.
+- CEF's own `cef_settings_t`/`cef_browser_settings_t` structs have no
+  WebRTC-toggle field (confirmed against this crate's own pinned-offset FFI
+  layout, which tracks every field it sets, and against CEF community
+  guidance for embedders asking the identical question).
+
+Net effect before the fix: **CEF's WebRTC stack (a full, standard, current
+Chromium implementation — real ICE/DTLS-SRTP, `getUserMedia`,
+`getDisplayMedia`, full codec negotiation) was fully reachable from any page
+a CEF tab loaded**, despite the code's explicit intent to disable it — the
+same local-IP-leak class of concern that motivated the Servo engine's
+`dom_webrtc_enabled: false` (`mde-web-preview/src/engine.rs`) applied equally
+to CEF tabs, with no working mitigation beyond the (real, but narrower)
+`--force-webrtc-ip-handling-policy` switch below.
+
+### 8.2 The fix
+
+- **Removed** `--disable-webrtc` from `chromium_privacy_switches()` — a
+  regression test (`init_paths_never_emit_the_inert_disable_webrtc_switch`)
+  guards against reintroducing it.
+- **Kept** `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` —
+  confirmed real (`kForceWebRtcIPHandlingPolicy`, backing the genuine Chrome
+  enterprise policy `WebRtcIPHandling`); it constrains ICE candidate
+  gathering to proxied/relayed transport, the correct mechanism for the
+  local-IP-leak concern.
+- **Added** renderer-level removal of the JS-reachable WebRTC surface
+  (`cef_browser::webrtc_block_script`): deletes `window.RTCPeerConnection`,
+  `webkitRTCPeerConnection`, `RTCDataChannel`, `RTCSessionDescription`,
+  `RTCIceCandidate`, and `navigator.mediaDevices`/`MediaDevices.prototype`'s
+  `getUserMedia`/`getDisplayMedia` (plus legacy vendor-prefixed
+  `getUserMedia`). Applied unconditionally — not a per-tab toggle — on every
+  `run_windowless_tab` session, on the same 250ms poll cadence and via the
+  same `cef_frame_t::execute_java_script` mechanism this codebase already
+  uses for the passkey-ceremony shim (`passkey_bridge_script`) and every
+  other renderer-side privacy/feature injection in that file.
+
+### 8.3 Accepted residual risk — defense-in-depth, not airtight
+
+Unlike a real command-line kill switch, `webrtc_block_script` is JS run
+*after* the renderer's JS context already exists, on a poll timer. This
+crate's hand-rolled CEF ABI has no `OnContextCreated`-equivalent hook (the
+mechanism that would let a script win the race against a page's own inline
+`<script>` deterministically), so:
+
+- A page's own synchronous top-of-document inline script can still execute
+  and construct an `RTCPeerConnection` before the first poll tick lands (the
+  first tick fires immediately on browser creation, then every 250ms
+  thereafter — the identical structural gap this codebase already accepts
+  for the passkey bridge).
+- A fresh document commit (e.g. same-tab in-page navigation to a new origin)
+  gets an unpatched JS context until the next poll tick re-applies the shim.
+- `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` is the backstop
+  for exactly this gap: even a same-tick `RTCPeerConnection` that wins the
+  race still cannot leak a raw local IP over non-proxied UDP without a
+  configured proxy.
+- Camera/mic OS-device permission for the CEF helper process is a separate,
+  still-unaudited question (§7.4 point 4) — this section covers WebRTC
+  transport/API-surface hardening only, not device-permission plumbing.
+
+### 8.4 Out of scope
+
+A full CEF confinement audit equivalent to §3 (Servo's `sandbox.rs`) — CEF
+has no such module today; this section documents the WebRTC-specific finding
+above, not a new confinement layer. Enabling real WebRTC as a feature
+(BROWSER-DD-9, `docs/design/browser-dd9-webrtc-rescope.md`) is a separate,
+much larger, not-yet-started item — this fix is a hardening correctness fix
+for the *current* (WebRTC-off) posture, not a step toward shipping it.
