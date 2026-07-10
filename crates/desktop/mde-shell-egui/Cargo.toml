@@ -34,6 +34,18 @@ live-helper = ["mde-web-preview-client/live-helper"]
 # in-shell. OFF by default for portable unit builds; ON for shipped shell builds.
 live-vdi = ["mde-vdi-rdp/live-connect", "mde-vdi-vnc/live-connect"]
 
+# BUG-VIDEO-1 / MEDIA-2 phase 1 (docs/gpu_encoder.md) — turn on the real libmpv2
+# engine for the embedded Media surface (MEDIA-18), forwarding straight through
+# to `mde-media-egui/mpv` (which forwards to `mde-media-core/mpv`). OFF by
+# default so the workspace build stays airgap-safe (no system libmpv needed);
+# ON, `player_stage` paints real decoded frames instead of the placeholder rect.
+# Honest-gated to a host with `mpv-libs-devel`, exactly like `drm`/`live-vdi`
+# gate their own native stacks. Release builds must enable this alongside `drm`
+# — see `release_shell_configuration_enables_the_real_media_engine` below,
+# which fails loudly if a `drm` build ever ships without it (the exact
+# "shipped player is FakeMpv" failure BUG-VIDEO-1 recorded).
+media-mpv = ["mde-media-egui/mpv"]
+
 [dependencies]
 # The §4/§5 harness is the shell's primary inward dependency (§6 layered tiers):
 # it provides run_client (the eframe Wayland-client runner), the shared Style, the

@@ -98,6 +98,60 @@ pub enum EndReason {
     Error,
 }
 
+/// One decoded video frame, captured off the engine (MEDIA-2 phase 1,
+/// `docs/gpu_encoder.md` "Render API to egui texture first").
+///
+/// Produced by [`MediaEngine::latest_frame`]; `mde-media-egui`'s frame sink
+/// uploads `rgba` to an `egui::TextureHandle` and `player_stage` paints it in
+/// place of the placeholder rect. This is the "first proof" shape (a plain CPU
+/// pixel buffer) — a later DRM overlay-plane path (MEDIA-2 phase 2) can replace
+/// it with zero-copy scanout without changing this type's meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoFrame {
+    /// The frame width in pixels.
+    pub width: u32,
+    /// The frame height in pixels.
+    pub height: u32,
+    /// Tightly packed, top-to-bottom, non-premultiplied RGBA8 rows —
+    /// `width * height * 4` bytes, the exact layout
+    /// `egui::ColorImage::from_rgba_unmultiplied` wants.
+    pub rgba: Vec<u8>,
+}
+
+impl VideoFrame {
+    /// Whether every pixel is the same RGBA colour (a uniform fill — all
+    /// black, all one flat colour, …) — the honest-gate check the L1
+    /// fixture-decode test uses to prove a real, non-degenerate frame came
+    /// back rather than an empty/placeholder buffer.
+    ///
+    /// Compares whole 4-byte pixels, not raw bytes: a uniform *black* frame
+    /// (every pixel `[0, 0, 0, 255]`) must read as blank even though its own
+    /// bytes aren't all numerically equal (0 vs. the 255 alpha channel).
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        let mut pixels = self.rgba.chunks_exact(4);
+        pixels
+            .next()
+            .is_none_or(|first| pixels.all(|pixel| pixel == first))
+    }
+
+    /// A cheap, stable content checksum (FNV-1a) over the raw pixel bytes.
+    ///
+    /// The frame sink uses this to skip a redundant GPU texture upload when the
+    /// throttled capture cadence outpaces the decode rate (the same bytes come
+    /// back); the L1 fixture-decode test uses it to assert a real, repeatable,
+    /// nonzero-content decode.
+    #[must_use]
+    pub fn checksum(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64 offset basis
+        for &byte in &self.rgba {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3); // FNV-1a 64 prime
+        }
+        hash
+    }
+}
+
 /// An asynchronous notification drained from the engine by [`Player::pump`].
 ///
 /// These are the raw engine-side facts (mpv events); the player-state machine
@@ -142,6 +196,7 @@ pub enum EngineSignal {
 /// | [`chapter`]        | `get_property chapter`                |
 /// | [`chapter_count`]  | `get_property chapters`               |
 /// | [`set_chapter`]    | `set_property chapter`                |
+/// | [`latest_frame`]   | `screenshot-to-file` (MEDIA-2 phase 1) |
 ///
 /// [`load_file`]: MediaEngine::load_file
 /// [`set_paused`]: MediaEngine::set_paused
@@ -161,6 +216,7 @@ pub enum EngineSignal {
 /// [`chapter`]: MediaEngine::chapter
 /// [`chapter_count`]: MediaEngine::chapter_count
 /// [`set_chapter`]: MediaEngine::set_chapter
+/// [`latest_frame`]: MediaEngine::latest_frame
 pub trait MediaEngine {
     /// Begin loading `url` (local path or stream URL). Playback readiness arrives
     /// later as an [`EngineSignal::FileLoaded`] from [`poll`](Self::poll).
@@ -302,4 +358,57 @@ pub trait MediaEngine {
     /// # Errors
     /// Returns [`EngineError`] if the backend rejects the property set.
     fn set_chapter(&mut self, chapter: i64) -> Result<(), EngineError>;
+
+    /// The newest decoded video frame available right now (MEDIA-2 phase 1,
+    /// `docs/gpu_encoder.md`), or [`None`] when nothing is loaded, there is no
+    /// video track, or the engine has not produced one yet.
+    ///
+    /// A *read* of current state, like [`position`](Self::position) /
+    /// [`duration`](Self::duration) / [`chapter`](Self::chapter) — not a
+    /// command — so failures fold to [`None`] rather than an [`EngineError`],
+    /// exactly like those. `FakeMpv` has nothing to decode, so it always
+    /// returns whatever was scripted (or [`None`] by default) — the airgap-safe
+    /// default build never fabricates a frame.
+    fn latest_frame(&mut self) -> Option<VideoFrame>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VideoFrame;
+
+    fn frame(rgba: Vec<u8>) -> VideoFrame {
+        VideoFrame {
+            width: 2,
+            height: 1,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn a_uniform_frame_is_blank() {
+        assert!(frame(vec![0, 0, 0, 255, 0, 0, 0, 255]).is_blank());
+        assert!(
+            frame(vec![]).is_blank(),
+            "an empty buffer is degenerate too"
+        );
+    }
+
+    #[test]
+    fn a_varied_frame_is_not_blank() {
+        assert!(!frame(vec![10, 20, 30, 255, 40, 50, 60, 255]).is_blank());
+    }
+
+    #[test]
+    fn checksum_is_stable_and_content_sensitive() {
+        let a = frame(vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        let b = frame(vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        let c = frame(vec![1, 2, 3, 255, 4, 5, 7, 255]);
+        assert_eq!(a.checksum(), b.checksum(), "identical bytes checksum equal");
+        assert_ne!(
+            a.checksum(),
+            c.checksum(),
+            "a changed byte changes the checksum"
+        );
+        assert_ne!(a.checksum(), 0, "a nonblank frame has a nonzero checksum");
+    }
 }

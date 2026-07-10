@@ -53,7 +53,7 @@ mod menubar;
 
 use mde_egui::{eframe, run_client};
 
-pub use app::{media_header, media_panel, media_pump, pip_window, MediaApp};
+pub use app::{media_header, media_panel, media_pump, pip_window, MediaApp, VideoTextureCache};
 pub use model::{
     capture_detail, client_capabilities, jellyfin_item_title, stream_media_type, CaptureUiState,
     CastUiState, JellyfinSession, JellyfinSourceRow, JellyfinState, MediaController, MediaTab,

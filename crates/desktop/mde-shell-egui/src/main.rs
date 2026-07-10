@@ -71,7 +71,9 @@ use mde_bookmarks_egui::{
 use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
 use mde_files::editor_open::EditorLaunchWatch;
 use mde_files_egui::{files_panel, FileBrowser};
-use mde_media_egui::{media_header, media_panel, media_pump, real_media, MediaSurface};
+use mde_media_egui::{
+    media_header, media_panel, media_pump, real_media, MediaSurface, VideoTextureCache,
+};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
 use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
 use mde_voice_egui::{voice_menubar, voice_panel, voice_pump, VoiceApp};
@@ -179,6 +181,13 @@ struct Shell {
     /// same way Music/Files/Voice are, so the whole media player (Sources / Library /
     /// Player / Queue) is reachable as an in-shell surface — no demo data (§7).
     media: MediaSurface,
+    /// The Media surface's MEDIA-2 phase-1 frame-sink texture cache
+    /// (`docs/gpu_encoder.md`) — owned alongside `media` so the Player tab's
+    /// video stage's `TextureHandle` persists across frames instead of
+    /// re-uploading a GPU texture every call. Only the real mpv engine
+    /// (`--features media-mpv`) ever populates it; `FakeMpv` (the default)
+    /// leaves it empty and the stage paints its placeholder, exactly as before.
+    media_video: VideoTextureCache,
     /// The Files surface model, owned + built once over the production backend.
     /// Rendered via `mde_files_egui::files_panel`.
     files: FileBrowser,
@@ -357,6 +366,7 @@ impl Shell {
             console: console::ConsoleState::default(),
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
+            media_video: VideoTextureCache::default(),
             files: mde_files_egui::real_browser(),
             voice: VoiceApp::new_with_ctx(ctx),
             vdi: vdi::VdiState::default(),
@@ -627,10 +637,11 @@ impl Shell {
                 // in the shell's one `Context`.
                 media_pump(&mut self.media);
                 let media = &mut self.media;
+                let media_video = &mut self.media_video;
                 ui.push_id("shell-media", |ui| {
                     media_header(ui, media);
                     ui.separator();
-                    media_panel(ui, media);
+                    media_panel(ui, media, media_video);
                 });
                 // Keep the frame loop ticking while playing so the core's live clock
                 // advances (the standalone MediaApp requests the same in its update).
@@ -1453,7 +1464,7 @@ mod tests {
     use super::{
         chat, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
         media_header, media_panel, real_editor, real_media, real_terminal, reserved_dock_gutter,
-        splash, status, terminal_panel, Boot, Nav, Plane, Shell, Surface,
+        splash, status, terminal_panel, Boot, Nav, Plane, Shell, Surface, VideoTextureCache,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -1873,6 +1884,7 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut media = real_media();
+        let mut media_video = VideoTextureCache::default();
         let mut active = Surface::Media;
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
@@ -1884,7 +1896,7 @@ mod tests {
                 ui.push_id("shell-media", |ui| {
                     media_header(ui, &mut media);
                     ui.separator();
-                    media_panel(ui, &mut media);
+                    media_panel(ui, &mut media, &mut media_video);
                 });
             });
         });
@@ -1892,6 +1904,38 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mounted media surface produced no draw primitives"
+        );
+    }
+
+    /// L0 production-feature detection (BUG-VIDEO-1, `docs/gpu_encoder.md`): a
+    /// shell built for the real DRM seat (`--features drm`, the shipped-shell
+    /// configuration — see the `drm` feature doc in `Cargo.toml`) must ALSO
+    /// enable the real mpv engine (`media-mpv`), or the embedded Media surface
+    /// silently ships backed by `FakeMpv` — simulated playback (flips to
+    /// Playing, 0:00 frozen, no A/V), the exact live-verified 2026-07-03 Eagle
+    /// failure. This assertion compiles into every build so it always runs,
+    /// but it is only a real constraint when `drm` is on: a normal portable dev
+    /// build (`drm` off) trivially passes regardless of `media-mpv`. Prove the
+    /// release combination with
+    /// `xcp-build.sh cargo test -p mde-shell-egui --features drm,media-mpv`;
+    /// drop `media-mpv` from that command to see this fail.
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "cfg!(...) is a compile-time constant WITHIN any one build, but this \
+                  must stay a runtime #[test] assert, not a `const { assert!() }` block \
+                  — the whole point is that dropping media-mpv from a drm build fails \
+                  `cargo test`, not that it fails to compile at all (§7 L0 gate: \"a \
+                  test that fails if…\", not a hard compile error every drm-only dev \
+                  build would trip)"
+    )]
+    fn release_shell_configuration_enables_the_real_media_engine() {
+        assert!(
+            !cfg!(feature = "drm") || cfg!(feature = "media-mpv"),
+            "mde-shell-egui was built with --features drm (the shipped DRM-seat \
+             shell) but without media-mpv — the embedded Media surface would ship \
+             backed by FakeMpv (BUG-VIDEO-1, simulated playback, no real A/V). \
+             Build with --features drm,media-mpv."
         );
     }
 

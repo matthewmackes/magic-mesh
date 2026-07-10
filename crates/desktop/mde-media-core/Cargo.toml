@@ -50,15 +50,29 @@ optional         = true
 # to Cargo.lock only requires REGISTRY resolution (metadata + checksum), not
 # compilation — so the binding is verified-fetchable + pinned in the lock even
 # where it cannot be built. Building `--features mpv` (the real-clip smoke) is
-# honest-gated on a host with `mpv-libs-devel`.
+# honest-gated on a host with `mpv-libs-devel`. Its default `render` feature
+# (OpenGL FBO rendering) stays enabled but unused here — MEDIA-2 phase 1
+# (`docs/gpu_encoder.md`) captures frames through the `screenshot-to-file`
+# command instead (no EGL/GL context, so it works with no display and needs no
+# `unsafe` — this crate is `unsafe_code = "forbid"`); the render API is the
+# phase-2 DRM-overlay optimization, not built here.
 [dependencies.libmpv2]
 version  = "6"
+optional = true
+
+# MEDIA-2 phase 1's frame sink decodes the PNG `screenshot-to-file` writes back
+# to raw RGBA8 (`mpv::latest_frame`) — the exact `png`-crate path
+# `mde-shell-egui`'s `chooser::decode_png_rgba` already uses at this same 0.18
+# pin, so it adds no new lock entry. Optional + tied to `mpv`: the default
+# airgap-safe build never decodes a PNG it never produced.
+[dependencies.png]
+version  = "0.18"
 optional = true
 
 [features]
 default = []
 # The real libmpv2 engine (`src/mpv.rs`) + the real-clip path of the smoke bin.
-mpv = ["dep:libmpv2"]
+mpv = ["dep:libmpv2", "dep:png"]
 # The live OpenSubtitles HTTPS client (`opensubtitles::OpenSubtitlesClient`). OFF
 # by default; the hash + request-builder + response-parser stay in the default
 # build. Enabling it is honest-gated on a host with egress + an API key.

@@ -12,14 +12,28 @@
 //! §6: pure glue — each seam method is one mpv command / property / event; no
 //! decoding is reimplemented here.
 
+use std::io::Cursor;
+use std::time::{Duration, Instant};
+
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{mpv_end_file_reason, Mpv};
 
 use crate::audio::AudioConfig;
 use crate::controls::{PlaybackControls, ScreenshotMode};
-use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
+use crate::engine::{
+    EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind, VideoFrame,
+};
 use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
+
+/// The minimum interval between real `screenshot-to-file` captures
+/// ([`MpvEngine::latest_frame`], MEDIA-2 phase 1, `docs/gpu_encoder.md`).
+///
+/// A "first proof" cadence, not the perf-tuned path: cheap enough to prove
+/// real, visibly changing decoded frames without round-tripping a PNG through
+/// disk on every UI frame (a DRM overlay plane, phase 2, is the zero-copy
+/// replacement for this whole path).
+const FRAME_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The real mpv-backed engine.
 ///
@@ -27,6 +41,16 @@ use crate::video::VideoConfig;
 /// drive it through the [`MediaEngine`] trait exactly like the fake.
 pub struct MpvEngine {
     mpv: Mpv,
+    /// A per-instance sequence number folded into the [`latest_frame`]
+    /// scratch-capture filename (MEDIA-2 phase 1), so two engines in one
+    /// process never collide on the same temp path.
+    ///
+    /// [`latest_frame`]: MediaEngine::latest_frame
+    frame_seq: u64,
+    /// The wall-clock time of the last real capture, so `latest_frame`
+    /// self-throttles to [`FRAME_CAPTURE_MIN_INTERVAL`] instead of hitting disk
+    /// every call.
+    last_capture: Option<Instant>,
 }
 
 impl std::fmt::Debug for MpvEngine {
@@ -43,9 +67,9 @@ fn backend(e: impl std::fmt::Display) -> EngineError {
 impl MpvEngine {
     /// Create an mpv instance with the platform defaults suitable for the
     /// player core (video enabled, terminal control off — the shell owns the
-    /// seat). Audio defaults to the seat's **PipeWire** ao (MEDIA-3, design Q5);
+    /// seat). Audio defaults to the seat's **`PipeWire`** ao (MEDIA-3, design Q5);
     /// [`apply_audio_config`](MediaEngine::apply_audio_config) then layers the
-    /// device / EQ / loudness / ReplayGain / gapless on top. MEDIA-2/4 layer the
+    /// device / EQ / loudness / `ReplayGain` / gapless on top. MEDIA-2/4 layer the
     /// DRM plane / VA-API options similarly.
     ///
     /// # Errors
@@ -58,16 +82,34 @@ impl MpvEngine {
             let _ = init.set_property("input-default-bindings", "no");
             let _ = init.set_property("input-vo-keyboard", "no");
             let _ = init.set_property("osc", "no");
+            // MEDIA-2 phase 1 (docs/gpu_encoder.md): the shell owns the seat's
+            // one display surface (DRM/KMS master) directly — mpv must never
+            // grab its own window/output, or it would fight the shell for the
+            // same seat resource, exactly like the terminal/input properties
+            // above. `vo=null` still runs the full decode + filter pipeline (it
+            // just draws nothing); `latest_frame` pulls frames out through the
+            // `screenshot-to-file` command, which works with a null VO because
+            // mpv's frame-queue tracking (`current_frame` in `video/out/vo.c`)
+            // is generic across every VO backend, not per-driver.
+            let _ = init.set_property("vo", "null");
             // MEDIA-3: audio leaves on the seat's PipeWire server by default.
             let _ = init.set_property("ao", "pipewire");
+            // A missing/broken audio device must degrade to silent video, never
+            // abort the whole file — the same "don't fight the seat for a
+            // resource it doesn't have" principle, extended to audio.
+            let _ = init.set_property("audio-fallback-to-null", "yes");
             Ok(())
         })
         .map_err(backend)?;
-        Ok(Self { mpv })
+        Ok(Self {
+            mpv,
+            frame_seq: 0,
+            last_capture: None,
+        })
     }
 
     /// Access the underlying [`libmpv2::Mpv`] for the AV-integration units
-    /// (MEDIA-2 DRM plane / MEDIA-3 PipeWire ao / MEDIA-4 VA-API) that set
+    /// (MEDIA-2 DRM plane / MEDIA-3 `PipeWire` ao / MEDIA-4 VA-API) that set
     /// further mpv options directly.
     #[must_use]
     pub const fn raw(&self) -> &Mpv {
@@ -80,7 +122,7 @@ impl MpvEngine {
             .mpv
             .get_property::<i64>("track-list/count")
             .unwrap_or(0);
-        let mut tracks = Vec::with_capacity(count.max(0) as usize);
+        let mut tracks = Vec::with_capacity(usize::try_from(count.max(0)).unwrap_or(0));
         for i in 0..count {
             let kind = self
                 .mpv
@@ -125,7 +167,7 @@ impl MpvEngine {
 }
 
 /// Translate an mpv `EndFile` reason into the seam's [`EndReason`].
-fn end_reason(reason: libmpv2::EndFileReason) -> EndReason {
+const fn end_reason(reason: libmpv2::EndFileReason) -> EndReason {
     if reason == mpv_end_file_reason::Eof {
         EndReason::Eof
     } else if reason == mpv_end_file_reason::Error {
@@ -167,6 +209,13 @@ impl MediaEngine for MpvEngine {
         self.read_tracks()
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the time-pos PropertyChange arm and the catch-all Ok(_) arm both \
+                  intentionally no-op, but for different reasons (documented per-arm) \
+                  — merging them would blur why time-pos specifically needs no handler \
+                  here (the live clock is read directly in Player::pump, not via events)"
+    )]
     fn poll(&mut self) -> Vec<EngineSignal> {
         let mut out = Vec::new();
         // Non-blocking drain of the event queue (timeout 0.0 = don't wait).
@@ -285,4 +334,84 @@ impl MediaEngine for MpvEngine {
     fn set_chapter(&mut self, chapter: i64) -> Result<(), EngineError> {
         self.mpv.set_property("chapter", chapter).map_err(backend)
     }
+
+    fn latest_frame(&mut self) -> Option<VideoFrame> {
+        // Self-throttle: a "first proof" cadence, not the perf-tuned path (see
+        // FRAME_CAPTURE_MIN_INTERVAL). Update the clock regardless of the
+        // outcome below so a "nothing loaded" caller doesn't retry every call.
+        if let Some(last) = self.last_capture {
+            if last.elapsed() < FRAME_CAPTURE_MIN_INTERVAL {
+                return None;
+            }
+        }
+        self.last_capture = Some(Instant::now());
+
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let path = std::env::temp_dir().join(format!(
+            "mde-media-frame-{}-{}.png",
+            std::process::id(),
+            self.frame_seq
+        ));
+        let path_str = path.to_str()?;
+
+        // `screenshot-to-file` is synchronous over the client API (mpv blocks
+        // the calling thread until its spawned screenshot-writer thread
+        // completes), so the file is fully written by the time this returns —
+        // no read-after-write race. "video" mode: the raw decoded picture, no
+        // subtitle burn-in (the shell paints the Carbon OSD separately, on top).
+        let command = self
+            .mpv
+            .command(
+                "screenshot-to-file",
+                &[path_str, ScreenshotMode::Video.as_mpv()],
+            )
+            .is_ok();
+        if !command {
+            return None; // nothing loaded / no video track / a transient failure.
+        }
+
+        let bytes = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        decode_png_rgba(&bytes?)
+    }
+}
+
+/// Decode 8-bit RGB/RGBA PNG bytes (mpv's `screenshot-to-file` output) into a
+/// [`VideoFrame`] — the same `png`-crate shape `mde-shell-egui`'s
+/// `chooser::decode_png_rgba` already uses (RGB expanded opaque), minus the
+/// `egui::ColorImage` wrapping: this crate stays toolkit-free, so the surface
+/// converts. Fails soft (`None`) on any other shape (paletted/grayscale/16-bit),
+/// mirroring every other honest-gated read on this engine.
+fn decode_png_rgba(bytes: &[u8]) -> Option<VideoFrame> {
+    let mut reader = png::Decoder::new(Cursor::new(bytes)).read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let width = info.width;
+    let height = info.height;
+    let w = usize::try_from(width).ok()?;
+    let h = usize::try_from(height).ok()?;
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => {
+            let needed = w.checked_mul(h)?.checked_mul(4)?;
+            buf.get(..needed)?.to_vec()
+        }
+        png::ColorType::Rgb => {
+            let needed = w.checked_mul(h)?.checked_mul(3)?;
+            let px = buf.get(..needed)?;
+            let mut out = Vec::with_capacity(w.checked_mul(h)?.checked_mul(4)?);
+            for c in px.chunks_exact(3) {
+                out.extend_from_slice(&[c[0], c[1], c[2], u8::MAX]);
+            }
+            out
+        }
+        _ => return None,
+    };
+    Some(VideoFrame {
+        width,
+        height,
+        rgba,
+    })
 }

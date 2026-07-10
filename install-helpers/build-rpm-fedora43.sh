@@ -66,7 +66,8 @@ echo "[f43] installing build deps"
 dnf install -y --setopt=install_weak_deps=False \
     gcc gcc-c++ cmake pkg-config git curl findutils which gzip tar xz \
     mold binutils protobuf-compiler \
-    gtk3-devel alsa-lib-devel openssl-devel opus-devel >/tmp/dnf.log 2>&1 || { tail -20 /tmp/dnf.log; exit 1; }
+    gtk3-devel alsa-lib-devel openssl-devel opus-devel \
+    mpv-libs-devel >/tmp/dnf.log 2>&1 || { tail -20 /tmp/dnf.log; exit 1; }
 
 echo "[f43] installing rustup + the pinned toolchain"
 export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
@@ -137,10 +138,14 @@ else
   # `live-helper` so the Browser surface really spawns the sandboxed
   # `mde-web-preview` shipped right above (without it the surface is permanently
   # the gated EmptyState — the RPM would ship a browser helper no shell can ever
-  # start), and `live-vdi` so the Desktop surface can pump live RDP in-shell. The
-  # workspace build compiled all deps; this only re-links one bin.
-  echo "[f43] re-linking mde-shell-egui --features drm,live-helper,live-vdi"
-  cargo build --release --locked -p mde-shell-egui --features drm,live-helper,live-vdi
+  # start), `live-vdi` so the Desktop surface can pump live RDP in-shell, and
+  # `media-mpv` (BUG-VIDEO-1 / MEDIA-2 phase 1, docs/gpu_encoder.md) so the
+  # embedded Media surface links the real mpv engine instead of silently
+  # shipping FakeMpv (simulated playback, no real A/V — the live-verified
+  # 2026-07-03 Eagle finding). The workspace build compiled all deps; this
+  # only re-links one bin.
+  echo "[f43] re-linking mde-shell-egui --features drm,live-helper,live-vdi,media-mpv"
+  cargo build --release --locked -p mde-shell-egui --features drm,live-helper,live-vdi,media-mpv
   echo "[f43] generating RPM"
   cargo generate-rpm -p crates/mesh/mackesd
 fi

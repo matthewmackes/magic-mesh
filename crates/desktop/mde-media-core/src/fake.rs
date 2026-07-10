@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 
 use crate::audio::AudioConfig;
 use crate::controls::{PlaybackControls, ScreenshotMode};
-use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
+use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, VideoFrame};
 use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
 
@@ -32,6 +32,11 @@ pub struct FakeMpv {
     position: f64,
     duration: Option<f64>,
     tracks: Vec<Track>,
+    /// The frame [`latest_frame`](MediaEngine::latest_frame) reports once media is
+    /// loaded (MEDIA-2 phase 1) — [`None`] unless a test scripts one with
+    /// [`with_frame`](Self::with_frame). A fake never decodes, so this is never
+    /// synthesized on its own.
+    frame: Option<VideoFrame>,
     signals: VecDeque<EngineSignal>,
     fail_load: bool,
     fail_audio: bool,
@@ -89,6 +94,17 @@ impl FakeMpv {
     #[must_use]
     pub fn with_tracks(mut self, tracks: Vec<Track>) -> Self {
         self.tracks = tracks;
+        self
+    }
+
+    /// Pre-set the frame [`latest_frame`](MediaEngine::latest_frame) reports once
+    /// media loads (MEDIA-2 phase 1) — lets a headless test drive the
+    /// `player_stage` texture-upload path with no real mpv, the same
+    /// no-GPU-needed idiom [`with_tracks`](Self::with_tracks) already gives the
+    /// track menus.
+    #[must_use]
+    pub fn with_frame(mut self, frame: VideoFrame) -> Self {
+        self.frame = Some(frame);
         self
     }
 
@@ -416,6 +432,13 @@ impl MediaEngine for FakeMpv {
         self.chapter = Some(chapter);
         Ok(())
     }
+
+    fn latest_frame(&mut self) -> Option<VideoFrame> {
+        // A fake decodes nothing on its own: report the scripted frame only once
+        // media is "loaded", exactly mirroring `tracks()`/`duration()` — never a
+        // frame out of nowhere.
+        self.loaded.as_ref().and_then(|_| self.frame.clone())
+    }
 }
 
 #[cfg(test)]
@@ -677,5 +700,30 @@ mod tests {
         let mut e = FakeMpv::new().with_chapters(3).failing_chapter();
         e.load_file("clip").expect("load");
         assert!(matches!(e.set_chapter(1), Err(EngineError::Backend(_))));
+    }
+
+    #[test]
+    fn latest_frame_reports_the_scripted_frame_only_once_loaded() {
+        let frame = VideoFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        let mut e = FakeMpv::new().with_frame(frame.clone());
+        // Nothing loaded yet — never fabricate a frame out of nowhere.
+        assert_eq!(e.latest_frame(), None);
+        e.load_file("clip").expect("load");
+        assert_eq!(e.latest_frame(), Some(frame));
+    }
+
+    #[test]
+    fn latest_frame_defaults_to_none_with_no_scripted_frame() {
+        let mut e = FakeMpv::new();
+        e.load_file("clip").expect("load");
+        assert_eq!(
+            e.latest_frame(),
+            None,
+            "a fake decodes nothing on its own — no with_frame() means no frame"
+        );
     }
 }

@@ -59,6 +59,10 @@ pub struct MediaApp {
     applied_fullscreen: bool,
     /// Frames since start, gating the MEDIA-16 roaming poll to a coarse cadence.
     roam_poll_frames: u32,
+    /// The MEDIA-2 phase-1 frame-sink texture (`docs/gpu_encoder.md`) the Player
+    /// tab's stage paints — owned here so it persists across frames instead of
+    /// re-uploading a GPU texture every call.
+    video: VideoTextureCache,
 }
 
 impl MediaApp {
@@ -86,6 +90,7 @@ impl MediaApp {
             controller: crate::real_media(),
             applied_fullscreen: false,
             roam_poll_frames: 0,
+            video: VideoTextureCache::default(),
         }
     }
 }
@@ -116,7 +121,9 @@ impl App for MediaApp {
 
         egui::TopBottomPanel::top("media-header")
             .show(ctx, |ui| media_header(ui, &mut self.controller));
-        egui::CentralPanel::default().show(ctx, |ui| media_panel(ui, &mut self.controller));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            media_panel(ui, &mut self.controller, &mut self.video);
+        });
 
         // The PiP mini-player (design Q31/Q32) floats above whatever view is active.
         pip_window(ctx, &mut self.controller);
@@ -185,11 +192,20 @@ pub fn media_header<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
 // ── central panel router ───────────────────────────────────────────────────────────
 
 /// Render the active view's body into `ui`, then the transient status line.
-pub fn media_panel<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+///
+/// `video` is the MEDIA-2 phase-1 frame-sink texture cache (`docs/gpu_encoder.md`)
+/// the Player tab's stage paints through — owned by the caller (the standalone
+/// [`MediaApp`], or the E12 shell for the embedded surface) so it persists across
+/// frames instead of re-uploading a GPU texture every call.
+pub fn media_panel<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+    video: &mut VideoTextureCache,
+) {
     match controller.ui().tab {
         MediaTab::Sources => sources_view(ui, controller),
         MediaTab::Library => library_view(ui, controller),
-        MediaTab::Player => player_view(ui, controller),
+        MediaTab::Player => player_view(ui, controller, video),
         MediaTab::Queue => queue_view(ui, controller),
     }
     status_line(ui, controller);
@@ -899,9 +915,13 @@ fn library_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
 /// The Player view: the video stage (with the auto-hide OSD over it), the scrubber,
 /// the transport row, the MEDIA-6 advanced controls, and the track menus.
 #[allow(clippy::too_many_lines)]
-fn player_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+fn player_view<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+    video: &mut VideoTextureCache,
+) {
     // The stage + OSD. Clicking it toggles play/pause; the controls below override.
-    let mut action: Option<TransportAction> = player_stage(ui, controller)
+    let mut action: Option<TransportAction> = player_stage(ui, controller, video)
         .clicked()
         .then_some(TransportAction::TogglePlay);
 
@@ -1279,29 +1299,117 @@ fn fmt_hz(hz: f64) -> String {
     }
 }
 
-/// Draw the video stage — a dark rounded panel with the title centred — and, over it,
-/// the translucent auto-hiding OSD (design Q34). Returns the stage's click response.
-fn player_stage<E: MediaEngine>(ui: &mut egui::Ui, controller: &MediaController<E>) -> Response {
+/// The MEDIA-2 phase-1 frame sink (`docs/gpu_encoder.md` "Render API to egui
+/// texture first"): the video stage's texture.
+///
+/// Uploaded from [`MediaEngine::latest_frame`]. Mirrors the shell's
+/// `VdiState.texture` pattern (`mde-shell-egui/src/vdi.rs` — allocate on the
+/// first frame, `TextureHandle::set` in place after) so the same "decode →
+/// `ColorImage` → `TextureHandle` → paint" shape is used everywhere an
+/// external/engine frame source lands in the shell.
+///
+/// Owned by whoever holds the [`MediaController`] — the standalone
+/// [`MediaApp`] here, the E12 shell for the embedded surface (MEDIA-18) — and
+/// threaded into [`media_panel`]/[`player_view`]/`player_stage`. Kept out of
+/// the render-agnostic [`crate::model`] on purpose: that module "touches no
+/// egui" so the core state stays GPU-free and unit-testable with no context.
+#[derive(Default)]
+pub struct VideoTextureCache {
+    texture: Option<egui::TextureHandle>,
+    /// The checksum of the uploaded frame, so a throttled capture that hasn't
+    /// changed yet (`MpvEngine::latest_frame`'s ~150 ms cadence) skips a
+    /// redundant GPU upload.
+    last_checksum: Option<u64>,
+}
+
+/// Linear filtering for the video texture — the same choice
+/// `mde-shell-egui/src/vdi.rs`'s `DESKTOP_TEX` makes for its decoded desktop
+/// framebuffer.
+const VIDEO_TEX: egui::TextureOptions = egui::TextureOptions::LINEAR;
+
+impl VideoTextureCache {
+    /// Upload `frame` to the GPU if its content differs from what is already
+    /// there; a no-op on an unchanged repeat capture.
+    fn upload(&mut self, ctx: &Context, frame: &mde_media_core::VideoFrame) {
+        let checksum = frame.checksum();
+        if self.last_checksum == Some(checksum) {
+            return;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.rgba,
+        );
+        match self.texture.as_mut() {
+            Some(handle) => handle.set(image, VIDEO_TEX),
+            None => self.texture = Some(ctx.load_texture("mde-media-video", image, VIDEO_TEX)),
+        }
+        self.last_checksum = Some(checksum);
+    }
+
+    /// The uploaded texture, if any frame has landed yet.
+    const fn texture(&self) -> Option<&egui::TextureHandle> {
+        self.texture.as_ref()
+    }
+
+    /// Drop the cached texture (media unloaded/stopped) so the stage falls
+    /// back to the placeholder instead of freezing on the last frame shown.
+    fn clear(&mut self) {
+        self.texture = None;
+        self.last_checksum = None;
+    }
+}
+
+/// Draw the video stage — the real decoded picture once the real mpv engine
+/// (`--features mpv`) produces one, else the dark rounded placeholder panel
+/// with the title centred — and, over it, the translucent auto-hiding OSD
+/// (design Q34). Returns the stage's click response.
+fn player_stage<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+    video: &mut VideoTextureCache,
+) -> Response {
     let size = egui::vec2(ui.available_width(), STAGE_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let painter = ui.painter();
-    painter.rect_filled(rect, Style::RADIUS, Style::BG);
 
     let title = now_playing_title(controller.player());
     let loaded = controller.player().media().is_some();
-    let center_text = if loaded {
-        title.clone()
+
+    // MEDIA-2 phase 1 (docs/gpu_encoder.md): pull the newest decoded frame off
+    // the engine and upload it to the stage texture. `FakeMpv` (the
+    // airgap-safe default) never produces one, so the placeholder paints
+    // exactly as before; the real mpv engine (`--features mpv`) does, closing
+    // the FakeMpv/placeholder gap BUG-VIDEO-1 records.
+    if loaded {
+        if let Some(frame) = controller.player_mut().engine_mut().latest_frame() {
+            video.upload(ui.ctx(), &frame);
+        }
     } else {
-        "No media loaded — pick a title in Library".to_owned()
-    };
-    let center_color = if loaded { Style::TEXT } else { Style::TEXT_DIM };
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        center_text,
-        FontId::proportional(Style::BODY),
-        center_color,
-    );
+        video.clear();
+    }
+
+    let painter = ui.painter();
+    match video.texture() {
+        Some(texture) if loaded => {
+            let tex_id = texture.id();
+            egui::Image::new(egui::load::SizedTexture::new(tex_id, rect.size())).paint_at(ui, rect);
+        }
+        _ => {
+            painter.rect_filled(rect, Style::RADIUS, Style::BG);
+            let center_text = if loaded {
+                title.clone()
+            } else {
+                "No media loaded — pick a title in Library".to_owned()
+            };
+            let center_color = if loaded { Style::TEXT } else { Style::TEXT_DIM };
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                center_text,
+                FontId::proportional(Style::BODY),
+                center_color,
+            );
+        }
+    }
 
     // The OSD scrim + line, over the video, auto-hidden after the dwell.
     let paused = controller.player().state() != PlayerState::Playing;
@@ -1578,6 +1686,32 @@ mod tests {
         assert!(!prims.is_empty(), "frame produced no draw primitives");
     }
 
+    /// Like [`render`], but also threads a [`VideoTextureCache`] — for bodies
+    /// that reach `player_stage` (`player_view`/`media_panel`), which now owns
+    /// the MEDIA-2 phase-1 video frame-sink texture (`docs/gpu_encoder.md`).
+    fn render_with_video(
+        controller: &mut MediaController<FakeMpv>,
+        video: &mut VideoTextureCache,
+        body: impl Fn(&mut egui::Ui, &mut MediaController<FakeMpv>, &mut VideoTextureCache),
+    ) {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("t").show(ctx, |ui| media_header(ui, controller));
+            egui::CentralPanel::default().show(ctx, |ui| body(ui, controller, video));
+            pip_window(ctx, controller);
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "frame produced no draw primitives");
+    }
+
     fn populate(controller: &mut MediaController<FakeMpv>) {
         controller.library_mut().add_root("/m");
         controller.library_mut().upsert(
@@ -1657,16 +1791,17 @@ mod tests {
     #[test]
     fn player_view_renders_idle_and_playing_with_osd() {
         let mut c = controller();
+        let mut video = VideoTextureCache::default();
         // Idle: the stage shows the "no media" prompt.
-        render(&mut c, player_view);
+        render_with_video(&mut c, &mut video, player_view);
         // Load + pump → Playing; the scrubber, transport, speed, A-B, tracks all draw.
         c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
         c.pump();
         c.ui_mut().osd_idle_secs = 0.0; // OSD visible
-        render(&mut c, player_view);
+        render_with_video(&mut c, &mut video, player_view);
         // Idle-hidden OSD branch.
         c.ui_mut().osd_idle_secs = crate::model::OSD_HIDE_SECS + 1.0;
-        render(&mut c, player_view);
+        render_with_video(&mut c, &mut video, player_view);
     }
 
     /// A canned discovery so the cast list renders with no real network probe.
@@ -1737,7 +1872,7 @@ mod tests {
             audio_processing_body(ui, c, &mut action);
         });
         // The collapsing wrapper itself renders inside the full player view.
-        render(&mut c, player_view);
+        render_with_video(&mut c, &mut VideoTextureCache::default(), player_view);
         assert_eq!(c.player().state(), PlayerState::Idle, "render never plays");
     }
 
@@ -1761,7 +1896,7 @@ mod tests {
         c.ui_mut().pip = true;
         c.ui_mut().fullscreen = true;
         // The PiP window + header (with the toggles lit) render.
-        render(&mut c, player_view);
+        render_with_video(&mut c, &mut VideoTextureCache::default(), player_view);
     }
 
     #[test]
@@ -1771,9 +1906,10 @@ mod tests {
         // state the header binds to and confirm a full frame renders on each tab.
         let mut c = controller();
         populate(&mut c);
+        let mut video = VideoTextureCache::default();
         for tab in MediaTab::all() {
             c.ui_mut().tab = tab;
-            render(&mut c, media_panel);
+            render_with_video(&mut c, &mut video, media_panel);
             assert_eq!(c.ui().tab, tab);
         }
     }

@@ -5,9 +5,12 @@
 #
 # The system dev libs mirror what the workspace links: the cosmic/iced GUI
 # (gtk3/xkbcommon), the audio chain (alsa + opus via audiopus_sys' vendored
-# build needs cmake + a C++ compiler), etcd-client (protobuf), and release
-# packaging (rpm-build/createrepo_c/cargo-generate-rpm). `mold` is the fast
-# linker the `.cargo/config.toml` selects.
+# build needs cmake + a C++ compiler), etcd-client (protobuf), release
+# packaging (rpm-build/createrepo_c/cargo-generate-rpm), and BUG-VIDEO-1 /
+# MEDIA-2 phase 1 (docs/gpu_encoder.md) real video playback — `mpv-libs-devel`
+# links the system libmpv `libmpv2-sys`/bindgen needs at build time for
+# `--features mpv` (mde-media-core) / `--features media-mpv` (mde-shell-egui).
+# `mold` is the fast linker the `.cargo/config.toml` selects.
 #
 # Usage:
 #   setup-build-vm-toolchain.sh [--host 172.20.0.50] [--user mm] [--key <priv>]
@@ -39,7 +42,8 @@ log "system dev libs (Fedora dnf)"
     gcc gcc-c++ cmake mold git rsync pkgconf-pkg-config genisoimage cloud-utils \
     protobuf-compiler openssl-devel \
     alsa-lib-devel opus-devel \
-    gtk3-devel libxkbcommon-devel'
+    gtk3-devel libxkbcommon-devel \
+    mpv-libs-devel'
 
 log "rustup + pinned Rust $RUST_VER + clippy/rustfmt"
 "${SSH[@]}" "command -v rustup >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_VER
@@ -54,5 +58,6 @@ log "verify"
   echo "  g++:     $(g++ --version 2>/dev/null | head -1)"
   echo "  cmake:   $(cmake --version 2>/dev/null | head -1)"
   echo "  mold:    $(mold --version 2>/dev/null | head -1)"
-  echo "  opus:    $(pkg-config --modversion opus 2>/dev/null)"'
+  echo "  opus:    $(pkg-config --modversion opus 2>/dev/null)"
+  echo "  mpv:     $(pkg-config --modversion mpv 2>/dev/null)"'
 log "DONE — build VM $HOST is toolchain-ready (drive builds with install-helpers/xcp-build.sh)"

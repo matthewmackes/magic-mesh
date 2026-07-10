@@ -442,7 +442,10 @@ case "${1:-}" in
     # helper and renderer bridge. The full RPM ships all browser helpers, so
     # build those separate workspaces into the same target/release directory
     # before generate-rpm.
-    remote "sudo dnf install -y --setopt=install_weak_deps=False clang llvm python3 fontconfig-devel freetype-devel harfbuzz-devel mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel libxkbcommon-devel"
+    # + BUG-VIDEO-1 / MEDIA-2 phase 1 `mpv-libs-devel` (docs/gpu_encoder.md):
+    # links the real libmpv2 engine for the `media-mpv` re-link below —
+    # without it the shell would silently fall back to FakeMpv.
+    remote "sudo dnf install -y --setopt=install_weak_deps=False clang llvm python3 fontconfig-devel freetype-devel harfbuzz-devel mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel libxkbcommon-devel mpv-libs-devel"
     # E12-3 DRM: after the workspace build, re-link mde-shell-egui with --features drm
     # so it owns the bare KMS/DRM seat (no Wayland compositor). The workspace build
     # compiles all dependencies; this one-crate rebuild only re-links the final binary.
@@ -451,7 +454,12 @@ case "${1:-}" in
     # surface is permanently the gated EmptyState (the live 2026-07-05 finding).
     # + E12-5 `live-vdi`: the RPM shell must also carry the in-shell IronRDP
     # transport, otherwise Desktop connects stay at the honest gated caption.
-    remote "cargo build --workspace --release && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release -p mde-shell-egui --features drm,live-helper,live-vdi && cargo generate-rpm -p crates/mesh/mackesd"
+    # + BUG-VIDEO-1 `media-mpv`: the RPM shell must link the real mpv engine, or
+    # the embedded Media surface ships silently backed by FakeMpv (simulated
+    # playback, no real A/V — the live-verified 2026-07-03 Eagle finding);
+    # `release_shell_configuration_enables_the_real_media_engine`
+    # (mde-shell-egui) fails loudly if this feature is ever dropped here.
+    remote "cargo build --workspace --release && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release -p mde-shell-egui --features drm,live-helper,live-vdi,media-mpv && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"

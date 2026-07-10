@@ -210,7 +210,7 @@ pub use cast::{
     MeshRoster, NetworkCaster, RendererDiscovery, SsdpProbe,
 };
 pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
-pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
+pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind, VideoFrame};
 pub use fake::FakeMpv;
 pub use library::{BrowseQuery, Library, LibraryItem, MediaKind, MediaMetadata, SortKey};
 pub use opensubtitles::{parse_search_response, request_headers, search_url, SubtitleSearchResult};
