@@ -258,11 +258,23 @@ pub struct CriticalEdgeCue {
     active: Option<ActiveCriticalEdge>,
     acknowledged: Option<CriticalEdgeKey>,
     muted: bool,
+    /// WIN7-6 (`docs/design/win7-desktop-survey.md` lock #9) — latched inside
+    /// [`Self::update`] on a [`Self::visible`] hidden→visible edge (a fresh
+    /// critical, one re-raised after an older one was acknowledged, or an
+    /// unmute revealing a still-live one — see [`Self::update`]'s own
+    /// comment), drained once by [`Self::take_became_visible`]. `main.rs`
+    /// uses the drain to auto-close an open Start Menu the instant the cue
+    /// starts showing, without re-firing on every steady "still visible"
+    /// frame afterward — the same one-shot `take_*` shape
+    /// `start_menu::StartMenuState`'s own `take_tile_activation`/
+    /// `HotkeyRouter::take_dock_toggle` already use.
+    became_visible: bool,
 }
 
 impl CriticalEdgeCue {
     /// Fold the daemon segment rollups into this seat's edge-cue state.
     pub fn update(&mut self, segments: &StatusSegments, local_host: &str, muted: bool) {
+        let was_visible = self.visible();
         self.muted = muted;
         let next = critical_edge_key(segments, local_host);
         match next {
@@ -279,6 +291,17 @@ impl CriticalEdgeCue {
                 self.acknowledged = None;
             }
         }
+        // WIN7-6 (lock #9) — an edge, not a level check: `visible()` can go
+        // false→true from a brand-new critical, a genuinely new one after an
+        // old (different) one was acknowledged, OR an unmute revealing a
+        // still-live one (see the `critical_edge_cue_respects_push_mute_
+        // without_clearing_state` test) — all three are real "the cue just
+        // started showing" moments and all three should latch here. A steady
+        // already-visible frame, and the same rollup staying acknowledged,
+        // must NOT latch (see `Self::became_visible`'s own doc for why).
+        if !was_visible && self.visible() {
+            self.became_visible = true;
+        }
     }
 
     /// Acknowledge the live cue without clearing the underlying daemon rollup.
@@ -293,6 +316,20 @@ impl CriticalEdgeCue {
         self.active
             .as_ref()
             .is_some_and(|active| !self.muted && self.acknowledged.as_ref() != Some(&active.key))
+    }
+
+    /// WIN7-6 — drain whether the last [`Self::update`] carried the cue
+    /// across a hidden→visible edge; `false` on every other call, including
+    /// every steady "still visible" frame while the SAME critical stays live
+    /// and un-acknowledged, and every frame after a caller has already
+    /// drained a `true`. `main.rs` calls this once per frame, right after
+    /// `update`, to react to the cue *starting* to show (closing the Start
+    /// Menu if it's open, lock #9) without fighting an operator who reopens
+    /// the Start Menu afterward — whether that's while this same critical is
+    /// still up (no further edge fires until something actually changes) or
+    /// after they've acknowledged it via [`Self::acknowledge`].
+    pub fn take_became_visible(&mut self) -> bool {
+        std::mem::take(&mut self.became_visible)
     }
 
     /// Render the no-text all-edges cue and let an edge click acknowledge it.
@@ -1355,6 +1392,97 @@ mod tests {
         assert!(!cue.visible(), "DND/focus mute suppresses the ambient push");
         cue.update(&live, "eagle", false);
         assert!(cue.visible(), "unmuting reveals the still-live critical");
+    }
+
+    #[test]
+    fn critical_edge_cue_take_became_visible_latches_once_per_real_edge() {
+        // WIN7-6 (lock #9): `take_became_visible` must fire exactly once per
+        // genuine hidden→visible transition — never on a steady "still
+        // visible" frame, never on a re-affirmed acknowledged rollup — so
+        // `main.rs`'s Start-Menu auto-close reacts to a firing without
+        // fighting an operator who reopens the menu afterward.
+        let live = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        let mut cue = CriticalEdgeCue::default();
+
+        cue.update(&live, "eagle", false);
+        assert!(
+            cue.take_became_visible(),
+            "a fresh critical is a hidden->visible edge"
+        );
+        assert!(
+            !cue.take_became_visible(),
+            "draining the edge clears it until the next real transition"
+        );
+
+        cue.update(&live, "eagle", false);
+        assert!(
+            !cue.take_became_visible(),
+            "the SAME still-active critical is not a new edge"
+        );
+
+        cue.acknowledge();
+        cue.update(&live, "eagle", false);
+        assert!(
+            !cue.take_became_visible(),
+            "re-affirming an acknowledged rollup is not a new edge"
+        );
+
+        let reraised = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                12,
+            )),
+            ..StatusSegments::default()
+        };
+        cue.update(&reraised, "eagle", false);
+        assert!(
+            cue.take_became_visible(),
+            "a genuinely new critical after an old one was acked is a fresh edge"
+        );
+
+        cue.update(&StatusSegments::default(), "eagle", false);
+        assert!(
+            !cue.take_became_visible(),
+            "a resolved rollup clearing the cue is not itself a visible edge"
+        );
+    }
+
+    #[test]
+    fn critical_edge_cue_take_became_visible_latches_on_unmute_too() {
+        let live = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        let mut cue = CriticalEdgeCue::default();
+        cue.update(&live, "eagle", true);
+        assert!(
+            !cue.take_became_visible(),
+            "a muted critical never became visible"
+        );
+
+        cue.update(&live, "eagle", false);
+        assert!(
+            cue.take_became_visible(),
+            "unmuting a still-live critical is also a real edge"
+        );
     }
 
     #[test]

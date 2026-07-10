@@ -1198,6 +1198,27 @@ impl Shell {
             dnd || focus_mute,
         );
         self.critical_edge.show(ctx);
+
+        // WIN7-6 (win7-desktop-survey lock #9) — a Critical firing (or an
+        // existing one unmuting into view) auto-closes the Start Menu if it's
+        // open, so the cue gets a clear field: a deliberate STRENGTHENING of
+        // the cue's own "always wins" posture above, not a weakening of
+        // anything WIN7-2 built. Edge-triggered off `take_became_visible` — a
+        // one-shot hidden->visible latch, NOT a per-frame "is it visible
+        // right now" poll — so this closes an open Start Menu exactly once
+        // per real firing and never re-fights an operator who reopens the
+        // Start Menu afterward: not while the SAME critical is still up but
+        // acknowledged (`visible()` stays false, so no further edge fires),
+        // and not while it's still up and un-acknowledged either (no NEW
+        // edge without a real change). `StartMenuState::close` already
+        // no-ops while closed, so this is safe to call unconditionally, and
+        // closing it also closes the embedded Console pane for free — its
+        // own `open` bit is a same-frame mirror of the Start Menu's
+        // (`start_menu.rs`'s `console.set_open(state.open)`), not a second
+        // latch this call would need to touch separately.
+        if self.critical_edge.take_became_visible() {
+            self.start_menu.close();
+        }
     }
 
     /// Mount the shell's **dock chrome** for this frame (VDOCK) — the left
@@ -1896,6 +1917,153 @@ mod tests {
                     && node.live() == Some(egui::accesskit::Live::Assertive)
             }),
             "critical live region exported"
+        );
+    }
+
+    /// WIN7-6's own `screen_rect` — a helper so its three tests below each
+    /// build a fresh `RawInput` per frame without repeating the literal
+    /// (`egui::RawInput` frames are consumed by `ctx.run`, so a multi-frame
+    /// test needs a new one each time).
+    fn win7_6_test_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        }
+    }
+
+    /// WIN7-6's own fixture segments — an own-seat rollup at the given
+    /// severity (the `shell_mounts_the_critical_edge_cue_from_own_seat_rollups`
+    /// fixture pattern, generalized so the non-Critical test below can reuse
+    /// it at "warning" instead of duplicating the whole literal).
+    fn win7_6_own_seat_segments(severity: &str, ts_unix_ms: i64) -> status::StatusSegments {
+        status::StatusSegments {
+            alerts: Some(status::SegmentRollup {
+                segment: "alerts".to_string(),
+                severity: severity.to_string(),
+                source: "thermal".to_string(),
+                summary: "thermal reading".to_string(),
+                host: "eagle".to_string(),
+                critical_policy: "own-seat-light-show".to_string(),
+                ts_unix_ms,
+            }),
+            seen: true,
+            ..status::StatusSegments::default()
+        }
+    }
+
+    #[test]
+    fn win7_6_a_critical_firing_closes_an_open_start_menu() {
+        // WIN7-6 (win7-desktop-survey lock #9): the NOTIF-6 edge-cue now also
+        // auto-closes the Start Menu if it's open the instant a Critical
+        // rollup fires, so the cue gets a clear field — a strengthening of
+        // the cue's existing "always wins" posture, not a weakening of
+        // anything WIN7-2 built.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.local_host = "eagle".to_string();
+        shell.start_menu.toggle();
+
+        // Frame 1: the menu is open, no critical has fired yet.
+        let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
+        assert!(
+            shell.start_menu.is_open(),
+            "test setup: the Start Menu opens with no critical firing"
+        );
+
+        // Frame 2: an own-seat Critical fires.
+        shell
+            .notify_status
+            .set_segments_for_test(win7_6_own_seat_segments("critical", 42));
+        let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
+
+        assert!(
+            shell.critical_edge.visible(),
+            "the own-seat critical keeps the shell edge cue visible"
+        );
+        assert!(
+            !shell.start_menu.is_open(),
+            "a Critical firing must auto-close an open Start Menu (lock #9)"
+        );
+    }
+
+    #[test]
+    fn win7_6_a_warning_alert_does_not_close_the_start_menu() {
+        // The strengthening is specifically for Critical severities
+        // (`is_critical_severity`) — a Warning rollup must not touch the
+        // Start Menu at all, matching the edge cue's own existing severity
+        // gate (it never lights up for anything less than Critical either).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.local_host = "eagle".to_string();
+        shell.start_menu.toggle();
+
+        shell
+            .notify_status
+            .set_segments_for_test(win7_6_own_seat_segments("warning", 42));
+        let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
+
+        assert!(
+            !shell.critical_edge.visible(),
+            "a Warning severity never lights the own-seat edge cue"
+        );
+        assert!(
+            shell.start_menu.is_open(),
+            "a non-Critical rollup must not touch the Start Menu's open state"
+        );
+    }
+
+    #[test]
+    fn win7_6_reopening_after_acknowledging_the_critical_is_not_re_closed() {
+        // WIN7-6's auto-close is edge-triggered off `take_became_visible`,
+        // not a per-frame "is it visible" poll — so once the operator has
+        // acknowledged the SAME critical (silencing the cue), reopening the
+        // Start Menu afterward must not be immediately fought shut again.
+        // This is the precise "strengthening, not an annoying loop" behavior
+        // the design lock calls for.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.local_host = "eagle".to_string();
+        shell.start_menu.toggle();
+
+        // Frame 1: menu open, no critical yet.
+        let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
+        assert!(shell.start_menu.is_open(), "test setup: opens clean");
+
+        // Frame 2: the critical fires and auto-closes the menu (the exact
+        // behavior `win7_6_a_critical_firing_closes_an_open_start_menu`
+        // covers in detail; re-confirmed here as this test's own setup).
+        shell
+            .notify_status
+            .set_segments_for_test(win7_6_own_seat_segments("critical", 42));
+        let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
+        assert!(
+            !shell.start_menu.is_open(),
+            "test setup: the firing auto-closed it"
+        );
+
+        // The operator acknowledges the still-live critical — the edge-click
+        // path itself is `status.rs`'s own territory (see
+        // `critical_edge_cue_tessellates_as_an_ambient_edge_overlay`); this
+        // test drives the same `acknowledge` entry point directly.
+        shell.critical_edge.acknowledge();
+
+        // Frame 3: the operator reopens the Start Menu. The SAME critical
+        // rollup is still technically active (just acknowledged/silent) —
+        // reopening must not be immediately fought shut again.
+        shell.start_menu.toggle();
+        let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
+
+        assert!(
+            shell.start_menu.is_open(),
+            "reopening after acknowledging the critical must not be re-closed \
+             (WIN7-6 must never become an annoying open/slam loop)"
+        );
+        assert!(
+            !shell.critical_edge.visible(),
+            "sanity: the cue stays hidden post-ack across this frame too"
         );
     }
 

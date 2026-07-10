@@ -119,6 +119,19 @@
 //! [`ConsoleState::set_open`] mirror, the same self-closure propagation —
 //! WIN7-5 changed what `console_content` draws inside the rect this module
 //! hands it, not the seam between the two modules.
+//!
+//! **WIN7-6 update:** a Critical firing now closes the menu too (lock #9) —
+//! the same outcome as the other closers listed above (Esc / click-away / an
+//! embedded Console self-closure / a tile activation), just triggered from
+//! OUTSIDE this module for the first time. `main.rs` calls
+//! [`StartMenuState::close`] (widened `pub(crate)`) directly off
+//! [`status::CriticalEdgeCue::take_became_visible`]'s one-shot
+//! hidden→visible edge, so an open menu closes exactly once per real firing
+//! — never every frame the cue stays lit (that would also block reopening
+//! the menu while a still-unacknowledged critical is up, which lock #9 never
+//! asked for), and never again for the SAME critical once the operator has
+//! acknowledged it. This module's own `close` already no-ops while closed,
+//! so no new guard was needed here.
 
 use std::time::Duration;
 
@@ -478,10 +491,17 @@ impl StartMenuState {
     }
 
     /// Close the panel (Esc / click-away / an embedded Console action closing
-    /// itself). A no-op while already closed, so a redundant close (e.g. Esc
-    /// racing the embedded content's own Esc-close, see the module doc) never
-    /// re-arms the click-away guard for no reason.
-    fn close(&mut self) {
+    /// itself / WIN7-6's Critical edge-cue firing, lock #9). A no-op while
+    /// already closed, so a redundant close (e.g. Esc racing the embedded
+    /// content's own Esc-close, or the cue firing while the menu is already
+    /// shut, see the module doc) never re-arms the click-away guard for no
+    /// reason. Widened `pub(crate)` (the `dock::response_activated`/
+    /// `status::severity_color` cross-module-widening idiom already used in
+    /// this module) so `main.rs` can call it directly off
+    /// `CriticalEdgeCue::take_became_visible`'s one-shot edge — a firing
+    /// closes an open menu exactly once and never re-fights an operator who
+    /// reopens it afterward.
+    pub(crate) fn close(&mut self) {
         if self.open {
             self.open = false;
             self.just_toggled = true;
