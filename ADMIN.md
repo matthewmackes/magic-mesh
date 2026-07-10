@@ -24,12 +24,13 @@ mackesd mesh-init --mesh-id <name> --external-addr <ip-or-dns>
 
 # Per joining peer — mint a token on the Lighthouse, redeem on the peer:
 mackesd enroll-token --mesh-id <name>     # prints a one-time token
-mackesd enroll --token <token>            # on the new peer
+mackesd join '<token>'                    # on the new peer
 ```
 
-Enrollment is CSR-based: the CSR lands on the replicated volume and the
-Lighthouse's auto-signer signs it under the active CA epoch (manual path:
-`mackesd ca sign-csr`). Full sequence: [`packaging/ENROLLMENT.md`](packaging/ENROLLMENT.md).
+Enrollment is CSR-based: the CSR goes straight to the Lighthouse's `/enroll`
+endpoint over TLS pinned to the token's fingerprint, and its auto-signer signs
+it under the active CA epoch (manual path: `mackesd ca sign-csr`). Full
+sequence: [`packaging/ENROLLMENT.md`](packaging/ENROLLMENT.md).
 
 ## 2. Provision the backup — do this on day one
 

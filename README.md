@@ -137,7 +137,7 @@ Maximum-crypto by lock (`AI_GOVERNANCE.md` §3); the trust model is flat trust
 among ≤8 peers, an accepted, documented trade-off (see `DISCLAIMER.md`):
 
 - **Identity & enrollment** — Ed25519 node identity; token-scoped CSR enrollment
-  (`enroll-token` → `enroll` → CA sign under the active epoch); `reenroll`.
+  (`enroll-token` → `join` → CA sign under the active epoch); `reenroll`.
 - **CA lifecycle** — mint / **rotate** (epoch bump + auto re-sign) / `sign-csr` /
   encrypted off-cluster `export`+`import`; **real revocation** (`revoke` / `ban`
   / blocklist — Nebula refuses revoked tunnels).

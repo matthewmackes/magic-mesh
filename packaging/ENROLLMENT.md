@@ -18,11 +18,11 @@ mackesd enroll-token --mesh-id <name>
 ```
 On the new box, redeem it (single-use, ENT-1):
 ```
-mackesd enroll --token 'mesh:<id>@<lighthouse-ip>:4242#<bearer>'
+mackesd join 'mesh:<id>@<lighthouse-ip>:4243#<bearer>'
 ```
 The token is self-contained — it already embeds the lighthouse address
-you passed to `enroll-token` (or the overlay IP if omitted). Copy it
-verbatim; there is no separate IP to hand-carry.
+you passed to `enroll-token` (or this lighthouse's own public address if
+omitted). Copy it verbatim; there is no separate IP to hand-carry.
 The role is pinned by the install chooser (Workstation) or
 `mackesd role-pin <server|lighthouse>` for headless nodes; downgrades
 are refused (PKG-7 / upgrade-only).
