@@ -575,6 +575,23 @@ pub fn start_menu_panel(
                 rect.max,
             );
             install_accessibility(ui.ctx(), rect, left_rect, right_rect);
+            // WIN7-7, lock #14 — the OPEN/CLOSE transition itself needs an
+            // announcement, not just the `Role::Menu` landmark above: a
+            // screen reader user needs to know the menu just opened, not
+            // discover it only by happening to explore the tree afterward.
+            // Runs every frame this closure does (i.e. whenever `t > 0.001`
+            // — opening, settled open, OR still mid-close-tween), keyed off
+            // `state.open` rather than `t` itself: the value stays constant
+            // for as long as the menu is steadily open (or steadily
+            // closing), so — matching how `install_status_accessibility`/
+            // `install_tiles_live_summary` already behave every frame their
+            // own condition holds — an AT only re-announces on the actual
+            // edge (a genuine value change), never once per frame. No node
+            // at all once fully closed and settled (`t` reaches ~0 and this
+            // whole closure stops running for the frame) — nothing left to
+            // announce, the same honest-silence posture `install_tiles_live_summary`
+            // already uses.
+            install_start_menu_state_announcement(ui.ctx(), rect, state.open);
             if state.open && esc_pressed(ui) {
                 state.close();
             }
@@ -1151,6 +1168,50 @@ fn install_accessibility(
         node.set_role(egui::accesskit::Role::Group);
         node.set_label("Console");
         node.set_bounds(accesskit_rect(right));
+    });
+}
+
+/// The stable accesskit node id for the Start Menu's own open/close
+/// announcement (WIN7-7, lock #14) — deliberately distinct from
+/// [`start_menu_accesskit_id`]'s `Role::Menu` landmark node (a different
+/// role AND a different label, "Start Menu status" vs. "Start Menu", so a
+/// label-keyed lookup — the established test idiom in this file — can never
+/// find the wrong one of the two).
+fn start_menu_state_accesskit_id() -> egui::Id {
+    egui::Id::new("start-menu-state-accesskit")
+}
+
+/// Announce the Start Menu's own open/close transition (lock #14 — "a
+/// screen reader user needs to know the menu opened, not just see new
+/// content appear"). [`install_accessibility`] gives the panel a `Role::Menu`
+/// landmark, but a landmark node silently appearing in the tree is not
+/// itself an announcement — this crate's own convention for "something
+/// changed, tell the user" is a `Live::Polite` region (`status.rs`'s
+/// `install_status_accessibility`, this module's own
+/// [`install_tiles_live_summary`]), restated here at the whole-panel level.
+/// Called every frame [`start_menu_panel`]'s content closure runs (i.e.
+/// whenever `t > 0.001`: opening, settled open, or still mid-close-tween),
+/// keyed off `open` rather than the slide progress — the value is constant
+/// for as long as the menu is steadily in ONE state, so it only actually
+/// re-announces on a genuine open→closed or closed→open edge, never once
+/// per frame (the same value-stability-avoids-spam reasoning
+/// `install_status_accessibility` already relies on). No call at all once
+/// the panel is fully closed and settled — [`start_menu_panel`]'s own early
+/// return means this whole closure stops running for that frame, so the
+/// node simply stops being emitted, the honest-silence posture
+/// [`install_tiles_live_summary`] already uses for "nothing to say."
+fn install_start_menu_state_announcement(ctx: &egui::Context, rect: egui::Rect, open: bool) {
+    let value = if open {
+        "Start Menu opened"
+    } else {
+        "Start Menu closed"
+    };
+    let _ = ctx.accesskit_node_builder(start_menu_state_accesskit_id(), |node| {
+        node.set_role(egui::accesskit::Role::Status);
+        node.set_live(egui::accesskit::Live::Polite);
+        node.set_label("Start Menu status");
+        node.set_value(value);
+        node.set_bounds(accesskit_rect(rect));
     });
 }
 
@@ -2099,5 +2160,81 @@ mod tests {
             .find(|n| n.label() == Some(Surface::About.label()))
             .expect("About tile node");
         assert_eq!(about.value(), Some(Surface::About.label()));
+    }
+
+    // ── WIN7-7: the open/close transition itself is announced (lock #14) ────
+    // Before this unit the panel exported a `Role::Menu` landmark (proven
+    // above) but NOTHING announced the transition into/out of existing — a
+    // screen reader user would only discover the menu by independently
+    // exploring the tree, never by an actual announcement the way this
+    // crate's other state changes (NOTIF-6's critical alert, WIN7-4's tile
+    // rotation, WIN7-5's honest-gate notice) already work.
+
+    #[test]
+    fn opening_the_start_menu_announces_it_via_a_live_region() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+
+        let status = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Start Menu status"))
+            .expect("a live status region announces the Start Menu opening");
+        assert_eq!(status.role(), egui::accesskit::Role::Status);
+        assert_eq!(status.live(), Some(egui::accesskit::Live::Polite));
+        assert_eq!(status.value(), Some("Start Menu opened"));
+    }
+
+    #[test]
+    fn closing_the_start_menu_announces_it_before_the_panel_fully_unmounts() {
+        // Motion::animate uses egui's own `predicted_dt` (1/60s, deterministic
+        // — NOT real wall-clock time, since `drive`'s RawInput leaves `time`
+        // as `None`) against `Motion::BASE` (0.18s), so one frame after
+        // closing is nowhere near settled — the panel is still mid-tween,
+        // exactly when this announcement needs to fire.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2); // settle open
+        s.close();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ); // one closing-tween frame
+        let nodes = accesskit_nodes(&out);
+
+        let status = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Start Menu status"))
+            .expect("a live status region announces the Start Menu closing, mid-tween");
+        assert_eq!(status.value(), Some("Start Menu closed"));
+    }
+
+    #[test]
+    fn a_fully_settled_closed_start_menu_exports_no_state_announcement() {
+        // Never opened — settled closed from the very first frame (the
+        // `a_closed_start_menu_mounts_no_layer...` precedent's own starting
+        // state): nothing to announce, the honest-silence posture
+        // `install_tiles_live_summary` already uses elsewhere in this file.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Start Menu status")),
+            "nothing to announce once fully closed and settled"
+        );
     }
 }

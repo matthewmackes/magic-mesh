@@ -1060,6 +1060,13 @@ pub fn notification_rail_with_sources(
                 local.top(),
                 egui::Stroke::new(HAIRLINE_W, Style::BORDER),
             );
+            // WIN7-7, lock #14 — the taskbar itself needs a landmark role, not
+            // just its contents: a screen reader jumping between landmarks
+            // should be able to find "the taskbar" as its own stop, the same
+            // way `start_menu.rs`'s `install_accessibility` gives the Start
+            // Menu panel a `Role::Menu` landmark before any of ITS content is
+            // covered.
+            install_taskbar_accessibility(ui.ctx(), local);
 
             let mut x = local.left() + Style::SP_XS;
             let cell = |x: f32| {
@@ -1117,6 +1124,12 @@ pub fn notification_rail_with_sources(
                     } else {
                         Style::TEXT_DIM
                     },
+                    "Sessions",
+                    if state.status.session_active {
+                        "Active"
+                    } else {
+                        "No active session"
+                    },
                 ) {
                     state.active = Surface::Desktop;
                     clicked = true;
@@ -1145,7 +1158,8 @@ pub fn notification_rail_with_sources(
                 }
                 if overflow.hidden_start < sessions.len() {
                     let more = cell(sx);
-                    let opened_more = rail_more_cell(ui, more, state);
+                    let opened_more =
+                        rail_more_cell(ui, more, state, sessions.len() - overflow.hidden_start);
                     if opened_more {
                         clicked = true;
                     }
@@ -1391,12 +1405,26 @@ fn start_cell_id() -> egui::Id {
     egui::Id::new("vdock-start-cell")
 }
 
-fn rail_icon(ui: &egui::Ui, rect: egui::Rect, icon: IconId, tint: egui::Color32) -> bool {
-    let resp = ui.interact(
-        rect,
-        egui::Id::new(("bottom-rail-icon", icon.name())),
-        egui::Sense::click(),
-    );
+/// Stable id for a bare icon-only taskbar cell ([`rail_icon`]) — keyed by the
+/// glyph itself since (today) each [`IconId`] only ever backs one such cell.
+fn rail_icon_id(icon: IconId) -> egui::Id {
+    egui::Id::new(("bottom-rail-icon", icon.name()))
+}
+
+/// A bare icon-only taskbar cell (WIN7-1's sessions-empty fallback glyph is
+/// its one caller today). `label`/`value` are the WIN7-7 accesskit pair
+/// (lock #14) — every other taskbar cell function exports its own `Button`
+/// node ([`install_cell_accessibility`]); this one is no exception just
+/// because it's the generic/shared shape.
+fn rail_icon(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    icon: IconId,
+    tint: egui::Color32,
+    label: &str,
+    value: &str,
+) -> bool {
+    let resp = ui.interact(rect, rail_icon_id(icon), egui::Sense::click());
     let color = if resp.hovered() { Style::TEXT } else { tint };
     if resp.hovered() {
         ui.painter()
@@ -1409,6 +1437,7 @@ fn rail_icon(ui: &egui::Ui, rect: egui::Rect, icon: IconId, tint: egui::Color32)
         ui.painter()
             .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
     }
+    install_cell_accessibility(ui.ctx(), rail_icon_id(icon), label, value, rect);
     resp.clicked()
 }
 
@@ -1476,6 +1505,13 @@ fn rail_surface_cell(
     paint_rail_label(ui, rect, label, tint);
     apply_picker_arrow_focus(ui, surface, &resp);
     paint_surface_context_menu(ui, surface, &resp, active, pinned);
+    install_cell_accessibility(
+        ui.ctx(),
+        pick_cell_id(surface),
+        label,
+        if selected { "Active" } else { "Not active" },
+        rect,
+    );
     if response_activated(ui, &resp) {
         *active = surface;
         return true;
@@ -1612,6 +1648,21 @@ fn session_entry(
             },
         );
     }
+    // WIN7-7, lock #14 — unconditional (unlike the visual text above, which
+    // clips away entirely when the cell is too narrow): a screen reader
+    // needs the session's name every time, not only when there happens to
+    // be pixel room for it.
+    install_cell_accessibility(
+        ui.ctx(),
+        session_entry_id(idx, entry),
+        format!("{} {}", entry.label, entry.protocol),
+        if selected {
+            "Active desktop session"
+        } else {
+            "Desktop session"
+        },
+        rect,
+    );
     resp.clicked()
 }
 
@@ -1648,6 +1699,13 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
         );
     }
     paint_rail_label(ui, rect, "Status", tint);
+    install_cell_accessibility(
+        ui.ctx(),
+        status_detail_toggle_id(),
+        "Notification panel",
+        if selected { "Expanded" } else { "Collapsed" },
+        rect,
+    );
     if resp.clicked() {
         state.status_panel_open = !state.status_panel_open;
         return true;
@@ -1691,6 +1749,17 @@ fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
         );
     }
     paint_rail_label(ui, rect, "Start", tint);
+    install_cell_accessibility(
+        ui.ctx(),
+        start_cell_id(),
+        "Start",
+        if state.start_menu_open {
+            "Start Menu open"
+        } else {
+            "Start Menu closed"
+        },
+        rect,
+    );
     if resp.clicked() {
         state.start_menu_toggle = true;
         return true;
@@ -1728,6 +1797,13 @@ fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
         );
     }
     paint_rail_label(ui, cell, "Pin", color);
+    install_cell_accessibility(
+        ui.ctx(),
+        egui::Id::new("vdock-pin"),
+        "Pin",
+        if pinned { "Pinned" } else { "Not pinned" },
+        cell,
+    );
     if resp.clicked() {
         state.toggle_pin();
         return true;
@@ -1773,6 +1849,7 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
         Style::TEXT_DIM
     };
     let now = crate::timers::now_unix();
+    let time_text = crate::timers::hhmm(now);
     painter.text(
         if rect.height() >= NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
             egui::pos2(rect.center().x, rect.top() + Style::SP_M)
@@ -1780,11 +1857,21 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
             rect.center()
         },
         egui::Align2::CENTER_CENTER,
-        crate::timers::hhmm(now),
+        &time_text,
         egui::FontId::proportional(Style::SMALL.min((rect.height() - 6.0).max(8.0))),
         tint,
     );
     paint_rail_label(ui, rect, "Clock", tint);
+    // WIN7-7, lock #14 — the clock's accessible VALUE is the same live
+    // `HH:MM` reading its glyph paints (the task's own "does the clock
+    // announce the time" question): a screen reader can navigate to the
+    // clock and hear the time on demand, exactly like a real desktop clock.
+    // Deliberately NOT a `Live::Polite` region — that would narrate the
+    // clock out loud on every unattended minute rollover, which nobody
+    // wants (the `install_tile_accessibility` "not individually live, would
+    // be a spam regression" precedent, restated here for a once-a-minute
+    // rather than a once-per-rotation cadence).
+    install_cell_accessibility(ui.ctx(), clock_cell_id(), "Clock", &time_text, rect);
     // Wake at the next minute rollover so the glyph never shows a stale minute
     // (cheap: egui keeps only the earliest scheduled repaint).
     ui.ctx()
@@ -1796,6 +1883,83 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
         return true;
     }
     false
+}
+
+// ── accesskit (lock #14, WIN7-7) ─────────────────────────────────────────────
+//
+// Before this unit, `dock.rs` exported NOTHING to the accessibility tree: every
+// cell above is a hand-rolled `ui.interact(rect, id, sense)` widget, and egui
+// only auto-generates accesskit nodes for real widgets (`TextEdit`, `Button`)
+// via `Response::widget_info` — never for raw `interact`-based cells (verified
+// against this crate: zero `widget_info` call sites in this file, the ONE
+// production call anywhere in the crate's dock/console/status/start_menu
+// group is `status.rs`'s own `#[cfg(test)]`-only retired `status_bar`). The
+// bottom taskbar's tray pips were always covered (`status.rs`'s
+// `install_segment_accessibility`, called per-segment from
+// `notification_rail`) — this section is what closes the REST of the gap:
+// the taskbar's own landmark, and every taskbar-owned cell (Start, the
+// Desktop rail cell, the Desktop-source caret + its flyout rows, session
+// entries + the overflow "more" popup — which reuses [`session_entry`], so
+// one fix covers both — the status/notification toggle, the clock, and the
+// pin). Restates the SAME `accesskit_rect` helper + `Role::Button` +
+// label/value/bounds/`Click` shape `status.rs`/`console.rs`/`start_menu.rs`
+// already use (each panel's accesskit section owns its own copy, the
+// established per-module convention), named `install_cell_accessibility`
+// here since this module's own vocabulary for one of these is a "cell", not
+// a "row" (`console.rs`) or a "tile" (`start_menu.rs`).
+
+/// Convert an egui rect to an accesskit one (the `status.rs`/`console.rs`/
+/// `start_menu.rs` helper, restated module-locally per this crate's
+/// established per-module-copy convention).
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+/// Stable id for the taskbar's own landmark node.
+fn taskbar_accesskit_id() -> egui::Id {
+    egui::Id::new("bottom-rail-taskbar-accesskit")
+}
+
+/// Install the taskbar's own landmark (lock #14 — "the taskbar itself", not
+/// just its contents): `Role::Toolbar` is accesskit's ARIA-`toolbar`-
+/// equivalent role for "a container grouping a set of controls," the exact
+/// shape of a Win7-style taskbar — matching how a real desktop taskbar
+/// exposes itself to Windows UI Automation. Mirrors `start_menu.rs`'s own
+/// `install_accessibility` giving the Start Menu panel a landmark role
+/// before any of its content is individually covered.
+fn install_taskbar_accessibility(ctx: &egui::Context, rect: egui::Rect) {
+    let _ = ctx.accesskit_node_builder(taskbar_accesskit_id(), |node| {
+        node.set_role(egui::accesskit::Role::Toolbar);
+        node.set_label("Taskbar");
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
+/// Install one taskbar cell's accesskit `Button` node: role + a fixed
+/// `label` (the control's identity) + a dynamic `value` (its current
+/// state/reading) + bounds + the `Click` action — the SAME shape
+/// `status.rs`'s `install_segment_accessibility` / `console.rs`'s
+/// `install_row_accessibility` / `start_menu.rs`'s `install_tile_accessibility`
+/// already use, restated here for this module's own raw-painted cells.
+fn install_cell_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    rect: egui::Rect,
+) {
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label.into());
+        node.set_value(value.into());
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1935,6 +2099,19 @@ fn desktop_source_toggle(
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
     }
+    install_cell_accessibility(
+        ui.ctx(),
+        desktop_source_toggle_id(),
+        "Desktop sources",
+        if empty {
+            "No desktop sources available"
+        } else if selected {
+            "Expanded"
+        } else {
+            "Collapsed"
+        },
+        rect,
+    );
     if response_activated(ui, &resp) {
         state.desktop_sources_open = !state.desktop_sources_open;
         return true;
@@ -2063,6 +2240,17 @@ fn desktop_source_row(ui: &egui::Ui, rect: egui::Rect, source: &DesktopRailSourc
         format!("{} {}", source.node, source.protocol),
         egui::FontId::proportional((Style::SMALL - 1.0).max(8.0)),
         Style::TEXT_DIM,
+    );
+    install_cell_accessibility(
+        ui.ctx(),
+        desktop_source_row_id(source),
+        source.label.as_str(),
+        if source.connectable {
+            format!("{} {}", source.node, source.protocol)
+        } else {
+            format!("{} {} (unavailable)", source.node, source.protocol)
+        },
+        rect,
     );
     source.connectable
         && (response_activated(ui, &resp)
@@ -2341,10 +2529,20 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
         egui::FontId::proportional(Style::SMALL),
         Style::TEXT,
     );
+    // WIN7-7, lock #14 — shared by both the (out-of-scope) app picker's own
+    // context menu and the taskbar's Desktop cell's context menu
+    // (`paint_surface_context_menu`'s two call sites); fixing it here covers
+    // the taskbar-reachable one without needing a picker-specific change.
+    install_cell_accessibility(ui.ctx(), id, label, "", rect);
     response_activated(ui, &resp)
 }
 
-fn rail_more_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+fn rail_more_cell(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    state: &mut DockState,
+    hidden_count: usize,
+) -> bool {
     let resp = ui.interact(rect, rail_more_id(), egui::Sense::click());
     let active = state.rail_more_open || resp.hovered();
     if active {
@@ -2357,6 +2555,16 @@ fn rail_more_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> boo
         "⋯",
         egui::FontId::proportional(Style::BODY),
         if active { Style::TEXT } else { Style::TEXT_DIM },
+    );
+    install_cell_accessibility(
+        ui.ctx(),
+        rail_more_id(),
+        "More sessions",
+        format!(
+            "{hidden_count} more session{}",
+            if hidden_count == 1 { "" } else { "s" }
+        ),
+        rect,
     );
     if response_activated(ui, &resp) {
         state.rail_more_open = !state.rail_more_open;
@@ -3842,30 +4050,34 @@ mod tests {
         state: &mut DockState,
         events: Vec<egui::Event>,
         size: egui::Vec2,
-    ) {
-        drive_vdock_with_sources(ctx, state, events, size, &[]);
+    ) -> egui::FullOutput {
+        drive_vdock_with_sources(ctx, state, events, size, &[])
     }
 
+    /// Returns the frame's [`egui::FullOutput`] (WIN7-7: the accesskit tests
+    /// below need `platform_output.accesskit_update`, the `start_menu.rs`
+    /// `drive` precedent) — existing callers that ignore it keep compiling
+    /// unchanged (`FullOutput` isn't `#[must_use]`).
     fn drive_vdock_with_sources(
         ctx: &egui::Context,
         state: &mut DockState,
         events: Vec<egui::Event>,
         size: egui::Vec2,
         sources: &[DesktopRailSource],
-    ) {
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
             events,
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
+        ctx.run(input, |ctx| {
             // A stand-in surface beneath the dock (the background layer).
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = ui.button("surface");
             });
             let _ = dock(ctx, state);
             let _ = notification_rail_with_sources(ctx, state, sources);
-        });
+        })
     }
 
     /// Drive `frames` quiet headless frames of the vertical dock on a 1280×800
@@ -5847,6 +6059,316 @@ mod tests {
         assert!(
             !s.grades_overflow_open,
             "routing from the expander closes it"
+        );
+    }
+
+    // ── WIN7-7: dock.rs's own accesskit pass (lock #14) ─────────────────────
+    // Before this unit `dock.rs` exported NOTHING to the accessibility tree —
+    // every taskbar cell is a hand-rolled `ui.interact` widget, and only
+    // `status.rs`'s tray pips (already covered by `install_segment_accessibility`,
+    // reused unchanged from this file) had real accesskit nodes. These tests
+    // follow the SAME pattern `status.rs`/`console.rs`/`start_menu.rs` already
+    // use: enable accesskit, drive a frame, read `platform_output.accesskit_update`.
+
+    fn accesskit_nodes(
+        out: &egui::FullOutput,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone()
+    }
+
+    #[test]
+    fn win7_7_the_taskbar_itself_exports_a_toolbar_landmark() {
+        // The task's own question: does the taskbar have a sensible landmark
+        // role, not just its contents? `Role::Toolbar` is accesskit's
+        // ARIA-toolbar-equivalent — "a container grouping a set of controls."
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle (this file's own 2-frame convention)
+        let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes = accesskit_nodes(&out);
+
+        let taskbar = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Taskbar"))
+            .expect("the taskbar exports its own landmark node");
+        assert_eq!(taskbar.role(), egui::accesskit::Role::Toolbar);
+    }
+
+    #[test]
+    fn win7_7_every_primary_taskbar_cell_exports_a_labelled_button_when_sessions_are_empty() {
+        // The sessions-empty state is DockState's default — this sweep proves
+        // the whole four-part contract (Start · sessions(fallback) · tray ·
+        // clock) plus the pin and the Desktop-source caret all export real
+        // `Button` nodes, not just the tray pips `status.rs` already covered.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
+        let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes = accesskit_nodes(&out);
+
+        for label in [
+            "Start",
+            "Desktop",
+            "Sessions",
+            "Notification panel",
+            "Clock",
+            "Pin",
+            "Desktop sources",
+        ] {
+            let node = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.label() == Some(label))
+                .unwrap_or_else(|| panic!("{label} exports no accesskit node"));
+            assert_eq!(
+                node.role(),
+                egui::accesskit::Role::Button,
+                "{label}'s accesskit role"
+            );
+        }
+    }
+
+    #[test]
+    fn win7_7_a_real_session_entry_exports_its_own_labelled_button() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        // `session_entry`'s `selected` param is `state.active == Surface::Desktop`
+        // (unrelated to the `session_active` bool below, which only tints the
+        // sessions-EMPTY fallback glyph) — set it explicitly so this test
+        // actually exercises the "Active desktop session" value branch rather
+        // than silently falling through to the not-selected one.
+        s.set_active(Surface::Desktop);
+        let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            true,
+            vec![entry],
+            NodeGrades::default(),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
+        let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes = accesskit_nodes(&out);
+
+        let session = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Accounting VM RDP"))
+            .expect("the session entry exports its own accesskit node");
+        assert_eq!(session.role(), egui::accesskit::Role::Button);
+        assert_eq!(session.value(), Some("Active desktop session"));
+    }
+
+    #[test]
+    fn win7_7_the_clocks_accesskit_value_carries_the_live_time_reading() {
+        // The task's own question: does the clock announce the time in an
+        // accessible way? Its `Button` node's VALUE is the same live `HH:MM`
+        // reading its glyph paints — a screen reader can navigate to it and
+        // hear the time on demand.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
+        let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes = accesskit_nodes(&out);
+
+        let clock = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Clock"))
+            .expect("the clock exports an accesskit node");
+        assert_eq!(clock.role(), egui::accesskit::Role::Button);
+        let expected = crate::timers::hhmm(crate::timers::now_unix());
+        assert_eq!(
+            clock.value(),
+            Some(expected.as_str()),
+            "the accessible value is the SAME live clock fold the glyph paints"
+        );
+    }
+
+    #[test]
+    fn win7_7_the_pin_and_notification_toggle_report_their_state_via_accesskit_value() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
+        let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes = accesskit_nodes(&out);
+        let pin = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Pin"))
+            .expect("the pin exports an accesskit node");
+        assert_eq!(pin.value(), Some("Not pinned"));
+        let toggle = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Notification panel"))
+            .expect("the notification toggle exports an accesskit node");
+        assert_eq!(toggle.value(), Some("Collapsed"));
+
+        // Pin it, and open the notification panel — the SAME nodes must now
+        // report the opposite state, not a value frozen at first paint.
+        s.toggle_pin();
+        s.status_panel_open = true;
+        let out2 = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes2 = accesskit_nodes(&out2);
+        let pin2 = nodes2
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Pin"))
+            .expect("the pin still exports an accesskit node");
+        assert_eq!(pin2.value(), Some("Pinned"));
+        let toggle2 = nodes2
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Notification panel"))
+            .expect("the notification toggle still exports an accesskit node");
+        assert_eq!(toggle2.value(), Some("Expanded"));
+    }
+
+    #[test]
+    fn win7_7_desktop_source_rows_export_accesskit_including_an_unavailable_source() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        s.desktop_sources_open = true;
+        let sources = vec![
+            DesktopRailSource::new(
+                "peer:oak",
+                "oak",
+                "lighthouse-oak",
+                "RDP",
+                true,
+                true,
+                false,
+            ),
+            DesktopRailSource::new(
+                "peer:elm",
+                "elm",
+                "lighthouse-elm",
+                "VNC",
+                false,
+                false,
+                false,
+            ),
+        ];
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources); // settle
+        let out = drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+        let nodes = accesskit_nodes(&out);
+
+        let available = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("oak"))
+            .expect("the connectable source row exports an accesskit node");
+        assert_eq!(available.role(), egui::accesskit::Role::Button);
+        assert_eq!(available.value(), Some("lighthouse-oak RDP"));
+
+        let unavailable = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("elm"))
+            .expect("the unavailable source row still exports an accesskit node");
+        assert_eq!(
+            unavailable.value(),
+            Some("lighthouse-elm VNC (unavailable)"),
+            "an unreachable source is still named AND flagged, never silently omitted"
+        );
+    }
+
+    #[test]
+    fn win7_7_the_session_overflow_more_cell_reports_the_real_hidden_count() {
+        // The `navbar7_bottom_rail_more_popup_keeps_overflow_sessions_reachable`
+        // fixture — a narrow rail with 4 sessions — reused here to prove the
+        // More cell's accesskit value carries the REAL hidden count rather
+        // than a generic "more" with no number. That precedent only pins
+        // "the LAST entry is folded out," not the exact count (session
+        // widths clamp up to 180px each, so exactly how many of the 4 fit
+        // in a 380px-wide rail isn't hand-computable without duplicating
+        // `session_entry_width`'s own arithmetic) — so this test derives the
+        // expected count from what's ACTUALLY registered inline (the same
+        // `ctx.read_response(session_entry_id(..))` the original precedent
+        // uses to prove an entry is hidden), rather than guessing a literal.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.enable_accesskit();
+        let mut s = DockState::default();
+        s.toggle();
+        let entries = vec![
+            SessionRailEntry::with_session_id("s1", "Alpha Desktop", "RDP"),
+            SessionRailEntry::with_session_id("s2", "Bravo Desktop", "RDP"),
+            SessionRailEntry::with_session_id("s3", "Charlie Desktop", "VNC"),
+            SessionRailEntry::with_session_id("s4", "Delta Desktop", "RDP"),
+        ];
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            true,
+            entries.clone(),
+            NodeGrades::default(),
+            StatusSegments::default(),
+        );
+        let sz = egui::vec2(380.0, 720.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let nodes = accesskit_nodes(&out);
+
+        let visible = entries
+            .iter()
+            .enumerate()
+            .filter(|(idx, entry)| ctx.read_response(session_entry_id(*idx, entry)).is_some())
+            .count();
+        let hidden = entries.len() - visible;
+        assert!(
+            hidden > 0,
+            "the narrow fixture must actually force overflow"
+        );
+
+        let more = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("More sessions"))
+            .expect("the overflow cell exports an accesskit node");
+        assert_eq!(
+            more.value(),
+            Some(format!(
+                "{hidden} more session{}",
+                if hidden == 1 { "" } else { "s" }
+            ))
+            .as_deref(),
+            "the accesskit value's count must match the REAL number of \
+             sessions folded out of the inline rail"
         );
     }
 }

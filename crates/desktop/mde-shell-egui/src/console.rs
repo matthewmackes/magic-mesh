@@ -87,6 +87,14 @@
 //! unit's redesign budget went to the rail, which genuinely needed it).
 //! WIN7-7 remains the later crate-wide full accesskit sweep; this unit does
 //! not claim to close every gap, only the rows it rewrote the rendering of.
+//! **WIN7-7 update:** audited — every raw-painted `ui.interact` call site in
+//! this file (jump rows, static/Custom entry rows, the Custom remove cross,
+//! the Custom add-form's Add row, the 4 Power rows, the arming stage's
+//! Confirm/Cancel) already had its own `install_row_accessibility` call from
+//! this unit; the crate-wide sweep found no residual gap HERE and changed
+//! nothing in this file. The real gaps it closed were in `dock.rs` (the
+//! bottom taskbar had NO accesskit at all before WIN7-7) and `start_menu.rs`
+//! (the panel's own open/close transition had no live announcement).
 //!
 //! **The launch (CONSOLE-5, §6/§7):** activating a command entry opens a
 //! **named terminal tab running it** through the CONSOLE-2 `spawn_tab` seam on
