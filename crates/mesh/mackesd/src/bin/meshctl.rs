@@ -196,15 +196,47 @@ fn forward(subcommand: &str, args: &[String]) -> ExitCode {
 }
 
 fn provision(role: Option<&str>, token: &str) -> ExitCode {
-    // enroll first; pin the role afterwards if one was requested.
-    let enroll = forward("enroll", &["--token".to_string(), token.to_string()]);
-    if enroll != ExitCode::SUCCESS {
-        return enroll;
+    // DAR-19 follow-up — `mackesd enroll --token` is the legacy CSR-publish-
+    // and-poll path (NF-3.6.a): it needs the joining box already co-located
+    // on QNM-Shared over the overlay, which a genuinely fresh box never is.
+    // `mackesd join <token>` is the ONBOARD-2 network path that honors the
+    // token's `?fp=` cert-pinned `/enroll` endpoint and is the one that
+    // actually reaches a fresh, not-yet-enrolled box. Join first; pin the
+    // role afterwards if one was requested (idempotent — `join` already
+    // pinned it when unpinned, `mde_role::pin`'s same-rank rewrite is a
+    // no-op `Unchanged`).
+    let (subcommand, args) = join_forward(token, role);
+    let join = forward(subcommand, &args);
+    if join != ExitCode::SUCCESS {
+        return join;
     }
     if let Some(role) = role {
         return forward("role-pin", &[role.to_string()]);
     }
     ExitCode::SUCCESS
+}
+
+/// The `mackesd <subcommand> <args...>` invocation `provision` forwards to —
+/// factored out as pure data so the DAR-19 follow-up fix (route through the
+/// working `join` network path, never the legacy `enroll --token`
+/// CSR-publish-and-poll path) is unit-testable without spawning `mackesd`.
+///
+/// The token rides POSITIONALLY: `mackesd`'s `Cmd::Join { token: Option<String>,
+/// .. }` has no `#[arg(long)]` on `token`, so `join --token <token>` would
+/// fail to parse as the token — it must be `join <token>`. `--role` is
+/// forwarded only when the caller requested one, so an unpinned box pins
+/// straight to the requested role instead of `join`'s own `--role`
+/// default (`workstation`) — which matters when the two disagree (e.g. a
+/// requested `lighthouse`, a strictly lower rank than the `workstation`
+/// default: pinning `workstation` first would make the caller's follow-up
+/// `role-pin lighthouse` a refused downgrade).
+fn join_forward(token: &str, role: Option<&str>) -> (&'static str, Vec<String>) {
+    let mut args = vec![token.to_string()];
+    if let Some(role) = role {
+        args.push("--role".to_string());
+        args.push(role.to_string());
+    }
+    ("join", args)
 }
 
 fn install(role: &str) -> ExitCode {
@@ -498,5 +530,59 @@ mod tests {
     fn latest_verdict_is_none_without_any_verdict() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(latest_verdict(tmp.path()), None);
+    }
+
+    #[test]
+    fn join_forward_never_reproduces_the_legacy_enroll_token_call_dar19_regression() {
+        // DAR-19 follow-up live regression: `meshctl provision`/`meshctl join`
+        // used to unconditionally forward to `mackesd enroll --token <token>`
+        // — the legacy CSR-publish-and-poll path a genuinely fresh box can
+        // never complete (it isn't on the overlay yet to reach QNM-Shared).
+        // Assert the forwarded invocation never takes that shape again, with
+        // or without a requested role.
+        for role in [None, Some("server")] {
+            let (subcommand, args) = join_forward("mesh:home@1.2.3.4:4243#bearer?fp=abc", role);
+            assert_eq!(subcommand, "join", "must forward to `join`, not `enroll`");
+            assert!(
+                !args.iter().any(|a| a == "--token"),
+                "must not carry a --token flag (that's the `enroll` verb's shape): {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_forward_passes_the_token_positionally() {
+        // `Cmd::Join`'s `token` field in mackesd.rs is a bare positional (no
+        // `#[arg(long)]`) — `mackesd join --token <token>` would fail to
+        // parse. The token must be argv[0] of the forwarded args.
+        let (subcommand, args) = join_forward("mesh:home@1.2.3.4:4243#bearer?fp=abc", None);
+        assert_eq!(subcommand, "join");
+        assert_eq!(
+            args,
+            vec!["mesh:home@1.2.3.4:4243#bearer?fp=abc".to_string()]
+        );
+    }
+
+    #[test]
+    fn join_forward_forwards_the_requested_role_as_a_flag() {
+        let (_, args) = join_forward("tok", Some("lighthouse"));
+        assert_eq!(
+            args,
+            vec![
+                "tok".to_string(),
+                "--role".to_string(),
+                "lighthouse".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn join_forward_omits_role_flag_when_none_requested() {
+        // `meshctl join --token <token>` (no role) must not force a
+        // `--role` onto the forwarded `join` call — `join`'s own
+        // "workstation" default applies, matching a direct `mackesd join
+        // <token>` invocation.
+        let (_, args) = join_forward("tok", None);
+        assert!(!args.iter().any(|a| a == "--role"), "unexpected: {args:?}");
     }
 }

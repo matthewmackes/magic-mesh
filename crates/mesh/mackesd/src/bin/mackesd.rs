@@ -4690,7 +4690,7 @@ fn main() -> anyhow::Result<()> {
                 .args(["stop", "nebula.service"])
                 .status();
             println!("left the mesh: {report:#?}");
-            println!("re-join later with: mackesd enroll --token <fresh token from a lighthouse>");
+            println!("re-join later with: mackesd join '<fresh token from a lighthouse>'");
             return Ok(());
         }
         Cmd::MeshInit {
@@ -4743,7 +4743,7 @@ fn main() -> anyhow::Result<()> {
             }
             println!("bundle: {}", report.bundle_path.display());
             println!(
-                "\nfirst peer joins with:\n  mackesd enroll --token '{}'",
+                "\nfirst peer joins with:\n  mackesd join '{}'",
                 report.join_token
             );
             return Ok(());

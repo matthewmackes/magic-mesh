@@ -154,7 +154,7 @@ manager, no compositor.
         mackesd role-pin workstation        # no reinstall, §5
 
 Found the founding lighthouse:  mackesd mesh-init --mesh-id <id> --external-addr <ip>:4242
-Join an existing mesh:          mackesd enroll --token '<join token>'
+Join an existing mesh:          mackesd join '<join token>'
 HINT
 
 # W60 — firstboot single-use auto-join. An auto-join profile bakes its bearer at
@@ -172,8 +172,8 @@ ConditionPathExists=/etc/magic-mesh/join-token
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '/usr/bin/mackesd enroll --token "$(cat /etc/magic-mesh/join-token)"'
-# Erase the single-use bearer + disable the unit whether or not enroll succeeded —
+ExecStart=/bin/sh -c '/usr/bin/mackesd join "$(cat /etc/magic-mesh/join-token)"'
+# Erase the single-use bearer + disable the unit whether or not join succeeded —
 # a stale token must never sit on disk or replay.
 ExecStartPost=/bin/sh -c 'rm -f /etc/magic-mesh/join-token; systemctl disable mde-firstboot-join.service'
 RemainAfterExit=no
