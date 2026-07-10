@@ -41,7 +41,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use mde_egui::eframe::{self, App, CreationContext};
 use mde_egui::egui::{self, Context};
 
-use mde_voice_hud::sip::SipAccount;
+use mde_voice_hud::sip::{CallState, SipAccount};
 
 use crate::fleet::FleetState;
 use crate::menubar::MenuBarState;
@@ -122,6 +122,18 @@ impl VoiceApp {
     /// Send an intent to the worker (a no-op if the worker has hung up).
     fn send(&self, cmd: Command) {
         let _ = self.commands.send(cmd);
+    }
+
+    /// WIN7-4 — the current call lifecycle, the SAME `self.state.call` field
+    /// the dialer's own status row already renders via [`CallState::label`]
+    /// (no second read, no new formatting, §7). `mde-shell-egui`'s embedding
+    /// shell holds this `VoiceApp` directly and reuses this SAME `label()`
+    /// (gated on its own `Idle` → `String::new()` convention, rather than a
+    /// second `is_active()`-derived subset) for the Start Menu Voice tile's
+    /// live fact.
+    #[must_use]
+    pub const fn call_state(&self) -> &CallState {
+        &self.state.call
     }
 }
 

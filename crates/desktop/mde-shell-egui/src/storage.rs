@@ -989,6 +989,26 @@ impl StorageState {
         ctx.request_repaint_after(REFRESH);
     }
 
+    /// WIN7-4 — this seat's own local-node disk count + total free space
+    /// (MiB), folded from the SAME `self.nodes` projection [`Self::poll`]
+    /// already keeps current (the identical `state/storage/<node>` mirror
+    /// [`project`] folds; no second read, §7). Backs the Start Menu Storage
+    /// tile's live facts. `None` until this node's own mirror has landed —
+    /// which, honestly, is only once the Storage surface has been opened at
+    /// least once this session ([`Self::poll`] only runs while it's active),
+    /// matching this module's existing pre-poll-is-honestly-empty posture.
+    pub(crate) fn local_summary(&self) -> Option<(usize, u64)> {
+        let node = self.nodes.iter().find(|n| n.host == self.local_host)?;
+        let disks = node.topology.devices.len();
+        let free_mib: u64 = node
+            .topology
+            .devices
+            .iter()
+            .map(BlockDevice::free_mib)
+            .sum();
+        Some((disks, free_mib))
+    }
+
     /// Read the `state/storage/*` mirrors + the selected node's progress lane and
     /// re-project. Split from the cadence gate so the pure projection stays testable;
     /// a missing dir / unreadable topic yields an empty or last-known projection,

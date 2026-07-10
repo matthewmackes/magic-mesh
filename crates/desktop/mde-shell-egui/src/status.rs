@@ -208,7 +208,11 @@ fn latest_rollup(persist: &Persist, segment: StatusSegment) -> Option<SegmentRol
     serde_json::from_str(msg.body.as_deref()?).ok()
 }
 
-fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
+/// `pub(crate)` (not private) because WIN7-4's Start Menu System tile
+/// (`start_menu.rs`) reuses this SAME fold for its own Device/Power segment
+/// tint rather than re-deriving a second severity→colour mapping (the
+/// `dock::response_activated` cross-module-reuse idiom, restated here).
+pub(crate) fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
     match rollup.map(|r| r.severity.as_str()) {
         Some("critical" | "error" | "fatal" | "urgent") => Style::SUPPORT_ERROR,
         Some("warning" | "warn" | "high") => Style::SUPPORT_WARNING,
@@ -218,7 +222,8 @@ fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
     }
 }
 
-fn severity_label(rollup: Option<&SegmentRollup>) -> &'static str {
+/// `pub(crate)` for the SAME WIN7-4 reuse [`severity_color`] documents.
+pub(crate) fn severity_label(rollup: Option<&SegmentRollup>) -> &'static str {
     match rollup.map(|r| r.severity.as_str()) {
         Some("critical" | "error" | "fatal" | "urgent") => "critical",
         Some("warning" | "warn" | "high") => "warning",

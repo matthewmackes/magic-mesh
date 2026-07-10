@@ -80,12 +80,46 @@
 //! this unit renders. Static content only (lock #5's live-fact rotation is
 //! WIN7-4's job) — this unit leaves a [`tile_status_tint`] seam WIN7-4 can
 //! light up rather than hardcoding "never any live data."
+//!
+//! **WIN7-4 update:** the live-tile rotation itself (lock #5) — a new
+//! [`TileFactInputs`] bundle ([`StartMenuState::set_tile_inputs`], mirroring
+//! `dock.rs`'s `DockState::set_status_inputs`/`StatusInputs` idiom exactly)
+//! carries the SAME already-published per-surface state an existing dock pip
+//! or the surface's own status chip already reads (§7 honest-gating — see
+//! each field's own doc comment for its exact source); [`tile_facts`] folds
+//! it into 0-4 short per-surface strings the SAME way `dock::badge_for`
+//! folds `StatusInputs` into a badge. A tile with 2+ facts rotates through
+//! them every [`TILE_FACT_ROTATE_INTERVAL`] (lock #5's own "~4-5s per fact"
+//! estimate); 0 facts keeps the static label WIN7-3 already painted; exactly
+//! 1 fact replaces the label with that fact rather than showing both at once
+//! — the locked 48pt tile height has no pixel room for a genuine third line
+//! (verified against the real `Style` spacing tokens: the icon and label
+//! already sit ~2px apart), a judgment call flagged in this unit's own
+//! report rather than silently picked. [`tile_status_tint`] is no longer the
+//! always-`None` seam WIN7-3 left inert: it now paints a severity colour
+//! where a surface genuinely has one (System's Device/Power segment
+//! rollups, MeshView's mesh health, Chat/Files' accent-on-nonzero-count —
+//! the SAME tone language `dock.rs`'s own badges already use), `None`
+//! everywhere else (most surfaces are plain counts, not health states — no
+//! invented severity). Every rotating tile also carries a live accesskit
+//! value (lock #14) and the whole tile grid exports ONE aggregate
+//! `Live::Polite` summary node when anything is actually rotating (the
+//! `status.rs` NOTIF-11 `status_live_region_id`/`install_status_accessibility`
+//! precedent, restated here at the tile-grid level rather than per-tile —
+//! mirroring status.rs's OWN shape of one live summary node plus per-item
+//! value-bearing-but-not-individually-live nodes, not eight independent
+//! announcers all firing on the same clock).
 
+use std::time::Duration;
+
+use mde_cosmic_applet::LighthouseHealth;
 use mde_egui::egui;
 use mde_egui::{Motion, Style};
 
+use crate::chrome::MeshSummary;
 use crate::console::{self, ConsoleState};
 use crate::dock::{icon_texture, response_activated, Surface, DOCK_W};
+use crate::status::{self, StatusSegments};
 
 // ── geometry ─────────────────────────────────────────────────────────────────
 
@@ -179,6 +213,117 @@ const PANEL_H: f32 = console::PANEL_H;
 /// build.
 #[cfg(test)]
 const TILE_GRID_CONTENT_H: f32 = 7.0 * (GROUP_HEADING_H + TILE_H) + 6.0 * GROUP_GAP;
+
+// ── live-tile facts (WIN7-4, lock #5) ───────────────────────────────────────
+
+/// How often a multi-fact tile advances to its next fact (lock #5's Win8-style
+/// rotation). The design doc's own note calls this "~4-5s per fact... not
+/// surveyed precisely, pick a constant that's trivially tunable later" — a
+/// single named constant every rotating tile reads, so retuning the pace
+/// later is a one-line change here, never a per-call-site guess.
+const TILE_FACT_ROTATE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often [`start_menu_panel`] asks for a repaint while the panel is
+/// settled-open and something is rotating — finer-grained than
+/// [`TILE_FACT_ROTATE_INTERVAL`] itself so a rotation step is never more than
+/// ~1s stale, without repainting every single frame the way a continuously
+/// animated value (e.g. `explorer.rs`'s spinning status ring) would need to.
+const TILE_FACT_REPAINT_TICK: Duration = Duration::from_secs(1);
+
+/// The live inputs [`tile_facts`]/[`tile_status_tint`] fold — bundled into ONE
+/// [`StartMenuState`] field, refreshed each frame by the shell
+/// ([`StartMenuState::set_tile_inputs`]) with the SAME already-published
+/// sources an existing dock pip or the surface's own status chip already
+/// reads (§7 honest-gating — never a second/fake source of truth). Mirrors
+/// `dock.rs`'s `DockState::set_status_inputs`/`StatusInputs` idiom exactly:
+/// owned clones/copies, not references, so this struct outlives the frame's
+/// borrows of each surface. `pub(crate)` fields (not a constructor) — the
+/// `StatusSegments` idiom (`status.rs`) for a plain per-frame data bundle
+/// with no invariants to enforce, since `main.rs` builds one fresh every
+/// frame from ~14 independent surfaces (a positional constructor would be a
+/// worse-than-`StatusInputs`-length unreadable argument list).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TileFactInputs {
+    /// Chat's unread total — the SAME `self.chat.total_unread()` dock.rs's
+    /// OWN Chat badge already reads (`dock::badge_for`).
+    pub(crate) chat_unread: usize,
+    /// The host whose conversation carries the most recent message
+    /// ([`crate::chat::ChatState::most_recent_sender`]) — a different fold of
+    /// the SAME live conversation store `chat_unread` sums, not a second read.
+    pub(crate) chat_recent_sender: Option<String>,
+    /// The mesh summary — the SAME `self.chrome.summary()` dock.rs's OWN
+    /// MeshView badge already reads (`dock::badge_for`).
+    pub(crate) mesh: MeshSummary,
+    /// The daemon segment rollups — the SAME `self.notify_status.segments()`
+    /// dock.rs's own bottom rail already reads; Device/Power already route to
+    /// `Surface::System` when their pip is clicked (`StatusSegment::route`).
+    pub(crate) segments: StatusSegments,
+    /// Media's now-playing title, when a track is loaded — the SAME
+    /// `mde_media_egui::model::now_playing_title` the lock-screen curtain
+    /// already reads for its own now-playing readout.
+    pub(crate) media_title: Option<String>,
+    /// Whether Media is actively playing (vs. paused) — `self.media.is_playing()`,
+    /// the SAME accessor the curtain reads alongside `media_title`.
+    pub(crate) media_playing: bool,
+    /// Music's now-playing `(title, artist)`, when a track is loaded —
+    /// `MusicApp::now_playing()` (added this unit, mirroring
+    /// `MediaController::player()`'s established shape).
+    pub(crate) music_now_playing: Option<(String, String)>,
+    /// Voice's current call-state label, when a call is active — folded via
+    /// `mde_voice_hud::sip::CallState::label()`, the SAME formatting the
+    /// dialer's own status row already uses (`VoiceApp::call_state()`, added
+    /// this unit), gated on that method's own `Idle` → empty-string
+    /// convention rather than a second parallel "is there a call" check.
+    pub(crate) voice_call_label: Option<String>,
+    /// Files' active-transfer count — the SAME `self.files.transfers_counts().active`
+    /// dock.rs's OWN Files badge already reads.
+    pub(crate) files_active_transfers: usize,
+    /// This seat's local Storage node `(disk count, total free MiB)`, once its
+    /// mirror has landed — `StorageState::local_summary()` (added this unit),
+    /// folded from the SAME `state/storage/<node>` projection the Storage
+    /// surface's own panel already renders.
+    pub(crate) storage_local: Option<(usize, u64)>,
+    /// Bookmarks' live item total — `Manager::total()` (already `pub`,
+    /// already Bus-fed via `state/bookmarks/collection`; simply never called
+    /// from the shell chrome before this unit).
+    pub(crate) bookmarks_total: usize,
+    /// Phones' `(paired, online)` device counts —
+    /// `PhonesHubState::device_counts()` (added this unit), folded from the
+    /// SAME roster `action/connect/devices` reply the Phones panel itself
+    /// already renders per-device.
+    pub(crate) phones: (usize, usize),
+    /// Whether a mesh-status snapshot has been seen at all — gates
+    /// `workbench_peer_count`/`workbench_leader` the same way every other
+    /// pre-poll-honest field in this bundle gates on its own "seen" bit.
+    pub(crate) workbench_seen: bool,
+    /// The mesh peer count Workbench's OWN status-chip cluster already shows
+    /// — `ControllerState::peer_count()`.
+    pub(crate) workbench_peer_count: usize,
+    /// The mesh leader, when one is elected — `ControllerState::leader()`,
+    /// the SAME source `workbench_peer_count` reads.
+    pub(crate) workbench_leader: Option<String>,
+    /// The Desktop Chooser's discovered-source count — the SAME
+    /// `ChooserState::source_count()` Desktop's own status chip already
+    /// shows ("No desktop" / "N sources").
+    pub(crate) desktop_sources: usize,
+    /// The pending/active Desktop session's `(name, protocol)`, when one
+    /// exists — `VdiState::requested_summary()`, the SAME source Desktop's
+    /// own status chip already shows for the "connecting…" state.
+    pub(crate) desktop_session: Option<(String, &'static str)>,
+    /// Infra as Code's `(total, healthy)` cataloged-service counts, once a
+    /// catalog has landed — `InfraCodeState::service_summary()` (added this
+    /// unit), folded from the SAME outcome the Overview's own status chips
+    /// already read.
+    pub(crate) infra_services: Option<(usize, usize)>,
+    /// The Browser's open-tab count — `WebState::tab_count()` (added this
+    /// unit), the SAME `tabs.len()` the accessibility summary already folds.
+    pub(crate) browser_tabs: usize,
+    /// The Terminal's open-tab count, when the surface has a live terminal —
+    /// `TerminalSurface::tab_count()` (added this unit), the SAME already-`pub`
+    /// `TabbedTerminal::tab_count()` the standalone binary's own tab strip
+    /// already calls.
+    pub(crate) terminal_tabs: Option<usize>,
+}
 
 // ── tile groups (lock #8: function-based grouping) ──────────────────────────
 
@@ -291,12 +436,28 @@ pub struct StartMenuState {
     /// "go to this surface, close the menu" outcome as an embedded Console
     /// row, just raised from the OTHER pane's data.
     tile_activation: Option<Surface>,
+    /// WIN7-4 — the live-tile fact sources, mirrored in each frame by the
+    /// shell ([`Self::set_tile_inputs`], the `DockState::set_status_inputs`
+    /// idiom) so [`start_menu_panel`]'s `(ctx, state, console)` signature
+    /// stays put. Defaults to the honest pre-poll-empty bundle — every field
+    /// gates on its own "seen"/`Option` bit, so a not-yet-refreshed bundle
+    /// renders every tile at its plain static label, never a fake rotation.
+    tile_inputs: TileFactInputs,
 }
 
 impl StartMenuState {
     /// Whether the panel is up.
     pub(crate) const fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// WIN7-4 — refresh the live-tile fact inputs for this frame (the
+    /// `DockState::set_status_inputs` idiom): `main.rs` calls this each frame
+    /// before [`start_menu_panel`] with the SAME already-published sources an
+    /// existing dock pip or the surface's own status chip already reads (§7 —
+    /// see [`TileFactInputs`]'s own field docs for each source).
+    pub(crate) fn set_tile_inputs(&mut self, inputs: TileFactInputs) {
+        self.tile_inputs = inputs;
     }
 
     /// Toggle the panel open/closed — the Start-cell click and the Super-tap
@@ -391,7 +552,7 @@ pub fn start_menu_panel(
             // panel at once (lock #23), the same "activation closes the
             // menu" outcome the embedded Console pane's self-closure below
             // already gives its own rows.
-            if let Some(surface) = left_pane(ui, left_rect) {
+            if let Some(surface) = left_pane(ui, left_rect, &state.tile_inputs) {
                 state.tile_activation = Some(surface);
                 state.close();
             }
@@ -420,6 +581,15 @@ pub fn start_menu_panel(
     if t > 0.001 && t < 0.999 {
         ctx.request_repaint();
     }
+    // WIN7-4 — once settled open, keep a coarser heartbeat alive so a
+    // rotating tile's next fact actually paints without waiting on incidental
+    // input (a mouse move, another animation) to trigger the next frame. Only
+    // while open: a closed-but-not-yet-unmounted panel (t between the slide's
+    // endpoints on the way down) is already covered by the tween repaint
+    // above, and there is nothing to rotate once fully closed.
+    if state.open && t >= 0.999 {
+        ctx.request_repaint_after(TILE_FACT_REPAINT_TICK);
+    }
 }
 
 /// The panel's outer chrome: the solid SURFACE sheet, the outer hairline, and
@@ -443,20 +613,22 @@ fn paint_frame(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
-/// The left pane (WIN7-3, locks #6/#7/#8): [`TILE_GROUPS`]' 7 headed
-/// sections, each a row of uniform [`TILE_W`]×[`TILE_H`] tiles in
+/// The left pane (WIN7-3, locks #6/#7/#8; WIN7-4, lock #5): [`TILE_GROUPS`]'
+/// 7 headed sections, each a row of uniform [`TILE_W`]×[`TILE_H`] tiles in
 /// [`Surface::ALL`] order. Returns the clicked tile's surface, if any, for
 /// the caller to route + close the whole panel with (lock #23 — a single
 /// click activates, mirroring the embedded Console pane's own
-/// click-routes-and-closes behaviour). Static content only: WIN7-4 is what
-/// makes a tile's face rotate through a few live facts (lock #5); this unit
-/// leaves that as one pluggable seam ([`tile_status_tint`]) rather than
-/// hardcoding "never any live data."
+/// click-routes-and-closes behaviour). Reads the ONE frame clock
+/// (`ui.input(|i| i.time)`) once and threads it to every tile, so every
+/// rotating tile in the grid advances in lockstep off the SAME clock rather
+/// than each reading its own slightly-different sample.
 #[allow(
     clippy::cast_precision_loss, // row/col indices are tiny (< TILE_COLUMNS)
     clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
 )]
-fn left_pane(ui: &egui::Ui, rect: egui::Rect) -> Option<Surface> {
+fn left_pane(ui: &egui::Ui, rect: egui::Rect, inputs: &TileFactInputs) -> Option<Surface> {
+    let time_secs = ui.input(|i| i.time);
+    install_tiles_live_summary(ui.ctx(), rect, inputs, time_secs);
     let mut activated = None;
     let x0 = rect.left() + PANE_PAD;
     let mut y = rect.top() + PANE_PAD;
@@ -478,7 +650,9 @@ fn left_pane(ui: &egui::Ui, rect: egui::Rect) -> Option<Surface> {
                 ),
                 egui::vec2(TILE_W, TILE_H),
             );
-            if tile(ui, surface, tile_rect) {
+            let facts = tile_facts(surface, inputs);
+            let tint = tile_status_tint(surface, inputs);
+            if tile(ui, surface, tile_rect, &facts, tint, time_secs) {
                 activated = Some(surface);
             }
         }
@@ -504,19 +678,29 @@ fn tile_group_heading(ui: &egui::Ui, rect: egui::Rect, label: &str) {
     );
 }
 
-/// One live tile (WIN7-3, locks #6/#8/#23): a uniform [`TILE_W`]×[`TILE_H`]
-/// cell wearing the surface's existing picker glyph (`Surface::icon_id`, the
-/// SAME [`icon_texture`] loader + the SAME 24px [`TILE_ICON`] size the app
-/// picker's own cells use) over its new tile label (`Surface::label`). A
-/// hover brightens both the fill and the tint — the same two-tone contract
-/// the app picker's own cells already use (§4, one hover language, not a
-/// second one invented here). A click (or Enter/Space while focused —
-/// [`response_activated`], reused verbatim rather than reimplemented)
-/// returns `true` so [`left_pane`] can route + close the whole panel (lock
-/// #23). Exports its own accesskit `Button` node (lock #14, WIN7-3's own
-/// per-tile parity, not WIN7-7's later full sweep) —
-/// [`install_tile_accessibility`].
-fn tile(ui: &egui::Ui, surface: Surface, rect: egui::Rect) -> bool {
+/// One live tile (WIN7-3, locks #6/#8/#23; WIN7-4, lock #5): a uniform
+/// [`TILE_W`]×[`TILE_H`] cell wearing the surface's existing picker glyph
+/// (`Surface::icon_id`, the SAME [`icon_texture`] loader + the SAME 24px
+/// [`TILE_ICON`] size the app picker's own cells use) over its label slot,
+/// which now shows [`tile_display_text`]'s fold of `facts` instead of always
+/// `Surface::label()` (WIN7-3's own static behaviour, still exactly what
+/// renders when `facts` is empty). A hover brightens both the fill and the
+/// tint — the same two-tone contract the app picker's own cells already use
+/// (§4, one hover language, not a second one invented here). A click (or
+/// Enter/Space while focused — [`response_activated`], reused verbatim
+/// rather than reimplemented) returns `true` so [`left_pane`] can route +
+/// close the whole panel (lock #23). Exports its own accesskit `Button` node
+/// (lock #14) carrying the CURRENT display text as its value — not
+/// individually `Live::Polite` (see [`install_tile_accessibility`]'s own doc
+/// for why); [`install_tiles_live_summary`] is the grid's one live announcer.
+fn tile(
+    ui: &egui::Ui,
+    surface: Surface,
+    rect: egui::Rect,
+    facts: &[String],
+    status_tint: Option<egui::Color32>,
+    time_secs: f64,
+) -> bool {
     let resp = ui.interact(rect, tile_id(surface), egui::Sense::click());
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
@@ -539,11 +723,10 @@ fn tile(ui: &egui::Ui, surface: Surface, rect: egui::Rect) -> bool {
         painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
     }
 
-    // The WIN7-4 seam (§7 honest-gating): a status-colour dot if this
-    // surface's already-published state has one for free. Always `None`
-    // today — see `tile_status_tint`'s own doc for why this unit leaves it
-    // wired-but-inert rather than half-plumbing a live source.
-    if let Some(color) = tile_status_tint(surface) {
+    // WIN7-4 — a severity-colour dot where this surface genuinely has one
+    // ([`tile_status_tint`]'s own doc names which surfaces + why); `None`
+    // paints nothing, never an invented colour (§7).
+    if let Some(color) = status_tint {
         painter.circle_filled(
             egui::pos2(
                 rect.right() - Style::SP_XS - TILE_STATUS_DOT_R,
@@ -554,18 +737,22 @@ fn tile(ui: &egui::Ui, surface: Surface, rect: egui::Rect) -> bool {
         );
     }
 
-    // The label — bottom-centred, clipped to the tile so a long name (e.g.
-    // "Infra as Code") trims cleanly at the tile edge instead of spilling
-    // into its neighbour.
+    // The label slot (WIN7-4): the static label with no live fact yet, the
+    // one fact itself when there is exactly one (replacing, not stacking —
+    // the module doc's pixel-budget note), or the current rotation step
+    // among 2+ facts (lock #5). Bottom-centred, clipped to the tile so a long
+    // string trims cleanly at the tile edge instead of spilling into its
+    // neighbour (unchanged WIN7-3 behaviour).
+    let display_text = tile_display_text(surface, facts, time_secs);
     painter.with_clip_rect(rect).text(
         egui::pos2(rect.center().x, rect.bottom() - Style::SP_XS),
         egui::Align2::CENTER_BOTTOM,
-        surface.label(),
+        display_text,
         egui::FontId::proportional(Style::SMALL),
         tint,
     );
 
-    install_tile_accessibility(ui.ctx(), surface, rect);
+    install_tile_accessibility(ui.ctx(), surface, rect, display_text);
     response_activated(ui, &resp)
 }
 
@@ -576,19 +763,293 @@ fn tile_id(surface: Surface) -> egui::Id {
     egui::Id::new(("start-menu-tile", surface))
 }
 
-/// The seam WIN7-4 (design lock #5's rotating live-tile content) hooks its
-/// per-surface "tile fact" source into: a status-colour dot when the SAME
-/// already-published state the dock's own picker badges
-/// (`dock::badge_for`) read has one for this surface (§7 honest-gating —
-/// never invented data). This unit ships the seam wired but inert (`None`
-/// for every surface) rather than reading real state here: doing that for
-/// real would mean threading `StatusInputs`/`DockState` into
-/// [`start_menu_panel`]'s own signature for a single static dot, when
-/// WIN7-4 has to build that live-fact plumbing "for real" anyway (the design
-/// doc's own "a new thin per-surface tile fact trait/source" note) — better
-/// built once, together, than half-wired twice.
-const fn tile_status_tint(_surface: Surface) -> Option<egui::Color32> {
-    None
+/// Fold [`TileFactInputs`] into `surface`'s rotating live facts (WIN7-4,
+/// lock #5) — the SAME "read already-published state, fold to a short
+/// display string" idiom [`crate::dock::badge_for`] already uses per-surface
+/// for the picker's own badges, mirrored here rather than reinvented. Every
+/// arm reads a [`TileFactInputs`] field folded from the SAME source an
+/// existing dock pip / status indicator / the surface's own already-shown
+/// status chip already reads (§7 honest-gating — see each field's own doc
+/// comment on [`TileFactInputs`] for its exact source). Surfaces with no
+/// genuinely live fact anywhere in the codebase today (Editor, About —
+/// verified, not assumed: Editor has no aggregate open/dirty count anywhere,
+/// About is 100% compile-time build info) fall to the empty `Vec` —
+/// [`tile_display_text`] then shows the plain static label, never a
+/// fabricated rotation. Zero counts/absent data are honest silence (the
+/// `dock.rs` "zero paints no badge" convention, restated per-fact here) —
+/// e.g. Files shows nothing while idle, not "0 transferring".
+#[allow(clippy::too_many_lines)] // one match arm per Surface::ALL variant (17), same shape as badge_for
+fn tile_facts(surface: Surface, inputs: &TileFactInputs) -> Vec<String> {
+    match surface {
+        Surface::Chat => {
+            let mut facts = Vec::new();
+            if inputs.chat_unread > 0 {
+                facts.push(format!("{} unread", inputs.chat_unread));
+            }
+            if let Some(host) = &inputs.chat_recent_sender {
+                facts.push(format!("Latest: {host}"));
+            }
+            facts
+        }
+        Surface::MeshView => {
+            let mut facts = Vec::new();
+            if inputs.mesh.seen && inputs.mesh.peers_total > 0 {
+                facts.push(format!(
+                    "{}/{} peers online",
+                    inputs.mesh.peers_online, inputs.mesh.peers_total
+                ));
+            }
+            if inputs.mesh.seen {
+                facts.push(mesh_health_label(inputs.mesh.health).to_string());
+            }
+            facts
+        }
+        Surface::System => {
+            let mut facts = Vec::new();
+            if let Some(r) = &inputs.segments.device {
+                facts.push(format!("Device: {}", r.summary));
+            }
+            if let Some(r) = &inputs.segments.power {
+                facts.push(format!("Power: {}", r.summary));
+            }
+            facts
+        }
+        Surface::Media => inputs.media_title.as_ref().map_or_else(Vec::new, |title| {
+            vec![
+                title.clone(),
+                if inputs.media_playing {
+                    "Playing".to_string()
+                } else {
+                    "Paused".to_string()
+                },
+            ]
+        }),
+        Surface::Music => match &inputs.music_now_playing {
+            Some((title, artist)) if !artist.is_empty() => {
+                vec![title.clone(), format!("by {artist}")]
+            }
+            Some((title, _)) => vec![title.clone()],
+            None => Vec::new(),
+        },
+        Surface::Voice => inputs.voice_call_label.clone().into_iter().collect(),
+        Surface::Files => {
+            if inputs.files_active_transfers > 0 {
+                vec![format!("{} transferring", inputs.files_active_transfers)]
+            } else {
+                Vec::new()
+            }
+        }
+        Surface::Storage => inputs
+            .storage_local
+            .map_or_else(Vec::new, |(disks, free_mib)| {
+                vec![
+                    format!("{disks} disk{}", plural_suffix(disks)),
+                    format!("{} GiB free", free_mib / 1024),
+                ]
+            }),
+        Surface::Bookmarks => {
+            if inputs.bookmarks_total > 0 {
+                vec![format!("{} bookmarks", inputs.bookmarks_total)]
+            } else {
+                Vec::new()
+            }
+        }
+        Surface::Phones => {
+            let (paired, online) = inputs.phones;
+            if paired > 0 {
+                vec![format!("{paired} paired"), format!("{online} online")]
+            } else {
+                Vec::new()
+            }
+        }
+        Surface::Workbench => {
+            if !inputs.workbench_seen {
+                return Vec::new();
+            }
+            vec![
+                format!(
+                    "{} peer{}",
+                    inputs.workbench_peer_count,
+                    plural_suffix(inputs.workbench_peer_count)
+                ),
+                inputs
+                    .workbench_leader
+                    .as_ref()
+                    .map_or_else(|| "no leader".to_string(), |l| format!("leader {l}")),
+            ]
+        }
+        Surface::Desktop => {
+            let mut facts = Vec::new();
+            if let Some((name, protocol)) = &inputs.desktop_session {
+                facts.push(format!("{name} · {protocol}"));
+            }
+            if inputs.desktop_sources > 0 {
+                facts.push(format!(
+                    "{} source{}",
+                    inputs.desktop_sources,
+                    plural_suffix(inputs.desktop_sources)
+                ));
+            }
+            facts
+        }
+        Surface::InfraCode => inputs
+            .infra_services
+            .map_or_else(Vec::new, |(total, healthy)| {
+                vec![
+                    format!("{total} service{}", plural_suffix(total)),
+                    format!("{healthy} healthy"),
+                ]
+            }),
+        Surface::Browser => {
+            if inputs.browser_tabs > 0 {
+                vec![format!("{} tabs", inputs.browser_tabs)]
+            } else {
+                Vec::new()
+            }
+        }
+        Surface::Terminal => inputs
+            .terminal_tabs
+            .filter(|&n| n > 0)
+            .map_or_else(Vec::new, |n| vec![format!("{n} tabs")]),
+        // Editor / About: no genuinely live fact exists anywhere in the
+        // codebase today (verified, not assumed) — the honest static tile,
+        // matching §7 over forcing a rotation with nothing real to show.
+        Surface::Editor | Surface::About => Vec::new(),
+        // Timers deliberately sits OUTSIDE Surface::ALL/TILE_GROUPS (lock
+        // #20 — the clock strip is its ONE home, never a picker/tile
+        // entry), so this arm is never actually reached by `left_pane`'s
+        // render loop; it exists only because `Surface`'s match must be
+        // exhaustive over every variant, not just the tileable ones.
+        Surface::Timers => Vec::new(),
+    }
+}
+
+/// `""` for 1, `"s"` otherwise — the tiny pluralization helper every
+/// count-shaped [`tile_facts`] arm above shares (mirrors the identical
+/// inline ternary `dock.rs`'s own count badges already repeat per call site;
+/// named once here instead of restating the ternary N times).
+fn plural_suffix(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Short label for a mesh health reading (WIN7-4's System/MeshView tile
+/// facts) — the SAME [`LighthouseHealth`] `dock::badge_for`'s own System
+/// arm already folds into a badge, worded for a tile's label slot instead of
+/// a bare dot.
+const fn mesh_health_label(health: LighthouseHealth) -> &'static str {
+    match health {
+        LighthouseHealth::AllHealthy => "Mesh healthy",
+        LighthouseHealth::Degraded => "Mesh degraded",
+        LighthouseHealth::None => "Mesh offline",
+    }
+}
+
+/// Tone colour for a mesh health reading — the SAME `Style::SUPPORT_*` tones
+/// `dock.rs`'s own `badge_tone_color` uses for its `BadgeTone::Healthy /
+/// Degraded / Offline` (that helper + its `BadgeTone` enum are private to
+/// dock.rs; restating this trivial 3-arm enum→constant-colour mapping here
+/// is not a second *source of truth* — no data is re-derived, only a fixed
+/// presentation colour is chosen per already-folded [`LighthouseHealth`]
+/// variant).
+const fn mesh_health_color(health: LighthouseHealth) -> egui::Color32 {
+    match health {
+        LighthouseHealth::AllHealthy => Style::SUPPORT_SUCCESS,
+        LighthouseHealth::Degraded => Style::SUPPORT_WARNING,
+        LighthouseHealth::None => Style::SUPPORT_ERROR,
+    }
+}
+
+/// Rank a segment rollup's severity for a worst-of comparison (System's tile
+/// tint below, [`tile_status_tint`]) — folds [`status::severity_label`]'s
+/// own 5-bucket vocabulary (the SAME fold `status.rs`'s segment pips already
+/// use) into an ordinal so "critical" outranks "warning" outranks
+/// "ok"/"info" outranks "no reading yet".
+fn severity_rank(rollup: Option<&status::SegmentRollup>) -> u8 {
+    match status::severity_label(rollup) {
+        "critical" => 4,
+        "warning" => 3,
+        "ok" => 2,
+        "info" => 1,
+        _ => 0,
+    }
+}
+
+/// The seam WIN7-4 (design lock #5's rotating live-tile content) lights up —
+/// a severity-colour dot where a surface genuinely HAS a severity/health
+/// concept (System's Device/Power segment rollups, MeshView's mesh health,
+/// Chat/Files' accent-on-nonzero-count, the SAME tone language `dock.rs`'s
+/// own badges already use for the identical surfaces/data), `None`
+/// everywhere else — most of the 17 surfaces are plain counts with no
+/// health concept at all, and painting a tint for those would be an
+/// invented severity, not a reused one (§7). `None` is also the honest
+/// "nothing has landed yet" answer (pre-poll / never-visited-this-session),
+/// matching [`tile_facts`]'s own zero-is-silence posture.
+fn tile_status_tint(surface: Surface, inputs: &TileFactInputs) -> Option<egui::Color32> {
+    match surface {
+        Surface::System => {
+            let device = inputs.segments.device.as_ref();
+            let power = inputs.segments.power.as_ref();
+            if device.is_none() && power.is_none() {
+                return None;
+            }
+            Some(if severity_rank(device) >= severity_rank(power) {
+                status::severity_color(device)
+            } else {
+                status::severity_color(power)
+            })
+        }
+        Surface::MeshView if inputs.mesh.seen => Some(mesh_health_color(inputs.mesh.health)),
+        Surface::Chat if inputs.chat_unread > 0 => Some(Style::ACCENT),
+        Surface::Files if inputs.files_active_transfers > 0 => Some(Style::ACCENT),
+        _ => None,
+    }
+}
+
+/// Which of `len` facts should show right now, given the current frame clock
+/// (`ui.input(|i| i.time)`, seconds since the egui `Context` was created —
+/// the SAME time source `explorer.rs`'s `hero_card`/`tick_ambient` already
+/// read for their own time-driven visuals, not a new mechanism). Pure: no
+/// per-tile stored state, so [`StartMenuState`] stays the "no egui handles"
+/// pure struct its own doc comment promises — every tile derives its
+/// current step fresh from the ONE shared clock each frame, so they all
+/// advance in lockstep and the displayed value never drifts/accumulates
+/// error the way a stored "last rotated at" counter could. `len <= 1` always
+/// answers `0` (nothing to rotate between).
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "time_secs is always >= 0.0 (a monotonic clock since context creation); \
+              truncating to whole rotation ticks is the intended behaviour"
+)]
+fn rotating_fact_index(len: usize, time_secs: f64) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let tick = (time_secs / TILE_FACT_ROTATE_INTERVAL.as_secs_f64()) as u64;
+    (tick % len as u64) as usize
+}
+
+/// The text [`tile`] paints in its label slot this frame (WIN7-4): the
+/// surface's static [`Surface::label`] when `facts` is empty (unchanged
+/// WIN7-3 behaviour), the one fact when exactly one exists (replacing the
+/// label on the SAME slot — the tile's locked 48pt height has no pixel room
+/// for a genuine third line, verified against the real `Style` spacing
+/// tokens: the icon and label already sit only ~2px apart at the current
+/// geometry), or the current [`rotating_fact_index`] step among 2+ facts
+/// (lock #5). The surface's real name is never actually lost when a fact is
+/// showing instead: its accesskit `Button` node still carries
+/// `surface.label()` as `.label()` unconditionally
+/// ([`install_tile_accessibility`]) — only the VISUAL slot swaps.
+fn tile_display_text<'a>(surface: Surface, facts: &'a [String], time_secs: f64) -> &'a str {
+    match facts.len() {
+        0 => surface.label(),
+        1 => facts[0].as_str(),
+        len => facts[rotating_fact_index(len, time_secs)].as_str(),
+    }
 }
 
 /// Whether Esc should dismiss the WHOLE Start Menu this frame — inert while a
@@ -673,13 +1134,79 @@ fn tile_accesskit_id(surface: Surface) -> egui::Id {
 /// bounds, plus the `Click` action — the SAME shape `status.rs`'s
 /// `install_segment_accessibility` already uses for its own per-item pips
 /// (role + label + bounds + `add_action(Click)`), restated here since that
-/// helper is module-private there.
-fn install_tile_accessibility(ctx: &egui::Context, surface: Surface, rect: egui::Rect) {
+/// helper is module-private there. WIN7-4 adds `.set_value(display_text)` —
+/// the SAME "label stays the identity, value carries the live reading" split
+/// `install_segment_accessibility` already uses (its own `.set_value` carries
+/// the segment's current severity summary while `.set_label` stays the fixed
+/// "{Segment} status"). Deliberately NOT individually `Live::Polite`: a
+/// screen reader hearing every one of up to 17 tiles announce itself on the
+/// same rotation clock would be a spam regression, not an accessibility win
+/// — [`install_tiles_live_summary`] is the ONE live-announcing node for the
+/// whole grid, mirroring NOTIF-11's own shape exactly (one live
+/// `status_live_region_id` summary + per-item value-bearing-but-not-live
+/// `segment_pip` nodes in `status.rs`).
+fn install_tile_accessibility(
+    ctx: &egui::Context,
+    surface: Surface,
+    rect: egui::Rect,
+    display_text: &str,
+) {
     let _ = ctx.accesskit_node_builder(tile_accesskit_id(surface), |node| {
         node.set_role(egui::accesskit::Role::Button);
         node.set_label(surface.label());
+        node.set_value(display_text);
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+/// Stable id for WIN7-4's tile-grid live region — the NOTIF-11
+/// `status_live_region_id` precedent, restated at the tile-grid level.
+fn tiles_live_region_id() -> egui::Id {
+    egui::Id::new("start-menu-tiles-live-region")
+}
+
+/// Join every ACTUALLY-rotating tile's (2+ facts) currently-shown fact into
+/// one summary string, `"{Surface label}: {current fact}"` per tile,
+/// `". "`-joined — the SAME shape `status.rs`'s `status_live_summary`
+/// already folds `StatusSegment::ALL` into. A tile with 0-1 facts never
+/// contributes (nothing to announce — it never changes on its own), so a
+/// menu with no live data anywhere yields an empty string.
+fn tiles_live_summary(inputs: &TileFactInputs, time_secs: f64) -> String {
+    let mut parts = Vec::new();
+    for surface in Surface::ALL {
+        let facts = tile_facts(surface, inputs);
+        if facts.len() >= 2 {
+            let text = &facts[rotating_fact_index(facts.len(), time_secs)];
+            parts.push(format!("{}: {text}", surface.label()));
+        }
+    }
+    parts.join(". ")
+}
+
+/// Install the tile grid's ONE aggregate live region (lock #14's rotating-
+/// content requirement, the NOTIF-11 `install_status_accessibility`
+/// precedent restated at the tile-grid level rather than per-tile — see
+/// [`install_tile_accessibility`]'s doc for why per-tile `Live::Polite` was
+/// rejected). Installs NO node at all when nothing is currently rotating
+/// (an empty summary) — a menu with no live data anywhere exports no live
+/// region, rather than one that politely announces silence.
+fn install_tiles_live_summary(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    inputs: &TileFactInputs,
+    time_secs: f64,
+) {
+    let summary = tiles_live_summary(inputs, time_secs);
+    if summary.is_empty() {
+        return;
+    }
+    let _ = ctx.accesskit_node_builder(tiles_live_region_id(), |node| {
+        node.set_role(egui::accesskit::Role::Status);
+        node.set_live(egui::accesskit::Live::Polite);
+        node.set_label("Start Menu live tiles");
+        node.set_value(summary);
+        node.set_bounds(accesskit_rect(rect));
     });
 }
 
@@ -688,6 +1215,7 @@ mod tests {
     use super::{start_menu_panel, StartMenuState, DOCK_W, PANEL_H, PANEL_W};
     use crate::console::{self, ConsoleState};
     use crate::dock::Surface;
+    use crate::status::{SegmentRollup, StatusSegments};
     use mde_egui::egui;
     use mde_egui::Style;
 
@@ -792,6 +1320,23 @@ mod tests {
             .expect("accesskit update")
             .nodes
             .clone()
+    }
+
+    /// A minimal real [`crate::status::SegmentRollup`] at a given severity —
+    /// every field but `severity` is a placeholder, mirroring `status.rs`'s
+    /// own private `rollup()` test helper (not reusable across modules) for
+    /// the fields WIN7-4's tint fold ([`super::severity_rank`]/
+    /// `status::severity_color`) actually reads.
+    fn segment_rollup(severity: &str) -> SegmentRollup {
+        SegmentRollup {
+            segment: "device".to_string(),
+            severity: severity.to_string(),
+            source: "test".to_string(),
+            summary: "test summary".to_string(),
+            host: "test-host".to_string(),
+            critical_policy: String::new(),
+            ts_unix_ms: 0,
+        }
     }
 
     // ── open/close (lock #13: Super tap + Start-cell click, both) ───────────
@@ -1171,5 +1716,338 @@ mod tests {
                 "{surface:?} tile's accesskit role"
             );
         }
+    }
+
+    // ── WIN7-4: live-tile rotation (lock #5) ─────────────────────────────────
+
+    #[test]
+    fn a_surface_with_two_real_facts_reports_both_for_rotation() {
+        // Chat: total_unread() + most_recent_sender() are BOTH real,
+        // already-wired sources (dock.rs's own Chat badge; chat.rs's own
+        // conversation store) — the len()>=2 rotating case lock #5 asks for,
+        // and lock #5's own literal example ("Chat cycles recent senders").
+        let inputs = super::TileFactInputs {
+            chat_unread: 3,
+            chat_recent_sender: Some("eagle".to_string()),
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Chat, &inputs),
+            vec!["3 unread".to_string(), "Latest: eagle".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_surface_with_exactly_one_real_fact_shows_it_without_rotating() {
+        // Bookmarks: Manager::total() is real + already-Bus-fed, but there is
+        // only ONE genuine fact to show — it must not rotate against itself.
+        let inputs = super::TileFactInputs {
+            bookmarks_total: 42,
+            ..super::TileFactInputs::default()
+        };
+        let facts = super::tile_facts(Surface::Bookmarks, &inputs);
+        assert_eq!(facts, vec!["42 bookmarks".to_string()]);
+        for t in [0.0, 5.0, 50.0, 500.0] {
+            assert_eq!(
+                super::tile_display_text(Surface::Bookmarks, &facts, t),
+                "42 bookmarks",
+                "a single fact never advances, at any point on the clock"
+            );
+        }
+    }
+
+    #[test]
+    fn a_currently_zero_count_shows_no_fact_not_a_fake_zero() {
+        // Files idle (no active transfers): "zero is meaningful silence" —
+        // the SAME convention dock.rs's own Files badge already follows
+        // (`badge_for`'s `Surface::Files if transfer_active_count > 0` gate) —
+        // restated per-fact here, never a painted "0 transferring".
+        let idle = super::TileFactInputs {
+            files_active_transfers: 0,
+            ..super::TileFactInputs::default()
+        };
+        assert!(super::tile_facts(Surface::Files, &idle).is_empty());
+        let busy = super::TileFactInputs {
+            files_active_transfers: 2,
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Files, &busy),
+            vec!["2 transferring".to_string()]
+        );
+    }
+
+    #[test]
+    fn surfaces_verified_to_have_no_live_fact_anywhere_never_rotate() {
+        // About (100% compile-time build info) and Editor (no aggregate
+        // open/dirty count exists anywhere in mde-editor-egui) — verified by
+        // this unit's own investigation, not assumed. Even a fully-defaulted
+        // bundle must never invent a fact for either: `tile_facts` never
+        // reads a single `inputs` field for these two arms, so any input
+        // (default or otherwise) yields the same honest empty answer.
+        let inputs = super::TileFactInputs::default();
+        assert!(super::tile_facts(Surface::About, &inputs).is_empty());
+        assert!(super::tile_facts(Surface::Editor, &inputs).is_empty());
+        assert_eq!(
+            super::tile_display_text(Surface::About, &[], 0.0),
+            Surface::About.label(),
+            "0 facts paints the plain static label — unchanged WIN7-3 behaviour"
+        );
+    }
+
+    #[test]
+    fn tile_facts_covers_a_spread_of_the_other_wired_surfaces() {
+        // A spot-check across the remaining source shapes (tuple/Option
+        // fields, the cross-crate Music/Voice accessors) so a wiring mistake
+        // in any one surface's match arm doesn't hide behind only testing
+        // Chat/Bookmarks/Files above.
+        let storage = super::TileFactInputs {
+            storage_local: Some((2, 10240)),
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Storage, &storage),
+            vec!["2 disks".to_string(), "10 GiB free".to_string()]
+        );
+        assert!(super::tile_facts(Surface::Storage, &super::TileFactInputs::default()).is_empty());
+
+        let media = super::TileFactInputs {
+            media_title: Some("Some Track".to_string()),
+            media_playing: true,
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Media, &media),
+            vec!["Some Track".to_string(), "Playing".to_string()]
+        );
+        assert!(super::tile_facts(Surface::Media, &super::TileFactInputs::default()).is_empty());
+
+        let music = super::TileFactInputs {
+            music_now_playing: Some(("A Song".to_string(), "An Artist".to_string())),
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Music, &music),
+            vec!["A Song".to_string(), "by An Artist".to_string()]
+        );
+
+        let voice = super::TileFactInputs {
+            voice_call_label: Some("In call · bob".to_string()),
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Voice, &voice),
+            vec!["In call · bob".to_string()]
+        );
+        assert!(super::tile_facts(Surface::Voice, &super::TileFactInputs::default()).is_empty());
+
+        let workbench = super::TileFactInputs {
+            workbench_seen: true,
+            workbench_peer_count: 4,
+            workbench_leader: Some("sfo3".to_string()),
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Workbench, &workbench),
+            vec!["4 peers".to_string(), "leader sfo3".to_string()]
+        );
+
+        let browser = super::TileFactInputs {
+            browser_tabs: 5,
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_facts(Surface::Browser, &browser),
+            vec!["5 tabs".to_string()]
+        );
+
+        let terminal_absent = super::TileFactInputs {
+            terminal_tabs: None,
+            ..super::TileFactInputs::default()
+        };
+        assert!(
+            super::tile_facts(Surface::Terminal, &terminal_absent).is_empty(),
+            "no live terminal (the first PTY was refused) shows no fact"
+        );
+    }
+
+    #[test]
+    fn rotating_fact_index_advances_every_locked_interval_and_wraps() {
+        let interval = super::TILE_FACT_ROTATE_INTERVAL.as_secs_f64();
+        assert_eq!(super::rotating_fact_index(3, 0.0), 0);
+        assert_eq!(super::rotating_fact_index(3, interval - 0.01), 0);
+        assert_eq!(super::rotating_fact_index(3, interval), 1);
+        assert_eq!(super::rotating_fact_index(3, interval * 2.0), 2);
+        assert_eq!(
+            super::rotating_fact_index(3, interval * 3.0),
+            0,
+            "wraps back to the first fact after a full cycle"
+        );
+    }
+
+    #[test]
+    fn rotating_fact_index_never_advances_a_0_or_1_fact_list() {
+        for t in [0.0, 1.0, 100.0, 1000.0] {
+            assert_eq!(super::rotating_fact_index(0, t), 0);
+            assert_eq!(super::rotating_fact_index(1, t), 0);
+        }
+    }
+
+    #[test]
+    fn tile_display_text_rotates_through_2plus_facts_on_the_locked_interval() {
+        let facts = vec!["3 unread".to_string(), "Latest: eagle".to_string()];
+        let interval = super::TILE_FACT_ROTATE_INTERVAL.as_secs_f64();
+        assert_eq!(
+            super::tile_display_text(Surface::Chat, &facts, 0.0),
+            "3 unread"
+        );
+        assert_eq!(
+            super::tile_display_text(Surface::Chat, &facts, interval),
+            "Latest: eagle"
+        );
+        assert_eq!(
+            super::tile_display_text(Surface::Chat, &facts, interval * 2.0),
+            "3 unread",
+            "wraps back to the first fact"
+        );
+    }
+
+    #[test]
+    fn tile_status_tint_paints_severity_where_meaningful_and_nothing_elsewhere() {
+        // System: the worse of Device/Power segment severity wins the tile's
+        // tint — the SAME `Style::SUPPORT_*` tone `status.rs`'s own segment
+        // pips already use for the identical rollups.
+        let system = super::TileFactInputs {
+            segments: StatusSegments {
+                device: Some(segment_rollup("warning")),
+                power: Some(segment_rollup("critical")),
+                seen: true,
+                ..StatusSegments::default()
+            },
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_status_tint(Surface::System, &system),
+            Some(Style::SUPPORT_ERROR),
+            "critical Power outranks warning Device"
+        );
+        assert_eq!(
+            super::tile_status_tint(Surface::System, &super::TileFactInputs::default()),
+            None,
+            "no segment has landed yet — the honest pre-poll answer"
+        );
+
+        // Chat/Files: an accent dot exactly when their count badge would
+        // paint one (`dock.rs`'s own `paint_count_badge` tone), `None` when
+        // quiet — never an invented severity for a plain count.
+        let chat_unread = super::TileFactInputs {
+            chat_unread: 1,
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_status_tint(Surface::Chat, &chat_unread),
+            Some(Style::ACCENT)
+        );
+        assert_eq!(
+            super::tile_status_tint(Surface::Chat, &super::TileFactInputs::default()),
+            None
+        );
+
+        // A plain count-only surface (no health/severity concept at all)
+        // never gets a tint, no matter how large the count.
+        let bookmarks = super::TileFactInputs {
+            bookmarks_total: 999,
+            ..super::TileFactInputs::default()
+        };
+        assert_eq!(
+            super::tile_status_tint(Surface::Bookmarks, &bookmarks),
+            None
+        );
+    }
+
+    // ── WIN7-4: accesskit live-region (lock #14) ─────────────────────────────
+
+    #[test]
+    fn the_tile_grid_exports_one_live_polite_summary_while_a_tile_is_rotating() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        s.set_tile_inputs(super::TileFactInputs {
+            chat_unread: 3,
+            chat_recent_sender: Some("eagle".to_string()),
+            ..super::TileFactInputs::default()
+        });
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+
+        let live = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Start Menu live tiles"))
+            .expect("a live region exports once a tile is rotating");
+        assert_eq!(live.role(), egui::accesskit::Role::Status);
+        assert_eq!(live.live(), Some(egui::accesskit::Live::Polite));
+        let value = live.value().expect("live summary value");
+        assert!(
+            value.contains("Chat: "),
+            "names the rotating surface: {value}"
+        );
+    }
+
+    #[test]
+    fn the_tile_grid_exports_no_live_region_when_nothing_is_rotating() {
+        // The default bundle: every surface has 0-1 facts, so nothing is
+        // ACTUALLY rotating — an honest silence, not a live region that
+        // politely announces nothing.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Start Menu live tiles")),
+            "no live-data bundle was ever set — no live region should export"
+        );
+    }
+
+    #[test]
+    fn a_tiles_accesskit_node_carries_its_current_display_text_as_its_value() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        s.set_tile_inputs(super::TileFactInputs {
+            bookmarks_total: 42,
+            ..super::TileFactInputs::default()
+        });
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+
+        let bookmarks = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some(Surface::Bookmarks.label()))
+            .expect("Bookmarks tile node");
+        assert_eq!(bookmarks.value(), Some("42 bookmarks"));
+
+        // A tile with genuinely no live fact still carries its static label
+        // as BOTH its accesskit label and value (never a blank/omitted
+        // value) — unchanged content, just also mirrored into `.value()`.
+        let about = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some(Surface::About.label()))
+            .expect("About tile node");
+        assert_eq!(about.value(), Some(Surface::About.label()));
     }
 }

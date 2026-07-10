@@ -1191,6 +1191,14 @@ impl WebState {
         self.tabs.get_mut(self.active)
     }
 
+    /// WIN7-4 — the open-tab count, the SAME `self.tabs` length
+    /// [`browser_accessibility_summary`] already folds into its "Active tab X
+    /// of N" string (no second read, §7). Backs the Start Menu Browser
+    /// tile's live fact.
+    pub(crate) fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
     #[cfg(test)]
     fn with_transfers(mut self, transfers: Box<dyn TransfersClient>) -> Self {
         self.transfers = transfers;

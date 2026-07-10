@@ -70,6 +70,18 @@ impl TerminalSurface {
             .as_mut()
             .is_ok_and(|term| term.spawn_tab(name, argv))
     }
+
+    /// WIN7-4 — the open-tab count, the SAME already-`pub`
+    /// [`TabbedTerminal::tab_count`] the standalone binary's own tab strip
+    /// already calls (no second read, §7). `None` when the surface has no
+    /// live terminal (the first PTY was refused — matching
+    /// [`Self::spawn_tab`]'s own honest-absence shape). `mde-shell-egui`
+    /// holds this `TerminalSurface` directly and reuses it for the Start
+    /// Menu Terminal tile's live fact.
+    #[must_use]
+    pub fn tab_count(&self) -> Option<usize> {
+        self.term.as_ref().ok().map(TabbedTerminal::tab_count)
+    }
 }
 
 /// Build the production [`TerminalSurface`] over a real local login shell.

@@ -1311,6 +1311,46 @@ impl Shell {
         if toggled {
             self.start_menu.toggle();
         }
+        // WIN7-4 — refresh the live-tile fact inputs before the panel renders
+        // (the `set_status_inputs`/`mount_dock_chrome` idiom): every field
+        // below reads the SAME already-published accessor an existing dock
+        // pip / the surface's own status chip already reads (§7 — see
+        // `TileFactInputs`'s own field docs for each exact source), cloned/
+        // copied out now so `start_menu::start_menu_panel` needs no extra
+        // parameters of its own.
+        let media_loaded = self.media.player().media().is_some();
+        self.start_menu.set_tile_inputs(start_menu::TileFactInputs {
+            chat_unread: self.chat.total_unread(),
+            chat_recent_sender: self.chat.most_recent_sender().map(str::to_owned),
+            mesh: self.chrome.summary().clone(),
+            segments: self.notify_status.segments().clone(),
+            media_title: media_loaded
+                .then(|| mde_media_egui::model::now_playing_title(self.media.player())),
+            media_playing: media_loaded && self.media.is_playing(),
+            music_now_playing: self
+                .music
+                .now_playing()
+                .map(|song| (song.title.clone(), song.artist.clone())),
+            voice_call_label: {
+                let label = self.voice.call_state().label();
+                (!label.is_empty()).then_some(label)
+            },
+            files_active_transfers: self.files.transfers_counts().active,
+            storage_local: self.storage.local_summary(),
+            bookmarks_total: self.bookmarks.total(),
+            phones: self.phones_hub.device_counts(),
+            workbench_seen: self.controller.seen(),
+            workbench_peer_count: self.controller.peer_count(),
+            workbench_leader: self.controller.leader().map(str::to_owned),
+            desktop_sources: self.chooser.source_count(),
+            desktop_session: self
+                .vdi
+                .requested_summary()
+                .map(|(name, protocol)| (name.to_owned(), protocol)),
+            infra_services: self.infra_code.service_summary(),
+            browser_tabs: self.web.tab_count(),
+            terminal_tabs: self.terminal.tab_count(),
+        });
         start_menu::start_menu_panel(ctx, &mut self.start_menu, &mut self.console);
         match self.console.take_request() {
             Some(console::ConsoleRequest::Goto(surface)) => {

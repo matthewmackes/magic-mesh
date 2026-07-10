@@ -310,6 +310,18 @@ impl Default for PhonesHubState {
 }
 
 impl PhonesHubState {
+    /// WIN7-4 — `(paired, online)` device counts, folded from the SAME
+    /// `self.devices` roster [`Self::poll`] already keeps current (the
+    /// identical `action/connect/devices` reply fold; no second read, §7).
+    /// Backs the Start Menu Phones tile's live facts. `(0, 0)` until the
+    /// roster has landed — which, honestly, is only once this surface has
+    /// been opened at least once this session (the Chat/Storage/`IaC` tail
+    /// idiom [`Self::poll`]'s own doc comment names).
+    pub(crate) fn device_counts(&self) -> (usize, usize) {
+        let online = self.devices.iter().filter(|d| d.online).count();
+        (self.devices.len(), online)
+    }
+
     /// Poll the Bus + the substrate on the shared cadence — the shell calls this each
     /// frame while the surface is in view (the Chat/Storage/`IaC` tail idiom). Resolves
     /// any in-flight reply, then refreshes the roster + directory when due. No

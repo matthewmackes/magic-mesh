@@ -86,6 +86,18 @@ impl MusicApp {
         }
     }
 
+    /// WIN7-4 — the currently loaded track, the SAME `self.state.now_playing`
+    /// field [`Self::menu_context`] already reads for its own transport
+    /// status cluster (no second read, §7). `mde-shell-egui`'s embedding
+    /// shell holds this `MusicApp` directly (the `mde-media-egui`
+    /// `MediaController::player` precedent — a thin, already-established
+    /// read-only accessor shape, not a new one invented here) and reuses it
+    /// for the Start Menu Music tile's live facts.
+    #[must_use]
+    pub fn now_playing(&self) -> Option<&Song> {
+        self.state.now_playing.as_ref()
+    }
+
     /// Snapshot the surface into the [`MenuContext`] the shared menu bar renders
     /// from (the read half of a frame) — its connection health, the transport
     /// state, whether an album is open, and the now-playing readout. The elapsed

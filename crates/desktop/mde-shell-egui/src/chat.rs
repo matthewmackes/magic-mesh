@@ -537,6 +537,21 @@ impl ChatState {
         contacts + rooms
     }
 
+    /// WIN7-4 — the host whose 1:1 contact timeline carries the most recent
+    /// message, across every contact's already-loaded merged DM+alert ring
+    /// (`self.convos` — the SAME live store [`Self::total_unread`] sums, just a
+    /// different fold of the identical already-loaded state; no second read,
+    /// no new Bus subscription, §7). Backs the Start Menu Chat tile's "recent
+    /// sender" live fact (design lock #5's own example). `None` on a quiet
+    /// mesh with no contact conversation yet (the honest empty state).
+    pub(crate) fn most_recent_sender(&self) -> Option<&str> {
+        self.convos
+            .iter()
+            .filter_map(|(host, conv)| conv.latest().map(|msg| (host.as_str(), msg.ts_unix_ms)))
+            .max_by_key(|&(_, ts)| ts)
+            .map(|(host, _)| host)
+    }
+
     /// Render the ICQ surface: the roster rail on the left, the selected
     /// contact's conversation pane filling the rest.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {

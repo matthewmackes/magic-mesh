@@ -466,6 +466,20 @@ impl Default for InfraCodeState {
 }
 
 impl InfraCodeState {
+    /// WIN7-4 — `(total, healthy)` cataloged-service counts, folded from the
+    /// SAME `self.outcome` [`Self::poll`] already keeps current (the
+    /// identical `get-catalog` reply fold `build_status`'s own status chips
+    /// read; no second read, §7). Backs the Start Menu Infra as Code tile's
+    /// live facts. `None` while `Querying`/`NotConfigured`/`Failed` — the
+    /// honest "nothing to count yet" state, matching this module's own
+    /// Overview render.
+    pub(crate) fn service_summary(&self) -> Option<(usize, usize)> {
+        let CatalogOutcome::Ready(view) = &self.outcome else {
+            return None;
+        };
+        Some((view.catalog.services.len(), view.healthy_count()))
+    }
+
     /// Poll the Bus for the catalog on the shared cadence + keep the repaint
     /// heartbeat alive — the shell calls this each frame while the surface is in
     /// view (the Chat / Storage tail idiom). Resolves any in-flight reply, then
