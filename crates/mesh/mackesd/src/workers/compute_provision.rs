@@ -28,7 +28,9 @@
 //! 7. **virt-install** — with `--filesystem` + `--memorybacking
 //!    access.mode=shared` when `share_meshfs` AND `/mnt/mesh-storage`
 //!    is mounted (lock 3). When asked but unmounted: create WITHOUT
-//!    the share + flag `meshfs_skipped` (lock 4).
+//!    the share + flag `meshfs_skipped` (lock 4). Every VM also gets a
+//!    `--sound model=virtio` + `--audio id=1,type=pipewire` device
+//!    (E12-9 local audio, unconditional — see `build_virt_install_args`).
 //! 8. **Reply** on `compute/create-ack/<request-ulid>` with
 //!    `{vm_id, nebula_ip, meshfs_skipped?}` or `{error}`.
 //! 9. **Immediate inventory publish** via
@@ -326,7 +328,10 @@ pub fn build_cloud_init_user_data(
 /// Build the `virt-install` argument vector (lock 2 + lock 3). The
 /// precise flag set is HW-bench-tunable (VIRT-12); this assembles a
 /// coherent baseline: name, memory, vcpus, the pool-backed qcow2
-/// disk, optional install ISO, default NAT NIC, generic os-variant,
+/// disk, optional install ISO, default NAT NIC, generic os-variant, a
+/// virtio sound device + QEMU's native PipeWire audiodev (E12-9 local
+/// audio — mirrors `vm_lifecycle.rs::build_domain_xml`'s device on the
+/// other create path, see `docs/design/e12-9-10-libvirt-rescope.md`),
 /// the NoCloud seed, and — when `attach_meshfs` — the libvirt-managed
 /// virtiofs filesystem + shared memory backing it requires.
 #[must_use]
@@ -358,6 +363,17 @@ pub fn build_virt_install_args(
         "detect=on,name=generic".into(),
         "--graphics".into(),
         "spice".into(),
+        // E12-9 local audio (Option A — docs/design/e12-9-10-libvirt-rescope.md):
+        // every mesh-desktop-flow VM gets the same local-audio device the
+        // Datacenter-UI-flow's build_domain_xml gives its VMs. Minimal
+        // `--audio` suboptions only (`id`+`type`) — virt-install's exact
+        // supported per-backend suboption set (e.g. a `streamName`
+        // equivalent) isn't confirmed, so this stays the honest minimal
+        // flag rather than guessing at unverified syntax.
+        "--sound".into(),
+        "model=virtio".into(),
+        "--audio".into(),
+        "id=1,type=pipewire".into(),
         "--noautoconsole".into(),
     ];
     if let Some(iso) = &req.iso_path {
@@ -1105,6 +1121,38 @@ mod tests {
         // No meshfs flags when not attaching.
         assert!(!args.contains(&"--filesystem".to_string()));
         assert!(!args.contains(&"--memorybacking".to_string()));
+        // E12-9: local PipeWire audio is unconditional (asserted precisely in
+        // virt_install_args_always_include_pipewire_audio_device below).
+        assert!(args.contains(&"--sound".to_string()));
+        assert!(args.contains(&"--audio".to_string()));
+    }
+
+    #[test]
+    fn virt_install_args_always_include_pipewire_audio_device() {
+        // E12-9 (docs/design/e12-9-10-libvirt-rescope.md): every VM this path
+        // creates gets local PipeWire audio, same as the Datacenter-UI-flow's
+        // build_domain_xml — both create paths need it independently (no
+        // shared XML/argv builder exists between them yet).
+        let req = sample_req(false, None);
+        let args = build_virt_install_args(
+            &req,
+            "vm-01",
+            "/var/lib/mde-vms/vm-01.qcow2",
+            "/tmp/ud",
+            "/tmp/md",
+            false,
+            "/mnt/mesh-storage",
+        );
+        assert!(args.contains(&"--sound".to_string()));
+        assert!(args.contains(&"model=virtio".to_string()));
+        assert!(args.contains(&"--audio".to_string()));
+        assert!(args.contains(&"id=1,type=pipewire".to_string()));
+        // --sound immediately precedes its model= value, same shape as every
+        // other flag/value pair this builder emits.
+        let sound_pos = args.iter().position(|a| a == "--sound").expect("--sound");
+        assert_eq!(args[sound_pos + 1], "model=virtio");
+        let audio_pos = args.iter().position(|a| a == "--audio").expect("--audio");
+        assert_eq!(args[audio_pos + 1], "id=1,type=pipewire");
     }
 
     #[test]

@@ -39,16 +39,34 @@
 //! (graceful `virsh shutdown` or `force` `virsh destroy`), **pause/resume**
 //! (`virsh suspend`/`virsh resume` — the CHOOSER-7 card power controls drive
 //! these to suspend/wake a running console), **destroy** (force-off then
-//! `virsh undefine`, optional `--remove-all-storage`), **list**, **info**, and
-//! the default dir storage-pool + default NAT-network ensure helpers.
+//! `virsh undefine`, optional `--remove-all-storage`), **list**, **info**, the
+//! default dir storage-pool + default NAT-network ensure helpers, **local
+//! PipeWire audio** (E12-9: every domain gets `<sound model='virtio'/>` +
+//! `<audio type='pipewire'>`, see [`build_domain_xml`]), **static USB
+//! passthrough** (E12-10: [`LifecycleAction::AttachUsb`] /
+//! [`DetachUsb`](LifecycleAction::DetachUsb), `virsh
+//! attach-device`/`detach-device --live` against a standalone `<hostdev
+//! type='usb'>` fragment), and **VFIO/PCI passthrough XML construction**
+//! (E12-10: [`VmSpec::pci_passthrough`] / [`build_pci_hostdev_xml`] — pure XML
+//! only; see that function's doc comment for why the live IOMMU/hardware
+//! runtime path isn't validated here).
 //!
 //! Deferred (intentionally NOT stubbed with `todo!()` — each rides an existing or
-//! future worker): live/cold **migration** (VIRT-8 `compute_migrate`),
-//! **snapshots** (DATACENTER-12 `dc_snap_scheduler`), vCPU/RAM
+//! future worker, or is explicitly hardware/live-gated per
+//! `docs/design/e12-9-10-libvirt-rescope.md`): live/cold **migration** (VIRT-8
+//! `compute_migrate`), **snapshots** (DATACENTER-12 `dc_snap_scheduler`), vCPU/RAM
 //! hotplug, cloud-init **identity seeding** (VIRT-6 `compute_provision`, the
 //! desktop/mesh-peer create path), console/VNC brokering (E12 egui VDI), UEFI
-//! nvram cleanup on undefine, and richer per-VM telemetry (VIRT-1
-//! `compute_registry` already publishes cpu/ram/disk to `compute/inventory`).
+//! nvram cleanup on undefine, richer per-VM telemetry (VIRT-1
+//! `compute_registry` already publishes cpu/ram/disk to `compute/inventory`),
+//! **dynamic SPICE `usbredir`** (the click-to-redirect UX — needs upstream
+//! `spice-client` protocol work the pinned crate doesn't implement),
+//! the **VFIO live/IOMMU-hardware runtime demo** (this project's farm
+//! build-VM slots run nested atop Xen dom0s, and no inventoried physical seat
+//! has a confirmed second GPU / IOMMU state — mirrors the pre-existing
+//! DATACENTER-22 finding on the old Xen stack), and **remote audio** (RDP
+//! RDPSND is WON'T-DO per `docs/NEEDS-OPERATOR.md`; a SPICE playback channel
+//! is a separate future slice, same `spice-client` wall as usbredir).
 
 #![cfg(feature = "async-services")]
 
@@ -115,6 +133,14 @@ pub struct VmSpec {
     /// libvirt network the guest NIC attaches to. `None` ⇒ [`DEFAULT_NETWORK`].
     #[serde(default)]
     pub network: Option<String>,
+    /// VFIO/GPU PCI passthrough devices (E12-10) — empty by default, so an
+    /// unconfigured VM's domain XML is unchanged. **Pure domain-XML
+    /// construction only** — see [`build_pci_hostdev_xml`]'s doc comment for
+    /// why the live IOMMU/hardware runtime path isn't validated by this
+    /// project's environment today
+    /// (`docs/design/e12-9-10-libvirt-rescope.md`).
+    #[serde(default)]
+    pub pci_passthrough: Vec<PciAddress>,
 }
 
 impl VmSpec {
@@ -123,6 +149,22 @@ impl VmSpec {
     pub fn network_or_default(&self) -> &str {
         self.network.as_deref().unwrap_or(DEFAULT_NETWORK)
     }
+}
+
+/// A PCI host device address for [`VmSpec::pci_passthrough`] (E12-10 VFIO).
+/// Each field is the raw, `0x`-prefixed hex string libvirt's `<address>`
+/// element expects — e.g. `lspci -D`'s `0000:01:00.0` splits into
+/// `domain="0x0000"`, `bus="0x01"`, `slot="0x00"`, `function="0x0"`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PciAddress {
+    /// PCI domain, e.g. `"0x0000"`.
+    pub domain: String,
+    /// PCI bus, e.g. `"0x01"`.
+    pub bus: String,
+    /// PCI slot (device), e.g. `"0x00"`.
+    pub slot: String,
+    /// PCI function, e.g. `"0x0"`.
+    pub function: String,
 }
 
 /// One lifecycle command drained off [`ACTION_TOPIC`]. Internally tagged by `op`
@@ -184,6 +226,36 @@ pub enum LifecycleAction {
         #[serde(default)]
         remove_storage: bool,
     },
+    /// Hot-attach a USB host device into a running VM (E12-10 static
+    /// passthrough) — `virsh attach-device --live` against a standalone
+    /// `<hostdev type='usb'>` fragment addressed by vendor/product id.
+    /// Requires the VM to be running (mirrors `Pause`'s own precondition
+    /// shape — there's no live QEMU process to hotplug into otherwise).
+    AttachUsb {
+        /// Target node id.
+        host: String,
+        /// Domain name.
+        name: String,
+        /// USB vendor id, e.g. `"0x0781"`.
+        vendor: String,
+        /// USB product id, e.g. `"0x5567"`.
+        product: String,
+    },
+    /// Hot-detach a previously attached USB host device — `virsh
+    /// detach-device --live` against the same `<hostdev>` shape
+    /// [`AttachUsb`](Self::AttachUsb) used (libvirt matches the device to
+    /// remove by its description, so vendor/product must match the original
+    /// attach).
+    DetachUsb {
+        /// Target node id.
+        host: String,
+        /// Domain name.
+        name: String,
+        /// USB vendor id, e.g. `"0x0781"`.
+        vendor: String,
+        /// USB product id, e.g. `"0x5567"`.
+        product: String,
+    },
     /// No-op lifecycle change — just asks the target to re-publish its roster
     /// (the operator's "refresh" button). The `list` verb of the first slice.
     Refresh {
@@ -203,6 +275,8 @@ impl LifecycleAction {
             | Self::Pause { host, .. }
             | Self::Resume { host, .. }
             | Self::Destroy { host, .. }
+            | Self::AttachUsb { host, .. }
+            | Self::DetachUsb { host, .. }
             | Self::Refresh { host } => host,
         }
     }
@@ -332,6 +406,10 @@ pub enum LifecycleOp {
     Resume,
     /// Remove a domain.
     Destroy,
+    /// Hot-attach a USB host device (E12-10 static passthrough).
+    AttachUsb,
+    /// Hot-detach a previously attached USB host device.
+    DetachUsb,
 }
 
 /// The intended outcome of a valid transition.
@@ -349,6 +427,11 @@ pub enum Transition {
     Resumed,
     /// Removed.
     Removed,
+    /// A USB host device was hot-attached (E12-10). The VM's coarse power
+    /// state is unchanged.
+    UsbAttached,
+    /// A previously attached USB host device was hot-detached.
+    UsbDetached,
 }
 
 /// A rejected transition — the precondition the current state failed.
@@ -430,6 +513,26 @@ pub fn plan_transition(
 
         (LifecycleOp::Destroy, None) => Err(TransitionError::NotFound),
         (LifecycleOp::Destroy, Some(_)) => Ok(Transition::Removed),
+
+        // E12-10 static USB passthrough: hot-attach/detach only act on a
+        // running domain — there's no live QEMU process to hotplug into
+        // otherwise. A shut-off VM reads as the same "not running" refusal
+        // Stop already uses; any other transient state is generically invalid.
+        (LifecycleOp::AttachUsb, None) => Err(TransitionError::NotFound),
+        (LifecycleOp::AttachUsb, Some(VmState::Running)) => Ok(Transition::UsbAttached),
+        (LifecycleOp::AttachUsb, Some(VmState::ShutOff)) => Err(TransitionError::NotRunning),
+        (LifecycleOp::AttachUsb, Some(state)) => Err(TransitionError::Invalid {
+            op: LifecycleOp::AttachUsb,
+            state,
+        }),
+
+        (LifecycleOp::DetachUsb, None) => Err(TransitionError::NotFound),
+        (LifecycleOp::DetachUsb, Some(VmState::Running)) => Ok(Transition::UsbDetached),
+        (LifecycleOp::DetachUsb, Some(VmState::ShutOff)) => Err(TransitionError::NotRunning),
+        (LifecycleOp::DetachUsb, Some(state)) => Err(TransitionError::Invalid {
+            op: LifecycleOp::DetachUsb,
+            state,
+        }),
     }
 }
 
@@ -500,6 +603,31 @@ pub fn build_undefine_argv(name: &str, remove_storage: bool) -> Vec<String> {
         a.push("--remove-all-storage".into());
     }
     a
+}
+
+/// `virsh attach-device <name> <xml_path> --live` — hot-attach a device
+/// described by the XML at `xml_path` into a running domain (E12-10 static
+/// USB passthrough).
+#[must_use]
+pub fn build_attach_device_argv(name: &str, xml_path: &str) -> Vec<String> {
+    vec![
+        "attach-device".into(),
+        name.into(),
+        xml_path.into(),
+        "--live".into(),
+    ]
+}
+
+/// `virsh detach-device <name> <xml_path> --live` — hot-detach a previously
+/// attached device described by the XML at `xml_path`.
+#[must_use]
+pub fn build_detach_device_argv(name: &str, xml_path: &str) -> Vec<String> {
+    vec![
+        "detach-device".into(),
+        name.into(),
+        xml_path.into(),
+        "--live".into(),
+    ]
 }
 
 /// `virsh pool-list --all --name` (one pool name per line).
@@ -585,15 +713,90 @@ pub fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Build a standalone `<hostdev>` USB-passthrough device-XML fragment,
+/// addressed by USB vendor/product id — the payload `virsh
+/// attach-device`/`detach-device --live` consumes for E12-10's static USB
+/// passthrough (admin-selected device, hot-attached). The dynamic SPICE
+/// `usbredir` click-to-redirect UX is a separate, deferred mechanism — see
+/// `docs/design/e12-9-10-libvirt-rescope.md`.
+#[must_use]
+pub fn build_usb_hostdev_xml(vendor: &str, product: &str) -> String {
+    format!(
+        "<hostdev mode='subsystem' type='usb'>\n\
+         \x20 <source>\n\
+         \x20   <vendor id='{vendor}'/>\n\
+         \x20   <product id='{product}'/>\n\
+         \x20 </source>\n\
+         </hostdev>\n",
+        vendor = xml_escape(vendor),
+        product = xml_escape(product),
+    )
+}
+
+/// Build a standalone `<hostdev>` PCI-passthrough (VFIO) device-XML fragment
+/// for one [`PciAddress`] — `managed='yes'` so libvirt handles the
+/// detach-from-host/attach-to-guest/reset cycle around the guest's lifetime.
+///
+/// E12-10 VFIO: **pure, unit-tested XML construction only.** This project's
+/// farm build-VM slots run nested atop Xen dom0s (no realistic IOMMU
+/// passthrough there), and no inventoried physical seat has a confirmed
+/// second GPU or checked IOMMU/VT-d BIOS state — so the live runtime path is
+/// explicitly NOT validated by this function or its tests. This mirrors the
+/// pre-existing DATACENTER-22 finding on the old Xen/`xen-pciback` stack
+/// (`install-helpers/setup-workstation-passthrough.sh`, stays `[!]`
+/// hardware-gated) — same wall, new hypervisor. See
+/// `docs/design/e12-9-10-libvirt-rescope.md`'s VFIO §Open question.
+#[must_use]
+pub fn build_pci_hostdev_xml(addr: &PciAddress) -> String {
+    format!(
+        "<hostdev mode='subsystem' type='pci' managed='yes'>\n\
+         \x20 <source>\n\
+         \x20   <address domain='{domain}' bus='{bus}' slot='{slot}' function='{function}'/>\n\
+         \x20 </source>\n\
+         </hostdev>\n",
+        domain = xml_escape(&addr.domain),
+        bus = xml_escape(&addr.bus),
+        slot = xml_escape(&addr.slot),
+        function = xml_escape(&addr.function),
+    )
+}
+
 /// Build the libvirt domain XML `virsh define` consumes for `spec`, with
 /// `disk_path` as the backing qcow2. A coherent, minimal q35/KVM baseline:
 /// host-passthrough CPU, a virtio disk + NIC, a serial console, the qemu
-/// guest-agent channel, spice graphics (localhost-listen), and virtio
-/// video/balloon. The device set is deliberately conservative for the first
-/// slice — richer knobs (UEFI/OVMF firmware, virtiofs, TPM, USB redirection)
-/// are follow-ons.
+/// guest-agent channel, spice graphics (localhost-listen), virtio
+/// video/balloon, local PipeWire audio (E12-9: `<sound>` + `<audio
+/// type='pipewire'>` — every VM gets this, see the module docs), and any
+/// VFIO/PCI passthrough devices from `spec.pci_passthrough` (E12-10 — pure
+/// XML only, see [`build_pci_hostdev_xml`]). Richer knobs (UEFI/OVMF
+/// firmware, virtiofs, TPM) remain follow-ons; static USB passthrough is a
+/// separate hot-attach op ([`LifecycleAction::AttachUsb`]), not part of the
+/// initial device set.
+///
+/// **On the mixer tag (E12-9, deliberately NOT wired here):** the `<output>`'s
+/// `streamName='vm-{name}'` is the doc-recommended connecting tissue toward
+/// `mde-seat/src/mixer.rs`'s `mde.vm.name`-keyed `classify_origin` (the
+/// already-shipped E12-16 mixer's VM-origin classifier). It is intentionally
+/// **not** wired end-to-end in this slice: which `pw-dump` JSON property
+/// libvirt's `streamName` actually lands under is unverified (needs a real
+/// running VM this environment can't spin up), and `mackesd` has no existing
+/// PipeWire seam/dependency to add a post-hoc stamping step blind (that would
+/// be new, cross-cutting, unverified integration work, not a small delta —
+/// see `docs/design/e12-9-10-libvirt-rescope.md`'s "one open verification
+/// step"). Guessing either the prop mapping or the stamping mechanism here
+/// would be exactly the kind of unverified claim this project's honest-gating
+/// convention avoids.
 #[must_use]
 pub fn build_domain_xml(spec: &VmSpec, disk_path: &str) -> String {
+    // E12-10 VFIO: each configured PCI passthrough device becomes its own
+    // <hostdev> stanza. Empty by default (`VmSpec::pci_passthrough` defaults
+    // to `vec![]`), so an unconfigured VM's XML is byte-for-byte unchanged.
+    let pci_hostdevs: String = spec
+        .pci_passthrough
+        .iter()
+        .map(build_pci_hostdev_xml)
+        .collect();
+
     format!(
         "<domain type='kvm'>\n\
          \x20 <name>{name}</name>\n\
@@ -634,6 +837,11 @@ pub fn build_domain_xml(spec: &VmSpec, disk_path: &str) -> String {
          \x20     <model type='virtio'/>\n\
          \x20   </video>\n\
          \x20   <memballoon model='virtio'/>\n\
+         \x20   <sound model='virtio'/>\n\
+         \x20   <audio id='1' type='pipewire'>\n\
+         \x20     <output name='mde-vms' streamName='vm-{name}' latency='40'/>\n\
+         \x20   </audio>\n\
+         {pci_hostdevs}\
          \x20 </devices>\n\
          </domain>\n",
         name = xml_escape(&spec.name),
@@ -641,6 +849,7 @@ pub fn build_domain_xml(spec: &VmSpec, disk_path: &str) -> String {
         vcpus = spec.vcpus,
         disk = xml_escape(disk_path),
         net = xml_escape(spec.network_or_default()),
+        pci_hostdevs = pci_hostdevs,
     )
 }
 
@@ -817,6 +1026,20 @@ pub trait LibvirtBackend {
     /// error on an already-off VM is tolerated).
     fn destroy(&self, name: &str, remove_storage: bool) -> Result<(), LibvirtError>;
 
+    /// Hot-attach a USB host device (by vendor/product id) into a running
+    /// domain (E12-10 static passthrough; `virsh attach-device --live`).
+    ///
+    /// # Errors
+    /// Spawn / non-zero virsh / disk failures (writing the device XML).
+    fn attach_usb(&self, name: &str, vendor: &str, product: &str) -> Result<(), LibvirtError>;
+
+    /// Hot-detach a previously attached USB host device (`virsh
+    /// detach-device --live`).
+    ///
+    /// # Errors
+    /// Spawn / non-zero virsh / disk failures (writing the device XML).
+    fn detach_usb(&self, name: &str, vendor: &str, product: &str) -> Result<(), LibvirtError>;
+
     /// The node's VM roster (`virsh list --all`).
     ///
     /// # Errors
@@ -896,6 +1119,30 @@ impl VirshCli {
     fn virsh_status(&self, args: &[String]) -> Result<(), LibvirtError> {
         let _ = self;
         Self::run_status("virsh", args)
+    }
+
+    /// Write `device_xml` to a temp file and run `virsh attach-device`
+    /// (`attach`) or `detach-device` (`!attach`) `--live` against `name`,
+    /// cleaning up the temp file regardless of outcome. Shared by the E12-10
+    /// USB hostdev attach/detach calls — mirrors [`Self::create`]'s
+    /// XML-to-tempfile pattern for `virsh define`.
+    fn device_xml_action(
+        &self,
+        name: &str,
+        device_xml: &str,
+        attach: bool,
+    ) -> Result<(), LibvirtError> {
+        let xml_path = std::env::temp_dir().join(format!("mde-vm-{name}-dev.xml"));
+        std::fs::write(&xml_path, device_xml.as_bytes())
+            .map_err(|e| LibvirtError::Disk(format!("write device xml: {e}")))?;
+        let argv = if attach {
+            build_attach_device_argv(name, &xml_path.to_string_lossy())
+        } else {
+            build_detach_device_argv(name, &xml_path.to_string_lossy())
+        };
+        let res = self.virsh_status(&argv);
+        let _ = std::fs::remove_file(&xml_path);
+        res
     }
 }
 
@@ -987,6 +1234,14 @@ impl LibvirtBackend for VirshCli {
         self.virsh_status(&build_undefine_argv(name, remove_storage))
     }
 
+    fn attach_usb(&self, name: &str, vendor: &str, product: &str) -> Result<(), LibvirtError> {
+        self.device_xml_action(name, &build_usb_hostdev_xml(vendor, product), true)
+    }
+
+    fn detach_usb(&self, name: &str, vendor: &str, product: &str) -> Result<(), LibvirtError> {
+        self.device_xml_action(name, &build_usb_hostdev_xml(vendor, product), false)
+    }
+
     fn list(&self) -> Result<Vec<Instance>, LibvirtError> {
         let (ok, stdout, stderr) = self.virsh_output(&build_list_argv())?;
         if !ok {
@@ -1035,6 +1290,8 @@ pub fn apply_action(backend: &dyn LibvirtBackend, action: &LifecycleAction) -> R
         LifecycleAction::Pause { name, .. } => (name.as_str(), LifecycleOp::Pause),
         LifecycleAction::Resume { name, .. } => (name.as_str(), LifecycleOp::Resume),
         LifecycleAction::Destroy { name, .. } => (name.as_str(), LifecycleOp::Destroy),
+        LifecycleAction::AttachUsb { name, .. } => (name.as_str(), LifecycleOp::AttachUsb),
+        LifecycleAction::DetachUsb { name, .. } => (name.as_str(), LifecycleOp::DetachUsb),
     };
     let current = backend
         .info(name)
@@ -1061,6 +1318,22 @@ pub fn apply_action(backend: &dyn LibvirtBackend, action: &LifecycleAction) -> R
             ..
         } => backend
             .destroy(name, *remove_storage)
+            .map_err(|e| e.to_string()),
+        LifecycleAction::AttachUsb {
+            name,
+            vendor,
+            product,
+            ..
+        } => backend
+            .attach_usb(name, vendor, product)
+            .map_err(|e| e.to_string()),
+        LifecycleAction::DetachUsb {
+            name,
+            vendor,
+            product,
+            ..
+        } => backend
+            .detach_usb(name, vendor, product)
             .map_err(|e| e.to_string()),
         LifecycleAction::Refresh { .. } => Ok(()),
     }
@@ -1369,6 +1642,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_and_detach_usb_actions() {
+        let attach = parse_action(
+            r#"{"op":"attach_usb","host":"n","name":"web1","vendor":"0x0781","product":"0x5567"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            attach,
+            LifecycleAction::AttachUsb {
+                host: "n".into(),
+                name: "web1".into(),
+                vendor: "0x0781".into(),
+                product: "0x5567".into(),
+            }
+        );
+        assert!(attach.targets("n"));
+
+        let detach = parse_action(
+            r#"{"op":"detach_usb","host":"n","name":"web1","vendor":"0x0781","product":"0x5567"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detach,
+            LifecycleAction::DetachUsb {
+                host: "n".into(),
+                name: "web1".into(),
+                vendor: "0x0781".into(),
+                product: "0x5567".into(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_refresh_and_reject_malformed() {
         assert_eq!(
             parse_action(r#"{"op":"refresh","host":"n"}"#).unwrap(),
@@ -1493,6 +1798,7 @@ mod tests {
             disk_gb: 20,
             image_path: None,
             network: Some("mesh-net".into()),
+            pci_passthrough: Vec::new(),
         };
         let xml = build_domain_xml(&spec, "/var/lib/mde-vms/web1.qcow2");
         assert!(xml.starts_with("<domain type='kvm'>"));
@@ -1508,6 +1814,91 @@ mod tests {
     }
 
     #[test]
+    fn domain_xml_includes_pipewire_audio_device() {
+        // E12-9 Option A (docs/design/e12-9-10-libvirt-rescope.md): every VM
+        // gets a virtio sound card + QEMU's native PipeWire audiodev, so the
+        // domain XML always carries this — no opt-in flag.
+        let spec = VmSpec {
+            name: "web1".into(),
+            vcpus: 2,
+            ram_mb: 2048,
+            disk_gb: 20,
+            image_path: None,
+            network: None,
+            pci_passthrough: Vec::new(),
+        };
+        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/web1.qcow2");
+        assert!(xml.contains("<sound model='virtio'/>"));
+        assert!(xml.contains("<audio id='1' type='pipewire'>"));
+        // The output's streamName carries the VM name (the doc-recommended
+        // connecting tissue toward the E12-16 mixer's mde.vm.name classifier
+        // — see build_domain_xml's doc comment for why the mixer-side match
+        // isn't wired in this slice).
+        assert!(xml.contains("streamName='vm-web1'"));
+        assert!(xml.contains("</audio>"));
+        // The audio block lands inside <devices>...</devices>.
+        let devices_start = xml.find("<devices>").expect("devices open");
+        let devices_end = xml.find("</devices>").expect("devices close");
+        let audio_pos = xml.find("<audio").expect("audio present");
+        assert!(audio_pos > devices_start && audio_pos < devices_end);
+    }
+
+    #[test]
+    fn domain_xml_includes_pci_passthrough_hostdevs_when_configured() {
+        // E12-10 VFIO: pure XML construction only (see build_pci_hostdev_xml's
+        // doc comment) — an empty pci_passthrough emits none; a populated one
+        // emits one <hostdev> per configured address.
+        let spec = VmSpec {
+            name: "gpu1".into(),
+            vcpus: 8,
+            ram_mb: 16384,
+            disk_gb: 100,
+            image_path: None,
+            network: None,
+            pci_passthrough: vec![
+                PciAddress {
+                    domain: "0x0000".into(),
+                    bus: "0x01".into(),
+                    slot: "0x00".into(),
+                    function: "0x0".into(),
+                },
+                PciAddress {
+                    domain: "0x0000".into(),
+                    bus: "0x01".into(),
+                    slot: "0x00".into(),
+                    function: "0x1".into(),
+                },
+            ],
+        };
+        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/gpu1.qcow2");
+        assert_eq!(
+            xml.matches("<hostdev mode='subsystem' type='pci'").count(),
+            2
+        );
+        assert!(xml.contains("function='0x0'"));
+        assert!(xml.contains("function='0x1'"));
+        let devices_start = xml.find("<devices>").expect("devices open");
+        let devices_end = xml.find("</devices>").expect("devices close");
+        let hostdev_pos = xml.find("<hostdev").expect("hostdev present");
+        assert!(hostdev_pos > devices_start && hostdev_pos < devices_end);
+    }
+
+    #[test]
+    fn domain_xml_omits_hostdev_when_pci_passthrough_is_empty() {
+        let spec = VmSpec {
+            name: "plain1".into(),
+            vcpus: 2,
+            ram_mb: 2048,
+            disk_gb: 20,
+            image_path: None,
+            network: None,
+            pci_passthrough: Vec::new(),
+        };
+        let xml = build_domain_xml(&spec, "/var/lib/mde-vms/plain1.qcow2");
+        assert!(!xml.contains("<hostdev"));
+    }
+
+    #[test]
     fn domain_xml_escapes_interpolated_values() {
         let spec = VmSpec {
             name: "a&b<c>".into(),
@@ -1516,6 +1907,7 @@ mod tests {
             disk_gb: 10,
             image_path: None,
             network: None,
+            pci_passthrough: Vec::new(),
         };
         let xml = build_domain_xml(&spec, "/p/x'y\".qcow2");
         assert!(xml.contains("<name>a&amp;b&lt;c&gt;</name>"));
@@ -1525,6 +1917,58 @@ mod tests {
         assert!(!xml.contains("a&b<c>"));
         // Absent network ⇒ the default.
         assert!(xml.contains("<source network='default'/>"));
+        // The escaped name also drives the audio streamName (E12-9).
+        assert!(xml.contains("streamName='vm-a&amp;b&lt;c&gt;'"));
+    }
+
+    // ── E12-10 hostdev XML fragments (USB + PCI) ──
+
+    #[test]
+    fn usb_hostdev_xml_carries_vendor_and_product() {
+        let xml = build_usb_hostdev_xml("0x0781", "0x5567");
+        assert!(xml.starts_with("<hostdev mode='subsystem' type='usb'>"));
+        assert!(xml.contains("<vendor id='0x0781'/>"));
+        assert!(xml.contains("<product id='0x5567'/>"));
+        assert!(xml.trim_end().ends_with("</hostdev>"));
+    }
+
+    #[test]
+    fn usb_hostdev_xml_escapes_interpolated_values() {
+        let xml = build_usb_hostdev_xml("0x0781\"", "<evil>");
+        assert!(xml.contains("&quot;"));
+        assert!(xml.contains("&lt;evil&gt;"));
+        assert!(!xml.contains("<evil>"));
+    }
+
+    #[test]
+    fn pci_hostdev_xml_carries_the_address() {
+        let addr = PciAddress {
+            domain: "0x0000".into(),
+            bus: "0x01".into(),
+            slot: "0x00".into(),
+            function: "0x0".into(),
+        };
+        let xml = build_pci_hostdev_xml(&addr);
+        assert!(xml.starts_with("<hostdev mode='subsystem' type='pci' managed='yes'>"));
+        assert!(xml.contains("domain='0x0000'"));
+        assert!(xml.contains("bus='0x01'"));
+        assert!(xml.contains("slot='0x00'"));
+        assert!(xml.contains("function='0x0'"));
+        assert!(xml.trim_end().ends_with("</hostdev>"));
+    }
+
+    // ── E12-10 attach/detach-device argv ──
+
+    #[test]
+    fn attach_detach_device_argv_shapes() {
+        assert_eq!(
+            build_attach_device_argv("web1", "/tmp/dev.xml"),
+            vec!["attach-device", "web1", "/tmp/dev.xml", "--live"]
+        );
+        assert_eq!(
+            build_detach_device_argv("web1", "/tmp/dev.xml"),
+            vec!["detach-device", "web1", "/tmp/dev.xml", "--live"]
+        );
     }
 
     // ── parsers ──
@@ -1706,6 +2150,44 @@ mod tests {
     }
 
     #[test]
+    fn plan_transition_attach_detach_usb() {
+        // Hot-attach/detach (E12-10) only act on a running domain — mirrors
+        // Stop's own "not running" refusal for a shut-off VM.
+        assert_eq!(
+            plan_transition(Some(VmState::Running), LifecycleOp::AttachUsb),
+            Ok(Transition::UsbAttached)
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::ShutOff), LifecycleOp::AttachUsb),
+            Err(TransitionError::NotRunning)
+        );
+        assert_eq!(
+            plan_transition(None, LifecycleOp::AttachUsb),
+            Err(TransitionError::NotFound)
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::Paused), LifecycleOp::AttachUsb),
+            Err(TransitionError::Invalid {
+                op: LifecycleOp::AttachUsb,
+                state: VmState::Paused,
+            })
+        );
+
+        assert_eq!(
+            plan_transition(Some(VmState::Running), LifecycleOp::DetachUsb),
+            Ok(Transition::UsbDetached)
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::ShutOff), LifecycleOp::DetachUsb),
+            Err(TransitionError::NotRunning)
+        );
+        assert_eq!(
+            plan_transition(None, LifecycleOp::DetachUsb),
+            Err(TransitionError::NotFound)
+        );
+    }
+
+    #[test]
     fn plan_transition_destroy() {
         assert_eq!(
             plan_transition(Some(VmState::Running), LifecycleOp::Destroy),
@@ -1807,6 +2289,15 @@ mod tests {
             self.domains.lock().unwrap().remove(name);
             Ok(())
         }
+        fn attach_usb(&self, name: &str, vendor: &str, product: &str) -> Result<(), LibvirtError> {
+            self.record(&format!("attach_usb:{name}:{vendor}:{product}"));
+            // Hot-attach doesn't change the domain's coarse power state.
+            Ok(())
+        }
+        fn detach_usb(&self, name: &str, vendor: &str, product: &str) -> Result<(), LibvirtError> {
+            self.record(&format!("detach_usb:{name}:{vendor}:{product}"));
+            Ok(())
+        }
         fn list(&self) -> Result<Vec<Instance>, LibvirtError> {
             Ok(self
                 .domains
@@ -1839,6 +2330,7 @@ mod tests {
                 disk_gb: 20,
                 image_path: Some("/img/base.qcow2".into()),
                 network: None,
+                pci_passthrough: Vec::new(),
             },
         }
     }
@@ -1943,6 +2435,55 @@ mod tests {
         )
         .expect_err("cannot resume a running VM");
         assert!(err.contains("not paused"), "{err}");
+    }
+
+    #[test]
+    fn apply_attach_detach_usb_lifecycle() {
+        // A running VM accepts hot-attach/detach; the backend call carries
+        // the vendor/product id through, and the VM's coarse state (unlike
+        // pause/resume) is unchanged.
+        let fake = FakeLibvirt::with_domain("web1", VmState::Running);
+        let attach = LifecycleAction::AttachUsb {
+            host: "node-a".into(),
+            name: "web1".into(),
+            vendor: "0x0781".into(),
+            product: "0x5567".into(),
+        };
+        apply_action(&fake, &attach).expect("attach ok");
+        assert_eq!(fake.state_of("web1"), Some(VmState::Running));
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|c| c == "attach_usb:web1:0x0781:0x5567"));
+
+        let detach = LifecycleAction::DetachUsb {
+            host: "node-a".into(),
+            name: "web1".into(),
+            vendor: "0x0781".into(),
+            product: "0x5567".into(),
+        };
+        apply_action(&fake, &detach).expect("detach ok");
+        assert_eq!(fake.state_of("web1"), Some(VmState::Running));
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|c| c == "detach_usb:web1:0x0781:0x5567"));
+
+        // A shut-off VM refuses hot-attach honestly (no backend call) — mirrors
+        // how Pause refuses a shut-off VM above.
+        let off = FakeLibvirt::with_domain("db1", VmState::ShutOff);
+        let err = apply_action(
+            &off,
+            &LifecycleAction::AttachUsb {
+                host: "node-a".into(),
+                name: "db1".into(),
+                vendor: "0x0781".into(),
+                product: "0x5567".into(),
+            },
+        )
+        .expect_err("cannot hot-attach to a shut-off VM");
+        assert!(err.contains("not running"), "{err}");
+        assert!(off.calls().is_empty());
     }
 
     #[test]
