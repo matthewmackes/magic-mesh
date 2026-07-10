@@ -13,7 +13,7 @@
 //!   sub-account (**no new-DID provisioning**, lock 11),
 //! - per-sub-account **failover / voicemail** config (lock 10).
 //!
-//! ## Shape (the mde-kvm / mde-seat integration-gated pattern)
+//! ## Shape (the typed, integration-gated client pattern)
 //!
 //! - The request-building (URL + query assembly) and response-parsing
 //!   (Vitelity's XML → typed structs) logic lives in [`request`] and

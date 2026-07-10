@@ -58,6 +58,8 @@
 pub use mde_egui::egui;
 
 pub mod config;
+#[cfg(feature = "live-connect")]
+pub mod connect;
 pub mod encoding;
 pub mod input;
 pub mod link;
@@ -67,6 +69,8 @@ pub mod tier;
 pub mod wire;
 
 pub use config::{ConfigError, VncConfig};
+#[cfg(feature = "live-connect")]
+pub use connect::{ConnectError, Negotiated, PumpOutcome, VncConnection};
 pub use encoding::{
     decode_framebuffer_update, decode_rect, parse_pixel_format, parse_rectangle_header,
     DecodeError, Encoding, Reader, Rectangle,

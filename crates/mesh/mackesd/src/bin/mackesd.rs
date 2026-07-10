@@ -447,6 +447,24 @@ enum Cmd {
         json: bool,
     },
 
+    /// QC-15 — audit a QUASAR-CLOUD cutover node for retired VM-stack leftovers
+    /// and Q58 fresh-VM rebuild evidence. Exits nonzero when any check fails.
+    CutoverAudit {
+        /// Repository root to inspect for old-stack artifacts.
+        #[arg(long, default_value = ".")]
+        repo_root: PathBuf,
+        /// Operator ledger proving every pre-cutover VM was rebuilt fresh, or
+        /// that no pre-cutover VMs existed on this node.
+        #[arg(
+            long,
+            default_value = mackesd_core::cutover_audit::DEFAULT_VM_REBUILD_LEDGER
+        )]
+        vm_rebuild_ledger: PathBuf,
+        /// Emit JSON instead of a short table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Rotate the shared mesh passcode (Phase 12.10.2). Prints a
     /// freshly-generated passcode. With `--store`, encrypts it to
     /// the cred file via `systemd-creds`. Peers pick up the new
@@ -658,14 +676,17 @@ enum Cmd {
 
     /// ENT-1 — mint a single-use 256-bit enrollment bearer on this
     /// lighthouse and print the join token a new box runs
-    /// `mackesd enroll --token <…>` with. The ledger records only the
+    /// `mackesd join <…>` with. The ledger records only the
     /// bearer's hash; the raw value is shown once, here.
     EnrollToken {
         /// Mesh id to embed in the token (e.g. `home-mesh`).
         #[arg(long)]
         mesh_id: String,
-        /// Lighthouse address the joining box dials. Defaults to the
-        /// published overlay-ip + :4242.
+        /// Lighthouse address the joining box dials. Defaults to this
+        /// lighthouse's published PUBLIC address (`set-external-addr`),
+        /// or the detected primary IPv4 — NEVER the overlay IP (a
+        /// not-yet-enrolled node can't reach it; DAR-19). Always paired
+        /// with the dedicated `/enroll` HTTPS port, not the one given here.
         #[arg(long)]
         lighthouse: Option<String>,
         /// Operator note recorded beside the issued hash.
@@ -1463,17 +1484,13 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// OW-7 — spawn this mesh's first lighthouse and migrate the CA to it: provision
-    /// a cloud droplet (`--cloud`) or a local cloud-hypervisor VM, push-enroll it as
-    /// a lighthouse, then migrate the CA over #12's lighthouse-scoped-bearer key
-    /// delivery. With no cloud token the mesh stays LAN-only (retry available). The
-    /// live provision/SSH/CA-move is integration-gated behind the Provisioner seam;
-    /// `--dry-run` prints the plan + the provision spec without provisioning.
+    /// OW-7 / QC-15 — spawn this mesh's first lighthouse and migrate the CA to it:
+    /// provision a cloud droplet, push-enroll it as a lighthouse, then migrate the
+    /// CA over #12's lighthouse-scoped-bearer key delivery. With no cloud token the
+    /// mesh stays LAN-only (retry available). The live provision/SSH/CA-move is
+    /// integration-gated behind the Provisioner seam; `--dry-run` prints the plan +
+    /// the provision spec without provisioning.
     SpawnLighthouse {
-        /// Provision a cloud droplet (DigitalOcean); omit for a local
-        /// cloud-hypervisor VM.
-        #[arg(long)]
-        cloud: bool,
         /// Provision a PAIR (two lighthouses) for an HA / two-voter quorum.
         #[arg(long)]
         pair: bool,
@@ -1481,16 +1498,16 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// OW-8 (first-desktop slice) — bring up this Workstation's FIRST local VM
-    /// desktop: select a golden image from the mesh image catalog, build an mde-kvm
-    /// VM (running-disk clone + dual-homed NIC), plan its create→boot, and open a
-    /// broker session the shell's Desktop surface renders. A desktop VM already
-    /// present ⇒ reconnect (offer it, not a duplicate); no VM golden image ⇒ a real
-    /// no-image outcome (see Services ▸ Images). The live create/boot/session is
-    /// integration-gated behind the FirstDesktopApply seam; `--dry-run` prints the
-    /// plan + ordered steps without creating anything.
+    /// OW-8 / QC-15 — bring up this Workstation's FIRST cloud-backed VM desktop:
+    /// select a VM image from the mesh image catalog, place it through the VDI
+    /// broker's Nova desktop path, and open a broker session the shell's Desktop
+    /// surface renders. A desktop VM already present ⇒ reconnect (offer it, not a
+    /// duplicate); no VM image ⇒ a real no-image outcome (see Services ▸ Images).
+    /// The live placement/session path is integration-gated behind the
+    /// FirstDesktopApply seam; `--dry-run` prints the plan + ordered steps without
+    /// creating anything.
     FirstDesktop {
-        /// Print the plan + ordered steps without creating / booting / opening.
+        /// Print the plan + ordered steps without placing / opening.
         #[arg(long)]
         dry_run: bool,
     },
@@ -2143,9 +2160,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::DiscoverMdns => {
             use mackesd_core::surrounding_hosts::{
-                HostSignals, arp_neigh_map, classify, collect_mdns, enrich_hosts, hosts_from_mdns,
+                arp_neigh_map, classify, collect_mdns, enrich_hosts, hosts_from_mdns,
                 load_system_oui, refine_unknown_with_http, refine_unknown_with_nmap_os,
-                reverse_dns,
+                reverse_dns, HostSignals,
             };
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2190,7 +2207,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::SurroundingTrust { key, state } => {
-            use mackesd_core::surrounding_hosts::{TrustState, set_host_trust};
+            use mackesd_core::surrounding_hosts::{set_host_trust, TrustState};
             let ts = match state.to_ascii_lowercase().as_str() {
                 "trusted" => TrustState::Trusted,
                 "blocked" => TrustState::Blocked,
@@ -2247,7 +2264,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::CaptivePortalCheck => {
-            use mackesd_core::surrounding_hosts::{CAPTIVE_PROBE_URL, detect_captive_portal};
+            use mackesd_core::surrounding_hosts::{detect_captive_portal, CAPTIVE_PROBE_URL};
             if let Some(portal) = detect_captive_portal(CAPTIVE_PROBE_URL) {
                 if portal.is_empty() {
                     eprintln!("CAPTIVE-PORTAL: detected (splash intercept; no redirect URL)");
@@ -2260,8 +2277,8 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::VoipRtt => {
             use mackesd_core::voip_rtt::{
-                VITELITY_PROXY_HOST, VITELITY_PROXY_PORT, own_nebula_ip, publish_link_rtt,
-                rtt_topic, sample_link_rtt,
+                own_nebula_ip, publish_link_rtt, rtt_topic, sample_link_rtt, VITELITY_PROXY_HOST,
+                VITELITY_PROXY_PORT,
             };
             let peer = own_nebula_ip().unwrap_or_default();
             let sample = sample_link_rtt(&peer);
@@ -2295,7 +2312,7 @@ fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "unknown".to_string())
             });
-            use mackes_mesh_types::cap_tags::{CapabilityTag, NodeTags, read_tags, write_tags};
+            use mackes_mesh_types::cap_tags::{read_tags, write_tags, CapabilityTag, NodeTags};
             if let Some(spec) = set {
                 let mut tags = NodeTags::default();
                 for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
@@ -2333,7 +2350,7 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::HopAdvertise { subnets, exit } => {
-            use mackesd_core::nebula_topology::{EXIT_ROUTE, HopAdvert, write_advert};
+            use mackesd_core::nebula_topology::{write_advert, HopAdvert, EXIT_ROUTE};
             let root = mackesd_core::default_qnm_shared_root();
             let host = local_hostname();
             let overlay_ip = local_overlay_ip().ok_or_else(|| {
@@ -2370,7 +2387,7 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::VpnImport { name, kind, file } => {
-            use mackesd_core::nebula_topology::{VpnKind, VpnProfile, write_vpn_profile};
+            use mackesd_core::nebula_topology::{write_vpn_profile, VpnKind, VpnProfile};
             let root = mackesd_core::default_qnm_shared_root();
             let kind = match kind.to_ascii_lowercase().as_str() {
                 "wireguard" | "wg" => VpnKind::Wireguard,
@@ -2598,7 +2615,12 @@ fn main() -> anyhow::Result<()> {
             }
             OnboardCmd::InviteIssue { ttl } => {
                 // Mint a short-TTL, mesh-scoped invite on THIS node, record it in
-                // the bearer ledger, and print both encodings headlessly.
+                // the bearer ledger, and print both encodings headlessly. When this
+                // node has the local /enroll endpoint identity, also print the
+                // endpoint-bearing `mesh:` token that `mackesd join` can consume
+                // directly; its bearer is the same canonical invite payload already
+                // recorded in the ledger, so the short code and join token spend the
+                // same single-use capability.
                 let node_id = default_node_id();
                 let root = mackesd_core::default_qnm_shared_root();
                 let mesh_id = mackesd_core::onboard::invite::resolve_mesh_id(&root, &node_id);
@@ -2620,6 +2642,16 @@ fn main() -> anyhow::Result<()> {
                 );
                 println!("  code: {}", issued.code);
                 println!("  qr:   {}", issued.qr);
+                match invite_issue_join_token(&issued, None, None) {
+                    Ok(join_token) => {
+                        println!("  join-token: {join_token}");
+                        println!("  join: mackesd join '{join_token}'");
+                    }
+                    Err(e) => eprintln!(
+                        "  join-token: unavailable ({e}); use the code/QR in a local wizard, \
+                         or mint an endpoint-bearing token on a lighthouse with `mackesd add-peer`"
+                    ),
+                }
             }
             OnboardCmd::Network { dry_run } => {
                 // Detect DHCP-vs-static on the primary LAN interface (reusing
@@ -2694,25 +2726,19 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            OnboardCmd::SpawnLighthouse {
-                cloud,
-                pair,
-                dry_run,
-            } => {
+            OnboardCmd::SpawnLighthouse { pair, dry_run } => {
                 // Plan the spawn: gather this node's facts (mesh-id, CA holder,
-                // cloud token / local virt), fold into a plan. The live
-                // provision/SSH/CA-move is integration-gated behind the Provisioner
-                // seam; --dry-run stops at the plan + rendered spec.
+                // cloud token), fold into a plan. The live provision/SSH/CA-move
+                // is integration-gated behind the Provisioner seam; --dry-run stops
+                // at the plan + rendered spec.
                 use mackesd_core::onboard::spawn_lighthouse as sl;
                 let node_id = default_node_id();
                 let root = mackesd_core::default_qnm_shared_root();
                 let facts = sl::gather(&root, &node_id);
-                let target = if cloud {
-                    sl::SpawnTarget::default_cloud()
-                } else {
-                    sl::SpawnTarget::default_local()
+                let req = sl::SpawnRequest {
+                    target: sl::SpawnTarget::default_cloud(),
+                    pair,
                 };
-                let req = sl::SpawnRequest { target, pair };
                 let plan = sl::plan_spawn(&req, &facts);
                 println!("onboard spawn-lighthouse: {}", plan.human());
                 if dry_run {
@@ -2740,11 +2766,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             OnboardCmd::FirstDesktop { dry_run } => {
-                // Plan the first local VM desktop: gather this node's facts (mesh-id,
-                // image catalog, whether a desktop VM already exists), fold into a
-                // create/reconnect/no-image plan. The live create/boot + broker
-                // session publish is integration-gated behind the FirstDesktopApply
-                // seam; --dry-run stops at the plan + ordered steps.
+                // Plan the first cloud-backed VM desktop: gather this node's facts
+                // (mesh-id, image catalog), fold into a place/reconnect/no-image
+                // plan. The live Nova placement + broker session publish is
+                // integration-gated behind the FirstDesktopApply seam; --dry-run
+                // stops at the plan + ordered steps.
                 use mackesd_core::onboard::first_desktop as fd;
                 let node_id = default_node_id();
                 let root = mackesd_core::default_qnm_shared_root();
@@ -2758,12 +2784,12 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 // Live path: drive the integration-gated FirstDesktopApply seam
-                // (create+boot → open-session).
+                // (place → open-session).
                 match fd::execute(&plan, &fd::LiveFirstDesktop::default()) {
                     Ok(outcome) => println!("  {}", outcome.human()),
                     Err(e) => {
                         eprintln!(
-                            "  first-desktop failed (live VM create/boot + session is integration-gated): {e}"
+                            "  first-desktop failed (live Nova placement + session is integration-gated): {e}"
                         );
                         std::process::exit(1);
                     }
@@ -3093,7 +3119,7 @@ fn main() -> anyhow::Result<()> {
                 nse_dir,
             } => {
                 use mackesd_core::card::probe::HostSource;
-                use mackesd_core::probe_nmap::{Profile, scan};
+                use mackesd_core::probe_nmap::{scan, Profile};
                 let src = match source.as_str() {
                     "lan" => HostSource::Lan,
                     "arbitrary" => HostSource::Arbitrary,
@@ -3167,7 +3193,7 @@ fn main() -> anyhow::Result<()> {
             // DdnsService rooted at the shared workgroup root and call the SAME
             // `ipc::ddns::build_reply` verb the bus responder serves, printing the
             // JSON reply. One config, two front-ends (CLI + GUI).
-            use mackesd_core::ipc::ddns::{DdnsService, build_reply};
+            use mackesd_core::ipc::ddns::{build_reply, DdnsService};
             let (verb, body, root): (&str, Option<String>, PathBuf) = match action {
                 DdnsCmd::GetConfig { workgroup_root } => (
                     "get-config",
@@ -3506,6 +3532,40 @@ fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+        Cmd::CutoverAudit {
+            repo_root,
+            vm_rebuild_ledger,
+            json,
+        } => {
+            let report = mackesd_core::cutover_audit::audit_cutover(&repo_root, &vm_rebuild_ledger);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": report.ok(),
+                        "failures": report.failures(),
+                        "repo_root": report.repo_root,
+                        "vm_rebuild_ledger": report.vm_rebuild_ledger,
+                        "checks": report.checks,
+                    })
+                );
+            } else {
+                println!(
+                    "QC-15 cutover audit: {}",
+                    if report.ok() { "clean" } else { "FAILED" }
+                );
+                for check in &report.checks {
+                    let mark = match check.status {
+                        mackesd_core::cutover_audit::CutoverAuditStatus::Pass => "ok",
+                        mackesd_core::cutover_audit::CutoverAuditStatus::Fail => "fail",
+                    };
+                    println!("{mark:<4} {:<32} {}", check.id, check.detail);
+                }
+            }
+            if !report.ok() {
+                std::process::exit(1);
             }
         }
         Cmd::RotatePasscode { store, cred_path } => {
@@ -3860,8 +3920,8 @@ fn main() -> anyhow::Result<()> {
                 // Long-running path: spawn the worker, install a
                 // SIGTERM/SIGINT handler that flips the shutdown
                 // flag, then block until the worker exits.
-                use std::sync::Arc;
                 use std::sync::atomic::{AtomicBool, Ordering};
+                use std::sync::Arc;
                 let shutdown = Arc::new(AtomicBool::new(false));
                 install_signal_handlers(Arc::clone(&shutdown))?;
                 let handle = mackesd_core::worker::spawn_reconcile_worker(
@@ -3960,7 +4020,7 @@ fn main() -> anyhow::Result<()> {
                     if new.len() < 8 {
                         anyhow::bail!("set-passphrase: at least 8 characters (SEC-2)");
                     }
-                    use mackesd_core::ca::rotation_gate::{GateCheck, verify};
+                    use mackesd_core::ca::rotation_gate::{verify, GateCheck};
                     if verify(&root, "") != GateCheck::NotSet {
                         let current =
                             std::env::var("MDE_CA_PASSPHRASE_CURRENT").unwrap_or_default();
@@ -4696,15 +4756,49 @@ fn main() -> anyhow::Result<()> {
             let root = mackesd_core::default_qnm_shared_root();
             let bearer = mackesd_core::bearer_ledger::issue(&root, &note)
                 .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
-            let lh = lighthouse.unwrap_or_else(|| {
-                let ip = std::fs::read_to_string("/var/lib/mackesd/nebula/overlay-ip")
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|_| "<lighthouse-ip>".to_string());
-                format!("{ip}:4242")
+            // DAR-19 / XPA-5 — default to THIS lighthouse's PUBLIC address at
+            // the dedicated `/enroll` HTTPS port, never the overlay IP at
+            // Nebula's UDP data-plane port (`:4242`). A not-yet-enrolled node
+            // can reach neither the overlay IP (it isn't on the mesh yet) nor
+            // `:4242` (not an HTTP(S) service) — it needs the public
+            // `nebula_enroll_listener` (default `:4243`), the one endpoint
+            // that works pre-overlay (docs/design/magic-onboarding.md).
+            let external_addr = mackesd_core::lighthouse_addr::read_external_addr();
+            let host =
+                resolve_enroll_endpoint_host(lighthouse.as_deref(), external_addr.as_deref())
+                    .map_or_else(detect_primary_ipv4, Ok)?;
+            let port = mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT;
+            // Pin the on-disk `/enroll` endpoint cert fingerprint when one
+            // exists (a `found`-bootstrapped lighthouse) so `join` takes the
+            // network path (ONBOARD-2) instead of the QNM-Shared co-located
+            // fallback — which needs the peer already on the overlay and is
+            // exactly the trap DAR-19 hit ("no bundle in 30s"). A
+            // `mesh-init`-only node has no endpoint cert yet; the token still
+            // mints (without `?fp=`), matching `join`'s documented fallback
+            // for a fingerprint-less token.
+            let cert_path = mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH;
+            let fp = std::fs::read(cert_path).ok().and_then(|pem| {
+                mackesd_core::nebula_enroll_endpoint::endpoint_fingerprint_from_pem(&pem)
             });
-            println!("mesh:{mesh_id}@{lh}#{bearer}");
+            if fp.is_none() {
+                eprintln!(
+                    "enroll-token: no /enroll endpoint cert at {cert_path} yet — minting a \
+                     token with no ?fp=; a non-overlay box needs QNM-Shared already reachable \
+                     with this shape. Run `mackesd found` (or otherwise stand up the /enroll \
+                     endpoint) and use `mackesd add-peer` for a network-joinable token."
+                );
+            }
+            let token = mackesd_core::nebula_enroll::JoinToken {
+                mesh_id,
+                lighthouse: host,
+                port,
+                bearer,
+                fp,
+            }
+            .encode();
+            println!("{token}");
             eprintln!(
-                "single-use token minted (ENT-1) — run on the joining box:\n  mackesd enroll --token 'mesh:{mesh_id}@{lh}#{bearer}'"
+                "single-use token minted (ENT-1) — run on the joining box:\n  mackesd join '{token}'"
             );
             return Ok(());
         }
@@ -5178,7 +5272,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Tags { json } => {
             // PLANES-3/W82 — the fleet tag census: for each v1 tag, the
             // roster nodes that carry it (read from the cap-tags store).
-            use mackes_mesh_types::cap_tags::{CapabilityTag, read_tags};
+            use mackes_mesh_types::cap_tags::{read_tags, CapabilityTag};
             let root = mackesd_core::default_qnm_shared_root();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5434,7 +5528,7 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 };
                 use mackesd_core::image_build::{
-                    BuildInputs, SubprocessBuild, build_image, now_ms,
+                    build_image, now_ms, BuildInputs, SubprocessBuild,
                 };
                 let runner = SubprocessBuild::new(BuildInputs::default());
                 match build_image(
@@ -6276,15 +6370,15 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        RestartPolicy, Spawn, Supervisor, device_control, firewall_preset::FirewallPresetWorker,
-        fleet_reconcile, heartbeat::HeartbeatWorker, job_exec, lifecycle_exec,
-        mdns_relay::MdnsRelayWorker, mesh_dns, mesh_router::MeshRouterWorker, netstate_apply,
-        presence_watch, ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
-        validation_suite, voice_config::VoiceConfigWorker,
+        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile,
+        heartbeat::HeartbeatWorker, job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker,
+        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
+        sshd_overlay_bind::SshdOverlayBindWorker, validation_suite,
+        voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::sync::RwLock;
     let workgroup_root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
     let node_id = node_id.unwrap_or_else(default_node_id);
@@ -6719,9 +6813,10 @@ fn run_serve(
         // and survive disconnect (on_disconnect default KeepRunning; on_node_loss
         // holds reconnectable). Rank-0-default like session_broker (runs everywhere);
         // the shared leader lock keeps an N-node mesh from multi-writing. REUSES the
-        // broker's VdiSession + SessionStore; the live cross-peer persist stays
-        // integration-gated through MeshSessionStore + the companion MeshLayoutStore
-        // (typed IntegrationGated, §7).
+        // broker's VdiSession + SessionStore; sessions and monitor layouts persist
+        // through the replicated workgroup-root stores (MeshSessionStore +
+        // MeshLayoutStore), with future etcd-backed stores hidden behind the same
+        // seams.
         if mackesd_core::worker_role::runs("session_roaming", role_rank) {
             sup.spawn(Spawn::new(
                 mackesd_core::workers::session_roaming::SessionRoamingWorker::new(
@@ -7831,6 +7926,29 @@ fn run_serve(
                 .push("browser_policy".into());
         }
 
+        // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Browser
+        // publishes strict ceremony metadata to `action/browser/passkey`; this
+        // worker validates RP/origin/challenge shape, persists pending
+        // challenges locally, mirrors them into the Syncthing-backed workgroup
+        // root, and publishes honest pending/error state without minting fake
+        // credentials. A Workstation-tier browser security feature; it idles on
+        // headless boxes with no Browser publishes.
+        if mackesd_core::worker_role::runs("browser_passkeys", role_rank) {
+            let local_root = mackesd_core::workers::browser_passkeys::resolve_local_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_passkeys::BrowserPasskeysWorker::new(
+                    node_id.clone(),
+                    local_root,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_passkeys".into());
+        }
+
         // BROWSER-DD-7 — the browser session-sync owner. The shell publishes
         // deduped `action/browser/session-sync` snapshots for tabs/settings/
         // downloads/speed-dial; this worker validates those restore-compatible
@@ -7855,6 +7973,167 @@ fn run_serve(
                 .lock()
                 .expect("worker_names mutex")
                 .push("browser_session_sync".into());
+        }
+
+        // BROWSER-DD-11 — Browser read-aloud/TTS owner. The shell publishes
+        // bounded `action/browser/read-aloud` page-text requests; this worker
+        // validates them, invokes the configured offline TTS command when present
+        // (`MDE_BROWSER_TTS_COMMAND` / `MDE_TTS_COMMAND`), and publishes honest
+        // spoken/unavailable/error state. A Workstation-tier browser feature; it
+        // idles on headless boxes with no Browser publishes.
+        if mackesd_core::worker_role::runs("browser_read_aloud", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_read_aloud::BrowserReadAloudWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_read_aloud".into());
+        }
+
+        // BROWSER-DD-11 — Browser voice-command/dictation STT owner. The shell
+        // publishes active-tab context to `action/browser/voice-command`; this
+        // worker validates it, invokes the configured offline STT/capture command
+        // when present (`MDE_BROWSER_STT_COMMAND` / `MDE_STT_COMMAND`), emits a
+        // bounded transcript event, and publishes honest unavailable/error state.
+        if mackesd_core::worker_role::runs("browser_voice_command", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_voice_command::BrowserVoiceCommandWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_voice_command".into());
+        }
+
+        // BROWSER-DD-12 — Browser external-protocol owner. The shell refuses to
+        // navigate `mailto:`/`magnet:` URLs and publishes
+        // `action/browser/protocol`; this worker validates those handoffs and
+        // emits retained route status/events for Email/Transfers owners.
+        if mackesd_core::worker_role::runs("browser_protocol", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_protocol::BrowserProtocolWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_protocol".into());
+        }
+
+        // BROWSER-DD-12 — Browser platform-share owner. The shell publishes
+        // `action/browser/share` for Peer/Email/QR platform targets; this worker
+        // validates those handoffs and emits retained route status/events
+        // without faking downstream delivery.
+        if mackesd_core::worker_role::runs("browser_share", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_share::BrowserShareWorker::new(node_id.clone()),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_share".into());
+        }
+
+        // BROWSER-DD-12 — Browser private offline/mesh translation owner. The
+        // shell publishes bounded page text to `action/browser/translate`; this
+        // worker validates the private-only request, invokes the configured
+        // local/mesh translation command when present
+        // (`MDE_BROWSER_TRANSLATE_COMMAND` / `MDE_TRANSLATE_COMMAND`), emits a
+        // bounded result event, and publishes honest unavailable/error state.
+        if mackesd_core::worker_role::runs("browser_translate", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_translate::BrowserTranslateWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_translate".into());
+        }
+
+        // BROWSER-DD-12 — Browser offline/mesh cache owner. The shell publishes
+        // explicit private page snapshots to `action/browser/offline-cache`; this
+        // worker validates them, writes a local durable cache record, and mirrors
+        // it into the Syncthing-backed workgroup root. The browser helper remains
+        // no-store; the cache is daemon-owned and private to the mesh.
+        if mackesd_core::worker_role::runs("browser_offline_cache", role_rank) {
+            let local_root =
+                mackesd_core::workers::browser_offline_cache::resolve_local_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_offline_cache::BrowserOfflineCacheWorker::new(
+                    node_id.clone(),
+                    local_root,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_offline_cache".into());
+        }
+
+        // BROWSER-DD-12 — Browser CEF security-update status owner. It watches
+        // the packaged fast-update manifest plus the active CEF runtime and
+        // publishes an honest current/missing/mismatch posture for the
+        // independent browser-engine update path.
+        if mackesd_core::worker_role::runs("browser_security_update", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_security_update::BrowserSecurityUpdateWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_security_update".into());
+        }
+
+        // BROWSER-DD-12 — Browser idle-tab suspend owner. The shell already
+        // stops inactive helpers and publishes `action/browser/tab-suspend`;
+        // this worker validates those handoffs and publishes retained
+        // suspend status/events for diagnostics and future orchestration.
+        if mackesd_core::worker_role::runs("browser_tab_suspend", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_tab_suspend::BrowserTabSuspendWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_tab_suspend".into());
+        }
+
+        // KDC-MESH-6 — seat-side phone remote-input consumer. `kdc_host`
+        // publishes sanitized `action/seat/remote-input` rows after the paired
+        // phone/protocol checks; this worker owns the local injection seam and
+        // honest unavailable/error state when no uinput helper is configured.
+        if mackesd_core::worker_role::runs("seat_remote_input", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::seat_remote_input::SeatRemoteInputWorker::new(
+                    node_id.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("seat_remote_input".into());
         }
 
         // CHOOSER-1 — the desktop-source discovery aggregator (design
@@ -10300,6 +10579,106 @@ fn write_voice_config_files(
     Ok(())
 }
 
+/// DAR-19 / XPA-5 — resolve the host an `enroll-token` v3 token should embed
+/// for the joining box to dial. NEVER the overlay IP: a not-yet-enrolled node
+/// can't reach it (chicken-and-egg — it isn't on the mesh yet), which is
+/// exactly the DAR-19 live failure (`mesh:<id>@10.42.0.1:4242`, unreachable by
+/// a fresh non-overlay `mcnf-control`). `explicit` is the operator's
+/// `--lighthouse` override; `external_addr` is this lighthouse's own
+/// persisted PUBLIC address ([`mackesd_core::lighthouse_addr::read_external_addr`],
+/// itself `host:4242` — Nebula's UDP data-plane port). Either input may carry
+/// a trailing `:port`, always stripped here: the enroll port is fixed
+/// independently by the caller
+/// ([`mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT`], the
+/// dedicated `/enroll` HTTPS listener — port `:4242` is not an HTTP(S)
+/// service). Returns `None` when neither input is present (the caller falls
+/// back to auto-detection).
+#[must_use]
+fn resolve_enroll_endpoint_host(
+    explicit: Option<&str>,
+    external_addr: Option<&str>,
+) -> Option<String> {
+    let raw = explicit.or(external_addr)?;
+    let host = raw.rsplit_once(':').map_or(raw, |(host, _)| host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+#[cfg(test)]
+mod enroll_endpoint_host_tests {
+    //! DAR-19 / XPA-5 regression coverage: `mackesd enroll-token` must never
+    //! default to the overlay IP (`10.42.0.1`) at Nebula's UDP data-plane
+    //! port (`:4242`) — a fresh, not-yet-enrolled node cannot reach either.
+    //! It must default to the lighthouse's PUBLIC address at the dedicated
+    //! `/enroll` HTTPS port (`DEFAULT_ENROLL_PORT`, `:4243`).
+    use super::resolve_enroll_endpoint_host;
+    use mackesd_core::nebula_enroll::JoinToken;
+    use mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT;
+
+    #[test]
+    fn prefers_the_explicit_override_over_the_external_addr() {
+        let host = resolve_enroll_endpoint_host(Some("203.0.113.9"), Some("198.51.100.1:4242"));
+        assert_eq!(host.as_deref(), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn strips_a_trailing_port_off_the_explicit_override() {
+        // An operator-supplied `--lighthouse host:port` must not leak an
+        // arbitrary port into the token — the enroll port is fixed
+        // independently at DEFAULT_ENROLL_PORT (or an explicit override).
+        let host = resolve_enroll_endpoint_host(Some("203.0.113.9:9999"), None);
+        assert_eq!(host.as_deref(), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn falls_back_to_the_persisted_external_addr_and_strips_its_nebula_port() {
+        // lighthouse_addr::read_external_addr() persists `host:4242` (the
+        // Nebula UDP data-plane port, for static_host_map) — only the host
+        // survives into the enroll token; the port is re-derived separately
+        // as the enroll HTTPS port, never left at 4242.
+        let host = resolve_enroll_endpoint_host(None, Some("165.227.188.238:4242"));
+        assert_eq!(host.as_deref(), Some("165.227.188.238"));
+    }
+
+    #[test]
+    fn none_when_neither_input_is_present() {
+        // The caller (cmd EnrollToken) falls back to detect_primary_ipv4().
+        assert_eq!(resolve_enroll_endpoint_host(None, None), None);
+    }
+
+    #[test]
+    fn never_resolves_to_the_overlay_ip_drk19_live_regression() {
+        // The exact live DAR-19 failure: `mcnf-control` (a68ab38b) got a
+        // token embedding `10.42.0.1:4242` (LH1's OWN overlay IP + Nebula's
+        // UDP port) instead of the LH's public `:4243` `/enroll` endpoint —
+        // a fresh box off the overlay cannot dial either coordinate. Feeding
+        // the founding lighthouse's real public external-addr through the
+        // resolver must never reproduce the overlay-IP/4242 shape, and the
+        // full v3 token built from it must carry the enroll port, not 4242.
+        let external_addr = Some("165.227.188.238:4242");
+        let host = resolve_enroll_endpoint_host(None, external_addr).expect("host resolves");
+        assert_ne!(host, "10.42.0.1", "must not fall back to the overlay IP");
+        assert_eq!(host, "165.227.188.238", "must be the LH's public host");
+
+        let token = JoinToken {
+            mesh_id: "magic-mesh".to_string(),
+            lighthouse: host,
+            port: DEFAULT_ENROLL_PORT,
+            bearer: "bearer".to_string(),
+            fp: Some("a".repeat(64)),
+        };
+        assert_eq!(token.port, 4243, "must be the public enroll port, not 4242");
+        let wire = token.encode();
+        assert!(
+            !wire.contains("10.42.0.1"),
+            "encoded token must not carry the overlay IP: {wire}"
+        );
+        assert!(
+            wire.starts_with("mesh:magic-mesh@165.227.188.238:4243#bearer?fp="),
+            "encoded token must target the public host at the enroll port: {wire}"
+        );
+    }
+}
+
 /// ONBOARD-4 — detect the primary outbound IPv4 by opening a UDP
 /// socket "to" a public address and reading back the kernel-chosen
 /// source IP. No packets are sent (UDP connect only sets the route);
@@ -10407,6 +10786,48 @@ fn mint_join_token(
     .encode())
 }
 
+/// OW-4 — re-express an issued `MDEINV1` invite as the endpoint-bearing `mesh:`
+/// token consumed by `mackesd join`.
+///
+/// Unlike [`mint_join_token`], this does NOT mint a second bearer. The bearer is
+/// the invite's canonical payload, already recorded by `invite::issue`, so either
+/// presentation spends the same single-use ledger entry.
+fn invite_issue_join_token(
+    issued: &mackesd_core::onboard::invite::IssuedInvite,
+    lighthouse: Option<String>,
+    enroll_port: Option<u16>,
+) -> anyhow::Result<String> {
+    let cert_path = mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH;
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("reading the /enroll endpoint cert {cert_path}: {e}"))?;
+    invite_issue_join_token_from_cert(issued, &cert_pem, lighthouse, enroll_port)
+}
+
+fn invite_issue_join_token_from_cert(
+    issued: &mackesd_core::onboard::invite::IssuedInvite,
+    cert_pem: &[u8],
+    lighthouse: Option<String>,
+    enroll_port: Option<u16>,
+) -> anyhow::Result<String> {
+    use mackesd_core::onboard::invite::{to_join_token, EnrollEndpoint};
+
+    let fp = mackesd_core::nebula_enroll_endpoint::endpoint_fingerprint_from_pem(cert_pem)
+        .ok_or_else(|| anyhow::anyhow!("no certificate in /enroll endpoint PEM"))?;
+    let addr = lighthouse
+        .or_else(mackesd_core::lighthouse_addr::read_external_addr)
+        .map_or_else(detect_primary_ipv4, Ok)?;
+    let host = addr
+        .rsplit_once(':')
+        .map_or(addr.as_str(), |(h, _)| h)
+        .to_string();
+    let endpoint = EnrollEndpoint {
+        lighthouse: host,
+        port: enroll_port.unwrap_or(mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT),
+        fp: Some(fp),
+    };
+    Ok(to_join_token(&issued.invite, &endpoint).encode())
+}
+
 /// SETUP-5 — remove a peer: decommission its directory row, revoke its certs,
 /// and ban its node-id from re-enrolling (the inverse of `add-peer`). Proceeds
 /// with the revoke+ban even when no directory row matches, so a stale identity
@@ -10478,7 +10899,7 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
 /// (keyed by the shared mesh age identity) — the operational put-path the readers
 /// (`media_registry`, VPN, DR) always assumed but no CLI exposed.
 fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
-    use mackesd_core::ipc::secret_store::{SecretStore, age_key_path, repo_root};
+    use mackesd_core::ipc::secret_store::{age_key_path, repo_root, SecretStore};
     let workgroup_root = mackesd_core::default_qnm_shared_root();
     let store_for = |local: bool| -> SecretStore {
         if local {
@@ -10533,8 +10954,8 @@ fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
 /// store the daemon uses, so the CLI and the daemon share one queue.
 fn cmd_transfer(cmd: TransferCmd) -> anyhow::Result<()> {
     use mackesd_core::workers::transfers::{
-        Ledger, Method, TransferJob, TransferPolicy, TransferVerb, default_store_root,
-        discover_destinations, write_verb,
+        default_store_root, discover_destinations, write_verb, Ledger, Method, TransferJob,
+        TransferPolicy, TransferVerb,
     };
 
     let store_root = default_store_root();
@@ -10644,7 +11065,7 @@ fn dispatch_transfer_lifecycle(
     verb: mackesd_core::workers::transfers::TransferVerb,
     name: &str,
 ) -> anyhow::Result<()> {
-    use mackesd_core::workers::transfers::{Ledger, write_verb};
+    use mackesd_core::workers::transfers::{write_verb, Ledger};
     let ledger = Ledger::open(store_root)
         .with_context(|| format!("opening the transfers ledger at {}", store_root.display()))?;
     if ledger.get(id).is_none() {
@@ -10658,7 +11079,7 @@ fn dispatch_transfer_lifecycle(
 
 fn cmd_mesh_ssh_key(cmd: MeshSshKeyCmd) -> anyhow::Result<()> {
     use mackesd_core::ipc::mesh_ssh_key::{MeshKeyProvisioner, ProvisionOutcome, SshdReload};
-    use mackesd_core::ipc::secret_store::{SecretStore, repo_root};
+    use mackesd_core::ipc::secret_store::{repo_root, SecretStore};
 
     let (args, verb) = match &cmd {
         MeshSshKeyCmd::Provision(a) => (a, "provision"),
@@ -10915,7 +11336,7 @@ fn cmd_found(
     enroll_port: Option<u16>,
     with_backoffice: Option<&str>,
 ) -> anyhow::Result<()> {
-    use mackesd_core::nebula_enroll_endpoint::{DEFAULT_ENROLL_PORT, generate_endpoint_identity};
+    use mackesd_core::nebula_enroll_endpoint::{generate_endpoint_identity, DEFAULT_ENROLL_PORT};
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
 
     let parsed: mde_role::Role = role
@@ -11491,7 +11912,7 @@ fn provision_caddy_if_lighthouse(role: mde_role::Role) {
 /// warning until the operator provisions it by hand per the unit
 /// comment).
 fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
-    use mackesd_core::ca::backup_provision::{ProvisionOutcome, provision};
+    use mackesd_core::ca::backup_provision::{provision, ProvisionOutcome};
     match provision(role) {
         Ok(ProvisionOutcome::Provisioned { sealed_bytes }) => {
             // Log presence/length only — NEVER the passphrase value.
@@ -11639,7 +12060,7 @@ mod found_backoffice_tests {
     //! a bogus tier is caught by [`normalize_backoffice_tier`]) and that the flag
     //! is purely ADDITIVE — `found` without it parses byte-for-byte the same
     //! (the regression that found is unchanged when the flag is absent).
-    use super::{Cli, Cmd, normalize_backoffice_tier};
+    use super::{normalize_backoffice_tier, Cli, Cmd};
     use clap::Parser;
 
     /// Extract the `with_backoffice` field from a parsed `found` (panics if the

@@ -6,7 +6,7 @@
 # the pure alert-fold (a Bus alert payload -> a Message from its origin host).
 # ZERO I/O: no Bus, no Syncthing, no zbus — that live plumbing is the
 # NOTIFY-CHAT-2 worker's job. Everything here is headless + unit-tested (the
-# mde-kvm / mde-notify pattern). No desktop-shell dep (layered-tiers gate).
+# typed-seam pattern). No desktop-shell dep (layered-tiers gate).
 [package]
 name        = "mde-chat"
 description = "NOTIFY-CHAT-1 (Mesh Chat) — the pure, headless model for the ICQ-style unified messaging + notification interface: Message (Text/Clipboard/Alert/File/Call/Remote kinds), the append-only ring-buffer Conversation/Room log, Roster/Contact/Presence, Ed25519 sign+verify binding a message to its sender host, and the pure alert-fold that turns a Bus alert into a message from the originating host. No I/O; the live Bus/Syncthing/presence plumbing is the mackesd chat worker (NOTIFY-CHAT-2)."

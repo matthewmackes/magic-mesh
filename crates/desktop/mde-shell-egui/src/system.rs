@@ -21,9 +21,9 @@
 //!   verb wiring is E12-19), so arrangement edits are the desired-state intent,
 //!   noted typed.
 //! - **Power & Battery** — confirm-gated local lock/suspend/reboot/poweroff
-//!   (logind, lock 12), multi-battery telemetry (incl. BT-peripheral batteries,
-//!   lock 6), and **per-VM power rows that reuse the Instances panel's broker
-//!   verbs** (§6 — one broker, two views; VM power is not reimplemented here).
+//!   (logind, lock 12), and multi-battery telemetry (incl. BT-peripheral batteries,
+//!   lock 6). VM lifecycle now lives in the QUASAR-CLOUD plane, not a local
+//!   cloud-hypervisor broker.
 //!
 //! Mixer / Bluetooth stay read-only here (their interaction is E12-16 / E12-17).
 //! The state holds the ONE [`Seat`] (lock 1) and re-`snapshot()`s it on the shell's
@@ -48,7 +48,6 @@ use mde_seat::{
 };
 
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
-use crate::instances::InstancesState;
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
 
@@ -177,7 +176,7 @@ impl Default for SystemState {
 }
 
 /// One control action collected during the render borrow, applied after it ends
-/// (the egui idiom the Instances panel uses) so the drive can take `&mut` freely.
+/// so the drive can take `&mut` freely.
 ///
 /// `pub(crate)` so the POWER-4 body-builders in [`crate::power_settings`] emit the
 /// same actions the section's `apply()` drives.
@@ -207,8 +206,6 @@ pub(crate) enum SysAction {
     /// Persist the POWER-5 idle/lid policy after a picker change — the config has
     /// already been mutated in place; this writes it to disk.
     SavePowerHonorConfig,
-    /// Drive a VM power verb through the Instances broker (§6).
-    VmPower { idx: usize, boot: bool },
     // ── Bluetooth control verbs (E12-17) ────────────────────────────────────
     /// Power an adapter radio on/off (`adapter path`, `on`).
     BtPower(String, bool),
@@ -353,9 +350,8 @@ impl SystemState {
     /// a left rail of the three domain groups + a wide right detail pane that
     /// renders ONLY the selected section's body via the existing per-section fns
     /// (a layout/routing pass — the bodies + their `apply()`/`SysAction` seams are
-    /// reused verbatim, §6). Drives Displays + Power against the seat and the shared
-    /// Instances broker (per-VM power rows, §6).
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, instances: &mut InstancesState) {
+    /// reused verbatim, §6). Drives Displays + Power against the seat.
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<SysAction> = Vec::new();
         // Capture the rail selection before the render borrow so a rail click that
         // moves it can be detected + persisted afterwards (the same collect-then-
@@ -443,7 +439,6 @@ impl SystemState {
                                 *confirm,
                                 charge_threshold,
                                 power_honor_config,
-                                instances,
                                 mesh,
                                 appearance,
                                 agent_active,
@@ -470,13 +465,13 @@ impl SystemState {
         if self.appearance != appearance_before {
             self.appearance.save();
         }
-        self.apply(actions, instances);
+        self.apply(actions);
     }
 
     /// Apply the collected actions after the render borrow ends: drive the seat /
-    /// the layout model / the Instances broker, folding any typed failure into the
+    /// the layout model, folding any typed failure into the
     /// honest inline error (never a panic, never a silent no-op).
-    fn apply(&mut self, actions: Vec<SysAction>, instances: &mut InstancesState) {
+    fn apply(&mut self, actions: Vec<SysAction>) {
         for action in actions {
             match action {
                 SysAction::ToggleOutput(id, on) => match self.layout.set_enabled(&id, on) {
@@ -522,7 +517,6 @@ impl SystemState {
                 SysAction::SetChargeThreshold(pct) => self.drive_charge_threshold(pct),
                 // POWER-5: persist the idle/lid policy the picker just mutated.
                 SysAction::SavePowerHonorConfig => self.power_honor_config.save(),
-                SysAction::VmPower { idx, boot } => instances.drive_power(idx, boot),
                 // ── Bluetooth writes (E12-17) — each drives the ONE seat's BlueZ
                 // client, folds a typed failure to the inline error + a toast, and
                 // optimistically reflects the cheap boolean toggles so the switch
@@ -1366,7 +1360,6 @@ fn settings_detail(
     confirm: Option<PowerVerb>,
     charge_threshold: &mut Option<u8>,
     power_honor_config: &mut PowerHonorConfig,
-    instances: &InstancesState,
     mesh: &MeshFacts,
     appearance: &mut AppearanceConfig,
     agent_active: bool,
@@ -1397,7 +1390,6 @@ fn settings_detail(
             confirm,
             charge_threshold,
             power_honor_config,
-            instances,
             actions,
         ),
         SettingsSection::Wallpaper => wallpaper_section(ui),
@@ -2152,18 +2144,16 @@ fn is_internal(name: &str) -> bool {
 // ──────────────────────────── Power & Battery (E12-18) ────────────────────────────
 
 /// The Power & Battery section — confirm-gated logind verbs (incl. Hibernate),
-/// the power-profile + charge-cap controls, the on-AC source line, multi-battery
-/// telemetry, and per-VM power rows (reusing the Instances broker, §6). Every
-/// POWER-4 control drives the real seat / reads the real snapshot — no inert
-/// affordance (§7). Idle-suspend + lid-close are deliberately out of scope here
-/// (POWER-5, once the honorer is not inert).
+/// the power-profile + charge-cap controls, the on-AC source line, and
+/// multi-battery telemetry. Every POWER-4 control drives the real seat / reads
+/// the real snapshot — no inert affordance (§7). Idle-suspend + lid-close are
+/// deliberately out of scope here (POWER-5, once the honorer is not inert).
 fn power_section(
     ui: &mut egui::Ui,
     snap: Option<&SeatSnapshot>,
     confirm: Option<PowerVerb>,
     charge_threshold: &mut Option<u8>,
     power_honor_config: &mut PowerHonorConfig,
-    instances: &InstancesState,
     actions: &mut Vec<SysAction>,
 ) {
     // Power controls and battery telemetry sit side by side in the wide pane
@@ -2276,52 +2266,6 @@ fn power_section(
             battery_pane(ui, charge_threshold, actions);
         });
     }
-
-    // Per-VM power rows — the Instances roster, a second view (§6) — span the full
-    // width below the two panes. Empty roster → an honest note pointing at the
-    // Instances surface (never fabricated VMs).
-    ui.add_space(Style::SP_S);
-    column_card(ui, "Local VMs", |ui| {
-        let rows = instances.power_rows();
-        if rows.is_empty() {
-            muted_note(ui, "No local VMs — define one on the Instances surface.");
-        }
-        for (idx, row) in rows.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let tone = if row.gated {
-                    Style::WARN
-                } else if row.running {
-                    Style::OK
-                } else {
-                    Style::TEXT_DIM
-                };
-                ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
-                ui.add_space(Style::SP_XS);
-                ui.label(
-                    RichText::new(&row.name)
-                        .color(Style::TEXT)
-                        .size(Style::SMALL),
-                );
-                ui.add_space(Style::SP_S);
-                ui.colored_label(tone, RichText::new(row.state).size(Style::SMALL));
-                ui.add_space(Style::SP_S);
-                // Reuse the broker verbs — Boot when down, Shutdown when running.
-                if row.running {
-                    if ui
-                        .button(RichText::new("Shutdown").size(Style::SMALL))
-                        .clicked()
-                    {
-                        actions.push(SysAction::VmPower { idx, boot: false });
-                    }
-                } else if ui
-                    .button(RichText::new("Boot").size(Style::SMALL))
-                    .clicked()
-                {
-                    actions.push(SysAction::VmPower { idx, boot: true });
-                }
-            });
-        }
-    });
 }
 
 /// One power-verb row: the honest availability, then either a Lock/act button, an
@@ -3103,9 +3047,9 @@ mod tests {
     use mde_egui::egui::{pos2, vec2, Rect};
     use mde_seat::{Battery, BatteryKind, BatteryState, ProfileState};
 
-    /// Drive one headless frame of the System panel over a real seat + a given
-    /// Instances roster, and tessellate on the CPU (the DRM runner's path minus GPU).
-    fn renders(state: &mut SystemState, instances: &mut InstancesState) -> bool {
+    /// Drive one headless frame of the System panel over a real seat, and tessellate
+    /// on the CPU (the DRM runner's path minus GPU).
+    fn renders(state: &mut SystemState) -> bool {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -3113,7 +3057,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| state.show(ui, instances));
+            egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
     }
@@ -3121,11 +3065,7 @@ mod tests {
     #[test]
     fn the_pre_poll_state_is_a_full_paint_not_a_blank_panel() {
         let mut st = SystemState::default();
-        let mut inst = InstancesState::default();
-        assert!(
-            renders(&mut st, &mut inst),
-            "pre-poll System panel drew nothing"
-        );
+        assert!(renders(&mut st), "pre-poll System panel drew nothing");
     }
 
     #[test]
@@ -3136,11 +3076,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut st = SystemState::default();
         st.poll(&ctx); // one snapshot + reconcile
-        let mut inst = InstancesState::default();
-        assert!(
-            renders(&mut st, &mut inst),
-            "live System panel drew nothing"
-        );
+        assert!(renders(&mut st), "live System panel drew nothing");
     }
 
     #[test]
@@ -3208,10 +3144,9 @@ mod tests {
         // the seat's logind is Absent on the farm host, so Power folds to an error,
         // never an actual poweroff).
         let mut st = SystemState::default();
-        let mut inst = InstancesState::default();
-        st.apply(vec![SysAction::ArmConfirm(PowerVerb::Reboot)], &mut inst);
+        st.apply(vec![SysAction::ArmConfirm(PowerVerb::Reboot)]);
         assert_eq!(st.confirm, Some(PowerVerb::Reboot));
-        st.apply(vec![SysAction::CancelConfirm], &mut inst);
+        st.apply(vec![SysAction::CancelConfirm]);
         assert!(st.confirm.is_none());
     }
 
@@ -3249,11 +3184,7 @@ mod tests {
         // the probe) before rendering, matching the live poll path.
         st.reconcile(&snap);
         st.snapshot = Some(snap);
-        let mut inst = InstancesState::default();
-        assert!(
-            renders(&mut st, &mut inst),
-            "the live POWER-4 panel drew nothing"
-        );
+        assert!(renders(&mut st), "the live POWER-4 panel drew nothing");
         assert_eq!(
             st.charge_threshold,
             Some(80),
@@ -3275,11 +3206,7 @@ mod tests {
             available: vec!["balanced".to_owned(), "performance".to_owned()],
         });
         st.snapshot = Some(snap);
-        let mut inst = InstancesState::default();
-        st.apply(
-            vec![SysAction::SetPowerProfile("performance".to_owned())],
-            &mut inst,
-        );
+        st.apply(vec![SysAction::SetPowerProfile("performance".to_owned())]);
         let active = match st.snapshot.as_ref().map(|s| &s.power_profile) {
             Some(Probe::Present(p)) => p.active.clone(),
             _ => unreachable!("the profile probe stays Present"),
@@ -3300,8 +3227,7 @@ mod tests {
         // + privilege it would succeed and seed the live cap — asserted as the
         // honest either/or so the test holds on any host.
         let mut st = SystemState::default();
-        let mut inst = InstancesState::default();
-        st.apply(vec![SysAction::SetChargeThreshold(70)], &mut inst);
+        st.apply(vec![SysAction::SetChargeThreshold(70)]);
         let ok = st.error.is_none() && st.charge_threshold == Some(70);
         let surfaced = st
             .error
@@ -3415,9 +3341,8 @@ mod tests {
         });
         st.snapshot = Some(snap);
 
-        let mut inst = InstancesState::default();
         assert!(
-            renders(&mut st, &mut inst),
+            renders(&mut st),
             "the live Bluetooth control panel drew nothing"
         );
     }
@@ -3443,15 +3368,10 @@ mod tests {
             devices: vec![],
         });
         st.snapshot = Some(snap);
-        let mut inst = InstancesState::default();
-
-        st.apply(
-            vec![SysAction::BtDiscoverable(
-                "/org/bluez/hci0".to_owned(),
-                true,
-            )],
-            &mut inst,
-        );
+        st.apply(vec![SysAction::BtDiscoverable(
+            "/org/bluez/hci0".to_owned(),
+            true,
+        )]);
         let toasts = st.take_toasts();
         let cached_on = matches!(
             st.snapshot.as_ref().map(|s| &s.bluetooth),
@@ -3566,9 +3486,8 @@ mod tests {
                     nav: SettingsNav::at(section),
                     ..SystemState::default()
                 };
-                let mut inst = InstancesState::default();
                 assert!(
-                    renders(&mut st, &mut inst),
+                    renders(&mut st),
                     "the detail pane for {} drew nothing",
                     section.label()
                 );
@@ -3893,18 +3812,14 @@ mod tests {
         // And the layered detail path actually paints headless — the section body
         // renders inside the layer-02 card without panicking, a full paint never blank.
         let mut st = SystemState::default();
-        let mut inst = InstancesState::default();
-        assert!(
-            renders(&mut st, &mut inst),
-            "the layered Settings page drew nothing"
-        );
+        assert!(renders(&mut st), "the layered Settings page drew nothing");
     }
 
     // ── Expressive wide layouts (SETTINGS-3) ──────────────────────────────────
 
     /// Render one headless frame at an explicit pane width, tessellating on the CPU
     /// (the DRM runner's path minus the GPU) — the wide-pane variant of [`renders`].
-    fn renders_at(state: &mut SystemState, instances: &mut InstancesState, width: f32) -> bool {
+    fn renders_at(state: &mut SystemState, width: f32) -> bool {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -3912,7 +3827,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| state.show(ui, instances));
+            egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
     }
@@ -4025,9 +3940,8 @@ mod tests {
             };
             st.reconcile(&snap);
             st.snapshot = Some(snap);
-            let mut inst = InstancesState::default();
             assert!(
-                renders_at(&mut st, &mut inst, 1440.0),
+                renders_at(&mut st, 1440.0),
                 "the wide {} pane drew nothing",
                 section.label()
             );
@@ -4057,9 +3971,8 @@ mod tests {
             "both outputs entered the layout"
         );
 
-        let mut inst = InstancesState::default();
         assert!(
-            renders_at(&mut st, &mut inst, 1440.0),
+            renders_at(&mut st, 1440.0),
             "the wide Displays row of cards drew nothing"
         );
 
@@ -4067,10 +3980,7 @@ mod tests {
         // last-console interlock keeps the second lit) — the real SysAction still
         // fires after the re-layout.
         let first = st.layout.outputs[0].id.clone();
-        st.apply(
-            vec![SysAction::ToggleOutput(first.clone(), false)],
-            &mut inst,
-        );
+        st.apply(vec![SysAction::ToggleOutput(first.clone(), false)]);
         let disabled = st
             .layout
             .outputs
@@ -4163,9 +4073,8 @@ mod tests {
                     mesh,
                     ..SystemState::default()
                 };
-                let mut inst = InstancesState::default();
                 assert!(
-                    renders_at(&mut st, &mut inst, 1440.0),
+                    renders_at(&mut st, 1440.0),
                     "the Mesh & System {} pane drew nothing",
                     section.label()
                 );
@@ -4184,8 +4093,7 @@ mod tests {
             agent_attempted: true,
             ..SystemState::default()
         };
-        let mut inst = InstancesState::default();
-        st.apply(vec![SysAction::PairingRetry], &mut inst);
+        st.apply(vec![SysAction::PairingRetry]);
         assert!(st.agent.is_none(), "no adapter ⇒ no agent registered");
         assert!(
             !st.agent_attempted,

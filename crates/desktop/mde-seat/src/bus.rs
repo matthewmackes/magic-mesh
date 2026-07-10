@@ -1,8 +1,8 @@
 //! The one system-D-Bus call path the three zbus clients share — a cached
 //! blocking connection plus typed-error classification.
 //!
-//! Mirrors the mde-kvm transport split: this module is the only place the D-Bus
-//! I/O happens; the per-backend folds stay pure and unit-tested. The connection
+//! This module is the only place the D-Bus I/O happens; the per-backend folds
+//! stay pure and unit-tested. The connection
 //! is dialled lazily, cached, and dropped on any call error so the next probe
 //! re-dials (self-healing across a bus restart) — a dead bus folds into a typed
 //! [`SeatError::Unavailable`], never a panic.

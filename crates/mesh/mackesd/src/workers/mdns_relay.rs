@@ -28,8 +28,8 @@
 
 #![cfg(feature = "async-services")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
@@ -524,11 +524,10 @@ mod tests {
             Some("10.42.0.9")
         );
         // advertised at the peer's mesh IP, not our LAN address.
-        assert!(
-            info.get_addresses()
-                .iter()
-                .any(|ip| ip.to_string() == "10.42.0.9")
-        );
+        assert!(info
+            .get_addresses()
+            .iter()
+            .any(|ip| ip.to_string() == "10.42.0.9"));
     }
 
     #[test]

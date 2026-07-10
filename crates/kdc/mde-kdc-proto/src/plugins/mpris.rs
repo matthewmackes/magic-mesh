@@ -21,9 +21,31 @@ use crate::wire::Packet;
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MprisBody {
+    /// Available player names. Used for player-list responses.
+    #[serde(default, rename = "playerList", skip_serializing_if = "Vec::is_empty")]
+    pub player_list: Vec<String>,
     /// Player identifier (e.g. `spotify`, `firefox`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub player: String,
+    /// Can pause.
+    #[serde(default, rename = "canPause", skip_serializing_if = "Option::is_none")]
+    pub can_pause: Option<bool>,
+    /// Can play.
+    #[serde(default, rename = "canPlay", skip_serializing_if = "Option::is_none")]
+    pub can_play: Option<bool>,
+    /// Can go next.
+    #[serde(default, rename = "canGoNext", skip_serializing_if = "Option::is_none")]
+    pub can_go_next: Option<bool>,
+    /// Can go previous.
+    #[serde(
+        default,
+        rename = "canGoPrevious",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub can_go_previous: Option<bool>,
+    /// Can seek.
+    #[serde(default, rename = "canSeek", skip_serializing_if = "Option::is_none")]
+    pub can_seek: Option<bool>,
     /// Current playback state. Optional in commands.
     #[serde(default)]
     pub is_playing: bool,
@@ -37,6 +59,40 @@ pub struct MprisBody {
     /// `Next`, `Previous`, `Stop`). Empty in state reports.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub action: String,
+    /// Deprecated upstream combined string (`Artist - Title`), still consumed by
+    /// older peers.
+    #[serde(
+        default,
+        rename = "nowPlaying",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub now_playing: String,
+    /// Current track artist.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub artist: String,
+    /// Current track title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Current track album.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub album: String,
+    /// Current track album-art URL.
+    #[serde(
+        default,
+        rename = "albumArtUrl",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub album_art_url: String,
+    /// Current player volume in percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<i64>,
+    /// Whether album-art payloads are supported. Sent with player-list reports.
+    #[serde(
+        default,
+        rename = "supportAlbumArtPayload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub support_album_art_payload: Option<bool>,
 }
 
 fn is_zero(n: &i64) -> bool {
@@ -46,6 +102,8 @@ fn is_zero(n: &i64) -> bool {
 /// Discriminator for the two MPRIS body shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MprisKind {
+    /// Player-list report.
+    PlayerList,
     /// Player state report.
     State,
     /// Remote command.
@@ -60,12 +118,36 @@ impl MprisBody {
     pub fn kind(&self) -> MprisKind {
         if !self.action.is_empty() {
             MprisKind::Command
+        } else if !self.player_list.is_empty() || self.support_album_art_payload.is_some() {
+            MprisKind::PlayerList
         } else if !self.player.is_empty() {
             MprisKind::State
         } else {
             MprisKind::Empty
         }
     }
+}
+
+/// `kdeconnect.mpris.request` body. A peer uses this packet kind to request a
+/// player list/state, request volume, or issue a media command.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MprisRequestBody {
+    /// Target player, if the request is player-specific.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub player: String,
+    /// Request the current player list.
+    #[serde(default)]
+    pub request_player_list: bool,
+    /// Request current track/playback state.
+    #[serde(default)]
+    pub request_now_playing: bool,
+    /// Request current volume.
+    #[serde(default)]
+    pub request_volume: bool,
+    /// Command for the target player.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action: String,
 }
 
 /// Build a remote MPRIS command packet (peer→player).
@@ -104,6 +186,7 @@ mod tests {
             length: 245_000,
             pos: 80_000,
             action: String::new(),
+            ..Default::default()
         };
         assert_eq!(body.kind(), MprisKind::State);
     }
@@ -145,10 +228,38 @@ mod tests {
             length: 100_000,
             pos: 25_000,
             action: String::new(),
+            ..Default::default()
         };
         let s = serde_json::to_string(&body).unwrap();
         let back: MprisBody = serde_json::from_str(&s).unwrap();
         assert_eq!(back, body);
+    }
+
+    #[test]
+    fn mpris_player_list_body_kind_is_player_list() {
+        let body = MprisBody {
+            player_list: vec!["mde-music".to_string()],
+            support_album_art_payload: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(body.kind(), MprisKind::PlayerList);
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(s.contains(r#""playerList":["mde-music"]"#));
+        assert!(s.contains(r#""supportAlbumArtPayload":false"#));
+    }
+
+    #[test]
+    fn mpris_request_body_parses_player_state_request() {
+        let body: MprisRequestBody = serde_json::from_value(serde_json::json!({
+            "player": "mde-music",
+            "requestNowPlaying": true,
+            "requestVolume": true
+        }))
+        .unwrap();
+        assert_eq!(body.player, "mde-music");
+        assert!(body.request_now_playing);
+        assert!(body.request_volume);
+        assert!(!body.request_player_list);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -174,6 +285,7 @@ mod tests {
             length: 245_000,
             pos: 80_000,
             action: String::new(),
+            ..Default::default()
         };
         let pkt = mpris_command_packet(1, String::new());
         // Reuse the same packet kind path; substitute body.

@@ -163,13 +163,17 @@ echo "==> built: $TAG"
 # ── Optional: a bootable disk image via bootc-image-builder ──────────────────
 if [ -n "$DISK_TYPE" ]; then
     resolve_image "$BIB_IMAGE" "bootc-image-builder"
-    mkdir -p "$OUT_DIR"
-    echo "==> bootc-image-builder: type=$DISK_TYPE out=$OUT_DIR"
+    case "$OUT_DIR" in
+        /*) OUT_DIR_ABS="$OUT_DIR" ;;
+        *) OUT_DIR_ABS="$PWD/$OUT_DIR" ;;
+    esac
+    mkdir -p "$OUT_DIR_ABS"
+    echo "==> bootc-image-builder: type=$DISK_TYPE out=$OUT_DIR_ABS"
     podman run --rm --privileged \
         --security-opt label=type:unconfined_t \
-        -v "$OUT_DIR:/output" \
+        -v "$OUT_DIR_ABS:/output" \
         -v /var/lib/containers/storage:/var/lib/containers/storage \
         "$BIB_IMAGE" \
         --type "$DISK_TYPE" --local "$TAG"
-    echo "==> disk image(s) under: $OUT_DIR"
+    echo "==> disk image(s) under: $OUT_DIR_ABS"
 fi

@@ -24,11 +24,10 @@
 //! hand-rolled) — and `growroot` grows the root partition to the flavor disk.
 //! There is nothing to "generalize" after the fact: the build output is already
 //! a clean, cloneable image, and the element list ([`StandardImage::elements`])
-//! is the reviewable source of truth the script never was. The golden script is
-//! then dead — its physical `git rm` lands with the QC-15 hard cutover (the
-//! cutover-map's "`build-mde-vm-golden.sh` deleted" verification, `docs/ops/
-//! quasar-cloud-cutover-map.md`), which retires the whole cloud-hypervisor/XCP
-//! template stack the script fed.
+//! is the reviewable source of truth the script never was. The cloud-facing
+//! golden script is deleted; the remaining XCP build-farm template refresh uses
+//! the explicitly farm-scoped `farm-generalize-xcp-template.sh` helper instead
+//! of reviving the retired cloud image path.
 //!
 //! ## The pipeline (three stages; the run itself is a deploy-time operator step)
 //!
@@ -37,7 +36,8 @@
 //! 2. **Land in Glance** — [`StandardImage::glance_create_command`]: `glance
 //!    image-create` uploads the qcow2 into the local **file** store
 //!    ([`super::config_render`]'s `[glance_store] stores = file`) of ONE API
-//!    node (design Q53).
+//!    node (design Q53), with the libvirt image metadata Nova consumes for the
+//!    QEMU display path (`hw_video_model=virtio`, QC-23).
 //! 3. **Replicate** — [`replicate_command`]: `glance-replicator livecopy` fans
 //!    the image (metadata + data) from that node to every other API node's local
 //!    store, so any node serves the standard image locally (Q53 — replication
@@ -64,6 +64,17 @@ pub const CONTAINER_FORMAT: &str = "bare";
 /// `--store` this renders and the `stores`/`default_store` in
 /// [`super::config_render`]'s glance-api.conf.
 pub const GLANCE_FILE_STORE: &str = "file";
+
+/// The libvirt video model the standard images request from Nova/QEMU. Glance's
+/// `hw_video_model` image property is consumed by Nova's libvirt driver; `virtio`
+/// is the QEMU-side prerequisite for the QC-23 virtio-gpu fast path. SPICE/VNC
+/// remain fallbacks at the protocol layer until the shell importer is live.
+pub const GLANCE_VIDEO_MODEL_PROPERTY: &str = "hw_video_model=virtio";
+
+/// Make the QEMU guest agent available to the instance when the image carries
+/// one; this does not fake agent presence inside the guest, but it lets prepared
+/// MCNF images expose the standard control channel.
+pub const GLANCE_QEMU_AGENT_PROPERTY: &str = "hw_qemu_guest_agent=yes";
 
 /// One standard platform image the DIB pipeline builds and lands in Glance.
 ///
@@ -108,15 +119,20 @@ impl StandardImage {
     /// The `glance image-create` invocation that lands the built qcow2 in one
     /// API node's local **file** store (stage 2). `--visibility public` so every
     /// member can launch it (Q81/82 — one cloud for all, no per-user image silo).
+    /// The two `--property` values are not cosmetic: Nova's libvirt driver reads
+    /// them when defining the QEMU domain for a launched instance.
     #[must_use]
     pub fn glance_create_command(&self) -> String {
         format!(
             "glance image-create --name {name} --disk-format {disk} \
-             --container-format {cont} --store {store} --visibility public --file {artifact}",
+             --container-format {cont} --store {store} --visibility public \
+             --property {video} --property {agent} --file {artifact}",
             name = self.name,
             disk = DISK_FORMAT,
             cont = CONTAINER_FORMAT,
             store = GLANCE_FILE_STORE,
+            video = GLANCE_VIDEO_MODEL_PROPERTY,
+            agent = GLANCE_QEMU_AGENT_PROPERTY,
             artifact = self.artifact(),
         )
     }
@@ -248,6 +264,17 @@ mod tests {
         assert!(cmd.contains("--file mcnf-base.qcow2"), "{cmd}");
         // One cloud for all — the image is launchable by every member (Q82).
         assert!(cmd.contains("--visibility public"), "{cmd}");
+    }
+
+    #[test]
+    fn glance_create_pins_the_qemu_virtio_video_contract() {
+        // QC-23 — Nova/libvirt consumes Glance image metadata when defining the
+        // QEMU domain. The live dmabuf importer is still separate, but launched
+        // standard instances must ask QEMU for virtio video instead of relying on
+        // a libvirt default such as cirrus/qxl.
+        let cmd = STANDARD_IMAGES[0].glance_create_command();
+        assert!(cmd.contains("--property hw_video_model=virtio"), "{cmd}");
+        assert!(cmd.contains("--property hw_qemu_guest_agent=yes"), "{cmd}");
     }
 
     #[test]

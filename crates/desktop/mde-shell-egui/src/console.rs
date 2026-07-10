@@ -45,10 +45,9 @@
 //! across every operational group (System / Network / Packages / Storage / Mesh
 //! / Containers & VMs / Shells), each row a real tool honest-gated on `$PATH`
 //! (§7) and carrying its own **domain glyph** (lock #33) — System / Storage /
-//! Mesh / Instances / Signal / … — so the menu scans by domain rather than a
+//! Mesh / Cloud / Signal / … — so the menu scans by domain rather than a
 //! wall of identical terminal icons. The Containers & VMs group's Cloud-plane
-//! row is the surface link to [`Surface::Instances`] (the combined-group
-//! decision, Q41/Q50).
+//! row is the Workbench Cloud-plane link (the combined-group decision, Q41/Q50).
 //!
 //! Like the dock, this module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
@@ -65,6 +64,7 @@ use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
 use crate::dock::{icon_texture, Surface, DOCK_W};
+use crate::workbench::Plane;
 
 // ── geometry (all §4 token math, the dock's 8px grid) ───────────────────────
 
@@ -171,6 +171,8 @@ enum EntryKind {
     /// Route to a shell surface (lock #41's "open the correct GUI surface") —
     /// live NOW through [`ConsoleRequest::Goto`].
     Link(Surface),
+    /// Route to a Workbench plane, used for the QUASAR-CLOUD replacement plane.
+    Plane(Plane),
 }
 
 /// One Console entry: icon + label + one-line description + provenance
@@ -471,11 +473,11 @@ const GROUPS: [ConsoleGroup; 7] = [
             },
             ConsoleEntry {
                 label: "Cloud Plane (GUI)",
-                desc: "Open the Instances surface — the VM lifecycle GUI",
+                desc: "Open the Workbench Cloud plane — the VM lifecycle GUI",
                 tool: "",
                 provenance: Provenance::Quasar,
-                icon: IconId::Instances,
-                kind: EntryKind::Link(Surface::Instances),
+                icon: IconId::Server,
+                kind: EntryKind::Plane(Plane::Cloud),
             },
         ],
     },
@@ -574,6 +576,8 @@ impl GateNotice {
 pub enum ConsoleRequest {
     /// Route the shell body to a surface (a live surface-link entry).
     Goto(Surface),
+    /// Route the shell body to a Workbench plane.
+    Plane(Plane),
     /// CONSOLE-5 — open a **named terminal tab** running `argv`: the shell
     /// switches to `Surface::Terminal` (lock #7) and drives
     /// `TerminalSurface::spawn_tab` (§6, the deferred-wire idiom — the panel
@@ -857,6 +861,10 @@ impl ConsoleState {
         match entry.kind {
             EntryKind::Link(surface) => {
                 self.pending = Some(ConsoleRequest::Goto(surface));
+                self.close();
+            }
+            EntryKind::Plane(plane) => {
+                self.pending = Some(ConsoleRequest::Plane(plane));
                 self.close();
             }
             EntryKind::Tab(cmd) => {
@@ -1540,7 +1548,7 @@ fn heading(ui: &mut egui::Ui, label: &str) -> egui::Rect {
 }
 
 /// One entry row (lock #33): the row's declared domain glyph (System / Storage
-/// / Mesh / Instances / Signal / … — a surface link wears its surface's own
+/// / Mesh / Cloud / Signal / … — a surface link wears its surface's own
 /// glyph), the label over the one-line description, and the subtle provenance
 /// tag (lock #38). An
 /// absent tool greys the row + names the absence in-line (§7). The focused row
@@ -1783,6 +1791,7 @@ mod tests {
         GateReason, PowerAction, CONSOLE_AREA, GROUPS, PINNED,
     };
     use crate::dock::Surface;
+    use crate::workbench::Plane;
     use mde_egui::egui;
     use mde_egui::Style;
     use mde_seat::PowerVerb;
@@ -1909,8 +1918,8 @@ mod tests {
         assert!(
             cvm.entries
                 .iter()
-                .any(|e| e.kind == EntryKind::Link(Surface::Instances)),
-            "the Containers & VMs group links to the Instances surface"
+                .any(|e| e.kind == EntryKind::Plane(Plane::Cloud)),
+            "the Containers & VMs group links to the Cloud plane"
         );
         // The flat index space is coherent.
         assert_eq!(static_rows().count(), total_rows());
@@ -1989,20 +1998,19 @@ mod tests {
     }
 
     #[test]
-    fn the_containers_and_vms_plane_link_routes_to_the_instances_surface() {
+    fn the_containers_and_vms_plane_link_routes_to_the_cloud_plane() {
         // Q41/Q50 — the combined Containers & VMs group carries the surface
-        // link that routes to the Cloud/Instances PLANE (a GUI surface), NOT a
-        // terminal tab; activating it records Goto(Instances) and closes.
+        // link that routes to the Cloud plane (a GUI plane), NOT a terminal tab.
         let flat = static_rows()
-            .position(|e| e.kind == EntryKind::Link(Surface::Instances))
+            .position(|e| e.kind == EntryKind::Plane(Plane::Cloud))
             .expect("the Cloud-plane surface link exists");
         let mut s = ConsoleState::with_store(None);
         s.toggle();
         s.activate(flat);
         assert_eq!(
             s.take_request(),
-            Some(ConsoleRequest::Goto(Surface::Instances)),
-            "the Containers & VMs plane link routes to the Instances surface"
+            Some(ConsoleRequest::Plane(Plane::Cloud)),
+            "the Containers & VMs plane link routes to the Cloud plane"
         );
         assert!(!s.is_open(), "a routed surface link closes the panel");
     }

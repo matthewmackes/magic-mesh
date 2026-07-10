@@ -61,7 +61,7 @@ secrets:
   <QNM-Shared>/secrets/xcp/<host>.age (B3) leader-managed XAPI creds
 install:
   install-helpers/xcp-host-join.sh    (B) native dom0 nebula (+ static etcd/Syncthing later; lizardfs retired SUBSTRATE-6); driven via XeSsh (appliance-guarded)
-  install-helpers/build-mde-vm-golden.sh  (A2) one-time golden template builder
+  install-helpers/setup-xcp-golden-template.sh  (A2) one-time golden template builder
 ```
 
 ### A — provisioning flow

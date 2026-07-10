@@ -8,9 +8,9 @@
 //! directly (in-process, zero-latency), and the `mackesd` `host_state` mirror
 //! worker (E12-19) consumes the *same crate* for its Bus mirror.
 //!
-//! Every client follows the mde-kvm `ChTransport` pattern: a narrow trait seam,
-//! typed errors, pure folds unit-tested headless, and a production impl that does
-//! only I/O. The seams:
+//! Every client follows the same narrow typed-seam pattern: pure folds
+//! unit-tested headless, typed errors, and a production impl that does only I/O.
+//! The seams:
 //!
 //! - [`BluezClient`] — `BlueZ` adapter/device enumeration (incl. `Battery1`
 //!   peripheral batteries) over the system D-Bus `ObjectManager`, **plus the

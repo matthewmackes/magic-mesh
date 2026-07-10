@@ -1,15 +1,16 @@
 # OW-12 — the Magic-on-Quasar Workstation ISO kickstart. A bootc/ostree-native
 # installer for the ONE immutable MCNF image (E12-13, §5 delivery lock): the
-# egui-DRM shell Workstation + cloud-hypervisor + mackesd + Podman + Nebula, with
-# the desktop seat gated on the role flag so the SAME image serves a headless
-# Server/Lighthouse (role is a config flag, not a build).
+# egui-DRM shell Workstation + mackesd + Podman + Nebula + the QC-1
+# libvirt/QEMU-KVM/OVN host bits, with the desktop seat gated on the role flag
+# so the SAME image serves a headless Server/Lighthouse (role is a config flag,
+# not a build).
 #
 # Supersedes the heritage magic-on-cosmic.ks, which installed the RETIRED
 # @^fedora-cosmic-desktop-environment via the package lane. This kickstart does
 # NOT %packages-install anything: it deploys the pre-built **bootc Workstation
 # image** with `ostreecontainer`, so the magic-mesh RPM, the Quasar DRM-seat unit
 # (packaging/bootc/units/mde-shell-egui.service) + its preset
-# (packaging/bootc/system-preset/45-mcnf-quasar.preset), cloud-hypervisor and the
+# (packaging/bootc/system-preset/45-mcnf-quasar.preset), the host virt bits and
 # graphical.target default ALL arrive baked in from the image
 # (packaging/bootc/Containerfile). The kickstart REFERENCES that image — it never
 # re-packages the RPM or re-authors the seat unit (both already exist).
@@ -54,7 +55,7 @@ autopart --type=plain --nohome
 # ── Deploy the ONE immutable bootc Workstation image (§5) ─────────────────────
 # NOT a %packages install: `ostreecontainer` lays the pre-built bootc image down
 # whole, bringing the magic-mesh RPM + the Quasar DRM-seat unit + its preset +
-# cloud-hypervisor + the graphical.target default already materialized by the
+# libvirt/QEMU-KVM/OVN + the graphical.target default already materialized by the
 # Containerfile's `systemctl enable` / `set-default`.
 #
 # --url is build-image.sh's DEFAULT --tag; --transport=containers-storage reads

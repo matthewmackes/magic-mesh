@@ -10,9 +10,10 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -20,6 +21,7 @@ use tokio::process::Command;
 
 use super::job::Method;
 use super::job::TransferJob;
+use super::job::TransferPolicy;
 
 /// Upper bound for one external transfer process. This is deliberately generous:
 /// it prevents an immortal child while leaving real large downloads room to finish.
@@ -28,6 +30,15 @@ pub const HTTP_LANE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const RSYNC_LANE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// Upper bound for one sftp process. Mirrors the other bounded external lanes.
 pub const SFTP_LANE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// Keep browser HLS package expansion bounded: large live/DVR manifests can be
+/// effectively unbounded, and Transfers must never turn one click into a crawl.
+const BROWSER_HLS_MAX_PLAYLISTS: usize = 16;
+const BROWSER_HLS_MAX_ASSETS: usize = 256;
+/// Keep browser DASH package expansion bounded for the same reason as HLS.
+const BROWSER_DASH_MAX_ASSETS: usize = 256;
+/// Keep Browser scrape crawl execution bounded. The Browser shell already emits
+/// a depth-1 handoff manifest; the daemon must not turn that into an open crawl.
+const BROWSER_SCRAPE_CRAWL_MAX_TARGETS: usize = 128;
 /// Env override for the shared Navidrome library directory. Live media
 /// lighthouses can point this at the rclone mount; tests and Workstations default
 /// to the canonical workgroup-root music directory.
@@ -309,7 +320,49 @@ impl BrowserDownloadLane {
             return Err("browser-download lane requires a local destination path".into());
         }
         prepare_destination(&dest)?;
-        Ok(BrowserDownloadPlan { source, dest })
+        if let Some(request) = browser_media_download_request(&source)? {
+            if browser_media_request_is_hls(&request) {
+                let (package_dir, manifest_filename) =
+                    hls_package_destination(&dest, &request.suggested_filename);
+                return Ok(BrowserDownloadPlan::FetchHlsPackage {
+                    manifest_url: request.asset_url,
+                    package_dir,
+                    manifest_filename,
+                });
+            }
+            if browser_media_request_is_dash(&request) {
+                let (package_dir, manifest_filename) =
+                    dash_package_destination(&dest, &request.suggested_filename);
+                return Ok(BrowserDownloadPlan::FetchDashPackage {
+                    manifest_url: request.asset_url,
+                    package_dir,
+                    manifest_filename,
+                });
+            }
+            let resolved_dest = if dest.is_dir() {
+                dest.join(&request.suggested_filename)
+            } else {
+                dest
+            };
+            return Ok(BrowserDownloadPlan::FetchMedia {
+                asset_url: request.asset_url,
+                dest: resolved_dest,
+            });
+        }
+        if let Some(request) = browser_scrape_crawl_request(&source)? {
+            if !request.targets.is_empty() {
+                let original_dest = resolve_dest_path(&source, &dest);
+                let package_dir = scrape_crawl_package_destination(&original_dest);
+                return Ok(BrowserDownloadPlan::FetchScrapeCrawlPackage {
+                    source,
+                    dest: original_dest,
+                    page_url: request.page_url,
+                    package_dir,
+                    targets: request.targets,
+                });
+            }
+        }
+        Ok(BrowserDownloadPlan::CopyMaterialized { source, dest })
     }
 }
 
@@ -401,18 +454,495 @@ impl LaneRunner for BrowserDownloadLane {
             Ok(plan) => plan,
             Err(e) => return LaneOutcome::failed(e),
         };
-        copy_materialized_file(
-            "browser-download lane",
-            &plan.source,
-            resolve_dest_path(&plan.source, &plan.dest),
-            progress,
-        )
-        .await
+        match plan {
+            BrowserDownloadPlan::CopyMaterialized { source, dest } => {
+                copy_materialized_file(
+                    "browser-download lane",
+                    &source,
+                    resolve_dest_path(&source, &dest),
+                    progress,
+                )
+                .await
+            }
+            BrowserDownloadPlan::FetchMedia { asset_url, dest } => {
+                fetch_http_child(&job.id, &job.policy, &asset_url, &dest, progress).await
+            }
+            BrowserDownloadPlan::FetchHlsPackage {
+                manifest_url,
+                package_dir,
+                manifest_filename,
+            } => {
+                fetch_hls_package(
+                    &job.id,
+                    &job.policy,
+                    &manifest_url,
+                    &package_dir,
+                    &manifest_filename,
+                    progress,
+                )
+                .await
+            }
+            BrowserDownloadPlan::FetchDashPackage {
+                manifest_url,
+                package_dir,
+                manifest_filename,
+            } => {
+                fetch_dash_package(
+                    &job.id,
+                    &job.policy,
+                    &manifest_url,
+                    &package_dir,
+                    &manifest_filename,
+                    progress,
+                )
+                .await
+            }
+            BrowserDownloadPlan::FetchScrapeCrawlPackage {
+                source,
+                dest,
+                page_url,
+                package_dir,
+                targets,
+            } => {
+                fetch_scrape_crawl_package(
+                    &job.id,
+                    &job.policy,
+                    &source,
+                    &dest,
+                    &page_url,
+                    &package_dir,
+                    &targets,
+                    progress,
+                )
+                .await
+            }
+        }
     }
 }
 
 async fn copy_node_plan(plan: NodePlan, progress: ProgressSink) -> LaneOutcome {
     copy_materialized_file("node lane", &plan.source, plan.dest, progress).await
+}
+
+async fn fetch_http_child(
+    job_id: &str,
+    policy: &TransferPolicy,
+    url: &str,
+    dest: &Path,
+    progress: ProgressSink,
+) -> LaneOutcome {
+    let mut http_job = TransferJob::new(
+        url.to_string(),
+        dest.display().to_string(),
+        Method::Http,
+        policy.clone(),
+    );
+    http_job.id = job_id.to_string();
+    HttpWgetLane.run(&http_job, progress).await
+}
+
+async fn fetch_hls_package(
+    job_id: &str,
+    policy: &TransferPolicy,
+    manifest_url: &str,
+    package_dir: &Path,
+    manifest_filename: &str,
+    progress: ProgressSink,
+) -> LaneOutcome {
+    if let Err(e) = tokio::fs::create_dir_all(package_dir).await {
+        return LaneOutcome::failed(format!(
+            "browser HLS package could not create {}: {e}",
+            package_dir.display()
+        ));
+    }
+
+    let mut used_filenames = BTreeSet::new();
+    let root_filename = unique_browser_package_filename(manifest_filename, &mut used_filenames);
+    let mut pending = VecDeque::from([(manifest_url.to_string(), root_filename.clone(), 0usize)]);
+    let mut seen_urls = BTreeSet::new();
+    let mut url_paths = BTreeMap::from([(manifest_url.to_string(), root_filename.clone())]);
+    let mut playlist_bodies = Vec::new();
+    let mut items = Vec::new();
+    let mut playlist_count = 0usize;
+    let mut asset_count = 0usize;
+
+    while let Some((playlist_url, filename, depth)) = pending.pop_front() {
+        if !seen_urls.insert(playlist_url.clone()) {
+            continue;
+        }
+        playlist_count += 1;
+        if playlist_count > BROWSER_HLS_MAX_PLAYLISTS {
+            return LaneOutcome::failed(format!(
+                "browser HLS package exceeded the {BROWSER_HLS_MAX_PLAYLISTS} playlist limit"
+            ));
+        }
+        let playlist_path = package_dir.join(&filename);
+        let outcome = fetch_http_child(
+            job_id,
+            policy,
+            &playlist_url,
+            &playlist_path,
+            progress.clone(),
+        )
+        .await;
+        if let LaneOutcome::Failed { error } = outcome {
+            return LaneOutcome::failed(format!(
+                "browser HLS package playlist fetch failed for {playlist_url}: {error}"
+            ));
+        }
+        items.push(HlsPackageItem {
+            kind: "playlist",
+            url: playlist_url.clone(),
+            path: filename.clone(),
+        });
+        let body = match tokio::fs::read_to_string(&playlist_path).await {
+            Ok(body) => body,
+            Err(e) => {
+                return LaneOutcome::failed(format!(
+                    "browser HLS package could not read playlist {}: {e}",
+                    playlist_path.display()
+                ));
+            }
+        };
+        playlist_bodies.push((playlist_url.clone(), filename.clone(), body.clone()));
+        for reference in hls_playlist_references(&body) {
+            let child_url = match resolve_hls_child_url(&playlist_url, &reference.uri) {
+                Ok(url) => url,
+                Err(e) => return LaneOutcome::failed(e),
+            };
+            if is_hls_manifest_url(&child_url) {
+                if depth + 1 >= BROWSER_HLS_MAX_PLAYLISTS {
+                    return LaneOutcome::failed(
+                        "browser HLS package exceeded nested playlist depth".to_string(),
+                    );
+                }
+                if seen_urls.contains(&child_url) {
+                    continue;
+                }
+                let child_filename = unique_browser_package_filename(
+                    &hls_url_filename(&child_url),
+                    &mut used_filenames,
+                );
+                url_paths.insert(child_url.clone(), child_filename.clone());
+                pending.push_back((child_url, child_filename, depth + 1));
+                continue;
+            }
+            if !seen_urls.insert(child_url.clone()) {
+                continue;
+            }
+            asset_count += 1;
+            if asset_count > BROWSER_HLS_MAX_ASSETS {
+                return LaneOutcome::failed(format!(
+                    "browser HLS package exceeded the {BROWSER_HLS_MAX_ASSETS} asset limit"
+                ));
+            }
+            let filename =
+                unique_browser_package_filename(&hls_url_filename(&child_url), &mut used_filenames);
+            url_paths.insert(child_url.clone(), filename.clone());
+            let dest = package_dir.join(&filename);
+            let outcome =
+                fetch_http_child(job_id, policy, &child_url, &dest, progress.clone()).await;
+            if let LaneOutcome::Failed { error } = outcome {
+                return LaneOutcome::failed(format!(
+                    "browser HLS package asset fetch failed for {child_url}: {error}"
+                ));
+            }
+            items.push(HlsPackageItem {
+                kind: reference.item_kind(),
+                url: child_url,
+                path: filename,
+            });
+        }
+        let rough = ((playlist_count + asset_count).min(99) as u8).min(99);
+        progress.report(rough);
+    }
+
+    for (playlist_url, filename, body) in playlist_bodies {
+        let rewritten = match rewrite_hls_playlist_to_local(&playlist_url, &body, &url_paths) {
+            Ok(body) => body,
+            Err(e) => return LaneOutcome::failed(e),
+        };
+        let path = package_dir.join(&filename);
+        if let Err(e) = tokio::fs::write(&path, rewritten).await {
+            return LaneOutcome::failed(format!(
+                "browser HLS package could not write offline playlist {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
+    let manifest = serde_json::json!({
+        "op": "browser_hls_download_package",
+        "source": "browser_download_lane",
+        "root_url": manifest_url,
+        "root_playlist_path": root_filename,
+        "offline_rewrite_status": "completed",
+        "playlist_count": playlist_count,
+        "asset_count": asset_count,
+        "items": items
+            .iter()
+            .map(|item| serde_json::json!({
+                "kind": item.kind,
+                "url": item.url,
+                "path": item.path,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let manifest_path = package_dir.join("browser-hls-package.json");
+    let body = match serde_json::to_vec_pretty(&manifest) {
+        Ok(body) => body,
+        Err(e) => return LaneOutcome::failed(format!("browser HLS package encode failed: {e}")),
+    };
+    if let Err(e) = tokio::fs::write(&manifest_path, body).await {
+        return LaneOutcome::failed(format!(
+            "browser HLS package could not write {}: {e}",
+            manifest_path.display()
+        ));
+    }
+    progress.report(99);
+    LaneOutcome::Done
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HlsPackageItem {
+    kind: &'static str,
+    url: String,
+    path: String,
+}
+
+async fn fetch_dash_package(
+    job_id: &str,
+    policy: &TransferPolicy,
+    manifest_url: &str,
+    package_dir: &Path,
+    manifest_filename: &str,
+    progress: ProgressSink,
+) -> LaneOutcome {
+    if let Err(e) = tokio::fs::create_dir_all(package_dir).await {
+        return LaneOutcome::failed(format!(
+            "browser DASH package could not create {}: {e}",
+            package_dir.display()
+        ));
+    }
+
+    let mut used_filenames = BTreeSet::new();
+    let root_filename = unique_browser_package_filename(manifest_filename, &mut used_filenames);
+    let manifest_path = package_dir.join(&root_filename);
+    let outcome = fetch_http_child(
+        job_id,
+        policy,
+        manifest_url,
+        &manifest_path,
+        progress.clone(),
+    )
+    .await;
+    if let LaneOutcome::Failed { error } = outcome {
+        return LaneOutcome::failed(format!(
+            "browser DASH package MPD fetch failed for {manifest_url}: {error}"
+        ));
+    }
+    let body = match tokio::fs::read_to_string(&manifest_path).await {
+        Ok(body) => body,
+        Err(e) => {
+            return LaneOutcome::failed(format!(
+                "browser DASH package could not read MPD {}: {e}",
+                manifest_path.display()
+            ));
+        }
+    };
+    let mut items = vec![DashPackageItem {
+        kind: "mpd",
+        url: manifest_url.to_string(),
+        path: root_filename.clone(),
+    }];
+    let mut seen_urls = BTreeSet::from([manifest_url.to_string()]);
+    let mut url_paths = BTreeMap::from([(manifest_url.to_string(), root_filename.clone())]);
+    let references = match dash_mpd_references(manifest_url, &body) {
+        Ok(references) => references,
+        Err(e) => return LaneOutcome::failed(e),
+    };
+    let mut asset_count = 0usize;
+    for reference in references {
+        if !seen_urls.insert(reference.url.clone()) {
+            continue;
+        }
+        asset_count += 1;
+        if asset_count > BROWSER_DASH_MAX_ASSETS {
+            return LaneOutcome::failed(format!(
+                "browser DASH package exceeded the {BROWSER_DASH_MAX_ASSETS} asset limit"
+            ));
+        }
+        let filename =
+            unique_browser_package_filename(&hls_url_filename(&reference.url), &mut used_filenames);
+        url_paths.insert(reference.url.clone(), filename.clone());
+        let dest = package_dir.join(&filename);
+        let outcome =
+            fetch_http_child(job_id, policy, &reference.url, &dest, progress.clone()).await;
+        if let LaneOutcome::Failed { error } = outcome {
+            return LaneOutcome::failed(format!(
+                "browser DASH package asset fetch failed for {}: {error}",
+                reference.url
+            ));
+        }
+        items.push(DashPackageItem {
+            kind: reference.kind,
+            url: reference.url,
+            path: filename,
+        });
+        progress.report(asset_count.min(99) as u8);
+    }
+
+    let rewritten = match rewrite_dash_mpd_to_local(manifest_url, &body, &url_paths) {
+        Ok(body) => body,
+        Err(e) => return LaneOutcome::failed(e),
+    };
+    if let Err(e) = tokio::fs::write(&manifest_path, rewritten).await {
+        return LaneOutcome::failed(format!(
+            "browser DASH package could not write offline MPD {}: {e}",
+            manifest_path.display()
+        ));
+    }
+
+    let package = serde_json::json!({
+        "op": "browser_dash_download_package",
+        "source": "browser_download_lane",
+        "root_url": manifest_url,
+        "root_mpd_path": root_filename,
+        "offline_rewrite_status": "completed",
+        "asset_count": asset_count,
+        "items": items
+            .iter()
+            .map(|item| serde_json::json!({
+                "kind": item.kind,
+                "url": item.url,
+                "path": item.path,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let package_path = package_dir.join("browser-dash-package.json");
+    let body = match serde_json::to_vec_pretty(&package) {
+        Ok(body) => body,
+        Err(e) => return LaneOutcome::failed(format!("browser DASH package encode failed: {e}")),
+    };
+    if let Err(e) = tokio::fs::write(&package_path, body).await {
+        return LaneOutcome::failed(format!(
+            "browser DASH package could not write {}: {e}",
+            package_path.display()
+        ));
+    }
+    progress.report(99);
+    LaneOutcome::Done
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashPackageItem {
+    kind: &'static str,
+    url: String,
+    path: String,
+}
+
+async fn fetch_scrape_crawl_package(
+    job_id: &str,
+    policy: &TransferPolicy,
+    source: &Path,
+    dest: &Path,
+    page_url: &str,
+    package_dir: &Path,
+    targets: &[BrowserScrapeCrawlTarget],
+    progress: ProgressSink,
+) -> LaneOutcome {
+    let copy_outcome = copy_materialized_file(
+        "browser scrape crawl",
+        source,
+        dest.to_path_buf(),
+        ProgressSink::noop(),
+    )
+    .await;
+    if let LaneOutcome::Failed { error } = copy_outcome {
+        return LaneOutcome::failed(error);
+    }
+    if let Err(e) = tokio::fs::create_dir_all(package_dir).await {
+        return LaneOutcome::failed(format!(
+            "browser scrape crawl package could not create {}: {e}",
+            package_dir.display()
+        ));
+    }
+
+    let mut used_filenames = BTreeSet::new();
+    let mut items = Vec::new();
+    for (idx, target) in targets
+        .iter()
+        .take(BROWSER_SCRAPE_CRAWL_MAX_TARGETS)
+        .enumerate()
+    {
+        let filename =
+            unique_browser_package_filename(&hls_url_filename(&target.url), &mut used_filenames);
+        let target_path = package_dir.join(&filename);
+        let outcome =
+            fetch_http_child(job_id, policy, &target.url, &target_path, progress.clone()).await;
+        if let LaneOutcome::Failed { error } = outcome {
+            return LaneOutcome::failed(format!(
+                "browser scrape crawl target fetch failed for {}: {error}",
+                target.url
+            ));
+        }
+        items.push(ScrapeCrawlPackageItem {
+            url: target.url.clone(),
+            source: target.source.clone(),
+            resource: target.resource.clone(),
+            depth: target.depth,
+            path: filename,
+        });
+        let rough = (((idx + 1) * 99) / targets.len().max(1)) as u8;
+        progress.report(rough);
+    }
+
+    let package = serde_json::json!({
+        "op": "browser_scrape_crawl_package",
+        "source": "browser_download_lane",
+        "page_url": page_url,
+        "execution_status": "completed",
+        "max_depth": 1,
+        "target_count": items.len(),
+        "original_export": dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("browser-active-page-scrape.json"),
+        "items": items
+            .iter()
+            .map(|item| serde_json::json!({
+                "url": item.url,
+                "source": item.source,
+                "resource": item.resource,
+                "depth": item.depth,
+                "path": item.path,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let package_path = package_dir.join("browser-scrape-crawl-package.json");
+    let body = match serde_json::to_vec_pretty(&package) {
+        Ok(body) => body,
+        Err(e) => {
+            return LaneOutcome::failed(format!("browser scrape crawl package encode failed: {e}"));
+        }
+    };
+    if let Err(e) = tokio::fs::write(&package_path, body).await {
+        return LaneOutcome::failed(format!(
+            "browser scrape crawl package could not write {}: {e}",
+            package_path.display()
+        ));
+    }
+    progress.report(99);
+    LaneOutcome::Done
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeCrawlPackageItem {
+    url: String,
+    source: String,
+    resource: String,
+    depth: u8,
+    path: String,
 }
 
 async fn copy_materialized_file(
@@ -714,9 +1244,32 @@ struct RsyncPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BrowserDownloadPlan {
-    source: PathBuf,
-    dest: PathBuf,
+enum BrowserDownloadPlan {
+    CopyMaterialized {
+        source: PathBuf,
+        dest: PathBuf,
+    },
+    FetchMedia {
+        asset_url: String,
+        dest: PathBuf,
+    },
+    FetchHlsPackage {
+        manifest_url: String,
+        package_dir: PathBuf,
+        manifest_filename: String,
+    },
+    FetchDashPackage {
+        manifest_url: String,
+        package_dir: PathBuf,
+        manifest_filename: String,
+    },
+    FetchScrapeCrawlPackage {
+        source: PathBuf,
+        dest: PathBuf,
+        page_url: String,
+        package_dir: PathBuf,
+        targets: Vec<BrowserScrapeCrawlTarget>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,6 +1328,1009 @@ struct NodePlan {
 fn is_http_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserMediaDownloadRequest {
+    asset_url: String,
+    suggested_filename: String,
+    kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserScrapeCrawlRequest {
+    page_url: String,
+    targets: Vec<BrowserScrapeCrawlTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserScrapeCrawlTarget {
+    url: String,
+    source: String,
+    resource: String,
+    depth: u8,
+}
+
+fn browser_media_download_request(
+    source: &Path,
+) -> Result<Option<BrowserMediaDownloadRequest>, String> {
+    if source.extension().and_then(|ext| ext.to_str()) != Some("json")
+        || !source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".download.json"))
+    {
+        return Ok(None);
+    }
+    let body = std::fs::read(source).map_err(|e| {
+        format!(
+            "browser media request {} could not be read: {e}",
+            source.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        format!(
+            "browser media request {} is not JSON: {e}",
+            source.display()
+        )
+    })?;
+    if value.get("op").and_then(serde_json::Value::as_str) != Some("browser_media_download_request")
+    {
+        return Ok(None);
+    }
+    let asset_url = value
+        .get("asset_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| is_http_url(url))
+        .ok_or_else(|| {
+            "browser media request requires an http:// or https:// asset_url".to_string()
+        })?
+        .to_owned();
+    if asset_url.as_bytes().contains(&0) {
+        return Err("browser media request rejects NUL bytes in asset_url".to_string());
+    }
+    let suggested = value
+        .get("suggested_filename")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("browser-media");
+    let suggested_filename = safe_browser_download_filename(suggested);
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| kind.to_ascii_lowercase());
+    Ok(Some(BrowserMediaDownloadRequest {
+        asset_url,
+        suggested_filename,
+        kind,
+    }))
+}
+
+fn browser_scrape_crawl_request(
+    source: &Path,
+) -> Result<Option<BrowserScrapeCrawlRequest>, String> {
+    if source.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return Ok(None);
+    }
+    if !source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("mde-browser-scrape-"))
+    {
+        return Ok(None);
+    }
+    let body = std::fs::read(source).map_err(|e| {
+        format!(
+            "browser scrape crawl request {} could not be read: {e}",
+            source.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        format!(
+            "browser scrape crawl request {} is not JSON: {e}",
+            source.display()
+        )
+    })?;
+    if value.get("op").and_then(serde_json::Value::as_str) != Some("browser_active_page_scrape") {
+        return Ok(None);
+    }
+    if value
+        .get("crawl_execution_status")
+        .and_then(serde_json::Value::as_str)
+        != Some("not_started")
+    {
+        return Ok(None);
+    }
+    let page_url = value
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| is_http_url(url))
+        .ok_or_else(|| {
+            "browser scrape crawl request requires an http:// or https:// page url".to_string()
+        })?
+        .to_owned();
+    if page_url.as_bytes().contains(&0) {
+        return Err("browser scrape crawl request rejects NUL bytes in page url".to_string());
+    }
+    let page = reqwest::Url::parse(&page_url)
+        .map_err(|e| format!("browser scrape crawl page URL is invalid: {e}"))?;
+    let mut seen = BTreeSet::new();
+    let mut targets = Vec::new();
+    if let Some(items) = value
+        .get("crawl_manifest")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in items.iter() {
+            if targets.len() >= BROWSER_SCRAPE_CRAWL_MAX_TARGETS {
+                break;
+            }
+            if item.get("same_origin").and_then(serde_json::Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(raw_url) = item.get("url").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let url = raw_url.trim();
+            if !is_http_url(url) || url.as_bytes().contains(&0) {
+                continue;
+            }
+            if !same_origin_url(&page, url) {
+                continue;
+            }
+            if !seen.insert(url.to_owned()) {
+                continue;
+            }
+            targets.push(BrowserScrapeCrawlTarget {
+                url: url.to_owned(),
+                source: item
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|source| !source.is_empty())
+                    .unwrap_or("crawl_manifest")
+                    .chars()
+                    .take(80)
+                    .collect(),
+                resource: item
+                    .get("resource")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|resource| !resource.is_empty())
+                    .unwrap_or("document")
+                    .chars()
+                    .take(80)
+                    .collect(),
+                depth: 1,
+            });
+        }
+    }
+    Ok(Some(BrowserScrapeCrawlRequest { page_url, targets }))
+}
+
+fn browser_media_request_is_hls(request: &BrowserMediaDownloadRequest) -> bool {
+    request.kind.as_deref() == Some("hls")
+        || is_hls_manifest_url(&request.asset_url)
+        || request
+            .suggested_filename
+            .to_ascii_lowercase()
+            .ends_with(".m3u8")
+}
+
+fn browser_media_request_is_dash(request: &BrowserMediaDownloadRequest) -> bool {
+    request.kind.as_deref() == Some("dash")
+        || is_dash_manifest_url(&request.asset_url)
+        || request
+            .suggested_filename
+            .to_ascii_lowercase()
+            .ends_with(".mpd")
+}
+
+fn same_origin_url(page: &reqwest::Url, candidate: &str) -> bool {
+    let Ok(candidate) = reqwest::Url::parse(candidate) else {
+        return false;
+    };
+    page.scheme().eq_ignore_ascii_case(candidate.scheme())
+        && page.host_str().map(str::to_ascii_lowercase)
+            == candidate.host_str().map(str::to_ascii_lowercase)
+        && page.port_or_known_default() == candidate.port_or_known_default()
+}
+
+fn is_hls_manifest_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(Iterator::last)
+                .map(str::to_ascii_lowercase)
+        })
+        .is_some_and(|leaf| leaf.ends_with(".m3u8"))
+}
+
+fn is_dash_manifest_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(Iterator::last)
+                .map(str::to_ascii_lowercase)
+        })
+        .is_some_and(|leaf| leaf.ends_with(".mpd"))
+}
+
+fn hls_package_destination(dest: &Path, suggested_filename: &str) -> (PathBuf, String) {
+    let manifest_filename = safe_browser_download_filename(suggested_filename);
+    let stem = Path::new(&manifest_filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "browser-media".to_string());
+    if dest.is_dir() {
+        return (dest.join(format!("{stem}.hls")), manifest_filename);
+    }
+    let package_dir = dest.with_extension("hls");
+    let filename = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(manifest_filename);
+    (package_dir, filename)
+}
+
+fn dash_package_destination(dest: &Path, suggested_filename: &str) -> (PathBuf, String) {
+    let manifest_filename = safe_browser_download_filename(suggested_filename);
+    let stem = Path::new(&manifest_filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "browser-media".to_string());
+    if dest.is_dir() {
+        return (dest.join(format!("{stem}.dash")), manifest_filename);
+    }
+    let package_dir = dest.with_extension("dash");
+    let filename = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(manifest_filename);
+    (package_dir, filename)
+}
+
+fn scrape_crawl_package_destination(original_dest: &Path) -> PathBuf {
+    if original_dest.is_dir() {
+        return original_dest.join("browser-scrape.crawl");
+    }
+    let stem = original_dest
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "browser-scrape".to_string());
+    match original_dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => parent.join(format!("{stem}.crawl")),
+        None => PathBuf::from(format!("{stem}.crawl")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HlsReference {
+    uri: String,
+    attr: bool,
+}
+
+impl HlsReference {
+    fn item_kind(&self) -> &'static str {
+        if self.attr {
+            "hls-asset"
+        } else {
+            "segment"
+        }
+    }
+}
+
+fn hls_playlist_references(body: &str) -> Vec<HlsReference> {
+    let mut refs = Vec::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') {
+            refs.extend(
+                hls_uri_attributes(line)
+                    .into_iter()
+                    .map(|uri| HlsReference { uri, attr: true }),
+            );
+        } else {
+            refs.push(HlsReference {
+                uri: line.to_string(),
+                attr: false,
+            });
+        }
+    }
+    refs
+}
+
+fn hls_uri_attributes(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(idx) = rest.find("URI=") {
+        rest = &rest[idx + 4..];
+        let (uri, next) = if let Some(quoted) = rest.strip_prefix('"') {
+            match quoted.split_once('"') {
+                Some((uri, tail)) => (uri, tail),
+                None => break,
+            }
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        };
+        let uri = uri.trim();
+        if !uri.is_empty() {
+            out.push(uri.to_string());
+        }
+        rest = next;
+    }
+    out
+}
+
+fn rewrite_hls_playlist_to_local(
+    base_url: &str,
+    body: &str,
+    url_paths: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            out.push_str(raw_line);
+        } else if line.starts_with('#') {
+            out.push_str(&rewrite_hls_uri_attributes(base_url, raw_line, url_paths)?);
+        } else {
+            let resolved = resolve_hls_child_url(base_url, line)?;
+            if let Some(path) = url_paths.get(&resolved) {
+                out.push_str(path);
+            } else {
+                out.push_str(raw_line);
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn rewrite_hls_uri_attributes(
+    base_url: &str,
+    line: &str,
+    url_paths: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(idx) = rest.find("URI=") {
+        out.push_str(&rest[..idx + 4]);
+        rest = &rest[idx + 4..];
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let Some(end) = quoted.find('"') else {
+                out.push('"');
+                out.push_str(quoted);
+                return Ok(out);
+            };
+            let raw_uri = &quoted[..end];
+            out.push('"');
+            out.push_str(&rewrite_hls_uri_value(base_url, raw_uri, url_paths)?);
+            out.push('"');
+            rest = &quoted[end + 1..];
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let raw_uri = &rest[..end];
+            out.push_str(&rewrite_hls_uri_value(base_url, raw_uri, url_paths)?);
+            rest = &rest[end..];
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn rewrite_hls_uri_value(
+    base_url: &str,
+    raw_uri: &str,
+    url_paths: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let trimmed = raw_uri.trim();
+    if trimmed.is_empty() {
+        return Ok(raw_uri.to_string());
+    }
+    let resolved = resolve_hls_child_url(base_url, trimmed)?;
+    Ok(url_paths
+        .get(&resolved)
+        .cloned()
+        .unwrap_or_else(|| raw_uri.to_string()))
+}
+
+fn resolve_hls_child_url(base_url: &str, child: &str) -> Result<String, String> {
+    let base = reqwest::Url::parse(base_url)
+        .map_err(|e| format!("browser HLS package base URL is invalid: {e}"))?;
+    let child = child.trim();
+    if child.as_bytes().contains(&0) {
+        return Err("browser HLS package rejects NUL bytes in child URI".to_string());
+    }
+    let resolved = base
+        .join(child)
+        .map_err(|e| format!("browser HLS package child URI `{child}` is invalid: {e}"))?;
+    if !matches!(resolved.scheme(), "http" | "https") {
+        return Err("browser HLS package only follows http:// or https:// child URIs".to_string());
+    }
+    Ok(resolved.to_string())
+}
+
+fn hls_url_filename(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .map(safe_browser_download_filename)
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "browser-media".to_string())
+}
+
+fn unique_browser_package_filename(raw: &str, used: &mut BTreeSet<String>) -> String {
+    let filename = safe_browser_download_filename(raw);
+    if used.insert(filename.clone()) {
+        return filename;
+    }
+    let path = Path::new(&filename);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("browser-media");
+    let ext = path.extension().and_then(|ext| ext.to_str());
+    for idx in 2..=BROWSER_HLS_MAX_ASSETS + BROWSER_HLS_MAX_PLAYLISTS + 2 {
+        let candidate = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem}-{idx}.{ext}"),
+            _ => format!("{stem}-{idx}"),
+        };
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    format!("browser-media-{}", used.len() + 1)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashReference {
+    kind: &'static str,
+    url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashRepresentation {
+    id: String,
+    bandwidth: String,
+}
+
+fn dash_mpd_references(manifest_url: &str, body: &str) -> Result<Vec<DashReference>, String> {
+    let manifest_base = reqwest::Url::parse(manifest_url)
+        .map_err(|e| format!("browser DASH package MPD URL is invalid: {e}"))?;
+    let base_urls = dash_base_urls(body);
+    let bases = if base_urls.is_empty() {
+        vec![manifest_base]
+    } else {
+        base_urls
+            .iter()
+            .map(|base| resolve_dash_child_url(manifest_base.as_str(), base))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|url| reqwest::Url::parse(&url).ok())
+            .collect::<Vec<_>>()
+    };
+    let bases = if bases.is_empty() {
+        vec![reqwest::Url::parse(manifest_url)
+            .map_err(|e| format!("browser DASH package MPD URL is invalid: {e}"))?]
+    } else {
+        bases
+    };
+    let representations = dash_representations(body);
+    let numbers = dash_segment_numbers(body);
+    let mut out = Vec::new();
+
+    for source in dash_source_urls(body) {
+        for base in &bases {
+            out.push(DashReference {
+                kind: "dash-asset",
+                url: resolve_dash_child_url(base.as_str(), &source)?,
+            });
+        }
+    }
+
+    for tag in xml_tags_named(body, "SegmentTemplate") {
+        let start_number = xml_attr(&tag, "startNumber")
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(1);
+        let numbers = if numbers.is_empty() {
+            vec![start_number]
+        } else {
+            numbers.clone()
+        };
+        let init = xml_attr(&tag, "initialization");
+        let media = xml_attr(&tag, "media");
+        for representation in &representations {
+            for base in &bases {
+                if let Some(init) = init.as_deref() {
+                    let uri = dash_expand_template(init, representation, start_number);
+                    out.push(DashReference {
+                        kind: "dash-init",
+                        url: resolve_dash_child_url(base.as_str(), &uri)?,
+                    });
+                }
+                if let Some(media) = media.as_deref() {
+                    for number in &numbers {
+                        let uri = dash_expand_template(media, representation, *number);
+                        out.push(DashReference {
+                            kind: "dash-segment",
+                            url: resolve_dash_child_url(base.as_str(), &uri)?,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn dash_base_urls(body: &str) -> Vec<String> {
+    xml_element_texts(body, "BaseURL")
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+fn dash_source_urls(body: &str) -> Vec<String> {
+    xml_tags(body)
+        .into_iter()
+        .filter_map(|tag| xml_attr(&tag, "sourceURL"))
+        .filter(|url| !url.trim().is_empty())
+        .collect()
+}
+
+fn dash_representations(body: &str) -> Vec<DashRepresentation> {
+    let reps = xml_tags_named(body, "Representation")
+        .into_iter()
+        .map(|tag| DashRepresentation {
+            id: xml_attr(&tag, "id").unwrap_or_else(|| "representation".to_string()),
+            bandwidth: xml_attr(&tag, "bandwidth").unwrap_or_else(|| "0".to_string()),
+        })
+        .collect::<Vec<_>>();
+    if reps.is_empty() {
+        vec![DashRepresentation {
+            id: "representation".to_string(),
+            bandwidth: "0".to_string(),
+        }]
+    } else {
+        reps
+    }
+}
+
+fn dash_segment_numbers(body: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut next = xml_tags_named(body, "SegmentTemplate")
+        .into_iter()
+        .find_map(|tag| xml_attr(&tag, "startNumber"))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(1);
+    for tag in xml_tags_named(body, "S") {
+        let repeat = xml_attr(&tag, "r")
+            .and_then(|r| r.parse::<i64>().ok())
+            .map_or(1usize, |r| {
+                if r < 0 {
+                    1
+                } else {
+                    (r as usize).saturating_add(1)
+                }
+            });
+        for _ in 0..repeat {
+            if numbers.len() >= BROWSER_DASH_MAX_ASSETS {
+                return numbers;
+            }
+            numbers.push(next);
+            next = next.saturating_add(1);
+        }
+    }
+    numbers
+}
+
+fn dash_expand_template(
+    template: &str,
+    representation: &DashRepresentation,
+    number: u64,
+) -> String {
+    let with_rep = template
+        .replace("$RepresentationID$", &representation.id)
+        .replace("$Bandwidth$", &representation.bandwidth);
+    dash_expand_number_token(&with_rep, number)
+}
+
+fn dash_expand_number_token(template: &str, number: u64) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("$Number") {
+        out.push_str(&rest[..start]);
+        let token_rest = &rest[start + 1..];
+        let Some(end) = token_rest.find('$') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let token = &token_rest[..end];
+        if let Some(width) = token
+            .strip_prefix("Number%0")
+            .and_then(|raw| raw.strip_suffix('d'))
+            .and_then(|raw| raw.parse::<usize>().ok())
+        {
+            out.push_str(&format!("{number:0width$}"));
+        } else {
+            out.push_str(&number.to_string());
+        }
+        rest = &token_rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_dash_child_url(base_url: &str, child: &str) -> Result<String, String> {
+    let base = reqwest::Url::parse(base_url)
+        .map_err(|e| format!("browser DASH package base URL is invalid: {e}"))?;
+    let child = xml_unescape(child.trim());
+    if child.as_bytes().contains(&0) {
+        return Err("browser DASH package rejects NUL bytes in child URI".to_string());
+    }
+    let resolved = base
+        .join(&child)
+        .map_err(|e| format!("browser DASH package child URI `{child}` is invalid: {e}"))?;
+    if !matches!(resolved.scheme(), "http" | "https") {
+        return Err("browser DASH package only follows http:// or https:// child URIs".to_string());
+    }
+    Ok(resolved.to_string())
+}
+
+fn rewrite_dash_mpd_to_local(
+    manifest_url: &str,
+    body: &str,
+    url_paths: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let base_urls = dash_base_urls(body);
+    let manifest_base = reqwest::Url::parse(manifest_url)
+        .map_err(|e| format!("browser DASH package MPD URL is invalid: {e}"))?;
+    let mut bases = if base_urls.is_empty() {
+        vec![manifest_base]
+    } else {
+        base_urls
+            .iter()
+            .map(|base| resolve_dash_child_url(manifest_base.as_str(), base))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|url| reqwest::Url::parse(&url).ok())
+            .collect::<Vec<_>>()
+    };
+    if bases.is_empty() {
+        bases.push(
+            reqwest::Url::parse(manifest_url)
+                .map_err(|e| format!("browser DASH package MPD URL is invalid: {e}"))?,
+        );
+    }
+    let representations = dash_representations(body);
+    let numbers = dash_segment_numbers(body);
+    let mut replacements = BTreeMap::new();
+
+    for source in dash_source_urls(body) {
+        for base in &bases {
+            let resolved = resolve_dash_child_url(base.as_str(), &source)?;
+            if let Some(path) = url_paths.get(&resolved) {
+                replacements.insert(source.clone(), path.clone());
+            }
+        }
+    }
+
+    for tag in xml_tags_named(body, "SegmentTemplate") {
+        let start_number = xml_attr(&tag, "startNumber")
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(1);
+        let numbers = if numbers.is_empty() {
+            vec![start_number]
+        } else {
+            numbers.clone()
+        };
+        if let Some(init) = xml_attr(&tag, "initialization") {
+            let rewrite_template = dash_local_asset_template(
+                &init,
+                &representations,
+                start_number,
+                &bases,
+                url_paths,
+            )?;
+            if let Some(template) = rewrite_template {
+                replacements.insert(init, template);
+            }
+        }
+        if let Some(media) = xml_attr(&tag, "media") {
+            let rewrite_template =
+                dash_local_segment_template(&media, &representations, &numbers, &bases, url_paths)?;
+            if let Some(template) = rewrite_template {
+                replacements.insert(media, template);
+            }
+        }
+    }
+
+    let mut rewritten = rewrite_xml_element_texts(body, "BaseURL", "");
+    for (from, to) in replacements {
+        rewritten = rewritten.replace(&from, &xml_escape_attr(&to));
+    }
+    Ok(rewritten)
+}
+
+fn dash_local_asset_template(
+    template: &str,
+    representations: &[DashRepresentation],
+    number: u64,
+    bases: &[reqwest::Url],
+    url_paths: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(first_representation) = representations.first() else {
+        return Ok(None);
+    };
+    let first_uri = dash_expand_template(template, first_representation, number);
+    let mut first_path = None;
+    for base in bases {
+        let resolved = resolve_dash_child_url(base.as_str(), &first_uri)?;
+        if let Some(path) = url_paths.get(&resolved) {
+            first_path = Some(path.clone());
+            break;
+        }
+    }
+    let Some(first_path) = first_path else {
+        return Ok(None);
+    };
+    Ok(Some(dash_localize_template_tokens(
+        template,
+        first_path,
+        first_representation,
+        number,
+    )))
+}
+
+fn dash_local_segment_template(
+    template: &str,
+    representations: &[DashRepresentation],
+    numbers: &[u64],
+    bases: &[reqwest::Url],
+    url_paths: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(first_representation) = representations.first() else {
+        return Ok(None);
+    };
+    let first_number = numbers.first().copied().unwrap_or(1);
+    let first_uri = dash_expand_template(template, first_representation, first_number);
+    let mut first_path = None;
+    for base in bases {
+        let resolved = resolve_dash_child_url(base.as_str(), &first_uri)?;
+        if let Some(path) = url_paths.get(&resolved) {
+            first_path = Some(path.clone());
+            break;
+        }
+    }
+    let Some(first_path) = first_path else {
+        return Ok(None);
+    };
+    Ok(Some(dash_localize_template_tokens(
+        template,
+        first_path,
+        first_representation,
+        first_number,
+    )))
+}
+
+fn dash_localize_template_tokens(
+    source_template: &str,
+    mut local_template: String,
+    first_representation: &DashRepresentation,
+    first_number: u64,
+) -> String {
+    if let Some(token) = dash_template_number_token(source_template) {
+        let raw_number = if let Some(width) = token.width {
+            format!("{first_number:0width$}")
+        } else {
+            first_number.to_string()
+        };
+        if local_template.contains(&raw_number) {
+            local_template = local_template.replacen(&raw_number, token.raw, 1);
+        }
+    }
+    if source_template.contains("$RepresentationID$")
+        && local_template.contains(&first_representation.id)
+    {
+        local_template = local_template.replacen(&first_representation.id, "$RepresentationID$", 1);
+    }
+    if source_template.contains("$Bandwidth$")
+        && local_template.contains(&first_representation.bandwidth)
+    {
+        local_template = local_template.replacen(&first_representation.bandwidth, "$Bandwidth$", 1);
+    }
+    local_template
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DashNumberToken<'a> {
+    raw: &'a str,
+    width: Option<usize>,
+}
+
+fn dash_template_number_token(template: &str) -> Option<DashNumberToken<'_>> {
+    let start = template.find("$Number")?;
+    let rest = &template[start..];
+    let end = rest[1..].find('$')? + 2;
+    let raw = &rest[..end];
+    let inner = &raw[1..raw.len().saturating_sub(1)];
+    let width = inner
+        .strip_prefix("Number%0")
+        .and_then(|raw| raw.strip_suffix('d'))
+        .and_then(|raw| raw.parse::<usize>().ok());
+    Some(DashNumberToken { raw, width })
+}
+
+fn rewrite_xml_element_texts(body: &str, name: &str, replacement: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    while let Some(start) = rest.find(&open) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(open_end) = rest.find('>') else {
+            out.push_str(rest);
+            return out;
+        };
+        let head_end = open_end + 1;
+        out.push_str(&rest[..head_end]);
+        rest = &rest[head_end..];
+        let Some(close_start) = rest.find(&close) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(replacement);
+        out.push_str(&rest[close_start..close_start + close.len()]);
+        rest = &rest[close_start + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn xml_escape_attr(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn xml_tags(body: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+            if let Some(end) = rest.find('>') {
+                rest = &rest[end + 1..];
+                continue;
+            }
+            break;
+        }
+        let Some(end) = rest.find('>') else {
+            break;
+        };
+        tags.push(rest[..end].trim().trim_end_matches('/').trim().to_string());
+        rest = &rest[end + 1..];
+    }
+    tags
+}
+
+fn xml_tags_named(body: &str, name: &str) -> Vec<String> {
+    xml_tags(body)
+        .into_iter()
+        .filter(|tag| {
+            tag == name
+                || tag
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        })
+        .collect()
+}
+
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let mut rest = tag;
+    loop {
+        let idx = rest.find(name)?;
+        rest = &rest[idx + name.len()..];
+        if !rest.trim_start().starts_with('=') {
+            continue;
+        }
+        rest = rest.trim_start();
+        rest = rest.strip_prefix('=')?.trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        rest = &rest[quote.len_utf8()..];
+        let end = rest.find(quote)?;
+        return Some(xml_unescape(&rest[..end]));
+    }
+}
+
+fn xml_element_texts(body: &str, name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = body;
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        let Some(open_end) = rest.find('>') else {
+            break;
+        };
+        rest = &rest[open_end + 1..];
+        let Some(close_start) = rest.find(&close) else {
+            break;
+        };
+        values.push(xml_unescape(&rest[..close_start]));
+        rest = &rest[close_start + close.len()..];
+    }
+    values
+}
+
+fn xml_unescape(raw: &str) -> String {
+    raw.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn safe_browser_download_filename(raw: &str) -> String {
+    let leaf = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in leaf.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            last_dash = false;
+            Some(ch)
+        } else if !last_dash {
+            last_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            out.push(ch);
+        }
+        if out.len() >= 128 {
+            break;
+        }
+    }
+    let out = out.trim_matches(['.', '-', '_']);
+    if out.is_empty() {
+        "browser-media".to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 fn valid_wget_rate(s: &str) -> bool {
@@ -1028,7 +2584,11 @@ fn node_target_peer(dest: &str) -> Option<String> {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect::<String>();
-    if peer.is_empty() { None } else { Some(peer) }
+    if peer.is_empty() {
+        None
+    } else {
+        Some(peer)
+    }
 }
 
 fn prepare_destination(dest: &Path) -> Result<(), String> {
@@ -1153,6 +2713,7 @@ pub fn parse_sftp_progress_percent(line: &str) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::workers::transfers::job::{Method, TransferPolicy};
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
@@ -1198,11 +2759,10 @@ mod tests {
         let plan = HttpWgetLane::plan(&job).unwrap();
         assert!(plan.args.iter().any(|a| a == "--continue"));
         assert!(plan.args.iter().any(|a| a == "--limit-rate=256k"));
-        assert!(
-            plan.args
-                .windows(2)
-                .any(|w| w == ["-O", &dest.display().to_string()])
-        );
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|w| w == ["-O", &dest.display().to_string()]));
     }
 
     #[test]
@@ -1218,11 +2778,9 @@ mod tests {
         assert!(HttpWgetLane::plan(&job).unwrap_err().contains("http://"));
         job.source = "http://example.invalid/x".into();
         job.policy.bwlimit = Some("1m;rm".into());
-        assert!(
-            HttpWgetLane::plan(&job)
-                .unwrap_err()
-                .contains("invalid wget --limit-rate")
-        );
+        assert!(HttpWgetLane::plan(&job)
+            .unwrap_err()
+            .contains("invalid wget --limit-rate"));
     }
 
     #[test]
@@ -1264,11 +2822,9 @@ mod tests {
         assert!(RsyncLane::plan(&job).unwrap_err().contains("source"));
         job.source = "/source".into();
         job.policy.bwlimit = Some("1m;rm".into());
-        assert!(
-            RsyncLane::plan(&job)
-                .unwrap_err()
-                .contains("invalid rsync --bwlimit")
-        );
+        assert!(RsyncLane::plan(&job)
+            .unwrap_err()
+            .contains("invalid rsync --bwlimit"));
     }
 
     #[test]
@@ -1298,8 +2854,13 @@ mod tests {
             TransferPolicy::default(),
         );
         let plan = BrowserDownloadLane::plan(&job).unwrap();
-        assert_eq!(plan.source, source);
-        assert_eq!(plan.dest, dest_dir);
+        assert_eq!(
+            plan,
+            BrowserDownloadPlan::CopyMaterialized {
+                source: source.clone(),
+                dest: dest_dir.clone()
+            }
+        );
 
         let remote = TransferJob::new(
             "https://example.invalid/file.bin",
@@ -1307,11 +2868,9 @@ mod tests {
             Method::BrowserDownload,
             TransferPolicy::default(),
         );
-        assert!(
-            BrowserDownloadLane::plan(&remote)
-                .unwrap_err()
-                .contains("local materialized source")
-        );
+        assert!(BrowserDownloadLane::plan(&remote)
+            .unwrap_err()
+            .contains("local materialized source"));
     }
 
     #[tokio::test]
@@ -1341,6 +2900,590 @@ mod tests {
             b"png bytes"
         );
         assert!(seen.lock().unwrap().contains(&99));
+    }
+
+    #[test]
+    fn browser_download_plan_promotes_media_request_files_to_http_fetches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("asset.download.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_media_download_request",
+                "asset_url": "https://media.example.test/video/poster image.jpg",
+                "suggested_filename": "../poster image.jpg",
+                "ignore_blocking": true,
+                "rename_strategy": "auto_rename_by_url_hint",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let plan = BrowserDownloadLane::plan(&job).unwrap();
+
+        assert_eq!(
+            plan,
+            BrowserDownloadPlan::FetchMedia {
+                asset_url: "https://media.example.test/video/poster image.jpg".to_string(),
+                dest: dest_dir.join("poster-image.jpg")
+            }
+        );
+    }
+
+    #[test]
+    fn browser_download_plan_promotes_hls_requests_to_package_fetches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("asset.download.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_media_download_request",
+                "asset_url": "https://media.example.test/video/master.m3u8",
+                "suggested_filename": "../master playlist.m3u8",
+                "kind": "hls",
+                "ignore_blocking": true,
+                "rename_strategy": "auto_rename_by_url_hint",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let plan = BrowserDownloadLane::plan(&job).unwrap();
+
+        assert_eq!(
+            plan,
+            BrowserDownloadPlan::FetchHlsPackage {
+                manifest_url: "https://media.example.test/video/master.m3u8".to_string(),
+                package_dir: dest_dir.join("master-playlist.hls"),
+                manifest_filename: "master-playlist.m3u8".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn browser_download_plan_promotes_dash_requests_to_package_fetches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("asset.download.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_media_download_request",
+                "asset_url": "https://media.example.test/video/manifest.mpd",
+                "suggested_filename": "../dash manifest.mpd",
+                "kind": "dash",
+                "ignore_blocking": true,
+                "rename_strategy": "auto_rename_by_url_hint",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let plan = BrowserDownloadLane::plan(&job).unwrap();
+
+        assert_eq!(
+            plan,
+            BrowserDownloadPlan::FetchDashPackage {
+                manifest_url: "https://media.example.test/video/manifest.mpd".to_string(),
+                package_dir: dest_dir.join("dash-manifest.dash"),
+                manifest_filename: "dash-manifest.mpd".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn browser_download_plan_promotes_scrape_exports_to_crawl_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("mde-browser-scrape-1-example.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_active_page_scrape",
+                "url": "https://example.test/articles/root.html",
+                "crawl_execution_status": "not_started",
+                "crawl_manifest": [
+                    {
+                        "url": "https://example.test/articles/related.html",
+                        "source": "telemetry",
+                        "resource": "xhr",
+                        "same_origin": true,
+                        "depth": 1
+                    },
+                    {
+                        "url": "https://example.test/articles/related.html",
+                        "source": "dom_link",
+                        "resource": "document",
+                        "same_origin": true,
+                        "depth": 1
+                    },
+                    {
+                        "url": "https://elsewhere.test/",
+                        "source": "dom_link",
+                        "resource": "document",
+                        "same_origin": false,
+                        "depth": 1
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let plan = BrowserDownloadLane::plan(&job).unwrap();
+
+        assert_eq!(
+            plan,
+            BrowserDownloadPlan::FetchScrapeCrawlPackage {
+                source: request.clone(),
+                dest: dest_dir.join("mde-browser-scrape-1-example.json"),
+                page_url: "https://example.test/articles/root.html".to_string(),
+                package_dir: dest_dir.join("mde-browser-scrape-1-example.crawl"),
+                targets: vec![BrowserScrapeCrawlTarget {
+                    url: "https://example.test/articles/related.html".to_string(),
+                    source: "telemetry".to_string(),
+                    resource: "xhr".to_string(),
+                    depth: 1,
+                }]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_download_lane_fetches_media_request_assets() {
+        if StdCommand::new("wget").arg("--version").output().is_err() {
+            return;
+        }
+        let body = b"#EXTM3U\n#EXT-X-VERSION:3\n".to_vec();
+        let (url, _range_rx, join) = fixture_http_server(body.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("asset.download.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_media_download_request",
+                "asset_url": url,
+                "suggested_filename": "poster.jpg",
+                "kind": "image",
+                "allowed_by_page_filter": false,
+                "ignore_blocking": true,
+                "rename_strategy": "auto_rename_by_url_hint",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy {
+                bwlimit: None,
+                verify: false,
+            },
+        );
+
+        let outcome = BrowserDownloadLane.run(&job, ProgressSink::noop()).await;
+        join.join().unwrap();
+
+        assert_eq!(outcome, LaneOutcome::Done);
+        assert_eq!(std::fs::read(dest_dir.join("poster.jpg")).unwrap(), body);
+    }
+
+    #[test]
+    fn hls_playlist_parser_finds_child_playlists_segments_and_uri_attributes() {
+        let body = "\
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1200000
+variant/main.m3u8
+#EXT-X-MAP:URI=\"init.mp4\"
+#EXT-X-KEY:METHOD=AES-128,URI=\"../keys/key.bin\"
+#EXTINF:4,
+seg-1.ts
+";
+        let refs = hls_playlist_references(body);
+        assert_eq!(
+            refs.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
+            vec![
+                "variant/main.m3u8",
+                "init.mp4",
+                "../keys/key.bin",
+                "seg-1.ts"
+            ]
+        );
+        assert_eq!(
+            resolve_hls_child_url(
+                "https://cdn.example.test/path/master.m3u8",
+                "../keys/key.bin"
+            )
+            .unwrap(),
+            "https://cdn.example.test/keys/key.bin"
+        );
+        let mut paths = BTreeMap::new();
+        paths.insert(
+            "https://cdn.example.test/path/variant/main.m3u8".to_string(),
+            "main.m3u8".to_string(),
+        );
+        paths.insert(
+            "https://cdn.example.test/path/init.mp4".to_string(),
+            "init.mp4".to_string(),
+        );
+        paths.insert(
+            "https://cdn.example.test/keys/key.bin".to_string(),
+            "key.bin".to_string(),
+        );
+        paths.insert(
+            "https://cdn.example.test/path/seg-1.ts".to_string(),
+            "seg-1.ts".to_string(),
+        );
+        let rewritten = rewrite_hls_playlist_to_local(
+            "https://cdn.example.test/path/master.m3u8",
+            body,
+            &paths,
+        )
+        .unwrap();
+        assert!(rewritten.contains("\nmain.m3u8\n"));
+        assert!(rewritten.contains("URI=\"init.mp4\""));
+        assert!(rewritten.contains("URI=\"key.bin\""));
+        assert!(rewritten.contains("\nseg-1.ts\n"));
+        assert!(!rewritten.contains("variant/main.m3u8"));
+        assert!(!rewritten.contains("../keys/key.bin"));
+    }
+
+    #[tokio::test]
+    async fn browser_download_lane_expands_hls_playlist_packages() {
+        if StdCommand::new("wget").arg("--version").output().is_err() {
+            return;
+        }
+        let master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000\nvariant/main.m3u8\n".to_vec();
+        let variant = b"#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"../keys/key.bin\"\n#EXTINF:4,\nseg-1.ts\n#EXTINF:4,\nmedia/seg-2.ts\n".to_vec();
+        let (base_url, requests_rx, join) = fixture_http_routes_server(vec![
+            ("/video/master.m3u8", master.clone()),
+            ("/video/variant/main.m3u8", variant.clone()),
+            ("/video/variant/init.mp4", b"init".to_vec()),
+            ("/video/keys/key.bin", b"key".to_vec()),
+            ("/video/variant/seg-1.ts", b"seg1".to_vec()),
+            ("/video/variant/media/seg-2.ts", b"seg2".to_vec()),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("asset.download.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_media_download_request",
+                "asset_url": format!("{base_url}/video/master.m3u8"),
+                "suggested_filename": "master.m3u8",
+                "kind": "hls",
+                "ignore_blocking": true,
+                "rename_strategy": "auto_rename_by_url_hint",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let outcome = BrowserDownloadLane.run(&job, ProgressSink::noop()).await;
+        let requests = requests_rx.recv().unwrap();
+        join.join().unwrap();
+
+        assert_eq!(outcome, LaneOutcome::Done);
+        let package = dest_dir.join("master.hls");
+        let master_playlist =
+            std::fs::read_to_string(package.join("master.m3u8")).expect("read rewritten master");
+        let variant_playlist =
+            std::fs::read_to_string(package.join("main.m3u8")).expect("read rewritten variant");
+        assert!(master_playlist.contains("\nmain.m3u8\n"));
+        assert!(!master_playlist.contains("variant/main.m3u8"));
+        assert!(variant_playlist.contains("URI=\"init.mp4\""));
+        assert!(variant_playlist.contains("URI=\"key.bin\""));
+        assert!(variant_playlist.contains("\nseg-1.ts\n"));
+        assert!(variant_playlist.contains("\nseg-2.ts\n"));
+        assert!(!variant_playlist.contains("../keys/key.bin"));
+        assert!(!variant_playlist.contains("media/seg-2.ts"));
+        assert_eq!(std::fs::read(package.join("init.mp4")).unwrap(), b"init");
+        assert_eq!(std::fs::read(package.join("key.bin")).unwrap(), b"key");
+        assert_eq!(std::fs::read(package.join("seg-1.ts")).unwrap(), b"seg1");
+        assert_eq!(std::fs::read(package.join("seg-2.ts")).unwrap(), b"seg2");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(package.join("browser-hls-package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["op"], "browser_hls_download_package");
+        assert_eq!(manifest["offline_rewrite_status"], "completed");
+        assert_eq!(manifest["root_playlist_path"], "master.m3u8");
+        assert_eq!(manifest["playlist_count"], 2);
+        assert_eq!(manifest["asset_count"], 4);
+        assert!(requests.contains(&"/video/master.m3u8".to_string()));
+        assert!(requests.contains(&"/video/variant/main.m3u8".to_string()));
+        assert!(requests.contains(&"/video/variant/media/seg-2.ts".to_string()));
+    }
+
+    #[test]
+    fn dash_mpd_parser_expands_baseurl_templates_and_timeline() {
+        let body = r#"
+<MPD>
+  <Period>
+    <AdaptationSet>
+      <BaseURL>media/</BaseURL>
+      <Representation id="v1" bandwidth="1200000">
+        <SegmentTemplate initialization="init-$RepresentationID$.mp4"
+          media="chunk-$RepresentationID$-$Number%05d$.m4s" startNumber="7">
+          <SegmentTimeline>
+            <S d="2000" r="1" />
+            <S d="2000" />
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#;
+
+        let refs =
+            dash_mpd_references("https://cdn.example.test/video/manifest.mpd", body).unwrap();
+
+        assert_eq!(
+            refs,
+            vec![
+                DashReference {
+                    kind: "dash-init",
+                    url: "https://cdn.example.test/video/media/init-v1.mp4".to_string()
+                },
+                DashReference {
+                    kind: "dash-segment",
+                    url: "https://cdn.example.test/video/media/chunk-v1-00007.m4s".to_string()
+                },
+                DashReference {
+                    kind: "dash-segment",
+                    url: "https://cdn.example.test/video/media/chunk-v1-00008.m4s".to_string()
+                },
+                DashReference {
+                    kind: "dash-segment",
+                    url: "https://cdn.example.test/video/media/chunk-v1-00009.m4s".to_string()
+                }
+            ]
+        );
+        let mut paths = BTreeMap::new();
+        paths.insert(
+            "https://cdn.example.test/video/media/init-v1.mp4".to_string(),
+            "init-v1.mp4".to_string(),
+        );
+        paths.insert(
+            "https://cdn.example.test/video/media/chunk-v1-00007.m4s".to_string(),
+            "chunk-v1-00007.m4s".to_string(),
+        );
+        let rewritten =
+            rewrite_dash_mpd_to_local("https://cdn.example.test/video/manifest.mpd", body, &paths)
+                .unwrap();
+        assert!(rewritten.contains("<BaseURL></BaseURL>"));
+        assert!(rewritten.contains("initialization=\"init-$RepresentationID$.mp4\""));
+        assert!(rewritten.contains("media=\"chunk-$RepresentationID$-$Number%05d$.m4s\""));
+        assert!(!rewritten.contains("<BaseURL>media/</BaseURL>"));
+    }
+
+    #[tokio::test]
+    async fn browser_download_lane_expands_dash_mpd_packages() {
+        if StdCommand::new("wget").arg("--version").output().is_err() {
+            return;
+        }
+        let mpd = br#"<MPD>
+  <Period>
+    <AdaptationSet>
+      <BaseURL>media/</BaseURL>
+      <Representation id="v1" bandwidth="1200000">
+        <SegmentTemplate initialization="init-$RepresentationID$.mp4"
+          media="chunk-$RepresentationID$-$Number$.m4s" startNumber="3">
+          <SegmentTimeline><S d="2" r="1"/></SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#
+        .to_vec();
+        let (base_url, requests_rx, join) = fixture_http_routes_server(vec![
+            ("/video/manifest.mpd", mpd.clone()),
+            ("/video/media/init-v1.mp4", b"init".to_vec()),
+            ("/video/media/chunk-v1-3.m4s", b"seg3".to_vec()),
+            ("/video/media/chunk-v1-4.m4s", b"seg4".to_vec()),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("asset.download.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_media_download_request",
+                "asset_url": format!("{base_url}/video/manifest.mpd"),
+                "suggested_filename": "manifest.mpd",
+                "kind": "dash",
+                "ignore_blocking": true,
+                "rename_strategy": "auto_rename_by_url_hint",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let outcome = BrowserDownloadLane.run(&job, ProgressSink::noop()).await;
+        let requests = requests_rx.recv().unwrap();
+        join.join().unwrap();
+
+        assert_eq!(outcome, LaneOutcome::Done);
+        let package = dest_dir.join("manifest.dash");
+        let rewritten_mpd =
+            std::fs::read_to_string(package.join("manifest.mpd")).expect("read rewritten MPD");
+        assert!(rewritten_mpd.contains("<BaseURL></BaseURL>"));
+        assert!(rewritten_mpd.contains("initialization=\"init-$RepresentationID$.mp4\""));
+        assert!(rewritten_mpd.contains("media=\"chunk-$RepresentationID$-$Number$.m4s\""));
+        assert!(!rewritten_mpd.contains("<BaseURL>media/</BaseURL>"));
+        assert_eq!(std::fs::read(package.join("init-v1.mp4")).unwrap(), b"init");
+        assert_eq!(
+            std::fs::read(package.join("chunk-v1-3.m4s")).unwrap(),
+            b"seg3"
+        );
+        assert_eq!(
+            std::fs::read(package.join("chunk-v1-4.m4s")).unwrap(),
+            b"seg4"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(package.join("browser-dash-package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["op"], "browser_dash_download_package");
+        assert_eq!(manifest["offline_rewrite_status"], "completed");
+        assert_eq!(manifest["root_mpd_path"], "manifest.mpd");
+        assert_eq!(manifest["asset_count"], 3);
+        assert!(requests.contains(&"/video/manifest.mpd".to_string()));
+        assert!(requests.contains(&"/video/media/init-v1.mp4".to_string()));
+        assert!(requests.contains(&"/video/media/chunk-v1-4.m4s".to_string()));
+    }
+
+    #[tokio::test]
+    async fn browser_download_lane_executes_scrape_crawl_packages() {
+        if StdCommand::new("wget").arg("--version").output().is_err() {
+            return;
+        }
+        let (base_url, requests_rx, join) = fixture_http_routes_server(vec![
+            ("/articles/related.html", b"<html>related</html>".to_vec()),
+            ("/articles/part-2.html", b"<html>part two</html>".to_vec()),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let request = tmp.path().join("mde-browser-scrape-2-example.json");
+        let dest_dir = tmp.path().join("picked");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(
+            &request,
+            serde_json::json!({
+                "op": "browser_active_page_scrape",
+                "url": format!("{base_url}/articles/root.html"),
+                "crawl_execution_status": "not_started",
+                "crawl_manifest": [
+                    {
+                        "url": format!("{base_url}/articles/related.html"),
+                        "source": "telemetry",
+                        "resource": "xhr",
+                        "same_origin": true,
+                        "depth": 1
+                    },
+                    {
+                        "url": format!("{base_url}/articles/part-2.html"),
+                        "source": "dom_link",
+                        "resource": "document",
+                        "same_origin": true,
+                        "depth": 1
+                    },
+                    {
+                        "url": "https://elsewhere.test/",
+                        "source": "dom_link",
+                        "resource": "document",
+                        "same_origin": false,
+                        "depth": 1
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = TransferJob::new(
+            request.display().to_string(),
+            dest_dir.display().to_string(),
+            Method::BrowserDownload,
+            TransferPolicy::default(),
+        );
+
+        let outcome = BrowserDownloadLane.run(&job, ProgressSink::noop()).await;
+        let requests = requests_rx.recv().unwrap();
+        join.join().unwrap();
+
+        assert_eq!(outcome, LaneOutcome::Done);
+        assert!(
+            dest_dir.join("mde-browser-scrape-2-example.json").exists(),
+            "original scrape JSON export is still copied"
+        );
+        let package = dest_dir.join("mde-browser-scrape-2-example.crawl");
+        assert_eq!(
+            std::fs::read(package.join("related.html")).unwrap(),
+            b"<html>related</html>"
+        );
+        assert_eq!(
+            std::fs::read(package.join("part-2.html")).unwrap(),
+            b"<html>part two</html>"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(package.join("browser-scrape-crawl-package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["op"], "browser_scrape_crawl_package");
+        assert_eq!(manifest["execution_status"], "completed");
+        assert_eq!(manifest["target_count"], 2);
+        assert!(requests.contains(&"/articles/related.html".to_string()));
+        assert!(requests.contains(&"/articles/part-2.html".to_string()));
+        assert!(!requests.iter().any(|path| path.contains("elsewhere")));
     }
 
     #[test]
@@ -1609,11 +3752,9 @@ Subsystem sftp internal-sftp
             Method::Music,
             TransferPolicy::default(),
         );
-        assert!(
-            MusicLibraryLane::plan(&job)
-                .unwrap_err()
-                .contains("local filesystem source")
-        );
+        assert!(MusicLibraryLane::plan(&job)
+            .unwrap_err()
+            .contains("local filesystem source"));
     }
 
     #[test]
@@ -1643,18 +3784,14 @@ Subsystem sftp internal-sftp
             Method::Node,
             TransferPolicy::default(),
         );
-        assert!(
-            NodeLane::plan_with_root(&job, root.clone())
-                .unwrap_err()
-                .contains("local filesystem source")
-        );
+        assert!(NodeLane::plan_with_root(&job, root.clone())
+            .unwrap_err()
+            .contains("local filesystem source"));
         job.source = "/home/user/file.iso".into();
         job.dest = "sftp.example.com:/drop".into();
-        assert!(
-            NodeLane::plan_with_root(&job, root)
-                .unwrap_err()
-                .contains("node:<peer>")
-        );
+        assert!(NodeLane::plan_with_root(&job, root)
+            .unwrap_err()
+            .contains("node:<peer>"));
     }
 
     #[tokio::test]
@@ -2017,6 +4154,48 @@ Subsystem sftp internal-sftp
             }
         });
         (format!("http://{addr}/payload.bin"), rx, join)
+    }
+
+    fn fixture_http_routes_server(
+        routes: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let routes = routes.into_iter().collect::<BTreeMap<_, _>>();
+        let expected = routes.len();
+        let (tx, rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..expected {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen.push(path.clone());
+                if let Some(body) = routes.get(path.as_str()) {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(body).unwrap();
+                } else {
+                    let body = b"not found";
+                    let head = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(body).unwrap();
+                }
+            }
+            let _ = tx.send(seen);
+        });
+        (format!("http://{addr}"), rx, join)
     }
 
     fn read_request(stream: &mut TcpStream) -> String {

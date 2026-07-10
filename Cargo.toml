@@ -49,7 +49,6 @@ members = [
     "crates/services/mde-bookmarks",
     "crates/services/mde-chat",
     "crates/services/mde-files",
-    "crates/services/mde-kvm",
     "crates/services/mde-musicd",
     "crates/services/mde-voice-config",
     "crates/services/mde-voice-hud",

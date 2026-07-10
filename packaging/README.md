@@ -26,8 +26,8 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   `magic-on-quasar.ks` (OW-12) is the current **Quasar Workstation** kickstart:
   a bootc/ostree-native installer that `ostreecontainer`-deploys the immutable
   bootc WS image (`bootc/`, so the magic-mesh RPM + the egui DRM-seat unit +
-  cloud-hypervisor arrive baked in — it references that image, never re-packages
-  it), with a `%post` that pins the role from the boot menu and supports a
+  QC-1 libvirt/QEMU-KVM/OVN host bits arrive baked in — it references that
+  image, never re-packages it), with a `%post` that pins the role from the boot menu and supports a
   headless (no-seat, mesh-daemons-only) variant via `mde.headless`; its menu is
   `quasar-bootmenu.cfg`, cut through the bootc anaconda-iso lane. The heritage
   `magic-on-cosmic.ks` (PKG-9) + `profile-bootmenu.cfg` remain the retired

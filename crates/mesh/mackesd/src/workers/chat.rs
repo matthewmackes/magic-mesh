@@ -55,9 +55,9 @@ use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_chat::{
-    AlertActionKind, Contact, Conversation, Message, MessageId, MessageKind, NodeRole, NotifyPrefs,
-    Presence, Room, RoomDescriptor, RoomKind, Roster, Severity, fold_alert, severity_room_id, sign,
-    system_room_descriptors,
+    fold_alert, severity_room_id, sign, system_room_descriptors, AlertActionKind, Contact,
+    Conversation, Message, MessageId, MessageKind, NodeRole, NotifyPrefs, Presence, Room,
+    RoomDescriptor, RoomKind, Roster, Severity,
 };
 use serde::{Deserialize, Serialize};
 
@@ -892,8 +892,8 @@ impl ChatWorker {
         // Seat-local notification policy (mute + threshold, NOTIFY-CHAT-5).
         state.notify = load_notify_prefs(&self.workgroup_root, &self.self_host);
         state.notify_dirty = true; // publish the loaded mute mirror on the first tick
-        // Seed the auto system rooms (All Fleet + per-severity), then union every
-        // host's persisted ad-hoc rooms so cross-node rooms surface on restart.
+                                   // Seed the auto system rooms (All Fleet + per-severity), then union every
+                                   // host's persisted ad-hoc rooms so cross-node rooms surface on restart.
         for d in system_room_descriptors() {
             state.rooms.insert(d.id.clone(), d);
         }
@@ -1864,12 +1864,10 @@ mod tests {
             MessageKind::Alert { .. }
         ));
         // And the read-model mirror is published for the UI.
-        assert!(
-            !persist
-                .list_since(&conversation_topic(&k), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!persist
+            .list_since(&conversation_topic(&k), None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2140,7 +2138,7 @@ mod tests {
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 100); // seed
-        // A Warning under DND is silent …
+                                                // A Warning under DND is silent …
         persist
             .write(
                 "event/security/alert",
@@ -2207,11 +2205,9 @@ mod tests {
             "the per-severity Warnings room is a real, populated view"
         );
         // It is NOT in the Critical room.
-        assert!(
-            !state
-                .convos
-                .contains_key(&room_key(&severity_room_id(Severity::Critical)))
-        );
+        assert!(!state
+            .convos
+            .contains_key(&room_key(&severity_room_id(Severity::Critical))));
     }
 
     // ── room lifecycle: create · open-join · creator-only dissolve ──────
@@ -2255,11 +2251,9 @@ mod tests {
             &format!(r#"{{"op":"join","id":"{SYS_ALL_FLEET_ID}"}}"#),
         );
         w.tick_once(&persist, &mut state, 300);
-        assert!(
-            state.rooms[SYS_ALL_FLEET_ID]
-                .members
-                .contains(&"eagle".to_string())
-        );
+        assert!(state.rooms[SYS_ALL_FLEET_ID]
+            .members
+            .contains(&"eagle".to_string()));
 
         // A non-creator cannot dissolve: fake nyc3 as creator by editing, then
         // eagle's dissolve is refused.
@@ -2301,11 +2295,9 @@ mod tests {
         w.bootstrap(&mut state);
         // System rooms are seeded …
         assert!(state.rooms.contains_key(SYS_ALL_FLEET_ID));
-        assert!(
-            state
-                .rooms
-                .contains_key(&severity_room_id(Severity::Critical))
-        );
+        assert!(state
+            .rooms
+            .contains_key(&severity_room_id(Severity::Critical)));
         // … the ad-hoc room reloaded, and the mute list restored.
         assert!(state.rooms.contains_key("ops"));
         assert!(state.notify.is_contact_muted("nyc3"));
@@ -2696,12 +2688,10 @@ mod tests {
         let refused = persist
             .list_since("state/chat/alert-action/m2", None)
             .unwrap();
-        assert!(
-            refused
-                .last()
-                .and_then(|m| m.body.as_deref())
-                .is_some_and(|body| body.contains("refused_unarmed"))
-        );
+        assert!(refused
+            .last()
+            .and_then(|m| m.body.as_deref())
+            .is_some_and(|body| body.contains("refused_unarmed")));
         assert_eq!(
             persist
                 .list_since(&format!("{STATE_CHAT_ALERT_ACK_PREFIX}m3"), None)

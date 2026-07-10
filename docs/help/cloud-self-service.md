@@ -27,10 +27,11 @@ node can author, so a preset made anywhere shows up everywhere.
 
 ## Get into your instance
 
-- **Console:** one click opens a SPICE console from the instance's row — no
-  setup.
-- **SSH:** your mesh-derived SSH key is injected automatically at launch;
-  `ssh` to the instance's address from any mesh machine just works.
+- **Console:** the instance row requests Nova's SPICE console descriptor. Direct
+  `spice://host:port` descriptors open in the native Desktop viewer; Nova HTML5
+  proxy URLs are shown as gated because they are not raw SPICE sockets.
+- **SSH:** launches use the mesh-derived Nova keypair `mcnf-mesh`; the daemon
+  ensures that keypair exists before Heat creates the server.
 
 ## What you can manage
 

@@ -15,9 +15,9 @@
 ## The three pillars locked here
 
 1. **Hypervisor = Fedora + KVM, not XCP-ng (Option B).** The host hypervisor is
-   **cloud-hypervisor/KVM on Fedora** (the same `mde-kvm` stack the Workstation
-   already uses), so one OS family runs every role and the VDI virtio-gpu→egui
-   fast-path is reused. **XCP-ng is demoted from a role to a day-2 "adopt external
+   **libvirt/QEMU-KVM on Fedora** (QUASAR-CLOUD Q32; `cloud-hypervisor` is
+   retired), so one OS family runs every role while the VM plane is the same
+   stack Nova drives. **XCP-ng is demoted from a role to a day-2 "adopt external
    hypervisor capacity" action** — magic-mesh can still enroll + drive an existing
    XCP-ng host (as the live build farm does via `xe`/tofu), but our installer never
    produces one. *(XCP-ng is its own XenServer-lineage OS; our Fedora ISO can't make
@@ -25,7 +25,7 @@
 
 2. **Two roles only — Lighthouse and Workstation.** "Headless" is **not** a role: a
    headless machine is a **Workstation without a local display** (it runs the daemon
-   stack — `mackesd` + cloud-hypervisor + Podman — and serves VMs/containers to the
+   stack — `mackesd` + libvirt/QEMU-KVM + Podman — and serves VMs/containers to the
    mesh; managed from a peer's Workbench; the egui-DRM shell simply doesn't start
    with no seat). See `onboarding-wizard.md`.
 
@@ -56,15 +56,15 @@ center** (§0), open-source.
 | 2 | **Nomad** | ✅ `qemu`+`podman` drivers (best literal fit) | ⚠️ soft (Raft quorum) | ❌ **BUSL**, no fork | excluded on license + lost VDI fast-path |
 | 3 | KubeVirt on K3s | VMs + CRI (not Podman) | ❌ k8s control plane | ✅ | too centralized/heavy |
 | 4 | Proxmox VE | KVM + LXC | ✅ multi-master | ✅ AGPL | wrong OS family (Debian) |
-| 5 | **Mesh-native** | ✅ libvirt/cloud-hypervisor + Podman direct | ✅ the mesh *is* the plane | ✅ (own code) | **CHOSEN** |
+| 5 | **Mesh-native** | ✅ libvirt/QEMU-KVM + Podman direct | ✅ the mesh *is* the plane | ✅ (own code) | **CHOSEN** |
 
 ### Locked direction: #5 (mesh-native), evolving with Option 2
 **Don't adopt a heavyweight orchestrator.** Each node runs a thin `mackesd` worker
-driving the **local cloud-hypervisor/libvirt (KVM) + Podman sockets**; desired-state
+driving the **local libvirt/QEMU-KVM + Podman sockets**; desired-state
 + placement live in the **etcd/Syncthing state already running over Nebula**; **any
 node can schedule** — there is no orchestrator to centralize, so "no center" is
-structural, not configured. **Cockpit** (`cockpit-machines` + `cockpit-podman`) is
-the zero-build per-node console while the thin scheduler is built.
+structural, not configured. Cockpit's interim per-node console is retired; the
+Workbench Cloud plane plus native VDI viewers own console access.
 - **Adopt-fallback: Incus (#1)** if building the scheduler proves too costly — it's
   genuinely no-master and one clean tool, at the cost of using its OCI runtime
   instead of Podman.
@@ -77,7 +77,7 @@ the zero-build per-node console while the thin scheduler is built.
 - **`mackesd` is the universal core** on every node: mesh/relay/CA(+media on a
   Lighthouse) + the **vm-lifecycle + container (Podman) workers** that ARE the
   management layer. It reads/writes desired-state in the shared etcd/Syncthing.
-- **Executors are battle-tested:** cloud-hypervisor/libvirt for KVM, Podman for
+- **Executors are battle-tested:** libvirt/QEMU-KVM for VMs, Podman for
   containers — `mackesd` orchestrates, it doesn't reimplement them (§6).
 - **The egui shell** is the one display-conditional host binary; the Workbench is the
   human front-end that submits desired-state (start this VM / run this service).
@@ -89,9 +89,8 @@ The Fedora+KVM replacement for the XCP-ng 16-service toolstack. Only ~4 packages
 
 - **Install:** `qemu-kvm` (VMM) · `libvirt` (+ qemu/network/storage drivers =
   `xapi`+`xenopsd`+`sm`+`xcp-networkd`) · `virt-install`/`libguestfs-tools` ·
-  **`podman`** (new) · `cloud-hypervisor` (VDI fast-path) · *opt*
-  `cockpit`+`cockpit-machines`+`cockpit-podman`.
-- **Enable:** `libvirtd.service` · `podman.socket` · (`cockpit.socket`) + the default
+  **`podman`** (new).
+- **Enable:** `libvirtd.service` · `podman.socket` + the default
   libvirt network (autostart) + a `default` dir storage pool + the mesh user in the
   `libvirt` group.
 - **Add nothing for:** `xen`/`xenstored`/`xenconsoled` (in-kernel KVM) · `squeezed`
@@ -115,8 +114,8 @@ This list IS the `KVM_SERVICES` catalog (worklist MV-1); the `kvm-host-health` w
   without being a role.
 
 ## Risks / open
-- Building the placement/health/migration scheduler is real work (mitigated: Cockpit
-  covers per-node ops day-1; Incus is the escape hatch).
+- Building the placement/health/migration scheduler is real work (mitigated by the
+  Workbench Cloud plane and typed verbs; Incus is the escape hatch).
 - Option-1 uniform image carries inert GUI/VDI weight on cloud Lighthouses (a few
   hundred MB + attack surface — units off, not active); Option-2 migration is what
   retires that weight.

@@ -27,8 +27,9 @@ use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::{MessageKind, Severity};
+use mde_editor_egui::spell::{self, SpellMiss};
 use mde_egui::egui::{self, RichText, Sense, TextureHandle, TextureOptions};
-use mde_egui::{muted_note, Style};
+use mde_egui::{muted_note, ChipTone, Style};
 use mde_files_egui::transfers::{
     FileTransfers, Method as TransferMethod, TransferJob, TransferPolicy, TransferState,
     TransferVerb, TransfersClient,
@@ -38,7 +39,9 @@ use mde_web_preview_client::{
     host_of, FilterListSource, FilterListStore, RequestFilter, SafeBrowsingBlocklist, SessionState,
     WebSession,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use qrcode::QrCode;
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -70,6 +73,10 @@ const DEFAULT_CEF_HELPER_BIN: &str = "/usr/bin/mde-web-cef";
 /// The env var overriding [`DEFAULT_CEF_HELPER_BIN`] (test bed / dev builds).
 #[cfg(feature = "live-helper")]
 const CEF_HELPER_BIN_ENV: &str = "MDE_WEB_CEF_BIN";
+
+const CEF_DEVTOOLS_URL: &str = "http://127.0.0.1:9222/";
+const CEF_DEVTOOLS_LIST_URL: &str = "http://127.0.0.1:9222/json/list";
+const CEF_DEVTOOLS_TIMEOUT: Duration = Duration::from_millis(450);
 
 /// Environment variable pointing at a pinned CEF bundle root (mirrors
 /// `mde-web-cef`; duplicated here so the shell can gate honestly without
@@ -223,6 +230,12 @@ struct Tab {
     force_dark: bool,
     /// Per-tab reader-mode state mirrored to the helper.
     reader_mode: bool,
+    /// Per-tab built-in userscript-library state mirrored to the helper.
+    user_scripts: bool,
+    /// Per-tab page-visible User-Agent override mirrored to the helper.
+    user_agent: UserAgentOverride,
+    /// Per-tab page-visible device profile override mirrored to the helper.
+    device_profile: DeviceProfile,
     /// Last operator/page activity seen by the shell for idle-suspend accounting.
     last_activity: Instant,
     /// Whether this inactive tab has been shell-suspended after the idle timeout.
@@ -373,6 +386,165 @@ impl DisplayTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevicePermissionKind {
+    Camera,
+    Microphone,
+    Location,
+    Notifications,
+    Clipboard,
+}
+
+impl DevicePermissionKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Camera => "Camera",
+            Self::Microphone => "Microphone",
+            Self::Location => "Location",
+            Self::Notifications => "Notifications",
+            Self::Clipboard => "Clipboard",
+        }
+    }
+
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+            Self::Microphone => "microphone",
+            Self::Location => "location",
+            Self::Notifications => "notifications",
+            Self::Clipboard => "clipboard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SitePermissionPrompt {
+    host: String,
+    kind: DevicePermissionKind,
+    decision: &'static str,
+    updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum UserAgentOverride {
+    #[default]
+    Default,
+    DesktopChrome,
+    AndroidChrome,
+}
+
+impl UserAgentOverride {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default User Agent",
+            Self::DesktopChrome => "Desktop Chrome",
+            Self::AndroidChrome => "Android Chrome",
+        }
+    }
+
+    const fn chip(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::DesktopChrome => "UA Desktop",
+            Self::AndroidChrome => "UA Mobile",
+        }
+    }
+
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::DesktopChrome => "UA ",
+            Self::AndroidChrome => "UAm ",
+        }
+    }
+
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::DesktopChrome => "desktop_chrome",
+            Self::AndroidChrome => "android_chrome",
+        }
+    }
+
+    const fn value(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::DesktopChrome => {
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            }
+            Self::AndroidChrome => {
+                "Mozilla/5.0 (Linux; Android 14; MDE Mesh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+            }
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Default => Self::DesktopChrome,
+            Self::DesktopChrome => Self::AndroidChrome,
+            Self::AndroidChrome => Self::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DeviceProfile {
+    #[default]
+    Default,
+    Phone,
+    Tablet,
+}
+
+impl DeviceProfile {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default Device",
+            Self::Phone => "Phone",
+            Self::Tablet => "Tablet",
+        }
+    }
+
+    const fn chip(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::Phone => "Device Phone",
+            Self::Tablet => "Device Tablet",
+        }
+    }
+
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::Phone => "Ph ",
+            Self::Tablet => "Tb ",
+        }
+    }
+
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Phone => "phone",
+            Self::Tablet => "tablet",
+        }
+    }
+
+    const fn dimensions(self) -> (u16, u16, u16, bool) {
+        match self {
+            Self::Default => (0, 0, 100, false),
+            Self::Phone => (390, 844, 300, true),
+            Self::Tablet => (820, 1180, 200, true),
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Default => Self::Phone,
+            Self::Phone => Self::Tablet,
+            Self::Tablet => Self::Default,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SiteDataRecord {
     host: String,
@@ -391,6 +563,13 @@ struct CupsPrintRequest {
     path: String,
     title: String,
     settings: CupsPrintSettings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SavedPdf {
+    path: PathBuf,
+    url: String,
+    title: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -513,7 +692,165 @@ const fn plural_u32(count: u32) -> &'static str {
 
 const DOWNLOADS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SEND_TAB_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const VOICE_COMMAND_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SHARE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TRANSLATION_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const OFFLINE_CACHE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SPEECH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PASSKEY_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PASSKEY_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SECURITY_UPDATE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const IDLE_TAB_SUSPEND_AFTER: Duration = Duration::from_secs(30 * 60);
+const CURATED_USERSCRIPT_COUNT: usize = 100;
+
+#[derive(Clone, Copy)]
+struct CuratedUserscriptRule {
+    id: &'static str,
+    hosts: &'static [&'static str],
+    css: &'static str,
+}
+
+const NEWS_CLEANUP_CSS: &str = r#"[class*="newsletter" i],[id*="newsletter" i],[class*="paywall" i],[id*="paywall" i],[class*="modal" i],[id*="modal" i],[class*="overlay" i],[id*="overlay" i],[class*="advert" i],[id*="advert" i],[class*="sponsor" i],[id*="sponsor" i]{display:none!important;}main,article{line-height:1.62!important;}article{max-width:82ch!important;margin-inline:auto!important;}"#;
+const VIDEO_FOCUS_CSS: &str = r#"[class*="ad" i],[id*="ad" i],[class*="promo" i],[id*="promo" i],[class*="recommended" i],[id*="recommended" i],[class*="shorts" i],[id*="shorts" i]{display:none!important;}video{max-height:82vh!important;}"#;
+const COMMERCE_CLEANUP_CSS: &str = r#"[class*="sponsored" i],[id*="sponsored" i],[class*="recommend" i],[id*="recommend" i],[class*="upsell" i],[id*="upsell" i],[class*="newsletter" i],[id*="newsletter" i]{display:none!important;}main{scroll-margin-top:1rem!important;}"#;
+const DOCS_READABLE_CSS: &str = r#"[class*="survey" i],[id*="survey" i],[class*="feedback" i],[id*="feedback" i],[class*="toc" i] nav[aria-label*="secondary" i]{display:none!important;}article,main{max-width:92ch!important;line-height:1.58!important;}pre{white-space:pre-wrap!important;}"#;
+const SOCIAL_QUIET_CSS: &str = r#"[aria-label*="trend" i],[data-testid*="trend" i],[class*="promoted" i],[data-testid*="promoted" i],[class*="suggest" i],[aria-label*="suggest" i],[class*="ad" i]{display:none!important;}main{max-width:74ch!important;margin-inline:auto!important;}"#;
+const MUSIC_QUIET_CSS: &str = r#"[class*="ad" i],[id*="ad" i],[class*="sponsor" i],[id*="sponsor" i],[data-testid*="upgrade" i],[aria-label*="upgrade" i]{display:none!important;}main{background:#121212!important;}"#;
+const RECIPE_CLEANUP_CSS: &str = r#"[class*="jump" i],[class*="video" i],[class*="newsletter" i],[class*="ad" i],[id*="ad" i],[class*="sponsor" i],[class*="related" i]{display:none!important;}article,main{max-width:78ch!important;margin-inline:auto!important;line-height:1.62!important;}"#;
+
+static CURATED_USERSCRIPTS: &[CuratedUserscriptRule] = &[
+    CuratedUserscriptRule { id: "youtube-focus", hosts: &["youtube.com", "youtu.be"], css: "ytd-rich-section-renderer,ytd-reel-shelf-renderer,#masthead-ad,ytd-promoted-sparkles-web-renderer{display:none!important;}#secondary{max-width:360px!important;}" },
+    CuratedUserscriptRule { id: "npr-reader", hosts: &["npr.org"], css: ".bucketwrap,.sponsor,.ad,.advertisement,[data-metrics*=\"sponsor\"]{display:none!important;}article{max-width:76ch!important;margin-inline:auto!important;line-height:1.65!important;}article img{max-width:100%!important;height:auto!important;}" },
+    CuratedUserscriptRule { id: "spotify-quiet", hosts: &["open.spotify.com"], css: "[data-testid=\"upgrade-button\"],.Root__right-sidebar,[aria-label*=\"Sponsored\"]{display:none!important;}.main-view-container{background:#121212!important;}" },
+    CuratedUserscriptRule { id: "wikipedia-readable", hosts: &["wikipedia.org", "wikimedia.org"], css: ".vector-page-titlebar-toc,.vector-column-start,.vector-toc-landmark{display:none!important;}.mw-body{max-width:92ch!important;margin-inline:auto!important;line-height:1.62!important;}" },
+    CuratedUserscriptRule { id: "nytimes-clean-reader", hosts: &["nytimes.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "washingtonpost-clean-reader", hosts: &["washingtonpost.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "guardian-clean-reader", hosts: &["theguardian.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "cnn-clean-reader", hosts: &["cnn.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "apnews-clean-reader", hosts: &["apnews.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "reuters-clean-reader", hosts: &["reuters.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "bbc-clean-reader", hosts: &["bbc.com", "bbc.co.uk"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "theatlantic-clean-reader", hosts: &["theatlantic.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "wired-clean-reader", hosts: &["wired.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "arstechnica-clean-reader", hosts: &["arstechnica.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "techcrunch-clean-reader", hosts: &["techcrunch.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "theverge-clean-reader", hosts: &["theverge.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "vox-clean-reader", hosts: &["vox.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "propublica-clean-reader", hosts: &["propublica.org"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "politico-clean-reader", hosts: &["politico.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "axios-clean-reader", hosts: &["axios.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "bloomberg-clean-reader", hosts: &["bloomberg.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "wsj-clean-reader", hosts: &["wsj.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "ft-clean-reader", hosts: &["ft.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "economist-clean-reader", hosts: &["economist.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "latimes-clean-reader", hosts: &["latimes.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "usatoday-clean-reader", hosts: &["usatoday.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "nbcnews-clean-reader", hosts: &["nbcnews.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "cbsnews-clean-reader", hosts: &["cbsnews.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "abcnews-clean-reader", hosts: &["abcnews.go.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "pbs-clean-reader", hosts: &["pbs.org"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "youtube-music-quiet", hosts: &["music.youtube.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "soundcloud-quiet", hosts: &["soundcloud.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "bandcamp-quiet", hosts: &["bandcamp.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "tidal-quiet", hosts: &["tidal.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "pandora-quiet", hosts: &["pandora.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "deezer-quiet", hosts: &["deezer.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "apple-music-quiet", hosts: &["music.apple.com"], css: MUSIC_QUIET_CSS },
+    CuratedUserscriptRule { id: "vimeo-focus", hosts: &["vimeo.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "twitch-focus", hosts: &["twitch.tv"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "dailymotion-focus", hosts: &["dailymotion.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "netflix-focus", hosts: &["netflix.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "hulu-focus", hosts: &["hulu.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "disneyplus-focus", hosts: &["disneyplus.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "max-focus", hosts: &["max.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "peacock-focus", hosts: &["peacocktv.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "primevideo-focus", hosts: &["primevideo.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "github-readable", hosts: &["github.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "gitlab-readable", hosts: &["gitlab.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "stackoverflow-readable", hosts: &["stackoverflow.com", "stackexchange.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "mdn-readable", hosts: &["developer.mozilla.org"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "rust-docs-readable", hosts: &["doc.rust-lang.org", "docs.rs"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "python-docs-readable", hosts: &["docs.python.org"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "go-docs-readable", hosts: &["go.dev"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "kubernetes-docs-readable", hosts: &["kubernetes.io"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "docker-docs-readable", hosts: &["docs.docker.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "archwiki-readable", hosts: &["wiki.archlinux.org"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "ubuntu-docs-readable", hosts: &["ubuntu.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "redhat-docs-readable", hosts: &["access.redhat.com", "docs.redhat.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "fedora-docs-readable", hosts: &["docs.fedoraproject.org"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "aws-docs-readable", hosts: &["docs.aws.amazon.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "gcp-docs-readable", hosts: &["cloud.google.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "azure-docs-readable", hosts: &["learn.microsoft.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "openai-docs-readable", hosts: &["platform.openai.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "anthropic-docs-readable", hosts: &["docs.anthropic.com"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "hackernews-readable", hosts: &["news.ycombinator.com"], css: "tr.athing{font-size:15px!important;}td.subtext{font-size:12px!important;}.pagetop{line-height:1.6!important;}" },
+    CuratedUserscriptRule { id: "reddit-quiet", hosts: &["reddit.com"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "x-quiet", hosts: &["x.com", "twitter.com"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "facebook-quiet", hosts: &["facebook.com"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "instagram-quiet", hosts: &["instagram.com"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "linkedin-quiet", hosts: &["linkedin.com"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "threads-quiet", hosts: &["threads.net"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "mastodon-quiet", hosts: &["mastodon.social"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "bluesky-quiet", hosts: &["bsky.app"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "amazon-clean-shop", hosts: &["amazon.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "ebay-clean-shop", hosts: &["ebay.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "etsy-clean-shop", hosts: &["etsy.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "walmart-clean-shop", hosts: &["walmart.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "target-clean-shop", hosts: &["target.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "bestbuy-clean-shop", hosts: &["bestbuy.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "newegg-clean-shop", hosts: &["newegg.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "homedepot-clean-shop", hosts: &["homedepot.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "lowes-clean-shop", hosts: &["lowes.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "costco-clean-shop", hosts: &["costco.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "allrecipes-clean-recipe", hosts: &["allrecipes.com"], css: RECIPE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "seriouseats-clean-recipe", hosts: &["seriouseats.com"], css: RECIPE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "foodnetwork-clean-recipe", hosts: &["foodnetwork.com"], css: RECIPE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "epicurious-clean-recipe", hosts: &["epicurious.com"], css: RECIPE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "bonappetit-clean-recipe", hosts: &["bonappetit.com"], css: RECIPE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "nyt-cooking-clean-recipe", hosts: &["cooking.nytimes.com"], css: RECIPE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "weather-clean-panel", hosts: &["weather.com", "wunderground.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "imdb-clean-page", hosts: &["imdb.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "rottentomatoes-clean-page", hosts: &["rottentomatoes.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "goodreads-clean-page", hosts: &["goodreads.com"], css: COMMERCE_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "medium-clean-reader", hosts: &["medium.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "substack-clean-reader", hosts: &["substack.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "quora-clean-reader", hosts: &["quora.com"], css: NEWS_CLEANUP_CSS },
+    CuratedUserscriptRule { id: "pinterest-quiet", hosts: &["pinterest.com"], css: SOCIAL_QUIET_CSS },
+    CuratedUserscriptRule { id: "tiktok-focus", hosts: &["tiktok.com"], css: VIDEO_FOCUS_CSS },
+    CuratedUserscriptRule { id: "coursera-readable", hosts: &["coursera.org"], css: DOCS_READABLE_CSS },
+    CuratedUserscriptRule { id: "edx-readable", hosts: &["edx.org"], css: DOCS_READABLE_CSS },
+];
+
+fn curated_userscript_bundle() -> String {
+    let rules = CURATED_USERSCRIPTS
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "id": rule.id,
+                "hosts": rule.hosts,
+                "css": rule.css,
+            })
+        })
+        .collect::<Vec<_>>();
+    let rules_json = serde_json::to_string(&rules).expect("curated userscript rules encode");
+    format!(
+        r#"(function(){{
+var rules={rules_json};
+var host=(location.hostname||'').toLowerCase().replace(/^www\./,'');
+var active=rules.filter(function(rule){{return rule.hosts.some(function(pattern){{return host===pattern||host.endsWith('.'+pattern);}});}});
+var root=document.head||document.documentElement;
+if(!root)return;
+var style=document.getElementById('mde-browser-userscript-style');
+if(!style){{style=document.createElement('style');style.id='mde-browser-userscript-style';root.appendChild(style);}}
+style.textContent=active.map(function(rule){{return '/* '+rule.id+' */\n'+rule.css;}}).join('\n');
+document.documentElement.dataset.mdeBrowserUserscripts='true';
+document.documentElement.dataset.mdeBrowserUserscriptCount=String(active.length);
+if(window.__mdeBrowserUserScriptsObserver)window.__mdeBrowserUserScriptsObserver.disconnect();
+window.__mdeBrowserUserScriptsObserver=new MutationObserver(function(){{document.documentElement.dataset.mdeBrowserUserscripts='true';}});
+window.__mdeBrowserUserScriptsObserver.observe(document.documentElement,{{childList:true,subtree:true}});
+}})();"#
+    )
+}
 
 const fn download_state_rank(state: TransferState) -> u8 {
     match state {
@@ -609,6 +946,24 @@ pub(crate) struct WebState {
     /// fetched off-thread from the mesh-local service; the UI only polls this
     /// small state object so typing never blocks a frame.
     suggestions: SuggestionState,
+    /// BROWSER-DD-11 offline spellcheck worker. Page text is extracted by the
+    /// helper, then Hunspell runs off the UI thread and reports an honest result.
+    spellcheck: SpellcheckState,
+    /// Latest Browser page-text spellcheck result visible in the spelling drawer.
+    latest_spellcheck: Option<BrowserSpellcheckResult>,
+    /// Next shell-minted page-text request id for spellcheck/TTS seams.
+    next_page_text_request_id: u64,
+    /// Page-text requests owned by Browser spellcheck, keyed by request id.
+    pending_spell_requests: BTreeMap<u64, usize>,
+    /// Page-text requests owned by Browser read-aloud, keyed by request id.
+    pending_read_aloud_requests: BTreeMap<u64, ReadAloudRequest>,
+    /// Page-text requests owned by Power-mode scrape exports, keyed by request id.
+    pending_scrape_export_requests: BTreeMap<u64, ScrapeExportRequest>,
+    /// Page-text requests owned by Browser translate-page, keyed by request id.
+    pending_translate_requests: BTreeMap<u64, TranslateRequest>,
+    /// Page-text requests owned by Browser offline-cache snapshots, keyed by
+    /// request id.
+    pending_offline_cache_requests: BTreeMap<u64, OfflineCacheRequest>,
     /// BROWSER-DD-3 native blocker policy. Starts with the bundled seed lists so
     /// tracker blocking is default-on offline; synced/custom sources and per-site
     /// toggles mutate this store, then every open tab receives a freshly compiled
@@ -622,6 +977,10 @@ pub(crate) struct WebState {
     /// forgot so the menu has a real state transition without offering fake allow
     /// toggles the engines cannot honor yet.
     forgotten_permission_sites: Vec<String>,
+    /// BROWSER-DD-8 prompted-device API trail. Helpers still enforce default-deny;
+    /// this records the operator-facing prompt/deny decisions per first-party site
+    /// and publishes a typed handoff for the later engine grant hook.
+    site_permission_prompts: Vec<SitePermissionPrompt>,
     /// BROWSER-DD-3 per-site data manager. Tracks committed first-party hosts,
     /// live tab counts, last-seen timestamps, and explicit clear actions.
     site_data: SiteDataManager,
@@ -632,6 +991,9 @@ pub(crate) struct WebState {
     download_jobs: Vec<TransferJob>,
     /// Browser transfer ids already announced to the mesh notification feed.
     notified_downloads: BTreeSet<String>,
+    /// BROWSER-DD-8 power mode. When enabled, the Browser exposes the developer /
+    /// media / scrape tool menu; disabled keeps the default clean browser chrome.
+    power_mode: bool,
     /// Last `action/browser/session-sync` body published. Keeps unchanged frames
     /// and ledger refreshes from flooding the Bus while still making every state
     /// transition observable.
@@ -646,6 +1008,53 @@ pub(crate) struct WebState {
     /// Last time the Browser scanned the daemon-owned send-tab outbox for concrete
     /// node-addressed records.
     incoming_send_tab_last_poll: Option<Instant>,
+    /// Last `event/browser-voice-command/<node>` ULID applied by this shell.
+    voice_command_result_cursor: Option<String>,
+    /// Last time the Browser scanned voice-command transcript results.
+    voice_command_result_last_poll: Option<Instant>,
+    /// Latest daemon-owned read-aloud/TTS status for this node.
+    latest_read_aloud_status: Option<BrowserReadAloudStatus>,
+    /// Latest daemon-owned voice-command/STT status for this node.
+    latest_voice_command_status: Option<BrowserVoiceCommandStatus>,
+    /// Last time the Browser scanned retained speech-owner status topics.
+    speech_status_last_poll: Option<Instant>,
+    /// Latest daemon-owned passkey/WebAuthn ceremony status for this node.
+    latest_passkey_status: Option<BrowserPasskeyStatus>,
+    /// Last time the Browser scanned retained passkey-owner status.
+    passkey_status_last_poll: Option<Instant>,
+    /// Last `event/browser-passkeys/<node>` ULID applied by this shell.
+    passkey_result_cursor: Option<String>,
+    /// Last time the Browser scanned passkey completion events.
+    passkey_result_last_poll: Option<Instant>,
+    /// Helper page request ids waiting for daemon passkey completion, keyed by
+    /// the bridge-minted `client_request_id`.
+    pending_passkey_requests: BTreeMap<String, usize>,
+    /// Last `event/browser-share/<node>` ULID applied by this shell.
+    share_result_cursor: Option<String>,
+    /// Last time the Browser scanned accepted share route events.
+    share_result_last_poll: Option<Instant>,
+    /// Latest accepted daemon QR-share route visible in the Browser drawer.
+    latest_qr_share: Option<BrowserQrShareResult>,
+    /// Last `event/browser-translate/<node>` ULID applied by this shell.
+    translation_result_cursor: Option<String>,
+    /// Last time the Browser scanned translation results.
+    translation_result_last_poll: Option<Instant>,
+    /// Latest private translation result visible in the Browser drawer.
+    latest_translation: Option<BrowserTranslationResult>,
+    /// Last `event/browser-offline-cache/<node>` ULID applied by this shell.
+    offline_cache_result_cursor: Option<String>,
+    /// Last time the Browser scanned offline-cache record results.
+    offline_cache_result_last_poll: Option<Instant>,
+    /// Latest private offline-cache record visible in the Browser drawer.
+    latest_offline_cache: Option<BrowserOfflineCacheResult>,
+    /// Private cache records keyed by exact and conservative canonical URL aliases
+    /// for unavailable-page fallback rendering. Records come only from the daemon
+    /// cache owner.
+    offline_cache_by_url: BTreeMap<String, BrowserOfflineCacheResult>,
+    /// Latest daemon-owned CEF runtime update posture for this node.
+    latest_security_update: Option<BrowserSecurityUpdateStatus>,
+    /// Last time the Browser scanned the retained CEF update status topic.
+    security_update_last_poll: Option<Instant>,
     /// Whether the compact download manager drawer is visible.
     downloads_open: bool,
     /// Last time the browser refreshed its ledger view.
@@ -655,8 +1064,10 @@ pub(crate) struct WebState {
     /// Last viewport-capture result, shown inline instead of being swallowed.
     capture_notice: Option<String>,
     /// Last successfully saved user PDF. CUPS spool PDFs are excluded; this feeds
-    /// the CEF-backed built-in PDF viewer action.
-    last_saved_pdf: Option<PathBuf>,
+    /// the CEF-backed built-in PDF viewer action and offline-cache PDF snapshots.
+    last_saved_pdf: Option<SavedPdf>,
+    /// Helper-produced save-PDF requests waiting for confirmation, keyed by path.
+    pending_saved_pdfs: BTreeMap<String, SavedPdf>,
     /// Compact CUPS destination/options drawer for Browser print jobs.
     print_settings_open: bool,
     /// Locally discovered CUPS destinations from `lpstat -e` plus default marker.
@@ -708,22 +1119,55 @@ impl Default for WebState {
             find_open: false,
             page_zoom_percent: 100,
             suggestions: SuggestionState::default(),
+            spellcheck: SpellcheckState::default(),
+            latest_spellcheck: None,
+            next_page_text_request_id: 1,
+            pending_spell_requests: BTreeMap::new(),
+            pending_read_aloud_requests: BTreeMap::new(),
+            pending_scrape_export_requests: BTreeMap::new(),
+            pending_translate_requests: BTreeMap::new(),
+            pending_offline_cache_requests: BTreeMap::new(),
             adfilter_store: FilterListStore::with_bundled(),
             safe_browsing_hosts: Vec::new(),
             forgotten_permission_sites: Vec::new(),
+            site_permission_prompts: Vec::new(),
             site_data: SiteDataManager::default(),
             transfers: Box::new(FileTransfers::from_env()),
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
+            power_mode: false,
             last_session_sync_body: None,
             startup_restore_attempted: false,
             session_restore_roots: default_session_restore_roots(),
             incoming_send_tab_last_poll: None,
+            voice_command_result_cursor: None,
+            voice_command_result_last_poll: None,
+            latest_read_aloud_status: None,
+            latest_voice_command_status: None,
+            speech_status_last_poll: None,
+            latest_passkey_status: None,
+            passkey_status_last_poll: None,
+            passkey_result_cursor: None,
+            passkey_result_last_poll: None,
+            pending_passkey_requests: BTreeMap::new(),
+            share_result_cursor: None,
+            share_result_last_poll: None,
+            latest_qr_share: None,
+            translation_result_cursor: None,
+            translation_result_last_poll: None,
+            latest_translation: None,
+            offline_cache_result_cursor: None,
+            offline_cache_result_last_poll: None,
+            latest_offline_cache: None,
+            offline_cache_by_url: BTreeMap::new(),
+            latest_security_update: None,
+            security_update_last_poll: None,
             downloads_open: false,
             downloads_last_poll: None,
             download_notice: None,
             capture_notice: None,
             last_saved_pdf: None,
+            pending_saved_pdfs: BTreeMap::new(),
             print_settings_open: false,
             cups_printers: Vec::new(),
             cups_notice: None,
@@ -916,6 +1360,9 @@ impl WebState {
             muted: false,
             force_dark: false,
             reader_mode: false,
+            user_scripts: false,
+            user_agent: UserAgentOverride::Default,
+            device_profile: DeviceProfile::Default,
             last_activity: Instant::now(),
             idle_suspended: false,
             page_focused: false,
@@ -937,6 +1384,61 @@ impl WebState {
     fn request_new_tab_with_url(&mut self, engine: BrowserEngine, url: String) {
         self.open_requested
             .push_back(TabOpenIntent::NewForegroundUrl { engine, url });
+    }
+
+    fn toggle_power_mode(&mut self) {
+        self.power_mode = !self.power_mode;
+        self.publish_session_snapshot();
+    }
+
+    fn open_active_view_source(&mut self) {
+        let Some((engine, url)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                Some((tab.engine, url))
+            }
+        }) else {
+            self.capture_notice = Some("View source unavailable: no live page".to_owned());
+            return;
+        };
+        let source_url = if url.starts_with("view-source:") {
+            url
+        } else {
+            format!("view-source:{url}")
+        };
+        self.request_new_tab_with_url(engine, source_url);
+        self.capture_notice = Some("Power mode: opening page source".to_owned());
+    }
+
+    fn open_chromium_devtools(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.capture_notice =
+                Some("Chromium DevTools unavailable: no live CEF page".to_owned());
+            return;
+        };
+        if tab.engine != BrowserEngine::Cef || tab.session.is_crashed() {
+            self.capture_notice = Some("Chromium DevTools requires a live CEF tab".to_owned());
+            return;
+        }
+        let active_url = tab.session.nav().url.trim().to_owned();
+        let (url, notice) = match chromium_devtools_frontend_for_active_url(&active_url) {
+            Ok(Some(url)) => (
+                url,
+                "Power mode: opening Chromium DevTools for active page".to_owned(),
+            ),
+            Ok(None) => (
+                CEF_DEVTOOLS_URL.to_owned(),
+                "Power mode: opening Chromium DevTools target list".to_owned(),
+            ),
+            Err(err) => (
+                CEF_DEVTOOLS_URL.to_owned(),
+                format!("Power mode: opening Chromium DevTools target list ({err})"),
+            ),
+        };
+        self.request_new_tab_with_url(BrowserEngine::Cef, url);
+        self.capture_notice = Some(notice);
     }
 
     /// Apply a Browser session-sync snapshot from the future mesh sync owner by
@@ -982,6 +1484,12 @@ impl WebState {
             .and_then(serde_json::Value::as_bool)
         {
             self.downloads_open = downloads_open;
+        }
+        if let Some(power_mode) = settings
+            .get("power_mode")
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.power_mode = power_mode;
         }
         if let Some(speed_dial) = speed_dial_from_settings(settings) {
             self.speed_dial = speed_dial;
@@ -1089,6 +1597,414 @@ impl WebState {
         }
         self.incoming_send_tab_last_poll = Some(Instant::now());
         self.drain_incoming_send_tabs();
+    }
+
+    fn poll_voice_command_results(&mut self) {
+        if self
+            .voice_command_result_last_poll
+            .is_some_and(|last| last.elapsed() < VOICE_COMMAND_RESULT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.voice_command_result_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_voice_command_result_topic(&local_hostname());
+        let Ok(msgs) = persist.list_since(&topic, self.voice_command_result_cursor.as_deref())
+        else {
+            return;
+        };
+        for msg in msgs {
+            self.voice_command_result_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(result) = parse_voice_transcript_result(body) else {
+                continue;
+            };
+            self.apply_voice_transcript_result(result);
+        }
+    }
+
+    fn poll_speech_statuses(&mut self) {
+        if self
+            .speech_status_last_poll
+            .is_some_and(|last| last.elapsed() < SPEECH_STATUS_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.speech_status_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let host = local_hostname();
+        let read_topic = browser_read_aloud_status_topic(&host);
+        if let Ok(msgs) = persist.list_since(&read_topic, None) {
+            for msg in msgs {
+                let Some(body) = msg.body.as_deref() else {
+                    continue;
+                };
+                if let Ok(status) = parse_read_aloud_status(body) {
+                    self.latest_read_aloud_status = Some(status);
+                }
+            }
+        }
+        let voice_topic = browser_voice_command_status_topic(&host);
+        if let Ok(msgs) = persist.list_since(&voice_topic, None) {
+            for msg in msgs {
+                let Some(body) = msg.body.as_deref() else {
+                    continue;
+                };
+                if let Ok(status) = parse_voice_command_status(body) {
+                    self.latest_voice_command_status = Some(status);
+                }
+            }
+        }
+    }
+
+    fn poll_passkey_status(&mut self) {
+        if self
+            .passkey_status_last_poll
+            .is_some_and(|last| last.elapsed() < PASSKEY_STATUS_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.passkey_status_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_passkey_status_topic(&local_hostname());
+        let Ok(mut msgs) = persist.list_since(&topic, None) else {
+            return;
+        };
+        let Some(msg) = msgs.pop() else {
+            return;
+        };
+        let Some(body) = msg.body.as_deref() else {
+            return;
+        };
+        let Ok(status) = parse_passkey_status(body) else {
+            return;
+        };
+        self.latest_passkey_status = Some(status);
+    }
+
+    fn poll_passkey_results(&mut self) {
+        if self
+            .passkey_result_last_poll
+            .is_some_and(|last| last.elapsed() < PASSKEY_RESULT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.passkey_result_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_passkey_event_topic(&local_hostname());
+        let Ok(msgs) = persist.list_since(&topic, self.passkey_result_cursor.as_deref()) else {
+            return;
+        };
+        for msg in msgs {
+            self.passkey_result_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(completion) = parse_passkey_completion(body) else {
+                continue;
+            };
+            let Some(tab_index) = self
+                .pending_passkey_requests
+                .remove(&completion.client_request_id)
+            else {
+                continue;
+            };
+            let Some(tab) = self.tabs.get_mut(tab_index) else {
+                continue;
+            };
+            tab.session.complete_passkey(completion.body);
+            self.capture_notice = Some("Passkey: returned result to page".to_owned());
+        }
+    }
+
+    fn poll_share_results(&mut self) {
+        if self
+            .share_result_last_poll
+            .is_some_and(|last| last.elapsed() < SHARE_RESULT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.share_result_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_share_result_topic(&local_hostname());
+        let Ok(msgs) = persist.list_since(&topic, self.share_result_cursor.as_deref()) else {
+            return;
+        };
+        for msg in msgs {
+            self.share_result_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(route) = parse_share_route_result(body) else {
+                continue;
+            };
+            self.apply_share_route_result(route);
+        }
+    }
+
+    fn poll_translation_results(&mut self) {
+        if self
+            .translation_result_last_poll
+            .is_some_and(|last| last.elapsed() < TRANSLATION_RESULT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.translation_result_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_translation_result_topic(&local_hostname());
+        let Ok(msgs) = persist.list_since(&topic, self.translation_result_cursor.as_deref()) else {
+            return;
+        };
+        for msg in msgs {
+            self.translation_result_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(result) = parse_translation_result(body) else {
+                continue;
+            };
+            self.apply_translation_result(result);
+        }
+    }
+
+    fn poll_offline_cache_results(&mut self) {
+        if self
+            .offline_cache_result_last_poll
+            .is_some_and(|last| last.elapsed() < OFFLINE_CACHE_RESULT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.offline_cache_result_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_offline_cache_result_topic(&local_hostname());
+        let Ok(msgs) = persist.list_since(&topic, self.offline_cache_result_cursor.as_deref())
+        else {
+            return;
+        };
+        for msg in msgs {
+            self.offline_cache_result_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(result) = parse_offline_cache_result(body) else {
+                continue;
+            };
+            self.apply_offline_cache_result(result);
+        }
+    }
+
+    fn poll_security_update_status(&mut self) {
+        if self
+            .security_update_last_poll
+            .is_some_and(|last| last.elapsed() < SECURITY_UPDATE_STATUS_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.security_update_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_security_update_status_topic(&local_hostname());
+        let Ok(mut msgs) = persist.list_since(&topic, None) else {
+            return;
+        };
+        let Some(msg) = msgs.pop() else {
+            return;
+        };
+        let Some(body) = msg.body.as_deref() else {
+            return;
+        };
+        let Ok(status) = parse_security_update_status(body) else {
+            return;
+        };
+        self.latest_security_update = Some(status);
+    }
+
+    fn apply_translation_result(&mut self, result: BrowserTranslationResult) {
+        if result.host != local_hostname() {
+            return;
+        }
+        let chars = result.translation.chars().count();
+        self.capture_notice = Some(format!(
+            "Translation ready: {} character{}",
+            chars,
+            plural(chars)
+        ));
+        self.latest_translation = Some(result);
+    }
+
+    fn apply_share_route_result(&mut self, route: BrowserShareRouteResult) {
+        if route.host != local_hostname() || route.target != BrowserShareTarget::Qr {
+            return;
+        }
+        match qr_share_result(route) {
+            Ok(result) => {
+                self.capture_notice = Some("QR share ready".to_owned());
+                self.latest_qr_share = Some(result);
+            }
+            Err(err) => {
+                self.capture_notice = Some(format!("QR share unavailable: {err}"));
+            }
+        }
+    }
+
+    fn apply_offline_cache_result(&mut self, result: BrowserOfflineCacheResult) {
+        if result.host != local_hostname() {
+            return;
+        }
+        let chars = result.text.chars().count();
+        self.capture_notice = Some(format!(
+            "Offline cache ready: {} character{}",
+            chars,
+            plural(chars)
+        ));
+        for key in cache_url_keys(&result.url) {
+            self.offline_cache_by_url.insert(key, result.clone());
+        }
+        self.latest_offline_cache = Some(result);
+    }
+
+    fn cached_snapshot_for_url(&self, url: &str) -> Option<&BrowserOfflineCacheResult> {
+        cache_url_keys(url)
+            .into_iter()
+            .find_map(|key| self.offline_cache_by_url.get(&key))
+    }
+
+    fn offline_cache_fallback_for_unavailable(&self) -> Option<&BrowserOfflineCacheResult> {
+        match self.tabs.get(self.active) {
+            Some(tab) if tab.session.is_crashed() => {
+                self.cached_snapshot_for_url(tab.session.nav().url.trim())
+            }
+            None => self.cached_snapshot_for_url(self.address.trim()),
+            _ => None,
+        }
+    }
+
+    fn apply_voice_transcript_result(&mut self, result: VoiceTranscriptResult) {
+        if result.host != local_hostname() {
+            return;
+        }
+        match result.mode {
+            VoiceCommandMode::Dictation => self.apply_voice_dictation(result),
+            VoiceCommandMode::Command => self.apply_voice_command(&result.transcript),
+        }
+    }
+
+    fn apply_voice_dictation(&mut self, result: VoiceTranscriptResult) {
+        let Some(tab) = self.tabs.get_mut(result.tab_index) else {
+            self.capture_notice =
+                Some("Dictation result ignored: tab is no longer open".to_owned());
+            return;
+        };
+        if result.focus != "page" || !tab.page_focused {
+            self.capture_notice =
+                Some("Dictation result ready: focus the page before dictating".to_owned());
+            return;
+        }
+        let event = egui::Event::Text(result.transcript.clone());
+        tab.session.send_input(&event, 1.0);
+        tab.last_activity = Instant::now();
+        self.capture_notice = Some(format!(
+            "Dictation inserted {} character{}",
+            result.transcript.chars().count(),
+            plural(result.transcript.chars().count())
+        ));
+    }
+
+    fn apply_voice_command(&mut self, transcript: &str) {
+        let Some(action) = voice_command_action(transcript) else {
+            self.capture_notice = Some(format!(
+                "Voice command not recognized: {}",
+                ellipsize(transcript.trim(), 48)
+            ));
+            return;
+        };
+        match action {
+            BrowserVoiceAction::NewTab => {
+                self.request_new_tab(self.engine);
+                self.capture_notice = Some("Voice command: new tab".to_owned());
+            }
+            BrowserVoiceAction::CloseTab => {
+                self.close_tab(self.active);
+                self.capture_notice = Some("Voice command: close tab".to_owned());
+            }
+            BrowserVoiceAction::Back => {
+                if let Some(tab) = self.active_tab() {
+                    tab.session.go_back();
+                    self.mark_active_tab_activity();
+                    self.capture_notice = Some("Voice command: back".to_owned());
+                }
+            }
+            BrowserVoiceAction::Forward => {
+                if let Some(tab) = self.active_tab() {
+                    tab.session.go_forward();
+                    self.mark_active_tab_activity();
+                    self.capture_notice = Some("Voice command: forward".to_owned());
+                }
+            }
+            BrowserVoiceAction::Reload => {
+                let crashed = self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|tab| tab.session.is_crashed());
+                if crashed {
+                    self.respawn_requested = true;
+                } else if let Some(tab) = self.active_tab() {
+                    tab.session.reload();
+                    self.mark_active_tab_activity();
+                }
+                self.capture_notice = Some("Voice command: reload".to_owned());
+            }
+            BrowserVoiceAction::ReadAloud => {
+                self.request_active_read_aloud();
+            }
+            BrowserVoiceAction::Find(query) => {
+                self.find_open = true;
+                self.find_query = query;
+                self.submit_find(false);
+                self.capture_notice = Some("Voice command: find".to_owned());
+            }
+        }
     }
 
     fn request_bookmarks_manager(&mut self) {
@@ -1287,12 +2203,19 @@ impl WebState {
             tab.muted = false;
             tab.force_dark = false;
             tab.reader_mode = false;
+            tab.user_scripts = false;
+            tab.user_agent = UserAgentOverride::Default;
+            tab.device_profile = DeviceProfile::Default;
             tab.session.load(NEW_TAB_URL);
             tab.session.set_zoom(self.page_zoom_percent);
             tab.session.clear_find();
             tab.session.set_audio_muted(false);
             tab.session.set_force_dark(false);
             tab.session.set_reader_mode(false);
+            tab.session.set_user_scripts(false, "");
+            tab.session.set_user_agent("");
+            tab.session
+                .set_device_profile(DeviceProfile::Default.wire(), 0, 0, 100, false);
         }
         if let Some(host) = cleared_host {
             self.site_data.mark_cleared(&host, unix_ms());
@@ -1369,6 +2292,304 @@ impl WebState {
                 self.capture_notice = Some(format!("Capture failed: {err}"));
             }
         }
+    }
+
+    fn export_active_page_metadata_scrape(&mut self) {
+        match self.request_active_page_metadata_scrape_to_dirs(
+            browser_scrape_spool_dir(),
+            browser_capture_dir(),
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                self.capture_notice = Some(format!("Scrape export failed: {err}"));
+            }
+        }
+    }
+
+    fn request_active_page_metadata_scrape_to_dirs(
+        &mut self,
+        spool_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Result<(), String> {
+        let Some((url, title, engine, resources)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                Some((
+                    url,
+                    tab.session.title().to_owned(),
+                    tab.engine,
+                    tab.session.recent_resource_requests(),
+                ))
+            }
+        }) else {
+            return Err("no live page to export".to_owned());
+        };
+        let request = ScrapeExportRequest {
+            tab_index: self.active,
+            engine,
+            url,
+            title,
+            resources,
+            spool_dir,
+            dest_dir,
+            captured_ms: unix_ms(),
+        };
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_scrape(
+                id,
+                64 * 1024,
+                SCRAPE_DOM_LINK_MAX_COUNT as u16,
+                SCRAPE_DOM_HEADING_MAX_COUNT as u16,
+            );
+            self.pending_scrape_export_requests.insert(id, request);
+            self.capture_notice = Some("Scrape export: reading page DOM".to_owned());
+        }
+        Ok(())
+    }
+
+    fn export_active_page_metadata_scrape_to_dirs(
+        &mut self,
+        spool_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Result<Vec<String>, String> {
+        let Some((url, title, engine, resources)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                Some((
+                    url,
+                    tab.session.title().to_owned(),
+                    tab.engine,
+                    tab.session.recent_resource_requests(),
+                ))
+            }
+        }) else {
+            return Err("no live page to export".to_owned());
+        };
+        let now = unix_ms();
+        std::fs::create_dir_all(&spool_dir)
+            .map_err(|err| format!("create scrape spool dir: {err}"))?;
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|err| format!("create scrape destination dir: {err}"))?;
+
+        let documents =
+            active_page_scrape_documents(&url, &title, engine, now, &resources, None, None)?;
+        let mut sources = Vec::with_capacity(documents.len());
+        for (ext, body) in documents {
+            let path = spool_dir.join(scrape_export_filename_for(&url, &title, now, ext));
+            std::fs::write(&path, body)
+                .map_err(|err| format!("write scrape export {}: {err}", path.display()))?;
+            sources.push(path.to_string_lossy().to_string());
+        }
+        enqueue_browser_output_batch(
+            self.transfers.as_ref(),
+            &sources,
+            dest_dir.to_string_lossy().as_ref(),
+        )
+    }
+
+    fn finish_page_metadata_scrape_export(
+        &self,
+        request: ScrapeExportRequest,
+        page_scrape_body: &str,
+    ) -> Result<Vec<String>, String> {
+        if request.tab_index >= self.tabs.len() {
+            return Err("scrape export tab disappeared before page text returned".to_owned());
+        }
+        std::fs::create_dir_all(&request.spool_dir)
+            .map_err(|err| format!("create scrape spool dir: {err}"))?;
+        std::fs::create_dir_all(&request.dest_dir)
+            .map_err(|err| format!("create scrape destination dir: {err}"))?;
+
+        let documents = active_page_scrape_documents(
+            &request.url,
+            &request.title,
+            request.engine,
+            request.captured_ms,
+            &request.resources,
+            None,
+            Some(page_scrape_body),
+        )?;
+        let mut sources = Vec::with_capacity(documents.len());
+        for (ext, body) in documents {
+            let path = request.spool_dir.join(scrape_export_filename_for(
+                &request.url,
+                &request.title,
+                request.captured_ms,
+                ext,
+            ));
+            std::fs::write(&path, body)
+                .map_err(|err| format!("write scrape export {}: {err}", path.display()))?;
+            sources.push(path.to_string_lossy().to_string());
+        }
+        enqueue_browser_output_batch(
+            self.transfers.as_ref(),
+            &sources,
+            request.dest_dir.to_string_lossy().as_ref(),
+        )
+    }
+
+    fn export_active_media_manifest(&mut self) {
+        match self
+            .export_active_media_manifest_to_dirs(browser_media_spool_dir(), browser_capture_dir())
+        {
+            Ok(id) => {
+                self.capture_notice = Some(format!("Power mode: queued media manifest ({id})"));
+                self.refresh_downloads();
+            }
+            Err(err) => {
+                self.capture_notice = Some(format!("Media manifest failed: {err}"));
+            }
+        }
+    }
+
+    fn export_active_media_manifest_to_dirs(
+        &mut self,
+        spool_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Result<String, String> {
+        let Some((url, title, engine, resources)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                Some((
+                    url,
+                    tab.session.title().to_owned(),
+                    tab.engine,
+                    tab.session.recent_resource_requests(),
+                ))
+            }
+        }) else {
+            return Err("no live page to sniff".to_owned());
+        };
+        let now = unix_ms();
+        std::fs::create_dir_all(&spool_dir)
+            .map_err(|err| format!("create media spool dir: {err}"))?;
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|err| format!("create media destination dir: {err}"))?;
+        let body = active_page_media_manifest(&url, &title, engine, now, &resources)?;
+        let path = spool_dir.join(media_manifest_filename_for(&url, &title, now));
+        std::fs::write(&path, body)
+            .map_err(|err| format!("write media manifest {}: {err}", path.display()))?;
+        enqueue_browser_output(
+            self.transfers.as_ref(),
+            &path.to_string_lossy(),
+            dest_dir.to_string_lossy().as_ref(),
+        )
+    }
+
+    fn download_observed_media_assets(&mut self) {
+        match self.download_observed_media_assets_to_dirs(
+            browser_media_spool_dir(),
+            browser_capture_dir(),
+        ) {
+            Ok(ids) => {
+                self.capture_notice = Some(format!(
+                    "Power mode: queued observed media downloads ({} assets)",
+                    ids.len()
+                ));
+                self.refresh_downloads();
+            }
+            Err(err) => {
+                self.capture_notice = Some(format!("Media download queue failed: {err}"));
+            }
+        }
+    }
+
+    fn download_observed_image_assets(&mut self) {
+        match self.download_observed_image_assets_to_dirs(
+            browser_media_spool_dir(),
+            browser_capture_dir(),
+        ) {
+            Ok(ids) => {
+                self.capture_notice = Some(format!(
+                    "Power mode: queued observed image downloads ({} assets)",
+                    ids.len()
+                ));
+                self.refresh_downloads();
+            }
+            Err(err) => {
+                self.capture_notice = Some(format!("Image download queue failed: {err}"));
+            }
+        }
+    }
+
+    fn download_observed_media_assets_to_dirs(
+        &mut self,
+        spool_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Result<Vec<String>, String> {
+        self.download_observed_assets_to_dirs(MediaAssetSelection::All, spool_dir, dest_dir)
+    }
+
+    fn download_observed_image_assets_to_dirs(
+        &mut self,
+        spool_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Result<Vec<String>, String> {
+        self.download_observed_assets_to_dirs(MediaAssetSelection::Images, spool_dir, dest_dir)
+    }
+
+    fn download_observed_assets_to_dirs(
+        &mut self,
+        selection: MediaAssetSelection,
+        spool_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Result<Vec<String>, String> {
+        let Some((url, title, engine, resources)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                Some((
+                    url,
+                    tab.session.title().to_owned(),
+                    tab.engine,
+                    tab.session.recent_resource_requests(),
+                ))
+            }
+        }) else {
+            return Err("no live page to download from".to_owned());
+        };
+        let now = unix_ms();
+        std::fs::create_dir_all(&spool_dir)
+            .map_err(|err| format!("create media download spool dir: {err}"))?;
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|err| format!("create media download destination dir: {err}"))?;
+        let requests = active_page_media_asset_requests_with_selection(
+            &url, &title, engine, now, &resources, selection,
+        )?;
+        if requests.is_empty() {
+            return Err(selection.empty_error().to_owned());
+        }
+        let mut sources = Vec::with_capacity(requests.len());
+        for (index, body) in requests.into_iter().enumerate() {
+            let request_url = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["asset_url"].as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| url.clone());
+            let path = spool_dir.join(media_asset_request_filename_for(
+                &url,
+                &title,
+                &request_url,
+                now,
+                index + 1,
+            ));
+            std::fs::write(&path, body)
+                .map_err(|err| format!("write media download request {}: {err}", path.display()))?;
+            sources.push(path.to_string_lossy().to_string());
+        }
+        enqueue_browser_output_batch(
+            self.transfers.as_ref(),
+            &sources,
+            dest_dir.to_string_lossy().as_ref(),
+        )
     }
 
     fn record_capture_success(&mut self, label: &str, path: &Path) {
@@ -1664,9 +2885,27 @@ impl WebState {
             };
         }
         if ok {
-            self.last_saved_pdf = Some(PathBuf::from(&path));
+            let saved = self.pending_saved_pdfs.remove(&path).unwrap_or_else(|| {
+                let (url, title) = self
+                    .tabs
+                    .get(self.active)
+                    .map(|tab| {
+                        (
+                            tab.session.nav().url.clone(),
+                            tab.session.title().to_owned(),
+                        )
+                    })
+                    .unwrap_or_default();
+                SavedPdf {
+                    path: PathBuf::from(&path),
+                    url,
+                    title,
+                }
+            });
+            self.last_saved_pdf = Some(saved);
             format!("PDF saved {path}")
         } else {
+            self.pending_saved_pdfs.remove(&path);
             format!("PDF failed {path}")
         }
     }
@@ -1684,9 +2923,10 @@ impl WebState {
     }
 
     fn last_saved_pdf_viewer_url(&self) -> Result<String, String> {
-        let Some(path) = &self.last_saved_pdf else {
+        let Some(saved) = &self.last_saved_pdf else {
             return Err("no saved PDF".to_owned());
         };
+        let path = &saved.path;
         if !pdf_file_looks_readable(path) {
             return Err(format!("{} is not a readable PDF", path.display()));
         }
@@ -1722,9 +2962,89 @@ impl WebState {
             .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
         let name = pdf_filename_for(&url, &title, unix_ms());
         let path = dir.join(name);
+        let key = path.to_string_lossy().into_owned();
+        self.pending_saved_pdfs.insert(
+            key.clone(),
+            SavedPdf {
+                path: path.clone(),
+                url,
+                title,
+            },
+        );
         if let Some(tab) = self.active_tab() {
-            tab.session.save_pdf(path.to_string_lossy().into_owned());
+            tab.session.save_pdf(key);
         }
+        Ok(path)
+    }
+
+    fn open_latest_offline_cache_pdf(&mut self) {
+        match self.save_latest_offline_cache_pdf_to_dir(browser_pdf_dir()) {
+            Ok(path) => {
+                if let Some(result) = &self.latest_offline_cache {
+                    self.last_saved_pdf = Some(SavedPdf {
+                        path,
+                        url: result.url.clone(),
+                        title: result.title.clone(),
+                    });
+                }
+                self.open_last_saved_pdf();
+            }
+            Err(err) => {
+                self.capture_notice = Some(format!("Offline PDF failed: {err}"));
+            }
+        }
+    }
+
+    fn save_latest_offline_cache_pdf_to_dir(
+        &self,
+        dir: impl AsRef<Path>,
+    ) -> Result<PathBuf, String> {
+        let result = self
+            .latest_offline_cache
+            .as_ref()
+            .ok_or_else(|| "no offline copy".to_owned())?;
+        let pdf = result
+            .pdf_snapshot
+            .as_ref()
+            .ok_or_else(|| "offline copy has no PDF snapshot".to_owned())?;
+        let bytes = offline_cache_pdf_bytes(pdf)?;
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+        let path = dir.join(&pdf.filename);
+        std::fs::write(&path, bytes)
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+        Ok(path)
+    }
+
+    fn save_latest_offline_cache_archive(&mut self) {
+        match self.save_latest_offline_cache_archive_to_dir(browser_capture_dir()) {
+            Ok(path) => self.record_capture_success("Saved offline archive", &path),
+            Err(err) => {
+                self.capture_notice = Some(format!("Offline archive failed: {err}"));
+            }
+        }
+    }
+
+    fn save_latest_offline_cache_archive_to_dir(
+        &self,
+        dir: impl AsRef<Path>,
+    ) -> Result<PathBuf, String> {
+        let result = self
+            .latest_offline_cache
+            .as_ref()
+            .ok_or_else(|| "no offline copy".to_owned())?;
+        let archive = result
+            .archive_mhtml
+            .as_ref()
+            .ok_or_else(|| "offline copy has no MHTML archive".to_owned())?;
+        let bytes = offline_cache_archive_bytes(archive)?;
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+        let path = dir.join(&archive.filename);
+        std::fs::write(&path, bytes)
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
         Ok(path)
     }
 
@@ -1815,6 +3135,393 @@ impl WebState {
             .get(self.active)
             .is_some_and(|tab| tab.reader_mode);
         self.set_active_tab_reader_mode(!enabled);
+    }
+
+    fn set_active_tab_user_scripts(&mut self, enabled: bool) {
+        if !self.can_drive_page_tools() {
+            return;
+        }
+        let bundle = if enabled {
+            curated_userscript_bundle()
+        } else {
+            String::new()
+        };
+        if let Some(tab) = self.active_tab() {
+            tab.user_scripts = enabled;
+            tab.session.set_user_scripts(enabled, bundle);
+        }
+        self.publish_session_snapshot();
+    }
+
+    fn toggle_active_tab_user_scripts(&mut self) {
+        let enabled = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.user_scripts);
+        self.set_active_tab_user_scripts(!enabled);
+    }
+
+    fn set_active_tab_user_agent(&mut self, user_agent: UserAgentOverride) {
+        if !self.can_drive_page_tools() {
+            return;
+        }
+        if let Some(tab) = self.active_tab() {
+            tab.user_agent = user_agent;
+            tab.session.set_user_agent(user_agent.value());
+        }
+        self.publish_session_snapshot();
+    }
+
+    fn cycle_active_tab_user_agent(&mut self) {
+        let user_agent = self
+            .tabs
+            .get(self.active)
+            .map_or(UserAgentOverride::Default, |tab| tab.user_agent)
+            .next();
+        self.set_active_tab_user_agent(user_agent);
+    }
+
+    fn set_active_tab_device_profile(&mut self, device_profile: DeviceProfile) {
+        if !self.can_drive_page_tools() {
+            return;
+        }
+        let (width, height, scale_percent, touch) = device_profile.dimensions();
+        if let Some(tab) = self.active_tab() {
+            tab.device_profile = device_profile;
+            tab.session.set_device_profile(
+                device_profile.wire(),
+                width,
+                height,
+                scale_percent,
+                touch,
+            );
+        }
+        self.publish_session_snapshot();
+    }
+
+    fn cycle_active_tab_device_profile(&mut self) {
+        let device_profile = self
+            .tabs
+            .get(self.active)
+            .map_or(DeviceProfile::Default, |tab| tab.device_profile)
+            .next();
+        self.set_active_tab_device_profile(device_profile);
+    }
+
+    fn apply_spellcheck_correction(&mut self, tab_index: usize, word: &str, replacement: &str) {
+        self.apply_spellcheck_correction_inner(tab_index, word, replacement, false);
+    }
+
+    fn apply_spellcheck_correction_all(&mut self, tab_index: usize, word: &str, replacement: &str) {
+        self.apply_spellcheck_correction_inner(tab_index, word, replacement, true);
+    }
+
+    fn apply_spellcheck_correction_at(
+        &mut self,
+        tab_index: usize,
+        word: &str,
+        replacement: &str,
+        occurrence: u16,
+    ) {
+        let word = word.trim();
+        let replacement = replacement.trim();
+        if word.is_empty() || replacement.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            self.capture_notice = Some("Spelling correction unavailable: tab closed".to_owned());
+            return;
+        };
+        if tab.session.is_crashed() {
+            self.capture_notice = Some("Spelling correction unavailable: page crashed".to_owned());
+            return;
+        }
+        tab.session.apply_spellcheck_correction_at(
+            word.to_owned(),
+            replacement.to_owned(),
+            occurrence,
+        );
+        self.capture_notice = Some(format!(
+            "Spelling: replaced occurrence {} of {word} with {replacement}",
+            u32::from(occurrence) + 1
+        ));
+    }
+
+    fn apply_spellcheck_correction_inner(
+        &mut self,
+        tab_index: usize,
+        word: &str,
+        replacement: &str,
+        replace_all: bool,
+    ) {
+        let word = word.trim();
+        let replacement = replacement.trim();
+        if word.is_empty() || replacement.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            self.capture_notice = Some("Spelling correction unavailable: tab closed".to_owned());
+            return;
+        };
+        if tab.session.is_crashed() {
+            self.capture_notice = Some("Spelling correction unavailable: page crashed".to_owned());
+            return;
+        }
+        if replace_all {
+            tab.session
+                .apply_spellcheck_correction_all(word.to_owned(), replacement.to_owned());
+            self.capture_notice = Some(format!("Spelling: replaced all {word} with {replacement}"));
+        } else {
+            tab.session
+                .apply_spellcheck_correction(word.to_owned(), replacement.to_owned());
+            self.capture_notice = Some(format!("Spelling: replaced {word} with {replacement}"));
+        }
+    }
+
+    fn request_active_spellcheck(&mut self) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some("Spelling unavailable: no live page".to_owned());
+            return;
+        }
+        if self.spellcheck.in_flight.is_some() {
+            self.capture_notice = Some("Spelling: check already running".to_owned());
+            return;
+        }
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        let active = self.active;
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_text(id, 64 * 1024);
+            self.pending_spell_requests.insert(id, active);
+            self.capture_notice = Some("Spelling: reading page text".to_owned());
+        }
+    }
+
+    fn request_active_read_aloud(&mut self) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some("Read aloud unavailable: no live page".to_owned());
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.capture_notice = Some("Read aloud unavailable: no live page".to_owned());
+            return;
+        };
+        let request = ReadAloudRequest {
+            tab_index: self.active,
+            engine: tab.engine,
+            url: tab.session.nav().url.clone(),
+            title: tab.session.title().to_owned(),
+        };
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_text(id, 64 * 1024);
+            self.pending_read_aloud_requests.insert(id, request);
+            self.capture_notice = Some("Read aloud: reading page text".to_owned());
+        }
+    }
+
+    fn request_active_translate_page(&mut self) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some("Translate unavailable: no live page".to_owned());
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.capture_notice = Some("Translate unavailable: no live page".to_owned());
+            return;
+        };
+        let request = TranslateRequest {
+            tab_index: self.active,
+            engine: tab.engine,
+            url: tab.session.nav().url.clone(),
+            title: tab.session.title().to_owned(),
+            source_lang: "auto".to_owned(),
+            target_lang: browser_translate_target_lang(),
+        };
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_text(id, 64 * 1024);
+            self.pending_translate_requests.insert(id, request);
+            self.capture_notice = Some("Translate: reading page text".to_owned());
+        }
+    }
+
+    fn request_active_offline_cache(&mut self) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some("Offline cache unavailable: no live page".to_owned());
+            return;
+        }
+        let (engine, url, title, viewport, resources) = {
+            let Some(tab) = self.tabs.get(self.active) else {
+                self.capture_notice = Some("Offline cache unavailable: no live page".to_owned());
+                return;
+            };
+            (
+                tab.engine,
+                tab.session.nav().url.clone(),
+                tab.session.title().to_owned(),
+                tab.last_frame
+                    .as_ref()
+                    .and_then(offline_cache_viewport_image),
+                offline_cache_resource_manifest(&tab.session.recent_resource_requests()),
+            )
+        };
+        let pdf_snapshot = self
+            .last_saved_pdf
+            .as_ref()
+            .filter(|saved| saved.url == url)
+            .and_then(offline_cache_pdf_snapshot);
+        let request = OfflineCacheRequest {
+            tab_index: self.active,
+            engine,
+            url,
+            title,
+            viewport,
+            resources,
+            pdf_snapshot,
+        };
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_text(id, 64 * 1024);
+            self.pending_offline_cache_requests.insert(id, request);
+            self.capture_notice = Some("Offline cache: reading page text".to_owned());
+        }
+    }
+
+    fn request_active_voice_command(&mut self, mode: VoiceCommandMode) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some(format!("{} unavailable: no live page", mode.label()));
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.capture_notice = Some(format!("{} unavailable: no live page", mode.label()));
+            return;
+        };
+        let body = browser_voice_command_body(
+            mode,
+            self.active,
+            tab.engine,
+            &tab.session.nav().url,
+            tab.session.title(),
+            &self.address,
+            tab.page_focused,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            ACTION_BROWSER_VOICE_COMMAND,
+            &body,
+        );
+        self.capture_notice = Some(format!("{}: sent STT request", mode.label()));
+    }
+
+    fn handle_page_text_event(&mut self, id: u64, text: String) {
+        if let Some(tab_index) = self.pending_spell_requests.remove(&id) {
+            if text.trim().is_empty() {
+                self.capture_notice = Some("Spelling: no page text found".to_owned());
+                return;
+            }
+            self.capture_notice = Some("Spelling: checking page text".to_owned());
+            self.spellcheck.start(id, tab_index, text);
+            return;
+        }
+        if let Some(request) = self.pending_read_aloud_requests.remove(&id) {
+            if text.trim().is_empty() {
+                self.capture_notice = Some("Read aloud: no page text found".to_owned());
+                return;
+            }
+            let body = browser_read_aloud_body(&request, &text);
+            publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_READ_ALOUD, &body);
+            self.capture_notice = Some("Read aloud: sent page text to TTS".to_owned());
+            return;
+        }
+        if let Some(request) = self.pending_translate_requests.remove(&id) {
+            if text.trim().is_empty() {
+                self.capture_notice = Some("Translate: no page text found".to_owned());
+                return;
+            }
+            let body = browser_translate_body(&request, &text);
+            publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_TRANSLATE, &body);
+            self.capture_notice = Some("Translate: sent page text to translation".to_owned());
+            return;
+        }
+        if let Some(request) = self.pending_offline_cache_requests.remove(&id) {
+            if text.trim().is_empty() {
+                self.capture_notice = Some("Offline cache: no page text found".to_owned());
+                return;
+            }
+            let body = browser_offline_cache_body(&request, &text);
+            publish_to_bus(
+                self.bus_root.as_deref(),
+                ACTION_BROWSER_OFFLINE_CACHE,
+                &body,
+            );
+            self.capture_notice = Some("Offline cache: saved page snapshot".to_owned());
+        }
+    }
+
+    fn handle_page_scrape_event(&mut self, id: u64, body: String) {
+        if let Some(request) = self.pending_scrape_export_requests.remove(&id) {
+            match self.finish_page_metadata_scrape_export(request, &body) {
+                Ok(ids) => {
+                    self.capture_notice = Some(format!(
+                        "Power mode: queued active-page scrape export ({} files)",
+                        ids.len()
+                    ));
+                    self.refresh_downloads();
+                }
+                Err(err) => {
+                    self.capture_notice = Some(format!("Scrape export failed: {err}"));
+                }
+            }
+            return;
+        }
+        self.capture_notice = Some(format!("Page scrape result ignored for stale request {id}"));
+    }
+
+    fn handle_passkey_event(&mut self, tab_index: usize, engine: BrowserEngine, body: &str) {
+        match browser_passkey_body(engine, body) {
+            Ok(handoff_body) => {
+                let client_request_id = passkey_client_request_id(body);
+                publish_to_bus(
+                    self.bus_root.as_deref(),
+                    ACTION_BROWSER_PASSKEY,
+                    &handoff_body,
+                );
+                if let Some(client_request_id) = client_request_id {
+                    self.pending_passkey_requests
+                        .insert(client_request_id, tab_index);
+                }
+                self.capture_notice = Some("Passkey: sent ceremony to daemon".to_owned());
+            }
+            Err(err) => {
+                self.capture_notice = Some(format!("Passkey: ignored helper event ({err})"));
+            }
+        }
+    }
+
+    fn poll_spellcheck(&mut self) {
+        let Some((id, tab_index, result)) = self.spellcheck.poll() else {
+            return;
+        };
+        if self.pending_spell_requests.contains_key(&id) {
+            return;
+        }
+        let highlight_words = match &result {
+            Ok(misses) => spellcheck_highlight_words(misses),
+            Err(_) => Vec::new(),
+        };
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            if !tab.session.is_crashed() {
+                tab.session.set_spellcheck_highlights(highlight_words);
+            }
+        }
+        self.latest_spellcheck = Some(BrowserSpellcheckResult::from_result(
+            tab_index,
+            result.clone(),
+        ));
+        self.capture_notice = Some(spellcheck_notice(result));
     }
 
     fn set_active_tab_container(&mut self, container: ContainerProfile) {
@@ -2010,16 +3717,27 @@ impl WebState {
 
     fn active_site_permission_summary(&self) -> Option<String> {
         let host = self.active_first_party()?;
-        let suffix = if self
+        if self
             .forgotten_permission_sites
             .iter()
             .any(|site| site == &host)
         {
-            "forgotten; default deny remains active"
+            return Some(format!("{host}: forgotten; default deny remains active"));
+        }
+        let prompts = self
+            .site_permission_prompts
+            .iter()
+            .filter(|prompt| prompt.host == host)
+            .map(|prompt| format!("{} {}", prompt.kind.wire(), prompt.decision))
+            .collect::<Vec<_>>();
+        if prompts.is_empty() {
+            Some(format!("{host}: all sensitive prompts denied by default"))
         } else {
-            "all sensitive prompts denied by default"
-        };
-        Some(format!("{host}: {suffix}"))
+            Some(format!(
+                "{host}: {}; helper default deny remains active",
+                prompts.join(", ")
+            ))
+        }
     }
 
     fn forget_active_site_permissions(&mut self) {
@@ -2027,7 +3745,50 @@ impl WebState {
             return;
         };
         self.forgotten_permission_sites.retain(|site| site != &host);
+        self.site_permission_prompts
+            .retain(|prompt| prompt.host != host);
         self.forgotten_permission_sites.push(host);
+    }
+
+    fn prompt_active_device_permission(&mut self, kind: DevicePermissionKind) {
+        let Some((url, title, engine, host)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                host_of(&url).map(|host| (url, tab.session.title().to_owned(), tab.engine, host))
+            }
+        }) else {
+            self.capture_notice = Some(format!("{} prompt requires a live site", kind.label()));
+            return;
+        };
+        let now = unix_ms();
+        if let Some(prompt) = self
+            .site_permission_prompts
+            .iter_mut()
+            .find(|prompt| prompt.host == host && prompt.kind == kind)
+        {
+            prompt.decision = "denied";
+            prompt.updated_ms = now;
+        } else {
+            self.site_permission_prompts.push(SitePermissionPrompt {
+                host: host.clone(),
+                kind,
+                decision: "denied",
+                updated_ms: now,
+            });
+        }
+        self.forgotten_permission_sites.retain(|site| site != &host);
+        let body = browser_permission_prompt_body(kind, engine, &url, &title, &host, now);
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            ACTION_BROWSER_PERMISSION_PROMPT,
+            &body,
+        );
+        self.capture_notice = Some(format!(
+            "{} prompt denied for {host}; helper default deny remains active",
+            kind.label()
+        ));
     }
 
     fn set_active_site_blocking(&mut self, enabled: bool) {
@@ -2232,11 +3993,22 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.poll_suggestions();
     state.poll_downloads();
     state.poll_incoming_send_tabs();
+    state.poll_voice_command_results();
+    state.poll_speech_statuses();
+    state.poll_passkey_status();
+    state.poll_passkey_results();
+    state.poll_share_results();
+    state.poll_translation_results();
+    state.poll_offline_cache_results();
+    state.poll_security_update_status();
     state.suspend_idle_tabs(Instant::now());
 
     // 1. Poll every tab so background tabs keep receiving — and so ONE tab's crash
     //    is observed here without disturbing the others (per-session isolation).
     let mut pdf_events = Vec::new();
+    let mut page_text_events = Vec::new();
+    let mut page_scrape_events = Vec::new();
+    let mut passkey_events = Vec::new();
     for (idx, tab) in state.tabs.iter_mut().enumerate() {
         if tab.idle_suspended && idx != state.active {
             continue;
@@ -2244,6 +4016,15 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         tab.session.poll();
         for event in tab.session.drain_pdf_events() {
             pdf_events.push((event.path, event.ok));
+        }
+        for event in tab.session.drain_page_text_events() {
+            page_text_events.push((event.id, event.text));
+        }
+        for event in tab.session.drain_page_scrape_events() {
+            page_scrape_events.push((event.id, event.body));
+        }
+        for event in tab.session.drain_passkey_events() {
+            passkey_events.push((idx, tab.engine, event.body));
         }
     }
     let mut pdf_notice = None;
@@ -2253,6 +4034,16 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     if let Some(notice) = pdf_notice {
         state.capture_notice = Some(notice);
     }
+    for (id, text) in page_text_events {
+        state.handle_page_text_event(id, text);
+    }
+    for (id, body) in page_scrape_events {
+        state.handle_page_scrape_event(id, body);
+    }
+    for (tab_index, engine, body) in passkey_events {
+        state.handle_passkey_event(tab_index, engine, &body);
+    }
+    state.poll_spellcheck();
     state.update_site_data_from_tabs();
     state.publish_session_snapshot();
 
@@ -2267,6 +4058,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             }
         }
     }
+    install_browser_accessibility(ui.ctx(), ui.max_rect(), state);
 
     // 3. The shared MENUBAR-ALL top bar — the UPPERCASE BROWSER title, the real
     //    WebSession menus (Edit / View / History / Bookmarks), and the live status
@@ -2289,6 +4081,12 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 find_chrome(ui, state);
                 insecure_prompt(ui, state);
                 capture_notice(ui, state);
+                qr_share_drawer(ui, state);
+                spellcheck_drawer(ui, state);
+                speech_status_drawer(ui, state);
+                security_update_drawer(ui, state);
+                translation_drawer(ui, state);
+                offline_cache_drawer(ui, state);
                 print_settings_drawer(ui, state);
                 downloads_drawer(ui, state);
                 ui.add_space(CHROME_GAP);
@@ -2307,6 +4105,12 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         find_chrome(ui, state);
         insecure_prompt(ui, state);
         capture_notice(ui, state);
+        qr_share_drawer(ui, state);
+        spellcheck_drawer(ui, state);
+        speech_status_drawer(ui, state);
+        security_update_drawer(ui, state);
+        translation_drawer(ui, state);
+        offline_cache_drawer(ui, state);
         print_settings_drawer(ui, state);
         downloads_drawer(ui, state);
         ui.add_space(CHROME_GAP);
@@ -2327,7 +4131,13 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         )
     });
     match status {
-        Some((true, _, _, reason)) => crashed_body(ui, reason, &mut state.respawn_requested),
+        Some((true, _, _, reason)) => {
+            if let Some(snapshot) = state.offline_cache_fallback_for_unavailable().cloned() {
+                cached_offline_body(ui, &snapshot, Some(reason.as_str()));
+            } else {
+                crashed_body(ui, reason, &mut state.respawn_requested);
+            }
+        }
         Some((false, _, true, _)) => new_tab_dashboard(ui, state),
         Some((false, true, false, _)) => paint_body(ui, state, active),
         Some((false, false, false, _)) => {
@@ -2337,6 +4147,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
             });
         }
         None => {
+            let cached = state.offline_cache_fallback_for_unavailable().cloned();
             // The honest gated body — a `live-helper` build shows the NAMED gate
             // notice (no seat · helper absent · spawn failed) when one is set; the
             // default build always shows the standard gated caption (§7).
@@ -2344,7 +4155,11 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
             let notice = state.gate_notice.as_deref();
             #[cfg(not(feature = "live-helper"))]
             let notice: Option<&str> = None;
-            empty_body(ui, notice);
+            if let Some(snapshot) = cached {
+                cached_offline_body(ui, &snapshot, notice);
+            } else {
+                empty_body(ui, notice);
+            }
         }
     }
 }
@@ -2364,6 +4179,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut mute_tab: Option<(usize, bool)> = None;
     let mut force_dark_tab: Option<(usize, bool)> = None;
     let mut reader_tab: Option<(usize, bool)> = None;
+    let mut user_scripts_tab: Option<(usize, bool)> = None;
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
     ui.horizontal_wrapped(|ui| {
@@ -2417,6 +4233,15 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         reader_tab = Some((idx, !tab.reader_mode));
                         ui.close_menu();
                     }
+                    let scripts_label = if tab.user_scripts {
+                        "Disable userscripts"
+                    } else {
+                        "Enable userscripts"
+                    };
+                    if ui.add(compact_menu_item(scripts_label)).clicked() {
+                        user_scripts_tab = Some((idx, !tab.user_scripts));
+                        ui.close_menu();
+                    }
                     ui.separator();
                     for container in ContainerProfile::ALL {
                         if ui
@@ -2463,6 +4288,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     } else if let Some((idx, enabled)) = reader_tab {
         state.select_tab(idx);
         state.set_active_tab_reader_mode(enabled);
+    } else if let Some((idx, enabled)) = user_scripts_tab {
+        state.select_tab(idx);
+        state.set_active_tab_user_scripts(enabled);
     } else if let Some((idx, container)) = container_tab {
         state.select_tab(idx);
         state.set_active_tab_container(container);
@@ -2485,6 +4313,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut mute_tab: Option<(usize, bool)> = None;
     let mut force_dark_tab: Option<(usize, bool)> = None;
     let mut reader_tab: Option<(usize, bool)> = None;
+    let mut user_scripts_tab: Option<(usize, bool)> = None;
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
     egui::Frame::NONE
@@ -2547,6 +4376,15 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     reader_tab = Some((idx, !tab.reader_mode));
                                     ui.close_menu();
                                 }
+                                let scripts_label = if tab.user_scripts {
+                                    "Disable userscripts"
+                                } else {
+                                    "Enable userscripts"
+                                };
+                                if ui.add(compact_menu_item(scripts_label)).clicked() {
+                                    user_scripts_tab = Some((idx, !tab.user_scripts));
+                                    ui.close_menu();
+                                }
                                 ui.separator();
                                 for container in ContainerProfile::ALL {
                                     if ui
@@ -2595,6 +4433,9 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     } else if let Some((idx, enabled)) = reader_tab {
         state.select_tab(idx);
         state.set_active_tab_reader_mode(enabled);
+    } else if let Some((idx, enabled)) = user_scripts_tab {
+        state.select_tab(idx);
+        state.set_active_tab_user_scripts(enabled);
     } else if let Some((idx, container)) = container_tab {
         state.select_tab(idx);
         state.set_active_tab_container(container);
@@ -2697,8 +4538,11 @@ fn tab_label(tab: &Tab) -> String {
     let muted = if tab.muted { "M " } else { "" };
     let force_dark = if tab.force_dark { "D " } else { "" };
     let reader = if tab.reader_mode { "R " } else { "" };
+    let user_scripts = if tab.user_scripts { "S " } else { "" };
+    let user_agent = tab.user_agent.marker();
+    let device_profile = tab.device_profile.marker();
     format!(
-        "{state} {container}{display}{muted}{force_dark}{reader}{}",
+        "{state} {container}{display}{muted}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
         ellipsize(base, 24)
     )
 }
@@ -2725,10 +4569,27 @@ fn tab_hover(tab: &Tab) -> String {
     let audio = if tab.muted { " - Muted" } else { "" };
     let force_dark = if tab.force_dark { " - Force dark" } else { "" };
     let reader = if tab.reader_mode { " - Reader" } else { "" };
-    if url.is_empty() {
-        format!("{state}{container}{display}{audio}{force_dark}{reader}")
+    let user_scripts = if tab.user_scripts {
+        " - Curated userscripts"
     } else {
-        format!("{state} - {url}{container}{display}{audio}{force_dark}{reader}")
+        ""
+    };
+    let user_agent = match tab.user_agent {
+        UserAgentOverride::Default => String::new(),
+        user_agent => format!(" - User agent: {}", user_agent.label()),
+    };
+    let device_profile = match tab.device_profile {
+        DeviceProfile::Default => String::new(),
+        profile => format!(" - Device: {}", profile.label()),
+    };
+    if url.is_empty() {
+        format!(
+            "{state}{container}{display}{audio}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+        )
+    } else {
+        format!(
+            "{state} - {url}{container}{display}{audio}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+        )
     }
 }
 
@@ -2799,6 +4660,60 @@ const ACTION_BROWSER_SHARE: &str = "action/browser/share";
 /// the tab metadata and stable user action.
 const ACTION_BROWSER_SEND_TAB: &str = "action/browser/send-tab";
 
+/// Browser passkey/WebAuthn ceremony handoff. The helper observes page WebAuthn
+/// calls; Browser adds local source metadata; the daemon passkey owner validates
+/// and persists the pending ceremony.
+const ACTION_BROWSER_PASSKEY: &str = "action/browser/passkey";
+
+/// Browser read-aloud handoff. The Browser owns page text extraction; the TTS
+/// owner drains this bounded text request and performs speech synthesis/playback.
+const ACTION_BROWSER_READ_ALOUD: &str = "action/browser/read-aloud";
+
+/// Browser translation handoff. The Browser owns page text extraction; the
+/// offline/mesh translation owner drains this bounded private request.
+const ACTION_BROWSER_TRANSLATE: &str = "action/browser/translate";
+
+/// Browser offline-cache handoff. The Browser owns page text extraction; the
+/// cache owner persists a private local copy and mirrors it onto the mesh file
+/// plane without re-enabling helper disk cache.
+const ACTION_BROWSER_OFFLINE_CACHE: &str = "action/browser/offline-cache";
+
+/// Browser voice-command/dictation handoff. The Browser owns active-tab context;
+/// the STT owner drains this request, captures audio, and publishes/apply commands.
+const ACTION_BROWSER_VOICE_COMMAND: &str = "action/browser/voice-command";
+
+/// Browser prompted sensitive-device permission decision. The current helpers
+/// enforce deny-all; this stream records the prompt decision and gives the later
+/// engine permission hook a typed contract.
+const ACTION_BROWSER_PERMISSION_PROMPT: &str = "action/browser/permission-prompt";
+
+/// Browser voice-command transcript result prefix, owned by the daemon STT worker.
+const EVENT_BROWSER_VOICE_COMMAND_PREFIX: &str = "event/browser-voice-command/";
+
+/// Browser read-aloud status prefix, owned by the daemon TTS worker.
+const STATE_BROWSER_READ_ALOUD_PREFIX: &str = "state/browser-read-aloud/";
+
+/// Browser voice-command status prefix, owned by the daemon STT worker.
+const STATE_BROWSER_VOICE_COMMAND_PREFIX: &str = "state/browser-voice-command/";
+
+/// Browser passkey/WebAuthn status prefix, owned by the daemon passkey worker.
+const STATE_BROWSER_PASSKEYS_PREFIX: &str = "state/browser-passkeys/";
+
+/// Browser passkey/WebAuthn completion-event prefix, owned by the daemon worker.
+const EVENT_BROWSER_PASSKEYS_PREFIX: &str = "event/browser-passkeys/";
+
+/// Browser translation result prefix, owned by the daemon translation worker.
+const EVENT_BROWSER_TRANSLATE_PREFIX: &str = "event/browser-translate/";
+
+/// Browser platform-share route event prefix, owned by the daemon share worker.
+const EVENT_BROWSER_SHARE_PREFIX: &str = "event/browser-share/";
+
+/// Browser offline-cache record prefix, owned by the daemon cache worker.
+const EVENT_BROWSER_OFFLINE_CACHE_PREFIX: &str = "event/browser-offline-cache/";
+
+/// Browser CEF security-update status prefix, owned by the daemon updater worker.
+const STATE_BROWSER_SECURITY_UPDATE_PREFIX: &str = "state/browser-security-update/";
+
 /// Browser follow-me session snapshot. The sync owner drains this stream into the
 /// Nebula+Syncthing session store and later drives startup restore; Browser only
 /// publishes the state it already owns.
@@ -2843,6 +4758,539 @@ const DEFAULT_SUGGEST_URL: &str = "https://search.mesh/autocompleter";
 const SUGGEST_TIMEOUT: Duration = Duration::from_millis(900);
 
 type SuggestionResult = Result<(String, Vec<String>), String>;
+type SpellcheckResult = (u64, Result<Vec<SpellMiss>, String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserSpellcheckResult {
+    tab_index: usize,
+    misses: Vec<SpellMiss>,
+    error: Option<String>,
+}
+
+impl BrowserSpellcheckResult {
+    fn from_result(tab_index: usize, result: Result<Vec<SpellMiss>, String>) -> Self {
+        match result {
+            Ok(misses) => Self {
+                tab_index,
+                misses,
+                error: None,
+            },
+            Err(error) => Self {
+                tab_index,
+                misses: Vec::new(),
+                error: Some(error),
+            },
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.error.is_some() || !self.misses.is_empty()
+    }
+
+    fn summary(&self) -> String {
+        if let Some(error) = self.error.as_deref() {
+            if error.trim().is_empty() {
+                "Spellcheck unavailable".to_owned()
+            } else {
+                format!("Spellcheck unavailable: {error}")
+            }
+        } else {
+            let count = self.misses.len();
+            let plural = if count == 1 { "" } else { "s" };
+            format!("{count} possible misspelling{plural}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadAloudRequest {
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: String,
+    title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeExportRequest {
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: String,
+    title: String,
+    resources: Vec<mde_web_preview_client::ResourceRequestStatus>,
+    spool_dir: PathBuf,
+    dest_dir: PathBuf,
+    captured_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranslateRequest {
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: String,
+    title: String,
+    source_lang: String,
+    target_lang: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineCacheRequest {
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: String,
+    title: String,
+    viewport: Option<OfflineCacheViewportImage>,
+    resources: Vec<OfflineCacheResource>,
+    pdf_snapshot: Option<OfflineCachePdf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineCacheArchive {
+    mime: String,
+    filename: String,
+    bytes: usize,
+    data_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineCachePdf {
+    mime: String,
+    filename: String,
+    bytes: usize,
+    data_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineCacheResource {
+    url: String,
+    resource: String,
+    allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineCacheViewportImage {
+    mime: String,
+    width: usize,
+    height: usize,
+    data_base64: String,
+}
+
+#[derive(Clone)]
+struct OfflineCacheViewportTexture {
+    data_sig: u64,
+    texture: Option<TextureHandle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceCommandMode {
+    Command,
+    Dictation,
+}
+
+impl VoiceCommandMode {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Dictation => "dictation",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Command => "Voice command",
+            Self::Dictation => "Dictation",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "command" => Some(Self::Command),
+            "dictation" => Some(Self::Dictation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceTranscriptResult {
+    host: String,
+    mode: VoiceCommandMode,
+    tab_index: usize,
+    focus: String,
+    transcript: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserReadAloudStatus {
+    node: String,
+    last_title: Option<String>,
+    last_url: Option<String>,
+    state: String,
+    last_error: Option<String>,
+    accepted: u64,
+    spoken: u64,
+    rejected: u64,
+    last_request_ms: Option<u64>,
+    updated_ms: u64,
+}
+
+impl BrowserReadAloudStatus {
+    fn is_visible(&self) -> bool {
+        self.state != "idle" || self.accepted > 0 || self.rejected > 0
+    }
+
+    fn is_actionable(&self) -> bool {
+        matches!(self.state.as_str(), "speaking" | "unavailable" | "error")
+    }
+
+    fn tone(&self) -> ChipTone {
+        match self.state.as_str() {
+            "spoken" => ChipTone::Ok,
+            "speaking" => ChipTone::Info,
+            "unavailable" | "error" => ChipTone::Warn,
+            _ => ChipTone::Neutral,
+        }
+    }
+
+    fn chip_label(&self) -> String {
+        format!("TTS {}", self.state)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserVoiceCommandStatus {
+    node: String,
+    last_url: Option<String>,
+    last_mode: Option<String>,
+    state: String,
+    last_error: Option<String>,
+    accepted: u64,
+    transcribed: u64,
+    rejected: u64,
+    last_transcript_chars: Option<u64>,
+    last_request_ms: Option<u64>,
+    updated_ms: u64,
+}
+
+impl BrowserVoiceCommandStatus {
+    fn is_visible(&self) -> bool {
+        self.state != "idle" || self.accepted > 0 || self.rejected > 0
+    }
+
+    fn is_actionable(&self) -> bool {
+        matches!(self.state.as_str(), "listening" | "unavailable" | "error")
+    }
+
+    fn tone(&self) -> ChipTone {
+        match self.state.as_str() {
+            "transcribed" => ChipTone::Ok,
+            "listening" => ChipTone::Info,
+            "unavailable" | "error" => ChipTone::Warn,
+            _ => ChipTone::Neutral,
+        }
+    }
+
+    fn chip_label(&self) -> String {
+        match self.last_mode.as_deref() {
+            Some("dictation") => format!("Dictation {}", self.state),
+            _ => format!("Voice {}", self.state),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserPasskeyStatus {
+    node: String,
+    last_request_id: Option<String>,
+    last_host: Option<String>,
+    last_ceremony: Option<String>,
+    last_rp_id: Option<String>,
+    state: String,
+    mirrored: bool,
+    last_error: Option<String>,
+    accepted: u64,
+    rejected: u64,
+    last_pending_ms: Option<u64>,
+    hardware_state: String,
+    hardware_key_count: u64,
+    hardware_readable_count: u64,
+    hardware_ctaphid_state: String,
+    hardware_ctaphid_init_frame_count: u64,
+    hardware_probe_ms: u64,
+    updated_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserPasskeyCompletion {
+    client_request_id: String,
+    body: String,
+}
+
+impl BrowserPasskeyStatus {
+    fn ceremony_is_visible(&self) -> bool {
+        self.state != "idle" || self.accepted > 0 || self.rejected > 0
+    }
+
+    fn hardware_is_visible(&self) -> bool {
+        self.hardware_state != "unknown"
+    }
+
+    fn ctaphid_is_visible(&self) -> bool {
+        self.hardware_ctaphid_state == "init_request_ready"
+            && self.hardware_ctaphid_init_frame_count > 0
+    }
+
+    fn tone(&self) -> ChipTone {
+        match self.state.as_str() {
+            "pending" => ChipTone::Info,
+            "created" | "asserted" => ChipTone::Ok,
+            "error" => ChipTone::Warn,
+            _ => ChipTone::Neutral,
+        }
+    }
+
+    fn chip_label(&self) -> String {
+        match self.state.as_str() {
+            "pending" => "Passkey pending".to_owned(),
+            "created" => "Passkey created".to_owned(),
+            "asserted" => "Passkey asserted".to_owned(),
+            "error" => "Passkey error".to_owned(),
+            other => format!("Passkey {other}"),
+        }
+    }
+
+    fn hardware_tone(&self) -> ChipTone {
+        match self.hardware_state.as_str() {
+            "ready" => ChipTone::Ok,
+            "present_permission_denied" => ChipTone::Warn,
+            "unavailable" => ChipTone::Neutral,
+            _ => ChipTone::Neutral,
+        }
+    }
+
+    fn hardware_chip_label(&self) -> String {
+        match self.hardware_state.as_str() {
+            "ready" => "Security key ready".to_owned(),
+            "present_permission_denied" => "Security key blocked".to_owned(),
+            "unavailable" => "Security key unavailable".to_owned(),
+            other => format!("Security key {other}"),
+        }
+    }
+
+    fn ctaphid_tone(&self) -> ChipTone {
+        match self.hardware_ctaphid_state.as_str() {
+            "init_request_ready" => ChipTone::Info,
+            _ => ChipTone::Neutral,
+        }
+    }
+
+    fn ctaphid_chip_label(&self) -> String {
+        match self.hardware_ctaphid_state.as_str() {
+            "init_request_ready" => "CTAP INIT framed".to_owned(),
+            other => format!("CTAP HID {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserTranslationResult {
+    host: String,
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: String,
+    title: String,
+    source_lang: String,
+    target_lang: String,
+    translation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserShareRouteResult {
+    host: String,
+    target: BrowserShareTarget,
+    url: String,
+    title: String,
+    preview: String,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserQrShareResult {
+    host: String,
+    url: String,
+    title: String,
+    preview: String,
+    request_id: String,
+    modules: Vec<Vec<bool>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserOfflineCacheResult {
+    host: String,
+    cache_id: String,
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: String,
+    title: String,
+    text: String,
+    viewport: Option<OfflineCacheViewportImage>,
+    resources: Vec<OfflineCacheResource>,
+    archive_mhtml: Option<OfflineCacheArchive>,
+    pdf_snapshot: Option<OfflineCachePdf>,
+    cached_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserSecurityUpdateStatus {
+    node: String,
+    state: String,
+    expected_cef_version: Option<String>,
+    expected_chromium_version: Option<String>,
+    expected_channel: Option<String>,
+    active_runtime: Option<String>,
+    installed_version: Option<String>,
+    installed_chromium: Option<String>,
+    libcef_present: bool,
+    updater_state: String,
+    last_update_ms: Option<u64>,
+    last_update_exit_code: Option<i32>,
+    last_update_error: Option<String>,
+    last_error: Option<String>,
+    updated_ms: u64,
+}
+
+impl BrowserSecurityUpdateStatus {
+    fn is_actionable(&self) -> bool {
+        self.state != "current" || !matches!(self.updater_state.as_str(), "idle" | "attempted")
+    }
+
+    fn tone(&self) -> ChipTone {
+        match self.state.as_str() {
+            "current" if matches!(self.updater_state.as_str(), "idle" | "attempted") => {
+                ChipTone::Ok
+            }
+            "missing" | "mismatch" | "manifest_missing" => ChipTone::Warn,
+            _ if self.updater_state == "installing" => ChipTone::Info,
+            _ if self.updater_state == "failed" => ChipTone::Warn,
+            _ => ChipTone::Neutral,
+        }
+    }
+
+    fn chip_label(&self) -> String {
+        match self.state.as_str() {
+            "current" => "CEF current".to_owned(),
+            "missing" => "CEF missing".to_owned(),
+            "mismatch" => "CEF mismatch".to_owned(),
+            "manifest_missing" => "CEF manifest".to_owned(),
+            other => format!("CEF {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserVoiceAction {
+    NewTab,
+    CloseTab,
+    Back,
+    Forward,
+    Reload,
+    ReadAloud,
+    Find(String),
+}
+
+#[derive(Default)]
+struct SpellcheckState {
+    in_flight: Option<u64>,
+    tab_index: Option<usize>,
+    rx: Option<mpsc::Receiver<SpellcheckResult>>,
+}
+
+impl SpellcheckState {
+    fn poll(&mut self) -> Option<(u64, usize, Result<Vec<SpellMiss>, String>)> {
+        let rx = self.rx.take()?;
+        match rx.try_recv() {
+            Ok((id, result)) => {
+                self.in_flight = None;
+                let tab_index = self.tab_index.take().unwrap_or_default();
+                Some((id, tab_index, result))
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.rx = Some(rx);
+                None
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let id = self.in_flight.take().unwrap_or_default();
+                let tab_index = self.tab_index.take().unwrap_or_default();
+                Some((id, tab_index, Err("Spell-check unavailable".to_owned())))
+            }
+        }
+    }
+
+    fn start(&mut self, id: u64, tab_index: usize, text: String) {
+        let (tx, rx) = mpsc::channel();
+        self.in_flight = Some(id);
+        self.tab_index = Some(tab_index);
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = spell::run_hunspell(spell::HUNSPELL, &text)
+                .map_err(|state| state.notice().to_owned());
+            let _ = tx.send((id, result));
+        });
+    }
+}
+
+fn spellcheck_notice(result: Result<Vec<SpellMiss>, String>) -> String {
+    match result {
+        Ok(misses) if misses.is_empty() => "Spelling: no misspellings found".to_owned(),
+        Ok(misses) => {
+            let count = misses.len();
+            let plural = if count == 1 { "" } else { "s" };
+            let first = misses
+                .first()
+                .map(|miss| {
+                    let suggestion = miss
+                        .suggestions
+                        .first()
+                        .map_or(String::new(), |s| format!(" -> {s}"));
+                    format!("; first: {}{}", miss.word, suggestion)
+                })
+                .unwrap_or_default();
+            format!("Spelling: {count} possible misspelling{plural}{first}")
+        }
+        Err(err) if err.is_empty() => "Spelling unavailable".to_owned(),
+        Err(err) => format!("Spelling unavailable: {err}"),
+    }
+}
+
+fn spellcheck_highlight_words(misses: &[SpellMiss]) -> Vec<String> {
+    let mut words = BTreeSet::new();
+    for miss in misses {
+        let word = miss.word.trim();
+        if word.len() < 2 || word.len() > 64 {
+            continue;
+        }
+        words.insert(word.to_owned());
+        if words.len() >= 64 {
+            break;
+        }
+    }
+    words.into_iter().collect()
+}
+
+fn spellcheck_occurrence_index(misses: &[SpellMiss], row_index: usize) -> u16 {
+    let Some(current) = misses.get(row_index) else {
+        return 0;
+    };
+    let word = current.word.trim();
+    if word.is_empty() {
+        return 0;
+    }
+    let prior = misses
+        .iter()
+        .take(row_index)
+        .filter(|miss| miss.word.trim().eq_ignore_ascii_case(word))
+        .count();
+    prior.min(u16::MAX as usize) as u16
+}
 
 #[derive(Default)]
 struct SuggestionState {
@@ -3156,6 +5604,7 @@ fn chat_share_body(to: &str, url: &str, title: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserShareTarget {
     Peer,
+    Phone,
     Email,
     Qr,
 }
@@ -3164,6 +5613,7 @@ impl BrowserShareTarget {
     const fn wire(self) -> &'static str {
         match self {
             Self::Peer => "peer",
+            Self::Phone => "phone",
             Self::Email => "email",
             Self::Qr => "qr",
         }
@@ -3172,8 +5622,26 @@ impl BrowserShareTarget {
     const fn label(self) -> &'static str {
         match self {
             Self::Peer => "Peer",
+            Self::Phone => "Phone",
             Self::Email => "Email",
             Self::Qr => "QR",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "peer" => Some(Self::Peer),
+            "phone" => Some(Self::Phone),
+            "email" => Some(Self::Email),
+            "qr" => Some(Self::Qr),
+            _ => None,
+        }
+    }
+
+    fn destination(self) -> Option<(String, String)> {
+        match self {
+            Self::Phone => browser_phone_target_destination(),
+            Self::Peer | Self::Email | Self::Qr => None,
         }
     }
 }
@@ -3205,20 +5673,24 @@ impl BrowserSendTabTarget {
                 let host = local_hostname();
                 Some((host.clone(), host))
             }
-            Self::Phone => std::env::var("MDE_BROWSER_SEND_PHONE_TARGET")
-                .ok()
-                .map(|id| id.trim().to_owned())
-                .filter(|id| !id.is_empty())
-                .map(|id| {
-                    let label = std::env::var("MDE_BROWSER_SEND_PHONE_LABEL")
-                        .ok()
-                        .map(|label| label.trim().to_owned())
-                        .filter(|label| !label.is_empty())
-                        .unwrap_or_else(|| id.clone());
-                    (id, label)
-                }),
+            Self::Phone => browser_phone_target_destination(),
         }
     }
+}
+
+fn browser_phone_target_destination() -> Option<(String, String)> {
+    std::env::var("MDE_BROWSER_SEND_PHONE_TARGET")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            let label = std::env::var("MDE_BROWSER_SEND_PHONE_LABEL")
+                .ok()
+                .map(|label| label.trim().to_owned())
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| id.clone());
+            (id, label)
+        })
 }
 
 /// Build the browser-owned platform share handoff. The receiving surfaces are
@@ -3227,7 +5699,7 @@ impl BrowserSendTabTarget {
 fn browser_share_body(target: BrowserShareTarget, url: &str, title: &str) -> String {
     let title = title.trim();
     let preview = if title.is_empty() { url } else { title };
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "op": "browser_share",
         "target": target.wire(),
         "url": url,
@@ -3235,8 +5707,14 @@ fn browser_share_body(target: BrowserShareTarget, url: &str, title: &str) -> Str
         "preview": preview,
         "source": "browser",
         "host": local_hostname(),
-    })
-    .to_string()
+    });
+    if let Some((id, label)) = target.destination() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("target_id".to_owned(), serde_json::json!(id));
+            obj.insert("target_label".to_owned(), serde_json::json!(label));
+        }
+    }
+    body.to_string()
 }
 
 fn publish_browser_share(root: Option<&Path>, target: BrowserShareTarget, url: &str, title: &str) {
@@ -3293,6 +5771,1263 @@ fn publish_browser_send_tab(
     }
 }
 
+fn browser_permission_prompt_body(
+    kind: DevicePermissionKind,
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    site: &str,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_permission_prompt",
+        "permission": kind.wire(),
+        "decision": "deny",
+        "enforcement": "helper_default_deny",
+        "engine": engine.wire(),
+        "url": url,
+        "title": title.trim(),
+        "site": site,
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+fn browser_passkey_body(engine: BrowserEngine, helper_body: &str) -> Result<String, String> {
+    let helper: serde_json::Value =
+        serde_json::from_str(helper_body).map_err(|err| format!("invalid helper JSON: {err}"))?;
+    let ceremony = status_required_str(&helper, "ceremony", "passkey helper event")?;
+    if !matches!(ceremony.as_str(), "create" | "get") {
+        return Err("unsupported ceremony".to_owned());
+    }
+    let origin = status_required_str(&helper, "origin", "passkey helper event")?;
+    let rp_id = status_required_str(&helper, "rp_id", "passkey helper event")?;
+    let challenge_b64url =
+        status_required_str(&helper, "challenge_b64url", "passkey helper event")?;
+
+    let mut body = serde_json::json!({
+        "op": "browser_passkey",
+        "source": "browser",
+        "host": local_hostname(),
+        "engine": engine.wire(),
+        "ceremony": ceremony,
+        "origin": origin,
+        "rp_id": rp_id,
+        "challenge_b64url": challenge_b64url,
+    });
+    let Some(obj) = body.as_object_mut() else {
+        return Err("could not build passkey body".to_owned());
+    };
+    for key in ["user_handle_b64url", "user_name"] {
+        if let Some(value) = optional_trimmed_str(&helper, key) {
+            obj.insert(key.to_owned(), serde_json::json!(value));
+        }
+    }
+    if let Some(value) = optional_trimmed_str(&helper, "client_request_id") {
+        obj.insert("client_request_id".to_owned(), serde_json::json!(value));
+    }
+    if let Some(timeout_ms) = helper.get("timeout_ms").and_then(serde_json::Value::as_u64) {
+        obj.insert("timeout_ms".to_owned(), serde_json::json!(timeout_ms));
+    }
+    if let Some(credentials) = helper
+        .get("allow_credentials")
+        .and_then(serde_json::Value::as_array)
+    {
+        let credentials = credentials
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|credential| !credential.is_empty())
+            .take(64)
+            .collect::<Vec<_>>();
+        obj.insert(
+            "allow_credentials".to_owned(),
+            serde_json::json!(credentials),
+        );
+    }
+    Ok(body.to_string())
+}
+
+fn passkey_client_request_id(helper_body: &str) -> Option<String> {
+    let helper: serde_json::Value = serde_json::from_str(helper_body).ok()?;
+    optional_trimmed_str(&helper, "client_request_id")
+}
+
+const READ_ALOUD_TEXT_MAX_CHARS: usize = 20_000;
+const TRANSLATE_TEXT_MAX_CHARS: usize = 20_000;
+const TRANSLATION_RESULT_MAX_CHARS: usize = 40_000;
+const OFFLINE_CACHE_TEXT_MAX_CHARS: usize = 64_000;
+const OFFLINE_CACHE_VIEWPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const OFFLINE_CACHE_MHTML_MAX_BYTES: usize = 4 * 1024 * 1024;
+const OFFLINE_CACHE_PDF_MAX_BYTES: usize = 8 * 1024 * 1024;
+const OFFLINE_CACHE_RESOURCE_MAX_COUNT: usize = 128;
+const OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS: usize = 2_048;
+const MEDIA_SNIFFER_MAX_COUNT: usize = 128;
+const MEDIA_SNIFFER_URL_MAX_CHARS: usize = 2_048;
+const SCRAPE_CRAWL_SEED_MAX_COUNT: usize = 64;
+const SCRAPE_CRAWL_MANIFEST_MAX_COUNT: usize = 128;
+const SCRAPE_EXTRACT_TEXT_MAX_CHARS: usize = 64_000;
+const SCRAPE_ARTICLE_TEXT_MAX_CHARS: usize = 16_000;
+const SCRAPE_DOM_LINK_MAX_COUNT: usize = 64;
+const SCRAPE_DOM_HEADING_MAX_COUNT: usize = 32;
+const SCRAPE_DOM_TEXT_MAX_CHARS: usize = 240;
+
+fn browser_read_aloud_body(request: &ReadAloudRequest, text: &str) -> String {
+    let trimmed = text.trim();
+    let original_chars = trimmed.chars().count();
+    let text = clamp_chars(trimmed, READ_ALOUD_TEXT_MAX_CHARS);
+    let text_chars = text.chars().count();
+    serde_json::json!({
+        "op": "browser_read_aloud",
+        "source": "browser",
+        "host": local_hostname(),
+        "tab_index": request.tab_index,
+        "engine": request.engine.wire(),
+        "url": request.url,
+        "title": request.title.trim(),
+        "text": text,
+        "text_chars": text_chars,
+        "truncated": text_chars < original_chars,
+    })
+    .to_string()
+}
+
+fn browser_translate_target_lang() -> String {
+    let raw =
+        std::env::var("MDE_BROWSER_TRANSLATE_TARGET_LANG").unwrap_or_else(|_| "en".to_owned());
+    let lang = raw.trim();
+    if lang.is_empty() {
+        "en".to_owned()
+    } else {
+        clamp_chars(lang, 32)
+    }
+}
+
+fn browser_translate_body(request: &TranslateRequest, text: &str) -> String {
+    let trimmed = text.trim();
+    let original_chars = trimmed.chars().count();
+    let text = clamp_chars(trimmed, TRANSLATE_TEXT_MAX_CHARS);
+    let text_chars = text.chars().count();
+    serde_json::json!({
+        "op": "browser_translate",
+        "source": "browser",
+        "host": local_hostname(),
+        "privacy": "offline_or_mesh_only",
+        "tab_index": request.tab_index,
+        "engine": request.engine.wire(),
+        "url": request.url,
+        "title": request.title.trim(),
+        "source_lang": request.source_lang.trim(),
+        "target_lang": request.target_lang.trim(),
+        "text": text,
+        "text_chars": text_chars,
+        "truncated": text_chars < original_chars,
+    })
+    .to_string()
+}
+
+fn browser_offline_cache_body(request: &OfflineCacheRequest, text: &str) -> String {
+    let trimmed = text.trim();
+    let original_chars = trimmed.chars().count();
+    let text = clamp_chars(trimmed, OFFLINE_CACHE_TEXT_MAX_CHARS);
+    let text_chars = text.chars().count();
+    let mut body = serde_json::json!({
+        "op": "browser_offline_cache",
+        "source": "browser",
+        "host": local_hostname(),
+        "privacy": "offline_or_mesh_only",
+        "tab_index": request.tab_index,
+        "engine": request.engine.wire(),
+        "url": request.url,
+        "title": request.title.trim(),
+        "text": text,
+        "text_chars": text_chars,
+        "truncated": text_chars < original_chars,
+    });
+    if let Some(viewport) = &request.viewport {
+        body["viewport_image"] = serde_json::json!({
+            "mime": &viewport.mime,
+            "width": viewport.width,
+            "height": viewport.height,
+            "data": &viewport.data_base64,
+        });
+    }
+    if !request.resources.is_empty() {
+        body["resource_manifest"] = serde_json::Value::Array(
+            request
+                .resources
+                .iter()
+                .map(|resource| {
+                    serde_json::json!({
+                        "url": &resource.url,
+                        "resource": &resource.resource,
+                        "allowed": resource.allowed,
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(archive) = offline_cache_mhtml_archive(request, &text, unix_ms()) {
+        body["archive_mhtml"] = serde_json::json!({
+            "mime": &archive.mime,
+            "filename": &archive.filename,
+            "bytes": archive.bytes,
+            "data": &archive.data_base64,
+        });
+    }
+    if let Some(pdf) = &request.pdf_snapshot {
+        body["pdf_snapshot"] = serde_json::json!({
+            "mime": &pdf.mime,
+            "filename": &pdf.filename,
+            "bytes": pdf.bytes,
+            "data": &pdf.data_base64,
+        });
+    }
+    body.to_string()
+}
+
+fn offline_cache_mhtml_archive(
+    request: &OfflineCacheRequest,
+    text: &str,
+    unix_ms: u64,
+) -> Option<OfflineCacheArchive> {
+    let viewport_png = request
+        .viewport
+        .as_ref()
+        .and_then(|viewport| {
+            base64::engine::general_purpose::STANDARD
+                .decode(viewport.data_base64.as_str())
+                .ok()
+        })
+        .filter(|bytes| bytes.len() <= OFFLINE_CACHE_VIEWPORT_MAX_BYTES);
+    let bytes = offline_cache_mhtml_document(
+        &request.url,
+        &request.title,
+        unix_ms,
+        text,
+        viewport_png.as_deref(),
+    );
+    if bytes.is_empty() || bytes.len() > OFFLINE_CACHE_MHTML_MAX_BYTES {
+        return None;
+    }
+    Some(OfflineCacheArchive {
+        mime: "multipart/related".to_owned(),
+        filename: capture_mhtml_filename_for(&request.url, &request.title, unix_ms),
+        bytes: bytes.len(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+fn offline_cache_viewport_image(frame: &egui::ColorImage) -> Option<OfflineCacheViewportImage> {
+    let [width, height] = frame.size;
+    let png = encode_color_image_png(frame).ok()?;
+    if png.len() > OFFLINE_CACHE_VIEWPORT_MAX_BYTES {
+        return None;
+    }
+    Some(OfflineCacheViewportImage {
+        mime: "image/png".to_owned(),
+        width,
+        height,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(png),
+    })
+}
+
+fn offline_cache_resource_manifest(
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> Vec<OfflineCacheResource> {
+    recent
+        .iter()
+        .rev()
+        .take(OFFLINE_CACHE_RESOURCE_MAX_COUNT)
+        .filter_map(|resource| {
+            let url = resource.url.trim();
+            if url.is_empty() {
+                return None;
+            }
+            Some(OfflineCacheResource {
+                url: clamp_chars(url, OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS),
+                resource: offline_cache_resource_type_name(resource.resource).to_owned(),
+                allowed: resource.allowed,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn offline_cache_resource_type_name(resource: u8) -> &'static str {
+    match mde_web_preview_client::resource_from_wire(resource) {
+        mde_web_preview_client::ResourceType::Document => "document",
+        mde_web_preview_client::ResourceType::Subdocument => "subdocument",
+        mde_web_preview_client::ResourceType::Stylesheet => "stylesheet",
+        mde_web_preview_client::ResourceType::Script => "script",
+        mde_web_preview_client::ResourceType::Image => "image",
+        mde_web_preview_client::ResourceType::Font => "font",
+        mde_web_preview_client::ResourceType::Media => "media",
+        mde_web_preview_client::ResourceType::Object => "object",
+        mde_web_preview_client::ResourceType::XmlHttpRequest => "xhr",
+        mde_web_preview_client::ResourceType::Ping => "ping",
+        mde_web_preview_client::ResourceType::WebSocket => "websocket",
+        mde_web_preview_client::ResourceType::Other => "other",
+    }
+}
+
+fn offline_cache_pdf_snapshot(saved: &SavedPdf) -> Option<OfflineCachePdf> {
+    let bytes = std::fs::read(&saved.path).ok()?;
+    if validate_offline_cache_pdf_bytes(&bytes, bytes.len()).is_err() {
+        return None;
+    }
+    let filename = saved
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| valid_offline_pdf_filename(name))
+        .map(str::to_owned)
+        .unwrap_or_else(|| pdf_filename_for(&saved.url, &saved.title, unix_ms()));
+    Some(OfflineCachePdf {
+        mime: "application/pdf".to_owned(),
+        filename,
+        bytes: bytes.len(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+fn browser_voice_command_body(
+    mode: VoiceCommandMode,
+    tab_index: usize,
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    address: &str,
+    page_focused: bool,
+) -> String {
+    serde_json::json!({
+        "op": "browser_voice_command",
+        "source": "browser",
+        "host": local_hostname(),
+        "mode": mode.wire(),
+        "tab_index": tab_index,
+        "engine": engine.wire(),
+        "url": url,
+        "title": title.trim(),
+        "address": address.trim(),
+        "focus": if page_focused { "page" } else { "chrome" },
+        "max_transcript_chars": 4096,
+    })
+    .to_string()
+}
+
+fn browser_voice_command_result_topic(host: &str) -> String {
+    format!("{EVENT_BROWSER_VOICE_COMMAND_PREFIX}{host}")
+}
+
+fn browser_read_aloud_status_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_READ_ALOUD_PREFIX}{host}")
+}
+
+fn browser_voice_command_status_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_VOICE_COMMAND_PREFIX}{host}")
+}
+
+fn browser_passkey_status_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_PASSKEYS_PREFIX}{host}")
+}
+
+fn browser_passkey_event_topic(host: &str) -> String {
+    format!("{EVENT_BROWSER_PASSKEYS_PREFIX}{host}")
+}
+
+fn browser_translation_result_topic(host: &str) -> String {
+    format!("{EVENT_BROWSER_TRANSLATE_PREFIX}{host}")
+}
+
+fn browser_share_result_topic(host: &str) -> String {
+    format!("{EVENT_BROWSER_SHARE_PREFIX}{host}")
+}
+
+fn browser_offline_cache_result_topic(host: &str) -> String {
+    format!("{EVENT_BROWSER_OFFLINE_CACHE_PREFIX}{host}")
+}
+
+fn browser_security_update_status_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_SECURITY_UPDATE_PREFIX}{host}")
+}
+
+fn cache_url_keys(url: &str) -> Vec<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = vec![url.to_owned()];
+    if let Some(canonical) = canonical_http_cache_url(url) {
+        if !keys.iter().any(|key| key == &canonical) {
+            keys.push(canonical);
+        }
+    }
+    keys
+}
+
+fn canonical_http_cache_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let (before_query, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(before, query)| (before, Some(query)));
+    let (authority, path) = before_query
+        .split_once('/')
+        .map_or((before_query, ""), |(authority, path)| (authority, path));
+    let authority = canonical_http_authority(&scheme, authority)?;
+    let query = canonical_query(query);
+    Some(match query {
+        Some(query) => format!("{scheme}://{authority}/{path}?{query}"),
+        None => format!("{scheme}://{authority}/{path}"),
+    })
+}
+
+fn canonical_http_authority(scheme: &str, authority: &str) -> Option<String> {
+    let authority = authority.trim();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after_host) = rest.split_once(']')?;
+        let host = host.to_ascii_lowercase();
+        let port = after_host.strip_prefix(':');
+        return match port {
+            Some(port) if is_default_http_port(scheme, port) => Some(format!("[{host}]")),
+            Some(port) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                Some(format!("[{host}]:{port}"))
+            }
+            Some(_) => None,
+            None if after_host.is_empty() => Some(format!("[{host}]")),
+            None => None,
+        };
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map_or((authority, None), |(host, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                (host, Some(port))
+            } else {
+                (authority, None)
+            }
+        });
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    match port {
+        Some(port) if is_default_http_port(scheme, port) => Some(host),
+        Some(port) => Some(format!("{host}:{port}")),
+        None => Some(host),
+    }
+}
+
+fn is_default_http_port(scheme: &str, port: &str) -> bool {
+    matches!((scheme, port), ("http", "80") | ("https", "443"))
+}
+
+fn canonical_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    if query.is_empty() {
+        return None;
+    }
+    let mut pairs = query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return None;
+    }
+    pairs.sort_unstable();
+    Some(pairs.join("&"))
+}
+
+fn parse_translation_result(body: &str) -> Result<BrowserTranslationResult, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("translation result JSON: {err}"))?;
+    if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_translation") {
+        return Err("translation result has the wrong op".to_owned());
+    }
+    if v.get("source").and_then(serde_json::Value::as_str) != Some("browser_translate") {
+        return Err("translation result has the wrong source".to_owned());
+    }
+    let host = result_required_str(&v, "host")?;
+    let tab_index = v
+        .get("tab_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| "translation result is missing tab_index".to_owned())?;
+    let engine_wire = result_required_str(&v, "engine")?;
+    let engine = BrowserEngine::from_wire(&engine_wire)
+        .ok_or_else(|| "translation result has an unsupported engine".to_owned())?;
+    let translation = clamp_chars(
+        &result_required_str(&v, "translation")?,
+        TRANSLATION_RESULT_MAX_CHARS,
+    );
+    Ok(BrowserTranslationResult {
+        host,
+        tab_index,
+        engine,
+        url: result_required_str(&v, "url")?,
+        title: v
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned(),
+        source_lang: result_required_str(&v, "source_lang")?,
+        target_lang: result_required_str(&v, "target_lang")?,
+        translation,
+    })
+}
+
+fn parse_share_route_result(body: &str) -> Result<BrowserShareRouteResult, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("share result JSON: {err}"))?;
+    if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_share_routed") {
+        return Err("share result has the wrong op".to_owned());
+    }
+    if v.get("source").and_then(serde_json::Value::as_str) != Some("browser_share") {
+        return Err("share result has the wrong source".to_owned());
+    }
+    let target_wire = result_required_str(&v, "target")?;
+    let target = BrowserShareTarget::from_wire(&target_wire)
+        .ok_or_else(|| "share result has an unsupported target".to_owned())?;
+    Ok(BrowserShareRouteResult {
+        host: result_required_str(&v, "host")?,
+        target,
+        url: result_required_str(&v, "url")?,
+        title: v
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned(),
+        preview: result_required_str(&v, "preview")?,
+        request_id: result_required_str(&v, "request_id")?,
+    })
+}
+
+fn qr_share_result(route: BrowserShareRouteResult) -> Result<BrowserQrShareResult, String> {
+    if route.target != BrowserShareTarget::Qr {
+        return Err("share result is not a QR route".to_owned());
+    }
+    let modules = qr_modules(&route.url)?;
+    Ok(BrowserQrShareResult {
+        host: route.host,
+        url: route.url,
+        title: route.title,
+        preview: route.preview,
+        request_id: route.request_id,
+        modules,
+    })
+}
+
+fn qr_modules(url: &str) -> Result<Vec<Vec<bool>>, String> {
+    let code = QrCode::new(url.as_bytes()).map_err(|err| format!("QR encode failed: {err}"))?;
+    let width = code.width();
+    let mut modules = Vec::with_capacity(width);
+    for y in 0..width {
+        let mut row = Vec::with_capacity(width);
+        for x in 0..width {
+            row.push(code[(x, y)] == qrcode::Color::Dark);
+        }
+        modules.push(row);
+    }
+    Ok(modules)
+}
+
+fn parse_offline_cache_result(body: &str) -> Result<BrowserOfflineCacheResult, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("offline-cache result JSON: {err}"))?;
+    if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_offline_cache_record") {
+        return Err("offline-cache result has the wrong op".to_owned());
+    }
+    if v.get("source").and_then(serde_json::Value::as_str) != Some("browser_offline_cache") {
+        return Err("offline-cache result has the wrong source".to_owned());
+    }
+    if v.get("privacy").and_then(serde_json::Value::as_str) != Some("offline_or_mesh_only") {
+        return Err("offline-cache result is not private".to_owned());
+    }
+    let host = cache_result_required_str(&v, "host")?;
+    let cache_id = cache_result_required_str(&v, "cache_id")?;
+    let tab_index = v
+        .get("tab_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| "offline-cache result is missing tab_index".to_owned())?;
+    let engine_wire = cache_result_required_str(&v, "engine")?;
+    let engine = BrowserEngine::from_wire(&engine_wire)
+        .ok_or_else(|| "offline-cache result has an unsupported engine".to_owned())?;
+    let text = clamp_chars(
+        &cache_result_required_str(&v, "text")?,
+        OFFLINE_CACHE_TEXT_MAX_CHARS,
+    );
+    let viewport = v
+        .get("viewport_image")
+        .map(parse_offline_cache_viewport_image)
+        .transpose()?;
+    let resources = v
+        .get("resource_manifest")
+        .map(parse_offline_cache_resource_manifest)
+        .transpose()?
+        .unwrap_or_default();
+    let archive_mhtml = v
+        .get("archive_mhtml")
+        .map(parse_offline_cache_mhtml_archive)
+        .transpose()?;
+    let pdf_snapshot = v
+        .get("pdf_snapshot")
+        .map(parse_offline_cache_pdf_snapshot)
+        .transpose()?;
+    Ok(BrowserOfflineCacheResult {
+        host,
+        cache_id,
+        tab_index,
+        engine,
+        url: cache_result_required_str(&v, "url")?,
+        title: v
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned(),
+        text,
+        viewport,
+        resources,
+        archive_mhtml,
+        pdf_snapshot,
+        cached_ms: v.get("cached_ms").and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn parse_offline_cache_viewport_image(
+    v: &serde_json::Value,
+) -> Result<OfflineCacheViewportImage, String> {
+    let mime = v
+        .get("mime")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|mime| *mime == "image/png")
+        .ok_or_else(|| "offline-cache viewport image must be image/png".to_owned())?;
+    let width = v
+        .get("width")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| "offline-cache viewport image is missing width".to_owned())?;
+    let height = v
+        .get("height")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| "offline-cache viewport image is missing height".to_owned())?;
+    let data_base64 = v
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "offline-cache viewport image is missing data".to_owned())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|err| format!("offline-cache viewport image base64: {err}"))?;
+    if bytes.len() > OFFLINE_CACHE_VIEWPORT_MAX_BYTES {
+        return Err("offline-cache viewport image is too large".to_owned());
+    }
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("offline-cache viewport image is not a PNG".to_owned());
+    }
+    Ok(OfflineCacheViewportImage {
+        mime: mime.to_owned(),
+        width,
+        height,
+        data_base64: data_base64.to_owned(),
+    })
+}
+
+fn parse_offline_cache_mhtml_archive(v: &serde_json::Value) -> Result<OfflineCacheArchive, String> {
+    let mime = v
+        .get("mime")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|mime| *mime == "multipart/related")
+        .ok_or_else(|| "offline-cache archive must be multipart/related".to_owned())?;
+    let filename = v
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| valid_offline_archive_filename(name))
+        .ok_or_else(|| "offline-cache archive filename is invalid".to_owned())?;
+    let declared_bytes = v
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0 && *n <= OFFLINE_CACHE_MHTML_MAX_BYTES)
+        .ok_or_else(|| "offline-cache archive has invalid byte count".to_owned())?;
+    let data_base64 = v
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "offline-cache archive is missing data".to_owned())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|err| format!("offline-cache archive base64: {err}"))?;
+    validate_offline_cache_archive_bytes(&bytes, declared_bytes)?;
+    Ok(OfflineCacheArchive {
+        mime: mime.to_owned(),
+        filename: filename.to_owned(),
+        bytes: declared_bytes,
+        data_base64: data_base64.to_owned(),
+    })
+}
+
+fn parse_offline_cache_resource_manifest(
+    v: &serde_json::Value,
+) -> Result<Vec<OfflineCacheResource>, String> {
+    let items = v
+        .as_array()
+        .ok_or_else(|| "offline-cache resource manifest must be an array".to_owned())?;
+    if items.len() > OFFLINE_CACHE_RESOURCE_MAX_COUNT {
+        return Err("offline-cache resource manifest has too many entries".to_owned());
+    }
+    items
+        .iter()
+        .map(parse_offline_cache_resource)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_offline_cache_resource(v: &serde_json::Value) -> Result<OfflineCacheResource, String> {
+    let url = v
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| {
+            !url.is_empty() && url.chars().count() <= OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS
+        })
+        .ok_or_else(|| "offline-cache resource URL is invalid".to_owned())?;
+    let resource = v
+        .get("resource")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|resource| valid_offline_resource_type(resource))
+        .ok_or_else(|| "offline-cache resource type is invalid".to_owned())?;
+    let allowed = v
+        .get("allowed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "offline-cache resource allowed flag is missing".to_owned())?;
+    Ok(OfflineCacheResource {
+        url: url.to_owned(),
+        resource: resource.to_owned(),
+        allowed,
+    })
+}
+
+fn offline_cache_archive_bytes(archive: &OfflineCacheArchive) -> Result<Vec<u8>, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(archive.data_base64.as_str())
+        .map_err(|err| format!("offline-cache archive base64: {err}"))?;
+    validate_offline_cache_archive_bytes(&bytes, archive.bytes)?;
+    Ok(bytes)
+}
+
+fn parse_offline_cache_pdf_snapshot(v: &serde_json::Value) -> Result<OfflineCachePdf, String> {
+    let mime = v
+        .get("mime")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|mime| *mime == "application/pdf")
+        .ok_or_else(|| "offline-cache PDF must be application/pdf".to_owned())?;
+    let filename = v
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| valid_offline_pdf_filename(name))
+        .ok_or_else(|| "offline-cache PDF filename is invalid".to_owned())?;
+    let declared_bytes = v
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0 && *n <= OFFLINE_CACHE_PDF_MAX_BYTES)
+        .ok_or_else(|| "offline-cache PDF has invalid byte count".to_owned())?;
+    let data_base64 = v
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "offline-cache PDF is missing data".to_owned())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|err| format!("offline-cache PDF base64: {err}"))?;
+    validate_offline_cache_pdf_bytes(&bytes, declared_bytes)?;
+    Ok(OfflineCachePdf {
+        mime: mime.to_owned(),
+        filename: filename.to_owned(),
+        bytes: declared_bytes,
+        data_base64: data_base64.to_owned(),
+    })
+}
+
+fn offline_cache_pdf_bytes(pdf: &OfflineCachePdf) -> Result<Vec<u8>, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(pdf.data_base64.as_str())
+        .map_err(|err| format!("offline-cache PDF base64: {err}"))?;
+    validate_offline_cache_pdf_bytes(&bytes, pdf.bytes)?;
+    Ok(bytes)
+}
+
+fn validate_offline_cache_pdf_bytes(bytes: &[u8], declared_bytes: usize) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() != declared_bytes {
+        return Err("offline-cache PDF byte count mismatch".to_owned());
+    }
+    if bytes.len() > OFFLINE_CACHE_PDF_MAX_BYTES {
+        return Err("offline-cache PDF is too large".to_owned());
+    }
+    if !bytes.starts_with(b"%PDF-") {
+        return Err("offline-cache PDF is not a PDF".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_offline_cache_archive_bytes(bytes: &[u8], declared_bytes: usize) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() != declared_bytes {
+        return Err("offline-cache archive byte count mismatch".to_owned());
+    }
+    if bytes.len() > OFFLINE_CACHE_MHTML_MAX_BYTES {
+        return Err("offline-cache archive is too large".to_owned());
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "offline-cache archive is not UTF-8 MHTML".to_owned())?;
+    if !text.starts_with("MIME-Version: 1.0\r\n") || !text.contains("multipart/related") {
+        return Err("offline-cache archive is not MHTML".to_owned());
+    }
+    Ok(())
+}
+
+fn valid_offline_archive_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 160
+        && name.ends_with(".mhtml")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn valid_offline_pdf_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 160
+        && name.ends_with(".pdf")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn valid_offline_resource_type(resource: &str) -> bool {
+    matches!(
+        resource,
+        "document"
+            | "subdocument"
+            | "stylesheet"
+            | "script"
+            | "image"
+            | "font"
+            | "media"
+            | "object"
+            | "xhr"
+            | "ping"
+            | "websocket"
+            | "other"
+    )
+}
+
+fn parse_read_aloud_status(body: &str) -> Result<BrowserReadAloudStatus, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("read-aloud status JSON: {err}"))?;
+    let state = status_required_str(&v, "state", "read-aloud status")?;
+    if !matches!(
+        state.as_str(),
+        "idle" | "speaking" | "spoken" | "unavailable" | "error"
+    ) {
+        return Err("read-aloud status has an unsupported state".to_owned());
+    }
+    Ok(BrowserReadAloudStatus {
+        node: status_required_str(&v, "node", "read-aloud status")?,
+        last_title: optional_trimmed_str(&v, "last_title"),
+        last_url: optional_trimmed_str(&v, "last_url"),
+        state,
+        last_error: optional_trimmed_str(&v, "last_error"),
+        accepted: v
+            .get("accepted")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        spoken: v
+            .get("spoken")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        rejected: v
+            .get("rejected")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        last_request_ms: v.get("last_request_ms").and_then(serde_json::Value::as_u64),
+        updated_ms: v
+            .get("updated_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    })
+}
+
+fn parse_voice_command_status(body: &str) -> Result<BrowserVoiceCommandStatus, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("voice status JSON: {err}"))?;
+    let state = status_required_str(&v, "state", "voice status")?;
+    if !matches!(
+        state.as_str(),
+        "idle" | "listening" | "transcribed" | "unavailable" | "error"
+    ) {
+        return Err("voice status has an unsupported state".to_owned());
+    }
+    if let Some(mode) = optional_trimmed_str(&v, "last_mode") {
+        if !matches!(mode.as_str(), "command" | "dictation") {
+            return Err("voice status has an unsupported mode".to_owned());
+        }
+    }
+    Ok(BrowserVoiceCommandStatus {
+        node: status_required_str(&v, "node", "voice status")?,
+        last_url: optional_trimmed_str(&v, "last_url"),
+        last_mode: optional_trimmed_str(&v, "last_mode"),
+        state,
+        last_error: optional_trimmed_str(&v, "last_error"),
+        accepted: v
+            .get("accepted")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        transcribed: v
+            .get("transcribed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        rejected: v
+            .get("rejected")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        last_transcript_chars: v
+            .get("last_transcript_chars")
+            .and_then(serde_json::Value::as_u64),
+        last_request_ms: v.get("last_request_ms").and_then(serde_json::Value::as_u64),
+        updated_ms: v
+            .get("updated_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    })
+}
+
+fn parse_passkey_status(body: &str) -> Result<BrowserPasskeyStatus, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("passkey status JSON: {err}"))?;
+    let state = status_required_str(&v, "state", "passkey status")?;
+    if !matches!(
+        state.as_str(),
+        "idle" | "pending" | "created" | "asserted" | "error"
+    ) {
+        return Err("passkey status has an unsupported state".to_owned());
+    }
+    if let Some(ceremony) = optional_trimmed_str(&v, "last_ceremony") {
+        if !matches!(ceremony.as_str(), "create" | "get") {
+            return Err("passkey status has an unsupported ceremony".to_owned());
+        }
+    }
+    let hardware_state =
+        optional_trimmed_str(&v, "hardware_state").unwrap_or_else(|| "unknown".to_owned());
+    if !matches!(
+        hardware_state.as_str(),
+        "unknown" | "unavailable" | "present_permission_denied" | "ready"
+    ) {
+        return Err("passkey status has an unsupported hardware state".to_owned());
+    }
+    let hardware_ctaphid_state =
+        optional_trimmed_str(&v, "hardware_ctaphid_state").unwrap_or_else(|| "unknown".to_owned());
+    if !matches!(
+        hardware_ctaphid_state.as_str(),
+        "unknown" | "unavailable" | "init_request_ready"
+    ) {
+        return Err("passkey status has an unsupported CTAP HID state".to_owned());
+    }
+    let hardware_ctaphid_init_frame_count = v
+        .get("hardware_ctaphid_init_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if hardware_ctaphid_state == "init_request_ready" && hardware_ctaphid_init_frame_count == 0 {
+        return Err("passkey status CTAP HID INIT diagnostic has no frames".to_owned());
+    }
+    if hardware_ctaphid_state != "init_request_ready" && hardware_ctaphid_init_frame_count > 0 {
+        return Err("passkey status CTAP HID frame count contradicts the CTAP state".to_owned());
+    }
+    Ok(BrowserPasskeyStatus {
+        node: status_required_str(&v, "node", "passkey status")?,
+        last_request_id: optional_trimmed_str(&v, "last_request_id"),
+        last_host: optional_trimmed_str(&v, "last_host"),
+        last_ceremony: optional_trimmed_str(&v, "last_ceremony"),
+        last_rp_id: optional_trimmed_str(&v, "last_rp_id"),
+        state,
+        mirrored: v
+            .get("mirrored")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_default(),
+        last_error: optional_trimmed_str(&v, "last_error"),
+        accepted: v
+            .get("accepted")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        rejected: v
+            .get("rejected")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        last_pending_ms: v.get("last_pending_ms").and_then(serde_json::Value::as_u64),
+        hardware_state,
+        hardware_key_count: v
+            .get("hardware_key_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        hardware_readable_count: v
+            .get("hardware_readable_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        hardware_ctaphid_state,
+        hardware_ctaphid_init_frame_count,
+        hardware_probe_ms: v
+            .get("hardware_probe_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        updated_ms: v
+            .get("updated_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    })
+}
+
+fn parse_passkey_completion(body: &str) -> Result<BrowserPasskeyCompletion, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("passkey event JSON: {err}"))?;
+    if v.get("source").and_then(serde_json::Value::as_str) != Some("browser_passkeys") {
+        return Err("passkey event has an unsupported source".to_owned());
+    }
+    let op = status_required_str(&v, "op", "passkey event")?;
+    if !matches!(
+        op.as_str(),
+        "browser_passkey_created" | "browser_passkey_assertion"
+    ) {
+        return Err("passkey event is not a completion".to_owned());
+    }
+    let client_request_id = status_required_str(&v, "client_request_id", "passkey event")?;
+    if client_request_id.len() > 128 {
+        return Err("passkey event client_request_id is too long".to_owned());
+    }
+    let body = serde_json::to_string(&v).map_err(|err| format!("passkey event encode: {err}"))?;
+    Ok(BrowserPasskeyCompletion {
+        client_request_id,
+        body,
+    })
+}
+
+fn parse_security_update_status(body: &str) -> Result<BrowserSecurityUpdateStatus, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("security update JSON: {err}"))?;
+    let state = security_status_required_str(&v, "state")?;
+    if !matches!(
+        state.as_str(),
+        "current" | "missing" | "mismatch" | "manifest_missing"
+    ) {
+        return Err("security update has an unsupported state".to_owned());
+    }
+    let updater_state = v
+        .get("updater_state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("idle")
+        .to_owned();
+    Ok(BrowserSecurityUpdateStatus {
+        node: security_status_required_str(&v, "node")?,
+        state,
+        expected_cef_version: optional_trimmed_str(&v, "expected_cef_version"),
+        expected_chromium_version: optional_trimmed_str(&v, "expected_chromium_version"),
+        expected_channel: optional_trimmed_str(&v, "expected_channel"),
+        active_runtime: optional_trimmed_str(&v, "active_runtime"),
+        installed_version: optional_trimmed_str(&v, "installed_version"),
+        installed_chromium: optional_trimmed_str(&v, "installed_chromium"),
+        libcef_present: v
+            .get("libcef_present")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        updater_state,
+        last_update_ms: v.get("last_update_ms").and_then(serde_json::Value::as_u64),
+        last_update_exit_code: v
+            .get("last_update_exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        last_update_error: optional_trimmed_str(&v, "last_update_error"),
+        last_error: optional_trimmed_str(&v, "last_error"),
+        updated_ms: v
+            .get("updated_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    })
+}
+
+fn security_status_required_str(v: &serde_json::Value, key: &str) -> Result<String, String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("security update is missing {key}"))
+}
+
+fn optional_trimmed_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn status_required_str(v: &serde_json::Value, key: &str, context: &str) -> Result<String, String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{context} is missing {key}"))
+}
+
+fn result_required_str(v: &serde_json::Value, key: &str) -> Result<String, String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("translation result is missing {key}"))
+}
+
+fn cache_result_required_str(v: &serde_json::Value, key: &str) -> Result<String, String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("offline-cache result is missing {key}"))
+}
+
+fn parse_voice_transcript_result(body: &str) -> Result<VoiceTranscriptResult, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("voice result JSON: {err}"))?;
+    if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_voice_transcript") {
+        return Err("voice result has the wrong op".to_owned());
+    }
+    if v.get("source").and_then(serde_json::Value::as_str) != Some("browser_voice_command") {
+        return Err("voice result has the wrong source".to_owned());
+    }
+    let host = v
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "voice result is missing host".to_owned())?;
+    let mode = v
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(VoiceCommandMode::from_wire)
+        .ok_or_else(|| "voice result has an unsupported mode".to_owned())?;
+    let tab_index = v
+        .get("tab_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| "voice result is missing tab_index".to_owned())?;
+    let focus = v
+        .get("focus")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|focus| matches!(*focus, "page" | "chrome"))
+        .ok_or_else(|| "voice result has an unsupported focus".to_owned())?;
+    let transcript = v
+        .get("transcript")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|transcript| !transcript.is_empty())
+        .ok_or_else(|| "voice result is missing transcript".to_owned())?;
+    Ok(VoiceTranscriptResult {
+        host: host.to_owned(),
+        mode,
+        tab_index,
+        focus: focus.to_owned(),
+        transcript: clamp_chars(transcript, 4096),
+    })
+}
+
+fn voice_command_action(transcript: &str) -> Option<BrowserVoiceAction> {
+    let command = normalize_voice_command(transcript);
+    match command.as_str() {
+        "new tab" | "open new tab" | "open a new tab" => Some(BrowserVoiceAction::NewTab),
+        "close tab" | "close current tab" => Some(BrowserVoiceAction::CloseTab),
+        "back" | "go back" => Some(BrowserVoiceAction::Back),
+        "forward" | "go forward" => Some(BrowserVoiceAction::Forward),
+        "reload" | "refresh" | "reload page" | "refresh page" => Some(BrowserVoiceAction::Reload),
+        "read aloud" | "read page aloud" | "read this page aloud" => {
+            Some(BrowserVoiceAction::ReadAloud)
+        }
+        _ => voice_find_query(&command).map(BrowserVoiceAction::Find),
+    }
+}
+
+fn voice_find_query(command: &str) -> Option<String> {
+    for prefix in [
+        "find in page ",
+        "find on page ",
+        "search page for ",
+        "search this page for ",
+        "search for ",
+        "find ",
+    ] {
+        if let Some(query) = command.strip_prefix(prefix).map(str::trim) {
+            if !query.is_empty() {
+                return Some(query.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_voice_command(transcript: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_space = true;
+    for ch in transcript.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_was_space = false;
+        } else if !last_was_space {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn clamp_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 fn session_state_wire(state: &SessionState) -> &'static str {
     match state {
         SessionState::Loading => "loading",
@@ -3322,6 +7057,9 @@ fn browser_session_sync_body(state: &WebState) -> String {
                 "muted": tab.muted,
                 "force_dark": tab.force_dark,
                 "reader_mode": tab.reader_mode,
+                "user_scripts": tab.user_scripts,
+                "user_agent": tab.user_agent.wire(),
+                "device_profile": tab.device_profile.wire(),
                 "idle_suspended": tab.idle_suspended,
             })
         })
@@ -3367,6 +7105,7 @@ fn browser_session_sync_body(state: &WebState) -> String {
             "page_zoom_percent": state.page_zoom_percent,
             "find_open": state.find_open,
             "downloads_open": state.downloads_open,
+            "power_mode": state.power_mode,
             "speed_dial": speed_dial,
         },
         "tabs": tabs,
@@ -3442,6 +7181,8 @@ impl ExternalProtocol {
 fn browser_protocol_handoff_body(protocol: ExternalProtocol, url: &str) -> String {
     serde_json::json!({
         "op": "browser_protocol_handoff",
+        "source": "browser",
+        "host": local_hostname(),
         "scheme": protocol.scheme(),
         "target": protocol.target(),
         "url": url,
@@ -3453,6 +7194,7 @@ fn voice_dial_body(url: &str) -> String {
     let number = url.split_once(':').map_or(url, |(_, rest)| rest).trim();
     serde_json::json!({
         "peer": number,
+        "host": local_hostname(),
         "source": "browser",
         "url": url,
     })
@@ -3519,6 +7261,83 @@ fn fetch_suggestions(query: &str) -> Result<Vec<String>, String> {
         .text()
         .map_err(|e| format!("Suggestions unavailable: {e}"))?;
     parse_suggestions_json(query, &body)
+}
+
+fn chromium_devtools_frontend_for_active_url(active_url: &str) -> Result<Option<String>, String> {
+    let body = reqwest::blocking::Client::builder()
+        .timeout(CEF_DEVTOOLS_TIMEOUT)
+        .build()
+        .map_err(|e| format!("target discovery unavailable: {e}"))?
+        .get(CEF_DEVTOOLS_LIST_URL)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| format!("target discovery unavailable: {e}"))?
+        .text()
+        .map_err(|e| format!("target discovery unavailable: {e}"))?;
+    chromium_devtools_frontend_from_list(active_url, &body)
+}
+
+fn chromium_devtools_frontend_from_list(
+    active_url: &str,
+    body: &str,
+) -> Result<Option<String>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid DevTools target JSON: {e}"))?;
+    let Some(targets) = value.as_array() else {
+        return Err("DevTools target JSON is not an array".to_owned());
+    };
+    let active_url = active_url.trim();
+    let mut fallback = None;
+    for target in targets {
+        let target_url = target
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let target_type = target
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("page");
+        if target_type != "page" || target_url.starts_with("devtools://") {
+            continue;
+        }
+        let Some(frontend) = chromium_devtools_frontend_url(target) else {
+            continue;
+        };
+        if target_url == active_url {
+            return Ok(Some(frontend));
+        }
+        fallback.get_or_insert(frontend);
+    }
+    Ok(fallback)
+}
+
+fn chromium_devtools_frontend_url(target: &serde_json::Value) -> Option<String> {
+    if let Some(frontend) = target
+        .get("devtoolsFrontendUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        if frontend.starts_with("http://127.0.0.1:9222/") {
+            return Some(frontend.to_owned());
+        }
+        if frontend.starts_with('/') {
+            return Some(format!("http://127.0.0.1:9222{frontend}"));
+        }
+    }
+    let ws = target
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())?;
+    let ws = ws
+        .strip_prefix("ws://")
+        .or_else(|| ws.strip_prefix("wss://"))
+        .unwrap_or(ws);
+    Some(format!(
+        "http://127.0.0.1:9222/devtools/inspector.html?ws={ws}"
+    ))
 }
 
 fn parse_suggestions_json(query: &str, body: &str) -> Result<Vec<String>, String> {
@@ -3740,6 +7559,14 @@ fn browser_print_spool_dir() -> PathBuf {
     std::env::temp_dir().join("mde-browser-cups")
 }
 
+fn browser_scrape_spool_dir() -> PathBuf {
+    std::env::temp_dir().join("mde-browser-scrapes")
+}
+
+fn browser_media_spool_dir() -> PathBuf {
+    std::env::temp_dir().join("mde-browser-media")
+}
+
 fn capture_filename_for(url: &str, title: &str, unix_ms: u64) -> String {
     output_filename_for("mde-browser", "png", url, title, unix_ms)
 }
@@ -3762,6 +7589,33 @@ fn capture_callout_filename_for(url: &str, title: &str, unix_ms: u64) -> String 
 
 fn capture_freehand_filename_for(url: &str, title: &str, unix_ms: u64) -> String {
     output_filename_for("mde-browser-freehand", "png", url, title, unix_ms)
+}
+
+fn scrape_export_filename_for(url: &str, title: &str, unix_ms: u64, ext: &str) -> String {
+    output_filename_for("mde-browser-scrape", ext, url, title, unix_ms)
+}
+
+fn media_manifest_filename_for(url: &str, title: &str, unix_ms: u64) -> String {
+    output_filename_for("mde-browser-media-manifest", "json", url, title, unix_ms)
+}
+
+fn media_asset_request_filename_for(
+    page_url: &str,
+    title: &str,
+    asset_url: &str,
+    unix_ms: u64,
+    index: usize,
+) -> String {
+    let base = output_filename_for(
+        "mde-browser-media-download",
+        "json",
+        page_url,
+        title,
+        unix_ms,
+    );
+    let stem = base.strip_suffix(".json").unwrap_or(&base);
+    let hint = sanitize_filename_component(&media_filename_hint(asset_url), 48);
+    format!("{stem}-{index:03}-{hint}.download.json")
 }
 
 fn capture_region_filename_for(url: &str, title: &str, unix_ms: u64) -> String {
@@ -3838,6 +7692,989 @@ fn output_filename_for(prefix: &str, ext: &str, url: &str, title: &str, unix_ms:
     format!("{prefix}-{unix_ms}-{slug}.{ext}")
 }
 
+fn active_page_scrape_documents(
+    url: &str,
+    title: &str,
+    engine: BrowserEngine,
+    unix_ms: u64,
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+    page_text: Option<&str>,
+    page_scrape_body: Option<&str>,
+) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let label = if title.trim().is_empty() {
+        host_of(url).unwrap_or_else(|| "Untitled page".to_owned())
+    } else {
+        title.trim().to_owned()
+    };
+    let crawl_seed = active_page_scrape_crawl_seed(url, recent);
+    let dom_extract = scrape_dom_extract(url, page_scrape_body)?;
+    let crawl_manifest = active_page_scrape_crawl_manifest(url, &crawl_seed, &dom_extract.links);
+    let text_extract = if let Some(text) = dom_extract.text.as_deref() {
+        scrape_text_extract_with_truncated(text, dom_extract.text_truncated)
+    } else {
+        scrape_text_extract(page_text)
+    };
+    let mut json_value = serde_json::json!({
+        "op": "browser_active_page_scrape",
+        "scope": "active_page_metadata_with_crawl_seed_text_and_dom",
+        "url": url,
+        "title": label,
+        "engine": engine.wire(),
+        "captured_ms": unix_ms,
+        "formats": ["json", "csv", "md"],
+        "crawl_seed_count": crawl_seed.len(),
+        "crawl_manifest_status": if crawl_manifest.is_empty() { "empty" } else { "ready" },
+        "crawl_execution_status": "not_started",
+        "crawl_manifest_max_depth": 1,
+        "crawl_manifest_count": crawl_manifest.len(),
+        "crawl_seed": crawl_seed
+            .iter()
+            .map(|seed| {
+                serde_json::json!({
+                    "url": seed.url,
+                    "resource": seed.resource,
+                    "allowed": seed.allowed,
+                    "same_origin": true,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "crawl_manifest": crawl_manifest
+            .iter()
+            .map(|target| {
+                serde_json::json!({
+                    "url": target.url,
+                    "source": target.source,
+                    "resource": target.resource,
+                    "allowed": target.allowed,
+                    "same_origin": true,
+                    "depth": target.depth,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "extracted_text_status": text_extract.status,
+        "extracted_text_chars": text_extract.original_chars,
+        "extracted_text_truncated": text_extract.truncated,
+        "dom_extract_status": dom_extract.status,
+        "article_extract_status": dom_extract.article_status,
+        "article_text_chars": dom_extract.article_text_chars,
+        "article_text_truncated": dom_extract.article_text_truncated,
+        "article_selector": dom_extract.article_selector,
+        "canonical_url": dom_extract.canonical_url,
+        "meta_description": dom_extract.meta_description,
+        "document_lang": dom_extract.document_lang,
+        "dom_link_count": dom_extract.links.len(),
+        "dom_heading_count": dom_extract.headings.len(),
+        "dom_links": dom_extract.links
+            .iter()
+            .map(|link| {
+                serde_json::json!({
+                    "url": link.url,
+                    "text": link.text,
+                    "rel": link.rel,
+                    "target": link.target,
+                    "same_origin": link.same_origin,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "dom_headings": dom_extract.headings
+            .iter()
+            .map(|heading| {
+                serde_json::json!({
+                    "level": heading.level,
+                    "text": heading.text,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    if let Some(text) = &text_extract.text {
+        json_value["extracted_text"] = serde_json::Value::String(text.clone());
+    }
+    if let Some(text) = &dom_extract.article_text {
+        json_value["article_text"] = serde_json::Value::String(text.clone());
+    }
+    let json = serde_json::to_vec_pretty(&json_value)
+        .map_err(|err| format!("encode scrape JSON: {err}"))?;
+    let mut csv = format!(
+        "captured_ms,engine,title,url,scope,seed_url,seed_resource,seed_allowed,text_status,text_chars,text_truncated,text,dom_kind,dom_url,dom_text,dom_level,dom_same_origin,dom_rel,dom_target\n{},{},{},{},active_page_metadata_with_crawl_seed_text_and_dom,,,,{},{},{},{},,,,,,,\n",
+        unix_ms,
+        csv_cell(engine.wire()),
+        csv_cell(&label),
+        csv_cell(url),
+        csv_cell(text_extract.status),
+        text_extract.original_chars,
+        text_extract.truncated,
+        csv_cell(text_extract.text.as_deref().unwrap_or(""))
+    );
+    for seed in &crawl_seed {
+        csv.push_str(&format!(
+            "{},{},{},{},crawl_seed,{},{},{},,,,,,,,,,,\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&seed.url),
+            csv_cell(seed.resource),
+            seed.allowed
+        ));
+    }
+    for target in &crawl_manifest {
+        csv.push_str(&format!(
+            "{},{},{},{},crawl_manifest,{},{},{},,,,crawl_target,{},{},{},true,,\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&target.url),
+            csv_cell(target.source),
+            target.allowed,
+            csv_cell(&target.url),
+            csv_cell(target.resource),
+            target.depth
+        ));
+    }
+    for link in &dom_extract.links {
+        csv.push_str(&format!(
+            "{},{},{},{},dom_link,,,,,,,,link,{},{},,{},{},{}\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&link.url),
+            csv_cell(&link.text),
+            link.same_origin,
+            csv_cell(&link.rel),
+            csv_cell(&link.target)
+        ));
+    }
+    for heading in &dom_extract.headings {
+        csv.push_str(&format!(
+            "{},{},{},{},dom_heading,,,,,,,,heading,,{},{},,,\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&heading.text),
+            heading.level
+        ));
+    }
+    if let Some(article_text) = &dom_extract.article_text {
+        csv.push_str(&format!(
+            "{},{},{},{},dom_article,,,,,,,,article,,{},,{},{},{}\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(article_text),
+            false,
+            csv_cell(&dom_extract.article_selector),
+            csv_cell(dom_extract.article_status)
+        ));
+    }
+    if !dom_extract.canonical_url.is_empty() {
+        csv.push_str(&format!(
+            "{},{},{},{},dom_canonical,,,,,,,,canonical,{},canonical,,{},,\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&dom_extract.canonical_url),
+            scrape_url_same_origin(url, &dom_extract.canonical_url)
+        ));
+    }
+    if !dom_extract.meta_description.is_empty() {
+        csv.push_str(&format!(
+            "{},{},{},{},dom_meta_description,,,,,,,,meta_description,,{},,,,\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&dom_extract.meta_description)
+        ));
+    }
+    if !dom_extract.document_lang.is_empty() {
+        csv.push_str(&format!(
+            "{},{},{},{},dom_document_lang,,,,,,,,document_lang,,{},,,,\n",
+            unix_ms,
+            csv_cell(engine.wire()),
+            csv_cell(&label),
+            csv_cell(url),
+            csv_cell(&dom_extract.document_lang)
+        ));
+    }
+    let csv = csv.into_bytes();
+    let seed_md = if crawl_seed.is_empty() {
+        "No same-origin crawl seed URLs were observed in helper resource telemetry.".to_owned()
+    } else {
+        crawl_seed
+            .iter()
+            .map(|seed| {
+                format!(
+                    "- `{}` ({}, allowed={})",
+                    seed.url.replace('`', "\\`"),
+                    seed.resource,
+                    seed.allowed
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let text_md = match &text_extract.text {
+        Some(text) if !text.is_empty() => {
+            format!("```text\n{}\n```", text.replace("```", "`\\`\\`"))
+        }
+        Some(_) => "No visible page text was returned by the helper.".to_owned(),
+        None => "Visible page text was not requested for this export path.".to_owned(),
+    };
+    let crawl_manifest_md = if crawl_manifest.is_empty() {
+        "No same-origin crawl targets were available for the handoff manifest.".to_owned()
+    } else {
+        crawl_manifest
+            .iter()
+            .map(|target| {
+                format!(
+                    "- `{}` (source={}, resource={}, depth={}, allowed={})",
+                    target.url.replace('`', "\\`"),
+                    target.source,
+                    target.resource,
+                    target.depth,
+                    target.allowed
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let links_md = if dom_extract.links.is_empty() {
+        match dom_extract.status {
+            "not_requested" => "DOM links were not requested for this export path.".to_owned(),
+            _ => "No DOM links were returned by the helper.".to_owned(),
+        }
+    } else {
+        dom_extract
+            .links
+            .iter()
+            .map(|link| {
+                format!(
+                    "- [{}]({}) (same_origin={}, rel=`{}`, target=`{}`)",
+                    markdown_inline_text(&link.text),
+                    link.url,
+                    link.same_origin,
+                    link.rel.replace('`', "\\`"),
+                    link.target.replace('`', "\\`")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let headings_md = if dom_extract.headings.is_empty() {
+        match dom_extract.status {
+            "not_requested" => "DOM headings were not requested for this export path.".to_owned(),
+            _ => "No DOM headings were returned by the helper.".to_owned(),
+        }
+    } else {
+        dom_extract
+            .headings
+            .iter()
+            .map(|heading| {
+                format!(
+                    "- h{} {}",
+                    heading.level,
+                    markdown_inline_text(&heading.text)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let article_md = match &dom_extract.article_text {
+        Some(text) if !text.is_empty() => {
+            let mut lines = vec![format!(
+                "- Status: `{}`, selector `{}`, chars `{}`, truncated `{}`",
+                dom_extract.article_status,
+                dom_extract.article_selector.replace('`', "\\`"),
+                dom_extract.article_text_chars,
+                dom_extract.article_text_truncated
+            )];
+            if !dom_extract.canonical_url.is_empty() {
+                lines.push(format!(
+                    "- Canonical: `{}`",
+                    dom_extract.canonical_url.replace('`', "\\`")
+                ));
+            }
+            if !dom_extract.meta_description.is_empty() {
+                lines.push(format!(
+                    "- Description: {}",
+                    markdown_inline_text(&dom_extract.meta_description)
+                ));
+            }
+            if !dom_extract.document_lang.is_empty() {
+                lines.push(format!(
+                    "- Language: `{}`",
+                    dom_extract.document_lang.replace('`', "\\`")
+                ));
+            }
+            lines.push(String::new());
+            lines.push("```text".to_owned());
+            lines.push(text.replace("```", "`\\`\\`"));
+            lines.push("```".to_owned());
+            lines.join("\n")
+        }
+        Some(_) => "No article/main-body text was returned by the helper.".to_owned(),
+        None => match dom_extract.status {
+            "not_requested" => {
+                "Article/main-body extraction was not requested for this export path.".to_owned()
+            }
+            _ => "No article/main-body text was returned by the helper.".to_owned(),
+        },
+    };
+    let md = format!(
+        "# {}\n\n- URL: `{}`\n- Engine: `{}`\n- Captured: `{}`\n- Scope: active page metadata with bounded crawl seed, extracted text, DOM links/headings/article metadata, and crawl manifest handoff\n- Crawl seed URLs: `{}`\n- Crawl manifest URLs: `{}` depth-1 handoff targets, execution `not_started`\n- Extracted text: `{}` chars, status `{}`, truncated `{}`\n- DOM extract: status `{}`, links `{}`, headings `{}`\n- Article extract: status `{}`, chars `{}`, truncated `{}`\n\n## Extracted Text\n\n{}\n\n## Article Extract\n\n{}\n\n## DOM Links\n\n{}\n\n## DOM Headings\n\n{}\n\n## Crawl Manifest\n\n{}\n\n## Crawl Seed\n\n{}\n\nRecursive network fetching remains a follow-up scraper hook.\n",
+        markdown_heading_text(&label),
+        url.replace('`', "\\`"),
+        engine.label(),
+        unix_ms,
+        crawl_seed.len(),
+        crawl_manifest.len(),
+        text_extract.original_chars,
+        text_extract.status,
+        text_extract.truncated,
+        dom_extract.status,
+        dom_extract.links.len(),
+        dom_extract.headings.len(),
+        dom_extract.article_status,
+        dom_extract.article_text_chars,
+        dom_extract.article_text_truncated,
+        text_md,
+        article_md,
+        links_md,
+        headings_md,
+        crawl_manifest_md,
+        seed_md
+    )
+    .into_bytes();
+    Ok(vec![("json", json), ("csv", csv), ("md", md)])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeCrawlSeed {
+    url: String,
+    resource: &'static str,
+    allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeCrawlTarget {
+    url: String,
+    source: &'static str,
+    resource: &'static str,
+    allowed: bool,
+    depth: u8,
+}
+
+fn active_page_scrape_crawl_seed(
+    page_url: &str,
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> Vec<ScrapeCrawlSeed> {
+    let Ok(page) = reqwest::Url::parse(page_url) else {
+        return Vec::new();
+    };
+    let Some(origin_host) = page.host_str().map(str::to_ascii_lowercase) else {
+        return Vec::new();
+    };
+    let origin_scheme = page.scheme().to_ascii_lowercase();
+    let origin_port = page.port_or_known_default();
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for resource in recent.iter().rev() {
+        if out.len() >= SCRAPE_CRAWL_SEED_MAX_COUNT {
+            break;
+        }
+        let url = resource.url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            continue;
+        };
+        if parsed.scheme().to_ascii_lowercase() != origin_scheme
+            || parsed.host_str().map(str::to_ascii_lowercase) != Some(origin_host.clone())
+            || parsed.port_or_known_default() != origin_port
+        {
+            continue;
+        }
+        let normalized = parsed.to_string();
+        if !seen.insert(normalized.clone()) {
+            continue;
+        }
+        out.push(ScrapeCrawlSeed {
+            url: clamp_chars(&normalized, MEDIA_SNIFFER_URL_MAX_CHARS),
+            resource: offline_cache_resource_type_name(resource.resource),
+            allowed: resource.allowed,
+        });
+    }
+    out.reverse();
+    out
+}
+
+fn active_page_scrape_crawl_manifest(
+    page_url: &str,
+    crawl_seed: &[ScrapeCrawlSeed],
+    dom_links: &[ScrapeDomLink],
+) -> Vec<ScrapeCrawlTarget> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for seed in crawl_seed {
+        if out.len() >= SCRAPE_CRAWL_MANIFEST_MAX_COUNT {
+            break;
+        }
+        if !seen.insert(seed.url.clone()) {
+            continue;
+        }
+        out.push(ScrapeCrawlTarget {
+            url: seed.url.clone(),
+            source: "telemetry",
+            resource: seed.resource,
+            allowed: seed.allowed,
+            depth: 1,
+        });
+    }
+    for link in dom_links {
+        if out.len() >= SCRAPE_CRAWL_MANIFEST_MAX_COUNT {
+            break;
+        }
+        if !link.same_origin || !scrape_url_same_origin(page_url, &link.url) {
+            continue;
+        }
+        if !seen.insert(link.url.clone()) {
+            continue;
+        }
+        out.push(ScrapeCrawlTarget {
+            url: link.url.clone(),
+            source: "dom_link",
+            resource: "document",
+            allowed: true,
+            depth: 1,
+        });
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeTextExtract {
+    status: &'static str,
+    text: Option<String>,
+    original_chars: usize,
+    truncated: bool,
+}
+
+fn scrape_text_extract(page_text: Option<&str>) -> ScrapeTextExtract {
+    if let Some(text) = page_text {
+        scrape_text_extract_with_truncated(text, false)
+    } else {
+        ScrapeTextExtract {
+            status: "not_requested",
+            text: None,
+            original_chars: 0,
+            truncated: false,
+        }
+    }
+}
+
+fn scrape_text_extract_with_truncated(text: &str, helper_truncated: bool) -> ScrapeTextExtract {
+    let trimmed = text.trim();
+    let original_chars = trimmed.chars().count();
+    let text = clamp_chars(trimmed, SCRAPE_EXTRACT_TEXT_MAX_CHARS);
+    ScrapeTextExtract {
+        status: if text.is_empty() {
+            "no_text"
+        } else {
+            "captured"
+        },
+        text: Some(text),
+        original_chars,
+        truncated: helper_truncated || original_chars > SCRAPE_EXTRACT_TEXT_MAX_CHARS,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeDomExtract {
+    status: &'static str,
+    text: Option<String>,
+    text_truncated: bool,
+    article_status: &'static str,
+    article_text: Option<String>,
+    article_text_chars: usize,
+    article_text_truncated: bool,
+    article_selector: String,
+    canonical_url: String,
+    meta_description: String,
+    document_lang: String,
+    links: Vec<ScrapeDomLink>,
+    headings: Vec<ScrapeDomHeading>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeDomLink {
+    url: String,
+    text: String,
+    rel: String,
+    target: String,
+    same_origin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeDomHeading {
+    level: u8,
+    text: String,
+}
+
+fn scrape_dom_extract(page_url: &str, body: Option<&str>) -> Result<ScrapeDomExtract, String> {
+    let Some(body) = body else {
+        return Ok(ScrapeDomExtract {
+            status: "not_requested",
+            text: None,
+            text_truncated: false,
+            article_status: "not_requested",
+            article_text: None,
+            article_text_chars: 0,
+            article_text_truncated: false,
+            article_selector: String::new(),
+            canonical_url: String::new(),
+            meta_description: String::new(),
+            document_lang: String::new(),
+            links: Vec::new(),
+            headings: Vec::new(),
+        });
+    };
+    if body.trim().is_empty() {
+        return Ok(ScrapeDomExtract {
+            status: "empty",
+            text: Some(String::new()),
+            text_truncated: false,
+            article_status: "empty",
+            article_text: Some(String::new()),
+            article_text_chars: 0,
+            article_text_truncated: false,
+            article_selector: String::new(),
+            canonical_url: String::new(),
+            meta_description: String::new(),
+            document_lang: String::new(),
+            links: Vec::new(),
+            headings: Vec::new(),
+        });
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("decode scrape DOM JSON: {err}"))?;
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| clamp_chars(text.trim(), SCRAPE_EXTRACT_TEXT_MAX_CHARS))
+        .unwrap_or_default();
+    let text_truncated = value
+        .get("text_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let article_text = value
+        .get("article_text")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| clamp_chars(text.trim(), SCRAPE_ARTICLE_TEXT_MAX_CHARS));
+    let article_text_chars = article_text
+        .as_deref()
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    let article_text_truncated = value
+        .get("article_text_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let article_status = match article_text.as_deref() {
+        Some(text) if !text.is_empty() => "captured",
+        Some(_) => "no_article",
+        None => "not_returned",
+    };
+    let article_selector = clamp_chars(
+        value
+            .get("article_selector")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim(),
+        80,
+    );
+    let canonical_url = clamp_chars(
+        value
+            .get("canonical_url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim(),
+        MEDIA_SNIFFER_URL_MAX_CHARS,
+    );
+    let meta_description = clamp_chars(
+        value
+            .get("meta_description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim(),
+        512,
+    );
+    let document_lang = clamp_chars(
+        value
+            .get("document_lang")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim(),
+        64,
+    );
+    let mut links = Vec::new();
+    if let Some(items) = value.get("links").and_then(serde_json::Value::as_array) {
+        for item in items.iter().take(SCRAPE_DOM_LINK_MAX_COUNT) {
+            let Some(raw_url) = item.get("url").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let url = clamp_chars(raw_url.trim(), MEDIA_SNIFFER_URL_MAX_CHARS);
+            if url.is_empty() {
+                continue;
+            }
+            links.push(ScrapeDomLink {
+                same_origin: scrape_url_same_origin(page_url, &url),
+                url,
+                text: clamp_chars(
+                    item.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .trim(),
+                    SCRAPE_DOM_TEXT_MAX_CHARS,
+                ),
+                rel: clamp_chars(
+                    item.get("rel")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .trim(),
+                    80,
+                ),
+                target: clamp_chars(
+                    item.get("target")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .trim(),
+                    40,
+                ),
+            });
+        }
+    }
+    let mut headings = Vec::new();
+    if let Some(items) = value.get("headings").and_then(serde_json::Value::as_array) {
+        for item in items.iter().take(SCRAPE_DOM_HEADING_MAX_COUNT) {
+            let text = clamp_chars(
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim(),
+                SCRAPE_DOM_TEXT_MAX_CHARS,
+            );
+            if text.is_empty() {
+                continue;
+            }
+            let level = item
+                .get("level")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|level| u8::try_from(level).ok())
+                .filter(|level| (1..=6).contains(level))
+                .unwrap_or(0);
+            headings.push(ScrapeDomHeading { level, text });
+        }
+    }
+    let status = if links.is_empty() && headings.is_empty() {
+        "no_dom"
+    } else {
+        "captured"
+    };
+    Ok(ScrapeDomExtract {
+        status,
+        text: Some(text),
+        text_truncated,
+        article_status,
+        article_text,
+        article_text_chars,
+        article_text_truncated,
+        article_selector,
+        canonical_url,
+        meta_description,
+        document_lang,
+        links,
+        headings,
+    })
+}
+
+fn scrape_url_same_origin(page_url: &str, candidate_url: &str) -> bool {
+    let (Ok(page), Ok(candidate)) = (
+        reqwest::Url::parse(page_url),
+        reqwest::Url::parse(candidate_url),
+    ) else {
+        return false;
+    };
+    page.scheme().eq_ignore_ascii_case(candidate.scheme())
+        && page.host_str().map(str::to_ascii_lowercase)
+            == candidate.host_str().map(str::to_ascii_lowercase)
+        && page.port_or_known_default() == candidate.port_or_known_default()
+}
+
+fn csv_cell(text: &str) -> String {
+    let escaped = text.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn markdown_heading_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\r' | '\n' => ' ',
+            _ => ch,
+        })
+        .collect::<String>()
+}
+
+fn markdown_inline_text(text: &str) -> String {
+    text.replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('`', "\\`")
+}
+
+fn active_page_media_manifest(
+    url: &str,
+    title: &str,
+    engine: BrowserEngine,
+    unix_ms: u64,
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> Result<Vec<u8>, String> {
+    let label = if title.trim().is_empty() {
+        host_of(url).unwrap_or_else(|| "Untitled page".to_owned())
+    } else {
+        title.trim().to_owned()
+    };
+    let items = media_manifest_items(recent);
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "op": "browser_media_manifest",
+        "scope": "active_page_media_sniffer",
+        "url": url,
+        "title": label,
+        "engine": engine.wire(),
+        "captured_ms": unix_ms,
+        "item_count": items.len(),
+        "items": items,
+    }))
+    .map_err(|err| format!("encode media manifest JSON: {err}"))
+}
+
+fn media_manifest_items(
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> Vec<serde_json::Value> {
+    recent
+        .iter()
+        .rev()
+        .filter_map(|resource| {
+            let url = resource.url.trim();
+            let kind = media_candidate_kind(resource.resource, url)?;
+            Some(serde_json::json!({
+                "url": clamp_chars(url, MEDIA_SNIFFER_URL_MAX_CHARS),
+                "resource": offline_cache_resource_type_name(resource.resource),
+                "kind": kind,
+                "allowed": resource.allowed,
+                "filename_hint": media_filename_hint(url),
+            }))
+        })
+        .take(MEDIA_SNIFFER_MAX_COUNT)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn active_page_media_asset_requests(
+    page_url: &str,
+    title: &str,
+    engine: BrowserEngine,
+    unix_ms: u64,
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> Result<Vec<Vec<u8>>, String> {
+    active_page_media_asset_requests_with_selection(
+        page_url,
+        title,
+        engine,
+        unix_ms,
+        recent,
+        MediaAssetSelection::All,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaAssetSelection {
+    All,
+    Images,
+}
+
+impl MediaAssetSelection {
+    fn accepts(self, kind: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Images => matches!(kind, "image"),
+        }
+    }
+
+    const fn empty_error(self) -> &'static str {
+        match self {
+            Self::All => "no observed media/image assets to queue",
+            Self::Images => "no observed image assets to queue",
+        }
+    }
+}
+
+fn active_page_media_asset_requests_with_selection(
+    page_url: &str,
+    title: &str,
+    engine: BrowserEngine,
+    unix_ms: u64,
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+    selection: MediaAssetSelection,
+) -> Result<Vec<Vec<u8>>, String> {
+    let label = if title.trim().is_empty() {
+        host_of(page_url).unwrap_or_else(|| "Untitled page".to_owned())
+    } else {
+        title.trim().to_owned()
+    };
+    let mut seen = BTreeSet::new();
+    let mut requests = Vec::new();
+    for resource in recent.iter().rev() {
+        if requests.len() >= MEDIA_SNIFFER_MAX_COUNT {
+            break;
+        }
+        let asset_url = resource.url.trim();
+        if asset_url.is_empty() || !seen.insert(asset_url.to_owned()) {
+            continue;
+        }
+        let Some(kind) = media_candidate_kind(resource.resource, asset_url) else {
+            continue;
+        };
+        if !selection.accepts(kind) {
+            continue;
+        }
+        let filename_hint = media_filename_hint(asset_url);
+        let body = serde_json::to_vec_pretty(&serde_json::json!({
+            "op": "browser_media_download_request",
+            "scope": "observed_media_asset",
+            "source": "browser_power_mode",
+            "page_url": page_url,
+            "page_title": label,
+            "engine": engine.wire(),
+            "captured_ms": unix_ms,
+            "asset_url": clamp_chars(asset_url, MEDIA_SNIFFER_URL_MAX_CHARS),
+            "resource": offline_cache_resource_type_name(resource.resource),
+            "kind": kind,
+            "allowed_by_page_filter": resource.allowed,
+            "ignore_blocking": !resource.allowed,
+            "suggested_filename": filename_hint,
+            "rename_strategy": "auto_rename_by_url_hint",
+            "retrieval": "native_media_downloader_request",
+        }))
+        .map_err(|err| format!("encode media download request: {err}"))?;
+        requests.push(body);
+    }
+    requests.reverse();
+    Ok(requests)
+}
+
+fn media_candidate_kind(resource: u8, url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains(".m3u8") {
+        return Some("hls");
+    }
+    if lower.contains(".mpd") {
+        return Some("dash");
+    }
+    if media_url_has_any_suffix(&lower, &[".mp4", ".m4v", ".webm", ".mov", ".m4s", ".ts"]) {
+        return Some("video");
+    }
+    if media_url_has_any_suffix(&lower, &[".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac"]) {
+        return Some("audio");
+    }
+    if media_url_has_any_suffix(
+        &lower,
+        &[
+            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg", ".bmp",
+        ],
+    ) {
+        return Some("image");
+    }
+    match mde_web_preview_client::resource_from_wire(resource) {
+        mde_web_preview_client::ResourceType::Media => Some("media"),
+        mde_web_preview_client::ResourceType::Image => Some("image"),
+        _ => None,
+    }
+}
+
+fn sanitize_filename_component(text: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in text.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            last_dash = false;
+            Some(ch)
+        } else if !last_dash {
+            last_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            out.push(ch);
+        }
+        if out.len() >= max_len {
+            break;
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() {
+        "media".to_owned()
+    } else {
+        out.to_owned()
+    }
+}
+
+fn media_url_has_any_suffix(lower_url: &str, suffixes: &[&str]) -> bool {
+    let path = lower_url.split(['?', '#']).next().unwrap_or(lower_url);
+    suffixes.iter().any(|suffix| path.ends_with(suffix))
+}
+
+fn media_filename_hint(url: &str) -> String {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let leaf = path.rsplit('/').next().unwrap_or("media");
+    let decoded = leaf.replace("%20", " ");
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in decoded.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            last_dash = false;
+            Some(ch)
+        } else if !last_dash {
+            last_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            out.push(ch);
+        }
+        if out.len() >= 96 {
+            break;
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() {
+        "media".to_owned()
+    } else {
+        out.to_owned()
+    }
+}
+
 fn capture_annotation_caption(url: &str, title: &str, unix_ms: u64) -> String {
     let title = title.trim();
     let label = if title.is_empty() {
@@ -3902,6 +8739,78 @@ fn mhtml_capture_document(url: &str, title: &str, unix_ms: u64, png: &[u8]) -> V
     for chunk in encoded_png.as_bytes().chunks(76) {
         out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
         out.push_str("\r\n");
+    }
+    out.push_str(&format!("--{BOUNDARY}--\r\n"));
+    out.into_bytes()
+}
+
+fn offline_cache_mhtml_document(
+    url: &str,
+    title: &str,
+    unix_ms: u64,
+    text: &str,
+    viewport_png: Option<&[u8]>,
+) -> Vec<u8> {
+    const BOUNDARY: &str = "----=_MagicMeshBrowserOfflineCache";
+    const IMAGE_LOCATION: &str = "mde-browser-offline-viewport.png";
+    let title = title.trim();
+    let label = if title.is_empty() {
+        host_of(url).unwrap_or_else(|| "Browser Offline Copy".to_owned())
+    } else {
+        title.to_owned()
+    };
+    let image_markup = viewport_png
+        .map(|_| "<img src=\"mde-browser-offline-viewport.png\" alt=\"Cached viewport\">")
+        .unwrap_or("");
+    let html = format!(
+        concat!(
+            "<!doctype html><html><head><meta charset=\"utf-8\">",
+            "<title>{title}</title></head><body>",
+            "<h1>{title}</h1>",
+            "<p>Offline copy from <a href=\"{url}\">{url}</a></p>",
+            "<p>Capture time: {unix_ms}</p>",
+            "{image_markup}",
+            "<pre>{text}</pre>",
+            "</body></html>"
+        ),
+        title = html_escape(&label),
+        url = html_escape(url),
+        unix_ms = unix_ms,
+        image_markup = image_markup,
+        text = html_escape(text)
+    );
+    let mut out = String::new();
+    out.push_str("MIME-Version: 1.0\r\n");
+    out.push_str(&format!(
+        "Content-Type: multipart/related; type=\"text/html\"; boundary=\"{BOUNDARY}\"\r\n"
+    ));
+    out.push_str(&format!(
+        "Subject: Magic Mesh Browser Offline Copy - {}\r\n\r\n",
+        mhtml_header_value(&html_escape(&label))
+    ));
+    out.push_str(&format!("--{BOUNDARY}\r\n"));
+    out.push_str("Content-Type: text/html; charset=\"utf-8\"\r\n");
+    out.push_str("Content-Transfer-Encoding: 8bit\r\n");
+    out.push_str(&format!(
+        "Content-Location: {}\r\n\r\n",
+        if url.trim().is_empty() {
+            "about:blank"
+        } else {
+            url.trim()
+        }
+    ));
+    out.push_str(&html);
+    out.push_str("\r\n");
+    if let Some(png) = viewport_png {
+        let encoded_png = base64::engine::general_purpose::STANDARD.encode(png);
+        out.push_str(&format!("--{BOUNDARY}\r\n"));
+        out.push_str("Content-Type: image/png\r\n");
+        out.push_str("Content-Transfer-Encoding: base64\r\n");
+        out.push_str(&format!("Content-Location: {IMAGE_LOCATION}\r\n\r\n"));
+        for chunk in encoded_png.as_bytes().chunks(76) {
+            out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            out.push_str("\r\n");
+        }
     }
     out.push_str(&format!("--{BOUNDARY}--\r\n"));
     out.into_bytes()
@@ -4678,6 +9587,7 @@ fn page_actions_menu(
     }
     for target in [
         BrowserShareTarget::Peer,
+        BrowserShareTarget::Phone,
         BrowserShareTarget::Email,
         BrowserShareTarget::Qr,
     ] {
@@ -5452,6 +10362,9 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     if let Some(tab) = state.tabs.get_mut(active) {
         tab.page_focused = page_focused;
     }
+    if let Some(tab) = state.tabs.get(active) {
+        install_browser_page_accessibility(ui.ctx(), image_rect, tab, page_focused);
+    }
 }
 
 fn handle_region_capture_drag(
@@ -5551,6 +10464,689 @@ fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
         });
 }
 
+fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(result) = state.latest_qr_share.clone() else {
+        return;
+    };
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("QR share")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new(result.request_id.chars().take(12).collect::<String>())
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Close QR share")
+                        .clicked()
+                    {
+                        state.latest_qr_share = None;
+                    }
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy QR share URL")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(result.url.clone());
+                        state.capture_notice = Some("QR share URL copied".to_owned());
+                    }
+                });
+            });
+            let page = if result.title.trim().is_empty() {
+                result.preview.as_str()
+            } else {
+                result.title.as_str()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(page)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} modules from {}",
+                        result.modules.len(),
+                        result.host
+                    ))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+                );
+            });
+            ui.add_space(Style::SP_XS);
+            paint_qr_matrix(ui, &result.modules);
+        });
+}
+
+fn paint_qr_matrix(ui: &mut egui::Ui, modules: &[Vec<bool>]) {
+    let width = modules.len();
+    if width == 0 {
+        return;
+    }
+    let side = 168.0_f32.min(ui.available_width().max(96.0));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, egui::Color32::WHITE);
+    let quiet_zone = 4_usize;
+    let total = width + quiet_zone * 2;
+    let cell = rect.width() / total as f32;
+    for (y, row) in modules.iter().enumerate() {
+        for (x, dark) in row.iter().enumerate() {
+            if !*dark {
+                continue;
+            }
+            let min = egui::pos2(
+                rect.left() + (x + quiet_zone) as f32 * cell,
+                rect.top() + (y + quiet_zone) as f32 * cell,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, egui::vec2(cell.ceil(), cell.ceil())),
+                0.0,
+                egui::Color32::BLACK,
+            );
+        }
+    }
+}
+
+fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(result) = state.latest_translation.clone() else {
+        return;
+    };
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Translation")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} \u{2192} {}",
+                        result.source_lang, result.target_lang
+                    ))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Close translation")
+                        .clicked()
+                    {
+                        state.latest_translation = None;
+                    }
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy translated text")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(result.translation.clone());
+                        state.capture_notice = Some("Translation copied".to_owned());
+                    }
+                });
+            });
+
+            let page = if result.title.trim().is_empty() {
+                result.url.as_str()
+            } else {
+                result.title.as_str()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(page)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} chars from tab {} / {}",
+                        result.translation.chars().count(),
+                        result.tab_index,
+                        result.engine.label()
+                    ))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+                );
+            });
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(result.translation.as_str())
+                            .size(Style::SMALL)
+                            .color(Style::TEXT),
+                    );
+                });
+        });
+}
+
+fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(result) = state.latest_spellcheck.clone() else {
+        return;
+    };
+    if !result.is_visible() {
+        return;
+    }
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Spelling")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(RichText::new(result.summary()).size(Style::SMALL).color(
+                    if result.error.is_some() {
+                        Style::WARN
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Close spelling results")
+                        .clicked()
+                    {
+                        state.latest_spellcheck = None;
+                    }
+                    if !result.misses.is_empty()
+                        && ui
+                            .small_button("Copy")
+                            .on_hover_text("Copy spelling results")
+                            .clicked()
+                    {
+                        ui.ctx().copy_text(spellcheck_results_text(&result.misses));
+                        state.capture_notice = Some("Spelling results copied".to_owned());
+                    }
+                });
+            });
+
+            if let Some(error) = result.error.as_deref() {
+                ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    for (row_index, miss) in result.misses.iter().take(24).enumerate() {
+                        let occurrence = spellcheck_occurrence_index(&result.misses, row_index);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(miss.word.as_str())
+                                    .size(Style::SMALL)
+                                    .color(Style::WARN),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "chars {}..{}",
+                                    miss.chars.start, miss.chars.end
+                                ))
+                                .size(Style::SMALL)
+                                .color(Style::TEXT_DIM),
+                            );
+                            if miss.suggestions.is_empty() {
+                                ui.label(
+                                    RichText::new("no suggestions")
+                                        .size(Style::SMALL)
+                                        .color(Style::TEXT_DIM),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("suggest:")
+                                        .size(Style::SMALL)
+                                        .color(Style::TEXT_DIM),
+                                );
+                                for suggestion in miss.suggestions.iter().take(4) {
+                                    if ui
+                                        .small_button(suggestion.as_str())
+                                        .on_hover_text(
+                                            "Apply spelling suggestion to this occurrence",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.apply_spellcheck_correction_at(
+                                            result.tab_index,
+                                            &miss.word,
+                                            suggestion,
+                                            occurrence,
+                                        );
+                                    }
+                                    if ui
+                                        .small_button("all")
+                                        .on_hover_text(
+                                            "Apply this suggestion to all visible matches",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.apply_spellcheck_correction_all(
+                                            result.tab_index,
+                                            &miss.word,
+                                            suggestion,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    if result.misses.len() > 24 {
+                        ui.label(
+                            RichText::new(format!("{} more", result.misses.len() - 24))
+                                .size(Style::SMALL)
+                                .color(Style::TEXT_DIM),
+                        );
+                    }
+                });
+        });
+}
+
+fn spellcheck_results_text(misses: &[SpellMiss]) -> String {
+    misses
+        .iter()
+        .map(|miss| {
+            let suggestions = if miss.suggestions.is_empty() {
+                "no suggestions".to_owned()
+            } else {
+                miss.suggestions.join(", ")
+            };
+            format!(
+                "{} [{}..{}]: {}",
+                miss.word, miss.chars.start, miss.chars.end, suggestions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(result) = state.latest_offline_cache.clone() else {
+        return;
+    };
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Offline copy")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new(result.cache_id.chars().take(12).collect::<String>())
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Close offline copy")
+                        .clicked()
+                    {
+                        state.latest_offline_cache = None;
+                    }
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy cached page text")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(result.text.clone());
+                        state.capture_notice = Some("Offline copy text copied".to_owned());
+                    }
+                    if result.archive_mhtml.is_some()
+                        && ui
+                            .small_button("MHTML")
+                            .on_hover_text("Save cached offline MHTML archive")
+                            .clicked()
+                    {
+                        state.save_latest_offline_cache_archive();
+                    }
+                    if result.pdf_snapshot.is_some()
+                        && ui
+                            .small_button("PDF")
+                            .on_hover_text("Open cached PDF snapshot")
+                            .clicked()
+                    {
+                        state.open_latest_offline_cache_pdf();
+                    }
+                });
+            });
+
+            let page = if result.title.trim().is_empty() {
+                result.url.as_str()
+            } else {
+                result.title.as_str()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(page)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} chars from tab {} / {}",
+                        result.text.chars().count(),
+                        result.tab_index,
+                        result.engine.label()
+                    ))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+                );
+                if let Some(cached_ms) = result.cached_ms {
+                    ui.label(
+                        RichText::new(format!("cached {cached_ms}"))
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+                if let Some(viewport) = &result.viewport {
+                    ui.label(
+                        RichText::new(format!(
+                            "viewport PNG {}x{}",
+                            viewport.width, viewport.height
+                        ))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                    );
+                }
+                if let Some(archive) = &result.archive_mhtml {
+                    ui.label(
+                        RichText::new(format!("MHTML {} bytes", archive.bytes))
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+                if !result.resources.is_empty() {
+                    let blocked = result
+                        .resources
+                        .iter()
+                        .filter(|resource| !resource.allowed)
+                        .count();
+                    ui.label(
+                        RichText::new(format!(
+                            "resources {} / {} blocked",
+                            result.resources.len(),
+                            blocked
+                        ))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                    );
+                }
+            });
+            if let Some(viewport) = &result.viewport {
+                if let Some(texture) =
+                    offline_cache_viewport_texture(ui.ctx(), &result.cache_id, viewport)
+                {
+                    let size = offline_cache_viewport_display_size(ui, viewport);
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
+                            .sense(Sense::hover()),
+                    )
+                    .on_hover_text("Cached viewport image");
+                }
+            }
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(result.text.as_str())
+                            .size(Style::SMALL)
+                            .color(Style::TEXT),
+                    );
+                });
+        });
+}
+
+fn offline_cache_viewport_texture(
+    ctx: &egui::Context,
+    cache_id: &str,
+    viewport: &OfflineCacheViewportImage,
+) -> Option<TextureHandle> {
+    let data_sig = offline_cache_viewport_data_sig(&viewport.data_base64);
+    let key = egui::Id::new(("browser-offline-cache-viewport", cache_id, data_sig));
+    if let Some(cached) = ctx.data_mut(|data| data.get_temp::<OfflineCacheViewportTexture>(key)) {
+        if cached.data_sig == data_sig {
+            return cached.texture;
+        }
+    }
+
+    let texture = base64::engine::general_purpose::STANDARD
+        .decode(viewport.data_base64.as_str())
+        .ok()
+        .and_then(|bytes| crate::chooser::decode_png_rgba(&bytes))
+        .filter(|image| image.size == [viewport.width, viewport.height])
+        .map(|image| {
+            ctx.load_texture(
+                format!("browser-offline-cache-viewport::{cache_id}"),
+                image,
+                TextureOptions::LINEAR,
+            )
+        });
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            key,
+            OfflineCacheViewportTexture {
+                data_sig,
+                texture: texture.clone(),
+            },
+        );
+    });
+    texture
+}
+
+fn offline_cache_viewport_data_sig(data_base64: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data_base64.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn offline_cache_viewport_display_size(
+    ui: &egui::Ui,
+    viewport: &OfflineCacheViewportImage,
+) -> egui::Vec2 {
+    let natural = egui::vec2(viewport.width as f32, viewport.height as f32);
+    if natural.x <= 0.0 || natural.y <= 0.0 {
+        return egui::vec2(1.0, 1.0);
+    }
+    let max = egui::vec2(ui.available_width().max(1.0), 180.0);
+    let scale = (max.x / natural.x).min(max.y / natural.y).min(1.0);
+    natural * scale
+}
+
+fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(status) = state.latest_security_update.clone() else {
+        return;
+    };
+    if !status.is_actionable() {
+        return;
+    }
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Browser engine update")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new(status.state.as_str())
+                        .size(Style::SMALL)
+                        .color(match status.tone() {
+                            ChipTone::Ok => Style::OK,
+                            ChipTone::Warn | ChipTone::Danger => Style::WARN,
+                            ChipTone::Info => Style::ACCENT,
+                            ChipTone::Neutral => Style::TEXT_DIM,
+                        }),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Hide browser engine update status")
+                        .clicked()
+                    {
+                        state.latest_security_update = None;
+                    }
+                });
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("updater {}", status.updater_state))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                if let Some(chromium) = &status.expected_chromium_version {
+                    ui.label(
+                        RichText::new(format!("Chromium {chromium}"))
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+                if let Some(runtime) = &status.active_runtime {
+                    ui.label(
+                        RichText::new(runtime)
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+            });
+
+            for detail in [
+                status.last_update_error.as_deref(),
+                status.last_error.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ui.label(RichText::new(detail).size(Style::SMALL).color(Style::WARN));
+            }
+        });
+}
+
+fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    let read_aloud = state
+        .latest_read_aloud_status
+        .clone()
+        .filter(BrowserReadAloudStatus::is_actionable);
+    let voice = state
+        .latest_voice_command_status
+        .clone()
+        .filter(BrowserVoiceCommandStatus::is_actionable);
+    if read_aloud.is_none() && voice.is_none() {
+        return;
+    }
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Browser speech")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Hide browser speech status")
+                        .clicked()
+                    {
+                        state.latest_read_aloud_status = None;
+                        state.latest_voice_command_status = None;
+                    }
+                });
+            });
+
+            if let Some(status) = read_aloud {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(status.chip_label())
+                            .size(Style::SMALL)
+                            .color(speech_status_color(status.tone())),
+                    );
+                    if let Some(title) = status.last_title.as_deref() {
+                        ui.label(
+                            RichText::new(title)
+                                .size(Style::SMALL)
+                                .color(Style::TEXT_DIM),
+                        );
+                    } else if let Some(url) = status.last_url.as_deref() {
+                        ui.label(RichText::new(url).size(Style::SMALL).color(Style::TEXT_DIM));
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{} accepted / {} spoken / {} rejected",
+                            status.accepted, status.spoken, status.rejected
+                        ))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                    );
+                });
+                if let Some(error) = status.last_error.as_deref() {
+                    ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                }
+            }
+
+            if let Some(status) = voice {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(status.chip_label())
+                            .size(Style::SMALL)
+                            .color(speech_status_color(status.tone())),
+                    );
+                    if let Some(url) = status.last_url.as_deref() {
+                        ui.label(RichText::new(url).size(Style::SMALL).color(Style::TEXT_DIM));
+                    }
+                    if let Some(chars) = status.last_transcript_chars {
+                        ui.label(
+                            RichText::new(format!("{chars} transcript chars"))
+                                .size(Style::SMALL)
+                                .color(Style::TEXT_DIM),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{} accepted / {} transcribed / {} rejected",
+                            status.accepted, status.transcribed, status.rejected
+                        ))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                    );
+                });
+                if let Some(error) = status.last_error.as_deref() {
+                    ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                }
+            }
+        });
+}
+
+fn speech_status_color(tone: ChipTone) -> egui::Color32 {
+    match tone {
+        ChipTone::Ok => Style::OK,
+        ChipTone::Warn | ChipTone::Danger => Style::WARN,
+        ChipTone::Info => Style::ACCENT,
+        ChipTone::Neutral => Style::TEXT_DIM,
+    }
+}
+
 fn fit_rect_preserving_aspect(outer: egui::Rect, content_size: egui::Vec2) -> egui::Rect {
     if content_size.x <= 0.0
         || content_size.y <= 0.0
@@ -5562,6 +11158,152 @@ fn fit_rect_preserving_aspect(outer: egui::Rect, content_size: egui::Vec2) -> eg
     let scale = (outer.width() / content_size.x).min(outer.height() / content_size.y);
     let size = content_size * scale;
     egui::Rect::from_center_size(outer.center(), size)
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+fn browser_accessibility_id() -> egui::Id {
+    egui::Id::new("browser-accessibility-status")
+}
+
+fn browser_page_accessibility_id() -> egui::Id {
+    egui::Id::new("browser-accessibility-page")
+}
+
+fn tab_accessibility_state(tab: &Tab) -> String {
+    if tab.idle_suspended {
+        return "idle suspended".to_owned();
+    }
+    match tab.session.state() {
+        SessionState::Loading => "loading".to_owned(),
+        SessionState::Live => {
+            if tab.texture.is_some() {
+                "live".to_owned()
+            } else {
+                "live, waiting for first painted frame".to_owned()
+            }
+        }
+        SessionState::Crashed { reason } => format!("crashed: {reason}"),
+    }
+}
+
+fn tab_accessibility_tools(tab: &Tab) -> String {
+    let mut tools = Vec::new();
+    if tab.muted {
+        tools.push("muted");
+    }
+    if tab.force_dark {
+        tools.push("force dark");
+    }
+    if tab.reader_mode {
+        tools.push("reader mode");
+    }
+    if tab.user_scripts {
+        tools.push("userscripts");
+    }
+    if tab.page_focused {
+        tools.push("page keyboard focus");
+    }
+    if tools.is_empty() {
+        "no page tools enabled".to_owned()
+    } else {
+        tools.join(", ")
+    }
+}
+
+fn tab_accessibility_summary(tab: &Tab) -> String {
+    let nav = tab.session.nav();
+    let title = tab.session.title().trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
+    let url = nav.url.trim();
+    let url = if url.is_empty() {
+        "no committed URL"
+    } else {
+        url
+    };
+    let security = if url.starts_with("https://") {
+        "secure"
+    } else if url.starts_with("http://") {
+        "not secure"
+    } else {
+        "local or internal"
+    };
+    format!(
+        "{} page, {title}, {url}, {}, {}, container {}, display target {}, {}",
+        tab.engine.label(),
+        tab_accessibility_state(tab),
+        security,
+        tab.container.label(),
+        tab.display_target.label(),
+        tab_accessibility_tools(tab)
+    )
+}
+
+fn browser_gate_notice(state: &WebState) -> &str {
+    const DEFAULT_NOTICE: &str = "No live browser helper session is attached on this build or seat";
+    #[cfg(feature = "live-helper")]
+    {
+        state.gate_notice.as_deref().unwrap_or(DEFAULT_NOTICE)
+    }
+    #[cfg(not(feature = "live-helper"))]
+    {
+        let _ = state;
+        DEFAULT_NOTICE
+    }
+}
+
+fn browser_accessibility_summary(state: &WebState) -> String {
+    match state.tabs.get(state.active) {
+        Some(tab) => format!(
+            "Browser. Active tab {} of {}. {}",
+            state.active + 1,
+            state.tabs.len(),
+            tab_accessibility_summary(tab)
+        ),
+        None => {
+            let notice = browser_gate_notice(state);
+            format!("Browser. No active tab. {notice}")
+        }
+    }
+}
+
+fn install_browser_accessibility(ctx: &egui::Context, rect: egui::Rect, state: &WebState) {
+    let summary = browser_accessibility_summary(state);
+    let _ = ctx.accesskit_node_builder(browser_accessibility_id(), |node| {
+        node.set_role(egui::accesskit::Role::Status);
+        node.set_live(egui::accesskit::Live::Polite);
+        node.set_label("Browser status");
+        node.set_value(summary);
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
+fn install_browser_page_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    tab: &Tab,
+    page_focused: bool,
+) {
+    let mut value = tab_accessibility_summary(tab);
+    if page_focused {
+        value.push_str(". Keyboard input is focused into the page canvas.");
+    } else {
+        value.push_str(". Click the page canvas to focus keyboard input.");
+    }
+    let _ = ctx.accesskit_node_builder(browser_page_accessibility_id(), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label("Browser page");
+        node.set_value(value);
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
 }
 
 fn browser_input_event(
@@ -5652,6 +11394,83 @@ fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool)
     });
 }
 
+/// Render a daemon-owned private offline copy when the live page is unavailable.
+fn cached_offline_body(
+    ui: &mut egui::Ui,
+    result: &BrowserOfflineCacheResult,
+    unavailable_reason: Option<&str>,
+) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Offline copy")
+                        .size(Style::HEADING)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new(result.cache_id.chars().take(12).collect::<String>())
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy cached page text")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(result.text.clone());
+                    }
+                });
+            });
+            if let Some(reason) = unavailable_reason
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(format!("Live page unavailable: {reason}"))
+                        .size(Style::SMALL)
+                        .color(Style::WARN),
+                );
+            }
+            ui.add_space(Style::SP_XS);
+            let page = if result.title.trim().is_empty() {
+                result.url.as_str()
+            } else {
+                result.title.as_str()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(page)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} chars from {}",
+                        result.text.chars().count(),
+                        result.engine.label()
+                    ))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+                );
+            });
+            ui.add_space(Style::SP_S);
+            egui::ScrollArea::vertical()
+                .max_height(ui.available_height())
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(result.text.as_str())
+                            .size(Style::SMALL)
+                            .color(Style::TEXT),
+                    );
+                });
+        });
+}
+
 /// The no-session `EmptyState` — an honest gated caption (or the NAMED live-path
 /// notice when one is passed), never a placeholder page.
 fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
@@ -5690,16 +11509,18 @@ fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
 /// behaviour). Engine choice lives in the tab strip as explicit `+ Servo` and
 /// `+ CEF` buttons. A context-gated item renders **disabled** and an absent
 /// capability is **omitted** (§7): no page-text Copy, no keyboard chord table —
-/// and the BROWSER-DD-8 **Power mode** is a named honest gate in View until its
-/// toggle lands. The
+/// and BROWSER-DD-8 **Power mode** is a real View toggle that reveals the
+/// separate Power menu while keeping unfinished power tools honestly captioned. The
 /// status cluster shows the active engine, committed URL, session lifecycle,
 /// http/https security state, and ad-filter shield (BOOKMARKS-7).
 mod menubar {
     use super::{
         bookmark_add_body, chat_share_body, local_hostname, publish, publish_browser_send_tab,
-        publish_browser_share, BrowserEngine, BrowserSendTabTarget, BrowserShareTarget,
-        ContainerProfile, CupsPrintSettings, DisplayTarget, WebState, ACTION_BOOKMARKS_ADD,
-        ACTION_CHAT_SEND, DEFAULT_DENIED_PERMISSIONS,
+        publish_browser_share, BrowserEngine, BrowserPasskeyStatus, BrowserReadAloudStatus,
+        BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
+        BrowserVoiceCommandStatus, ContainerProfile, CupsPrintSettings, DevicePermissionKind,
+        DeviceProfile, DisplayTarget, UserAgentOverride, WebState, ACTION_BOOKMARKS_ADD,
+        ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
     };
     use mde_egui::egui;
     use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
@@ -5741,6 +11562,8 @@ mod menubar {
         ToggleVerticalTabs,
         /// Toggle the browser download manager drawer.
         ToggleDownloads,
+        /// Toggle BROWSER-DD-8 power mode.
+        TogglePowerMode,
         /// Cycle the active tab through the built-in container profiles.
         CycleContainer,
         /// Cycle the active tab through display-placement targets.
@@ -5759,6 +11582,20 @@ mod menubar {
         ToggleForceDark,
         /// Toggle reader-mode styling for the active tab.
         ToggleReaderMode,
+        /// Toggle the shell-curated userscript bundle for the active tab.
+        ToggleUserScripts,
+        /// Run offline Hunspell over helper-extracted page text.
+        CheckSpelling,
+        /// Send helper-extracted page text to the platform TTS owner.
+        ReadAloud,
+        /// Send helper-extracted page text to the private translation owner.
+        TranslatePage,
+        /// Save helper-extracted page text to the private offline/mesh cache owner.
+        SaveOfflineCopy,
+        /// Ask the platform STT owner to capture and interpret a browser command.
+        VoiceCommand,
+        /// Ask the platform STT owner to capture dictation for the active page.
+        Dictate,
         /// Capture the latest painted browser viewport to a PNG file.
         CaptureViewport,
         /// Capture the current full helper surface to a PNG file.
@@ -5781,6 +11618,32 @@ mod menubar {
         SavePdf,
         /// Open the last saved PDF in a CEF tab using Chromium's built-in viewer.
         OpenLastPdf,
+        /// Open the active page through the helper's `view-source:` navigation.
+        OpenViewSource,
+        /// Open the CEF helper's loopback Chromium DevTools portal.
+        OpenChromiumDevtools,
+        /// Export active-page scrape metadata files into the shared Transfers queue.
+        ExportActivePageScrape,
+        /// Export the active tab's observed media/image request manifest.
+        ExportMediaManifest,
+        /// Queue observed media/image asset download requests through Transfers.
+        DownloadObservedMedia,
+        /// Queue only observed image asset download requests through Transfers.
+        DownloadObservedImages,
+        /// Cycle the active tab's page-visible User-Agent override.
+        CycleUserAgent,
+        /// Cycle the active tab's page-visible device profile override.
+        CycleDeviceProfile,
+        /// Prompt and deny camera access for the active site.
+        PromptCameraPermission,
+        /// Prompt and deny microphone access for the active site.
+        PromptMicrophonePermission,
+        /// Prompt and deny location access for the active site.
+        PromptLocationPermission,
+        /// Prompt and deny notification access for the active site.
+        PromptNotificationsPermission,
+        /// Prompt and deny clipboard access for the active site.
+        PromptClipboardPermission,
         /// Reset the active tab's transient browser state to the new-tab surface.
         ClearCurrentTabData,
         /// Toggle the current first-party site's ad/tracker blocking policy.
@@ -5797,6 +11660,8 @@ mod menubar {
         SendInChat,
         /// Hand the live page to the platform peer-share owner.
         ShareToPeer,
+        /// Hand the live page to the platform phone-share owner.
+        ShareToPhone,
         /// Hand the live page to the platform email owner.
         ShareToEmail,
         /// Hand the live page to the platform QR owner.
@@ -5848,12 +11713,20 @@ mod menubar {
         active_downloads: usize,
         /// Total browser-originated transfer count.
         total_downloads: usize,
+        /// BROWSER-DD-8 power mode is enabled.
+        power_mode: bool,
         /// Active tab audio is muted.
         audio_muted: bool,
         /// Active tab force-dark styling is enabled.
         force_dark: bool,
         /// Active tab reader-mode styling is enabled.
         reader_mode: bool,
+        /// Active tab has the shell-curated userscript bundle enabled.
+        user_scripts: bool,
+        /// Active tab page-visible User-Agent override.
+        user_agent: UserAgentOverride,
+        /// Active tab page-visible device profile override.
+        device_profile: DeviceProfile,
         /// Active tab has a retained helper frame that can be captured.
         can_capture: bool,
         /// Drag-to-select region capture is armed.
@@ -5880,6 +11753,14 @@ mod menubar {
         url: String,
         /// The session lifecycle, or `None` with no tab.
         state: Option<SessionState>,
+        /// Daemon-owned read-aloud/TTS status for this node.
+        read_aloud_status: Option<BrowserReadAloudStatus>,
+        /// Daemon-owned voice-command/STT status for this node.
+        voice_command_status: Option<BrowserVoiceCommandStatus>,
+        /// Daemon-owned passkey/WebAuthn ceremony status for this node.
+        passkey_status: Option<BrowserPasskeyStatus>,
+        /// Daemon-owned CEF runtime updater status for this node.
+        security_update: Option<BrowserSecurityUpdateStatus>,
     }
 
     impl Snapshot {
@@ -5922,14 +11803,22 @@ mod menubar {
                     downloads_open: state.downloads_open,
                     active_downloads,
                     total_downloads,
+                    power_mode: state.power_mode,
                     audio_muted: tab.muted,
                     force_dark: tab.force_dark,
                     reader_mode: tab.reader_mode,
+                    user_scripts: tab.user_scripts,
+                    user_agent: tab.user_agent,
+                    device_profile: tab.device_profile,
                     can_capture: tab.last_frame.is_some(),
                     capture_region_mode: state.capture_region_mode,
                     print_settings_open: state.print_settings_open,
                     print_options_active: print_options_active(&state.cups_settings),
                     has_saved_pdf: state.last_saved_pdf.is_some(),
+                    read_aloud_status: state.latest_read_aloud_status.clone(),
+                    voice_command_status: state.latest_voice_command_status.clone(),
+                    passkey_status: state.latest_passkey_status.clone(),
+                    security_update: state.latest_security_update.clone(),
                 }
             });
         let (active_downloads, total_downloads) = state.download_counts();
@@ -5938,6 +11827,7 @@ mod menubar {
         snap.page_zoom_percent = state.page_zoom_percent;
         snap.find_open = state.find_open;
         snap.downloads_open = state.downloads_open;
+        snap.power_mode = state.power_mode;
         snap.capture_region_mode = state.capture_region_mode;
         snap.print_settings_open = state.print_settings_open;
         snap.print_options_active = print_options_active(&state.cups_settings);
@@ -5946,6 +11836,10 @@ mod menubar {
         snap.total_downloads = total_downloads;
         snap.safe_browsing = state.safe_browsing_summary();
         snap.site_data = state.site_data_summary();
+        snap.read_aloud_status = state.latest_read_aloud_status.clone();
+        snap.voice_command_status = state.latest_voice_command_status.clone();
+        snap.passkey_status = state.latest_passkey_status.clone();
+        snap.security_update = state.latest_security_update.clone();
         snap
     }
 
@@ -5961,13 +11855,15 @@ mod menubar {
 
     /// Build the Browser menus from live state (§6/§7): Page (the address-bar open
     /// seam), Edit (Copy URL), View (Reload, zoom, find, and the named BROWSER-DD-8
-    /// Power-mode gate), History (Back/Forward, gated on the live history),
+    /// Power-mode toggle), History (Back/Forward, gated on the live history),
     /// Privacy, and Bookmarks (add plus share). New-tab engine choice is handled by
     /// the tab strip's explicit `+ Servo` and `+ CEF` buttons.
     fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
         let has_page = s.has_page();
         let can_tools = s.has_tab && !s.crashed;
-        vec![
+        let can_chromium_devtools = can_tools && s.active_engine == Some(BrowserEngine::Cef);
+        let can_prompt_device_api = has_page && s.current_site.is_some();
+        let mut menus = vec![
             Menu::new(
                 "Page",
                 vec![Entry::Item(
@@ -6004,6 +11900,17 @@ mod menubar {
                             "Show Downloads"
                         },
                     )),
+                    Entry::Item(
+                        Item::new(
+                            MenuAction::TogglePowerMode,
+                            if s.power_mode {
+                                "Disable Power Mode"
+                            } else {
+                                "Enable Power Mode"
+                            },
+                        )
+                        .enabled(can_tools),
+                    ),
                     Entry::Item(
                         Item::new(
                             MenuAction::CycleContainer,
@@ -6073,6 +11980,35 @@ mod menubar {
                         .enabled(can_tools),
                     ),
                     Entry::Item(
+                        Item::new(
+                            MenuAction::ToggleUserScripts,
+                            if s.user_scripts {
+                                "Disable Curated Userscripts"
+                            } else {
+                                "Enable Curated Userscripts"
+                            },
+                        )
+                        .enabled(can_tools),
+                    ),
+                    Entry::Caption(format!(
+                        "Userscript library: {CURATED_USERSCRIPT_COUNT} bundled site fixups"
+                    )),
+                    Entry::Item(
+                        Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_tools),
+                    ),
+                    Entry::Item(Item::new(MenuAction::ReadAloud, "Read Aloud").enabled(can_tools)),
+                    Entry::Item(
+                        Item::new(MenuAction::TranslatePage, "Translate Page").enabled(can_tools),
+                    ),
+                    Entry::Item(
+                        Item::new(MenuAction::SaveOfflineCopy, "Save Offline Copy")
+                            .enabled(can_tools),
+                    ),
+                    Entry::Item(
+                        Item::new(MenuAction::VoiceCommand, "Voice Command").enabled(can_tools),
+                    ),
+                    Entry::Item(Item::new(MenuAction::Dictate, "Dictate").enabled(can_tools)),
+                    Entry::Item(
                         Item::new(MenuAction::CaptureViewport, "Capture Viewport")
                             .enabled(can_tools && s.can_capture),
                     ),
@@ -6131,12 +12067,6 @@ mod menubar {
                     Entry::Item(
                         Item::new(MenuAction::OpenLastPdf, "Open Last PDF")
                             .enabled(s.has_saved_pdf),
-                    ),
-                    Entry::Separator,
-                    Entry::Caption(
-                        "Power mode \u{2014} not yet available (BROWSER-DD-8: the dev/power \
-                         toolset lands behind one toggle)."
-                            .to_owned(),
                     ),
                 ],
             ),
@@ -6212,6 +12142,9 @@ mod menubar {
                         Item::new(MenuAction::ShareToPeer, "Share to Peer").enabled(has_page),
                     ),
                     Entry::Item(
+                        Item::new(MenuAction::ShareToPhone, "Share to Phone").enabled(has_page),
+                    ),
+                    Entry::Item(
                         Item::new(MenuAction::ShareToEmail, "Share to Email").enabled(has_page),
                     ),
                     Entry::Item(Item::new(MenuAction::ShareToQr, "Share as QR").enabled(has_page)),
@@ -6225,7 +12158,121 @@ mod menubar {
                     ),
                 ],
             ),
-        ]
+        ];
+        if s.power_mode {
+            menus.insert(
+                3,
+                Menu::new(
+                    "Power",
+                    vec![
+                        Entry::Item(
+                            Item::new(MenuAction::OpenViewSource, "View Source").enabled(has_page),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::OpenChromiumDevtools, "Chromium DevTools")
+                                .enabled(can_chromium_devtools),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::ExportActivePageScrape, "Export Page Scrape")
+                                .enabled(has_page),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::ExportMediaManifest, "Export Media Manifest")
+                                .enabled(has_page),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::DownloadObservedMedia, "Download Observed Media")
+                                .enabled(has_page),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::DownloadObservedImages, "Download Observed Images")
+                                .enabled(has_page),
+                        ),
+                        Entry::Item(
+                            Item::new(
+                                MenuAction::CycleUserAgent,
+                                format!("User Agent: {}", s.user_agent.label()),
+                            )
+                            .enabled(can_tools),
+                        ),
+                        Entry::Item(
+                            Item::new(
+                                MenuAction::CycleDeviceProfile,
+                                format!("Device Profile: {}", s.device_profile.label()),
+                            )
+                            .enabled(can_tools),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::PromptCameraPermission, "Prompt Camera Access")
+                                .enabled(can_prompt_device_api),
+                        ),
+                        Entry::Item(
+                            Item::new(
+                                MenuAction::PromptMicrophonePermission,
+                                "Prompt Microphone Access",
+                            )
+                            .enabled(can_prompt_device_api),
+                        ),
+                        Entry::Item(
+                            Item::new(MenuAction::PromptLocationPermission, "Prompt Location")
+                                .enabled(can_prompt_device_api),
+                        ),
+                        Entry::Item(
+                            Item::new(
+                                MenuAction::PromptNotificationsPermission,
+                                "Prompt Notifications",
+                            )
+                            .enabled(can_prompt_device_api),
+                        ),
+                        Entry::Item(
+                            Item::new(
+                                MenuAction::PromptClipboardPermission,
+                                "Prompt Clipboard Access",
+                            )
+                            .enabled(can_prompt_device_api),
+                        ),
+                        Entry::Separator,
+                        Entry::Caption(
+                            "UA/device overrides change page-visible navigator, screen, and \
+                             viewport metadata; native request-header and compositor emulation \
+                             remain follow-up hooks."
+                                .to_owned(),
+                        ),
+                        Entry::Caption(
+                            "Device API prompts record explicit per-site deny decisions for camera, \
+                             microphone, location, notifications, and clipboard while helper \
+                             enforcement remains default-deny."
+                                .to_owned(),
+                        ),
+                        Entry::Caption(
+                            "Chromium DevTools opens the CEF helper's loopback debugging portal; \
+                             active CEF pages are selected from Chromium's target list when \
+                             discovery is available. Servo DevTools remain a follow-up hook."
+                                .to_owned(),
+                        ),
+                        Entry::Caption(
+                            "Media Manifest exports observed image/media/HLS/DASH requests; \
+                             Download Observed Media queues per-asset request files through \
+                             Transfers, Download Observed Images narrows that batch to every \
+                             observed image candidate, and blocked resources are marked for \
+                             Power-mode ignore-blocking retrieval. Transfers now performs native \
+                             direct/HLS/DASH fetches; native device emulation remains a follow-up \
+                             tool."
+                                .to_owned(),
+                        ),
+                        Entry::Caption(
+                            "Export Page Scrape requests visible text plus DOM links/headings, writes \
+                             bounded crawl seed/article/crawl-manifest JSON/CSV/Markdown artifacts, \
+                             and submits the files through Transfers; the daemon executes bounded \
+                             same-origin depth-1 crawl packages while deeper recursive discovery remains \
+                             open."
+                                .to_owned(),
+                        ),
+                    ],
+                ),
+            );
+        }
+        menus
     }
 
     /// The lifecycle status chip: Loading (a load in flight or the pre-first-frame
@@ -6328,8 +12375,54 @@ mod menubar {
         if s.has_tab && s.reader_mode {
             chips.push(StatusChip::new("Reader", ChipTone::Info));
         }
+        if s.has_tab && s.user_scripts {
+            chips.push(StatusChip::new("Userscripts", ChipTone::Info));
+        }
+        if s.has_tab {
+            let user_agent = s.user_agent.chip();
+            if !user_agent.is_empty() {
+                chips.push(StatusChip::new(user_agent, ChipTone::Warn));
+            }
+            let device_profile = s.device_profile.chip();
+            if !device_profile.is_empty() {
+                chips.push(StatusChip::new(device_profile, ChipTone::Warn));
+            }
+        }
+        if s.power_mode {
+            chips.push(StatusChip::new("Power", ChipTone::Warn));
+        }
         if s.print_settings_open || s.print_options_active {
             chips.push(StatusChip::new("Print", ChipTone::Neutral));
+        }
+        if let Some(status) = &s.read_aloud_status {
+            if status.is_visible() {
+                chips.push(StatusChip::new(status.chip_label(), status.tone()));
+            }
+        }
+        if let Some(status) = &s.voice_command_status {
+            if status.is_visible() {
+                chips.push(StatusChip::new(status.chip_label(), status.tone()));
+            }
+        }
+        if let Some(status) = &s.passkey_status {
+            if status.ceremony_is_visible() {
+                chips.push(StatusChip::new(status.chip_label(), status.tone()));
+            }
+            if status.hardware_is_visible() {
+                chips.push(StatusChip::new(
+                    status.hardware_chip_label(),
+                    status.hardware_tone(),
+                ));
+            }
+            if status.ctaphid_is_visible() {
+                chips.push(StatusChip::new(
+                    status.ctaphid_chip_label(),
+                    status.ctaphid_tone(),
+                ));
+            }
+        }
+        if let Some(status) = &s.security_update {
+            chips.push(StatusChip::new(status.chip_label(), status.tone()));
         }
         chips.push(state_chip(s));
         if let Some(chip) = security_chip(s) {
@@ -6416,6 +12509,7 @@ mod menubar {
                     state.refresh_downloads();
                 }
             }
+            MenuAction::TogglePowerMode => state.toggle_power_mode(),
             MenuAction::CycleContainer => state.cycle_active_tab_container(),
             MenuAction::CycleDisplayTarget => state.cycle_active_tab_display_target(),
             MenuAction::ZoomIn => state.zoom_in(),
@@ -6425,6 +12519,17 @@ mod menubar {
             MenuAction::ToggleAudioMute => state.toggle_active_tab_mute(),
             MenuAction::ToggleForceDark => state.toggle_active_tab_force_dark(),
             MenuAction::ToggleReaderMode => state.toggle_active_tab_reader_mode(),
+            MenuAction::ToggleUserScripts => state.toggle_active_tab_user_scripts(),
+            MenuAction::CheckSpelling => state.request_active_spellcheck(),
+            MenuAction::ReadAloud => state.request_active_read_aloud(),
+            MenuAction::TranslatePage => state.request_active_translate_page(),
+            MenuAction::SaveOfflineCopy => state.request_active_offline_cache(),
+            MenuAction::VoiceCommand => {
+                state.request_active_voice_command(super::VoiceCommandMode::Command)
+            }
+            MenuAction::Dictate => {
+                state.request_active_voice_command(super::VoiceCommandMode::Dictation)
+            }
             MenuAction::CaptureViewport => state.capture_active_viewport(),
             MenuAction::CaptureFullPage => state.capture_active_full_page(),
             MenuAction::CaptureMhtml => state.capture_active_mhtml(),
@@ -6442,6 +12547,29 @@ mod menubar {
             MenuAction::TogglePrintSettings => state.toggle_print_settings(),
             MenuAction::SavePdf => state.save_active_page_pdf(),
             MenuAction::OpenLastPdf => state.open_last_saved_pdf(),
+            MenuAction::OpenViewSource => state.open_active_view_source(),
+            MenuAction::OpenChromiumDevtools => state.open_chromium_devtools(),
+            MenuAction::ExportActivePageScrape => state.export_active_page_metadata_scrape(),
+            MenuAction::ExportMediaManifest => state.export_active_media_manifest(),
+            MenuAction::DownloadObservedMedia => state.download_observed_media_assets(),
+            MenuAction::DownloadObservedImages => state.download_observed_image_assets(),
+            MenuAction::CycleUserAgent => state.cycle_active_tab_user_agent(),
+            MenuAction::CycleDeviceProfile => state.cycle_active_tab_device_profile(),
+            MenuAction::PromptCameraPermission => {
+                state.prompt_active_device_permission(DevicePermissionKind::Camera)
+            }
+            MenuAction::PromptMicrophonePermission => {
+                state.prompt_active_device_permission(DevicePermissionKind::Microphone)
+            }
+            MenuAction::PromptLocationPermission => {
+                state.prompt_active_device_permission(DevicePermissionKind::Location)
+            }
+            MenuAction::PromptNotificationsPermission => {
+                state.prompt_active_device_permission(DevicePermissionKind::Notifications)
+            }
+            MenuAction::PromptClipboardPermission => {
+                state.prompt_active_device_permission(DevicePermissionKind::Clipboard)
+            }
             MenuAction::ClearCurrentTabData => state.clear_active_session_data(),
             MenuAction::ToggleSiteBlocking => {
                 let enabled = !state.active_site_blocking_enabled();
@@ -6476,6 +12604,17 @@ mod menubar {
                     publish_browser_share(
                         state.bus_root.as_deref(),
                         BrowserShareTarget::Peer,
+                        &url,
+                        &title,
+                    );
+                }
+            }
+            MenuAction::ShareToPhone => {
+                let (url, title) = page_url_title(state);
+                if !url.trim().is_empty() {
+                    publish_browser_share(
+                        state.bus_root.as_deref(),
+                        BrowserShareTarget::Phone,
                         &url,
                         &title,
                     );
@@ -6545,9 +12684,11 @@ mod menubar {
     mod tests {
         use super::{
             apply, build_menus, build_status, reload_label, security_chip, show, state_chip,
-            truncate_url, BrowserEngine, ContainerProfile, DisplayTarget, MenuAction, Snapshot,
-            WebState, URL_MAX,
+            truncate_url, BrowserEngine, BrowserPasskeyStatus, BrowserReadAloudStatus,
+            BrowserVoiceCommandStatus, ContainerProfile, DeviceProfile, DisplayTarget, MenuAction,
+            Snapshot, UserAgentOverride, WebState, URL_MAX,
         };
+        use crate::web::BrowserSecurityUpdateStatus;
         use mde_egui::egui;
         use mde_egui::menubar::Entry;
         use mde_egui::{ChipTone, Style};
@@ -6572,9 +12713,13 @@ mod menubar {
                 downloads_open: false,
                 active_downloads: 0,
                 total_downloads: 0,
+                power_mode: false,
                 audio_muted: false,
                 force_dark: false,
                 reader_mode: false,
+                user_scripts: false,
+                user_agent: UserAgentOverride::Default,
+                device_profile: DeviceProfile::Default,
                 can_capture: true,
                 capture_region_mode: false,
                 print_settings_open: false,
@@ -6591,6 +12736,10 @@ mod menubar {
                     .to_owned(),
                 url: "https://example.com/path".to_owned(),
                 state: Some(SessionState::Live),
+                read_aloud_status: None,
+                voice_command_status: None,
+                passkey_status: None,
+                security_update: None,
             }
         }
 
@@ -6646,17 +12795,138 @@ mod menubar {
         }
 
         #[test]
-        fn the_view_menu_names_the_power_mode_gate() {
+        fn the_view_menu_toggles_power_mode_without_showing_power_tools_by_default() {
             let view = build_menus(&https_page())
                 .into_iter()
                 .find(|m| m.title == "View")
                 .expect("View menu present");
+            let power = view
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == MenuAction::TogglePowerMode => Some(i),
+                    _ => None,
+                })
+                .expect("Power mode toggle is in View");
+            assert_eq!(power.label, "Enable Power Mode");
             assert!(
-                view.entries.iter().any(|e| matches!(
-                    e,
-                    Entry::Caption(c) if c.contains("Power mode") && c.contains("BROWSER-DD-8")
-                )),
-                "the BROWSER-DD-8 Power-mode gate is a named honest caption"
+                build_menus(&https_page())
+                    .iter()
+                    .all(|menu| menu.title != "Power"),
+                "the Power menu stays hidden until the operator enables Power mode"
+            );
+        }
+
+        #[test]
+        fn power_mode_adds_power_menu_and_status_chip() {
+            let snap = Snapshot {
+                power_mode: true,
+                ..https_page()
+            };
+            let menus = build_menus(&snap);
+            let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+            assert_eq!(
+                titles,
+                [
+                    "Page",
+                    "Edit",
+                    "View",
+                    "Power",
+                    "History",
+                    "Privacy",
+                    "Bookmarks"
+                ]
+            );
+            let power = menus
+                .iter()
+                .find(|m| m.title == "Power")
+                .expect("Power menu present");
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::OpenViewSource && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::OpenChromiumDevtools && !i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::ExportActivePageScrape && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::ExportMediaManifest && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::DownloadObservedMedia
+                    && i.label == "Download Observed Media"
+                    && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::DownloadObservedImages
+                    && i.label == "Download Observed Images"
+                    && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::CycleUserAgent
+                    && i.label == "User Agent: Default User Agent"
+                    && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::CycleDeviceProfile
+                    && i.label == "Device Profile: Default Device"
+                    && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::PromptCameraPermission
+                    && i.label == "Prompt Camera Access"
+                    && i.enabled
+            )));
+            assert!(power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::PromptClipboardPermission
+                    && i.label == "Prompt Clipboard Access"
+                    && i.enabled
+            )));
+            let chips = build_status(&snap);
+            assert!(
+                chips.iter().any(|chip| chip.text == "Power"),
+                "Power mode is visible in the status cluster"
+            );
+
+            let cef_snap = Snapshot {
+                power_mode: true,
+                active_engine: Some(BrowserEngine::Cef),
+                ..https_page()
+            };
+            let cef_power = build_menus(&cef_snap)
+                .into_iter()
+                .find(|m| m.title == "Power")
+                .expect("CEF Power menu present");
+            assert!(cef_power.entries.iter().any(|e| matches!(
+                e,
+                Entry::Item(i) if i.id == MenuAction::OpenChromiumDevtools && i.enabled
+            )));
+
+            let ua_snap = Snapshot {
+                power_mode: true,
+                user_agent: UserAgentOverride::AndroidChrome,
+                device_profile: DeviceProfile::Phone,
+                ..https_page()
+            };
+            let chips = build_status(&ua_snap);
+            assert!(
+                chips.iter().any(|chip| chip.text == "UA Mobile"),
+                "UA override is visible in the status cluster"
+            );
+            assert!(
+                chips.iter().any(|chip| chip.text == "Device Phone"),
+                "device override is visible in the status cluster"
             );
         }
 
@@ -6684,6 +12954,8 @@ mod menubar {
             assert!(item(MenuAction::OpenFind).enabled);
             assert_eq!(item(MenuAction::ToggleDownloads).label, "Show Downloads");
             assert!(item(MenuAction::ToggleDownloads).enabled);
+            assert_eq!(item(MenuAction::TogglePowerMode).label, "Enable Power Mode");
+            assert!(item(MenuAction::TogglePowerMode).enabled);
             assert_eq!(item(MenuAction::ToggleAudioMute).label, "Mute Tab");
             assert!(item(MenuAction::ToggleAudioMute).enabled);
             assert_eq!(item(MenuAction::ToggleForceDark).label, "Enable Force Dark");
@@ -6693,6 +12965,21 @@ mod menubar {
                 "Enable Reader Mode"
             );
             assert!(item(MenuAction::ToggleReaderMode).enabled);
+            assert_eq!(
+                item(MenuAction::ToggleUserScripts).label,
+                "Enable Curated Userscripts"
+            );
+            assert!(item(MenuAction::ToggleUserScripts).enabled);
+            assert_eq!(item(MenuAction::CheckSpelling).label, "Check Spelling");
+            assert!(item(MenuAction::CheckSpelling).enabled);
+            assert_eq!(item(MenuAction::ReadAloud).label, "Read Aloud");
+            assert!(item(MenuAction::ReadAloud).enabled);
+            assert_eq!(item(MenuAction::TranslatePage).label, "Translate Page");
+            assert!(item(MenuAction::TranslatePage).enabled);
+            assert_eq!(item(MenuAction::VoiceCommand).label, "Voice Command");
+            assert!(item(MenuAction::VoiceCommand).enabled);
+            assert_eq!(item(MenuAction::Dictate).label, "Dictate");
+            assert!(item(MenuAction::Dictate).enabled);
             assert!(item(MenuAction::CaptureViewport).enabled);
             assert!(item(MenuAction::CaptureFullPage).enabled);
             assert!(item(MenuAction::CaptureMhtml).enabled);
@@ -6730,6 +13017,7 @@ mod menubar {
                 audio_muted: true,
                 force_dark: true,
                 reader_mode: true,
+                user_scripts: true,
                 ..https_page()
             };
             let texts = build_status(&zoomed)
@@ -6744,11 +13032,13 @@ mod menubar {
             assert!(texts.contains(&"Muted".to_owned()));
             assert!(texts.contains(&"Dark".to_owned()));
             assert!(texts.contains(&"Reader".to_owned()));
+            assert!(texts.contains(&"Userscripts".to_owned()));
 
             let muted = Snapshot {
                 audio_muted: true,
                 force_dark: true,
                 reader_mode: true,
+                user_scripts: true,
                 ..https_page()
             };
             let view = build_menus(&muted)
@@ -6782,6 +13072,15 @@ mod menubar {
                 })
                 .expect("reader item present");
             assert_eq!(disable_reader.label, "Disable Reader Mode");
+            let disable_scripts = view
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == MenuAction::ToggleUserScripts => Some(i),
+                    _ => None,
+                })
+                .expect("userscripts item present");
+            assert_eq!(disable_scripts.label, "Disable Curated Userscripts");
         }
 
         #[test]
@@ -6814,6 +13113,218 @@ mod menubar {
                 build_menus(&snap).iter().all(|m| m.title != "Engine"),
                 "future-tab engine choice lives in the tab strip, not a menu"
             );
+        }
+
+        #[test]
+        fn speech_owner_status_chips_reflect_retained_daemon_state() {
+            let idle = Snapshot {
+                read_aloud_status: Some(BrowserReadAloudStatus {
+                    node: "node-a".to_owned(),
+                    last_title: None,
+                    last_url: None,
+                    state: "idle".to_owned(),
+                    last_error: None,
+                    accepted: 0,
+                    spoken: 0,
+                    rejected: 0,
+                    last_request_ms: None,
+                    updated_ms: 1,
+                }),
+                ..https_page()
+            };
+            assert!(
+                !build_status(&idle).iter().any(|c| c.text == "TTS idle"),
+                "idle workers do not crowd the status cluster"
+            );
+
+            let active = Snapshot {
+                read_aloud_status: Some(BrowserReadAloudStatus {
+                    node: "node-a".to_owned(),
+                    last_title: Some("Example".to_owned()),
+                    last_url: Some("https://example.test/".to_owned()),
+                    state: "speaking".to_owned(),
+                    last_error: None,
+                    accepted: 1,
+                    spoken: 0,
+                    rejected: 0,
+                    last_request_ms: Some(2),
+                    updated_ms: 3,
+                }),
+                voice_command_status: Some(BrowserVoiceCommandStatus {
+                    node: "node-a".to_owned(),
+                    last_url: Some("https://example.test/".to_owned()),
+                    last_mode: Some("dictation".to_owned()),
+                    state: "unavailable".to_owned(),
+                    last_error: Some("STT runtime is not configured".to_owned()),
+                    accepted: 1,
+                    transcribed: 0,
+                    rejected: 0,
+                    last_transcript_chars: None,
+                    last_request_ms: Some(4),
+                    updated_ms: 5,
+                }),
+                ..https_page()
+            };
+            let chips = build_status(&active);
+            assert!(chips
+                .iter()
+                .any(|c| { c.text == "TTS speaking" && c.tone == ChipTone::Info }));
+            assert!(chips
+                .iter()
+                .any(|c| { c.text == "Dictation unavailable" && c.tone == ChipTone::Warn }));
+        }
+
+        #[test]
+        fn passkey_owner_status_chip_reflects_retained_daemon_state() {
+            let idle = Snapshot {
+                passkey_status: Some(BrowserPasskeyStatus {
+                    node: "node-a".to_owned(),
+                    last_request_id: None,
+                    last_host: None,
+                    last_ceremony: None,
+                    last_rp_id: None,
+                    state: "idle".to_owned(),
+                    mirrored: false,
+                    last_error: None,
+                    accepted: 0,
+                    rejected: 0,
+                    last_pending_ms: None,
+                    hardware_state: "unknown".to_owned(),
+                    hardware_key_count: 0,
+                    hardware_readable_count: 0,
+                    hardware_ctaphid_state: "unknown".to_owned(),
+                    hardware_ctaphid_init_frame_count: 0,
+                    hardware_probe_ms: 0,
+                    updated_ms: 1,
+                }),
+                ..https_page()
+            };
+            assert!(
+                !build_status(&idle).iter().any(|c| c.text == "Passkey idle"),
+                "idle passkey worker state does not crowd the status cluster"
+            );
+
+            let hardware_ready = Snapshot {
+                passkey_status: Some(BrowserPasskeyStatus {
+                    node: "node-a".to_owned(),
+                    last_request_id: None,
+                    last_host: None,
+                    last_ceremony: None,
+                    last_rp_id: None,
+                    state: "idle".to_owned(),
+                    mirrored: false,
+                    last_error: None,
+                    accepted: 0,
+                    rejected: 0,
+                    last_pending_ms: None,
+                    hardware_state: "ready".to_owned(),
+                    hardware_key_count: 1,
+                    hardware_readable_count: 1,
+                    hardware_ctaphid_state: "init_request_ready".to_owned(),
+                    hardware_ctaphid_init_frame_count: 1,
+                    hardware_probe_ms: 2,
+                    updated_ms: 3,
+                }),
+                ..https_page()
+            };
+            assert!(build_status(&hardware_ready)
+                .iter()
+                .any(|c| { c.text == "Security key ready" && c.tone == ChipTone::Ok }));
+            assert!(build_status(&hardware_ready)
+                .iter()
+                .any(|c| { c.text == "CTAP INIT framed" && c.tone == ChipTone::Info }));
+
+            let pending = Snapshot {
+                passkey_status: Some(BrowserPasskeyStatus {
+                    node: "node-a".to_owned(),
+                    last_request_id: Some("01HPASSKEY".to_owned()),
+                    last_host: Some("node-a".to_owned()),
+                    last_ceremony: Some("create".to_owned()),
+                    last_rp_id: Some("example.test".to_owned()),
+                    state: "pending".to_owned(),
+                    mirrored: true,
+                    last_error: None,
+                    accepted: 1,
+                    rejected: 0,
+                    last_pending_ms: Some(2),
+                    hardware_state: "present_permission_denied".to_owned(),
+                    hardware_key_count: 1,
+                    hardware_readable_count: 0,
+                    hardware_ctaphid_state: "unavailable".to_owned(),
+                    hardware_ctaphid_init_frame_count: 0,
+                    hardware_probe_ms: 2,
+                    updated_ms: 3,
+                }),
+                ..https_page()
+            };
+            assert!(build_status(&pending)
+                .iter()
+                .any(|c| { c.text == "Passkey pending" && c.tone == ChipTone::Info }));
+            assert!(build_status(&pending)
+                .iter()
+                .any(|c| { c.text == "Security key blocked" && c.tone == ChipTone::Warn }));
+
+            let created = Snapshot {
+                passkey_status: Some(BrowserPasskeyStatus {
+                    node: "node-a".to_owned(),
+                    last_request_id: Some("01HPASSKEY2".to_owned()),
+                    last_host: Some("node-a".to_owned()),
+                    last_ceremony: Some("create".to_owned()),
+                    last_rp_id: Some("example.test".to_owned()),
+                    state: "created".to_owned(),
+                    mirrored: true,
+                    last_error: None,
+                    accepted: 2,
+                    rejected: 0,
+                    last_pending_ms: Some(4),
+                    hardware_state: "unavailable".to_owned(),
+                    hardware_key_count: 0,
+                    hardware_readable_count: 0,
+                    hardware_ctaphid_state: "unavailable".to_owned(),
+                    hardware_ctaphid_init_frame_count: 0,
+                    hardware_probe_ms: 4,
+                    updated_ms: 5,
+                }),
+                ..https_page()
+            };
+            assert!(build_status(&created)
+                .iter()
+                .any(|c| { c.text == "Passkey created" && c.tone == ChipTone::Ok }));
+            assert!(build_status(&created)
+                .iter()
+                .any(|c| { c.text == "Security key unavailable" && c.tone == ChipTone::Neutral }));
+        }
+
+        #[test]
+        fn security_update_status_chip_reflects_retained_daemon_state() {
+            let snap = Snapshot {
+                security_update: Some(BrowserSecurityUpdateStatus {
+                    node: "node-a".to_owned(),
+                    state: "mismatch".to_owned(),
+                    expected_cef_version: Some("149.0.6".to_owned()),
+                    expected_chromium_version: Some("149.0.7827.201".to_owned()),
+                    expected_channel: Some("stable".to_owned()),
+                    active_runtime: Some("/opt/mde/cef".to_owned()),
+                    installed_version: Some("old".to_owned()),
+                    installed_chromium: Some("old".to_owned()),
+                    libcef_present: true,
+                    updater_state: "failed".to_owned(),
+                    last_update_ms: Some(123),
+                    last_update_exit_code: Some(69),
+                    last_update_error: Some("installer unavailable".to_owned()),
+                    last_error: Some(
+                        "active CEF runtime does not match packaged manifest".to_owned(),
+                    ),
+                    updated_ms: 124,
+                }),
+                ..https_page()
+            };
+
+            let chips = build_status(&snap);
+
+            assert!(chips
+                .iter()
+                .any(|c| { c.text == "CEF mismatch" && c.tone == ChipTone::Warn }));
         }
 
         #[test]
@@ -6882,6 +13393,7 @@ mod menubar {
                     ("Add Bookmark", true),
                     ("Send in Chat", true),
                     ("Share to Peer", true),
+                    ("Share to Phone", true),
                     ("Share to Email", true),
                     ("Share as QR", true),
                     ("Send Tab to Node", true),
@@ -7126,6 +13638,7 @@ mod menubar {
                 MenuAction::Forward,
                 MenuAction::Reload,
                 MenuAction::OpenAddress,
+                MenuAction::TogglePowerMode,
                 MenuAction::CycleContainer,
                 MenuAction::CycleDisplayTarget,
                 MenuAction::ZoomIn,
@@ -7135,6 +13648,12 @@ mod menubar {
                 MenuAction::ToggleAudioMute,
                 MenuAction::ToggleForceDark,
                 MenuAction::ToggleReaderMode,
+                MenuAction::ToggleUserScripts,
+                MenuAction::CheckSpelling,
+                MenuAction::ReadAloud,
+                MenuAction::TranslatePage,
+                MenuAction::VoiceCommand,
+                MenuAction::Dictate,
                 MenuAction::CaptureViewport,
                 MenuAction::CaptureFullPage,
                 MenuAction::CaptureMhtml,
@@ -7144,6 +13663,19 @@ mod menubar {
                 MenuAction::CaptureRegion,
                 MenuAction::PrintPage,
                 MenuAction::SavePdf,
+                MenuAction::OpenViewSource,
+                MenuAction::OpenChromiumDevtools,
+                MenuAction::ExportActivePageScrape,
+                MenuAction::ExportMediaManifest,
+                MenuAction::DownloadObservedMedia,
+                MenuAction::DownloadObservedImages,
+                MenuAction::CycleUserAgent,
+                MenuAction::CycleDeviceProfile,
+                MenuAction::PromptCameraPermission,
+                MenuAction::PromptMicrophonePermission,
+                MenuAction::PromptLocationPermission,
+                MenuAction::PromptNotificationsPermission,
+                MenuAction::PromptClipboardPermission,
                 MenuAction::ClearCurrentTabData,
                 MenuAction::ToggleSiteBlocking,
                 MenuAction::ForgetSitePermissions,
@@ -7152,6 +13684,7 @@ mod menubar {
                 MenuAction::OpenBookmarksManager,
                 MenuAction::SendInChat,
                 MenuAction::ShareToPeer,
+                MenuAction::ShareToPhone,
                 MenuAction::ShareToEmail,
                 MenuAction::ShareToQr,
                 MenuAction::SendTabToNode,
@@ -7274,6 +13807,93 @@ mod tests {
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         !prims.is_empty()
+    }
+
+    fn run_panel_output(
+        ctx: &egui::Context,
+        state: &mut WebState,
+        input: egui::RawInput,
+    ) -> egui::FullOutput {
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
+        })
+    }
+
+    fn accesskit_nodes(
+        out: &egui::FullOutput,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone()
+    }
+
+    #[test]
+    fn curated_userscript_bundle_contains_the_first_site_fixups() {
+        let bundle = curated_userscript_bundle();
+        assert_eq!(CURATED_USERSCRIPT_COUNT, 100);
+        assert_eq!(CURATED_USERSCRIPTS.len(), CURATED_USERSCRIPT_COUNT);
+        for needle in [
+            "youtube-focus",
+            "npr-reader",
+            "spotify-quiet",
+            "wikipedia-readable",
+            "nytimes-clean-reader",
+            "github-readable",
+            "amazon-clean-shop",
+            "allrecipes-clean-recipe",
+            "coursera-readable",
+            "mde-browser-userscript-style",
+            "__mdeBrowserUserScriptsObserver",
+        ] {
+            assert!(
+                bundle.contains(needle),
+                "missing userscript payload: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_page_exports_accesskit_status_and_clickable_page_region() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        state.tabs[state.active].force_dark = true;
+        state.tabs[state.active].reader_mode = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let nodes = accesskit_nodes(&out);
+        let browser = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser status"))
+            .expect("browser status accesskit node");
+        assert_eq!(browser.role(), egui::accesskit::Role::Status);
+        assert_eq!(browser.live(), Some(egui::accesskit::Live::Polite));
+        let browser_value = browser.value().expect("browser status value");
+        assert!(browser_value.contains("Active tab 1 of 1"));
+        assert!(browser_value.contains("Example"));
+        assert!(browser_value.contains("https://example.test/"));
+        assert!(browser_value.contains("force dark"));
+        assert!(browser_value.contains("reader mode"));
+
+        let page = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser page"))
+            .expect("browser page accesskit node");
+        assert_eq!(page.role(), egui::accesskit::Role::Button);
+        let page_value = page.value().expect("browser page value");
+        assert!(
+            !page_value.contains("CEF"),
+            "test session defaults to Servo"
+        );
+        assert!(page_value.contains("Click the page canvas to focus keyboard input"));
     }
 
     fn write_helper_event(stream: &UnixStream, msg: &mde_web_preview_client::EventMsg) {
@@ -7856,7 +14476,11 @@ mod tests {
         let path = dir.path().join("not-pdf.pdf");
         std::fs::write(&path, b"not a pdf\n").expect("bad fixture");
         let mut state = WebState::default();
-        state.last_saved_pdf = Some(path.clone());
+        state.last_saved_pdf = Some(SavedPdf {
+            path: path.clone(),
+            url: "https://example.test/".to_owned(),
+            title: "Example".to_owned(),
+        });
 
         state.open_last_saved_pdf();
 
@@ -8014,6 +14638,35 @@ mod tests {
         assert!(state.tabs[state.active].reader_mode);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleReaderMode);
         assert!(!state.tabs[state.active].reader_mode);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleUserScripts);
+        assert!(state.tabs[state.active].user_scripts);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleUserScripts);
+        assert!(!state.tabs[state.active].user_scripts);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::CycleUserAgent);
+        assert_eq!(
+            state.tabs[state.active].user_agent,
+            UserAgentOverride::DesktopChrome
+        );
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::CycleUserAgent);
+        assert_eq!(
+            state.tabs[state.active].user_agent,
+            UserAgentOverride::AndroidChrome
+        );
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::CycleDeviceProfile);
+        assert_eq!(
+            state.tabs[state.active].device_profile,
+            DeviceProfile::Phone
+        );
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::CycleDeviceProfile);
+        assert_eq!(
+            state.tabs[state.active].device_profile,
+            DeviceProfile::Tablet
+        );
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::CheckSpelling);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Spelling: reading page text")
+        );
         let print_dir = tempfile::tempdir().expect("print spool dir");
         let print_path = state
             .queue_active_page_cups_print_to_dir(print_dir.path())
@@ -8112,6 +14765,82 @@ mod tests {
         assert!(
             controls.iter().any(|msg| matches!(
                 msg,
+                mde_web_preview_client::ControlMsg::SetUserScripts {
+                    enabled: true,
+                    bundle,
+                } if bundle.contains("youtube-focus")
+                    && bundle.contains("npr-reader")
+                    && bundle.contains("spotify-quiet")
+            )),
+            "enabling curated userscripts must reach the helper with the bundled library: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetUserScripts {
+                    enabled: false,
+                    bundle,
+                } if bundle.is_empty()
+            )),
+            "disabling curated userscripts must clear the helper bundle: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetUserAgent { user_agent }
+                    if user_agent.contains("X11; Linux x86_64")
+                        && user_agent.contains("Chrome/126")
+            )),
+            "desktop UA override must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetUserAgent { user_agent }
+                    if user_agent.contains("Android 14")
+                        && user_agent.contains("Mobile Safari")
+            )),
+            "mobile UA override must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetDeviceProfile {
+                    profile,
+                    width: 390,
+                    height: 844,
+                    scale_percent: 300,
+                    touch: true,
+                } if profile == "phone"
+            )),
+            "phone device profile must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetDeviceProfile {
+                    profile,
+                    width: 820,
+                    height: 1180,
+                    scale_percent: 200,
+                    touch: true,
+                } if profile == "tablet"
+            )),
+            "tablet device profile must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::RequestPageText {
+                    id: 1,
+                    max_bytes: 65536,
+                }
+            )),
+            "spellcheck must request bounded page text from the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
                 mde_web_preview_client::ControlMsg::SavePdf { path }
                     if path == &print_path_text
             )),
@@ -8123,6 +14852,231 @@ mod tests {
                 mde_web_preview_client::ControlMsg::SavePdf { path } if path == &pdf_path_text
             )),
             "save-as-PDF must reach the helper with the chosen path: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn spellcheck_notice_summarizes_results_without_hunspell() {
+        assert_eq!(
+            spellcheck_notice(Ok(Vec::new())),
+            "Spelling: no misspellings found"
+        );
+        assert_eq!(
+            spellcheck_notice(Ok(vec![SpellMiss {
+                chars: 0..5,
+                word: "wrold".to_owned(),
+                suggestions: vec!["world".to_owned()],
+            }])),
+            "Spelling: 1 possible misspelling; first: wrold -> world"
+        );
+        assert_eq!(
+            spellcheck_notice(Err("hunspell not installed".to_owned())),
+            "Spelling unavailable: hunspell not installed"
+        );
+    }
+
+    #[test]
+    fn browser_spellcheck_result_model_keeps_misses_and_copy_text() {
+        let misses = vec![
+            SpellMiss {
+                chars: 0..5,
+                word: "wrold".to_owned(),
+                suggestions: vec!["world".to_owned(), "would".to_owned()],
+            },
+            SpellMiss {
+                chars: 12..18,
+                word: "msh".to_owned(),
+                suggestions: Vec::new(),
+            },
+        ];
+        let result = BrowserSpellcheckResult::from_result(3, Ok(misses.clone()));
+        assert!(result.is_visible());
+        assert_eq!(result.tab_index, 3);
+        assert_eq!(result.summary(), "2 possible misspellings");
+        assert_eq!(result.misses, misses);
+        assert_eq!(
+            spellcheck_results_text(&result.misses),
+            "wrold [0..5]: world, would\nmsh [12..18]: no suggestions"
+        );
+
+        let unavailable =
+            BrowserSpellcheckResult::from_result(4, Err("hunspell not installed".to_owned()));
+        assert!(unavailable.is_visible());
+        assert_eq!(unavailable.tab_index, 4);
+        assert_eq!(
+            unavailable.summary(),
+            "Spellcheck unavailable: hunspell not installed"
+        );
+    }
+
+    #[test]
+    fn spellcheck_highlight_words_are_bounded_and_deduped() {
+        let words = spellcheck_highlight_words(&[
+            SpellMiss {
+                chars: 0..5,
+                word: " wrold ".to_owned(),
+                suggestions: Vec::new(),
+            },
+            SpellMiss {
+                chars: 7..12,
+                word: "wrold".to_owned(),
+                suggestions: Vec::new(),
+            },
+            SpellMiss {
+                chars: 13..14,
+                word: "x".to_owned(),
+                suggestions: Vec::new(),
+            },
+            SpellMiss {
+                chars: 15..20,
+                word: "msh".to_owned(),
+                suggestions: Vec::new(),
+            },
+        ]);
+        assert_eq!(words, vec!["msh".to_owned(), "wrold".to_owned()]);
+    }
+
+    #[test]
+    fn spellcheck_occurrence_index_counts_prior_matching_rows() {
+        let misses = vec![
+            SpellMiss {
+                chars: 0..5,
+                word: "wrold".to_owned(),
+                suggestions: Vec::new(),
+            },
+            SpellMiss {
+                chars: 8..12,
+                word: "msh".to_owned(),
+                suggestions: Vec::new(),
+            },
+            SpellMiss {
+                chars: 16..21,
+                word: "WROLD".to_owned(),
+                suggestions: Vec::new(),
+            },
+        ];
+
+        assert_eq!(spellcheck_occurrence_index(&misses, 0), 0);
+        assert_eq!(spellcheck_occurrence_index(&misses, 1), 0);
+        assert_eq!(spellcheck_occurrence_index(&misses, 2), 1);
+        assert_eq!(spellcheck_occurrence_index(&misses, 99), 0);
+    }
+
+    #[test]
+    fn browser_spellcheck_poll_retains_latest_page_text_result_and_marks_page() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let (tx, rx) = mpsc::channel();
+        state.spellcheck.in_flight = Some(7);
+        state.spellcheck.tab_index = Some(0);
+        state.spellcheck.rx = Some(rx);
+        tx.send((
+            7,
+            Ok(vec![SpellMiss {
+                chars: 3..8,
+                word: "wrold".to_owned(),
+                suggestions: vec!["world".to_owned()],
+            }]),
+        ))
+        .expect("send spell result");
+
+        state.poll_spellcheck();
+
+        let result = state
+            .latest_spellcheck
+            .as_ref()
+            .expect("stored spellcheck result");
+        assert_eq!(result.misses.len(), 1);
+        assert_eq!(result.misses[0].word, "wrold");
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Spelling: 1 possible misspelling; first: wrold -> world")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetSpellcheckHighlights { words }
+                    if words == &vec!["wrold".to_owned()]
+            )),
+            "spellcheck misses must be sent back to the helper as page highlights: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn browser_spellcheck_correction_sends_selected_suggestion_to_result_tab() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        state.apply_spellcheck_correction(0, "wrold", "world");
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Spelling: replaced wrold with world")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::ApplySpellcheckCorrection {
+                    word,
+                    replacement,
+                } if word == "wrold" && replacement == "world"
+            )),
+            "selected spelling suggestions must reach the helper: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn browser_spellcheck_correction_all_sends_selected_suggestion_to_result_tab() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        state.apply_spellcheck_correction_all(0, "wrold", "world");
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Spelling: replaced all wrold with world")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::ApplySpellcheckCorrectionAll {
+                    word,
+                    replacement,
+                } if word == "wrold" && replacement == "world"
+            )),
+            "all-occurrence spelling suggestions must reach the helper: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn browser_spellcheck_correction_at_sends_selected_occurrence_to_result_tab() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        state.apply_spellcheck_correction_at(0, "wrold", "world", 2);
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Spelling: replaced occurrence 3 of wrold with world")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::ApplySpellcheckCorrectionAt {
+                    word,
+                    replacement,
+                    occurrence,
+                } if word == "wrold" && replacement == "world" && *occurrence == 2
+            )),
+            "indexed spelling suggestions must reach the helper: {controls:?}"
         );
     }
 
@@ -8728,6 +15682,9 @@ mod tests {
             muted: false,
             force_dark: false,
             reader_mode: false,
+            user_scripts: false,
+            user_agent: UserAgentOverride::Default,
+            device_profile: DeviceProfile::Default,
             last_activity: Instant::now(),
             idle_suspended: false,
             page_focused: false,
@@ -9258,6 +16215,183 @@ mod tests {
     }
 
     #[test]
+    fn browser_permission_prompt_body_records_default_deny_decision() {
+        assert_eq!(
+            ACTION_BROWSER_PERMISSION_PROMPT,
+            "action/browser/permission-prompt"
+        );
+        let body = browser_permission_prompt_body(
+            DevicePermissionKind::Microphone,
+            BrowserEngine::Cef,
+            "https://meet.example/",
+            "Meeting",
+            "meet.example",
+            123,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_permission_prompt");
+        assert_eq!(v["permission"], "microphone");
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["enforcement"], "helper_default_deny");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://meet.example/");
+        assert_eq!(v["title"], "Meeting");
+        assert_eq!(v["site"], "meet.example");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["updated_ms"], 123);
+    }
+
+    #[test]
+    fn browser_power_mode_view_source_opens_source_in_a_foreground_tab() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let ctx = egui::Context::default();
+
+        super::menubar::apply(
+            &ctx,
+            &mut state,
+            super::menubar::MenuAction::TogglePowerMode,
+        );
+        assert!(state.power_mode);
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::OpenViewSource);
+
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Servo,
+                url: "view-source:https://example.test/".to_owned(),
+            })
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Power mode: opening page source")
+        );
+    }
+
+    #[test]
+    fn browser_power_mode_device_permission_prompt_records_default_deny_handoff() {
+        let (session, _helper, _writer) = live_page_session();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        run_until_texture(&mut state);
+        state.power_mode = true;
+        let ctx = egui::Context::default();
+
+        super::menubar::apply(
+            &ctx,
+            &mut state,
+            super::menubar::MenuAction::PromptCameraPermission,
+        );
+
+        assert!(
+            state
+                .active_site_permission_summary()
+                .is_some_and(|summary| summary
+                    .contains("example.test: camera denied; helper default deny remains active")),
+            "prompt history should be reflected in the active-site permission summary"
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Camera prompt denied for example.test; helper default deny remains active")
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let entries = persist
+            .list_since(ACTION_BROWSER_PERMISSION_PROMPT, None)
+            .expect("read permission prompt action");
+        assert_eq!(entries.len(), 1);
+        let body = entries[0].body.as_deref().expect("permission prompt body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("permission prompt body JSON");
+        assert_eq!(v["op"], "browser_permission_prompt");
+        assert_eq!(v["permission"], "camera");
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["enforcement"], "helper_default_deny");
+        assert_eq!(v["engine"], "servo");
+        assert_eq!(v["site"], "example.test");
+        assert_eq!(v["url"], "https://example.test/");
+    }
+
+    #[test]
+    fn chromium_devtools_target_json_selects_active_page_frontend() {
+        let body = serde_json::json!([
+            {
+                "type": "page",
+                "url": "https://other.example/",
+                "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/OTHER",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/OTHER"
+            },
+            {
+                "type": "page",
+                "url": "https://example.test/app",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/ACTIVE"
+            }
+        ])
+        .to_string();
+
+        let selected =
+            chromium_devtools_frontend_from_list("https://example.test/app", &body).unwrap();
+
+        assert_eq!(
+            selected.as_deref(),
+            Some("http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/ACTIVE")
+        );
+        let fallback =
+            chromium_devtools_frontend_from_list("https://missing.example/", &body).unwrap();
+        assert_eq!(
+            fallback.as_deref(),
+            Some("http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/OTHER")
+        );
+    }
+
+    #[test]
+    fn browser_power_mode_chromium_devtools_opens_cef_debug_portal() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        state.power_mode = true;
+        state.tabs[state.active].engine = BrowserEngine::Cef;
+        let ctx = egui::Context::default();
+
+        super::menubar::apply(
+            &ctx,
+            &mut state,
+            super::menubar::MenuAction::OpenChromiumDevtools,
+        );
+
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Cef,
+                url: CEF_DEVTOOLS_URL.to_owned(),
+            })
+        );
+        assert!(
+            state
+                .capture_notice
+                .as_deref()
+                .is_some_and(|notice| notice
+                    .starts_with("Power mode: opening Chromium DevTools target list")),
+            "unexpected DevTools notice: {:?}",
+            state.capture_notice
+        );
+
+        state.tabs[state.active].engine = BrowserEngine::Servo;
+        super::menubar::apply(
+            &ctx,
+            &mut state,
+            super::menubar::MenuAction::OpenChromiumDevtools,
+        );
+        assert_eq!(state.take_open_request(), None);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Chromium DevTools requires a live CEF tab")
+        );
+    }
+
+    #[test]
     fn browser_session_sync_body_carries_tabs_settings_and_downloads() {
         assert_eq!(ACTION_BROWSER_SESSION_SYNC, "action/browser/session-sync");
         let (session, _helper, _writer) = live_page_session();
@@ -9268,9 +16402,13 @@ mod tests {
         state.tabs[state.active].display_target = DisplayTarget::Secondary;
         state.tabs[state.active].muted = true;
         state.tabs[state.active].force_dark = true;
+        state.tabs[state.active].user_scripts = true;
+        state.tabs[state.active].user_agent = UserAgentOverride::AndroidChrome;
+        state.tabs[state.active].device_profile = DeviceProfile::Phone;
         state.vertical_tabs = true;
         state.page_zoom_percent = 125;
         state.downloads_open = true;
+        state.power_mode = true;
         state.speed_dial = vec![SpeedDialEntry::new(
             "Ops",
             "https://ops.mesh/",
@@ -9289,6 +16427,7 @@ mod tests {
         assert_eq!(v["settings"]["vertical_tabs"], true);
         assert_eq!(v["settings"]["page_zoom_percent"], 125);
         assert_eq!(v["settings"]["downloads_open"], true);
+        assert_eq!(v["settings"]["power_mode"], true);
         assert_eq!(v["settings"]["speed_dial"][0]["label"], "Ops");
         assert_eq!(v["settings"]["speed_dial"][0]["url"], "https://ops.mesh/");
         assert_eq!(
@@ -9301,6 +16440,9 @@ mod tests {
         assert_eq!(v["tabs"][0]["url"], "https://example.test/");
         assert_eq!(v["tabs"][0]["muted"], true);
         assert_eq!(v["tabs"][0]["force_dark"], true);
+        assert_eq!(v["tabs"][0]["user_scripts"], true);
+        assert_eq!(v["tabs"][0]["user_agent"], "android_chrome");
+        assert_eq!(v["tabs"][0]["device_profile"], "phone");
         assert_eq!(v["downloads"][0]["method"], "browser_download");
         assert_eq!(v["downloads"][0]["state"], "running");
         assert_eq!(v["downloads"][0]["progress"], 42);
@@ -9317,6 +16459,7 @@ mod tests {
                 "page_zoom_percent": 135,
                 "find_open": true,
                 "downloads_open": true,
+                "power_mode": true,
                 "speed_dial": [
                     {"label": "Ops", "url": "https://ops.mesh/", "hint": "Open ops"},
                     {"label": "", "url": "https://drop.example/", "hint": "drop"},
@@ -9343,6 +16486,7 @@ mod tests {
         assert_eq!(state.page_zoom_percent, 135);
         assert!(state.find_open);
         assert!(state.downloads_open);
+        assert!(state.power_mode);
         assert_eq!(
             state.speed_dial,
             vec![SpeedDialEntry::new("Ops", "https://ops.mesh/", "Open ops")]
@@ -9620,6 +16764,7 @@ mod tests {
         let body = msgs[0].body.as_deref().expect("dial body");
         let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
         assert_eq!(v["peer"], "+15551234567");
+        assert_eq!(v["host"], local_hostname());
         assert_eq!(v["source"], "browser");
         assert_eq!(v["url"], "tel:+15551234567");
         assert_eq!(
@@ -9660,6 +16805,8 @@ mod tests {
             serde_json::from_str(msgs[0].body.as_deref().expect("mailto body"))
                 .expect("valid JSON");
         assert_eq!(mail["op"], "browser_protocol_handoff");
+        assert_eq!(mail["source"], "browser");
+        assert_eq!(mail["host"], local_hostname());
         assert_eq!(mail["scheme"], "mailto");
         assert_eq!(mail["target"], "email");
         assert_eq!(mail["url"], "mailto:ops@example.test?subject=mesh");
@@ -9669,6 +16816,8 @@ mod tests {
                 .expect("valid JSON");
         assert_eq!(magnet["scheme"], "magnet");
         assert_eq!(magnet["target"], "transfers");
+        assert_eq!(magnet["source"], "browser");
+        assert_eq!(magnet["host"], local_hostname());
         assert_eq!(magnet["url"], "magnet:?xt=urn:btih:0123456789abcdef");
         assert_eq!(
             state.capture_notice.as_deref(),
@@ -9694,6 +16843,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::ShareToPeer);
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::ShareToPhone);
         super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::ShareToEmail);
         super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::ShareToQr);
 
@@ -9701,7 +16851,7 @@ mod tests {
         let msgs = persist
             .list_since(ACTION_BROWSER_SHARE, None)
             .expect("list browser share actions");
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.len(), 4);
         let targets: Vec<String> = msgs
             .iter()
             .map(|msg| {
@@ -9713,7 +16863,102 @@ mod tests {
                 v["target"].as_str().expect("target").to_owned()
             })
             .collect();
-        assert_eq!(targets, ["peer", "email", "qr"]);
+        assert_eq!(targets, ["peer", "phone", "email", "qr"]);
+    }
+
+    #[test]
+    fn browser_share_route_result_parser_accepts_daemon_qr_routes() {
+        let body = serde_json::json!({
+            "op": "browser_share_routed",
+            "source": "browser_share",
+            "node": local_hostname(),
+            "request_id": "01HSHARE",
+            "host": local_hostname(),
+            "target": "qr",
+            "url": "https://example.test/share",
+            "title": "Example",
+            "preview": "Example",
+            "routed_ms": 123,
+            "updated_ms": 123,
+        })
+        .to_string();
+
+        let route = parse_share_route_result(&body).expect("valid share route");
+        assert_eq!(route.host, local_hostname());
+        assert_eq!(route.target, BrowserShareTarget::Qr);
+        assert_eq!(route.url, "https://example.test/share");
+        let qr = qr_share_result(route).expect("QR route renders");
+        assert!(
+            qr.modules.len() >= 21,
+            "a real QR matrix is generated, not a placeholder"
+        );
+        assert!(
+            qr.modules.iter().flatten().any(|dark| *dark),
+            "QR matrix has dark modules"
+        );
+
+        let bad_source = body.replace("browser_share", "cloud_share");
+        assert!(parse_share_route_result(&bad_source).is_err());
+        let bad_target = body.replace(r#""target":"qr""#, r#""target":"fax""#);
+        assert!(parse_share_route_result(&bad_target).is_err());
+    }
+
+    #[test]
+    fn browser_qr_share_results_are_displayed_once_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_share_result_topic(&local_hostname());
+        let peer_body = serde_json::json!({
+            "op": "browser_share_routed",
+            "source": "browser_share",
+            "node": local_hostname(),
+            "request_id": "01HPEER",
+            "host": local_hostname(),
+            "target": "peer",
+            "url": "https://example.test/peer",
+            "title": "Peer",
+            "preview": "Peer",
+            "routed_ms": 123,
+            "updated_ms": 123,
+        })
+        .to_string();
+        let qr_body = serde_json::json!({
+            "op": "browser_share_routed",
+            "source": "browser_share",
+            "node": local_hostname(),
+            "request_id": "01HQR",
+            "host": local_hostname(),
+            "target": "qr",
+            "url": "https://example.test/qr",
+            "title": "QR",
+            "preview": "QR",
+            "routed_ms": 124,
+            "updated_ms": 124,
+        })
+        .to_string();
+        persist
+            .write(&topic, Priority::Default, None, Some(&peer_body))
+            .expect("write peer share result");
+        persist
+            .write(&topic, Priority::Default, None, Some(&qr_body))
+            .expect("write qr share result");
+
+        state.poll_share_results();
+        let latest = state.latest_qr_share.as_ref().expect("QR share displayed");
+        assert_eq!(latest.url, "https://example.test/qr");
+        assert_eq!(latest.request_id, "01HQR");
+        assert_eq!(state.capture_notice.as_deref(), Some("QR share ready"));
+
+        state.latest_qr_share = None;
+        state.share_result_last_poll = None;
+        state.poll_share_results();
+        assert!(
+            state.latest_qr_share.is_none(),
+            "cursor prevents replaying the same QR share event"
+        );
     }
 
     #[test]
@@ -9751,6 +16996,1539 @@ mod tests {
             })
             .collect();
         assert_eq!(targets, ["node", "phone"]);
+    }
+
+    #[test]
+    fn browser_read_aloud_requests_page_text_and_publishes_tts_handoff() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+        let ctx = egui::Context::default();
+
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::ReadAloud);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Read aloud: reading page text")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::RequestPageText {
+                    id: 1,
+                    max_bytes: 65536,
+                }
+            )),
+            "read aloud must request bounded page text from the helper: {controls:?}"
+        );
+
+        state.handle_page_text_event(1, "  Hello from the page.  ".to_owned());
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Read aloud: sent page text to TTS")
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(ACTION_BROWSER_READ_ALOUD, None)
+            .expect("list browser read-aloud actions");
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().expect("read-aloud body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_read_aloud");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["engine"], "servo");
+        assert_eq!(v["url"], "https://example.test/");
+        assert_eq!(v["title"], "Example");
+        assert_eq!(v["text"], "Hello from the page.");
+        assert_eq!(v["text_chars"], 20);
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
+    fn browser_read_aloud_body_clamps_page_text_for_the_bus() {
+        let request = ReadAloudRequest {
+            tab_index: 3,
+            engine: BrowserEngine::Cef,
+            url: "https://long.example/".to_owned(),
+            title: "Long".to_owned(),
+        };
+        let body = browser_read_aloud_body(
+            &request,
+            &format!("{}tail", "x".repeat(READ_ALOUD_TEXT_MAX_CHARS)),
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_read_aloud");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(
+            v["text"].as_str().expect("text").chars().count(),
+            READ_ALOUD_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            v["text_chars"],
+            u64::try_from(READ_ALOUD_TEXT_MAX_CHARS).expect("fits")
+        );
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn browser_translate_requests_page_text_and_publishes_private_handoff() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+        let ctx = egui::Context::default();
+
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::TranslatePage);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Translate: reading page text")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::RequestPageText {
+                    id: 1,
+                    max_bytes: 65536,
+                }
+            )),
+            "translate must request bounded page text from the helper: {controls:?}"
+        );
+
+        state.handle_page_text_event(1, "  Bonjour from the page.  ".to_owned());
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Translate: sent page text to translation")
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(ACTION_BROWSER_TRANSLATE, None)
+            .expect("list browser translate actions");
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().expect("translate body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_translate");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["privacy"], "offline_or_mesh_only");
+        assert_eq!(v["engine"], "servo");
+        assert_eq!(v["url"], "https://example.test/");
+        assert_eq!(v["title"], "Example");
+        assert_eq!(v["source_lang"], "auto");
+        assert_eq!(v["target_lang"], "en");
+        assert_eq!(v["text"], "Bonjour from the page.");
+        assert_eq!(v["text_chars"], 22);
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
+    fn browser_translate_body_clamps_page_text_for_the_bus() {
+        let request = TranslateRequest {
+            tab_index: 2,
+            engine: BrowserEngine::Cef,
+            url: "https://long.example/".to_owned(),
+            title: "Long".to_owned(),
+            source_lang: "auto".to_owned(),
+            target_lang: "es".to_owned(),
+        };
+        let body = browser_translate_body(
+            &request,
+            &format!("{}tail", "x".repeat(TRANSLATE_TEXT_MAX_CHARS)),
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_translate");
+        assert_eq!(v["privacy"], "offline_or_mesh_only");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["target_lang"], "es");
+        assert_eq!(
+            v["text"].as_str().expect("text").chars().count(),
+            TRANSLATE_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            v["text_chars"],
+            u64::try_from(TRANSLATE_TEXT_MAX_CHARS).expect("fits")
+        );
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn browser_offline_cache_requests_page_text_and_publishes_private_snapshot() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+        let ctx = egui::Context::default();
+        let pdf_dir = tempfile::tempdir().expect("pdf fixture dir");
+        let pdf_path = pdf_dir.path().join("mde-browser-current.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.7\n% offline cache fixture\n").expect("pdf fixture");
+        state.last_saved_pdf = Some(SavedPdf {
+            path: pdf_path,
+            url: "https://example.test/".to_owned(),
+            title: "Example".to_owned(),
+        });
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 77,
+                url: "https://example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+            },
+        );
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 78,
+                url: "https://www.google-analytics.com/collect".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+            },
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+
+        super::menubar::apply(
+            &ctx,
+            &mut state,
+            super::menubar::MenuAction::SaveOfflineCopy,
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Offline cache: reading page text")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::RequestPageText {
+                    id: 1,
+                    max_bytes: 65536,
+                }
+            )),
+            "offline cache must request bounded page text from the helper: {controls:?}"
+        );
+
+        state.handle_page_text_event(1, "  Cached page body.  ".to_owned());
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Offline cache: saved page snapshot")
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(ACTION_BROWSER_OFFLINE_CACHE, None)
+            .expect("list browser offline-cache actions");
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().expect("offline-cache body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_offline_cache");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["privacy"], "offline_or_mesh_only");
+        assert_eq!(v["engine"], "servo");
+        assert_eq!(v["url"], "https://example.test/");
+        assert_eq!(v["title"], "Example");
+        assert_eq!(v["text"], "Cached page body.");
+        assert_eq!(v["text_chars"], 17);
+        assert_eq!(v["truncated"], false);
+        let viewport = v["viewport_image"]
+            .as_object()
+            .expect("offline cache carries viewport image");
+        assert_eq!(viewport["mime"], "image/png");
+        assert_eq!(viewport["width"], testkit::FAKE_W);
+        assert_eq!(viewport["height"], testkit::FAKE_H);
+        let viewport_bytes = base64::engine::general_purpose::STANDARD
+            .decode(viewport["data"].as_str().expect("viewport data"))
+            .expect("viewport base64 decodes");
+        assert!(viewport_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let archive = v["archive_mhtml"]
+            .as_object()
+            .expect("offline cache carries MHTML archive");
+        assert_eq!(archive["mime"], "multipart/related");
+        assert!(archive["filename"]
+            .as_str()
+            .expect("archive filename")
+            .ends_with(".mhtml"));
+        let archive_bytes = base64::engine::general_purpose::STANDARD
+            .decode(archive["data"].as_str().expect("archive data"))
+            .expect("archive base64 decodes");
+        assert_eq!(
+            archive["bytes"].as_u64().expect("archive bytes") as usize,
+            archive_bytes.len()
+        );
+        let archive_text = String::from_utf8(archive_bytes).expect("archive is utf8");
+        assert!(archive_text.starts_with("MIME-Version: 1.0\r\n"));
+        assert!(archive_text.contains("multipart/related"));
+        assert!(archive_text.contains("Cached page body."));
+        let pdf = v["pdf_snapshot"]
+            .as_object()
+            .expect("offline cache carries current-page PDF snapshot");
+        assert_eq!(pdf["mime"], "application/pdf");
+        assert_eq!(pdf["filename"], "mde-browser-current.pdf");
+        let pdf_bytes = base64::engine::general_purpose::STANDARD
+            .decode(pdf["data"].as_str().expect("pdf data"))
+            .expect("pdf base64 decodes");
+        assert_eq!(
+            pdf["bytes"].as_u64().expect("pdf bytes") as usize,
+            pdf_bytes.len()
+        );
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
+        let resources = v["resource_manifest"]
+            .as_array()
+            .expect("offline cache carries resource manifest");
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0]["url"], "https://example.test/app.js");
+        assert_eq!(resources[0]["resource"], "script");
+        assert_eq!(resources[0]["allowed"], true);
+        assert_eq!(
+            resources[1]["url"],
+            "https://www.google-analytics.com/collect"
+        );
+        assert_eq!(resources[1]["resource"], "script");
+        assert_eq!(resources[1]["allowed"], false);
+    }
+
+    #[test]
+    fn browser_offline_cache_body_clamps_page_text_for_the_bus() {
+        let request = OfflineCacheRequest {
+            tab_index: 4,
+            engine: BrowserEngine::Cef,
+            url: "https://long.example/".to_owned(),
+            title: "Long".to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            pdf_snapshot: None,
+        };
+        let body = browser_offline_cache_body(
+            &request,
+            &format!("{}tail", "x".repeat(OFFLINE_CACHE_TEXT_MAX_CHARS)),
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_offline_cache");
+        assert_eq!(v["privacy"], "offline_or_mesh_only");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(
+            v["text"].as_str().expect("text").chars().count(),
+            OFFLINE_CACHE_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            v["text_chars"],
+            u64::try_from(OFFLINE_CACHE_TEXT_MAX_CHARS).expect("fits")
+        );
+        assert_eq!(v["truncated"], true);
+        let archive = v["archive_mhtml"].as_object().expect("MHTML archive");
+        let archive_bytes = base64::engine::general_purpose::STANDARD
+            .decode(archive["data"].as_str().expect("archive data"))
+            .expect("archive base64 decodes");
+        assert!(
+            archive_bytes.len() <= OFFLINE_CACHE_MHTML_MAX_BYTES,
+            "archive is bounded"
+        );
+    }
+
+    #[test]
+    fn browser_offline_cache_result_parser_is_private_and_bounded() {
+        let viewport = offline_cache_viewport_image(&egui::ColorImage {
+            size: [1, 1],
+            pixels: vec![egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255)],
+        })
+        .expect("small viewport encodes");
+        let archive_request = OfflineCacheRequest {
+            tab_index: 2,
+            engine: BrowserEngine::Cef,
+            url: "https://example.test/".to_owned(),
+            title: "Example".to_owned(),
+            viewport: Some(viewport.clone()),
+            resources: Vec::new(),
+            pdf_snapshot: None,
+        };
+        let archive = offline_cache_mhtml_archive(&archive_request, "Cached archive body", 123)
+            .expect("archive encodes");
+        let pdf_bytes = b"%PDF-1.7\n% cached parser fixture\n";
+        let pdf_data = base64::engine::general_purpose::STANDARD.encode(pdf_bytes);
+        let body = serde_json::json!({
+            "op": "browser_offline_cache_record",
+            "source": "browser_offline_cache",
+            "node": local_hostname(),
+            "cache_id": "cache-123",
+            "host": local_hostname(),
+            "privacy": "offline_or_mesh_only",
+            "tab_index": 2,
+            "engine": "cef",
+            "url": "https://example.test/",
+            "title": "Example",
+            "text": format!("{}tail", "x".repeat(OFFLINE_CACHE_TEXT_MAX_CHARS)),
+            "text_chars": OFFLINE_CACHE_TEXT_MAX_CHARS + 4,
+            "viewport_image": {
+                "mime": viewport.mime,
+                "width": viewport.width,
+                "height": viewport.height,
+                "data": viewport.data_base64,
+            },
+            "archive_mhtml": {
+                "mime": archive.mime,
+                "filename": archive.filename,
+                "bytes": archive.bytes,
+                "data": archive.data_base64,
+            },
+            "resource_manifest": [
+                {
+                    "url": "https://example.test/app.js",
+                    "resource": "script",
+                    "allowed": true,
+                },
+                {
+                    "url": "https://tracker.example/pixel.gif",
+                    "resource": "image",
+                    "allowed": false,
+                }
+            ],
+            "pdf_snapshot": {
+                "mime": "application/pdf",
+                "filename": "mde-browser-123-example.test.pdf",
+                "bytes": pdf_bytes.len(),
+                "data": pdf_data.clone(),
+            },
+            "cached_ms": 123,
+        })
+        .to_string();
+        let result = parse_offline_cache_result(&body).expect("valid offline-cache result");
+        assert_eq!(result.host, local_hostname());
+        assert_eq!(result.cache_id, "cache-123");
+        assert_eq!(result.tab_index, 2);
+        assert_eq!(result.engine, BrowserEngine::Cef);
+        assert_eq!(result.cached_ms, Some(123));
+        let viewport = result.viewport.as_ref().expect("viewport image retained");
+        assert_eq!(viewport.mime, "image/png");
+        assert_eq!((viewport.width, viewport.height), (1, 1));
+        let archive = result.archive_mhtml.as_ref().expect("archive retained");
+        assert_eq!(archive.mime, "multipart/related");
+        assert!(archive.filename.ends_with(".mhtml"));
+        assert_eq!(
+            offline_cache_archive_bytes(archive).unwrap().len(),
+            archive.bytes
+        );
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(result.resources[0].resource, "script");
+        assert!(result.resources[0].allowed);
+        assert_eq!(result.resources[1].resource, "image");
+        assert!(!result.resources[1].allowed);
+        let pdf = result.pdf_snapshot.as_ref().expect("PDF snapshot retained");
+        assert_eq!(pdf.mime, "application/pdf");
+        assert_eq!(pdf.filename, "mde-browser-123-example.test.pdf");
+        assert_eq!(offline_cache_pdf_bytes(pdf).unwrap(), pdf_bytes);
+        assert_eq!(result.text.chars().count(), OFFLINE_CACHE_TEXT_MAX_CHARS);
+        assert!(!result.text.ends_with("tail"));
+
+        let bad_source = body.replace("browser_offline_cache", "cloud_cache");
+        assert!(parse_offline_cache_result(&bad_source).is_err());
+        let bad_privacy = body.replace("offline_or_mesh_only", "public");
+        assert!(parse_offline_cache_result(&bad_privacy).is_err());
+        let bad_engine = body.replace(r#""engine":"cef""#, r#""engine":"webkit""#);
+        assert!(parse_offline_cache_result(&bad_engine).is_err());
+        let empty = body.replace(
+            &format!(
+                r#""text":"{}tail""#,
+                "x".repeat(OFFLINE_CACHE_TEXT_MAX_CHARS)
+            ),
+            r#""text":"   ""#,
+        );
+        assert!(parse_offline_cache_result(&empty).is_err());
+        let bad_archive_name = body.replace(".mhtml", "../bad.mhtml");
+        assert!(parse_offline_cache_result(&bad_archive_name).is_err());
+        let bad_resource = body.replace(r#""resource":"script""#, r#""resource":"cookie""#);
+        assert!(parse_offline_cache_result(&bad_resource).is_err());
+        let bad_pdf = body.replace(
+            &pdf_data,
+            &base64::engine::general_purpose::STANDARD.encode(b"not a pdf"),
+        );
+        assert!(parse_offline_cache_result(&bad_pdf).is_err());
+    }
+
+    #[test]
+    fn browser_offline_cache_viewport_texture_decodes_and_caches_png() {
+        let mut image = egui::ColorImage::new([4, 3], egui::Color32::TRANSPARENT);
+        for y in 0..3 {
+            for x in 0..4 {
+                image.pixels[y * 4 + x] =
+                    egui::Color32::from_rgba_unmultiplied(x as u8, y as u8, 40, 255);
+            }
+        }
+        let viewport = offline_cache_viewport_image(&image).expect("small viewport encodes");
+        let ctx = egui::Context::default();
+
+        let first = offline_cache_viewport_texture(&ctx, "cache-texture", &viewport)
+            .expect("viewport texture decodes");
+        assert_eq!(first.size(), [4, 3]);
+        let second = offline_cache_viewport_texture(&ctx, "cache-texture", &viewport)
+            .expect("cached viewport texture is reused");
+        assert_eq!(first.id(), second.id());
+
+        let mut mismatched = viewport.clone();
+        mismatched.width = 5;
+        assert!(
+            offline_cache_viewport_texture(&ctx, "cache-texture-mismatch", &mismatched).is_none(),
+            "decoded PNG dimensions must match the advertised viewport metadata"
+        );
+    }
+
+    #[test]
+    fn browser_offline_cache_archive_saves_valid_mhtml_to_disk() {
+        let request = OfflineCacheRequest {
+            tab_index: 0,
+            engine: BrowserEngine::Cef,
+            url: "https://archive.example/".to_owned(),
+            title: "Archive".to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            pdf_snapshot: None,
+        };
+        let archive =
+            offline_cache_mhtml_archive(&request, "Archived text", 123).expect("archive encodes");
+        let mut state = WebState::default();
+        state.latest_offline_cache = Some(BrowserOfflineCacheResult {
+            host: local_hostname(),
+            cache_id: "cache-archive".to_owned(),
+            tab_index: 0,
+            engine: BrowserEngine::Cef,
+            url: "https://archive.example/".to_owned(),
+            title: "Archive".to_owned(),
+            text: "Archived text".to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            archive_mhtml: Some(archive.clone()),
+            pdf_snapshot: None,
+            cached_ms: Some(123),
+        });
+        let dir = tempfile::tempdir().expect("temp archive dir");
+
+        let path = state
+            .save_latest_offline_cache_archive_to_dir(dir.path())
+            .expect("archive saves");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(archive.filename.as_str())
+        );
+        let saved = std::fs::read(&path).expect("read saved archive");
+        assert_eq!(saved.len(), archive.bytes);
+        let saved = String::from_utf8(saved).expect("archive is utf8");
+        assert!(saved.starts_with("MIME-Version: 1.0\r\n"));
+        assert!(saved.contains("Archived text"));
+    }
+
+    #[test]
+    fn browser_offline_cache_pdf_snapshot_saves_valid_pdf_to_disk() {
+        let pdf_bytes = b"%PDF-1.7\n% cached PDF fixture\n";
+        let pdf = OfflineCachePdf {
+            mime: "application/pdf".to_owned(),
+            filename: "mde-browser-123-archive.example.pdf".to_owned(),
+            bytes: pdf_bytes.len(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(pdf_bytes),
+        };
+        let mut state = WebState::default();
+        state.latest_offline_cache = Some(BrowserOfflineCacheResult {
+            host: local_hostname(),
+            cache_id: "cache-pdf".to_owned(),
+            tab_index: 0,
+            engine: BrowserEngine::Cef,
+            url: "https://archive.example/".to_owned(),
+            title: "Archive".to_owned(),
+            text: "Archived text".to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            archive_mhtml: None,
+            pdf_snapshot: Some(pdf.clone()),
+            cached_ms: Some(123),
+        });
+        let dir = tempfile::tempdir().expect("temp pdf dir");
+
+        let path = state
+            .save_latest_offline_cache_pdf_to_dir(dir.path())
+            .expect("PDF saves");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(pdf.filename.as_str())
+        );
+        assert_eq!(std::fs::read(&path).expect("read saved PDF"), pdf_bytes);
+    }
+
+    #[test]
+    fn browser_security_update_status_parser_surfaces_updater_posture() {
+        let body = serde_json::json!({
+            "node": local_hostname(),
+            "state": "mismatch",
+            "expected_cef_version": "149.0.6",
+            "expected_chromium_version": "149.0.7827.201",
+            "expected_channel": "stable",
+            "active_runtime": "/opt/mde/cef",
+            "installed_version": "old",
+            "installed_chromium": "old",
+            "libcef_present": true,
+            "updater_state": "failed",
+            "last_update_ms": 123,
+            "last_update_exit_code": 69,
+            "last_update_error": "installer unavailable",
+            "last_error": "active CEF runtime does not match packaged manifest",
+            "updated_ms": 124,
+        })
+        .to_string();
+
+        let status = parse_security_update_status(&body).expect("valid security status");
+
+        assert_eq!(status.node, local_hostname());
+        assert_eq!(status.state, "mismatch");
+        assert_eq!(
+            status.expected_chromium_version.as_deref(),
+            Some("149.0.7827.201")
+        );
+        assert_eq!(status.installed_version.as_deref(), Some("old"));
+        assert!(status.libcef_present);
+        assert_eq!(status.updater_state, "failed");
+        assert_eq!(status.last_update_exit_code, Some(69));
+        assert!(status.is_actionable());
+        assert!(parse_security_update_status(r#"{"node":"n","state":"pretend"}"#).is_err());
+        assert!(parse_security_update_status(r#"{"state":"current"}"#).is_err());
+    }
+
+    #[test]
+    fn browser_speech_status_parsers_surface_worker_posture() {
+        let read_body = serde_json::json!({
+            "node": local_hostname(),
+            "last_request_id": "01HTTS",
+            "last_host": local_hostname(),
+            "last_url": "https://example.test/",
+            "last_title": "Example",
+            "state": "unavailable",
+            "last_error": "piper voice model is not installed",
+            "accepted": 2,
+            "spoken": 1,
+            "rejected": 0,
+            "last_request_ms": 123,
+            "updated_ms": 124,
+        })
+        .to_string();
+        let read_status = parse_read_aloud_status(&read_body).expect("read-aloud status");
+        assert_eq!(read_status.node, local_hostname());
+        assert_eq!(read_status.state, "unavailable");
+        assert_eq!(read_status.last_title.as_deref(), Some("Example"));
+        assert_eq!(read_status.accepted, 2);
+        assert!(read_status.is_visible());
+        assert!(read_status.is_actionable());
+        assert_eq!(read_status.chip_label(), "TTS unavailable");
+        assert!(parse_read_aloud_status(r#"{"node":"n","state":"pretend"}"#).is_err());
+
+        let voice_body = serde_json::json!({
+            "node": local_hostname(),
+            "last_request_id": "01HSTT",
+            "last_host": local_hostname(),
+            "last_url": "https://example.test/",
+            "last_mode": "dictation",
+            "state": "listening",
+            "last_error": null,
+            "accepted": 3,
+            "transcribed": 2,
+            "rejected": 1,
+            "last_transcript_chars": 17,
+            "last_request_ms": 223,
+            "updated_ms": 224,
+        })
+        .to_string();
+        let voice_status = parse_voice_command_status(&voice_body).expect("voice status");
+        assert_eq!(voice_status.node, local_hostname());
+        assert_eq!(voice_status.state, "listening");
+        assert_eq!(voice_status.last_mode.as_deref(), Some("dictation"));
+        assert_eq!(voice_status.last_transcript_chars, Some(17));
+        assert!(voice_status.is_visible());
+        assert!(voice_status.is_actionable());
+        assert_eq!(voice_status.chip_label(), "Dictation listening");
+        assert!(parse_voice_command_status(
+            r#"{"node":"n","state":"listening","last_mode":"song"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn browser_passkey_status_parser_surfaces_ceremony_posture() {
+        let body = serde_json::json!({
+            "node": local_hostname(),
+            "last_request_id": "01HPASSKEY",
+            "last_host": local_hostname(),
+            "last_ceremony": "create",
+            "last_rp_id": "example.test",
+            "state": "pending",
+            "mirrored": true,
+            "last_error": null,
+            "accepted": 1,
+            "rejected": 0,
+            "last_pending_ms": 333,
+            "hardware_state": "ready",
+            "hardware_key_count": 1,
+            "hardware_readable_count": 1,
+            "hardware_ctaphid_state": "init_request_ready",
+            "hardware_ctaphid_init_frame_count": 1,
+            "hardware_probe_ms": 332,
+            "updated_ms": 334,
+        })
+        .to_string();
+        let status = parse_passkey_status(&body).expect("passkey status");
+        assert_eq!(status.node, local_hostname());
+        assert_eq!(status.state, "pending");
+        assert_eq!(status.last_ceremony.as_deref(), Some("create"));
+        assert_eq!(status.last_rp_id.as_deref(), Some("example.test"));
+        assert!(status.mirrored);
+        assert!(status.ceremony_is_visible());
+        assert!(status.hardware_is_visible());
+        assert_eq!(status.chip_label(), "Passkey pending");
+        assert_eq!(status.tone(), ChipTone::Info);
+        assert_eq!(status.hardware_state, "ready");
+        assert_eq!(status.hardware_key_count, 1);
+        assert_eq!(status.hardware_readable_count, 1);
+        assert_eq!(status.hardware_chip_label(), "Security key ready");
+        assert_eq!(status.hardware_tone(), ChipTone::Ok);
+        assert!(status.ctaphid_is_visible());
+        assert_eq!(status.hardware_ctaphid_state, "init_request_ready");
+        assert_eq!(status.hardware_ctaphid_init_frame_count, 1);
+        assert_eq!(status.ctaphid_chip_label(), "CTAP INIT framed");
+        assert_eq!(status.ctaphid_tone(), ChipTone::Info);
+        let body = body.replace(r#""state":"pending""#, r#""state":"asserted""#);
+        let asserted = parse_passkey_status(&body).expect("asserted passkey status");
+        assert_eq!(asserted.chip_label(), "Passkey asserted");
+        assert_eq!(asserted.tone(), ChipTone::Ok);
+        let old_body = serde_json::json!({
+            "node": "n",
+            "state": "idle",
+            "hardware_state": "unknown",
+        })
+        .to_string();
+        let old_status = parse_passkey_status(&old_body).expect("old passkey status");
+        assert_eq!(old_status.hardware_ctaphid_state, "unknown");
+        assert_eq!(old_status.hardware_ctaphid_init_frame_count, 0);
+        assert!(!old_status.ctaphid_is_visible());
+        assert!(parse_passkey_status(r#"{"node":"n","state":"signed"}"#).is_err());
+        assert!(
+            parse_passkey_status(r#"{"node":"n","state":"pending","last_ceremony":"delete"}"#)
+                .is_err()
+        );
+        assert!(
+            parse_passkey_status(r#"{"node":"n","state":"idle","hardware_state":"wedged"}"#)
+                .is_err()
+        );
+        assert!(parse_passkey_status(
+            r#"{"node":"n","state":"idle","hardware_ctaphid_state":"wedged"}"#
+        )
+        .is_err());
+        assert!(parse_passkey_status(
+            r#"{"node":"n","state":"idle","hardware_ctaphid_state":"init_request_ready"}"#
+        )
+        .is_err());
+        assert!(
+            parse_passkey_status(
+                r#"{"node":"n","state":"idle","hardware_ctaphid_state":"unavailable","hardware_ctaphid_init_frame_count":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_speech_statuses_are_displayed_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let host = local_hostname();
+        let read_body = serde_json::json!({
+            "node": host,
+            "last_request_id": "01HTTS",
+            "last_host": host,
+            "last_url": "https://example.test/",
+            "last_title": "Example",
+            "state": "speaking",
+            "last_error": null,
+            "accepted": 1,
+            "spoken": 0,
+            "rejected": 0,
+            "last_request_ms": 123,
+            "updated_ms": 124,
+        })
+        .to_string();
+        persist
+            .write(
+                &browser_read_aloud_status_topic(&host),
+                Priority::Min,
+                None,
+                Some(&read_body),
+            )
+            .expect("write read-aloud status");
+        let voice_body = serde_json::json!({
+            "node": host,
+            "last_request_id": "01HSTT",
+            "last_host": host,
+            "last_url": "https://example.test/",
+            "last_mode": "command",
+            "state": "unavailable",
+            "last_error": "STT runtime is not configured",
+            "accepted": 1,
+            "transcribed": 0,
+            "rejected": 0,
+            "last_transcript_chars": null,
+            "last_request_ms": 223,
+            "updated_ms": 224,
+        })
+        .to_string();
+        persist
+            .write(
+                &browser_voice_command_status_topic(&host),
+                Priority::Min,
+                None,
+                Some(&voice_body),
+            )
+            .expect("write voice status");
+
+        state.poll_speech_statuses();
+
+        let read_status = state
+            .latest_read_aloud_status
+            .as_ref()
+            .expect("read-aloud status");
+        assert_eq!(read_status.state, "speaking");
+        assert_eq!(read_status.chip_label(), "TTS speaking");
+        let voice_status = state
+            .latest_voice_command_status
+            .as_ref()
+            .expect("voice status");
+        assert_eq!(voice_status.state, "unavailable");
+        assert_eq!(
+            voice_status.last_error.as_deref(),
+            Some("STT runtime is not configured")
+        );
+        assert_eq!(voice_status.chip_label(), "Voice unavailable");
+    }
+
+    #[test]
+    fn browser_passkey_status_is_displayed_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let host = local_hostname();
+        let body = serde_json::json!({
+            "node": host,
+            "last_request_id": "01HPASSKEY",
+            "last_host": host,
+            "last_ceremony": "get",
+            "last_rp_id": "login.example.test",
+            "state": "error",
+            "mirrored": false,
+            "last_error": "rp_id must match the origin host or a parent domain",
+            "accepted": 1,
+            "rejected": 1,
+            "last_pending_ms": 444,
+            "hardware_state": "present_permission_denied",
+            "hardware_key_count": 1,
+            "hardware_readable_count": 0,
+            "hardware_ctaphid_state": "unavailable",
+            "hardware_ctaphid_init_frame_count": 0,
+            "hardware_probe_ms": 443,
+            "updated_ms": 445,
+        })
+        .to_string();
+        persist
+            .write(
+                &browser_passkey_status_topic(&host),
+                Priority::Min,
+                None,
+                Some(&body),
+            )
+            .expect("write passkey status");
+
+        state.poll_passkey_status();
+
+        let status = state
+            .latest_passkey_status
+            .as_ref()
+            .expect("passkey status");
+        assert_eq!(status.state, "error");
+        assert_eq!(status.last_ceremony.as_deref(), Some("get"));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("rp_id must match the origin host or a parent domain")
+        );
+        assert_eq!(status.hardware_state, "present_permission_denied");
+        assert_eq!(status.hardware_key_count, 1);
+        assert_eq!(status.hardware_readable_count, 0);
+        assert_eq!(status.hardware_ctaphid_state, "unavailable");
+        assert_eq!(status.hardware_ctaphid_init_frame_count, 0);
+        assert!(!status.ctaphid_is_visible());
+        assert_eq!(status.chip_label(), "Passkey error");
+        assert_eq!(status.tone(), ChipTone::Warn);
+        assert_eq!(status.hardware_chip_label(), "Security key blocked");
+        assert_eq!(status.hardware_tone(), ChipTone::Warn);
+    }
+
+    #[test]
+    fn browser_passkey_body_adds_browser_metadata_to_helper_event() {
+        let body = browser_passkey_body(
+            BrowserEngine::Cef,
+            r#"{
+                "ceremony":"create",
+                "origin":"https://login.example/register",
+                "rp_id":"login.example",
+                "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456",
+                "client_request_id":"mde-pk-test-1",
+                "user_handle_b64url":"user_handle_123",
+                "user_name":"MDE User",
+                "timeout_ms":60000
+            }"#,
+        )
+        .expect("passkey body");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_passkey");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["ceremony"], "create");
+        assert_eq!(v["rp_id"], "login.example");
+        assert_eq!(v["client_request_id"], "mde-pk-test-1");
+        assert_eq!(v["user_name"], "MDE User");
+        assert_eq!(v["timeout_ms"], 60000);
+        assert!(browser_passkey_body(
+            BrowserEngine::Servo,
+            r#"{"ceremony":"delete","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn browser_passkey_helper_event_publishes_daemon_handoff() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::PasskeyRequest {
+                body: r#"{
+                    "ceremony":"get",
+                    "origin":"https://login.example/auth",
+                    "rp_id":"login.example",
+                    "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456",
+                    "client_request_id":"mde-pk-test-2",
+                    "allow_credentials":["credential_id_123456"],
+                    "timeout_ms":45000
+                }"#
+                .to_owned(),
+            },
+        );
+        run_until_texture(&mut state);
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: sent ceremony to daemon")
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(ACTION_BROWSER_PASSKEY, None)
+            .expect("list passkey actions");
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().expect("passkey body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_passkey");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["ceremony"], "get");
+        assert_eq!(v["origin"], "https://login.example/auth");
+        assert_eq!(v["rp_id"], "login.example");
+        assert_eq!(v["client_request_id"], "mde-pk-test-2");
+        assert_eq!(v["allow_credentials"][0], "credential_id_123456");
+        assert_eq!(
+            state.pending_passkey_requests.get("mde-pk-test-2"),
+            Some(&0usize)
+        );
+    }
+
+    #[test]
+    fn browser_passkey_daemon_completion_returns_to_helper_page() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        run_until_texture(&mut state);
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::PasskeyRequest {
+                body: r#"{
+                    "ceremony":"get",
+                    "origin":"https://login.example/auth",
+                    "rp_id":"login.example",
+                    "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456",
+                    "client_request_id":"mde-pk-test-3",
+                    "allow_credentials":["credential_id_123456"]
+                }"#
+                .to_owned(),
+            },
+        );
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let completion = serde_json::json!({
+            "op": "browser_passkey_assertion",
+            "source": "browser_passkeys",
+            "node": local_hostname(),
+            "request_id": "01HPASSKEY",
+            "client_request_id": "mde-pk-test-3",
+            "host": local_hostname(),
+            "engine": "cef",
+            "ceremony": "get",
+            "origin": "https://login.example/auth",
+            "rp_id": "login.example",
+            "credential_id_b64url": "credential_id_123456",
+            "user_handle_b64url": "user_handle_123",
+            "authenticator_data_b64url": "auth_data_123456",
+            "client_data_json_b64url": "client_data_123456",
+            "signature_b64url": "signature_123456",
+            "sign_count": 1,
+            "updated_ms": 777,
+        })
+        .to_string();
+        persist
+            .write(
+                &browser_passkey_event_topic(&local_hostname()),
+                Priority::Default,
+                None,
+                Some(&completion),
+            )
+            .expect("write passkey completion");
+
+        state.passkey_result_last_poll = None;
+        state.poll_passkey_results();
+        let controls = drain_control_messages(&helper);
+        let Some(mde_web_preview_client::ControlMsg::CompletePasskey { body }) =
+            controls.iter().find(|msg| {
+                matches!(
+                    msg,
+                    mde_web_preview_client::ControlMsg::CompletePasskey { .. }
+                )
+            })
+        else {
+            panic!("expected CompletePasskey control, got {controls:?}");
+        };
+        let returned: serde_json::Value = serde_json::from_str(body).expect("completion JSON");
+        assert_eq!(returned["client_request_id"], "mde-pk-test-3");
+        assert_eq!(returned["op"], "browser_passkey_assertion");
+        assert!(
+            !state.pending_passkey_requests.contains_key("mde-pk-test-3"),
+            "completion removes the pending route"
+        );
+    }
+
+    #[test]
+    fn browser_offline_cache_results_are_displayed_once_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_offline_cache_result_topic(&local_hostname());
+        let body = serde_json::json!({
+            "op": "browser_offline_cache_record",
+            "source": "browser_offline_cache",
+            "node": local_hostname(),
+            "cache_id": "cache-456",
+            "host": local_hostname(),
+            "privacy": "offline_or_mesh_only",
+            "tab_index": 0,
+            "engine": "servo",
+            "url": "https://example.test/",
+            "title": "Example",
+            "text": "Cached page text.",
+            "text_chars": 17,
+            "cached_ms": 123,
+        })
+        .to_string();
+        persist
+            .write(&topic, Priority::Default, None, Some(&body))
+            .expect("write offline-cache result");
+
+        state.poll_offline_cache_results();
+        let latest = state
+            .latest_offline_cache
+            .as_ref()
+            .expect("offline-cache result displayed");
+        assert_eq!(latest.cache_id, "cache-456");
+        assert_eq!(latest.text, "Cached page text.");
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Offline cache ready: 17 characters")
+        );
+
+        state.latest_offline_cache = None;
+        state.offline_cache_result_last_poll = None;
+        state.poll_offline_cache_results();
+        assert!(
+            state.latest_offline_cache.is_none(),
+            "cursor prevents replaying the same offline-cache record"
+        );
+    }
+
+    #[test]
+    fn browser_security_update_status_is_displayed_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_security_update_status_topic(&local_hostname());
+        let body = serde_json::json!({
+            "node": local_hostname(),
+            "state": "current",
+            "expected_cef_version": "149.0.6",
+            "expected_chromium_version": "149.0.7827.201",
+            "expected_channel": "stable",
+            "active_runtime": "/opt/mde/cef",
+            "installed_version": "149.0.6",
+            "installed_chromium": "149.0.7827.201",
+            "libcef_present": true,
+            "updater_state": "attempted",
+            "last_update_ms": 123,
+            "last_update_exit_code": 0,
+            "updated_ms": 124,
+        })
+        .to_string();
+        persist
+            .write(&topic, Priority::Min, None, Some(&body))
+            .expect("write security status");
+
+        state.poll_security_update_status();
+
+        let status = state
+            .latest_security_update
+            .as_ref()
+            .expect("security status");
+        assert_eq!(status.state, "current");
+        assert_eq!(status.updater_state, "attempted");
+        assert_eq!(status.last_update_exit_code, Some(0));
+        assert!(!status.is_actionable());
+    }
+
+    fn offline_cache_result(url: &str, text: &str) -> BrowserOfflineCacheResult {
+        BrowserOfflineCacheResult {
+            host: local_hostname(),
+            cache_id: "cache-fallback".to_owned(),
+            tab_index: 0,
+            engine: BrowserEngine::Servo,
+            url: url.to_owned(),
+            title: "Cached Example".to_owned(),
+            text: text.to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            archive_mhtml: None,
+            pdf_snapshot: None,
+            cached_ms: Some(123),
+        }
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn seed_gate_notice_for_test(state: &mut WebState) {
+        state.gate_notice = Some("helper unavailable".to_owned());
+    }
+
+    #[cfg(not(feature = "live-helper"))]
+    fn seed_gate_notice_for_test(_state: &mut WebState) {}
+
+    #[test]
+    fn browser_offline_cache_indexes_records_for_gated_page_fallback() {
+        let mut state = WebState::default();
+        state.address = "https://example.test/".to_owned();
+        seed_gate_notice_for_test(&mut state);
+        state.apply_offline_cache_result(offline_cache_result(
+            "https://example.test/",
+            "Cached fallback body.",
+        ));
+
+        let fallback = state
+            .offline_cache_fallback_for_unavailable()
+            .expect("matching offline fallback");
+        assert_eq!(fallback.text, "Cached fallback body.");
+        assert_eq!(
+            state
+                .cached_snapshot_for_url(" https://example.test/ ")
+                .expect("trimmed cache URL lookup")
+                .cache_id,
+            "cache-fallback"
+        );
+        assert!(
+            run_panel(&mut state),
+            "gated Browser state renders cached fallback body"
+        );
+    }
+
+    #[test]
+    fn browser_offline_cache_matches_canonical_url_aliases() {
+        let mut state = WebState::default();
+        state.apply_offline_cache_result(offline_cache_result(
+            "HTTPS://Example.Test:443/search?b=2&a=1#section",
+            "Canonical cached fallback.",
+        ));
+
+        let fallback = state
+            .cached_snapshot_for_url("https://example.test/search?a=1&b=2#other")
+            .expect("query-order and fragment-insensitive cache URL lookup");
+        assert_eq!(fallback.text, "Canonical cached fallback.");
+        assert_eq!(
+            state
+                .cached_snapshot_for_url("https://EXAMPLE.TEST/search?b=2&a=1")
+                .expect("host casing cache URL lookup")
+                .cache_id,
+            "cache-fallback"
+        );
+    }
+
+    #[test]
+    fn browser_offline_cache_url_canonicalizer_is_conservative() {
+        assert_eq!(
+            canonical_http_cache_url("HTTP://Example.Test:80"),
+            Some("http://example.test/".to_owned())
+        );
+        assert_eq!(
+            canonical_http_cache_url("https://example.test/path?z=9&a=1&z=8#top"),
+            Some("https://example.test/path?a=1&z=8&z=9".to_owned())
+        );
+        assert_eq!(
+            canonical_http_cache_url("ftp://example.test/path"),
+            None,
+            "non-HTTP schemes stay exact-only"
+        );
+        assert_eq!(
+            canonical_http_cache_url("https://user@example.test/path"),
+            None,
+            "userinfo stays exact-only instead of broadening private URLs"
+        );
+    }
+
+    #[test]
+    fn browser_offline_cache_renders_for_matching_crashed_tab() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        state.apply_offline_cache_result(offline_cache_result(
+            "https://example.test/",
+            "Cached crash fallback.",
+        ));
+        drop(helper);
+        for _ in 0..20 {
+            state.tabs[0].session.poll();
+            if state.tabs[0].session.is_crashed() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(state.tabs[0].session.is_crashed(), "test tab crashed");
+        let fallback = state
+            .offline_cache_fallback_for_unavailable()
+            .expect("crashed tab uses matching offline cache");
+        assert_eq!(fallback.text, "Cached crash fallback.");
+        assert!(
+            run_panel(&mut state),
+            "crashed Browser tab renders cached fallback body"
+        );
+        assert!(
+            !state.respawn_requested,
+            "rendering the offline fallback does not auto-respawn the crashed helper"
+        );
+    }
+
+    #[test]
+    fn browser_translation_result_parser_is_private_and_bounded() {
+        let body = serde_json::json!({
+            "op": "browser_translation",
+            "source": "browser_translate",
+            "node": local_hostname(),
+            "request_id": "01HTRANSLATE",
+            "host": local_hostname(),
+            "tab_index": 2,
+            "engine": "cef",
+            "url": "https://example.test/",
+            "title": "Example",
+            "source_lang": "auto",
+            "target_lang": "es",
+            "translation": format!("{}tail", "x".repeat(TRANSLATION_RESULT_MAX_CHARS)),
+            "translation_chars": TRANSLATION_RESULT_MAX_CHARS + 4,
+            "updated_ms": 123,
+        })
+        .to_string();
+        let result = parse_translation_result(&body).expect("valid translation result");
+        assert_eq!(result.host, local_hostname());
+        assert_eq!(result.tab_index, 2);
+        assert_eq!(result.engine, BrowserEngine::Cef);
+        assert_eq!(result.source_lang, "auto");
+        assert_eq!(result.target_lang, "es");
+        assert_eq!(
+            result.translation.chars().count(),
+            TRANSLATION_RESULT_MAX_CHARS
+        );
+        assert!(!result.translation.ends_with("tail"));
+
+        let bad_source = body.replace("browser_translate", "cloud_translate");
+        assert!(parse_translation_result(&bad_source).is_err());
+        let bad_engine = body.replace(r#""engine":"cef""#, r#""engine":"webkit""#);
+        assert!(parse_translation_result(&bad_engine).is_err());
+        let empty = body.replace(
+            &format!(
+                r#""translation":"{}tail""#,
+                "x".repeat(TRANSLATION_RESULT_MAX_CHARS)
+            ),
+            r#""translation":"   ""#,
+        );
+        assert!(parse_translation_result(&empty).is_err());
+    }
+
+    #[test]
+    fn browser_translation_results_are_displayed_once_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_translation_result_topic(&local_hostname());
+        let body = serde_json::json!({
+            "op": "browser_translation",
+            "source": "browser_translate",
+            "node": local_hostname(),
+            "request_id": "01HTRANSLATE",
+            "host": local_hostname(),
+            "tab_index": 0,
+            "engine": "servo",
+            "url": "https://example.test/",
+            "title": "Example",
+            "source_lang": "auto",
+            "target_lang": "es",
+            "translation": "Hola desde la pagina.",
+            "translation_chars": 21,
+            "updated_ms": 123,
+        })
+        .to_string();
+        persist
+            .write(&topic, Priority::Default, None, Some(&body))
+            .expect("write translation result");
+
+        state.poll_translation_results();
+        let latest = state
+            .latest_translation
+            .as_ref()
+            .expect("translation result displayed");
+        assert_eq!(latest.translation, "Hola desde la pagina.");
+        assert_eq!(latest.target_lang, "es");
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Translation ready: 21 characters")
+        );
+
+        state.latest_translation = None;
+        state.translation_result_last_poll = None;
+        state.poll_translation_results();
+        assert!(
+            state.latest_translation.is_none(),
+            "cursor prevents replaying the same translation"
+        );
+    }
+
+    #[test]
+    fn browser_voice_command_menu_publishes_stt_handoffs_with_tab_context() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        state.tabs[state.active].engine = BrowserEngine::Cef;
+        state.tabs[state.active].page_focused = true;
+        state.address = "https://example.test/current".to_owned();
+        run_until_texture(&mut state);
+        let ctx = egui::Context::default();
+
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::VoiceCommand);
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::Dictate);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(ACTION_BROWSER_VOICE_COMMAND, None)
+            .expect("list browser voice command actions");
+        assert_eq!(msgs.len(), 2);
+        let modes: Vec<String> = msgs
+            .iter()
+            .map(|msg| {
+                let body = msg.body.as_deref().expect("voice command body");
+                let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+                assert_eq!(v["op"], "browser_voice_command");
+                assert_eq!(v["source"], "browser");
+                assert_eq!(v["engine"], "cef");
+                assert_eq!(v["url"], "https://example.test/");
+                assert_eq!(v["title"], "Example");
+                assert_eq!(v["address"], "https://example.test/current");
+                assert_eq!(v["focus"], "page");
+                assert_eq!(v["max_transcript_chars"], 4096);
+                v["mode"].as_str().expect("mode").to_owned()
+            })
+            .collect();
+        assert_eq!(modes, ["command", "dictation"]);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Dictation: sent STT request")
+        );
+    }
+
+    #[test]
+    fn browser_voice_transcript_parser_and_command_classifier_are_conservative() {
+        let body = serde_json::json!({
+            "op": "browser_voice_transcript",
+            "source": "browser_voice_command",
+            "node": local_hostname(),
+            "request_id": "01HVOICE",
+            "host": local_hostname(),
+            "mode": "command",
+            "tab_index": 2,
+            "engine": "servo",
+            "url": "https://example.test/",
+            "title": "Example",
+            "address": "https://example.test/",
+            "focus": "chrome",
+            "transcript": "Search this page for mesh policy.",
+            "transcript_chars": 33,
+            "updated_ms": 123,
+        })
+        .to_string();
+        let result = parse_voice_transcript_result(&body).expect("valid voice result");
+        assert_eq!(result.mode, VoiceCommandMode::Command);
+        assert_eq!(result.tab_index, 2);
+        assert_eq!(
+            voice_command_action(&result.transcript),
+            Some(BrowserVoiceAction::Find("mesh policy".to_owned()))
+        );
+        assert_eq!(
+            voice_command_action("find in page status beacon"),
+            Some(BrowserVoiceAction::Find("status beacon".to_owned()))
+        );
+        assert_eq!(
+            voice_command_action("open a new tab"),
+            Some(BrowserVoiceAction::NewTab)
+        );
+        assert_eq!(
+            voice_command_action("please send my passwords"),
+            None,
+            "unsupported transcripts must not become browser actions"
+        );
+        let bad = body.replace("browser_voice_transcript", "browser_voice_action");
+        assert!(parse_voice_transcript_result(&bad).is_err());
+    }
+
+    #[test]
+    fn browser_voice_command_results_are_applied_once_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_voice_command_result_topic(&local_hostname());
+        let body = serde_json::json!({
+            "op": "browser_voice_transcript",
+            "source": "browser_voice_command",
+            "node": local_hostname(),
+            "request_id": "01HVOICE",
+            "host": local_hostname(),
+            "mode": "command",
+            "tab_index": 0,
+            "engine": "servo",
+            "url": "https://example.test/",
+            "title": "Example",
+            "address": "https://example.test/",
+            "focus": "chrome",
+            "transcript": "new tab",
+            "transcript_chars": 7,
+            "updated_ms": 123,
+        })
+        .to_string();
+        persist
+            .write(&topic, Priority::Default, None, Some(&body))
+            .expect("write result");
+
+        state.poll_voice_command_results();
+        assert!(
+            matches!(
+                state.take_open_request(),
+                Some(TabOpenIntent::NewForeground(_))
+            ),
+            "voice command result should enqueue one foreground tab"
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Voice command: new tab")
+        );
+
+        state.voice_command_result_last_poll = None;
+        state.poll_voice_command_results();
+        assert!(
+            state.take_open_request().is_none(),
+            "cursor prevents replaying the same transcript"
+        );
+    }
+
+    #[test]
+    fn browser_voice_dictation_result_inserts_text_only_when_page_is_focused() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        state.tabs[state.active].page_focused = true;
+        let _ = drain_control_messages(&helper);
+
+        state.apply_voice_transcript_result(VoiceTranscriptResult {
+            host: local_hostname(),
+            mode: VoiceCommandMode::Dictation,
+            tab_index: 0,
+            focus: "page".to_owned(),
+            transcript: "hello mesh".to_owned(),
+        });
+
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::Input(
+                    mde_web_preview_client::InputEvent::Text(text)
+                ) if text == "hello mesh"
+            )),
+            "page-focused dictation should be forwarded as committed text: {controls:?}"
+        );
+
+        state.tabs[state.active].page_focused = false;
+        state.apply_voice_transcript_result(VoiceTranscriptResult {
+            host: local_hostname(),
+            mode: VoiceCommandMode::Dictation,
+            tab_index: 0,
+            focus: "page".to_owned(),
+            transcript: "ignored".to_owned(),
+        });
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().all(|msg| !matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::Input(
+                    mde_web_preview_client::InputEvent::Text(_)
+                )
+            )),
+            "dictation without page focus must not type into the helper"
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Dictation result ready: focus the page before dictating")
+        );
     }
 
     #[test]
@@ -9933,6 +18711,740 @@ mod tests {
             };
             assert_eq!(job.method, TransferMethod::BrowserDownload);
             assert_eq!(job.dest, "/home/mm/Exports");
+            assert!(job.policy.verify);
+        }
+    }
+
+    #[test]
+    fn active_page_scrape_export_writes_formats_and_queues_transfers() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        state.tabs[state.active].engine = BrowserEngine::Cef;
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 501,
+                url: "https://example.test/products/page-2.html".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::XmlHttpRequest,
+                ),
+            },
+        );
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 502,
+                url: "https://example.test/assets/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+            },
+        );
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 503,
+                url: "https://cdn.example.test/ignored.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+            },
+        );
+        run_panel(&mut state);
+        let spool = tempfile::tempdir().expect("scrape spool dir");
+        let dest = tempfile::tempdir().expect("scrape destination dir");
+
+        let ids = state
+            .export_active_page_metadata_scrape_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("export active page scrape");
+
+        assert_eq!(ids.len(), 3);
+        let mut files = std::fs::read_dir(spool.path())
+            .expect("read scrape spool")
+            .map(|entry| entry.expect("scrape file").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        let exts = files
+            .iter()
+            .map(|path| path.extension().and_then(|ext| ext.to_str()).unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(exts, ["csv", "json", "md"]);
+        let json = std::fs::read_to_string(
+            files
+                .iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .expect("json export"),
+        )
+        .expect("read json export");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("scrape JSON");
+        assert_eq!(v["op"], "browser_active_page_scrape");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(
+            v["scope"],
+            "active_page_metadata_with_crawl_seed_text_and_dom"
+        );
+        assert_eq!(v["extracted_text_status"], "not_requested");
+        assert_eq!(v["dom_extract_status"], "not_requested");
+        assert_eq!(v["dom_link_count"], 0);
+        assert_eq!(v["dom_heading_count"], 0);
+        assert_eq!(v["crawl_seed_count"], 2);
+        assert_eq!(v["crawl_manifest_status"], "ready");
+        assert_eq!(v["crawl_execution_status"], "not_started");
+        assert_eq!(v["crawl_manifest_max_depth"], 1);
+        assert_eq!(v["crawl_manifest_count"], 2);
+        let seed = v["crawl_seed"].as_array().expect("crawl seed array");
+        assert!(seed
+            .iter()
+            .any(|item| item["url"] == "https://example.test/products/page-2.html"));
+        assert!(seed
+            .iter()
+            .any(|item| item["url"] == "https://example.test/assets/app.js"));
+        assert!(
+            !seed
+                .iter()
+                .any(|item| item["url"] == "https://cdn.example.test/ignored.js"),
+            "cross-origin telemetry must not become a crawl seed"
+        );
+        let crawl_manifest = v["crawl_manifest"].as_array().expect("crawl manifest");
+        assert!(crawl_manifest.iter().any(|item| {
+            item["url"] == "https://example.test/products/page-2.html"
+                && item["source"] == "telemetry"
+                && item["depth"] == 1
+        }));
+        assert!(
+            !crawl_manifest
+                .iter()
+                .any(|item| item["url"] == "https://cdn.example.test/ignored.js"),
+            "cross-origin telemetry must not become a crawl manifest target"
+        );
+        let csv = std::fs::read_to_string(
+            files
+                .iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "csv"))
+                .expect("csv export"),
+        )
+        .expect("read csv export");
+        assert!(
+            csv.contains("captured_ms,engine,title,url,scope,seed_url,seed_resource,seed_allowed,text_status,text_chars,text_truncated,text,dom_kind,dom_url,dom_text,dom_level,dom_same_origin,dom_rel,dom_target")
+        );
+        assert!(csv.contains("\"Example\""));
+        assert!(csv.contains("\"not_requested\""));
+        assert!(csv.contains("\"https://example.test/products/page-2.html\""));
+        assert!(csv.contains("crawl_manifest"));
+        assert!(csv.contains("crawl_target"));
+        assert!(!csv.contains("cdn.example.test"));
+        let md = std::fs::read_to_string(
+            files
+                .iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "md"))
+                .expect("markdown export"),
+        )
+        .expect("read markdown export");
+        assert!(md.contains("# Example"));
+        assert!(md.contains(
+            "active page metadata with bounded crawl seed, extracted text, DOM links/headings"
+        ));
+        assert!(md.contains("Visible page text was not requested"));
+        assert!(md.contains("DOM links were not requested"));
+        assert!(md.contains("## Crawl Manifest"));
+        assert!(md.contains("source=telemetry"));
+        assert!(md.contains("https://example.test/assets/app.js"));
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 3);
+        for verb in verbs {
+            let TransferVerb::Submit(job) = verb else {
+                panic!("expected submit");
+            };
+            assert_eq!(job.method, TransferMethod::BrowserDownload);
+            assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+            assert!(job.policy.verify);
+        }
+    }
+
+    #[test]
+    fn power_scrape_export_requests_page_scrape_and_writes_dom_extract() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 601,
+                url: "https://example.test/article/related.html".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::XmlHttpRequest,
+                ),
+            },
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("scrape spool dir");
+        let dest = tempfile::tempdir().expect("scrape destination dir");
+
+        state
+            .request_active_page_metadata_scrape_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("request page DOM scrape export");
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Scrape export: reading page DOM")
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::RequestPageScrape {
+                    id: 1,
+                    max_bytes: 65536,
+                    max_links: 64,
+                    max_headings: 32,
+                }
+            )),
+            "scrape export must request bounded page DOM from the helper: {controls:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(spool.path())
+                .expect("read empty scrape spool")
+                .count(),
+            0,
+            "scrape files wait for page DOM"
+        );
+
+        state.handle_page_scrape_event(
+            1,
+            serde_json::json!({
+                "text": "  Visible article body.\n\nSecond paragraph.  ",
+                "text_truncated": false,
+                "article_text": "  Article lead.\n\nArticle detail.  ",
+                "article_text_truncated": false,
+                "article_selector": "article",
+                "canonical_url": "https://example.test/article/",
+                "meta_description": "An example article summary.",
+                "document_lang": "en-US",
+                "links": [
+                    {
+                        "url": "https://example.test/article/related.html",
+                        "text": "Related Article",
+                        "rel": "next",
+                        "target": "_self"
+                    },
+                    {
+                        "url": "https://example.test/article/part-2.html",
+                        "text": "Part Two",
+                        "rel": "",
+                        "target": ""
+                    },
+                    {
+                        "url": "https://elsewhere.test/",
+                        "text": "External",
+                        "rel": "",
+                        "target": "_blank"
+                    }
+                ],
+                "headings": [
+                    {"level": 1, "text": "Story Headline"},
+                    {"level": 2, "text": "Second Section"}
+                ]
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Power mode: queued active-page scrape export (3 files)")
+        );
+
+        let mut files = std::fs::read_dir(spool.path())
+            .expect("read scrape spool")
+            .map(|entry| entry.expect("scrape file").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files.len(), 3);
+        let json = std::fs::read_to_string(
+            files
+                .iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .expect("json export"),
+        )
+        .expect("read json export");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("scrape JSON");
+        assert_eq!(v["extracted_text_status"], "captured");
+        assert_eq!(
+            v["extracted_text"],
+            "Visible article body.\n\nSecond paragraph."
+        );
+        assert_eq!(v["extracted_text_truncated"], false);
+        assert_eq!(v["dom_extract_status"], "captured");
+        assert_eq!(v["article_extract_status"], "captured");
+        assert_eq!(v["article_text"], "Article lead.\n\nArticle detail.");
+        assert_eq!(v["article_text_chars"], 30);
+        assert_eq!(v["article_text_truncated"], false);
+        assert_eq!(v["article_selector"], "article");
+        assert_eq!(v["canonical_url"], "https://example.test/article/");
+        assert_eq!(v["meta_description"], "An example article summary.");
+        assert_eq!(v["document_lang"], "en-US");
+        assert_eq!(v["dom_link_count"], 3);
+        assert_eq!(v["dom_heading_count"], 2);
+        assert_eq!(v["crawl_seed_count"], 1);
+        assert_eq!(v["crawl_manifest_status"], "ready");
+        assert_eq!(v["crawl_execution_status"], "not_started");
+        assert_eq!(v["crawl_manifest_count"], 2);
+        let links = v["dom_links"].as_array().expect("dom links");
+        assert!(links.iter().any(|link| {
+            link["url"] == "https://example.test/article/related.html"
+                && link["text"] == "Related Article"
+                && link["same_origin"] == true
+        }));
+        assert!(links.iter().any(|link| {
+            link["url"] == "https://elsewhere.test/" && link["same_origin"] == false
+        }));
+        let crawl_manifest = v["crawl_manifest"].as_array().expect("crawl manifest");
+        assert!(crawl_manifest.iter().any(|target| {
+            target["url"] == "https://example.test/article/related.html"
+                && target["source"] == "telemetry"
+        }));
+        assert!(crawl_manifest.iter().any(|target| {
+            target["url"] == "https://example.test/article/part-2.html"
+                && target["source"] == "dom_link"
+        }));
+        assert!(
+            !crawl_manifest
+                .iter()
+                .any(|target| target["url"] == "https://elsewhere.test/"),
+            "cross-origin DOM links stay out of the crawl manifest"
+        );
+        let csv = std::fs::read_to_string(
+            files
+                .iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "csv"))
+                .expect("csv export"),
+        )
+        .expect("read csv export");
+        assert!(csv.contains("\"captured\""));
+        assert!(csv.contains("\"Visible article body."));
+        assert!(csv.contains("dom_link"));
+        assert!(csv.contains("\"Related Article\""));
+        assert!(csv.contains("dom_heading"));
+        assert!(csv.contains("\"Story Headline\""));
+        assert!(csv.contains("dom_article"));
+        assert!(csv.contains("\"Article lead."));
+        assert!(csv.contains("dom_canonical"));
+        assert!(csv.contains("\"https://example.test/article/\""));
+        assert!(csv.contains("crawl_manifest"));
+        assert!(csv.contains("\"https://example.test/article/part-2.html\""));
+        assert!(csv.contains("dom_meta_description"));
+        assert!(csv.contains("\"An example article summary.\""));
+        assert!(csv.contains("dom_document_lang"));
+        assert!(csv.contains("\"en-US\""));
+        let md = std::fs::read_to_string(
+            files
+                .iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "md"))
+                .expect("markdown export"),
+        )
+        .expect("read markdown export");
+        assert!(md.contains("## Extracted Text"));
+        assert!(md.contains("Visible article body."));
+        assert!(md.contains("## Article Extract"));
+        assert!(md.contains("Article lead."));
+        assert!(md.contains("https://example.test/article/"));
+        assert!(md.contains("An example article summary."));
+        assert!(md.contains("## Crawl Manifest"));
+        assert!(md.contains("source=dom_link"));
+        assert!(md.contains("## DOM Links"));
+        assert!(md.contains("[Related Article](https://example.test/article/related.html)"));
+        assert!(md.contains("## DOM Headings"));
+        assert!(md.contains("h1 Story Headline"));
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 3);
+        for verb in verbs {
+            let TransferVerb::Submit(job) = verb else {
+                panic!("expected submit");
+            };
+            assert_eq!(job.method, TransferMethod::BrowserDownload);
+            assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+            assert!(job.policy.verify);
+        }
+    }
+
+    #[test]
+    fn media_manifest_export_sniffs_media_requests_and_queues_transfer() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let resource = |id, url: &str, ty| {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ty),
+                },
+            );
+        };
+        resource(
+            90,
+            "https://cdn.example.test/app.js",
+            mde_web_preview_client::ResourceType::Script,
+        );
+        resource(
+            91,
+            "https://cdn.example.test/poster.webp?cache=1",
+            mde_web_preview_client::ResourceType::Image,
+        );
+        resource(
+            92,
+            "https://video.example.test/master.m3u8",
+            mde_web_preview_client::ResourceType::XmlHttpRequest,
+        );
+        resource(
+            93,
+            "https://video.example.test/manifest.mpd",
+            mde_web_preview_client::ResourceType::XmlHttpRequest,
+        );
+        resource(
+            94,
+            "https://video.example.test/clip.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("media spool dir");
+        let dest = tempfile::tempdir().expect("media destination dir");
+
+        let id = state
+            .export_active_media_manifest_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("export media manifest");
+
+        let mut files = std::fs::read_dir(spool.path())
+            .expect("read media spool")
+            .map(|entry| entry.expect("media file").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].extension().and_then(|ext| ext.to_str()),
+            Some("json")
+        );
+        let body = std::fs::read_to_string(&files[0]).expect("read media manifest");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("media manifest JSON");
+        assert_eq!(v["op"], "browser_media_manifest");
+        assert_eq!(v["scope"], "active_page_media_sniffer");
+        assert_eq!(v["item_count"], 4);
+        let items = v["items"].as_array().expect("items array");
+        assert!(items.iter().any(|item| item["kind"] == "image"));
+        assert!(items.iter().any(|item| item["kind"] == "hls"));
+        assert!(items.iter().any(|item| item["kind"] == "dash"));
+        assert!(items.iter().any(|item| item["kind"] == "video"));
+        assert!(
+            !items.iter().any(|item| item["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("app.js"))),
+            "non-media script requests stay out of the media manifest"
+        );
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1);
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected submit");
+        };
+        assert_eq!(job.id, id);
+        assert_eq!(job.method, TransferMethod::BrowserDownload);
+        assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+        assert_eq!(job.source, files[0].to_string_lossy().as_ref());
+        assert!(job.policy.verify);
+    }
+
+    #[test]
+    fn media_asset_request_marks_blocked_resources_for_ignore_blocking() {
+        let recent = vec![
+            mde_web_preview_client::ResourceRequestStatus {
+                url: "https://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: true,
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                url: "https://video.example.test/master.m3u8".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::XmlHttpRequest,
+                ),
+                allowed: false,
+            },
+        ];
+
+        let requests = active_page_media_asset_requests(
+            "https://example.test/watch",
+            "Example Video",
+            BrowserEngine::Cef,
+            42,
+            &recent,
+        )
+        .expect("encode media asset requests");
+
+        assert_eq!(requests.len(), 1, "non-media script requests stay out");
+        let v: serde_json::Value =
+            serde_json::from_slice(&requests[0]).expect("media request JSON");
+        assert_eq!(v["op"], "browser_media_download_request");
+        assert_eq!(v["asset_url"], "https://video.example.test/master.m3u8");
+        assert_eq!(v["kind"], "hls");
+        assert_eq!(v["allowed_by_page_filter"], false);
+        assert_eq!(v["ignore_blocking"], true);
+        assert_eq!(v["suggested_filename"], "master.m3u8");
+        assert_eq!(v["rename_strategy"], "auto_rename_by_url_hint");
+    }
+
+    #[test]
+    fn media_asset_request_selection_batches_only_observed_images() {
+        let recent = vec![
+            mde_web_preview_client::ResourceRequestStatus {
+                url: "https://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: true,
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                url: "https://cdn.example.test/hero.png".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Image,
+                ),
+                allowed: true,
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                url: "https://cdn.example.test/photo".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Image,
+                ),
+                allowed: false,
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                url: "https://video.example.test/clip.mp4".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Media,
+                ),
+                allowed: true,
+            },
+        ];
+
+        let requests = active_page_media_asset_requests_with_selection(
+            "https://example.test/gallery",
+            "Example Gallery",
+            BrowserEngine::Cef,
+            42,
+            &recent,
+            MediaAssetSelection::Images,
+        )
+        .expect("encode image asset requests");
+
+        assert_eq!(requests.len(), 2);
+        let bodies = requests
+            .iter()
+            .map(|body| serde_json::from_slice::<serde_json::Value>(body).expect("request JSON"))
+            .collect::<Vec<_>>();
+        assert!(bodies.iter().all(|v| v["kind"] == "image"));
+        assert!(bodies
+            .iter()
+            .any(|v| v["asset_url"] == "https://cdn.example.test/hero.png"));
+        assert!(bodies
+            .iter()
+            .any(|v| v["asset_url"] == "https://cdn.example.test/photo"));
+        assert!(bodies.iter().any(|v| v["ignore_blocking"] == true));
+        assert!(!bodies
+            .iter()
+            .any(|v| v["asset_url"] == "https://video.example.test/clip.mp4"));
+    }
+
+    #[test]
+    fn observed_media_download_queue_writes_request_files_and_transfers() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let resource = |id, url: &str, ty| {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ty),
+                },
+            );
+        };
+        resource(
+            90,
+            "https://cdn.example.test/app.js",
+            mde_web_preview_client::ResourceType::Script,
+        );
+        resource(
+            91,
+            "https://cdn.example.test/poster.webp?cache=1",
+            mde_web_preview_client::ResourceType::Image,
+        );
+        resource(
+            92,
+            "https://video.example.test/master.m3u8",
+            mde_web_preview_client::ResourceType::XmlHttpRequest,
+        );
+        resource(
+            93,
+            "https://video.example.test/manifest.mpd",
+            mde_web_preview_client::ResourceType::XmlHttpRequest,
+        );
+        resource(
+            94,
+            "https://video.example.test/clip.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("media download spool dir");
+        let dest = tempfile::tempdir().expect("media download destination dir");
+
+        let ids = state
+            .download_observed_media_assets_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("queue observed media downloads");
+
+        assert_eq!(ids.len(), 4);
+        let mut files = std::fs::read_dir(spool.path())
+            .expect("read media download spool")
+            .map(|entry| entry.expect("media request file").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files.len(), 4);
+        let bodies = files
+            .iter()
+            .map(|path| {
+                let body = std::fs::read_to_string(path).expect("read request file");
+                serde_json::from_str::<serde_json::Value>(&body).expect("request JSON")
+            })
+            .collect::<Vec<_>>();
+        assert!(bodies
+            .iter()
+            .all(|v| v["op"] == "browser_media_download_request"));
+        assert!(bodies.iter().any(|v| v["kind"] == "image"));
+        assert!(bodies.iter().any(|v| v["kind"] == "hls"));
+        assert!(bodies.iter().any(|v| v["kind"] == "dash"));
+        assert!(bodies.iter().any(|v| v["kind"] == "video"));
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 4);
+        for verb in verbs {
+            let TransferVerb::Submit(job) = verb else {
+                panic!("expected submit");
+            };
+            assert_eq!(job.method, TransferMethod::BrowserDownload);
+            assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+            assert!(job.source.ends_with(".download.json"));
+            assert!(job.policy.verify);
+        }
+    }
+
+    #[test]
+    fn observed_image_download_queue_writes_only_image_request_files_and_transfers() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let resource = |id, url: &str, ty| {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ty),
+                },
+            );
+        };
+        resource(
+            90,
+            "https://cdn.example.test/app.js",
+            mde_web_preview_client::ResourceType::Script,
+        );
+        resource(
+            91,
+            "https://cdn.example.test/hero.png",
+            mde_web_preview_client::ResourceType::Image,
+        );
+        resource(
+            92,
+            "https://cdn.example.test/photo",
+            mde_web_preview_client::ResourceType::Image,
+        );
+        resource(
+            93,
+            "https://video.example.test/clip.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("image download spool dir");
+        let dest = tempfile::tempdir().expect("image download destination dir");
+
+        let ids = state
+            .download_observed_image_assets_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("queue observed image downloads");
+
+        assert_eq!(ids.len(), 2);
+        let mut files = std::fs::read_dir(spool.path())
+            .expect("read image download spool")
+            .map(|entry| entry.expect("image request file").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files.len(), 2);
+        let bodies = files
+            .iter()
+            .map(|path| {
+                let body = std::fs::read_to_string(path).expect("read request file");
+                serde_json::from_str::<serde_json::Value>(&body).expect("request JSON")
+            })
+            .collect::<Vec<_>>();
+        assert!(bodies.iter().all(|v| v["kind"] == "image"));
+        assert!(bodies
+            .iter()
+            .any(|v| v["asset_url"] == "https://cdn.example.test/hero.png"));
+        assert!(bodies
+            .iter()
+            .any(|v| v["asset_url"] == "https://cdn.example.test/photo"));
+        assert!(!bodies
+            .iter()
+            .any(|v| v["asset_url"] == "https://video.example.test/clip.mp4"));
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 2);
+        for verb in verbs {
+            let TransferVerb::Submit(job) = verb else {
+                panic!("expected submit");
+            };
+            assert_eq!(job.method, TransferMethod::BrowserDownload);
+            assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+            assert!(job.source.ends_with(".download.json"));
             assert!(job.policy.verify);
         }
     }

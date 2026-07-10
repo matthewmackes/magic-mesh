@@ -22,5 +22,11 @@ path = "src/lib.rs"
 # integration-gated layer added on top.
 mde-egui = { path = "../../shared/mde-egui" }
 
+[features]
+default = []
+# E12-6: the live RFB transport (TCP handshake + framebuffer update pump). The
+# default crate remains server-free so decoder/input unit tests stay hermetic.
+live-connect = []
+
 [lints]
 workspace = true

@@ -51,7 +51,7 @@ Required packages (installed): `gcc-c++`, `cmake`, `mold`, system `libopus`
 | Hypervisor mgmt + **console** + REST API | **Xen Orchestra** (`http://172.20.145.192:8080`, in podman) | raw `xe` over ssh |
 | Declarative VM lifecycle (create/recover/destroy) | **OpenTofu** + `vatesfr/xenorchestra` provider (`infra/tofu/`) | `setup-xcp-build-vm.sh` |
 | Toolchain / config (idempotent) | **Ansible** (`infra/ansible/`) | `setup-build-vm-toolchain.sh`, `xcp-authorize-farm-key.sh` |
-| Golden image build | **Packer** | `build-mde-vm-golden.sh` |
+| Golden image build | **Packer** | `setup-xcp-golden-template.sh` + farm template bake helpers |
 | Parallel build CI | **Forgejo Actions** / Woodpecker (planned) | `xcp-build.sh` + ad-hoc parallelism |
 | Local parallel slots | **podman** | — |
 

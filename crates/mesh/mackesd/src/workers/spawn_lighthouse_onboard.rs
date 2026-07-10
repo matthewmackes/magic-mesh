@@ -62,18 +62,16 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 // ───────────────────────────── wire contract ─────────────────────────────
 
-/// Where the operator asked to provision — the shell's honest cloud-vs-local
-/// choice. The wire carries only the discriminant; the daemon maps it to the
-/// shared `do-lighthouse-join` defaults ([`SpawnTarget::default_cloud`] /
-/// [`SpawnTarget::default_local`]) — the single source of truth for region/size
-/// and vCPU/mem, so a front-end can't name an off-policy shape.
+/// Where the operator asked to provision. QC-15 retired the old local
+/// cloud-hypervisor option, so the wire is cloud-only; the daemon maps the
+/// discriminant to the shared `do-lighthouse-join` defaults
+/// ([`SpawnTarget::default_cloud`]) — the single source of truth for region/size,
+/// so a front-end can't name an off-policy shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpawnTargetKind {
     /// A cloud droplet (`DigitalOcean`, the `zone1-do` `IaC`).
     Cloud,
-    /// A local cloud-hypervisor VM on this host.
-    Local,
 }
 
 impl SpawnTargetKind {
@@ -82,7 +80,6 @@ impl SpawnTargetKind {
     pub fn to_target(self) -> SpawnTarget {
         match self {
             Self::Cloud => SpawnTarget::default_cloud(),
-            Self::Local => SpawnTarget::default_local(),
         }
     }
 }
@@ -96,7 +93,7 @@ impl SpawnTargetKind {
 pub struct SpawnLighthouseAction {
     /// Caller-minted correlation id — echoed on the [`SpawnLighthouseEvent`].
     pub id: String,
-    /// Where to provision (cloud droplet vs local CH VM).
+    /// Where to provision.
     pub target: SpawnTargetKind,
     /// Provision two lighthouses for quorum/HA (`false` ⇒ a single lighthouse).
     #[serde(default)]
@@ -179,9 +176,9 @@ pub struct SpawnLighthouseEvent {
     /// pair).
     #[serde(default)]
     pub lighthouse_count: usize,
-    /// `true` for the honest retryable LAN-only outcome (no cloud token / no
-    /// local virt / not founded) — the mesh keeps running and the operator
-    /// retries after clearing the blocker.
+    /// `true` for the honest retryable LAN-only outcome (no cloud token / not
+    /// founded) — the mesh keeps running and the operator retries after clearing
+    /// the blocker.
     #[serde(default)]
     pub retry_available: bool,
     /// What the operator must fix before a retry succeeds (LAN-only only).
@@ -217,9 +214,9 @@ fn outcome_summary(outcome: &SpawnOutcome) -> String {
 /// [`SpawnLighthouseEvent`] to publish.
 ///
 /// Reuses the onboard engine verbatim: [`plan_spawn`] resolves the plan (cloud
-/// vs local, the rendered spec + enroll bootstrap + ordered CA-migration steps,
-/// or the honest LAN-only outcome), and — apply only — [`execute`] drives the
-/// seam. A dry-run never touches the seam; a LAN-only plan short-circuits inside
+/// cloud rendered spec + enroll bootstrap + ordered CA-migration steps, or the
+/// honest LAN-only outcome), and — apply only — [`execute`] drives the seam. A
+/// dry-run never touches the seam; a LAN-only plan short-circuits inside
 /// `execute` without seam calls either.
 ///
 /// [`SpawnFacts`]: crate::onboard::spawn_lighthouse::SpawnFacts
@@ -451,15 +448,10 @@ mod tests {
     use mde_bus::hooks::config::Priority;
     use std::sync::{Arc, Mutex};
 
-    fn facts(
-        cloud_token: bool,
-        local_virt: bool,
-        founded: bool,
-    ) -> crate::onboard::spawn_lighthouse::SpawnFacts {
+    fn facts(cloud_token: bool, founded: bool) -> crate::onboard::spawn_lighthouse::SpawnFacts {
         crate::onboard::spawn_lighthouse::SpawnFacts {
             mesh_id: "home-deadbeef".to_string(),
             cloud_token_present: cloud_token,
-            local_virt_ready: local_virt,
             ca_holder_overlay_ip: founded.then(|| "10.42.0.1".to_string()),
         }
     }
@@ -541,10 +533,11 @@ mod tests {
         assert_eq!(parse_action(&json).expect("parse"), a);
         // A minimal body omitting pair/dry_run defaults both to false.
         let m: SpawnLighthouseAction =
-            parse_action(r#"{"id":"lh-1","target":"local"}"#).expect("minimal parse");
-        assert_eq!(m.target, SpawnTargetKind::Local);
+            parse_action(r#"{"id":"lh-1","target":"cloud"}"#).expect("minimal parse");
+        assert_eq!(m.target, SpawnTargetKind::Cloud);
         assert!(!m.pair);
         assert!(!m.dry_run);
+        assert!(parse_action(r#"{"id":"lh-old","target":"local"}"#).is_err());
         assert!(parse_action("not json").is_err());
     }
 
@@ -580,7 +573,7 @@ mod tests {
         let prov = FakeProvisioner::default();
         let ev = resolve(
             &action(SpawnTargetKind::Cloud, false, true),
-            &facts(true, false, true),
+            &facts(true, true),
             &prov,
         );
         assert_eq!(ev.id, "lh-test");
@@ -605,7 +598,7 @@ mod tests {
         let prov = FakeProvisioner::default();
         let ev = resolve(
             &action(SpawnTargetKind::Cloud, true, true),
-            &facts(true, false, true),
+            &facts(true, true),
             &prov,
         );
         assert!(ev.pair);
@@ -619,7 +612,7 @@ mod tests {
         let prov = FakeProvisioner::default();
         let ev = resolve(
             &action(SpawnTargetKind::Cloud, false, true),
-            &facts(false, false, true),
+            &facts(false, true),
             &prov,
         );
         assert!(
@@ -635,18 +628,6 @@ mod tests {
         assert!(prov.calls.lock().expect("calls mutex").is_empty());
     }
 
-    #[test]
-    fn dry_run_local_without_virt_is_lan_only() {
-        let prov = FakeProvisioner::default();
-        let ev = resolve(
-            &action(SpawnTargetKind::Local, false, true),
-            &facts(false, false, true),
-            &prov,
-        );
-        assert!(ev.retry_available);
-        assert!(ev.lan_only_hint.expect("hint").contains("cloud-hypervisor"));
-    }
-
     // ── apply drives the seam / surfaces the typed error ──
 
     #[test]
@@ -654,7 +635,7 @@ mod tests {
         let prov = FakeProvisioner::default();
         let ev = resolve(
             &action(SpawnTargetKind::Cloud, false, false),
-            &facts(true, false, true),
+            &facts(true, true),
             &prov,
         );
         assert!(!ev.dry_run);
@@ -672,7 +653,7 @@ mod tests {
         let prov = FakeProvisioner::default();
         let ev = resolve(
             &action(SpawnTargetKind::Cloud, false, false),
-            &facts(false, false, true),
+            &facts(false, true),
             &prov,
         );
         assert!(ev.retry_available);
@@ -689,7 +670,7 @@ mod tests {
         // carries the typed error, never a fake success.
         let ev = resolve(
             &action(SpawnTargetKind::Cloud, false, false),
-            &facts(true, false, true),
+            &facts(true, true),
             &LiveProvisioner::default(),
         );
         let Some(WireProvisionError::IntegrationGated { step, reason }) = &ev.error else {

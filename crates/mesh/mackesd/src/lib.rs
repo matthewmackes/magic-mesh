@@ -11,6 +11,8 @@
 #![warn(missing_docs)]
 
 pub mod audit;
+/// QC-15 cutover audit for retired VM-stack deletion and Q58 rebuild evidence.
+pub mod cutover_audit;
 // NF-2 (v2.5) — Nebula CA module. Owns mint / sign / seal /
 // bundle. Reachable from `bin/mackesd.rs::run_serve` via the
 // upcoming NF-3.4 supervisor and from the CLI's `mackesd ca`

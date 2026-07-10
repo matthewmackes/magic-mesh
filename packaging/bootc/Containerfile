@@ -30,8 +30,8 @@
 #    /var/lib/mde/role.toml      THE role flag (+ the `branded` run-once stamp)
 #    /var/lib/etcd               etcd data dir
 #    /var/lib/mcnf-syncthing     Syncthing home (syncthing.service Environment=)
-#    /var/home/<u>/Local         ~/Local VM running disks (mde-kvm running_disk_path,
-#                                lock 18 — never mesh-synced); /home → var/home
+#    /var/home/<u>/Local         ~/Local VM running disks (never mesh-synced);
+#                                /home → var/home
 #    /var/mnt/mesh-storage       the Syncthing-replicated workgroup dir; /mnt → var/mnt,
 #                                so the tmpfiles.d line `d /mnt/mesh-storage` (RPM's
 #                                magic-mesh.conf) creates it through the symlink and
@@ -70,11 +70,11 @@ COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 # RPM; its post-install scriptlet runs here and its `systemctl enable` calls are
 # offline-safe symlink creation). Weak deps stay ON — this is the full
 # Workstation image; a Lighthouse runs the same bits with the seat masked (§5).
-# podman is half the §5 VDI substrate (mackesd's kvm probe checks
+# podman remains the container substrate (mackesd's kvm/openstack probes check
 # podman.socket) — the fedora-bootc base already ships it, the explicit install
 # is a no-op guard against future base slimming; nebula arrives as the RPM's
-# hard Require. cloud-hypervisor is baked separately below (NOT in Fedora 42 —
-# proven live: `No match for argument: cloud-hypervisor`, farm build 2026-07-01).
+# hard Require. QUASAR-CLOUD/QC-1 replaces the old cloud-hypervisor bake with
+# libvirt/QEMU-KVM + OVN/Open vSwitch host bits in this immutable image lane.
 RUN set -eux; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { \
@@ -85,7 +85,17 @@ RUN set -eux; \
     else \
         dnf -y install magic-mesh; \
     fi; \
-    dnf -y install podman; \
+    dnf -y install \
+        podman \
+        libvirt-client libvirt-daemon-driver-qemu libvirt-daemon-config-network \
+        qemu-kvm qemu-img virt-install edk2-ovmf \
+        openvswitch ovn-host \
+        cloud-init qemu-guest-agent; \
+    mkdir -p /etc/cloud/cloud.cfg.d; \
+    printf '%s\n' \
+        '# MCNF bootc image: NoCloud enables VM/farm first-boot seeds; None keeps no-seed boots fast.' \
+        'datasource_list: [ NoCloud, None ]' \
+        > /etc/cloud/cloud.cfg.d/90-mcnf-nocloud.cfg; \
     dnf clean all; \
     rm -rf /tmp/mcnf-rpms
 
@@ -126,9 +136,10 @@ RUN set -eux; \
 # BOOKMARKS-9 (browser packaging, docs/design/mesh-bookmarks.md + docs/THREAT_MODEL.md)
 # — the Servo browser helper. `/usr/bin/mde-web-preview` ships IN the magic-mesh
 # RPM installed above, so the base bootc image already carries the browser binary
-# (its confined SELinux domain loads via the RPM %post where SELinux is enabled;
-# on the disabled-SELinux platform standard the helper's in-process OS sandbox is
-# the confinement). WHETHER it may spawn is decided at RUNTIME by the BOOKMARKS-8
+# (its confined SELinux domain loads via the boot-bounded SELinux policy oneshot
+# on QC-22 enforcing nodes; where SELinux is unavailable/disabled the helper's
+# in-process OS sandbox remains the confinement). WHETHER it may spawn is decided
+# at RUNTIME by the BOOKMARKS-8
 # `browser_policy` worker (per-role enable/disable), never baked into the image.
 # The helper's Servo runtime libs are HARD Requires of the RPM, so the install
 # above already pulled them; install them explicitly too (mirroring the seat +
@@ -177,8 +188,7 @@ RUN set -eux; \
 # the matching linux-surface channel. --allowerasing lets kernel-surface REPLACE
 # the base kernel (the intended single-kernel bootc image; the surface kernel is
 # the mainline superset described above). Network egress to pkg.surfacelinux.com +
-# raw.githubusercontent.com is needed here (gated like the cloud-hypervisor fetch
-# below); airgapped builders point at a LAN mirror.
+# raw.githubusercontent.com is needed here; airgapped builders point at a LAN mirror.
 RUN set -eux; \
     rpm --import https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc || { \
         echo "GATED[SURFACE-1/key]: cannot fetch the linux-surface signing key"; \
@@ -194,40 +204,23 @@ RUN set -eux; \
         'skip_if_unavailable=1' \
         'gpgkey=https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc' \
         > /etc/yum.repos.d/linux-surface.repo; \
-    dnf -y --allowerasing install \
+    dnf -y install --allowerasing \
         kernel-surface iptsd libwacom-surface \
         surface-control surface-secureboot \
         fwupd; \
+    base_kernels="$(rpm -qa \
+        kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra \
+        | grep -v surface || true)"; \
+    if [ -n "${base_kernels}" ]; then \
+        dnf -y remove ${base_kernels}; \
+    fi; \
     dnf clean all
-
-# The other half of the VDI substrate: **cloud-hypervisor, baked in** (§5 /
-# E12-13). Fedora 42 does not package it, so pin the upstream static-musl
-# release binary and verify its sha256 — the pin makes every rebuild
-# tamper-evident; bump CH_VERSION + CH_SHA256 together. Installed at
-# /usr/bin/cloud-hypervisor, the FIRST path mackesd's local_virt_ready() probe
-# checks (spawn_lighthouse.rs); mde-kvm drives the running VMM over its
-# api-socket, so the one binary is the whole requirement (ch-remote is a debug
-# nicety, deliberately not baked). CH_URL is overridable for a LAN mirror on
-# an airgapped builder; the sha256 gate still applies to the mirror's copy.
-ARG CH_VERSION=v52.0
-ARG CH_SHA256=829af01ff075bb96c4f183905134c453a88d68cbabdc6b87df21098842581ee9
-ARG CH_URL=https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static
-RUN set -eux; \
-    command -v curl >/dev/null 2>&1 || dnf -y install curl; \
-    curl -sfL --retry 3 -o /tmp/cloud-hypervisor "${CH_URL}" || { \
-        echo "GATED[E12-13/ch-release]: cannot fetch cloud-hypervisor ${CH_VERSION} from ${CH_URL}"; \
-        echo "  the builder needs GitHub egress here — or point CH_URL at a LAN mirror"; \
-        echo "  (--build-arg CH_URL=…); the sha256 pin below still guards the mirror copy."; \
-        exit 1; }; \
-    echo "${CH_SHA256}  /tmp/cloud-hypervisor" | sha256sum -c -; \
-    install -m 0755 /tmp/cloud-hypervisor /usr/bin/cloud-hypervisor; \
-    rm -f /tmp/cloud-hypervisor; \
-    /usr/bin/cloud-hypervisor --version
 
 # The DRM-seat unit + its preset. Boot-to-seat: quasar-vdi-desktop.md lock 34.
 # The RPM lane ships the same unit through generate-rpm (SEAT-BOOT-1).
 COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-shell-egui.service
 COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
+COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-mesh.toml
 
 # Workstation-role wiring. The RPM post-install already enabled the all-roles
 # set (mackesd, nebula, mesh-health.timer, mesh-status.timer, the first-boot
@@ -236,7 +229,11 @@ COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system
 # declared policy, the enable materializes it in the image /etc now) and boots
 # to graphical. NOTHING is masked by default (§5): the seat unit self-gates on
 # the role flag, so this one image serves every role unmodified.
-RUN systemctl enable mde-shell-egui.service podman.socket && \
+RUN systemctl enable \
+        cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service \
+        qemu-guest-agent.service \
+        openvswitch.service \
+        mde-shell-egui.service podman.socket && \
     systemctl set-default graphical.target
 
 # Surface bootc's own image lint in the build log (non-fatal: it flags the

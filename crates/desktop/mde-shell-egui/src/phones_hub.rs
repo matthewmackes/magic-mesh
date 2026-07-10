@@ -22,9 +22,9 @@
 //! * **Pair** — the pair-a-phone flow: the KDE Connect device name the phone sees
 //!   (the "Quasar Mesh" endpoint name when this node is the mesh-fanout endpoint,
 //!   #8), the reachable overlay address, and the scannable KDC-MESH-4 QR payload.
-//!   The payload already has slots for both the mesh enroll token and KDC pairing
-//!   token; until the onboarding worker publishes a fresh enroll token to this hub,
-//!   the QR honestly carries `enroll:null` and the UI labels that leg pending (§7).
+//!   The payload carries both the daemon-published mesh enroll token and the KDC
+//!   pairing token when available; until a fresh token is published, the QR
+//!   honestly carries `enroll:null` and labels that leg pending (§7).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,6 +60,13 @@ const MESH_ENDPOINT_NAME: &str = "Quasar Mesh";
 /// KDC-MESH-4 — latest-wins short-TTL mesh enroll token for the Pair QR. Minting
 /// stays in the onboard path; the hub only consumes the worker-published state.
 const PAIR_ENROLL_TOKEN_TOPIC: &str = "state/connect/mesh-enroll-token";
+
+/// KDC-MESH-4 — request the daemon to mint + publish a fresh short-TTL enroll
+/// token. The shell never mints enrollment credentials itself.
+const PAIR_ENROLL_TOKEN_ACTION: &str = "action/connect/mesh-enroll-token";
+
+/// Refresh a daemon token before its expiry reaches the visible Pair QR.
+const PAIR_ENROLL_REFRESH_LEAD_MS: i64 = 60_000;
 
 // ── Bus payload mirrors (local serde, the shell-tier pattern) ────────────────
 
@@ -267,12 +274,14 @@ pub struct PhonesHubState {
     /// The Commands tab composer draft.
     draft: CmdDraft,
     /// KDC-MESH-4 — operator-provided short-TTL mesh enroll token to include in
-    /// the Pair QR. Minting remains owned by the onboard path; the hub never
-    /// fabricates a token.
+    /// the Pair QR. Manual paste overrides daemon-published state; minting remains
+    /// owned by the onboard path.
     pair_enroll_token: String,
     /// KDC-MESH-4 — worker-published short-TTL token, read from
     /// [`PAIR_ENROLL_TOKEN_TOPIC`]. Manual paste above wins when non-empty.
     published_pair_enroll: Option<PairEnrollToken>,
+    /// The in-flight daemon mint request for [`PAIR_ENROLL_TOKEN_ACTION`].
+    pair_enroll_pending: Option<PendingVerb>,
 }
 
 impl Default for PhonesHubState {
@@ -295,6 +304,7 @@ impl Default for PhonesHubState {
             draft: CmdDraft::default(),
             pair_enroll_token: String::new(),
             published_pair_enroll: None,
+            pair_enroll_pending: None,
         }
     }
 }
@@ -336,7 +346,18 @@ impl PhonesHubState {
             }
         }
 
-        // 3) Refresh the roster + the directory when due.
+        // 3) Resolve the daemon mesh-enroll mint request. The daemon also writes
+        // state, but folding the reply avoids waiting one more refresh tick.
+        if let Some(p) = self.pair_enroll_pending.clone() {
+            if let Some(body) = self.read_reply(&p.ulid) {
+                self.resolve_pair_enroll_token(&body);
+                self.pair_enroll_pending = None;
+            } else if p.sent.elapsed() >= VERB_TIMEOUT {
+                self.pair_enroll_pending = None;
+            }
+        }
+
+        // 4) Refresh the roster + the directory when due.
         let due = self.last_refresh.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_refresh = Some(Instant::now());
@@ -358,9 +379,17 @@ impl PhonesHubState {
     /// Re-read the daemon-minted short-TTL mesh enroll token for the Pair QR.
     /// Expired/malformed state is treated as absent so the QR stays honest.
     fn refresh_pair_enroll_token(&mut self) {
+        let now = now_ms();
         self.published_pair_enroll = self
             .persist()
-            .and_then(|persist| latest_pair_enroll_token(&persist, now_ms()));
+            .and_then(|persist| latest_pair_enroll_token(&persist, now));
+        if pair_enroll_token_needs_refresh(
+            &self.pair_enroll_token,
+            self.published_pair_enroll.as_ref(),
+            now,
+        ) {
+            self.request_pair_enroll_token();
+        }
     }
 
     /// Publish an (empty) `action/connect/devices` request; the reply lands the live
@@ -374,6 +403,44 @@ impl PhonesHubState {
                 is_browse: false,
             });
         }
+    }
+
+    /// Ask `mackesd` to mint + publish a fresh short-TTL mesh invite for the Pair
+    /// QR. Manual paste wins, so this is only called when the manual field is empty.
+    fn request_pair_enroll_token(&mut self) {
+        if self.pair_enroll_pending.is_some() {
+            return;
+        }
+        if let Some(ulid) = self.publish(PAIR_ENROLL_TOKEN_ACTION, None) {
+            self.pair_enroll_pending = Some(PendingVerb {
+                ulid,
+                sent: Instant::now(),
+                label: "mesh enroll token".to_string(),
+                is_browse: false,
+            });
+        }
+    }
+
+    fn resolve_pair_enroll_token(&mut self, body: &str) {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return;
+        }
+        let Some(token) = v
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.published_pair_enroll = Some(PairEnrollToken {
+            token,
+            expires_at_ms: v.get("expires_at_ms").and_then(serde_json::Value::as_i64),
+            source: v
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
     }
 
     /// Publish one `action/connect/<verb>` request, recording it as the pending verb
@@ -963,8 +1030,8 @@ impl PhonesHubState {
             ui.colored_label(
                 Style::TEXT_DIM,
                 RichText::new(
-                    "Paste a fresh short-TTL token from `mackesd found` or \
-                     `mackesd onboard invite-issue`. Empty uses the latest \
+                    "Optional override: paste a fresh short-TTL token from `mackesd found` \
+                     or `mackesd onboard invite-issue`. Empty uses an automatically \
                      daemon-published token when available.",
                 )
                 .size(Style::SMALL),
@@ -1301,6 +1368,25 @@ fn fresh_pair_enroll_token(published: Option<&PairEnrollToken>, now_ms: i64) -> 
     Some(token)
 }
 
+fn pair_enroll_token_needs_refresh(
+    manual: &str,
+    published: Option<&PairEnrollToken>,
+    now_ms: i64,
+) -> bool {
+    if normalized_enroll_token(manual).is_some() {
+        return false;
+    }
+    let Some(published) = published else {
+        return true;
+    };
+    if normalized_enroll_token(&published.token).is_none() {
+        return true;
+    }
+    published
+        .expires_at_ms
+        .is_some_and(|expiry| expiry <= now_ms.saturating_add(PAIR_ENROLL_REFRESH_LEAD_MS))
+}
+
 fn pair_qr_status_text(
     manual: Option<&str>,
     published: Option<&PairEnrollToken>,
@@ -1577,6 +1663,73 @@ mod tests {
         assert!(
             pair_qr_status_text(None, Some(&token), 1_000).contains("pending"),
             "status text should stay honest when the published token is stale"
+        );
+    }
+
+    #[test]
+    fn pair_enroll_token_refreshes_only_when_automatic_token_is_missing_or_expiring() {
+        let fresh = PairEnrollToken {
+            token: "mde-invite:fresh".to_string(),
+            expires_at_ms: Some(120_001),
+            source: Some("kdc-host".to_string()),
+        };
+        let expiring = PairEnrollToken {
+            token: "mde-invite:expiring".to_string(),
+            expires_at_ms: Some(120_000),
+            source: Some("kdc-host".to_string()),
+        };
+        assert!(!pair_enroll_token_needs_refresh(
+            " mde-invite:manual ",
+            None,
+            60_000
+        ));
+        assert!(pair_enroll_token_needs_refresh("", None, 60_000));
+        assert!(!pair_enroll_token_needs_refresh("", Some(&fresh), 60_000));
+        assert!(pair_enroll_token_needs_refresh("", Some(&expiring), 60_000));
+    }
+
+    #[test]
+    fn hub_requests_and_folds_daemon_enroll_token_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("bus");
+        let mut state = PhonesHubState {
+            bus_root: Some(tmp.path().to_path_buf()),
+            workgroup_root: PathBuf::from("/nonexistent"),
+            self_host: "eagle".to_string(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+
+        state.poll(&ctx);
+        let request = persist
+            .list_since(PAIR_ENROLL_TOKEN_ACTION, None)
+            .expect("mint request")
+            .pop()
+            .expect("one mint request");
+        persist
+            .write(
+                &reply_topic(&request.ulid),
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"ok":true,"token":"mde-invite:auto","expires_at_ms":123456,"source":"kdc-host"}"#,
+                ),
+            )
+            .expect("reply");
+
+        state.poll(&ctx);
+
+        assert!(state.pair_enroll_pending.is_none());
+        assert_eq!(
+            selected_pair_enroll_token("", state.published_pair_enroll.as_ref(), 1_000),
+            Some("mde-invite:auto")
+        );
+        assert_eq!(
+            state
+                .published_pair_enroll
+                .as_ref()
+                .and_then(|t| t.source.as_deref()),
+            Some("kdc-host")
         );
     }
 

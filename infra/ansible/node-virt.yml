@@ -11,15 +11,16 @@
 #   ansible-playbook node-virt.yml -l <host>       # one node
 #   ansible-playbook node-virt.yml -e virt_target=build_vms   # any group
 ---
-- name: MCNF node KVM virtualization stack (libvirt + Podman + cloud-hypervisor)
+- name: MCNF node KVM virtualization stack (libvirt + Podman)
   hosts: "{{ virt_target | default('mesh_nodes') }}"
   gather_facts: true
 
   tasks:
     # libvirt = xapi + xenopsd + sm + xcp-networkd (lifecycle + storage pools +
     # virtual networks + the management API). qemu-kvm = the VMM userspace over the
-    # in-kernel KVM. cloud-hypervisor = the VDI desktop fast-path runtime (mde-kvm).
-    # podman = the container side XCP-ng never had.
+    # in-kernel KVM. podman = the container side XCP-ng never had. Cockpit and
+    # cloud-hypervisor are retired by QUASAR-CLOUD/QC-15; the Workbench Cloud
+    # plane and native VDI viewers own the console path.
     - name: KVM virt service set (dnf)
       become: true
       ansible.builtin.dnf:
@@ -32,12 +33,6 @@
           - virt-install
           - libguestfs-tools
           - podman
-          - cloud-hypervisor
-          # Per-node KVM+Podman web console (replaces the XO/console UI). Optional
-          # but cheap; the Datacenter panels are the primary UI.
-          - cockpit
-          - cockpit-machines
-          - cockpit-podman
         state: present
         install_weak_deps: false
 
@@ -53,14 +48,6 @@
       loop:
         - libvirtd.service
         - podman.socket
-
-    - name: Cockpit socket (optional console)
-      become: true
-      ansible.builtin.systemd:
-        name: cockpit.socket
-        enabled: true
-        state: started
-      failed_when: false
 
     # The default libvirt network (virbr0, NAT) — autostart so guests get DHCP
     # without a per-boot dance (the xcp-networkd job). Guarded for idempotency.

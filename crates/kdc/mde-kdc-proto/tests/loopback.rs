@@ -276,9 +276,17 @@ fn every_plugin_kind_dispatches_unambiguously_on_packet_kind() {
             },
         ),
         plugins::mpris_command_packet(7, "Play".to_string()),
-        plugins::sms_messages_packet(8, vec![]),
+        plugins::mousepad_packet(
+            8,
+            plugins::MousepadBody {
+                dx: 1.0,
+                dy: 2.0,
+                ..Default::default()
+            },
+        ),
+        plugins::sms_messages_packet(9, vec![]),
         plugins::telephony_packet(
-            9,
+            10,
             plugins::TelephonyBody {
                 event: plugins::TelephonyEvent::Ringing,
                 phone_number: "+15551234".to_string(),
@@ -287,7 +295,7 @@ fn every_plugin_kind_dispatches_unambiguously_on_packet_kind() {
             },
         ),
         plugins::run_command_packet(
-            10,
+            11,
             "open-browser".to_string(),
             "Open browser".to_string(),
             "xdg-open https://example.com".to_string(),
@@ -307,8 +315,8 @@ fn every_plugin_kind_dispatches_unambiguously_on_packet_kind() {
     }
     assert_eq!(
         received.len(),
-        10,
-        "received one packet per plugin (9 canonical + RunCommand)"
+        11,
+        "received one packet per sampled plugin (canonical set + RunCommand + Mousepad)"
     );
 
     for pkt in &received {

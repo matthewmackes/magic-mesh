@@ -18,8 +18,8 @@ use mackes_mesh_types::peers::PeerRecord;
 use super::enrich;
 use super::sources::{CloudObjectRecord, LanHostRecord, MeshSnapshot};
 use super::unit::{
-    Extras, Health, MeshFacts, Reachability, Unit, UnitKind, lan_unit_id, peer_hostname,
-    peer_unit_id,
+    lan_unit_id, peer_hostname, peer_unit_id, Extras, Health, MeshFacts, Reachability, Unit,
+    UnitKind,
 };
 
 /// Per-unit-id first-seen memory carried across ticks (E10).

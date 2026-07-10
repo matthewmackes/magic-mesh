@@ -60,11 +60,12 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mde_bookmarks::{key_between, Author, Collection, Hlc, HlcClock, Op, OpKind, Source};
+use mde_bookmarks::{key_between, Author, Collection, Hlc, HlcClock, Item, Op, OpKind, Source};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use uuid::Uuid;
@@ -85,6 +86,13 @@ pub const STATE_COLLECTION: &str = "state/bookmarks/collection";
 /// Retained-latest topic carrying the [`SyncStatus`] (the freshness / "not
 /// syncing" indicator, locks Q21/Q91).
 pub const STATE_SYNC: &str = "state/bookmarks/sync";
+
+/// Retained-latest topic carrying the most recent daemon-owned bookmark
+/// dead-link check. This is operational state, not CRDT bookmark content.
+pub const STATE_LINK_CHECK: &str = "state/bookmarks/link-check";
+
+/// Event topic emitted for every operator-requested bookmark dead-link check.
+pub const EVENT_LINK_CHECK: &str = "event/bookmarks/link-check";
 
 /// The share subdirectory the per-node bookmark stores live under
 /// (`<root>/bookmarks/<node>/…`).
@@ -116,9 +124,23 @@ pub const DEFAULT_PRUNE_EVERY: u32 = 20;
 /// of edits can't unbound the segment between periodic prunes (lock Q20).
 pub const DEFAULT_TAIL_THRESHOLD: usize = 256;
 
+/// The `action/bookmarks/<verb>` slot used for daemon-owned dead-link checks.
+const CHECK_LINKS_VERB: &str = "check-links";
+
+/// Hard cap per link-check request. The worker is operator-triggered but still
+/// bounded so a stale imported collection cannot turn into a network storm.
+const MAX_LINK_CHECKS: usize = 64;
+
+/// Maximum diagnostic detail stored per checked URL.
+const MAX_LINK_DETAIL: usize = 160;
+
 /// A wall-clock source (ms since the Unix epoch). Injected so the model stays
 /// pure and tests drive a deterministic fake clock.
 type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Injected URL probe. Production uses a bounded fixed-argv `curl`; tests use a
+/// deterministic pure map so the suite never depends on the public network.
+type LinkProbeFn = Arc<dyn Fn(&str) -> LinkProbeOutcome + Send + Sync>;
 
 // ── the typed Bus action ────────────────────────────────────────────────────
 
@@ -130,10 +152,15 @@ type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// rename).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookmarkAction {
-    /// Add a bookmark leaf. The id + fractional order key are minted worker-side.
+    /// Add a bookmark leaf. The id + fractional order key are minted worker-side
+    /// unless an optimistic UI supplies its already-applied values.
     Add {
+        /// Optional client-supplied id.
+        id: Option<Uuid>,
         /// Parent folder, or `None` for top level.
         parent: Option<Uuid>,
+        /// Optional client-supplied fractional order key.
+        order_key: Option<String>,
         /// Target URL.
         url: String,
         /// Display title (falls back to the URL when empty).
@@ -159,13 +186,15 @@ pub enum BookmarkAction {
         notes: Option<String>,
     },
     /// Reparent and/or reorder an item — one op (lock Q3). `before`/`after` name
-    /// the sibling ids the item should land between; the order key is minted from
-    /// their current keys.
+    /// the sibling ids the item should land between when no explicit order key is
+    /// supplied.
     Move {
         /// The item to move.
         id: Uuid,
         /// The new parent, or `None` for top level.
         parent: Option<Uuid>,
+        /// Optional client-supplied fractional order key.
+        order_key: Option<String>,
         /// The sibling that should sort *before* the moved item, if any.
         before: Option<Uuid>,
         /// The sibling that should sort *after* the moved item, if any.
@@ -176,10 +205,15 @@ pub enum BookmarkAction {
         /// The item to delete.
         id: Uuid,
     },
-    /// Add a folder. The id + order key are minted worker-side.
+    /// Add a folder. The id + order key are minted worker-side unless an
+    /// optimistic UI supplies its already-applied values.
     AddFolder {
+        /// Optional client-supplied id.
+        id: Option<Uuid>,
         /// Parent folder, or `None` for top level.
         parent: Option<Uuid>,
+        /// Optional client-supplied fractional order key.
+        order_key: Option<String>,
         /// The folder name.
         name: String,
     },
@@ -197,7 +231,11 @@ pub enum BookmarkAction {
 #[derive(serde::Deserialize)]
 struct AddReq {
     #[serde(default)]
+    id: Option<Uuid>,
+    #[serde(default)]
     parent: Option<Uuid>,
+    #[serde(default)]
+    order_key: Option<String>,
     url: String,
     #[serde(default)]
     title: String,
@@ -228,6 +266,8 @@ struct MoveReq {
     #[serde(default)]
     parent: Option<Uuid>,
     #[serde(default)]
+    order_key: Option<String>,
+    #[serde(default)]
     before: Option<Uuid>,
     #[serde(default)]
     after: Option<Uuid>,
@@ -241,7 +281,11 @@ struct IdReq {
 #[derive(serde::Deserialize)]
 struct AddFolderReq {
     #[serde(default)]
+    id: Option<Uuid>,
+    #[serde(default)]
     parent: Option<Uuid>,
+    #[serde(default)]
+    order_key: Option<String>,
     name: String,
 }
 
@@ -268,7 +312,9 @@ pub fn parse_action(verb: &str, body: &str) -> Result<BookmarkAction, String> {
         "add" => {
             let r: AddReq = serde_json::from_str(json).map_err(malformed)?;
             Ok(BookmarkAction::Add {
+                id: r.id,
                 parent: r.parent,
+                order_key: r.order_key,
                 url: r.url,
                 title: r.title,
                 tags: r.tags,
@@ -291,6 +337,7 @@ pub fn parse_action(verb: &str, body: &str) -> Result<BookmarkAction, String> {
             Ok(BookmarkAction::Move {
                 id: r.id,
                 parent: r.parent,
+                order_key: r.order_key,
                 before: r.before,
                 after: r.after,
             })
@@ -303,7 +350,9 @@ pub fn parse_action(verb: &str, body: &str) -> Result<BookmarkAction, String> {
         "add-folder" | "add_folder" => {
             let r: AddFolderReq = serde_json::from_str(json).map_err(malformed)?;
             Ok(BookmarkAction::AddFolder {
+                id: r.id,
                 parent: r.parent,
+                order_key: r.order_key,
                 name: r.name,
             })
         }
@@ -344,6 +393,118 @@ pub struct SyncStatus {
     /// Wall-clock epoch millis of the last successful mirror to the share, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_mirror_ms: Option<u64>,
+}
+
+/// Operator request body for `action/bookmarks/check-links`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkCheckRequest {
+    /// Optional specific bookmark ids to check. Empty means "check the current
+    /// converged collection's bookmarks up to the request limit".
+    pub ids: Vec<Uuid>,
+    /// Per-request cap, clamped to [`MAX_LINK_CHECKS`].
+    pub limit: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct LinkCheckReq {
+    #[serde(default)]
+    ids: Vec<Uuid>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Per-URL link health class published by the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkHealth {
+    /// HTTP returned a success/redirect class status.
+    Alive,
+    /// HTTP returned a client/server failure class status.
+    Dead,
+    /// The URL scheme is not checkable by this HTTP(S)-only worker.
+    Unsupported,
+    /// The probe failed before an HTTP status was available.
+    Error,
+}
+
+/// Result of one URL probe before bookmark metadata is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkProbeOutcome {
+    /// Coarse link health.
+    pub health: LinkHealth,
+    /// HTTP status code, when the transport reached the server.
+    pub http_status: Option<u16>,
+    /// Short human-readable diagnostic.
+    pub detail: String,
+}
+
+impl LinkProbeOutcome {
+    fn new(health: LinkHealth, http_status: Option<u16>, detail: impl Into<String>) -> Self {
+        Self {
+            health,
+            http_status,
+            detail: truncate_detail(&detail.into()),
+        }
+    }
+}
+
+/// One bookmark's dead-link check record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkCheckRecord {
+    /// Bookmark id.
+    pub id: Uuid,
+    /// Bookmark URL.
+    pub url: String,
+    /// Bookmark title at check time.
+    pub title: String,
+    /// Coarse link health.
+    pub health: LinkHealth,
+    /// HTTP status code, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Short human-readable diagnostic.
+    pub detail: String,
+}
+
+/// Published result of a bookmark dead-link check pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkCheckStatus {
+    /// Fixed op marker so downstream UIs can validate the payload.
+    pub op: String,
+    /// This node's id.
+    pub node: String,
+    /// Wall-clock epoch millis of the check.
+    pub checked_at_ms: u64,
+    /// Total records checked.
+    pub checked: usize,
+    /// Number of alive links.
+    pub alive: usize,
+    /// Number of dead links.
+    pub dead: usize,
+    /// Number of unsupported-scheme links.
+    pub unsupported: usize,
+    /// Number of probe errors.
+    pub errors: usize,
+    /// Whether the request hit the worker cap.
+    pub truncated: bool,
+    /// Per-bookmark bounded results.
+    pub records: Vec<LinkCheckRecord>,
+}
+
+/// Parse `action/bookmarks/check-links`.
+///
+/// # Errors
+/// Returns a typed message for malformed JSON.
+pub fn parse_link_check_request(body: &str) -> Result<LinkCheckRequest, String> {
+    let body = body.trim();
+    let json = if body.is_empty() { "{}" } else { body };
+    let r: LinkCheckReq = serde_json::from_str(json)
+        .map_err(|e| format!("malformed `check-links` bookmarks request: {e}"))?;
+    let requested = r.limit.unwrap_or(MAX_LINK_CHECKS);
+    Ok(LinkCheckRequest {
+        ids: r.ids,
+        limit: requested.clamp(1, MAX_LINK_CHECKS),
+    })
 }
 
 // ── pure store helpers (path building + (de)serialization) ───────────────────
@@ -460,6 +621,89 @@ fn move_order_key(
     }
 }
 
+/// Whether this worker can probe `url` directly.
+fn is_http_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Production bookmark link probe: a bounded fixed-argument `curl` invocation.
+///
+/// The URL is passed as one argv element (never through a shell). `--range 0-0`
+/// keeps successful probes small while still using GET, which avoids the common
+/// `HEAD`-not-supported false negative.
+fn probe_link_with_curl(url: &str) -> LinkProbeOutcome {
+    if !is_http_url(url) {
+        return LinkProbeOutcome::new(
+            LinkHealth::Unsupported,
+            None,
+            "only http:// and https:// bookmark URLs are checked",
+        );
+    }
+    let output = Command::new("curl")
+        .args([
+            "-L",
+            "-sS",
+            "--max-time",
+            "5",
+            "--range",
+            "0-0",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            url,
+        ])
+        .output();
+    match output {
+        Ok(out) => {
+            let code = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|c| *c != 0);
+            if let Some(status) = code {
+                return LinkProbeOutcome::new(
+                    classify_http_status(status),
+                    Some(status),
+                    format!("http {status}"),
+                );
+            }
+            let detail = String::from_utf8_lossy(&out.stderr);
+            LinkProbeOutcome::new(
+                LinkHealth::Error,
+                None,
+                if detail.trim().is_empty() {
+                    format!("curl exited {}", out.status)
+                } else {
+                    format!("curl exited {}: {}", out.status, detail.trim())
+                },
+            )
+        }
+        Err(e) => LinkProbeOutcome::new(LinkHealth::Error, None, format!("curl spawn failed: {e}")),
+    }
+}
+
+fn classify_http_status(status: u16) -> LinkHealth {
+    match status {
+        200..=399 => LinkHealth::Alive,
+        400..=599 => LinkHealth::Dead,
+        _ => LinkHealth::Error,
+    }
+}
+
+fn truncate_detail(detail: &str) -> String {
+    let trimmed = detail.trim();
+    if trimmed.len() <= MAX_LINK_DETAIL {
+        return trimmed.to_string();
+    }
+    let mut end = MAX_LINK_DETAIL;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
+}
+
 // ── the worker ───────────────────────────────────────────────────────────────
 
 /// BOOKMARKS-2 — the mesh-synced bookmarks worker.
@@ -502,6 +746,8 @@ pub struct BookmarksWorker {
     cursors: HashMap<String, String>,
     /// Injected wall clock (tests use a deterministic fake).
     now_fn: NowFn,
+    /// Injected bookmark URL health probe.
+    link_probe: LinkProbeFn,
     /// Test seam to force the share up/down (offline-first tests). `None` in
     /// production → the real [`crate::shared_root_writable`] guard.
     share_gate: Option<Arc<AtomicBool>>,
@@ -535,6 +781,7 @@ impl BookmarksWorker {
             tail_threshold: DEFAULT_TAIL_THRESHOLD,
             cursors: HashMap::new(),
             now_fn: Arc::new(default_now),
+            link_probe: Arc::new(probe_link_with_curl),
             share_gate: None,
             bus_root_override: None,
         }
@@ -544,6 +791,13 @@ impl BookmarksWorker {
     #[must_use]
     pub fn with_now_fn(mut self, now: NowFn) -> Self {
         self.now_fn = now;
+        self
+    }
+
+    /// Inject a deterministic link probe (tests).
+    #[must_use]
+    pub fn with_link_probe(mut self, probe: LinkProbeFn) -> Self {
+        self.link_probe = probe;
         self
     }
 
@@ -635,21 +889,23 @@ impl BookmarksWorker {
         let now = self.now_ms();
         let kind = match action {
             BookmarkAction::Add {
+                id,
                 parent,
+                order_key,
                 url,
                 title,
                 tags,
                 notes,
                 source,
             } => {
-                let order_key = append_order_key(&self.index, parent);
+                let order_key = order_key.unwrap_or_else(|| append_order_key(&self.index, parent));
                 let title = if title.trim().is_empty() {
                     url.clone()
                 } else {
                     title
                 };
                 OpKind::AddBookmark {
-                    id: Uuid::new_v4(),
+                    id: id.unwrap_or_else(Uuid::new_v4),
                     parent,
                     order_key,
                     url,
@@ -678,10 +934,12 @@ impl BookmarksWorker {
             BookmarkAction::Move {
                 id,
                 parent,
+                order_key,
                 before,
                 after,
             } => {
-                let order_key = move_order_key(&self.index, parent, before, after);
+                let order_key =
+                    order_key.unwrap_or_else(|| move_order_key(&self.index, parent, before, after));
                 OpKind::MoveItem {
                     id,
                     parent,
@@ -689,10 +947,15 @@ impl BookmarksWorker {
                 }
             }
             BookmarkAction::Delete { id } => OpKind::DeleteItem { id },
-            BookmarkAction::AddFolder { parent, name } => {
-                let order_key = append_order_key(&self.index, parent);
+            BookmarkAction::AddFolder {
+                id,
+                parent,
+                order_key,
+                name,
+            } => {
+                let order_key = order_key.unwrap_or_else(|| append_order_key(&self.index, parent));
                 OpKind::AddFolder {
-                    id: Uuid::new_v4(),
+                    id: id.unwrap_or_else(Uuid::new_v4),
                     name,
                     parent,
                     order_key,
@@ -873,6 +1136,91 @@ impl BookmarksWorker {
         }
     }
 
+    /// Build and run one bounded dead-link check over the current converged
+    /// collection. This never mints bookmark ops: link health is observational
+    /// state and can change independently of the synced bookmark tree.
+    fn run_link_check(&self, request: &LinkCheckRequest) -> LinkCheckStatus {
+        let mut candidates = Vec::new();
+        if request.ids.is_empty() {
+            for item in self.index.items() {
+                if let Item::Bookmark(b) = item {
+                    candidates.push((b.id, b.url, b.title));
+                }
+            }
+        } else {
+            for id in &request.ids {
+                if let Some(Item::Bookmark(b)) = self.index.item(*id) {
+                    candidates.push((b.id, b.url, b.title));
+                }
+            }
+        }
+        let truncated = candidates.len() > request.limit;
+        let records = candidates
+            .into_iter()
+            .take(request.limit)
+            .map(|(id, url, title)| {
+                let outcome = if is_http_url(&url) {
+                    (self.link_probe)(&url)
+                } else {
+                    LinkProbeOutcome::new(
+                        LinkHealth::Unsupported,
+                        None,
+                        "only http:// and https:// bookmark URLs are checked",
+                    )
+                };
+                LinkCheckRecord {
+                    id,
+                    url,
+                    title,
+                    health: outcome.health,
+                    http_status: outcome.http_status,
+                    detail: outcome.detail,
+                }
+            })
+            .collect::<Vec<_>>();
+        let alive = records
+            .iter()
+            .filter(|r| r.health == LinkHealth::Alive)
+            .count();
+        let dead = records
+            .iter()
+            .filter(|r| r.health == LinkHealth::Dead)
+            .count();
+        let unsupported = records
+            .iter()
+            .filter(|r| r.health == LinkHealth::Unsupported)
+            .count();
+        let errors = records
+            .iter()
+            .filter(|r| r.health == LinkHealth::Error)
+            .count();
+        LinkCheckStatus {
+            op: "bookmarks_link_check".to_string(),
+            node: self.node.clone(),
+            checked_at_ms: self.now_ms(),
+            checked: records.len(),
+            alive,
+            dead,
+            unsupported,
+            errors,
+            truncated,
+            records,
+        }
+    }
+
+    /// Publish the latest dead-link check as both retained state and an event.
+    fn publish_link_check(&self, persist: &Persist, status: &LinkCheckStatus) {
+        let Ok(body) = serde_json::to_string(status) else {
+            return;
+        };
+        if let Err(e) = persist.write(STATE_LINK_CHECK, Priority::Default, None, Some(&body)) {
+            tracing::warn!(target: "mackesd::bookmarks", error = %e, "link-check state publish failed");
+        }
+        if let Err(e) = persist.write(EVENT_LINK_CHECK, Priority::Default, None, Some(&body)) {
+            tracing::warn!(target: "mackesd::bookmarks", error = %e, "link-check event publish failed");
+        }
+    }
+
     /// Flush = one sync pass + publish (the tick body's convergence half).
     fn flush(&mut self, persist: &Persist) {
         self.sync();
@@ -906,6 +1254,18 @@ impl BookmarksWorker {
             };
             for msg in msgs {
                 self.cursors.insert(topic.clone(), msg.ulid.clone());
+                if verb == CHECK_LINKS_VERB {
+                    match parse_link_check_request(msg.body.as_deref().unwrap_or_default()) {
+                        Ok(request) => {
+                            let status = self.run_link_check(&request);
+                            self.publish_link_check(persist, &status);
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "mackesd::bookmarks", error = %e, "bad link-check request");
+                        }
+                    }
+                    continue;
+                }
                 match parse_action(&verb, msg.body.as_deref().unwrap_or_default()) {
                     Ok(action) => {
                         self.apply_action(action);
@@ -1053,13 +1413,27 @@ mod tests {
 
     fn add(url: &str, title: &str) -> BookmarkAction {
         BookmarkAction::Add {
+            id: None,
             parent: None,
+            order_key: None,
             url: url.to_string(),
             title: title.to_string(),
             tags: vec![],
             notes: String::new(),
             source: None,
         }
+    }
+
+    fn test_link_probe() -> LinkProbeFn {
+        Arc::new(|url| {
+            if url.contains("alive") {
+                LinkProbeOutcome::new(LinkHealth::Alive, Some(204), "http 204")
+            } else if url.contains("dead") {
+                LinkProbeOutcome::new(LinkHealth::Dead, Some(404), "http 404")
+            } else {
+                LinkProbeOutcome::new(LinkHealth::Error, None, "connection refused")
+            }
+        })
     }
 
     fn title_of(coll: &Collection, id: Uuid) -> Option<String> {
@@ -1081,27 +1455,45 @@ mod tests {
     #[test]
     fn parse_action_covers_every_verb() {
         let id = Uuid::from_u128(1);
+        let supplied = Uuid::from_u128(2);
         let idj = id.to_string();
-        assert!(matches!(
-            parse_action("add", r#"{"url":"https://x","title":"X"}"#).unwrap(),
-            BookmarkAction::Add { .. }
-        ));
+        let supplied_j = supplied.to_string();
+        match parse_action(
+            "add",
+            &format!(r#"{{"id":"{supplied_j}","url":"https://x","title":"X","order_key":"m"}}"#),
+        )
+        .unwrap()
+        {
+            BookmarkAction::Add { id, order_key, .. } => {
+                assert_eq!(id, Some(supplied));
+                assert_eq!(order_key.as_deref(), Some("m"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
         assert!(matches!(
             parse_action("edit", &format!(r#"{{"id":"{idj}","title":"Y"}}"#)).unwrap(),
             BookmarkAction::Edit { .. }
         ));
-        assert!(matches!(
-            parse_action("move", &format!(r#"{{"id":"{idj}"}}"#)).unwrap(),
-            BookmarkAction::Move { .. }
-        ));
+        match parse_action("move", &format!(r#"{{"id":"{idj}","order_key":"n"}}"#)).unwrap() {
+            BookmarkAction::Move { order_key, .. } => assert_eq!(order_key.as_deref(), Some("n")),
+            other => panic!("unexpected action: {other:?}"),
+        }
         assert!(matches!(
             parse_action("delete", &format!(r#"{{"id":"{idj}"}}"#)).unwrap(),
             BookmarkAction::Delete { .. }
         ));
-        assert!(matches!(
-            parse_action("add-folder", r#"{"name":"F"}"#).unwrap(),
-            BookmarkAction::AddFolder { .. }
-        ));
+        match parse_action(
+            "add-folder",
+            &format!(r#"{{"id":"{supplied_j}","name":"F","order_key":"p"}}"#),
+        )
+        .unwrap()
+        {
+            BookmarkAction::AddFolder { id, order_key, .. } => {
+                assert_eq!(id, Some(supplied));
+                assert_eq!(order_key.as_deref(), Some("p"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
         assert!(matches!(
             parse_action("add_folder", r#"{"name":"F"}"#).unwrap(),
             BookmarkAction::AddFolder { .. }
@@ -1119,6 +1511,148 @@ mod tests {
         assert!(parse_action("edit", r#"{"title":"x"}"#).is_err());
         // `add` without a url is malformed.
         assert!(parse_action("add", "{}").is_err());
+    }
+
+    #[test]
+    fn parse_link_check_request_defaults_and_clamps_the_limit() {
+        let id = Uuid::from_u128(42);
+        let req = parse_link_check_request("{}").unwrap();
+        assert!(req.ids.is_empty());
+        assert_eq!(req.limit, MAX_LINK_CHECKS);
+
+        let req = parse_link_check_request(&format!(r#"{{"ids":["{id}"],"limit":9999}}"#)).unwrap();
+        assert_eq!(req.ids, vec![id]);
+        assert_eq!(req.limit, MAX_LINK_CHECKS);
+
+        let req = parse_link_check_request(r#"{"limit":0}"#).unwrap();
+        assert_eq!(req.limit, 1);
+        assert!(parse_link_check_request("{").is_err());
+    }
+
+    #[test]
+    fn link_check_classifies_alive_dead_unsupported_and_errors() {
+        let (_c, now) = fake_clock(7000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let mut w =
+            worker("n1", "u", local.path(), share.path(), now).with_link_probe(test_link_probe());
+        w.apply_action(add("https://alive.example/", "Alive"));
+        w.apply_action(add("https://dead.example/", "Dead"));
+        w.apply_action(add("gopher://old.example/", "Old"));
+        w.apply_action(add("https://error.example/", "Error"));
+
+        let status = w.run_link_check(&parse_link_check_request("{}").unwrap());
+        assert_eq!(status.op, "bookmarks_link_check");
+        assert_eq!(status.node, "n1");
+        assert_eq!(status.checked_at_ms, 7000);
+        assert_eq!(status.checked, 4);
+        assert_eq!(status.alive, 1);
+        assert_eq!(status.dead, 1);
+        assert_eq!(status.unsupported, 1);
+        assert_eq!(status.errors, 1);
+        assert!(!status.truncated);
+        assert!(status
+            .records
+            .iter()
+            .any(|r| r.title == "Dead" && r.http_status == Some(404)));
+        assert!(status
+            .records
+            .iter()
+            .any(|r| r.title == "Old" && r.health == LinkHealth::Unsupported));
+    }
+
+    #[test]
+    fn client_supplied_ids_and_order_keys_are_preserved() {
+        let (_c, now) = fake_clock(1000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let mut w = worker("n1", "u", local.path(), share.path(), now);
+        let folder = Uuid::from_u128(0xabc1);
+        let bookmark = Uuid::from_u128(0xabc2);
+
+        w.apply_action(BookmarkAction::AddFolder {
+            id: Some(folder),
+            parent: None,
+            order_key: Some("folder-key".into()),
+            name: "Client Folder".into(),
+        });
+        w.apply_action(BookmarkAction::Add {
+            id: Some(bookmark),
+            parent: Some(folder),
+            order_key: Some("bookmark-key".into()),
+            url: "https://client.example".into(),
+            title: "Client Bookmark".into(),
+            tags: vec![],
+            notes: String::new(),
+            source: None,
+        });
+
+        let mde_bookmarks::Item::Folder(f) = w.collection().item(folder).expect("folder") else {
+            panic!("expected folder");
+        };
+        assert_eq!(f.order_key, "folder-key");
+        let mde_bookmarks::Item::Bookmark(b) = w.collection().item(bookmark).expect("bookmark")
+        else {
+            panic!("expected bookmark");
+        };
+        assert_eq!(b.parent, Some(folder));
+        assert_eq!(b.order_key, "bookmark-key");
+
+        w.apply_action(BookmarkAction::Move {
+            id: bookmark,
+            parent: None,
+            order_key: Some("moved-key".into()),
+            before: None,
+            after: None,
+        });
+        let mde_bookmarks::Item::Bookmark(b) = w.collection().item(bookmark).expect("bookmark")
+        else {
+            panic!("expected bookmark");
+        };
+        assert_eq!(b.parent, None);
+        assert_eq!(b.order_key, "moved-key");
+    }
+
+    #[test]
+    fn link_check_request_publishes_status_without_minting_bookmark_ops() {
+        let (_c, now) = fake_clock(9000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let mut w =
+            worker("n1", "u", local.path(), share.path(), now).with_link_probe(test_link_probe());
+        w.apply_action(add("https://alive.example/", "Alive"));
+        w.apply_action(add("https://dead.example/", "Dead"));
+        let alive = find_by_title(w.collection(), "Alive").unwrap();
+        let dead = find_by_title(w.collection(), "Dead").unwrap();
+        let tail_before = w.own_tail.len();
+
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let body = format!(r#"{{"ids":["{alive}","{dead}"],"limit":1}}"#);
+        persist
+            .write(
+                &format!("{ACTION_PREFIX}{CHECK_LINKS_VERB}"),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .unwrap();
+        w.drain_requests(&persist);
+
+        assert_eq!(
+            w.own_tail.len(),
+            tail_before,
+            "link checks publish operational state, not bookmark CRDT ops"
+        );
+        let state = persist.list_since(STATE_LINK_CHECK, None).unwrap();
+        assert_eq!(state.len(), 1);
+        let body = state[0].body.as_deref().unwrap();
+        let status: LinkCheckStatus = serde_json::from_str(body).unwrap();
+        assert_eq!(status.checked, 1);
+        assert!(status.truncated);
+        assert_eq!(status.alive, 1);
+        let events = persist.list_since(EVENT_LINK_CHECK, None).unwrap();
+        assert_eq!(events.len(), 1);
     }
 
     // ── segment (de)serialization is lossless + corruption-tolerant ─────────
@@ -1280,7 +1814,9 @@ mod tests {
         let share = tempfile::tempdir().unwrap();
         let mut w = worker("n1", "u", local.path(), share.path(), now);
         w.apply_action(BookmarkAction::AddFolder {
+            id: None,
             parent: None,
+            order_key: None,
             name: "Imported".into(),
         });
         let folder = w
@@ -1299,6 +1835,7 @@ mod tests {
         w.apply_action(BookmarkAction::Move {
             id: x,
             parent: Some(folder),
+            order_key: None,
             before: None,
             after: None,
         });

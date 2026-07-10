@@ -76,6 +76,8 @@ const SERVICE_USERS: &[&str] = &[
     "octavia",
     // Wave-2 naming (QC-17): the Designate API authenticates to Keystone.
     "designate",
+    // QC-18: Swift proxy authenticates to Keystone as the object-store service.
+    "swift",
 ];
 
 /// The single `RabbitMQ` `openstack` user password (Q16 — internal RPC, strictly

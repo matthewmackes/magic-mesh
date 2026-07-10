@@ -35,7 +35,6 @@ mod formfactor;
 mod host_mirror;
 mod hotkeys;
 mod iac;
-mod instances;
 mod keyboard;
 mod lock_signal;
 mod mesh_view;
@@ -66,7 +65,9 @@ use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
-use mde_bookmarks_egui::{bookmarks_panel, real_manager, Manager as BookmarksManager};
+use mde_bookmarks_egui::{
+    bookmarks_panel, real_manager, BookmarksBus, Manager as BookmarksManager,
+};
 use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
 use mde_files::editor_open::EditorLaunchWatch;
 use mde_files_egui::{files_panel, FileBrowser};
@@ -136,9 +137,9 @@ struct Shell {
     /// the Bus, and render the `service_onboard` worker's typed answer.
     services: services_flow::ServicesFlowState,
     /// The Spawn Lighthouse flow (OW-7) — the Provisioning plane's promote-to-
-    /// lighthouse action: pick a cloud (zone1-do) or local (cloud-hypervisor)
-    /// target, optionally an HA pair, preview the daemon's plan (dry-run), spawn
-    /// over the Bus, and render the `spawn_lighthouse_onboard` worker's typed
+    /// lighthouse action: pick a cloud target, optionally an HA pair, preview the
+    /// daemon's plan (dry-run), spawn over the Bus, and render the
+    /// `spawn_lighthouse_onboard` worker's typed
     /// answer (plan summary / CA-migration steps / LAN-only retry hint / typed
     /// gated error).
     spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState,
@@ -201,11 +202,6 @@ struct Shell {
     /// rail. Falls back to the pending `VdiState` request until the broker log has
     /// a matching session for this seat.
     session_rail: session_rail::SessionRailState,
-    /// The Instances surface — this workstation's local cloud-hypervisor VMs via
-    /// the `mde-kvm` broker (E12-7). Create / boot / shutdown drive mde-kvm's real
-    /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
-    /// an empty roster shows the honest "No local VMs" EmptyState.
-    instances: instances::InstancesState,
     /// The Infra as Code (`IaC`) surface — the `OpenStack` `IaaS` control plane
     /// (IAC-2). Consumes the Keystone service catalog + per-service API health off
     /// the Bus read verb `action/cloud/get-catalog` (no shell→mackesd dep, §6) and renders
@@ -271,6 +267,7 @@ struct Shell {
     /// platform chrome. Persistence and mesh sync remain owned by the bookmarks
     /// worker; this is the existing egui manager over the CRDT model.
     bookmarks: BookmarksManager,
+    bookmarks_bus: BookmarksBus,
     /// The Terminal surface (TERM-16) — the production `TerminalSurface` (the
     /// TERM-4/5/8 `TabbedTerminal`: tabs / splits / broadcast / a shell on any mesh
     /// peer) over a real local PTY, built once by `mde_term_egui::real_terminal()`.
@@ -365,7 +362,6 @@ impl Shell {
             vdi: vdi::VdiState::default(),
             chooser: chooser::ChooserState::default(),
             session_rail: session_rail::SessionRailState::new(),
-            instances: instances::InstancesState::default(),
             infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
             phones_hub: phones_hub::PhonesHubState::default(),
@@ -378,6 +374,7 @@ impl Shell {
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
             bookmarks: real_manager(),
+            bookmarks_bus: BookmarksBus::default(),
             terminal: real_terminal(),
             editor: real_editor(),
             editor_launch: EditorLaunchWatch::from_env(),
@@ -602,15 +599,6 @@ impl Shell {
                     }
                 }
             }
-            Surface::Instances => {
-                // The local cloud-hypervisor VM broker (E12-7). Scoped under its
-                // own `push_id` like every mounted surface so its egui ids can't
-                // collide in the shell's one `Context`.
-                let instances = &mut self.instances;
-                ui.push_id("shell-instances", |ui| {
-                    instances::instances_panel(ui, instances);
-                });
-            }
             Surface::InfraCode => {
                 // The OpenStack IaaS control plane (IAC-2) — the Overview tab: the
                 // API status band + the merged service directory, consumed off the
@@ -709,6 +697,7 @@ impl Shell {
             }
             Surface::Bookmarks => {
                 let bookmarks = &mut self.bookmarks;
+                self.bookmarks_bus.pump(bookmarks);
                 ui.push_id("shell-bookmarks", |ui| {
                     bookmarks_panel(ui, bookmarks);
                 });
@@ -766,13 +755,10 @@ impl Shell {
                 // in the shell's one `Context`. The snapshot is refreshed in
                 // `render` (it also feeds dock status), so the panel
                 // only renders here. The System panel drives Displays + Power live
-                // (E12-18); its per-VM power rows reuse the Instances broker (§6),
-                // so it takes a `&mut` to that roster — two disjoint field borrows
-                // of the shell.
+                // (E12-18).
                 let system = &mut self.system;
-                let instances = &mut self.instances;
                 ui.push_id("shell-system", |ui| {
-                    system.show(ui, instances);
+                    system.show(ui);
                 });
             }
             Surface::Storage => {
@@ -1042,6 +1028,15 @@ impl Shell {
         // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
         self.central_view(ctx);
 
+        // QC-13 — Cloud row → Desktop SPICE handoff. The Cloud plane lives inside
+        // Workbench and parks its state in egui memory; after Workbench renders, a
+        // dialable Nova console descriptor can queue one native VDI attach here.
+        if let Some(request) = workbench::cloud_plane::take_console_attach(ctx) {
+            self.vdi.request_connect(request);
+            self.nav.expanded = true;
+            self.nav.surface = Surface::Desktop;
+        }
+
         // Route the System surface's own control-error alerts (a refused / absent
         // Bluetooth write, a pairing-agent registration failure — §7) into the ONE
         // ToastBridge, applying the same suppression + sound policy as a Bus alert.
@@ -1281,6 +1276,9 @@ impl Shell {
                 // behind the session.
                 self.nav.expanded = true;
                 self.nav.surface = surface;
+            }
+            Some(console::ConsoleRequest::Plane(plane)) => {
+                self.apply_nav(toast_bridge::Navigate::Plane(plane));
             }
             // CONSOLE-5 — the front door opens a real tab: a command / Custom
             // entry switches the body to the Terminal surface (lock #7) and

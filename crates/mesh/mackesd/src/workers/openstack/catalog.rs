@@ -36,9 +36,10 @@ pub enum Placement {
 /// The variant set is the QC-2 skeleton catalog: the QC-4 foundation trio +
 /// the QC-5/6 identity + core-API set + the QC-7/8 OVN/Cinder plane, extended
 /// by QC-19 with the wave-2 services (Heat, Octavia, and the optional Horizon —
-/// Q25/47/61) and by QC-17 with the Designate naming plane (Q46). Names follow
-/// the Kolla conventions the mirrored archives carry: container names use
-/// underscores (`nova_api`), image basenames use dashes (`nova-api`).
+/// Q25/47/61), by QC-17 with the Designate naming plane (Q46), and by QC-18
+/// with the Swift object tier (Q54/55/57). Names follow the Kolla conventions
+/// the mirrored archives carry: container names use underscores (`nova_api`),
+/// image basenames use dashes (`nova-api`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceKind {
@@ -92,6 +93,18 @@ pub enum ServiceKind {
     /// object store are node-local LVM (Q51/59), so the backup agent runs where
     /// they live — never a controller box (Q5/22).
     CinderBackup,
+    // ── Object tier (QC-18, Q54/55/57) ──
+    /// Swift proxy API — Keystone-native hot object tier at `swift.mesh:8080`;
+    /// Cinder backups land here and the off-site DO Spaces leg is Swift
+    /// replication, not a second Cinder driver.
+    SwiftProxyServer,
+    /// Swift account server — ring member for account DB partitions.
+    SwiftAccountServer,
+    /// Swift container server — ring member for container DB partitions.
+    SwiftContainerServer,
+    /// Swift object server — ring member for object partitions on the node's
+    /// writable object-store directory.
+    SwiftObjectServer,
     // ── Wave-2 orchestration + load-balancing + dashboard (QC-19, Q25/47/61) ──
     /// Heat orchestration API (Q61) — serves `openstack stack {list,create}`.
     /// The fleet is authoritative: the worker renders stacks from fleet state
@@ -141,7 +154,7 @@ pub enum ServiceKind {
 impl ServiceKind {
     /// Every catalogued service, in the canonical (enum-order) sequence the
     /// mirror rows + reconcile folds iterate.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 37] = [
         Self::Mariadb,
         Self::Rabbitmq,
         Self::Memcached,
@@ -161,6 +174,10 @@ impl ServiceKind {
         Self::CinderScheduler,
         Self::CinderVolume,
         Self::CinderBackup,
+        Self::SwiftProxyServer,
+        Self::SwiftAccountServer,
+        Self::SwiftContainerServer,
+        Self::SwiftObjectServer,
         Self::HeatApi,
         Self::HeatApiCfn,
         Self::HeatEngine,
@@ -202,6 +219,10 @@ impl ServiceKind {
             Self::CinderScheduler => "cinder_scheduler",
             Self::CinderVolume => "cinder_volume",
             Self::CinderBackup => "cinder_backup",
+            Self::SwiftProxyServer => "swift_proxy_server",
+            Self::SwiftAccountServer => "swift_account_server",
+            Self::SwiftContainerServer => "swift_container_server",
+            Self::SwiftObjectServer => "swift_object_server",
             Self::HeatApi => "heat_api",
             Self::HeatApiCfn => "heat_api_cfn",
             Self::HeatEngine => "heat_engine",
@@ -243,6 +264,10 @@ impl ServiceKind {
             Self::CinderScheduler => "cinder-scheduler",
             Self::CinderVolume => "cinder-volume",
             Self::CinderBackup => "cinder-backup",
+            Self::SwiftProxyServer => "swift-proxy-server",
+            Self::SwiftAccountServer => "swift-account-server",
+            Self::SwiftContainerServer => "swift-container-server",
+            Self::SwiftObjectServer => "swift-object-server",
             Self::HeatApi => "heat-api",
             Self::HeatApiCfn => "heat-api-cfn",
             Self::HeatEngine => "heat-engine",
@@ -313,6 +338,7 @@ impl ServiceKind {
             Self::NovaApi => Some(8774),
             Self::NeutronServer => Some(9696),
             Self::CinderApi => Some(8776),
+            Self::SwiftProxyServer => Some(8080),
             // Wave-2 APIs (QC-19). Heat's two endpoints (orchestration + the
             // CFN-compatible callback API, Q61) and Octavia's LB API (Q47). The
             // Octavia agents + Horizon carry no Keystone-catalog endpoint.
@@ -341,6 +367,7 @@ impl ServiceKind {
             Self::NovaApi => Some("nova.mesh"),
             Self::NeutronServer => Some("neutron.mesh"),
             Self::CinderApi => Some("cinder.mesh"),
+            Self::SwiftProxyServer => Some("swift.mesh"),
             Self::HeatApi => Some("heat.mesh"),
             Self::HeatApiCfn => Some("heat-cfn.mesh"),
             Self::OctaviaApi => Some("octavia.mesh"),
@@ -501,6 +528,10 @@ mod tests {
             ServiceKind::CinderApi.endpoint_url().as_deref(),
             Some("http://cinder.mesh:8776")
         );
+        assert_eq!(
+            ServiceKind::SwiftProxyServer.endpoint_url().as_deref(),
+            Some("http://swift.mesh:8080")
+        );
         // Wave-2 (QC-19): Heat's two endpoints + the Octavia LB API advertise
         // over the mesh like every other API.
         assert_eq!(
@@ -532,6 +563,9 @@ mod tests {
             ServiceKind::CinderScheduler,
             ServiceKind::CinderVolume,
             ServiceKind::CinderBackup,
+            ServiceKind::SwiftAccountServer,
+            ServiceKind::SwiftContainerServer,
+            ServiceKind::SwiftObjectServer,
             // Wave-2 (QC-19): Heat's engine + all four Octavia agents + the
             // Horizon dashboard are not Keystone-catalog API endpoints.
             ServiceKind::HeatEngine,
@@ -581,6 +615,57 @@ mod tests {
             ServiceKind::from_container_name("cinder_backup"),
             Some(ServiceKind::CinderBackup)
         );
+    }
+
+    #[test]
+    fn swift_is_the_every_node_object_tier_with_one_keystone_api() {
+        // QC-18/Q54/55/57 — Swift is the hot object tier: the proxy advertises a
+        // Keystone-catalog object-store endpoint on the mesh, while account /
+        // container / object servers are every-node ring members with no
+        // tenant-facing HTTP endpoint.
+        assert_eq!(
+            ServiceKind::SwiftProxyServer.container_name(),
+            "swift_proxy_server"
+        );
+        assert_eq!(
+            ServiceKind::SwiftProxyServer.image_name(),
+            "swift-proxy-server"
+        );
+        assert_eq!(ServiceKind::SwiftProxyServer.api_port(), Some(8080));
+        assert_eq!(
+            ServiceKind::SwiftProxyServer.endpoint_url().as_deref(),
+            Some("http://swift.mesh:8080")
+        );
+        for kind in [
+            ServiceKind::SwiftProxyServer,
+            ServiceKind::SwiftAccountServer,
+            ServiceKind::SwiftContainerServer,
+            ServiceKind::SwiftObjectServer,
+        ] {
+            assert_eq!(kind.placement(), Placement::EveryNode, "{kind:?}");
+        }
+        for (kind, container, image) in [
+            (
+                ServiceKind::SwiftAccountServer,
+                "swift_account_server",
+                "swift-account-server",
+            ),
+            (
+                ServiceKind::SwiftContainerServer,
+                "swift_container_server",
+                "swift-container-server",
+            ),
+            (
+                ServiceKind::SwiftObjectServer,
+                "swift_object_server",
+                "swift-object-server",
+            ),
+        ] {
+            assert_eq!(kind.container_name(), container);
+            assert_eq!(kind.image_name(), image);
+            assert_eq!(kind.api_port(), None, "{kind:?}");
+            assert_eq!(ServiceKind::from_container_name(container), Some(kind));
+        }
     }
 
     #[test]

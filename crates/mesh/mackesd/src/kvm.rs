@@ -48,8 +48,9 @@ impl KvmService {
 /// (`infra/ansible/node-virt.yml`) — the Fedora + KVM replacement for the
 /// xcp-ng toolstack. Ordered management-brain-first: `libvirtd` (the lifecycle +
 /// network + storage daemon) leads, then the container socket, host networking,
-/// the libvirt-served default network + storage pool, and the optional console
-/// last.
+/// and the libvirt-served default network + storage pool. Cockpit's interim VM
+/// console is retired by the QUASAR-CLOUD/QC-15 cutover and is deliberately not
+/// part of the live catalog.
 pub static KVM_SERVICES: &[KvmService] = &[
     KvmService::new(
         "libvirtd",
@@ -82,12 +83,6 @@ pub static KVM_SERVICES: &[KvmService] = &[
         "libvirtd.service",
         "The default dir storage pool VM disks live in (the sm/SR equivalent) — \
          autostarted and served in-process by libvirtd.",
-    ),
-    KvmService::new(
-        "cockpit",
-        "cockpit.socket",
-        "Optional per-node KVM + Podman web console (cockpit-machines + \
-         cockpit-podman), socket-activated.",
     ),
 ];
 

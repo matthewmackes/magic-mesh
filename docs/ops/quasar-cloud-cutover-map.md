@@ -26,7 +26,7 @@
 | Dies | Replaced by | Where |
 |---|---|---|
 | mackesd `vm_lifecycle` worker + the mesh-native VM scheduler paths | **Nova + Placement** own ALL VM lifecycle; the mackesd verbs become wrappers over the Nova API | Q31/40, QC-15 |
-| `cloud-hypervisor` (hypervisor + its glue, incl. the `mde-kvm` broker crate) | **libvirt/QEMU-KVM**; the virtio-gpu→egui path is re-validated on QEMU | Q32, QC-1/QC-15 |
+| `cloud-hypervisor` (hypervisor + its glue, incl. the `mde-kvm` broker crate) | **libvirt/QEMU-KVM**; image/host virt foundation proven in QC-1, QEMU virtio-gpu→egui fast path split to QC-23 | Q32, QC-1/QC-15/QC-23 |
 | The shell's local-VM **Instances** surface (`mde-shell-egui`, the cloud-hypervisor broker view) | the **Cloud plane** — one VM surface for local and mesh-wide alike | QC-12/QC-15 |
 | `install-helpers/build-mde-vm-golden.sh` + on-disk golden qcow2s | **Glance + diskimage-builder** pipeline; images replicate between API nodes | Q36/53, QC-9 |
 | Cockpit VM console (the interim) | the **Cloud plane** (+ optional mesh-only Horizon) | Q66, QC-15 |

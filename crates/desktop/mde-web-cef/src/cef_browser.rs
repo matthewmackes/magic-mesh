@@ -36,6 +36,10 @@ pub const CEF_WINDOW_INFO_WINDOWLESS_OFFSET: usize = 56;
 pub const CEF_WINDOW_INFO_SHARED_TEXTURE_OFFSET: usize = 60;
 /// `offsetof(cef_window_info_t, external_begin_frame_enabled)`.
 pub const CEF_WINDOW_INFO_EXTERNAL_BEGIN_FRAME_OFFSET: usize = 64;
+/// `offsetof(cef_window_info_t, runtime_style)`.
+pub const CEF_WINDOW_INFO_RUNTIME_STYLE_OFFSET: usize = 80;
+/// `cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY` for pinned Linux CEF 149.
+pub const CEF_RUNTIME_STYLE_ALLOY: i32 = 2;
 /// `sizeof(cef_browser_settings_t)` for pinned Linux CEF 149.
 pub const CEF_BROWSER_SETTINGS_SIZE: usize = 264;
 /// `offsetof(cef_browser_settings_t, windowless_frame_rate)`.
@@ -70,6 +74,13 @@ pub const CEF_REQUEST_HANDLER_GET_RESOURCE_REQUEST_HANDLER_OFFSET: usize = 56;
 pub const CEF_RESOURCE_REQUEST_HANDLER_SIZE: usize = 104;
 /// `offsetof(cef_resource_request_handler_t, on_before_resource_load)`.
 pub const CEF_RESOURCE_REQUEST_HANDLER_ON_BEFORE_RESOURCE_LOAD_OFFSET: usize = 48;
+const CEF_PAGE_TEXT_BEACON_PREFIX: &str = "https://mde-page-text.invalid/capture/";
+const CEF_PAGE_TEXT_BEACON_LEGACY_PREFIX: &str = "mde-page-text://capture/";
+const CEF_PAGE_TEXT_BEACON_MAX_BYTES: u32 = 8 * 1024;
+const CEF_PAGE_SCRAPE_BEACON_PREFIX: &str = "https://mde-page-scrape.invalid/capture/";
+const CEF_PAGE_SCRAPE_BEACON_MAX_BYTES: usize = 32 * 1024;
+const CEF_PASSKEY_BEACON_PREFIX: &str = "https://mde-passkey.invalid/request/";
+const CEF_PASSKEY_BEACON_MAX_BYTES: usize = 8 * 1024;
 /// `sizeof(cef_print_handler_t)` for pinned Linux CEF 149.
 pub const CEF_PRINT_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_print_handler_t, on_print_dialog)`.
@@ -214,6 +225,17 @@ pub struct CefBrowserProbe {
     pub last_paint_height: i32,
 }
 
+/// Result of a bounded page-text smoke probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CefTextProbe {
+    /// Browser paint probe details.
+    pub browser: CefBrowserProbe,
+    /// Text marker that had to appear in visible page text.
+    pub expected: String,
+    /// Bytes captured from visible page text.
+    pub text_bytes: usize,
+}
+
 impl CefBrowserProbe {
     /// Operator-facing status line.
     #[must_use]
@@ -227,6 +249,23 @@ impl CefBrowserProbe {
             self.paints,
             self.last_paint_width,
             self.last_paint_height
+        )
+    }
+}
+
+impl CefTextProbe {
+    /// Operator-facing status line.
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        format!(
+            "CEF_TEXT_PROBE_READY url={} view={}x{} created={} paints={} marker_bytes={} text_bytes={}",
+            self.browser.url,
+            self.browser.width,
+            self.browser.height,
+            self.browser.created,
+            self.browser.paints,
+            self.expected.len(),
+            self.text_bytes
         )
     }
 }
@@ -245,6 +284,15 @@ pub enum CefBrowserError {
         /// Paint callbacks observed.
         paints: usize,
     },
+    /// Browser painted but the expected text marker was not observed.
+    TextProbeMissing {
+        /// Browser-created callbacks observed.
+        created: usize,
+        /// Paint callbacks observed.
+        paints: usize,
+        /// Last captured text byte count, if any page text arrived.
+        text_bytes: usize,
+    },
     /// Creating or publishing through the BOOKMARKS-6 frame sink failed.
     Offscreen(String),
 }
@@ -259,6 +307,14 @@ impl fmt::Display for CefBrowserError {
             Self::TimedOut { created, paints } => write!(
                 f,
                 "timed out waiting for CEF paint callback (created={created} paints={paints})"
+            ),
+            Self::TextProbeMissing {
+                created,
+                paints,
+                text_bytes,
+            } => write!(
+                f,
+                "timed out waiting for CEF text marker (created={created} paints={paints} text_bytes={text_bytes})"
             ),
             Self::Offscreen(err) => write!(f, "CEF offscreen frame sink failed: {err}"),
         }
@@ -340,6 +396,119 @@ pub fn run_windowless_browser_probe_with_stream(
     })
 }
 
+/// Create a windowless browser, request visible page text, and require a marker.
+///
+/// This is the runtime smoke primitive used for live WebExtension proof: a test
+/// extension can inject a visible marker into a page, and this probe only passes
+/// when CEF paints and the existing page-text beacon observes that marker.
+///
+/// # Errors
+/// Returns [`CefBrowserError`] when CEF does not paint or the marker is absent
+/// before the bounded deadline.
+pub fn run_windowless_text_probe(
+    abi: &CefAbi,
+    url: &str,
+    width: u32,
+    height: u32,
+    timeout: Duration,
+    expected: &str,
+) -> Result<CefTextProbe, CefBrowserError> {
+    const TEXT_PROBE_ID: u64 = u64::MAX - 7;
+    const TEXT_PROBE_MAX_BYTES: u32 = 16 * 1024;
+
+    let (helper, shell) = UnixStream::pair()?;
+    helper.set_nonblocking(true)?;
+    shell.set_nonblocking(true)?;
+
+    let window_info = CefWindowInfo::windowless(width, height);
+    let browser_settings = CefBrowserSettings::windowless(30);
+    let url = CefStringOwned::new(url)?;
+    let callbacks = CefBrowserCallbacks::new(
+        width,
+        height,
+        Some(&helper),
+        abi.string_userfree_utf16_free(),
+    )?;
+
+    let browser = abi.create_browser_sync(
+        window_info.as_ptr(),
+        callbacks.client_ptr(),
+        url.as_ptr(),
+        browser_settings.as_ptr(),
+    );
+    if browser.is_null() {
+        abi.shutdown();
+        return Err(CefBrowserError::CreateReturnedNull);
+    }
+    notify_browser_view_ready(browser);
+
+    let deadline = Instant::now() + timeout;
+    let mut rbuf = Vec::new();
+    let mut first_paint = None;
+    let mut last_text_bytes = 0;
+    let mut last_text_request = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    while Instant::now() < deadline {
+        abi.do_message_loop_work();
+        match sock::recv(&shell) {
+            Ok(RecvOutcome::Data { bytes, .. }) => {
+                rbuf.extend_from_slice(&bytes);
+                if let Some(text) = drain_page_text_events(&mut rbuf, TEXT_PROBE_ID) {
+                    last_text_bytes = text.len();
+                    if text.contains(expected) {
+                        let browser_probe = first_paint.unwrap_or(CefBrowserProbe {
+                            url: url.text().to_owned(),
+                            width,
+                            height,
+                            created: callbacks.created(),
+                            paints: callbacks.paints(),
+                            last_paint_width: callbacks.last_paint_width(),
+                            last_paint_height: callbacks.last_paint_height(),
+                        });
+                        close_browser(browser);
+                        for _ in 0..8 {
+                            abi.do_message_loop_work();
+                            thread::sleep(Duration::from_millis(4));
+                        }
+                        abi.shutdown();
+                        return Ok(CefTextProbe {
+                            browser: browser_probe,
+                            expected: expected.to_owned(),
+                            text_bytes: last_text_bytes,
+                        });
+                    }
+                }
+            }
+            Ok(RecvOutcome::WouldBlock) => {}
+            Ok(RecvOutcome::Eof) | Err(_) => break,
+        }
+        if first_paint.is_none() && callbacks.paints() > 0 {
+            first_paint = Some(CefBrowserProbe {
+                url: url.text().to_owned(),
+                width,
+                height,
+                created: callbacks.created(),
+                paints: callbacks.paints(),
+                last_paint_width: callbacks.last_paint_width(),
+                last_paint_height: callbacks.last_paint_height(),
+            });
+        }
+        if first_paint.is_some() && last_text_request.elapsed() >= Duration::from_millis(100) {
+            request_page_text(browser, TEXT_PROBE_ID, TEXT_PROBE_MAX_BYTES);
+            last_text_request = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(8));
+    }
+
+    abi.shutdown();
+    Err(CefBrowserError::TextProbeMissing {
+        created: callbacks.created(),
+        paints: callbacks.paints(),
+        text_bytes: last_text_bytes,
+    })
+}
+
 /// Serve one CEF tab over the BOOKMARKS-6 session socket until the shell closes
 /// the socket. This currently supports initial load + frame publication; decoded
 /// control frames are drained so the stream stays aligned while navigation/input
@@ -380,6 +549,9 @@ pub fn run_windowless_tab(
     let mut first_paint = None;
     let started = Instant::now();
     let mut rbuf = Vec::new();
+    let mut last_passkey_poll = Instant::now()
+        .checked_sub(Duration::from_millis(250))
+        .unwrap_or_else(Instant::now);
     loop {
         abi.do_message_loop_work();
         match sock::recv(stream) {
@@ -401,6 +573,10 @@ pub fn run_windowless_tab(
                 last_paint_width: callbacks.last_paint_width(),
                 last_paint_height: callbacks.last_paint_height(),
             });
+        }
+        if last_passkey_poll.elapsed() >= Duration::from_millis(250) {
+            poll_passkey_bridge(browser);
+            last_passkey_poll = Instant::now();
         }
         if first_paint.is_none() && started.elapsed() > Duration::from_secs(15) {
             abi.shutdown();
@@ -455,6 +631,23 @@ fn drain_control_frames(rbuf: &mut Vec<u8>, browser: *mut c_void, callbacks: &Ce
     }
 }
 
+fn drain_page_text_events(rbuf: &mut Vec<u8>, expected_id: u64) -> Option<String> {
+    let mut latest = None;
+    loop {
+        match wire::take_frame(rbuf) {
+            Ok(Some(payload)) => {
+                if let Ok(EventMsg::PageText { id, text }) = EventMsg::decode(&payload) {
+                    if id == expected_id {
+                        latest = Some(text);
+                    }
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    latest
+}
+
 fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, msg: &ControlMsg) {
     match msg {
         ControlMsg::Load(url) => load_url(browser, url),
@@ -484,8 +677,47 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
         ControlMsg::SetForceDark { enabled } => apply_force_dark(browser, *enabled),
         ControlMsg::SetReaderMode { enabled } => apply_reader_mode(browser, *enabled),
+        ControlMsg::SetUserScripts { enabled, bundle } => {
+            apply_user_scripts(browser, *enabled, bundle);
+        }
+        ControlMsg::SetUserAgent { user_agent } => apply_user_agent(browser, user_agent),
+        ControlMsg::SetDeviceProfile {
+            profile,
+            width,
+            height,
+            scale_percent,
+            touch,
+        } => apply_device_profile(browser, profile, *width, *height, *scale_percent, *touch),
+        ControlMsg::SetSpellcheckHighlights { words } => {
+            apply_spellcheck_highlights(browser, words);
+        }
+        ControlMsg::ApplySpellcheckCorrection { word, replacement } => {
+            apply_spellcheck_correction(browser, word, replacement);
+        }
+        ControlMsg::ApplySpellcheckCorrectionAll { word, replacement } => {
+            apply_spellcheck_correction_all(browser, word, replacement);
+        }
+        ControlMsg::ApplySpellcheckCorrectionAt {
+            word,
+            replacement,
+            occurrence,
+        } => {
+            apply_spellcheck_correction_at(browser, word, replacement, *occurrence);
+        }
         ControlMsg::PrintPage => print_page(browser),
         ControlMsg::SavePdf { path } => save_pdf(browser, callbacks, path),
+        ControlMsg::RequestPageText { id, max_bytes } => {
+            request_page_text(browser, *id, *max_bytes);
+        }
+        ControlMsg::RequestPageScrape {
+            id,
+            max_bytes,
+            max_links,
+            max_headings,
+        } => {
+            request_page_scrape(browser, *id, *max_bytes, *max_links, *max_headings);
+        }
+        ControlMsg::CompletePasskey { body } => complete_passkey(browser, body),
         ControlMsg::ResourceVerdict { id, allow } => callbacks.apply_resource_verdict(*id, *allow),
     }
 }
@@ -557,6 +789,10 @@ impl CefWindowInfo {
         info.put_i32(CEF_WINDOW_INFO_WINDOWLESS_OFFSET, 1);
         info.put_i32(CEF_WINDOW_INFO_SHARED_TEXTURE_OFFSET, 0);
         info.put_i32(CEF_WINDOW_INFO_EXTERNAL_BEGIN_FRAME_OFFSET, 0);
+        info.put_i32(
+            CEF_WINDOW_INFO_RUNTIME_STYLE_OFFSET,
+            CEF_RUNTIME_STYLE_ALLOY,
+        );
         info
     }
 
@@ -883,6 +1119,27 @@ impl CefBrowserState {
     }
 
     fn begin_resource_request(&self, url: String, callback: *mut c_void) -> c_int {
+        if let Some((id, text)) = decode_page_text_beacon(&url) {
+            self.publish_page_text(id, text);
+            if !callback.is_null() {
+                cancel_cef_callback(callback);
+            }
+            return RV_CANCEL;
+        }
+        if let Some((id, body)) = decode_page_scrape_beacon(&url) {
+            self.publish_page_scrape(id, body);
+            if !callback.is_null() {
+                cancel_cef_callback(callback);
+            }
+            return RV_CANCEL;
+        }
+        if let Some(body) = decode_passkey_beacon(&url) {
+            self.publish_passkey_request(body);
+            if !callback.is_null() {
+                cancel_cef_callback(callback);
+            }
+            return RV_CANCEL;
+        }
         if callback.is_null() {
             return RV_CONTINUE;
         }
@@ -959,6 +1216,33 @@ impl CefBrowserState {
     fn publish_pdf_finished(&self, path: String, ok: bool) {
         let ok = ok && pdf_file_looks_written(&path);
         let event = EventMsg::PdfSaved { path, ok };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    fn publish_page_text(&self, id: u64, text: String) {
+        let event = EventMsg::PageText { id, text };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    fn publish_page_scrape(&self, id: u64, body: String) {
+        let event = EventMsg::PageScrape { id, body };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    fn publish_passkey_request(&self, body: String) {
+        let event = EventMsg::PasskeyRequest { body };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -1723,6 +2007,10 @@ fn load_url(browser: *mut c_void, url: &str) {
     let Some(frame) = main_frame(browser) else {
         return;
     };
+    load_frame_url(frame, url);
+}
+
+fn load_frame_url(frame: *mut c_void, url: &str) {
     let Ok(url) = CefStringOwned::new(url) else {
         return;
     };
@@ -1758,6 +2046,116 @@ fn apply_reader_mode(browser: *mut c_void, enabled: bool) {
         return;
     };
     execute_java_script(frame, &reader_mode_script(enabled));
+}
+
+fn apply_user_scripts(browser: *mut c_void, enabled: bool, bundle: &str) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &userscript_library_script(enabled, bundle));
+}
+
+fn apply_user_agent(browser: *mut c_void, user_agent: &str) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &user_agent_override_script(user_agent));
+}
+
+fn apply_device_profile(
+    browser: *mut c_void,
+    profile: &str,
+    width: u16,
+    height: u16,
+    scale_percent: u16,
+    touch: bool,
+) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(
+        frame,
+        &device_profile_script(profile, width, height, scale_percent, touch),
+    );
+}
+
+fn apply_spellcheck_highlights(browser: *mut c_void, words: &[String]) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &spellcheck_highlight_script(words));
+}
+
+fn apply_spellcheck_correction(browser: *mut c_void, word: &str, replacement: &str) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &spellcheck_correction_script(word, replacement));
+}
+
+fn apply_spellcheck_correction_all(browser: *mut c_void, word: &str, replacement: &str) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &spellcheck_correction_all_script(word, replacement));
+}
+
+fn apply_spellcheck_correction_at(
+    browser: *mut c_void,
+    word: &str,
+    replacement: &str,
+    occurrence: u16,
+) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(
+        frame,
+        &spellcheck_correction_at_script(word, replacement, occurrence),
+    );
+}
+
+fn request_page_text(browser: *mut c_void, id: u64, max_bytes: u32) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    load_frame_url(
+        frame,
+        &format!("javascript:{}", page_text_beacon_script(id, max_bytes)),
+    );
+}
+
+fn request_page_scrape(
+    browser: *mut c_void,
+    id: u64,
+    max_bytes: u32,
+    max_links: u16,
+    max_headings: u16,
+) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    load_frame_url(
+        frame,
+        &format!(
+            "javascript:{}",
+            page_scrape_beacon_script(id, max_bytes, max_links, max_headings)
+        ),
+    );
+}
+
+fn poll_passkey_bridge(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &passkey_bridge_script());
+}
+
+fn complete_passkey(browser: *mut c_void, body: &str) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &passkey_complete_script(body));
 }
 
 fn apply_page_zoom(browser: *mut c_void, percent: u16) {
@@ -1872,6 +2270,36 @@ html.mde-reader-mode img, html.mde-reader-mode video {
     )
 }
 
+fn user_agent_override_script(user_agent: &str) -> String {
+    if user_agent.trim().is_empty() {
+        return "(function(){delete window.__mdeUserAgentOverride;})();".to_owned();
+    }
+    let ua = js_string_literal(&clamp_utf8(user_agent, 512));
+    format!(
+        "(function(){{var ua={ua};window.__mdeUserAgentOverride=ua;try{{Object.defineProperty(Navigator.prototype,'userAgent',{{get:function(){{return window.__mdeUserAgentOverride||ua;}},configurable:true}});Object.defineProperty(Navigator.prototype,'appVersion',{{get:function(){{return window.__mdeUserAgentOverride||ua;}},configurable:true}});Object.defineProperty(Navigator.prototype,'platform',{{get:function(){{return /Android|Mobile|iPhone|iPad/.test(window.__mdeUserAgentOverride||ua)?'Linux armv8l':'Linux x86_64';}},configurable:true}});}}catch(_e){{}}}})();"
+    )
+}
+
+fn device_profile_script(
+    profile: &str,
+    width: u16,
+    height: u16,
+    scale_percent: u16,
+    touch: bool,
+) -> String {
+    if profile == "default" || width == 0 || height == 0 {
+        return "(function(){delete window.__mdeDeviceProfile;try{delete window.innerWidth;delete window.innerHeight;delete window.devicePixelRatio;}catch(_e){}var meta=document.getElementById('mde-device-profile-viewport');if(meta)meta.remove();delete document.documentElement.dataset.mdeDeviceProfile;})();".to_owned();
+    }
+    let profile = js_string_literal(&clamp_utf8(profile, 32));
+    let width = width.clamp(240, 7680);
+    let height = height.clamp(240, 7680);
+    let scale = scale_percent.clamp(50, 600);
+    let touch_points = if touch { 5 } else { 0 };
+    format!(
+        "(function(){{var p={{profile:{profile},width:{width},height:{height},dpr:{scale}/100,touch:{touch},touchPoints:{touch_points}}};window.__mdeDeviceProfile=p;document.documentElement.dataset.mdeDeviceProfile=p.profile;var meta=document.getElementById('mde-device-profile-viewport');if(!meta){{meta=document.createElement('meta');meta.id='mde-device-profile-viewport';meta.name='viewport';(document.head||document.documentElement).appendChild(meta);}}meta.content='width='+p.width+', initial-scale=1';function def(o,n,g){{try{{Object.defineProperty(o,n,{{get:g,configurable:true}});}}catch(_e){{}}}}def(window,'innerWidth',function(){{return p.width;}});def(window,'innerHeight',function(){{return p.height;}});def(window,'devicePixelRatio',function(){{return p.dpr;}});if(window.Screen&&Screen.prototype){{def(Screen.prototype,'width',function(){{return p.width;}});def(Screen.prototype,'height',function(){{return p.height;}});def(Screen.prototype,'availWidth',function(){{return p.width;}});def(Screen.prototype,'availHeight',function(){{return p.height;}});}}if(window.Navigator&&Navigator.prototype){{def(Navigator.prototype,'maxTouchPoints',function(){{return p.touchPoints;}});}}}})();"
+    )
+}
+
 fn page_zoom_script(percent: u16) -> String {
     let percent = percent.clamp(25, 500);
     format!("(function(){{document.documentElement.style.zoom='{percent}%';}})();")
@@ -1885,6 +2313,422 @@ fn find_in_page_script(query: &str, backwards: bool) -> String {
 
 const fn clear_find_script() -> &'static str {
     "(function(){var s=window.getSelection&&window.getSelection();if(s)s.removeAllRanges();})();"
+}
+
+fn userscript_library_script(enabled: bool, bundle: &str) -> String {
+    if !enabled {
+        return "(function(){var style=document.getElementById('mde-browser-userscript-style');if(style)style.remove();if(window.__mdeBrowserUserScriptsObserver){window.__mdeBrowserUserScriptsObserver.disconnect();window.__mdeBrowserUserScriptsObserver=null;}delete document.documentElement.dataset.mdeBrowserUserscripts;})();".to_owned();
+    }
+    format!(
+        "(function(){{try{{document.documentElement.dataset.mdeBrowserUserscripts='true';\n{bundle}\n}}catch(err){{console.warn('mde userscript bundle failed',err);}}}})();"
+    )
+}
+
+fn spellcheck_highlight_script(words: &[String]) -> String {
+    let words: Vec<String> = words
+        .iter()
+        .filter_map(|word| {
+            let trimmed = word.trim();
+            if trimmed.len() < 2 || trimmed.len() > 64 {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        })
+        .take(64)
+        .collect();
+    let words = js_string_array_literal(&words);
+    r#"(function(){
+var cls='mde-browser-spell-miss';
+var old=document.querySelectorAll('span.'+cls);
+for(var i=old.length-1;i>=0;i--){var n=old[i];n.replaceWith(document.createTextNode(n.textContent||''));}
+if(!document.body){return;}
+document.body.normalize();
+var words=__WORDS__;
+if(!words.length){delete document.documentElement.dataset.mdeBrowserSpellcheck;return;}
+var style=document.getElementById('mde-browser-spellcheck-style');
+if(!style){style=document.createElement('style');style.id='mde-browser-spellcheck-style';(document.head||document.documentElement).appendChild(style);}
+style.textContent='span.'+cls+'{text-decoration: underline wavy #d13438; text-decoration-thickness: 1.5px; text-underline-offset: 0.12em;}';
+var escaped=words.map(function(w){return String(w).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}).filter(Boolean);
+if(!escaped.length){return;}
+var re=new RegExp('\\b('+escaped.join('|')+')\\b','gi');
+var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,{acceptNode:function(node){
+  var p=node.parentElement;
+  if(!p||p.closest('script,style,textarea,input,select,span.'+cls))return NodeFilter.FILTER_REJECT;
+  re.lastIndex=0;
+  return re.test(node.nodeValue||'')?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_REJECT;
+}});
+var nodes=[];
+while(nodes.length<256){var node=walker.nextNode();if(!node)break;nodes.push(node);}
+for(var n=0;n<nodes.length;n++){
+  var text=nodes[n].nodeValue||'';re.lastIndex=0;
+  var frag=document.createDocumentFragment();var last=0;var m;
+  while((m=re.exec(text))&&frag.childNodes.length<512){
+    if(m.index>last)frag.appendChild(document.createTextNode(text.slice(last,m.index)));
+    var span=document.createElement('span');span.className=cls;span.dataset.mdeBrowserSpellcheck='miss';span.textContent=m[0];frag.appendChild(span);
+    last=m.index+m[0].length;
+  }
+  if(last<text.length)frag.appendChild(document.createTextNode(text.slice(last)));
+  nodes[n].replaceWith(frag);
+}
+document.documentElement.dataset.mdeBrowserSpellcheck=String(words.length);
+})();"#
+        .replace("__WORDS__", &words)
+}
+
+fn spellcheck_correction_script(word: &str, replacement: &str) -> String {
+    spellcheck_correction_script_with_target(word, replacement, Some(0))
+}
+
+fn spellcheck_correction_all_script(word: &str, replacement: &str) -> String {
+    spellcheck_correction_script_with_target(word, replacement, None)
+}
+
+fn spellcheck_correction_at_script(word: &str, replacement: &str, occurrence: u16) -> String {
+    spellcheck_correction_script_with_target(word, replacement, Some(occurrence))
+}
+
+fn spellcheck_correction_script_with_target(
+    word: &str,
+    replacement: &str,
+    target_occurrence: Option<u16>,
+) -> String {
+    let word = word.trim();
+    let replacement = replacement.trim();
+    if word.is_empty() || replacement.is_empty() || word.len() > 64 || replacement.len() > 128 {
+        return "()=>{}".to_owned();
+    }
+    let word = js_string_literal(word);
+    let replacement = js_string_literal(replacement);
+    let target_occurrence = target_occurrence.map_or(-1, i32::from);
+    format!(
+        r#"(function(){{
+var word={word};
+var replacement={replacement};
+var targetOccurrence={target_occurrence};
+var replaceAll=targetOccurrence<0;
+var cls='mde-browser-spell-miss';
+function same(value){{return String(value||'').toLocaleLowerCase()===word.toLocaleLowerCase();}}
+var marks=document.querySelectorAll('span.'+cls);
+var changed=0;var seen=0;var markMatches=0;
+for(var i=0;i<marks.length;i++){{
+  if(same(marks[i].textContent)){{
+    markMatches++;
+    if(!replaceAll&&seen!==targetOccurrence){{seen++;continue;}}
+    marks[i].replaceWith(document.createTextNode(replacement));
+    changed++;
+    if(!replaceAll){{
+      document.body&&document.body.normalize();
+      return;
+    }}
+    seen++;
+  }}
+}}
+if(markMatches>0&&!replaceAll)return;
+if(changed>0){{
+  document.body&&document.body.normalize();
+  return;
+}}
+if(!document.body)return;
+var escaped=word.replace(/[.*+?^${{}}()|[\]\\]/g,'\\$&');
+var re=new RegExp('\\b'+escaped+'\\b','gi');
+var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,{{acceptNode:function(node){{
+  var p=node.parentElement;
+  if(!p||p.closest('script,style,textarea,input,select'))return NodeFilter.FILTER_REJECT;
+  re.lastIndex=0;
+  return re.test(node.nodeValue||'')?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_REJECT;
+}}}});
+var node;var total=0;
+while((node=walker.nextNode())&&total<512){{
+  var text=node.nodeValue||'';
+  re.lastIndex=0;
+  if(!replaceAll){{
+    var m;
+    while((m=re.exec(text))&&total<512){{
+      if(total===targetOccurrence){{
+        node.nodeValue=text.slice(0,m.index)+replacement+text.slice(m.index+m[0].length);
+        return;
+      }}
+      total++;
+    }}
+    continue;
+  }}
+  var next=text.replace(re,function(m){{total++;return total<=512?replacement:m;}});
+  if(next!==text)node.nodeValue=next;
+}}
+}})();"#
+    )
+}
+
+fn page_text_beacon_script(id: u64, max_bytes: u32) -> String {
+    let max_bytes = max_bytes.clamp(1, CEF_PAGE_TEXT_BEACON_MAX_BYTES);
+    format!(
+        "(function(){{try{{var cap={max_bytes};var root=document.body||document.documentElement;\
+var text=root?String(root.innerText||root.textContent||''):'';\
+text=text.replace(/\\s+/g,' ').trim();if(text.length>cap)text=text.slice(0,cap);\
+var img=document.createElement('img');img.alt='';img.width=1;img.height=1;\
+img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';\
+img.src='{}{}?text='+encodeURIComponent(text);\
+(document.body||document.documentElement).appendChild(img);}}catch(err){{\
+var fallback=document.createElement('img');fallback.alt='';fallback.width=1;fallback.height=1;\
+fallback.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';\
+fallback.src='{}{}?text=';(document.body||document.documentElement).appendChild(fallback);}}}})();",
+        CEF_PAGE_TEXT_BEACON_PREFIX, id, CEF_PAGE_TEXT_BEACON_PREFIX, id
+    )
+}
+
+fn page_scrape_beacon_script(id: u64, max_bytes: u32, max_links: u16, max_headings: u16) -> String {
+    let max_bytes = max_bytes.clamp(1, CEF_PAGE_SCRAPE_BEACON_MAX_BYTES as u32);
+    let max_links = max_links.min(128);
+    let max_headings = max_headings.min(64);
+    format!(
+        r#"(function(){{try{{
+var textCap=Math.min({max_bytes},16384),linkCap={max_links},headingCap={max_headings},articleCap=8192,bodyCap={body_cap};
+function trim(v,n){{v=String(v||'').replace(/\s+/g,' ').trim();return v.length>n?v.slice(0,n):v;}}
+function visible(el){{try{{if(!el||!el.getClientRects||!el.getClientRects().length)return false;var s=getComputedStyle(el);return s.visibility!=='hidden'&&s.display!=='none';}}catch(_){{return true;}}}}
+var root=document.body||document.documentElement;
+var raw=root?String(root.innerText||root.textContent||''):'';
+var normalized=trim(raw,textCap);
+var articleNode=null,articleSelector='';
+var candidates=document.querySelectorAll?document.querySelectorAll('article,main,[role=main]'):[];
+for(var c=0;c<candidates.length;c++){{if(visible(candidates[c])){{articleNode=candidates[c];articleSelector=(articleNode.tagName||'').toLowerCase();if(articleNode.getAttribute&&articleNode.getAttribute('role'))articleSelector+='[role='+articleNode.getAttribute('role')+']';break;}}}}
+var articleRaw=articleNode?String(articleNode.innerText||articleNode.textContent||''):'';
+var articleText=trim(articleRaw,articleCap);
+var links=[];
+var anchors=document.querySelectorAll?document.querySelectorAll('a[href]'):[];
+for(var i=0;i<anchors.length&&links.length<linkCap;i++){{var a=anchors[i];if(!visible(a))continue;var href=trim(a.href||a.getAttribute('href')||'',2048);if(!href)continue;links.push({{url:href,text:trim(a.innerText||a.textContent||a.getAttribute('aria-label')||'',160),rel:trim(a.getAttribute('rel')||'',80),target:trim(a.getAttribute('target')||'',40)}});}}
+var headings=[];
+var hs=document.querySelectorAll?document.querySelectorAll('h1,h2,h3,h4,h5,h6'):[];
+for(var h=0;h<hs.length&&headings.length<headingCap;h++){{var el=hs[h];if(!visible(el))continue;var label=trim(el.innerText||el.textContent||'',240);if(!label)continue;headings.push({{level:Number(String(el.tagName||'H0').slice(1))||0,text:label}});}}
+var canonicalEl=document.querySelector?document.querySelector('link[rel~="canonical"][href]'):null;
+var descriptionEl=document.querySelector?document.querySelector('meta[name="description" i][content],meta[property="og:description"][content]'):null;
+function payload(){{return {{text:normalized,text_truncated:trim(raw,2147483647).length>textCap,article_text:articleText,article_text_truncated:trim(articleRaw,2147483647).length>articleCap,article_selector:articleSelector,canonical_url:canonicalEl?trim(canonicalEl.href||canonicalEl.getAttribute('href')||'',2048):'',meta_description:descriptionEl?trim(descriptionEl.getAttribute('content')||'',512):'',document_lang:trim((document.documentElement&&document.documentElement.lang)||'',64),links:links,headings:headings}};}}
+var body=JSON.stringify(payload());
+if(body.length>bodyCap){{links=links.slice(0,32);headings=headings.slice(0,16);normalized=trim(normalized,8192);articleText=trim(articleText,4096);body=JSON.stringify(payload());}}
+if(body.length>bodyCap){{links=[];headings=[];normalized=trim(normalized,4096);articleText=trim(articleText,2048);body=JSON.stringify(payload());}}
+var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src='{prefix}{id}?body='+encodeURIComponent(body);(document.body||document.documentElement).appendChild(img);
+}}catch(err){{var fallback=document.createElement('img');fallback.alt='';fallback.width=1;fallback.height=1;fallback.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';fallback.src='{prefix}{id}?body=';(document.body||document.documentElement).appendChild(fallback);}}}})();"#,
+        body_cap = CEF_PAGE_SCRAPE_BEACON_MAX_BYTES,
+        prefix = CEF_PAGE_SCRAPE_BEACON_PREFIX,
+    )
+}
+
+fn passkey_bridge_script() -> String {
+    format!(
+        r#"(function(){{
+try{{
+  if(!window.__mdeBrowserPasskeyQueue)window.__mdeBrowserPasskeyQueue=[];
+  if(!window.__mdeBrowserPasskeyPending)window.__mdeBrowserPasskeyPending={{}};
+  if(!window.__mdeBrowserPasskeyComplete){{
+    window.__mdeBrowserPasskeyComplete=function(event){{
+      try{{
+        event=event||{{}};
+        var id=String(event.client_request_id||'');
+        var pending=window.__mdeBrowserPasskeyPending&&window.__mdeBrowserPasskeyPending[id];
+        if(!pending)return false;
+        delete window.__mdeBrowserPasskeyPending[id];
+        function ab(v){{
+          try{{
+            v=String(v||'').replace(/-/g,'+').replace(/_/g,'/');
+            while(v.length%4)v+='=';
+            var s=atob(v),out=new Uint8Array(s.length);
+            for(var i=0;i<s.length;i++)out[i]=s.charCodeAt(i);
+            return out.buffer;
+          }}catch(_){{return new ArrayBuffer(0);}}
+        }}
+        if(event.error||event.state==='error'){{
+          pending.reject(new DOMException(String(event.error||'Passkey ceremony failed'),'NotAllowedError'));
+          return true;
+        }}
+        function setProto(obj,ctor){{try{{if(ctor&&ctor.prototype)Object.setPrototypeOf(obj,ctor.prototype);}}catch(_){{}}return obj;}}
+        function b64(v){{return String(v||'');}}
+        var credentialId=String(event.credential_id_b64url||'');
+        var response={{}};
+        if(event.op==='browser_passkey_assertion'||event.ceremony==='get'){{
+          response.authenticatorData=ab(event.authenticator_data_b64url);
+          response.clientDataJSON=ab(event.client_data_json_b64url);
+          response.signature=ab(event.signature_b64url);
+          response.userHandle=ab(event.user_handle_b64url);
+          response.toJSON=function(){{return {{authenticatorData:b64(event.authenticator_data_b64url),clientDataJSON:b64(event.client_data_json_b64url),signature:b64(event.signature_b64url),userHandle:b64(event.user_handle_b64url)}};}};
+          setProto(response,window.AuthenticatorAssertionResponse);
+        }}else{{
+          response.clientDataJSON=ab(event.client_data_json_b64url);
+          response.attestationObject=ab(event.attestation_object_b64url);
+          response.getPublicKey=function(){{return ab(event.public_key_spki_der_b64url||event.public_key_sec1_b64url);}};
+          response.getPublicKeyAlgorithm=function(){{return Number(event.cose_alg||-7);}};
+          response.getTransports=function(){{return ['internal'];}};
+          response.getAuthenticatorData=function(){{return ab(event.authenticator_data_b64url);}};
+          response.toJSON=function(){{return {{attestationObject:b64(event.attestation_object_b64url),clientDataJSON:b64(event.client_data_json_b64url),publicKey:b64(event.public_key_spki_der_b64url||event.public_key_sec1_b64url),publicKeyAlgorithm:Number(event.cose_alg||-7),authenticatorData:b64(event.authenticator_data_b64url),transports:['internal']}};}};
+          setProto(response,window.AuthenticatorAttestationResponse);
+        }}
+        var credential={{id:credentialId,rawId:ab(credentialId),type:'public-key',authenticatorAttachment:'platform',response:response}};
+        credential.getClientExtensionResults=function(){{return {{}};}};
+        credential.toJSON=function(){{return {{id:credentialId,rawId:credentialId,type:'public-key',authenticatorAttachment:'platform',response:response.toJSON?response.toJSON():{{}},clientExtensionResults:{{}}}};}};
+        pending.resolve(setProto(credential,window.PublicKeyCredential));
+        return true;
+      }}catch(err){{return false;}}
+    }};
+  }}
+  function emit(item){{
+    try{{
+      var img=document.createElement('img');img.alt='';img.width=1;img.height=1;
+      img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';
+      img.src='{prefix}?body='+encodeURIComponent(JSON.stringify(item).slice(0,8192));
+      (document.body||document.documentElement).appendChild(img);
+    }}catch(_){{}}
+  }}
+  if(!window.__mdeBrowserPasskeyBridgeInstalled){{
+    window.__mdeBrowserPasskeyBridgeInstalled=true;
+    window.__mdeBrowserPasskeySeq=window.__mdeBrowserPasskeySeq||0;
+    try{{
+      if(!window.PublicKeyCredential)window.PublicKeyCredential=function PublicKeyCredential(){{}};
+      if(!window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable=function(){{return Promise.resolve(true);}};
+      if(!window.PublicKeyCredential.isConditionalMediationAvailable)window.PublicKeyCredential.isConditionalMediationAvailable=function(){{return Promise.resolve(false);}};
+      if(!window.AuthenticatorAttestationResponse)window.AuthenticatorAttestationResponse=function AuthenticatorAttestationResponse(){{}};
+      if(!window.AuthenticatorAssertionResponse)window.AuthenticatorAssertionResponse=function AuthenticatorAssertionResponse(){{}};
+    }}catch(_){{}}
+    function trim(v,n){{v=String(v||'').trim();return v.length>n?v.slice(0,n):v;}}
+    function b64url(value){{
+      try{{
+        if(value==null)return '';
+        if(typeof value==='string')return value.replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+        var bytes=null;
+        if(value instanceof ArrayBuffer)bytes=new Uint8Array(value);
+        else if(ArrayBuffer.isView(value))bytes=new Uint8Array(value.buffer,value.byteOffset,value.byteLength);
+        if(!bytes)return '';
+        var s='',max=Math.min(bytes.length,1536);
+        for(var i=0;i<max;i++)s+=String.fromCharCode(bytes[i]);
+        return btoa(s).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+      }}catch(_){{return '';}}
+    }}
+    function ceremony(kind,options){{
+      var pk=(options&&options.publicKey)||{{}};
+      var rp=(pk.rp&&pk.rp.id)||location.hostname;
+      var out={{ceremony:kind,origin:String(location.href||''),rp_id:trim(rp,253),challenge_b64url:b64url(pk.challenge)}};
+      if(kind==='create'&&pk.user){{
+        out.user_handle_b64url=b64url(pk.user.id);
+        out.user_name=trim(pk.user.displayName||pk.user.name||'',256);
+      }}
+      if(kind==='get'&&Array.isArray(pk.allowCredentials)){{
+        out.allow_credentials=pk.allowCredentials.slice(0,64).map(function(c){{return b64url(c&&c.id);}}).filter(Boolean);
+      }}
+      if(typeof pk.timeout==='number')out.timeout_ms=Math.max(0,Math.floor(pk.timeout));
+      return out;
+    }}
+    function enqueue(kind,options){{
+      var item=ceremony(kind,options);
+      if(!item.challenge_b64url)return Promise.reject(new DOMException('Passkey challenge missing','NotAllowedError'));
+      item.client_request_id='mde-pk-'+Date.now().toString(36)+'-'+(++window.__mdeBrowserPasskeySeq).toString(36);
+      var q=window.__mdeBrowserPasskeyQueue;
+      q.push(item);
+      while(q.length>16)q.shift();
+      return new Promise(function(resolve,reject){{window.__mdeBrowserPasskeyPending[item.client_request_id]={{resolve:resolve,reject:reject,ceremony:kind}};}});
+    }}
+    var creds=navigator.credentials||(navigator.credentials={{}});
+    creds.create=function(options){{return enqueue('create',options);}};
+    creds.get=function(options){{return enqueue('get',options);}};
+  }}
+  var q=window.__mdeBrowserPasskeyQueue;
+  for(var n=0;n<4&&q.length;n++)emit(q.shift());
+}}catch(_){{}}
+}})();"#,
+        prefix = CEF_PASSKEY_BEACON_PREFIX
+    )
+}
+
+fn passkey_complete_script(body: &str) -> String {
+    let body = js_string_literal(body);
+    format!(
+        "(function(){{try{{var event=JSON.parse({body});if(window.__mdeBrowserPasskeyComplete)window.__mdeBrowserPasskeyComplete(event);}}catch(_){{}}}})();"
+    )
+}
+
+fn decode_page_text_beacon(url: &str) -> Option<(u64, String)> {
+    let rest = url
+        .strip_prefix(CEF_PAGE_TEXT_BEACON_PREFIX)
+        .or_else(|| url.strip_prefix(CEF_PAGE_TEXT_BEACON_LEGACY_PREFIX))?;
+    let (id, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let id = id.parse::<u64>().ok()?;
+    let text = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("text="))
+        .unwrap_or_default();
+    Some((
+        id,
+        clamp_utf8(
+            &percent_decode(text),
+            CEF_PAGE_TEXT_BEACON_MAX_BYTES as usize,
+        ),
+    ))
+}
+
+fn decode_page_scrape_beacon(url: &str) -> Option<(u64, String)> {
+    let rest = url.strip_prefix(CEF_PAGE_SCRAPE_BEACON_PREFIX)?;
+    let (id, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let id = id.parse::<u64>().ok()?;
+    let body = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("body="))
+        .unwrap_or_default();
+    Some((
+        id,
+        clamp_utf8(&percent_decode(body), CEF_PAGE_SCRAPE_BEACON_MAX_BYTES),
+    ))
+}
+
+fn decode_passkey_beacon(url: &str) -> Option<String> {
+    let query = url.strip_prefix(CEF_PASSKEY_BEACON_PREFIX)?;
+    let query = query.strip_prefix('?').unwrap_or(query);
+    let body = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("body="))
+        .unwrap_or_default();
+    let body = clamp_utf8(&percent_decode(body), CEF_PASSKEY_BEACON_MAX_BYTES);
+    body.trim_start().starts_with('{').then_some(body)
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn clamp_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 fn js_string_literal(value: &str) -> String {
@@ -1906,6 +2750,18 @@ fn js_string_literal(value: &str) -> String {
         }
     }
     out.push('"');
+    out
+}
+
+fn js_string_array_literal(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&js_string_literal(value));
+    }
+    out.push(']');
     out
 }
 
@@ -2120,6 +2976,10 @@ mod tests {
         assert_eq!(
             read_i32(&info.bytes, CEF_WINDOW_INFO_SHARED_TEXTURE_OFFSET),
             0
+        );
+        assert_eq!(
+            read_i32(&info.bytes, CEF_WINDOW_INFO_RUNTIME_STYLE_OFFSET),
+            CEF_RUNTIME_STYLE_ALLOY
         );
     }
 
@@ -2454,6 +3314,176 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_override_script_installs_and_clears_page_visible_ua() {
+        let enable = user_agent_override_script("Mozilla/5.0 MDE-Test");
+        assert!(enable.contains("Navigator.prototype"));
+        assert!(enable.contains("userAgent"));
+        assert!(enable.contains("MDE-Test"));
+        assert!(
+            !enable.contains("</script>"),
+            "UA override is injected as bounded script text only"
+        );
+
+        let disable = user_agent_override_script("");
+        assert!(disable.contains("__mdeUserAgentOverride"));
+        assert!(disable.contains("delete"));
+    }
+
+    #[test]
+    fn device_profile_script_installs_and_clears_page_visible_device_metadata() {
+        let enable = device_profile_script("phone", 390, 844, 300, true);
+        assert!(enable.contains("mdeDeviceProfile"));
+        assert!(enable.contains("innerWidth"));
+        assert!(enable.contains("maxTouchPoints"));
+        assert!(enable.contains("mde-device-profile-viewport"));
+        assert!(enable.contains("width:390"));
+        assert!(
+            !enable.contains("</script>"),
+            "device profile is injected as bounded script text only"
+        );
+
+        let disable = device_profile_script("default", 0, 0, 100, false);
+        assert!(disable.contains("__mdeDeviceProfile"));
+        assert!(disable.contains("delete"));
+    }
+
+    #[test]
+    fn userscript_library_script_runs_and_cleans_the_bundle() {
+        let enable = userscript_library_script(
+            true,
+            "document.documentElement.dataset.curatedUserscript='npr';",
+        );
+        assert!(enable.contains("mdeBrowserUserscripts"));
+        assert!(enable.contains("curatedUserscript='npr'"));
+        assert!(enable.contains("try{"));
+
+        let disable = userscript_library_script(false, "");
+        assert!(disable.contains("mde-browser-userscript-style"));
+        assert!(disable.contains("__mdeBrowserUserScriptsObserver"));
+        assert!(disable.contains("delete document.documentElement.dataset.mdeBrowserUserscripts"));
+    }
+
+    #[test]
+    fn spellcheck_highlight_script_marks_and_clears_words() {
+        let script =
+            spellcheck_highlight_script(&["wrold".to_owned(), "mesh?".to_owned(), "x".to_owned()]);
+        assert!(script.contains("mde-browser-spell-miss"));
+        assert!(script.contains("mde-browser-spellcheck-style"));
+        assert!(script.contains("\"wrold\""));
+        assert!(script.contains("\"mesh?\""));
+        assert!(!script.contains("\"x\""));
+
+        let clear = spellcheck_highlight_script(&[]);
+        assert!(clear.contains("delete document.documentElement.dataset.mdeBrowserSpellcheck"));
+    }
+
+    #[test]
+    fn spellcheck_correction_script_replaces_mark_or_text() {
+        let script = spellcheck_correction_script("wrold", "world");
+        assert!(script.contains("mde-browser-spell-miss"));
+        assert!(script.contains(r#"word="wrold""#));
+        assert!(script.contains(r#"replacement="world""#));
+        assert!(script.contains("replaceWith(document.createTextNode(replacement))"));
+        assert!(script.contains("createTreeWalker"));
+        assert!(script.contains("var targetOccurrence=0"));
+        assert!(script.contains("var replaceAll=targetOccurrence<0"));
+
+        let all = spellcheck_correction_all_script("wrold", "world");
+        assert!(all.contains("var targetOccurrence=-1"));
+        assert!(all.contains("while((node=walker.nextNode())&&total<512)"));
+        assert!(all.contains("text.replace(re,function(m)"));
+
+        let indexed = spellcheck_correction_at_script("wrold", "world", 3);
+        assert!(indexed.contains("var targetOccurrence=3"));
+        assert!(indexed.contains("if(total===targetOccurrence)"));
+        assert!(indexed.contains("if(markMatches>0&&!replaceAll)return"));
+
+        assert_eq!(spellcheck_correction_script("", "world"), "()=>{}");
+        assert_eq!(spellcheck_correction_script("wrold", ""), "()=>{}");
+        assert_eq!(spellcheck_correction_all_script("", "world"), "()=>{}");
+        assert_eq!(spellcheck_correction_at_script("", "world", 1), "()=>{}");
+    }
+
+    #[test]
+    fn page_text_beacon_script_is_bounded_and_decodable() {
+        let script = page_text_beacon_script(42, 200_000);
+        assert!(script.contains("cap=8192"));
+        assert!(script.contains("innerText||root.textContent"));
+        assert!(script.contains("encodeURIComponent(text)"));
+        assert!(script.contains("https://mde-page-text.invalid/capture/42?text="));
+
+        assert_eq!(
+            decode_page_text_beacon(
+                "https://mde-page-text.invalid/capture/42?text=hello%20w%C3%B8rld"
+            ),
+            Some((42, "hello wørld".to_owned()))
+        );
+        assert_eq!(
+            decode_page_text_beacon("mde-page-text://capture/42?text=hello%20w%C3%B8rld"),
+            Some((42, "hello wørld".to_owned()))
+        );
+        assert_eq!(percent_decode("%zz+ok"), "%zz+ok");
+        assert_eq!(clamp_utf8("abé", 3), "ab");
+        assert_eq!(decode_page_text_beacon("https://example.com/"), None);
+    }
+
+    #[test]
+    fn page_scrape_beacon_script_is_bounded_and_decodable() {
+        let script = page_scrape_beacon_script(43, 200_000, 400, 300);
+        assert!(script.contains("textCap=Math.min(32768,16384)"));
+        assert!(script.contains("articleCap=8192"));
+        assert!(script.contains("linkCap=128"));
+        assert!(script.contains("headingCap=64"));
+        assert!(script.contains("querySelectorAll('a[href]')"));
+        assert!(script.contains("querySelectorAll('h1,h2,h3,h4,h5,h6')"));
+        assert!(script.contains("querySelectorAll('article,main,[role=main]')"));
+        assert!(script.contains("link[rel~=\"canonical\"][href]"));
+        assert!(script.contains("meta[name=\"description\" i][content]"));
+        assert!(script.contains("links=links.slice(0,32)"));
+        assert!(script.contains("https://mde-page-scrape.invalid/capture/43?body="));
+
+        assert_eq!(
+            decode_page_scrape_beacon(
+                "https://mde-page-scrape.invalid/capture/43?body=%7B%22text%22%3A%22hello%22%7D"
+            ),
+            Some((43, r#"{"text":"hello"}"#.to_owned()))
+        );
+        assert_eq!(decode_page_scrape_beacon("https://example.com/"), None);
+    }
+
+    #[test]
+    fn passkey_bridge_script_uses_bounded_beacon_metadata() {
+        let script = passkey_bridge_script();
+        assert!(script.contains("navigator.credentials"));
+        assert!(script.contains("creds.create=function"));
+        assert!(script.contains("creds.get=function"));
+        assert!(script.contains(CEF_PASSKEY_BEACON_PREFIX));
+        assert!(script.contains("challenge_b64url"));
+        assert!(script.contains("allow_credentials"));
+        assert!(script.contains("client_request_id"));
+        assert!(script.contains("__mdeBrowserPasskeyComplete"));
+        assert!(script.contains("pending.resolve"));
+        assert!(script.contains("public_key_spki_der_b64url"));
+        assert!(script.contains("getClientExtensionResults"));
+        assert!(script.contains("isUserVerifyingPlatformAuthenticatorAvailable"));
+        assert!(script.contains("isConditionalMediationAvailable"));
+        assert!(script.contains("Object.setPrototypeOf"));
+        assert!(script.contains("getTransports"));
+        assert!(script.contains("toJSON"));
+
+        let complete = passkey_complete_script(r#"{"client_request_id":"pk-1"}"#);
+        assert!(complete.contains("__mdeBrowserPasskeyComplete"));
+        assert!(complete.contains("JSON.parse"));
+
+        let body = decode_passkey_beacon(
+            "https://mde-passkey.invalid/request/?body=%7B%22ceremony%22%3A%22get%22%7D",
+        )
+        .expect("passkey beacon");
+        assert_eq!(body, r#"{"ceremony":"get"}"#);
+        assert_eq!(decode_passkey_beacon("https://example.test/"), None);
+    }
+
+    #[test]
     fn js_string_literal_escapes_script_sensitive_characters() {
         assert_eq!(js_string_literal("a\"b\\c\n\r\t"), r#""a\"b\\c\n\r\t""#);
         assert_eq!(js_string_literal("nul\u{1}"), r#""nul\u0001""#);
@@ -2700,6 +3730,170 @@ mod tests {
         assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
         assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
         assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
+        use crate::sock::{recv, RecvOutcome};
+        use crate::wire::{take_frame, EventMsg};
+
+        let (helper, shell) = UnixStream::pair().expect("socketpair");
+        let callbacks =
+            CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+        let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+            panic!("expected attach")
+        };
+
+        let cef_callback = TestCefCallback::new();
+        let rv = callbacks.state.begin_resource_request(
+            "mde-page-text://capture/77?text=hello%20page".to_owned(),
+            cef_callback.as_mut_ptr(),
+        );
+        assert_eq!(rv, RV_CANCEL);
+
+        let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page text recv") else {
+            panic!("expected page text")
+        };
+        assert!(fds.is_empty());
+        let mut bytes = bytes;
+        let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+        assert_eq!(
+            EventMsg::decode(&payload).expect("event"),
+            EventMsg::PageText {
+                id: 77,
+                text: "hello page".to_owned(),
+            }
+        );
+        assert_eq!(cef_callback.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
+        assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
+        assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
+        use crate::sock::{recv, RecvOutcome};
+        use crate::wire::{take_frame, EventMsg};
+
+        let (helper, shell) = UnixStream::pair().expect("socketpair");
+        let callbacks =
+            CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+        let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+            panic!("expected attach")
+        };
+
+        let cef_callback = TestCefCallback::new();
+        let rv = callbacks.state.begin_resource_request(
+            "https://mde-page-scrape.invalid/capture/88?body=%7B%22text%22%3A%22hello%22%2C%22links%22%3A%5B%5D%7D".to_owned(),
+            cef_callback.as_mut_ptr(),
+        );
+        assert_eq!(rv, RV_CANCEL);
+
+        let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page scrape recv") else {
+            panic!("expected page scrape")
+        };
+        assert!(fds.is_empty());
+        let mut bytes = bytes;
+        let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+        assert_eq!(
+            EventMsg::decode(&payload).expect("event"),
+            EventMsg::PageScrape {
+                id: 88,
+                body: r#"{"text":"hello","links":[]}"#.to_owned(),
+            }
+        );
+        assert_eq!(cef_callback.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
+        assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
+        assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn passkey_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
+        use crate::sock::{recv, RecvOutcome};
+        use crate::wire::{take_frame, EventMsg};
+
+        let (helper, shell) = UnixStream::pair().expect("socketpair");
+        let callbacks =
+            CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+        let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+            panic!("expected attach")
+        };
+
+        let cef_callback = TestCefCallback::new();
+        let rv = callbacks.state.begin_resource_request(
+            "https://mde-passkey.invalid/request/?body=%7B%22ceremony%22%3A%22get%22%7D".to_owned(),
+            cef_callback.as_mut_ptr(),
+        );
+        assert_eq!(rv, RV_CANCEL);
+
+        let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("passkey recv") else {
+            panic!("expected passkey event")
+        };
+        assert!(fds.is_empty());
+        let mut bytes = bytes;
+        let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+        assert_eq!(
+            EventMsg::decode(&payload).expect("event"),
+            EventMsg::PasskeyRequest {
+                body: r#"{"ceremony":"get"}"#.to_owned(),
+            }
+        );
+        assert_eq!(cef_callback.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
+        assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
+        assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn text_probe_status_and_event_drain_are_operator_readable() {
+        let probe = CefTextProbe {
+            browser: CefBrowserProbe {
+                url: "https://example.test/".to_owned(),
+                width: 1024,
+                height: 768,
+                created: 1,
+                paints: 3,
+                last_paint_width: 1024,
+                last_paint_height: 768,
+            },
+            expected: "mde-extension-smoke-ok".to_owned(),
+            text_bytes: 128,
+        };
+        let line = probe.status_line();
+        assert!(line.contains("CEF_TEXT_PROBE_READY"));
+        assert!(line.contains("https://example.test/"));
+        assert!(line.contains("marker_bytes=22"));
+        assert!(line.contains("text_bytes=128"));
+
+        let mut bytes = wire::frame(
+            &EventMsg::PageText {
+                id: 99,
+                text: "ignored".to_owned(),
+            }
+            .encode(),
+        );
+        bytes.extend(wire::frame(
+            &EventMsg::PageText {
+                id: 42,
+                text: "mde-extension-smoke-ok".to_owned(),
+            }
+            .encode(),
+        ));
+        assert_eq!(
+            drain_page_text_events(&mut bytes, 42),
+            Some("mde-extension-smoke-ok".to_owned())
+        );
+        assert!(bytes.is_empty());
+
+        let err = CefBrowserError::TextProbeMissing {
+            created: 1,
+            paints: 2,
+            text_bytes: 12,
+        }
+        .to_string();
+        assert!(err.contains("CEF text marker"));
+        assert!(err.contains("text_bytes=12"));
     }
 
     #[test]

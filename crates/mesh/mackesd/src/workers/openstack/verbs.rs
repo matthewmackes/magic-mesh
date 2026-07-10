@@ -19,6 +19,11 @@
 //! - **Lifecycle (audited mutations):** `instance-start` / `instance-stop` /
 //!   `instance-reboot` / `instance-delete` — the ops KDC-MESH-8's phone
 //!   run-commands + the Cloud plane call.
+//! - **Instance access (QC-13/QC-23):** `ensure-mesh-keypair` publishes the
+//!   existing mesh SSH public key as Nova keypair `mcnf-mesh`;
+//!   `get-instance-console` prefers a native libvirt/QEMU SPICE descriptor for
+//!   the shell's in-process SPICE client, then falls back to Nova's SPICE HTML5
+//!   console descriptor.
 //!
 //! ## Honest, never fake (§7)
 //!
@@ -61,6 +66,8 @@ use mackes_mesh_types::openstack::{
 
 use crate::workers::proc::output_with_timeout;
 
+use crate::ipc::mesh_ssh_key::DEFAULT_MESH_KEYS_PATH;
+
 use super::catalog::ServiceKind;
 use super::client::{CatalogHealth, CloudClient};
 use super::reconcile::{DoctrineStatus, OpenStackState, RuntimeStatus, ServiceRow, ServiceStatus};
@@ -93,7 +100,7 @@ pub const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 /// The four **mutations** change the cloud and audit (both the auditable Bus
 /// topic + a tracing audit line): `heat-check` (drift stack-check), `heat-create`,
 /// `heat-update`, `heat-delete` (the last three typed-armed at the surface, #22).
-pub const CLOUD_VERBS: [&str; 16] = [
+pub const CLOUD_VERBS: [&str; 18] = [
     "get-status",
     "get-catalog",
     "list-services",
@@ -103,6 +110,8 @@ pub const CLOUD_VERBS: [&str; 16] = [
     "instance-stop",
     "instance-reboot",
     "instance-delete",
+    "ensure-mesh-keypair",
+    "get-instance-console",
     "get-heat-detail",
     "get-heat-preview",
     "get-heat-reverse",
@@ -141,8 +150,14 @@ pub fn heat_verb_audits(verb: &str) -> bool {
 /// tests).
 #[must_use]
 pub fn verb_audits(verb: &str) -> bool {
-    LifecycleAction::from_verb(verb).is_some() || heat_verb_audits(verb)
+    LifecycleAction::from_verb(verb).is_some()
+        || heat_verb_audits(verb)
+        || verb == "ensure-mesh-keypair"
 }
+
+/// The Nova keypair name every Cloud-plane launch references. It is backed by
+/// the existing shared mesh SSH public key, not a second cloud-only credential.
+pub const MESH_KEYPAIR_NAME: &str = "mcnf-mesh";
 
 /// The Bus topic for cloud verb `verb`: `action/cloud/<verb>`.
 #[must_use]
@@ -246,6 +261,15 @@ pub enum InstanceOpError {
     /// `openstack server list -f json` output didn't parse.
     #[error("parsing `openstack server list` output failed: {0}")]
     Parse(String),
+    /// The mesh SSH public key file is not installed on this node, so Nova
+    /// keypair injection cannot be made automatic yet.
+    #[error("mesh SSH public key unavailable at {path}: {reason}")]
+    MeshKeyAbsent {
+        /// The expected public-key file.
+        path: String,
+        /// The filesystem error.
+        reason: String,
+    },
 }
 
 /// The injectable Nova instance seam (QC-11). [`OpenstackCli`] is the
@@ -268,6 +292,21 @@ pub trait InstanceOps {
     /// # Errors
     /// [`InstanceOpError::CliAbsent`] / spawn / non-zero failures.
     fn perform(&self, action: LifecycleAction, instance: &str) -> Result<(), InstanceOpError>;
+
+    /// Ensure the existing mesh SSH public key is registered as a Nova keypair.
+    ///
+    /// # Errors
+    /// [`InstanceOpError::CliAbsent`] / spawn / non-zero / missing-public-key
+    /// failures.
+    fn ensure_keypair(&self, name: &str, public_key_path: &str) -> Result<String, InstanceOpError>;
+
+    /// Fetch a SPICE console descriptor for `instance`.
+    ///
+    /// # Errors
+    /// [`InstanceOpError::CliAbsent`] / spawn / non-zero / parse failures when
+    /// neither the native libvirt/QEMU descriptor nor Nova's proxy descriptor is
+    /// available.
+    fn console(&self, instance: &str) -> Result<ConsoleInfo, InstanceOpError>;
 }
 
 // ─────────────────── pure: openstack argv builders + parse ───────────────────
@@ -287,6 +326,76 @@ pub fn build_server_list_argv() -> Vec<String> {
 #[must_use]
 pub fn build_lifecycle_argv(action: LifecycleAction, instance: &str) -> Vec<String> {
     vec!["server".into(), action.cli_verb().into(), instance.into()]
+}
+
+/// The `openstack keypair show <name> -f json` argv.
+#[must_use]
+pub fn build_keypair_show_argv(name: &str) -> Vec<String> {
+    vec![
+        "keypair".into(),
+        "show".into(),
+        name.into(),
+        "-f".into(),
+        "json".into(),
+    ]
+}
+
+/// The `openstack keypair create --public-key <path> <name>` argv.
+#[must_use]
+pub fn build_keypair_create_argv(name: &str, public_key_path: &str) -> Vec<String> {
+    vec![
+        "keypair".into(),
+        "create".into(),
+        "--public-key".into(),
+        public_key_path.into(),
+        name.into(),
+    ]
+}
+
+/// The native libvirt/QEMU `virsh domdisplay` argv.
+///
+/// It is deliberately separate from Nova's HTML5 console URL: this is the direct
+/// SPICE socket descriptor the in-shell `mde-vdi-spice` transport can dial for
+/// QC-23, without pretending an HTTP proxy URL is a framebuffer.
+#[must_use]
+pub fn build_native_spice_display_argv(instance: &str) -> Vec<String> {
+    vec![
+        "--connect".into(),
+        "qemu:///system".into(),
+        "domdisplay".into(),
+        instance.into(),
+        "--type".into(),
+        "spice".into(),
+        "--include-password".into(),
+    ]
+}
+
+/// The fallback `openstack console url show --spice-html5 <instance> -f json`
+/// argv.
+#[must_use]
+pub fn build_console_url_argv(instance: &str) -> Vec<String> {
+    vec![
+        "console".into(),
+        "url".into(),
+        "show".into(),
+        "--spice-html5".into(),
+        instance.into(),
+        "-f".into(),
+        "json".into(),
+    ]
+}
+
+/// A SPICE console descriptor returned by libvirt/QEMU or Nova.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleInfo {
+    /// The Nova server id/name the console belongs to.
+    pub instance: String,
+    /// The console protocol/type (`spice` for native libvirt/QEMU,
+    /// `spice-html5` for Nova's proxy descriptor).
+    pub protocol: String,
+    /// The returned URL. It may be a raw SPICE TCP endpoint or a proxy URL; the
+    /// shell treats it honestly and does not fake a native session.
+    pub url: String,
 }
 
 /// Parse `openstack server list -f json` output into the typed roster.
@@ -334,6 +443,65 @@ pub fn parse_server_list_json(body: &str) -> Result<Vec<CloudInstance>, Instance
         .collect())
 }
 
+/// Parse `virsh domdisplay --type spice <server>` output.
+///
+/// `virsh` prints one display URI per line. QC-23 only consumes a direct SPICE
+/// descriptor; anything else is rejected so the caller can fall back to Nova's
+/// HTML5 descriptor instead of treating VNC/HTTP as the native path.
+pub fn parse_native_spice_display(
+    instance: &str,
+    body: &str,
+) -> Result<ConsoleInfo, InstanceOpError> {
+    let url = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            InstanceOpError::Parse("native SPICE display response was empty".to_string())
+        })?;
+    if !url.starts_with("spice://") {
+        return Err(InstanceOpError::Parse(format!(
+            "native display response was not a direct SPICE URL: {url}"
+        )));
+    }
+    Ok(ConsoleInfo {
+        instance: instance.to_string(),
+        protocol: "spice".to_string(),
+        url: url.to_string(),
+    })
+}
+
+/// Parse `openstack console url show --spice-html5 <server> -f json`.
+///
+/// OpenStack client versions differ on capitalization (`type` vs `Type`,
+/// `url` vs `Url`), so both shapes are accepted. Missing values stay a parse
+/// error because a console action without a URL would be a dead button.
+pub fn parse_console_url_json(instance: &str, body: &str) -> Result<ConsoleInfo, InstanceOpError> {
+    let v: serde_json::Value =
+        serde_json::from_str(body.trim()).map_err(|e| InstanceOpError::Parse(e.to_string()))?;
+    let protocol = v
+        .get("type")
+        .or_else(|| v.get("Type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("spice-html5")
+        .trim()
+        .to_string();
+    let url = v
+        .get("url")
+        .or_else(|| v.get("Url"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            InstanceOpError::Parse("console response carried no `url` field".to_string())
+        })?;
+    Ok(ConsoleInfo {
+        instance: instance.to_string(),
+        protocol,
+        url: url.to_string(),
+    })
+}
+
 /// The bound on one `openstack` CLI call.
 ///
 /// Generous — the CLI mints a Keystone token + hits Nova over the overlay,
@@ -378,6 +546,38 @@ impl OpenstackCli {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ))
     }
+
+    /// Run `virsh <args>` capturing stdout/stderr + exit code, bounded.
+    fn run_virsh(args: &[String]) -> Result<(i32, String, String), String> {
+        let mut cmd = Command::new("virsh");
+        cmd.args(args);
+        let out = output_with_timeout(cmd, OPENSTACK_CMD_TIMEOUT).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "the `virsh` binary is not on PATH".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        Ok((
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+
+    /// Best-effort native QEMU/SPICE descriptor probe. Failure is not terminal:
+    /// non-compute nodes and dev boxes may not have libvirt/virsh, so
+    /// [`Self::console`] falls back to Nova's HTML5 descriptor.
+    fn native_spice_console(instance: &str) -> Result<ConsoleInfo, String> {
+        let (code, stdout, stderr) = Self::run_virsh(&build_native_spice_display_argv(instance))?;
+        if code != 0 {
+            return Err(format!(
+                "virsh domdisplay failed (exit {code}): {}",
+                stderr.trim()
+            ));
+        }
+        parse_native_spice_display(instance, &stdout).map_err(|e| e.to_string())
+    }
 }
 
 impl InstanceOps for OpenstackCli {
@@ -404,6 +604,47 @@ impl InstanceOps for OpenstackCli {
                 stderr: stderr.trim().to_string(),
             })
         }
+    }
+
+    fn ensure_keypair(&self, name: &str, public_key_path: &str) -> Result<String, InstanceOpError> {
+        std::fs::metadata(public_key_path).map_err(|e| InstanceOpError::MeshKeyAbsent {
+            path: public_key_path.to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let show = build_keypair_show_argv(name);
+        let (show_code, _stdout, _stderr) = Self::run(&show)?;
+        if show_code == 0 {
+            return Ok(name.to_string());
+        }
+
+        let create = build_keypair_create_argv(name, public_key_path);
+        let (code, _stdout, stderr) = Self::run(&create)?;
+        if code == 0 {
+            Ok(name.to_string())
+        } else {
+            Err(InstanceOpError::Command {
+                cmd: "keypair create".into(),
+                code,
+                stderr: stderr.trim().to_string(),
+            })
+        }
+    }
+
+    fn console(&self, instance: &str) -> Result<ConsoleInfo, InstanceOpError> {
+        if let Ok(console) = Self::native_spice_console(instance) {
+            return Ok(console);
+        }
+
+        let (code, stdout, stderr) = Self::run(&build_console_url_argv(instance))?;
+        if code != 0 {
+            return Err(InstanceOpError::Command {
+                cmd: "console url show".into(),
+                code,
+                stderr: stderr.trim().to_string(),
+            });
+        }
+        parse_console_url_json(instance, &stdout)
     }
 }
 
@@ -532,6 +773,13 @@ pub struct CloudReply {
     /// The instance a lifecycle verb acted on, on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
+    /// `ensure-mesh-keypair` — the Nova keypair now present for launch-time
+    /// injection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keypair: Option<String>,
+    /// `get-instance-console` — the Nova SPICE console descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub console: Option<ConsoleInfo>,
     /// `get-heat-detail` — a stack's full detail (IAC-4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heat_detail: Option<HeatStackDetail>,
@@ -568,6 +816,8 @@ impl CloudReply {
             resources: None,
             instances: None,
             instance: None,
+            keypair: None,
+            console: None,
             heat_detail: None,
             heat_preview: None,
             template: None,
@@ -670,6 +920,25 @@ impl CloudReply {
         Self {
             instance: Some(instance.into()),
             audited,
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `ensure-mesh-keypair` — the mesh keypair exists in Nova.
+    #[must_use]
+    pub fn keypair(verb: &str, keypair: impl Into<String>, audited: bool) -> Self {
+        Self {
+            keypair: Some(keypair.into()),
+            audited,
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `get-instance-console` — Nova returned a SPICE console descriptor.
+    #[must_use]
+    pub fn console(verb: &str, console: ConsoleInfo) -> Self {
+        Self {
+            console: Some(console),
             ..Self::base(verb, true)
         }
     }
@@ -808,7 +1077,16 @@ pub fn handle_cloud_request(
         // failure, never a fabricated stack/diff/template (§7). The mutations
         // (check/create/update/delete) audit; the reads do not.
         "get-heat-detail" | "get-heat-preview" | "get-heat-reverse" | "heat-check"
-        | "heat-create" | "heat-update" | "heat-delete" => handle_heat(verb, body, client),
+        | "heat-create" | "heat-update" | "heat-delete" => {
+            if verb == "heat-create" {
+                if let Some(reply) = maybe_ensure_launch_keypair(verb, body, state, ops) {
+                    return reply;
+                }
+            }
+            handle_heat(verb, body, client)
+        }
+        "ensure-mesh-keypair" => handle_ensure_mesh_keypair(verb, state, ops),
+        "get-instance-console" => handle_console(verb, body, state, ops),
         "list-instances" => match cloud_gate(state) {
             Err(reason) => CloudReply::gated(verb, reason),
             Ok(()) => match ops.list() {
@@ -820,6 +1098,88 @@ pub fn handle_cloud_request(
             || CloudReply::rejected(verb, format!("unknown cloud verb: {other}")),
             |action| handle_lifecycle(verb, action, body, state, ops),
         ),
+    }
+}
+
+/// If the HOT template references the mesh keypair, ensure that keypair exists
+/// before Heat tries to create the server. `None` means "continue with Heat";
+/// `Some(reply)` is a rejection/gate/failure that must be returned immediately.
+fn maybe_ensure_launch_keypair(
+    verb: &str,
+    body: &str,
+    state: &OpenStackState,
+    ops: &dyn InstanceOps,
+) -> Option<CloudReply> {
+    let req = match parse_heat_request(body) {
+        Ok(r) => r,
+        Err(e) => return Some(CloudReply::rejected(verb, e)),
+    };
+    if !template_uses_mesh_keypair(&req.template) {
+        return None;
+    }
+    if let Err(reason) = cloud_gate(state) {
+        return Some(CloudReply::gated(verb, reason));
+    }
+    match ops.ensure_keypair(MESH_KEYPAIR_NAME, DEFAULT_MESH_KEYS_PATH) {
+        Ok(_) => None,
+        Err(e) => Some(CloudReply::failed(verb, e.to_string())),
+    }
+}
+
+fn template_uses_mesh_keypair(template: &str) -> bool {
+    template.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == format!("key_name: {MESH_KEYPAIR_NAME}")
+            || trimmed == format!("key_name: \"{MESH_KEYPAIR_NAME}\"")
+            || trimmed == format!("key_name: '{MESH_KEYPAIR_NAME}'")
+    })
+}
+
+fn handle_ensure_mesh_keypair(
+    verb: &str,
+    state: &OpenStackState,
+    ops: &dyn InstanceOps,
+) -> CloudReply {
+    if let Err(reason) = cloud_gate(state) {
+        return CloudReply::gated(verb, reason);
+    }
+    match ops.ensure_keypair(MESH_KEYPAIR_NAME, DEFAULT_MESH_KEYS_PATH) {
+        Ok(name) => {
+            tracing::info!(
+                target: "mackesd::openstack",
+                verb,
+                keypair = %name,
+                "ensured mesh SSH keypair in Nova (audited)"
+            );
+            CloudReply::keypair(verb, name, true)
+        }
+        Err(e) => CloudReply::failed(verb, e.to_string()),
+    }
+}
+
+fn handle_console(
+    verb: &str,
+    body: &str,
+    state: &OpenStackState,
+    ops: &dyn InstanceOps,
+) -> CloudReply {
+    let req = match parse_instance_request(body) {
+        Ok(r) => r,
+        Err(e) => return CloudReply::rejected(verb, e),
+    };
+    let instance = req.instance.trim();
+    if instance.is_empty() {
+        return CloudReply::rejected(
+            verb,
+            "a console request requires a non-empty `instance` (the Nova server id)",
+        );
+    }
+    if let Err(reason) = cloud_gate(state) {
+        return CloudReply::gated(verb, reason);
+    }
+    match ops.console(instance) {
+        Ok(console) => CloudReply::console(verb, console),
+        Err(e) => CloudReply::failed(verb, e.to_string()),
     }
 }
 
@@ -1352,6 +1712,7 @@ mod tests {
             "list-services",
             "list-resources",
             "list-instances",
+            "get-instance-console",
         ] {
             let t = cloud_action_topic(read);
             assert!(
@@ -1364,6 +1725,7 @@ mod tests {
             "instance-stop",
             "instance-reboot",
             "instance-delete",
+            "ensure-mesh-keypair",
         ] {
             let t = cloud_action_topic(mutation);
             assert!(
@@ -1761,6 +2123,274 @@ mod tests {
     }
 
     #[test]
+    fn heat_create_with_mesh_keypair_ensures_keypair_first() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![])
+            .with_resources(ResourceTable::default());
+        let reply = handle_cloud_request(
+            "heat-create",
+            r#"{"stack_name":"fresh","template":"heat_template_version: 2021-04-16\nresources:\n  server:\n    type: OS::Nova::Server\n    properties:\n      key_name: mcnf-mesh"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(reply.ok && reply.audited);
+        assert_eq!(ops.calls(), vec![format!("keypair:{MESH_KEYPAIR_NAME}")]);
+        assert_eq!(cat.heat_calls(), vec!["create:fresh".to_string()]);
+    }
+
+    #[test]
+    fn qc16_dev_cloud_boot_net_volume_roundtrip_rides_typed_verbs() {
+        // QC-16's farm-dev-cloud lane must drive boot/net/volume through the
+        // public Bus verb vocabulary, not a side-channel OpenStack script. This
+        // fixture pins the exact contract the live lane runs against disposable
+        // farm VMs: Heat creates the stack, Heat detail proves Nova+Neutron+
+        // Cinder resources exist, then the Nova roster/console verbs observe the
+        // booted server before Heat deletes the stack.
+        let state = enabled_state();
+        let hot = r#"heat_template_version: 2021-04-16
+description: QC-16 disposable dev-cloud boot/net/volume round-trip
+resources:
+  qc16_net:
+    type: OS::Neutron::Net
+  qc16_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network: { get_resource: qc16_net }
+      cidr: 10.216.16.0/24
+      ip_version: 4
+  qc16_volume:
+    type: OS::Cinder::Volume
+    properties:
+      size: 1
+  qc16_server:
+    type: OS::Nova::Server
+    properties:
+      key_name: mcnf-mesh
+      flavor: m1.tiny
+      image: mcnf-dev-node
+      networks:
+        - network: { get_resource: qc16_net }
+      block_device_mapping_v2:
+        - volume_id: { get_resource: qc16_volume }
+          device_name: vdb
+          delete_on_termination: true
+"#;
+        for resource_type in ["OS::Nova::Server", "OS::Neutron::Net", "OS::Cinder::Volume"] {
+            assert!(
+                hot.contains(resource_type),
+                "QC-16 template must include {resource_type}"
+            );
+        }
+
+        let ops = FakeInstanceOps::new()
+            .with_instances(vec![CloudInstance {
+                id: "qc16-server-id".into(),
+                name: "qc16-server".into(),
+                status: "ACTIVE".into(),
+                flavor: Some("m1.tiny".into()),
+                image: Some("mcnf-dev-node".into()),
+                networks: Some("qc16_net=10.216.16.42".into()),
+            }])
+            .with_console(ConsoleInfo {
+                instance: "qc16-server-id".into(),
+                protocol: "spice-html5".into(),
+                url: "https://nova.mesh/spice/qc16-server-id".into(),
+            });
+
+        let create_client = FakeCatalogSource::ok(ServiceCatalog::default(), vec![]);
+        let create = handle_cloud_request(
+            "heat-create",
+            &serde_json::json!({
+                "stack_name": "qc16-dev-cloud",
+                "template": hot,
+            })
+            .to_string(),
+            &state,
+            &ops,
+            &create_client,
+        );
+        assert!(create.ok && create.audited);
+        assert_eq!(create.stack.as_deref(), Some("qc16-dev-cloud"));
+        assert_eq!(
+            cloud_action_topic("heat-create"),
+            "action/cloud/heat-create"
+        );
+        assert_eq!(
+            ops.calls(),
+            vec![format!("keypair:{MESH_KEYPAIR_NAME}")],
+            "the stack's Nova keypair is ensured through the instance seam first"
+        );
+        assert_eq!(create_client.heat_calls(), vec!["create:qc16-dev-cloud"]);
+
+        let detail = HeatStackDetail::from_stack_json(
+            r#"{"stack":{"id":"qc16-stack-id","stack_name":"qc16-dev-cloud","stack_status":"CREATE_COMPLETE"}}"#,
+        )
+        .unwrap()
+        .with_resources_json(
+            r#"{"resources":[
+                {"resource_name":"qc16_net","resource_type":"OS::Neutron::Net","resource_status":"CREATE_COMPLETE","physical_resource_id":"net-1"},
+                {"resource_name":"qc16_volume","resource_type":"OS::Cinder::Volume","resource_status":"CREATE_COMPLETE","physical_resource_id":"vol-1"},
+                {"resource_name":"qc16_server","resource_type":"OS::Nova::Server","resource_status":"CREATE_COMPLETE","physical_resource_id":"qc16-server-id"}
+            ]}"#,
+        );
+        let detail_client =
+            FakeCatalogSource::ok(ServiceCatalog::default(), vec![]).with_heat_detail(detail);
+        let detail_reply = handle_cloud_request(
+            "get-heat-detail",
+            r#"{"stack":"qc16-dev-cloud"}"#,
+            &state,
+            &ops,
+            &detail_client,
+        );
+        assert!(detail_reply.ok && !detail_reply.audited);
+        let detail = detail_reply.heat_detail.expect("detail");
+        let resource_types: Vec<&str> = detail
+            .resources
+            .iter()
+            .map(|r| r.resource_type.as_str())
+            .collect();
+        for resource_type in ["OS::Nova::Server", "OS::Neutron::Net", "OS::Cinder::Volume"] {
+            assert!(
+                resource_types.contains(&resource_type),
+                "Heat detail must prove {resource_type} was provisioned"
+            );
+        }
+        assert_eq!(detail_client.heat_calls(), vec!["show:qc16-dev-cloud"]);
+
+        let preview_client = FakeCatalogSource::ok(ServiceCatalog::default(), vec![])
+            .with_heat_preview(HeatPreview {
+                updated: vec!["qc16_server".into()],
+                unchanged: vec!["qc16_net".into(), "qc16_volume".into()],
+                ..HeatPreview::default()
+            });
+        let preview = handle_cloud_request(
+            "get-heat-preview",
+            r#"{"stack_name":"qc16-dev-cloud","stack_id":"qc16-stack-id","template":"heat_template_version: 2021-04-16"}"#,
+            &state,
+            &ops,
+            &preview_client,
+        );
+        assert!(preview.ok && !preview.audited);
+        assert_eq!(preview.heat_preview.expect("preview").change_count(), 1);
+        assert_eq!(
+            preview_client.heat_calls(),
+            vec!["preview:qc16-dev-cloud/qc16-stack-id"]
+        );
+
+        let update_client = FakeCatalogSource::ok(ServiceCatalog::default(), vec![]);
+        let update = handle_cloud_request(
+            "heat-update",
+            r#"{"stack_name":"qc16-dev-cloud","stack_id":"qc16-stack-id","template":"heat_template_version: 2021-04-16"}"#,
+            &state,
+            &ops,
+            &update_client,
+        );
+        assert!(update.ok && update.audited);
+        assert_eq!(
+            update_client.heat_calls(),
+            vec!["update:qc16-dev-cloud/qc16-stack-id"]
+        );
+
+        let instances = handle_cloud_request(
+            "list-instances",
+            "",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(instances.ok && !instances.audited);
+        let instance = &instances.instances.as_ref().expect("instances")[0];
+        assert_eq!(instance.id, "qc16-server-id");
+        assert_eq!(instance.status, "ACTIVE");
+        assert_eq!(instance.networks.as_deref(), Some("qc16_net=10.216.16.42"));
+
+        let console = handle_cloud_request(
+            "get-instance-console",
+            r#"{"instance":"qc16-server-id"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(console.ok);
+        assert_eq!(
+            console.console.expect("console").url,
+            "https://nova.mesh/spice/qc16-server-id"
+        );
+
+        let delete_client = FakeCatalogSource::ok(ServiceCatalog::default(), vec![]);
+        let delete = handle_cloud_request(
+            "heat-delete",
+            r#"{"stack_name":"qc16-dev-cloud","stack_id":"qc16-stack-id"}"#,
+            &state,
+            &ops,
+            &delete_client,
+        );
+        assert!(delete.ok && delete.audited);
+        assert_eq!(
+            delete_client.heat_calls(),
+            vec!["delete:qc16-dev-cloud/qc16-stack-id"]
+        );
+        assert_eq!(
+            ops.calls(),
+            vec![
+                format!("keypair:{MESH_KEYPAIR_NAME}"),
+                "list".to_string(),
+                "console:qc16-server-id".to_string(),
+            ],
+            "only the public keypair/list/console seams were touched outside Heat"
+        );
+    }
+
+    #[test]
+    fn ensure_mesh_keypair_is_audited_and_gated() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let reply = handle_cloud_request(
+            "ensure-mesh-keypair",
+            "{}",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(reply.ok && reply.audited);
+        assert_eq!(reply.keypair.as_deref(), Some(MESH_KEYPAIR_NAME));
+        assert_eq!(ops.calls(), vec![format!("keypair:{MESH_KEYPAIR_NAME}")]);
+
+        let mut disabled = enabled_state();
+        disabled.doctrine = DoctrineStatus::Disabled;
+        let gated = handle_cloud_request(
+            "ensure-mesh-keypair",
+            "{}",
+            &disabled,
+            &FakeInstanceOps::new(),
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(!gated.ok && gated.gated.expect("gated").contains("disabled"));
+    }
+
+    #[test]
+    fn get_instance_console_returns_the_spice_descriptor() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new().with_console(ConsoleInfo {
+            instance: "i-1".into(),
+            protocol: "spice-html5".into(),
+            url: "spice://i-1.mesh:5900".into(),
+        });
+        let reply = handle_cloud_request(
+            "get-instance-console",
+            r#"{"instance":"i-1"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(reply.ok);
+        assert_eq!(reply.console.expect("console").url, "spice://i-1.mesh:5900");
+        assert_eq!(ops.calls(), vec!["console:i-1".to_string()]);
+    }
+
+    #[test]
     fn a_heat_mutation_is_failed_not_gated_on_a_real_error() {
         // §7 — a real transport failure is a failure, not a gate; nothing faked.
         let state = enabled_state();
@@ -1912,9 +2542,9 @@ mod tests {
                 "{verb}: verb_audits must match the Bus hash-chain guard"
             );
         }
-        // Sanity: the mutations are the 4 lifecycle + 4 Heat verbs, nothing else.
+        // Sanity: the mutations are the 4 lifecycle + 4 Heat verbs + keypair ensure.
         let audited = CLOUD_VERBS.into_iter().filter(|v| verb_audits(v)).count();
-        assert_eq!(audited, 8, "exactly 8 mutating verbs audit");
+        assert_eq!(audited, 9, "exactly 9 mutating verbs audit");
     }
 
     #[test]
@@ -2045,6 +2675,60 @@ mod tests {
             build_lifecycle_argv(LifecycleAction::Reboot, "i-2"),
             vec!["server", "reboot", "i-2"]
         );
+        assert_eq!(
+            build_keypair_show_argv(MESH_KEYPAIR_NAME),
+            vec!["keypair", "show", MESH_KEYPAIR_NAME, "-f", "json"]
+        );
+        assert_eq!(
+            build_keypair_create_argv(MESH_KEYPAIR_NAME, DEFAULT_MESH_KEYS_PATH),
+            vec![
+                "keypair",
+                "create",
+                "--public-key",
+                DEFAULT_MESH_KEYS_PATH,
+                MESH_KEYPAIR_NAME
+            ]
+        );
+        assert_eq!(
+            build_native_spice_display_argv("i-1"),
+            vec![
+                "--connect",
+                "qemu:///system",
+                "domdisplay",
+                "i-1",
+                "--type",
+                "spice",
+                "--include-password"
+            ]
+        );
+        assert_eq!(
+            build_console_url_argv("i-1"),
+            vec![
+                "console",
+                "url",
+                "show",
+                "--spice-html5",
+                "i-1",
+                "-f",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn native_spice_display_parses_the_direct_qemu_descriptor() {
+        let console = parse_native_spice_display("i-1", "\nspice://i-1.mesh:5900\n")
+            .expect("parse native spice display");
+        assert_eq!(console.instance, "i-1");
+        assert_eq!(console.protocol, "spice");
+        assert_eq!(console.url, "spice://i-1.mesh:5900");
+    }
+
+    #[test]
+    fn native_spice_display_rejects_non_spice_output() {
+        let err = parse_native_spice_display("i-1", "vnc://i-1.mesh:5900")
+            .expect_err("must reject non-SPICE native output");
+        assert!(matches!(err, InstanceOpError::Parse(_)));
     }
 
     #[test]
@@ -2070,6 +2754,18 @@ mod tests {
                 .contains("10.0.0.6"),
             "an object Networks column renders to a string"
         );
+    }
+
+    #[test]
+    fn console_url_json_parses_openstack_columns() {
+        let console = parse_console_url_json(
+            "i-1",
+            r#"{"Type":"spice-html5","Url":"https://nova.mesh/spice/i-1"}"#,
+        )
+        .expect("parse console");
+        assert_eq!(console.instance, "i-1");
+        assert_eq!(console.protocol, "spice-html5");
+        assert_eq!(console.url, "https://nova.mesh/spice/i-1");
     }
 
     #[test]

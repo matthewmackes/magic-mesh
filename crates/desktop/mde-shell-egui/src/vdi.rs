@@ -2,10 +2,11 @@
 //!
 //! E12 "Quasar" brokers VM desktops *into* the one shell (§5 EMBED, lock 21):
 //! there is no external viewer. The remote framebuffer is decoded by
-//! `mde-vdi-rdp` (RDP-primary) or `mde-vdi-vnc` (VNC / XAPI-console fallback) into
-//! an [`egui::ColorImage`]; this panel uploads that image to a `TextureHandle` and
-//! paints it as the shell body, and forwards the frame's egui input straight back
-//! to the session's input mapper.
+//! `mde-vdi-rdp` (RDP-primary), `mde-vdi-vnc` (VNC / XAPI-console fallback), or
+//! `mde-vdi-spice` (native QEMU/KVM console) into an [`egui::ColorImage`]; this
+//! panel uploads that image to a `TextureHandle` and paints it as the shell body,
+//! and forwards the frame's egui input straight back to the session's input
+//! mapper.
 //!
 //! ```text
 //!   session.frame() ─▶ ColorImage ─▶ TextureHandle ─▶ ui paints the body
@@ -20,6 +21,7 @@
 use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
 
 use mde_vdi_rdp::RdpSession;
+use mde_vdi_spice::SpiceSession;
 use mde_vdi_vnc::VncSession;
 
 use crate::auth::DesktopAuth;
@@ -29,13 +31,16 @@ use std::path::PathBuf;
 #[cfg(feature = "live-vdi")]
 use {
     mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
+    mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
+    mde_vdi_vnc::{PumpOutcome as VncPumpOutcome, VncConfig, VncConnection},
     std::sync::mpsc,
     std::thread,
     std::time::Duration,
 };
 
-/// A live VDI desktop the shell drives — RDP-primary, VNC the console fallback.
-/// Both decoder crates expose the *identical* egui-facing surface
+/// A live VDI desktop the shell drives — RDP-primary, VNC the console fallback,
+/// and SPICE for native QEMU/KVM consoles. The decoder crates expose the same
+/// egui-facing surface
 /// (`frame()` → [`egui::ColorImage`], `send_input(&egui::Event)`), so the panel
 /// drives whichever is attached through one match.
 ///
@@ -55,6 +60,8 @@ enum Session {
     Rdp(RdpSession),
     /// A VNC/RFB desktop (`mde-vdi-vnc`, the universal console fallback).
     Vnc(VncSession),
+    /// A SPICE desktop (`mde-vdi-spice`, the native QEMU/KVM console).
+    Spice(SpiceSession),
 }
 
 impl Session {
@@ -63,6 +70,7 @@ impl Session {
         match self {
             Session::Rdp(s) => s.frame(),
             Session::Vnc(s) => s.frame(),
+            Session::Spice(s) => s.frame(),
         }
     }
 
@@ -72,6 +80,7 @@ impl Session {
         match self {
             Session::Rdp(s) => s.send_input(event),
             Session::Vnc(s) => s.send_input(event),
+            Session::Spice(s) => s.send_input(event),
         }
     }
 }
@@ -168,7 +177,7 @@ pub(crate) enum VdiProtocol {
     Rdp,
     /// VNC / RFB — `mde-vdi-vnc` (the universal console fallback).
     Vnc,
-    /// Spice — `mde-vdi-spice` (CHOOSER-5; honest-gated until the crate lands).
+    /// Spice — `mde-vdi-spice` (native QEMU/KVM console).
     Spice,
 }
 
@@ -182,11 +191,9 @@ impl VdiProtocol {
         }
     }
 
-    /// Whether a decoder crate exists to render this protocol today. Spice's
-    /// client is CHOOSER-5 — a Spice request is built honestly but never faked
-    /// into a live session (§7).
+    /// Whether a decoder crate exists to render this protocol today.
     pub(crate) const fn has_client(self) -> bool {
-        matches!(self, Self::Rdp | Self::Vnc)
+        matches!(self, Self::Rdp | Self::Vnc | Self::Spice)
     }
 
     /// The short picker / caption label.
@@ -244,9 +251,9 @@ impl MonitorSpan {
 /// several — lock 6), the [`DisplayMode`] (lock 9), the [`MonitorSpan`] (lock
 /// 12), and the [`RequestedTarget`] the session attaches to. The Desktop surface
 /// routes it to the matching decoder crate ([`VdiProtocol::client_crate`]); the
-/// live wire transport that constructs the session is the gated E12-4 layer, and
-/// a Spice route is honest-gated on CHOOSER-5 until `mde-vdi-spice` lands — the
-/// request is still built truthfully, but no session is ever faked (§7).
+/// live wire transport that constructs the session is the gated E12-4 layer; a
+/// request is still built truthfully while the transport resolves, and no
+/// placeholder session is ever faked (§7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConnectRequest {
     /// The desktop the session attaches to (serving peer + VM/host name).
@@ -312,6 +319,36 @@ struct LiveRdpHandle {
 }
 
 #[cfg(feature = "live-vdi")]
+enum LiveVncEvent {
+    Connected(String),
+    Frame(egui::ColorImage),
+    Error(String),
+    Ended(String),
+}
+
+#[cfg(feature = "live-vdi")]
+struct LiveVncHandle {
+    input_tx: mpsc::Sender<egui::Event>,
+    stop_tx: mpsc::Sender<()>,
+    event_rx: mpsc::Receiver<LiveVncEvent>,
+}
+
+#[cfg(feature = "live-vdi")]
+enum LiveSpiceEvent {
+    Connected(String),
+    Frame(egui::ColorImage),
+    Error(String),
+    Ended(String),
+}
+
+#[cfg(feature = "live-vdi")]
+struct LiveSpiceHandle {
+    input_tx: mpsc::Sender<egui::Event>,
+    stop_tx: mpsc::Sender<()>,
+    event_rx: mpsc::Receiver<LiveSpiceEvent>,
+}
+
+#[cfg(feature = "live-vdi")]
 impl LiveRdpHandle {
     fn spawn(request: &ConnectRequest) -> Result<Self, String> {
         let Some(endpoint) = request.target.endpoint.clone() else {
@@ -355,6 +392,64 @@ impl LiveRdpHandle {
 }
 
 #[cfg(feature = "live-vdi")]
+impl LiveVncHandle {
+    fn spawn(request: &ConnectRequest) -> Result<Self, String> {
+        let config = live_vnc_config(request)?;
+        let (input_tx, input_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name(format!("mde-live-vnc-{}", request.target.name))
+            .spawn(move || run_live_vnc(config, input_rx, stop_rx, event_tx))
+            .map_err(|e| format!("failed to spawn live VNC worker: {e}"))?;
+
+        Ok(Self {
+            input_tx,
+            stop_tx,
+            event_rx,
+        })
+    }
+
+    fn send_input(&self, event: egui::Event) {
+        let _ = self.input_tx.send(event);
+    }
+
+    fn stop(&self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+impl LiveSpiceHandle {
+    fn spawn(request: &ConnectRequest) -> Result<Self, String> {
+        let config = live_spice_config(request)?;
+        let (input_tx, input_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name(format!("mde-live-spice-{}", request.target.name))
+            .spawn(move || run_live_spice(config, input_rx, stop_rx, event_tx))
+            .map_err(|e| format!("failed to spawn live SPICE worker: {e}"))?;
+
+        Ok(Self {
+            input_tx,
+            stop_tx,
+            event_rx,
+        })
+    }
+
+    fn send_input(&self, event: egui::Event) {
+        let _ = self.input_tx.send(event);
+    }
+
+    fn stop(&self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
 fn live_rdp_credential(request: &ConnectRequest) -> Result<&crate::auth::Credential, String> {
     match &request.auth {
         DesktopAuth::Sealed { credential, .. } => Ok(credential),
@@ -368,7 +463,80 @@ fn live_rdp_credential(request: &ConnectRequest) -> Result<&crate::auth::Credent
 }
 
 #[cfg(feature = "live-vdi")]
+fn live_vnc_config(request: &ConnectRequest) -> Result<VncConfig, String> {
+    let Some(endpoint) = request.target.endpoint.clone() else {
+        return Err("discovery has not published a dialable endpoint for this desktop".into());
+    };
+    let mut config = VncConfig::new(endpoint.host)
+        .with_port(endpoint.port)
+        .shared(true);
+    match &request.auth {
+        DesktopAuth::Sealed { credential, .. } => {
+            if !credential.secret.expose().is_empty() {
+                config = config.with_password(credential.secret.expose().to_owned());
+            }
+        }
+        DesktopAuth::MeshIdentity {
+            guest: Some(guest), ..
+        } => {
+            if !guest.credential.secret.expose().is_empty() {
+                config = config.with_password(guest.credential.secret.expose().to_owned());
+            }
+        }
+        DesktopAuth::MeshIdentity { guest: None, .. } => {
+            // XCP-ng console fallback is mesh/dom0-route gated and usually exposes
+            // RFB security type None; no guest credential is required for that path.
+        }
+    }
+    Ok(config)
+}
+
+#[cfg(feature = "live-vdi")]
+fn live_spice_config(request: &ConnectRequest) -> Result<SpiceConfig, String> {
+    let Some(endpoint) = request.target.endpoint.clone() else {
+        return Err("discovery has not published a dialable endpoint for this desktop".into());
+    };
+    let mut config = SpiceConfig::new(endpoint.host)
+        .with_port(endpoint.port)
+        .with_size(1024, 768);
+    match &request.auth {
+        DesktopAuth::Sealed { credential, .. } => {
+            if !credential.secret.expose().is_empty() {
+                config = config.with_password(credential.secret.expose().to_owned());
+            }
+        }
+        DesktopAuth::MeshIdentity {
+            guest: Some(guest), ..
+        } => {
+            if !guest.credential.secret.expose().is_empty() {
+                config = config.with_password(guest.credential.secret.expose().to_owned());
+            }
+        }
+        DesktopAuth::MeshIdentity { guest: None, .. } => {
+            // Mesh-gated QEMU/KVM consoles commonly carry no SPICE ticket; if a
+            // ticket is required, discovery/auth provides it as the optional guest
+            // credential above.
+        }
+    }
+    Ok(config)
+}
+
+#[cfg(feature = "live-vdi")]
 impl Drop for LiveRdpHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+impl Drop for LiveVncHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+impl Drop for LiveSpiceHandle {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
     }
@@ -440,6 +608,138 @@ fn run_live_rdp(
     }
 }
 
+#[cfg(feature = "live-vdi")]
+fn run_live_vnc(
+    config: VncConfig,
+    input_rx: mpsc::Receiver<egui::Event>,
+    stop_rx: mpsc::Receiver<()>,
+    event_tx: mpsc::Sender<LiveVncEvent>,
+) {
+    let target = format!("{}:{}", config.host, config.port);
+    let mut session = match VncSession::new(config) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = event_tx.send(LiveVncEvent::Error(format!("VNC config rejected: {e}")));
+            return;
+        }
+    };
+    let mut conn = match VncConnection::connect(&mut session) {
+        Ok(conn) => conn,
+        Err(e) => {
+            let _ = event_tx.send(LiveVncEvent::Error(format!("VNC connect failed: {e}")));
+            return;
+        }
+    };
+    let negotiated = conn.negotiated().clone();
+    let _ = event_tx.send(LiveVncEvent::Connected(format!(
+        "{target} (RFB {}.{}, {}x{}, {:?})",
+        negotiated.major, negotiated.minor, negotiated.width, negotiated.height, negotiated.name
+    )));
+    if let Some(frame) = session.frame() {
+        let _ = event_tx.send(LiveVncEvent::Frame(frame));
+    }
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            conn.shutdown();
+            return;
+        }
+
+        let mut had_input = false;
+        while let Ok(event) = input_rx.try_recv() {
+            session.send_input(&event);
+            had_input = true;
+        }
+        if had_input {
+            if let Err(e) = conn.flush_input(&mut session) {
+                let _ = event_tx.send(LiveVncEvent::Error(format!("VNC input failed: {e}")));
+                return;
+            }
+        }
+
+        match conn.pump_once(&mut session, Duration::from_millis(50)) {
+            Ok(VncPumpOutcome::Processed { rects, .. }) => {
+                if rects > 0 {
+                    if let Some(frame) = session.frame() {
+                        let _ = event_tx.send(LiveVncEvent::Frame(frame));
+                    }
+                }
+            }
+            Ok(VncPumpOutcome::TimedOut) => {}
+            Ok(VncPumpOutcome::Terminated { reason }) => {
+                let _ = event_tx.send(LiveVncEvent::Ended(reason));
+                return;
+            }
+            Err(e) => {
+                let _ = event_tx.send(LiveVncEvent::Error(format!("VNC pump failed: {e}")));
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+fn run_live_spice(
+    config: SpiceConfig,
+    input_rx: mpsc::Receiver<egui::Event>,
+    stop_rx: mpsc::Receiver<()>,
+    event_tx: mpsc::Sender<LiveSpiceEvent>,
+) {
+    let target = format!("{}:{}", config.host, config.port);
+    let mut session = match SpiceSession::new(config.clone()) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = event_tx.send(LiveSpiceEvent::Error(format!("SPICE config rejected: {e}")));
+            return;
+        }
+    };
+    let mut conn = match BlockingSpiceTransport::connect(&config) {
+        Ok(conn) => conn,
+        Err(e) => {
+            let _ = event_tx.send(LiveSpiceEvent::Error(format!("SPICE connect failed: {e}")));
+            return;
+        }
+    };
+    let _ = event_tx.send(LiveSpiceEvent::Connected(target));
+    if let Some(frame) = session.frame() {
+        let _ = event_tx.send(LiveSpiceEvent::Frame(frame));
+    }
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            let _ = event_tx.send(LiveSpiceEvent::Ended(
+                "SPICE session stopped by shell".to_string(),
+            ));
+            return;
+        }
+
+        let mut had_input = false;
+        while let Ok(event) = input_rx.try_recv() {
+            session.send_input(&event);
+            had_input = true;
+        }
+        if had_input {
+            if let Err(e) = conn.flush_input(&mut session) {
+                let _ = event_tx.send(LiveSpiceEvent::Error(format!("SPICE input failed: {e}")));
+                return;
+            }
+        }
+
+        match conn.pump_frame(&mut session) {
+            Ok(true) => {
+                if let Some(frame) = session.frame() {
+                    let _ = event_tx.send(LiveSpiceEvent::Frame(frame));
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let _ = event_tx.send(LiveSpiceEvent::Error(format!("SPICE pump failed: {e}")));
+                return;
+            }
+        }
+    }
+}
+
 /// The Desktop surface's state: the active session (if any), the desktop texture
 /// the framebuffer is uploaded into, the decode → upload hand-off slot, and the
 /// picked target the discovery picker requested before a live session attaches.
@@ -469,6 +769,12 @@ pub(crate) struct VdiState {
     /// `session`, which remains the single-threaded decoder used by tests and VNC.
     #[cfg(feature = "live-vdi")]
     live_rdp: Option<LiveRdpHandle>,
+    /// Live in-shell VNC transport for a direct endpoint / XAPI console fallback.
+    #[cfg(feature = "live-vdi")]
+    live_vnc: Option<LiveVncHandle>,
+    /// Live in-shell SPICE transport for native QEMU/KVM consoles.
+    #[cfg(feature = "live-vdi")]
+    live_spice: Option<LiveSpiceHandle>,
     /// Log-safe live transport status/error shown under the empty backdrop until a
     /// frame arrives.
     #[cfg(feature = "live-vdi")]
@@ -513,10 +819,16 @@ impl VdiState {
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
             }
+            if let Some(live) = self.live_vnc.take() {
+                live.stop();
+            }
+            if let Some(live) = self.live_spice.take() {
+                live.stop();
+            }
             self.texture = None;
             self.incoming = None;
-            if request.protocol == VdiProtocol::Rdp {
-                match LiveRdpHandle::spawn(&request) {
+            match request.protocol {
+                VdiProtocol::Rdp => match LiveRdpHandle::spawn(&request) {
                     Ok(handle) => {
                         self.live_status = Some("Opening live RDP transport".to_string());
                         self.live_rdp = Some(handle);
@@ -524,7 +836,25 @@ impl VdiState {
                     Err(reason) => {
                         self.live_status = Some(format!("Live RDP gated: {reason}"));
                     }
-                }
+                },
+                VdiProtocol::Vnc => match LiveVncHandle::spawn(&request) {
+                    Ok(handle) => {
+                        self.live_status = Some("Opening live VNC transport".to_string());
+                        self.live_vnc = Some(handle);
+                    }
+                    Err(reason) => {
+                        self.live_status = Some(format!("Live VNC gated: {reason}"));
+                    }
+                },
+                VdiProtocol::Spice => match LiveSpiceHandle::spawn(&request) {
+                    Ok(handle) => {
+                        self.live_status = Some("Opening live SPICE transport".to_string());
+                        self.live_spice = Some(handle);
+                    }
+                    Err(reason) => {
+                        self.live_status = Some(format!("Live SPICE gated: {reason}"));
+                    }
+                },
             }
         }
         self.requested = Some(request);
@@ -542,6 +872,12 @@ impl VdiState {
         #[cfg(feature = "live-vdi")]
         {
             if let Some(live) = self.live_rdp.take() {
+                live.stop();
+            }
+            if let Some(live) = self.live_vnc.take() {
+                live.stop();
+            }
+            if let Some(live) = self.live_spice.take() {
                 live.stop();
             }
             self.publish_broker_close_if_active();
@@ -574,6 +910,74 @@ impl VdiState {
                 }
                 LiveRdpEvent::Ended(reason) => {
                     self.live_status = Some(format!("RDP session ended: {reason}"));
+                    publish_disconnect = true;
+                }
+            }
+        }
+        if publish_active {
+            self.publish_broker_active();
+        }
+        if publish_disconnect {
+            self.publish_broker_disconnect_if_active();
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn poll_live_vnc(&mut self) {
+        let Some(live) = self.live_vnc.as_ref() else {
+            return;
+        };
+        let mut publish_active = false;
+        let mut publish_disconnect = false;
+        while let Ok(event) = live.event_rx.try_recv() {
+            match event {
+                LiveVncEvent::Connected(target) => {
+                    self.live_status = Some(format!("Live VNC connected to {target}"));
+                    publish_active = true;
+                }
+                LiveVncEvent::Frame(frame) => {
+                    self.incoming = Some(frame);
+                }
+                LiveVncEvent::Error(reason) => {
+                    self.live_status = Some(reason);
+                    publish_disconnect = true;
+                }
+                LiveVncEvent::Ended(reason) => {
+                    self.live_status = Some(format!("VNC session ended: {reason}"));
+                    publish_disconnect = true;
+                }
+            }
+        }
+        if publish_active {
+            self.publish_broker_active();
+        }
+        if publish_disconnect {
+            self.publish_broker_disconnect_if_active();
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn poll_live_spice(&mut self) {
+        let Some(live) = self.live_spice.as_ref() else {
+            return;
+        };
+        let mut publish_active = false;
+        let mut publish_disconnect = false;
+        while let Ok(event) = live.event_rx.try_recv() {
+            match event {
+                LiveSpiceEvent::Connected(target) => {
+                    self.live_status = Some(format!("Live SPICE connected to {target}"));
+                    publish_active = true;
+                }
+                LiveSpiceEvent::Frame(frame) => {
+                    self.incoming = Some(frame);
+                }
+                LiveSpiceEvent::Error(reason) => {
+                    self.live_status = Some(reason);
+                    publish_disconnect = true;
+                }
+                LiveSpiceEvent::Ended(reason) => {
+                    self.live_status = Some(format!("SPICE session ended: {reason}"));
                     publish_disconnect = true;
                 }
             }
@@ -653,7 +1057,11 @@ const DESKTOP_TEX: TextureOptions = TextureOptions::LINEAR;
 /// session attached it draws the honest "no desktop" EmptyState instead.
 pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     #[cfg(feature = "live-vdi")]
-    state.poll_live_rdp();
+    {
+        state.poll_live_rdp();
+        state.poll_live_vnc();
+        state.poll_live_spice();
+    }
 
     // 1. Pull the newest decoded frame off the live session into the upload slot.
     if let Some(session) = state.session.as_mut() {
@@ -698,8 +1106,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 // The Chooser's picker chose a connect but no live decoder is
                 // attached yet (the wire transport is gated) — the status honestly
                 // names the desktop + the chosen protocol/display below the logo,
-                // never a placeholder render (§7). A Spice route says its client is
-                // CHOOSER-5, so it's plain no session was faked.
+                // never a placeholder render (§7).
                 Some(req) => {
                     let title = format!(
                         "Connecting to {} via {}",
@@ -709,41 +1116,32 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                     // CHOOSER-6 — name the auth mode honestly (SSO vs sealed cred);
                     // `auth.summary()` is log-safe and never carries the secret.
                     let auth = req.auth.summary();
-                    let detail = if req.protocol.has_client() {
-                        let endpoint = req.target.endpoint.as_ref().map_or_else(
-                            || req.target.serving_peer.clone(),
-                            DesktopEndpoint::label,
-                        );
-                        let live_status = {
-                            #[cfg(feature = "live-vdi")]
-                            {
-                                state
-                                    .live_status
-                                    .as_deref()
-                                    .unwrap_or("Waiting for the live transport")
-                                    .to_string()
-                            }
-                            #[cfg(not(feature = "live-vdi"))]
-                            {
-                                "the live transport is not compiled into this shell build"
-                                    .to_string()
-                            }
-                        };
-                        format!(
-                            "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — {live_status}.",
-                            req.protocol.client_crate(),
-                            endpoint,
-                            req.display.label(),
-                            req.monitors.label(),
-                        )
-                    } else {
-                        format!(
-                            "Spice desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — the Spice client lands in CHOOSER-5; no session is faked.",
-                            req.target.serving_peer,
-                            req.display.label(),
-                            req.monitors.label(),
-                        )
+                    let endpoint = req
+                        .target
+                        .endpoint
+                        .as_ref()
+                        .map_or_else(|| req.target.serving_peer.clone(), DesktopEndpoint::label);
+                    let live_status = {
+                        #[cfg(feature = "live-vdi")]
+                        {
+                            state
+                                .live_status
+                                .as_deref()
+                                .unwrap_or("Waiting for the live transport")
+                                .to_string()
+                        }
+                        #[cfg(not(feature = "live-vdi"))]
+                        {
+                            "the live transport is not compiled into this shell build".to_string()
+                        }
                     };
+                    let detail = format!(
+                        "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — {live_status}.",
+                        req.protocol.client_crate(),
+                        endpoint,
+                        req.display.label(),
+                        req.monitors.label(),
+                    );
                     crate::backdrop::show(
                         ui,
                         crate::backdrop::Coverage::Empty,
@@ -773,7 +1171,7 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
     let has_live = {
         #[cfg(feature = "live-vdi")]
         {
-            state.live_rdp.is_some()
+            state.live_rdp.is_some() || state.live_vnc.is_some() || state.live_spice.is_some()
         }
         #[cfg(not(feature = "live-vdi"))]
         {
@@ -800,6 +1198,14 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
         }
         #[cfg(feature = "live-vdi")]
         if let Some(live) = state.live_rdp.as_ref() {
+            live.send_input(event.clone());
+        }
+        #[cfg(feature = "live-vdi")]
+        if let Some(live) = state.live_vnc.as_ref() {
+            live.send_input(event.clone());
+        }
+        #[cfg(feature = "live-vdi")]
+        if let Some(live) = state.live_spice.as_ref() {
             live.send_input(event);
         }
     }
@@ -928,6 +1334,7 @@ mod tests {
     use mde_egui::egui::{pos2, vec2, Rect};
     use mde_egui::Style;
     use mde_vdi_rdp::RdpConfig;
+    use mde_vdi_spice::{Scancode, SpiceConfig, SpiceInputEvent};
     use mde_vdi_vnc::VncConfig;
 
     /// A headless 960×640 shell body, mirroring the E12-3b render test.
@@ -991,10 +1398,10 @@ mod tests {
     }
 
     #[test]
-    fn a_gated_spice_connect_paints_without_faking_a_session() {
-        // A Spice request is constructed honestly, but no client crate exists
-        // (CHOOSER-5), so the surface stays on the connecting caption — it never
-        // constructs a `Session::Spice` (there is none) nor a fake desktop (§7).
+    fn a_spice_connect_without_an_endpoint_paints_without_faking_a_session() {
+        // A Spice request is constructed honestly. Without a published endpoint,
+        // the live transport gates before dialing, and the surface never fakes a
+        // desktop (§7).
         let mut state = VdiState::default();
         state.request_connect(ConnectRequest::new(
             RequestedTarget::new("oak", "win11"),
@@ -1008,7 +1415,7 @@ mod tests {
         assert!(state.texture.is_none(), "no fake desktop texture");
         assert!(
             drew,
-            "the gated-Spice connecting caption produced no draw primitives"
+            "the endpoint-gated Spice connecting caption produced no draw primitives"
         );
     }
 
@@ -1017,10 +1424,9 @@ mod tests {
         assert_eq!(VdiProtocol::Rdp.client_crate(), "mde-vdi-rdp");
         assert_eq!(VdiProtocol::Vnc.client_crate(), "mde-vdi-vnc");
         assert_eq!(VdiProtocol::Spice.client_crate(), "mde-vdi-spice");
-        // RDP/VNC render today; Spice is CHOOSER-5-gated.
         assert!(VdiProtocol::Rdp.has_client());
         assert!(VdiProtocol::Vnc.has_client());
-        assert!(!VdiProtocol::Spice.has_client());
+        assert!(VdiProtocol::Spice.has_client());
     }
 
     #[test]
@@ -1100,6 +1506,82 @@ mod tests {
         assert!(err.contains("sealed guest credential"));
     }
 
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_vnc_accepts_mesh_identity_without_a_guest_credential() {
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "bios-console")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 5900)),
+            VdiProtocol::Vnc,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("client-node"),
+        );
+        let cfg = live_vnc_config(&req).expect("mesh-gated VNC console needs no guest password");
+        assert_eq!(cfg.host, "10.42.0.9");
+        assert_eq!(cfg.port, 5900);
+        assert!(
+            cfg.shared,
+            "console connects should not evict existing viewers"
+        );
+        assert_eq!(cfg.password, None);
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_vnc_carries_a_sealed_guest_password_when_present() {
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "secured-vnc")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 5901)),
+            VdiProtocol::Vnc,
+            DisplayMode::Windowed,
+            MonitorSpan::Single,
+            DesktopAuth::Sealed {
+                store_ref: "desktop/oak/vnc".to_string(),
+                credential: Credential::new("ignored-by-rfb", "vnc-secret"),
+            },
+        );
+        let cfg = live_vnc_config(&req).expect("sealed VNC config builds");
+        assert_eq!(cfg.port, 5901);
+        assert_eq!(cfg.password.as_deref(), Some("vnc-secret"));
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_spice_accepts_mesh_identity_without_a_guest_ticket() {
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "qemu-console")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 5930)),
+            VdiProtocol::Spice,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("client-node"),
+        );
+        let cfg = live_spice_config(&req).expect("mesh-gated SPICE console needs no guest ticket");
+        assert_eq!(cfg.host, "10.42.0.9");
+        assert_eq!(cfg.port, 5930);
+        assert_eq!(cfg.password, None);
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_spice_carries_a_sealed_guest_ticket_when_present() {
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "secured-spice")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 5931)),
+            VdiProtocol::Spice,
+            DisplayMode::Windowed,
+            MonitorSpan::Single,
+            DesktopAuth::Sealed {
+                store_ref: "desktop/oak/spice".to_string(),
+                credential: Credential::new("", "spice-ticket"),
+            },
+        );
+        let cfg = live_spice_config(&req).expect("sealed SPICE config builds");
+        assert_eq!(cfg.port, 5931);
+        assert_eq!(cfg.password.as_deref(), Some("spice-ticket"));
+    }
+
     #[test]
     fn an_attached_frame_is_uploaded_to_a_texture_and_painted() {
         // The decode side hands the panel a frame; the panel uploads + paints it.
@@ -1131,6 +1613,23 @@ mod tests {
         assert!(
             state.texture.is_some(),
             "the RDP session's first frame was not pulled and uploaded"
+        );
+    }
+
+    #[test]
+    fn a_live_spice_session_frame_flows_to_the_texture() {
+        // Proves the shell is a real caller of `mde-vdi-spice`: a fresh session
+        // marks its framebuffer dirty, so the panel pulls a `frame()` and uploads
+        // it with no server in the loop.
+        let session = SpiceSession::new(SpiceConfig::new("host")).expect("valid SPICE config");
+        let mut state = VdiState {
+            session: Some(Session::Spice(session)),
+            ..Default::default()
+        };
+        run_panel(&mut state, body_input());
+        assert!(
+            state.texture.is_some(),
+            "the SPICE session's first frame was not pulled and uploaded"
         );
     }
 
@@ -1266,5 +1765,290 @@ mod tests {
             ),
             "the pointer event was not forwarded to the guest"
         );
+    }
+
+    #[test]
+    fn input_forwards_to_a_spice_session_and_esc_returns_to_chrome() {
+        // The native QEMU/SPICE fallback receives pointer + scancode input through
+        // the shell's common forwarding seam, while Esc stays reserved for chrome.
+        let session = SpiceSession::new(SpiceConfig::new("host")).expect("valid SPICE config");
+        let mut state = VdiState {
+            session: Some(Session::Spice(session)),
+            ..Default::default()
+        };
+        let mut input = body_input();
+        input.events = vec![
+            egui::Event::PointerMoved(pos2(200.0, 120.0)),
+            egui::Event::Key {
+                key: egui::Key::M,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        run_panel(&mut state, input);
+
+        assert!(
+            state.return_to_chrome,
+            "Esc did not raise the return-to-chrome chord"
+        );
+        let Some(Session::Spice(session)) = &state.session else {
+            panic!("SPICE session was detached");
+        };
+        assert_eq!(
+            session.pointer_position(),
+            (200, 120),
+            "the pointer event was not forwarded to the SPICE guest"
+        );
+        assert!(
+            session.pending_input().contains(&SpiceInputEvent::Key {
+                scancode: Scancode {
+                    code: 0x32,
+                    extended: false,
+                },
+                down: true,
+            }),
+            "the M key scancode was not queued for the SPICE transport"
+        );
+        assert!(
+            !session.pending_input().contains(&SpiceInputEvent::Key {
+                scancode: Scancode {
+                    code: 0x01,
+                    extended: false,
+                },
+                down: true,
+            }),
+            "Esc leaked through to the SPICE guest"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    #[ignore = "live VNC console required — set MDE_VNC_LIVE_TARGET=host:port"]
+    fn live_vnc_worker_renders_real_console_and_accepts_input() {
+        let Ok(target) = std::env::var("MDE_VNC_LIVE_TARGET") else {
+            eprintln!("live-shell-vnc: SKIP — MDE_VNC_LIVE_TARGET not set");
+            return;
+        };
+        let (host, port_str) = target
+            .rsplit_once(':')
+            .expect("MDE_VNC_LIVE_TARGET must be host:port");
+        let port: u16 = port_str.parse().expect("MDE_VNC_LIVE_TARGET port parses");
+        let mut state = VdiState::default();
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("KVM-XCP1", "live-xapi-console")
+                .with_endpoint(DesktopEndpoint::new(host, port)),
+            VdiProtocol::Vnc,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("live-proof"),
+        ));
+
+        let first = wait_for_live_vnc_frame(&mut state, std::time::Duration::from_secs(20))
+            .expect("live VNC worker produced no frame");
+        assert!(
+            !first.pixels.is_empty(),
+            "live VNC worker produced an empty frame"
+        );
+        let first_hash = color_image_fnv1a64(&first);
+        println!(
+            "live-shell-vnc: FRAME OK {}x{} fnv1a64={first_hash:#018x}",
+            first.size[0], first.size[1]
+        );
+
+        let Some(live) = state.live_vnc.as_ref() else {
+            panic!("live VNC handle disappeared after first frame");
+        };
+        live.send_input(egui::Event::Text("m".to_string()));
+        for pressed in [true, false] {
+            live.send_input(egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+
+        let after = wait_for_live_vnc_frame(&mut state, std::time::Duration::from_secs(20))
+            .expect("live VNC worker produced no post-input frame");
+        let after_hash = color_image_fnv1a64(&after);
+        if after_hash == first_hash {
+            println!(
+                "live-shell-vnc: INPUT sent; framebuffer unchanged \
+                 fnv1a64={after_hash:#018x}"
+            );
+        } else {
+            println!(
+                "live-shell-vnc: INPUT ECHOED before={first_hash:#018x} \
+                 after={after_hash:#018x}"
+            );
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    #[ignore = "live SPICE console required — set MDE_SPICE_LIVE_TARGET=host:port[,ticket]"]
+    fn live_spice_worker_renders_real_console_and_accepts_input() {
+        let Ok(target) = std::env::var("MDE_SPICE_LIVE_TARGET") else {
+            eprintln!("live-shell-spice: SKIP — MDE_SPICE_LIVE_TARGET not set");
+            return;
+        };
+        let (host, port, ticket) = parse_live_spice_target(&target);
+        let auth = ticket.map_or_else(
+            || DesktopAuth::mesh_identity("live-proof"),
+            |ticket| DesktopAuth::Sealed {
+                store_ref: "desktop/live-spice/spice".to_string(),
+                credential: Credential::new("", ticket),
+            },
+        );
+        let mut state = VdiState::default();
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("libvirt-qemu", "live-spice-console")
+                .with_endpoint(DesktopEndpoint::new(host, port)),
+            VdiProtocol::Spice,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            auth,
+        ));
+
+        let first = wait_for_live_spice_frame(&mut state, std::time::Duration::from_secs(20))
+            .expect("live SPICE worker produced no frame");
+        assert!(
+            !first.pixels.is_empty(),
+            "live SPICE worker produced an empty frame"
+        );
+        let first_hash = color_image_fnv1a64(&first);
+        println!(
+            "live-shell-spice: FRAME OK {}x{} fnv1a64={first_hash:#018x}",
+            first.size[0], first.size[1]
+        );
+
+        let Some(live) = state.live_spice.as_ref() else {
+            panic!("live SPICE handle disappeared after first frame");
+        };
+        for key in [egui::Key::M, egui::Key::Enter] {
+            for pressed in [true, false] {
+                live.send_input(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+        }
+
+        let after = wait_for_live_spice_frame(&mut state, std::time::Duration::from_secs(20))
+            .expect("live SPICE worker produced no post-input frame");
+        let after_hash = color_image_fnv1a64(&after);
+        if after_hash == first_hash {
+            println!(
+                "live-shell-spice: INPUT sent; framebuffer unchanged \
+                 fnv1a64={after_hash:#018x}"
+            );
+        } else {
+            println!(
+                "live-shell-spice: INPUT ECHOED before={first_hash:#018x} \
+                 after={after_hash:#018x}"
+            );
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn wait_for_live_vnc_frame(
+        state: &mut VdiState,
+        timeout: std::time::Duration,
+    ) -> Option<egui::ColorImage> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            state.poll_live_vnc();
+            if let Some(frame) = state.incoming.take() {
+                return Some(frame);
+            }
+            if state
+                .live_status
+                .as_deref()
+                .is_some_and(|s| s.contains("failed") || s.contains("ended"))
+            {
+                panic!(
+                    "live VNC worker failed before frame: {}",
+                    state.live_status.as_deref().unwrap_or("unknown")
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn wait_for_live_spice_frame(
+        state: &mut VdiState,
+        timeout: std::time::Duration,
+    ) -> Option<egui::ColorImage> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            state.poll_live_spice();
+            if let Some(frame) = state.incoming.take() {
+                return Some(frame);
+            }
+            if state
+                .live_status
+                .as_deref()
+                .is_some_and(|s| s.contains("failed") || s.contains("ended"))
+            {
+                panic!(
+                    "live SPICE worker failed before frame: {}",
+                    state.live_status.as_deref().unwrap_or("unknown")
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn parse_live_spice_target(raw: &str) -> (&str, u16, Option<&str>) {
+        let (endpoint, ticket) = raw
+            .split_once(',')
+            .map_or((raw, None), |(endpoint, ticket)| (endpoint, Some(ticket)));
+        let (host, port_str) = endpoint
+            .rsplit_once(':')
+            .expect("MDE_SPICE_LIVE_TARGET must be host:port[,ticket]");
+        let port = port_str.parse().expect("MDE_SPICE_LIVE_TARGET port parses");
+        (host, port, ticket.filter(|s| !s.is_empty()))
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_spice_target_parser_accepts_optional_ticket() {
+        assert_eq!(
+            parse_live_spice_target("127.0.0.1:5930"),
+            ("127.0.0.1", 5930, None)
+        );
+        assert_eq!(
+            parse_live_spice_target("spice.mesh:5900,secret"),
+            ("spice.mesh", 5900, Some("secret"))
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn color_image_fnv1a64(image: &egui::ColorImage) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for px in &image.pixels {
+            for byte in px.to_array() {
+                h ^= u64::from(byte);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
     }
 }

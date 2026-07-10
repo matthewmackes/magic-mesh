@@ -38,9 +38,20 @@ mde-egui = { path = "../../shared/mde-egui" }
 # REUSE: the pure Bookmarks model + CRDT ops. Consumed headless (it has no GUI);
 # every UI edit mints one of its `Op`s and applies it to the `Collection`.
 mde-bookmarks = { path = "../../services/mde-bookmarks" }
+# BOOKMARKS-7 — the manager surface talks to the daemon over the shared Bus:
+# publish `action/bookmarks/check-links`, read the retained
+# `state/bookmarks/link-check` status. This is a local Persist edge only; the
+# model remains render/test pure.
+mde-bus = { path = "../../platform/mde-bus" }
+# BOOKMARKS-7 — local mirrors of the daemon's link-check wire shape.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
 # The per-item CRDT key type (`Uuid`) that mde-bookmarks' API returns, and
 # `new_v4` to mint the id for an added bookmark/folder (lock Q1).
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

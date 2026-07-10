@@ -11,7 +11,7 @@ use crate::workers::container::{Container, ContainerState};
 use super::designate::PeerDirectorySource;
 use super::fleet::{CloudDesired, FleetStateError, FleetStateSource};
 use super::podman::{KollaServiceSpec, PodmanRunner, RunnerError};
-use super::verbs::{CloudInstance, InstanceOpError, InstanceOps, LifecycleAction};
+use super::verbs::{CloudInstance, ConsoleInfo, InstanceOpError, InstanceOps, LifecycleAction};
 
 /// An in-memory [`FleetStateSource`]: a fixed doctrine view or a typed gate.
 pub struct FakeFleet {
@@ -273,6 +273,7 @@ pub struct FakeInstanceOps {
     calls: Mutex<Vec<String>>,
     /// When set, every op fails with this reason (a typed CLI error).
     fail: Option<String>,
+    console: Option<ConsoleInfo>,
 }
 
 impl FakeInstanceOps {
@@ -282,6 +283,7 @@ impl FakeInstanceOps {
             instances: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             fail: None,
+            console: None,
         }
     }
 
@@ -301,6 +303,13 @@ impl FakeInstanceOps {
     #[must_use]
     pub fn failing(mut self, reason: &str) -> Self {
         self.fail = Some(reason.to_string());
+        self
+    }
+
+    /// Seed the console descriptor returned by `get-instance-console`.
+    #[must_use]
+    pub fn with_console(mut self, console: ConsoleInfo) -> Self {
+        self.console = Some(console);
         self
     }
 
@@ -336,5 +345,40 @@ impl InstanceOps for FakeInstanceOps {
             });
         }
         Ok(())
+    }
+
+    fn ensure_keypair(
+        &self,
+        name: &str,
+        _public_key_path: &str,
+    ) -> Result<String, InstanceOpError> {
+        self.calls.lock().unwrap().push(format!("keypair:{name}"));
+        if let Some(reason) = &self.fail {
+            return Err(InstanceOpError::Command {
+                cmd: "keypair create".into(),
+                code: 1,
+                stderr: reason.clone(),
+            });
+        }
+        Ok(name.to_string())
+    }
+
+    fn console(&self, instance: &str) -> Result<ConsoleInfo, InstanceOpError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("console:{instance}"));
+        if let Some(reason) = &self.fail {
+            return Err(InstanceOpError::Command {
+                cmd: "console url show".into(),
+                code: 1,
+                stderr: reason.clone(),
+            });
+        }
+        Ok(self.console.clone().unwrap_or_else(|| ConsoleInfo {
+            instance: instance.to_string(),
+            protocol: "spice-html5".to_string(),
+            url: format!("spice://{instance}.mesh:5900"),
+        }))
     }
 }

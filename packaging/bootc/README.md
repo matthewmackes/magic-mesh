@@ -1,21 +1,20 @@
 # packaging/bootc/ — the ONE immutable MCNF image (E12-13)
 
-The §5 delivery lock: **one immutable bootc/ostree image for every role** —
-egui-DRM shell + cloud-hypervisor + `mackesd` + Podman + Nebula baked in; VM
-disks + mesh state on the writable partition. **Role is a config flag, not a
-build**: a Lighthouse runs the byte-identical image with the desktop seat
-skipped/masked. The dnf/RPM channel lane (PKG-8, gh-pages) is unchanged and
-carries on in parallel — this directory adds the image lane on top of the same
-monolithic `magic-mesh` RPM.
+The §5/QC-1 delivery lock: **one immutable bootc/ostree image for every role** —
+egui-DRM shell + `mackesd` + Podman + Nebula + the QUASAR-CLOUD
+libvirt/QEMU-KVM/OVN host bits baked in; VM disks + mesh state live on the
+writable partition. **Role is a config flag, not a build**: a Lighthouse runs
+the byte-identical image with the desktop seat skipped/masked. The dnf/RPM
+channel lane (PKG-8, gh-pages) is unchanged and carries on in parallel — this
+directory adds the image lane on top of the same monolithic `magic-mesh` RPM.
 
 Contents:
 
 - `Containerfile` — FROM `quay.io/fedora/fedora-bootc:42`, installs the
-  `magic-mesh` RPM (two lanes, below), adds the VDI substrate: `podman`
-  (ships in the base; the install is a no-op guard) + **cloud-hypervisor
-  baked in as the pinned upstream static binary, sha256-verified** — Fedora
-  42 does not package it (proven live on the farm). Wires the DRM seat,
-  boots to `graphical.target`. The writable-partition doctrine is inline.
+  `magic-mesh` RPM (two lanes, below), adds the cloud substrate: `podman`,
+  libvirt/QEMU-KVM, Open vSwitch, and OVN host bits. `cloud-hypervisor` is
+  deliberately absent per QUASAR-CLOUD/QC-1. Wires the DRM seat, boots to
+  `graphical.target`. The writable-partition doctrine is inline.
 - `units/mde-shell-egui.service` — the Quasar **DRM-seat unit** (greetd-style,
   no display manager, no compositor — `quasar-vdi-desktop.md` lock 34). Image
   lane only; the dnf/RPM lane keeps launching the shell from a session via
@@ -31,8 +30,9 @@ Contents:
   declared seat policy; the Containerfile's `systemctl enable` materializes
   it, the preset keeps factory-reset/`preset-all` flows honest).
 - `verify-image.sh` — **static** acceptance checks against the built image
-  (payload binaries, seat unit + preset, enablement symlinks, graphical
-  default, doctrine artifacts). Explicitly not a boot test.
+  (payload binaries including `virsh`, `ovs-vsctl`, and QEMU; explicit
+  cloud-hypervisor absence; seat unit + preset; enablement symlinks;
+  graphical default; doctrine artifacts). Explicitly not a boot test.
 - `rpms/` — staging dir for the local-RPM lane (populated by
   `build-image.sh --rpm`; only `.gitkeep` is committed).
 - `context.containerignore` — build-context allowlist (only `packaging/`
@@ -176,24 +176,48 @@ alongside the RPM channel publish (/release).
   channel 404s for fedora-42 repodata (`No match for argument: magic-mesh`).
   The channel lane is therefore gated on the operator `/release` channel
   publish, not on reachability.
-- **Local lane: GREEN end-to-end** with the farm-built
-  `magic-mesh-11.4.5-1.x86_64.rpm` → `localhost/magic-mesh-bootc:latest`.
-  Found + fixed live: **Fedora 42 does not package cloud-hypervisor**
-  (`No match for argument`), and podman already ships in the bootc base —
-  hence the pinned sha256-verified upstream static bake (v52.0, `--version`
-  proven in-build). `bootc container lint`: 9 passed / 4 warnings (the
-  documented `/var` seeding + dnf log noise; non-fatal by design).
-- **`verify-image.sh`: all static checks pass** against the built image —
-  payload binaries (incl. `cloud-hypervisor v52.0` executing), seat unit +
-  preset, role gate, the 7 enablement symlinks, `graphical.target` default,
-  `.repo` + tmpfiles doctrine. Static container inspection only — **not** a
-  boot.
+- **Local lane: green again for QC-1 (2026-07-10)** with the farm-built
+  `magic-mesh-12.0.0-1.x86_64.rpm` →
+  `localhost/magic-mesh-bootc:qc1-20260710` on BigBoy. QC-1 supersedes the older
+  cloud-hypervisor bake: the image now installs libvirt/QEMU-KVM, Open vSwitch,
+  and OVN directly from Fedora and rejects `/usr/bin/cloud-hypervisor` in the
+  static verifier. The build also fixed the linux-surface layer for Fedora 42
+  `dnf5` by using `dnf -y install --allowerasing`.
+- **Disk lane: green for qcow2 on BigBoy (2026-07-10)** using root podman and
+  `bootc-image-builder` against `localhost/magic-mesh-bootc:qc1-ovs-20260710`.
+  Artifact:
+  `~/magic-mesh-farm-qc1-image-build/packaging/bootc/out-qc1-ovs/qcow2/disk.qcow2`
+  (2,080,833,536 bytes). The run fixed two disk-lane blockers: relative `--out`
+  paths now mount as absolute host paths, and the image now embeds
+  `/usr/lib/bootc/install/50-magic-mesh.toml` with XFS as the default root
+  filesystem. The linux-surface layer also removes the Fedora base kernel so
+  bootc sees a single `/usr/lib/modules` tree.
+- **Generated-qcow2 boot proof: live on BigBoy XCP (2026-07-10).** The qcow2
+  was converted/imported as raw into throwaway XCP VMs, then destroyed after
+  evidence capture. The final `qc1-ovs-20260710` VM (`testvm-qc1-cloudinit`)
+  reported `running`, BIOS boot, and Xen PV drivers detected. A stock-preserving
+  NoCloud seed created only the temporary `mm` SSH user and static test IP.
+  Inside the booted image, `cloud-init-*`, `NetworkManager`, `openvswitch`,
+  `ovsdb-server`, and `ovs-vswitchd` were active; `virsh version` reported
+  libvirt 11.0.0 / QEMU 9.2.4; `sudo ovs-vsctl show` returned the OVS UUID and
+  `ovs_version: "3.4.5-3.fc42"`; required RPMs were installed; and
+  `/usr/bin/cloud-hypervisor` was absent. Plain `ovs-vsctl show` as the seeded
+  non-root user is denied by Fedora's `/run/openvswitch/db.sock` permissions
+  (`openvswitch:hugetlbfs`, `750`); root/sudo is the expected host-admin proof.
+- **`verify-image.sh`: static checks cover QC-1 and pass on the built image** — payload binaries
+  (`virsh`, `ovs-vsctl`, QEMU, `cloud-init`, `qemu-ga`), explicit
+  cloud-hypervisor absence, seat unit + preset, role gate, the bootc install
+  rootfs config, single-kernel tree, the cloud-init/OVS enablement symlinks,
+  `graphical.target` default, `.repo` + tmpfiles doctrine.
+  Static container inspection only — **not** a boot and not live
+  virtio-gpu/QEMU validation.
 
-**Still live-gated (unchanged in kind, updated in cause):**
+**Still gated outside the image lane:**
 
-- **Boot acceptance** — needs a boot target; the `--disk`
-  bootc-image-builder lane additionally needs root podman on the farm VM.
-  No boot was faked.
+- **QEMU virtio-gpu→egui validation** — the stock qcow2 now has live in-guest
+  access and host-virt proof. The missing QEMU/libvirt fast-path implementation
+  is filed as `docs/WORKLIST.md` **QC-23**; RDP/VNC/SPICE remain the honest
+  fallback paths until that lands.
 - **Channel-lane image build** — operator-gated `/release` channel publish
   (the 404 above).
 - **Registry publish** of the bootc image (what gives `bootc upgrade` a

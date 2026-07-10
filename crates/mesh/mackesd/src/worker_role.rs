@@ -180,12 +180,64 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // so Workstation-tier; it idles gracefully on a headless box (no browser, no
     // action/browser/* requests) while still replicating the policy doc.
     ("browser_policy", 1),
+    // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
+    // Browser-origin passkey ceremony metadata, persists pending challenges into
+    // local + Syncthing-backed roots, and publishes honest pending/error state.
+    // A desktop/browser security feature, so Workstation-tier; it idles
+    // gracefully on headless boxes with no Browser publishes.
+    ("browser_passkeys", 1),
     // BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
     // action/browser/session-sync snapshots into a local durable latest snapshot
     // and mirrors them to the Syncthing share for follow-me/startup restore. A
     // desktop/browser feature, so Workstation-tier; idles gracefully on a headless
     // box with no Browser publishes.
     ("browser_session_sync", 1),
+    // BROWSER-DD-11 — Browser read-aloud/TTS owner. Drains Browser page-text
+    // read-aloud requests and speaks them through the configured offline TTS
+    // command when present, publishing honest unavailable/error state otherwise.
+    // A desktop/browser accessibility feature, so Workstation-tier.
+    ("browser_read_aloud", 1),
+    // BROWSER-DD-11 — Browser voice-command/dictation STT owner. Drains Browser
+    // command/dictation requests and transcribes them through the configured
+    // offline STT/capture command when present, publishing honest unavailable or
+    // error state otherwise. A desktop/browser accessibility feature.
+    ("browser_voice_command", 1),
+    // BROWSER-DD-12 — Browser external-protocol owner. Drains Browser
+    // action/browser/protocol handoffs for schemes the shell refuses to navigate,
+    // publishing retained route status/events for downstream Email/Transfers
+    // owners without faking those surfaces. A desktop/browser integration
+    // feature, so Workstation-tier.
+    ("browser_protocol", 1),
+    // BROWSER-DD-12 — Browser platform-share owner. Drains Browser
+    // action/browser/share handoffs for Peer/Email/QR targets, publishing
+    // retained route status/events without faking downstream delivery. A
+    // desktop/browser integration feature, so Workstation-tier.
+    ("browser_share", 1),
+    // BROWSER-DD-12 — Browser private offline/mesh translation owner. Drains
+    // Browser page-text translation requests and translates them through a
+    // configured local/mesh command when present, publishing honest unavailable
+    // or error state otherwise. A desktop/browser integration feature.
+    ("browser_translate", 1),
+    // BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
+    // page snapshots, keeps the helper no-store policy intact, and mirrors the
+    // bounded private cache records onto the Syncthing-backed file plane.
+    ("browser_offline_cache", 1),
+    // BROWSER-DD-12 — Browser CEF security-update status owner. Watches the
+    // packaged fast-update manifest and active CEF runtime, publishing an honest
+    // current/missing/mismatch posture for the independent browser engine update
+    // path. A desktop/browser integration feature, so Workstation-tier.
+    ("browser_security_update", 1),
+    // BROWSER-DD-12 — Browser idle-tab suspend owner. Drains shell-published
+    // action/browser/tab-suspend handoffs after the shell stops inactive helper
+    // load paths, publishing retained suspend status/events for diagnostics and
+    // future orchestration. A desktop/browser integration feature, so
+    // Workstation-tier.
+    ("browser_tab_suspend", 1),
+    // KDC-MESH-6 — phone-as-touchpad/keyboard seat consumer. Drains KDC
+    // worker's action/seat/remote-input handoffs and invokes the configured
+    // local uinput/seat helper when present. Workstation-tier; idles on
+    // headless nodes.
+    ("seat_remote_input", 1),
     // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
     // (the seated user browses peers), so Workstation-tier; it idles gracefully
     // with no mount requests on a headless box.
@@ -466,6 +518,8 @@ mod tests {
         // +1 browser_session_sync (BROWSER-DD-7 — Browser follow-me/startup-restore
         // session snapshots mirrored onto the Syncthing file plane,
         // Workstation-tier browser feature).
+        // +1 browser_read_aloud (BROWSER-DD-11 — Browser read-aloud/TTS owner,
+        // Workstation-tier accessibility feature).
         // +1 storage (BUG-STORAGE-1 — the E12-20 universal per-node topology mirror,
         // pinned at rank 0 so it is a deliberate census entry on every role instead
         // of riding the silent unknown-worker default that hid it from role-workers).
@@ -497,7 +551,17 @@ mod tests {
         // +1 transfers (TRANSFERS-1 — the Workstation-tier transfers queue/ledger/
         // verb spine, sibling of pty_broker/mesh_mount. Split 30/15 → 30/16, len
         // 45 → 46). +1 browser_session_sync shifts split 30/16 → 30/17, len 46 → 47.
-        assert_eq!(WORKER_TIERS.len(), 47);
+        // +1 browser_read_aloud shifts split 30/17 → 30/18, len 47 → 48.
+        // +1 browser_voice_command shifts split 30/18 → 30/19, len 48 → 49.
+        // +1 browser_translate shifts split 30/19 → 30/20, len 49 → 50.
+        // +1 browser_offline_cache shifts split 30/20 → 30/21, len 50 → 51.
+        // +1 browser_security_update shifts split 30/21 → 30/22, len 51 → 52.
+        // +1 browser_tab_suspend shifts split 30/22 → 30/23, len 52 → 53.
+        // +1 browser_protocol shifts split 30/23 → 30/24, len 53 → 54.
+        // +1 browser_share shifts split 30/24 → 30/25, len 54 → 55.
+        // +1 seat_remote_input shifts split 30/25 → 30/26, len 55 → 56.
+        // +1 browser_passkeys shifts split 30/26 → 30/27, len 56 → 57.
+        assert_eq!(WORKER_TIERS.len(), 57);
     }
 
     #[test]
@@ -525,8 +589,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            17,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_session_sync (BROWSER-DD-7) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3)"
+            27,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -779,12 +843,17 @@ mod tests {
         // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
         // NODE-GRADE-1 universal node_grade self-grade + the KDC-MESH-3 universal
         // kdc_host + the CHAT-FIX-1 universal chat worker + the DEVMGR-8 universal
-        // device_control executor at rank 0); Workstation adds the 17 fleet + desktop
-        // workers (incl. the TRANSFERS-1 transfers worker and BROWSER-DD-7
-        // browser_session_sync owner) for the full 47 (the retired Server tier
-        // folded into Workstation in the 2-role model).
+        // device_control executor at rank 0); Workstation adds the 22 fleet + desktop
+        // workers (incl. the TRANSFERS-1 transfers worker, BROWSER-DD-6
+        // browser_passkeys owner, BROWSER-DD-7 browser_session_sync owner,
+        // BROWSER-DD-11 browser read-aloud +
+        // voice-command owners, and BROWSER-DD-12 browser_protocol +
+        // browser_share + browser_translate + browser_offline_cache +
+        // browser_security_update + browser_tab_suspend owners, plus the
+        // KDC-MESH-6 seat_remote_input consumer) for the full 57 (the retired
+        // Server tier folded into Workstation in the 2-role model).
         assert_eq!(lh.len(), 30);
-        assert_eq!(ws.len(), 47);
+        assert_eq!(ws.len(), 57);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

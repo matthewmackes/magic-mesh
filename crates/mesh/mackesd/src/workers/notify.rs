@@ -1267,7 +1267,7 @@ mod tests {
 
         // Service (sshd failed): reported the first time it's seen (tick 0).
         assert!(count_notify_msgs(&persist, NotifySource::Service) >= 2); // prime + real
-        // Disk 97% → Critical; SMART FAILED → Critical (both on the disk lane).
+                                                                          // Disk 97% → Critical; SMART FAILED → Critical (both on the disk lane).
         assert!(count_notify_msgs(&persist, NotifySource::Disk) >= 2);
         // Updates available.
         assert!(count_notify_msgs(&persist, NotifySource::Updates) >= 2);

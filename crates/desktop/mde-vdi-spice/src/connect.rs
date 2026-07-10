@@ -194,6 +194,7 @@ impl SpiceTransport {
 pub struct BlockingSpiceTransport {
     runtime: tokio::runtime::Runtime,
     transport: SpiceTransport,
+    event_loop: tokio::task::JoinHandle<()>,
 }
 
 impl BlockingSpiceTransport {
@@ -208,7 +209,15 @@ impl BlockingSpiceTransport {
             .build()
             .map_err(ConnectError::Runtime)?;
         let transport = runtime.block_on(SpiceTransport::connect(config))?;
-        Ok(Self { runtime, transport })
+        let loop_client = transport.client().clone();
+        let event_loop = runtime.spawn(async move {
+            let _ = loop_client.start_event_loop().await;
+        });
+        Ok(Self {
+            runtime,
+            transport,
+            event_loop,
+        })
     }
 
     /// Pump one frame (blocking). See [`SpiceTransport::pump_frame`].
@@ -216,7 +225,10 @@ impl BlockingSpiceTransport {
     /// # Errors
     /// Propagates [`SpiceTransport::pump_frame`].
     pub fn pump_frame(&mut self, session: &mut SpiceSession) -> Result<bool, ConnectError> {
-        self.runtime.block_on(self.transport.pump_frame(session))
+        self.runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.transport.pump_frame(session).await
+        })
     }
 
     /// Flush queued input (blocking). See [`SpiceTransport::flush_input`].
@@ -225,6 +237,12 @@ impl BlockingSpiceTransport {
     /// Propagates [`SpiceTransport::flush_input`].
     pub fn flush_input(&mut self, session: &mut SpiceSession) -> Result<(), ConnectError> {
         self.runtime.block_on(self.transport.flush_input(session))
+    }
+}
+
+impl Drop for BlockingSpiceTransport {
+    fn drop(&mut self) {
+        self.event_loop.abort();
     }
 }
 

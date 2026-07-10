@@ -99,8 +99,7 @@ const PROP_VM_NAME: &str = "mde.vm.name";
 /// Classify a node's [`StripOrigin`] from its `pw-dump` props object.
 ///
 /// The MDE-private tags win first (`mde.mesh.peer` → mesh-remote, `mde.vm.name` →
-/// local VM); an untagged cloud-hypervisor stream is still recognised as a VM by
-/// its `application.name`; everything else is the honest host session default.
+/// local VM); everything else is the honest host session default.
 fn classify_origin(props: &serde_json::Value) -> StripOrigin {
     if let Some(peer) = props
         .get(PROP_MESH_PEER)
@@ -110,18 +109,6 @@ fn classify_origin(props: &serde_json::Value) -> StripOrigin {
     }
     if let Some(vm) = props.get(PROP_VM_NAME).and_then(serde_json::Value::as_str) {
         return StripOrigin::LocalVm(vm.to_owned());
-    }
-    // Fallback: an untagged cloud-hypervisor guest stream reads as a local VM,
-    // named by its description, so a plain broker VM still lands in the VM group.
-    let app = props
-        .get("application.name")
-        .and_then(serde_json::Value::as_str);
-    if app == Some("cloud-hypervisor") {
-        let name = props
-            .get("node.description")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("VM");
-        return StripOrigin::LocalVm(name.to_owned());
     }
     StripOrigin::HostSession
 }
@@ -627,16 +614,6 @@ mod tests {
         let status = fold_graph(&two_sinks).expect("folds");
         assert_eq!(status.master.id, "33", "lowest id is the stable master");
         assert_eq!(status.master.volume, 60);
-    }
-
-    #[test]
-    fn an_untagged_cloud_hypervisor_stream_reads_as_a_local_vm() {
-        let props = serde_json::json!({ "application.name": "cloud-hypervisor" });
-        assert_eq!(
-            classify_origin(&props),
-            StripOrigin::LocalVm("VM".into()),
-            "an untagged CH guest still lands in the VM group"
-        );
     }
 
     #[test]

@@ -58,12 +58,14 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
@@ -76,9 +78,10 @@ use mde_kdc_host::sftp::{SftpMount, SshfsMount};
 use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
-use mde_kdc_proto::plugins::mpris::{MprisBody, MprisKind};
-use mde_kdc_proto::plugins::notification::{NotificationBody, notification_packet};
-use serde_json::{Value, json};
+use mde_kdc_proto::plugins::mousepad::{MouseModifiers, MousepadBody, MousepadEvent};
+use mde_kdc_proto::plugins::mpris::{MprisBody, MprisKind, MprisRequestBody};
+use mde_kdc_proto::plugins::notification::{notification_packet, NotificationBody};
+use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
@@ -87,7 +90,7 @@ use super::{ShutdownToken, Worker};
 // is a read-only consumer of the public `verbs` surface — the openstack worker
 // itself (its state, its responder) is never touched.
 use crate::workers::openstack::verbs::{
-    CloudInstance, CloudReply, LifecycleAction, cloud_action_topic,
+    cloud_action_topic, CloudInstance, CloudReply, LifecycleAction,
 };
 
 /// The Connect verbs served over `action/connect/<verb>` (E2.2 — replacing
@@ -118,11 +121,28 @@ const CONNECT_VERBS: [&str; 11] = [
 /// `connect::devices()`). Distinct from the `<verb>` action topics.
 const DEVICES_TOPIC: &str = "action/connect/devices";
 
+/// KDC-MESH-6 — handoff lane for phone-originated remote input. The KDC worker
+/// parses/authorizes KDE Connect packets; a later seat worker owns evdev/uinput.
+const REMOTE_INPUT_TOPIC: &str = "action/seat/remote-input";
+
+/// Per-packet event cap so one buggy phone packet cannot flood the local Bus lane
+/// before the seat injector has its own backpressure.
+const REMOTE_INPUT_EVENT_CAP: usize = 8;
+
 /// KDC-MESH-7 — Bus topic the worker answers with a listing of THIS node's shared
 /// files (the node-targeted file browse, design #7/#11b). Served separately from
 /// the pure `<verb>` responder because the listing needs the node's shared-roots
 /// config. Request body `{"path": "<path>"}` (empty ⇒ list the roots themselves).
 const BROWSE_TOPIC: &str = "action/connect/browse";
+
+/// KDC-MESH-4 — Bus request that mints + publishes a fresh mesh invite for the
+/// Phones hub Pair QR. The daemon owns credentials; the shell only consumes state.
+const MESH_ENROLL_TOKEN_ACTION: &str = "action/connect/mesh-enroll-token";
+
+/// Latest-wins short-TTL mesh invite published for desktop surfaces.
+const MESH_ENROLL_TOKEN_TOPIC: &str = "state/connect/mesh-enroll-token";
+
+const MESH_ENROLL_TOKEN_SOURCE: &str = "kdc-host";
 
 /// KDE Connect's stock UDP/TCP port (identity broadcast + TLS link).
 const KDC_PORT: u16 = 1716;
@@ -518,6 +538,77 @@ fn publish_kdc_alert(summary: &str, severity: &str) {
         Priority::Default
     };
     let _ = persist.write("fdo/KDE Connect", prio, Some("KDE Connect"), Some(&body));
+}
+
+fn publish_kdc_remote_input_events(peer: &PeerId, events: &[MousepadEvent]) -> usize {
+    if events.is_empty() {
+        return 0;
+    }
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return 0;
+    };
+    let Ok(persist) = Persist::open(dir) else {
+        return 0;
+    };
+    let ts_ms = now_ms();
+    let mut published = 0;
+    for event in events.iter().take(REMOTE_INPUT_EVENT_CAP) {
+        let body = kdc_remote_input_body(peer, event, ts_ms).to_string();
+        if persist
+            .write(REMOTE_INPUT_TOPIC, Priority::Default, None, Some(&body))
+            .is_ok()
+        {
+            published += 1;
+        }
+    }
+    published
+}
+
+fn kdc_remote_input_body(peer: &PeerId, event: &MousepadEvent, ts_ms: i64) -> Value {
+    let mut body = json!({
+        "op": "kdc_remote_input",
+        "source": "kdc_host",
+        "phone": peer.as_str(),
+        "ts_unix_ms": ts_ms,
+    });
+    if let Some(map) = body.as_object_mut() {
+        match event {
+            MousepadEvent::Move { dx, dy } => {
+                map.insert("kind".into(), json!("move"));
+                map.insert("dx".into(), json!(dx));
+                map.insert("dy".into(), json!(dy));
+            }
+            MousepadEvent::Scroll { delta } => {
+                map.insert("kind".into(), json!("scroll"));
+                map.insert("delta".into(), json!(delta));
+            }
+            MousepadEvent::Button { button, clicks } => {
+                map.insert("kind".into(), json!("button"));
+                map.insert("button".into(), json!(button.as_str()));
+                map.insert("clicks".into(), json!(clicks));
+            }
+            MousepadEvent::Text { text, modifiers } => {
+                map.insert("kind".into(), json!("text"));
+                map.insert("text".into(), json!(text));
+                map.insert("modifiers".into(), mouse_modifiers_body(*modifiers));
+            }
+            MousepadEvent::SpecialKey { code, modifiers } => {
+                map.insert("kind".into(), json!("special_key"));
+                map.insert("special_key".into(), json!(code));
+                map.insert("modifiers".into(), mouse_modifiers_body(*modifiers));
+            }
+        }
+    }
+    body
+}
+
+fn mouse_modifiers_body(modifiers: MouseModifiers) -> Value {
+    json!({
+        "shift": modifiers.shift,
+        "ctrl": modifiers.ctrl,
+        "alt": modifiers.alt,
+        "super": modifiers.super_key,
+    })
 }
 
 // ─────────────────────── KDC-MESH-5: notification I/O ctx ─────────────────────
@@ -1074,8 +1165,8 @@ fn local_announce() -> Announce {
     // right after the handshake (observed: a paired phone reconnecting every
     // ~30s, never persistent, no features). But advertising packets we DON'T
     // handle is the false advertising the KDC-PLUGINS epic removes — so
-    // `mpris.request` state-pull and `notification.request` (no inbound handler
-    // for player-state reports / notification-pull yet) are dropped.
+    // `notification.request` (no inbound handler for notification-pull yet) is
+    // dropped.
     // `incoming` = packets we accept + act on; `outgoing` = packets we send.
     let incoming_capabilities = [
         // Liveness — surfaced to the Alert Center.
@@ -1103,12 +1194,16 @@ fn local_announce() -> Announce {
         // KDC-MESH-8 — the phone's call/SMS state (telephony alert, #12), surfaced
         // to THIS host's desktop feed + audited.
         "kdeconnect.telephony",
+        // KDC-MESH-6 — phone-as-touchpad/keyboard input. Parsed into a bounded
+        // Bus handoff for the seat injector; no direct uinput injection here.
+        "kdeconnect.mousepad.request",
         // KDC-MESH-8 — a connectivity-report request; answered with THIS host's
         // connectivity summary (#12).
         "kdeconnect.connectivity_report.request",
-        // KDC-MESH-6 — phone media transport keys, mapped to the host's active
-        // MPRIS player through playerctl. State reports remain future work.
+        // KDC-MESH-6 — phone media transport keys + state pulls, mapped to the
+        // host's active MPRIS player through playerctl.
         "kdeconnect.mpris",
+        "kdeconnect.mpris.request",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -1125,6 +1220,7 @@ fn local_announce() -> Announce {
         "kdeconnect.sms.request",
         "kdeconnect.telephony.request",
         "kdeconnect.runcommand",
+        "kdeconnect.mpris",
         // KDC-MESH-7 — ask the phone to start browsing (it replies with the SFTP
         // mount info above).
         "kdeconnect.sftp.request",
@@ -1379,9 +1475,8 @@ async fn run_host(
                     }
                     // KDC-MESH-6 — Media transport controls from the phone. The
                     // raw MPRIS action is parsed through the protocol body and then
-                    // mapped to a fixed playerctl allowlist; state-report bodies
-                    // are ignored until the player-state path lands.
-                    if packet.kind == "kdeconnect.mpris" {
+                    // mapped to a fixed playerctl allowlist.
+                    if packet.kind == "kdeconnect.mpris" && pairing.is_paired(peer.as_str()) {
                         if let Ok(body) =
                             mde_kdc_proto::plugins::from_packet_body::<MprisBody>(packet)
                         {
@@ -1392,6 +1487,64 @@ async fn run_host(
                                     "action": "kdc_media_control",
                                     "phone": peer.as_str(),
                                     "command": command,
+                                }));
+                            }
+                        }
+                    }
+                    // KDC-MESH-6 — MPRIS state pulls / command requests. Stock KDE
+                    // Connect asks `kdeconnect.mpris.request` for player lists,
+                    // now-playing, volume, and sometimes transport actions; reply
+                    // with `kdeconnect.mpris` reports built from playerctl.
+                    if packet.kind == "kdeconnect.mpris.request"
+                        && pairing.is_paired(peer.as_str())
+                    {
+                        if let Ok(body) =
+                            mde_kdc_proto::plugins::from_packet_body::<MprisRequestBody>(packet)
+                        {
+                            if let Some(command) =
+                                apply_mpris_request_command(&PlayerctlMediaControl, &body)
+                            {
+                                audit_kdc_action(json!({
+                                    "action": "kdc_media_control",
+                                    "phone": peer.as_str(),
+                                    "command": command,
+                                }));
+                            }
+                            let reports =
+                                mpris_response_bodies_for_request(&PlayerctlMediaControl, &body);
+                            for report in reports {
+                                let packet = build_packet(
+                                    "kdeconnect.mpris",
+                                    serde_json::to_value(report)
+                                        .expect("MprisBody is always JSON-serializable"),
+                                );
+                                if let Err(e) = transport.send_to(peer, packet).await {
+                                    debug!(
+                                        phone = %peer.as_str(),
+                                        error = %e,
+                                        "kdc-host: MPRIS state report skipped"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // KDC-MESH-6 — phone touchpad/keyboard requests. Pairing is
+                    // the auth boundary; the worker parses the KDE packet into
+                    // bounded local Bus events and leaves evdev/uinput injection
+                    // to the seat-facing consumer.
+                    if packet.kind == "kdeconnect.mousepad.request"
+                        && pairing.is_paired(peer.as_str())
+                    {
+                        if let Ok(body) =
+                            mde_kdc_proto::plugins::from_packet_body::<MousepadBody>(packet)
+                        {
+                            let events = body.events();
+                            let published = publish_kdc_remote_input_events(peer, &events);
+                            if published > 0 {
+                                audit_kdc_action(json!({
+                                    "action": "kdc_remote_input",
+                                    "phone": peer.as_str(),
+                                    "events": published,
                                 }));
                             }
                         }
@@ -1659,6 +1812,30 @@ fn default_runcommands() -> Vec<RunCmd> {
             "systemd-run --on-active=2 systemctl restart mackesd >/dev/null 2>&1; \
              echo 'mesh service restarting in 2s'",
         ),
+        (
+            "presenter-next",
+            "Presenter next slide",
+            "/usr/libexec/mackesd/seat-remote-input '{\"kind\":\"special_key\",\"special_key\":9,\"modifiers\":{\"shift\":false,\"ctrl\":false,\"alt\":false,\"super\":false}}' >/dev/null 2>&1 \
+             && echo 'presenter next slide' || echo 'presenter input unavailable'",
+        ),
+        (
+            "presenter-previous",
+            "Presenter previous slide",
+            "/usr/libexec/mackesd/seat-remote-input '{\"kind\":\"special_key\",\"special_key\":8,\"modifiers\":{\"shift\":false,\"ctrl\":false,\"alt\":false,\"super\":false}}' >/dev/null 2>&1 \
+             && echo 'presenter previous slide' || echo 'presenter input unavailable'",
+        ),
+        (
+            "presenter-start",
+            "Presenter start",
+            "/usr/libexec/mackesd/seat-remote-input '{\"kind\":\"special_key\",\"special_key\":25,\"modifiers\":{\"shift\":false,\"ctrl\":false,\"alt\":false,\"super\":false}}' >/dev/null 2>&1 \
+             && echo 'presenter started' || echo 'presenter input unavailable'",
+        ),
+        (
+            "presenter-exit",
+            "Presenter exit",
+            "/usr/libexec/mackesd/seat-remote-input '{\"kind\":\"special_key\",\"special_key\":14,\"modifiers\":{\"shift\":false,\"ctrl\":false,\"alt\":false,\"super\":false}}' >/dev/null 2>&1 \
+             && echo 'presenter exited' || echo 'presenter input unavailable'",
+        ),
     ]
     .iter()
     .map(|(key, name, command)| RunCmd {
@@ -1873,42 +2050,96 @@ fn ring_local_device() {
 
 // ───────────────────────── KDC-MESH-6: MPRIS media keys ───────────────────
 //
-// A paired phone sends `kdeconnect.mpris` command bodies for transport controls.
-// The desktop-side standard control surface is MPRIS, so this worker shells the
-// narrow, allowlisted action set through `playerctl` and never executes the raw
-// phone-provided string.
+// A paired phone sends `kdeconnect.mpris` command bodies for transport and player
+// volume controls. The desktop-side standard control surface is MPRIS, so this
+// worker shells the narrow, allowlisted action set through `playerctl` and never
+// executes the raw phone-provided string.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlayerctlInvocation {
+    audit: &'static str,
+    args: &'static [&'static str],
+}
 
 /// Injectable runner for phone-originated media transport commands.
 trait MediaControl {
-    /// Run one `playerctl` subcommand. Returns whether a helper accepted the
+    /// Run one `playerctl` invocation. Returns whether a helper accepted the
     /// request; a missing helper is an honest no-op for the caller.
-    fn run_playerctl(&self, subcommand: &'static str) -> bool;
+    fn run_playerctl(&self, invocation: PlayerctlInvocation) -> bool;
+
+    /// Query `playerctl` and return stdout. A missing helper or failed query is
+    /// an honest no-state result.
+    fn query_playerctl(&self, args: &[String]) -> Option<String>;
 }
 
 /// Production media-control runner.
 struct PlayerctlMediaControl;
 
 impl MediaControl for PlayerctlMediaControl {
-    fn run_playerctl(&self, subcommand: &'static str) -> bool {
+    fn run_playerctl(&self, invocation: PlayerctlInvocation) -> bool {
         use std::process::{Command, Stdio};
         Command::new("playerctl")
-            .arg(subcommand)
+            .args(invocation.args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .is_ok()
     }
+
+    fn query_playerctl(&self, args: &[String]) -> Option<String> {
+        use std::process::{Command, Stdio};
+        let output = Command::new("playerctl")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()
+    }
 }
 
 /// Map KDE Connect's MPRIS action token to an allowlisted `playerctl` command.
-fn playerctl_command_for_mpris_action(action: &str) -> Option<&'static str> {
+fn playerctl_invocation_for_mpris_action(action: &str) -> Option<PlayerctlInvocation> {
     match action.trim().to_ascii_lowercase().as_str() {
-        "play" => Some("play"),
-        "pause" => Some("pause"),
-        "playpause" | "play-pause" | "toggle" => Some("play-pause"),
-        "next" => Some("next"),
-        "previous" | "prev" => Some("previous"),
-        "stop" => Some("stop"),
+        "play" => Some(PlayerctlInvocation {
+            audit: "play",
+            args: &["play"],
+        }),
+        "pause" => Some(PlayerctlInvocation {
+            audit: "pause",
+            args: &["pause"],
+        }),
+        "playpause" | "play-pause" | "toggle" => Some(PlayerctlInvocation {
+            audit: "play-pause",
+            args: &["play-pause"],
+        }),
+        "next" => Some(PlayerctlInvocation {
+            audit: "next",
+            args: &["next"],
+        }),
+        "previous" | "prev" => Some(PlayerctlInvocation {
+            audit: "previous",
+            args: &["previous"],
+        }),
+        "stop" => Some(PlayerctlInvocation {
+            audit: "stop",
+            args: &["stop"],
+        }),
+        "volumeup" | "volume-up" | "volup" | "raisevolume" | "raise-volume" => {
+            Some(PlayerctlInvocation {
+                audit: "volume-up",
+                args: &["volume", "0.05+"],
+            })
+        }
+        "volumedown" | "volume-down" | "voldown" | "lowervolume" | "lower-volume" => {
+            Some(PlayerctlInvocation {
+                audit: "volume-down",
+                args: &["volume", "0.05-"],
+            })
+        }
         _ => None,
     }
 }
@@ -1922,9 +2153,162 @@ fn apply_mpris_media_command<C: MediaControl>(
     if body.kind() != MprisKind::Command {
         return None;
     }
-    let command = playerctl_command_for_mpris_action(&body.action)?;
-    let _accepted = control.run_playerctl(command);
-    Some(command)
+    let invocation = playerctl_invocation_for_mpris_action(&body.action)?;
+    let _accepted = control.run_playerctl(invocation);
+    Some(invocation.audit)
+}
+
+fn apply_mpris_request_command<C: MediaControl>(
+    control: &C,
+    body: &MprisRequestBody,
+) -> Option<&'static str> {
+    if body.action.trim().is_empty() {
+        return None;
+    }
+    let invocation = playerctl_invocation_for_mpris_action(&body.action)?;
+    let _accepted = control.run_playerctl(invocation);
+    Some(invocation.audit)
+}
+
+fn playerctl_query<C: MediaControl>(control: &C, args: &[&str]) -> Option<String> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    control.query_playerctl(&args)
+}
+
+fn mpris_player_list<C: MediaControl>(control: &C) -> Vec<String> {
+    playerctl_query(control, &["-l"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn selected_mpris_player<C: MediaControl>(control: &C, requested: &str) -> Option<String> {
+    let requested = requested.trim();
+    if !requested.is_empty() {
+        return Some(requested.to_string());
+    }
+    mpris_player_list(control).into_iter().next()
+}
+
+fn parse_playerctl_position_ms(raw: &str) -> Option<i64> {
+    let seconds = raw.trim().parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some((seconds * 1000.0).round().clamp(0.0, i64::MAX as f64) as i64)
+}
+
+fn parse_playerctl_volume_percent(raw: &str) -> Option<i64> {
+    let volume = raw.trim().parse::<f64>().ok()?;
+    if !volume.is_finite() {
+        return None;
+    }
+    Some((volume * 100.0).round().clamp(0.0, 100.0) as i64)
+}
+
+fn parse_mpris_length_ms(raw: &str) -> Option<i64> {
+    let micros = raw.trim().parse::<i64>().ok()?;
+    if micros <= 0 {
+        return None;
+    }
+    Some(micros / 1000)
+}
+
+fn playerctl_for_player(player: &str, tail: &[&str]) -> Vec<String> {
+    let mut args = vec!["-p".to_string(), player.to_string()];
+    args.extend(tail.iter().map(|arg| (*arg).to_string()));
+    args
+}
+
+fn mpris_state_body_for_player<C: MediaControl>(
+    control: &C,
+    player: &str,
+    include_now_playing: bool,
+    include_volume: bool,
+) -> Option<MprisBody> {
+    let mut body = MprisBody {
+        player: player.to_string(),
+        can_pause: Some(true),
+        can_play: Some(true),
+        can_go_next: Some(true),
+        can_go_previous: Some(true),
+        can_seek: Some(true),
+        ..Default::default()
+    };
+
+    if let Some(status) = control.query_playerctl(&playerctl_for_player(player, &["status"])) {
+        body.is_playing = status.trim().eq_ignore_ascii_case("playing");
+    }
+    if let Some(pos) = control
+        .query_playerctl(&playerctl_for_player(player, &["position"]))
+        .and_then(|raw| parse_playerctl_position_ms(&raw))
+    {
+        body.pos = pos;
+    }
+    if include_volume {
+        body.volume = control
+            .query_playerctl(&playerctl_for_player(player, &["volume"]))
+            .and_then(|raw| parse_playerctl_volume_percent(&raw));
+    }
+    if include_now_playing {
+        let metadata_args = playerctl_for_player(
+            player,
+            &[
+                "metadata",
+                "--format",
+                "{{artist}}\n{{title}}\n{{album}}\n{{mpris:length}}\n{{mpris:artUrl}}",
+            ],
+        );
+        if let Some(metadata) = control.query_playerctl(&metadata_args) {
+            let mut lines = metadata.lines();
+            body.artist = lines.next().unwrap_or_default().trim().to_string();
+            body.title = lines.next().unwrap_or_default().trim().to_string();
+            body.album = lines.next().unwrap_or_default().trim().to_string();
+            body.length = lines
+                .next()
+                .and_then(parse_mpris_length_ms)
+                .unwrap_or_default();
+            body.album_art_url = lines.next().unwrap_or_default().trim().to_string();
+            body.now_playing = match (body.artist.is_empty(), body.title.is_empty()) {
+                (false, false) => format!("{} - {}", body.artist, body.title),
+                (true, false) => body.title.clone(),
+                (false, true) => body.artist.clone(),
+                (true, true) => String::new(),
+            };
+        }
+    }
+
+    Some(body)
+}
+
+fn mpris_response_bodies_for_request<C: MediaControl>(
+    control: &C,
+    body: &MprisRequestBody,
+) -> Vec<MprisBody> {
+    let mut reports = Vec::new();
+    if body.request_player_list {
+        reports.push(MprisBody {
+            player_list: mpris_player_list(control),
+            support_album_art_payload: Some(false),
+            ..Default::default()
+        });
+    }
+    if body.request_now_playing || body.request_volume {
+        if let Some(player) = selected_mpris_player(control, &body.player) {
+            if let Some(report) = mpris_state_body_for_player(
+                control,
+                &player,
+                body.request_now_playing,
+                body.request_volume,
+            ) {
+                reports.push(report);
+            }
+        }
+    }
+    reports
 }
 
 // ───────────────────────── KDC-PLUGINS: Clipboard ────────────────────────
@@ -2904,6 +3288,58 @@ fn handle_connect_verb(
     reply.to_string()
 }
 
+/// The daemon-published mesh enroll token state consumed by the Phones hub Pair QR.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct MeshEnrollTokenState {
+    token: String,
+    expires_at_ms: i64,
+    source: &'static str,
+    recorded: bool,
+}
+
+fn mesh_enroll_token_state(issued: &crate::onboard::invite::IssuedInvite) -> MeshEnrollTokenState {
+    MeshEnrollTokenState {
+        token: issued.qr.clone(),
+        expires_at_ms: i64::try_from(issued.invite.exp_ms).unwrap_or(i64::MAX),
+        source: MESH_ENROLL_TOKEN_SOURCE,
+        recorded: issued.recorded,
+    }
+}
+
+fn mint_mesh_enroll_token_state(
+    workgroup_root: &Path,
+    node_id: &str,
+    ttl: Duration,
+) -> io::Result<MeshEnrollTokenState> {
+    let mesh_id = crate::onboard::invite::resolve_mesh_id(workgroup_root, node_id);
+    let issued = crate::onboard::invite::issue(workgroup_root, &mesh_id, ttl)?;
+    Ok(mesh_enroll_token_state(&issued))
+}
+
+fn serve_mesh_enroll_token(persist: &Persist, workgroup_root: &Path, node_id: &str) -> String {
+    let ttl = Duration::from_secs(crate::onboard::invite::DEFAULT_TTL_MINUTES * 60);
+    match mint_mesh_enroll_token_state(workgroup_root, node_id, ttl) {
+        Ok(state) => {
+            let body = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+            let _ = persist.write(
+                MESH_ENROLL_TOKEN_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            );
+            json!({
+                "ok": true,
+                "token": state.token,
+                "expires_at_ms": state.expires_at_ms,
+                "source": state.source,
+                "recorded": state.recorded,
+            })
+            .to_string()
+        }
+        Err(e) => json!({ "ok": false, "error": e.to_string() }).to_string(),
+    }
+}
+
 /// The `action/connect/*` Bus responder loop. Sync (the verb handlers +
 /// `Persist` are all sync), so it runs on its own `std::thread` and stops
 /// when `stop` is set. Mirrors `mde-session`'s poll responder.
@@ -2916,6 +3352,8 @@ fn serve_connect_bus(
     stop: &AtomicBool,
 ) {
     let mut cursors: HashMap<String, String> = HashMap::new();
+    let workgroup_root = default_workgroup_root();
+    let node_id = hostname_for_shunt();
     while !stop.load(Ordering::Relaxed) {
         for verb in CONNECT_VERBS {
             let topic = format!("action/connect/{verb}");
@@ -2981,6 +3419,24 @@ fn serve_connect_bus(
                     .and_then(|b| serde_json::from_str(b).ok())
                     .unwrap_or(Value::Null);
                 let reply = serve_browse(config_dir, &body);
+                let _ = persist.write(
+                    &reply_topic(&msg.ulid),
+                    Priority::Default,
+                    None,
+                    Some(&reply),
+                );
+            }
+        }
+        // KDC-MESH-4 — automatic short-TTL mesh invite minting for the Phones
+        // hub Pair QR. The daemon records the invite in the bearer ledger, then
+        // publishes latest state and replies to the requesting shell.
+        if let Ok(msgs) = persist.list_since(
+            MESH_ENROLL_TOKEN_ACTION,
+            cursors.get(MESH_ENROLL_TOKEN_ACTION).map(String::as_str),
+        ) {
+            for msg in msgs {
+                cursors.insert(MESH_ENROLL_TOKEN_ACTION.to_string(), msg.ulid.clone());
+                let reply = serve_mesh_enroll_token(persist, &workgroup_root, &node_id);
                 let _ = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,
@@ -3092,8 +3548,13 @@ impl Worker for KdcHostWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
+    use tokio_rustls::TlsAcceptor;
+
+    static MDE_HOME_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn worker_name_matches_module() {
@@ -3141,13 +3602,20 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingMediaControl {
-        calls: StdMutex<Vec<&'static str>>,
+        calls: StdMutex<Vec<Vec<&'static str>>>,
+        queries: StdMutex<Vec<Vec<String>>>,
+        outputs: StdMutex<HashMap<Vec<String>, String>>,
     }
 
     impl MediaControl for RecordingMediaControl {
-        fn run_playerctl(&self, subcommand: &'static str) -> bool {
-            self.calls.lock().unwrap().push(subcommand);
+        fn run_playerctl(&self, invocation: PlayerctlInvocation) -> bool {
+            self.calls.lock().unwrap().push(invocation.args.to_vec());
             true
+        }
+
+        fn query_playerctl(&self, args: &[String]) -> Option<String> {
+            self.queries.lock().unwrap().push(args.to_vec());
+            self.outputs.lock().unwrap().get(args).cloned()
         }
     }
 
@@ -3162,11 +3630,85 @@ mod tests {
             "phone media transport keys must be advertised once handled"
         );
         assert!(
-            !announce
+            announce
                 .incoming_capabilities
                 .iter()
                 .any(|cap| cap == "kdeconnect.mpris.request"),
-            "state-pull remains unadvertised until player state reports are implemented"
+            "phone MPRIS state pulls must be advertised once player state reports are implemented"
+        );
+        assert!(
+            announce
+                .outgoing_capabilities
+                .iter()
+                .any(|cap| cap == "kdeconnect.mpris"),
+            "player state reports are sent as kdeconnect.mpris packets"
+        );
+    }
+
+    #[test]
+    fn local_announce_advertises_remote_input_handoff_once_parser_exists() {
+        let announce = local_announce();
+        assert!(
+            announce
+                .incoming_capabilities
+                .iter()
+                .any(|cap| cap == "kdeconnect.mousepad.request"),
+            "phone touchpad/keyboard packets must be advertised once parsed into the Bus handoff"
+        );
+    }
+
+    #[test]
+    fn kdc_remote_input_body_maps_motion_click_and_text() {
+        let peer = PeerId::from("moto");
+        let move_body =
+            kdc_remote_input_body(&peer, &MousepadEvent::Move { dx: 7.5, dy: -2.0 }, 123);
+        assert_eq!(
+            move_body,
+            json!({
+                "op": "kdc_remote_input",
+                "source": "kdc_host",
+                "phone": "moto",
+                "ts_unix_ms": 123,
+                "kind": "move",
+                "dx": 7.5,
+                "dy": -2.0,
+            })
+        );
+
+        let click_body = kdc_remote_input_body(
+            &peer,
+            &MousepadEvent::Button {
+                button: mde_kdc_proto::plugins::mousepad::MouseButton::Secondary,
+                clicks: 1,
+            },
+            124,
+        );
+        assert_eq!(click_body["kind"], "button");
+        assert_eq!(click_body["button"], "secondary");
+        assert_eq!(click_body["clicks"], 1);
+
+        let text_body = kdc_remote_input_body(
+            &peer,
+            &MousepadEvent::Text {
+                text: "A".into(),
+                modifiers: MouseModifiers {
+                    shift: true,
+                    ctrl: true,
+                    ..Default::default()
+                },
+            },
+            125,
+        );
+        assert_eq!(text_body["kind"], "text");
+        assert_eq!(text_body["text"], "A");
+        assert_eq!(
+            text_body["modifiers"],
+            json!({
+                "shift": true,
+                "ctrl": true,
+                "alt": false,
+                "super": false,
+            })
         );
     }
 
@@ -3179,7 +3721,7 @@ mod tests {
         };
 
         assert_eq!(apply_mpris_media_command(&control, &body), Some("next"));
-        assert_eq!(*control.calls.lock().unwrap(), vec!["next"]);
+        assert_eq!(*control.calls.lock().unwrap(), vec![vec!["next"]]);
 
         let state_report = MprisBody {
             player: "mde-music".into(),
@@ -3189,7 +3731,7 @@ mod tests {
         assert_eq!(apply_mpris_media_command(&control, &state_report), None);
         assert_eq!(
             *control.calls.lock().unwrap(),
-            vec!["next"],
+            vec![vec!["next"]],
             "state reports must not execute media commands"
         );
 
@@ -3200,9 +3742,144 @@ mod tests {
         assert_eq!(apply_mpris_media_command(&control, &raw_shell), None);
         assert_eq!(
             *control.calls.lock().unwrap(),
-            vec!["next"],
+            vec![vec!["next"]],
             "unknown/raw actions must be dropped rather than executed"
         );
+    }
+
+    #[test]
+    fn mpris_media_command_maps_volume_to_bounded_playerctl_steps() {
+        let control = RecordingMediaControl::default();
+
+        assert_eq!(
+            apply_mpris_media_command(
+                &control,
+                &MprisBody {
+                    action: "VolumeUp".into(),
+                    ..Default::default()
+                }
+            ),
+            Some("volume-up")
+        );
+        assert_eq!(
+            apply_mpris_media_command(
+                &control,
+                &MprisBody {
+                    action: "volume-down".into(),
+                    ..Default::default()
+                }
+            ),
+            Some("volume-down")
+        );
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            vec![vec!["volume", "0.05+"], vec!["volume", "0.05-"]],
+            "phone volume controls are fixed playerctl steps, not raw action strings"
+        );
+    }
+
+    #[test]
+    fn mpris_request_player_list_maps_playerctl_list_to_report() {
+        let control = RecordingMediaControl::default();
+        control
+            .outputs
+            .lock()
+            .unwrap()
+            .insert(vec!["-l".into()], "mde-music\nvlc\n".into());
+
+        let reports = mpris_response_bodies_for_request(
+            &control,
+            &MprisRequestBody {
+                request_player_list: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].kind(), MprisKind::PlayerList);
+        assert_eq!(reports[0].player_list, vec!["mde-music", "vlc"]);
+        assert_eq!(reports[0].support_album_art_payload, Some(false));
+    }
+
+    #[test]
+    fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
+        let control = RecordingMediaControl::default();
+        let mut outputs = control.outputs.lock().unwrap();
+        outputs.insert(
+            vec!["-p".into(), "mde-music".into(), "status".into()],
+            "Playing\n".into(),
+        );
+        outputs.insert(
+            vec!["-p".into(), "mde-music".into(), "position".into()],
+            "83.25\n".into(),
+        );
+        outputs.insert(
+            vec!["-p".into(), "mde-music".into(), "volume".into()],
+            "0.42\n".into(),
+        );
+        outputs.insert(
+            vec![
+                "-p".into(),
+                "mde-music".into(),
+                "metadata".into(),
+                "--format".into(),
+                "{{artist}}\n{{title}}\n{{album}}\n{{mpris:length}}\n{{mpris:artUrl}}".into(),
+            ],
+            "Test Artist\nTest Title\nTest Album\n245000000\nfile:///tmp/art.png\n".into(),
+        );
+        drop(outputs);
+
+        let reports = mpris_response_bodies_for_request(
+            &control,
+            &MprisRequestBody {
+                player: "mde-music".into(),
+                request_now_playing: true,
+                request_volume: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.kind(), MprisKind::State);
+        assert_eq!(report.player, "mde-music");
+        assert!(report.is_playing);
+        assert_eq!(report.pos, 83_250);
+        assert_eq!(report.length, 245_000);
+        assert_eq!(report.volume, Some(42));
+        assert_eq!(report.artist, "Test Artist");
+        assert_eq!(report.title, "Test Title");
+        assert_eq!(report.album, "Test Album");
+        assert_eq!(report.album_art_url, "file:///tmp/art.png");
+        assert_eq!(report.now_playing, "Test Artist - Test Title");
+        assert_eq!(report.can_play, Some(true));
+        assert_eq!(report.can_pause, Some(true));
+    }
+
+    #[test]
+    fn mpris_request_command_reuses_the_transport_allowlist() {
+        let control = RecordingMediaControl::default();
+        assert_eq!(
+            apply_mpris_request_command(
+                &control,
+                &MprisRequestBody {
+                    action: "PlayPause".into(),
+                    ..Default::default()
+                }
+            ),
+            Some("play-pause")
+        );
+        assert_eq!(
+            apply_mpris_request_command(
+                &control,
+                &MprisRequestBody {
+                    action: "next; rm -rf /".into(),
+                    ..Default::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(*control.calls.lock().unwrap(), vec![vec!["play-pause"]]);
     }
 
     #[test]
@@ -3282,8 +3959,39 @@ mod tests {
             "mesh-status",
             "disk-headroom",
             "restart-mesh",
+            "presenter-next",
+            "presenter-previous",
+            "presenter-start",
+            "presenter-exit",
         ] {
             assert!(keys.contains(&k), "missing default runcommand {k}");
+        }
+    }
+
+    #[test]
+    fn default_runcommands_include_presenter_seat_helper_actions() {
+        let defaults = default_runcommands();
+        let command_for = |key: &str| {
+            defaults
+                .iter()
+                .find(|cmd| cmd.key == key)
+                .unwrap_or_else(|| panic!("missing default runcommand {key}"))
+                .command
+                .as_str()
+        };
+
+        for (key, special_key) in [
+            ("presenter-next", 9),
+            ("presenter-previous", 8),
+            ("presenter-start", 25),
+            ("presenter-exit", 14),
+        ] {
+            let command = command_for(key);
+            assert!(command.contains("/usr/libexec/mackesd/seat-remote-input"));
+            assert!(command.contains(&format!("\"special_key\":{special_key}")));
+            assert!(command.contains("\"kind\":\"special_key\""));
+            assert!(!command.contains('$'));
+            assert!(!command.contains('`'));
         }
     }
 
@@ -3342,6 +4050,48 @@ mod tests {
         let store = w.open_pairing().unwrap();
         assert!(Arc::strong_count(&store) >= 1);
         assert!(tmp.path().join("identity.pkcs8").exists());
+    }
+
+    #[test]
+    fn mesh_enroll_token_mint_records_a_short_ttl_invite() {
+        let tmp = tempdir().unwrap();
+        let state = mint_mesh_enroll_token_state(tmp.path(), "peer:anvil", Duration::from_secs(60))
+            .expect("mint token");
+
+        assert!(state.token.starts_with("mde-invite:"));
+        assert!(state.recorded);
+        assert_eq!(state.source, MESH_ENROLL_TOKEN_SOURCE);
+        assert!(crate::onboard::invite::is_recorded(
+            tmp.path(),
+            &state.token
+        ));
+        let invite = crate::onboard::invite::Invite::decode(&state.token).expect("invite");
+        assert_eq!(invite.mesh_id, "mesh-peer:anvil");
+        assert_eq!(state.expires_at_ms, i64::try_from(invite.exp_ms).unwrap());
+    }
+
+    #[test]
+    fn mesh_enroll_token_bus_handler_publishes_state_and_reply() {
+        let bus = tempdir().unwrap();
+        let workgroup = tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).expect("bus");
+
+        let reply = serve_mesh_enroll_token(&persist, workgroup.path(), "node-a");
+        let reply: Value = serde_json::from_str(&reply).expect("reply json");
+
+        assert_eq!(reply["ok"], true);
+        let token = reply["token"].as_str().expect("reply token");
+        assert!(crate::onboard::invite::is_recorded(workgroup.path(), token));
+        let state_msg = persist
+            .list_since(MESH_ENROLL_TOKEN_TOPIC, None)
+            .expect("state messages")
+            .pop()
+            .expect("published state");
+        let state: Value =
+            serde_json::from_str(state_msg.body.as_deref().expect("state body")).unwrap();
+        assert_eq!(state["token"], token);
+        assert_eq!(state["source"], MESH_ENROLL_TOKEN_SOURCE);
+        assert_eq!(state["recorded"], true);
     }
 
     fn test_store(dir: &std::path::Path) -> PairingStore {
@@ -3445,6 +4195,66 @@ mod tests {
         let reopened = PairingStore::open(tmp.path()).unwrap();
         assert!(reopened.is_paired("d1"));
         assert_eq!(reopened.get("d1").unwrap().device_name, "Pixel");
+    }
+
+    fn spawn_loopback_pair_device() -> (std::thread::JoinHandle<()>, SocketAddr, String) {
+        let pkcs8 = mde_kdc_host::keygen::generate_pkcs8().expect("keygen");
+        let cert = mde_kdc_host::keygen::issue_identity_cert(&pkcs8, "device-qr").expect("cert");
+        let fingerprint = mde_kdc_host::compute_fingerprint(&cert);
+        let config = mde_kdc_host::build_server_config(&cert, &pkcs8).expect("server config");
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind pair device");
+        let addr = std_listener.local_addr().expect("loopback addr");
+        std_listener
+            .set_nonblocking(true)
+            .expect("pair device nonblocking listener");
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("pair-device test runtime");
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(std_listener)
+                    .expect("tokio pair device listener");
+                if let Ok((tcp, _)) = listener.accept().await {
+                    let acceptor = TlsAcceptor::from(Arc::new(config));
+                    if let Ok(stream) = acceptor.accept(tcp).await {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        drop(stream);
+                    }
+                }
+            });
+        });
+        (handle, addr, fingerprint)
+    }
+
+    #[test]
+    fn connect_verb_pair_device_tofu_pins_and_persists_the_pairing_record() {
+        let tmp = tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let outbound = PendingSends::new();
+        let (server, addr, expected_fingerprint) = spawn_loopback_pair_device();
+
+        let reply: Value = serde_json::from_str(&handle_connect_verb(
+            &store,
+            &outbound,
+            "pair-device",
+            &json!({
+                "id": "device-qr",
+                "name": "QR Phone",
+                "addr": addr.to_string(),
+            }),
+        ))
+        .expect("pair-device reply");
+        server.join().expect("loopback pair device exits");
+
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["device_id"], "device-qr");
+        assert_eq!(reply["fingerprint"], expected_fingerprint);
+        let reopened = PairingStore::open(tmp.path()).unwrap();
+        let record = reopened.get("device-qr").expect("persisted pair record");
+        assert_eq!(record.device_name, "QR Phone");
+        assert_eq!(record.fingerprint, expected_fingerprint);
+        assert!(tmp.path().join("sessions.enc").exists());
     }
 
     #[test]
@@ -4239,8 +5049,9 @@ mod tests {
 
     #[test]
     fn kdc_mesh7_service_directory_and_node_targeted_browse() {
-        // Serial-only (mackesd tests run `--test-threads=1`), so pointing MDE_HOME
-        // at a tempdir makes the browse audit write hermetically.
+        // `MDE_HOME` is process-global; serialize the few tests that redirect it
+        // so the default parallel harness still writes audit rows hermetically.
+        let _env_guard = MDE_HOME_LOCK.lock().unwrap();
         let tmp = tempdir().unwrap();
         std::env::set_var("MDE_HOME", tmp.path());
 
@@ -4460,8 +5271,9 @@ mod tests {
 
     #[test]
     fn kdc_mesh8_a_phone_action_appends_a_hash_chained_audit_row() {
-        // design #16 — pairing is the auth, but EVERY action is recorded. Serial
-        // tests (`--test-threads=1`) make MDE_HOME a safe hermetic redirect.
+        // design #16 — pairing is the auth, but EVERY action is recorded.
+        // `MDE_HOME` is process-global; serialize this with the browse-audit test.
+        let _env_guard = MDE_HOME_LOCK.lock().unwrap();
         let tmp = tempdir().unwrap();
         std::env::set_var("MDE_HOME", tmp.path());
         let before = audit_row_count(&crate::default_db_path());

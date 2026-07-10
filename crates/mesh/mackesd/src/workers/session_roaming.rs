@@ -47,10 +47,10 @@
 //!   the whole-tick composer [`plan_roaming`] take `now_ms` (the crate forbids
 //!   ambient time on these paths, exactly as the broker's state machine does).
 //! - **The session persistence reuses the broker's [`SessionStore`] seam verbatim**
-//!   (production [`MeshSessionStore`], integration-gated) — this worker never
-//!   invents a parallel session model. The [`MonitorLayout`] rides a tiny companion
-//!   [`LayoutStore`] gated by the very same [`SessionStoreError::IntegrationGated`],
-//!   so the live cross-peer persist stays honest (§7) until the etcd writer lands.
+//!   (production [`MeshSessionStore`]) — this worker never invents a parallel
+//!   session model. The [`MonitorLayout`] rides a tiny companion [`LayoutStore`]
+//!   on the same replicated workgroup root, preloaded on worker start so saved
+//!   layouts survive a daemon restart before the next roam.
 //! - **Leader-gated** on the shared `.mackesd-leader.lock` (the same
 //!   [`crate::leader`] election [`super::session_broker`] / `dc_auditor` use): every
 //!   node folds the roaming request log, but only the elected node writes the shared
@@ -993,13 +993,14 @@ pub fn plan_roaming(
 /// The injectable per-peer [`MonitorLayout`] persistence seam.
 ///
 /// Production wires [`MeshLayoutStore`]; the tests drive an in-memory fake so the
-/// whole pipeline runs without etcd. Reuses the broker's [`SessionStoreError`] as its
-/// error type, so the layout persist is gated identically to the session persist.
+/// whole pipeline runs without the replicated workgroup root. Reuses the broker's
+/// [`SessionStoreError`] as its error type, so the layout persist reports failures
+/// identically to the session persist.
 pub trait LayoutStore {
     /// Publish (create or update) `client_peer`'s layout in the shared plane.
     ///
     /// # Errors
-    /// A [`SessionStoreError`] — `IntegrationGated` until the live etcd writer lands.
+    /// A [`SessionStoreError`] if the replicated store cannot be written.
     fn publish(
         &self,
         client_peer: &NodeId,
@@ -1009,24 +1010,24 @@ pub trait LayoutStore {
     /// List every persisted `(client_peer, layout)` pair.
     ///
     /// # Errors
-    /// A [`SessionStoreError`] — `IntegrationGated` until the live etcd reader lands.
+    /// A [`SessionStoreError`] if the replicated store cannot be read.
     fn list(&self) -> Result<Vec<(NodeId, MonitorLayout)>, SessionStoreError>;
 
     /// Remove `client_peer`'s layout from the shared plane.
     ///
     /// # Errors
-    /// A [`SessionStoreError`] — `IntegrationGated` until the live etcd deleter lands.
+    /// A [`SessionStoreError`] if the replicated store cannot be updated.
     fn remove(&self, client_peer: &NodeId) -> Result<(), SessionStoreError>;
 }
 
 /// Production [`LayoutStore`]: the per-peer monitor-layout plane on the same
-/// etcd-leased / Syncthing-replicated coordination substrate the broker's
-/// [`MeshSessionStore`] roams sessions on.
+/// Syncthing-replicated coordination substrate the broker's [`MeshSessionStore`]
+/// roams sessions on.
 ///
-/// Like [`MeshSessionStore`], this slice (E12-8) delivers the pure policy + the seam;
-/// the live etcd writer/reader/deleter is wired by a later E12 unit. Until then each
-/// method returns a typed [`SessionStoreError::IntegrationGated`] naming exactly what
-/// the live call needs — never a fake success (§7).
+/// Each peer layout is one JSON row under the workgroup root. Writes are staged to
+/// a temp file and atomically renamed into place, list output is deterministic, and
+/// remove is idempotent. A future etcd lease-backed store can replace this trait
+/// implementation without changing the roaming fold.
 #[derive(Debug, Clone)]
 pub struct MeshLayoutStore {
     /// Shared-storage root — the Syncthing-replicated fallback plane.
@@ -1039,44 +1040,129 @@ impl MeshLayoutStore {
     pub const fn new(workgroup_root: PathBuf) -> Self {
         Self { workgroup_root }
     }
+
+    fn dir(&self) -> PathBuf {
+        self.workgroup_root
+            .join("sessions")
+            .join("vdi")
+            .join("layouts")
+    }
+
+    fn path_for(&self, client_peer: &NodeId) -> PathBuf {
+        self.dir()
+            .join(format!("{}.json", safe_layout_file_stem(client_peer)))
+    }
 }
 
 impl LayoutStore for MeshLayoutStore {
     fn publish(
         &self,
         client_peer: &NodeId,
-        _layout: &MonitorLayout,
+        layout: &MonitorLayout,
     ) -> Result<(), SessionStoreError> {
-        Err(SessionStoreError::IntegrationGated {
+        let dir = self.dir();
+        std::fs::create_dir_all(&dir).map_err(|e| SessionStoreError::Failed {
             op: "publish",
-            reason: format!(
-                "layout for {client_peer} → needs the live etcd layout-lease writer over Nebula \
-                 (the roaming-session plane under {}); the cross-peer persist isn't wired yet",
-                self.workgroup_root.display()
-            ),
-        })
+            reason: format!("create {}: {e}", dir.display()),
+        })?;
+        let final_path = self.path_for(client_peer);
+        let tmp = dir.join(format!(
+            ".{}.{}.tmp",
+            safe_layout_file_stem(client_peer),
+            std::process::id()
+        ));
+        let row = PersistedLayout {
+            client_peer: client_peer.clone(),
+            layout: layout.clone(),
+        };
+        let body = serde_json::to_vec_pretty(&row).map_err(|e| SessionStoreError::Failed {
+            op: "publish",
+            reason: format!("serialize layout for {client_peer}: {e}"),
+        })?;
+        std::fs::write(&tmp, body).map_err(|e| SessionStoreError::Failed {
+            op: "publish",
+            reason: format!("write {}: {e}", tmp.display()),
+        })?;
+        std::fs::rename(&tmp, &final_path).map_err(|e| SessionStoreError::Failed {
+            op: "publish",
+            reason: format!("rename {} -> {}: {e}", tmp.display(), final_path.display()),
+        })?;
+        Ok(())
     }
 
     fn list(&self) -> Result<Vec<(NodeId, MonitorLayout)>, SessionStoreError> {
-        Err(SessionStoreError::IntegrationGated {
-            op: "list",
-            reason: format!(
-                "needs the live etcd layout-directory reader over Nebula (the roaming-session \
-                 plane under {})",
-                self.workgroup_root.display()
-            ),
-        })
+        let dir = self.dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(SessionStoreError::Failed {
+                    op: "list",
+                    reason: format!("read {}: {e}", dir.display()),
+                });
+            }
+        };
+        let mut rows = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| SessionStoreError::Failed {
+                op: "list",
+                reason: format!("read {} entry: {e}", dir.display()),
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).map_err(|e| SessionStoreError::Failed {
+                op: "list",
+                reason: format!("read {}: {e}", path.display()),
+            })?;
+            let row: PersistedLayout =
+                serde_json::from_str(&raw).map_err(|e| SessionStoreError::Failed {
+                    op: "list",
+                    reason: format!("parse {}: {e}", path.display()),
+                })?;
+            rows.push((row.client_peer, row.layout));
+        }
+        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(rows)
     }
 
     fn remove(&self, client_peer: &NodeId) -> Result<(), SessionStoreError> {
-        Err(SessionStoreError::IntegrationGated {
-            op: "remove",
-            reason: format!(
-                "layout for {client_peer} → needs the live etcd layout-lease deleter over Nebula \
-                 (the roaming-session plane under {})",
-                self.workgroup_root.display()
-            ),
-        })
+        let path = self.path_for(client_peer);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SessionStoreError::Failed {
+                op: "remove",
+                reason: format!("remove {}: {e}", path.display()),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedLayout {
+    client_peer: NodeId,
+    layout: MonitorLayout,
+}
+
+fn safe_layout_file_stem(id: &str) -> String {
+    let mut out = String::new();
+    for byte in id.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b':' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "_{byte:02x}");
+            }
+        }
+    }
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
     }
 }
 
@@ -1213,6 +1299,32 @@ impl RoamingFold {
             },
         }
     }
+
+    /// Seed the in-memory fold from persisted layout rows before replaying new bus
+    /// requests. Invalid rows are refused just like conflicted [`SaveLayout`]
+    /// requests: they are logged and never used for placement.
+    fn load_layouts(
+        &mut self,
+        rows: impl IntoIterator<Item = (NodeId, MonitorLayout)>,
+    ) -> Vec<(NodeId, LayoutConflict)> {
+        let mut refused = Vec::new();
+        for (client_peer, layout) in rows {
+            match layout.validate() {
+                Ok(()) => {
+                    self.layouts.insert(client_peer, layout);
+                }
+                Err(conflict) => {
+                    tracing::warn!(
+                        peer = %client_peer,
+                        error = %conflict,
+                        "session_roaming: refused persisted conflicted monitor layout"
+                    );
+                    refused.push((client_peer, conflict));
+                }
+            }
+        }
+        refused
+    }
 }
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
@@ -1335,6 +1447,23 @@ impl SessionRoamingWorker {
         self.bus_root_override.clone().or_else(default_bus_root)
     }
 
+    /// Warm the roaming fold from the replicated layout plane. This is what makes a
+    /// saved monitor layout survive a daemon restart before a later `Arrive`
+    /// request re-keys that layout onto the new Workstation.
+    fn preload_layouts(&self, fold: &mut RoamingFold) {
+        match self.layouts.list() {
+            Ok(rows) => {
+                fold.load_layouts(rows);
+            }
+            Err(e @ SessionStoreError::IntegrationGated { .. }) => {
+                tracing::info!(error = %e, "session_roaming: layout store integration-gated; starting without persisted layouts");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "session_roaming: layout store list failed; starting without persisted layouts");
+            }
+        }
+    }
+
     /// Only the elected node converges the shared plane (no-fixed-center: any
     /// eligible node can be it, the elected one writes). Reuses the shared lock.
     fn is_leader(&self) -> bool {
@@ -1423,6 +1552,7 @@ impl Worker for SessionRoamingWorker {
         // is a fold of the whole log, so a (re)start rebuilds it before converging.
         let mut cursor: Option<String> = None;
         let mut fold = RoamingFold::default();
+        self.preload_layouts(&mut fold);
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
@@ -2213,30 +2343,54 @@ mod tests {
     // ── store seams ──
 
     #[test]
-    fn mesh_layout_store_is_integration_gated_not_faked() {
-        let store = MeshLayoutStore::new(PathBuf::from("/tmp/mesh-wg"));
-        let peer = "peer:c".to_string();
-        for (label, err) in [
-            (
-                "publish",
-                store.publish(&peer, &MonitorLayout::empty()).unwrap_err(),
-            ),
-            ("list", store.list().map(|_| ()).unwrap_err()),
-            ("remove", store.remove(&peer).unwrap_err()),
-        ] {
-            match err {
-                SessionStoreError::IntegrationGated { op, reason } => {
-                    assert_eq!(op, label);
-                    assert!(
-                        reason.contains("etcd"),
-                        "names the missing live dep: {reason}"
-                    );
-                }
-                SessionStoreError::Failed { op, reason } => {
-                    panic!("expected integration-gated, got Failed {{{op}: {reason}}}")
-                }
-            }
-        }
+    fn mesh_layout_store_round_trips_sorted_records_and_removes_idempotently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MeshLayoutStore::new(tmp.path().to_path_buf());
+        assert_eq!(
+            store.list().expect("missing layout dir lists empty"),
+            Vec::<(NodeId, MonitorLayout)>::new()
+        );
+
+        let peer_b = "peer:b/with space".to_string();
+        let peer_a = "peer:a".to_string();
+        let layout_b = MonitorLayout::empty()
+            .with_monitor_sessions(vec![MonitorSession::new("edid:DEL:U2720Q:B", "s-b")]);
+        let layout_a = MonitorLayout::empty()
+            .with_monitor_sessions(vec![MonitorSession::new("index:0", "s-a")]);
+
+        store.publish(&peer_b, &layout_b).expect("publish b");
+        store.publish(&peer_a, &layout_a).expect("publish a");
+
+        assert_eq!(
+            store.list().expect("list"),
+            vec![
+                (peer_a.clone(), layout_a.clone()),
+                (peer_b.clone(), layout_b)
+            ]
+        );
+        assert!(
+            store.dir().join("peer:b_2fwith_20space.json").exists(),
+            "peer ids are encoded into one safe path component"
+        );
+
+        let layout_a2 = MonitorLayout::empty()
+            .with_monitor_sessions(vec![MonitorSession::new("index:1", "s-a2")]);
+        store.publish(&peer_a, &layout_a2).expect("replace a");
+        assert_eq!(
+            store.list().expect("list after replace")[0],
+            (peer_a.clone(), layout_a2)
+        );
+
+        store.remove(&peer_b).expect("remove b");
+        store.remove(&peer_b).expect("remove b again");
+        assert_eq!(store.list().expect("list after remove").len(), 1);
+    }
+
+    #[test]
+    fn safe_layout_file_stem_encodes_path_separators_and_spaces() {
+        assert_eq!(safe_layout_file_stem(""), "_");
+        assert_eq!(safe_layout_file_stem("peer:ok-1"), "peer:ok-1");
+        assert_eq!(safe_layout_file_stem("a/b c"), "a_2fb_20c");
     }
 
     /// An in-memory [`SessionStore`] — the Fake seam (the broker's `FakeStore` is
@@ -2424,6 +2578,34 @@ mod tests {
     }
 
     #[test]
+    fn fold_preloads_persisted_layouts_and_refuses_conflicts() {
+        let mut fold = RoamingFold::default();
+        let valid = MonitorLayout::empty()
+            .with_monitor_sessions(vec![MonitorSession::new("edid:DEL:U2720Q:1", "s1")]);
+        let invalid = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+            MonitorSession::new("edid:LEN:P27:2", "s3"),
+        ]);
+
+        let refused = fold.load_layouts([
+            ("peer:old".to_string(), valid.clone()),
+            ("peer:bad".to_string(), invalid),
+        ]);
+
+        assert_eq!(fold.layouts.get("peer:old"), Some(&valid));
+        assert!(
+            !fold.layouts.contains_key("peer:bad"),
+            "a conflicted persisted row is never folded"
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, "peer:bad");
+        assert!(matches!(
+            refused[0].1,
+            LayoutConflict::TwoSessionsOnOneMonitor { .. }
+        ));
+    }
+
+    #[test]
     fn topic_is_namespaced() {
         assert_eq!(ACTION_TOPIC, "action/vdi/roaming");
         assert!(ACTION_TOPIC.starts_with("action/"));
@@ -2604,6 +2786,70 @@ mod tests {
             saved.get("peer:new"),
             Some(&layout),
             "the per-monitor layout followed the user to the arriving peer"
+        );
+        drop(saved);
+
+        let _ = std::fs::remove_dir_all(&bus);
+        let _ = std::fs::remove_dir_all(&wg);
+    }
+
+    #[tokio::test]
+    async fn worker_preloads_persisted_layouts_before_roaming_arrivals() {
+        // E12-8 restart proof: the saved layout already exists in the layout
+        // plane, but this process only sees a later Arrive request. Preloading
+        // layouts before the bus fold lets the layout still follow the user.
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        let bus = seed_bus(&[RoamingRequest::Arrive {
+            from: "peer:old".into(),
+            workstation: "peer:new".into(),
+            monitors: Some(WorkstationMonitors::new(
+                "edid:DEL:U2720Q:1",
+                ["edid:LEN:P27:2"],
+            )),
+        }]);
+        let wg = std::env::temp_dir().join(format!("mde-sr-wg3-{}", now_ms()));
+        std::fs::create_dir_all(&wg).expect("mk workgroup");
+
+        let store = FakeStore::default();
+        for (id, host) in [("s1", "peer:h1"), ("s2", "peer:h2")] {
+            store
+                .publish(&sess(id, "peer:old", host, SessionState::Disconnected))
+                .unwrap();
+        }
+        let rows = store.rows.clone();
+        let layouts = FakeLayoutStore::default();
+        layouts
+            .publish(&"peer:old".to_string(), &layout)
+            .expect("seed persisted layout");
+        let layout_rows = layouts.rows.clone();
+
+        let w = SessionRoamingWorker::new(wg.clone(), "peer:a".to_string())
+            .with_store(Box::new(store))
+            .with_layout_store(Box::new(layouts))
+            .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["h1", "h2"]))))
+            .with_bus_root(bus.clone());
+
+        let mut cursor = None;
+        let mut fold = RoamingFold::default();
+        w.preload_layouts(&mut fold);
+        drain(&bus, &mut cursor, &mut fold);
+        w.converge(&fold);
+
+        let published = rows.lock().expect("rows mutex");
+        assert_eq!(published["s1"].client_peer, "peer:new");
+        assert_eq!(published["s2"].client_peer, "peer:new");
+        assert_eq!(published["s1"].state, SessionState::Active);
+        assert_eq!(published["s2"].state, SessionState::Active);
+        drop(published);
+
+        let saved = layout_rows.lock().expect("layout mutex");
+        assert_eq!(
+            saved.get("peer:new"),
+            Some(&layout),
+            "the persisted old-peer layout followed the user after preload"
         );
         drop(saved);
 

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::job::{IntegrityStatus, TransferJob, TransferState, Transition};
-use super::lane::{LaneOutcome, node_dest_dir, node_dest_dir_with_root};
+use super::lane::{node_dest_dir, node_dest_dir_with_root, LaneOutcome};
 use super::ledger::Ledger;
 
 /// Why a control verb could not be applied to a job (the honest, typed refusal the
@@ -692,13 +692,11 @@ mod tests {
         queue.complete(&running.id, &LaneOutcome::Done).unwrap();
         let failed = queue.get(&id).unwrap();
         assert_eq!(failed.state, TransferState::Failed);
-        assert!(
-            failed
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("integrity verify failed")
-        );
+        assert!(failed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("integrity verify failed"));
         assert!(matches!(
             failed.integrity,
             Some(IntegrityStatus::Mismatch {

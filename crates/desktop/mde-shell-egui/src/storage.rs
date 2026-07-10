@@ -44,7 +44,7 @@
 //! or `/mnt/mesh-storage` — and disables staging against them. The VM/container
 //! in-use wall isn't visible in the topology, so it's enforced at apply-time by the
 //! worker and surfaces as a `Refused` progress row with a deep-link hint to free it
-//! in the Instances surface. **Typed arming** (lock 8) is always demanded before an
+//! in the Cloud plane. **Typed arming** (lock 8) is always demanded before an
 //! Apply: the operator types the exact target device, matched against the queue's
 //! single resolved disk (the worker re-checks authoritatively).
 //!
@@ -1319,7 +1319,7 @@ impl StorageState {
         }
 
         // A walled row (advisory in-use note here, or a `Refused` progress row
-        // below) can deep-link to Instances to free the guest holding the disk.
+        // below) can deep-link to the Cloud plane to free the guest holding the disk.
         // Collected across the render, published once after the borrows end.
         let mut goto_instances = false;
 
@@ -1401,10 +1401,11 @@ impl StorageState {
         ui.add_space(Style::SP_M);
         show_progress(ui, &self.progress, &mut goto_instances);
 
-        // A walled-row deep-link hands off to Instances via the shell's one nav
-        // grammar (a `shell/goto/instances` toast the KIRON bridge resolves).
+        // A walled-row deep-link hands off to the Cloud plane via the shell's one
+        // nav grammar (a `shell/goto/instances` compatibility toast resolves
+        // there after QC-15).
         if goto_instances {
-            self.emit_goto(&node.host, INSTANCES_SURFACE);
+            self.emit_goto(&node.host, CLOUD_COMPAT_SURFACE);
         }
     }
 
@@ -1437,7 +1438,7 @@ impl StorageState {
     /// shell's ONE navigation grammar ([`crate::toast_bridge::resolve_action`], no
     /// second copy). This is how a row blocked by the worker's in-use wall hands the
     /// operator off to the surface that frees it — a running-VM backer routes to the
-    /// **Instances** surface, where the guest can be stopped, then the apply retried.
+    /// **Cloud** plane, where the guest can be stopped, then the apply retried.
     /// Reuses the same persist-first publish path as a storage action; a missing Bus
     /// dir is a silent no-op (the button simply can't navigate).
     fn emit_goto(&self, source: &str, surface: &str) {
@@ -1449,7 +1450,7 @@ impl StorageState {
             "source_host": source,
             "flag": "STORAGE",
             "headline": format!("Free the disk on {source} to apply"),
-            "action_label": "Open Instances",
+            "action_label": "Open Cloud",
             "action_verb": format!("shell/goto/{surface}"),
         })
         .to_string();
@@ -1479,7 +1480,7 @@ impl StorageState {
 }
 
 /// The dock surface a running-VM/container wall routes to (free the guest there).
-const INSTANCES_SURFACE: &str = "instances";
+const CLOUD_COMPAT_SURFACE: &str = "instances";
 
 /// The per-node action topic (`action/storage/<node>`).
 fn action_topic(node: &str) -> String {
@@ -1616,7 +1617,7 @@ fn show_disk(
     }
 
     // In-use wall reminder (not visible in the topology — worker-enforced) with a
-    // live deep-link to the surface that frees it (lock 7 → Instances).
+    // live deep-link to the plane that frees it (lock 7 → Cloud).
     ui.add_space(Style::SP_XS);
     ui.horizontal_wrapped(|ui| {
         mde_egui::muted_note(
@@ -1624,8 +1625,8 @@ fn show_disk(
             "A disk backing a running VM/container is refused at apply-time —",
         );
         if ui
-            .button(RichText::new("free it in Instances").size(Style::SMALL))
-            .on_hover_text("Jump to the Instances surface to stop the guest holding this disk.")
+            .button(RichText::new("free it in Cloud").size(Style::SMALL))
+            .on_hover_text("Jump to the Cloud plane to stop the guest holding this disk.")
             .clicked()
         {
             *goto_instances = true;
@@ -2107,9 +2108,9 @@ fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress], goto_instances
                     ui.horizontal_wrapped(|ui| {
                         mde_egui::muted_note(ui, "\u{2192} free the disk, then re-apply:");
                         if ui
-                            .button(RichText::new("Open Instances").size(Style::SMALL))
+                            .button(RichText::new("Open Cloud").size(Style::SMALL))
                             .on_hover_text(
-                                "Jump to the Instances surface to stop the guest holding this disk.",
+                                "Jump to the Cloud plane to stop the guest holding this disk.",
                             )
                             .clicked()
                         {
@@ -3183,14 +3184,15 @@ mod tests {
     }
 
     #[test]
-    fn instances_deep_link_resolves_through_the_shell_nav_grammar() {
-        // The walled-row deep-link must name a surface the shell's ONE resolver
-        // accepts — guard against the constant drifting out of the goto grammar.
-        assert!(
-            crate::toast_bridge::resolve_action(&format!("shell/goto/{INSTANCES_SURFACE}"))
-                .is_some(),
-            "the Instances deep-link must resolve to a real dock surface"
-        );
+    fn cloud_compat_deep_link_resolves_through_the_shell_nav_grammar() {
+        // The walled-row deep-link keeps the old `instances` verb for forward
+        // compatibility, but QC-15 routes it to the Workbench Cloud plane.
+        assert!(matches!(
+            crate::toast_bridge::resolve_action(&format!("shell/goto/{CLOUD_COMPAT_SURFACE}")),
+            Some(crate::toast_bridge::Navigate::Plane(
+                crate::workbench::Plane::Cloud
+            ))
+        ));
     }
 
     #[test]
@@ -3253,7 +3255,6 @@ mod menubar_coverage {
             Surface::Workbench => Coverage::Covered {
                 title: "State of the Mesh", // MENU-1 (workbench.rs)
             },
-            Surface::Instances => Coverage::Covered { title: "Instances" },
             Surface::InfraCode => Coverage::Covered {
                 title: "Infra as Code", // IAC-5 (iac.rs)
             },
@@ -3369,7 +3370,7 @@ mod menubar_coverage {
             }
         }
         assert_eq!(covered + exempt, every_routed().len());
-        assert_eq!(covered, 9, "the covered set is the nine landed bars");
+        assert_eq!(covered, 8, "the covered set is the eight landed bars");
         for (view, reason) in ROUTED_NON_SURFACE_VIEWS {
             assert!(
                 reason.contains("MENUBAR-SWEEP"),
@@ -3442,7 +3443,7 @@ mod menubar_coverage {
         text
     }
 
-    /// The four surfaces whose states construct cheaply from here render for
+    /// The three surfaces whose states construct cheaply from here render for
     /// real, and each bar's UPPERCASE DISPLAY title appears in the painted text —
     /// the register's `Covered` claim proven at the pixel-feed level for them.
     /// The other five covered bars (Workbench / `IaC` / Desktop / Browser / System)
@@ -3450,7 +3451,7 @@ mod menubar_coverage {
     /// files' tests, so their register rows rest on those files' render tests.
     #[test]
     fn covered_titles_render_on_the_cheaply_constructible_bars() {
-        let proofs: [(Surface, fn() -> String); 4] = [
+        let proofs: [(Surface, fn() -> String); 3] = [
             (Surface::Storage, || {
                 let mut s = crate::storage::StorageState {
                     nodes: crate::storage::project(&[crate::storage::state_body("nodeA", 1, true)]),
@@ -3462,10 +3463,6 @@ mod menubar_coverage {
             (Surface::Chat, || {
                 let mut s = crate::chat::ChatState::default();
                 rendered_text(|ui| s.show(ui))
-            }),
-            (Surface::Instances, || {
-                let mut s = crate::instances::InstancesState::default();
-                rendered_text(|ui| crate::instances::instances_panel(ui, &mut s))
             }),
             (Surface::About, || {
                 let mut s = crate::device_manager::DeviceManagerState::default();

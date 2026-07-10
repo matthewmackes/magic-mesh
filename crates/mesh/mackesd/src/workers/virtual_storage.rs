@@ -1,8 +1,8 @@
-//! E12-22 — **virtual disks first-class**: KVM images + Podman storage.
+//! E12-22 / QC-15 — **virtual disks first-class**: QEMU images + Podman storage.
 //!
-//! KVM images + Podman volumes become citizens of the Storage plane's staged op queue
-//! (`docs/design/workbench-storage-plane.md`, lock 10), beside the E12-20 physical-disk
-//! queue ([`super::storage`]).
+//! QEMU images + Podman volumes become citizens of the Storage plane's staged op
+//! queue (`docs/design/workbench-storage-plane.md`, lock 10), beside the E12-20
+//! physical-disk queue ([`super::storage`]).
 //!
 //! ## Why a parallel [`VirtualStorageOp`] and not more [`super::storage::StorageOp`] variants
 //!
@@ -20,35 +20,29 @@
 //!
 //! ## Seams (all injectable, headless-tested — §7 honest gating)
 //!
-//! - **KVM images** go through [`mde_kvm::QemuImgRunner`] (production
-//!   [`mde_kvm::LiveQemuImg`] shells the real `qemu-img`; absent ⇒ a typed
-//!   [`mde_kvm::QemuImgError::Unavailable`]). Attach/detach **reuses the running
-//!   guest** via [`mde_kvm::Vm::add_disk`]/[`remove_device`](mde_kvm::Vm::remove_device)
-//!   — no VM-lifecycle reimplementation; the live hot-plug needs a running CH
-//!   api-socket, so on a headless host it answers a typed error.
+//! - **QEMU images** go through the local [`QemuImgRunner`] seam (production
+//!   [`LiveQemuImg`] shells the real `qemu-img`; absent ⇒ a typed
+//!   [`QemuImgError::Unavailable`]). QC-15 deleted the old mde-kvm
+//!   cloud-hypervisor hotplug path; this worker only manages images at rest.
 //! - **Podman storage** goes through [`PodmanStorageRunner`] (production
 //!   [`LivePodman`] shells `podman` bounded by the EFF-20 timeout; absent ⇒ a typed
 //!   [`PodmanError::Unavailable`]). Volume create/remove/**prune** + the
 //!   `system df` usage views.
-//! - **The in-use walls reuse E12-20's sources**: running VMs (the CH broker's
-//!   `/run/mde-kvm` sockets **and** virsh domblklist, via
-//!   [`super::compute_registry`]) and podman container mounts — an image backing a
-//!   running VM or a volume mounted by a running container is a hard [`VirtualWallRefusal`],
-//!   with the same **assume-in-use** safe default when the probe can't verify.
+//! - **The in-use walls reuse E12-20's sources**: running VMs from libvirt
+//!   `virsh domblklist` (via [`super::compute_registry`]) and podman container
+//!   mounts — an image backing a running VM or a volume mounted by a running
+//!   container is a hard [`VirtualWallRefusal`], with the same **assume-in-use**
+//!   safe default when the probe can't verify.
 
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mde_bus::persist::Persist;
-use mde_kvm::{
-    api_socket_path, hotplug_disk_id, ImageFormat, LiveQemuImg, QemuImgError, QemuImgRunner,
-    SnapshotAction, Vm, RUNTIME_DIR,
-};
 use thiserror::Error;
 
 use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
@@ -78,6 +72,405 @@ pub fn progress_topic(node: &str) -> String {
 /// `podman system df` are not free, so they stay off the hot path (between
 /// action-triggered republishes).
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+// ───────────────────────────── qemu-img seam ─────────────────────────────
+
+/// The disk-image format `qemu-img` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFormat {
+    /// A raw disk image.
+    Raw,
+    /// A qcow2 image (copy-on-write; carries internal snapshots).
+    Qcow2,
+}
+
+impl ImageFormat {
+    /// The canonical `qemu-img -f`/`-O` format id.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Qcow2 => "qcow2",
+        }
+    }
+
+    /// Parse a `qemu-img info` `format` string.
+    #[must_use]
+    pub fn from_qemu(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "raw" => Some(Self::Raw),
+            "qcow2" => Some(Self::Qcow2),
+            _ => None,
+        }
+    }
+
+    /// Whether this format carries internal (qcow2) snapshots.
+    #[must_use]
+    pub const fn supports_snapshots(self) -> bool {
+        matches!(self, Self::Qcow2)
+    }
+}
+
+/// One qcow2 internal snapshot as `qemu-img info --output=json` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageSnapshot {
+    /// The snapshot id `qemu-img` assigns.
+    pub id: String,
+    /// The snapshot tag/name.
+    pub tag: String,
+    /// The saved VM-state size in bytes.
+    #[serde(default)]
+    pub vm_state_bytes: u64,
+}
+
+/// The slice of `qemu-img info --output=json` the plane consumes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageInfo {
+    /// The image path this info describes.
+    pub path: PathBuf,
+    /// The image format.
+    pub format: ImageFormat,
+    /// The logical guest-visible size in bytes.
+    pub virtual_size_bytes: u64,
+    /// The allocated size in bytes.
+    #[serde(default)]
+    pub actual_size_bytes: u64,
+    /// The backing file, when this is an overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing_file: Option<String>,
+    /// Internal qcow2 snapshots.
+    #[serde(default)]
+    pub snapshots: Vec<ImageSnapshot>,
+}
+
+impl ImageInfo {
+    /// The logical size in MiB.
+    #[must_use]
+    pub const fn virtual_size_mib(&self) -> u64 {
+        self.virtual_size_bytes / (1024 * 1024)
+    }
+}
+
+/// A typed `qemu-img` failure.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum QemuImgError {
+    /// No `qemu-img` on this host.
+    #[error("qemu-img unavailable: {0}")]
+    Unavailable(String),
+    /// `qemu-img` ran but the op failed.
+    #[error("qemu-img {op} failed: {reason}")]
+    Failed {
+        /// The op that failed.
+        op: &'static str,
+        /// `qemu-img`'s error text.
+        reason: String,
+    },
+    /// `qemu-img info` output did not parse.
+    #[error("qemu-img info parse: {0}")]
+    Parse(String),
+}
+
+/// The `qemu-img` I/O seam.
+pub trait QemuImgRunner: Send + Sync {
+    /// `qemu-img info --output=json <path>`.
+    ///
+    /// # Errors
+    /// A [`QemuImgError`].
+    fn info(&self, path: &Path) -> Result<ImageInfo, QemuImgError>;
+
+    /// `qemu-img create -f <format> <path> <size_mib>M`.
+    ///
+    /// # Errors
+    /// A [`QemuImgError`].
+    fn create(&self, path: &Path, format: ImageFormat, size_mib: u64) -> Result<(), QemuImgError>;
+
+    /// `qemu-img resize [--shrink] <path> <new_size_mib>M`.
+    ///
+    /// # Errors
+    /// A [`QemuImgError`].
+    fn resize(&self, path: &Path, new_size_mib: u64, shrink: bool) -> Result<(), QemuImgError>;
+
+    /// `qemu-img convert -O <dst_format> <src> <dst>`.
+    ///
+    /// # Errors
+    /// A [`QemuImgError`].
+    fn convert(&self, src: &Path, dst: &Path, dst_format: ImageFormat) -> Result<(), QemuImgError>;
+
+    /// `qemu-img snapshot -c|-a|-d <tag> <path>`.
+    ///
+    /// # Errors
+    /// A [`QemuImgError`].
+    fn snapshot(&self, action: SnapshotAction, path: &Path, tag: &str) -> Result<(), QemuImgError>;
+}
+
+/// Which `qemu-img snapshot` sub-verb to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotAction {
+    /// Create a snapshot.
+    Create,
+    /// Apply/revert to a snapshot.
+    Apply,
+    /// Delete a snapshot.
+    Delete,
+}
+
+impl SnapshotAction {
+    /// The `qemu-img snapshot` flag.
+    #[must_use]
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::Create => "-c",
+            Self::Apply => "-a",
+            Self::Delete => "-d",
+        }
+    }
+
+    /// A short op label for typed errors.
+    #[must_use]
+    pub const fn op(self) -> &'static str {
+        match self {
+            Self::Create => "snapshot-create",
+            Self::Apply => "snapshot-revert",
+            Self::Delete => "snapshot-delete",
+        }
+    }
+}
+
+fn mib_arg(mib: u64) -> String {
+    format!("{mib}M")
+}
+
+/// `qemu-img info --output=json --force-share <path>` argv after the program.
+#[must_use]
+pub fn info_argv(path: &Path) -> Vec<String> {
+    vec![
+        "info".into(),
+        "--output=json".into(),
+        "--force-share".into(),
+        path.to_string_lossy().into_owned(),
+    ]
+}
+
+/// `qemu-img create` argv after the program.
+#[must_use]
+pub fn create_argv(path: &Path, format: ImageFormat, size_mib: u64) -> Vec<String> {
+    vec![
+        "create".into(),
+        "-f".into(),
+        format.as_str().into(),
+        path.to_string_lossy().into_owned(),
+        mib_arg(size_mib),
+    ]
+}
+
+/// `qemu-img resize` argv after the program.
+#[must_use]
+pub fn resize_argv(path: &Path, new_size_mib: u64, shrink: bool) -> Vec<String> {
+    let mut argv = vec!["resize".to_string()];
+    if shrink {
+        argv.push("--shrink".into());
+    }
+    argv.push(path.to_string_lossy().into_owned());
+    argv.push(mib_arg(new_size_mib));
+    argv
+}
+
+/// `qemu-img convert` argv after the program.
+#[must_use]
+pub fn convert_argv(src: &Path, dst: &Path, dst_format: ImageFormat) -> Vec<String> {
+    vec![
+        "convert".into(),
+        "-O".into(),
+        dst_format.as_str().into(),
+        src.to_string_lossy().into_owned(),
+        dst.to_string_lossy().into_owned(),
+    ]
+}
+
+/// `qemu-img snapshot` argv after the program.
+#[must_use]
+pub fn snapshot_argv(action: SnapshotAction, path: &Path, tag: &str) -> Vec<String> {
+    vec![
+        "snapshot".into(),
+        action.flag().into(),
+        tag.to_string(),
+        path.to_string_lossy().into_owned(),
+    ]
+}
+
+/// Parse a `qemu-img info --output=json` body for `path`.
+///
+/// # Errors
+/// [`QemuImgError::Parse`] on malformed JSON or missing required fields.
+pub fn parse_image_info(json: &str, path: &Path) -> Result<ImageInfo, QemuImgError> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| QemuImgError::Parse(e.to_string()))?;
+    let format = v
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ImageFormat::from_qemu)
+        .ok_or_else(|| {
+            QemuImgError::Parse(format!(
+                "missing/unknown format in qemu-img info for {}",
+                path.display()
+            ))
+        })?;
+    let virtual_size_bytes = v
+        .get("virtual-size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| QemuImgError::Parse("missing virtual-size".into()))?;
+    let actual_size_bytes = v
+        .get("actual-size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let backing_file = v
+        .get("backing-filename")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let snapshots = v
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let tag = s
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string();
+                    let id = s
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let vm_state_bytes = s
+                        .get("vm-state-size")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Some(ImageSnapshot {
+                        id,
+                        tag,
+                        vm_state_bytes,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ImageInfo {
+        path: path.to_path_buf(),
+        format,
+        virtual_size_bytes,
+        actual_size_bytes,
+        backing_file,
+        snapshots,
+    })
+}
+
+/// The default per-invocation `qemu-img` timeout.
+pub const DEFAULT_QEMU_IMG_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Production [`QemuImgRunner`]: shells the real `qemu-img` bounded by a deadline.
+#[derive(Debug, Clone)]
+pub struct LiveQemuImg {
+    timeout: Duration,
+}
+
+impl LiveQemuImg {
+    /// The production runner with [`DEFAULT_QEMU_IMG_TIMEOUT`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            timeout: DEFAULT_QEMU_IMG_TIMEOUT,
+        }
+    }
+
+    /// Override the per-invocation timeout.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn run(&self, op: &'static str, argv: &[String]) -> Result<String, QemuImgError> {
+        let mut cmd = Command::new("qemu-img");
+        cmd.args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| QemuImgError::Unavailable(format!("spawn qemu-img: {e}")))?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(QemuImgError::Failed {
+                            op,
+                            reason: format!("timed out after {:?}", self.timeout),
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => {
+                    return Err(QemuImgError::Failed {
+                        op,
+                        reason: format!("wait: {e}"),
+                    });
+                }
+            }
+        }
+        let out = child.wait_with_output().map_err(|e| QemuImgError::Failed {
+            op,
+            reason: format!("collect output: {e}"),
+        })?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(QemuImgError::Failed {
+                op,
+                reason: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            })
+        }
+    }
+}
+
+impl Default for LiveQemuImg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QemuImgRunner for LiveQemuImg {
+    fn info(&self, path: &Path) -> Result<ImageInfo, QemuImgError> {
+        let stdout = self.run("info", &info_argv(path))?;
+        parse_image_info(&stdout, path)
+    }
+
+    fn create(&self, path: &Path, format: ImageFormat, size_mib: u64) -> Result<(), QemuImgError> {
+        self.run("create", &create_argv(path, format, size_mib))
+            .map(|_| ())
+    }
+
+    fn resize(&self, path: &Path, new_size_mib: u64, shrink: bool) -> Result<(), QemuImgError> {
+        self.run("resize", &resize_argv(path, new_size_mib, shrink))
+            .map(|_| ())
+    }
+
+    fn convert(&self, src: &Path, dst: &Path, dst_format: ImageFormat) -> Result<(), QemuImgError> {
+        self.run("convert", &convert_argv(src, dst, dst_format))
+            .map(|_| ())
+    }
+
+    fn snapshot(&self, action: SnapshotAction, path: &Path, tag: &str) -> Result<(), QemuImgError> {
+        self.run(action.op(), &snapshot_argv(action, path, tag))
+            .map(|_| ())
+    }
+}
 
 // ───────────────────────────── op model ─────────────────────────────
 
@@ -113,13 +506,13 @@ pub enum VirtualStorageOp {
         format: ImageFormat,
     },
     /// Clone a golden base to a fresh, self-contained `~/Local` image (`qemu-img
-    /// convert` — a full flat copy, never a backing overlay, lock 18).
+    /// convert` — a full flat copy, never a backing overlay).
     ImageCloneGolden {
         /// The golden base (must exist).
         golden: PathBuf,
         /// The destination running-disk image (must not exist).
         dest: PathBuf,
-        /// The destination format (raw is CH-native).
+        /// The destination format.
         format: ImageFormat,
     },
     /// Take an internal snapshot of a qcow2 image (`qemu-img snapshot -c`).
@@ -147,22 +540,6 @@ pub enum VirtualStorageOp {
     ImageDelete {
         /// The image path (must exist and be free).
         path: PathBuf,
-    },
-    /// Hot-plug an image into a running VM as a virtio-blk device
-    /// ([`mde_kvm::Vm::add_disk`], reusing the running guest).
-    ImageAttach {
-        /// The image to attach (must exist and be free).
-        path: PathBuf,
-        /// The target VM name (its CH api-socket).
-        vm: String,
-    },
-    /// Detach a hot-plugged image from a running VM
-    /// ([`mde_kvm::Vm::remove_device`]).
-    ImageDetach {
-        /// The image whose hot-plug device to remove.
-        path: PathBuf,
-        /// The VM name.
-        vm: String,
     },
     /// Create a podman named volume (`podman volume create`).
     VolumeCreate {
@@ -195,8 +572,6 @@ impl VirtualStorageOp {
             Self::ImageRevert { .. } => "image_revert",
             Self::ImageDeleteSnapshot { .. } => "image_delete_snapshot",
             Self::ImageDelete { .. } => "image_delete",
-            Self::ImageAttach { .. } => "image_attach",
-            Self::ImageDetach { .. } => "image_detach",
             Self::VolumeCreate { .. } => "volume_create",
             Self::VolumeRemove { .. } => "volume_remove",
             Self::VolumePrune => "volume_prune",
@@ -214,9 +589,7 @@ impl VirtualStorageOp {
             | Self::ImageSnapshot { path, .. }
             | Self::ImageRevert { path, .. }
             | Self::ImageDeleteSnapshot { path, .. }
-            | Self::ImageDelete { path }
-            | Self::ImageAttach { path, .. }
-            | Self::ImageDetach { path, .. } => path.to_string_lossy().into_owned(),
+            | Self::ImageDelete { path } => path.to_string_lossy().into_owned(),
             Self::ImageConvert { dst, .. } => dst.to_string_lossy().into_owned(),
             Self::ImageCloneGolden { dest, .. } => dest.to_string_lossy().into_owned(),
             Self::VolumeCreate { name } | Self::VolumeRemove { name, .. } => {
@@ -227,8 +600,7 @@ impl VirtualStorageOp {
     }
 
     /// The **existing image** this op requires to be free (the in-use wall target),
-    /// or `None` for ops that write a new file / don't touch an at-rest image, and
-    /// for `ImageDetach` (the freeing action — its image is *expected* in use).
+    /// or `None` for ops that write a new file / don't touch an at-rest image.
     #[must_use]
     fn walled_image(&self) -> Option<&Path> {
         match self {
@@ -236,14 +608,12 @@ impl VirtualStorageOp {
             | Self::ImageSnapshot { path, .. }
             | Self::ImageRevert { path, .. }
             | Self::ImageDeleteSnapshot { path, .. }
-            | Self::ImageDelete { path }
-            | Self::ImageAttach { path, .. } => Some(path.as_path()),
+            | Self::ImageDelete { path } => Some(path.as_path()),
             // A consistent read of the source must be offline too.
             Self::ImageConvert { src, .. } => Some(src.as_path()),
             Self::ImageCloneGolden { golden, .. } => Some(golden.as_path()),
-            // New-file writers, detach (freeing), and all volume ops: no image wall.
+            // New-file writers and all volume ops: no image wall.
             Self::ImageCreate { .. }
-            | Self::ImageDetach { .. }
             | Self::VolumeCreate { .. }
             | Self::VolumeRemove { .. }
             | Self::VolumePrune => None,
@@ -375,10 +745,10 @@ pub struct DfRow {
     pub reclaimable: String,
 }
 
-/// The virtual-storage topology mirror — KVM images + podman volumes + `system df`.
+/// The virtual-storage topology mirror — QEMU images + podman volumes + `system df`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VirtualTopology {
-    /// The `~/Local` KVM images.
+    /// The `~/Local` QEMU images.
     #[serde(default)]
     pub images: Vec<ImageEntry>,
     /// The podman volumes.
@@ -500,9 +870,7 @@ pub fn validate_vop(op: &VirtualStorageOp, topo: &VirtualTopology) -> Result<(),
                 })
             }
         }
-        VirtualStorageOp::ImageDelete { path }
-        | VirtualStorageOp::ImageAttach { path, .. }
-        | VirtualStorageOp::ImageDetach { path, .. } => require_image(topo, path).map(|_| ()),
+        VirtualStorageOp::ImageDelete { path } => require_image(topo, path).map(|_| ()),
         VirtualStorageOp::VolumeCreate { name } => {
             if topo.volume(name).is_some() {
                 Err(VopInvalid::VolumeExists(name.clone()))
@@ -581,7 +949,7 @@ pub struct VirtualInUseSnapshot {
     pub vm_images: BTreeMap<String, String>,
     /// volume name → the container mounting it.
     pub container_volumes: BTreeMap<String, String>,
-    /// Whether a VM source (CH broker / virsh) could be queried at all.
+    /// Whether a VM source (virsh) could be queried at all.
     pub vm_tool: bool,
     /// Whether podman could be queried at all.
     pub container_tool: bool,
@@ -644,8 +1012,8 @@ pub enum VirtualWallRefusal {
 }
 
 /// The in-use probe seam: snapshot which images/volumes back running units.
-/// Production [`ComputeVirtualInUse`] reuses the CH broker + virsh + podman;
-/// tests inject a fixed snapshot.
+/// Production [`ComputeVirtualInUse`] reuses virsh + podman; tests inject a
+/// fixed snapshot.
 pub trait VirtualInUseProbe: Send + Sync {
     /// Snapshot the live in-use image/volume sets.
     fn snapshot(&self) -> VirtualInUseSnapshot;
@@ -694,11 +1062,10 @@ pub fn check_wall(
     Ok(())
 }
 
-/// Production [`VirtualInUseProbe`] over the CH broker + virsh + podman.
+/// Production [`VirtualInUseProbe`] over virsh + podman.
 ///
-/// Snapshots which `~/Local` images back running VMs (the CH broker's `/run/mde-kvm`
-/// sockets **and** virsh domblklist — E12-20's VM source) and which volumes are mounted
-/// by running podman containers.
+/// Snapshots which image paths back running libvirt VMs (E12-20's VM source) and
+/// which volumes are mounted by running podman containers.
 #[derive(Debug, Clone, Default)]
 pub struct ComputeVirtualInUse;
 
@@ -713,35 +1080,6 @@ impl ComputeVirtualInUse {
 impl VirtualInUseProbe for ComputeVirtualInUse {
     fn snapshot(&self) -> VirtualInUseSnapshot {
         let mut snap = VirtualInUseSnapshot::default();
-
-        // ── CH broker: running cloud-hypervisor guests → their disk image ──
-        // Each live VM has a /run/mde-kvm/<name>/api.sock; vm.info's config carries
-        // the running disk path. This is the authoritative source for the E12
-        // desktops (mde-kvm).
-        if let Ok(entries) = std::fs::read_dir(RUNTIME_DIR) {
-            snap.vm_tool = true;
-            for entry in entries.flatten() {
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                let sock = api_socket_path(&name);
-                if !sock.exists() {
-                    continue;
-                }
-                if let Ok(info) = Vm::connect(sock).info() {
-                    if let Some(disk) = info
-                        .config
-                        .get("disks")
-                        .and_then(|d| d.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|d| d.get("path"))
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        snap.vm_images.insert(disk.to_string(), name);
-                    }
-                }
-            }
-        }
 
         // ── virsh: running libvirt domains → their disk source (E12-20 source) ──
         if let Some(uuids) = bounded_stdout("virsh", &["list", "--state-running", "--uuid"]) {
@@ -1052,17 +1390,6 @@ pub enum VExecError {
     /// A podman op failed / the binary is absent.
     #[error("{0}")]
     Podman(#[from] PodmanError),
-    /// An attach/detach against the live VM failed (no CH api-socket / VMM refusal)
-    /// — the live hot-plug is integration-gated on a running guest.
-    #[error("{op} {vm}: {reason}")]
-    Attach {
-        /// `attach`/`detach`.
-        op: &'static str,
-        /// The VM name.
-        vm: String,
-        /// The failure detail.
-        reason: String,
-    },
     /// A filesystem op (image delete) failed.
     #[error("image delete {path}: {reason}")]
     Fs {
@@ -1074,7 +1401,7 @@ pub enum VExecError {
 }
 
 /// Apply one [`VirtualStorageOp`] against the live backends. Production
-/// [`LiveVirtualExecutor`] drives `qemu-img` / podman / the CH broker; tests inject a
+/// [`LiveVirtualExecutor`] drives `qemu-img` / podman; tests inject a
 /// recording fake.
 pub trait VirtualExecutor: Send + Sync {
     /// Execute `op` (the queue is already validated + walled by the caller).
@@ -1086,11 +1413,9 @@ pub trait VirtualExecutor: Send + Sync {
 
 /// Production [`VirtualExecutor`] over the injectable `qemu-img` + podman runners.
 ///
-/// Image ops call `qemu-img`; volume ops call podman; attach/detach reuses the
-/// running guest through [`mde_kvm::Vm`] (no VM-lifecycle reimplementation). The live
-/// hot-plug + live `qemu-img` snapshot/revert/golden-clone are only exercised against
-/// a real host — on the headless farm each answers a typed error, never a fake
-/// success (§7).
+/// Image ops call `qemu-img`; volume ops call podman. Live `qemu-img`
+/// snapshot/revert/golden-clone are only exercised against a real host — on the
+/// headless farm each answers a typed error, never a fake success (§7).
 pub struct LiveVirtualExecutor {
     qemu: Arc<dyn QemuImgRunner>,
     podman: Arc<dyn PodmanStorageRunner>,
@@ -1143,26 +1468,6 @@ impl VirtualExecutor for LiveVirtualExecutor {
                     path: disp(path),
                     reason: e.to_string(),
                 })
-            }
-            VirtualStorageOp::ImageAttach { path, vm } => {
-                let id = hotplug_disk_id(path);
-                Vm::connect(api_socket_path(vm))
-                    .add_disk(&id, path, false)
-                    .map_err(|e| VExecError::Attach {
-                        op: "attach",
-                        vm: vm.clone(),
-                        reason: e.to_string(),
-                    })
-            }
-            VirtualStorageOp::ImageDetach { path, vm } => {
-                let id = hotplug_disk_id(path);
-                Vm::connect(api_socket_path(vm))
-                    .remove_device(&id)
-                    .map_err(|e| VExecError::Attach {
-                        op: "detach",
-                        vm: vm.clone(),
-                        reason: e.to_string(),
-                    })
             }
             VirtualStorageOp::VolumeCreate { name } => Ok(self.podman.volume_create(name)?),
             VirtualStorageOp::VolumeRemove { name, force } => {
@@ -1366,7 +1671,7 @@ fn publish_json<T: serde::Serialize>(topic: &str, body: &T) {
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
-/// The default `~/Local` image directory (lock 18 running disks live here).
+/// The default `~/Local` image directory.
 #[must_use]
 pub fn default_local_dir() -> PathBuf {
     dirs::home_dir()
@@ -1392,8 +1697,8 @@ pub struct VirtualStorage {
 }
 
 impl VirtualStorage {
-    /// The production sub-worker: the live `qemu-img` + podman runners, the CH/virsh/
-    /// podman in-use probe, and the `~/Local` image directory.
+    /// The production sub-worker: the live `qemu-img` + podman runners, the
+    /// virsh/podman in-use probe, and the `~/Local` image directory.
     #[must_use]
     pub fn production(node_id: String) -> Self {
         let qemu: Arc<dyn QemuImgRunner> = Arc::new(LiveQemuImg::new());
@@ -1931,14 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn wall_lets_detach_and_create_through_even_when_in_use_or_no_tool() {
-        // detach targets an in-use image (it's the freeing action) → allowed.
-        let snap = snap_with(&[("/home/op/Local/web1.qcow2", "web1")], &[], true);
-        let detach = VirtualStorageOp::ImageDetach {
-            path: "/home/op/Local/web1.qcow2".into(),
-            vm: "web1".into(),
-        };
-        assert!(check_wall(&detach, &snap).is_ok());
+    fn wall_lets_create_through_even_when_no_vm_tool() {
         // create writes a new file → no image wall even with no tooling.
         let snap0 = snap_with(&[], &[], false);
         let create = VirtualStorageOp::ImageCreate {
@@ -2186,10 +2484,10 @@ mod tests {
 
     /// A fake qemu-img runner returning canned info per path.
     struct FakeQemu {
-        infos: BTreeMap<PathBuf, mde_kvm::ImageInfo>,
+        infos: BTreeMap<PathBuf, ImageInfo>,
     }
     impl QemuImgRunner for FakeQemu {
-        fn info(&self, path: &Path) -> Result<mde_kvm::ImageInfo, QemuImgError> {
+        fn info(&self, path: &Path) -> Result<ImageInfo, QemuImgError> {
             self.infos
                 .get(path)
                 .cloned()
@@ -2252,13 +2550,13 @@ mod tests {
         let mut infos = BTreeMap::new();
         infos.insert(
             img_path.clone(),
-            mde_kvm::ImageInfo {
+            ImageInfo {
                 path: img_path.clone(),
                 format: ImageFormat::Qcow2,
                 virtual_size_bytes: 10 * 1024 * 1024 * 1024,
                 actual_size_bytes: 1024 * 1024,
                 backing_file: None,
-                snapshots: vec![mde_kvm::ImageSnapshot {
+                snapshots: vec![ImageSnapshot {
                     id: "1".into(),
                     tag: "clean".into(),
                     vm_state_bytes: 0,

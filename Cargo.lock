@@ -4195,7 +4195,6 @@ dependencies = [
  "mde-chat",
  "mde-kdc-host",
  "mde-kdc-proto",
- "mde-kvm",
  "mde-role",
  "mde-theme",
  "mde-voice-config",
@@ -4531,15 +4530,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mde-kvm"
-version = "12.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "mde-media-core"
 version = "12.0.0"
 dependencies = [
@@ -4647,7 +4637,6 @@ dependencies = [
  "mde-egui",
  "mde-files",
  "mde-files-egui",
- "mde-kvm",
  "mde-media-egui",
  "mde-mesh-view",
  "mde-music-egui",

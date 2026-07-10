@@ -48,8 +48,8 @@ pub struct PlannedUnit {
 ///   timer (a unit test pins that superset relationship).
 /// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell, the
 ///   voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
-///   worker's tier), the Chromium/CEF + optional Widevine runtime setup gates,
-///   and the one-way Carbon desktop branding.
+///   worker's tier), the Chromium/CEF + optional Widevine/Browser-TTS/STT/
+///   translation runtime setup gates, and the one-way Carbon desktop branding.
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
@@ -64,6 +64,9 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("rtpengine-mde.service", 1),
     ("mde-cef-runtime-setup.service", 1),
     ("mde-widevine-cdm-setup.service", 1),
+    ("mde-browser-tts-voice-setup.service", 1),
+    ("mde-browser-stt-model-setup.service", 1),
+    ("mde-browser-translate-model-setup.service", 1),
     ("magic-mesh-brand.service", 1),
 ];
 
@@ -221,6 +224,9 @@ mod tests {
             "rtpengine-mde.service",
             "mde-cef-runtime-setup.service",
             "mde-widevine-cdm-setup.service",
+            "mde-browser-tts-voice-setup.service",
+            "mde-browser-stt-model-setup.service",
+            "mde-browser-translate-model-setup.service",
             "magic-mesh-brand.service",
         ] {
             assert_eq!(
@@ -277,6 +283,16 @@ mod tests {
             rpm["requires"]["bzip2"].as_str(),
             Some("*"),
             "the full RPM must require bzip2 so the CEF .tar.bz2 runtime extracts on fresh Workstations"
+        );
+        assert_eq!(
+            rpm["requires"]["hunspell"].as_str(),
+            Some("*"),
+            "the full RPM must require hunspell for offline editor/browser spell checking"
+        );
+        assert_eq!(
+            rpm["requires"]["hunspell-en-US"].as_str(),
+            Some("*"),
+            "the full RPM must require a default hunspell dictionary"
         );
         let base_assets = rpm["assets"].as_array().expect("base assets array");
         assert!(
@@ -357,6 +373,75 @@ mod tests {
         assert!(
             !server_recommends.contains_key("playerctl"),
             "the headless server variant should not pull the desktop media-key helper"
+        );
+    }
+
+    #[test]
+    fn bootc_image_lane_bakes_qemu_libvirt_ovn_and_excludes_cloud_hypervisor() {
+        let containerfile = include_str!("../../../../../packaging/bootc/Containerfile");
+        for needle in [
+            "libvirt-client",
+            "libvirt-daemon-driver-qemu",
+            "libvirt-daemon-config-network",
+            "qemu-kvm",
+            "virt-install",
+            "openvswitch",
+            "ovn-host",
+            "cloud-init",
+            "qemu-guest-agent",
+            "datasource_list: [ NoCloud, None ]",
+            "cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service",
+            "openvswitch.service",
+            "dnf -y install --allowerasing",
+            "/usr/lib/bootc/install/50-magic-mesh.toml",
+            "dnf -y remove ${base_kernels}",
+        ] {
+            assert!(
+                containerfile.contains(needle),
+                "bootc image must install QC-1 host virt package {needle}"
+            );
+        }
+        for stale in [
+            "ARG CH_VERSION",
+            "ARG CH_SHA256",
+            "cloud-hypervisor-static",
+            "install -m 0755 /tmp/cloud-hypervisor",
+            "dnf -y --allowerasing install",
+        ] {
+            assert!(
+                !containerfile.contains(stale),
+                "QC-1 bootc image must not keep the retired cloud-hypervisor bake: {stale}"
+            );
+        }
+
+        let verifier = include_str!("../../../../../packaging/bootc/verify-image.sh");
+        for needle in [
+            "virsh",
+            "virsh --version",
+            "ovs-vsctl",
+            "cloud-init",
+            "qemu-ga",
+            "rpm -q \"$p\"",
+            "qemu-kvm libvirt-daemon-driver-qemu libvirt-daemon-config-network ovn-host openvswitch cloud-init qemu-guest-agent",
+            "[ ! -e /usr/bin/cloud-hypervisor ]",
+            "bootc install rootfs default = xfs",
+            "cloud-init constrained to NoCloud/None",
+            "openvswitch.service",
+            "single kernel modules tree present",
+            "surface kernel is the bootc kernel",
+        ] {
+            assert!(
+                verifier.contains(needle),
+                "bootc verifier must pin QC-1 payload check {needle}"
+            );
+        }
+
+        let install_config =
+            include_str!("../../../../../packaging/bootc/install/50-magic-mesh.toml");
+        assert!(
+            install_config.contains("[install.filesystem.root]")
+                && install_config.contains("type = \"xfs\""),
+            "bootc-image-builder needs a default root filesystem type"
         );
     }
 
@@ -447,6 +532,253 @@ mod tests {
     }
 
     #[test]
+    fn full_rpm_ships_browser_read_aloud_tts_wrapper_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let source = "install-helpers/browser-read-aloud-tts.sh";
+        let dest = "/usr/libexec/mackesd/browser-read-aloud-tts";
+
+        assert!(
+            base_assets.iter().any(|asset| {
+                asset["source"].as_str() == Some(source)
+                    && asset["dest"].as_str() == Some(dest)
+                    && asset["mode"].as_str() == Some("755")
+            }),
+            "full Workstation RPM must ship the Browser read-aloud TTS wrapper"
+        );
+        assert!(
+            server_assets
+                .iter()
+                .all(|asset| asset["dest"].as_str() != Some(dest)),
+            "headless server RPM must not ship the Browser read-aloud TTS wrapper"
+        );
+    }
+
+    #[test]
+    fn full_rpm_ships_browser_tts_voice_provisioning_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/install-browser-tts-voice.sh",
+                "/usr/libexec/mackesd/install-browser-tts-voice",
+                "755",
+            ),
+            (
+                "packaging/browser/browser-read-aloud-voice.env",
+                "/usr/share/magic-mesh/browser/browser-read-aloud-voice.env",
+                "644",
+            ),
+            (
+                "packaging/systemd/mde-browser-tts-voice-setup.service",
+                "/usr/lib/systemd/system/mde-browser-tts-voice-setup.service",
+                "644",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some(mode)
+                }),
+                "full Workstation RPM must ship Browser TTS voice provisioning asset {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship Browser TTS voice provisioning asset {dest}"
+            );
+        }
+        assert!(
+            post_install.contains("mde-browser-tts-voice-setup.service"),
+            "base RPM post-install must enable the Browser TTS voice setup unit"
+        );
+
+        let unit =
+            include_str!("../../../../../packaging/systemd/mde-browser-tts-voice-setup.service");
+        assert!(
+            unit.contains("SuccessExitStatus=78")
+                && unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+                && unit.contains("ExecStart=/usr/libexec/mackesd/install-browser-tts-voice"),
+            "Browser TTS voice setup unit must be Workstation-gated and treat an unconfigured voice manifest as a clean gate"
+        );
+    }
+
+    #[test]
+    fn full_rpm_ships_browser_stt_provisioning_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/browser-voice-command-stt.sh",
+                "/usr/libexec/mackesd/browser-voice-command-stt",
+                "755",
+            ),
+            (
+                "install-helpers/install-browser-stt-model.sh",
+                "/usr/libexec/mackesd/install-browser-stt-model",
+                "755",
+            ),
+            (
+                "packaging/browser/browser-voice-command-stt.env",
+                "/usr/share/magic-mesh/browser/browser-voice-command-stt.env",
+                "644",
+            ),
+            (
+                "packaging/systemd/mde-browser-stt-model-setup.service",
+                "/usr/lib/systemd/system/mde-browser-stt-model-setup.service",
+                "644",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some(mode)
+                }),
+                "full Workstation RPM must ship Browser STT asset {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship Browser STT asset {dest}"
+            );
+        }
+        assert!(
+            post_install.contains("mde-browser-stt-model-setup.service"),
+            "base RPM post-install must enable the Browser STT model setup unit"
+        );
+
+        let unit =
+            include_str!("../../../../../packaging/systemd/mde-browser-stt-model-setup.service");
+        assert!(
+            unit.contains("SuccessExitStatus=78")
+                && unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+                && unit.contains("ExecStart=/usr/libexec/mackesd/install-browser-stt-model"),
+            "Browser STT model setup unit must be Workstation-gated and treat an unconfigured model manifest as a clean gate"
+        );
+    }
+
+    #[test]
+    fn full_rpm_ships_browser_translate_provisioning_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base post install script");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/browser-translate.sh",
+                "/usr/libexec/mackesd/browser-translate",
+                "755",
+            ),
+            (
+                "install-helpers/install-browser-translate-model.sh",
+                "/usr/libexec/mackesd/install-browser-translate-model",
+                "755",
+            ),
+            (
+                "packaging/browser/browser-translate.env",
+                "/usr/share/magic-mesh/browser/browser-translate.env",
+                "644",
+            ),
+            (
+                "packaging/systemd/mde-browser-translate-model-setup.service",
+                "/usr/lib/systemd/system/mde-browser-translate-model-setup.service",
+                "644",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some(mode)
+                }),
+                "full Workstation RPM must ship Browser translation asset {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship Browser translation asset {dest}"
+            );
+        }
+        assert!(
+            post_install.contains("mde-browser-translate-model-setup.service"),
+            "base RPM post-install must enable the Browser translation model setup unit"
+        );
+
+        let unit = include_str!(
+            "../../../../../packaging/systemd/mde-browser-translate-model-setup.service"
+        );
+        assert!(
+            unit.contains("SuccessExitStatus=78")
+                && unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+                && unit.contains("ExecStart=/usr/libexec/mackesd/install-browser-translate-model"),
+            "Browser translation model setup unit must be Workstation-gated and treat an unconfigured model manifest as a clean gate"
+        );
+    }
+
+    #[test]
+    fn full_rpm_ships_seat_remote_input_helper_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let source = "install-helpers/seat-remote-input.py";
+        let dest = "/usr/libexec/mackesd/seat-remote-input";
+
+        assert!(
+            base_assets.iter().any(|asset| {
+                asset["source"].as_str() == Some(source)
+                    && asset["dest"].as_str() == Some(dest)
+                    && asset["mode"].as_str() == Some("755")
+            }),
+            "full Workstation RPM must ship the KDC remote-input seat helper"
+        );
+        assert!(
+            server_assets
+                .iter()
+                .all(|asset| asset["dest"].as_str() != Some(dest)),
+            "headless server RPM must not ship the KDC remote-input seat helper"
+        );
+    }
+
+    #[test]
     fn full_rpm_ships_cef_runtime_provisioning_but_server_variant_does_not() {
         let manifest: toml::Value =
             toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
@@ -518,6 +850,78 @@ mod tests {
                 && installer.contains("need_cmd bzip2"),
             "installed CEF runtime installer must use installed manifest/cache paths"
         );
+    }
+
+    #[test]
+    fn full_rpm_ships_cef_webextensions_smoke_assets_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/browser-cef-webextension-smoke.sh",
+                "/usr/libexec/mackesd/browser-cef-webextension-smoke",
+                "755",
+            ),
+            (
+                "packaging/browser/webextensions-allowlist.env",
+                "/usr/share/magic-mesh/browser/webextensions-allowlist.env",
+                "644",
+            ),
+            (
+                "packaging/browser/webextensions-smoke.env",
+                "/usr/share/magic-mesh/browser/webextensions-smoke.env",
+                "644",
+            ),
+            (
+                "packaging/browser/smoke-extension/manifest.json",
+                "/usr/share/magic-mesh/browser/smoke-extension/manifest.json",
+                "644",
+            ),
+            (
+                "packaging/browser/smoke-extension/smoke.js",
+                "/usr/share/magic-mesh/browser/smoke-extension/smoke.js",
+                "644",
+            ),
+        ] {
+            assert!(
+                base_assets.iter().any(|asset| {
+                    asset["source"].as_str() == Some(source)
+                        && asset["dest"].as_str() == Some(dest)
+                        && asset["mode"].as_str() == Some(mode)
+                }),
+                "full Workstation RPM must ship CEF WebExtensions asset {dest}"
+            );
+            assert!(
+                server_assets
+                    .iter()
+                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                "headless server RPM must not ship CEF WebExtensions asset {dest}"
+            );
+        }
+
+        let runner =
+            include_str!("../../../../../install-helpers/browser-cef-webextension-smoke.sh");
+        for needle in [
+            "/usr/share/magic-mesh/browser/webextensions-smoke.env",
+            "MDE_CEF_BROWSER_PROBE=1",
+            "MDE_CEF_EXTENSION_POWER_MODE=true",
+            "MDE_CEF_TEXT_PROBE_EXPECT",
+            "mde-cef-extension-autofill-ok",
+            "ReuseTcpServer",
+            "CEF_EXTENSION_AUTOFILL_SMOKE_READY",
+            "CEF_EXTENSIONS_WINDOWLESS_ALLOY_GATED",
+        ] {
+            assert!(
+                runner.contains(needle),
+                "CEF WebExtensions smoke runner must contain {needle}"
+            );
+        }
     }
 
     #[test]
@@ -806,11 +1210,11 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the 6 Workstation units.
+        // Lighthouse masks exactly the 9 Workstation units.
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            6,
-            "lighthouse masks the rank-1 shell + voice + browser runtime/CDM + brand units"
+            9,
+            "lighthouse masks the rank-1 shell + voice + browser runtime/CDM/TTS/STT/translate + brand units"
         );
     }
 

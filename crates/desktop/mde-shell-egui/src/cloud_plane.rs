@@ -65,6 +65,11 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
 
+use crate::auth::DesktopAuth;
+use crate::vdi::{
+    ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol,
+};
+
 /// The egui data-store key the plane's shared state handle parks under.
 pub const STATE_KEY: &str = "workbench-cloud-plane";
 
@@ -82,6 +87,9 @@ const RESOURCES_VERB: &str = "list-resources";
 /// `instance-*` lifecycle verbs drive the Nova roster.
 const HEAT_CREATE_VERB: &str = "heat-create";
 const HEAT_DELETE_VERB: &str = "heat-delete";
+const ENSURE_MESH_KEYPAIR_VERB: &str = "ensure-mesh-keypair";
+const INSTANCE_CONSOLE_VERB: &str = "get-instance-console";
+const MESH_KEYPAIR_NAME: &str = "mcnf-mesh";
 
 /// The auto-poll cadence — matches the `IaC` surface's catalog cadence.
 const REFRESH: Duration = Duration::from_secs(15);
@@ -126,6 +134,10 @@ struct CloudReply {
     resources: Option<ResourceTable>,
     /// The instance a lifecycle verb acted on, on success.
     instance: Option<String>,
+    /// `ensure-mesh-keypair` — the Nova keypair backing mesh SSH injection.
+    keypair: Option<String>,
+    /// `get-instance-console` — the Nova SPICE console descriptor.
+    console: Option<ConsoleInfo>,
     /// The stack a Heat mutation acted on / created, on success.
     stack: Option<String>,
     /// An honest gate reason (no clouds.yaml / doctrine off / nova down).
@@ -267,6 +279,18 @@ struct InstanceRow {
     image: Option<String>,
     /// The networks column, when present.
     networks: Option<String>,
+}
+
+/// A Nova SPICE console descriptor mirrored from the daemon reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+struct ConsoleInfo {
+    /// The Nova server id/name the console belongs to.
+    instance: String,
+    /// The console protocol/type Nova returned.
+    protocol: String,
+    /// The URL Nova returned.
+    url: String,
 }
 
 // ─────────────────────────── poll lanes ───────────────────────────
@@ -604,6 +628,8 @@ fn launch_hot(
     let _ = writeln!(out, "      name: {}", yaml_scalar(name));
     let _ = writeln!(out, "      image: {}", yaml_scalar(image));
     let _ = writeln!(out, "      flavor: {}", yaml_scalar(flavor));
+    let _ = writeln!(out, "      key_name: {MESH_KEYPAIR_NAME}");
+    out.push_str("      metadata:\n        mcnf:ssh-key-source: mesh-ssh-key\n");
     if let Some(net) = network {
         out.push_str("      networks:\n");
         let _ = writeln!(out, "        - network: {}", yaml_scalar(net));
@@ -919,6 +945,9 @@ pub struct CloudPlaneState {
     /// in the note. A newly-issued mutation replaces an unresolved one (the
     /// abandoned reply is simply never read).
     mutation_pending: Option<Pending>,
+    /// One-shot native Desktop attach request produced by a dialable console
+    /// descriptor. Drained by the shell after the Workbench frame renders.
+    console_attach: Option<ConnectRequest>,
     /// A transient one-line action note — honest feedback, never a silent op.
     note: Option<String>,
 }
@@ -1017,6 +1046,7 @@ impl Default for CloudPlaneState {
             presets_loaded_at: None,
             arming: None,
             mutation_pending: None,
+            console_attach: None,
             note: None,
         }
     }
@@ -1031,6 +1061,17 @@ pub fn state_handle(ui: &egui::Ui) -> Arc<Mutex<CloudPlaneState>> {
         d.get_temp_mut_or_insert_with(id, || Arc::new(Mutex::new(CloudPlaneState::default())))
             .clone()
     })
+}
+
+/// Drain a native SPICE attach request produced by the Cloud plane, if the latest
+/// Nova console descriptor was directly dialable. The Cloud plane's state lives
+/// in egui memory under [`STATE_KEY`], so the shell calls this after rendering
+/// Workbench and routes the request into [`crate::vdi::VdiState`].
+pub(crate) fn take_console_attach(ctx: &egui::Context) -> Option<ConnectRequest> {
+    let id = egui::Id::new(STATE_KEY);
+    let handle = ctx.data_mut(|d| d.get_temp::<Arc<Mutex<CloudPlaneState>>>(id))?;
+    let attach = handle.lock().ok()?.console_attach.take();
+    attach
 }
 
 impl CloudPlaneState {
@@ -1158,7 +1199,7 @@ impl CloudPlaneState {
             return;
         };
         if let Some(reply) = read_reply(self.bus_root.as_ref(), &ulid) {
-            self.note = Some(mutation_note(&reply));
+            self.note = Some(self.apply_mutation_reply(&reply));
             self.mutation_pending = None;
             if reply.ok {
                 self.instances.forced = true;
@@ -1170,6 +1211,34 @@ impl CloudPlaneState {
             self.note = Some("the cloud did not answer the request".to_string());
             self.mutation_pending = None;
         }
+    }
+
+    /// Apply a mutation/read reply that was issued from an instance card. Console
+    /// replies get one extra fold: if Nova returned a native `spice://host:port`
+    /// descriptor, queue a Desktop attach for the shell to drain; if it returned
+    /// the common HTML5 proxy URL, keep the descriptor visible and explain the
+    /// native attach gate honestly.
+    fn apply_mutation_reply(&mut self, reply: &CloudReply) -> String {
+        if reply.ok {
+            if let Some(console) = &reply.console {
+                match console_attach_request(console) {
+                    Ok(request) => {
+                        self.console_attach = Some(request);
+                        return format!(
+                            "Console ready for {}: opening native SPICE Desktop attach.",
+                            console.instance
+                        );
+                    }
+                    Err(reason) => {
+                        return format!(
+                            "Console ready for {}: {} {}. Native attach gated: {reason}.",
+                            console.instance, console.protocol, console.url
+                        );
+                    }
+                }
+            }
+        }
+        mutation_note(reply)
     }
 
     /// Publish a mutation verb and track its reply (the honest outcome lands
@@ -1290,9 +1359,92 @@ fn action_word(verb: &str) -> &'static str {
     }
 }
 
+/// Convert a Nova console descriptor into the native Desktop attach request, but
+/// only when the descriptor names a direct SPICE endpoint. Nova's common
+/// `--spice-html5` result is an HTTP proxy page; the native `mde-vdi-spice`
+/// transport cannot consume that browser URL, so it remains an honest gate.
+fn console_attach_request(console: &ConsoleInfo) -> Result<ConnectRequest, String> {
+    if !console.protocol.to_ascii_lowercase().contains("spice") {
+        return Err(format!(
+            "Nova returned a {} console, but the native Desktop attach expects SPICE",
+            console.protocol
+        ));
+    }
+    let (host, port) = parse_native_spice_url(&console.url)?;
+    let endpoint = DesktopEndpoint::new(host.clone(), port)
+        .ok_or_else(|| "the SPICE descriptor did not contain a dialable endpoint".to_string())?;
+    let request = ConnectRequest::new(
+        RequestedTarget::new("openstack", console.instance.clone()).with_endpoint(Some(endpoint)),
+        VdiProtocol::Spice,
+        DisplayMode::Fullscreen,
+        MonitorSpan::Single,
+        DesktopAuth::mesh_identity("openstack"),
+    );
+    Ok(request)
+}
+
+/// Parse the native direct SPICE URL shapes the shell can dial:
+/// `spice://host:port`, `spice://host`, and bracketed IPv6. HTML5 proxy URLs are
+/// rejected with a message that names the missing native endpoint instead of
+/// pretending a web console URL is a SPICE socket.
+fn parse_native_spice_url(url: &str) -> Result<(String, u16), String> {
+    let trimmed = url.trim();
+    let Some(rest) = trimmed.strip_prefix("spice://") else {
+        let scheme = trimmed.split_once(':').map(|(s, _)| s).unwrap_or("unknown");
+        return Err(format!(
+            "Nova returned a {scheme} URL; native attach needs a direct spice://host:port endpoint"
+        ));
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if authority.is_empty() {
+        return Err("the SPICE URL did not include a host".to_string());
+    }
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((host, tail)) = after_bracket.split_once(']') else {
+            return Err("the SPICE IPv6 host is missing its closing bracket".to_string());
+        };
+        let port = match tail.strip_prefix(':') {
+            Some(raw) if !raw.is_empty() => parse_console_port(raw)?,
+            Some(_) => return Err("the SPICE URL has an empty port".to_string()),
+            None => 5900,
+        };
+        return Ok((host.to_string(), port));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, raw_port)) if !host.is_empty() && !raw_port.is_empty() => {
+            (host, parse_console_port(raw_port)?)
+        }
+        Some((_host, _raw_port)) => {
+            return Err("the SPICE URL did not include a valid host:port".to_string());
+        }
+        None => (authority, 5900),
+    };
+    Ok((host.to_string(), port))
+}
+
+fn parse_console_port(raw: &str) -> Result<u16, String> {
+    raw.parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("the SPICE URL port `{raw}` is invalid"))
+}
+
 /// Render a settled mutation reply to the honest note line.
 fn mutation_note(reply: &CloudReply) -> String {
     if reply.ok {
+        if let Some(console) = &reply.console {
+            return format!(
+                "Console ready for {}: {} {}.",
+                console.instance, console.protocol, console.url
+            );
+        }
+        if let Some(keypair) = &reply.keypair {
+            return format!("Mesh SSH keypair {keypair} is present in Nova.");
+        }
         let subject = reply
             .instance
             .as_deref()
@@ -1770,9 +1922,31 @@ fn render_instance_card(ui: &mut egui::Ui, state: &mut CloudPlaneState, row: &In
         if let Some(networks) = &row.networks {
             facts.push(networks.clone());
         }
+        facts.push(format!("ssh key {MESH_KEYPAIR_NAME}"));
         facts.push(row.id.clone());
         mde_egui::muted_note(ui, facts.join(" \u{00B7} "));
         ui.horizontal(|ui| {
+            if ui
+                .button(RichText::new("Console").size(Style::SMALL))
+                .clicked()
+            {
+                let body = serde_json::json!({ "instance": row.id }).to_string();
+                state.issue_mutation(
+                    INSTANCE_CONSOLE_VERB,
+                    &body,
+                    &format!("console for {}", row.name),
+                );
+            }
+            if ui
+                .button(RichText::new("Ensure SSH key").size(Style::SMALL))
+                .clicked()
+            {
+                state.issue_mutation(
+                    ENSURE_MESH_KEYPAIR_VERB,
+                    "{}",
+                    &format!("mesh SSH keypair {MESH_KEYPAIR_NAME}"),
+                );
+            }
             if ui
                 .button(RichText::new("Start").size(Style::SMALL))
                 .clicked()
@@ -1874,7 +2048,7 @@ fn render_launch_picker(ui: &mut egui::Ui, state: &mut CloudPlaneState) {
         mde_egui::muted_note(
             ui,
             "Launch composes a Heat stack (server + optional volume) and drives the audited \
-             heat-create verb \u{2014} the instance lands as a managed stack.",
+             heat-create verb. The stack uses the mesh SSH keypair mcnf-mesh automatically.",
         );
 
         if let Some(err) = state.picker.error.as_deref() {
@@ -2440,6 +2614,69 @@ mod tests {
             serde_json::from_str(r#"{"ok":false,"verb":"instance-delete","error":"denied"}"#)
                 .unwrap();
         assert_eq!(mutation_note(&failed), "Failed: denied");
+        let keypair: CloudReply = serde_json::from_str(
+            r#"{"ok":true,"verb":"ensure-mesh-keypair","keypair":"mcnf-mesh","audited":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mutation_note(&keypair),
+            "Mesh SSH keypair mcnf-mesh is present in Nova."
+        );
+        let console: CloudReply =
+            serde_json::from_str(r#"{"ok":true,"verb":"get-instance-console","console":{"instance":"i-1","protocol":"spice-html5","url":"spice://i-1.mesh:5900"},"audited":false}"#)
+                .unwrap();
+        assert_eq!(
+            mutation_note(&console),
+            "Console ready for i-1: spice-html5 spice://i-1.mesh:5900."
+        );
+    }
+
+    #[test]
+    fn console_descriptor_builds_a_native_spice_attach_request() {
+        let console = ConsoleInfo {
+            instance: "i-1".to_string(),
+            protocol: "spice-html5".to_string(),
+            url: "spice://i-1.mesh:5930".to_string(),
+        };
+        let request = console_attach_request(&console).expect("native SPICE URL is dialable");
+        assert_eq!(request.target.serving_peer, "openstack");
+        assert_eq!(request.target.name, "i-1");
+        assert_eq!(request.protocol, VdiProtocol::Spice);
+        let endpoint = request.target.endpoint.as_ref().expect("endpoint set");
+        assert_eq!(endpoint.host, "i-1.mesh");
+        assert_eq!(endpoint.port, 5930);
+        assert!(matches!(request.auth, DesktopAuth::MeshIdentity { .. }));
+    }
+
+    #[test]
+    fn console_descriptor_gates_html5_proxy_urls() {
+        let console = ConsoleInfo {
+            instance: "i-1".to_string(),
+            protocol: "spice-html5".to_string(),
+            url: "https://nova.mesh/spice_auto.html?token=abc".to_string(),
+        };
+        let err =
+            console_attach_request(&console).expect_err("HTML5 proxy URL is not native SPICE");
+        assert!(err.contains("direct spice://host:port"));
+    }
+
+    #[test]
+    fn console_reply_queues_native_attach_once() {
+        let reply: CloudReply =
+            serde_json::from_str(r#"{"ok":true,"verb":"get-instance-console","console":{"instance":"i-1","protocol":"spice-html5","url":"spice://i-1.mesh:5900"},"audited":false}"#)
+                .unwrap();
+        let mut state = CloudPlaneState::default();
+        let note = state.apply_mutation_reply(&reply);
+        assert!(note.contains("opening native SPICE Desktop attach"));
+        let request = state
+            .console_attach
+            .take()
+            .expect("native console queued a VDI request");
+        assert_eq!(request.target.name, "i-1");
+        assert!(
+            state.console_attach.is_none(),
+            "the attach request is one-shot once drained"
+        );
     }
 
     // ── the kinds resolve against the live catalog ──
@@ -2496,6 +2733,8 @@ mod tests {
         assert!(hot.contains("name: web1"));
         assert!(hot.contains("image: fedora-42"));
         assert!(hot.contains("flavor: m1.small"));
+        assert!(hot.contains("key_name: mcnf-mesh"));
+        assert!(hot.contains("mcnf:ssh-key-source: mesh-ssh-key"));
         assert!(hot.contains("- network: mesh-flat"));
         assert!(hot.contains("type: OS::Cinder::Volume"));
         assert!(hot.contains("size: 20"));

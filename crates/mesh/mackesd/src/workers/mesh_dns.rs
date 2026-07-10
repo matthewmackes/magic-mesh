@@ -485,7 +485,7 @@ mod tests {
         // End-to-end through the worker: a replicated media-lighthouse record
         // lands `music.mesh -> its overlay IP` in the hosts file, alongside its
         // own `<host>.mesh` record — both via the existing merge path.
-        use mackes_mesh_types::peers::{PeerRecord, peers_dir, write_peer_record};
+        use mackes_mesh_types::peers::{peers_dir, write_peer_record, PeerRecord};
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("wg");
         let pdir = peers_dir(&root);

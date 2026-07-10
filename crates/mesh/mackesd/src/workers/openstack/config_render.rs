@@ -94,15 +94,28 @@ const MESH_NET_MTU: u16 = 1342;
 const CINDER_VOLUME_GROUP: &str = "cinder-volumes";
 /// Mesh-DNS name the Keystone-native **Swift** hot object tier (Q55) answers on
 /// — resolved over the overlay (QC-6 idiom, like `keystone.mesh`). cinder-backup
-/// streams volume backups here (Q57); Swift replicates the ring off-site to DO
-/// Spaces (Q54 — the two-tier store), so the single cinder `backup_driver`
-/// targets the hot tier and the off-site leg rides Swift's own replication, not
-/// a second cinder driver.
+/// streams volume backups here (Q57); the leader bootstrap mirrors/audits that
+/// Swift container to DO Spaces (Q54 — the two-tier store), so the single
+/// cinder `backup_driver` targets the hot tier and the off-site leg is not a
+/// second cinder driver.
 const SWIFT_MESH_NAME: &str = "swift.mesh";
 /// The Swift proxy port the object API answers on (the cinder-backup target).
 const SWIFT_PORT: u16 = 8080;
 /// The Swift container cinder-backup lands each volume's backup objects in.
 const CINDER_BACKUP_CONTAINER: &str = "volumebackups";
+/// DO Spaces prefix used by the off-site Swift backup mirror/audit artifact.
+const SWIFT_OFFSITE_PREFIX: &str = "swift/volumebackups";
+/// Swift's node-local device root on the writable partition (Q59) — the hot
+/// object tier's local ring storage, carved beside the Cinder VG and Glance
+/// store. The DO Spaces off-site leg is the leader-rendered mirror/audit lane,
+/// not this path.
+const SWIFT_DEVICE_DIR: &str = "/srv/node";
+/// Swift account-server internal ring port.
+const SWIFT_ACCOUNT_PORT: u16 = 6202;
+/// Swift container-server internal ring port.
+const SWIFT_CONTAINER_PORT: u16 = 6201;
+/// Swift object-server internal ring port.
+const SWIFT_OBJECT_PORT: u16 = 6200;
 
 // ── QC-9: the Glance local-file store + replication/caching (Q36/53) ──
 /// The on-disk **local file store** every API node's glance-api serves images
@@ -138,6 +151,14 @@ const HORIZON_PORT: u16 = 80;
 /// bootstrap seed under `<config_root>/bootstrap/` (design Q61 — the worker
 /// renders stacks, Heat executes).
 const FLEET_HEAT_STACK_FILE: &str = "fleet-stack.yaml";
+/// The rendered QC-18 Navidrome-as-Nova-instance Heat stack.
+const NAVIDROME_HEAT_STACK_FILE: &str = "navidrome-stack.yaml";
+/// The stack name for the re-platformed media service.
+const NAVIDROME_STACK_NAME: &str = "mcnf-navidrome";
+/// Navidrome/Subsonic API port.
+const NAVIDROME_PORT: u16 = 4533;
+/// The pinned Navidrome image already used by the legacy media helper.
+const NAVIDROME_CONTAINER_IMAGE: &str = "docker.io/deluan/navidrome:0.53.3";
 
 // ── QC-17: the wave-2 Designate naming plane (Q25/46) ──
 /// The port every node's bind9 backend answers DNS on — bound to the overlay
@@ -423,6 +444,8 @@ const BOOTSTRAP_SERVICE: &str = "cloud-bootstrap";
 
 /// The rendered bootstrap seed's filename under `<config_root>/bootstrap/`.
 const BOOTSTRAP_SEED_NAME: &str = "cloud-bootstrap.sh";
+/// The rendered Swift ring/object bootstrap script beside the seed.
+const SWIFT_BOOTSTRAP_FILE: &str = "swift-bootstrap.sh";
 
 /// Render the QC-10 **cloud bootstrap seed** from this node's real `capacity`.
 ///
@@ -545,6 +568,67 @@ pub fn render_cloud_bootstrap(
          fi"
     );
 
+    // ── QC-18: Navidrome re-platformed as a Nova instance (Q60) ──
+    // The worker renders an applyable Heat stack for the media service. The
+    // seed creates it only when the operator's existing media secret env is
+    // present, and writes a temporary Heat environment file so the S3/admin
+    // secrets do not appear as CLI argv.
+    body.push_str(
+        "\n# QC-18 — Navidrome as a Nova/Heat-managed media instance (Q60).\n\
+         # Requires /etc/mackesd/media-spaces.env (or MCNF_MEDIA_SPACES_ENV) with\n\
+         # the same DO_SPACES_* + ND_ADMIN_* keys the legacy media helper uses.\n\
+         # The Heat environment is root-only temp state so secrets stay off argv.\n",
+    );
+    let _ = writeln!(
+        body,
+        "NAVIDROME_STACK_TEMPLATE=\"$(dirname \"$0\")/{NAVIDROME_HEAT_STACK_FILE}\"\n\
+         MEDIA_ENV=\"${{MCNF_MEDIA_SPACES_ENV:-/etc/mackesd/media-spaces.env}}\"\n\
+         if [ -f \"$NAVIDROME_STACK_TEMPLATE\" ] && [ -s \"$MEDIA_ENV\" ]; then\n  \
+         # shellcheck disable=SC1090\n  \
+         set -a; . \"$MEDIA_ENV\"; set +a\n  \
+         for k in DO_SPACES_KEY DO_SPACES_SECRET DO_SPACES_ENDPOINT DO_SPACES_REGION DO_SPACES_BUCKET ND_ADMIN_USER ND_ADMIN_PASS; do\n    \
+         eval \"v=\\${{$k:-}}\"\n    \
+         [ -n \"$v\" ] || {{ echo \"media env missing $k\" >&2; exit 1; }}\n  \
+         done\n  \
+         yaml_quote() {{ printf '%s' \"$1\" | sed \"s/'/''/g\"; }}\n  \
+         NAVIDROME_HEAT_ENV=\"$(mktemp)\"\n  \
+         cleanup_navidrome_env() {{ rm -f \"$NAVIDROME_HEAT_ENV\"; }}\n  \
+         trap cleanup_navidrome_env EXIT INT TERM\n  \
+         umask 077\n  \
+         {{\n    \
+         printf 'parameter_defaults:\\n'\n    \
+         printf \"  media_bucket: '%s'\\n\" \"$(yaml_quote \"$DO_SPACES_BUCKET\")\"\n    \
+         printf \"  spaces_endpoint: '%s'\\n\" \"$(yaml_quote \"$DO_SPACES_ENDPOINT\")\"\n    \
+         printf \"  spaces_region: '%s'\\n\" \"$(yaml_quote \"$DO_SPACES_REGION\")\"\n    \
+         printf \"  spaces_access_key: '%s'\\n\" \"$(yaml_quote \"$DO_SPACES_KEY\")\"\n    \
+         printf \"  spaces_secret_key: '%s'\\n\" \"$(yaml_quote \"$DO_SPACES_SECRET\")\"\n    \
+         printf \"  navidrome_admin_user: '%s'\\n\" \"$(yaml_quote \"$ND_ADMIN_USER\")\"\n    \
+         printf \"  navidrome_admin_password: '%s'\\n\" \"$(yaml_quote \"$ND_ADMIN_PASS\")\"\n  \
+         }} > \"$NAVIDROME_HEAT_ENV\"\n  \
+         umask 022\n  \
+         openstack stack show {NAVIDROME_STACK_NAME} >/dev/null 2>&1 \\\n    \
+         || openstack stack create -t \"$NAVIDROME_STACK_TEMPLATE\" -e \"$NAVIDROME_HEAT_ENV\" {NAVIDROME_STACK_NAME}\n\
+         fi"
+    );
+
+    // ── QC-18: Swift rings + Cinder backup container (Q54/55/57) ──
+    // The worker renders a peer-directory-derived Swift bootstrap script
+    // beside this seed. Running it builds the account/container/object rings
+    // and creates the object container cinder-backup targets. Skipped when the
+    // Swift plane is not rendered yet.
+    body.push_str(
+        "\n# QC-18 — Swift hot object tier bootstrap (Q54/55/57): peer-derived\n\
+         # rings plus the cinder-backup object container. Idempotent; skipped\n\
+         # until the Swift bootstrap artifact has been rendered.\n",
+    );
+    let _ = writeln!(
+        body,
+        "SWIFT_BOOTSTRAP=\"$(dirname \"$0\")/{SWIFT_BOOTSTRAP_FILE}\"\n\
+         if [ -f \"$SWIFT_BOOTSTRAP\" ]; then\n  \
+         sh \"$SWIFT_BOOTSTRAP\"\n\
+         fi"
+    );
+
     // ── QC-17: the Designate zone feed (Q46 — Designate replaces naming) ──
     // The worker renders the peer-directory-derived pool + record feed beside
     // this seed ([`super::designate`]); running it here seeds/re-seeds the mesh
@@ -567,6 +651,178 @@ pub fn render_cloud_bootstrap(
     let path = dir.join(BOOTSTRAP_SEED_NAME);
     write_atomic(&path, &body).map_err(|source| RenderError::Io {
         service: BOOTSTRAP_SERVICE.to_string(),
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(path)
+}
+
+/// Render the QC-18 Swift bootstrap artifact from the peer directory.
+///
+/// The service configs make Swift first-class; this script supplies the
+/// cluster-global object-store bootstrap the live deploy applies: account,
+/// container, and object rings derived from the peer directory plus the
+/// Keystone-auth object container that `cinder-backup` writes to.
+///
+/// Written atomically to `<config_root>/bootstrap/swift-bootstrap.sh`.
+///
+/// # Errors
+/// A [`RenderError::Io`] if the script cannot be written.
+pub fn render_swift_bootstrap(
+    config_root: &Path,
+    release: &str,
+    peers: &[(String, String)],
+) -> Result<std::path::PathBuf, RenderError> {
+    use std::fmt::Write as _;
+
+    let mut live: Vec<(&str, &str)> = peers
+        .iter()
+        .filter(|(_, ip)| !ip.trim().is_empty())
+        .map(|(host, ip)| (host.as_str(), ip.as_str()))
+        .collect();
+    live.sort_unstable();
+    live.dedup();
+    let replicas = live.len().clamp(1, 3);
+
+    let mut body = String::new();
+    body.push_str("#!/bin/sh\n");
+    let _ = writeln!(
+        body,
+        "# rendered by mackesd openstack worker (QC-18) — kolla release {release}"
+    );
+    body.push_str(
+        "# Builds Swift account/container/object rings from the peer directory\n\
+         # and creates the Cinder backup container in the Keystone-auth object\n\
+         # store. Re-running refreshes the rings from current peer state.\n\
+         set -eu\n\n\
+         if ! command -v swift-ring-builder >/dev/null 2>&1; then\n  \
+         echo \"swift-ring-builder is required to build Swift rings\" >&2\n  \
+         exit 1\n\
+         fi\n\n\
+         CONFIG_ROOT=\"$(CDPATH= cd -- \"$(dirname \"$0\")/..\" && pwd)\"\n\
+         RING_WORK=\"$(mktemp -d)\"\n\
+         OFFSITE_TMP=\"\"\n\
+         OFFSITE_RCLONE_CONFIG=\"\"\n\
+         cleanup_swift_bootstrap() {\n  \
+         rm -rf \"$RING_WORK\"\n  \
+         [ -n \"$OFFSITE_TMP\" ] && rm -rf \"$OFFSITE_TMP\"\n  \
+         [ -n \"$OFFSITE_RCLONE_CONFIG\" ] && rm -f \"$OFFSITE_RCLONE_CONFIG\"\n\
+         }\n\
+         trap cleanup_swift_bootstrap EXIT INT TERM\n\n",
+    );
+
+    if live.is_empty() {
+        body.push_str(
+            "echo \"no peer-directory Swift ring members were rendered; refusing empty rings\" >&2\n\
+             exit 1\n",
+        );
+    } else {
+        body.push_str(
+            "for svc in swift_proxy_server swift_account_server swift_container_server swift_object_server; do\n  \
+             install -d -m 0755 \"$CONFIG_ROOT/$svc\"\n\
+             done\n\n",
+        );
+        let _ = writeln!(
+            body,
+            "build_ring() {{  # <account|container|object> <port>\n  \
+             name=\"$1\"\n  port=\"$2\"\n  builder=\"$RING_WORK/$name.builder\"\n  \
+             rm -f \"$builder\" \"$RING_WORK/$name.ring.gz\"\n  \
+             swift-ring-builder \"$builder\" create 10 {replicas} 1"
+        );
+        for (idx, (host, ip)) in live.iter().enumerate() {
+            let zone = idx + 1;
+            let _ = writeln!(
+                body,
+                "  # peer-directory member: {host} -> {ip}\n  \
+                 swift-ring-builder \"$builder\" add --region 1 --zone {zone} \
+                 --ip {ip} --port \"$port\" --device d{zone} --weight 100"
+            );
+        }
+        body.push_str(
+            "  swift-ring-builder \"$builder\" rebalance\n  \
+             for svc in swift_proxy_server swift_account_server swift_container_server swift_object_server; do\n    \
+             install -m 0644 \"$RING_WORK/$name.ring.gz\" \"$CONFIG_ROOT/$svc/$name.ring.gz\"\n  \
+             done\n\
+             }\n\n",
+        );
+        let _ = writeln!(
+            body,
+            "build_ring account {SWIFT_ACCOUNT_PORT}\n\
+             build_ring container {SWIFT_CONTAINER_PORT}\n\
+             build_ring object {SWIFT_OBJECT_PORT}\n\n\
+             openstack container show {CINDER_BACKUP_CONTAINER} >/dev/null 2>&1 \\\n  \
+             || openstack container create {CINDER_BACKUP_CONTAINER}"
+        );
+        body.push_str(
+            "\n\n# Q54 — off-site mirror/audit of the Swift hot-tier backup container\n\
+             # into DO Spaces. This is optional on credential-free farms, but when\n\
+             # MCNF_SWIFT_OFFSITE_ENV / MCNF_MEDIA_SPACES_ENV is present the copy\n\
+             # is real and audited. Spaces secrets are written only to a root-only\n\
+             # temporary rclone config, never placed on CLI argv.\n\
+             sync_offsite_backup_container() {\n  \
+             OFFSITE_ENV=\"${MCNF_SWIFT_OFFSITE_ENV:-${MCNF_MEDIA_SPACES_ENV:-/etc/mackesd/media-spaces.env}}\"\n  \
+             if [ ! -s \"$OFFSITE_ENV\" ]; then\n    \
+             echo \"Swift off-site mirror skipped: $OFFSITE_ENV missing or empty\" >&2\n    \
+             return 0\n  \
+             fi\n  \
+             for cmd in openstack rclone; do\n    \
+             if ! command -v \"$cmd\" >/dev/null 2>&1; then\n      \
+             echo \"Swift off-site mirror requires $cmd\" >&2\n      \
+             exit 1\n    \
+             fi\n  \
+             done\n  \
+             # shellcheck disable=SC1090\n  \
+             set -a; . \"$OFFSITE_ENV\"; set +a\n  \
+             for k in DO_SPACES_KEY DO_SPACES_SECRET DO_SPACES_ENDPOINT DO_SPACES_REGION DO_SPACES_BUCKET; do\n    \
+             eval \"v=\\${$k:-}\"\n    \
+             [ -n \"$v\" ] || { echo \"Swift off-site env missing $k\" >&2; exit 1; }\n  \
+             done\n  \
+             OFFSITE_TMP=\"$(mktemp -d)\"\n  \
+             OFFSITE_RCLONE_CONFIG=\"$(mktemp)\"\n  \
+             umask 077\n  \
+             cat > \"$OFFSITE_RCLONE_CONFIG\" <<EOF\n\
+         [spaces]\n\
+         type = s3\n\
+         provider = DigitalOcean\n\
+         access_key_id = $DO_SPACES_KEY\n\
+         secret_access_key = $DO_SPACES_SECRET\n\
+         endpoint = $DO_SPACES_ENDPOINT\n\
+         region = $DO_SPACES_REGION\n\
+         no_check_bucket = true\n\
+         EOF\n  \
+             umask 022\n  \
+             mkdir -p \"$OFFSITE_TMP/export\"\n  \
+             openstack object list volumebackups -f value -c Name > \"$OFFSITE_TMP/objects.txt\"\n  \
+             while IFS= read -r object; do\n    \
+             [ -n \"$object\" ] || continue\n    \
+             case \"$object\" in\n      \
+             /*|../*|*/../*|*/..|..)\n        \
+             echo \"refusing unsafe Swift object name for off-site export: $object\" >&2\n        \
+             exit 1\n        \
+             ;;\n    \
+             esac\n    \
+             target=\"$OFFSITE_TMP/export/$object\"\n    \
+             mkdir -p \"$(dirname \"$target\")\"\n    \
+             openstack object save volumebackups \"$object\" --file \"$target\"\n  \
+             done < \"$OFFSITE_TMP/objects.txt\"\n  \
+             exported_count=\"$(find \"$OFFSITE_TMP/export\" -type f 2>/dev/null | wc -l | tr -d ' ')\"\n",
+        );
+        let _ = writeln!(
+            body,
+            "  \
+             rclone copy \"$OFFSITE_TMP/export/\" \"spaces:$DO_SPACES_BUCKET/{SWIFT_OFFSITE_PREFIX}\" \\\n    \
+             --config \"$OFFSITE_RCLONE_CONFIG\" --checksum --s3-no-check-bucket\n  \
+             rclone check \"$OFFSITE_TMP/export/\" \"spaces:$DO_SPACES_BUCKET/{SWIFT_OFFSITE_PREFIX}\" \\\n    \
+             --config \"$OFFSITE_RCLONE_CONFIG\" --one-way --s3-no-check-bucket\n  \
+             echo \"Swift off-site mirror audited $exported_count objects to spaces:$DO_SPACES_BUCKET/{SWIFT_OFFSITE_PREFIX}\"\n\
+             }}\n\
+             sync_offsite_backup_container"
+        );
+    }
+
+    let path = config_root.join("bootstrap").join(SWIFT_BOOTSTRAP_FILE);
+    write_atomic(&path, &body).map_err(|source| RenderError::Io {
+        service: "swift-bootstrap".to_string(),
         path: path.display().to_string(),
         source,
     })?;
@@ -769,6 +1025,38 @@ fn service_plan(
         ServiceKind::CinderScheduler => cinder("cinder-scheduler", overlay, ctx, secrets),
         ServiceKind::CinderVolume => cinder("cinder-volume", overlay, ctx, secrets),
         ServiceKind::CinderBackup => cinder("cinder-backup", overlay, ctx, secrets),
+        // ── Object tier (QC-18, Q54/55/57) ──
+        ServiceKind::SwiftProxyServer => swift_proxy(overlay, secrets),
+        ServiceKind::SwiftAccountServer => swift_storage(
+            "swift-account-server",
+            "account-server.conf",
+            "/etc/swift/account-server.conf",
+            "account-server",
+            "account",
+            SWIFT_ACCOUNT_PORT,
+            overlay,
+            secrets,
+        ),
+        ServiceKind::SwiftContainerServer => swift_storage(
+            "swift-container-server",
+            "container-server.conf",
+            "/etc/swift/container-server.conf",
+            "container-server",
+            "container",
+            SWIFT_CONTAINER_PORT,
+            overlay,
+            secrets,
+        ),
+        ServiceKind::SwiftObjectServer => swift_storage(
+            "swift-object-server",
+            "object-server.conf",
+            "/etc/swift/object-server.conf",
+            "object-server",
+            "object",
+            SWIFT_OBJECT_PORT,
+            overlay,
+            secrets,
+        ),
         // ── Wave-2 (QC-19, Q25/47/61) ──
         ServiceKind::HeatApi => heat("heat-api", overlay, ctx, secrets),
         ServiceKind::HeatApiCfn => heat("heat-api-cfn", overlay, ctx, secrets),
@@ -853,7 +1141,10 @@ fn glance(overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
 /// overlay (QC-6, Q22). The `[quota]` block selects the **`UnifiedLimitsDriver`**
 /// (QC-10, Q89) so Nova enforces the Keystone unified limits the
 /// [`render_cloud_bootstrap`] seed registers — the hard per-user boundary is a
-/// real enforcement path, not just a declared number.
+/// real enforcement path, not just a declared number. QC-23 makes the display
+/// backend explicit: libvirt/KVM, VNC disabled, and SPICE bound to this node's
+/// overlay IP so the in-shell `mde-vdi-spice` fallback has a real QEMU console
+/// path while the virtio-gpu fast importer is built.
 fn nova(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
@@ -871,8 +1162,13 @@ fn nova(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> Ser
                  user_domain_name = Default\nproject_domain_name = Default\n\
                  project_name = service\n\
                  [libvirt]\nvirt_type = kvm\n\
+                 [vnc]\nenabled = False\n\
+                 [spice]\nenabled = True\nagent_enabled = True\n\
+                 html5proxy_base_url = http://nova.mesh:6082/spice_auto.html\n\
+                 server_listen = {host}\nserver_proxyclient_address = {host}\n\
                  [quota]\ndriver = nova.quota.UnifiedLimitsDriver\n",
                 default = api_default(overlay, secrets),
+                host = overlay,
                 api_db = db_url("nova_api", overlay, ctx, secrets),
                 db = db_url("nova", overlay, ctx, secrets),
                 authtoken = authtoken("nova", overlay, secrets),
@@ -933,6 +1229,105 @@ fn cinder(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> S
                 authtoken = authtoken("cinder", overlay, secrets),
             ),
         }],
+    }
+}
+
+/// The Swift hot object tier proxy (QC-18, Q54/55/57).
+///
+/// The proxy is the only Swift service with a Keystone-catalog endpoint
+/// (`swift.mesh:8080`). It authenticates through Keystone like the other
+/// OpenStack APIs, binds only to the overlay, and is the endpoint Cinder backup
+/// targets. Ring files are a separate bootstrap artifact; this renderer provides
+/// the service configs the Kolla containers consume and never falls back to an
+/// underlay bind (§7/Q23).
+fn swift_proxy(overlay: &str, secrets: &Secrets) -> ServicePlan {
+    ServicePlan {
+        command: "swift-proxy-server /etc/swift/proxy-server.conf".to_string(),
+        files: vec![
+            swift_common_conf(secrets),
+            ConfFile {
+                name: "proxy-server.conf",
+                dest: "/etc/swift/proxy-server.conf",
+                owner: "swift:swift",
+                body: format!(
+                    "[DEFAULT]\nbind_ip = {host}\nbind_port = {port}\n\
+                     user = swift\nswift_dir = /etc/swift\n\
+                     [pipeline:main]\npipeline = catch_errors gatekeeper healthcheck cache authtoken keystoneauth proxy-server\n\
+                     [app:proxy-server]\nuse = egg:swift#proxy\naccount_autocreate = true\n\
+                     [filter:authtoken]\npaste.filter_factory = keystonemiddleware.auth_token:filter_factory\n\
+                     www_authenticate_uri = http://{ks}:{ksp}\nauth_url = http://{ks}:{ksp}\n\
+                     memcached_servers = {host}:{memcache}\nauth_type = password\n\
+                     project_domain_name = Default\nuser_domain_name = Default\n\
+                     project_name = service\nusername = swift\npassword = {pw}\n\
+                     delay_auth_decision = true\n\
+                     [filter:keystoneauth]\nuse = egg:swift#keystoneauth\noperator_roles = admin,member,reader\n\
+                     [filter:cache]\nuse = egg:swift#memcache\nmemcache_servers = {host}:{memcache}\n\
+                     [filter:healthcheck]\nuse = egg:swift#healthcheck\n\
+                     [filter:catch_errors]\nuse = egg:swift#catch_errors\n\
+                     [filter:gatekeeper]\nuse = egg:swift#gatekeeper\n",
+                    host = overlay,
+                    port = ServiceKind::SwiftProxyServer.api_port().unwrap_or_default(),
+                    ks = KEYSTONE_MESH_NAME,
+                    ksp = KEYSTONE_PORT,
+                    memcache = MEMCACHE_PORT,
+                    pw = secrets.service_user_password("swift"),
+                ),
+            },
+        ],
+    }
+}
+
+/// One Swift ring-storage server (account/container/object).
+fn swift_storage(
+    command: &str,
+    name: &'static str,
+    dest: &'static str,
+    app: &str,
+    egg: &str,
+    port: u16,
+    overlay: &str,
+    secrets: &Secrets,
+) -> ServicePlan {
+    ServicePlan {
+        command: format!("{command} {dest}"),
+        files: vec![
+            swift_common_conf(secrets),
+            ConfFile {
+                name,
+                dest,
+                owner: "swift:swift",
+                body: format!(
+                    "[DEFAULT]\nbind_ip = {host}\nbind_port = {port}\n\
+                     user = swift\nswift_dir = /etc/swift\ndevices = {devices}\n\
+                     mount_check = false\n\
+                     [pipeline:main]\npipeline = healthcheck recon {app}\n\
+                     [app:{app}]\nuse = egg:swift#{egg}\n\
+                     [filter:healthcheck]\nuse = egg:swift#healthcheck\n\
+                     [filter:recon]\nuse = egg:swift#recon\nrecon_cache_path = /var/cache/swift\n",
+                    host = overlay,
+                    port = port,
+                    devices = SWIFT_DEVICE_DIR,
+                    app = app,
+                    egg = egg,
+                ),
+            },
+        ],
+    }
+}
+
+/// Shared Swift secret/config file. The hash-path suffix rides a sealed value so
+/// all nodes agree, but logs/debug never print it through [`Secrets`].
+fn swift_common_conf(secrets: &Secrets) -> ConfFile {
+    ConfFile {
+        name: "swift.conf",
+        dest: "/etc/swift/swift.conf",
+        owner: "swift:swift",
+        body: format!(
+            "[swift-hash]\nswift_hash_path_suffix = {suffix}\n\
+             swift_hash_path_prefix = mcnf\n\
+             [storage-policy:0]\nname = Policy-0\ndefault = yes\n",
+            suffix = secrets.service_user_password("swift"),
+        ),
     }
 }
 
@@ -1388,6 +1783,140 @@ pub fn render_fleet_heat_stack(
     Ok(path)
 }
 
+/// Render the QC-18 Navidrome media-service Heat stack.
+///
+/// The legacy lighthouse media path remains documented and live, but QC-18's
+/// cloud acceptance needs the media service to become a Nova workload. This HOT
+/// declares a single Nova server, a mesh-only Subsonic port security rule, and a
+/// cloud-init contract that writes the existing media secret env file then runs
+/// the packaged Navidrome helper inside the guest. Media still comes from the
+/// object tier: the guest mounts the DO Spaces bucket read-only via the helper,
+/// while its Navidrome scan database remains node-local inside the instance.
+///
+/// Written atomically to `<config_root>/bootstrap/navidrome-stack.yaml` beside
+/// the cloud seed. Returns the written path.
+///
+/// # Errors
+/// A [`RenderError::Io`] if the template cannot be written.
+pub fn render_navidrome_heat_stack(
+    config_root: &Path,
+    release: &str,
+) -> Result<std::path::PathBuf, RenderError> {
+    let body = format!(
+        r#"heat_template_version: 2021-04-16
+description: >
+  QC-18 Navidrome media service re-platformed as a Nova instance.
+  Rendered by mackesd from the Quasar cloud doctrine; Heat owns the
+  workload, Nova runs it, and media is mounted from the object tier.
+  Kolla release: {release}.
+parameters:
+  image:
+    type: string
+    default: mcnf-quasar-media
+    description: guest image containing /usr/libexec/mackesd/setup-media-navidrome.
+  flavor:
+    type: string
+    default: m1.small
+    description: bounded media-service flavor.
+  network:
+    type: string
+    default: mesh
+    description: flat mesh provider network (QC-7).
+  media_bucket:
+    type: string
+    description: DO Spaces bucket backing /music.
+  spaces_endpoint:
+    type: string
+    description: DO Spaces S3 endpoint.
+  spaces_region:
+    type: string
+    description: DO Spaces region.
+  spaces_access_key:
+    type: string
+    hidden: true
+  spaces_secret_key:
+    type: string
+    hidden: true
+  navidrome_admin_user:
+    type: string
+    hidden: true
+  navidrome_admin_password:
+    type: string
+    hidden: true
+resources:
+  navidrome_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: mcnf-navidrome
+      description: QC-18 Navidrome Subsonic API over the mesh only.
+      rules:
+        - protocol: tcp
+          port_range_min: {port}
+          port_range_max: {port}
+          remote_ip_prefix: 10.0.0.0/8
+  navidrome_server:
+    type: OS::Nova::Server
+    properties:
+      name: mcnf-navidrome
+      image: {{ get_param: image }}
+      flavor: {{ get_param: flavor }}
+      networks:
+        - network: {{ get_param: network }}
+      security_groups:
+        - {{ get_resource: navidrome_security_group }}
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #cloud-config
+            write_files:
+              - path: /etc/mackesd/media-spaces.env
+                permissions: '0600'
+                owner: root:root
+                content: |
+                  DO_SPACES_KEY=__SPACES_ACCESS_KEY__
+                  DO_SPACES_SECRET=__SPACES_SECRET_KEY__
+                  DO_SPACES_ENDPOINT=__SPACES_ENDPOINT__
+                  DO_SPACES_REGION=__SPACES_REGION__
+                  DO_SPACES_BUCKET=__MEDIA_BUCKET__
+                  ND_ADMIN_USER=__NAVIDROME_ADMIN_USER__
+                  ND_ADMIN_PASS=__NAVIDROME_ADMIN_PASSWORD__
+            runcmd:
+              - [ sh, -lc, "test -x /usr/libexec/mackesd/setup-media-navidrome && /usr/libexec/mackesd/setup-media-navidrome --listen 0.0.0.0 --creds /etc/mackesd/media-spaces.env --port {port} --image {image}" ]
+          params:
+            __SPACES_ACCESS_KEY__: {{ get_param: spaces_access_key }}
+            __SPACES_SECRET_KEY__: {{ get_param: spaces_secret_key }}
+            __SPACES_ENDPOINT__: {{ get_param: spaces_endpoint }}
+            __SPACES_REGION__: {{ get_param: spaces_region }}
+            __MEDIA_BUCKET__: {{ get_param: media_bucket }}
+            __NAVIDROME_ADMIN_USER__: {{ get_param: navidrome_admin_user }}
+            __NAVIDROME_ADMIN_PASSWORD__: {{ get_param: navidrome_admin_password }}
+outputs:
+  navidrome_url:
+    description: Navidrome Subsonic API on the flat mesh network.
+    value:
+      list_join:
+        - ''
+        - - http://
+          - {{ get_attr: [navidrome_server, first_address] }}
+          - :{port}
+"#,
+        release = release,
+        port = NAVIDROME_PORT,
+        image = NAVIDROME_CONTAINER_IMAGE,
+    );
+
+    let path = config_root
+        .join("bootstrap")
+        .join(NAVIDROME_HEAT_STACK_FILE);
+    write_atomic(&path, &body).map_err(|source| RenderError::Io {
+        service: "navidrome-heat-stack".to_string(),
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +2178,26 @@ mod tests {
             (ServiceKind::NovaApi, "nova.conf", "osapi_compute_listen"),
             (ServiceKind::NeutronServer, "neutron.conf", "bind_host"),
             (ServiceKind::CinderApi, "cinder.conf", "osapi_volume_listen"),
+            (
+                ServiceKind::SwiftProxyServer,
+                "proxy-server.conf",
+                "bind_ip",
+            ),
+            (
+                ServiceKind::SwiftAccountServer,
+                "account-server.conf",
+                "bind_ip",
+            ),
+            (
+                ServiceKind::SwiftContainerServer,
+                "container-server.conf",
+                "bind_ip",
+            ),
+            (
+                ServiceKind::SwiftObjectServer,
+                "object-server.conf",
+                "bind_ip",
+            ),
         ];
         for (kind, file, directive) in cases {
             render_service_config(dir.path(), *kind, &ctx(false)).unwrap();
@@ -1710,6 +2259,18 @@ mod tests {
         assert!(
             nova.contains("auth_url = http://keystone.mesh:5000"),
             "{nova}"
+        );
+
+        render_service_config(dir.path(), ServiceKind::SwiftProxyServer, &ctx(false)).unwrap();
+        let swift = read_conf(
+            dir.path(),
+            ServiceKind::SwiftProxyServer,
+            "proxy-server.conf",
+        );
+        assert!(swift.contains("bind_port = 8080"), "{swift}");
+        assert!(
+            swift.contains("auth_url = http://keystone.mesh:5000"),
+            "{swift}"
         );
     }
 
@@ -1933,8 +2494,8 @@ mod tests {
     fn cinder_renders_backup_to_the_swift_object_tier() {
         // Q55/57 — cinder-backup streams volumes to the Keystone-native Swift hot
         // object tier, reached over the mesh by its Nebula-DNS name (Swift
-        // replicates off-site to DO Spaces per Q54 — the off-site leg rides
-        // Swift's own replication, not a second cinder driver).
+        // is mirrored/audited off-site to DO Spaces per Q54 by the leader
+        // bootstrap lane, not by a second cinder driver).
         let dir = tempfile::tempdir().unwrap();
         render_service_config(dir.path(), ServiceKind::CinderVolume, &ctx(false)).unwrap();
         let conf = read_conf(dir.path(), ServiceKind::CinderVolume, "cinder.conf");
@@ -1976,6 +2537,238 @@ mod tests {
             conf.contains("backup_driver = cinder.backup.drivers.swift.SwiftBackupDriver"),
             "{conf}"
         );
+    }
+
+    #[test]
+    fn swift_renders_the_hot_object_tier_that_cinder_backup_targets() {
+        // QC-18/Q54/55/57 — Swift is not just a name in cinder.conf: the proxy
+        // is a real Kolla service, Keystone-authenticated on swift.mesh:8080,
+        // and the ring storage agents bind only to this node's overlay address.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::SwiftProxyServer, &ctx(false)).unwrap();
+        assert!(config_rendered(dir.path(), ServiceKind::SwiftProxyServer));
+        let proxy = read_conf(
+            dir.path(),
+            ServiceKind::SwiftProxyServer,
+            "proxy-server.conf",
+        );
+        assert!(proxy.contains(&format!("bind_ip = {OVERLAY}")), "{proxy}");
+        assert!(proxy.contains("bind_port = 8080"), "{proxy}");
+        assert!(proxy.contains("username = swift"), "{proxy}");
+        assert!(
+            proxy.contains("auth_url = http://keystone.mesh:5000"),
+            "{proxy}"
+        );
+        assert!(
+            proxy.contains("pipeline = catch_errors gatekeeper healthcheck cache authtoken keystoneauth proxy-server"),
+            "{proxy}"
+        );
+        let common = read_conf(dir.path(), ServiceKind::SwiftProxyServer, "swift.conf");
+        assert!(common.contains("[swift-hash]"), "{common}");
+        assert!(
+            common.contains("[storage-policy:0]") && common.contains("default = yes"),
+            "{common}"
+        );
+
+        for (kind, file, port, app, egg) in [
+            (
+                ServiceKind::SwiftAccountServer,
+                "account-server.conf",
+                SWIFT_ACCOUNT_PORT,
+                "account-server",
+                "account",
+            ),
+            (
+                ServiceKind::SwiftContainerServer,
+                "container-server.conf",
+                SWIFT_CONTAINER_PORT,
+                "container-server",
+                "container",
+            ),
+            (
+                ServiceKind::SwiftObjectServer,
+                "object-server.conf",
+                SWIFT_OBJECT_PORT,
+                "object-server",
+                "object",
+            ),
+        ] {
+            render_service_config(dir.path(), kind, &ctx(false)).unwrap();
+            assert!(config_rendered(dir.path(), kind), "{kind:?}");
+            let conf = read_conf(dir.path(), kind, file);
+            assert!(conf.contains(&format!("bind_ip = {OVERLAY}")), "{conf}");
+            assert!(conf.contains(&format!("bind_port = {port}")), "{conf}");
+            assert!(
+                conf.contains(&format!("devices = {SWIFT_DEVICE_DIR}")),
+                "{conf}"
+            );
+            assert!(
+                conf.contains(&format!("pipeline = healthcheck recon {app}")),
+                "{conf}"
+            );
+            assert!(conf.contains(&format!("use = egg:swift#{egg}")), "{conf}");
+            assert!(!conf.contains("0.0.0.0"), "{conf}");
+            assert!(!conf.contains("127.0.0.1"), "{conf}");
+        }
+
+        render_service_config(dir.path(), ServiceKind::CinderBackup, &ctx(false)).unwrap();
+        let cinder = read_conf(dir.path(), ServiceKind::CinderBackup, "cinder.conf");
+        assert!(
+            cinder.contains("backup_swift_url = http://swift.mesh:8080/v1/AUTH_"),
+            "{cinder}"
+        );
+    }
+
+    #[test]
+    fn swift_bootstrap_builds_peer_derived_rings_and_backup_container() {
+        // QC-18/Q54/55/57 — the object tier has a rendered bootstrap path, not
+        // just service configs: the peer directory feeds Swift rings and the
+        // Keystone-auth object container cinder-backup writes to is created
+        // idempotently.
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![
+            ("node-b".to_string(), "10.42.0.4".to_string()),
+            ("node-a".to_string(), "10.42.0.9".to_string()),
+        ];
+        render_swift_bootstrap(dir.path(), "2024.1", &peers).unwrap();
+        let script = std::fs::read_to_string(
+            dir.path()
+                .join("bootstrap")
+                .join(super::SWIFT_BOOTSTRAP_FILE),
+        )
+        .unwrap();
+        assert!(script.contains("QC-18"), "{script}");
+        assert!(
+            script.contains("swift-ring-builder \"$builder\" create 10 2 1"),
+            "{script}"
+        );
+        assert!(
+            script.contains("--ip 10.42.0.9 --port \"$port\" --device d1"),
+            "peer members are sorted/deterministic: {script}"
+        );
+        assert!(
+            script.contains("--ip 10.42.0.4 --port \"$port\" --device d2"),
+            "peer members are sorted/deterministic: {script}"
+        );
+        assert!(script.contains("build_ring account 6202"), "{script}");
+        assert!(script.contains("build_ring container 6201"), "{script}");
+        assert!(script.contains("build_ring object 6200"), "{script}");
+        assert!(
+            script.contains("openstack container show volumebackups"),
+            "{script}"
+        );
+        assert!(
+            script.contains("openstack container create volumebackups"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn swift_bootstrap_declares_the_do_spaces_offsite_mirror_audit() {
+        // Q54 — Swift is the hot object tier and DO Spaces is the off-site tier.
+        // The bootstrap artifact exports the cinder-backup container, mirrors it
+        // with rclone, and audits the result. It writes Spaces secrets to a temp
+        // rclone config instead of passing them as process arguments.
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![("node-a".to_string(), "10.42.0.9".to_string())];
+        render_swift_bootstrap(dir.path(), "2024.1", &peers).unwrap();
+        let script = std::fs::read_to_string(
+            dir.path()
+                .join("bootstrap")
+                .join(super::SWIFT_BOOTSTRAP_FILE),
+        )
+        .unwrap();
+
+        assert!(
+            script.contains("sync_offsite_backup_container()"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "OFFSITE_ENV=\"${MCNF_SWIFT_OFFSITE_ENV:-${MCNF_MEDIA_SPACES_ENV:-/etc/mackesd/media-spaces.env}}\""
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains("OFFSITE_RCLONE_CONFIG=\"$(mktemp)\""),
+            "{script}"
+        );
+        assert!(script.contains("umask 077"), "{script}");
+        assert!(script.contains("provider = DigitalOcean"), "{script}");
+        assert!(
+            script.contains("openstack object list volumebackups -f value -c Name"),
+            "{script}"
+        );
+        assert!(
+            script.contains("openstack object save volumebackups \"$object\" --file \"$target\""),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "rclone copy \"$OFFSITE_TMP/export/\" \"spaces:$DO_SPACES_BUCKET/swift/volumebackups\""
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "rclone check \"$OFFSITE_TMP/export/\" \"spaces:$DO_SPACES_BUCKET/swift/volumebackups\""
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains("refusing unsafe Swift object name for off-site export"),
+            "{script}"
+        );
+        assert!(
+            !script.contains("--s3-secret-access-key")
+                && !script.contains("--s3-access-key-id")
+                && !script.contains("--password"),
+            "Spaces secrets must stay out of argv: {script}"
+        );
+    }
+
+    #[test]
+    fn swift_bootstrap_script_is_valid_posix_shell_syntax() {
+        // The Swift bootstrap carries shell functions and a heredoc for the
+        // root-only rclone config; keep a real parser check around it.
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![("node-a".to_string(), "10.42.0.9".to_string())];
+        let path = render_swift_bootstrap(dir.path(), "2024.1", &peers).unwrap();
+
+        let output = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "sh -n failed for {}:\nstdout:\n{}\nstderr:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn cloud_bootstrap_runs_the_swift_bootstrap_when_rendered() {
+        // The QC-10 seed is the deploy-applied entrypoint; it now runs the
+        // QC-18 Swift artifact when present, so rings/container bootstrap rides
+        // the same idempotent cloud-global lane as flavors, quotas, Heat, and
+        // Designate.
+        let dir = tempfile::tempdir().unwrap();
+        let cap = NodeCapacity {
+            vcpus: 8,
+            ram_mib: 32_768,
+            disk_gib: 500,
+        };
+        render_cloud_bootstrap(dir.path(), "2024.1", &cap).unwrap();
+        let seed = std::fs::read_to_string(dir.path().join("bootstrap").join("cloud-bootstrap.sh"))
+            .unwrap();
+        assert!(
+            seed.contains("SWIFT_BOOTSTRAP=\"$(dirname \"$0\")/swift-bootstrap.sh\""),
+            "{seed}"
+        );
+        assert!(seed.contains("sh \"$SWIFT_BOOTSTRAP\""), "{seed}");
     }
 
     // ── QC-9: the Glance local-file store + replication/caching (Q36/53) ──
@@ -2073,6 +2866,33 @@ mod tests {
         assert!(nova.contains("[quota]"), "{nova}");
         assert!(
             nova.contains("driver = nova.quota.UnifiedLimitsDriver"),
+            "{nova}"
+        );
+    }
+
+    #[test]
+    fn nova_selects_libvirt_spice_and_disables_vnc_for_qemu_consoles() {
+        // QC-23/Q34 — the QEMU/libvirt display contract is explicit. SPICE is
+        // the in-shell console fallback while the virtio-gpu fast importer is
+        // built; VNC must not silently win by default, and console traffic is
+        // reachable over this node's overlay address only.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::NovaCompute, &ctx(false)).unwrap();
+        let nova = read_conf(dir.path(), ServiceKind::NovaCompute, "nova.conf");
+        assert!(nova.contains("[libvirt]\nvirt_type = kvm"), "{nova}");
+        assert!(nova.contains("[vnc]\nenabled = False"), "{nova}");
+        assert!(nova.contains("[spice]\nenabled = True"), "{nova}");
+        assert!(nova.contains("agent_enabled = True"), "{nova}");
+        assert!(
+            nova.contains("html5proxy_base_url = http://nova.mesh:6082/spice_auto.html"),
+            "{nova}"
+        );
+        assert!(
+            nova.contains(&format!("server_listen = {OVERLAY}")),
+            "{nova}"
+        );
+        assert!(
+            nova.contains(&format!("server_proxyclient_address = {OVERLAY}")),
             "{nova}"
         );
     }
@@ -2294,6 +3114,78 @@ mod tests {
         assert!(
             seed.contains("if [ -f \"$FLEET_STACK_TEMPLATE\" ]"),
             "{seed}"
+        );
+    }
+
+    #[test]
+    fn navidrome_heat_stack_declares_the_media_instance_contract() {
+        // QC-18/Q60 — the media stack is now a Heat/Nova workload contract:
+        // one server on the flat mesh, Subsonic port exposed only to mesh
+        // addresses, existing media secrets written into the guest, and the
+        // packaged helper running Navidrome against the object-tier bucket.
+        let dir = tempfile::tempdir().unwrap();
+        let path = render_navidrome_heat_stack(dir.path(), "2024.1").unwrap();
+        assert!(path.ends_with("bootstrap/navidrome-stack.yaml"));
+        let hot = std::fs::read_to_string(path).unwrap();
+        assert!(hot.contains("type: OS::Nova::Server"), "{hot}");
+        assert!(hot.contains("type: OS::Neutron::SecurityGroup"), "{hot}");
+        assert!(hot.contains("port_range_min: 4533"), "{hot}");
+        assert!(hot.contains("remote_ip_prefix: 10.0.0.0/8"), "{hot}");
+        assert!(hot.contains("default: mcnf-quasar-media"), "{hot}");
+        assert!(hot.contains("default: m1.small"), "{hot}");
+        assert!(hot.contains("default: mesh"), "{hot}");
+        for secret in [
+            "spaces_access_key",
+            "spaces_secret_key",
+            "navidrome_admin_password",
+        ] {
+            assert!(
+                hot.contains(&format!("{secret}:\n    type: string\n    hidden: true")),
+                "{secret} must be hidden: {hot}"
+            );
+        }
+        assert!(hot.contains("DO_SPACES_BUCKET=__MEDIA_BUCKET__"), "{hot}");
+        assert!(
+            hot.contains("/usr/libexec/mackesd/setup-media-navidrome"),
+            "{hot}"
+        );
+        assert!(
+            hot.contains("--port 4533 --image docker.io/deluan/navidrome:0.53.3"),
+            "{hot}"
+        );
+        assert!(hot.contains("navidrome_url:"), "{hot}");
+    }
+
+    #[test]
+    fn bootstrap_seed_creates_navidrome_stack_from_a_temp_heat_environment() {
+        // QC-18/Q60 — the seed applies the rendered Navidrome HOT only when the
+        // existing media secret env is present. It writes a root-only temporary
+        // Heat environment file and passes `-e <file>`, keeping S3/admin secrets
+        // off the OpenStack CLI argv.
+        let dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(dir.path(), "2024.1", &BIG_NODE).unwrap();
+        let seed = read_seed(dir.path());
+        assert!(
+            seed.contains("NAVIDROME_STACK_TEMPLATE=\"$(dirname \"$0\")/navidrome-stack.yaml\""),
+            "{seed}"
+        );
+        assert!(
+            seed.contains("MEDIA_ENV=\"${MCNF_MEDIA_SPACES_ENV:-/etc/mackesd/media-spaces.env}\""),
+            "{seed}"
+        );
+        assert!(seed.contains("NAVIDROME_HEAT_ENV=\"$(mktemp)\""), "{seed}");
+        assert!(seed.contains("umask 077"), "{seed}");
+        assert!(
+            seed.contains("openstack stack show mcnf-navidrome"),
+            "{seed}"
+        );
+        assert!(
+            seed.contains("openstack stack create -t \"$NAVIDROME_STACK_TEMPLATE\" -e \"$NAVIDROME_HEAT_ENV\" mcnf-navidrome"),
+            "{seed}"
+        );
+        assert!(
+            !seed.contains("--parameter spaces_secret_key"),
+            "secret parameters must not ride argv: {seed}"
         );
     }
 

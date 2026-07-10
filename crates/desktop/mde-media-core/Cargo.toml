@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # response are parsed from JSON.
 serde      = { workspace = true }
 serde_json = { workspace = true }
-# Error enum, matching the mde-kvm / mackes-xcp convention.
+# Error enum, matching the mackes-xcp convention.
 thiserror  = "1"
 
 # MEDIA-16 session roaming: the canonical Syncthing-replicated workgroup root

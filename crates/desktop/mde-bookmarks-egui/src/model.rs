@@ -83,6 +83,85 @@ pub enum ActionOutcome {
     Done(String),
 }
 
+/// Per-URL link health class published by the daemon bookmark worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkHealth {
+    /// HTTP returned a success/redirect class status.
+    Alive,
+    /// HTTP returned a client/server failure class status.
+    Dead,
+    /// The URL scheme is not checked by the HTTP(S)-only worker.
+    Unsupported,
+    /// The probe failed before an HTTP status was available.
+    Error,
+}
+
+impl LinkHealth {
+    /// Human-facing short label for the UI.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Dead => "dead",
+            Self::Unsupported => "unsupported",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One bookmark's daemon dead-link check record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkCheckRecord {
+    /// Bookmark id.
+    pub id: Uuid,
+    /// Bookmark URL at check time.
+    pub url: String,
+    /// Bookmark title at check time.
+    pub title: String,
+    /// Coarse link health.
+    pub health: LinkHealth,
+    /// HTTP status code, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Short human-readable diagnostic.
+    pub detail: String,
+}
+
+/// Published result of a bookmark dead-link check pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkCheckStatus {
+    /// Fixed op marker so the surface can reject unrelated payloads.
+    pub op: String,
+    /// Daemon node that ran the check.
+    pub node: String,
+    /// Wall-clock epoch millis of the check.
+    pub checked_at_ms: u64,
+    /// Total records checked.
+    pub checked: usize,
+    /// Number of alive links.
+    pub alive: usize,
+    /// Number of dead links.
+    pub dead: usize,
+    /// Number of unsupported-scheme links.
+    pub unsupported: usize,
+    /// Number of probe errors.
+    pub errors: usize,
+    /// Whether the request hit the worker cap.
+    pub truncated: bool,
+    /// Per-bookmark bounded results.
+    pub records: Vec<LinkCheckRecord>,
+}
+
+/// One queued UI edit for the daemon bookmark worker action surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonBookmarkAction {
+    /// The `action/bookmarks/<verb>` topic suffix.
+    pub verb: &'static str,
+    /// JSON request body for the worker's typed action parser.
+    pub body: String,
+}
+
 /// The whole render-agnostic state of the Bookmarks surface.
 pub struct Manager {
     /// The converged bookmark tree. Every edit applies one [`Op`] to it.
@@ -113,6 +192,12 @@ pub struct Manager {
     sort: SortBy,
     /// The last action outcome (status line).
     last: ActionOutcome,
+    /// Latest daemon-published link-check pass, if one has been observed.
+    latest_link_check: Option<LinkCheckStatus>,
+    /// One-shot UI intent: publish `action/bookmarks/check-links` on the bus.
+    link_check_requested: bool,
+    /// UI-authored bookmark edits waiting to be published to the daemon worker.
+    daemon_actions: VecDeque<DaemonBookmarkAction>,
 
     // ── Compose / dialog drafts (render-agnostic; the view binds text fields) ──
     /// Whether the add-bookmark form is open.
@@ -156,6 +241,9 @@ impl Manager {
             query: String::new(),
             sort: SortBy::Manual,
             last: ActionOutcome::Idle,
+            latest_link_check: None,
+            link_check_requested: false,
+            daemon_actions: VecDeque::new(),
             add_open: false,
             add_url: String::new(),
             add_title: String::new(),
@@ -175,6 +263,53 @@ impl Manager {
         Self::new(Author::new(user, node))
     }
 
+    /// Replace the visible collection with the daemon's converged snapshot.
+    ///
+    /// This is the read-side BOOKMARKS-2 binding: the worker owns persistence and
+    /// mesh sync, and the surface hydrates its tree from `state/bookmarks/collection`.
+    /// UI-only affordances survive when their ids still exist; stale focus,
+    /// selection, rename, and delete confirmation ids are pruned.
+    pub fn replace_collection(&mut self, collection: Collection) {
+        self.collection = collection;
+        let live_items: BTreeSet<Uuid> = self.collection.items().iter().map(Item::id).collect();
+        let live_folders: BTreeSet<Uuid> = self
+            .collection
+            .items()
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Folder(folder) => Some(folder.id),
+                Item::Bookmark(_) => None,
+            })
+            .collect();
+        if self.current.is_some_and(|id| !live_folders.contains(&id)) {
+            self.current = None;
+        }
+        self.expanded.retain(|id| live_folders.contains(id));
+        self.selection.retain(|id| live_items.contains(id));
+        if self.anchor.is_some_and(|id| !live_items.contains(&id)) {
+            self.anchor = None;
+        }
+        if self.detail.is_some_and(|id| !live_items.contains(&id)) {
+            self.detail = None;
+        }
+        if self
+            .rename_target
+            .is_some_and(|id| !live_items.contains(&id))
+        {
+            self.cancel_rename();
+        }
+        if self
+            .confirm_delete
+            .is_some_and(|id| !live_folders.contains(&id))
+        {
+            self.confirm_delete = None;
+        }
+        self.last = ActionOutcome::Done(format!(
+            "Loaded {} bookmark item(s) from the daemon.",
+            self.total()
+        ));
+    }
+
     // ── Op plumbing (§6 — the one path every edit takes) ─────────────────────
 
     /// Mint one op (stamped + attributed) and apply it to the collection — the
@@ -183,6 +318,13 @@ impl Manager {
         let hlc = self.clock.tick(now_ms());
         let op = Op::new(hlc, self.author.clone(), kind);
         self.collection.apply(&op);
+    }
+
+    fn enqueue_daemon_action(&mut self, verb: &'static str, body: serde_json::Value) {
+        if let Ok(body) = serde_json::to_string(&body) {
+            self.daemon_actions
+                .push_back(DaemonBookmarkAction { verb, body });
+        }
     }
 
     // ── Reads ────────────────────────────────────────────────────────────────
@@ -531,6 +673,81 @@ impl Manager {
         &self.last
     }
 
+    // ── Daemon link-check status (BOOKMARKS-7) ─────────────────────────────
+
+    /// Latest daemon-published dead-link check result, if any.
+    #[must_use]
+    pub const fn latest_link_check(&self) -> Option<&LinkCheckStatus> {
+        self.latest_link_check.as_ref()
+    }
+
+    /// Latest daemon-published dead-link check record for `id`, if present.
+    #[must_use]
+    pub fn link_check_for(&self, id: Uuid) -> Option<&LinkCheckRecord> {
+        self.latest_link_check
+            .as_ref()
+            .and_then(|status| status.records.iter().find(|record| record.id == id))
+    }
+
+    /// Apply a daemon-published dead-link check result. Rejects unrelated JSON
+    /// op markers so a wrong topic body cannot masquerade as bookmark health.
+    pub fn apply_link_check_status(&mut self, status: LinkCheckStatus) {
+        if status.op != "bookmarks_link_check" {
+            self.last =
+                ActionOutcome::Note("Ignored an unknown bookmark link-check payload.".into());
+            return;
+        }
+        let checked = status.checked;
+        let dead = status.dead;
+        let errors = status.errors;
+        let truncated = status.truncated;
+        self.latest_link_check = Some(status);
+        let suffix = if truncated { " (truncated)" } else { "" };
+        self.last = ActionOutcome::Done(format!(
+            "Link check updated: {checked} checked, {dead} dead, {errors} error(s){suffix}."
+        ));
+    }
+
+    /// Record a user request to ask the daemon for a fresh bounded link check.
+    pub fn request_link_check(&mut self) {
+        self.link_check_requested = true;
+        self.last =
+            ActionOutcome::Note("Requested a bookmark link check from the daemon.".to_string());
+    }
+
+    /// Drain the one-shot link-check request intent for the bus bridge.
+    #[must_use]
+    pub fn take_link_check_request(&mut self) -> bool {
+        let requested = self.link_check_requested;
+        self.link_check_requested = false;
+        requested
+    }
+
+    /// Record a best-effort bus edge failure without panicking the UI.
+    pub fn note_link_check_bus_error(&mut self, error: impl Into<String>) {
+        self.last = ActionOutcome::Note(format!("Bookmark link-check bus edge: {}", error.into()));
+    }
+
+    /// Record a bookmark write-side bus edge failure without dropping queued edits.
+    pub fn note_bookmark_bus_error(&mut self, error: impl Into<String>) {
+        self.last = ActionOutcome::Note(format!("Bookmark bus edge: {}", error.into()));
+    }
+
+    // ── Daemon write-side actions (BOOKMARKS-2 binding) ────────────────────
+
+    /// Drain queued UI-authored bookmark edits for the Bus bridge.
+    #[must_use]
+    pub fn take_daemon_actions(&mut self) -> Vec<DaemonBookmarkAction> {
+        self.daemon_actions.drain(..).collect()
+    }
+
+    /// Requeue unpublished edits at the front, preserving publish order.
+    pub fn prepend_daemon_actions(&mut self, actions: Vec<DaemonBookmarkAction>) {
+        for action in actions.into_iter().rev() {
+            self.daemon_actions.push_front(action);
+        }
+    }
+
     // ── Add (lock Q26) ───────────────────────────────────────────────────────
 
     /// Whether the add-bookmark form is open.
@@ -602,12 +819,13 @@ impl Manager {
         let id = Uuid::new_v4();
         let order_key = self.tail_key(parent);
         let added = now_ms();
+        let url = url.into();
         let title = title.into();
         self.commit(OpKind::AddBookmark {
             id,
             parent,
-            order_key,
-            url: url.into(),
+            order_key: order_key.clone(),
+            url: url.clone(),
             title: title.clone(),
             favicon_ref: None,
             tags: Vec::new(),
@@ -615,6 +833,19 @@ impl Manager {
             added,
             source: Source::Manual,
         });
+        self.enqueue_daemon_action(
+            "add",
+            serde_json::json!({
+                "id": id,
+                "parent": parent,
+                "order_key": order_key,
+                "url": url,
+                "title": title.clone(),
+                "tags": [],
+                "notes": "",
+                "source": "manual",
+            }),
+        );
         self.last = ActionOutcome::Done(format!("Added \u{201c}{title}\u{201d}."));
         id
     }
@@ -630,8 +861,17 @@ impl Manager {
             id,
             name: name.clone(),
             parent,
-            order_key,
+            order_key: order_key.clone(),
         });
+        self.enqueue_daemon_action(
+            "add-folder",
+            serde_json::json!({
+                "id": id,
+                "parent": parent,
+                "order_key": order_key,
+                "name": name.clone(),
+            }),
+        );
         if let Some(p) = parent {
             self.expanded.insert(p);
         }
@@ -687,18 +927,30 @@ impl Manager {
             return;
         }
         match self.collection.item(id) {
-            Some(Item::Folder(_)) => self.commit(OpKind::RenameFolder {
-                id,
-                name: name.clone(),
-            }),
-            Some(Item::Bookmark(_)) => self.commit(OpKind::EditBookmark {
-                id,
-                url: None,
-                title: Some(name.clone()),
-                favicon_ref: None,
-                tags: None,
-                notes: None,
-            }),
+            Some(Item::Folder(_)) => {
+                self.commit(OpKind::RenameFolder {
+                    id,
+                    name: name.clone(),
+                });
+                self.enqueue_daemon_action(
+                    "rename",
+                    serde_json::json!({ "id": id, "name": name.clone() }),
+                );
+            }
+            Some(Item::Bookmark(_)) => {
+                self.commit(OpKind::EditBookmark {
+                    id,
+                    url: None,
+                    title: Some(name.clone()),
+                    favicon_ref: None,
+                    tags: None,
+                    notes: None,
+                });
+                self.enqueue_daemon_action(
+                    "edit",
+                    serde_json::json!({ "id": id, "title": name.clone() }),
+                );
+            }
             None => {}
         }
         self.cancel_rename();
@@ -748,6 +1000,7 @@ impl Manager {
         let victims = self.subtree(id);
         for vid in &victims {
             self.commit(OpKind::DeleteItem { id: *vid });
+            self.enqueue_daemon_action("delete", serde_json::json!({ "id": *vid }));
             self.selection.remove(vid);
             self.expanded.remove(vid);
             if self.detail == Some(*vid) {
@@ -774,6 +1027,7 @@ impl Manager {
                 let victims = self.subtree(id);
                 for vid in victims {
                     self.commit(OpKind::DeleteItem { id: vid });
+                    self.enqueue_daemon_action("delete", serde_json::json!({ "id": vid }));
                     self.expanded.remove(&vid);
                     if self.detail == Some(vid) {
                         self.detail = None;
@@ -818,8 +1072,16 @@ impl Manager {
                 self.commit(OpKind::MoveItem {
                     id: *id,
                     parent: folder,
-                    order_key: key,
+                    order_key: key.clone(),
                 });
+                self.enqueue_daemon_action(
+                    "move",
+                    serde_json::json!({
+                        "id": *id,
+                        "parent": folder,
+                        "order_key": key,
+                    }),
+                );
             }
         }
     }
@@ -853,6 +1115,14 @@ impl Manager {
                 parent,
                 order_key: key.clone(),
             });
+            self.enqueue_daemon_action(
+                "move",
+                serde_json::json!({
+                    "id": *id,
+                    "parent": parent,
+                    "order_key": key,
+                }),
+            );
             lo = Some(key);
         }
     }
@@ -1019,6 +1289,44 @@ mod tests {
         items.iter().map(display_label).collect()
     }
 
+    fn action_body(action: &DaemonBookmarkAction) -> serde_json::Value {
+        serde_json::from_str(&action.body).expect("action body json")
+    }
+
+    fn collection_with_folder_and_bookmark() -> (Collection, Uuid, Uuid) {
+        let author = Author::new("daemon".into(), "node-a".into());
+        let mut collection = Collection::new();
+        let folder = Uuid::from_u128(100);
+        let bookmark = Uuid::from_u128(101);
+        collection.apply(&Op::new(
+            mde_bookmarks::Hlc::new(10, 0, "node-a".into()),
+            author.clone(),
+            OpKind::AddFolder {
+                id: folder,
+                name: "Daemon".to_string(),
+                parent: None,
+                order_key: "a".to_string(),
+            },
+        ));
+        collection.apply(&Op::new(
+            mde_bookmarks::Hlc::new(11, 0, "node-a".into()),
+            author,
+            OpKind::AddBookmark {
+                id: bookmark,
+                parent: Some(folder),
+                order_key: "a".to_string(),
+                url: "https://daemon.example".to_string(),
+                title: "Daemon bookmark".to_string(),
+                favicon_ref: None,
+                tags: Vec::new(),
+                notes: String::new(),
+                added: 11,
+                source: Source::Manual,
+            },
+        ));
+        (collection, folder, bookmark)
+    }
+
     #[test]
     fn starts_empty_and_honest() {
         let m = manager();
@@ -1037,6 +1345,93 @@ mod tests {
         assert_eq!(titles(&m.listing()), vec!["Example"]);
         assert!(matches!(m.item(id), Some(Item::Bookmark(_))));
         assert!(matches!(m.last_action(), ActionOutcome::Done(_)));
+    }
+
+    #[test]
+    fn add_bookmark_queues_daemon_add_with_stable_id_and_order() {
+        let mut m = manager();
+        let id = m.add_bookmark("https://example.com", "Example", None);
+        let actions = m.take_daemon_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].verb, "add");
+        let body = action_body(&actions[0]);
+        assert_eq!(body["id"].as_str().map(str::to_owned), Some(id.to_string()));
+        assert_eq!(body["url"], "https://example.com");
+        assert_eq!(body["title"], "Example");
+        assert!(body["parent"].is_null());
+        assert!(body["order_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()));
+        assert!(m.take_daemon_actions().is_empty());
+    }
+
+    #[test]
+    fn rename_move_and_delete_queue_daemon_actions() {
+        let mut m = manager();
+        let folder = m.add_folder("Folder", None);
+        let bookmark = m.add_bookmark("https://example.com", "Example", Some(folder));
+        let _ = m.take_daemon_actions();
+
+        m.begin_rename(folder);
+        *m.rename_buf_mut() = "Renamed Folder".to_string();
+        m.commit_rename();
+        m.begin_rename(bookmark);
+        *m.rename_buf_mut() = "Renamed Bookmark".to_string();
+        m.commit_rename();
+        m.move_into(&[bookmark], None);
+        m.request_delete(folder);
+
+        let actions = m.take_daemon_actions();
+        let verbs: Vec<&str> = actions.iter().map(|action| action.verb).collect();
+        assert_eq!(verbs, vec!["rename", "edit", "move", "delete"]);
+
+        let rename = action_body(&actions[0]);
+        assert_eq!(
+            rename["id"].as_str().map(str::to_owned),
+            Some(folder.to_string())
+        );
+        assert_eq!(rename["name"], "Renamed Folder");
+        let edit = action_body(&actions[1]);
+        assert_eq!(
+            edit["id"].as_str().map(str::to_owned),
+            Some(bookmark.to_string())
+        );
+        assert_eq!(edit["title"], "Renamed Bookmark");
+        let moved = action_body(&actions[2]);
+        assert_eq!(
+            moved["id"].as_str().map(str::to_owned),
+            Some(bookmark.to_string())
+        );
+        assert!(moved["parent"].is_null());
+        assert!(moved["order_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()));
+        let deleted = action_body(&actions[3]);
+        assert_eq!(
+            deleted["id"].as_str().map(str::to_owned),
+            Some(folder.to_string())
+        );
+    }
+
+    #[test]
+    fn daemon_collection_replacement_hydrates_and_prunes_stale_focus() {
+        let mut m = manager();
+        let stale = m.add_bookmark("https://local.example", "Local", None);
+        m.select_only(stale);
+        m.rename_target = Some(stale);
+        assert_eq!(m.total(), 1);
+
+        let (collection, folder, bookmark) = collection_with_folder_and_bookmark();
+        m.replace_collection(collection);
+
+        assert_eq!(m.total(), 2);
+        assert!(m.item(stale).is_none());
+        assert_eq!(m.detail(), None);
+        assert_eq!(m.rename_target(), None);
+        assert!(m.selection().is_empty());
+        assert!(m.folder(folder).is_some());
+        assert!(matches!(m.item(bookmark), Some(Item::Bookmark(_))));
+        assert_eq!(titles(&m.listing()), vec!["Daemon"]);
     }
 
     #[test]
@@ -1105,6 +1500,45 @@ mod tests {
         m.request_delete(id);
         assert_eq!(m.confirm_delete(), None, "a leaf needs no confirmation");
         assert!(m.item(id).is_none());
+    }
+
+    #[test]
+    fn link_check_status_is_stored_and_indexed_by_bookmark_id() {
+        let mut m = manager();
+        let id = m.add_bookmark("https://a.example", "A", None);
+        m.apply_link_check_status(LinkCheckStatus {
+            op: "bookmarks_link_check".to_string(),
+            node: "test-node".to_string(),
+            checked_at_ms: 7,
+            checked: 1,
+            alive: 0,
+            dead: 1,
+            unsupported: 0,
+            errors: 0,
+            truncated: false,
+            records: vec![LinkCheckRecord {
+                id,
+                url: "https://a.example".to_string(),
+                title: "A".to_string(),
+                health: LinkHealth::Dead,
+                http_status: Some(404),
+                detail: "HTTP 404".to_string(),
+            }],
+        });
+        assert_eq!(m.latest_link_check().expect("status").dead, 1);
+        assert_eq!(
+            m.link_check_for(id).expect("record").health,
+            LinkHealth::Dead
+        );
+    }
+
+    #[test]
+    fn link_check_request_is_a_one_shot_intent() {
+        let mut m = manager();
+        assert!(!m.take_link_check_request());
+        m.request_link_check();
+        assert!(m.take_link_check_request());
+        assert!(!m.take_link_check_request());
     }
 
     #[test]

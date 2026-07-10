@@ -24,9 +24,8 @@
 //!   seat / peer VM / local VM), publishes the broker `SessionRequest::Open`
 //!   through [`crate::discovery::publish_open`] — the ONE copy of that wire
 //!   shape (§6). An off-mesh endpoint (mDNS / manual) has no broker verb; its
-//!   direct RDP/VNC transport is the gated E12-4 layer and a Spice route is gated
-//!   on CHOOSER-5 — both stated honestly on the note (§7 — never a silent stub,
-//!   never a faked session).
+//!   direct RDP/VNC/SPICE transport is the gated E12-4 layer — stated honestly on
+//!   the note (§7 — never a silent stub, never a faked session).
 //! * **Auto-popup** (lock 1) — the fold keeps a **seen set** of source ids; a
 //!   genuinely new id after the first fold raises a one-shot popup flag the
 //!   shell drains to surface the Chooser through its normal central-view
@@ -120,7 +119,7 @@ pub(crate) enum Protocol {
     Rdp,
     /// VNC / RFB (`mde-vdi-vnc`).
     Vnc,
-    /// Spice (`mde-vdi-spice`, CHOOSER-5).
+    /// Spice (`mde-vdi-spice`).
     Spice,
     /// A tag this build doesn't know — badged honestly, never connected blind.
     #[serde(other)]
@@ -167,8 +166,7 @@ impl Protocol {
     }
 
     /// The VDI route this protocol maps to, or `None` for a tag this build can't
-    /// render (badged, never connected blind — §7). Spice routes to the CHOOSER-5
-    /// client, which is honest-gated downstream in [`crate::vdi`].
+    /// render (badged, never connected blind — §7).
     const fn route(self) -> Option<VdiProtocol> {
         match self {
             Self::Rdp => Some(VdiProtocol::Rdp),
@@ -272,7 +270,7 @@ impl SourceOrigin {
 
     /// Whether connecting goes through the mesh session broker (`Open` on
     /// `action/vdi/session`). Off-mesh endpoints have no broker verb — their
-    /// direct client transport is the gated E12-4/CHOOSER-5 layer.
+    /// direct client transport is the gated E12-4 layer.
     const fn is_mesh_brokered(self) -> bool {
         matches!(self, Self::MeshPeer | Self::LocalVm)
     }
@@ -2051,8 +2049,7 @@ impl ChooserState {
     /// broker `SessionRequest::Open` through the ONE existing wire path
     /// ([`crate::discovery::publish_open`], §6). An off-mesh endpoint has no
     /// broker verb, so only the hand-off happens; either way the note says which
-    /// leg is gated, and a Spice route is honest-gated on CHOOSER-5 — no session
-    /// is ever faked (§7).
+    /// leg is gated, and no session is ever faked (§7).
     fn connect_source(
         &mut self,
         source: &DesktopSource,
@@ -2120,11 +2117,11 @@ impl ChooserState {
                 note.push_str(&suffix);
             }
         }
-        // A Spice route is constructed honestly but its client is CHOOSER-5 —
-        // name the gate so the note never implies a live Spice session (§7).
+        // Future protocol routes without a client must say so, never imply a live
+        // session (§7).
         if !protocol.has_client() {
             if let Some(note) = self.note.as_mut() {
-                note.push_str(" The Spice client lands in CHOOSER-5 — no session is faked.");
+                note.push_str(" The selected client is not wired yet — no session is faked.");
             }
         }
         let mut request = ConnectRequest::new(
@@ -3005,15 +3002,14 @@ fn connect_picker(
         ui.radio_value(&mut draft.monitors, MonitorSpan::All, "Span all");
     });
 
-    // A Spice route is built honestly but its client is CHOOSER-5 — say so, never
-    // imply a live session (§7).
+    // Future protocol routes without a client must say so, never imply a live
+    // session (§7).
     if !draft.protocol.has_client() {
         ui.add_space(Style::SP_XS);
         muted_note(
             ui,
             format!(
-                "The {} client lands in CHOOSER-5 — the request is recorded, but no session is \
-                 faked.",
+                "The {} client is not wired yet — the request is recorded, but no session is faked.",
                 draft.protocol.label()
             ),
         );
@@ -3597,11 +3593,12 @@ mod tests {
             "seeded to single display"
         );
         assert!(state.take_connect().is_none(), "the hand-off drains once");
-        // The Spice route is gated on CHOOSER-5 — the note says so, no fake.
+        // The Spice route is live-client-capable now, so the note should describe
+        // the brokered request without a stale CHOOSER-5 gate.
         assert!(state
             .note
             .as_deref()
-            .is_some_and(|n| n.contains("CHOOSER-5")));
+            .is_some_and(|n| n.contains("brokering over the mesh") && !n.contains("CHOOSER-5")));
     }
 
     /// Fold a single external (mDNS) RDP endpoint into a fresh `ChooserState`
@@ -4122,9 +4119,9 @@ mod tests {
     }
 
     #[test]
-    fn a_gated_spice_picker_renders_the_chooser5_note() {
-        // A Spice-only source: the picker renders, and the gated-Spice note is
-        // present (§7 — the request is honest, no session faked).
+    fn a_spice_picker_renders_without_a_stale_chooser5_gate() {
+        // A Spice-only source: the picker renders through the normal live-client
+        // path and does not show the retired CHOOSER-5 gate.
         let mut state = state_with(Some(roster(vec![source(
             "peer-vm:oak:win11",
             "oak",
@@ -4134,8 +4131,12 @@ mod tests {
         state.activate(&sources, "peer-vm:oak:win11");
         assert!(
             run_panel(&mut state),
-            "the gated-Spice picker produced no draw primitives"
+            "the Spice picker produced no draw primitives"
         );
+        assert!(state
+            .pending
+            .as_ref()
+            .is_some_and(|draft| draft.protocol == VdiProtocol::Spice));
         assert!(state.take_connect().is_none(), "rendering is not a connect");
     }
 

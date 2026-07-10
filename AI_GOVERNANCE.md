@@ -124,8 +124,8 @@ security (Q23).
 > `docs/design/quasar-cloud.md`). The VM plane is now OpenStack.**
 > **Nova + Placement replace the mesh-native VM scheduler** (the
 > `mesh-virt-management.md` "mesh-native #5" lock is superseded); the hypervisor
-> is **libvirt/QEMU-KVM** — **cloud-hypervisor is retired** wherever this section
-> (or `mde-kvm`) names it. OpenStack services run as **Kolla containers under
+> is **libvirt/QEMU-KVM** — **cloud-hypervisor is retired** wherever older
+> sections name it. OpenStack services run as **Kolla containers under
 > Podman**, supervised by a **mackesd `openstack` worker** rendering config from
 > fleet state (one-state doctrine) — control plane **distributed, APIs on every
 > node, no controller box**; role stays configuration (services are pure
@@ -143,9 +143,9 @@ security (Q23).
   host. A thin persistent chrome bar (peers · sessions · status) frames the active
   desktop and **expands into the full Workbench**.
 - **The desktop you use is a VM.** A Workstation **brokers and displays full OS
-  desktops** (Windows/Ubuntu/…) that run either **locally on cloud-hypervisor** or
-  **remotely on any mesh peer** (a **headless Workstation** serving VM desktops over
-  KVM/cloud-hypervisor), rendered
+  desktops** (Windows/Ubuntu/…) that run either **locally on libvirt/QEMU-KVM
+  through Nova** or **remotely on any mesh peer** (a **headless Workstation**
+  serving VM desktops over the same libvirt/QEMU-KVM stack), rendered
   **egui-native** (ironrdp/vnc → an egui texture) over Nebula. A "session" is a
   fullscreen VM desktop; sessions **roam** per-peer via etcd/Syncthing. The
   mesh-control surfaces (Workbench/Files/Music/Voice) are **panels inside the one
@@ -157,22 +157,25 @@ security (Q23).
   is a Workstation without a local display** (daemon stack only, no egui seat, serving
   VMs/containers to the mesh). The **Lighthouse** is relay + control plane + **media
   server (Navidrome→DO Spaces) + CA/signer**. There is **no XCP-NG role** — the
-  hypervisor is **Fedora + KVM/cloud-hypervisor + Podman** (`mde-kvm`); an external
-  XCP-ng host may be *adopted* day-2 but is never produced by our installer. A
-  **`desktop-host`** tag marks peers serving VM desktops; `mackesd` runs the
-  **session-broker + vm-lifecycle + container** workers (the shell renders; mackesd
-  brokers — §1/§9).
+  hypervisor is **Fedora + libvirt/QEMU-KVM + OVN + Podman**; the old
+  cloud-hypervisor path is deleted/retired, not the target stack. An external
+  XCP-ng host may be *adopted* day-2 but is never
+  produced by our installer. A **`desktop-host`** tag marks peers serving VM
+  desktops; `mackesd` runs the **session-broker + vm-lifecycle + container**
+  workers (the shell renders; mackesd brokers — §1/§9).
 - **Delivery:** **one immutable bootc/ostree image for every role** (egui-DRM shell +
-  cloud-hypervisor + ironrdp/virtio-gpu + `mackesd` + Podman + Nebula baked in, plus the
-  **seat services — PipeWire/WirePlumber · BlueZ · UPower** — per the host-controls locks,
-  `docs/design/quasar-host-controls.md` / E12-15..19, and **UDisks2 + the fs toolchain**
-  (e2fsprogs/xfsprogs/btrfs-progs/exfatprogs/ntfs-3g/cryptsetup/qemu-img) per the Storage-plane
-  locks, `docs/design/workbench-storage-plane.md` / E12-20..23; VM disks
-  + mesh state on the writable partition). The **role is a config flag**, not a separate
-  build — a Lighthouse runs the same image with the desktop units masked (Option 1),
-  role-features migrating to managed Podman/VM workloads over time (Option 2). The
-  install-time **role chooser** (binary: Lighthouse / Workstation) + the GitHub-hosted
-  dnf repo (Releases asset + GitHub Pages, project-GPG-signed) carry forward.
+  libvirt/QEMU-KVM + OVN + ironrdp/VNC + `mackesd` + Podman + Nebula baked in,
+  plus the **seat services — PipeWire/WirePlumber · BlueZ · UPower** — per the
+  host-controls locks, `docs/design/quasar-host-controls.md` / E12-15..19, and
+  **UDisks2 + the fs toolchain**
+  (e2fsprogs/xfsprogs/btrfs-progs/exfatprogs/ntfs-3g/cryptsetup/qemu-img) per the
+  Storage-plane locks, `docs/design/workbench-storage-plane.md` / E12-20..23; VM
+  disks + mesh state on the writable partition). The **role is a config flag**,
+  not a separate build — a Lighthouse runs the same image with the desktop units
+  masked (Option 1), role-features migrating to managed Podman/VM workloads over
+  time (Option 2). The install-time **role chooser** (binary: Lighthouse /
+  Workstation) + the GitHub-hosted dnf repo (Releases asset + GitHub Pages,
+  project-GPG-signed) carry forward.
 
 ## §6 — The boundary: layered tiers (E12 — replaces the two-bucket gate)
 

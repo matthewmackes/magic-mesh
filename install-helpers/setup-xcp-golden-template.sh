@@ -5,8 +5,9 @@
 # A pristine Fedora *cloud* image is ALREADY generalized — no SSH host keys,
 # empty machine-id; cloud-init regenerates both on first boot from the clone's
 # fresh NoCloud seed. So we import the image straight into a VDI and mark the VM
-# a template; no boot+generalize pass is needed (that pass is for when you've
-# booted+customized a VM instead — see build-mde-vm-golden.sh).
+# a template; no boot+generalize pass is needed. The farm-only
+# `farm-generalize-xcp-template.sh` path is reserved for booted/customized build
+# template clones after toolchain baking.
 #
 # The resulting template is what infra/tofu (and XCP-3's `provision spawn`) clone:
 # the clone gets a fresh cloud-init seed (hostname/keys/network) at clone time.

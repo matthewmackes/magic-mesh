@@ -47,7 +47,7 @@
 //! [`FakeVitelityClient`] ([`reconcile_once`] takes `&dyn VitelityClient`).
 //! Production builds a [`LiveVitelityClient`] from the sealed master creds;
 //! its transport is integration-gated (a typed [`VitelityError`]), never
-//! faked (§7, the mde-kvm/mde-seat pattern). No raw shell — the only I/O is
+//! faked (§7, same typed-seam pattern as the seat clients). No raw shell — the only I/O is
 //! the typed client, the secret store, and the Bus (§9).
 
 #![cfg(feature = "async-services")]

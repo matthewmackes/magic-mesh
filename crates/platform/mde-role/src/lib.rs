@@ -34,8 +34,8 @@ pub enum Role {
     /// the media server, and the CA/signer. Always-on, no desktop. Rank 0.
     /// VPS-friendly.
     Lighthouse,
-    /// Full workstation — the Quasar stack: the egui-DRM shell + VDI + local
-    /// KVM/cloud-hypervisor + Podman. A headless box is a `Workstation` with no
+    /// Full workstation — the Quasar stack: the egui-DRM shell + VDI +
+    /// libvirt/QEMU-KVM + Podman. A headless box is a `Workstation` with no
     /// local display. Rank 1. *(The retired XCP-NG/Server role folded in here;
     /// the legacy `xcpng`/`server`/`headless` slugs stay accepted aliases.)*
     Workstation,

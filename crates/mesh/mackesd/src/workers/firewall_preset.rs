@@ -653,7 +653,12 @@ mod tests {
         // underlay zone, so a headless/lighthouse node running kdc_host keeps 1716
         // closed on the public boundary (public stays default-deny for KDC).
         for is_lighthouse in [false, true] {
-            let plan = zone_plan(is_lighthouse, /* runs_kdc */ true, OVERLAY_IFACE, Some("eth0"));
+            let plan = zone_plan(
+                is_lighthouse,
+                /* runs_kdc */ true,
+                OVERLAY_IFACE,
+                Some("eth0"),
+            );
             // 1716/tcp is present on the trusted (overlay) zone...
             assert!(
                 plan.ports
@@ -684,9 +689,17 @@ mod tests {
         }
         // A node NOT running kdc_host opens no 1716 anywhere (defensive — kdc is
         // universal now, but the plan honors the gate honestly).
-        let none = zone_plan(false, /* runs_kdc */ false, OVERLAY_IFACE, Some("eth0"));
+        let none = zone_plan(
+            false,
+            /* runs_kdc */ false,
+            OVERLAY_IFACE,
+            Some("eth0"),
+        );
         assert!(
-            !none.ports.iter().any(|(_, port, _)| *port == KDC_OVERLAY_PORT),
+            !none
+                .ports
+                .iter()
+                .any(|(_, port, _)| *port == KDC_OVERLAY_PORT),
             "no kdc_host → no 1716 in any zone"
         );
     }

@@ -40,22 +40,21 @@
 //!   nodes by name over the overlay without memorizing Nebula IPs (reusing the
 //!   own-row directory, not a new sync).
 //! * [`spawn_lighthouse`] (OW-7) promotes a lone Workstation's LAN-only mesh by
-//!   standing up its first lighthouse (a cloud droplet or a local cloud-hypervisor
-//!   VM), push-enrolling it, and **migrating the CA** to it over #12's existing
-//!   lighthouse-scoped-bearer CA-key delivery. This slice is the pure `plan_spawn`
-//!   core + the injectable [`spawn_lighthouse::Provisioner`] apply seam (production
-//!   `LiveProvisioner` is honestly integration-gated); the no-cloud-token case is a
-//!   real `LanOnly` + retry branch, not a stub.
-//! * [`first_desktop`] (OW-8, first-desktop slice) plans + offers this Workstation's
-//!   **first local VM desktop**: it selects a golden image from the PLANES-22 image
-//!   catalog, builds an mde-kvm `VmSpec` (running-disk clone + dual-homed NIC), plans
-//!   create→boot, and emits the broker's `SessionRequest::Open` so the shell's
-//!   Desktop surface renders it. This slice is the pure `plan_first_desktop` core +
-//!   the injectable [`first_desktop::FirstDesktopApply`] seam (production
-//!   `LiveFirstDesktop` is honestly integration-gated — needs a live cloud-hypervisor
-//!   + the golden image on disk); the create/reconnect/no-image branches are all real
-//!   outcomes, not stubs. The shell/DRM-boot half (E12-2/E12-3) is hardware-gated and
-//!   lands in its own units.
+//!   standing up its first cloud lighthouse, push-enrolling it, and **migrating
+//!   the CA** to it over #12's existing lighthouse-scoped-bearer CA-key delivery.
+//!   This slice is the pure `plan_spawn` core + the injectable
+//!   [`spawn_lighthouse::Provisioner`] apply seam (production `LiveProvisioner` is
+//!   honestly integration-gated); the no-cloud-token case is a real `LanOnly` +
+//!   retry branch, not a stub.
+//! * [`first_desktop`] (OW-8, QC-15 cutover) plans + offers this Workstation's
+//!   **first cloud-backed VM desktop**: it selects a VM image from the PLANES-22 image
+//!   catalog, builds the VDI broker desktop-placement request, and emits the
+//!   broker's `SessionRequest::Open` so the shell's Desktop surface renders it.
+//!   This slice is the pure `plan_first_desktop` core + the injectable
+//!   [`first_desktop::FirstDesktopApply`] seam (production `LiveFirstDesktop` is
+//!   honestly integration-gated — needs a live Nova+Heat cloud + the Bus); the
+//!   place/reconnect/no-image branches are all real outcomes, not stubs. The
+//!   shell/DRM-boot half (E12-2/E12-3) is hardware-gated and lands in its own units.
 //! * [`service_add`] (OW-11) adds a curated back-office service without blocking the
 //!   working network (#20): **Music** provisions Navidrome on a media-lighthouse
 //!   reading DO Spaces (reusing [`spawn_lighthouse`]'s `ProvisionSpec` + the peer

@@ -2,11 +2,11 @@
 //!
 //! The operator-facing face of `onboard spawn-lighthouse`: promote a lone
 //! Workstation's LAN-only mesh by standing up its first always-on **lighthouse**
-//! (and migrating the CA to it). Pick where to provision — a **cloud** droplet
-//! (`zone1-do`) or a **local** cloud-hypervisor VM — optionally as an HA
-//! **pair**, **Preview** the plan (dry-run), and **Spawn** it — all over the Bus,
-//! against the `mackesd` `spawn_lighthouse_onboard` worker that runs the one
-//! existing onboard engine (the CLI and this panel drive the SAME core, §6).
+//! (and migrating the CA to it). Provision a **cloud** droplet (`zone1-do`),
+//! optionally as an HA **pair**, **Preview** the plan (dry-run), and **Spawn** it
+//! — all over the Bus, against the `mackesd` `spawn_lighthouse_onboard` worker
+//! that runs the one existing onboard engine (the CLI and this panel drive the
+//! SAME core, §6).
 //!
 //! ## One wire contract, no daemon dependency (§6 glue)
 //!
@@ -21,8 +21,8 @@
 //! ## Honest by construction (§7)
 //!
 //! The daemon's answer is rendered as-is: a dry-run shows the real plan summary +
-//! the ordered CA-migration steps, a **LAN-only** outcome (no cloud token / no
-//! local virt / not founded) shows the retry hint, and a Spawn that hits the live
+//! the ordered CA-migration steps, a **LAN-only** outcome (no cloud token / not
+//! founded) shows the retry hint, and a Spawn that hits the live
 //! seam's typed `IntegrationGated` error is shown as exactly that — this panel
 //! never fakes a successful spawn. With no Bus on the box it renders the shared
 //! EmptyState idiom instead of a dead form.
@@ -51,43 +51,36 @@ const REFRESH: Duration = Duration::from_secs(2);
 
 // ───────────────────────── the wire mirrors (§6) ─────────────────────────
 
-/// The provision target — the shell's mirror of the daemon's `SpawnTargetKind`
-/// (`cloud` | `local` on the wire). The wire carries only the discriminant; the
-/// daemon maps it to the shared `do-lighthouse-join` defaults (region/size,
-/// vCPU/mem), so no off-policy shape can be named here.
+/// The provision target — the shell's mirror of the daemon's cloud-only
+/// `SpawnTargetKind`. The wire carries only the discriminant; the daemon maps it
+/// to the shared `do-lighthouse-join` defaults (region/size), so no off-policy
+/// shape can be named here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum TargetPick {
     /// A cloud droplet — `DigitalOcean`, the `zone1-do` `IaC`.
     Cloud,
-    /// A local cloud-hypervisor VM on this host.
-    Local,
 }
 
 impl TargetPick {
     /// The choices in presentation order (cloud first — the durable off-desktop
     /// CA home the verb exists to create).
-    const ALL: [TargetPick; 2] = [TargetPick::Cloud, TargetPick::Local];
+    const ALL: [TargetPick; 1] = [TargetPick::Cloud];
 
     /// The row label.
     const fn label(self) -> &'static str {
         match self {
             Self::Cloud => "Cloud droplet",
-            Self::Local => "Local VM",
         }
     }
 
-    /// The one-line description — honestly stated (cloud = a DO droplet off the
-    /// `zone1-do` IaC; local = a cloud-hypervisor VM on this host).
+    /// The one-line description — honestly stated (a DO droplet off the
+    /// `zone1-do` IaC).
     const fn blurb(self) -> &'static str {
         match self {
             Self::Cloud => {
                 "A DigitalOcean droplet on the zone1-do IaC \u{2014} a durable, always-on CA home \
                  off the desktop."
-            }
-            Self::Local => {
-                "A cloud-hypervisor VM on this host \u{2014} an always-on lighthouse without a \
-                 cloud account."
             }
         }
     }
@@ -96,7 +89,6 @@ impl TargetPick {
     const fn wire(self) -> &'static str {
         match self {
             Self::Cloud => "cloud",
-            Self::Local => "local",
         }
     }
 }
@@ -108,7 +100,7 @@ impl TargetPick {
 struct SpawnLighthouseAction {
     /// Shell-minted correlation id — the result event echoes it.
     id: String,
-    /// Where to provision (cloud droplet vs local CH VM).
+    /// Where to provision.
     target: TargetPick,
     /// Provision two lighthouses for quorum/HA.
     pair: bool,
@@ -308,8 +300,8 @@ impl SpawnLighthouseFlowState {
         }
     }
 
-    /// Render the Spawn Lighthouse flow into `ui`: the cloud/local target
-    /// catalog, the HA-pair toggle, Preview/Spawn, and the daemon's typed answer.
+    /// Render the Spawn Lighthouse flow into `ui`: the cloud target, the HA-pair
+    /// toggle, Preview/Spawn, and the daemon's typed answer.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new("SPAWN LIGHTHOUSE")
@@ -532,13 +524,6 @@ mod tests {
             s.build_action(true, 42).to_body(),
             r#"{"id":"lh-42-cloud","target":"cloud","pair":false,"dry_run":true}"#
         );
-        // A local spawn with the HA pair set.
-        s.target = TargetPick::Local;
-        s.pair = true;
-        assert_eq!(
-            s.build_action(false, 7).to_body(),
-            r#"{"id":"lh-7-local","target":"local","pair":true,"dry_run":false}"#
-        );
     }
 
     #[test]
@@ -664,11 +649,9 @@ mod tests {
 
     #[test]
     fn catalog_blurbs_state_the_honest_semantics() {
-        // Cloud names the zone1-do IaC + a durable CA home; Local names
-        // cloud-hypervisor + no cloud account.
+        // Cloud names the zone1-do IaC + a durable CA home.
         assert!(TargetPick::Cloud.blurb().contains("zone1-do"));
         assert!(TargetPick::Cloud.blurb().contains("CA home"));
-        assert!(TargetPick::Local.blurb().contains("cloud-hypervisor"));
         for p in TargetPick::ALL {
             assert!(!p.label().is_empty());
             assert!(p.blurb().len() > p.label().len());

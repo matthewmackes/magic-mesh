@@ -316,8 +316,8 @@ mod tests {
     #[test]
     fn decide_marks_down_services_and_counts() {
         // Only libvirtd active — and because the default network + storage pool
-        // share libvirtd's unit, they come up with it; podman / NetworkManager /
-        // cockpit are down.
+        // share libvirtd's unit, they come up with it; podman and
+        // NetworkManager are down.
         let h = decide(
             "node-b",
             KVM_SERVICES,
@@ -330,7 +330,6 @@ mod tests {
         let down = h.down_ids();
         assert!(down.contains(&"podman"));
         assert!(down.contains(&"network-manager"));
-        assert!(down.contains(&"cockpit"));
         assert!(!down.contains(&"libvirtd"));
         assert!(!down.contains(&"libvirt-network"));
         assert!(!down.contains(&"libvirt-storage"));

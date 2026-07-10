@@ -436,12 +436,98 @@ pub enum ControlMsg {
         /// `true` to install reader styling, `false` to clear it.
         enabled: bool,
     },
+    /// Set whether the helper should run the shell-curated userscript bundle.
+    SetUserScripts {
+        /// `true` to install/run the bundle, `false` to clear its page effects.
+        enabled: bool,
+        /// The trusted shell-bundled JavaScript payload. Empty when clearing.
+        bundle: String,
+    },
+    /// Override page-visible User-Agent metadata for the tab. Empty means the
+    /// helper should restore its engine default.
+    SetUserAgent {
+        /// A bounded User-Agent string chosen by the shell.
+        user_agent: String,
+    },
+    /// Override page-visible device metadata for the tab. `profile = "default"`
+    /// asks the helper to restore its engine defaults where possible.
+    SetDeviceProfile {
+        /// Stable shell profile id, such as `phone` or `tablet`.
+        profile: String,
+        /// CSS viewport width exposed to page scripts.
+        width: u16,
+        /// CSS viewport height exposed to page scripts.
+        height: u16,
+        /// Device-pixel-ratio percentage; `100` means 1.0.
+        scale_percent: u16,
+        /// Whether page-visible touch capability should be exposed.
+        touch: bool,
+    },
     /// Ask the helper to print the current page.
     PrintPage,
     /// Ask the helper to save the current page as a PDF at `path`.
     SavePdf {
         /// Absolute output path owned by the shell.
         path: String,
+    },
+    /// Ask the helper to extract bounded visible page text for spellcheck/TTS.
+    RequestPageText {
+        /// Shell-minted request id echoed by [`EventMsg::PageText`].
+        id: u64,
+        /// Maximum UTF-8 bytes the helper may return.
+        max_bytes: u32,
+    },
+    /// Ask the helper to extract a bounded active-page scrape body with visible
+    /// text plus DOM-derived links/headings.
+    RequestPageScrape {
+        /// Shell-minted request id echoed by [`EventMsg::PageScrape`].
+        id: u64,
+        /// Maximum UTF-8 text bytes the helper may include.
+        max_bytes: u32,
+        /// Maximum DOM anchor records the helper may include.
+        max_links: u16,
+        /// Maximum heading records the helper may include.
+        max_headings: u16,
+    },
+    /// Apply shell-owned spellcheck highlights to visible page text. Empty words
+    /// clear prior highlights.
+    SetSpellcheckHighlights {
+        /// Bounded misspelled words from the offline Hunspell pass.
+        words: Vec<String>,
+    },
+    /// Replace one shell-vetted spelling miss with a selected suggestion in the
+    /// current page where the helper can find it.
+    ApplySpellcheckCorrection {
+        /// Misspelled word selected by the shell.
+        word: String,
+        /// Replacement suggestion selected by the operator.
+        replacement: String,
+    },
+    /// Replace every visible occurrence the helper can safely match for one
+    /// shell-vetted spelling miss.
+    ApplySpellcheckCorrectionAll {
+        /// Misspelled word selected by the shell.
+        word: String,
+        /// Replacement suggestion selected by the operator.
+        replacement: String,
+    },
+    /// Replace one indexed visible occurrence for a shell-vetted spelling miss.
+    ///
+    /// The index is zero-based among visible matches for `word` in document order.
+    ApplySpellcheckCorrectionAt {
+        /// Misspelled word selected by the shell.
+        word: String,
+        /// Replacement suggestion selected by the operator.
+        replacement: String,
+        /// Zero-based visible occurrence index to replace.
+        occurrence: u16,
+    },
+    /// Resolve or reject one page WebAuthn/passkey promise with daemon-owned
+    /// credential/assertion material. The JSON body carries `client_request_id`
+    /// so the helper resolves only the matching pending page request.
+    CompletePasskey {
+        /// Bounded daemon completion JSON.
+        body: String,
     },
 }
 
@@ -504,6 +590,74 @@ impl ControlMsg {
                 out.push(16);
                 put_str(&mut out, path);
             }
+            Self::SetUserScripts { enabled, bundle } => {
+                out.push(17);
+                out.push(u8::from(*enabled));
+                put_str(&mut out, bundle);
+            }
+            Self::RequestPageText { id, max_bytes } => {
+                out.push(18);
+                put_u64(&mut out, *id);
+                put_u32(&mut out, *max_bytes);
+            }
+            Self::SetSpellcheckHighlights { words } => {
+                out.push(19);
+                put_string_vec(&mut out, words);
+            }
+            Self::ApplySpellcheckCorrection { word, replacement } => {
+                out.push(20);
+                put_str(&mut out, word);
+                put_str(&mut out, replacement);
+            }
+            Self::ApplySpellcheckCorrectionAll { word, replacement } => {
+                out.push(21);
+                put_str(&mut out, word);
+                put_str(&mut out, replacement);
+            }
+            Self::ApplySpellcheckCorrectionAt {
+                word,
+                replacement,
+                occurrence,
+            } => {
+                out.push(22);
+                put_str(&mut out, word);
+                put_str(&mut out, replacement);
+                put_u16(&mut out, *occurrence);
+            }
+            Self::CompletePasskey { body } => {
+                out.push(23);
+                put_str(&mut out, body);
+            }
+            Self::SetUserAgent { user_agent } => {
+                out.push(24);
+                put_str(&mut out, user_agent);
+            }
+            Self::SetDeviceProfile {
+                profile,
+                width,
+                height,
+                scale_percent,
+                touch,
+            } => {
+                out.push(25);
+                put_str(&mut out, profile);
+                put_u16(&mut out, *width);
+                put_u16(&mut out, *height);
+                put_u16(&mut out, *scale_percent);
+                out.push(u8::from(*touch));
+            }
+            Self::RequestPageScrape {
+                id,
+                max_bytes,
+                max_links,
+                max_headings,
+            } => {
+                out.push(26);
+                put_u64(&mut out, *id);
+                put_u32(&mut out, *max_bytes);
+                put_u16(&mut out, *max_links);
+                put_u16(&mut out, *max_headings);
+            }
         }
         out
     }
@@ -542,6 +696,47 @@ impl ControlMsg {
             14 => Self::SetReaderMode { enabled: c.bool()? },
             15 => Self::PrintPage,
             16 => Self::SavePdf { path: c.string()? },
+            17 => Self::SetUserScripts {
+                enabled: c.bool()?,
+                bundle: c.string()?,
+            },
+            18 => Self::RequestPageText {
+                id: c.u64()?,
+                max_bytes: c.u32()?,
+            },
+            19 => Self::SetSpellcheckHighlights {
+                words: c.string_vec()?,
+            },
+            20 => Self::ApplySpellcheckCorrection {
+                word: c.string()?,
+                replacement: c.string()?,
+            },
+            21 => Self::ApplySpellcheckCorrectionAll {
+                word: c.string()?,
+                replacement: c.string()?,
+            },
+            22 => Self::ApplySpellcheckCorrectionAt {
+                word: c.string()?,
+                replacement: c.string()?,
+                occurrence: c.u16()?,
+            },
+            23 => Self::CompletePasskey { body: c.string()? },
+            24 => Self::SetUserAgent {
+                user_agent: c.string()?,
+            },
+            25 => Self::SetDeviceProfile {
+                profile: c.string()?,
+                width: c.u16()?,
+                height: c.u16()?,
+                scale_percent: c.u16()?,
+                touch: c.bool()?,
+            },
+            26 => Self::RequestPageScrape {
+                id: c.u64()?,
+                max_bytes: c.u32()?,
+                max_links: c.u16()?,
+                max_headings: c.u16()?,
+            },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -601,6 +796,28 @@ pub enum EventMsg {
         /// Whether the engine reported a successful PDF write.
         ok: bool,
     },
+    /// Bounded visible page text extracted by the helper.
+    PageText {
+        /// Request id from [`ControlMsg::RequestPageText`].
+        id: u64,
+        /// Extracted visible text, possibly truncated to the requested byte cap.
+        text: String,
+    },
+    /// Bounded active-page scrape body extracted by the helper.
+    PageScrape {
+        /// Request id from [`ControlMsg::RequestPageScrape`].
+        id: u64,
+        /// JSON object with visible text plus DOM-derived links/headings.
+        body: String,
+    },
+    /// A page attempted a WebAuthn/passkey ceremony. The helper carries only
+    /// public ceremony metadata as a bounded JSON object; the shell adds Browser
+    /// source/engine/host fields and the daemon validates the final handoff.
+    PasskeyRequest {
+        /// JSON object with `ceremony`, `origin`, `rp_id`, challenge, and optional
+        /// user / allow-credential metadata.
+        body: String,
+    },
 }
 
 impl EventMsg {
@@ -645,6 +862,20 @@ impl EventMsg {
                 put_str(&mut out, path);
                 out.push(u8::from(*ok));
             }
+            Self::PageText { id, text } => {
+                out.push(7);
+                put_u64(&mut out, *id);
+                put_str(&mut out, text);
+            }
+            Self::PasskeyRequest { body } => {
+                out.push(8);
+                put_str(&mut out, body);
+            }
+            Self::PageScrape { id, body } => {
+                out.push(9);
+                put_u64(&mut out, *id);
+                put_str(&mut out, body);
+            }
         }
         out
     }
@@ -677,6 +908,15 @@ impl EventMsg {
             6 => Self::PdfSaved {
                 path: c.string()?,
                 ok: c.bool()?,
+            },
+            7 => Self::PageText {
+                id: c.u64()?,
+                text: c.string()?,
+            },
+            8 => Self::PasskeyRequest { body: c.string()? },
+            9 => Self::PageScrape {
+                id: c.u64()?,
+                body: c.string()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -743,6 +983,12 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     put_len(out, s.len());
     out.extend_from_slice(s.as_bytes());
 }
+fn put_string_vec(out: &mut Vec<u8>, values: &[String]) {
+    put_len(out, values.len());
+    for value in values {
+        put_str(out, value);
+    }
+}
 
 /// A bounds-checked forward reader over a payload.
 struct Cursor<'a> {
@@ -798,6 +1044,17 @@ impl<'a> Cursor<'a> {
         std::str::from_utf8(b)
             .map(ToOwned::to_owned)
             .map_err(|_| WireError::BadUtf8)
+    }
+    fn string_vec(&mut self) -> Result<Vec<String>, WireError> {
+        let len = self.u32()? as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(WireError::TooLong(len));
+        }
+        let mut values = Vec::with_capacity(len.min(256));
+        for _ in 0..len {
+            values.push(self.string()?);
+        }
+        Ok(values)
     }
 }
 
@@ -878,9 +1135,67 @@ mod tests {
         round_control(&ControlMsg::SetForceDark { enabled: false });
         round_control(&ControlMsg::SetReaderMode { enabled: true });
         round_control(&ControlMsg::SetReaderMode { enabled: false });
+        round_control(&ControlMsg::SetUserScripts {
+            enabled: true,
+            bundle: "console.log('mde');".to_owned(),
+        });
+        round_control(&ControlMsg::SetUserScripts {
+            enabled: false,
+            bundle: String::new(),
+        });
+        round_control(&ControlMsg::SetUserAgent {
+            user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".to_owned(),
+        });
+        round_control(&ControlMsg::SetUserAgent {
+            user_agent: String::new(),
+        });
+        round_control(&ControlMsg::SetDeviceProfile {
+            profile: "phone".to_owned(),
+            width: 390,
+            height: 844,
+            scale_percent: 300,
+            touch: true,
+        });
+        round_control(&ControlMsg::SetDeviceProfile {
+            profile: "default".to_owned(),
+            width: 0,
+            height: 0,
+            scale_percent: 100,
+            touch: false,
+        });
         round_control(&ControlMsg::PrintPage);
         round_control(&ControlMsg::SavePdf {
             path: "/tmp/mde-page.pdf".to_owned(),
+        });
+        round_control(&ControlMsg::RequestPageText {
+            id: 42,
+            max_bytes: 16 * 1024,
+        });
+        round_control(&ControlMsg::RequestPageScrape {
+            id: 43,
+            max_bytes: 64 * 1024,
+            max_links: 64,
+            max_headings: 32,
+        });
+        round_control(&ControlMsg::SetSpellcheckHighlights {
+            words: vec!["wrold".to_owned(), "msh".to_owned()],
+        });
+        round_control(&ControlMsg::SetSpellcheckHighlights { words: Vec::new() });
+        round_control(&ControlMsg::ApplySpellcheckCorrection {
+            word: "wrold".to_owned(),
+            replacement: "world".to_owned(),
+        });
+        round_control(&ControlMsg::ApplySpellcheckCorrectionAll {
+            word: "wrold".to_owned(),
+            replacement: "world".to_owned(),
+        });
+        round_control(&ControlMsg::ApplySpellcheckCorrectionAt {
+            word: "wrold".to_owned(),
+            replacement: "world".to_owned(),
+            occurrence: 3,
+        });
+        round_control(&ControlMsg::CompletePasskey {
+            body: r#"{"client_request_id":"pk-1","op":"browser_passkey_assertion"}"#.to_owned(),
         });
     }
 
@@ -910,6 +1225,17 @@ mod tests {
         round_event(&EventMsg::PdfSaved {
             path: "/tmp/mde-page.pdf".to_owned(),
             ok: false,
+        });
+        round_event(&EventMsg::PageText {
+            id: 42,
+            text: "hello page".to_owned(),
+        });
+        round_event(&EventMsg::PageScrape {
+            id: 43,
+            body: r#"{"text":"hello","links":[],"headings":[]}"#.to_owned(),
+        });
+        round_event(&EventMsg::PasskeyRequest {
+            body: r#"{"ceremony":"create","origin":"https://login.example"}"#.to_owned(),
         });
     }
 

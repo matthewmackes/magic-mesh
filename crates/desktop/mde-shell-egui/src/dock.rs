@@ -6,8 +6,8 @@
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
 //! is that shell nav: a left-edge, full-height, ~48px slide-in auto-hide column
 //! that selects which surface fills the shell body — the mesh-control
-//! [`Workbench`](Surface::Workbench), the live Mesh Map, the VM surfaces
-//! (Instances / Desktop), the embedded app surfaces (Music / Media / Files /
+//! [`Workbench`](Surface::Workbench), the live Mesh Map, the Desktop surface, the
+//! embedded app surfaces (Music / Media / Files /
 //! Voice / Browser / Terminal / Editor), the unified [`Chat`](Surface::Chat)
 //! surface, and the System / Storage / About screens. One surface shows at a
 //! time; the Workbench is always one click away.
@@ -60,14 +60,11 @@ pub enum Surface {
     /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
     /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
     Desktop,
-    /// The **Instances** surface — this workstation's local cloud-hypervisor VMs
-    /// (`mde-kvm`): the create / boot / shutdown lifecycle broker (E12-7).
-    Instances,
     /// The **Infra as Code (`IaC`)** surface — the `OpenStack` `IaaS` control
     /// plane (`docs/design/iac-workspace.md`, IAC-2): the Keystone service
     /// catalog + per-service API health + the merged service directory, consumed
     /// off the Bus (`action/cloud/get-catalog`). The comprehensive `OpenStack`
-    /// admin beside the focused Instances VM view (#24).
+    /// admin beside the member-facing Cloud plane (#24).
     InfraCode,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
@@ -140,16 +137,15 @@ pub enum Surface {
 impl Surface {
     /// Every surface in canonical order — the ordering authority the picker is
     /// built + checked against: the Workbench (mesh-control home) first, then the
-    /// live Mesh Map, the local VM Instances broker + the brokered Desktop, the
+    /// live Mesh Map, the Cloud/IaC control surface + the brokered Desktop, the
     /// app surfaces, the unified Chat surface (the ONE notification interface),
     /// and the System / Storage / About screens. PICKER-1 gathers these into the
     /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
     /// relative order within each group (L7); a compile-time guard keeps the two
     /// tables in sync.
-    pub(crate) const ALL: [Surface; 18] = [
+    pub(crate) const ALL: [Surface; 17] = [
         Surface::Workbench,
         Surface::MeshView,
-        Surface::Instances,
         Surface::InfraCode,
         Surface::Desktop,
         Surface::Music,
@@ -176,10 +172,8 @@ impl Surface {
         match self {
             Surface::Workbench => IconId::Workbench,
             Surface::MeshView => IconId::MeshView,
-            Surface::Instances => IconId::Instances,
             // The IaC surface wears the **Server** (infrastructure/rack) badge —
-            // the OpenStack IaaS control plane reads as "infrastructure", and it
-            // stays distinct from the Instances cloud glyph (the map is 1:1).
+            // the OpenStack IaaS control plane reads as "infrastructure".
             Surface::InfraCode => IconId::Server,
             Surface::Desktop => IconId::Desktop,
             Surface::Music => IconId::Music,
@@ -257,7 +251,7 @@ struct Group {
 /// standalone anchor, and **System** (Settings) + **Desktop** (Show-Desktop) are
 /// VDOCK-4's bottom system-quad cells; every other surface appears here exactly
 /// once (About lives in System's group) — the union with those three reproduces
-/// all 18 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
+/// all 17 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
 /// grouping authority).
 const GROUPS: [Group; 6] = [
     Group {
@@ -268,7 +262,7 @@ const GROUPS: [Group; 6] = [
     Group {
         label: "Workloads",
         accent: Style::ACCENT_WORKLOADS,
-        surfaces: &[Surface::Instances, Surface::InfraCode],
+        surfaces: &[Surface::InfraCode],
     },
     Group {
         label: "Terminals",
@@ -299,12 +293,11 @@ const GROUPS: [Group; 6] = [
     },
 ];
 
-const PICKER_FOCUS_ORDER: [Surface; 17] = [
+const PICKER_FOCUS_ORDER: [Surface; 16] = [
     Surface::Workbench,
     Surface::Voice,
     Surface::Chat,
     Surface::Phones,
-    Surface::Instances,
     Surface::InfraCode,
     Surface::Browser,
     Surface::Bookmarks,
@@ -3490,8 +3483,8 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Eighteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
-        // two VM surfaces (Instances / Desktop), the app surfaces (Music / Media — the
+        // Seventeen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+        // the brokered Desktop surface, the app surfaces (Music / Media — the
         // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
         // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
         // PTY, TERM-16 / Editor — the native Zed-style code editor, EDITOR-1), the
@@ -3500,11 +3493,10 @@ mod tests {
         // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
         // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
         // and the About surface (the platform-identity screen, QBRAND-6).
-        assert_eq!(Surface::ALL.len(), 18);
+        assert_eq!(Surface::ALL.len(), 17);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
-            Surface::Instances,
             Surface::InfraCode,
             Surface::Desktop,
             Surface::Music,
@@ -3540,7 +3532,6 @@ mod tests {
         let cases = [
             (Surface::Workbench, IconId::Workbench),
             (Surface::MeshView, IconId::MeshView),
-            (Surface::Instances, IconId::Instances),
             (Surface::InfraCode, IconId::Server),
             (Surface::Desktop, IconId::Desktop),
             (Surface::Music, IconId::Music),
@@ -3568,7 +3559,7 @@ mod tests {
                 "{surface:?} maps to the blank wordmark"
             );
         }
-        // The map is injective — 18 surfaces, 18 distinct glyph names (IaC wears
+        // The map is injective — 17 surfaces, 17 distinct glyph names (IaC wears
         // the Server badge, unshared by any other surface).
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
         names.sort_unstable();
@@ -3614,12 +3605,12 @@ mod tests {
         // System surface (right-side Settings button), and Desktop (far-right
         // Show-Desktop sliver).
         use Surface::{
-            About, Bookmarks, Browser, Chat, Editor, Files, InfraCode, Instances, Media, MeshView,
-            Music, Phones, Storage, Terminal, Voice, Workbench,
+            About, Bookmarks, Browser, Chat, Editor, Files, InfraCode, Media, MeshView, Music,
+            Phones, Storage, Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 6] = [
             ("Comms", &[Voice, Chat, Phones]),
-            ("Workloads", &[Instances, InfraCode]),
+            ("Workloads", &[InfraCode]),
             ("Terminals", &[Browser, Bookmarks, Terminal, Editor]),
             ("Mesh", &[MeshView]),
             ("System", &[Files, Storage, About]),

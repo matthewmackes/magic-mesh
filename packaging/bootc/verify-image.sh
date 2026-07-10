@@ -26,13 +26,38 @@ fail=0
 ok()  { echo "  OK   $1"; }
 bad() { echo "  FAIL $1"; fail=1; }
 
-# Payload binaries (the §5 stack: shell, daemon, VMM, wizard, CLI).
-for b in mde-shell-egui mackesd cloud-hypervisor magic-setup meshctl; do
+# Payload binaries (the §5/QC-1 stack: shell, daemon, libvirt/OVN, wizard, CLI).
+for b in mde-shell-egui mackesd magic-setup meshctl virsh ovs-vsctl cloud-init qemu-ga; do
     [ -x "/usr/bin/$b" ] && ok "/usr/bin/$b" || bad "/usr/bin/$b missing/not executable"
 done
-/usr/bin/cloud-hypervisor --version >/dev/null 2>&1 \
-    && ok "cloud-hypervisor runs ($(/usr/bin/cloud-hypervisor --version))" \
-    || bad "cloud-hypervisor does not execute"
+for p in qemu-kvm libvirt-daemon-driver-qemu libvirt-daemon-config-network ovn-host openvswitch cloud-init qemu-guest-agent; do
+    rpm -q "$p" >/dev/null 2>&1 && ok "package installed: $p" || bad "package missing: $p"
+done
+virsh --version >/dev/null 2>&1 \
+    && ok "virsh executes ($(virsh --version))" \
+    || bad "virsh does not execute"
+ovs-vsctl --version >/dev/null 2>&1 \
+    && ok "ovs-vsctl executes ($(ovs-vsctl --version | head -n 1))" \
+    || bad "ovs-vsctl does not execute"
+[ ! -e /usr/bin/cloud-hypervisor ] \
+    && ok "cloud-hypervisor absent per QUASAR-CLOUD/QC-1" \
+    || bad "cloud-hypervisor still present"
+[ -f /usr/lib/bootc/install/50-magic-mesh.toml ] \
+    && ok "bootc install rootfs config present" \
+    || bad "bootc install rootfs config missing"
+grep -q 'type = "xfs"' /usr/lib/bootc/install/50-magic-mesh.toml 2>/dev/null \
+    && ok "bootc install rootfs default = xfs" \
+    || bad "bootc install rootfs default is not xfs"
+grep -q 'datasource_list: \[ NoCloud, None \]' /etc/cloud/cloud.cfg.d/90-mcnf-nocloud.cfg 2>/dev/null \
+    && ok "cloud-init constrained to NoCloud/None" \
+    || bad "cloud-init NoCloud datasource config missing"
+module_count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)"
+[ "$module_count" -eq 1 ] \
+    && ok "single kernel modules tree present" \
+    || bad "found $module_count kernel modules trees (bootc install requires one)"
+find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -name '*.surface.*' | grep -q . \
+    && ok "surface kernel is the bootc kernel" \
+    || bad "surface kernel modules tree missing"
 
 # The seat unit, its preset, and the role gate.
 [ -f /usr/lib/systemd/system/mde-shell-egui.service ] \
@@ -44,7 +69,9 @@ grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \
-         magic-setup.service magic-mesh-brand.service mesh-health.timer; do
+         magic-setup.service magic-mesh-brand.service mesh-health.timer \
+         cloud-init-local.service cloud-init.service cloud-config.service \
+         cloud-final.service qemu-guest-agent.service openvswitch.service; do
     state="$(systemctl is-enabled "$u" 2>/dev/null || true)"
     [ "$state" = enabled ] && ok "enabled: $u" || bad "$u is '$state' (want enabled)"
 done

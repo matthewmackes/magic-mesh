@@ -200,6 +200,9 @@ pub(crate) enum Navigate {
 pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
     let rest = verb.strip_prefix("shell/")?;
     if let Some(name) = rest.strip_prefix("goto/") {
+        if matches!(name.to_ascii_lowercase().as_str(), "instances" | "cloud") {
+            return Some(Navigate::Plane(Plane::Cloud));
+        }
         return surface_by_name(name).map(Navigate::Surface);
     }
     if let Some(name) = rest.strip_prefix("plane/") {
@@ -216,7 +219,6 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // through this same grammar (accepting the `mde-mesh-view` variant name too).
         "mesh-map" | "meshview" | "mesh" => Some(Surface::MeshView),
         "desktop" => Some(Surface::Desktop),
-        "instances" => Some(Surface::Instances),
         // The Infra as Code (IaC) OpenStack control plane (IAC-2).
         "iac" | "infra-code" | "infracode" | "infra" => Some(Surface::InfraCode),
         "music" => Some(Surface::Music),
@@ -540,6 +542,14 @@ mod tests {
         assert!(matches!(
             resolve_action("shell/goto/bookmarks"),
             Some(Navigate::Surface(Surface::Bookmarks))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/instances"),
+            Some(Navigate::Plane(Plane::Cloud))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/cloud"),
+            Some(Navigate::Plane(Plane::Cloud))
         ));
         assert!(matches!(
             resolve_action("shell/plane/fleet"),

@@ -24,7 +24,7 @@ LIMIT="bake_golden"
 TEMPLATE_NAME="${MCNF_GOLDEN_TEMPLATE:-MDE-VM-golden}"
 TOOLCHAIN_PLAYBOOK="$REPO/infra/ansible/build-vm-toolchain.yml"
 SCCACHE_PLAYBOOK="$REPO/infra/ansible/sccache.yml"
-GENERALIZE="$HERE/build-mde-vm-golden.sh"
+GENERALIZE="$HERE/farm-generalize-xcp-template.sh"
 MINIO_ENDPOINT="${MCNF_MINIO_ENDPOINT:-}"
 EXTRA_ANSIBLE_ARGS=()
 

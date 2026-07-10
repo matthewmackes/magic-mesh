@@ -18,13 +18,15 @@ engine underneath.
 >
 > 1. **TWO roles only — Lighthouse and Workstation** (not three). The XCP-NG/Server
 >    role is REMOVED. A **headless machine is a Workstation without a local display**
->    — it runs the daemon stack (`mackesd` + cloud-hypervisor + Podman) and serves
->    VMs/containers to the mesh, managed from a peer's Workbench; the egui-DRM shell
->    simply doesn't start with no seat. → **deletes lock #15** (XCP-NG toolstack) and
->    the Round-4/5 XCP-NG branches entirely.
+>    — it runs the daemon stack (`mackesd` + libvirt/QEMU-KVM + OVN + Podman) and
+>    serves VMs/containers to the mesh, managed from a peer's Workbench; the
+>    egui-DRM shell simply doesn't start with no seat. → **deletes lock #15**
+>    (XCP-NG toolstack) and the Round-4/5 XCP-NG branches entirely.
 > 2. **Hypervisor = Fedora + KVM (Option B), not XCP-ng.** XCP-ng is a day-2 "adopt
 >    external capacity" action, never a role. The VM stack everywhere is
->    cloud-hypervisor/`mde-kvm` + Podman. See `docs/design/mesh-virt-management.md`.
+>    libvirt/QEMU-KVM + OVN + Podman; the older cloud-hypervisor/`mde-kvm` path is
+>    superseded by `docs/design/quasar-cloud.md` and remains only as cutover/deletion
+>    backlog until QC-15 removes it.
 > 3. **Same stack on every machine; role = configuration, not a build.** One identical
 >    image; `role=lighthouse|workstation` toggles systemd units (Option 1), evolving to
 >    features-as-workloads (Option 2). → **supersedes lock #29**: role is now
@@ -33,9 +35,9 @@ engine underneath.
 >    display exists; ratatui / `mackesd onboard` / push-from-a-peer for a headless
 >    Workstation. (Locks #1–#4 about ISO/RPM split collapse: it's now ONE image, role
 >    = config.)
-> 5. **Management layer = mesh-native (#5)** — `mackesd` + cloud-hypervisor/libvirt +
+> 5. **Management layer = mesh-native (#5)** — `mackesd` + libvirt/QEMU-KVM + OVN +
 >    Podman over the existing etcd/Syncthing/Nebula, no center; Incus the
->    adopt-fallback; Nomad excluded (BUSL). See `mesh-virt-management.md`.
+>    adopt-fallback; Nomad excluded (BUSL). See `docs/design/quasar-cloud.md`.
 >
 > The 50-lock table below is kept as the survey record — read it through this revision.
 
@@ -127,7 +129,7 @@ boot → role-chooser (DISCLAIMER ack, §43) ─┬─ Lighthouse ─┐
 ### `mackesd` engine surface (new workers/verbs the wizard drives)
 `onboard` · `mesh-create` (CA + id) · `invite-issue` (QR + short code, short-TTL) ·
 `enroll` (CSR→bundle, reuse ONBOARD-3) · `spawn-lighthouse` (cloud via zone1-do IaC /
-local via cloud-hypervisor; push-provision; pair) · `ca-migrate` ·
+local via libvirt/QEMU-KVM; push-provision; pair) · `ca-migrate` ·
 `role-provision` (per-role stack) · `service-add` (Navidrome/Files/Voice) ·
 `mesh-dns` (`<host>.<mesh>`) · `self-test` · `revoke` (passive/expiry).
 

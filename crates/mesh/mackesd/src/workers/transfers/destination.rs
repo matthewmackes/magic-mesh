@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use mackes_mesh_types::peers::{PeerRecord, peers_dir, read_peers};
+use mackes_mesh_types::peers::{peers_dir, read_peers, PeerRecord};
 use serde::{Deserialize, Serialize};
 
 use super::job::Method;

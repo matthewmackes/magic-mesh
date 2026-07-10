@@ -184,7 +184,7 @@ mod tests {
         let svcs = vec![
             "rdp".to_string(),
             "vnc".to_string(),
-            "rdp".to_string(),   // duplicate collapses
+            "rdp".to_string(),    // duplicate collapses
             "gopher".to_string(), // unmapped drops
         ];
         assert_eq!(

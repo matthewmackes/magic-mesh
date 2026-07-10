@@ -4,21 +4,21 @@
 //!
 //! A founded Workstation (OW-3 `mesh-create`) holds its own CA but has no
 //! always-on lighthouse — the overlay is LAN-only and there is no durable CA home
-//! off the desktop. This verb provisions one: a **cloud** droplet (`DigitalOcean` /
-//! the `zone1-do` `IaC`) or a **local** cloud-hypervisor VM, push-provisions it over
-//! SSH (RPM install + a lighthouse-scoped enroll), then **migrates the CA** to it
-//! so the lighthouse becomes the mesh's durable signer + etcd voter.
+//! off the desktop. This verb provisions one cloud droplet (`DigitalOcean` / the
+//! `zone1-do` `IaC`), push-provisions it over SSH (RPM install + a
+//! lighthouse-scoped enroll), then **migrates the CA** to it so the lighthouse
+//! becomes the mesh's durable signer + etcd voter.
 //!
 //! The shape mirrors the sibling onboard verbs ([`crate::onboard::network`] /
 //! [`crate::onboard::mesh_dns`]): a pure planning core the unit tests pin, plus a
 //! thin **injectable apply seam** so the live side effects are faked in tests and
 //! honestly integration-gated in production.
 //! * [`gather`] — impure probe: reads the mesh-id, the CA-holder overlay IP, and
-//!   whether a cloud token / local virt / operator SSH key are present.
+//!   whether a cloud token / operator SSH key are present.
 //! * [`plan_spawn`] — pure fold: `[SpawnRequest] + [SpawnFacts] → [SpawnPlan]`,
-//!   deciding cloud-vs-local, rendering the provision spec (cloud-init / CH config),
-//!   the enroll bootstrap, and the **ordered, idempotent CA-migration steps** — or
-//!   the [`SpawnPlan::LanOnly`] outcome when it cannot provision yet.
+//!   rendering the cloud-init provision spec, the enroll bootstrap, and the
+//!   **ordered, idempotent CA-migration steps** — or the [`SpawnPlan::LanOnly`]
+//!   outcome when it cannot provision yet.
 //! * [`Provisioner`] — the injectable side-effect seam ([`provision`] →
 //!   [`push_enroll`] → [`migrate_ca`]). Production [`LiveProvisioner`] returns a
 //!   typed [`ProvisionError::IntegrationGated`] naming exactly what the live call
@@ -39,12 +39,13 @@
 //! * The mesh-id + CA-holder come from the founding bundle
 //!   ([`crate::onboard::invite::resolve_mesh_id`] / [`crate::ca::bundle`]).
 //!
-//! # This slice (OW-7): the pure core + the injectable seam — NOT the live infra
-//! The live DO API call / cloud-hypervisor spawn / SSH push / real CA move land
-//! behind [`Provisioner`], exactly as OW-5's live `nmcli` apply sits behind
-//! [`crate::onboard::network::KeyfileSink`]. [`LiveProvisioner`] returning a typed
-//! `IntegrationGated` error (never a fake success) is §7-legal — the same way
-//! OW-5's apply returns a typed error when `NetworkManager` is not reachable.
+//! # This slice (QC-15): cloud-only, no local cloud-hypervisor spawn
+//! The older local cloud-hypervisor lighthouse path is deleted. The live DO API
+//! call / SSH push / real CA move land behind [`Provisioner`], exactly as OW-5's
+//! live `nmcli` apply sits behind [`crate::onboard::network::KeyfileSink`].
+//! [`LiveProvisioner`] returning a typed `IntegrationGated` error (never a fake
+//! success) is §7-legal — the same way OW-5's apply returns a typed error when
+//! `NetworkManager` is not reachable.
 
 use std::fmt::Write as _;
 
@@ -58,11 +59,6 @@ pub const DEFAULT_CLOUD_REGION: &str = "nyc3";
 pub const DEFAULT_CLOUD_SIZE: &str = "s-1vcpu-1gb";
 /// Default cloud image (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_IMAGE: &str = "fedora-43-x64";
-/// Default vCPUs for a local cloud-hypervisor lighthouse VM.
-pub const DEFAULT_LOCAL_VCPUS: u32 = 1;
-/// Default memory (MiB) for a local cloud-hypervisor lighthouse VM.
-pub const DEFAULT_LOCAL_MEM_MB: u64 = 1024;
-
 /// The join-token placeholder the rendered provision spec carries.
 ///
 /// The impure [`migrate_ca`] step mints a fresh lighthouse-scoped token and
@@ -80,13 +76,6 @@ pub enum SpawnTarget {
         /// DO droplet size slug (e.g. `s-1vcpu-1gb`).
         size: String,
     },
-    /// A local cloud-hypervisor VM on this host.
-    Local {
-        /// Virtual CPUs for the VM.
-        vcpus: u32,
-        /// Memory (MiB) for the VM.
-        mem_mb: u64,
-    },
 }
 
 impl SpawnTarget {
@@ -98,21 +87,6 @@ impl SpawnTarget {
             size: DEFAULT_CLOUD_SIZE.to_string(),
         }
     }
-
-    /// A local cloud-hypervisor target with the default 1-vCPU/1GB shape.
-    #[must_use]
-    pub const fn default_local() -> Self {
-        Self::Local {
-            vcpus: DEFAULT_LOCAL_VCPUS,
-            mem_mb: DEFAULT_LOCAL_MEM_MB,
-        }
-    }
-
-    /// Whether this is a cloud target (else local).
-    #[must_use]
-    pub const fn is_cloud(&self) -> bool {
-        matches!(self, Self::Cloud { .. })
-    }
 }
 
 /// The spawn request — the [`SpawnTarget`] plus whether a **pair** (two
@@ -120,7 +94,7 @@ impl SpawnTarget {
 /// one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpawnRequest {
-    /// Where to provision (cloud droplet vs local CH VM).
+    /// Where to provision.
     pub target: SpawnTarget,
     /// Provision two lighthouses for quorum/HA (`false` ⇒ a single lighthouse).
     pub pair: bool,
@@ -136,9 +110,6 @@ pub struct SpawnFacts {
     /// `DIGITALOCEAN_ACCESS_TOKEN`). `false` on a Cloud target ⇒ the LAN-only +
     /// retry branch.
     pub cloud_token_present: bool,
-    /// Whether the local virtualization stack (cloud-hypervisor) is available.
-    /// `false` on a Local target ⇒ the LAN-only + retry branch.
-    pub local_virt_ready: bool,
     /// This node's overlay IP — the current CA holder, i.e. the migration source.
     /// `None` when this box has not founded a mesh (nothing to migrate).
     pub ca_holder_overlay_ip: Option<String>,
@@ -150,8 +121,6 @@ pub struct SpawnFacts {
 pub enum LanOnlyReason {
     /// A cloud target was asked for but no cloud API token is present.
     NoCloudToken,
-    /// A local target was asked for but cloud-hypervisor is not available.
-    NoLocalVirt,
     /// This node has not founded a mesh, so it holds no CA to migrate.
     NotFounded,
 }
@@ -164,7 +133,6 @@ impl LanOnlyReason {
             Self::NoCloudToken => {
                 "set a cloud token (DIGITALOCEAN_ACCESS_TOKEN / `doctl auth init`), then retry"
             }
-            Self::NoLocalVirt => "install/enable cloud-hypervisor, then retry",
             Self::NotFounded => "found this mesh first (`mackesd onboard mesh-create`), then retry",
         }
     }
@@ -174,7 +142,6 @@ impl std::fmt::Display for LanOnlyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Self::NoCloudToken => "no cloud token",
-            Self::NoLocalVirt => "no local virtualization (cloud-hypervisor)",
             Self::NotFounded => "no founded mesh / CA on this node",
         };
         f.write_str(s)
@@ -241,8 +208,8 @@ impl CaMigrationStep {
     }
 }
 
-/// The rendered provisioning spec — the cloud-init user-data (cloud) or the
-/// cloud-hypervisor VM config (local).
+/// The rendered provisioning spec — the cloud-init user-data for the cloud
+/// droplet.
 ///
 /// Deterministic given the target, so it round-trips in tests. Carries a
 /// [`JOIN_TOKEN_PLACEHOLDER`] the enroll step substitutes.
@@ -259,26 +226,15 @@ pub enum ProvisionSpec {
         /// The rendered `#cloud-config` user-data (installs the RPM + joins).
         user_data: String,
     },
-    /// A local cloud-hypervisor VM: its shape + the rendered VM config document.
-    CloudHypervisor {
-        /// Virtual CPUs.
-        vcpus: u32,
-        /// Memory (MiB).
-        mem_mb: u64,
-        /// The rendered cloud-hypervisor VM config (cpus/memory/boot + the join
-        /// bootstrap `NoCloud` seed).
-        vm_config: String,
-    },
 }
 
 impl ProvisionSpec {
-    /// The rendered provisioning document (user-data / VM config) for the dry-run
-    /// print + the real provisioner.
+    /// The rendered provisioning document for the dry-run print + the real
+    /// provisioner.
     #[must_use]
     pub fn document(&self) -> &str {
         match self {
             Self::CloudInit { user_data, .. } => user_data,
-            Self::CloudHypervisor { vm_config, .. } => vm_config,
         }
     }
 }
@@ -375,9 +331,6 @@ impl SpawnPlan {
                     ProvisionSpec::CloudInit { region, size, .. } => {
                         format!("cloud droplet ({size} in {region})")
                     }
-                    ProvisionSpec::CloudHypervisor { vcpus, mem_mb, .. } => {
-                        format!("local CH VM ({vcpus} vCPU / {mem_mb} MiB)")
-                    }
                 };
                 let count = if *pair {
                     "a pair of lighthouses"
@@ -397,10 +350,10 @@ impl SpawnPlan {
 /// Pure fold: turn a [`SpawnRequest`] + gathered [`SpawnFacts`] into a
 /// [`SpawnPlan`]. No I/O — fully unit-testable.
 ///
-/// A Cloud target with no cloud token, a Local target with no cloud-hypervisor, or
-/// an un-founded node (no CA to migrate) all resolve to the retryable
-/// [`SpawnPlan::LanOnly`] outcome. Otherwise the plan renders the provision spec,
-/// the lighthouse-scoped enroll bootstrap, and the ordered CA-migration steps.
+/// A Cloud target with no cloud token or an un-founded node (no CA to migrate)
+/// resolves to the retryable [`SpawnPlan::LanOnly`] outcome. Otherwise the plan
+/// renders the provision spec, the lighthouse-scoped enroll bootstrap, and the
+/// ordered CA-migration steps.
 #[must_use]
 pub fn plan_spawn(req: &SpawnRequest, facts: &SpawnFacts) -> SpawnPlan {
     // A spawn migrates *this node's* CA, so it must hold one (be founded).
@@ -410,17 +363,12 @@ pub fn plan_spawn(req: &SpawnRequest, facts: &SpawnFacts) -> SpawnPlan {
         };
     }
 
-    // The no-cloud-token → LAN-only + retry branch (and its local-virt twin): a
-    // real code path, not a comment.
+    // The no-cloud-token → LAN-only + retry branch is a real code path, not a
+    // comment.
     match &req.target {
         SpawnTarget::Cloud { .. } if !facts.cloud_token_present => {
             return SpawnPlan::LanOnly {
                 reason: LanOnlyReason::NoCloudToken,
-            };
-        }
-        SpawnTarget::Local { .. } if !facts.local_virt_ready => {
-            return SpawnPlan::LanOnly {
-                reason: LanOnlyReason::NoLocalVirt,
             };
         }
         _ => {}
@@ -439,9 +387,8 @@ pub fn plan_spawn(req: &SpawnRequest, facts: &SpawnFacts) -> SpawnPlan {
 /// Pure renderer: the provisioning spec for `target`.
 ///
 /// Cloud → a `#cloud-config` user-data that installs the RPM off the channel and
-/// runs the lighthouse join; local → a cloud-hypervisor VM config that boots the
-/// same join bootstrap. Both carry the [`JOIN_TOKEN_PLACEHOLDER`] the enroll step
-/// substitutes.
+/// runs the lighthouse join. It carries the [`JOIN_TOKEN_PLACEHOLDER`] the enroll
+/// step substitutes.
 #[must_use]
 pub fn render_spec(target: &SpawnTarget) -> ProvisionSpec {
     match target {
@@ -472,24 +419,6 @@ pub fn render_spec(target: &SpawnTarget) -> ProvisionSpec {
                 user_data,
             }
         }
-        SpawnTarget::Local { vcpus, mem_mb } => {
-            let mut vm_config = String::new();
-            let _ = writeln!(vm_config, "# cloud-hypervisor lighthouse VM");
-            let _ = writeln!(vm_config, "[cpus]");
-            let _ = writeln!(vm_config, "boot_vcpus = {vcpus}");
-            let _ = writeln!(vm_config, "[memory]");
-            let _ = writeln!(vm_config, "size_mib = {mem_mb}");
-            let _ = writeln!(vm_config, "[bootstrap]");
-            let _ = writeln!(
-                vm_config,
-                "cmd = \"mackesd join --role lighthouse {JOIN_TOKEN_PLACEHOLDER}\""
-            );
-            ProvisionSpec::CloudHypervisor {
-                vcpus: *vcpus,
-                mem_mb: *mem_mb,
-                vm_config,
-            }
-        }
     }
 }
 
@@ -508,7 +437,7 @@ pub fn enroll_bootstrap(mesh_id: &str) -> EnrollBootstrap {
 /// The reachable box a [`Provisioner`] stood up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
-    /// The public/reachable host (droplet public IPv4, or the local VM's LAN IP).
+    /// The public/reachable host (droplet public IPv4).
     pub host: String,
     /// The overlay IP the box takes as a lighthouse once enrolled (`None` until
     /// the enroll signs it).
@@ -583,7 +512,7 @@ pub trait Provisioner {
     ) -> Result<(), ProvisionError>;
 }
 
-/// Production [`Provisioner`] — the live cloud/local spawn + SSH push + CA move.
+/// Production [`Provisioner`] — the live cloud spawn + SSH push + CA move.
 ///
 /// OW-7's **push-enroll** is a **bootstrap** remote push (the target box is not on
 /// the mesh yet): [`push_enroll`](Self::push_enroll) drives the shared OW-15
@@ -659,9 +588,6 @@ impl Provisioner for LiveProvisioner {
             ProvisionSpec::CloudInit { .. } => {
                 "needs a cloud token (DIGITALOCEAN_ACCESS_TOKEN) + the `do-lighthouse-join` \
                  executor (doctl)"
-            }
-            ProvisionSpec::CloudHypervisor { .. } => {
-                "needs a local cloud-hypervisor host to boot the VM"
             }
         };
         Err(ProvisionError::IntegrationGated {
@@ -762,7 +688,6 @@ pub fn gather(workgroup_root: &std::path::Path, node_id: &str) -> SpawnFacts {
     SpawnFacts {
         mesh_id,
         cloud_token_present: cloud_token_present(),
-        local_virt_ready: local_virt_ready(),
         ca_holder_overlay_ip,
     }
 }
@@ -781,27 +706,15 @@ fn cloud_token_present() -> bool {
     .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
 }
 
-/// Whether the local cloud-hypervisor binary is available (best-effort probe).
-#[must_use]
-fn local_virt_ready() -> bool {
-    [
-        "/usr/bin/cloud-hypervisor",
-        "/usr/local/bin/cloud-hypervisor",
-    ]
-    .iter()
-    .any(|p| std::path::Path::new(p).exists())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    fn facts(cloud_token: bool, local_virt: bool, founded: bool) -> SpawnFacts {
+    fn facts(cloud_token: bool, founded: bool) -> SpawnFacts {
         SpawnFacts {
             mesh_id: "home-deadbeef".to_string(),
             cloud_token_present: cloud_token,
-            local_virt_ready: local_virt,
             ca_holder_overlay_ip: founded.then(|| "10.42.0.1".to_string()),
         }
     }
@@ -813,16 +726,9 @@ mod tests {
         }
     }
 
-    fn local_req(pair: bool) -> SpawnRequest {
-        SpawnRequest {
-            target: SpawnTarget::default_local(),
-            pair,
-        }
-    }
-
     #[test]
     fn cloud_with_token_plans_a_provision() {
-        let plan = plan_spawn(&cloud_req(false), &facts(true, false, true));
+        let plan = plan_spawn(&cloud_req(false), &facts(true, true));
         match &plan {
             SpawnPlan::Provision {
                 mesh_id,
@@ -848,7 +754,7 @@ mod tests {
     #[test]
     fn cloud_without_token_stays_lan_only_with_retry() {
         // The headline no-cloud-token → LAN-only + retry branch (a real path).
-        let plan = plan_spawn(&cloud_req(false), &facts(false, false, true));
+        let plan = plan_spawn(&cloud_req(false), &facts(false, true));
         assert_eq!(
             plan,
             SpawnPlan::LanOnly {
@@ -864,39 +770,9 @@ mod tests {
     }
 
     #[test]
-    fn local_with_virt_plans_a_ch_provision() {
-        let plan = plan_spawn(&local_req(false), &facts(false, true, true));
-        let spec = plan.provision_spec().expect("provision");
-        match spec {
-            ProvisionSpec::CloudHypervisor {
-                vcpus,
-                mem_mb,
-                vm_config,
-            } => {
-                assert_eq!(*vcpus, DEFAULT_LOCAL_VCPUS);
-                assert_eq!(*mem_mb, DEFAULT_LOCAL_MEM_MB);
-                assert!(vm_config.contains("cloud-hypervisor"));
-            }
-            ProvisionSpec::CloudInit { .. } => panic!("local target must render CH config"),
-        }
-    }
-
-    #[test]
-    fn local_without_virt_stays_lan_only() {
-        let plan = plan_spawn(&local_req(false), &facts(false, false, true));
-        assert_eq!(
-            plan,
-            SpawnPlan::LanOnly {
-                reason: LanOnlyReason::NoLocalVirt
-            }
-        );
-        assert!(plan.retry_available());
-    }
-
-    #[test]
     fn unfounded_node_cannot_migrate_a_ca() {
         // No CA holder ⇒ nothing to migrate, even with a token present.
-        let plan = plan_spawn(&cloud_req(false), &facts(true, true, false));
+        let plan = plan_spawn(&cloud_req(false), &facts(true, false));
         assert_eq!(
             plan,
             SpawnPlan::LanOnly {
@@ -908,7 +784,7 @@ mod tests {
 
     #[test]
     fn a_pair_provisions_two_lighthouses() {
-        let plan = plan_spawn(&cloud_req(true), &facts(true, false, true));
+        let plan = plan_spawn(&cloud_req(true), &facts(true, true));
         assert_eq!(plan.lighthouse_count(), 2);
         assert!(plan.human().contains("pair of lighthouses"));
     }
@@ -1033,7 +909,7 @@ mod tests {
 
     #[test]
     fn execute_drives_the_seam_in_order() {
-        let plan = plan_spawn(&cloud_req(false), &facts(true, false, true));
+        let plan = plan_spawn(&cloud_req(false), &facts(true, true));
         let prov = RecordingProvisioner::new();
         let outcome = execute(&plan, &prov).expect("execute");
         match outcome {
@@ -1058,7 +934,7 @@ mod tests {
     #[test]
     fn execute_short_circuits_a_lan_only_plan() {
         // A LAN-only plan makes no seam calls — nothing to provision.
-        let plan = plan_spawn(&cloud_req(false), &facts(false, false, true));
+        let plan = plan_spawn(&cloud_req(false), &facts(false, true));
         let prov = RecordingProvisioner::new();
         let outcome = execute(&plan, &prov).expect("execute");
         assert_eq!(
@@ -1111,7 +987,7 @@ mod tests {
     #[test]
     fn execute_propagates_the_integration_gated_error() {
         // Through the LIVE provisioner, execute surfaces the first typed error.
-        let plan = plan_spawn(&cloud_req(false), &facts(true, false, true));
+        let plan = plan_spawn(&cloud_req(false), &facts(true, true));
         let err = execute(&plan, &LiveProvisioner::default()).expect_err("live path is gated");
         assert!(matches!(
             err,

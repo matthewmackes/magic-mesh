@@ -54,8 +54,8 @@ pub mod sync_pair;
 pub mod verb;
 
 pub use destination::{
-    DestinationKind, TransferDestination, destinations_from_state, discover_destinations,
-    is_ad_hoc_endpoint,
+    destinations_from_state, discover_destinations, is_ad_hoc_endpoint, DestinationKind,
+    TransferDestination,
 };
 pub use job::{Method, TransferJob, TransferPolicy, TransferState, Transition};
 pub use lane::{
@@ -65,7 +65,7 @@ pub use lane::{
 pub use ledger::Ledger;
 pub use queue::{QueueError, TransferQueue};
 pub use sync_pair::{SyncPair, SyncPairStore};
-pub use verb::{TransferVerb, inbox_dir, take_verbs, write_verb};
+pub use verb::{inbox_dir, take_verbs, write_verb, TransferVerb};
 
 /// Default number of jobs run in parallel when the cap env is unset (Q12).
 pub const DEFAULT_PARALLEL_CAP: usize = 3;
@@ -747,12 +747,10 @@ mod tests {
             serde_json::from_str(msgs[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["source"], "transfers");
         assert_eq!(body["severity"], "warning");
-        assert!(
-            body["summary"]
-                .as_str()
-                .unwrap()
-                .contains("fixture failure")
-        );
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("fixture failure"));
         assert_eq!(body["transfer_state"], "failed");
     }
 

@@ -8,6 +8,8 @@
 //! * `event/vm/instances` (MV-3 `vm_lifecycle`) — each node's VM roster.
 //! * `event/podman/containers` (MV-4 `container`) — each node's Podman container
 //!   roster (MV-6b).
+//! * `state/browser-security-update/<node>` (BROWSER-DD-12) — each Workstation's
+//!   daemon-owned CEF runtime/updater posture.
 //! * `action/vm/lifecycle` (MV-3) — create / start / stop, **host-targeted** so a
 //!   request can only ever act on the one node it names (the worker drops any
 //!   request that doesn't `targets()` its own id; an empty host never matches).
@@ -59,6 +61,9 @@ const ADFILTER_STATE_PREFIX: &str = "state/adfilter/";
 /// Fleet view folds these into the per-host browser-governance row (enabled /
 /// forced ad-blocker / allowlist size / policy source + enforcement counters).
 const BROWSER_POLICY_STATE_PREFIX: &str = "state/browser-policy/";
+/// BROWSER-DD-12 — per-node CEF runtime security-update posture, published by the
+/// `browser_security_update` worker.
+const BROWSER_SECURITY_UPDATE_STATE_PREFIX: &str = "state/browser-security-update/";
 
 /// Poll cadence for the two live topics — a node's health flip or a new VM
 /// surfaces within this window. Matches the panel shell's 5 s refresh; the read
@@ -223,6 +228,37 @@ struct BrowserPolicyStat {
     last_flush_ms: u64,
 }
 
+/// Per-node CEF runtime/updater posture — mirrors
+/// `browser_security_update::BrowserSecurityUpdateStatus` (BROWSER-DD-12). The
+/// Fleet view keeps only operator-visible fields.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BrowserSecurityUpdateStat {
+    /// Publishing node id.
+    node: String,
+    /// `current`, `missing`, `mismatch`, or `manifest_missing`.
+    state: String,
+    /// Expected Chromium build from the packaged updater manifest.
+    expected_chromium_version: Option<String>,
+    /// Resolved active runtime directory, when present.
+    active_runtime: Option<String>,
+    /// Installed CEF version from the active runtime manifest.
+    installed_version: Option<String>,
+    /// Installed Chromium version from the active runtime manifest.
+    installed_chromium: Option<String>,
+    /// Whether `Release/libcef.so` exists under the active runtime.
+    libcef_present: bool,
+    /// `idle`, `installing`, `attempted`, `failed`, or `unavailable`.
+    updater_state: String,
+    /// Process exit code from the most recent updater attempt, when it spawned.
+    last_update_exit_code: Option<i32>,
+    /// Process spawn/stderr summary from the most recent failed updater attempt.
+    last_update_error: Option<String>,
+    /// Human-readable reason when the state is not `current`.
+    last_error: Option<String>,
+    /// Wall-clock ms for this inspection (latest-wins fold key).
+    updated_ms: u64,
+}
+
 /// One node's browser + ad-block fleet reality, folded from the latest
 /// `state/adfilter/*` + `state/browser-policy/*` messages seen for that host.
 #[derive(Debug, Clone)]
@@ -233,12 +269,19 @@ struct BrowserFleetRow {
     adblock: Option<AdblockStat>,
     /// Latest browser-policy state, once any has arrived.
     policy: Option<BrowserPolicyStat>,
+    /// Latest CEF runtime/updater posture, once any has arrived.
+    security_update: Option<BrowserSecurityUpdateStat>,
 }
 
-/// Fold `state/adfilter/*` + `state/browser-policy/*` bodies into a sorted-by-host
-/// per-node view. Latest message wins per host (each stream tracked by its own
-/// `last_flush_ms`). Pure — no Bus, no GPU.
-fn project_browser(adfilter_bodies: &[String], policy_bodies: &[String]) -> Vec<BrowserFleetRow> {
+/// Fold `state/adfilter/*` + `state/browser-policy/*` +
+/// `state/browser-security-update/*` bodies into a sorted-by-host per-node view.
+/// Latest message wins per host (each stream tracked by its own publish time).
+/// Pure — no Bus, no GPU.
+fn project_browser(
+    adfilter_bodies: &[String],
+    policy_bodies: &[String],
+    security_update_bodies: &[String],
+) -> Vec<BrowserFleetRow> {
     let mut rows: BTreeMap<String, BrowserFleetRow> = BTreeMap::new();
 
     for body in adfilter_bodies {
@@ -251,6 +294,7 @@ fn project_browser(adfilter_bodies: &[String], policy_bodies: &[String]) -> Vec<
                 host: s.node.clone(),
                 adblock: None,
                 policy: None,
+                security_update: None,
             });
         if entry
             .adblock
@@ -271,6 +315,7 @@ fn project_browser(adfilter_bodies: &[String], policy_bodies: &[String]) -> Vec<
                 host: s.node.clone(),
                 adblock: None,
                 policy: None,
+                security_update: None,
             });
         if entry
             .policy
@@ -281,7 +326,49 @@ fn project_browser(adfilter_bodies: &[String], policy_bodies: &[String]) -> Vec<
         }
     }
 
+    for body in security_update_bodies {
+        let Ok(s) = serde_json::from_str::<BrowserSecurityUpdateStat>(body) else {
+            continue;
+        };
+        if !valid_security_update_state(&s.state) || !valid_security_updater_state(&s.updater_state)
+        {
+            continue;
+        }
+        let entry = rows
+            .entry(s.node.clone())
+            .or_insert_with(|| BrowserFleetRow {
+                host: s.node.clone(),
+                adblock: None,
+                policy: None,
+                security_update: None,
+            });
+        if entry
+            .security_update
+            .as_ref()
+            .is_none_or(|cur| s.updated_ms >= cur.updated_ms)
+        {
+            entry.security_update = Some(s);
+        }
+    }
+
     rows.into_values().collect()
+}
+
+/// Accept only the daemon's real runtime states; malformed/future values are
+/// skipped rather than shown as facts.
+fn valid_security_update_state(state: &str) -> bool {
+    matches!(
+        state,
+        "current" | "missing" | "mismatch" | "manifest_missing"
+    )
+}
+
+/// Accept only the updater states the worker publishes today.
+fn valid_security_updater_state(state: &str) -> bool {
+    matches!(
+        state,
+        "idle" | "installing" | "attempted" | "failed" | "unavailable"
+    )
 }
 
 /// A compact staleness label + tone for the ad-block row.
@@ -599,7 +686,9 @@ impl DatacenterState {
         let topics = persist.list_topics().unwrap_or_default();
         let adfilter = read_bodies_by_prefix(&persist, &topics, ADFILTER_STATE_PREFIX);
         let policy = read_bodies_by_prefix(&persist, &topics, BROWSER_POLICY_STATE_PREFIX);
-        self.browser = project_browser(&adfilter, &policy);
+        let security_update =
+            read_bodies_by_prefix(&persist, &topics, BROWSER_SECURITY_UPDATE_STATE_PREFIX);
+        self.browser = project_browser(&adfilter, &policy, &security_update);
     }
 
     /// Render the Fleet plane's live datacenter content: per-node KVM
@@ -878,6 +967,12 @@ fn show_browser_row(ui: &mut egui::Ui, row: &BrowserFleetRow) {
     ui.indent((row.host.as_str(), "adblock"), |ui| {
         show_adblock_stats(ui, row.adblock.as_ref());
     });
+
+    // CEF runtime/updater posture (BROWSER-DD-12).
+    ui.add_space(Style::SP_XS);
+    ui.indent((row.host.as_str(), "cef-update"), |ui| {
+        show_security_update(ui, row.security_update.as_ref());
+    });
 }
 
 /// The enforced browser-policy detail rows: the folded role + forced-ad-blocker
@@ -967,6 +1062,85 @@ fn show_adblock_stats(ui: &mut egui::Ui, adblock: Option<&AdblockStat>) {
             mde_egui::muted_note(ui, "ad-block stats not yet reported");
         }
     }
+}
+
+/// The CEF runtime/updater posture row (BROWSER-DD-12): daemon-owned state only,
+/// or an honest "not yet reported" note.
+fn show_security_update(ui: &mut egui::Ui, security: Option<&BrowserSecurityUpdateStat>) {
+    match security {
+        Some(s) => {
+            ui.horizontal(|ui| {
+                let (dot, label) = security_update_label(s);
+                ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.colored_label(dot, RichText::new(label).size(Style::SMALL));
+            });
+            let mut detail = String::new();
+            if let Some(chromium) = s.expected_chromium_version.as_deref() {
+                detail.push_str("Chromium ");
+                detail.push_str(chromium);
+            }
+            if let Some(installed) = s.installed_chromium.as_deref() {
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str("installed ");
+                detail.push_str(installed);
+            } else if let Some(installed) = s.installed_version.as_deref() {
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str("CEF ");
+                detail.push_str(installed);
+            }
+            if let Some(runtime) = s.active_runtime.as_deref() {
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str(runtime);
+            }
+            if !s.libcef_present {
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str("libcef missing");
+            }
+            if !detail.is_empty() {
+                mde_egui::muted_note(ui, detail);
+            }
+            if let Some(err) = s.last_update_error.as_deref().or(s.last_error.as_deref()) {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!("updater: {err}")).size(Style::SMALL),
+                );
+            } else if let Some(code) = s.last_update_exit_code {
+                mde_egui::muted_note(ui, format!("updater exit code {code}"));
+            }
+        }
+        None => {
+            mde_egui::muted_note(ui, "CEF security-update status not yet reported");
+        }
+    }
+}
+
+/// CEF runtime/updater state label and tone. Non-current states are fleet-visible
+/// warnings because the browser engine fast-update path has work to do.
+fn security_update_label(s: &BrowserSecurityUpdateStat) -> (Color32, String) {
+    let tone = match s.state.as_str() {
+        "current" => Style::OK,
+        "missing" | "mismatch" | "manifest_missing" => Style::WARN,
+        _ => Style::DANGER,
+    };
+    let state = match s.state.as_str() {
+        "manifest_missing" => "manifest".to_string(),
+        other => other.to_string(),
+    };
+    let mut label = format!("CEF {state}");
+    if s.updater_state != "idle" {
+        label.push_str(" · updater ");
+        label.push_str(&s.updater_state);
+    }
+    (tone, label)
 }
 
 /// One VM roster row: a state pip + name + raw state, and a Start (when not
@@ -1138,6 +1312,15 @@ mod tests {
         )
     }
 
+    /// A faithful `state/browser-security-update/<node>` body (BROWSER-DD-12).
+    fn security_update_body(node: &str, state: &str, updater: &str, at: u64) -> String {
+        format!(
+            r#"{{"node":"{node}","state":"{state}","expected_cef_version":"149.0.6","expected_chromium_version":"149.0.7827.201","expected_channel":"stable","expected_asset":"cef.tar.xz","expected_sha256":"{}","manifest_path":"/usr/share/magic-mesh/browser/cef-linux64-minimal.env","active_link":"/opt/mde/cef","active_runtime":"/opt/mde/cef","installed_version":"old","installed_chromium":"old","installed_sha256":"{}","libcef_present":true,"last_error":"active CEF runtime does not match packaged manifest","updater_command":"/usr/libexec/mackesd/install-cef-runtime","updater_state":"{updater}","last_update_ms":123,"last_update_exit_code":69,"last_update_error":"installer unavailable","updated_ms":{at}}}"#,
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+    }
+
     #[test]
     fn project_browser_folds_one_row_per_host_sorted_with_both_streams() {
         let adfilter = vec![
@@ -1145,20 +1328,26 @@ mod tests {
             adfilter_body("node-a", 4, 55, 1),
         ];
         let policy = vec![policy_body("node-a", "workstation", true, true, 1)];
-        let rows = project_browser(&adfilter, &policy);
+        let security = vec![security_update_body("node-a", "mismatch", "failed", 1)];
+        let rows = project_browser(&adfilter, &policy, &security);
         assert_eq!(rows.len(), 2, "one row per host");
         assert_eq!(rows[0].host, "node-a"); // BTreeMap sorted
         assert_eq!(rows[1].host, "node-b");
-        // node-a folds BOTH the ad-block stats and the browser policy.
+        // node-a folds the ad-block stats, browser policy, and CEF updater posture.
         let a = &rows[0];
         assert!(a.adblock.as_ref().is_some_and(|s| s.enabled_sources == 4));
         assert!(a
             .policy
             .as_ref()
             .is_some_and(|p| p.browser_enabled && p.force_adblock));
+        assert!(a
+            .security_update
+            .as_ref()
+            .is_some_and(|s| s.state == "mismatch" && s.updater_state == "failed"));
         // node-b has ad-block stats but no policy reported yet.
         assert!(rows[1].adblock.is_some());
         assert!(rows[1].policy.is_none());
+        assert!(rows[1].security_update.is_none());
     }
 
     #[test]
@@ -1167,7 +1356,7 @@ mod tests {
             adfilter_body("node-a", 3, 30, 10),
             adfilter_body("node-a", 5, 60, 20),
         ];
-        let rows = project_browser(&adfilter, &[]);
+        let rows = project_browser(&adfilter, &[], &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].adblock.as_ref().map(|s| s.enabled_sources),
@@ -1177,11 +1366,29 @@ mod tests {
     }
 
     #[test]
+    fn project_browser_latest_security_update_wins_per_host() {
+        let security = vec![
+            security_update_body("node-a", "mismatch", "failed", 10),
+            security_update_body("node-a", "current", "idle", 20),
+        ];
+        let rows = project_browser(&[], &[], &security);
+        assert_eq!(rows.len(), 1);
+        let status = rows[0]
+            .security_update
+            .as_ref()
+            .expect("security update folded");
+        assert_eq!(status.state, "current");
+        assert_eq!(status.updater_state, "idle");
+        assert_eq!(status.updated_ms, 20);
+        assert_eq!(security_update_label(status).1, "CEF current");
+    }
+
+    #[test]
     fn project_browser_surfaces_a_disabled_policy_with_retained_data() {
         // A lighthouse node with the browser DISABLED — the fleet view must surface
         // the honest disabled + retained-data state (BOOKMARKS-8 acceptance).
         let policy = vec![policy_body("peer:lh", "lighthouse", false, true, 1)];
-        let rows = project_browser(&[], &policy);
+        let rows = project_browser(&[], &policy, &[]);
         assert_eq!(rows.len(), 1);
         let p = rows[0].policy.as_ref().expect("policy folded");
         assert!(!p.browser_enabled);
@@ -1193,7 +1400,12 @@ mod tests {
     fn project_browser_skips_malformed_bodies() {
         let adfilter = vec!["not json".to_string(), "{}".to_string()];
         let policy = vec![r#"{"unexpected":true}"#.to_string()];
-        assert!(project_browser(&adfilter, &policy).is_empty());
+        let security = vec![
+            r#"{"node":"node-a","state":"pretend","updater_state":"idle","updated_ms":1}"#
+                .to_string(),
+            security_update_body("node-b", "missing", "pretend", 1),
+        ];
+        assert!(project_browser(&adfilter, &policy, &security).is_empty());
     }
 
     #[test]

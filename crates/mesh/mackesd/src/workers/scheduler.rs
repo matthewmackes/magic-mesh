@@ -50,7 +50,7 @@
 //! The live-node set is the etcd-lease-backed peer directory
 //! ([`crate::substrate::peers::read_directory`], seam [`LiveDirectory`]): liveness
 //! IS the keepalive lease — a departed node's row auto-deletes — so no staleness
-//! guess is needed. Cockpit is already installed by `node-virt.yml`.
+//! guess is needed.
 
 #![cfg(feature = "async-services")]
 

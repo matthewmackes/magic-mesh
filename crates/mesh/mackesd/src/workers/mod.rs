@@ -181,12 +181,57 @@ pub mod adfilter;
 // Publishes state/browser-policy/<node> for the Workbench fleet view. No external
 // transport to fake — file I/O against the same share the adfilter worker uses.
 pub mod browser_policy;
+// BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
+// action/browser/passkey handoffs, persists pending challenges locally, mirrors
+// them into the Syncthing-backed workgroup root, and publishes honest pending or
+// error state without minting fake credentials.
+pub mod browser_passkeys;
+// BROWSER-DD-12 — Browser external-protocol owner. Drains
+// action/browser/protocol handoffs for external schemes Browser refused to
+// navigate, validates mailto/email and magnet/transfers routes, and publishes
+// retained route status/events without faking the downstream surface.
+pub mod browser_protocol;
+// BROWSER-DD-12 — Browser platform-share owner. Drains
+// action/browser/share handoffs, validates Peer/Email/QR routes, and publishes
+// retained route status/events without faking downstream delivery.
+pub mod browser_share;
+// BROWSER-DD-11 — Browser voice-command/dictation STT owner. Drains
+// action/browser/voice-command, invokes a locally configured offline STT/capture
+// command when present, emits bounded transcript events, and publishes honest
+// unavailable/error/transcribed state for the shell.
+pub mod browser_voice_command;
+// BROWSER-DD-12 — Browser private offline/mesh translation owner. Drains
+// action/browser/translate, invokes a locally configured offline/mesh translation
+// command when present, emits bounded translation events, and publishes honest
+// unavailable/error/translated state for the shell.
+pub mod browser_translate;
+// BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
+// cache snapshots, validates private offline/mesh payloads, writes local durable
+// records, and mirrors them into the Syncthing-backed workgroup root.
+pub mod browser_offline_cache;
+// BROWSER-DD-12 — Browser CEF security-update status owner. Watches the
+// packaged fast-update manifest and active CEF runtime, publishing an honest
+// current/missing/mismatch posture for the independent browser-engine update path.
+pub mod browser_security_update;
+// BROWSER-DD-12 — Browser idle-tab suspend owner. Drains shell-published
+// action/browser/tab-suspend handoffs after the shell has stopped the inactive
+// helper, validates the payload, and publishes retained suspend status/events.
+pub mod browser_tab_suspend;
+// KDC-MESH-6 — Seat-side consumer for phone-originated remote input. Drains the
+// KDC worker's action/seat/remote-input handoff, validates the event, and invokes
+// the configured uinput/seat helper when available.
+pub mod seat_remote_input;
 // BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
 // action/browser/session-sync snapshots, validates the restore-compatible JSON
 // shape, persists the latest local copy, and mirrors it to the Syncthing-backed
 // workgroup root as browser-session-sync/<host>/latest.json. No external
 // transport to fake — Syncthing replicates the file plane.
 pub mod browser_session_sync;
+// BROWSER-DD-11 — Browser read-aloud/TTS owner. Drains bounded
+// action/browser/read-aloud page-text requests, invokes a locally configured
+// offline TTS command when present, and publishes honest unavailable/error/spoken
+// state for the shell.
+pub mod browser_read_aloud;
 pub mod heartbeat;
 // OV-7.a (v2.6) — Health reconciler. Reads each known peer's
 // QNM-Shared heartbeat.json on a 5 s tick, applies the
@@ -678,9 +723,9 @@ pub mod session_broker;
 // user's desktops follow them to any Workstation and survive disconnect: pure
 // `reconcile_roaming` (desktops-follow-me), `on_disconnect` (default KeepRunning),
 // and `on_node_loss` (hold reconnectable). REUSES the broker's `VdiSession` +
-// `SessionStore` verbatim (no parallel session model); the `MonitorLayout` rides a
-// companion seam gated by the same `SessionStoreError::IntegrationGated` (§7). The
-// pure policy + layout model + drain/fold/plan pipeline ship green behind the seam.
+// `SessionStore` verbatim (no parallel session model); `MonitorLayout` rides the
+// companion replicated layout store and preloads on worker start so saved layouts
+// survive daemon restarts before the next roam.
 pub mod session_roaming;
 // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
 // bridges. Drains `action/vdi/clipboard`, applies a per-session [`ClipboardPolicy`]
@@ -740,9 +785,9 @@ pub mod media_server;
 pub mod service_onboard;
 // OW-7 (Bus half) — the spawn_lighthouse_onboard worker: `onboard spawn-lighthouse`
 // reachable over the Bus for the shell's Spawn Lighthouse flow. Drains
-// `action/onboard/spawn-lighthouse` (a typed SpawnLighthouseAction: cloud-vs-local
-// target + the --pair HA flag + dry_run), runs the EXISTING onboard::spawn_lighthouse
-// engine (`plan_spawn` + the injectable `Provisioner` seam — §6 glue, no re-planning),
+// `action/onboard/spawn-lighthouse` (a typed cloud SpawnLighthouseAction + the
+// --pair HA flag + dry_run), runs the EXISTING onboard::spawn_lighthouse engine
+// (`plan_spawn` + the injectable `Provisioner` seam — §6 glue, no re-planning),
 // and — leader-gated so an N-node mesh answers once — publishes the typed
 // SpawnLighthouseEvent (plan summary / CA-migration steps / LAN-only retry hint /
 // typed error) on `event/onboard/spawn-lighthouse`. Production provisions run over

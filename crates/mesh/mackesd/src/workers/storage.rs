@@ -63,7 +63,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
-use crate::workers::proc::{DEFAULT_CMD_TIMEOUT, output_with_timeout};
+use crate::workers::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 use super::fs_tools::{
     self, CapabilityRefusal, FsToolRunner, LiveFsTools, ResizeDirection, ResizeTarget,
@@ -1138,7 +1138,11 @@ pub fn parent_disk(dev: &str) -> String {
             let is_part = tail.len() > 1
                 && tail[1..].bytes().all(|b| b.is_ascii_digit())
                 && head.bytes().last().is_some_and(|b| b.is_ascii_digit());
-            if is_part { head } else { base }
+            if is_part {
+                head
+            } else {
+                base
+            }
         })
     } else {
         base.trim_end_matches(|c: char| c.is_ascii_digit())
@@ -2900,16 +2904,14 @@ mod tests {
         ));
         // Grow beyond current is ok (fits in 90 GiB free); grow that doesn't move
         // up is InvalidResize.
-        assert!(
-            validate_op(
-                &StorageOp::Grow {
-                    partition: "/dev/sdb1".into(),
-                    new_size_mib: 20 * 1024
-                },
-                &topo
-            )
-            .is_ok()
-        );
+        assert!(validate_op(
+            &StorageOp::Grow {
+                partition: "/dev/sdb1".into(),
+                new_size_mib: 20 * 1024
+            },
+            &topo
+        )
+        .is_ok());
         assert!(matches!(
             validate_op(
                 &StorageOp::Grow {
@@ -2932,16 +2934,14 @@ mod tests {
             Err(OpInvalid::InvalidResize { .. })
         ));
         // A valid shrink.
-        assert!(
-            validate_op(
-                &StorageOp::Shrink {
-                    partition: "/dev/sdb1".into(),
-                    new_size_mib: 5 * 1024
-                },
-                &topo
-            )
-            .is_ok()
-        );
+        assert!(validate_op(
+            &StorageOp::Shrink {
+                partition: "/dev/sdb1".into(),
+                new_size_mib: 5 * 1024
+            },
+            &topo
+        )
+        .is_ok());
     }
 
     #[test]
@@ -3486,18 +3486,16 @@ mod tests {
         ));
         // btrfs + mounted → ok.
         btrfs.devices[0].partitions[0].mountpoint = Some("/mnt/b".into());
-        assert!(
-            validate_op(
-                &StorageOp::SubvolumeSnapshot {
-                    partition: "/dev/sdb1".into(),
-                    source: "home".into(),
-                    dest: "home-snap".into(),
-                    readonly: true,
-                },
-                &btrfs
-            )
-            .is_ok()
-        );
+        assert!(validate_op(
+            &StorageOp::SubvolumeSnapshot {
+                partition: "/dev/sdb1".into(),
+                source: "home".into(),
+                dest: "home-snap".into(),
+                readonly: true,
+            },
+            &btrfs
+        )
+        .is_ok());
     }
 
     #[test]

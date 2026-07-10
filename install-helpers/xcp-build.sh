@@ -69,6 +69,7 @@ do_sync() {
   # dir cannot be `git reset` out from under a build.
   rsync -az --delete -e "${SSH[*]}" \
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
+    --exclude '/.claude' \
     --exclude '/.git' \
     "$REPO/" "$DEST:$REMOTE_DIR/"
 }

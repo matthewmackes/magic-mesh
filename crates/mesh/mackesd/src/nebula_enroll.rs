@@ -32,14 +32,15 @@ use serde::{Deserialize, Serialize};
 use crate::ca::bundle::{bundle_path, read_bundle};
 use crate::enrollment::{build_identity, EnrolledIdentity};
 
-/// QR-friendly upper bound on the wire-form join token. The v2.5
-/// base form (`mesh:<id>@<ip>:<port>#<bearer>`) fits in ~120 chars;
-/// ONBOARD-1's additive `?fp=<sha256-hex>` suffix adds up to 68
-/// (`?fp=` + 64 hex), so the bound is lifted to 200 to keep a
-/// fingerprint-bearing token QR-friendly. The Python helper's
-/// `JOIN_TOKEN_MAX_LEN` lock at `mackes/wizard/pages/mesh_passcode.py`
-/// tracks this value.
-pub const JOIN_TOKEN_MAX_LEN: usize = 200;
+/// QR-friendly upper bound on the wire-form join token.
+///
+/// Legacy v2.5 tokens carry a short bare bearer. OW-4 invite-issue can also
+/// re-express a wizard invite as the same `mesh:` token by using the invite's
+/// canonical payload as the bearer; that binds mesh-id + expiry to the ledger but
+/// makes the token longer. Keep enough room for that form plus `?fp=<sha256>`.
+/// The Python helper's `JOIN_TOKEN_MAX_LEN` lock at
+/// `mackes/wizard/pages/mesh_passcode.py` tracks this value.
+pub const JOIN_TOKEN_MAX_LEN: usize = 512;
 
 /// Length of a SHA-256 fingerprint rendered as lowercase hex.
 const SHA256_HEX_LEN: usize = 64;

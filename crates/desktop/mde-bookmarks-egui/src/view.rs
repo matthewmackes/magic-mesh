@@ -22,7 +22,7 @@ use mde_egui::Style;
 
 use mde_bookmarks::{Bookmark, Folder, Item, Source};
 
-use crate::model::{ActionOutcome, Manager, SortBy};
+use crate::model::{ActionOutcome, LinkCheckRecord, LinkHealth, Manager, SortBy};
 
 /// The drag-and-drop payload for this surface — a wrapper so egui routes drops by
 /// this surface's own type (never colliding with another panel's `Uuid` payload).
@@ -73,6 +73,8 @@ enum Action {
     OpenSelection,
     /// Bulk: copy the selected URLs to the clipboard.
     CopyUrls,
+    /// Ask the daemon to run a fresh bounded dead-link check.
+    CheckLinks,
     /// Copy a single bookmark's URL (the detail pane's "Copy URL").
     CopyOneUrl(uuid::Uuid),
     /// Bulk: move the selection into a folder.
@@ -183,6 +185,9 @@ fn toolbar(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
         if ui.button("New folder").clicked() {
             actions.push(Action::AddFolder(m.current()));
         }
+        if ui.button("Check links").clicked() {
+            actions.push(Action::CheckLinks);
+        }
         if m.is_searching() {
             ui.add_space(Style::SP_S);
             ui.colored_label(Style::TEXT_DIM, format!("Search: {}", m.query()));
@@ -267,6 +272,25 @@ fn status_line(ui: &mut egui::Ui, m: &Manager) {
         ActionOutcome::Done(done) => {
             ui.colored_label(Style::OK, done);
         }
+    }
+    if let Some(status) = m.latest_link_check() {
+        let truncated = if status.truncated {
+            " · truncated"
+        } else {
+            ""
+        };
+        ui.colored_label(
+            Style::TEXT_DIM,
+            format!(
+                "Link check: {} checked · {} alive · {} dead · {} unsupported · {} error(s){}",
+                status.checked,
+                status.alive,
+                status.dead,
+                status.unsupported,
+                status.errors,
+                truncated
+            ),
+        );
     }
 }
 
@@ -495,6 +519,16 @@ fn bookmark_detail(
         &author_line(&bookmark.last_author),
         Style::TEXT_DIM,
     );
+    if let Some(record) = m.link_check_for(bookmark.id) {
+        link_check_detail(ui, record);
+    } else if m.latest_link_check().is_some() {
+        mde_egui::field(
+            ui,
+            "Link health",
+            "not checked in latest pass",
+            Style::TEXT_DIM,
+        );
+    }
     if !bookmark.tags.is_empty() {
         mde_egui::field(ui, "Tags", &bookmark.tags.join(", "), Style::TEXT_DIM);
     }
@@ -509,6 +543,22 @@ fn bookmark_detail(
     });
     ui.add_space(Style::SP_S);
     detail_actions(ui, m, bookmark.id, actions);
+}
+
+fn link_check_detail(ui: &mut egui::Ui, record: &LinkCheckRecord) {
+    let color = match record.health {
+        LinkHealth::Alive => Style::OK,
+        LinkHealth::Dead | LinkHealth::Error => Style::DANGER,
+        LinkHealth::Unsupported => Style::TEXT_DIM,
+    };
+    let status = record.http_status.map_or_else(
+        || record.health.label().to_string(),
+        |code| format!("{} · HTTP {code}", record.health.label()),
+    );
+    mde_egui::field(ui, "Link health", &status, color);
+    if !record.detail.is_empty() {
+        mde_egui::field(ui, "Probe detail", &record.detail, Style::TEXT_DIM);
+    }
 }
 
 /// The Rename / Delete row shared by folder + bookmark detail.
@@ -806,6 +856,7 @@ fn apply(ctx: &egui::Context, m: &mut Manager, action: Action) {
         Action::SetSort(sort) => m.set_sort(sort),
         Action::ClearSearch => m.open_folder(m.current()),
         Action::OpenSelection => m.open_selection(),
+        Action::CheckLinks => m.request_link_check(),
         Action::CopyUrls => {
             let text = m.copy_selected_urls();
             if !text.is_empty() {
@@ -943,6 +994,33 @@ mod tests {
         m.select_only(f); // focus the folder in the detail pane
         m.open(bm); // record an open intent (browser seam)
         assert!(!m.open_intent().is_empty());
+        render(&mut m);
+    }
+
+    #[test]
+    fn renders_link_check_summary_and_detail() {
+        let mut m = manager();
+        let bm = m.add_bookmark("https://broken.example", "Broken", None);
+        m.select_only(bm);
+        m.apply_link_check_status(crate::model::LinkCheckStatus {
+            op: "bookmarks_link_check".to_string(),
+            node: "test-node".to_string(),
+            checked_at_ms: 42,
+            checked: 1,
+            alive: 0,
+            dead: 1,
+            unsupported: 0,
+            errors: 0,
+            truncated: false,
+            records: vec![crate::model::LinkCheckRecord {
+                id: bm,
+                url: "https://broken.example".to_string(),
+                title: "Broken".to_string(),
+                health: crate::model::LinkHealth::Dead,
+                http_status: Some(404),
+                detail: "HTTP 404".to_string(),
+            }],
+        });
         render(&mut m);
     }
 }

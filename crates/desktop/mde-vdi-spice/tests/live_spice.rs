@@ -4,9 +4,10 @@
 //! The unit suite proves the SPICE decode/input surface on synthetic bytes and
 //! `tests/loopback_spice.rs` proves the connect path errors cleanly without a
 //! server; this test proves the assembled stack against a live QEMU/KVM SPICE
-//! console (the CHOOSER-5 acceptance "connects to a KVM VM's Spice console;
-//! connect→a frame arrives"), mirroring the RDP/VNC live proofs
-//! (`mde-vdi-rdp/tests/live_rdp.rs`, `mde-vdi-vnc/tests/live_console.rs`).
+//! console (the CHOOSER-5/QC-23 acceptance "connects to a KVM VM's Spice
+//! console; connect→a frame arrives; input is forwarded"), mirroring the RDP/VNC
+//! live proofs (`mde-vdi-rdp/tests/live_rdp.rs`,
+//! `mde-vdi-vnc/tests/live_console.rs`).
 //!
 //! Everything goes through the crate's public API — [`SpiceTransport::connect`]
 //! runs the real `spice-client` connection + channel handshake,
@@ -14,7 +15,9 @@
 //! display channel, [`pump_frame`] folds the decoded primary surface into the
 //! session via the same [`SpiceSession::apply_surface`] the unit tests drive,
 //! [`frame`] yields the egui [`ColorImage`] the shell would upload, and
-//! [`flush_input`] puts a real keystroke on the SPICE inputs channel.
+//! [`flush_input`] puts real scancode input on the SPICE inputs channel. The
+//! proof prints deterministic `FRAME OK`, settled baseline, and input
+//! echoed/unchanged checksum lines so the live run has auditable pixel evidence.
 //!
 //! [`pump_frame`]: mde_vdi_spice::SpiceTransport::pump_frame
 //! [`flush_input`]: mde_vdi_spice::SpiceTransport::flush_input
@@ -79,6 +82,59 @@ fn parse_target(raw: &str) -> SpiceConfig {
     cfg
 }
 
+/// Pump decoded SPICE surfaces until a new egui frame is available.
+async fn pump_until_frame(
+    transport: &SpiceTransport,
+    session: &mut SpiceSession,
+    timeout: Duration,
+    label: &str,
+) -> ColorImage {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if transport.pump_frame(session).await.expect(label) {
+            if let Some(img) = session.frame() {
+                return img;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("live: no SPICE frame arrived within {timeout:?} for {label}");
+}
+
+/// Drain late paints until the display quiets down or the timeout expires,
+/// returning the last frame seen. This keeps input echo checks from diffing
+/// against a half-painted desktop.
+async fn settle(
+    transport: &SpiceTransport,
+    session: &mut SpiceSession,
+    timeout: Duration,
+) -> Option<ColorImage> {
+    let deadline = Instant::now() + timeout;
+    let mut last = None;
+    while Instant::now() < deadline {
+        if transport.pump_frame(session).await.ok()? {
+            if let Some(img) = session.frame() {
+                last = Some(img);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    last
+}
+
+/// Queue a key down/up pair through the same egui event API the shell drives.
+fn send_key(session: &mut SpiceSession, key: Key) {
+    for pressed in [true, false] {
+        session.send_input(&Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        });
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live SPICE console required — set MDE_SPICE_LIVE_TARGET=host:port[,password] (see module docs)"]
 async fn live_spice_console_connects_renders_and_accepts_input() {
@@ -99,46 +155,66 @@ async fn live_spice_console_connects_renders_and_accepts_input() {
     let event_loop = tokio::spawn(async move { loop_client.start_event_loop().await });
 
     // Pump until a real primary surface arrives (bounded), then assert it renders.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut rendered = None;
-    while Instant::now() < deadline {
-        if transport.pump_frame(&mut session).await.expect("pump") {
-            if let Some(img) = session.frame() {
-                rendered = Some(img);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let img = rendered.expect("no SPICE frame arrived within 20 s");
-    eprintln!(
-        "live SPICE frame: {}x{} checksum={:016x} distinct_colors={}",
-        img.size[0],
-        img.size[1],
-        fnv1a64(&img),
-        distinct_colors(&img),
+    let img = pump_until_frame(
+        &transport,
+        &mut session,
+        Duration::from_secs(20),
+        "the first SPICE desktop paint",
+    )
+    .await;
+    let checksum = fnv1a64(&img);
+    let colors = distinct_colors(&img);
+    println!(
+        "live: FRAME OK {}x{} fnv1a64={checksum:#018x} distinct_colors={colors}",
+        img.size[0], img.size[1]
     );
     assert!(img.size[0] > 0 && img.size[1] > 0, "empty desktop");
 
-    // Put a real keystroke on the wire (Enter) — proves the inputs channel.
-    session.send_input(&Event::Key {
-        key: Key::Enter,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: Modifiers::default(),
-    });
-    session.send_input(&Event::Key {
-        key: Key::Enter,
-        physical_key: None,
-        pressed: false,
-        repeat: false,
-        modifiers: Modifiers::default(),
-    });
+    let settled = settle(&transport, &mut session, Duration::from_secs(5)).await;
+    let baseline = settled.as_ref().map_or(checksum, fnv1a64);
+    println!("live: settled baseline fnv1a64={baseline:#018x}");
+
+    // Put real scancode input on the wire. SPICE does not carry a unicode text
+    // path in this crate, so type "m" as a Key::M down/up pair, then Enter.
+    send_key(&mut session, Key::M);
+    send_key(&mut session, Key::Enter);
     transport
         .flush_input(&mut session)
         .await
         .expect("flush input");
+    println!("live: sent Key::M + Enter via SpiceTransport::flush_input");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    match settle(&transport, &mut session, Duration::from_secs(10)).await {
+        Some(after) => {
+            let checksum_after = fnv1a64(&after);
+            if checksum_after == baseline {
+                println!(
+                    "live: INPUT sent OK; framebuffer UNCHANGED after keypress \
+                     (fnv1a64={checksum_after:#018x}) — console may not echo"
+                );
+            } else {
+                println!(
+                    "live: INPUT ECHOED — framebuffer changed after keypress \
+                     (before={baseline:#018x} after={checksum_after:#018x})"
+                );
+            }
+        }
+        None => println!("live: INPUT sent OK; server repainted nothing afterwards"),
+    }
 
     event_loop.abort();
+}
+
+#[test]
+fn target_parser_accepts_host_port_and_optional_ticket() {
+    let plain = parse_target("127.0.0.1:5900");
+    assert_eq!(plain.host, "127.0.0.1");
+    assert_eq!(plain.port, 5900);
+    assert_eq!(plain.password, None);
+
+    let ticketed = parse_target("spice.mesh:5930,secret-ticket");
+    assert_eq!(ticketed.host, "spice.mesh");
+    assert_eq!(ticketed.port, 5930);
+    assert_eq!(ticketed.password.as_deref(), Some("secret-ticket"));
 }

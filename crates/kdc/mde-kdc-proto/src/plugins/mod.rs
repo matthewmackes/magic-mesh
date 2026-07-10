@@ -1,10 +1,10 @@
 //! KDC2-2 plugins — per-feature plugin trait + the canonical
 //! plugin registry (ping, clipboard, share, notification,
-//! findmyphone, battery, mpris, sms, telephony).
+//! findmyphone, battery, mpris, mousepad, sms, telephony).
 //!
-//! KDE Connect's wire format multiplexes nine plugins through a
+//! KDE Connect's wire format multiplexes KDE Connect plugins through a
 //! single TLS session, distinguished by the `Packet.kind` string
-//! (`kdeconnect.<plugin>`). KDC2 keeps the same nine plugins for
+//! (`kdeconnect.<plugin>`). KDC2 keeps the stock plugin kinds it implements for
 //! wire compatibility with stock clients. Extending with MDE-only
 //! plugins is a v2.2+ deferred feature — the trait + registry
 //! below are the seam.
@@ -16,6 +16,7 @@
 pub mod battery;
 pub mod clipboard;
 pub mod findmyphone;
+pub mod mousepad;
 pub mod mpris;
 pub mod notification;
 pub mod ping;
@@ -28,7 +29,8 @@ pub mod telephony;
 pub use battery::{battery_packet, BatteryBody, BatteryPlugin};
 pub use clipboard::{clipboard_packet, from_packet_body, ClipboardBody, ClipboardPlugin};
 pub use findmyphone::{find_my_phone_packet, FindMyPhoneBody, FindMyPhonePlugin};
-pub use mpris::{mpris_command_packet, MprisBody, MprisKind, MprisPlugin};
+pub use mousepad::{mousepad_packet, MouseButton, MouseModifiers, MousepadBody, MousepadEvent};
+pub use mpris::{mpris_command_packet, MprisBody, MprisKind, MprisPlugin, MprisRequestBody};
 pub use notification::{notification_packet, NotificationBody, NotificationPlugin};
 pub use ping::{ping_packet, PingBody, PingPlugin};
 pub use run_command::{run_command_packet, RunCommandBody};
@@ -66,6 +68,10 @@ pub enum PluginKind {
     Battery,
     /// MPRIS media-player control.
     Mpris,
+    /// KDC-MESH-6 — Android remote input (`kdeconnect.mousepad.request`).
+    /// The host parses this into a Bus handoff for the seat injector; it does
+    /// not inject input from this protocol crate.
+    Mousepad,
     /// SMS read/send (Android only).
     Sms,
     /// Phone-call state mirror.
@@ -96,7 +102,7 @@ impl PluginKind {
     /// in a deterministic shape (some KDC clients are sensitive to
     /// list order during pairing).
     #[must_use]
-    pub const fn all() -> [Self; 11] {
+    pub const fn all() -> [Self; 12] {
         [
             Self::Ping,
             Self::Clipboard,
@@ -105,6 +111,7 @@ impl PluginKind {
             Self::FindMyPhone,
             Self::Battery,
             Self::Mpris,
+            Self::Mousepad,
             Self::Sms,
             Self::Telephony,
             Self::RunCommand,
@@ -123,6 +130,7 @@ impl PluginKind {
             Self::FindMyPhone => "findmyphone.request",
             Self::Battery => "battery",
             Self::Mpris => "mpris",
+            Self::Mousepad => "mousepad.request",
             Self::Sms => "sms.messages",
             Self::Telephony => "telephony",
             Self::RunCommand => "runcommand",
@@ -311,10 +319,11 @@ mod tests {
     #[test]
     fn plugin_kind_count_matches_upstream_kdc() {
         // v2.1 KDC2: parity with upstream KDE Connect's 9
-        // canonical plugins + RunCommand (KDC2-2.19, deny-by-
+        // canonical plugins + Mousepad (KDC-MESH-6 remote-input handoff) +
+        // RunCommand (KDC2-2.19, deny-by-
         // default in policy.toml) + Sftp (KDC-MESH-7, host-side
         // browse-the-phone mount).
-        assert_eq!(PluginKind::all().len(), 11);
+        assert_eq!(PluginKind::all().len(), 12);
     }
 
     #[test]
@@ -354,14 +363,22 @@ mod tests {
     }
 
     #[test]
+    fn mousepad_plugin_uses_request_suffix() {
+        assert_eq!(
+            PluginKind::Mousepad.packet_kind(),
+            "kdeconnect.mousepad.request",
+        );
+    }
+
+    #[test]
     fn plugin_kind_tokens_are_unique() {
         // Two plugins sharing the same token would silently merge
-        // in the registry. Hard-lock uniqueness across all 11
-        // variants (9 canonical + RunCommand + Sftp).
+        // in the registry. Hard-lock uniqueness across all 12
+        // variants (9 canonical + Mousepad + RunCommand + Sftp).
         let mut tokens: Vec<&'static str> = PluginKind::all().iter().map(|k| k.token()).collect();
         tokens.sort_unstable();
         tokens.dedup();
-        assert_eq!(tokens.len(), 11);
+        assert_eq!(tokens.len(), 12);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -394,6 +411,7 @@ mod tests {
                 PluginKind::Notification => vec!["kdeconnect.notification"],
                 PluginKind::Battery => vec!["kdeconnect.battery"],
                 PluginKind::Mpris => vec!["kdeconnect.mpris"],
+                PluginKind::Mousepad => vec!["kdeconnect.mousepad.request"],
                 PluginKind::Share => vec!["kdeconnect.share.request"],
                 PluginKind::FindMyPhone => vec!["kdeconnect.findmyphone.request"],
                 PluginKind::Sms => vec!["kdeconnect.sms.messages"],

@@ -115,7 +115,10 @@ use super::{ShutdownToken, Worker};
 
 use capacity::NodeCapacity;
 use client::{CloudClient, LiveOpenStack};
-use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind};
+use config_render::{
+    render_cloud_bootstrap, render_fleet_heat_stack, render_navidrome_heat_stack,
+    render_swift_bootstrap, OverlayBind,
+};
 use designate::{MeshPeerDirectory, PeerDirectorySource};
 use events::{watch_cycle, EventSource, NotificationFeed, WatchState};
 use fleet::{FleetStateSource, MeshFleetState};
@@ -268,6 +271,28 @@ fn render_leader_bootstrap(
             .push(format!("openstack: fleet Heat stack render failed — {e}"));
     }
 
+    // QC-18/Q60 — the leader renders the media-service Heat stack that
+    // re-platforms Navidrome as a Nova instance. The QC-10 seed creates it only
+    // when the media secret env exists, keeping the template applyable without
+    // claiming a live instance on a credentials-free farm.
+    if let Err(e) = render_navidrome_heat_stack(config_root, &release) {
+        outcome.alerts.push(format!(
+            "openstack: Navidrome Heat stack render failed — {e}"
+        ));
+    }
+
+    let peer_pairs = peers.pairs();
+
+    // QC-18 — the leader renders the Swift object-tier bootstrap artifact
+    // (Q54/55/57): rings derived from the same peer directory plus the Cinder
+    // backup container that lands volume backups in the hot object tier. The
+    // QC-10 seed runs it idempotently when present.
+    if let Err(e) = render_swift_bootstrap(config_root, &release, &peer_pairs) {
+        outcome
+            .alerts
+            .push(format!("openstack: swift bootstrap render failed — {e}"));
+    }
+
     // QC-17 — the leader renders the Designate naming plane's peer-fed inputs
     // (Q46: the peer directory feeds — and can re-seed — the mesh zone):
     // the pool topology (every node's bind9, no fixed center) and the zone
@@ -277,7 +302,6 @@ fn render_leader_bootstrap(
     // resolve check gates honestly into the feed's provenance header (§7 —
     // never a claimed-working naming plane). Render failures ride the alert
     // lane (→ chat), never a silent swallow.
-    let peer_pairs = peers.pairs();
     if let Err(e) = designate::render_designate_pools(config_root, &release, &peer_pairs) {
         outcome
             .alerts
@@ -791,6 +815,12 @@ mod tests {
                 .join("bootstrap")
                 .join("designate-feed.sh")
                 .exists());
+            // QC-18 — nor the Swift ring/bootstrap artifact.
+            assert!(!dir
+                .path()
+                .join("bootstrap")
+                .join("swift-bootstrap.sh")
+                .exists());
             assert!(outcome.alerts.is_empty(), "{:?}", outcome.alerts);
         }
     }
@@ -816,6 +846,55 @@ mod tests {
         assert!(seed.contains("QC-10"), "{seed}");
         assert!(seed.contains("ensure_flavor m1.large"), "{seed}");
         assert!(seed.contains("ensure_limit nova class:VCPU"), "{seed}");
+        assert!(
+            seed.contains("SWIFT_BOOTSTRAP=\"$(dirname \"$0\")/swift-bootstrap.sh\""),
+            "{seed}"
+        );
+        assert!(
+            dir.path()
+                .join("bootstrap")
+                .join("navidrome-stack.yaml")
+                .exists(),
+            "the leader renders the QC-18 Navidrome Heat stack beside the seed"
+        );
+    }
+
+    #[test]
+    fn the_leader_renders_the_swift_object_tier_bootstrap() {
+        // QC-18/Q54/55/57 — the leader renders the Swift bootstrap script from
+        // the peer directory beside the QC-10 seed. The seed runs this artifact
+        // to build account/container/object rings and create the cinder-backup
+        // object container idempotently.
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcome = outcome_with(DoctrineStatus::Enabled {
+            leader: true,
+            kolla_release: "2024.1".into(),
+        });
+        render_leader_bootstrap(dir.path(), &fake_peers(), "node-a", &[], &mut outcome);
+        assert!(
+            outcome.alerts.is_empty(),
+            "renders must succeed: {:?}",
+            outcome.alerts
+        );
+        let swift =
+            std::fs::read_to_string(dir.path().join("bootstrap").join("swift-bootstrap.sh"))
+                .expect("the leader rendered the Swift bootstrap artifact");
+        assert!(
+            swift.contains("swift-ring-builder \"$builder\" create 10 2 1"),
+            "{swift}"
+        );
+        assert!(
+            swift.contains("--ip 10.42.0.9 --port \"$port\" --device d1"),
+            "{swift}"
+        );
+        assert!(
+            swift.contains("--ip 10.42.0.4 --port \"$port\" --device d2"),
+            "{swift}"
+        );
+        assert!(
+            swift.contains("openstack container create volumebackups"),
+            "{swift}"
+        );
     }
 
     #[test]

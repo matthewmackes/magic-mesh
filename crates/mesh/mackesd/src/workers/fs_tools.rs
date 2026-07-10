@@ -9,7 +9,7 @@
 //! silent partial), and the injectable **typed verb layer** ([`FsToolRunner`]) the
 //! executor drives instead of raw shell (§9).
 //!
-//! ## Shape (mirrors `mde_kvm::qemu_img`'s runner seam)
+//! ## Shape (typed runner seam)
 //!
 //! - **The pure core is fully unit-tested with no process.** [`FsCapabilities`] (the
 //!   real support matrix per fs), the argv builders ([`ToolCmd`]), and the
@@ -430,7 +430,7 @@ pub fn parse_subvol_list(stdout: &str) -> Vec<String> {
 
 // ───────────────────────────── runner seam ─────────────────────────────
 
-/// A typed fs-tooling failure (mirrors `mde_kvm::QemuImgError`).
+/// A typed fs-tooling failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FsToolError {
     /// The tool isn't installed on this host — the honest §7 gate.

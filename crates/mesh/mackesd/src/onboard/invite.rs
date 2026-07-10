@@ -835,5 +835,10 @@ mod tests {
         assert_ne!(token.bearer, inv.secret);
         // It round-trips to the exact v3 wire shape the enroll path speaks.
         assert!(token.encode().starts_with("mesh:home-mesh@10.9.9.9:4242#"));
+        assert_eq!(
+            crate::nebula_enroll::parse_join_token(&token.encode()),
+            Some(token),
+            "MDEINV1-derived join tokens must remain accepted by the v3 parser"
+        );
     }
 }

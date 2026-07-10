@@ -1,4 +1,4 @@
-# MCNF Threat Model — the mesh web browser + `mde-web-preview` helper
+# MCNF Threat Model — the mesh web browser, phone remote-input, and WebAuthn/passkeys
 
 Scope: the sandboxed Servo browser that MCNF ships inside the desktop shell
 (BOOKMARKS-5..9; design: `docs/design/mesh-bookmarks.md`). This document states
@@ -10,6 +10,16 @@ It is a living document: it is the security contract the browser is packaged
 against (`crates/mesh/mackesd/Cargo.toml` `generate-rpm` block + the confined
 SELinux domain in `packaging/selinux/mde-web-preview.te`). Change the sandbox or
 the packaging and you update this file.
+
+This file has grown to cover MCNF's other privileged, security-relevant
+`mackesd` worker surfaces alongside the browser — each below as its own
+numbered section using the same shape (trust boundary → attack surface →
+mitigations → accepted residual risks → out of scope): **§6, phone-to-desktop
+remote-input injection** (KDC-MESH-6: `workers/seat_remote_input.rs` +
+`install-helpers/seat-remote-input.py`) and **§7, WebAuthn / passkey
+ceremonies** (BROWSER-DD-6: `workers/browser_passkeys.rs`). Each section is
+the security contract for that worker; change its trust model and update its
+section.
 
 ---
 
@@ -94,13 +104,14 @@ mesh-storage) is denied by the SELinux default-deny**. That omission *is* the
 confinement; there are no blanket `unconfined_*` grants — it is a real confined
 domain, not a permissive stub.
 
-> **Platform note.** The operator sets **SELinux disabled platform-wide**
-> (2026-06-20). Where SELinux is disabled the kernel does not enforce this
-> domain and the loader (`setup-selinux-web-preview.sh`) self-skips — the OS
-> sandbox in §3.1 remains the operative confinement, and the primary security
-> properties never depend on SELinux. The module ships + loads so that any node
-> re-enabling SELinux Enforcing gains the confined domain with no extra step
-> (defense-in-depth).
+> **Platform note.** The 2026-06-20 disabled-SELinux fleet standard is
+> superseded for Quasar-cloud nodes by QC-22: shipped nodes target SELinux
+> Enforcing and load the MCNF policy modules through the bounded boot-time
+> policy oneshot. If a node is still kernel-disabled, has not rebooted after the
+> enforcing config change, or lacks the SELinux policy toolchain, the kernel does
+> not enforce this browser domain and the loader (`setup-selinux-web-preview.sh`)
+> self-skips; the OS sandbox in §3.1 remains the operative confinement, and the
+> primary security properties never depend on SELinux.
 
 ### 3.3 Blast radius & lifecycle
 - **One sandboxed process per tab**, torn down per session (Q53). A crash or
@@ -170,8 +181,9 @@ These are conscious tradeoffs; the sandbox (§3) contains everything else.
    security fix and the next MCNF pin (see the CHANGELOG's update cadence). The
    pin makes each build reproducible + tamper-evident.
 4. **Fingerprinting / anti-adblock are best-effort**, not guaranteed.
-5. **SELinux disabled on the platform standard** — the confined domain (§3.2) is
-   defense-in-depth that is inert until an operator enables SELinux; the OS
+5. **SELinux policy rollout state** — Quasar-cloud nodes target Enforcing under
+   QC-22, but a host that is still kernel-disabled, pre-reboot, or missing the
+   policy toolchain does not get the browser confined domain (§3.2). The OS
    sandbox (§3.1) is the operative confinement meanwhile. Accepted because the
    primary security properties do not depend on SELinux.
 6. **`unsafe` in the helper + the client** — confined to named FFI/sandbox/shm
@@ -185,3 +197,309 @@ No credential/password/cookie-jar/history persistence; no uploads (downloads to
 quarantine only); no browser inside VM sessions; no standalone window (shell
 surface only); **no Firefox/NSS required**; no CA-signed anything; the egress
 proxy is declined; perfect anti-fingerprint / anti-adblock is not attempted.
+
+---
+
+## 6. Phone-to-desktop remote-input injection (KDC-MESH-6)
+
+Scope: a paired Android phone driving the active desktop seat as a touchpad +
+keyboard, over KDE Connect riding the Nebula mesh overlay (design:
+`docs/design/kdc-mesh.md`). The pipeline is two pieces: `kdc_host`
+(`crates/mesh/mackesd/src/workers/kdc_host.rs`, pre-existing) parses a paired
+phone's `kdeconnect.mousepad.request` packets into a local Bus handoff, and
+the pieces documented here — `seat_remote_input`
+(`crates/mesh/mackesd/src/workers/seat_remote_input.rs`) and the uinput helper
+(`install-helpers/seat-remote-input.py`) — turn that handoff into real
+keyboard/mouse events on the seat.
+
+### 6.1 What ships, and where the trust boundary is
+
+| Component | Tier | Trust |
+|-----------|------|-------|
+| Paired Android phone | remote mesh peer (KDE Connect + Nebula client) | Trusted **once paired** — RSA-4096 device identity, TOFU + fingerprint-pin (SEC-4), riding the Nebula overlay only (mutually authenticated, encrypted). |
+| `kdc_host` worker (universal, rank 0) | mackesd, every node | Trusted. Owns the pairing store; gates `kdeconnect.mousepad.request` on `pairing.is_paired(peer)` before it ever becomes a Bus event; hash-chain audits every accepted batch (`kdc_remote_input`). |
+| `seat_remote_input` worker (Workstation, rank 1) | mackesd, seated nodes | Trusted; consumes `action/seat/remote-input` as already-authorized (pairing happened upstream in `kdc_host`) and only bounds-checks shape. |
+| `seat-remote-input` helper (`install-helpers/seat-remote-input.py`) | root-invoked, short-lived subprocess | Trusted **input**, but wields **root/uinput privilege** — it creates a virtual USB HID keyboard+mouse device and can inject into whatever has focus in the active session. No sandbox of its own; its only defense is the bounded JSON it receives. |
+
+```
+phone (paired, Nebula-authenticated)
+   -> kdc_host            [pairing.is_paired() gate; hash-chain audit]
+   -> Bus action/seat/remote-input     (local, same-host handoff)
+   -> seat_remote_input    [shape/bounds validation only -- trust already spent]
+   -> seat-remote-input.py
+   -> /dev/uinput -> virtual HID device -> whatever has focus on the seat
+```
+
+The trust boundary is the **KDC pairing ceremony**, not the input stream
+itself. Once a phone is paired, KDC-MESH-6 grants it full keyboard+mouse
+control of the active desktop with **no per-action confirmation** — a
+deliberate, locked design choice (`docs/design/kdc-mesh.md` decision #16,
+"pairing is enough"), not an omission in this worker.
+
+### 6.2 Attack surface
+
+1. **The pairing ceremony itself.** TOFU-on-first-pair + a fingerprint pin is
+   the entire authorization step; a spoofed pairing at enrollment, or a
+   stolen/cloned already-paired phone, inherits full seat control.
+2. **The Nebula overlay transport.** KDC-MESH-6 traffic rides the overlay
+   only (`docs/design/kdc-mesh.md` #3) — encrypted and cert-authenticated by
+   Nebula itself; a compromised overlay peer or CA is a pre-existing
+   mesh-wide risk, not something this feature adds or mitigates further.
+3. **The local Bus handoff.** `action/seat/remote-input` is same-host,
+   same-user trust: `parse_request` checks the `op`/`source` string fields
+   and bounds the payload, but has no cryptographic link back to the phone —
+   anything running as the daemon's user that can write to the Bus root can
+   forge a remote-input event (shared with every `action/*` worker in
+   mackesd; called out here because the payload is unusually high-privilege).
+4. **The uinput helper.** A JSON-driven, root-capable process
+   (`seat-remote-input.py`); a parsing bug in `event_to_ops`/`create_device`
+   would run with full uinput privilege. Today it fails closed on anything it
+   doesn't recognize (§6.3.3).
+5. **The receiving application.** An injected key/click is indistinguishable
+   from physical input to whatever has focus; there is no per-window scoping
+   (inherent to uinput, not unique to this implementation).
+
+### 6.3 Mitigations — the layers
+
+#### 6.3.1 Pairing gate (`kdc_host.rs`)
+`pairing.is_paired(peer.as_str())` is checked before a
+`kdeconnect.mousepad.request` packet is parsed or dispatched at all — an
+unpaired phone's packets never reach the remote-input pipeline. Every
+accepted batch is recorded in the hash-chained KDC audit log
+(`audit_kdc_action`, `"action": "kdc_remote_input"`) — there is no per-event
+confirmation, but there is always a durable record.
+
+#### 6.3.2 Bounded, typed event parsing (`seat_remote_input.rs`)
+- Move/scroll deltas: finite `f64`, `|value| <= 4096.0`.
+- Text tokens: ≤ 16 chars; button clicks: 1–2; special-key codes: `0..=255`;
+  phone id: ≤ 128 chars, identifier charset only (`valid_phone`).
+- `classify_helper_status` maps the helper's exit code honestly: `0` →
+  injected, `69`/`78` → `unavailable` (no live seat), anything else
+  (including the helper's own `65` for a malformed event) → `error` — never a
+  fake `injected` (proven by the worker's own
+  `unavailable_injector_is_honest_state_not_fake_success` test).
+- The Bus cursor prevents replaying the same already-drained message twice.
+
+#### 6.3.3 The uinput helper fails closed
+- Exits `69` when `/dev/uinput` is absent or permission is denied, `65` on
+  any unsupported/malformed op (an unmapped Unicode character, an
+  out-of-range delta) — before any `ioctl`/write touches `/dev/uinput`.
+- A fixed key/character allowlist (`TEXT_KEYS`, `SPECIAL_KEYS`); an unmapped
+  character is refused, never best-effort substituted.
+- mackesd bounds the call itself with a 500 ms exec timeout
+  (`INJECT_CMD_TIMEOUT`), so a hung helper can't stall the worker forever.
+
+#### 6.3.4 Role + package gating
+`seat_remote_input` is Workstation-tier (rank 1 in `worker_role.rs`) — it
+idles on headless/Lighthouse nodes. The Server RPM variant deliberately does
+not ship `seat-remote-input.py` at all
+(`full_rpm_ships_seat_remote_input_helper_but_server_variant_does_not`) — a
+box with no seat has no injector to invoke.
+
+### 6.4 Accepted residual risks
+
+1. **No per-action confirmation — by design.** This is
+   `docs/design/kdc-mesh.md` decision #16, not an oversight: a paired phone
+   drives full keyboard+mouse input (open a terminal, run anything the
+   logged-in user can run) with no per-keystroke prompt. The audit log is the
+   only brake. A lost, stolen, or cloned paired phone is full seat control
+   until unpaired — the design doc's own risk list already names this ("a
+   lost/stolen paired phone = fleet control until unpaired").
+2. **One mesh-wide pairing record.** A phone pairs once and every node
+   recognizes it (`docs/design/kdc-mesh.md` #5) — there's no per-node
+   re-authorization, so pairing against one compromised node trusts the phone
+   fleet-wide.
+3. **No on-screen "a phone is driving this seat" indicator.** Nothing in
+   `mde-shell-egui` surfaces phone-driven input distinctly from local input —
+   a seated user has no in-the-moment visual cue. KDC-MESH-6's own WORKLIST
+   entry still lists live on-seat validation as remaining work.
+4. **No timestamp/freshness check.** `ts_unix_ms` is recorded but never
+   compared against wall-clock time; replay protection, if any, is left
+   entirely to the Nebula transport underneath.
+5. **uinput is inherently seat-wide.** The helper cannot scope injected
+   events to one window/app — true of any uinput-based remote input, not
+   specific to this implementation.
+
+### 6.5 Out of scope / non-goals
+
+No phone-side code review (the Android Nebula client + KDE Connect app are
+stock, out-of-repo); no per-command confirmation UI (declined by design lock
+number 16); no evdev *capture* (this worker only injects, never reads the
+desktop's own input); no device-binding scheme beyond the phone's
+Nebula-enrolled identity.
+
+---
+
+## 7. WebAuthn / passkey ceremonies (BROWSER-DD-6)
+
+Scope: a software "platform authenticator" that lets the mesh browser answer
+`navigator.credentials.create()`/`.get()` calls, storing the resulting keys in
+a Syncthing-mirrored, sealed mesh credential store. Tracked as BROWSER-DD-6
+(`docs/WORKLIST.md`); the worker's own doc comment scopes hardware-key
+ceremonies and phone-as-authenticator as separate, not-yet-built owners, and
+the WORKLIST entry is still unchecked. This section covers
+`crates/mesh/mackesd/src/workers/browser_passkeys.rs` — `browser_protocol.rs`,
+despite the similar name, is a different, unrelated worker (BROWSER-DD-12's
+`mailto:`/`magnet:` external-link handoff) with no WebAuthn role.
+
+### 7.1 What ships, and where the trust boundary is
+
+| Component | Tier | Trust |
+|-----------|------|-------|
+| Page JavaScript (`navigator.credentials`) | inside the browser engine | **UNTRUSTED** page content — confined the same as any other script (§3) when the engine is Servo. |
+| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Defines `navigator.credentials.create`/`.get` in page context itself and ships the ceremony to the shell over the existing IPC/beacon channel. See the CEF note in §7.4. |
+| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Forwards the ceremony to the local Bus **verbatim** — there is no confirmation UI at this layer (§7.4). |
+| `browser_passkeys` worker (Workstation, rank 1) | mackesd | Trusted. Validates the request shape + RP-ID/origin binding, mints or uses a P-256 keypair, signs, mirrors to the Syncthing share. |
+| Sealed credential store (`credentials/sealed/*.age`, local + Syncthing-shared workgroup root) | at rest | Confidentiality rests on the **mesh-wide age identity** (`/root/.mcnf-age-key`) — the same trust root already used for VPN tunnel secrets and XCP dom0 passwords, not a per-device or per-user secret (§7.4). |
+| Hardware FIDO2 keys / phone-as-authenticator | — | **Not wired to a live ceremony.** Only a HID readiness probe + CTAPHID_INIT diagnostic exist; the worker's own doc comment says CTAP2 credential commands and phone-as-authenticator "remain separate owners." |
+
+```
+page JS  navigator.credentials.create()/get()
+   -> injected shim (engine process, Servo or CEF)   [no user-gesture check found]
+   -> beacon/IPC -> mde-shell-egui::web.rs            [forwarded verbatim, no consent UI]
+   -> Bus action/browser/passkey
+   -> browser_passkeys worker
+        create: mint P-256 keypair, seal private key, mirror public+sealed record over Syncthing
+        get:    locate stored credential by rp_id (+ allow_credentials), unseal, sign
+   -> event back over the Bus -> shell -> shim resolves the page's Promise
+```
+
+The actual anti-phishing boundary is enforced **daemon-side**, where `rp_id`
+is checked against the request's `origin` (§7.3.1) — not by the browser
+sandbox. A compromised *or merely aggressive* page at its own real origin can
+drive this entire pipeline; see §7.4 for what does, and does not, gate it.
+
+### 7.2 Attack surface
+
+1. **Any page at a matching origin calling `navigator.credentials`.** The
+   shim and the daemon complete the ceremony with no user-presence check and
+   no confirmation UI. The single biggest surface (§7.4).
+2. **The RP-ID/origin binding logic** (`rp_matches_origin`, `valid_rp_id`,
+   `origin_host`) — a bug here would be a direct cross-origin credential /
+   phishing bypass. Reviewed line-by-line; found correct (§7.3.1).
+3. **The sealed credential store and its Syncthing mirror** — anything that
+   can read `credentials/sealed/*.age` (local disk or the shared root) *and*
+   obtain the mesh age identity decrypts every mirrored private key (§7.4).
+4. **The CTAP HID diagnostic path** (`probe_hardware_key_status_with_live_
+   probe`) reads `/dev/hidraw*`; the live INIT exchange is opt-in only
+   (`MDE_BROWSER_PASSKEY_CTAPHID_LIVE_PROBE`) specifically because polling it
+   by default "can otherwise block or perturb an authenticator" (own doc
+   comment) — a narrow, honestly-scoped surface.
+5. **Supply chain.** Same Servo pin as §2 (supply chain), plus the
+   CEF/Chromium engine lane (`mde-web-cef`) that also originates passkey
+   ceremonies but is not in this document's §1 trust table at all (§7.4).
+
+### 7.3 Mitigations — the layers
+
+#### 7.3.1 RP-ID / origin binding is real and correct
+- `origin_host()` accepts only `https://` origins (or `http://localhost` /
+  `127.0.0.1`), lowercased, no embedded userinfo, no IPv6-literal shortcut.
+- `rp_matches_origin` requires an exact match or a **label-boundary** suffix
+  match: `origin_host.strip_suffix(rp_id)` must end in `.`. `evilexample.com`
+  does **not** match `rp_id = "example.com"`; `login.example.com` does. This
+  is the correct WebAuthn "RP ID must be a registrable-domain suffix of the
+  origin" rule, and it is enforced daemon-side, not merely trusted from the
+  page.
+- Every field is bounded and charset-checked before use (host/rp_id/origin/
+  challenge/credential-id lengths; b64url charset; `create` requires both a
+  user handle and a name).
+
+#### 7.3.2 Real cryptography, not a stub
+- Registration mints a fresh P-256/ES256 keypair via a CSPRNG
+  (`SigningKey::generate()`); the credential id is 32 CSPRNG bytes.
+- Assertions sign the actual WebAuthn `authenticatorData || clientDataHash`
+  payload and **self-verify** (`verifying_key.verify(...)`) before returning
+  — a broken signature is caught before it reaches the page.
+- Registration emits a spec-shaped CBOR `none`-format attestation object +
+  COSE ES256 public key; the worker's own tests round-trip these the way a
+  relying party would
+  (`registration_and_assertion_outputs_verify_like_a_relying_party`).
+
+#### 7.3.3 Sealed at rest, never plaintext on disk
+Private key material is written only inside an Argon2id + XChaCha20-Poly1305
+envelope (`crate::ca::backup::seal_bytes` — the same primitive the CA
+disaster-recovery bundles use); `PendingPasskeyCeremony`'s own doc comment
+notes it "intentionally contains no private key material, signatures,
+client-data JSON, or authenticator data" — only the public record and the
+sealed blob are ever mirrored. Sealed files are written `0600`.
+
+#### 7.3.4 Honest hardware-key gating
+Hardware FIDO2 ceremonies are not claimed as working: status only reports
+readiness (`unknown`/`unavailable`/`present_permission_denied`/`ready`) and a
+CTAP HID diagnostic — never a fake credential from a hardware key. The live
+CTAPHID_INIT probe is off by default (env opt-in) precisely to avoid
+perturbing a real authenticator during a routine status poll.
+
+#### 7.3.5 Role gating + honest-absent
+Workstation-tier only (idles on headless/Lighthouse nodes). No Bus root, or a
+`Persist::open` failure, leaves the worker idle rather than fabricating a
+credential.
+
+### 7.4 Accepted residual risks — including one that is not yet mitigated
+
+1. **No user-presence / user-verification gate exists.** This is the
+   load-bearing gap, not a conscious tradeoff like the rest of this list:
+   nothing between a page's `navigator.credentials.create()`/`.get()` call
+   and a completed, signed ceremony asks the seated human anything.
+   `handle_passkey_event` (`mde-shell-egui/src/web.rs`) forwards the shim's
+   event to the Bus unconditionally; the shim itself (both
+   `mde-web-preview/src/engine.rs` and `mde-web-cef/src/cef_browser.rs`)
+   has no check for a user gesture before dispatching. Yet
+   `assertion_payload`/`registration_authenticator_data` in
+   `browser_passkeys.rs` unconditionally set **both** the User Present (`UP`)
+   and User Verified (`UV`) authenticator-data flag bits (`0x05` on
+   assertion, `0x45` on registration) on every ceremony — claiming to every
+   relying party that a human was present and verified when no local check
+   ever happened. The one visible side effect, `capture_notice` ("Passkey:
+   sent ceremony to daemon"), is a post-hoc transient status line shared
+   with routine, non-security chrome messages (e.g. "Translate: sent page
+   text...") — not a yes/no prompt, and easy to miss. **Net effect: any page
+   can silently obtain a valid, "user-verified" WebAuthn assertion for its
+   own origin the instant it calls the API**, with no click, PIN, or
+   biometric — materially different from what every relying party's
+   `userVerification: "required"` policy assumes. `docs/WORKLIST.md`'s own
+   BROWSER-DD-6 entry is still unchecked ("passwordless login works
+   end-to-end" not yet claimed done), consistent with this being unfinished
+   rather than hidden — but the worker is already spawned in `mackesd.rs`
+   and reachable today, so it needs disclosure now, not just at "done."
+2. **Mesh-wide key-sealing root, not a per-device secret.** `seal_private_key`
+   keys its passphrase off `age_key_path()` (`/root/.mcnf-age-key` by
+   default) — the same identity distributed "to leader-eligible nodes like
+   the mesh SSH key" and reused for VPN tunnel secrets and XCP dom0
+   passwords. Any node holding that one identity, or the identity itself if
+   exfiltrated, decrypts every synced passkey private key mesh-wide, not
+   just one user's. A deliberate reuse of the existing mesh trust root (real
+   Argon2id/XChaCha20-Poly1305, not weakened crypto), but it trades away
+   WebAuthn's usual "the private key never leaves one device" property for
+   "follow me to any of my mesh nodes" — worth the same explicit accept the
+   rest of this document gives its tradeoffs.
+3. **Automatic discoverable-credential selection.** When `allow_credentials`
+   is empty and several stored credentials match an `rp_id`,
+   `find_credential` deterministically returns the alphabetically-first one
+   — no account picker. Fine for a single-account site; silently chooses for
+   the user on a multi-account one.
+4. **The CEF/Chromium engine lane is outside this document's trust table.**
+   Ceremonies can originate from `engine: "servo"` **or** `engine: "cef"`.
+   `mde-web-cef` has its own sandbox-related code (`cef_abi.rs`,
+   `cef_init.rs`, `renderer.rs`) but §1's trust table above only describes
+   Servo/`mde-web-preview`. Not introduced by this diff, but the passkey
+   worker is the first place this document needed to say "or CEF" out loud —
+   the CEF lane's confinement is unaudited here and shouldn't be assumed
+   identical to §3.
+5. **Local Bus trust, same caveat as §6.4's.** Anything running as the
+   desktop user that can write `action/browser/passkey` can trigger a real
+   signed ceremony for any `rp_id` it can also satisfy the origin check for
+   — it cannot forge a credential for a domain it doesn't control the origin
+   string for (§7.3.1 still applies), but it can trigger a ceremony the real
+   browser never asked for, for its own reported origin.
+6. **No challenge/nonce replay tracking.** The daemon does not record seen
+   challenges; replay resistance is whatever the relying party's own
+   challenge lifecycle provides, not an additional local check.
+
+### 7.5 Out of scope / non-goals
+
+CTAP2 hardware-key create/get ceremonies (readiness probe only, §7.3.4);
+phone-as-authenticator (a separate future owner per the worker's own doc
+comment); any change to Servo's or CEF's native credential UI (there isn't
+one in this pipeline — §7.4); cross-mesh credential export/backup UX (the
+sealed store mirrors silently by design, not for manual export).
