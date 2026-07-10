@@ -9650,6 +9650,33 @@ fn page_actions_button(
     .on_hover_text("Page actions \u{2014} bookmark, copy URL, share");
 }
 
+/// Whether the compact toolbar's reload slot should present as a real Stop
+/// control instead of Reload.
+///
+/// Only CEF exposes a genuine cancel-load hook (`cef_browser_t::stop_load`,
+/// offset-verified against the pinned CEF 149 headers — see
+/// `mde-web-cef::cef_browser::apply_control_frame`). Servo's embedding API does
+/// not: the official `servo`/`servo-embedder-traits`/`servo-constellation-traits`
+/// 0.3.0 crates.io publications this workspace pins were inspected directly
+/// (DD-2, 2026-07-10) — `WebView`'s and `Servo`'s complete public method sets
+/// carry no stop/cancel-navigation method, the `WebDriverCommandMsg` relay
+/// `Servo::execute_webdriver_command` accepts has no stop/cancel-navigation
+/// variant (only `LoadUrl`/`Refresh`/`GoBack`/`GoForward` affect navigation),
+/// and the `EmbedderToConstellationMessage` channel `WebView::load`/`reload`
+/// send on (unreachable anyway — `WebView::inner()` is a private accessor)
+/// has no such variant either. Returning `true` for a non-CEF engine would
+/// paint a Stop button that silently does nothing when clicked, which is worse
+/// than the honest Reload it would replace, so this stays a hard per-engine
+/// check rather than a capability guess.
+fn can_show_stop_control(
+    has_tab: bool,
+    crashed: bool,
+    loading: bool,
+    engine: Option<BrowserEngine>,
+) -> bool {
+    has_tab && !crashed && loading && engine == Some(BrowserEngine::Cef)
+}
+
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
 /// the active session; the address bar loads on submit. On a crashed tab, Reload
 /// becomes a respawn request. The page-actions menu (BOOKMARKS-10) hangs off both
@@ -9704,10 +9731,10 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             }
         }
         // Stop while CEF is loading; otherwise Reload respawns crashed tabs or
-        // reloads the page. Servo currently has no real cancel-load hook, so its
-        // compact chrome keeps the honest Reload control while loading.
-        let can_stop =
-            has_tab && !crashed && nav.loading && active_engine == Some(BrowserEngine::Cef);
+        // reloads the page. Servo currently has no real cancel-load hook (DD-2,
+        // investigated 2026-07-10 — see `can_show_stop_control`), so its compact
+        // chrome keeps the honest Reload control while loading.
+        let can_stop = can_show_stop_control(has_tab, crashed, nav.loading, active_engine);
         let (nav_label, nav_tip) = if can_stop {
             ("\u{00D7}", "Stop loading")
         } else if crashed {
@@ -16388,6 +16415,55 @@ mod tests {
         assert_eq!(
             state.capture_notice.as_deref(),
             Some("Chromium DevTools requires a live CEF tab")
+        );
+    }
+
+    // ── DD-2: the compact toolbar's Stop control stays CEF-only ────────────────
+    //
+    // Servo's embedding API (the pinned `servo`/`servo-embedder-traits`/
+    // `servo-constellation-traits` 0.3.0 crates.io publications) exposes no
+    // stop/cancel-navigation primitive anywhere in its reachable surface
+    // (investigated 2026-07-10 — see `can_show_stop_control`'s doc comment).
+    // These lock in the honest degrade: a loading Servo tab must never present
+    // a Stop control that would silently do nothing when clicked.
+
+    #[test]
+    fn a_loading_cef_tab_shows_a_real_stop_control() {
+        assert!(
+            can_show_stop_control(true, false, true, Some(BrowserEngine::Cef)),
+            "CEF has a real cef_browser_t::stop_load hook, so Stop must be offered"
+        );
+    }
+
+    #[test]
+    fn a_loading_servo_tab_never_shows_a_fake_stop_control() {
+        assert!(
+            !can_show_stop_control(true, false, true, Some(BrowserEngine::Servo)),
+            "Servo exposes no cancel-load hook (DD-2 2026-07-10) — a Stop button \
+             here would do nothing when clicked, so it must stay honest Reload"
+        );
+    }
+
+    #[test]
+    fn stop_control_still_requires_a_live_loading_uncrashed_tab() {
+        // Even for CEF, Stop is gated on every other precondition: no tab, no
+        // in-flight load, and a crashed tab (which shows a respawn Reload
+        // instead) must all fall back to the honest Reload control too.
+        assert!(
+            !can_show_stop_control(false, false, true, Some(BrowserEngine::Cef)),
+            "no tab ⇒ no Stop"
+        );
+        assert!(
+            !can_show_stop_control(true, false, false, Some(BrowserEngine::Cef)),
+            "not loading ⇒ no Stop"
+        );
+        assert!(
+            !can_show_stop_control(true, true, true, Some(BrowserEngine::Cef)),
+            "a crashed tab shows a respawn Reload, never Stop"
+        );
+        assert!(
+            !can_show_stop_control(true, false, true, None),
+            "no active engine ⇒ no Stop"
         );
     }
 
