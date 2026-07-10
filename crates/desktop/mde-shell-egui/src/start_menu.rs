@@ -535,11 +535,19 @@ impl StartMenuState {
 /// (lock #23) — both panes close the WHOLE menu on activation, just via
 /// different data ([`ConsoleState::is_open`]'s self-closure vs.
 /// [`StartMenuState::tile_activation`]).
+///
+/// `rail_h` is the live bottom-taskbar height ([`crate::dock::DockState::
+/// rail_height`]) the panel reserves above itself (the WIN7-DESKTOP-1
+/// regression fix, `docs/WORKLIST.md`) so its Power-anchored bottom (lock
+/// #11) sits flush ABOVE the taskbar rather than underneath/behind it — a
+/// true Win7 Start Menu never overlaps the taskbar (lock #1). Callers with no
+/// taskbar in the fixture (most of this module's own tests) pass `0.0`.
 #[allow(clippy::suboptimal_flops)] // the slide offset reads clearer than mul_add
 pub fn start_menu_panel(
     ctx: &egui::Context,
     state: &mut StartMenuState,
     console: &mut ConsoleState,
+    rail_h: f32,
 ) {
     let t = Motion::animate(ctx, SLIDE_KEY, state.open, Motion::BASE);
     if t <= 0.001 {
@@ -553,11 +561,19 @@ pub fn start_menu_panel(
     console.set_open(state.open);
 
     let screen = ctx.screen_rect();
-    let panel_h = PANEL_H.min(screen.height() - Style::SP_XL);
-    // The slide-up: the panel's top rides from the screen bottom (t=0) to its
-    // settled height (t=1) — the console.rs precedent, restated here since the
-    // Area now lives in this module.
-    let top = screen.bottom() - t * panel_h;
+    // `rail_h` (`DockState::rail_height()`, live) reserves the bottom
+    // taskbar's own band: a true Win7 Start Menu sits flush ABOVE the
+    // taskbar, never overlapping it (design lock #1's "true Win7 bottom
+    // taskbar"). Before this fix `panel_h`/`top` ignored the rail entirely —
+    // a latent WIN7-DESKTOP-1 regression (see `docs/WORKLIST.md`) invisible
+    // only because the taskbar itself was mispositioned at the time; once it
+    // renders where it belongs this panel's Power-anchored bottom (lock #11)
+    // would sit right underneath it without this reservation.
+    let panel_h = PANEL_H.min(screen.height() - rail_h - Style::SP_XL);
+    // The slide-up: the panel's top rides from the taskbar's top edge (t=0)
+    // to its settled height above it (t=1) — the console.rs precedent,
+    // restated here since the Area now lives in this module.
+    let top = screen.bottom() - rail_h - t * panel_h;
 
     let area = egui::Area::new(egui::Id::new(START_MENU_AREA))
         .order(egui::Order::Foreground)
@@ -1331,7 +1347,12 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = ui.button("surface");
             });
-            start_menu_panel(ctx, state, console);
+            // No taskbar modeled in this isolated fixture — `rail_h = 0.0`
+            // preserves every existing test's "panel reaches the screen's
+            // true bottom edge" fixture semantics exactly (see the dedicated
+            // `win7_desktop_1_regression_a_nonzero_rail_height_reserves_room_
+            // above_the_taskbar` test below for the reservation itself).
+            start_menu_panel(ctx, state, console, 0.0);
         })
     }
 
@@ -1526,6 +1547,60 @@ mod tests {
             ctx.layer_id_at(left_of_dock),
             Some(start_menu_layer()),
             "the panel is anchored beside the dock column, not under it"
+        );
+    }
+
+    #[test]
+    fn win7_desktop_1_regression_a_nonzero_rail_height_reserves_room_above_the_taskbar() {
+        // Regression companion to dock.rs's own WIN7-DESKTOP-1 regression-fix
+        // tests: fixing the taskbar rail's absolute position (it now really
+        // renders flush with the screen's bottom edge, instead of floating
+        // uselessly near the top) exposed a second, latent bug this test
+        // covers — `start_menu_panel`'s own slide-up anchor never reserved any
+        // room for the rail, so its footprint always extended to the literal
+        // screen bottom regardless of `rail_h`. That was invisible before the
+        // taskbar fix (the rail was nowhere near the Start Menu's footprint)
+        // and would become a REAL visible overlap the moment the taskbar
+        // started rendering where it belongs — the taskbar sitting on top of
+        // (or under) the last slice of the Start Menu's right pane, exactly
+        // where its Power section anchors (lock #11's "the pane's TRUE bottom
+        // edge"). Proves the fix: a point just inside the reserved band (near
+        // the screen's true bottom) is no longer part of the panel's
+        // footprint, while a point just above that band still is — the panel
+        // now stops flush at the taskbar's own top edge, matching a true Win7
+        // Start Menu that never overlaps the taskbar (lock #1).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        let rail_h = 40.0;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), SZ)),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.button("surface");
+                });
+                start_menu_panel(ctx, &mut s, &mut console, rail_h);
+            });
+        }
+
+        let inside_the_reserved_band = egui::pos2(DOCK_W + 10.0, SZ.y - rail_h / 2.0);
+        assert_ne!(
+            ctx.layer_id_at(inside_the_reserved_band),
+            Some(start_menu_layer()),
+            "the Start Menu must not extend into the reserved taskbar band \
+             (the last {rail_h}pt above the screen's true bottom edge)"
+        );
+        let just_above_the_band = egui::pos2(DOCK_W + 10.0, SZ.y - rail_h - 10.0);
+        assert_eq!(
+            ctx.layer_id_at(just_above_the_band),
+            Some(start_menu_layer()),
+            "the Start Menu's footprint must still reach flush up to the top \
+             of the reserved taskbar band, not shrink further than necessary"
         );
     }
 

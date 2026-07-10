@@ -1377,7 +1377,16 @@ impl Shell {
             browser_tabs: self.web.tab_count(),
             terminal_tabs: self.terminal.tab_count(),
         });
-        start_menu::start_menu_panel(ctx, &mut self.start_menu, &mut self.console);
+        // WIN7-DESKTOP-1 regression fix — reserve the SAME live taskbar height
+        // `mount_dock_chrome` just rendered the rail at, so the Start Menu's
+        // Power-anchored bottom sits flush above the taskbar rather than under
+        // it (see `start_menu::start_menu_panel`'s own doc comment).
+        start_menu::start_menu_panel(
+            ctx,
+            &mut self.start_menu,
+            &mut self.console,
+            self.vdock.rail_height(),
+        );
         match self.console.take_request() {
             Some(console::ConsoleRequest::Goto(surface)) => {
                 // A live surface-link entry (the pinned Terminal, the Cloud-plane
@@ -2315,7 +2324,12 @@ mod tests {
     ) {
         let _ = dock::dock(ctx, vdock);
         let _ = dock::notification_rail_with_sources(ctx, vdock, &[]);
-        start_menu::start_menu_panel(ctx, menu, console);
+        // Mirrors main.rs's real `mount_start_menu` wiring (WIN7-DESKTOP-1
+        // regression fix) so this fixture's Start Menu reserves the SAME live
+        // taskbar height the rail above just rendered at, exactly like
+        // production — load-bearing for this test's own screenshot to show
+        // the accumulated chrome correctly, not just each piece in isolation.
+        start_menu::start_menu_panel(ctx, menu, console, vdock.rail_height());
     }
 
     /// WIN7-SHOT-1's actual payoff: the FIRST real look at the accumulated

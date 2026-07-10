@@ -799,7 +799,15 @@ impl DockState {
         self.density = density;
     }
 
-    const fn rail_height(&self) -> f32 {
+    /// The bottom taskbar's live height for the current density (WIN7-1's
+    /// compact [`NOTIFICATION_RAIL_H`] under `Density::Mouse`, the touch-sized
+    /// [`NOTIFICATION_RAIL_EXPANDED_H`] under `Density::Touch`). Widened
+    /// `pub(crate)` (the `dock::response_activated`/`status::severity_color`
+    /// cross-module-widening idiom this crate already uses) so `start_menu.rs`
+    /// can reserve the SAME live height above the taskbar for the Start Menu's
+    /// own slide-up anchor — the WIN7-DESKTOP-1 regression fix, see
+    /// `docs/WORKLIST.md` — rather than a second, possibly-drifting guess.
+    pub(crate) const fn rail_height(&self) -> f32 {
         match self.density {
             Density::Mouse => NOTIFICATION_RAIL_H,
             Density::Touch => NOTIFICATION_RAIL_EXPANDED_H,
@@ -1046,10 +1054,29 @@ pub fn notification_rail_with_sources(
         .fixed_pos(area_rect.min)
         .show(ctx, |ui| {
             ui.set_min_size(area_rect.size());
-            let local = egui::Rect::from_min_size(
-                egui::pos2(0.0, rail_rect.top() - area_top),
-                rail_rect.size(),
-            );
+            // WIN7-DESKTOP-1 regression fix (see `docs/WORKLIST.md`): `ui.painter()`
+            // (and `ui.interact`, used throughout this closure for every cell's hit
+            // rect) always works in ABSOLUTE screen-space coordinates — an
+            // `egui::Area`'s `fixed_pos` only seeds where the Area's own `Ui`
+            // starts; egui establishes no separate (0,0)-based "local" frame for
+            // content painted inside it (contrast `dock()` above, which hands
+            // `paint_dock_frame` the rect it gets straight back from
+            // `ui.allocate_exact_size` — already absolute, never re-derived). The
+            // rail's own strip is always exactly `rail_rect` (already absolute,
+            // computed above from `screen.bottom()`), regardless of whether the
+            // Area grew upward this frame to also fit the animating status panel —
+            // reuse it directly instead of re-deriving a rect offset by `area_top`.
+            //
+            // The pre-fix code built this as `Rect::from_min_size(pos2(0.0,
+            // rail_rect.top() - area_top), rail_rect.size())`: in the rail's default
+            // (no status-panel) state `area_top == rail_rect.top()`, so that
+            // subtraction was always exactly `0.0` — pinning the WHOLE taskbar
+            // (paint AND click hit-rects) at literal screen y=0 instead of the
+            // bottom. Caught by WIN7-SHOT-1's screenshot harness; regression-tested
+            // below (`win7_desktop_1_regression_the_taskbar_anchors_to_the_screens_
+            // true_bottom_edge`) and by the analogous status-panel test, since
+            // `notification_panel_rect` derives from this same rect.
+            let local = rail_rect;
             ui.painter().rect_filled(
                 local,
                 egui::CornerRadius::ZERO,
@@ -2418,10 +2445,57 @@ fn pick_app_cell_with_badge(
     false
 }
 
+/// Apply this cell's own one-step `PICKER_FOCUS_ORDER` arrow-key navigation
+/// (NAVBAR-6). Makes this function the SOLE authority over arrow-key focus
+/// movement among the picker cells — matching what every existing behavioral
+/// test already assumed — by neutralizing TWO independent ways an arrow key
+/// press could otherwise move focus more than the intended one step.
+///
+/// WIN7-DESKTOP-1 regression fix (see `docs/WORKLIST.md`): investigating the
+/// taskbar-position fix's fallout found this function was never actually
+/// robust — it just happened to LOOK correct because the pre-fix bottom-rail
+/// Desktop cell (mispositioned at literal screen y≈0) coincidentally masked
+/// both bugs below; confirmed by reverting the taskbar-position fix in
+/// isolation and observing these SAME two mechanisms fire, unchanged.
+///
+/// 1. **Egui's own built-in spatial arrow-key nav races this function.**
+///    Vendored egui 0.31.1's `memory/mod.rs`, `Focus::begin_pass`/`end_pass`:
+///    `begin_pass` latches a cardinal `FocusDirection` for any arrow key the
+///    CURRENTLY-focused widget's `EventFilter` doesn't claim, and `end_pass`
+///    then unconditionally overwrites `focused_widget` with whatever its own
+///    `find_widget_in_direction` spatial search finds — a raw screen-position
+///    search that knows nothing about `PICKER_FOCUS_ORDER`. Pre-fix, that
+///    spatial search (from the app-picker column, searching "down") landed on
+///    the SAME cell this function's own table-driven logic wanted, by pure
+///    positional coincidence; post-fix there is nothing spatially "below" the
+///    true-bottom taskbar, so the search finds nothing and end_pass leaves
+///    focus wherever mechanism 2 below left it. Fixed by claiming vertical +
+///    horizontal arrows via `set_focus_lock_filter` — egui's own documented
+///    seam for "I handle these keys myself" — every frame this cell holds
+///    focus, so `begin_pass` never latches a direction in the first place.
+/// 2. **This function's OWN `request_focus` call can cascade in one frame.**
+///    `ui.input(|i| i.key_pressed(...))` doesn't consume the event — it stays
+///    "pressed" for the rest of the frame. So the cell focus just moved TO
+///    (rendered later this same frame, e.g. the next `PICKER_FOCUS_ORDER`
+///    entry) sees `resp.has_focus() == true` (this call just set it) AND the
+///    SAME still-pressed key, and moves focus again — and so on, potentially
+///    through the WHOLE table in one frame. Fixed by consuming every arrow
+///    key event the moment a move actually fires, so no widget rendered later
+///    this same frame can see it "pressed" again.
 fn apply_picker_arrow_focus(ui: &egui::Ui, surface: Surface, resp: &egui::Response) {
     if !resp.has_focus() {
         return;
     }
+    ui.memory_mut(|m| {
+        m.set_focus_lock_filter(
+            pick_cell_id(surface),
+            egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                ..egui::EventFilter::default()
+            },
+        );
+    });
     let dir = ui.input(|i| {
         if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
             Some(1)
@@ -2433,6 +2507,26 @@ fn apply_picker_arrow_focus(ui: &egui::Ui, surface: Surface, resp: &egui::Respon
     });
     if let Some(dir) = dir.and_then(|d| picker_focus_neighbor(surface, d)) {
         ui.memory_mut(|m| m.request_focus(pick_cell_id(dir)));
+        // Consume every arrow key this frame (mechanism 2 above) — key-only
+        // matching (no modifier filter), mirroring `key_pressed`'s own match
+        // above exactly; `InputState::consume_key` needs an EXACT modifier
+        // match, which would silently stop claiming e.g. Shift+ArrowDown, a
+        // real (if narrow) behavior change this regression fix doesn't need.
+        ui.input_mut(|i| {
+            i.events.retain(|ev| {
+                !matches!(
+                    ev,
+                    egui::Event::Key { key, pressed: true, .. }
+                    if matches!(
+                        key,
+                        egui::Key::ArrowDown
+                            | egui::Key::ArrowRight
+                            | egui::Key::ArrowUp
+                            | egui::Key::ArrowLeft
+                    )
+                )
+            });
+        });
     }
 }
 
@@ -5102,6 +5196,99 @@ mod tests {
         );
     }
 
+    // ── WIN7-DESKTOP-1 regression fix (post-WIN7-SHOT-1) ────────────────────
+    // Every rail test above this point — including WIN7-1's own two — asserts
+    // cells RELATIVE to each other (left-to-right order, same-row sharing via
+    // `center().y` deltas). None of them read the actual driven `screen_rect`,
+    // so all of them stayed green while `notification_rail_with_sources`
+    // painted the whole taskbar (and its `ui.interact` hit-rects — the SAME
+    // rects, so clicks moved with the paint) at literal screen y≈0 instead of
+    // the bottom. These two tests read the rail back against the screen's own
+    // true edges — the one check that structurally could not have missed it.
+
+    #[test]
+    fn win7_desktop_1_regression_the_taskbar_anchors_to_the_screens_true_bottom_edge() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let start = ctx
+            .read_response(start_cell_id())
+            .expect("Start cell registered")
+            .rect;
+        let clock = ctx
+            .read_response(clock_cell_id())
+            .expect("clock registered")
+            .rect;
+        let pin = ctx
+            .read_response(egui::Id::new("vdock-pin"))
+            .expect("pin registered")
+            .rect;
+
+        for (label, r) in [("Start", start), ("clock", clock), ("pin", pin)] {
+            assert!(
+                (r.bottom() - sz.y).abs() < Style::SP_S,
+                "{label} cell's bottom edge must sit within one small-spacing \
+                 token of the screen's TRUE bottom edge ({}), got {} — design \
+                 lock #1's \"true Win7 bottom taskbar\" anchors to the bottom \
+                 of the screen, it does not float near the top",
+                sz.y,
+                r.bottom()
+            );
+            assert!(
+                r.top() > sz.y / 2.0,
+                "{label} cell must sit in the bottom half of the screen, not \
+                 the top half — got top={}",
+                r.top()
+            );
+        }
+    }
+
+    #[test]
+    fn win7_desktop_1_regression_the_status_panel_opens_above_the_rail_not_the_screen_top() {
+        // The SAME `local`/`area_top` coordinate bug the taskbar regression
+        // test above catches also fed `notification_panel_rect` (NOTIF-4's
+        // slide-out detail panel, computed from the identical `local` rect) —
+        // verify the fix covers it too: once open, the panel sits ABOVE the
+        // (now correctly bottom-anchored) rail, never pinned up at the
+        // screen's literal top edge.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        s.open_status_panel_for_test();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let panel = ctx
+            .read_response(status::status_panel_id())
+            .expect("status panel registered while open")
+            .rect;
+        let clock = ctx
+            .read_response(clock_cell_id())
+            .expect("clock registered")
+            .rect;
+        assert!(
+            panel.bottom() <= clock.top() + 1.0,
+            "the status detail panel must sit ABOVE the bottom rail (panel \
+             bottom {}, rail top {}), not float independently of it",
+            panel.bottom(),
+            clock.top()
+        );
+        assert!(
+            panel.top() > sz.y / 4.0,
+            "the panel must not be pinned near the literal screen top (got \
+             top={}) — the pre-fix symptom when `area_top`/`local` collapsed \
+             to (0,0)-based coordinates",
+            panel.top()
+        );
+    }
+
     #[test]
     fn navbar8_shell_density_selects_compact_or_expanded_bottom_rail() {
         // NAVBAR-8 — the rail rides the same density the shell installs from the
@@ -5326,6 +5513,36 @@ mod tests {
         click_vdock_with_sources(&ctx, &mut s, caret, sz, &sources);
         assert!(s.desktop_sources_open, "caret opens the source flyout");
 
+        // Three settle frames, not one, before reading the flyout row's rect —
+        // verified directly against the vendored egui 0.31.1 source (both
+        // `containers/area.rs` and `context.rs`'s own `read_response` doc
+        // comment), not guessed:
+        //   1. The flyout's `egui::Area` uses a non-default `.pivot(LEFT_
+        //      BOTTOM)` (open upward from the Desktop cell). Egui doesn't know
+        //      an Area's content size until AFTER it has been laid out once,
+        //      so the FIRST frame an Area id is ever shown is a "sizing pass"
+        //      that positions it using a hardcoded `(600, 400)` placeholder
+        //      size (`Spacing::default_area_size`) — wildly wrong for this
+        //      36pt-tall popup. The REAL size gets recorded at the end of
+        //      that same frame, so the frame right after already computes the
+        //      correct position (confirmed directly: `AreaState::load` goes
+        //      from `None` to `Some(size: [240, 36])` between these two
+        //      frames).
+        //   2. `Context::read_response`'s own doc: "widget interaction
+        //      happens at the start of the pass, using the widget rects from
+        //      the PREVIOUS pass" — so reading a rect right after the frame
+        //      that first computed it correctly still returns the STALE
+        //      (sizing-pass) one; a THIRD frame is what makes the correct
+        //      rect the "previous pass" `read_response` actually returns.
+        // Pre-fix this was invisible: the flyout's anchor sat at literal
+        // screen y≈0, where the wrong sizing-pass estimate and the correct
+        // position happened to land within a couple of points of each other
+        // (both near the top), not the ~360pt gap they differ by once the
+        // WIN7-DESKTOP-1 taskbar-position fix moved the anchor to the true
+        // screen bottom — so this dance, always technically required, only
+        // became load-bearing now.
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
+        drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
         drive_vdock_with_sources(&ctx, &mut s, Vec::new(), sz, &sources);
         let row = ctx
             .read_response(desktop_source_row_id(&sources[0]))
@@ -5402,6 +5619,19 @@ mod tests {
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
 
         ctx.memory_mut(|m| m.request_focus(pick_cell_id(Surface::Workbench)));
+        // One settle frame so `apply_picker_arrow_focus` gets a chance to claim
+        // vertical/horizontal arrows as Workbench's OWN `EventFilter`
+        // (`set_focus_lock_filter`, the WIN7-DESKTOP-1 regression fix below)
+        // BEFORE the ArrowDown frame: egui's `Focus::begin_pass` decides
+        // whether to run its OWN built-in spatial arrow-key nav using
+        // whatever filter the focused widget ALREADY carried as of the START
+        // of a frame, not one set mid-frame, so a filter claimed reactively
+        // this same frame arrives one frame too late to matter. A real user
+        // always presses a key at least one rendered frame after Tab/click
+        // gives a widget focus, so this settle frame matches production
+        // timing — it's this test's OWN prior same-instant focus+keypress
+        // that was artificial, not a new requirement this fix invented.
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
         drive_vdock(&ctx, &mut s, vec![key(egui::Key::ArrowDown)], sz);
         assert_eq!(
             ctx.memory(|m| m.focused()),
