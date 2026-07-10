@@ -49,6 +49,7 @@ mod session;
 mod session_rail;
 mod spawn_lighthouse_flow;
 mod splash;
+mod start_menu;
 mod status;
 mod storage;
 mod surface_card;
@@ -164,13 +165,24 @@ struct Shell {
     /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
     /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
     vdock: dock::DockState,
-    /// CONSOLE-1 — the Console front-door panel (the Terminal's Start Menu,
-    /// `docs/design/console-frontdoor.md`): the Win10 two-pane of operational
-    /// entries the dock's Start cell toggles. The dock latches the toggle and
-    /// the shell drains it here (the deferred wire), mounts the panel each
-    /// frame, and drives its typed [`console::ConsoleRequest`]s (a live
-    /// surface-link routes the nav; command launches stay honest-gated on the
-    /// CONSOLE-2 spawn-tab seam, §7).
+    /// WIN7-2 — the Start Menu's cross-frame state (the fixed-size overlay
+    /// panel's own open latch + click-away guard, `docs/design/
+    /// win7-desktop-survey.md` lock #13). The dock's Start cell AND a clean
+    /// Super tap both latch its toggle (see `start_menu`'s module doc for how
+    /// the Super tap fans out to this alongside VDOCK-1's own dock toggle);
+    /// the shell drains it, mirrored open-state into [`Self::console`], and
+    /// mounts the panel each frame (`start_menu::start_menu_panel`).
+    start_menu: start_menu::StartMenuState,
+    /// CONSOLE-1 — the Console front door (`docs/design/console-frontdoor.md`):
+    /// the Win10-style taxonomy of operational entries. Pre-WIN7-2 this was
+    /// its own standalone panel the dock's Start cell toggled directly; it is
+    /// now embedded as the Start Menu's right pane ([`Self::start_menu`],
+    /// lock #10) — `console::console_content` renders it there, and this
+    /// field's own `open` bit is a mirror of the Start Menu's, not a second
+    /// independent latch. The shell still drives its typed
+    /// [`console::ConsoleRequest`]s the same way (a live surface-link routes
+    /// the nav; command launches stay honest-gated on the CONSOLE-2 spawn-tab
+    /// seam, §7).
     console: console::ConsoleState,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
@@ -363,6 +375,7 @@ impl Shell {
             critical_edge: status::CriticalEdgeCue::default(),
             local_host: local_hostname(),
             vdock: dock::DockState::default(),
+            start_menu: start_menu::StartMenuState::default(),
             console: console::ConsoleState::default(),
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
@@ -1030,10 +1043,11 @@ impl Shell {
         // Extracted to a helper so `render` stays within the line budget.
         self.mount_dock_chrome(ctx);
 
-        // CONSOLE-1 — the Terminal's Start-Menu front door: the panel + its
-        // toggle/request drains, split to a helper (the mount_dock_chrome idiom)
-        // so `render` stays within the line budget.
-        self.mount_console(ctx);
+        // WIN7-2 — the Start Menu: the panel + its toggle/request drains, split
+        // to a helper (the mount_dock_chrome idiom) so `render` stays within
+        // the line budget. Its Super-tap trigger drains later, alongside
+        // VDOCK-1's own dock toggle (see below).
+        self.mount_start_menu(ctx);
 
         // The central view: the session↔body cross-fade — or nothing at all
         // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
@@ -1111,8 +1125,19 @@ impl Shell {
         // chord used in between) toggles the vertical dock. Always DRAINED so the
         // router's latch never backs up; but, like every chord above, swallowed
         // while the curtain is engaged (lock 10).
+        //
+        // WIN7-2 (win7-desktop-survey lock #13) reuses this SAME drain for the
+        // Start Menu: the survey never anticipated VDOCK-1's pre-existing claim
+        // on Super, and stranding the vertical dock behind an unreachable
+        // hotkey would break the shell's only surface launcher until WIN7-3
+        // lands real tiles in the Start Menu. So one clean Super tap now
+        // reveals BOTH — not a UX collision in practice, since the Start Menu
+        // already mounts immediately beside the dock column (`x = DOCK_W`), so
+        // the two read as one "reveal the nav chrome" gesture. A flagged
+        // judgment call (see `start_menu`'s module doc), not a surveyed answer.
         if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
             self.vdock.toggle();
+            self.start_menu.toggle();
         }
 
         // The KIRON alert/OSD bridge (KIRON-2) — driven late so its centered OSD
@@ -1193,9 +1218,9 @@ impl Shell {
         self.vdock.set_active(self.nav.surface);
         self.vdock
             .set_transfer_active_count(self.files.transfers_counts().active);
-        // CONSOLE-1 — mirror the Console panel's open state in first, so the
-        // Start cell's active tint follows the real panel (the set_active idiom).
-        self.vdock.set_console_open(self.console.is_open());
+        // WIN7-2 — mirror the Start Menu's open state in first, so the Start
+        // cell's active tint follows the real panel (the set_active idiom).
+        self.vdock.set_start_menu_open(self.start_menu.is_open());
         self.notify_status.poll(ctx);
         let mut rail_sessions = self.session_rail.entries(&self.local_host);
         let has_visible_desktop_session = !rail_sessions.is_empty();
@@ -1262,24 +1287,26 @@ impl Shell {
         }
     }
 
-    /// CONSOLE-1 — mount the Terminal's Start-Menu **front door** for this
-    /// frame: drain the dock Start cell's toggle latch (ALWAYS drained so it
-    /// never backs up — the Super-tap idiom), mount the Console panel (the
-    /// floating slide-up beside the dock, `console::console_panel`), and drive
-    /// its typed requests. Everything but the drain sits behind the curtain
-    /// gate (CURTAIN-1 lock 10): the panel reads raw Esc/arrow/Enter presses,
-    /// which must never act past the lock — the hotkey-gate posture. Split out
-    /// of `render` (the `mount_dock_chrome` idiom) so each stays within the
-    /// line budget.
-    fn mount_console(&mut self, ctx: &egui::Context) {
-        let toggled = self.vdock.take_console_toggle();
+    /// WIN7-2 — mount the **Start Menu** for this frame: drain the dock Start
+    /// cell's toggle latch (ALWAYS drained so it never backs up — the
+    /// Super-tap idiom), mount the panel (the fixed-size floating slide-up
+    /// beside the dock, `start_menu::start_menu_panel`, which embeds the
+    /// Console front door as its right pane), and drive Console's typed
+    /// requests exactly as before (the panel is a presentation change, lock
+    /// #10 says the underlying requests/data don't move). Everything but the
+    /// drain sits behind the curtain gate (CURTAIN-1 lock 10): the panel reads
+    /// raw Esc/arrow/Enter presses, which must never act past the lock — the
+    /// hotkey-gate posture. Split out of `render` (the `mount_dock_chrome`
+    /// idiom) so each stays within the line budget.
+    fn mount_start_menu(&mut self, ctx: &egui::Context) {
+        let toggled = self.vdock.take_start_menu_toggle();
         if self.curtain.engaged() {
             return;
         }
         if toggled {
-            self.console.toggle();
+            self.start_menu.toggle();
         }
-        console::console_panel(ctx, &mut self.console);
+        start_menu::start_menu_panel(ctx, &mut self.start_menu, &mut self.console);
         match self.console.take_request() {
             Some(console::ConsoleRequest::Goto(surface)) => {
                 // A live surface-link entry (the pinned Terminal, the Cloud-plane

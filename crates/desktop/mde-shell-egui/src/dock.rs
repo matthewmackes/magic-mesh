@@ -526,14 +526,16 @@ pub struct DockState {
     /// [`Self::take_node_focus`] (the deferred-wire idiom, like [`Self::pending`]).
     /// A `String` (not `Copy`), so it rides its own field rather than [`DockRequest`].
     pending_node_focus: Option<String>,
-    /// CONSOLE-1 — whether the Console front-door panel is up, mirrored in by
-    /// the shell each frame ([`Self::set_console_open`]) so the Start cell wears
-    /// its active tint (the `set_active` mirror idiom).
-    console_open: bool,
-    /// CONSOLE-1 — latched `true` by a Start-cell click ([`start_cell`]); the
-    /// shell drains it ([`Self::take_console_toggle`]) and toggles the Console
-    /// panel. The dock can't reach the panel itself (§6, the deferred wire).
-    console_toggle: bool,
+    /// WIN7-2 — whether the Start Menu panel is up, mirrored in by the shell
+    /// each frame ([`Self::set_start_menu_open`]) so the Start cell wears its
+    /// active tint (the `set_active` mirror idiom). Was `console_open`
+    /// pre-WIN7-2, when the Start cell opened Console directly.
+    start_menu_open: bool,
+    /// WIN7-2 — latched `true` by a Start-cell click ([`start_cell`]); the
+    /// shell drains it ([`Self::take_start_menu_toggle`]) and toggles the
+    /// Start Menu panel (`crate::start_menu`). The dock can't reach the panel
+    /// itself (§6, the deferred wire). Was `console_toggle` pre-WIN7-2.
+    start_menu_toggle: bool,
     /// NAVBAR-U1 — latched by the bottom-rail Desktop cell. The shell drains it
     /// and asks the chooser to reconnect the newest recent desktop, falling back
     /// to the chooser if no recent can connect.
@@ -845,21 +847,27 @@ impl DockState {
         self.pending_node_focus.take()
     }
 
-    /// Mirror the Console front-door panel's open state into the dock before
-    /// [`dock`] (CONSOLE-1) — the Start cell's active tint then follows the real
-    /// panel (the [`Self::set_active`] mirror idiom). Wired by
+    /// Mirror the Start Menu panel's open state into the dock before [`dock`]
+    /// (WIN7-2) — the Start cell's active tint then follows the real panel
+    /// (the [`Self::set_active`] mirror idiom). Wired by
     /// `main.rs::mount_dock_chrome`.
-    pub const fn set_console_open(&mut self, open: bool) {
-        self.console_open = open;
+    pub const fn set_start_menu_open(&mut self, open: bool) {
+        self.start_menu_open = open;
     }
 
-    /// Drain the Start cell's **Console toggle** (CONSOLE-1) — `true` exactly
-    /// once per Start-cell click; the shell flips the Console panel on it (the
-    /// [`Self::take_request`] deferred-wire idiom). Pressing Start with the
-    /// panel already up drains through the same latch and closes it (lock #4).
-    pub const fn take_console_toggle(&mut self) -> bool {
-        let toggled = self.console_toggle;
-        self.console_toggle = false;
+    /// Drain the Start cell's **Start Menu toggle** (WIN7-2) — `true` exactly
+    /// once per Start-cell click; the shell flips the Start Menu panel on it
+    /// (the [`Self::take_request`] deferred-wire idiom). Pressing Start with
+    /// the panel already up drains through the same latch and closes it (lock
+    /// #4, restated as WIN7-2's lock #13). A clean Super tap fires the SAME
+    /// toggle through a different path — `main.rs` applies
+    /// `crate::hotkeys::HotkeyRouter::take_dock_toggle`'s drain (the vertical
+    /// dock's OWN pre-existing Super-tap latch) to this panel too; see
+    /// `crate::start_menu`'s module doc for why one Super tap now reveals
+    /// both.
+    pub const fn take_start_menu_toggle(&mut self) -> bool {
+        let toggled = self.start_menu_toggle;
+        self.start_menu_toggle = false;
         toggled
     }
 
@@ -1344,7 +1352,8 @@ fn paint_dock_frame(ui: &mut egui::Ui, rect: egui::Rect, state: &mut DockState) 
     clicked
 }
 
-/// The stable id of CONSOLE-1's Start cell, so tests read its settled `Rect`.
+/// The stable id of the Start Menu's trigger cell (WIN7-2; CONSOLE-1
+/// originally), so tests read its settled `Rect`.
 fn start_cell_id() -> egui::Id {
     egui::Id::new("vdock-start-cell")
 }
@@ -1613,26 +1622,25 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
     false
 }
 
-/// CONSOLE-1's **Start cell** — the Console front door's trigger (console
-/// design locks #1/#2; relabelled "Start" per WIN7-1, still opening the SAME
-/// Console panel — WIN7-2 is what turns this into the real two-pane Start Menu,
-/// not this unit): the bottom taskbar's far-left affordance, wearing the repo's
-/// Win10-style Start/Menu tray glyph. A click latches the Console toggle for the
-/// shell to drain ([`DockState::take_console_toggle`] — the deferred wire;
-/// pressing it again closes, lock #4). While the panel is up (mirrored in via
-/// [`DockState::set_console_open`]) the cell wears the selection wash + ACCENT
-/// tint, the sys-cell "menu open" idiom. Every colour is a Style token (§4).
-/// Returns `true` on a click.
+/// The **Start cell** — the Start Menu's trigger (WIN7-2, design locks
+/// #4/#13; CONSOLE-1's original Start front door, relabelled "Start" per
+/// WIN7-1): the bottom taskbar's far-left affordance, wearing the repo's
+/// Win10-style Start/Menu tray glyph. A click latches the Start Menu toggle
+/// for the shell to drain ([`DockState::take_start_menu_toggle`] — the
+/// deferred wire; pressing it again closes, lock #4/#13). While the panel is
+/// up (mirrored in via [`DockState::set_start_menu_open`]) the cell wears the
+/// selection wash + ACCENT tint, the sys-cell "menu open" idiom. Every colour
+/// is a Style token (§4). Returns `true` on a click.
 fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(rect, start_cell_id(), egui::Sense::click());
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
-    if state.console_open {
+    if state.start_menu_open {
         painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
     } else if hovered {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
-    let tint = if state.console_open {
+    let tint = if state.start_menu_open {
         Style::ACCENT
     } else if hovered {
         Style::TEXT
@@ -1651,7 +1659,7 @@ fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     }
     paint_rail_label(ui, rect, "Start", tint);
     if resp.clicked() {
-        state.console_toggle = true;
+        state.start_menu_toggle = true;
         return true;
     }
     false
@@ -3939,15 +3947,17 @@ mod tests {
         assert!(s.pinned(), "clicking the pin holds the dock open (lock #9)");
     }
 
-    // ── CONSOLE-1: the Start front door's dock cell ────────────────────────────
+    // ── WIN7-2: the Start Menu's dock cell (CONSOLE-1's original front door) ──
 
     #[test]
-    fn the_start_cell_anchors_the_bottom_rail_and_latches_the_console_toggle() {
+    fn the_start_cell_anchors_the_bottom_rail_and_latches_the_start_menu_toggle() {
         // Console locks #1/#2 moved to the bottom rail: the Start cell is the
-        // far-left rail icon, before Desktop, and a click latches the console
-        // toggle the shell drains — exactly once (WIN7-1 relabels the rail text
-        // "Advanced" → "Start" but does NOT change this click behavior — WIN7-2
-        // is what turns it into the real two-pane Start Menu).
+        // far-left rail icon, before Desktop, and a click latches the Start
+        // Menu toggle the shell drains — exactly once (WIN7-1 relabelled the
+        // rail text "Advanced" → "Start" without changing this click's target;
+        // WIN7-2 is the unit that turns the target into the real two-pane
+        // Start Menu, `crate::start_menu`, superseding the direct-to-Console
+        // toggle this test used to name).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
@@ -3982,20 +3992,20 @@ mod tests {
             "Workbench remains in the left rail while Start lives in the bottom taskbar"
         );
 
-        assert!(!s.take_console_toggle(), "no toggle before a click");
+        assert!(!s.take_start_menu_toggle(), "no toggle before a click");
         click_vdock(&ctx, &mut s, start.center(), sz);
         assert!(
-            s.take_console_toggle(),
-            "a Start-cell click latches the console toggle"
+            s.take_start_menu_toggle(),
+            "a Start-cell click latches the Start Menu toggle"
         );
         assert!(
-            !s.take_console_toggle(),
+            !s.take_start_menu_toggle(),
             "the toggle latch drains exactly once"
         );
         assert_eq!(
             s.active,
             Surface::default(),
-            "the Start cell routes NO surface — it only toggles the Console"
+            "the Start cell routes NO surface — it only toggles the Start Menu"
         );
     }
 

@@ -1,23 +1,30 @@
-//! CONSOLE — the **Terminal's Start-Menu front door** (design
+//! CONSOLE — the **Terminal's operational front door** (design
 //! `docs/design/console-frontdoor.md`, CONSOLE-1).
 //!
-//! A Carbon-styled Win10 Start menu whose entries are **operational terminal
-//! ops**: the dock's Start cell (the Terminal glyph — it IS the terminal's front
-//! door, lock #2) toggles this panel, a two-pane footprint that slides up beside
-//! the dock (~200ms Motion, lock #44). The **left rail** is the category
-//! jump-index (clicking a category jump-scrolls the list, lock #49) over the
-//! `user@host · version` footer (lock #43); the **right pane** is the pinned
-//! Terminal + Monitor pair (lock #31) above the grouped entry list — each row an
-//! icon + label + one-line description + a subtle Fedora/Quasar provenance tag
-//! (locks #33/#38). Full arrow-key nav with the EXPLORER-18 focus-ring posture
-//! (locks #40/#48); Esc / click-away / pressing Start again dismiss (lock #4).
+//! A Carbon-styled taxonomy of **operational terminal ops**: the **left rail**
+//! is the category jump-index (clicking a category jump-scrolls the list, lock
+//! #49) over the `user@host · version` footer (lock #43); the **right pane** is
+//! the pinned Terminal + Monitor pair (lock #31) above the grouped entry list —
+//! each row an icon + label + one-line description + a subtle Fedora/Quasar
+//! provenance tag (locks #33/#38). Full arrow-key nav with the EXPLORER-18
+//! focus-ring posture (locks #40/#48).
 //!
-//! **Vertical-dock reconciliation:** the design's "far-left Start button" came
-//! from the retired horizontal taskbar. The dock is now the left VERTICAL column
-//! (VDOCK), so Start maps to the dock's **topmost cell** (the vertical analog of
-//! far-left, still "before Workbench", lock #2) while the panel keeps its Win10
-//! **bottom-left footprint** — anchored beside the dock column at the screen
-//! bottom, rising with the locked slide-up Motion (lock #3/#44).
+//! **WIN7-2 update:** this module used to mount its own floating `egui::Area`
+//! (slide/Esc/click-away, toggled straight off the dock's Start cell). The
+//! win7-desktop-survey (lock #10) migrates that whole front door into the new
+//! **Start Menu**'s right pane (`crate::start_menu`) — the Start Menu now owns
+//! the outer panel (Area, slide, Esc, click-away, the bottom-left footprint) and
+//! embeds this module's content at its own right-pane rect via
+//! [`console_content`]. `ConsoleState::open` is no longer a self-toggled latch;
+//! it is mirrored in from the Start Menu each frame ([`ConsoleState::set_open`],
+//! the `DockState::set_active` idiom) so the focus ring / `handle_keys` still
+//! read a meaningful "am I showing" bit. This is a presentation-layer
+//! extraction only — WIN7-5 is what actually **redesigns** this content for its
+//! new home (lock #10); today it renders unchanged, just embedded rather than
+//! self-mounted. Every action that used to close the whole front door (a routed
+//! link, a spawned tab, a fired power verb, Esc) still calls [`ConsoleState::close`]
+//! exactly as before; `start_menu` detects that self-closure and dismisses the
+//! whole Start Menu with it (see `start_menu`'s module doc).
 //!
 //! **The launch (CONSOLE-5, §6/§7):** activating a command entry opens a
 //! **named terminal tab running it** through the CONSOLE-2 `spawn_tab` seam on
@@ -57,24 +64,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui;
-use mde_egui::{Motion, Style};
+use mde_egui::Style;
 use mde_seat::PowerVerb;
 use mde_term_egui::sudo_argv;
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
-use crate::dock::{icon_texture, Surface, DOCK_W};
+use crate::dock::{icon_texture, Surface};
 use crate::workbench::Plane;
 
 // ── geometry (all §4 token math, the dock's 8px grid) ───────────────────────
-
-/// The stable id of the console's floating [`egui::Area`] layer, so the shell
-/// (and the layer tests) can name its `LayerId`.
-const CONSOLE_AREA: &str = "console-frontdoor";
-
-/// The egui memory key for the panel's slide animation (the Motion latch that
-/// eases the rise 0↔1 — the dock's `DOCK_SLIDE_KEY` idiom).
-const SLIDE_KEY: &str = "console-slide";
 
 /// The left rail's width (categories + footer) — `SP_XL · 5` (160pt).
 const RAIL_W: f32 = Style::SP_XL * 5.0;
@@ -83,11 +82,16 @@ const RAIL_W: f32 = Style::SP_XL * 5.0;
 /// label + one-line description + the provenance tag on the 8px grid.
 const LIST_W: f32 = Style::SP_XL * 11.0;
 
-/// The whole panel's width — rail + list (the Win10 two-pane footprint).
-const PANEL_W: f32 = RAIL_W + LIST_W;
+/// The whole content's width — rail + list (the Win10 two-pane footprint).
+/// `pub(crate)` — WIN7-2's `start_menu` reads it to size its own right pane
+/// (the rect it hands to [`console_content`]) exactly to this content's width.
+pub(crate) const PANEL_W: f32 = RAIL_W + LIST_W;
 
-/// The panel's height — `SP_XL · 18` (576pt), clamped to the screen at mount.
-const PANEL_H: f32 = Style::SP_XL * 18.0;
+/// The content's height — `SP_XL · 18` (576pt). `pub(crate)` — `start_menu`
+/// reuses this AS its own overall panel height (already satisfying the
+/// win7-desktop-survey's lock #2 "roughly half-height", clamped to the screen
+/// at mount) rather than inventing a second height for the embedding panel.
+pub(crate) const PANEL_H: f32 = Style::SP_XL * 18.0;
 
 /// One entry row's height — two text lines (label + description) on the grid.
 const ROW_H: f32 = Style::SP_XL + Style::SP_S;
@@ -716,17 +720,16 @@ impl CustomFile {
 
 // ── state ────────────────────────────────────────────────────────────────────
 
-/// The Console panel's cross-frame state: the open latch the dock's Start cell
-/// toggles, the keyboard focus ring, the rail's pending jump-scroll, the honest
-/// gate notice, and the pending shell request. Pure (no egui handles), so the
-/// open/close + nav + gate invariants are unit-tested without a GPU.
+/// The Console content's cross-frame state: whether it's showing (mirrored in
+/// from the WIN7-2 Start Menu, [`Self::set_open`]), the keyboard focus ring,
+/// the rail's pending jump-scroll, the honest gate notice, and the pending
+/// shell request. Pure (no egui handles), so the open/close + nav + gate
+/// invariants are unit-tested without a GPU.
 pub struct ConsoleState {
-    /// Whether the panel is up (the Start cell's toggle latch).
+    /// Whether the content is showing — mirrored in from `start_menu`'s own
+    /// open state each frame ([`Self::set_open`]); also still flippable
+    /// directly via [`Self::toggle`] for this module's own standalone tests.
     open: bool,
-    /// Set by [`Self::toggle`] and cleared at the end of the panel frame — the
-    /// same-frame click-away guard (the Start-cell click that opened the panel
-    /// lands outside it and must not read as a dismissal; the power-menu idiom).
-    just_toggled: bool,
     /// The keyboard focus, a flat index into the activation ring (lock #40).
     focus: usize,
     /// Set when an arrow moved the focus this frame, so the focused row scrolls
@@ -770,14 +773,16 @@ impl Default for ConsoleState {
 impl ConsoleState {
     /// Build over an explicit Custom store path (the testable constructor
     /// `Default` folds to — the timers `with_roots` idiom): load the operator's
-    /// Custom entries, everything else cold.
-    fn with_store(store: Option<PathBuf>) -> Self {
+    /// Custom entries, everything else cold. `pub(crate)` — `start_menu`'s own
+    /// tests use `with_store(None)` too, for the same deterministic-headless
+    /// reason this module's own tests do (never touching a real client data
+    /// dir).
+    pub(crate) fn with_store(store: Option<PathBuf>) -> Self {
         let custom = store
             .as_deref()
             .map_or_else(CustomFile::default, CustomFile::load_from);
         Self {
             open: false,
-            just_toggled: false,
             focus: 0,
             focus_moved: false,
             jump: None,
@@ -794,19 +799,30 @@ impl ConsoleState {
         }
     }
 
-    /// Whether the panel is up — the dock mirrors this into the Start cell's
-    /// active tint each frame.
+    /// Whether the content is showing.
     pub(crate) const fn is_open(&self) -> bool {
         self.open
     }
 
-    /// Toggle the panel (the Start cell's drained click; pressing Start again
-    /// closes, lock #4). Opening resets the focus ring + notice and refreshes
-    /// the `$PATH` presence table; either edge arms the same-frame click-away
-    /// guard.
+    /// Flip [`Self::open`]. Opening resets the focus ring + notice and
+    /// refreshes the `$PATH` presence table. Kept for this module's own
+    /// standalone tests (a one-line "open it" primer); production code drives
+    /// [`Self::set_open`] instead, mirroring the Start Menu's own open state in.
     pub(crate) fn toggle(&mut self) {
-        self.open = !self.open;
-        self.just_toggled = true;
+        self.set_open(!self.open);
+    }
+
+    /// Mirror an externally-owned open state in (the `DockState::set_active`
+    /// idiom) — WIN7-2's Start Menu is the single source of truth for whether
+    /// this content shows; a no-op unless the value actually changes, so a
+    /// steady "still open" mirror each frame doesn't re-reset the focus ring.
+    /// A closed→open edge resets the focus ring + notice and refreshes the
+    /// `$PATH` presence table, exactly like the old self-`toggle` did.
+    pub(crate) fn set_open(&mut self, open: bool) {
+        if open == self.open {
+            return;
+        }
+        self.open = open;
         if self.open {
             self.focus = 0;
             self.focus_moved = false;
@@ -1046,8 +1062,11 @@ fn identity_line() -> String {
 
 // ── stable ids (the dock's addressable-cell idiom, for routing + tests) ─────
 
-/// A flat entry row's stable id.
-fn console_entry_id(flat: usize) -> egui::Id {
+/// A flat entry row's stable id. `pub(crate)` (the other stable-id functions
+/// below stay module-private) — `start_menu`'s own test reads this one back
+/// to click a specific row of the embedded content and prove the WIN7-2
+/// embedding is reachable end-to-end, not just architecturally wired.
+pub(crate) fn console_entry_id(flat: usize) -> egui::Id {
     egui::Id::new(("console-entry", flat))
 }
 
@@ -1104,74 +1123,28 @@ fn console_custom_add_id() -> egui::Id {
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-/// Mount the Console panel for this frame: the Win10 two-pane over the shared
-/// [`Style`] (§4), rising from the screen bottom beside the dock column over the
-/// shared [`Motion`] table (lock #44). Fully hidden + settled it mounts **no
-/// layer at all** (the dock's passthrough guarantee), so a closed Console steals
-/// no input from the surface beneath. Esc, a click away, and the Start cell's
-/// re-toggle all dismiss (lock #4).
-#[allow(clippy::suboptimal_flops)] // the slide offset reads clearer than mul_add
-pub fn console_panel(ctx: &egui::Context, state: &mut ConsoleState) {
-    let t = Motion::animate(ctx, SLIDE_KEY, state.open, Motion::BASE);
-    if t <= 0.001 {
-        state.just_toggled = false;
-        return;
-    }
-
-    let screen = ctx.screen_rect();
-    let panel_h = PANEL_H.min(screen.height() - Style::SP_XL);
-    // The slide-up: the panel's top rides from the screen bottom (t=0) to its
-    // settled height (t=1), anchored beside the dock column (the reconciliation
-    // note in the module doc — the Win10 bottom-left footprint kept).
-    let top = screen.bottom() - t * panel_h;
-
-    let area = egui::Area::new(egui::Id::new(CONSOLE_AREA))
-        .order(egui::Order::Foreground)
-        // It SLIDES (lock #44) — never egui's default fade-in.
-        .fade_in(false)
-        .constrain(false)
-        .fixed_pos(egui::pos2(DOCK_W, top))
-        .show(ctx, |ui| {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(PANEL_W, panel_h), egui::Sense::hover());
-            paint_panel_frame(ui, rect);
-            if state.open {
-                handle_keys(ui, state);
-            }
-            rail(ui, rect, state);
-            list_pane(ui, rect, state);
-        });
-
-    // Click-away dismissal (lock #4) — but never on the very frame the Start
-    // cell toggled (that click lands outside the panel and would dismiss it
-    // in the same frame; the power-menu / overflow-popup guard).
-    if state.open && !state.just_toggled && area.response.clicked_elsewhere() {
-        state.close();
-    }
-    state.just_toggled = false;
-
-    // Keep frames flowing while the slide is in flight (the dock's tween idiom).
-    if t > 0.001 && t < 0.999 {
-        ctx.request_repaint();
-    }
-}
-
-/// The panel's chrome: the solid SURFACE sheet, the outer hairline, and the
-/// rail/list divider (§4 tokens).
-fn paint_panel_frame(ui: &egui::Ui, rect: egui::Rect) {
-    let painter = ui.painter().clone();
-    painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
-    painter.rect_stroke(
-        rect,
-        Style::RADIUS,
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-        egui::StrokeKind::Inside,
-    );
-    painter.vline(
+/// Render the Console content into `rect` — the rail|list divider (§4 tokens),
+/// the keyboard layer while showing, and the two panes. `pub(crate)`: WIN7-2's
+/// `start_menu` calls this directly at its own right-pane rect, having already
+/// mirrored its own open state into `state` via [`ConsoleState::set_open`] and
+/// painted the OUTER panel chrome (fill/border) itself — this function only
+/// owns what's specific to the content's own internal rail|list split, not a
+/// second outer frame (no double border). Before WIN7-2 this lived inside a
+/// standalone `console_panel` that also mounted its own floating `egui::Area`
+/// (slide/click-away/dismiss); that machinery now lives in `start_menu`
+/// instead, so embedding this content is a plain rect-scoped call, not a
+/// second nested panel.
+pub(crate) fn console_content(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
+    ui.painter().vline(
         rect.left() + RAIL_W,
         (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
     );
+    if state.open {
+        handle_keys(ui, state);
+    }
+    rail(ui, rect, state);
+    list_pane(ui, rect, state);
 }
 
 /// The keyboard layer (locks #40/#48, the EXPLORER-18 posture): Esc closes,
@@ -1785,10 +1758,10 @@ fn custom_add_form(ui: &mut egui::Ui, state: &mut ConsoleState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        console_confirm_id, console_entry_id, console_heading_id, console_panel, console_power_id,
-        console_rail_id, entry_at, identity_line, launch_argv, static_rows, tool_present,
-        tool_present_in, total_rows, ConsoleRequest, ConsoleState, CustomEntry, EntryKind,
-        GateReason, PowerAction, CONSOLE_AREA, GROUPS, PINNED,
+        console_confirm_id, console_content, console_entry_id, console_heading_id,
+        console_power_id, console_rail_id, entry_at, identity_line, launch_argv, static_rows,
+        tool_present, tool_present_in, total_rows, ConsoleRequest, ConsoleState, CustomEntry,
+        EntryKind, GateReason, PowerAction, GROUPS, PANEL_H, PANEL_W, PINNED,
     };
     use crate::dock::Surface;
     use crate::workbench::Plane;
@@ -1796,9 +1769,15 @@ mod tests {
     use mde_egui::Style;
     use mde_seat::PowerVerb;
 
-    /// Drive ONE headless frame of the console over a stand-in surface (the
-    /// dock tests' `drive_vdock` idiom — the same `Context::run` path the DRM
-    /// runner drives, minus the GPU).
+    /// Drive ONE headless frame of the console content over a stand-in surface
+    /// (the dock tests' `drive_vdock` idiom — the same `Context::run` path the
+    /// DRM runner drives, minus the GPU). Mounts [`console_content`] at the
+    /// SAME rect the old standalone `console_panel` used to settle at
+    /// (bottom-left, `PANEL_W` × `PANEL_H`) so every existing coordinate-based
+    /// row/rail assertion below still lands on the same pixels — this helper
+    /// stands in for `start_menu`'s outer Area now that `console.rs` no longer
+    /// mounts one itself (WIN7-2). Renders content only while `state.is_open()`,
+    /// the closest local analogue to the old Motion-settled visibility gate.
     fn drive(
         ctx: &egui::Context,
         state: &mut ConsoleState,
@@ -1814,7 +1793,18 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = ui.button("surface");
             });
-            console_panel(ctx, state);
+            if state.is_open() {
+                egui::Area::new(egui::Id::new("test-console-content-area"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(crate::dock::DOCK_W, size.y - PANEL_H))
+                    .show(ctx, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(PANEL_W, PANEL_H),
+                            egui::Sense::hover(),
+                        );
+                        console_content(ui, rect, state);
+                    });
+            }
         })
     }
 
@@ -1856,11 +1846,6 @@ mod tests {
             size,
         );
         drive(ctx, state, vec![release_at(center)], size);
-    }
-
-    /// The console's floating-Area `LayerId`.
-    fn console_layer() -> egui::LayerId {
-        egui::LayerId::new(egui::Order::Foreground, egui::Id::new(CONSOLE_AREA))
     }
 
     const SZ: egui::Vec2 = egui::Vec2::new(1280.0, 800.0);
@@ -2037,40 +2022,14 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_console_mounts_no_layer_and_an_open_one_paints() {
-        // The dock's passthrough guarantee: closed + settled → no Area at all,
-        // so input over the panel's would-be footprint reaches the surface.
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut s = ConsoleState::default();
-        drive(&ctx, &mut s, Vec::new(), SZ);
-        drive(&ctx, &mut s, Vec::new(), SZ);
-        let inside = egui::pos2(crate::dock::DOCK_W + 100.0, SZ.y - 100.0);
-        assert_ne!(
-            ctx.layer_id_at(inside),
-            Some(console_layer()),
-            "a CLOSED console must not float an intercepting layer"
-        );
-
-        // Open on a fresh context (the slide latch settles at the open endpoint
-        // on first sight) → the layer mounts and the frame paints primitives.
-        let ctx2 = egui::Context::default();
-        Style::install(&ctx2);
-        let mut s2 = ConsoleState::default();
-        s2.toggle();
-        drive(&ctx2, &mut s2, Vec::new(), SZ);
-        let out = drive(&ctx2, &mut s2, Vec::new(), SZ);
-        assert_eq!(
-            ctx2.layer_id_at(inside),
-            Some(console_layer()),
-            "an OPEN console claims its footprint"
-        );
-        let prims = ctx2.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "the open console painted nothing");
-    }
-
-    #[test]
     fn esc_closes_the_panel() {
+        // The panel-level Area/slide/click-away machinery moved to
+        // `start_menu` (WIN7-2) — the "mounts no layer while closed" and
+        // "click away dismisses" contracts are now tested there, over the
+        // real embedding Area. This module keeps the content-level half of
+        // Esc: `handle_keys` still calls `ConsoleState::close` on its own
+        // `state.open`, which is what `start_menu` reads to propagate the
+        // dismissal to the whole panel (see its module doc).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = ConsoleState::default();
@@ -2079,28 +2038,6 @@ mod tests {
         assert!(s.is_open());
         drive(&ctx, &mut s, vec![key(egui::Key::Escape)], SZ);
         assert!(!s.is_open(), "Esc dismisses the Console (lock #4)");
-    }
-
-    #[test]
-    fn click_away_closes_but_never_on_the_opening_frame() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut s = ConsoleState::default();
-        s.toggle();
-        // The very frame the Start cell toggled: its click lands outside the
-        // panel — the guard must swallow it (the power-menu opened idiom).
-        let far = egui::pos2(SZ.x - 40.0, 40.0);
-        drive(
-            &ctx,
-            &mut s,
-            vec![egui::Event::PointerMoved(far), release_at(far)],
-            SZ,
-        );
-        assert!(s.is_open(), "the opening click must not self-dismiss");
-        // Settle, then a real click away → dismissed (lock #4).
-        drive(&ctx, &mut s, Vec::new(), SZ);
-        click(&ctx, &mut s, far, SZ);
-        assert!(!s.is_open(), "a click away dismisses the Console");
     }
 
     // ── keyboard nav + activation (locks #40/#48, §7 honest gates) ──────────
