@@ -1298,6 +1298,11 @@ impl Shell {
     /// raw Esc/arrow/Enter presses, which must never act past the lock — the
     /// hotkey-gate posture. Split out of `render` (the `mount_dock_chrome`
     /// idiom) so each stays within the line budget.
+    ///
+    /// WIN7-3 — also drains a live-tile click (the left pane) after Console's
+    /// own requests: the SAME "route + expand the body" outcome as a Console
+    /// `Goto`, just raised from `StartMenuState::take_tile_activation`
+    /// instead.
     fn mount_start_menu(&mut self, ctx: &egui::Context) {
         let toggled = self.vdock.take_start_menu_toggle();
         if self.curtain.engaged() {
@@ -1339,6 +1344,14 @@ impl Shell {
                 let _ = self.system.honor_power(verb);
             }
             None => {}
+        }
+        // WIN7-3 — a live-tile click (the left pane) ends in the SAME
+        // outcome as an embedded Console `Goto` above: route the body and
+        // expand it (a navigation raised from the Start Menu is never a
+        // no-op behind the session, matching every other nav path here).
+        if let Some(surface) = self.start_menu.take_tile_activation() {
+            self.nav.expanded = true;
+            self.nav.surface = surface;
         }
     }
 

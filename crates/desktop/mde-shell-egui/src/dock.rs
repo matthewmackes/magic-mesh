@@ -208,6 +208,39 @@ impl Surface {
             Surface::About | Surface::Timers => IconId::Mark,
         }
     }
+
+    /// The tile/menu **display label** for this surface (WIN7-3, design
+    /// `docs/design/win7-desktop-survey.md` lock #8's "icon + label" tile
+    /// face). This is NOT an existing mapping the app picker already
+    /// rendered: PICKER-1's own lock is "no per-icon captions, no tooltips
+    /// anywhere" (this module's top doc comment), so unlike [`Self::icon_id`]
+    /// there was no reusable label table for a tile grid to inherit — this
+    /// method is new data, added alongside the icon map so a surface's two
+    /// tile-facing facts live in one place. Human-facing names, matching each
+    /// variant's own doc comment above (`MeshView` → "Mesh Map", `InfraCode`
+    /// → "Infra as Code"; the rest a plain rendering of the variant name).
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Surface::Workbench => "Workbench",
+            Surface::MeshView => "Mesh Map",
+            Surface::InfraCode => "Infra as Code",
+            Surface::Desktop => "Desktop",
+            Surface::Music => "Music",
+            Surface::Media => "Media",
+            Surface::Files => "Files",
+            Surface::Voice => "Voice",
+            Surface::Browser => "Browser",
+            Surface::Bookmarks => "Bookmarks",
+            Surface::Terminal => "Terminal",
+            Surface::Editor => "Editor",
+            Surface::Chat => "Chat",
+            Surface::Phones => "Phones",
+            Surface::System => "System",
+            Surface::Storage => "Storage",
+            Surface::About => "About",
+            Surface::Timers => "Timers & Alarms",
+        }
+    }
 }
 
 /// A shared bar-height token in logical points (`SP_XL + SP_M + SP_S` on the 8px
@@ -2477,7 +2510,12 @@ fn badge_tone_color(tone: BadgeTone) -> egui::Color32 {
     }
 }
 
-fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
+/// Whether `resp` should activate its target this frame: a click, or
+/// Enter/Space while it holds keyboard focus — the picker cell's activation
+/// contract. `pub(crate)` (not private) because WIN7-3's Start Menu tile
+/// grid (`start_menu.rs`) reuses this SAME predicate for its own tiles
+/// rather than reimplementing click-vs-keyboard activation a second time.
+pub(crate) fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
     resp.clicked()
         || (resp.has_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)))
@@ -3618,6 +3656,52 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), Surface::ALL.len(), "surface→glyph map not 1:1");
+    }
+
+    // --- WIN7-3: every dock surface has a tile-facing display label ---------------
+
+    #[test]
+    fn every_surface_maps_to_a_nonempty_display_label() {
+        // `label()` is new data (WIN7-3) — the picker itself deliberately has no
+        // per-icon caption to inherit (PICKER-1's own "no per-icon captions, no
+        // tooltips anywhere" lock), so this is its own exhaustive, injective map,
+        // the same shape as `every_surface_maps_to_a_named_brand_glyph` above.
+        let cases = [
+            (Surface::Workbench, "Workbench"),
+            (Surface::MeshView, "Mesh Map"),
+            (Surface::InfraCode, "Infra as Code"),
+            (Surface::Desktop, "Desktop"),
+            (Surface::Music, "Music"),
+            (Surface::Media, "Media"),
+            (Surface::Files, "Files"),
+            (Surface::Voice, "Voice"),
+            (Surface::Browser, "Browser"),
+            (Surface::Bookmarks, "Bookmarks"),
+            (Surface::Terminal, "Terminal"),
+            (Surface::Editor, "Editor"),
+            (Surface::Chat, "Chat"),
+            (Surface::Phones, "Phones"),
+            (Surface::System, "System"),
+            (Surface::Storage, "Storage"),
+            (Surface::About, "About"),
+        ];
+        assert_eq!(cases.len(), Surface::ALL.len(), "a surface is unlabelled");
+        for (surface, label) in cases {
+            assert_eq!(surface.label(), label, "{surface:?} → wrong label");
+            assert!(!label.is_empty(), "{surface:?} has a blank label");
+        }
+        // Injective over Surface::ALL — 17 surfaces, 17 distinct labels.
+        let mut labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            Surface::ALL.len(),
+            "surface→label map not 1:1"
+        );
+        // Timers sits outside `ALL` (lock #20 — the clock-cell glyph, never a
+        // tile) but `label()` stays exhaustive over the full enum like `icon_id`.
+        assert_eq!(Surface::Timers.label(), "Timers & Alarms");
     }
 
     #[test]

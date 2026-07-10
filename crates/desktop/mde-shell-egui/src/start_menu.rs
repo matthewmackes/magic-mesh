@@ -59,12 +59,33 @@
 //! for each pane — so a screen reader can already navigate the shell. Deep
 //! per-tile / per-row accesskit is WIN7-3's (tiles) and WIN7-7's (the full
 //! sweep) job, not re-litigated here.
+//!
+//! **WIN7-3 update:** the left pane described above as an empty placeholder is
+//! now the real live-tile grid (locks #6/#7/#8/#23): all 17 [`Surface::ALL`]
+//! entries, grouped into lock #8's 7 function-based groups (Mesh Control ·
+//! Desktop & Session · Media · Files & Data · Web & Tools · Comms · System —
+//! [`TILE_GROUPS`]), each a uniform [`TILE_W`]×[`TILE_H`] tile (lock #6 — one
+//! size, no variants). A tile wears the SAME glyph the app picker already
+//! draws (`Surface::icon_id`) plus a NEW text label (`Surface::label`,
+//! added this unit): the picker itself deliberately carries no per-icon
+//! captions (`dock.rs`'s own PICKER-1 lock), so there was no existing label
+//! table to inherit, only the icon one. A click reuses the picker's own
+//! click-vs-Enter/Space activation predicate (`dock::response_activated`,
+//! widened to `pub(crate)` for this reuse, not reimplemented) and records
+//! the surface in a new [`StartMenuState::tile_activation`] slot, drained by
+//! `main.rs` exactly like an embedded Console `Goto` request — both panes
+//! end in the same "go to this surface, close the whole menu" outcome (lock
+//! #23), just raised from different data. [`LEFT_PANE_W`] is no longer
+//! WIN7-2's arbitrary 288pt placeholder; it is now sized to the real grid
+//! this unit renders. Static content only (lock #5's live-fact rotation is
+//! WIN7-4's job) — this unit leaves a [`tile_status_tint`] seam WIN7-4 can
+//! light up rather than hardcoding "never any live data."
 
 use mde_egui::egui;
 use mde_egui::{Motion, Style};
 
 use crate::console::{self, ConsoleState};
-use crate::dock::DOCK_W;
+use crate::dock::{icon_texture, response_activated, Surface, DOCK_W};
 
 // ── geometry ─────────────────────────────────────────────────────────────────
 
@@ -80,14 +101,64 @@ const SLIDE_KEY: &str = "start-menu-slide";
 /// module-private in each, the established per-module idiom).
 const HAIRLINE_W: f32 = 1.0;
 
-/// The left (tile-grid) pane's placeholder width. WIN7-3 replaces the whole
-/// pane's content with the real uniform-tile grid (lock #6) and will very
-/// likely resize it to fit; picked as a round `SP_XL` multiple (the
-/// `console.rs` `RAIL_W`/`LIST_W`/`PANEL_W` token-composition idiom) rather
-/// than an arbitrary literal, not a measured final value.
-const LEFT_PANE_W: f32 = Style::SP_XL * 9.0;
+// ── tile grid geometry (WIN7-3, locks #6/#7/#8) ─────────────────────────────
 
-/// The whole panel's width — the placeholder left pane plus Console's existing
+/// One tile's height — `SP_XL + SP_M` (48pt), the SAME cell-height
+/// composition `dock.rs`'s own (module-private) `CELL_W` icon-cell token
+/// already uses, restated here per this module's own established
+/// per-file-restatement idiom (see [`HAIRLINE_W`] above). Every one of the
+/// 17 tiles shares this ONE size (lock #6 — no small/wide/large variants).
+const TILE_H: f32 = Style::SP_XL + Style::SP_M;
+
+/// One tile's width — `SP_XL · 2.5` (80pt): wider than tall, so a full
+/// surface label (e.g. "Infra as Code") has real room beside the shorter
+/// ones. Every tile still shares this ONE width (lock #6 rules out
+/// per-tile small/wide/large *variants*, not a non-square aspect ratio).
+const TILE_W: f32 = Style::SP_XL * 2.5;
+
+/// The gap between adjacent tiles, in both directions of the grid.
+const TILE_GAP: f32 = Style::SP_XS;
+
+/// How many tiles sit in one row before wrapping. The widest of lock #8's 7
+/// groups (Mesh Control / Media / Files & Data / Web & Tools) has exactly 3
+/// members, so every one of today's groups renders as a single tidy row —
+/// pinned by a test below rather than just assumed. [`left_pane`]'s render
+/// loop still wraps generally (N rows, not hardcoded to 1 — `usize::div_ceil`)
+/// so a group that later grows past 3 members degrades to a second row
+/// instead of silently overlapping.
+const TILE_COLUMNS: usize = 3;
+
+/// A tile-group heading's height — matches `console.rs`'s own
+/// (module-private) `HEADING_H` exactly (`SP_L`), so the two panes' section
+/// labels read as one visual rhythm (Console's heading sits right next to
+/// this pane in the same panel).
+const GROUP_HEADING_H: f32 = Style::SP_L;
+
+/// The gap after one group's tile row(s), before the next group's heading.
+const GROUP_GAP: f32 = Style::SP_XS;
+
+/// The pane's inner padding on every edge — matches `console.rs`'s own
+/// `list_pane` `SP_S` inset idiom.
+const PANE_PAD: f32 = Style::SP_S;
+
+/// The tile's icon glyph size — the SAME 24px [`Style::SP_L`] the app
+/// picker's own cells already draw their glyphs at (one icon language, not a
+/// second size invented here).
+const TILE_ICON: f32 = Style::SP_L;
+
+/// The status-tint dot's radius ([`tile_status_tint`]'s seam, WIN7-4).
+const TILE_STATUS_DOT_R: f32 = Style::SP_XS / 2.0;
+
+/// The left (tile-grid) pane's width: [`PANE_PAD`] on both sides plus three
+/// (see [`TILE_COLUMNS`]) [`TILE_W`]-wide columns, [`TILE_GAP`] apart.
+/// WIN7-2 shipped this pane at an arbitrary 288pt placeholder ("WIN7-3 will
+/// very likely resize it" — its own doc comment); this is that resize,
+/// derived from the real grid this unit renders rather than picked by eye.
+/// A test below pins `TILE_COLUMNS == 3` so the `3.0`/`2.0` literals here
+/// can't silently drift from the grid they're meant to fit.
+const LEFT_PANE_W: f32 = PANE_PAD * 2.0 + TILE_W * 3.0 + TILE_GAP * 2.0;
+
+/// The whole panel's width — the left tile-grid pane plus Console's existing
 /// migrated-content width (right pane, locks #4/#10).
 const PANEL_W: f32 = LEFT_PANE_W + console::PANEL_W;
 
@@ -97,15 +168,111 @@ const PANEL_W: f32 = LEFT_PANE_W + console::PANEL_W;
 /// one unified frame, not two mismatched panels glued together.
 const PANEL_H: f32 = console::PANEL_H;
 
+/// The tile grid's total content height: 7 group headings + 7 single tile
+/// rows (see [`TILE_COLUMNS`]'s note — every locked group fits one row
+/// today) + 6 inter-group gaps. Comfortably inside [`PANEL_H`] minus its own
+/// top/bottom [`PANE_PAD`] inset — pinned by a test below rather than
+/// trusted by eye. `#[cfg(test)]`: nothing in the render path reads a
+/// pre-summed total (`left_pane` accumulates `y` incrementally instead), so
+/// this is verification-only data (the `status.rs` `local_grade_pip_id`
+/// `#[cfg(test)]`-on-a-top-level-item idiom), not dead weight in a release
+/// build.
+#[cfg(test)]
+const TILE_GRID_CONTENT_H: f32 = 7.0 * (GROUP_HEADING_H + TILE_H) + 6.0 * GROUP_GAP;
+
+// ── tile groups (lock #8: function-based grouping) ──────────────────────────
+
+/// One labelled group of the left pane's tile grid (lock #8). Mirrors
+/// `dock.rs`'s `Group` / `console.rs`'s `ConsoleGroup` shape — this module's
+/// own copy since the Start Menu's tile grouping is its own domain concern
+/// (lock #8), distinct from the app picker's PICKER-1 grouping.
+struct TileGroup {
+    /// The group heading, painted by [`tile_group_heading`] (visually
+    /// matching `console.rs`'s own `heading()` row, per this unit's steer to
+    /// match Console's precedent since it sits right next to this pane).
+    label: &'static str,
+    /// The group's surfaces, kept in [`Surface::ALL`] relative order (the
+    /// `dock.rs` `Group::surfaces` L7 convention) — lock #8's own listed
+    /// order already satisfies this, checked by a test below.
+    surfaces: &'static [Surface],
+}
+
+/// The 7 function-based groups in their locked order (lock #8), each listing
+/// its surfaces in [`Surface::ALL`] relative order. Unlike the app picker's
+/// `GROUPS` (which pulls the Workbench/System/Desktop out to standalone
+/// cells), every one of the 17 [`Surface::ALL`] entries sits inside exactly
+/// one group here — lock #8 places all 17, none outside. Drives the tile
+/// render + the shell tests (the one grouping authority for this pane).
+const TILE_GROUPS: [TileGroup; 7] = [
+    TileGroup {
+        label: "Mesh Control",
+        surfaces: &[Surface::Workbench, Surface::MeshView, Surface::InfraCode],
+    },
+    TileGroup {
+        label: "Desktop & Session",
+        surfaces: &[Surface::Desktop],
+    },
+    TileGroup {
+        label: "Media",
+        surfaces: &[Surface::Music, Surface::Media, Surface::Voice],
+    },
+    TileGroup {
+        label: "Files & Data",
+        surfaces: &[Surface::Files, Surface::Bookmarks, Surface::Storage],
+    },
+    TileGroup {
+        label: "Web & Tools",
+        surfaces: &[Surface::Browser, Surface::Terminal, Surface::Editor],
+    },
+    TileGroup {
+        label: "Comms",
+        surfaces: &[Surface::Chat, Surface::Phones],
+    },
+    TileGroup {
+        label: "System",
+        surfaces: &[Surface::System, Surface::About],
+    },
+];
+
+// Compile-time guard: every `Surface::ALL` entry appears in `TILE_GROUPS`
+// exactly once (the `dock.rs` `GROUPS` completeness-guard idiom, restated
+// here since this table is its own domain concern — lock #8's grouping, not
+// `dock.rs`'s picker grouping) — so a future `Surface` addition that forgets
+// to place a tile fails the BUILD, not a silent missing/duplicate tile.
+const _: () = {
+    let mut i = 0;
+    while i < Surface::ALL.len() {
+        let target = Surface::ALL[i] as usize;
+        let mut count = 0;
+        let mut g = 0;
+        while g < TILE_GROUPS.len() {
+            let surfaces = TILE_GROUPS[g].surfaces;
+            let mut s = 0;
+            while s < surfaces.len() {
+                if surfaces[s] as usize == target {
+                    count += 1;
+                }
+                s += 1;
+            }
+            g += 1;
+        }
+        assert!(
+            count == 1,
+            "every Surface::ALL entry must appear in TILE_GROUPS exactly once (lock #8)",
+        );
+        i += 1;
+    }
+};
+
 // ── state ────────────────────────────────────────────────────────────────────
 
 /// The Start Menu's cross-frame state: the open latch (driven by the Start
-/// cell click and the Super key, lock #13) and the same-frame click-away guard
+/// cell click and the Super key, lock #13), the same-frame click-away guard
 /// (the Console/VDOCK-4 `just_toggled` idiom, restated here since this panel
-/// now owns its own outer `Area`/dismiss machinery). Pure (no egui handles),
-/// so open/close is unit-tested without a GPU. Deliberately minimal for this
-/// unit — WIN7-3/4 (the tile grid + rotation) and WIN7-8 (multi-seat sync) are
-/// what actually grow this state; empty panes need no more than open/close.
+/// now owns its own outer `Area`/dismiss machinery), and (WIN7-3) a pending
+/// tile-click surface activation. Pure (no egui handles), so open/close and
+/// tile activation are unit-tested without a GPU. WIN7-4 (tile rotation) and
+/// WIN7-8 (multi-seat sync) are what grow this further.
 #[derive(Debug, Default)]
 pub struct StartMenuState {
     /// Whether the panel is up — toggled by a Start-cell click or a clean
@@ -117,6 +284,13 @@ pub struct StartMenuState {
     /// opened the panel must not immediately read as a click-away dismissal
     /// (the Console/VDOCK-4 `just_toggled` idiom).
     just_toggled: bool,
+    /// WIN7-3 — a live-tile click's pending surface activation (lock #23):
+    /// set by [`left_pane`]/[`tile`] when a tile fires, drained once by
+    /// `main.rs` ([`Self::take_tile_activation`]) exactly like
+    /// [`console::ConsoleState::take_request`]'s `Goto` variant — the SAME
+    /// "go to this surface, close the menu" outcome as an embedded Console
+    /// row, just raised from the OTHER pane's data.
+    tile_activation: Option<Surface>,
 }
 
 impl StartMenuState {
@@ -142,6 +316,17 @@ impl StartMenuState {
             self.just_toggled = true;
         }
     }
+
+    /// Drain a pending tile-click surface activation (WIN7-3, lock #23) —
+    /// `main.rs` calls this each frame after [`start_menu_panel`] and routes
+    /// `nav.surface` exactly as it already does for an embedded Console
+    /// `Goto` request (the SAME deferred-wire idiom, §6 — this panel can't
+    /// reach the shell nav itself). `None` (drained once) otherwise. `const`
+    /// matching [`console::ConsoleState::take_request`]'s identical
+    /// `self.pending.take()` shape.
+    pub(crate) const fn take_tile_activation(&mut self) -> Option<Surface> {
+        self.tile_activation.take()
+    }
 }
 
 // ── render ───────────────────────────────────────────────────────────────────
@@ -155,7 +340,10 @@ impl StartMenuState {
 /// overlays, never hides/replaces the active surface behind it). Esc, a click
 /// away, and a second trigger all dismiss; so does an embedded Console action
 /// that fires for real (a routed link, a spawned tab, a power verb — see the
-/// module doc's self-closure note).
+/// module doc's self-closure note), and so (WIN7-3) does a live-tile click
+/// (lock #23) — both panes close the WHOLE menu on activation, just via
+/// different data ([`ConsoleState::is_open`]'s self-closure vs.
+/// [`StartMenuState::tile_activation`]).
 #[allow(clippy::suboptimal_flops)] // the slide offset reads clearer than mul_add
 pub fn start_menu_panel(
     ctx: &egui::Context,
@@ -199,7 +387,14 @@ pub fn start_menu_panel(
             if state.open && esc_pressed(ui) {
                 state.close();
             }
-            left_pane(ui, left_rect);
+            // WIN7-3 — a tile click records its surface and closes the WHOLE
+            // panel at once (lock #23), the same "activation closes the
+            // menu" outcome the embedded Console pane's self-closure below
+            // already gives its own rows.
+            if let Some(surface) = left_pane(ui, left_rect) {
+                state.tile_activation = Some(surface);
+                state.close();
+            }
             console::console_content(ui, right_rect, console);
         });
 
@@ -248,18 +443,152 @@ fn paint_frame(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
-/// The left pane — WIN7-2 ships the shell only, so this is a labelled
-/// placeholder (per the unit's own "empty panes to start" scope); WIN7-3
-/// replaces it with the real grouped, uniform-size live-tile grid (locks
-/// #6/#7/#8).
-fn left_pane(ui: &egui::Ui, rect: egui::Rect) {
+/// The left pane (WIN7-3, locks #6/#7/#8): [`TILE_GROUPS`]' 7 headed
+/// sections, each a row of uniform [`TILE_W`]×[`TILE_H`] tiles in
+/// [`Surface::ALL`] order. Returns the clicked tile's surface, if any, for
+/// the caller to route + close the whole panel with (lock #23 — a single
+/// click activates, mirroring the embedded Console pane's own
+/// click-routes-and-closes behaviour). Static content only: WIN7-4 is what
+/// makes a tile's face rotate through a few live facts (lock #5); this unit
+/// leaves that as one pluggable seam ([`tile_status_tint`]) rather than
+/// hardcoding "never any live data."
+#[allow(
+    clippy::cast_precision_loss, // row/col indices are tiny (< TILE_COLUMNS)
+    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
+)]
+fn left_pane(ui: &egui::Ui, rect: egui::Rect) -> Option<Surface> {
+    let mut activated = None;
+    let x0 = rect.left() + PANE_PAD;
+    let mut y = rect.top() + PANE_PAD;
+    for group in &TILE_GROUPS {
+        let heading_rect = egui::Rect::from_min_size(
+            egui::pos2(x0, y),
+            egui::vec2((rect.width() - PANE_PAD * 2.0).max(0.0), GROUP_HEADING_H),
+        );
+        tile_group_heading(ui, heading_rect, group.label);
+        y += GROUP_HEADING_H;
+
+        for (i, &surface) in group.surfaces.iter().enumerate() {
+            let col = (i % TILE_COLUMNS) as f32;
+            let row = (i / TILE_COLUMNS) as f32;
+            let tile_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    x0 + col * (TILE_W + TILE_GAP),
+                    y + row * (TILE_H + TILE_GAP),
+                ),
+                egui::vec2(TILE_W, TILE_H),
+            );
+            if tile(ui, surface, tile_rect) {
+                activated = Some(surface);
+            }
+        }
+        let rows = group.surfaces.len().div_ceil(TILE_COLUMNS).max(1);
+        y += rows as f32 * (TILE_H + TILE_GAP) - TILE_GAP + GROUP_GAP;
+    }
+    activated
+}
+
+/// One tile-group heading — visually matches `console.rs`'s own
+/// (module-private) `heading()` row exactly (same uppercased micro-label,
+/// same `SMALL`/`TEXT_DIM` treatment, same `SP_XS` left inset), restated
+/// here since it's private to that module and this pane paints via explicit
+/// rects rather than `console.rs`'s layout-managed `ui.allocate_exact_size`
+/// (this module's own established direct-painter style, e.g. [`paint_frame`]).
+fn tile_group_heading(ui: &egui::Ui, rect: egui::Rect, label: &str) {
     ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "Tiles \u{2014} coming in WIN7-3",
+        egui::pos2(rect.left() + Style::SP_XS, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label.to_uppercase(),
         egui::FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
     );
+}
+
+/// One live tile (WIN7-3, locks #6/#8/#23): a uniform [`TILE_W`]×[`TILE_H`]
+/// cell wearing the surface's existing picker glyph (`Surface::icon_id`, the
+/// SAME [`icon_texture`] loader + the SAME 24px [`TILE_ICON`] size the app
+/// picker's own cells use) over its new tile label (`Surface::label`). A
+/// hover brightens both the fill and the tint — the same two-tone contract
+/// the app picker's own cells already use (§4, one hover language, not a
+/// second one invented here). A click (or Enter/Space while focused —
+/// [`response_activated`], reused verbatim rather than reimplemented)
+/// returns `true` so [`left_pane`] can route + close the whole panel (lock
+/// #23). Exports its own accesskit `Button` node (lock #14, WIN7-3's own
+/// per-tile parity, not WIN7-7's later full sweep) —
+/// [`install_tile_accessibility`].
+fn tile(ui: &egui::Ui, surface: Surface, rect: egui::Rect) -> bool {
+    let resp = ui.interact(rect, tile_id(surface), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+
+    if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+
+    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), TILE_ICON, tint) {
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + Style::SP_XS + TILE_ICON / 2.0),
+            egui::vec2(TILE_ICON, TILE_ICON),
+        );
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    }
+
+    // The WIN7-4 seam (§7 honest-gating): a status-colour dot if this
+    // surface's already-published state has one for free. Always `None`
+    // today — see `tile_status_tint`'s own doc for why this unit leaves it
+    // wired-but-inert rather than half-plumbing a live source.
+    if let Some(color) = tile_status_tint(surface) {
+        painter.circle_filled(
+            egui::pos2(
+                rect.right() - Style::SP_XS - TILE_STATUS_DOT_R,
+                rect.top() + Style::SP_XS + TILE_STATUS_DOT_R,
+            ),
+            TILE_STATUS_DOT_R,
+            color,
+        );
+    }
+
+    // The label — bottom-centred, clipped to the tile so a long name (e.g.
+    // "Infra as Code") trims cleanly at the tile edge instead of spilling
+    // into its neighbour.
+    painter.with_clip_rect(rect).text(
+        egui::pos2(rect.center().x, rect.bottom() - Style::SP_XS),
+        egui::Align2::CENTER_BOTTOM,
+        surface.label(),
+        egui::FontId::proportional(Style::SMALL),
+        tint,
+    );
+
+    install_tile_accessibility(ui.ctx(), surface, rect);
+    response_activated(ui, &resp)
+}
+
+/// The stable id of one tile's interactive rect (the `dock.rs` `pick_cell_id`
+/// idiom restated — tests read a tile's settled `Rect` back to click its
+/// exact centre, the addressable-cell idiom).
+fn tile_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("start-menu-tile", surface))
+}
+
+/// The seam WIN7-4 (design lock #5's rotating live-tile content) hooks its
+/// per-surface "tile fact" source into: a status-colour dot when the SAME
+/// already-published state the dock's own picker badges
+/// (`dock::badge_for`) read has one for this surface (§7 honest-gating —
+/// never invented data). This unit ships the seam wired but inert (`None`
+/// for every surface) rather than reading real state here: doing that for
+/// real would mean threading `StatusInputs`/`DockState` into
+/// [`start_menu_panel`]'s own signature for a single static dot, when
+/// WIN7-4 has to build that live-fact plumbing "for real" anyway (the design
+/// doc's own "a new thin per-surface tile fact trait/source" note) — better
+/// built once, together, than half-wired twice.
+const fn tile_status_tint(_surface: Surface) -> Option<egui::Color32> {
+    None
 }
 
 /// Whether Esc should dismiss the WHOLE Start Menu this frame — inert while a
@@ -306,9 +635,11 @@ fn console_pane_accesskit_id() -> egui::Id {
 /// Install the panel-level accesskit tree (lock #14 — "the panel itself needs
 /// proper roles/labels even before its content is filled in"): the whole
 /// panel as a `Menu`, and each pane as a landmark `Group`, so a screen reader
-/// can already navigate the shell before WIN7-3/5/7 land the tiles' / Console's
-/// own per-row accesskit (the `status.rs` `install_status_accessibility`
-/// idiom, restated here since this crate's dock/console panels have none yet).
+/// can already navigate the shell before WIN7-5/7 land Console's own per-row
+/// accesskit / the full sweep (the `status.rs` `install_status_accessibility`
+/// idiom, restated here since this crate's dock/console panels have none
+/// yet). WIN7-3 lands the tiles' own per-tile accesskit separately —
+/// [`install_tile_accessibility`], called per tile from [`tile`].
 fn install_accessibility(
     ctx: &egui::Context,
     rect: egui::Rect,
@@ -332,10 +663,31 @@ fn install_accessibility(
     });
 }
 
+/// The stable accesskit node id for one tile (WIN7-3, lock #14).
+fn tile_accesskit_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("start-menu-tile-accesskit", surface))
+}
+
+/// Install one tile's own accesskit node (lock #14 — "every tile", not just
+/// the panel level): a `Button` role with the surface's display label and
+/// bounds, plus the `Click` action — the SAME shape `status.rs`'s
+/// `install_segment_accessibility` already uses for its own per-item pips
+/// (role + label + bounds + `add_action(Click)`), restated here since that
+/// helper is module-private there.
+fn install_tile_accessibility(ctx: &egui::Context, surface: Surface, rect: egui::Rect) {
+    let _ = ctx.accesskit_node_builder(tile_accesskit_id(surface), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(surface.label());
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{start_menu_panel, StartMenuState, DOCK_W, PANEL_H, PANEL_W};
     use crate::console::{self, ConsoleState};
+    use crate::dock::Surface;
     use mde_egui::egui;
     use mde_egui::Style;
 
@@ -609,6 +961,154 @@ mod tests {
         );
     }
 
+    // ── WIN7-3: live tiles (locks #6/#7/#8/#23) ──────────────────────────────
+
+    #[test]
+    fn the_17_surfaces_are_grouped_into_lock_8s_7_function_based_groups() {
+        // Lock #8's exact taxonomy + order — the `dock.rs`
+        // `the_locked_group_taxonomy_and_order` precedent, restated for this
+        // pane's own (different) grouping table.
+        use Surface::{
+            About, Bookmarks, Browser, Chat, Desktop, Editor, Files, InfraCode, Media, MeshView,
+            Music, Phones, Storage, System, Terminal, Voice, Workbench,
+        };
+        let expect: [(&str, &[Surface]); 7] = [
+            ("Mesh Control", &[Workbench, MeshView, InfraCode]),
+            ("Desktop & Session", &[Desktop]),
+            ("Media", &[Music, Media, Voice]),
+            ("Files & Data", &[Files, Bookmarks, Storage]),
+            ("Web & Tools", &[Browser, Terminal, Editor]),
+            ("Comms", &[Chat, Phones]),
+            ("System", &[System, About]),
+        ];
+        assert_eq!(
+            super::TILE_GROUPS.len(),
+            expect.len(),
+            "seven groups (lock #8)"
+        );
+        for (g, (label, surfaces)) in super::TILE_GROUPS.iter().zip(expect) {
+            assert_eq!(g.label, label, "group order");
+            assert_eq!(
+                g.surfaces, surfaces,
+                "{label} membership + within-group order"
+            );
+        }
+        // Unlike the app picker (which pulls Workbench/System/Desktop out to
+        // standalone cells), lock #8 places ALL 17 Surface::ALL entries
+        // inside a group — none sit outside. The compile-time guard above
+        // already enforces "exactly once"; re-prove it here at runtime too
+        // (the dock.rs belt-and-suspenders convention).
+        let mut placed: Vec<Surface> = Vec::new();
+        for g in &super::TILE_GROUPS {
+            placed.extend_from_slice(g.surfaces);
+        }
+        assert_eq!(
+            placed.len(),
+            Surface::ALL.len(),
+            "every surface placed once"
+        );
+        for surface in Surface::ALL {
+            assert_eq!(
+                placed.iter().filter(|&&s| s == surface).count(),
+                1,
+                "{surface:?} must be placed in exactly one tile group"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tile_grid_content_fits_the_shared_panel_height_without_overflow() {
+        // The panel is fixed-size (lock #2) and shares ONE height across
+        // both panes (`PANEL_H`) — the tile grid's own derived content
+        // height, plus its top/bottom `PANE_PAD` inset, must fit inside it.
+        // Asserted directly on the compile-time geometry (the WIN7-2
+        // `PANEL_H`/`PANEL_W` constant-assertion precedent), no
+        // GPU/context needed.
+        assert!(
+            super::TILE_GRID_CONTENT_H + super::PANE_PAD * 2.0 <= PANEL_H,
+            "the tile grid overflows the shared panel height"
+        );
+        // The widest locked group (3 members) is what `LEFT_PANE_W`'s
+        // literal `3.0`/`2.0` and `TILE_GRID_CONTENT_H`'s "one row per
+        // group" literal `7.0`/`6.0` both depend on — pin the assumption so
+        // a future `TILE_GROUPS` edit that breaks it fails a test, not a
+        // silently wrong layout.
+        assert_eq!(super::TILE_COLUMNS, 3);
+        assert!(
+            super::TILE_GROUPS
+                .iter()
+                .all(|g| g.surfaces.len() <= super::TILE_COLUMNS),
+            "a group wider than TILE_COLUMNS wraps to a second row, which \
+             TILE_GRID_CONTENT_H's literal derivation does not account for"
+        );
+    }
+
+    #[test]
+    fn all_17_tiles_render_at_one_uniform_size_and_stay_within_the_left_pane() {
+        // Lock #6 — one uniform tile size for all 17, no variants — proven
+        // on REAL rendered rects (the addressable-cell idiom via
+        // `tile_id`), not just on the shared constants two tiles happen to
+        // both reference.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+
+        let left_pane_right_edge = DOCK_W + super::LEFT_PANE_W;
+        for surface in Surface::ALL {
+            let rect = ctx
+                .read_response(super::tile_id(surface))
+                .unwrap_or_else(|| panic!("{surface:?} tile is not registered"))
+                .rect;
+            assert!(
+                (rect.width() - super::TILE_W).abs() < 0.01,
+                "{surface:?} tile width drifted from the uniform TILE_W"
+            );
+            assert!(
+                (rect.height() - super::TILE_H).abs() < 0.01,
+                "{surface:?} tile height drifted from the uniform TILE_H"
+            );
+            assert!(
+                rect.right() <= left_pane_right_edge + 0.01,
+                "{surface:?} tile overflows the left pane's right edge"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_a_tile_activates_its_surface_and_closes_the_whole_start_menu() {
+        // Lock #23 — a single click activates, mirroring the embedded
+        // Console pane's own click-routes-and-closes contract (proven above
+        // in `activating_an_embedded_console_row_closes_the_whole_start_menu`)
+        // — proven here for the OTHER pane's tiles. Picks a tile that is
+        // neither the default surface nor the first tile in its group, so
+        // the assertion actually distinguishes "the right one" from "any
+        // one."
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        let rect = ctx
+            .read_response(super::tile_id(Surface::Phones))
+            .expect("the Phones tile is registered")
+            .rect;
+        click(&ctx, &mut s, &mut console, rect.center(), SZ);
+        assert_eq!(
+            s.take_tile_activation(),
+            Some(Surface::Phones),
+            "the clicked tile's surface is recorded for main.rs to route"
+        );
+        assert!(
+            !s.is_open(),
+            "a tile click closes the whole Start Menu, matching the embedded \
+             Console pane's own activation contract"
+        );
+    }
+
     // ── accesskit (lock #14) ─────────────────────────────────────────────────
 
     #[test]
@@ -642,5 +1142,34 @@ mod tests {
             .find(|n| n.label() == Some("Console"))
             .expect("console pane node");
         assert_eq!(console_pane.role(), egui::accesskit::Role::Group);
+    }
+
+    #[test]
+    fn every_tile_exports_a_labelled_button_role_for_accesskit() {
+        // Lock #14 — "every tile", not just the panel level proven above
+        // (`console.rs`'s own rows export none yet — WIN7-7's later full
+        // sweep — so a tile's label is unambiguous among this frame's
+        // exported nodes).
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+
+        for surface in Surface::ALL {
+            let node = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.label() == Some(surface.label()))
+                .unwrap_or_else(|| panic!("{surface:?} tile exports no accesskit node"));
+            assert_eq!(
+                node.role(),
+                egui::accesskit::Role::Button,
+                "{surface:?} tile's accesskit role"
+            );
+        }
     }
 }
