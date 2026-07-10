@@ -3581,15 +3581,65 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   with the live SPICE proof compiled and ignored; `.170` slot
   `qc23-shell-spice-input-fmt2` scoped `rustfmt --edition 2021 --check
   crates/desktop/mde-shell-egui/src/vdi.rs` passed.
-  **Still open:** this is not the live dmabuf/virgl/venus importer. The QC-23
-  acceptance still needs a real libvirt/QEMU VM producing framebuffer evidence,
-  shell import into the Desktop texture path, input echo, and fallback proof.
+  **Still open:** this is not the live dmabuf/virgl/venus importer, and — per
+  the design doc below — none of the SPICE work in the Progress notes above
+  advances it: SPICE is a wire protocol and cannot become zero-copy by
+  definition, and it answers a different question (`quasar-cloud.md` Q34, the
+  *remote*/Nova-brokered console) than this unit's own "As a Workstation
+  user" acceptance criteria, which target the *local* same-host VM case
+  (`quasar-vdi-desktop.md` lock 12). The QC-23 acceptance still needs a real
+  libvirt/QEMU VM producing framebuffer evidence, shell import, input echo,
+  and fallback proof — none of that has moved.
+  **Design doc landed 2026-07-10:**
+  `docs/design/qc23-virtio-gpu-zerocopy-rescope.md` re-scopes the remainder
+  against the live libvirt/QEMU-KVM stack and this crate's actual DRM code
+  (design/options only, nothing implemented). **Current-path cost, made
+  concrete:** tracing a real SPICE frame through `mde-vdi-spice` finds ≥3
+  full-framebuffer CPU copies (decode → `Framebuffer` → `ColorImage` → GPU
+  upload), a hard 50ms/~20Hz poll ceiling in
+  `BlockingSpiceTransport::pump_frame`, and whole-surface (not damage-rect)
+  updates per the crate's own doc comments. **Correction:** this project's
+  production DRM renderer is verified to be `egui_glow`/EGL/GLES2
+  (`mde-egui/src/drm.rs`), **not wgpu** — lock 12's "dmabuf → wgpu texture"
+  wording (and its own R1 risk) predate or were never reconciled with that
+  shipped choice; a real design targets EGL/GLES external-texture APIs
+  instead. **The actual bottleneck:** sourcing a dmabuf handle out of QEMU's
+  process at all (a vhost-user-gpu backend, or QEMU's `-display
+  dbus,gl=on` + a new D-Bus client) — both substantial new infrastructure;
+  the natural pure-Rust building block (`vhost-device-gpu`) does not yet
+  support dmabuf display sharing upstream. Once a handle exists, shell-side
+  import is cheaper than this entry's "existing Desktop texture path"
+  wording implies: a KMS-plane import (`prime_fd_to_buffer` +
+  `add_planar_framebuffer` + `set_plane`, all already in the pinned `drm`
+  0.14 crate, reusing MEDIA-2's exact `PlaneSet`/`VideoScanout` seam) needs
+  zero new dependencies, versus a GL-texture import needing new unsafe
+  EGL/GLES FFI, an EGL 1.4→1.5 bump, and possibly a shader fork.
+  **Testability:** unlike the E12-10 VFIO finding, virgl/venus need no
+  IOMMU/dedicated-device passthrough — but the farm's build VMs still cannot
+  run any part of the DRM shell at all (the pre-existing `drm`-feature
+  constraint), and no physical seat has a recorded
+  libvirt/QEMU-plus-accelerated-render-node setup to test against — an
+  unconfirmed combination, not a confirmed absence. **Recommendation:** no
+  full first slice exists for the live importer itself (the
+  delivery-mechanism choice is a real infrastructure decision, not made
+  here); two small, decoupled pieces of real progress do: (1)
+  `accel3d='yes'` on the virtio-gpu video model in both
+  `vm_lifecycle.rs`/`compute_provision.rs` domain builders — cheap, works
+  with the existing SPICE graphics stanza unchanged; (2) a self-contained
+  PRIME-import liveness check (round-trip a locally-allocated GBM buffer
+  through the same fd-import primitives, no QEMU involved), mirroring how
+  MEDIA-2's `probe_primary_video_plane` proves its plane path with a
+  harmless `clear()`, not a real frame. Also flags (not fixed here):
+  `docs/WORKLIST.md` **E12-7** is a zombie entry describing the
+  QC-15-deleted `mde-kvm`/cloud-hypervisor stack and should be marked
+  superseded-by-QC-23 in a future reconciliation pass.
   **Acceptance**:
     - [ ] a libvirt/QEMU VM is launched with the selected local display backend
       (virtio-gpu/virgl/venus or the chosen replacement) and produces a
       framebuffer without relying on RDP/VNC
     - [ ] `mde-shell-egui` imports that framebuffer into the existing Desktop
-      texture path and forwards input
+      texture path (or a KMS plane-scanout path — see the design doc) and
+      forwards input
     - [ ] the same live proof records frame checksum/pixel evidence plus input
       echo, comparable to the existing VNC/RDP live proofs
     - [ ] RDP/VNC/SPICE remain honest fallbacks when the fast path is unavailable
