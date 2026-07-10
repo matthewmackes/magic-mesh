@@ -44,6 +44,11 @@ mod phones_hub;
 mod power_honor;
 mod power_settings;
 mod provisioning;
+// WIN7-SHOT-1 — a headless CPU screenshot capture, test-only tooling (see the
+// module doc): never compiled into the production binary, so it is gated here
+// rather than declared like every real surface module above/below it.
+#[cfg(test)]
+mod screenshot;
 mod services_flow;
 mod session;
 mod session_rail;
@@ -1563,9 +1568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
+        chat, console, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
         media_header, media_panel, real_editor, real_media, real_terminal, reserved_dock_gutter,
-        splash, status, terminal_panel, Boot, Nav, Plane, Shell, Surface, VideoTextureCache,
+        screenshot, splash, start_menu, status, terminal_panel, Boot, Nav, Plane, Shell, Surface,
+        VideoTextureCache,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -1575,6 +1581,7 @@ mod tests {
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
+    use std::path::Path;
 
     #[test]
     fn shell_starts_collapsed_on_the_workbench() {
@@ -2246,5 +2253,120 @@ mod tests {
             !prims.is_empty(),
             "the mounted editor surface produced no draw primitives"
         );
+    }
+
+    // ── WIN7-SHOT-1: real pixels, not just layout rects / accesskit nodes ──────
+
+    /// The screenshot capture PROOF: five WIN7 chrome units (WIN7-1..5) landed
+    /// real layout changes verified only by layout-assertion + accesskit tests
+    /// (like every test above this one) — every one flagged that nobody, human
+    /// or test, had actually SEEN a rendered pixel of the result. This proves
+    /// `screenshot::Capture`'s pixel path is real, not just "the file exists":
+    /// mirrors how `mde_media_core::VideoFrame::is_blank` proved BUG-VIDEO-1's
+    /// own pixel path was real this same session — a wired-but-broken raster
+    /// path leaves a UNIFORM canvas; the current shell state (whatever it is —
+    /// this fixture doesn't force a surface open, so a fresh boot may render
+    /// the CURTAIN-3 lock curtain rather than the desktop, which is itself a
+    /// real, non-blank, honest state) never does.
+    #[test]
+    fn win7_shot_1_screenshot_capture_renders_real_non_blank_pixels() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+
+        let canvas = screenshot::Capture::new().frame(&ctx, input, |ctx| shell.render(ctx));
+
+        assert_eq!(
+            (canvas.width(), canvas.height()),
+            (1280, 800),
+            "the canvas must be sized to the driven screen_rect (pixels_per_point defaults to 1.0)"
+        );
+        assert!(
+            !canvas.is_blank(),
+            "the current shell state must paint real, non-uniform pixels — a blank \
+             canvas means the raster path (or the shell itself) painted nothing"
+        );
+
+        let tmp = tempfile::tempdir().expect("scratch dir for the capture proof");
+        let path = tmp.path().join("current-shell-state.png");
+        canvas.write_png(&path).expect("write the proof PNG");
+        let written = std::fs::metadata(&path).expect("the PNG must exist on disk");
+        assert!(written.len() > 0, "write_png must produce a non-empty file");
+    }
+
+    /// Paint the SAME three free functions `Shell::render` composes in
+    /// production for this exact slice (`dock::dock`, `dock::
+    /// notification_rail_with_sources`, `start_menu::start_menu_panel`) —
+    /// bypassing `Shell`/`Curtain` entirely, exactly like `dock.rs`'s own
+    /// standalone tests already drive `dock()` without a `Shell`. Going through
+    /// the full `Shell` would hit the CURTAIN-3 boot gate (`Shell::new_for_ctx`
+    /// starts locked under the shipped `require_login_at_boot` default), which
+    /// would hide the whole nav — including the Start Menu — behind the PAM
+    /// curtain on any host/CI sandbox with no persisted power-honor config.
+    fn paint_taskbar_and_start_menu(
+        ctx: &egui::Context,
+        vdock: &mut dock::DockState,
+        menu: &mut start_menu::StartMenuState,
+        console: &mut console::ConsoleState,
+    ) {
+        let _ = dock::dock(ctx, vdock);
+        let _ = dock::notification_rail_with_sources(ctx, vdock, &[]);
+        start_menu::start_menu_panel(ctx, menu, console);
+    }
+
+    /// WIN7-SHOT-1's actual payoff: the FIRST real look at the accumulated
+    /// WIN7-1..5 result (the bottom taskbar + the open two-pane Start Menu) —
+    /// every prior WIN7 unit was verified by layout-rect/accesskit assertions
+    /// alone. Writes a REAL file at a stable, reportable path (unlike the
+    /// proof above's tempdir) — this PNG IS the deliverable a human opens.
+    #[test]
+    fn win7_shot_2_start_menu_screenshot_shows_the_accumulated_win7_chrome() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut vdock = dock::DockState::default();
+        let mut menu = start_menu::StartMenuState::default();
+        let mut console = console::ConsoleState::with_store(None);
+        // The start_menu.rs idiom throughout this crate: toggle, then settle a
+        // quiet frame before the shot (e.g.
+        // `the_open_start_menu_does_not_cover_the_rest_of_the_screen`).
+        menu.toggle();
+        vdock.set_start_menu_open(true);
+
+        let size = vec2(1280.0, 800.0);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+
+        let mut cap = screenshot::Capture::new();
+        let _settle = cap.frame(&ctx, input(), |ctx| {
+            paint_taskbar_and_start_menu(ctx, &mut vdock, &mut menu, &mut console);
+        });
+        let canvas = cap.frame(&ctx, input(), |ctx| {
+            paint_taskbar_and_start_menu(ctx, &mut vdock, &mut menu, &mut console);
+        });
+
+        assert!(
+            menu.is_open(),
+            "the fixture must really have the Start Menu open"
+        );
+        assert_eq!((canvas.width(), canvas.height()), (1280, 800));
+        assert!(
+            !canvas.is_blank(),
+            "the Start Menu screenshot must not be blank"
+        );
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("screenshots")
+            .join("win7-start-menu.png");
+        canvas
+            .write_png(&path)
+            .expect("write the WIN7 Start Menu screenshot");
+        println!("WIN7 Start Menu screenshot written to {}", path.display());
     }
 }
