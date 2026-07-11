@@ -137,6 +137,11 @@ pub const ALERT_LANE_PREFIXES: &[&str] = &[
     // here routes each into this node's `alert:<self>` conversation the Chat
     // surface renders (the real empty-Chat fix — design console-frontdoor.md Q34).
     "event/notify/",
+    // test-obs-10 — the circuit-breaker trip alert (`fleet/health/breaker/<worker>`,
+    // workers::mod → notify::breaker_trip_alert) lands on this lane; folding it here
+    // is what actually surfaces "worker X's breaker is OPEN" in the operator's
+    // `alert:<self>` Chat feed instead of leaving it a Bus event nobody sees.
+    "fleet/health/",
 ];
 
 /// Whether `topic` is one of chat's own lanes (never fold these — it would loop).
