@@ -22,6 +22,14 @@
 //! Plaintext JSON shape: [`BundlePlaintext`]. Carries the CA cert
 //! + key PEMs + every signed peer cert under the active epoch.
 //!
+//! The binary envelope itself (magic + version + salt + nonce +
+//! ciphertext), the Argon2id + XChaCha20-Poly1305 primitives, and the
+//! [`BackupError`] type now live in the shared [`mde_seal`] leaf crate
+//! (arch-7) so `browser_passkeys`, the VPN secret store, and this CA
+//! disaster-recovery path all share ONE audited seal implementation.
+//! They are re-exported below VERBATIM, so this module's callers +
+//! wrappers are byte-identical to the pre-extraction code.
+//!
 //! Crypto choices (best-choice per iteration skill standing
 //! authorizations, locked 2026-05-24):
 //!
@@ -42,28 +50,19 @@
 //! commodity-GPU brute-force feasibility for any operator-typed
 //! passphrase ≥ 8 random chars.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use super::CaError;
 
-/// Bundle magic — distinguishes our envelope from generic
-/// base64 blobs. ASCII "MNCA".
-pub const BUNDLE_MAGIC: &[u8; 4] = b"MNCA";
-
-/// Current bundle version. New crypto swaps bump this byte +
-/// add a new arm in [`unseal`].
-pub const BUNDLE_VERSION: u8 = 0x01;
-
-/// Argon2id salt length (16 bytes — OWASP minimum).
-pub const SALT_LEN: usize = 16;
-
-/// XChaCha20-Poly1305 nonce length.
-pub const NONCE_LEN: usize = 24;
-
-/// Header length before the ciphertext starts:
-/// magic + version + salt + nonce.
-pub const HEADER_LEN: usize = 4 + 1 + SALT_LEN + NONCE_LEN;
+// arch-7 — the passphrase-sealed byte envelope, the `BackupError` type, the raw
+// `seal_bytes`/`unseal_bytes` primitives, and the framing constants now live in
+// the shared `mde-seal` leaf crate. Re-exported here so every existing
+// `ca::backup::{seal_bytes, unseal_bytes, BackupError, BUNDLE_MAGIC, …}` caller
+// (and this module's `seal`/`unseal`/`armor` wrappers below) compiles unchanged.
+pub use mde_seal::{
+    seal_bytes, unseal_bytes, BackupError, BUNDLE_MAGIC, BUNDLE_VERSION, HEADER_LEN, NONCE_LEN,
+    SALT_LEN,
+};
 
 /// Plaintext JSON the [`seal`] caller hands in. The CA mint
 /// path writes its own files separately; this format is the
@@ -121,37 +120,6 @@ pub struct PeerCertRow {
     pub expires_at: i64,
 }
 
-/// Errors the seal/unseal path can hit. Each variant carries
-/// operator-actionable copy so the CLI doesn't have to assemble
-/// hint strings.
-#[derive(Debug, thiserror::Error)]
-pub enum BackupError {
-    /// Argon2id KDF failure — almost always
-    /// "bad parameter shape" from a malformed bundle header.
-    #[error("kdf: {0}")]
-    Kdf(String),
-    /// AEAD seal/unseal failure. On unseal: usually wrong
-    /// passphrase OR tampered ciphertext (both surface the same
-    /// AEAD-tag-mismatch error from the underlying crate).
-    #[error("aead: {0} (wrong passphrase, or bundle tampered)")]
-    Aead(String),
-    /// Bundle header didn't parse (magic mismatch, unknown
-    /// version, truncated bytes).
-    #[error("bundle format: {0}")]
-    Format(String),
-    /// Plaintext JSON didn't deserialize. Symptom of a corrupt
-    /// or version-mismatched export.
-    #[error("plaintext json: {0}")]
-    Json(String),
-    /// ASCII-armor decode failure.
-    #[error("ascii armor: {0}")]
-    Armor(String),
-    /// Caller passed an empty passphrase. We reject early
-    /// rather than letting Argon2 derive a weak key.
-    #[error("empty passphrase")]
-    EmptyPassphrase,
-}
-
 impl From<BackupError> for CaError {
     fn from(e: BackupError) -> Self {
         CaError::Io(format!("backup: {e}"))
@@ -169,37 +137,6 @@ pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, Ba
     seal_bytes(passphrase, &json)
 }
 
-/// Encrypt an arbitrary byte payload under the same versioned envelope [`seal`]
-/// uses (magic + version + salt + nonce + ciphertext).
-///
-/// Exposed so other passphrase-sealed-blob callers (e.g. the VPN secret store's
-/// local-AEAD fallback) reuse the one audited Argon2id + XChaCha20-Poly1305 path
-/// rather than re-rolling AEAD. [`seal`] is this over the bundle JSON.
-///
-/// # Errors
-///
-/// Per [`BackupError`] (empty passphrase, KDF, or AEAD failure).
-pub fn seal_bytes(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, BackupError> {
-    if passphrase.is_empty() {
-        return Err(BackupError::EmptyPassphrase);
-    }
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce);
-
-    let key = derive_key(passphrase.as_bytes(), &salt)?;
-    let ciphertext = aead_seal(&key, &nonce, plaintext)?;
-
-    let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-    out.extend_from_slice(BUNDLE_MAGIC);
-    out.push(BUNDLE_VERSION);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
 /// Decrypt + deserialize. Inverse of [`seal`]. Accepts the
 /// binary bundle (post-armor-strip) OR the raw bytes returned
 /// by [`seal`].
@@ -213,50 +150,6 @@ pub fn seal_bytes(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, BackupE
 pub fn unseal(passphrase: &str, sealed: &[u8]) -> Result<BundlePlaintext, BackupError> {
     let plain_bytes = unseal_bytes(passphrase, sealed)?;
     serde_json::from_slice(&plain_bytes).map_err(|e| BackupError::Json(e.to_string()))
-}
-
-/// Decrypt a payload sealed by [`seal_bytes`], returning the raw
-/// plaintext bytes. Inverse of [`seal_bytes`]; [`unseal`] is this
-/// plus a bundle-JSON deserialize.
-///
-/// # Errors
-///
-/// Per [`BackupError`]. Wrong passphrase + tampered ciphertext
-/// both surface as `Aead` (intentional — see [`unseal`]).
-///
-/// # Panics
-///
-/// Never in practice: the salt/nonce fixed-slice conversions are
-/// guarded by the `sealed.len() >= HEADER_LEN` check above, so the
-/// `try_into` always has exactly the bytes it needs.
-pub fn unseal_bytes(passphrase: &str, sealed: &[u8]) -> Result<Vec<u8>, BackupError> {
-    if passphrase.is_empty() {
-        return Err(BackupError::EmptyPassphrase);
-    }
-    if sealed.len() < HEADER_LEN {
-        return Err(BackupError::Format(format!(
-            "bundle too short: {} bytes (header alone needs {})",
-            sealed.len(),
-            HEADER_LEN
-        )));
-    }
-    if &sealed[..4] != BUNDLE_MAGIC {
-        return Err(BackupError::Format(
-            "magic mismatch — not a Mackes Nebula CA bundle".to_string(),
-        ));
-    }
-    let version = sealed[4];
-    if version != BUNDLE_VERSION {
-        return Err(BackupError::Format(format!(
-            "unknown version {version}; this build expects {BUNDLE_VERSION}",
-        )));
-    }
-    let salt: [u8; SALT_LEN] = sealed[5..21].try_into().expect("16 bytes");
-    let nonce: [u8; NONCE_LEN] = sealed[21..45].try_into().expect("24 bytes");
-    let ciphertext = &sealed[HEADER_LEN..];
-
-    let key = derive_key(passphrase.as_bytes(), &salt)?;
-    aead_unseal(&key, &nonce, ciphertext)
 }
 
 /// ASCII-armor a binary bundle for sneakernet-friendly transport
@@ -315,45 +208,6 @@ pub fn dearmor(armored: &str) -> Result<Vec<u8>, BackupError> {
 }
 
 // ----- internals --------------------------------------------
-
-fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], BackupError> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    // OWASP 2023 baseline for Argon2id (t=2, m=19456 KiB, p=1).
-    let params = Params::new(19_456, 2, 1, Some(32))
-        .map_err(|e| BackupError::Kdf(format!("params: {e}")))?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
-    argon
-        .hash_password_into(passphrase, salt, &mut key)
-        .map_err(|e| BackupError::Kdf(e.to_string()))?;
-    Ok(key)
-}
-
-fn aead_seal(
-    key: &[u8; 32],
-    nonce: &[u8; NONCE_LEN],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, BackupError> {
-    use chacha20poly1305::aead::{Aead, KeyInit};
-    use chacha20poly1305::XChaCha20Poly1305;
-    let cipher = XChaCha20Poly1305::new(key.into());
-    cipher
-        .encrypt(nonce.into(), plaintext)
-        .map_err(|e| BackupError::Aead(e.to_string()))
-}
-
-fn aead_unseal(
-    key: &[u8; 32],
-    nonce: &[u8; NONCE_LEN],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, BackupError> {
-    use chacha20poly1305::aead::{Aead, KeyInit};
-    use chacha20poly1305::XChaCha20Poly1305;
-    let cipher = XChaCha20Poly1305::new(key.into());
-    cipher
-        .decrypt(nonce.into(), ciphertext)
-        .map_err(|e| BackupError::Aead(e.to_string()))
-}
 
 fn format_iso8601(epoch_secs: i64) -> String {
     use chrono::TimeZone;

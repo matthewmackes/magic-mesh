@@ -65,6 +65,11 @@ mackes-transport = { path = "../mackes-transport" }
 # XCP-6 — the xcp_host worker drives the dom0's local `xe` via this layer to
 # advertise hypervisor capacity into the compute plane.
 mackes-xcp = { path = "../mackes-xcp" }
+# arch-7 — the passphrase-sealed byte envelope (Argon2id + XChaCha20-Poly1305).
+# Extracted out of `ca::backup` so browser_passkeys / the VPN secret store / CA
+# disaster-recovery share ONE audited primitive; `ca::backup` + `ipc::secret_store`
+# re-export from here so every existing caller compiles unchanged.
+mde-seal = { path = "../mde-seal" }
 
 # KDC2-3.10 — the canonical host integration crate consumed by the
 # kdc_host worker under async-services (E2.2, 2026-06-05: converged

@@ -45,12 +45,13 @@ pub const MCNF_SECRET_SCRIPT: &str = "automation/secrets/mcnf-secret.sh";
 /// `mcnf-farm-reconcile.service`), defaulting here.
 const DEFAULT_REPO_ROOT: &str = "/root/magic-mesh";
 
-/// The mesh age **identity** (private) — the only host-local artifact of the
-/// secret store, distributed to leader-eligible nodes like the mesh SSH key.
-/// Overridable via `MCNF_AGE_KEY` to match the script's own default. Used by the
-/// local-AEAD fallback to derive its key (the mesh store proper uses the key via
-/// the `age` CLI inside the script).
-const DEFAULT_AGE_KEY: &str = "/root/.mcnf-age-key";
+// arch-7 — the mesh age **identity** path (`MCNF_AGE_KEY` env, else
+// `/root/.mcnf-age-key`) moved into the shared `mde-seal` crate alongside the
+// seal/unseal primitives, so consumers that key against it (the local-AEAD
+// fallback here and `browser_passkeys`) reach it without depending on `mackesd`.
+// Re-exported so `secret_store::age_key_path` callers + this module's own
+// `resolve` use it unchanged.
+pub use mde_seal::age_key_path;
 
 /// Derive the secret-store key for a tunnel's materialized config from its
 /// interface name (`name` in the mesh store / file stem in the fallback).
@@ -189,13 +190,6 @@ impl SecretStore {
             Self::LocalAead { dir, key_path } => local_get(dir, key_path, name),
         }
     }
-}
-
-/// The mesh age identity path (`MCNF_AGE_KEY` env, else [`DEFAULT_AGE_KEY`]) —
-/// matches the script's own default so both backends key off the same artifact.
-#[must_use]
-pub fn age_key_path() -> PathBuf {
-    std::env::var_os("MCNF_AGE_KEY").map_or_else(|| PathBuf::from(DEFAULT_AGE_KEY), PathBuf::from)
 }
 
 /// The deployed repo root holding the mesh secret-store helper.

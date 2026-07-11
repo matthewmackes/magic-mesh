@@ -170,11 +170,12 @@ pub use mde_browser_workers::browser_policy;
 // because it seals platform passkey private keys with
 // `crate::ca::backup::{seal_bytes, unseal_bytes}` — the audited Argon2id +
 // XChaCha20-Poly1305 primitives that ALSO back the CA disaster-recovery bundle
-// and the VPN secret-store fallback. Moving it cleanly needs those primitives
-// (+ `ipc::secret_store::age_key_path`) factored into a shared `mde-seal`
-// crypto crate first — a separate, security-reviewed change with 3+ consumers,
-// not a browser-worker relocation. Until then this is the one browser worker
-// still living in the control-plane crate.
+// and the VPN secret-store fallback. Those primitives (+ `age_key_path`) have
+// now been factored into the shared leaf crate `mde-seal`, and `ca::backup` +
+// `ipc::secret_store` re-export from it — so the relocation of passkeys itself
+// into its own crate is a mechanical fast-follow (it can depend on `mde-seal`
+// directly rather than back on the daemon). Until that fast-follow lands this
+// is the one browser worker still living in the control-plane crate.
 pub mod browser_passkeys;
 // BROWSER-DD-12 — Browser external-protocol owner. Drains
 // action/browser/protocol handoffs for external schemes Browser refused to

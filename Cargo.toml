@@ -53,6 +53,7 @@ members = [
     "crates/mesh/mackes-transport",
     "crates/mesh/mackes-xcp",
     "crates/mesh/mackesd",
+    "crates/mesh/mde-seal",
     "crates/mesh/mde-worker-core",
     "crates/mesh/mde-browser-workers",
     "crates/mesh/mde-enroll",
