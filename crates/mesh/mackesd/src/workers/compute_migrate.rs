@@ -10,11 +10,18 @@
 //!    over the Nebula overlay.
 //! 4. Publishes `event/compute/migrate-ready` so the target peer's
 //!    `compute_provision` (VIRT-8.b, ships with VIRT-6) defines the
-//!    VM with the migrated disk + starts it.
-//! 5. `virsh undefine <vm_id>` to remove the source-side VM
-//!    definition. `compute_registry`'s next 10 s tick publishes
-//!    the updated `compute/inventory/<peer>` automatically (VIRT-8
-//!    bullet 3 satisfied without an explicit publish here).
+//!    VM with the migrated disk + starts it. The source domain is left
+//!    DEFINED-BUT-SHUTOFF as a rollback anchor.
+//! 5. Waits for the target's `event/compute/migrate-committed` ack
+//!    (correlated by request ULID, bounded by
+//!    [`DEFAULT_COMMIT_TIMEOUT`]) and only THEN `virsh undefine`s the
+//!    source-side definition. On a `migrate-failed` event or a commit
+//!    timeout the source instead RE-DEFINES + re-starts the retained
+//!    domain XML (rollback), so a failed migration never loses the VM
+//!    — it stays runnable on the source (vdi-vm-5). `compute_registry`'s
+//!    next 10 s tick publishes the updated `compute/inventory/<peer>`
+//!    automatically (VIRT-8 bullet 3 satisfied without an explicit
+//!    publish here).
 //!
 //! ## Topic-shape lock
 //!
@@ -35,7 +42,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -51,9 +58,19 @@ pub const ACTION_TOPIC: &str = "action/compute/migrate";
 pub const MIGRATE_READY_TOPIC: &str = "event/compute/migrate-ready";
 
 /// Event topic the target side publishes when it can't define/start
-/// the migrated VM (so the operator UI can surface the failure
-/// instead of the VM silently vanishing on both peers).
+/// the migrated VM. It surfaces the failure to the operator UI AND
+/// (vdi-vm-5) is consumed by the source side, which rolls the VM back
+/// (re-defines + re-starts the retained domain) instead of leaving it
+/// undefined and lost.
 pub const MIGRATE_FAILED_TOPIC: &str = "event/compute/migrate-failed";
+
+/// Event topic the target side publishes AFTER it has successfully
+/// `virsh define`d + `virsh start`ed the migrated VM. It is the
+/// source's signal that the destructive `virsh undefine` is now safe:
+/// the source keeps its domain defined-but-shutoff until it observes
+/// this ack (correlated by request ULID), so a target that never comes
+/// up can never leave the VM lost (vdi-vm-5).
+pub const MIGRATE_COMMITTED_TOPIC: &str = "event/compute/migrate-committed";
 
 /// Default poll cadence — control surface.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -82,6 +99,15 @@ pub const DEFAULT_TARGET_VM_DIR: &str = "/var/lib/mde-vms/";
 /// non-zero rsync exit. (mackesd-02: the migration also runs off the async
 /// runtime thread — see `run()` — so a slow ship can't starve the watchdog.)
 pub const RSYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Maximum the source waits for the target's `migrate-committed` ack
+/// after publishing `migrate-ready`, before it treats the migration as
+/// failed and ROLLS BACK (re-defines + re-starts the retained domain).
+/// Generous — the target must drain migrate-ready, `virsh define`, boot
+/// the guest, and publish the ack, all across the Nebula overlay — but
+/// finite so a target that silently never comes up can't strand the
+/// source's domain in the shut-off limbo forever (vdi-vm-5).
+pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Migration-request payload per design doc §3.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -137,11 +163,59 @@ pub struct MigrateFailedEvent {
     pub error: String,
 }
 
+/// `event/compute/migrate-committed` payload (target-side). Published
+/// only after a SUCCESSFUL define+start, it is the source's cue that
+/// the deferred `virsh undefine` is now safe to run (vdi-vm-5).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MigrateCommittedEvent {
+    /// VM id now running on the target.
+    pub vm_id: String,
+    /// Source peer still holding the shut-off rollback anchor — the
+    /// recipient the ack is addressed to (audit; correlation is by ULID).
+    pub source_peer: String,
+    /// Target peer that brought the VM up.
+    pub target_peer: String,
+    /// Correlation ULID of the original migrate request — the source
+    /// matches this against its pending commits.
+    pub request_ulid: String,
+}
+
+/// Reason the source rolled a migration back instead of undefining.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RollbackReason {
+    /// Target published `migrate-failed` — it couldn't define/start.
+    TargetFailed {
+        /// The target's failure description.
+        error: String,
+    },
+    /// No `migrate-committed` (nor `migrate-failed`) arrived within
+    /// [`DEFAULT_COMMIT_TIMEOUT`].
+    CommitTimeout,
+}
+
+/// How a source-side pending commit resolves on a given tick.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommitResolution {
+    /// Target confirmed the VM is running → the source may now run the
+    /// deferred `virsh undefine`.
+    Undefine,
+    /// Migration failed or the ack timed out → the source re-defines +
+    /// re-starts the retained domain (rollback), so the VM is not lost.
+    RollBack {
+        /// Why the source is rolling back.
+        reason: RollbackReason,
+    },
+    /// Neither ack nor timeout yet — keep waiting.
+    Pending,
+}
+
 /// Outcome of the source-side migration flow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MigrationOutcome {
-    /// Disk landed on target + migrate-ready published. Carries the
-    /// captured `virsh dumpxml` so the publish can include it.
+    /// Disk landed on the target; the source domain is left
+    /// DEFINED-BUT-SHUTOFF as the rollback anchor. Carries the captured
+    /// `virsh dumpxml` so the caller can include it in migrate-ready AND
+    /// retain it to roll back / undefine once the target acks (vdi-vm-5).
     Ok {
         /// `virsh dumpxml` output captured before shutdown.
         domain_xml: String,
@@ -295,6 +369,73 @@ pub fn build_migrate_ready_event(
     }
 }
 
+/// Parse a migrate-failed event body (source side consumes these to
+/// roll back — vdi-vm-5).
+///
+/// # Errors
+///
+/// Returns a human-readable error on malformed JSON.
+pub fn parse_migrate_failed_event(body: &str) -> Result<MigrateFailedEvent, String> {
+    serde_json::from_str(body).map_err(|e| format!("malformed migrate-failed event: {e}"))
+}
+
+/// Parse a migrate-committed event body.
+///
+/// # Errors
+///
+/// Returns a human-readable error on malformed JSON.
+pub fn parse_migrate_committed_event(body: &str) -> Result<MigrateCommittedEvent, String> {
+    serde_json::from_str(body).map_err(|e| format!("malformed migrate-committed event: {e}"))
+}
+
+/// Build the `event/compute/migrate-committed` payload from the
+/// migrate-ready event the target just provisioned, preserving the
+/// correlation ULID so the source can match its pending commit.
+#[must_use]
+pub fn build_migrate_committed_event(event: &MigrateReadyEvent) -> MigrateCommittedEvent {
+    MigrateCommittedEvent {
+        vm_id: event.vm_id.clone(),
+        source_peer: event.source_peer.clone(),
+        target_peer: event.target_peer.clone(),
+        request_ulid: event.request_ulid.clone(),
+    }
+}
+
+/// Pure resolver for a source-side pending commit: decide, from the
+/// ULIDs observed committed, the ULIDs observed failed (with their
+/// error text), and whether the commit deadline has passed, whether the
+/// source should undefine, roll back, or keep waiting (vdi-vm-5).
+///
+/// Precedence: a `migrate-committed` wins (the VM is confirmed up on the
+/// target, so the undefine is safe even if a stale failure was also
+/// seen); then a `migrate-failed`; then the timeout. The run loop
+/// supplies `timed_out` from the clock, so the decision core is
+/// deterministically testable without wall-clock waits.
+#[must_use]
+pub fn classify_commit(
+    request_ulid: &str,
+    committed_ulids: &[String],
+    failed: &[(String, String)],
+    timed_out: bool,
+) -> CommitResolution {
+    if committed_ulids.iter().any(|u| u == request_ulid) {
+        return CommitResolution::Undefine;
+    }
+    if let Some((_, error)) = failed.iter().find(|(u, _)| u == request_ulid) {
+        return CommitResolution::RollBack {
+            reason: RollbackReason::TargetFailed {
+                error: error.clone(),
+            },
+        };
+    }
+    if timed_out {
+        return CommitResolution::RollBack {
+            reason: RollbackReason::CommitTimeout,
+        };
+    }
+    CommitResolution::Pending
+}
+
 /// Pure waiter: take a state-observer closure, poll until the
 /// observer returns "shut off" (any case) or the deadline passes.
 /// Returns `true` on shutoff, `false` on timeout.
@@ -414,11 +555,51 @@ fn run_migration(req: &MigrateRequest) -> MigrationOutcome {
         };
     }
 
-    // Step 5: undefine (publish happens in the caller so we can
-    // include the request_ulid in the event).
-    let _ = run_virsh_status(&build_virsh_undefine_args(&req.vm_id));
-
+    // NOTE (vdi-vm-5): the source-side `virsh undefine` is DEFERRED. The
+    // domain stays DEFINED-BUT-SHUTOFF here as the rollback anchor; the
+    // run loop only undefines after the target acks with
+    // `migrate-committed`, and re-defines + re-starts from the retained
+    // `domain_xml` on a `migrate-failed` or a commit timeout. Publish of
+    // migrate-ready also happens in the caller so it can carry the
+    // request_ulid.
     MigrationOutcome::Ok { domain_xml }
+}
+
+/// Recreate a VM from captured domain XML: write it to a temp file,
+/// `virsh define` it, then `virsh start <vm_id>`. Shared by the target's
+/// provision step (VIRT-8.b) and the source's rollback (vdi-vm-5) —
+/// both bring a VM up from a retained `virsh dumpxml`, and the disk the
+/// XML references is already in place (the target's was rsync'd; the
+/// source's never moved).
+///
+/// The payload is validated (non-empty XML) BEFORE touching the
+/// environment, so a malformed input is rejected deterministically (and
+/// testably) regardless of whether virsh is installed.
+///
+/// # Errors
+///
+/// Returns a description when the XML is empty (source dumpxml failed),
+/// virsh is absent, or define/start exits non-zero.
+fn define_and_start_from_xml(vm_id: &str, domain_xml: &str) -> Result<(), String> {
+    if domain_xml.trim().is_empty() {
+        return Err("no domain_xml (source dumpxml failed)".into());
+    }
+    if !binary_present("virsh") {
+        return Err("virsh not available".into());
+    }
+    let tmp_dir = std::env::temp_dir().join("mde-vm-migrate");
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir tmp: {e}"))?;
+    let xml_path = tmp_dir.join(format!("{vm_id}.xml"));
+    std::fs::write(&xml_path, domain_xml).map_err(|e| format!("write xml: {e}"))?;
+    let define_ok = run_virsh_status(&build_virsh_define_args(&xml_path.to_string_lossy()));
+    let _ = std::fs::remove_file(&xml_path);
+    if !define_ok {
+        return Err(format!("virsh define failed for {vm_id}"));
+    }
+    if !run_virsh_status(&build_virsh_start_args(vm_id)) {
+        return Err(format!("virsh start failed for {vm_id}"));
+    }
+    Ok(())
 }
 
 /// VIRT-8.b — target-side: define + start the migrated VM from the
@@ -432,28 +613,26 @@ fn run_migration(req: &MigrateRequest) -> MigrationOutcome {
 /// Returns a description when virsh is absent, the XML is empty
 /// (source dumpxml failed), or define/start exits non-zero.
 fn run_migrate_target(event: &MigrateReadyEvent) -> Result<(), String> {
-    // Validate the payload before touching the environment so a
-    // malformed event is rejected deterministically (and testably)
-    // regardless of whether virsh is installed.
-    if event.domain_xml.trim().is_empty() {
-        return Err("migrate-ready event carried no domain_xml (source dumpxml failed)".into());
-    }
-    if !binary_present("virsh") {
-        return Err("virsh not available on target peer".into());
-    }
-    let tmp_dir = std::env::temp_dir().join("mde-vm-migrate");
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir tmp: {e}"))?;
-    let xml_path = tmp_dir.join(format!("{}.xml", event.vm_id));
-    std::fs::write(&xml_path, &event.domain_xml).map_err(|e| format!("write xml: {e}"))?;
-    let define_ok = run_virsh_status(&build_virsh_define_args(&xml_path.to_string_lossy()));
-    let _ = std::fs::remove_file(&xml_path);
-    if !define_ok {
-        return Err(format!("virsh define failed for {}", event.vm_id));
-    }
-    if !run_virsh_status(&build_virsh_start_args(&event.vm_id)) {
-        return Err(format!("virsh start failed for {}", event.vm_id));
-    }
-    Ok(())
+    define_and_start_from_xml(&event.vm_id, &event.domain_xml)
+}
+
+/// vdi-vm-5 — source-side rollback: re-define + re-start the retained
+/// domain so a failed or timed-out migration leaves the VM runnable on
+/// the source instead of lost. `virsh define` is a define-or-update, so
+/// this is safe whether the shut-off anchor still exists or not.
+///
+/// # Errors
+///
+/// Same as [`define_and_start_from_xml`].
+fn run_source_rollback(vm_id: &str, domain_xml: &str) -> Result<(), String> {
+    define_and_start_from_xml(vm_id, domain_xml)
+}
+
+/// vdi-vm-5 — the DEFERRED destructive step: remove the source-side
+/// definition, run only once the target has acked with
+/// `migrate-committed`. Returns whether virsh reported success.
+fn run_source_undefine(vm_id: &str) -> bool {
+    run_virsh_status(&build_virsh_undefine_args(vm_id))
 }
 
 fn publish_migrate_failed(persist: &Persist, event: &MigrateReadyEvent, error: &str) {
@@ -485,11 +664,99 @@ fn publish_migrate_ready(persist: &Persist, event: &MigrateReadyEvent) {
     }
 }
 
+fn publish_migrate_committed(persist: &Persist, event: &MigrateReadyEvent) {
+    let committed = build_migrate_committed_event(event);
+    let Ok(body) = serde_json::to_string(&committed) else {
+        return;
+    };
+    if let Err(e) = persist.write(
+        MIGRATE_COMMITTED_TOPIC,
+        Priority::Default,
+        None,
+        Some(&body),
+    ) {
+        tracing::warn!(
+            error = %e,
+            vm_id = %event.vm_id,
+            "compute_migrate: migrate-committed publish failed"
+        );
+    }
+}
+
+/// A migration whose disk shipped + `migrate-ready` published, now
+/// awaiting the target's `migrate-committed` ack. Holds the retained
+/// `virsh dumpxml` so the source can roll back (re-define + re-start) if
+/// the target fails or the ack times out (vdi-vm-5). The source domain
+/// stays defined-but-shutoff until this resolves.
+#[derive(Debug, Clone)]
+struct PendingCommit {
+    request_ulid: String,
+    vm_id: String,
+    domain_xml: String,
+    deadline: Instant,
+}
+
+/// Source-side drain of `event/compute/migrate-committed`. Advances
+/// `cursor` past every message (same at-least-once semantics as the
+/// other drains) and returns the parsed events; the run loop correlates
+/// them to its own pending commits by `request_ulid`.
+fn drain_committed_events(
+    persist: &Persist,
+    cursor: &mut Option<String>,
+) -> Vec<MigrateCommittedEvent> {
+    let msgs = match persist.list_since(MIGRATE_COMMITTED_TOPIC, cursor.as_deref()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(error = %e, "compute_migrate: migrate-committed list_since failed");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for msg in msgs {
+        *cursor = Some(msg.ulid.clone());
+        let body = msg.body.as_deref().unwrap_or("");
+        match parse_migrate_committed_event(body) {
+            Ok(ev) => out.push(ev),
+            Err(e) => {
+                tracing::warn!(ulid = %msg.ulid, error = %e, "compute_migrate: bad migrate-committed event");
+            }
+        }
+    }
+    out
+}
+
+/// Source-side drain of `event/compute/migrate-failed`. Advances
+/// `cursor` past every message and returns the parsed events; the run
+/// loop rolls back any pending commit whose `request_ulid` matches
+/// (vdi-vm-5).
+fn drain_failed_events(persist: &Persist, cursor: &mut Option<String>) -> Vec<MigrateFailedEvent> {
+    let msgs = match persist.list_since(MIGRATE_FAILED_TOPIC, cursor.as_deref()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(error = %e, "compute_migrate: migrate-failed list_since failed");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for msg in msgs {
+        *cursor = Some(msg.ulid.clone());
+        let body = msg.body.as_deref().unwrap_or("");
+        match parse_migrate_failed_event(body) {
+            Ok(ev) => out.push(ev),
+            Err(e) => {
+                tracing::warn!(ulid = %msg.ulid, error = %e, "compute_migrate: bad migrate-failed event");
+            }
+        }
+    }
+    out
+}
+
 /// Worker handle.
 pub struct ComputeMigrateWorker {
     nebula_interface: String,
     nebula_addr_hint: String,
     poll_interval: Duration,
+    commit_timeout: Duration,
     bus_root_override: Option<PathBuf>,
 }
 
@@ -507,6 +774,7 @@ impl ComputeMigrateWorker {
             nebula_interface: DEFAULT_NEBULA_INTERFACE.into(),
             nebula_addr_hint: String::new(),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            commit_timeout: DEFAULT_COMMIT_TIMEOUT,
             bus_root_override: None,
         }
     }
@@ -530,6 +798,15 @@ impl ComputeMigrateWorker {
     #[must_use]
     pub fn with_poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
+        self
+    }
+
+    /// Override how long the source waits for a `migrate-committed` ack
+    /// before rolling back. Used in tests to drive the commit-timeout
+    /// path deterministically (vdi-vm-5).
+    #[must_use]
+    pub fn with_commit_timeout(mut self, d: Duration) -> Self {
+        self.commit_timeout = d;
         self
     }
 }
@@ -651,6 +928,12 @@ impl Worker for ComputeMigrateWorker {
         };
         let mut source_cursor: Option<String> = None;
         let mut target_cursor: Option<String> = None;
+        // Source side (vdi-vm-5): the target's commit/failure acks, plus the
+        // in-flight migrations whose source domain is still defined-but-shutoff
+        // awaiting a commit.
+        let mut committed_cursor: Option<String> = None;
+        let mut failed_cursor: Option<String> = None;
+        let mut pending_commits: Vec<PendingCommit> = Vec::new();
         let mut tick = tokio::time::interval(self.poll_interval);
         tick.tick().await;
         loop {
@@ -669,10 +952,20 @@ impl Worker for ComputeMigrateWorker {
                                 let event = build_migrate_ready_event(
                                     &req,
                                     target_disk_path_for(&req.disk_path, DEFAULT_TARGET_VM_DIR),
-                                    ulid,
-                                    domain_xml,
+                                    ulid.clone(),
+                                    domain_xml.clone(),
                                 );
                                 publish_migrate_ready(&persist, &event);
+                                // vdi-vm-5: the source domain is now shut off but
+                                // STILL DEFINED. Track the commit so the destructive
+                                // undefine is deferred behind the target's ack, and
+                                // retain the dumpxml for rollback.
+                                pending_commits.push(PendingCommit {
+                                    request_ulid: ulid,
+                                    vm_id: req.vm_id.clone(),
+                                    domain_xml,
+                                    deadline: Instant::now() + self.commit_timeout,
+                                });
                             }
                             Ok(other) => {
                                 tracing::warn!(
@@ -688,12 +981,14 @@ impl Worker for ComputeMigrateWorker {
                         }
                     }
                     // Target side (VIRT-8.b): event/compute/migrate-ready. Define
-                    // + start each migrated VM off-runtime too.
+                    // + start each migrated VM off-runtime too. On success, ack
+                    // with migrate-committed so the source can undefine (vdi-vm-5).
                     for event in drain_target_jobs(&persist, self, &mut target_cursor) {
                         let event_run = event.clone();
                         match tokio::task::spawn_blocking(move || run_migrate_target(&event_run)).await {
                             Ok(Ok(())) => {
                                 tracing::info!(vm_id = %event.vm_id, "compute_migrate: migrated VM defined + started on target");
+                                publish_migrate_committed(&persist, &event);
                             }
                             Ok(Err(e)) => {
                                 tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target define/start failed");
@@ -703,6 +998,57 @@ impl Worker for ComputeMigrateWorker {
                                 tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target task join failed");
                             }
                         }
+                    }
+                    // Source side (vdi-vm-5): resolve pending commits against the
+                    // target's acks + the commit deadline. Only now — after a
+                    // confirmed migrate-committed — does the destructive undefine
+                    // run; a migrate-failed or a timeout instead rolls the domain
+                    // back from the retained dumpxml, so the VM is never lost.
+                    if !pending_commits.is_empty() {
+                        let committed_ulids: Vec<String> =
+                            drain_committed_events(&persist, &mut committed_cursor)
+                                .into_iter()
+                                .map(|e| e.request_ulid)
+                                .collect();
+                        let failed_pairs: Vec<(String, String)> =
+                            drain_failed_events(&persist, &mut failed_cursor)
+                                .into_iter()
+                                .map(|e| (e.request_ulid, e.error))
+                                .collect();
+                        let mut still_pending = Vec::with_capacity(pending_commits.len());
+                        for pc in std::mem::take(&mut pending_commits) {
+                            let timed_out = Instant::now() >= pc.deadline;
+                            match classify_commit(
+                                &pc.request_ulid,
+                                &committed_ulids,
+                                &failed_pairs,
+                                timed_out,
+                            ) {
+                                CommitResolution::Undefine => {
+                                    let vm = pc.vm_id.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        run_source_undefine(&vm)
+                                    })
+                                    .await;
+                                    tracing::info!(vm_id = %pc.vm_id, "compute_migrate: target committed; source undefined (migration complete)");
+                                }
+                                CommitResolution::RollBack { reason } => {
+                                    let vm = pc.vm_id.clone();
+                                    let xml = pc.domain_xml.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        run_source_rollback(&vm, &xml)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => tracing::warn!(vm_id = %pc.vm_id, reason = ?reason, "compute_migrate: migration rolled back; VM restored on source"),
+                                        Ok(Err(e)) => tracing::error!(vm_id = %pc.vm_id, reason = ?reason, error = %e, "compute_migrate: ROLLBACK FAILED; VM may need manual recovery"),
+                                        Err(e) => tracing::error!(vm_id = %pc.vm_id, error = %e, "compute_migrate: rollback task join failed"),
+                                    }
+                                }
+                                CommitResolution::Pending => still_pending.push(pc),
+                            }
+                        }
+                        pending_commits = still_pending;
                     }
                 }
                 _ = shutdown.wait() => break,
@@ -1083,5 +1429,255 @@ mod tests {
         // Cursor advanced past BOTH messages → a second drain is empty.
         assert!(cursor.is_some());
         assert!(drain_source_jobs(&persist, &worker, &mut cursor).is_empty());
+    }
+
+    // ── vdi-vm-5: deferred undefine behind a target commit ack ──
+
+    #[test]
+    fn migrate_committed_topic_under_event_prefix() {
+        assert!(MIGRATE_COMMITTED_TOPIC.starts_with("event/"));
+    }
+
+    #[test]
+    fn commit_timeout_is_generous_but_finite() {
+        // The target must drain migrate-ready, define + boot the guest, and ack
+        // across the overlay — so the bound is generous, but finite so a target
+        // that never comes up can't strand the source forever (vdi-vm-5).
+        assert!(DEFAULT_COMMIT_TIMEOUT >= Duration::from_secs(60));
+        assert!(DEFAULT_COMMIT_TIMEOUT.as_secs() > 0);
+    }
+
+    #[test]
+    fn build_migrate_committed_preserves_correlation() {
+        let ready = MigrateReadyEvent {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "abc".into(),
+            target_disk_path: "/var/lib/mde-vms/abc.qcow2".into(),
+            request_ulid: "01JANULID".into(),
+            domain_xml: "<domain/>".into(),
+        };
+        let committed = build_migrate_committed_event(&ready);
+        assert_eq!(committed.vm_id, "abc");
+        assert_eq!(committed.source_peer, "10.42.0.1");
+        assert_eq!(committed.target_peer, "10.42.0.2");
+        // The correlation ULID must survive so the source matches its pending
+        // commit and undefines the right domain.
+        assert_eq!(committed.request_ulid, "01JANULID");
+    }
+
+    #[test]
+    fn migrate_committed_event_round_trips() {
+        let ev = MigrateCommittedEvent {
+            vm_id: "abc".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01JAN".into(),
+        };
+        let body = serde_json::to_string(&ev).unwrap();
+        let back = parse_migrate_committed_event(&body).expect("parse");
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn parse_migrate_committed_rejects_malformed() {
+        assert!(parse_migrate_committed_event("not json").is_err());
+    }
+
+    #[test]
+    fn parse_migrate_failed_round_trips() {
+        // The source now CONSUMES migrate-failed to roll back, so it needs a
+        // parser that round-trips the target's published shape (vdi-vm-5).
+        let ev = MigrateFailedEvent {
+            vm_id: "abc".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01JAN".into(),
+            error: "virsh define failed for abc".into(),
+        };
+        let body = serde_json::to_string(&ev).unwrap();
+        let back = parse_migrate_failed_event(&body).expect("parse");
+        assert_eq!(back, ev);
+        assert!(back.error.contains("virsh define"));
+    }
+
+    // ── classify_commit: the source-side decision core ──
+
+    #[test]
+    fn classify_commit_pending_when_no_signal() {
+        // Required scenario 1 (ordering): before the target acks, the source
+        // must NOT undefine — the domain stays the shut-off rollback anchor.
+        let r = classify_commit("01JAN", &[], &[], false);
+        assert_eq!(r, CommitResolution::Pending);
+    }
+
+    #[test]
+    fn classify_commit_undefines_only_after_committed() {
+        // Required scenario 1: the destructive undefine is authorized ONLY once
+        // migrate-committed carrying the matching ULID is observed.
+        let before = classify_commit("01JAN", &[], &[], false);
+        assert_eq!(before, CommitResolution::Pending, "no undefine pre-commit");
+        let after = classify_commit("01JAN", &["01JAN".into()], &[], false);
+        assert_eq!(after, CommitResolution::Undefine);
+        // A commit for a DIFFERENT migration must not undefine this one.
+        let other = classify_commit("01JAN", &["09ZZZ".into()], &[], false);
+        assert_eq!(other, CommitResolution::Pending);
+    }
+
+    #[test]
+    fn classify_commit_rolls_back_on_target_failure() {
+        // Required scenario: target-failure → source rolls back (VM not lost).
+        let r = classify_commit(
+            "01JAN",
+            &[],
+            &[("01JAN".into(), "virsh start failed for abc".into())],
+            false,
+        );
+        match r {
+            CommitResolution::RollBack {
+                reason: RollbackReason::TargetFailed { error },
+            } => assert!(error.contains("virsh start failed")),
+            other => panic!("expected TargetFailed rollback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_commit_rolls_back_on_commit_timeout() {
+        // Required scenario: commit-timeout → same rollback path.
+        let r = classify_commit("01JAN", &[], &[], true);
+        assert_eq!(
+            r,
+            CommitResolution::RollBack {
+                reason: RollbackReason::CommitTimeout
+            }
+        );
+    }
+
+    #[test]
+    fn classify_commit_committed_beats_failed() {
+        // If both a commit and a (stale) failure are seen, the VM is confirmed
+        // up on the target, so undefine is safe — commit wins over rollback.
+        let r = classify_commit(
+            "01JAN",
+            &["01JAN".into()],
+            &[("01JAN".into(), "spurious".into())],
+            true,
+        );
+        assert_eq!(r, CommitResolution::Undefine);
+    }
+
+    #[test]
+    fn run_source_rollback_errors_on_empty_xml_deterministically() {
+        // Rollback re-defines from the retained dumpxml; an empty XML (source
+        // dumpxml had failed) is rejected before touching the environment, so
+        // this is deterministic whether or not virsh is installed.
+        let err = run_source_rollback("abc", "   ").expect_err("empty xml must fail");
+        assert!(err.contains("no domain_xml"), "{err}");
+    }
+
+    #[test]
+    fn retained_dumpxml_round_trips_for_rollback() {
+        // Required scenario: the retained dumpxml round-trips. The source
+        // captures dumpxml before shutdown, ships it in migrate-ready, and
+        // retains the SAME bytes to re-define on rollback — prove the XML
+        // survives the migrate-ready wire hop verbatim so rollback recreates
+        // the identical domain.
+        let xml = "<domain type='kvm'><name>abc</name><vcpu>4</vcpu></domain>";
+        let req = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "abc".into(),
+            disk_path: "/var/lib/mde-vms/abc.qcow2".into(),
+        };
+        let ready = build_migrate_ready_event(
+            &req,
+            target_disk_path_for(&req.disk_path, DEFAULT_TARGET_VM_DIR),
+            "01JAN".into(),
+            xml.to_string(),
+        );
+        let body = serde_json::to_string(&ready).unwrap();
+        let back = parse_migrate_ready_event(&body).expect("parse");
+        // The bytes the target would define AND the bytes the source retains for
+        // rollback are byte-identical to the captured dumpxml.
+        assert_eq!(back.domain_xml, xml);
+        assert!(back.domain_xml.contains("<vcpu>4</vcpu>"));
+    }
+
+    #[test]
+    fn drain_committed_events_advances_cursor_and_returns_all() {
+        // Same at-least-once drain shape as the request/ready drains: every
+        // committed message advances the cursor, and a second drain is empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let a = MigrateCommittedEvent {
+            vm_id: "vm-a".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01A".into(),
+        };
+        let b = MigrateCommittedEvent {
+            vm_id: "vm-b".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01B".into(),
+        };
+        for ev in [&a, &b] {
+            persist
+                .write(
+                    MIGRATE_COMMITTED_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(ev).unwrap()),
+                )
+                .unwrap();
+        }
+        let mut cursor = None;
+        let drained = drain_committed_events(&persist, &mut cursor);
+        assert_eq!(drained.len(), 2);
+        let ulids: Vec<&str> = drained.iter().map(|e| e.request_ulid.as_str()).collect();
+        assert!(ulids.contains(&"01A") && ulids.contains(&"01B"));
+        assert!(cursor.is_some());
+        assert!(drain_committed_events(&persist, &mut cursor).is_empty());
+    }
+
+    #[test]
+    fn full_commit_lifecycle_undefines_then_next_drain_empty() {
+        // End-to-end (headless) source-side lifecycle: a pending commit stays
+        // Pending until its committed event lands, then resolves to Undefine.
+        // Proves the deferred-undefine ordering with a real Bus (vdi-vm-5).
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let mut committed_cursor = None;
+
+        // Tick 1: no ack yet → Pending (source keeps the shut-off anchor).
+        let acks = drain_committed_events(&persist, &mut committed_cursor);
+        let ulids: Vec<String> = acks.into_iter().map(|e| e.request_ulid).collect();
+        assert_eq!(
+            classify_commit("01JAN", &ulids, &[], false),
+            CommitResolution::Pending
+        );
+
+        // Target commits.
+        let committed = MigrateCommittedEvent {
+            vm_id: "abc".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01JAN".into(),
+        };
+        persist
+            .write(
+                MIGRATE_COMMITTED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&committed).unwrap()),
+            )
+            .unwrap();
+
+        // Tick 2: ack observed → Undefine authorized.
+        let acks = drain_committed_events(&persist, &mut committed_cursor);
+        let ulids: Vec<String> = acks.into_iter().map(|e| e.request_ulid).collect();
+        assert_eq!(
+            classify_commit("01JAN", &ulids, &[], false),
+            CommitResolution::Undefine
+        );
     }
 }
