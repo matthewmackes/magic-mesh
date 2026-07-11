@@ -165,18 +165,15 @@ pub use mde_browser_workers::browser_policy;
 // them into the Syncthing-backed workgroup root, and publishes honest pending or
 // error state without minting fake credentials.
 //
-// arch-7 (2026-07-11) — the DELIBERATE remainder. The other 10 browser workers
-// moved to `mde-browser-workers` (re-exported below); passkeys stays here
-// because it seals platform passkey private keys with
-// `crate::ca::backup::{seal_bytes, unseal_bytes}` — the audited Argon2id +
-// XChaCha20-Poly1305 primitives that ALSO back the CA disaster-recovery bundle
-// and the VPN secret-store fallback. Those primitives (+ `age_key_path`) have
-// now been factored into the shared leaf crate `mde-seal`, and `ca::backup` +
-// `ipc::secret_store` re-export from it — so the relocation of passkeys itself
-// into its own crate is a mechanical fast-follow (it can depend on `mde-seal`
-// directly rather than back on the daemon). Until that fast-follow lands this
-// is the one browser worker still living in the control-plane crate.
-pub mod browser_passkeys;
+// arch-7 (2026-07-11) — the 11th and final browser worker, now moved into
+// `mde-browser-workers` alongside the other 10. It seals platform passkey
+// private keys with the audited Argon2id + XChaCha20-Poly1305 primitives that
+// ALSO back the CA disaster-recovery bundle and the VPN secret-store fallback;
+// those primitives (+ `age_key_path`) were factored into the shared leaf crate
+// `mde-seal`, so the worker now depends on `mde-seal` directly rather than back
+// on this daemon. Re-exported here so `crate::workers::browser_passkeys::…`
+// spawn sites resolve unchanged.
+pub use mde_browser_workers::browser_passkeys;
 // BROWSER-DD-12 — Browser external-protocol owner. Drains
 // action/browser/protocol handoffs for external schemes Browser refused to
 // navigate, validates mailto/email and magnet/transfers routes, and publishes

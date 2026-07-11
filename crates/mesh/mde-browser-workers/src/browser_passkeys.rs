@@ -24,7 +24,8 @@
 //! `UP` reflects the best available honest signal (a checked gesture) instead of
 //! a constant, and the shim refuses to auto-dispatch a gesture-less ceremony.
 
-#![cfg(feature = "async-services")]
+// arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
+// code; `mackesd` pulls it in only under its own `async-services` feature.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -43,7 +44,7 @@ use p256::elliptic_curve::Generate as _;
 use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 
-use super::{ShutdownToken, Worker};
+use mde_worker_core::{ShutdownToken, Worker};
 
 /// Browser-owned WebAuthn/passkey ceremony handoff topic.
 pub const ACTION_TOPIC: &str = "action/browser/passkey";
@@ -261,7 +262,7 @@ impl BrowserPasskeysWorker {
             node: node.clone(),
             local_root,
             share_root,
-            key_path: crate::ipc::secret_store::age_key_path(),
+            key_path: mde_seal::age_key_path(),
             cursor: None,
             tick: DEFAULT_TICK,
             now_fn,
@@ -337,7 +338,7 @@ impl BrowserPasskeysWorker {
 
     fn share_writable(&self) -> bool {
         self.share_gate.as_ref().map_or_else(
-            || crate::shared_root_writable(&self.share_root),
+            || mackes_mesh_types::mesh_storage::shared_root_writable(&self.share_root),
             |g| g.load(Ordering::SeqCst),
         )
     }
@@ -1207,7 +1208,7 @@ fn seal_private_key(
     private_seed_b64url: &str,
 ) -> Result<(), String> {
     let passphrase = local_passphrase(key_path)?;
-    let sealed = crate::ca::backup::seal_bytes(&passphrase, private_seed_b64url.as_bytes())
+    let sealed = mde_seal::seal_bytes(&passphrase, private_seed_b64url.as_bytes())
         .map_err(|e| format!("platform passkey private key seal: {e}"))?;
     let path = credential_sealed_path(root, credential_id);
     if let Some(parent) = path.parent() {
@@ -1229,7 +1230,7 @@ fn unseal_private_key(root: &Path, key_path: &Path, credential_id: &str) -> Resu
     let sealed = std::fs::read(&path)
         .map_err(|e| format!("platform passkey private key read {}: {e}", path.display()))?;
     let passphrase = local_passphrase(key_path)?;
-    let plain = crate::ca::backup::unseal_bytes(&passphrase, &sealed).map_err(|e| {
+    let plain = mde_seal::unseal_bytes(&passphrase, &sealed).map_err(|e| {
         format!(
             "platform passkey private key unseal {}: {e}",
             path.display()
