@@ -3595,6 +3595,15 @@ fn device_row(
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let mut action: Option<RowActionRequest> = None;
     resp.context_menu(|ui| action = device_context_menu(ui, category, dev, allow_control));
+    // a11y-05 — the row's accesskit node (name + the MDM status reading), keyed
+    // by the strip response id. Pure metadata over the raw-painted row.
+    install_row_accessibility(
+        ui.ctx(),
+        resp.id,
+        device_a11y_label(dev),
+        device_a11y_value(dev),
+        resp.rect,
+    );
     RowOutcome {
         clicked: resp.clicked(),
         action,
@@ -3972,10 +3981,20 @@ fn host_row(
         .response;
     // The row's labels don't sense clicks, so re-interact the whole strip as one
     // selection target (click a host to inspect it), with a hover summary.
-    resp.interact(egui::Sense::click())
+    let resp = resp
+        .interact(egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(host_hover(entry, now_ms))
-        .clicked()
+        .on_hover_text(host_hover(entry, now_ms));
+    // a11y-05 — the rail row's accesskit node (host name + freshness/counts),
+    // keyed by the strip response id.
+    install_row_accessibility(
+        ui.ctx(),
+        resp.id,
+        &entry.label,
+        host_a11y_value(entry, now_ms),
+        resp.rect,
+    );
+    resp.clicked()
 }
 
 /// The status-dot tone for a rail host (design §7): an **absent** host is dim
@@ -4027,15 +4046,111 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
     s
 }
 
+// ── accesskit (a11y-05 / shell-ux-6) ─────────────────────────────────────────
+//
+// The Device Manager's two selection rows are hand-rolled: [`device_row`] and
+// [`host_row`] each lay out plain `ui.label`s (which don't sense clicks) and
+// then `.interact(Sense::click())` the whole strip as one target — so egui
+// auto-generates no accesskit node for either (the same raw-cell gap dock.rs /
+// console.rs closed under WIN7-5/WIN7-7). A screen reader walking the tree /
+// rail heard nothing. This section gives each row a `Role::Button` node keyed
+// by the strip response's id, with the device/host name as the accessible label
+// and its MDM status / freshness reading as the value — the established
+// `install_row_accessibility` idiom (role + label + value + bounds + Click),
+// reusing [`device_status_display`] so the a11y value can never drift from the
+// painted status.
+
+/// Convert an egui rect to an accesskit one (the `console.rs`/`dock.rs` helper,
+/// restated module-locally — the established per-module-copy idiom).
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+/// The accessible **name** of a device row — the device's display name (the same
+/// bold string the row paints).
+fn device_a11y_label(dev: &DeviceRecord) -> String {
+    dev.name.clone()
+}
+
+/// The accessible **state/value** of a device row — the exact MDM status text
+/// the drawer shows ([`device_status_display`]): the problem code + honest Linux
+/// reason for a faulted device, the "working properly" line for a healthy one,
+/// or the honest "could not be determined" otherwise. Reuses the shared display
+/// so the spoken status can never drift from the painted one.
+fn device_a11y_value(dev: &DeviceRecord) -> String {
+    device_status_display(dev).0
+}
+
+/// The freshness word a rail row reads out — the spoken counterpart of the
+/// host dot's dim/amber/green tone ([`host_dot_tone`]).
+const fn freshness_word(fresh: HostFreshness) -> &'static str {
+    match fresh {
+        HostFreshness::Fresh => "live",
+        HostFreshness::Stale => "stale",
+        HostFreshness::Absent => "offline",
+    }
+}
+
+/// The accessible **value** of a rail host row — its freshness plus the device /
+/// problem counts, mirroring the [`host_hover`] summary in one spoken line; an
+/// absent host reads the honest "nothing published" (§7).
+fn host_a11y_value(entry: &HostEntry, now_ms: u64) -> String {
+    let fresh = entry.freshness(now_ms);
+    if fresh == HostFreshness::Absent {
+        return "offline \u{00B7} nothing published".to_string();
+    }
+    let mut parts = vec![
+        freshness_word(fresh).to_owned(),
+        format!(
+            "{} {}",
+            entry.device_count,
+            plural(entry.device_count, "device", "devices")
+        ),
+    ];
+    if entry.problem_count > 0 {
+        parts.push(format!(
+            "{} {}",
+            entry.problem_count,
+            plural(entry.problem_count, "problem", "problems")
+        ));
+    }
+    parts.join(" \u{00B7} ")
+}
+
+/// Install one raw-painted selection row's accesskit `Button` node, keyed by the
+/// strip response's own id so egui merges it onto the cell (the dock.rs id-keyed
+/// merge). Shared by the device row + the host rail row.
+fn install_row_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    rect: egui::Rect,
+) {
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label.into());
+        node.set_value(value.into());
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_connection_tree, build_node_tree, build_rail, cpu_line, derive_bus, device_armed,
-        device_status_display, device_target, export_dir, format_mem_kb, header_lines,
-        host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code,
-        render_device_details, render_json, render_report, sanitize, scanned_label, status_tone,
-        write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection, DrawerTab,
-        HostEntry, HostFreshness, MenuAction, RowActionRequest, ViewMode, STALE_AFTER,
+        build_connection_tree, build_node_tree, build_rail, cpu_line, derive_bus,
+        device_a11y_label, device_a11y_value, device_armed, device_status_display, device_target,
+        export_dir, format_mem_kb, header_lines, host_a11y_value, host_dot_tone, host_hover,
+        humanize_ago, humanize_uptime, now_ms, problem_code, render_device_details, render_json,
+        render_report, sanitize, scanned_label, status_tone, write_export, DeviceAction,
+        DeviceArming, DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness,
+        MenuAction, RowActionRequest, ViewMode, STALE_AFTER,
     };
     use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
     use mackes_mesh_types::device_inventory::{
@@ -4131,6 +4246,47 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
         });
         ctx.tessellate(out.shapes, out.pixels_per_point).len()
+    }
+
+    // ── a11y-05: the device-row + host-row accessible name/state seam ──
+
+    #[test]
+    fn device_a11y_label_and_value_read_the_name_and_mdm_status() {
+        // A faulted device speaks the MDM problem code + the honest Linux reason.
+        let mut dev = DeviceRecord::new("Intel Wi-Fi 6 AX200", DeviceStatus::NoDriver);
+        dev.problem = Some("no kernel driver bound".to_string());
+        assert_eq!(device_a11y_label(&dev), "Intel Wi-Fi 6 AX200");
+        assert_eq!(
+            device_a11y_value(&dev),
+            "Code 28 \u{2014} no kernel driver bound",
+            "the a11y value is the exact MDM status the drawer shows",
+        );
+        // A healthy device reads the plain "working properly" line.
+        let ok = DeviceRecord::new("Samsung NVMe SSD", DeviceStatus::Ok);
+        assert_eq!(device_a11y_value(&ok), "This device is working properly.");
+    }
+
+    #[test]
+    fn host_a11y_value_reads_freshness_and_device_and_problem_counts() {
+        // A live host with a faulted device.
+        let live = HostEntry {
+            host: "node-a".to_string(),
+            label: "node-a".to_string(),
+            kind: HostKind::Node,
+            published_at_ms: Some(1_000),
+            device_count: 12,
+            problem_count: 1,
+        };
+        assert_eq!(
+            host_a11y_value(&live, 1_500),
+            "live \u{00B7} 12 devices \u{00B7} 1 problem",
+        );
+        // An absent host reads the honest offline line (§7).
+        let absent = HostEntry::absent("node-b");
+        assert_eq!(
+            host_a11y_value(&absent, 1_500),
+            "offline \u{00B7} nothing published",
+        );
     }
 
     #[test]
