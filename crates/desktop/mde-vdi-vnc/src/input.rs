@@ -9,6 +9,7 @@
 //! button mask and the modifier state egui reports as a per-event snapshot.
 
 use crate::egui::{Event, Key, MouseWheelUnit, PointerButton, Vec2};
+use mde_vdi_core::{clamp_u16, dominant_axis, ModKey, ModifierTracker};
 
 /// A protocol-neutral pointer button.
 ///
@@ -92,22 +93,6 @@ pub(crate) const ALT_KEYSYM: u32 = 0xFFE9; // Alt_L
 /// egui logical Point (pixel) scroll distance treated as one wheel notch.
 const POINTS_PER_NOTCH: f32 = 50.0;
 
-/// Round + clamp an egui logical coordinate into the `u16` framebuffer-pixel
-/// range.
-#[inline]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "value is rounded then clamped into [0, u16::MAX]; NaN maps to 0"
-)]
-fn clamp_u16(v: f32) -> u16 {
-    if v.is_nan() {
-        0
-    } else {
-        v.round().clamp(0.0, f32::from(u16::MAX)) as u16
-    }
-}
-
 /// Map an egui pointer button to the protocol-neutral [`Button`], or `None` for a
 /// button RFB's 8-bit mask has no slot for (egui's `Extra2` / "forward").
 #[must_use]
@@ -128,11 +113,8 @@ pub const fn map_button(b: PointerButton) -> Option<Button> {
     reason = "notch count is clamped into the i16 range before the cast"
 )]
 fn map_wheel(unit: MouseWheelUnit, delta: Vec2) -> Option<VncInputEvent> {
-    let (value, horizontal) = if delta.y.abs() >= delta.x.abs() {
-        (delta.y, false)
-    } else {
-        (delta.x, true)
-    };
+    // Pick the dominant axis (vertical wins ties); the shared core owns the choice.
+    let (value, horizontal) = dominant_axis(delta);
     if value == 0.0 {
         return None;
     }
@@ -326,41 +308,38 @@ pub fn map_text(text: &str) -> Vec<VncInputEvent> {
     out
 }
 
+/// The X11 keysym VNC sends for a given core modifier key. Unlike RDP/SPICE (which
+/// share the set-1 scancode identity in the core), RFB keyboard input is
+/// keysym-based, so VNC maps the shared [`ModKey`] to its own `Shift_L` /
+/// `Control_L` / `Alt_L` keysyms here.
+const fn modifier_keysym(key: ModKey) -> u32 {
+    match key {
+        ModKey::Shift => SHIFT_KEYSYM,
+        ModKey::Ctrl => CTRL_KEYSYM,
+        ModKey::Alt => ALT_KEYSYM,
+    }
+}
+
 /// Tracks the modifier state already pushed to the guest.
 ///
 /// Lets the session emit the right `Shift_L` / `Control_L` / `Alt_L` keysym
 /// transitions: egui carries modifiers as a snapshot on every event rather than
-/// as discrete key events.
+/// as discrete key events. A thin wrapper over the shared [`ModifierTracker`]: the
+/// diff algorithm lives in the core, and VNC renders each transition as a
+/// [`VncInputEvent::Key`] by X11 keysym.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ModifierState {
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
-}
+pub struct ModifierState(ModifierTracker);
 
 impl ModifierState {
     /// Diff the stored state against the live `(shift, ctrl, alt)` snapshot,
     /// update self, and return the modifier keysym transitions to send first.
     /// Releases are emitted before presses so a chord re-press is unambiguous.
     pub fn diff(&mut self, shift: bool, ctrl: bool, alt: bool) -> Vec<VncInputEvent> {
-        let mut out = Vec::new();
-        let mut emit = |changed: bool, now: bool, keysym: u32, want_down: bool| {
-            if changed && now == want_down {
-                out.push(VncInputEvent::Key { keysym, down: now });
-            }
-        };
-        // Pass 1: releases (want_down == false).
-        emit(self.shift != shift, shift, SHIFT_KEYSYM, false);
-        emit(self.ctrl != ctrl, ctrl, CTRL_KEYSYM, false);
-        emit(self.alt != alt, alt, ALT_KEYSYM, false);
-        // Pass 2: presses (want_down == true).
-        emit(self.shift != shift, shift, SHIFT_KEYSYM, true);
-        emit(self.ctrl != ctrl, ctrl, CTRL_KEYSYM, true);
-        emit(self.alt != alt, alt, ALT_KEYSYM, true);
-        self.shift = shift;
-        self.ctrl = ctrl;
-        self.alt = alt;
-        out
+        self.0
+            .diff(shift, ctrl, alt, |key: ModKey, down| VncInputEvent::Key {
+                keysym: modifier_keysym(key),
+                down,
+            })
     }
 }
 

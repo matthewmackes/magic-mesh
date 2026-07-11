@@ -18,6 +18,13 @@ path = "src/lib.rs"
 # types (ColorImage / Event / Key / ...).
 mde-egui = { path = "../../shared/mde-egui" }
 
+# The transport-neutral VDI core: the set-1 scancode map + Scancode identity, the
+# egui coordinate/wheel input helpers, the generic modifier-diff tracker, and the
+# shared RGBA8 framebuffer surface. Deduplicates the pieces that were identical
+# across mde-vdi-{rdp,vnc,spice} (arch-8). SPICE keeps its own surface-format tags
+# + scancode wire packing on top.
+mde-vdi-core = { path = "../mde-vdi-core" }
+
 # Structured logs in the workspace JSON-line format.
 tracing = "0.1"
 

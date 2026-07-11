@@ -16,6 +16,7 @@
 //! is no divergence between the tested path and the shipped path.
 
 use crate::egui::ColorImage;
+use mde_vdi_core::RgbaSurface;
 
 /// Byte layout of a decoded SPICE display surface.
 ///
@@ -132,20 +133,18 @@ type SurfaceSignature = (usize, usize, SurfaceFormat, u64);
 /// A persistent RGBA8 desktop surface the display channel's frames accumulate
 /// into.
 ///
-/// Stored canonically as tightly-packed RGBA so [`Framebuffer::to_color_image`]
-/// is a direct hand-off to egui. Construct it once at the negotiated desktop
-/// size; replace it whole from each decoded surface with
-/// [`Framebuffer::apply_surface`] (SPICE hands the display channel a whole
-/// primary surface, not the RFB-style sub-rectangles VNC accumulates). The
-/// `rgba` backing is reused across every same-size frame (only a resize
-/// reallocates), and each apply is fingerprinted so an unchanged repaint costs
-/// only the hash — no copy, no egui image, no upload.
+/// Wraps the shared [`RgbaSurface`] (canonical tightly-packed RGBA, so
+/// [`Framebuffer::to_color_image`] is a direct hand-off to egui) and adds the
+/// SPICE whole-surface replace + dirty-check. Construct it once at the negotiated
+/// desktop size; replace it whole from each decoded surface with
+/// [`Framebuffer::apply_surface`] (SPICE hands the display channel a whole primary
+/// surface, not the RFB-style sub-rectangles VNC accumulates). The surface backing
+/// is reused across every same-size frame (only a resize reallocates), and each
+/// apply is fingerprinted so an unchanged repaint costs only the hash — no copy, no
+/// egui image, no upload.
 #[derive(Clone)]
 pub struct Framebuffer {
-    width: usize,
-    height: usize,
-    /// Tightly packed RGBA8, exactly `width * height * 4` bytes.
-    rgba: Vec<u8>,
+    surface: RgbaSurface,
     /// Fingerprint of the surface currently stored, or `None` before the first
     /// [`Framebuffer::apply_surface`] (the constructed opaque-black desktop).
     signature: Option<SurfaceSignature>,
@@ -155,19 +154,8 @@ impl Framebuffer {
     /// A new opaque-black surface of `width × height`.
     #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
-        let mut rgba = vec![0u8; width * height * SurfaceFormat::BYTES_PER_PIXEL];
-        // Opaque black: every 4th byte (alpha) = 0xFF.
-        for a in rgba
-            .iter_mut()
-            .skip(3)
-            .step_by(SurfaceFormat::BYTES_PER_PIXEL)
-        {
-            *a = 0xFF;
-        }
         Self {
-            width,
-            height,
-            rgba,
+            surface: RgbaSurface::new(width, height),
             signature: None,
         }
     }
@@ -175,19 +163,19 @@ impl Framebuffer {
     /// Surface width in pixels.
     #[must_use]
     pub const fn width(&self) -> usize {
-        self.width
+        self.surface.width()
     }
 
     /// Surface height in pixels.
     #[must_use]
     pub const fn height(&self) -> usize {
-        self.height
+        self.surface.height()
     }
 
     /// Surface size as egui's `[w, h]`.
     #[must_use]
     pub const fn size(&self) -> [usize; 2] {
-        [self.width, self.height]
+        self.surface.size()
     }
 
     /// Replace the whole surface from a decoded SPICE display surface: `w × h`
@@ -200,7 +188,7 @@ impl Framebuffer {
     /// Returns `true` if the desktop actually changed (the caller must mark the
     /// framebuffer dirty and re-upload), `false` if the decoded surface is
     /// byte-identical to the one already stored — in which case the whole-surface
-    /// normalise/copy is skipped and no texture upload is warranted. The `rgba`
+    /// normalise/copy is skipped and no texture upload is warranted. The surface
     /// backing is reused in place for every same-size frame; only a resize
     /// reallocates.
     ///
@@ -232,14 +220,15 @@ impl Framebuffer {
         if self.signature == Some(signature) {
             return Ok(false);
         }
-        if self.width != w || self.height != h {
-            self.width = w;
-            self.height = h;
-            self.rgba = vec![0u8; need];
+        // Only a size change reallocates; a same-size frame reuses the backing in
+        // place (the pointer stays stable), so a live desktop is not per-frame
+        // allocation churn.
+        if self.surface.width() != w || self.surface.height() != h {
+            self.surface = RgbaSurface::new(w, h);
         }
         for (s, d) in src[..need]
             .chunks_exact(bpp)
-            .zip(self.rgba.chunks_exact_mut(bpp))
+            .zip(self.surface.rgba_mut().chunks_exact_mut(bpp))
         {
             // chunks_exact(4) yields exactly 4 bytes; copy into a fixed array so
             // the format normaliser has no fallible indexing.
@@ -256,13 +245,13 @@ impl Framebuffer {
     /// pixels are unaffected by premultiplication).
     #[must_use]
     pub fn to_color_image(&self) -> ColorImage {
-        ColorImage::from_rgba_unmultiplied([self.width, self.height], &self.rgba)
+        self.surface.to_color_image()
     }
 
     /// Borrow the raw canonical RGBA bytes (testing / zero-copy callers).
     #[must_use]
     pub fn rgba_bytes(&self) -> &[u8] {
-        &self.rgba
+        self.surface.rgba_bytes()
     }
 }
 

@@ -71,6 +71,7 @@ members = [
     "crates/desktop/mde-files-egui",
     "crates/desktop/mde-bookmarks-egui",
     "crates/desktop/mde-voice-egui",
+    "crates/desktop/mde-vdi-core",
     "crates/desktop/mde-vdi-rdp",
     "crates/desktop/mde-vdi-vnc",
     "crates/desktop/mde-vdi-spice",

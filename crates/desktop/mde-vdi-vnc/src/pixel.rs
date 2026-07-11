@@ -16,6 +16,7 @@
 //! shipped path do not diverge.
 
 use crate::egui::ColorImage;
+use mde_vdi_core::RgbaSurface;
 
 /// Bytes in a canonical RGBA pixel — the framebuffer is stored RGBA8.
 pub(crate) const RGBA_BYTES: usize = 4;
@@ -201,65 +202,51 @@ impl std::error::Error for FramebufferError {}
 
 /// A persistent RGBA8 desktop surface that accumulates RFB rectangle updates.
 ///
-/// Stored canonically as tightly-packed RGBA so [`Framebuffer::to_color_image`]
-/// is a direct hand-off to egui. Construct it at the server's framebuffer size;
-/// feed it decoded pixels with [`Framebuffer::blit_rgba`], solid fills with
+/// Wraps the shared [`RgbaSurface`] (canonical tightly-packed RGBA, so
+/// [`Framebuffer::to_color_image`] is a direct hand-off to egui) and adds the RFB
+/// rectangle ops. Construct it at the server's framebuffer size; feed it decoded
+/// pixels with [`Framebuffer::blit_rgba`], solid fills with
 /// [`Framebuffer::fill_rect`], and intra-surface copies with
 /// [`Framebuffer::copy_rect`] (the `CopyRect` encoding).
 #[derive(Clone)]
 pub struct Framebuffer {
-    width: usize,
-    height: usize,
-    /// Tightly packed RGBA8, exactly `width * height * 4` bytes.
-    rgba: Vec<u8>,
+    surface: RgbaSurface,
 }
 
 impl Framebuffer {
     /// A new opaque-black surface of `width × height`.
     #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
-        let mut rgba = vec![0u8; width * height * RGBA_BYTES];
-        // Opaque black: every 4th byte (alpha) = 0xFF.
-        for a in rgba.iter_mut().skip(3).step_by(RGBA_BYTES) {
-            *a = 0xFF;
-        }
         Self {
-            width,
-            height,
-            rgba,
+            surface: RgbaSurface::new(width, height),
         }
     }
 
     /// Surface width in pixels.
     #[must_use]
     pub const fn width(&self) -> usize {
-        self.width
+        self.surface.width()
     }
 
     /// Surface height in pixels.
     #[must_use]
     pub const fn height(&self) -> usize {
-        self.height
+        self.surface.height()
     }
 
     /// Surface size as egui's `[w, h]`.
     #[must_use]
     pub const fn size(&self) -> [usize; 2] {
-        [self.width, self.height]
+        self.surface.size()
     }
 
     /// Reject a rectangle that escapes the surface.
-    const fn check_bounds(
-        &self,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-    ) -> Result<(), FramebufferError> {
-        if x + w > self.width || y + h > self.height {
+    fn check_bounds(&self, x: usize, y: usize, w: usize, h: usize) -> Result<(), FramebufferError> {
+        let (width, height) = (self.surface.width(), self.surface.height());
+        if x + w > width || y + h > height {
             return Err(FramebufferError::RectOutOfBounds {
                 rect: (x, y, w, h),
-                surface: (self.width, self.height),
+                surface: (width, height),
             });
         }
         Ok(())
@@ -282,11 +269,13 @@ impl Framebuffer {
             return Ok(());
         }
         self.check_bounds(x, y, w, h)?;
+        let width = self.surface.width();
+        let buf = self.surface.rgba_mut();
         for row in 0..h {
-            let base = ((y + row) * self.width + x) * RGBA_BYTES;
+            let base = ((y + row) * width + x) * RGBA_BYTES;
             for col in 0..w {
                 let off = base + col * RGBA_BYTES;
-                self.rgba[off..off + RGBA_BYTES].copy_from_slice(&rgba);
+                buf[off..off + RGBA_BYTES].copy_from_slice(&rgba);
             }
         }
         Ok(())
@@ -318,11 +307,12 @@ impl Framebuffer {
                 need,
             });
         }
+        let width = self.surface.width();
+        let buf = self.surface.rgba_mut();
         for row in 0..h {
             let src_off = row * row_bytes;
-            let dst_off = ((y + row) * self.width + x) * RGBA_BYTES;
-            self.rgba[dst_off..dst_off + row_bytes]
-                .copy_from_slice(&src[src_off..src_off + row_bytes]);
+            let dst_off = ((y + row) * width + x) * RGBA_BYTES;
+            buf[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
         Ok(())
     }
@@ -349,16 +339,18 @@ impl Framebuffer {
         self.check_bounds(src_x, src_y, w, h)?;
         self.check_bounds(dst_x, dst_y, w, h)?;
         let row_bytes = w * RGBA_BYTES;
+        let width = self.surface.width();
+        let buf = self.surface.rgba_mut();
         // Snapshot the source rows first so overlap is handled correctly.
         let mut tmp = vec![0u8; row_bytes * h];
         for row in 0..h {
-            let s = ((src_y + row) * self.width + src_x) * RGBA_BYTES;
+            let s = ((src_y + row) * width + src_x) * RGBA_BYTES;
             tmp[row * row_bytes..row * row_bytes + row_bytes]
-                .copy_from_slice(&self.rgba[s..s + row_bytes]);
+                .copy_from_slice(&buf[s..s + row_bytes]);
         }
         for row in 0..h {
-            let d = ((dst_y + row) * self.width + dst_x) * RGBA_BYTES;
-            self.rgba[d..d + row_bytes]
+            let d = ((dst_y + row) * width + dst_x) * RGBA_BYTES;
+            buf[d..d + row_bytes]
                 .copy_from_slice(&tmp[row * row_bytes..row * row_bytes + row_bytes]);
         }
         Ok(())
@@ -368,16 +360,19 @@ impl Framebuffer {
     /// top-left region (the `DesktopSize` pseudo-encoding the live layer applies).
     /// New area is opaque black.
     pub fn resize(&mut self, width: usize, height: usize) {
-        if width == self.width && height == self.height {
+        let (old_w, old_h) = (self.surface.width(), self.surface.height());
+        if width == old_w && height == old_h {
             return;
         }
         let mut next = Self::new(width, height);
-        let cw = self.width.min(width);
-        let ch = self.height.min(height);
+        let cw = old_w.min(width);
+        let ch = old_h.min(height);
+        let src = self.surface.rgba_bytes();
+        let dst = next.surface.rgba_mut();
         for row in 0..ch {
-            let s = (row * self.width) * RGBA_BYTES;
+            let s = (row * old_w) * RGBA_BYTES;
             let d = (row * width) * RGBA_BYTES;
-            next.rgba[d..d + cw * RGBA_BYTES].copy_from_slice(&self.rgba[s..s + cw * RGBA_BYTES]);
+            dst[d..d + cw * RGBA_BYTES].copy_from_slice(&src[s..s + cw * RGBA_BYTES]);
         }
         *self = next;
     }
@@ -387,13 +382,13 @@ impl Framebuffer {
     /// straight hand-off through egui's unmultiplied-RGBA constructor.
     #[must_use]
     pub fn to_color_image(&self) -> ColorImage {
-        ColorImage::from_rgba_unmultiplied([self.width, self.height], &self.rgba)
+        self.surface.to_color_image()
     }
 
     /// Borrow the raw canonical RGBA bytes (testing / zero-copy callers).
     #[must_use]
     pub fn rgba_bytes(&self) -> &[u8] {
-        &self.rgba
+        self.surface.rgba_bytes()
     }
 }
 

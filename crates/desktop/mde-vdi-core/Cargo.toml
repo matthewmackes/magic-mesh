@@ -1,0 +1,23 @@
+[package]
+name        = "mde-vdi-core"
+description = "MCNF E12 'Quasar' VDI — the transport-neutral core the RDP/VNC/SPICE backends share. Owns the pieces that were byte-for-byte duplicated across mde-vdi-{rdp,vnc,spice} (arch-8): the egui coordinate clamp + wheel-axis pick, the PC/AT set-1 scancode identity + map (shared by RDP + SPICE), the generic Shift/Ctrl/Alt modifier-diff tracker, and the RGBA8 desktop surface (opaque-black init + egui ColorImage hand-off) each Framebuffer wraps. A scancode or clamp fix now lives in ONE place. Transport-free and fully unit-tested; the divergent wire pieces (VNC X11 keysyms/DES, SPICE surface format, each transport's blit) stay in their own crate."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_vdi_core"
+path = "src/lib.rs"
+
+[dependencies]
+# egui comes via the harness so this shared core resolves to the ONE
+# harness-pinned egui (no cross-surface version skew, §4). We use only the egui
+# types (ColorImage / Key / Vec2). The three transport crates depend on the same
+# harness egui, so the types line up across the crate boundary with no glue.
+mde-egui = { path = "../../shared/mde-egui" }
+
+[lints]
+workspace = true

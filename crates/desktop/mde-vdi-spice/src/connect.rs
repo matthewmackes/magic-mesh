@@ -22,14 +22,14 @@
 //! does.
 //!
 //! The intent→wire translation ([`spice_button`], the scancode packing in
-//! [`crate::input::Scancode::to_spice`], the wheel-to-clicks expansion) is pure
-//! and unit-tested here; the connect + pump are proven against a real (loopback /
+//! [`crate::input::to_spice`], the wheel-to-clicks expansion) is pure and
+//! unit-tested here; the connect + pump are proven against a real (loopback /
 //! live) server since they need one to exercise.
 
 use spice_client::{MouseButton as SpiceMouseButton, SpiceClientShared, SpiceError};
 
 use crate::config::SpiceConfig;
-use crate::input::{MouseButton, SpiceInputEvent};
+use crate::input::{to_spice, MouseButton, SpiceInputEvent};
 use crate::session::SpiceSession;
 
 /// The SPICE channel id the primary display + inputs ride (display 0).
@@ -173,7 +173,7 @@ impl SpiceTransport {
                 }
             }
             SpiceInputEvent::Key { scancode, down } => {
-                let code = scancode.to_spice();
+                let code = to_spice(scancode);
                 if down {
                     self.client.send_key_down(PRIMARY_CHANNEL, code).await?;
                 } else {

@@ -22,6 +22,12 @@ path = "src/lib.rs"
 # integration-gated layer added on top.
 mde-egui = { path = "../../shared/mde-egui" }
 
+# The transport-neutral VDI core: the egui coordinate/wheel input helpers, the
+# generic modifier-diff tracker, and the shared RGBA8 framebuffer surface. VNC
+# keeps its own X11-keysym map + DES + RFB pixel format (a legitimate divergence
+# from RDP/SPICE, not duplication), but shares the rest (arch-8).
+mde-vdi-core = { path = "../mde-vdi-core" }
+
 [features]
 default = []
 # E12-6: the live RFB transport (TCP handshake + framebuffer update pump). The

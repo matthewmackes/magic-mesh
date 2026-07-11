@@ -15,6 +15,7 @@
 //! between the tested path and the shipped path.
 
 use crate::egui::ColorImage;
+use mde_vdi_core::RgbaSurface;
 
 /// Byte order of a source pixel buffer coming off the RDP decoder.
 ///
@@ -100,54 +101,41 @@ impl std::error::Error for FramebufferError {}
 
 /// A persistent RGBA8 desktop surface that accumulates rectangular updates.
 ///
-/// Stored canonically as tightly-packed RGBA so [`Framebuffer::to_color_image`]
-/// is a direct hand-off to egui. Construct it once at the negotiated desktop
-/// size; feed decoded rectangles with [`Framebuffer::apply_rect`] (or the whole
-/// surface with [`Framebuffer::apply_full`]).
+/// Wraps the shared [`RgbaSurface`] (canonical tightly-packed RGBA, so
+/// [`Framebuffer::to_color_image`] is a direct hand-off to egui) and adds the
+/// RDP-specific stride blit. Construct it once at the negotiated desktop size; feed
+/// decoded rectangles with [`Framebuffer::apply_rect`] (or the whole surface with
+/// [`Framebuffer::apply_full`]).
 #[derive(Clone)]
 pub struct Framebuffer {
-    width: usize,
-    height: usize,
-    /// Tightly packed RGBA8, exactly `width * height * 4` bytes.
-    rgba: Vec<u8>,
+    surface: RgbaSurface,
 }
 
 impl Framebuffer {
     /// A new opaque-black surface of `width × height`.
     #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
-        let mut rgba = vec![0u8; width * height * PixelFormat::BYTES_PER_PIXEL];
-        // Opaque black: every 4th byte (alpha) = 0xFF.
-        for a in rgba
-            .iter_mut()
-            .skip(3)
-            .step_by(PixelFormat::BYTES_PER_PIXEL)
-        {
-            *a = 0xFF;
-        }
         Self {
-            width,
-            height,
-            rgba,
+            surface: RgbaSurface::new(width, height),
         }
     }
 
     /// Surface width in pixels.
     #[must_use]
     pub const fn width(&self) -> usize {
-        self.width
+        self.surface.width()
     }
 
     /// Surface height in pixels.
     #[must_use]
     pub const fn height(&self) -> usize {
-        self.height
+        self.surface.height()
     }
 
     /// Surface size as egui's `[w, h]`.
     #[must_use]
     pub const fn size(&self) -> [usize; 2] {
-        [self.width, self.height]
+        self.surface.size()
     }
 
     /// Blit a decoded rectangle of `src` pixels (in `format`) at `(x, y)`.
@@ -181,10 +169,11 @@ impl Framebuffer {
                 min: row_bytes,
             });
         }
-        if x + w > self.width || y + h > self.height {
+        let (width, height) = (self.surface.width(), self.surface.height());
+        if x + w > width || y + h > height {
             return Err(FramebufferError::RectOutOfBounds {
                 rect: (x, y, w, h),
-                surface: (self.width, self.height),
+                surface: (width, height),
             });
         }
         let need = (h - 1) * src_stride + row_bytes;
@@ -195,11 +184,12 @@ impl Framebuffer {
             });
         }
 
-        let dst_stride = self.width * bpp;
+        let dst_stride = width * bpp;
+        let rgba = self.surface.rgba_mut();
         for row in 0..h {
             let src_row = &src[row * src_stride..row * src_stride + row_bytes];
             let dst_off = (y + row) * dst_stride + x * bpp;
-            let dst_row = &mut self.rgba[dst_off..dst_off + row_bytes];
+            let dst_row = &mut rgba[dst_off..dst_off + row_bytes];
             for (s, d) in src_row.chunks_exact(bpp).zip(dst_row.chunks_exact_mut(bpp)) {
                 // chunks_exact(4) yields exactly 4 bytes; copy into a fixed array
                 // so the format normaliser has no fallible indexing.
@@ -217,8 +207,9 @@ impl Framebuffer {
     /// # Errors
     /// [`FramebufferError::ShortSource`] if `src` is smaller than the surface.
     pub fn apply_full(&mut self, format: PixelFormat, src: &[u8]) -> Result<(), FramebufferError> {
-        let stride = self.width * PixelFormat::BYTES_PER_PIXEL;
-        self.apply_rect(0, 0, self.width, self.height, format, src, stride)
+        let (width, height) = (self.surface.width(), self.surface.height());
+        let stride = width * PixelFormat::BYTES_PER_PIXEL;
+        self.apply_rect(0, 0, width, height, format, src, stride)
     }
 
     /// Convert the current surface into an [`egui::ColorImage`] for upload to a
@@ -227,13 +218,13 @@ impl Framebuffer {
     /// pixels are unaffected by premultiplication).
     #[must_use]
     pub fn to_color_image(&self) -> ColorImage {
-        ColorImage::from_rgba_unmultiplied([self.width, self.height], &self.rgba)
+        self.surface.to_color_image()
     }
 
     /// Borrow the raw canonical RGBA bytes (testing / zero-copy callers).
     #[must_use]
     pub fn rgba_bytes(&self) -> &[u8] {
-        &self.rgba
+        self.surface.rgba_bytes()
     }
 }
 

@@ -1,15 +1,30 @@
-//! egui input event → protocol-neutral RDP input intent + the PC/AT scancode map.
+//! egui input event → protocol-neutral RDP input intent.
 //!
 //! The shell hands raw [`egui::Event`]s to the session; this module turns them
 //! into [`RdpInputEvent`]s — pointer move/button/wheel, key down/up by **hardware
 //! scancode**, and unicode text. It is `ironrdp`-free and fully unit-tested with
 //! synthetic events (governance §7). The thin adapter that turns an
 //! [`RdpInputEvent`] into an actual `ironrdp` input PDU is layered on top in
-//! `connect` (behind the `live-connect` feature); keeping the egui→intent
-//! mapping pure here means the egui-facing surface is real and tested
-//! independent of the wire encoder.
+//! `connect` (behind the `live-connect` feature); keeping the egui→intent mapping
+//! pure here means the egui-facing surface is real and tested independent of the
+//! wire encoder.
+//!
+//! The transport-neutral pieces — the [`Scancode`] identity + the PC/AT set-1
+//! [`scancode_for`] map (shared with SPICE), the coordinate/wheel helpers, and the
+//! generic modifier-diff — live in [`mde_vdi_core`]; this module re-exports the
+//! scancode surface unchanged and wires the RDP-specific event shape on top.
 
 use crate::egui::{Event, Key, MouseWheelUnit, PointerButton, Vec2};
+use mde_vdi_core::{clamp_u16, dominant_axis, ModKey, ModifierTracker};
+
+// The set-1 scancode identity + map are the single source in mde-vdi-core; RDP
+// re-exports them unchanged so `mde_vdi_rdp::{Scancode, scancode_for}` keep working.
+pub use mde_vdi_core::{scancode_for, Scancode};
+
+/// Set-1 scancodes for the three core modifier keys the session synthesises from
+/// egui's `Modifiers` snapshot — re-exported from [`mde_vdi_core`] (RDP + SPICE
+/// share these identities).
+pub(crate) use mde_vdi_core::{ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE};
 
 /// A mouse button, protocol-neutral.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,39 +39,6 @@ pub enum MouseButton {
     X1,
     /// Extra button 2 (browser-forward).
     X2,
-}
-
-/// A PC/AT **set-1** hardware scancode plus whether it is an `E0`-extended key
-/// (the arrow / navigation cluster, right-hand modifiers, etc.). RDP keyboard
-/// input is scancode-based, so this is the layout-independent identity the guest
-/// re-maps through its own keyboard layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Scancode {
-    /// The set-1 make code (the break code is the same value with bit 7 set; the
-    /// session sends down/up as a flag, so only the make code is carried here).
-    pub code: u8,
-    /// Whether the key is `E0`-prefixed (extended).
-    pub extended: bool,
-}
-
-impl Scancode {
-    /// A non-extended set-1 scancode.
-    #[must_use]
-    const fn plain(code: u8) -> Self {
-        Self {
-            code,
-            extended: false,
-        }
-    }
-
-    /// An `E0`-extended set-1 scancode.
-    #[must_use]
-    const fn ext(code: u8) -> Self {
-        Self {
-            code,
-            extended: true,
-        }
-    }
 }
 
 /// A protocol-neutral input intent derived from an egui event. The session feeds
@@ -102,21 +84,6 @@ pub enum RdpInputEvent {
     Unicode(char),
 }
 
-/// Round + clamp an egui logical coordinate into the `u16` desktop-pixel range.
-#[inline]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "value is rounded then clamped into [0, u16::MAX]; NaN maps to 0"
-)]
-fn clamp_u16(v: f32) -> u16 {
-    if v.is_nan() {
-        0
-    } else {
-        v.round().clamp(0.0, f32::from(u16::MAX)) as u16
-    }
-}
-
 /// Map an egui pointer button to the protocol-neutral [`MouseButton`].
 #[must_use]
 const fn map_button(b: PointerButton) -> MouseButton {
@@ -136,12 +103,8 @@ const fn map_button(b: PointerButton) -> MouseButton {
     reason = "rotation is clamped into the i16 range before the cast"
 )]
 fn map_wheel(unit: MouseWheelUnit, delta: Vec2) -> Option<RdpInputEvent> {
-    // Pick the dominant axis so one event maps to one rotation; vertical wins ties.
-    let (value, horizontal) = if delta.y.abs() >= delta.x.abs() {
-        (delta.y, false)
-    } else {
-        (delta.x, true)
-    };
+    // Pick the dominant axis (vertical wins ties); the shared core owns the choice.
+    let (value, horizontal) = dominant_axis(delta);
     if value == 0.0 {
         return None;
     }
@@ -164,142 +127,26 @@ fn map_wheel(unit: MouseWheelUnit, delta: Vec2) -> Option<RdpInputEvent> {
     }
 }
 
-/// The PC/AT **set-1** scancode for an egui [`Key`], or `None` for a key with no
-/// stable scancode (handled as unicode text instead). Covers letters, digits,
-/// the function row, the editing/navigation cluster, and the common ASCII
-/// punctuation; the navigation/arrow keys are correctly `E0`-extended.
-#[must_use]
-pub fn scancode_for(key: Key) -> Option<Scancode> {
-    use Key as K;
-    let sc = match key {
-        // ── Letters (set-1 make codes) ──────────────────────────────────────
-        K::A => 0x1E,
-        K::B => 0x30,
-        K::C => 0x2E,
-        K::D => 0x20,
-        K::E => 0x12,
-        K::F => 0x21,
-        K::G => 0x22,
-        K::H => 0x23,
-        K::I => 0x17,
-        K::J => 0x24,
-        K::K => 0x25,
-        K::L => 0x26,
-        K::M => 0x32,
-        K::N => 0x31,
-        K::O => 0x18,
-        K::P => 0x19,
-        K::Q => 0x10,
-        K::R => 0x13,
-        K::S => 0x1F,
-        K::T => 0x14,
-        K::U => 0x16,
-        K::V => 0x2F,
-        K::W => 0x11,
-        K::X => 0x2D,
-        K::Y => 0x15,
-        K::Z => 0x2C,
-        // ── Number row ──────────────────────────────────────────────────────
-        K::Num1 => 0x02,
-        K::Num2 => 0x03,
-        K::Num3 => 0x04,
-        K::Num4 => 0x05,
-        K::Num5 => 0x06,
-        K::Num6 => 0x07,
-        K::Num7 => 0x08,
-        K::Num8 => 0x09,
-        K::Num9 => 0x0A,
-        K::Num0 => 0x0B,
-        // ── Whitespace / editing ────────────────────────────────────────────
-        K::Escape => 0x01,
-        K::Backspace => 0x0E,
-        K::Tab => 0x0F,
-        K::Enter => 0x1C,
-        K::Space => 0x39,
-        // ── ASCII punctuation ───────────────────────────────────────────────
-        K::Minus => 0x0C,
-        K::Equals => 0x0D,
-        K::OpenBracket => 0x1A,
-        K::CloseBracket => 0x1B,
-        K::Backslash => 0x2B,
-        K::Semicolon => 0x27,
-        K::Backtick => 0x29,
-        K::Comma => 0x33,
-        K::Period => 0x34,
-        K::Slash => 0x35,
-        // ── Function row ────────────────────────────────────────────────────
-        K::F1 => 0x3B,
-        K::F2 => 0x3C,
-        K::F3 => 0x3D,
-        K::F4 => 0x3E,
-        K::F5 => 0x3F,
-        K::F6 => 0x40,
-        K::F7 => 0x41,
-        K::F8 => 0x42,
-        K::F9 => 0x43,
-        K::F10 => 0x44,
-        K::F11 => 0x57,
-        K::F12 => 0x58,
-        // ── Editing / navigation cluster (E0-extended) ──────────────────────
-        K::Insert => return Some(Scancode::ext(0x52)),
-        K::Delete => return Some(Scancode::ext(0x53)),
-        K::Home => return Some(Scancode::ext(0x47)),
-        K::End => return Some(Scancode::ext(0x4F)),
-        K::PageUp => return Some(Scancode::ext(0x49)),
-        K::PageDown => return Some(Scancode::ext(0x51)),
-        K::ArrowUp => return Some(Scancode::ext(0x48)),
-        K::ArrowDown => return Some(Scancode::ext(0x50)),
-        K::ArrowLeft => return Some(Scancode::ext(0x4B)),
-        K::ArrowRight => return Some(Scancode::ext(0x4D)),
-        // Any other key (IME, media keys, ...) has no stable scancode here.
-        _ => return None,
-    };
-    Some(Scancode::plain(sc))
-}
-
-/// Set-1 scancodes for the three core modifier keys the session synthesises from
-/// egui's `Modifiers` snapshot (egui reports modifiers as state, not as discrete
-/// key events).
-pub(crate) const SHIFT_SCANCODE: Scancode = Scancode::plain(0x2A); // left shift
-pub(crate) const CTRL_SCANCODE: Scancode = Scancode::plain(0x1D); // left ctrl
-pub(crate) const ALT_SCANCODE: Scancode = Scancode::plain(0x38); // left alt
-
 /// Tracks the modifier state already pushed to the guest so the session can emit
 /// the right modifier key transitions (egui carries modifiers as a snapshot on
 /// every event rather than as discrete Shift/Ctrl/Alt key events).
+///
+/// A thin wrapper over the shared [`ModifierTracker`]: the diff algorithm lives in
+/// the core, and RDP renders each transition as an [`RdpInputEvent::Key`] by set-1
+/// scancode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ModifierState {
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
-}
+pub struct ModifierState(ModifierTracker);
 
 impl ModifierState {
-    /// Diff the stored state against the live `(shift, ctrl, alt)` snapshot,
-    /// update self, and return the modifier key transitions to send first.
-    /// Releases are emitted before presses so a chord re-press is unambiguous.
+    /// Diff the stored state against the live `(shift, ctrl, alt)` snapshot, update
+    /// self, and return the modifier key transitions to send first. Releases are
+    /// emitted before presses so a chord re-press is unambiguous.
     pub fn diff(&mut self, shift: bool, ctrl: bool, alt: bool) -> Vec<RdpInputEvent> {
-        let mut out = Vec::new();
-        let mut emit = |changed: bool, now: bool, sc: Scancode, want_down: bool| {
-            if changed && now == want_down {
-                out.push(RdpInputEvent::Key {
-                    scancode: sc,
-                    down: now,
-                });
-            }
-        };
-        // Pass 1: releases (want_down == false).
-        emit(self.shift != shift, shift, SHIFT_SCANCODE, false);
-        emit(self.ctrl != ctrl, ctrl, CTRL_SCANCODE, false);
-        emit(self.alt != alt, alt, ALT_SCANCODE, false);
-        // Pass 2: presses (want_down == true).
-        emit(self.shift != shift, shift, SHIFT_SCANCODE, true);
-        emit(self.ctrl != ctrl, ctrl, CTRL_SCANCODE, true);
-        emit(self.alt != alt, alt, ALT_SCANCODE, true);
-        self.shift = shift;
-        self.ctrl = ctrl;
-        self.alt = alt;
-        out
+        self.0
+            .diff(shift, ctrl, alt, |key: ModKey, down| RdpInputEvent::Key {
+                scancode: key.scancode(),
+                down,
+            })
     }
 }
 
@@ -358,6 +205,22 @@ mod tests {
         Scancode, ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE,
     };
     use crate::egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, Vec2};
+
+    #[test]
+    fn scancode_map_is_the_shared_core_source() {
+        // The set-1 table lives once in mde-vdi-core; RDP re-exports it, so a
+        // scancode fix is applied in exactly one place for RDP + SPICE.
+        for key in [
+            Key::A,
+            Key::Z,
+            Key::Enter,
+            Key::ArrowUp,
+            Key::F12,
+            Key::Slash,
+        ] {
+            assert_eq!(scancode_for(key), mde_vdi_core::scancode_for(key));
+        }
+    }
 
     #[test]
     fn pointer_move_maps_and_clamps() {
@@ -479,98 +342,6 @@ mod tests {
                 down: false,
             })
         );
-    }
-
-    #[test]
-    fn navigation_keys_are_extended() {
-        for (key, code) in [
-            (Key::ArrowUp, 0x48u8),
-            (Key::ArrowDown, 0x50),
-            (Key::ArrowLeft, 0x4B),
-            (Key::ArrowRight, 0x4D),
-            (Key::Home, 0x47),
-            (Key::End, 0x4F),
-            (Key::PageUp, 0x49),
-            (Key::PageDown, 0x51),
-            (Key::Insert, 0x52),
-            (Key::Delete, 0x53),
-        ] {
-            assert_eq!(
-                scancode_for(key),
-                Some(Scancode {
-                    code,
-                    extended: true,
-                }),
-                "{key:?} must be E0-extended"
-            );
-        }
-    }
-
-    #[test]
-    fn function_row_and_punctuation_have_scancodes() {
-        assert_eq!(
-            scancode_for(Key::F1),
-            Some(Scancode {
-                code: 0x3B,
-                extended: false
-            })
-        );
-        assert_eq!(
-            scancode_for(Key::F12),
-            Some(Scancode {
-                code: 0x58,
-                extended: false
-            })
-        );
-        assert_eq!(
-            scancode_for(Key::Minus),
-            Some(Scancode {
-                code: 0x0C,
-                extended: false
-            })
-        );
-        assert_eq!(
-            scancode_for(Key::Slash),
-            Some(Scancode {
-                code: 0x35,
-                extended: false
-            })
-        );
-    }
-
-    #[test]
-    fn scancodes_are_unique_across_the_mapped_set() {
-        // No two distinct keys collide on the same (code, extended) identity.
-        let keys = [
-            Key::A,
-            Key::B,
-            Key::Q,
-            Key::Z,
-            Key::Num0,
-            Key::Num1,
-            Key::Num9,
-            Key::Escape,
-            Key::Enter,
-            Key::Space,
-            Key::Tab,
-            Key::Backspace,
-            Key::F1,
-            Key::F12,
-            Key::Minus,
-            Key::Equals,
-            Key::Slash,
-            Key::ArrowUp,
-            Key::ArrowDown,
-            Key::Home,
-            Key::End,
-            Key::Insert,
-            Key::Delete,
-        ];
-        let mut seen = std::collections::HashSet::new();
-        for k in keys {
-            let sc = scancode_for(k).expect("mapped key");
-            assert!(seen.insert((sc.code, sc.extended)), "{k:?} collides");
-        }
     }
 
     #[test]
