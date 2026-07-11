@@ -49,6 +49,7 @@ mod provisioning;
 // rather than declared like every real surface module above/below it.
 #[cfg(test)]
 mod screenshot;
+mod seat_pump;
 mod services_flow;
 mod session;
 mod session_rail;

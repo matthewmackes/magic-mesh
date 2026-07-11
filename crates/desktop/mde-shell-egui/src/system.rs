@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::{field, muted_note, OsdKind, OsdLevel, Severity, Style, Toast};
@@ -50,6 +50,7 @@ use mde_seat::{
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
+use crate::seat_pump::{connector_key, SnapshotPump};
 
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
 /// this window.
@@ -75,12 +76,20 @@ const HOTKEY_STEP: i16 = 5;
 /// The System surface's live state: the ONE [`Seat`] (lock 1) plus its latest
 /// snapshot, the editable display arrangement, and the live brightness values.
 pub(crate) struct SystemState {
-    /// The one seat over the real host hardware (in-process, lock 1).
+    /// The one seat over the real host hardware (in-process, lock 1). On the render
+    /// thread it now drives only the **control verbs** (backlight / DDC / power /
+    /// mixer / Bluetooth writes); the read-only `snapshot()` moved off-thread to the
+    /// [`pump`](Self::pump) so the slow I2C/DBus probes never freeze a frame (perf-2).
     seat: Seat,
-    /// The latest snapshot. `None` until the first poll.
+    /// The latest snapshot, drained from the off-thread [`pump`](Self::pump). `None`
+    /// until the pump publishes its first one (within a frame of spawn).
     snapshot: Option<SeatSnapshot>,
-    /// When the seat was last snapshotted (drives the fixed cadence).
-    last_poll: Option<Instant>,
+    /// The background snapshot producer (perf-2): a dedicated thread over its own
+    /// read-only seat that publishes the newest [`SeatSnapshot`] over a channel the
+    /// render thread drains. Spawned lazily on the first [`poll`](Self::poll) (it
+    /// needs the `egui::Context` to wake the render thread), dropped — which stops +
+    /// joins the thread — with the surface.
+    pump: Option<SnapshotPump>,
     /// The editable multi-head arrangement intent (E12-18). Rebuilt from the probe
     /// only when the connector set changes (a replug), so operator edits persist.
     layout: DisplayLayout,
@@ -152,7 +161,7 @@ impl Default for SystemState {
         Self {
             seat: Seat::new(),
             snapshot: None,
-            last_poll: None,
+            pump: None,
             layout: DisplayLayout::default(),
             layout_key: Vec::new(),
             panel_brightness: BTreeMap::new(),
@@ -234,13 +243,24 @@ pub(crate) enum SysAction {
 }
 
 impl SystemState {
-    /// The poll seam: re-snapshot on cadence, then reconcile the arrangement model
-    /// + brightness seeds against the fresh probe.
+    /// The poll seam: drain the newest OFF-THREAD snapshot (never blocking on the
+    /// probe — perf-2), then reconcile the arrangement model + brightness seeds
+    /// against it.
+    ///
+    /// The expensive `seat.snapshot()` (pw-dump + the I2C DDC/CI probe + the
+    /// system-bus reads) used to run inline here every 5 s, freezing the frame for the probe's
+    /// duration. It now runs on the [`SnapshotPump`] background thread; the render
+    /// thread only drains the latest published snapshot — a `try_recv`, so this can
+    /// never block. Data freshness is unchanged from the UI's view: the pump wakes
+    /// the render thread on each publish, so a fresh snapshot lands within a frame.
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
-        let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
-        if due {
-            self.last_poll = Some(Instant::now());
-            let snap = self.seat.snapshot();
+        // Spawn the pump once (it needs the ctx to wake us on each publish).
+        if self.pump.is_none() {
+            self.pump = Some(SnapshotPump::spawn(ctx.clone()));
+        }
+        // Drain to the newest published snapshot — non-blocking. `None` means nothing
+        // new arrived, so the surface keeps the snapshot it already holds.
+        if let Some(snap) = self.pump.as_ref().and_then(SnapshotPump::drain_latest) {
             self.reconcile(&snap);
             // Mirror the fresh snapshot mesh-wide (E12-19, lock 1): the host_state
             // worker republishes it to state/host/<node>/seat for every peer's
@@ -288,7 +308,10 @@ impl SystemState {
     /// seen brightness value — without clobbering an in-flight operator edit.
     fn reconcile(&mut self, snap: &SeatSnapshot) {
         if let Probe::Present(connectors) = &snap.displays {
-            let key: Vec<String> = connectors.iter().map(|c| c.name.clone()).collect();
+            // The SAME connector-set signal the snapshot pump's DDC cache keys its
+            // `ddcutil detect` on (perf-2), so a re-plug rebuilds the layout here AND
+            // re-detects DDC there off one shared derivation.
+            let key = connector_key(connectors);
             if key != self.layout_key {
                 self.layout = DisplayLayout::from_connectors(connectors);
                 self.layout_key = key;
@@ -3085,6 +3108,58 @@ mod tests {
         assert!(st.snapshot().is_none());
         assert!(st.layout.outputs.is_empty());
         assert!(st.confirm.is_none());
+    }
+
+    #[test]
+    fn poll_drains_the_latest_published_snapshot_without_probing_inline() {
+        // perf-2: the render path (`poll`) must NEVER run the blocking seat probe —
+        // it only drains the newest snapshot the off-thread pump published. Inject a
+        // pump backed by a plain channel (no thread, no producing Seat), publish
+        // three snapshots carrying an ASCENDING marker, and assert one `poll` adopts
+        // the LAST of them (latest-wins). If `poll` had probed the real (headless)
+        // seat inline it would show an Absent `charge_limit` instead of the injected
+        // marker, so the marker surviving is the proof the probe never ran here.
+        use std::sync::mpsc;
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let mut st = SystemState::default();
+        st.pump = Some(SnapshotPump::from_receiver(rx));
+
+        for marker in 1u8..=3 {
+            let mut snap = Seat::new().snapshot();
+            snap.charge_limit = Probe::Present(Some(marker));
+            tx.send(snap).expect("publish");
+        }
+        st.poll(&ctx);
+
+        assert!(
+            matches!(
+                st.snapshot().map(|s| &s.charge_limit),
+                Some(Probe::Present(Some(3)))
+            ),
+            "poll must adopt the newest published snapshot (latest-wins drain)"
+        );
+        // The drained snapshot flowed through reconcile, seeding the charge slider.
+        assert_eq!(st.charge_threshold, Some(3));
+    }
+
+    #[test]
+    fn poll_is_non_blocking_with_no_snapshot_published_yet() {
+        // An empty pump channel: `poll` must return at once (a `try_recv` drain,
+        // never a block on the probe) and leave the pre-poll snapshot untouched. The
+        // test simply completing proves the drain does not block.
+        use std::sync::mpsc;
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel::<SeatSnapshot>();
+        let mut st = SystemState::default();
+        st.pump = Some(SnapshotPump::from_receiver(rx));
+
+        st.poll(&ctx);
+        assert!(
+            st.snapshot().is_none(),
+            "no publish yet → the snapshot stays None, not a blocked inline probe"
+        );
+        drop(tx);
     }
 
     #[test]

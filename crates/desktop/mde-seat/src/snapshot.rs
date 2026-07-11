@@ -174,6 +174,18 @@ impl Seat {
     /// section independently becomes `Present` or a typed `Absent`.
     #[must_use]
     pub fn snapshot(&self) -> SeatSnapshot {
+        self.snapshot_with_ddc(Probe::from_result(self.ddc.displays()))
+    }
+
+    /// Fold every section EXCEPT DDC, taking the DDC probe from the caller.
+    ///
+    /// This is the seam the shell's off-thread snapshot pump uses to inject a
+    /// *cached* DDC probe — re-detected only on a connector-set change, brightness
+    /// re-read on a slow cadence — so the expensive `ddcutil` I2C work never runs on
+    /// the render thread (perf-2). [`Self::snapshot`] passes the live
+    /// `ddc.displays()` fold, so every existing caller is byte-for-byte unchanged.
+    #[must_use]
+    pub fn snapshot_with_ddc(&self, ddc: Probe<Vec<DdcDisplay>>) -> SeatSnapshot {
         SeatSnapshot {
             bluetooth: Probe::from_result(self.bluez.status()),
             batteries: Probe::from_result(self.upower.batteries()),
@@ -185,8 +197,24 @@ impl Seat {
             displays: Probe::from_result(self.display.connectors()),
             backlights: Probe::from_result(self.backlight.devices()),
             mixer: Probe::from_result(self.mixer.status()),
-            ddc: Probe::from_result(self.ddc.displays()),
+            ddc,
         }
+    }
+
+    /// The `ddcutil detect` inventory only — no per-monitor brightness. The cheap
+    /// half of the DDC probe the snapshot pump caches on the DRM connector set.
+    ///
+    /// # Errors
+    /// The DDC client's typed errors ([`SeatError::Unavailable`] with no `ddcutil`).
+    pub fn ddc_detect(&self) -> Result<Vec<DdcDisplay>, SeatError> {
+        self.ddc.detect()
+    }
+
+    /// Fill each already-detected monitor's live brightness (`getvcp` VCP 0x10) in
+    /// place — the expensive per-monitor I2C half the pump runs on a slow cadence.
+    /// A monitor that rejects the read keeps its last-known value (never dropped).
+    pub fn ddc_read_brightness(&self, displays: &mut [DdcDisplay]) {
+        self.ddc.fill_brightness(displays);
     }
 
     // ── control verbs (E12-18: the Displays + Power sections act through these) ──

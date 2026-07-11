@@ -44,14 +44,40 @@ impl DdcDisplay {
 
 /// The DDC/CI seam. Production impl ([`DdcCtl`] over the [`DdcUtil`] runner) drives
 /// i2c-dev via `ddcutil`; [`UnboundDdc`] is the explicit no-backend answer.
+///
+/// The enumeration is split into two halves so the shell's off-thread snapshot
+/// pump can run each on its own cadence (perf-2): [`detect`](Self::detect) is the
+/// cheap `ddcutil detect` inventory the pump caches on the DRM connector set, and
+/// [`fill_brightness`](Self::fill_brightness) is the SLOW per-monitor I2C `getvcp`
+/// it re-reads on a much slower beat. [`displays`](Self::displays) composes both —
+/// the original one-shot seam, unchanged for its existing callers.
 pub trait DdcClient: Send {
-    /// Enumerate DDC/CI-controllable external monitors, each with its current
-    /// brightness read from VCP 0x10.
+    /// Detect DDC/CI-controllable external monitors — the inventory only, with
+    /// brightness left at 0 for [`fill_brightness`](Self::fill_brightness) to fill.
+    /// This is the cheap half the pump caches on the connector set.
     ///
     /// # Errors
     /// [`SeatError::Unavailable`] when no `ddcutil` is present or no i2c-dev bus
     /// answers DDC.
-    fn displays(&self) -> Result<Vec<DdcDisplay>, SeatError>;
+    fn detect(&self) -> Result<Vec<DdcDisplay>, SeatError>;
+
+    /// Fill each already-detected monitor's live brightness (VCP 0x10) in place —
+    /// the SLOW per-monitor I2C `getvcp`. A monitor that rejects the read keeps its
+    /// current value (never dropped), so a working sibling is unaffected.
+    fn fill_brightness(&self, displays: &mut [DdcDisplay]);
+
+    /// Enumerate DDC/CI-controllable external monitors, each with its current
+    /// brightness read from VCP 0x10 — [`detect`](Self::detect) then
+    /// [`fill_brightness`](Self::fill_brightness) in one call.
+    ///
+    /// # Errors
+    /// [`SeatError::Unavailable`] when no `ddcutil` is present or no i2c-dev bus
+    /// answers DDC.
+    fn displays(&self) -> Result<Vec<DdcDisplay>, SeatError> {
+        let mut out = self.detect()?;
+        self.fill_brightness(&mut out);
+        Ok(out)
+    }
 
     /// Set an external monitor's brightness (VCP 0x10), 0–100, addressed by its
     /// i2c bus label (`i2c-<n>`).
@@ -117,13 +143,16 @@ impl Default for DdcCtl {
 }
 
 impl DdcClient for DdcCtl {
-    fn displays(&self) -> Result<Vec<DdcDisplay>, SeatError> {
-        let mut out = parse_detect(&self.runner.detect()?);
+    fn detect(&self) -> Result<Vec<DdcDisplay>, SeatError> {
+        Ok(parse_detect(&self.runner.detect()?))
+    }
+
+    fn fill_brightness(&self, displays: &mut [DdcDisplay]) {
         // Fill each monitor's live brightness. A monitor that rejects the getvcp
-        // (DDC refused) keeps brightness 0 and stays in the list — the Display
+        // (DDC refused) keeps its current value and stays in the list — the Display
         // section can still render it as an honest "not controllable" row rather
         // than dropping it, and a working sibling on another bus is unaffected.
-        for disp in &mut out {
+        for disp in displays {
             if let Some(bus) = disp.bus_number() {
                 if let Ok(text) = self.runner.getvcp_brightness(bus) {
                     if let Some((cur, max)) = parse_getvcp_brightness(&text) {
@@ -132,8 +161,10 @@ impl DdcClient for DdcCtl {
                 }
             }
         }
-        Ok(out)
     }
+
+    // `displays()` uses the trait default (detect + fill_brightness) — the same
+    // one-shot inventory-with-brightness it always produced.
 
     fn set_brightness(&self, bus: &str, percent: u8) -> Result<(), SeatError> {
         if percent > 100 {
@@ -246,9 +277,16 @@ impl UnboundDdc {
 }
 
 impl DdcClient for UnboundDdc {
-    fn displays(&self) -> Result<Vec<DdcDisplay>, SeatError> {
+    fn detect(&self) -> Result<Vec<DdcDisplay>, SeatError> {
         Err(Self::unavailable())
     }
+
+    fn fill_brightness(&self, _displays: &mut [DdcDisplay]) {
+        // No backend bound — nothing to read; leaves the (empty) list untouched.
+    }
+
+    // `displays()` uses the trait default: `detect()` Errs first, so it propagates
+    // the same honest `Unavailable` it always did.
 
     fn set_brightness(&self, _bus: &str, _percent: u8) -> Result<(), SeatError> {
         Err(Self::unavailable())
