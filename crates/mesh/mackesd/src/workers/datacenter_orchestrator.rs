@@ -402,9 +402,11 @@ fn publish_route(dom0: &str, route: &SshRoute, note: &str) {
     })
     .to_string();
     let topic = format!("event/dc/route/xen/{dom0}");
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_topic_body(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        &body,
+    );
 }
 
 /// Parse the remote `xe` helper's pipe-delimited `uuid|name|power-state` lines
@@ -1209,12 +1211,28 @@ fn gather_gateway() -> Vec<DcResource> {
     vec![DcResource::new("gateway", host, sig)]
 }
 
-/// Emit a datacenter event onto the Bus (best-effort, fire-and-reap — same lane
-/// shape as the other workers' events).
+/// Emit a datacenter event onto the Bus in-process (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI per event. Byte-identical stored row to the
+/// old `mde-bus publish <topic> --body-flag <body>`.
 fn publish(ev: &DcEvent) {
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", &ev.topic(), "--body-flag", &ev.body()]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_topic_body(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &ev.topic(),
+        &ev.body(),
+    );
+}
+
+/// Root-injectable in-process write shared by the datacenter event publishers
+/// ([`publish`] + [`publish_route`]). Fresh-opens the Bus at `bus_root` (the
+/// CLI-equivalent [`crate::bus_publish::default_bus_root`] in production,
+/// honouring `MDE_BUS_ROOT`) and writes `body` verbatim to `topic`.
+/// Best-effort; tests pass a temp root.
+fn publish_topic_body(bus_root: Option<&std::path::Path>, topic: &str, body: &str) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, topic, body);
+    }
 }
 
 /// A datacenter control zone, each with its OWN leader election (the design's

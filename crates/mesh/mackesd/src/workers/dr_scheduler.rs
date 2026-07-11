@@ -86,12 +86,23 @@ fn detail_summary(detail: &str) -> String {
     detail.chars().take(DETAIL_LEN).collect()
 }
 
-/// Publish one DR outcome body onto the Bus (best-effort, fire-and-reap — same
-/// lane shape as the other dc workers' events).
+/// Publish one DR outcome body onto the Bus in-process (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI per outcome. `body` is an already-serialized
+/// JSON string, written VERBATIM (byte-identical to the old
+/// `mde-bus publish <topic> --body-flag <body>`). Targets
+/// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT`).
 fn publish(body: &str) {
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", DR_TOPIC, "--body-flag", body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_to(crate::bus_publish::default_bus_root().as_deref(), body);
+}
+
+/// Root-injectable body of [`publish`] — fresh-opens the Bus at `bus_root` and
+/// writes `body` verbatim to [`DR_TOPIC`]. Best-effort; tests pass a temp root.
+fn publish_to(bus_root: Option<&std::path::Path>, body: &str) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, DR_TOPIC, body);
+    }
 }
 
 /// JSON body for a successful run: the script's last stdout line as `path`.

@@ -199,9 +199,24 @@ pub fn selinux_alert_body(host: &str, d: &AvcDenial) -> String {
 fn publish_selinux_alert(host: &str, d: &AvcDenial) {
     let topic = format!("fleet/sec/selinux/{host}");
     let body = selinux_alert_body(host, d);
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_alert_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        &body,
+    );
+}
+
+/// Root-injectable in-process write for the SELinux alert (perf-10 / arch-6) —
+/// no fork+exec of the `mde-bus` CLI per denial. Fresh-opens the Bus at
+/// `bus_root` (the CLI-equivalent [`crate::bus_publish::default_bus_root`] in
+/// production, honouring `MDE_BUS_ROOT`) and writes the already-serialized
+/// `body` verbatim to `topic`. Best-effort; tests pass a temp root.
+fn publish_alert_to(bus_root: Option<&std::path::Path>, topic: &str, body: &str) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, topic, body);
+    }
 }
 
 #[async_trait::async_trait]
