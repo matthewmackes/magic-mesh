@@ -80,6 +80,6 @@ A healthy node shows the `mackesd` service active and an overlay IP on `nebula1`
   `DISCLAIMER.md`); VM desktop guests are first-class members on top of it. Split
   larger groups into separate workgroups.
 - All node management is `meshctl` (and the `mackesd` daemon CLI), plus the egui
-  shell's graphical mesh-control planes — **This Node**, **Cloud**, **Network**,
-  **Fleet**, and **Provisioning** — reached from the dock. Run `meshctl --help`
-  for the full lifecycle command set.
+  shell's **Workbench** surface (opened from the dock), whose five planes — **This
+  Node**, **Cloud**, **Network**, **Fleet**, and **Provisioning** — are the
+  graphical mesh view. Run `meshctl --help` for the full lifecycle command set.
