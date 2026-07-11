@@ -40,7 +40,13 @@
 //! picker (protocol · display · monitors) and nothing connects until the operator
 //! confirms it (lock 6 — never a silent protocol default).
 
-mod chooser_prefs;
+// `pub(crate)` (was private) — WIN7-8 reuses `resolve_identity`/`resolve_seat`/
+// `unix_millis` verbatim from `console::custom_sync`'s own mesh-synced Custom
+// entries, so every identity-bound record in this crate agrees on the same
+// resolution precedence (the `dock::response_activated`/`status::severity_color`
+// cross-module-widening idiom already established this epic, restated for a
+// `mod` declaration instead of a `fn`).
+pub(crate) mod chooser_prefs;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

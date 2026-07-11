@@ -129,6 +129,21 @@
 //! Like the dock, this module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
 //! reaches the nav / curtain / seat itself (§6, the VDOCK deferred-wire idiom).
+//!
+//! **WIN7-8 update:** the Custom group's entries (lock #35) now ALSO sync
+//! mesh-wide per operator identity (lock #21), over
+//! [`custom_sync`] — see that module's own doc for the full investigation
+//! (where entries were persisted before this unit, the mechanism reused,
+//! and the merge semantics). `CustomFile`/`CUSTOM_FILE` (below) are
+//! UNCHANGED — the local file remains the per-seat cache / offline
+//! fallback; [`custom_sync`] is an additive mirror, never a replacement.
+//! Every OTHER piece of this module's state (`open`, `focus`, `jump`,
+//! `gate`, `arming`, the draft fields) stays ordinary local widget state,
+//! never published anywhere — see `console.rs`'s own
+//! `win7_8_*`-prefixed tests near the bottom of this file for the explicit
+//! negative proof.
+
+mod custom_sync;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -140,6 +155,7 @@ use mde_term_egui::sudo_argv;
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
+use crate::chooser::chooser_prefs::unix_millis;
 use crate::dock::{icon_texture, Surface};
 use crate::workbench::Plane;
 
@@ -878,6 +894,19 @@ pub struct ConsoleState {
     draft_name: String,
     /// The Custom add-form's draft command field.
     draft_command: String,
+    /// WIN7-8 (lock #21) — the mesh-wide Custom-entry sync session, or
+    /// `None` when this `ConsoleState` was built via [`Self::with_store`]
+    /// (every existing test, plus `start_menu`'s own tests) — see
+    /// [`custom_sync`]'s module doc. Deliberately NOT wired into `Default`/
+    /// `with_store` themselves: those two constructors are used by 30+
+    /// pre-existing tests across this file and `start_menu.rs`, and
+    /// [`custom_sync::CustomSync::open_default`] resolves the REAL
+    /// Syncthing workgroup root (`/mnt/mesh-storage` by default) — on a
+    /// farm build host where that mount is genuinely live, silently wiring
+    /// it into every test constructor would make `cargo test` read/write
+    /// real shared mesh state. Only [`Self::for_shell`] (the real
+    /// production constructor, `main.rs`'s own call site) enables it.
+    custom_sync: Option<custom_sync::CustomSync>,
 }
 
 impl Default for ConsoleState {
@@ -892,12 +921,28 @@ impl ConsoleState {
     /// Custom entries, everything else cold. `pub(crate)` — `start_menu`'s own
     /// tests use `with_store(None)` too, for the same deterministic-headless
     /// reason this module's own tests do (never touching a real client data
-    /// dir).
+    /// dir). Mesh sync ([`custom_sync`]) is OFF over this constructor — see
+    /// [`Self::for_shell`] for the real production path, and this
+    /// constructor's own field doc on why the split exists.
     pub(crate) fn with_store(store: Option<PathBuf>) -> Self {
+        Self::with_store_and_sync(store, None)
+    }
+
+    /// [`Self::with_store`], plus an explicit (possibly real,
+    /// possibly-`None`) [`custom_sync::CustomSync`] session — the seam
+    /// WIN7-8's own sync-behavior tests inject a tempdir-rooted session
+    /// through, and [`Self::for_shell`] wires the real one through.
+    /// Immediately folds the merged mesh view in when `sync` is `Some` and
+    /// ready, so a fresh open already reflects every other seat's entries
+    /// (the `ChooserState::with_client` "hydrates... at once" idiom).
+    pub(crate) fn with_store_and_sync(
+        store: Option<PathBuf>,
+        sync: Option<custom_sync::CustomSync>,
+    ) -> Self {
         let custom = store
             .as_deref()
             .map_or_else(CustomFile::default, CustomFile::load_from);
-        Self {
+        let mut state = Self {
             open: false,
             focus: 0,
             focus_moved: false,
@@ -912,7 +957,25 @@ impl ConsoleState {
             store,
             draft_name: String::new(),
             draft_command: String::new(),
-        }
+            custom_sync: sync,
+        };
+        state.refresh_custom_sync();
+        state
+    }
+
+    /// The real production constructor (`main.rs`'s own call site): local
+    /// persistence via the client data dir (exactly [`Self::default`]'s
+    /// path) PLUS real mesh-wide Custom-entry sync via the workgroup root
+    /// (WIN7-8, lock #21) — kept OFF [`Self::default`] itself so this
+    /// module's own + `start_menu`'s existing tests (which construct via
+    /// `Default`/`with_store`) never touch a real mesh mount; see the
+    /// `custom_sync` field's own doc.
+    #[must_use]
+    pub(crate) fn for_shell() -> Self {
+        Self::with_store_and_sync(
+            mde_bus::client_data_dir().map(|d| d.join(CUSTOM_FILE)),
+            Some(custom_sync::CustomSync::open_default()),
+        )
     }
 
     /// Whether the content is showing.
@@ -946,6 +1009,14 @@ impl ConsoleState {
             self.gate = None;
             self.arming = None;
             self.refresh_presence();
+            // WIN7-8 — pick up any Custom entry another seat added/removed
+            // since this seat last opened (the `refresh_presence` "just
+            // installed a tool" cadence restated for the mesh-synced list).
+            // `open`/`focus`/`jump`/`gate`/`arming` above are never touched
+            // by this call — see `custom_sync`'s own doc for why they can't
+            // be (they have no analogue in the synced record's shape at
+            // all).
+            self.refresh_custom_sync();
         }
     }
 
@@ -967,6 +1038,26 @@ impl ConsoleState {
     /// Refresh the per-row `$PATH` presence table (called on open).
     fn refresh_presence(&mut self) {
         self.present = static_rows().map(|e| tool_present(e.tool)).collect();
+    }
+
+    /// WIN7-8 (lock #21) — refold [`Self::custom`] from the mesh-synced
+    /// merged view when [`Self::custom_sync`] is present AND its workgroup
+    /// root is actually provisioned; a complete no-op otherwise (`None`, or
+    /// `Some` but not [`custom_sync::CustomSync::is_ready`]), so
+    /// [`Self::custom`] stays exactly the plain local-file `Vec` every
+    /// pre-existing test already asserts on. When it DOES refold, the
+    /// merged view is also cached back to the local file
+    /// ([`Self::persist_custom`]) — the BROWSER-DD-7 "local snapshot is
+    /// both the offline fallback and the mirror source" shape restated —
+    /// so a later fully-offline run (mesh volume unmounted) still shows
+    /// the last-known-good merged set, not just this seat's own history.
+    fn refresh_custom_sync(&mut self) {
+        if let Some(sync) = self.custom_sync.as_ref() {
+            if sync.is_ready() {
+                self.custom.entries = sync.merged();
+                self.persist_custom();
+            }
+        }
     }
 
     /// The whole activation ring's length: the static rows plus the operator's
@@ -1069,27 +1160,45 @@ impl ConsoleState {
     /// CONSOLE-4 — register the drafted Custom entry (lock #35): both fields
     /// trimmed non-empty, appended, persisted (atomic), drafts cleared. A blank
     /// draft is refused (`false`) — the Add affordance disables on it too.
+    /// WIN7-8 — ALSO published through [`Self::custom_sync`] (when present),
+    /// then [`Self::refresh_custom_sync`] refolds [`Self::custom`] from the
+    /// merged mesh view, so this seat sees the authoritative cross-seat list
+    /// immediately, exactly like `ChooserState`'s own mutators do.
     fn add_custom(&mut self) -> bool {
         let name = self.draft_name.trim().to_owned();
         let command = self.draft_command.trim().to_owned();
         if name.is_empty() || command.is_empty() {
             return false;
         }
-        self.custom.entries.push(CustomEntry { name, command });
+        let entry = CustomEntry { name, command };
+        self.custom.entries.push(entry.clone());
         self.draft_name.clear();
         self.draft_command.clear();
         self.persist_custom();
+        if let Some(sync) = self.custom_sync.as_mut() {
+            sync.add(entry, unix_millis());
+        }
+        self.refresh_custom_sync();
         true
     }
 
     /// CONSOLE-4 — unregister a Custom entry by index (persisted); the focus
-    /// ring re-clamps so it never points past the shrunken tail.
+    /// ring re-clamps so it never points past the shrunken tail. WIN7-8 —
+    /// ALSO tombstones the entry through [`Self::custom_sync`] (when
+    /// present) so the removal converges mesh-wide, even for an entry this
+    /// seat never itself added ([`custom_sync::CustomSync::remove`]'s own
+    /// doc explains why that case is safe), then refolds the merged view.
     fn remove_custom(&mut self, index: usize) {
-        if index < self.custom.entries.len() {
-            self.custom.entries.remove(index);
-            self.persist_custom();
-            self.focus = self.focus.min(self.rows_total().saturating_sub(1));
+        let Some(entry) = self.custom.entries.get(index).cloned() else {
+            return;
+        };
+        self.custom.entries.remove(index);
+        self.persist_custom();
+        if let Some(sync) = self.custom_sync.as_mut() {
+            sync.remove(&entry, unix_millis());
         }
+        self.refresh_custom_sync();
+        self.focus = self.focus.min(self.rows_total().saturating_sub(1));
     }
 
     /// Persist the Custom store (a silent no-op headless — no data dir, §7;
@@ -2125,10 +2234,10 @@ fn console_gate_live_region_id() -> egui::Id {
 mod tests {
     use super::{
         console_confirm_id, console_content, console_entry_id, console_heading_id,
-        console_power_id, console_rail_id, entry_at, identity_line, jump_caption, launch_argv,
-        static_rows, tool_present, tool_present_in, total_rows, ConsoleRequest, ConsoleState,
-        CustomEntry, EntryKind, GateReason, PowerAction, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H,
-        PANEL_W, PINNED, POWER_H, RAIL_SECTION_GAP,
+        console_power_id, console_rail_id, custom_sync, entry_at, identity_line, jump_caption,
+        launch_argv, static_rows, tool_present, tool_present_in, total_rows, ConsoleRequest,
+        ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction, CUSTOM_GROUP_LABEL, GROUPS,
+        PANEL_H, PANEL_W, PINNED, POWER_H, RAIL_SECTION_GAP,
     };
     use crate::dock::Surface;
     use crate::workbench::Plane;
@@ -2759,6 +2868,229 @@ mod tests {
         );
         assert!(s.gate.is_none(), "a launched custom entry raises no gate");
         assert!(!s.is_open(), "launching a custom entry closes the panel");
+    }
+
+    // ── WIN7-8: multi-seat sync (lock #21) — Custom entries sync mesh-wide ──
+
+    #[test]
+    fn win7_8_a_custom_entry_added_on_one_seat_syncs_to_another_over_the_shared_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let local_a = tempfile::tempdir().expect("tempdir");
+        let local_b = tempfile::tempdir().expect("tempdir");
+
+        let sync_a = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-a",
+        );
+        let mut a = ConsoleState::with_store_and_sync(
+            Some(local_a.path().join("console-custom.json")),
+            Some(sync_a),
+        );
+        a.draft_name = "Fleet status".to_owned();
+        a.draft_command = "meshctl fleet status".to_owned();
+        assert!(a.add_custom());
+
+        let sync_b = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-b",
+        );
+        let mut b = ConsoleState::with_store_and_sync(
+            Some(local_b.path().join("console-custom.json")),
+            Some(sync_b),
+        );
+        // Opening is what refolds the merged mesh view (the `refresh_presence`
+        // "refreshed on each open" cadence restated) — the constructor above
+        // already folds once too, so this also proves a SECOND refold
+        // (on open) re-reads rather than just trusting the first.
+        b.toggle();
+        assert_eq!(
+            b.custom.entries,
+            vec![CustomEntry {
+                name: "Fleet status".to_owned(),
+                command: "meshctl fleet status".to_owned(),
+            }],
+            "seat A's add roamed to seat B"
+        );
+    }
+
+    #[test]
+    fn win7_8_removing_a_custom_entry_converges_mesh_wide_even_for_another_seats_entry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let local_a = tempfile::tempdir().expect("tempdir");
+        let local_b = tempfile::tempdir().expect("tempdir");
+
+        let sync_a = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-a",
+        );
+        let mut a = ConsoleState::with_store_and_sync(
+            Some(local_a.path().join("console-custom.json")),
+            Some(sync_a),
+        );
+        a.draft_name = "Fleet status".to_owned();
+        a.draft_command = "meshctl fleet status".to_owned();
+        assert!(a.add_custom());
+
+        let sync_b = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-b",
+        );
+        let mut b = ConsoleState::with_store_and_sync(
+            Some(local_b.path().join("console-custom.json")),
+            Some(sync_b),
+        );
+        b.toggle();
+        assert_eq!(b.custom.entries.len(), 1, "seat B sees seat A's entry");
+
+        // Seat B removes an entry it never itself added.
+        b.remove_custom(0);
+        assert!(b.custom.entries.is_empty(), "seat B's own view drops it");
+
+        // Seat A folds the remove back on its next open.
+        let sync_a2 = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-a",
+        );
+        let mut a2 = ConsoleState::with_store_and_sync(
+            Some(local_a.path().join("console-custom.json")),
+            Some(sync_a2),
+        );
+        a2.toggle();
+        assert!(
+            a2.custom.entries.is_empty(),
+            "seat B's remove of seat A's entry roamed back to seat A"
+        );
+    }
+
+    #[test]
+    fn win7_8_without_a_workgroup_root_custom_entries_stay_purely_local() {
+        // `with_store` (the constructor every pre-existing test in this file
+        // uses) leaves the sync session `None` — confirms the pre-WIN7-8
+        // local-only contract is completely unchanged for every caller that
+        // doesn't explicitly opt in via `with_store_and_sync`/`for_shell`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("console-custom.json");
+        let mut s = ConsoleState::with_store(Some(store));
+        s.draft_name = "Fleet status".to_owned();
+        s.draft_command = "meshctl fleet status".to_owned();
+        assert!(s.add_custom());
+        s.toggle(); // would refold from a sync session if one were wired in
+        assert_eq!(s.custom.entries.len(), 1);
+    }
+
+    // ── WIN7-8: transient UI state is NEVER published (lock #21's other half) ──
+    //
+    // Design doc lock #21: "transient state (menu open/closed, scroll
+    // position, which group is expanded) stays local per seat." Investigated
+    // before writing these: this module has no persisted "scroll position"
+    // field at all (scroll offset is owned entirely by egui's own internal
+    // `ScrollArea` memory, never read or serialized by this crate) and no
+    // "which group is expanded" concept either (the rail's `jump` field is a
+    // one-shot scroll TRIGGER drained by the next render, not a persisted
+    // expand/collapse state — the list pane always shows every group, it is
+    // not an accordion) — both are already local-only purely by construction,
+    // with nothing in this crate that could even attempt to publish them.
+    // The tests below pin the closest honest, real proof: driving every
+    // piece of `ConsoleState`'s OWN transient state (open/close, jump,
+    // focus) against a REAL, ready sync session never creates a synced
+    // record, and a synced record that DOES exist (from a real Custom-entry
+    // add) never carries any of it.
+
+    #[test]
+    fn win7_8_opening_and_closing_the_panel_never_writes_to_the_synced_store() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sync = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-a",
+        );
+        let mut s = ConsoleState::with_store_and_sync(None, Some(sync));
+        for _ in 0..5 {
+            s.toggle(); // open
+            s.toggle(); // close
+        }
+        let identity_dir = root
+            .path()
+            .join(custom_sync::CUSTOM_SYNC_SUBDIR)
+            .join("matthew");
+        assert!(
+            !identity_dir.exists(),
+            "open/close activity alone must never create a synced record"
+        );
+    }
+
+    #[test]
+    fn win7_8_jump_scroll_and_focus_movement_never_write_to_the_synced_store() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sync = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-a",
+        );
+        let mut s = ConsoleState::with_store_and_sync(None, Some(sync));
+        s.toggle();
+        // The rail's jump-scroll target and the keyboard focus ring — the
+        // closest things to a "scroll position" / "which group is active"
+        // this module actually has.
+        s.jump = Some(2);
+        s.focus = 3;
+        s.focus_moved = true;
+        let identity_dir = root
+            .path()
+            .join(custom_sync::CUSTOM_SYNC_SUBDIR)
+            .join("matthew");
+        assert!(
+            !identity_dir.exists(),
+            "jump-scroll/focus activity alone must never create a synced record"
+        );
+    }
+
+    #[test]
+    fn win7_8_the_synced_record_carries_only_custom_entry_data_never_transient_ui_state() {
+        // A belt-and-suspenders proof over the RAW JSON on disk (not just the
+        // typed shape, which already forbids this by construction): add a
+        // real entry (so a file actually gets written), drive open/close and
+        // jump/focus around it, then read the file back and confirm it names
+        // only what CONSOLE-4's Custom entries actually are.
+        let root = tempfile::tempdir().expect("tempdir");
+        let sync = custom_sync::CustomSync::new(
+            custom_sync::CustomSyncStore::new(root.path().to_path_buf()),
+            "matthew",
+            "seat-a",
+        );
+        let mut s = ConsoleState::with_store_and_sync(None, Some(sync));
+        s.toggle();
+        s.jump = Some(1);
+        s.focus = 4;
+        s.draft_name = "Fleet status".to_owned();
+        s.draft_command = "meshctl fleet status".to_owned();
+        assert!(s.add_custom());
+        s.toggle();
+        s.toggle();
+
+        let path = root
+            .path()
+            .join(custom_sync::CUSTOM_SYNC_SUBDIR)
+            .join("matthew")
+            .join("seat-a.json");
+        let raw = std::fs::read_to_string(&path).expect("the synced record was written");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(v["entries"][0]["name"], "Fleet status");
+        assert_eq!(v["entries"][0]["command"], "meshctl fleet status");
+        for field in [
+            "open", "jump", "focus", "scroll", "expanded", "gate", "arming",
+        ] {
+            assert!(
+                !raw.contains(field),
+                "the synced record must never mention transient UI state \
+                 ({field}), got: {raw}"
+            );
+        }
     }
 
     // ── WIN7-5: the redesigned right pane (locks #10/#11/#14) ────────────────

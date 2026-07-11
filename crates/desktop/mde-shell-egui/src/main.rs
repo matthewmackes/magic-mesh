@@ -381,7 +381,10 @@ impl Shell {
             local_host: local_hostname(),
             vdock: dock::DockState::default(),
             start_menu: start_menu::StartMenuState::default(),
-            console: console::ConsoleState::default(),
+            // WIN7-8 (lock #21) — `for_shell` (not bare `default`) so the real
+            // shell also gets mesh-wide Custom-entry sync; see `console.rs`'s
+            // `custom_sync` field doc for why the two constructors are split.
+            console: console::ConsoleState::for_shell(),
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
             media_video: VideoTextureCache::default(),
