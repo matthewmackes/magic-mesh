@@ -340,6 +340,12 @@ pub(crate) struct ChatState {
     /// View → Unread Only (MENU-2): the roster rail lists only conversations
     /// carrying unread (self + the open one stay visible).
     unread_only: bool,
+    /// shell-ux-11 — the last Bus-publish failure, surfaced as an inline DANGER
+    /// note under the composer (mirrors the datacenter `last_error` idiom). Set
+    /// when a send / file-send / mute publish fails so the draft is KEPT and the
+    /// operator sees why, instead of the message being silently destroyed; cleared
+    /// on the next successful send.
+    last_error: Option<String>,
     last_poll: Option<Instant>,
 }
 
@@ -365,6 +371,7 @@ impl Default for ChatState {
             show_clips: true,
             show_messages: true,
             unread_only: false,
+            last_error: None,
             last_poll: None,
         }
     }
@@ -950,7 +957,7 @@ impl ChatState {
             // remote desktop. Only for a peer: you don't Call / Remote-Control your
             // own node (the self-contact is alerts/clips only, lock 17).
             if !is_self {
-                contact_actions(ui, bus_root.as_deref(), host, muted);
+                contact_actions(ui, bus_root.as_deref(), host, muted, &mut self.last_error);
             }
         }
         ui.separator();
@@ -1088,7 +1095,11 @@ impl ChatState {
                         .on_hover_text(format!("Mute {source} notification surfaces"))
                         .changed()
                     {
-                        publish_mute(self.bus_root.as_deref(), "source", &source, muted);
+                        // Best-effort: this &self control holds a borrow of `items`,
+                        // so it can't reach `last_error`; the toggle is retriable and
+                        // the worker republishes the true policy (the per-contact and
+                        // per-room mute buttons DO surface via `mute_button`).
+                        let _ = publish_mute(self.bus_root.as_deref(), "source", &source, muted);
                     }
                 }
             });
@@ -1144,22 +1155,40 @@ impl ChatState {
 
         let text = self.draft.trim().to_string();
         if send && !text.is_empty() {
-            self.send(host, &text);
-            self.draft.clear();
+            // shell-ux-11: clear the draft ONLY on a successful publish; a Bus
+            // failure KEEPS the message + surfaces why, never silently destroys it.
+            match self.send(host, &text) {
+                Ok(()) => {
+                    self.draft.clear();
+                    self.last_error = None;
+                }
+                Err(e) => self.last_error = Some(e),
+            }
         }
         let path = self.attach_path.trim().to_string();
         if send_file && !path.is_empty() {
-            self.send_file(host, Path::new(&path));
-            self.attach_path.clear();
+            match self.send_file(host, Path::new(&path)) {
+                Ok(()) => {
+                    self.attach_path.clear();
+                    self.last_error = None;
+                }
+                Err(e) => self.last_error = Some(e),
+            }
+        }
+        // The inline DANGER note (mirrors the datacenter `last_error` idiom): a
+        // failed send stays visible right under the composer with the draft intact.
+        if let Some(err) = self.last_error.as_deref() {
+            ui.add_space(Style::SP_XS);
+            ui.colored_label(Style::DANGER, err);
         }
     }
 
     /// Publish `action/chat/send` `{scope:"peer", to, text}` to the local Bus —
-    /// the worker signs, persists, and relays it (best-effort; a missing Bus is a
-    /// silent no-op, the honest solo-host state).
-    fn send(&self, to: &str, text: &str) {
+    /// the worker signs, persists, and relays it. Returns the publish result so the
+    /// composer keeps the draft + surfaces the error on failure (shell-ux-11).
+    fn send(&self, to: &str, text: &str) -> Result<(), String> {
         let body = serde_json::json!({ "scope": "peer", "to": to, "text": text }).to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body);
+        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body)
     }
 
     /// Offer `path` to the `to` contact (lock 15, file kind): fire the real
@@ -1168,7 +1197,7 @@ impl ChatState {
     /// carrying an inline `file` descriptor. The worker relaying the descriptor into
     /// a rich [`MessageKind::File`] card is the integration seam — until then the
     /// offer still shows as its human-readable `text`, never faked.
-    fn send_file(&self, to: &str, path: &Path) {
+    fn send_file(&self, to: &str, path: &Path) -> Result<(), String> {
         let name = path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
             |n| n.to_string_lossy().into_owned(),
@@ -1182,7 +1211,7 @@ impl ChatState {
             "conflict": "rename",
         })
         .to_string();
-        publish(self.bus_root.as_deref(), ACTION_FILE_SEND_TO, &send_to);
+        publish(self.bus_root.as_deref(), ACTION_FILE_SEND_TO, &send_to)?;
         // 2) The conversation offer — human text now, an upgradeable `file` field for
         //    the worker's File-card fold.
         let offer = serde_json::json!({
@@ -1192,7 +1221,9 @@ impl ChatState {
             "file": { "name": name, "size_bytes": size_bytes },
         })
         .to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &offer);
+        // The offer publish carries the user's intent; surface its failure so the
+        // attach path is kept for a retry (shell-ux-11).
+        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &offer)
     }
 
     /// The conversation pane for the open room (NOTIFY-CHAT-5): header (name, kind,
@@ -1255,7 +1286,14 @@ impl ChatState {
                 self.room_action("dissolve", id, None);
                 self.selected = None;
             }
-            mute_button(ui, bus_root.as_deref(), "room", id, room_muted);
+            mute_button(
+                ui,
+                bus_root.as_deref(),
+                "room",
+                id,
+                room_muted,
+                &mut self.last_error,
+            );
         });
         ui.separator();
 
@@ -1322,17 +1360,27 @@ impl ChatState {
         ui.add_space(Style::SP_XS);
         let text = self.draft.trim().to_string();
         if send && !text.is_empty() {
-            self.send_room(id, &text);
-            self.draft.clear();
+            // shell-ux-11: clear only on a successful publish; keep + surface on fail.
+            match self.send_room(id, &text) {
+                Ok(()) => {
+                    self.draft.clear();
+                    self.last_error = None;
+                }
+                Err(e) => self.last_error = Some(e),
+            }
+        }
+        if let Some(err) = self.last_error.as_deref() {
+            ui.add_space(Style::SP_XS);
+            ui.colored_label(Style::DANGER, err);
         }
     }
 
     /// Publish `action/chat/send` `{scope:"room", to:<id>, text}` — the worker signs
     /// it, appends to the room's shared Syncthing log, and fans it out to each online
     /// member (best-effort; a missing Bus is a silent no-op).
-    fn send_room(&self, id: &str, text: &str) {
+    fn send_room(&self, id: &str, text: &str) -> Result<(), String> {
         let body = serde_json::json!({ "scope": "room", "to": id, "text": text }).to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body);
+        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body)
     }
 
     /// Create an ad-hoc room named `name`: derive a stable id from the name and fire
@@ -1343,7 +1391,8 @@ impl ChatState {
             return;
         }
         let body = serde_json::json!({ "op": "create", "id": id, "name": name }).to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &body);
+        // Best-effort: the create op is retriable and the worker owns room state.
+        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &body);
     }
 
     /// Fire an `action/chat/room` lifecycle op (`join` / `dissolve`) for room `id`.
@@ -1352,7 +1401,8 @@ impl ChatState {
         if let Some(n) = name {
             obj["name"] = serde_json::Value::String(n.to_string());
         }
-        publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &obj.to_string());
+        // Best-effort: a retriable lifecycle op the worker republishes.
+        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &obj.to_string());
     }
 
     /// Post `action/chat/presence` to set this seat's presence (Available ⇒ clear
@@ -1360,14 +1410,16 @@ impl ChatState {
     /// the self roster entry the roster rail then reads back.
     fn set_presence(&self, choice: PresenceChoice) {
         let body = serde_json::json!({ "presence": choice.wire() }).to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
+        // Best-effort: presence is a retriable toggle the worker republishes.
+        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
     }
 
     /// Post `action/chat/presence` to set this seat's free-text status (empty ⇒
     /// clear at the worker). Carried on the same action the worker republishes.
     fn set_status(&self, status: Option<&str>) {
         let body = serde_json::json!({ "status": status }).to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
+        // Best-effort: a retriable status the worker republishes.
+        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
     }
 
     /// Whether the View feed filters admit a message of `kind` (MENU-2). The
@@ -1437,7 +1489,8 @@ impl ChatState {
     /// Post `action/chat/notify-prefs` to update the persisted alert threshold.
     fn set_notify_threshold(&self, threshold: Severity) {
         let body = serde_json::json!({ "threshold": threshold.tag() }).to_string();
-        publish(self.bus_root.as_deref(), ACTION_CHAT_NOTIFY_PREFS, &body);
+        // Best-effort: a retriable pref the worker republishes.
+        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_NOTIFY_PREFS, &body);
     }
 
     /// Read the fleet-wide DND toggle. Missing Bus state honestly reads as off.
@@ -1859,7 +1912,10 @@ mod menubar {
                     Selection::Room(id) => ("room", id.clone(), state.is_room_muted(id)),
                 };
                 // The SAME publish the row mute button uses — flip the persisted policy.
-                super::publish_mute(state.bus_root.as_deref(), target, &id, !muted);
+                if let Err(e) = super::publish_mute(state.bus_root.as_deref(), target, &id, !muted)
+                {
+                    state.last_error = Some(e);
+                }
             }
             MenuAction::CloseConversation => state.selected = None,
             MenuAction::ToggleAlerts => state.show_alerts = !state.show_alerts,
@@ -1875,14 +1931,25 @@ mod menubar {
                 match state.selected.clone() {
                     Some(Selection::Contact(host)) => {
                         if state.roster.as_ref().is_some_and(|r| !r.is_self(&host)) {
-                            state.send(&host, &text);
-                            state.draft.clear();
+                            // shell-ux-11: keep the draft + surface on a failed send.
+                            match state.send(&host, &text) {
+                                Ok(()) => {
+                                    state.draft.clear();
+                                    state.last_error = None;
+                                }
+                                Err(e) => state.last_error = Some(e),
+                            }
                         }
                     }
                     Some(Selection::Room(id)) => {
                         if state.room_descriptor(&id).is_some() {
-                            state.send_room(&id, &text);
-                            state.draft.clear();
+                            match state.send_room(&id, &text) {
+                                Ok(()) => {
+                                    state.draft.clear();
+                                    state.last_error = None;
+                                }
+                                Err(e) => state.last_error = Some(e),
+                            }
                         }
                     }
                     Some(Selection::Notifications) | None => {}
@@ -2066,7 +2133,7 @@ mod menubar {
         }
 
         #[test]
-        fn send_draft_gates_like_the_composer_and_clears_on_send() {
+        fn send_draft_gates_like_the_composer_and_keeps_the_draft_on_bus_failure() {
             let mut state = peered_state();
             assert!(!can_send(&state), "empty draft can't send");
             state.draft = "hello".into();
@@ -2075,11 +2142,36 @@ mod menubar {
             assert!(!can_send(&state), "the self alert timeline has no composer");
             state.selected = Some(Selection::Contact("nyc3".into()));
             assert!(can_send(&state));
-            // The publish is best-effort (no Bus dir in a test) — the draft still
-            // clears, proving the send seam ran.
+            // shell-ux-11: with no Bus dir the publish fails, so the draft is KEPT
+            // (never silently destroyed) and the failure is surfaced inline.
             state.bus_root = None;
             super::apply(&mut state, MenuAction::SendDraft);
-            assert!(state.draft.is_empty(), "a sent draft clears");
+            assert_eq!(
+                state.draft, "hello",
+                "a failed send keeps the draft to retry"
+            );
+            assert!(
+                state.last_error.is_some(),
+                "a failed send surfaces why it didn't go"
+            );
+        }
+
+        #[test]
+        fn send_draft_clears_the_draft_on_a_successful_publish() {
+            // shell-ux-11: the composer's other half — a successful publish clears
+            // the draft AND any prior error note (the same seam the composer runs).
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut state = peered_state();
+            state.bus_root = Some(tmp.path().join("bus"));
+            state.selected = Some(Selection::Contact("nyc3".into()));
+            state.draft = "hello".into();
+            state.last_error = Some("a stale error".into());
+            super::apply(&mut state, MenuAction::SendDraft);
+            assert!(state.draft.is_empty(), "a successful send clears the draft");
+            assert!(
+                state.last_error.is_none(),
+                "a successful send clears the prior error note"
+            );
         }
 
         #[test]
@@ -2171,17 +2263,22 @@ fn room_id_from_name(name: &str) -> String {
 }
 
 /// Publish `body` to `topic` on the local Bus via the persist-first path (the same
-/// discipline as [`ChatState::send`] and `discovery::publish`). Best-effort — a
-/// missing Bus directory / open failure is a silent no-op (the honest solo-host
-/// state), never a panic.
-fn publish(bus_root: Option<&Path>, topic: &str, body: &str) {
+/// discipline as [`ChatState::send`] and `discovery::publish`). Returns the failure
+/// reason (missing Bus dir / open error / write error) so a caller carrying user
+/// intent — a composed message — can KEEP the draft and surface why it didn't send
+/// (shell-ux-11), instead of the message being silently destroyed. Never panics.
+/// Callers whose intent is a retriable, worker-republished toggle stay best-effort
+/// with an explicit `let _ = publish(…)`.
+fn publish(bus_root: Option<&Path>, topic: &str, body: &str) -> Result<(), String> {
     let Some(root) = bus_root else {
-        return;
+        return Err("No local Bus — the mesh daemon may be down.".to_string());
     };
-    let Ok(persist) = Persist::open(root.to_path_buf()) else {
-        return;
-    };
-    let _ = persist.write(topic, Priority::Default, None, Some(body));
+    let persist = Persist::open(root.to_path_buf())
+        .map_err(|e| format!("Couldn't open the local Bus: {e}"))?;
+    persist
+        .write(topic, Priority::Default, None, Some(body))
+        .map_err(|e| format!("Bus write failed: {e}"))?;
+    Ok(())
 }
 
 /// Raise a click-to-navigate chyron on the shell's ONE toast lane
@@ -2200,7 +2297,8 @@ fn navigate_via_toast(bus_root: Option<&Path>, source_host: &str, headline: &str
         "action_verb": verb,
     })
     .to_string();
-    publish(bus_root, TOAST_TOPIC, &body);
+    // Best-effort: a navigation chyron, not user-composed content.
+    let _ = publish(bus_root, TOAST_TOPIC, &body);
 }
 
 /// Read the newest (latest-wins) message on `topic` and deserialize its body.
@@ -2599,7 +2697,13 @@ fn notification_sources(items: &[NotificationItem<'_>]) -> Vec<String> {
 /// VDI connect are integration-gated — the honest reachable launch, never a faked
 /// session); Mute posts `action/chat/mute`, which the worker drains into its
 /// `NotifyPrefs` and republishes so `muted` reflects the true persisted policy.
-fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str, muted: bool) {
+fn contact_actions(
+    ui: &mut egui::Ui,
+    bus_root: Option<&Path>,
+    host: &str,
+    muted: bool,
+    err: &mut Option<String>,
+) {
     ui.horizontal(|ui| {
         if ui
             .button("\u{1F4DE} Call")
@@ -2615,7 +2719,7 @@ fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str, muted
         {
             request_host_desktop(bus_root, host);
         }
-        mute_button(ui, bus_root, "contact", host, muted);
+        mute_button(ui, bus_root, "contact", host, muted, err);
     });
 }
 
@@ -2623,7 +2727,14 @@ fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str, muted
 /// (worker-published) state; clicking posts `action/chat/mute` with the flipped
 /// value so the worker updates + republishes the policy (the round-trip that
 /// makes the toggle real, not a local-only switch — §7).
-fn mute_button(ui: &mut egui::Ui, bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
+fn mute_button(
+    ui: &mut egui::Ui,
+    bus_root: Option<&Path>,
+    target: &str,
+    id: &str,
+    muted: bool,
+    err: &mut Option<String>,
+) {
     let (glyph, hint) = if muted {
         (
             "\u{1F514} Unmute",
@@ -2636,16 +2747,25 @@ fn mute_button(ui: &mut egui::Ui, bus_root: Option<&Path>, target: &str, id: &st
         )
     };
     if ui.button(glyph).on_hover_text(hint).clicked() {
-        publish_mute(bus_root, target, id, !muted);
+        // shell-ux-11: surface a failed mute rather than silently dropping it.
+        if let Err(e) = publish_mute(bus_root, target, id, !muted) {
+            *err = Some(e);
+        }
     }
 }
 
 /// Publish `action/chat/mute` `{target, id, muted}` to the local Bus — the worker
-/// drains it into this seat's `NotifyPrefs` (best-effort; a missing Bus is a
-/// silent no-op, the honest solo-host state).
-fn publish_mute(bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
+/// drains it into this seat's `NotifyPrefs`. Returns the publish result so the mute
+/// controls surface a failure into `last_error` (shell-ux-11) instead of silently
+/// dropping it.
+fn publish_mute(
+    bus_root: Option<&Path>,
+    target: &str,
+    id: &str,
+    muted: bool,
+) -> Result<(), String> {
     let body = serde_json::json!({ "target": target, "id": id, "muted": muted }).to_string();
-    publish(bus_root, ACTION_CHAT_MUTE, &body);
+    publish(bus_root, ACTION_CHAT_MUTE, &body)
 }
 
 fn publish_alert_action(bus_root: Option<&Path>, msg: &Message, action: &AlertAction, armed: bool) {
@@ -2659,7 +2779,11 @@ fn publish_alert_action(bus_root: Option<&Path>, msg: &Message, action: &AlertAc
         "armed": armed,
     })
     .to_string();
-    publish(bus_root, ACTION_CHAT_ALERT_ACTION, &body);
+    // Best-effort, but no longer a buried silent swallow (shell-ux-11): the action
+    // button stays on screen after a failed publish, so nothing is destroyed and the
+    // operator can click again — unlike a composed draft, which is why alert actions
+    // don't thread through the immediate-mode message tree to `last_error`.
+    let _ = publish(bus_root, ACTION_CHAT_ALERT_ACTION, &body);
 }
 
 fn now_unix_ms() -> i64 {
@@ -2687,7 +2811,8 @@ fn local_hostname() -> String {
 /// the live register/call is integration-gated.
 fn dial_peer(bus_root: Option<&Path>, host: &str) {
     let body = serde_json::json!({ "peer": host }).to_string();
-    publish(bus_root, ACTION_VOICE_DIAL, &body);
+    // Best-effort: a retriable dial verb, no composed content to lose.
+    let _ = publish(bus_root, ACTION_VOICE_DIAL, &body);
 }
 
 /// Translate a folded alert's `action_verb` (`action/shell/goto/<surface>`, lock
@@ -2854,11 +2979,15 @@ mod tests {
         assert!(alert_nav_verb(None).is_none());
     }
 
-    /// The Bus-writing action helpers are best-effort: with no Bus directory they
-    /// are a silent no-op (the honest solo-host state), never a panic.
+    /// The Bus-writing action helpers never panic without a Bus directory: the
+    /// best-effort ones no-op, and the message-carrying ones report `Err` (so the
+    /// caller can keep the draft) rather than silently dropping it (shell-ux-11).
     #[test]
-    fn action_helpers_are_silent_without_a_bus() {
-        publish(None, "action/x", "{}");
+    fn action_helpers_report_without_a_bus_and_never_panic() {
+        assert!(
+            publish(None, "action/x", "{}").is_err(),
+            "no Bus is an honest Err, not a silent drop"
+        );
         navigate_via_toast(None, "chat", "hi", "shell/goto/files");
         dial_peer(None, "nyc3");
         // send_file opens no Bus either — a ChatState with no bus_root.
@@ -2866,7 +2995,12 @@ mod tests {
             bus_root: None,
             ..ChatState::default()
         };
-        state.send_file("nyc3", Path::new("/tmp/does-not-matter.txt"));
+        assert!(
+            state
+                .send_file("nyc3", Path::new("/tmp/does-not-matter.txt"))
+                .is_err(),
+            "a file send with no Bus reports Err so the attach path is kept"
+        );
     }
 
     /// Every one of the six kinds renders *and* draws its action affordance: build a
@@ -3086,7 +3220,10 @@ mod tests {
             bus_root: None,
             ..ChatState::default()
         };
-        state.send_room("sys:all-fleet", "hi");
+        assert!(
+            state.send_room("sys:all-fleet", "hi").is_err(),
+            "a room send with no Bus reports Err (kept, not silently dropped)"
+        );
         state.create_room("Build Farm");
         state.create_room("***"); // empty slug → refused, still no panic
         state.room_action("join", "ops", None);
@@ -3363,7 +3500,7 @@ mod tests {
         };
 
         state.set_notify_threshold(Severity::Critical);
-        publish_mute(Some(&bus_root), "source", "security", true);
+        publish_mute(Some(&bus_root), "source", "security", true).expect("mute publishes");
         let persist = Persist::open(bus_root.clone()).expect("persist");
         let prefs_msgs = persist
             .list_since(ACTION_CHAT_NOTIFY_PREFS, None)
@@ -3509,7 +3646,7 @@ mod tests {
         state.set_status(Some("brb"));
         state.set_status(Some("")); // empty clears at the worker
         state.set_status(None);
-        publish_mute(None, "contact", "nyc3", true);
-        publish_mute(None, "room", "ops", false);
+        assert!(publish_mute(None, "contact", "nyc3", true).is_err());
+        assert!(publish_mute(None, "room", "ops", false).is_err());
     }
 }

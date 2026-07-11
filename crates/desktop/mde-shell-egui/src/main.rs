@@ -67,6 +67,8 @@ mod vdi;
 mod web;
 mod workbench;
 
+use std::time::{Duration, Instant};
+
 use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 
 use mde_seat::hotkeys::HotkeyAction;
@@ -90,6 +92,25 @@ use dock::Surface;
 // listener source for `loginctl lock-session` (the trait's `poll`).
 use lock_signal::LockSignals;
 use workbench::Plane;
+
+/// perf-11 — the seven Workbench planes share a 5 s `last_poll: None` + `REFRESH`
+/// gate. Polled cold on one frame they all fire together AND re-expire in lockstep
+/// every 5 s: seven back-to-back `Persist::open` + `list_topics` + full-read frame
+/// spikes. Delaying each plane's FIRST poll by a distinct prime offset (all under
+/// one `REFRESH` period) phase-shifts its otherwise-identical 5 s cadence so the
+/// reads interleave instead of piling onto one frame — without touching the 5 s
+/// period or any poll body. Ordered to match the poll sequence in `render`; the
+/// first offset is 0 so the Fleet roster still reads immediately on open. Distinct
+/// by construction (asserted in the tests).
+const WORKBENCH_POLL_STAGGER: [Duration; 7] = [
+    Duration::from_millis(0),
+    Duration::from_millis(700),
+    Duration::from_millis(1400),
+    Duration::from_millis(2100),
+    Duration::from_millis(2800),
+    Duration::from_millis(3500),
+    Duration::from_millis(4200),
+];
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
@@ -357,6 +378,12 @@ struct Shell {
     /// system bus / logind (headless CI, the windowed fallback) — honest, never a
     /// faked signal. The idle/lid Lock actions + the boot-gate feed the SAME curtain.
     lock_signal: lock_signal::LogindLockSource,
+    /// perf-11 — the monotonic clock the Workbench-plane poll stagger measures its
+    /// per-plane first-poll offsets ([`WORKBENCH_POLL_STAGGER`]) against. Set the
+    /// first frame the Workbench comes into view and cleared when it leaves, so
+    /// every open re-staggers the seven planes' 5 s cadences instead of firing them
+    /// on one frame. `None` while the Workbench is not in view.
+    workbench_poll_epoch: Option<Instant>,
 }
 
 impl Shell {
@@ -417,6 +444,7 @@ impl Shell {
             power_honor: power_honor::PowerHonor::default(),
             curtain: curtain::Curtain::pam(),
             lock_signal: lock_signal::LogindLockSource::new(ctx),
+            workbench_poll_epoch: None,
         };
 
         // CURTAIN-3 boot-gate (design lock 2): when the persisted policy requires a
@@ -912,18 +940,55 @@ impl Shell {
         // without operator input; the polls self-gate and keep the repaint heartbeat
         // alive. The app surfaces drive their own repaints from their workers.
         if self.nav.expanded && self.nav.surface == Surface::Workbench {
-            self.datacenter.poll(ctx);
-            self.thisnode.poll(ctx);
-            self.surface_card.poll(ctx);
-            self.network.poll(ctx);
-            self.controller.poll(ctx);
-            self.provisioning.poll(ctx);
-            // The Services flow only actually reads while a request is in
-            // flight (it self-gates on `pending`), so this is free otherwise.
-            self.services.poll(ctx);
+            // perf-11: stagger the seven planes' FIRST poll by a distinct offset so
+            // their shared 5 s cadences interleave instead of all firing on this
+            // frame (and re-expiring in lockstep every 5 s). `elapsed` is measured
+            // from the frame the Workbench came into view; a plane polls once its
+            // offset has passed, after which its own 5 s gate owns the (now
+            // phase-shifted) cadence. The offsets/poll order stay in lockstep with
+            // WORKBENCH_POLL_STAGGER.
+            let elapsed = self
+                .workbench_poll_epoch
+                .get_or_insert_with(Instant::now)
+                .elapsed();
+            let due = |i: usize| elapsed >= WORKBENCH_POLL_STAGGER[i];
+            if due(0) {
+                self.datacenter.poll(ctx);
+            }
+            if due(1) {
+                self.thisnode.poll(ctx);
+            }
+            if due(2) {
+                self.surface_card.poll(ctx);
+            }
+            if due(3) {
+                self.network.poll(ctx);
+            }
+            if due(4) {
+                self.controller.poll(ctx);
+            }
+            if due(5) {
+                self.provisioning.poll(ctx);
+            }
+            if due(6) {
+                // The Services flow only actually reads while a request is in
+                // flight (it self-gates on `pending`), so this is free otherwise.
+                self.services.poll(ctx);
+            }
+            // Keep frames flowing through the stagger warm-up so each plane's first
+            // poll actually lands at its own offset instead of collapsing onto the
+            // 5 s heartbeat the first-polled plane requests.
+            if let Some(next) = WORKBENCH_POLL_STAGGER.iter().find(|&&o| o > elapsed) {
+                ctx.request_repaint_after(*next - elapsed);
+            }
             // The Spawn Lighthouse flow (OW-7) self-gates on `pending` too — free
-            // unless a spawn request is awaiting the worker's answer.
+            // unless a spawn request is awaiting the worker's answer; kept off the
+            // stagger so an in-flight spawn answer is never held back.
             self.spawn_lighthouse.poll(ctx);
+        } else {
+            // perf-11: re-arm the stagger so the next Workbench open re-interleaves
+            // the seven planes from a fresh epoch.
+            self.workbench_poll_epoch = None;
         }
 
         // OW-10 — the onboard self-test watch: an all-green verdict landing on the
@@ -1616,6 +1681,29 @@ mod tests {
         );
         assert_eq!(n.surface, Surface::Workbench);
         assert_eq!(n.plane, Plane::ThisNode);
+    }
+
+    #[test]
+    fn workbench_poll_stagger_first_deadlines_are_distinct() {
+        // perf-11: the seven planes' first-poll offsets must all differ so their
+        // shared 5 s cadences interleave instead of firing on one frame.
+        let offsets = super::WORKBENCH_POLL_STAGGER;
+        for i in 0..offsets.len() {
+            for j in (i + 1)..offsets.len() {
+                assert_ne!(
+                    offsets[i], offsets[j],
+                    "planes {i} and {j} share a first-poll deadline — they'd fire in lockstep"
+                );
+            }
+        }
+        // The Fleet roster (offset 0) still reads immediately on open.
+        assert_eq!(offsets[0], super::Duration::ZERO);
+        // Every offset lands inside one 5 s REFRESH period, so the whole stagger
+        // warm-up completes before the first plane is due again.
+        assert!(
+            offsets.iter().all(|o| *o < super::Duration::from_secs(5)),
+            "an offset >= REFRESH would delay a plane's first read past its own cadence"
+        );
     }
 
     #[test]

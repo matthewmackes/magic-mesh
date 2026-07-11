@@ -627,6 +627,13 @@ pub(crate) struct DatacenterState {
     form: CreateForm,
     /// The last lifecycle-publish error, surfaced inline.
     last_error: Option<String>,
+    /// shell-ux-5 — the single VM row whose Stop is armed (awaiting Confirm), as
+    /// `(host, name)`. Only one row arms at a time; a Stop elsewhere re-arms to it.
+    stop_arm: Option<(String, String)>,
+    /// shell-ux-5 — VMs with a confirmed Stop in flight → when it was dispatched.
+    /// The row shows an optimistic "stopping…" until the roster fold reflects the
+    /// stop (the key leaves `running`) or `STOP_PENDING_TIMEOUT` re-exposes Stop.
+    stopping: BTreeMap<(String, String), Instant>,
     /// When the Bus was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
 }
@@ -640,6 +647,8 @@ impl Default for DatacenterState {
             create_for: None,
             form: CreateForm::default(),
             last_error: None,
+            stop_arm: None,
+            stopping: BTreeMap::new(),
             last_poll: None,
         }
     }
@@ -704,8 +713,17 @@ impl DatacenterState {
             create_for,
             form,
             last_error,
+            stop_arm,
+            stopping,
             ..
         } = self;
+
+        // shell-ux-5: drop optimistic "stopping…" markers the roster now reflects
+        // (the VM left `running`) or that outlived the timeout, so a stop that never
+        // took re-exposes its Stop control instead of hanging on "stopping…".
+        stopping.retain(|(h, n), since| {
+            since.elapsed() < STOP_PENDING_TIMEOUT && roster_shows_running(nodes.as_slice(), h, n)
+        });
 
         if let Some(err) = last_error.as_deref() {
             ui.colored_label(Style::DANGER, err);
@@ -736,7 +754,7 @@ impl DatacenterState {
             .show(ui, |ui| {
                 for node in nodes.iter() {
                     ui.group(|ui| {
-                        show_node(ui, node, create_for, form, &mut pending);
+                        show_node(ui, node, create_for, form, &mut pending, stop_arm, stopping);
                     });
                     ui.add_space(Style::SP_S);
                 }
@@ -804,6 +822,8 @@ fn show_node(
     create_for: &mut Option<String>,
     form: &mut CreateForm,
     pending: &mut Option<Lifecycle>,
+    stop_arm: &mut Option<(String, String)>,
+    stopping: &mut BTreeMap<(String, String), Instant>,
 ) {
     // Header — host + KVM health summary.
     ui.horizontal(|ui| {
@@ -870,7 +890,7 @@ fn show_node(
         } else {
             for inst in &node.instances {
                 ui.horizontal(|ui| {
-                    show_instance_row(ui, &node.host, inst, pending);
+                    show_instance_row(ui, &node.host, inst, pending, stop_arm, stopping);
                 });
             }
         }
@@ -1143,13 +1163,80 @@ fn security_update_label(s: &BrowserSecurityUpdateStat) -> (Color32, String) {
     (tone, label)
 }
 
+/// How long an optimistic "stopping…" marker holds before the Stop control is
+/// re-exposed for a confirmed request the roster never reflected (a stuck or lost
+/// publish) — so the row can never hang forever on "stopping…".
+const STOP_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The three Stop-control clicks in the two-step arm (shell-ux-5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StopButton {
+    /// Idle → armed: the first click, which only arms this row (no dispatch).
+    Stop,
+    /// Armed → dispatch: the confirm click, which queues the Stop.
+    Confirm,
+    /// Armed → idle: back out without stopping.
+    Cancel,
+}
+
+/// Apply a Stop-control click for `(host, name)` to the shared single-row `arm`
+/// slot. Mirrors the dock power-row's arm-then-confirm gate
+/// ([`crate::dock`]'s `power_arming_stage`) scaled to a per-row Stop: the first
+/// `Stop` arms this row, a second (`Confirm`) disarms and returns the Stop action
+/// to dispatch, `Cancel` disarms. Returns `Some` ONLY on a confirmed click, so a
+/// running VM — plausibly a live brokered desktop — is never stopped on one click.
+fn apply_stop_click(
+    arm: &mut Option<(String, String)>,
+    host: &str,
+    name: &str,
+    click: StopButton,
+) -> Option<Lifecycle> {
+    match click {
+        StopButton::Stop => {
+            *arm = Some((host.to_string(), name.to_string()));
+            None
+        }
+        StopButton::Confirm => {
+            *arm = None;
+            Some(Lifecycle::Stop {
+                host: host.to_string(),
+                name: name.to_string(),
+                force: false,
+            })
+        }
+        StopButton::Cancel => {
+            *arm = None;
+            None
+        }
+    }
+}
+
+/// Whether the roster projection still shows `name` on `host` in the `running`
+/// state — the signal an optimistic "stopping…" marker watches for so it clears
+/// itself the moment the next roster fold reflects the stop.
+fn roster_shows_running(nodes: &[NodeView], host: &str, name: &str) -> bool {
+    nodes.iter().any(|nv| {
+        nv.host == host
+            && nv
+                .instances
+                .iter()
+                .any(|i| i.name == name && i.state.trim() == "running")
+    })
+}
+
 /// One VM roster row: a state pip + name + raw state, and a Start (when not
-/// running) or Stop (when running) button targeted at this node.
+/// running) or a two-step Stop (when running) targeted at this node. Stopping a
+/// running VM is plausibly someone's live brokered desktop, so the Stop arms first
+/// — a DANGER "Confirm stop <name>" + Cancel — matching the typed-arm discipline
+/// the disk controls already require (shell-ux-5). Once confirmed, the row shows an
+/// optimistic "stopping…" until the roster reflects it (or `STOP_PENDING_TIMEOUT`).
 fn show_instance_row(
     ui: &mut egui::Ui,
     host: &str,
     inst: &Instance,
     pending: &mut Option<Lifecycle>,
+    stop_arm: &mut Option<(String, String)>,
+    stopping: &mut BTreeMap<(String, String), Instant>,
 ) {
     let running = inst.state.trim() == "running";
     let dot = if running { Style::OK } else { Style::TEXT_DIM };
@@ -1164,15 +1251,40 @@ fn show_instance_row(
     mde_egui::muted_note(ui, &inst.state);
     ui.add_space(Style::SP_S);
     if running {
-        if ui
+        let key = (host.to_string(), inst.name.clone());
+        if stopping.contains_key(&key) {
+            // Optimistic pending — a confirmed stop is in flight; wait for the
+            // roster fold (or the timeout) rather than offer Stop again.
+            mde_egui::muted_note(ui, "stopping…");
+        } else if stop_arm.as_ref() == Some(&key) {
+            // Armed — a DANGER Confirm (a disabled-by-arming echo isn't needed for a
+            // one-VM stop; the explicit second click is the gate) + a Cancel.
+            if ui
+                .button(
+                    RichText::new(format!("Confirm stop {}", inst.name))
+                        .size(Style::SMALL)
+                        .color(Style::DANGER),
+                )
+                .clicked()
+            {
+                if let Some(action) =
+                    apply_stop_click(stop_arm, host, &inst.name, StopButton::Confirm)
+                {
+                    *pending = Some(action);
+                    stopping.insert(key, Instant::now());
+                }
+            }
+            if ui
+                .button(RichText::new("Cancel").size(Style::SMALL))
+                .clicked()
+            {
+                apply_stop_click(stop_arm, host, &inst.name, StopButton::Cancel);
+            }
+        } else if ui
             .button(RichText::new("Stop").size(Style::SMALL))
             .clicked()
         {
-            *pending = Some(Lifecycle::Stop {
-                host: host.to_string(),
-                name: inst.name.clone(),
-                force: false,
-            });
+            apply_stop_click(stop_arm, host, &inst.name, StopButton::Stop);
         }
     } else if ui
         .button(RichText::new("Start").size(Style::SMALL))
@@ -1480,6 +1592,72 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].instances.len(), 2, "the newer roster wins");
         assert_eq!(nodes[0].roster_at_ms, 9);
+    }
+
+    #[test]
+    fn stop_click_arms_then_confirm_dispatches_and_cancel_disarms() {
+        // shell-ux-5: a running VM is stopped only on a two-step arm, never a
+        // single click.
+        let mut arm: Option<(String, String)> = None;
+
+        // First Stop click only arms this row — no action dispatched.
+        let dispatched = apply_stop_click(&mut arm, "node-a", "vm1", StopButton::Stop);
+        assert!(
+            dispatched.is_none(),
+            "the first Stop click must not dispatch"
+        );
+        assert_eq!(
+            arm,
+            Some(("node-a".to_string(), "vm1".to_string())),
+            "the first click arms this row"
+        );
+
+        // Confirm on the armed row dispatches a non-forced Stop and disarms.
+        let dispatched = apply_stop_click(&mut arm, "node-a", "vm1", StopButton::Confirm);
+        match dispatched {
+            Some(Lifecycle::Stop { host, name, force }) => {
+                assert_eq!(host, "node-a");
+                assert_eq!(name, "vm1");
+                assert!(!force, "the row Stop is graceful, never forced");
+            }
+            other => panic!("Confirm should dispatch a Stop, got {other:?}"),
+        }
+        assert!(arm.is_none(), "Confirm disarms");
+
+        // Re-arm, then Cancel disarms without dispatching anything.
+        apply_stop_click(&mut arm, "node-a", "vm1", StopButton::Stop);
+        assert!(arm.is_some(), "re-armed");
+        let dispatched = apply_stop_click(&mut arm, "node-a", "vm1", StopButton::Cancel);
+        assert!(dispatched.is_none(), "Cancel dispatches nothing");
+        assert!(arm.is_none(), "Cancel disarms");
+    }
+
+    #[test]
+    fn stopping_marker_watches_the_roster_running_state() {
+        // The optimistic "stopping…" marker clears once the roster fold no longer
+        // shows the VM running (or never showed it) — the clear signal in `show`.
+        let instances = vec![roster_body(
+            "node-a",
+            &[("vm1", "running"), ("vm2", "shut off")],
+            5,
+        )];
+        let nodes = project(&[], &instances, &[]);
+        assert!(
+            roster_shows_running(&nodes, "node-a", "vm1"),
+            "vm1 is still running — keep the marker"
+        );
+        assert!(
+            !roster_shows_running(&nodes, "node-a", "vm2"),
+            "vm2 left running — clear the marker"
+        );
+        assert!(
+            !roster_shows_running(&nodes, "node-a", "ghost"),
+            "an unknown VM is not running"
+        );
+        assert!(
+            !roster_shows_running(&nodes, "other-host", "vm1"),
+            "a VM on a different host is not this row"
+        );
     }
 
     #[test]
