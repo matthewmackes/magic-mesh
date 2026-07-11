@@ -68,6 +68,25 @@ pub struct MackesdConfig {
     /// No webhooks by design — operators wire `curl` themselves.
     /// Default: empty (no hooks fire).
     pub alert_hooks: Vec<AlertHookEntry>,
+
+    /// mackesd-03 — master switch for the reconcile worker's
+    /// safe-repair apply step. When `false`, the reconciler is
+    /// observe-only: drift is still detected + surfaced (audit log +
+    /// operator inbox) but no repair action ever fires. Default
+    /// [`crate::worker::DEFAULT_AUTO_REPAIR`] (`true`), so a box with
+    /// no config template keeps the locked opt-out semantics. An
+    /// operator flips this to `false` to fall the fleet back to
+    /// observe-only without a code change.
+    pub auto_repair: bool,
+
+    /// mackesd-03 — blast-radius cap: the maximum number of safe
+    /// repair *actions* (overlay re-probes) the reconcile worker takes
+    /// in a single tick. Overflow drift is deferred to the next tick
+    /// (audit-logged) so a mass-drift event can't trigger a fleet-wide
+    /// probe storm in one pass. Default
+    /// [`crate::worker::DEFAULT_MAX_REPAIRS_PER_TICK`]. `0` takes no
+    /// repair actions (equivalent to observe-only for that tick).
+    pub max_repairs_per_tick: usize,
 }
 
 /// One configured 12.6.4 alert hook (the TOML shape of
@@ -91,6 +110,10 @@ impl Default for MackesdConfig {
             heartbeat_interval_secs: crate::telemetry::HEARTBEAT_INTERVAL_S,
             mesh_latency_sweep_secs: DEFAULT_MESH_LATENCY_SWEEP_SECS,
             alert_hooks: Vec::new(),
+            // mackesd-03 — single source of truth for the repair
+            // defaults is the worker module (not duplicated here).
+            auto_repair: crate::worker::DEFAULT_AUTO_REPAIR,
+            max_repairs_per_tick: crate::worker::DEFAULT_MAX_REPAIRS_PER_TICK,
         }
     }
 }
@@ -361,6 +384,42 @@ some_future_knob = "ignored"
         assert_eq!(
             default_config_path(),
             PathBuf::from("/etc/mackesd/mackesd.toml")
+        );
+    }
+
+    #[test]
+    fn repair_defaults_track_the_worker_consts() {
+        // mackesd-03 — the repair knobs default to the worker's locked
+        // consts (single source of truth), so an un-templated box keeps
+        // auto-repair ON with the default per-tick cap.
+        let d = MackesdConfig::default();
+        assert_eq!(d.auto_repair, crate::worker::DEFAULT_AUTO_REPAIR);
+        assert_eq!(
+            d.max_repairs_per_tick,
+            crate::worker::DEFAULT_MAX_REPAIRS_PER_TICK
+        );
+        assert!(d.auto_repair, "auto-repair is opt-out by default");
+    }
+
+    #[test]
+    fn repair_knobs_parse_from_toml() {
+        // mackesd-03 — an operator turns auto-repair OFF (observe-only)
+        // and/or retunes the blast-radius cap without a code change.
+        let cfg = parse("auto_repair = false\nmax_repairs_per_tick = 4\n").unwrap();
+        assert!(!cfg.auto_repair);
+        assert_eq!(cfg.max_repairs_per_tick, 4);
+        // Unset knobs still fall back to their locked defaults.
+        assert_eq!(cfg.heartbeat_interval_secs, 10);
+    }
+
+    #[test]
+    fn repair_knobs_partial_config_keeps_other_defaults() {
+        // Only auto_repair set → the cap stays at its default.
+        let cfg = parse("auto_repair = false\n").unwrap();
+        assert!(!cfg.auto_repair);
+        assert_eq!(
+            cfg.max_repairs_per_tick,
+            crate::worker::DEFAULT_MAX_REPAIRS_PER_TICK
         );
     }
 

@@ -17,14 +17,35 @@
 //!      and routes each [`crate::reconcile::DriftRow`] to either the
 //!      audit log + repair dispatcher (`repair_now`) or the operator
 //!      inbox (`inbox`).
+//!   4. For the SAFE subset of `repair_now` drift — an
+//!      auto-repairable *missing edge* where THIS node is one of the
+//!      two endpoints — it APPLIES a bounded, idempotent repair:
+//!      [`apply_safe_repairs`] forces a fresh overlay re-probe of the
+//!      peer ([`crate::transport_probe::probe_rtt`]). That probe is a
+//!      TCP SYN through the Nebula tunnel, which both prompts Nebula
+//!      to (re)establish the underlay tunnel for the pair (the actual
+//!      self-heal for a dropped/never-punched hole-punch — the
+//!      "transient hiccup" the drift detector names) and re-measures
+//!      reachability. It is read-only on the peer (discard port),
+//!      idempotent (a probe mutates nothing), and bounded
+//!      ([`DEFAULT_MAX_REPAIRS_PER_TICK`]). Every attempt is
+//!      audit-logged before + after.
 //!
-//! What the worker does NOT do today, per the Phase 12.5 lock and
+//! What the worker deliberately leaves OBSERVE-ONLY (mackesd-03 —
+//! repair only the clearly-safe subset), per the Phase 12.5 lock and
 //! the 12.14+ connectivity scope:
 //!
-//!   * It does NOT push routes through Tailscale or any other
-//!     transport. The take-action step is gated on the connectivity
-//!     layer (12.14+, multi-week scope) — this is an explicit,
-//!     documented scope boundary, not a stub.
+//!   * A missing edge NOT incident to this node. Re-establishing a
+//!     remote A↔B adjacency needs a route push over the connectivity
+//!     layer (12.14+, multi-week scope) — this node has no safe local
+//!     action, so the row is logged `manual-repair-required` and left
+//!     for the operator / the gated layer. Explicit, documented scope
+//!     boundary, not a stub.
+//!   * Every `ManualReview` (extra-edge) drift row. Tearing down an
+//!     observed-but-undesired adjacency is destructive (it could cut
+//!     off a legitimately-recovering peer or mask tampering), so it
+//!     stays in the operator inbox for explicit approval — never
+//!     auto-repaired.
 //!   * It does NOT INSERT into a `pending_changes` table. The
 //!     `SQLite` schema (`migrations/0001_init.sql`) treats
 //!     "pending changes" as `desired_config WHERE state IN
@@ -40,6 +61,7 @@
 //! [`SHUTDOWN_POLL`] so SIGTERM exits the thread in at most that
 //! interval instead of waiting out the full cadence.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -56,6 +78,7 @@ use crate::events::{Event, EventKind};
 use crate::reconcile::{plan_tick, DriftRow, TickPlan};
 use crate::telemetry::{Heartbeat, LinkSample};
 use crate::topology::{calculate, diff, DesiredSnapshot, Edge, EdgeKind, TopologySnapshot};
+use crate::transport_probe::ProbeResult;
 use crate::Result;
 
 /// Reconcile cadence in seconds (Phase 12.5.1 lock — "30 s default").
@@ -72,7 +95,25 @@ pub const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 /// The auto-repair policy flag the worker passes into
 /// `reconcile::plan_tick`. True by default per the 12.5.3 lock —
 /// auto-repair is opt-out via desired-config policy, not opt-in.
+///
+/// This is the *default*; the live flag comes from the daemon config
+/// (`/etc/mackesd/mackesd.toml` `auto_repair = false` turns the apply
+/// step OFF and falls the whole reconciler back to observe-only, per
+/// [`load_repair_policy`]).
 pub const DEFAULT_AUTO_REPAIR: bool = true;
+
+/// Blast-radius cap: the maximum number of *safe repair actions* the
+/// worker will take in a single reconcile tick (mackesd-03 guardrail).
+///
+/// A mass-drift event (e.g. a lighthouse flap that drops half the
+/// observed adjacencies at once) must not let the daemon fire a probe
+/// storm across the whole fleet in one pass. When the number of
+/// auto-repairable, incident missing edges exceeds this cap, the
+/// overflow is *deferred* to the next tick (audit-logged, `warn`) —
+/// the reconciler converges over several ticks instead of thrashing in
+/// one. Overridable via `/etc/mackesd/mackesd.toml`
+/// `max_repairs_per_tick`.
+pub const DEFAULT_MAX_REPAIRS_PER_TICK: usize = 16;
 
 /// One reconcile tick's result. Captured so `mackesd reconcile
 /// --once` can serialize it to JSON and so tests can assert against
@@ -234,6 +275,34 @@ fn interruptible_sleep(total: Duration, shutdown: &Arc<AtomicBool>) {
 /// logged and skipped — one corrupt heartbeat doesn't poison the
 /// whole tick.
 pub fn tick(workgroup_root: &Path, node_id: &str, db_path: &Path) -> Result<TickOutcome> {
+    tick_with(
+        workgroup_root,
+        node_id,
+        db_path,
+        &LiveEdgeProber,
+        &load_repair_policy(),
+    )
+}
+
+/// Run one reconcile tick with an injected [`EdgeProber`] + explicit
+/// [`RepairPolicy`] — the seam the tests drive so the safe-repair path
+/// is exercised deterministically (fake prober, no live network) and
+/// the live `mackesd` config can't perturb a test.
+///
+/// [`tick`] is the production entry point: it wires in the live prober
+/// ([`LiveEdgeProber`]) and the operator's on-disk policy
+/// ([`load_repair_policy`]). Same shutdown / error semantics.
+///
+/// # Errors
+///
+/// See [`tick`].
+pub fn tick_with(
+    workgroup_root: &Path,
+    node_id: &str,
+    db_path: &Path,
+    prober: &dyn EdgeProber,
+    policy: &RepairPolicy,
+) -> Result<TickOutcome> {
     let started = Instant::now();
     let started_at_ms = now_ms();
 
@@ -266,12 +335,32 @@ pub fn tick(workgroup_root: &Path, node_id: &str, db_path: &Path) -> Result<Tick
     );
 
     let topology_diff = diff(&desired_topo, &observed_edges_set);
-    let plan = plan_tick(&topology_diff, DEFAULT_AUTO_REPAIR);
+    // The apply-side gate: `policy.enabled` drives `plan_tick`'s
+    // routing (auto-repairable rows → `repair_now` when on, → `inbox`
+    // when off) AND `apply_safe_repairs`'s short-circuit, so flipping
+    // `auto_repair = false` in the daemon config falls the entire
+    // reconciler back to observe-only.
+    let plan = plan_tick(&topology_diff, policy.enabled);
 
-    // Emit one ConfigChange-or-Reconcile event per repair-now row +
-    // log every inbox row. Audit hash chain is per-row so an audit
-    // verify walks back through them cleanly (12.6.3 / 12.10.3).
-    let emitted = apply_repair_rows(&mut conn, node_id, &plan.repair_now)?;
+    // mackesd-03 — APPLY the safe subset of the drift. Runs BEFORE the
+    // audit transaction so the (potentially blocking) probes never sit
+    // inside the SQL write lock; the per-edge outcomes then ride into
+    // the audit event detail. Only the auto-repairable *missing* edges
+    // are candidates; extra edges are `ManualReview` and never reach
+    // here (they're in `plan.inbox`).
+    let repair = apply_safe_repairs(
+        prober,
+        node_id,
+        workgroup_root,
+        &topology_diff.missing,
+        policy,
+    );
+
+    // Emit one Reconcile event per repair-now row (enriched with the
+    // applied repair's outcome) + log every inbox row. Audit hash
+    // chain is per-row so an audit verify walks back through them
+    // cleanly (12.6.3 / 12.10.3).
+    let emitted = apply_repair_rows(&mut conn, node_id, &plan.repair_now, &repair.outcomes)?;
     // EFF-25 — fire the 12.6.4 alert hooks for the committed events.
     // Hooks come from /etc/mackesd/mackesd.toml `[[alert_hooks]]`
     // (fail-open load, default empty → no-op). Dispatch is post-commit
@@ -349,7 +438,6 @@ pub fn read_all_heartbeats(workgroup_root: &Path) -> Vec<Heartbeat> {
 /// `NebulaLighthouseRelay` / `NebulaHttps443` from the probe metadata.
 #[must_use]
 pub fn read_all_observed_edges(workgroup_root: &Path) -> TopologySnapshot {
-    use std::collections::BTreeSet;
     let mut edges: BTreeSet<Edge> = BTreeSet::new();
     let entries = match std::fs::read_dir(workgroup_root) {
         Ok(e) => e,
@@ -482,18 +570,276 @@ fn materialize_voice_desired_for_tick(
     }
 }
 
-/// Emit one audit-log event per `repair_now` row and write a
-/// `tracing::info` line describing the intended repair action.
-/// Returns the emitted [`Event`]s so the caller can fire the 12.6.4
-/// alert hooks AFTER the transaction commits (EFF-25 — alerts must
-/// never fire for a rolled-back event).
+/// mackesd-03 — the live-flag pair that gates the safe-repair apply
+/// step. Sourced from the daemon config via [`load_repair_policy`];
+/// tests build one by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairPolicy {
+    /// Master switch. `false` → the reconciler is observe-only:
+    /// `plan_tick` routes even auto-repairable drift to the inbox and
+    /// [`apply_safe_repairs`] takes no action. Defaults to
+    /// [`DEFAULT_AUTO_REPAIR`].
+    pub enabled: bool,
+    /// Blast-radius cap — the max number of repair *actions* (probes)
+    /// per tick. Overflow drift is deferred to the next tick. Defaults
+    /// to [`DEFAULT_MAX_REPAIRS_PER_TICK`].
+    pub max_per_tick: usize,
+}
+
+impl Default for RepairPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_AUTO_REPAIR,
+            max_per_tick: DEFAULT_MAX_REPAIRS_PER_TICK,
+        }
+    }
+}
+
+/// Load the live [`RepairPolicy`] from `/etc/mackesd/mackesd.toml`
+/// (fail-open: a missing / malformed file → the locked defaults, so an
+/// un-templated box behaves exactly as before this loader existed).
+#[must_use]
+pub fn load_repair_policy() -> RepairPolicy {
+    let cfg = crate::config::daemon::load();
+    RepairPolicy {
+        enabled: cfg.auto_repair,
+        max_per_tick: cfg.max_repairs_per_tick,
+    }
+}
+
+/// Per-edge result of the safe-repair pass. Carried into the audit
+/// event detail (what drift → what action → what outcome) and asserted
+/// by the tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// The re-probe reached the peer — the overlay tunnel is
+    /// (re)established; the drift should clear once telemetry catches
+    /// up next tick.
+    Reprobed {
+        reachable: bool,
+        rtt_ms: Option<u64>,
+    },
+    /// No safe local action: the missing edge is not incident to this
+    /// node, or the peer's overlay IP couldn't be resolved. Left for
+    /// the operator / the gated 12.14+ connectivity layer.
+    ManualRepairRequired(&'static str),
+    /// The per-cycle repair cap was already spent this tick — the row
+    /// is deferred (audit-logged) and retried next tick.
+    DeferredCapReached,
+    /// Auto-repair is disabled by config — observe-only.
+    Disabled,
+}
+
+impl RepairOutcome {
+    /// Stable snake_case action token for the audit event detail.
+    fn action(&self) -> &'static str {
+        match self {
+            RepairOutcome::Reprobed { .. } => "reprobe_overlay",
+            RepairOutcome::ManualRepairRequired(_) => "manual_repair_required",
+            RepairOutcome::DeferredCapReached => "deferred_cap_reached",
+            RepairOutcome::Disabled => "observe_only_disabled",
+        }
+    }
+}
+
+/// The probe seam. Production uses [`LiveEdgeProber`]
+/// ([`crate::transport_probe::probe_rtt`]); tests inject a fake so the
+/// safe-repair path runs deterministically with no live network.
+pub trait EdgeProber {
+    /// Probe `overlay_ip` once (a TCP SYN through the Nebula tunnel).
+    fn probe_overlay(&self, overlay_ip: &str) -> ProbeResult;
+}
+
+/// Production prober — a real overlay RTT probe.
+pub struct LiveEdgeProber;
+
+impl EdgeProber for LiveEdgeProber {
+    fn probe_overlay(&self, overlay_ip: &str) -> ProbeResult {
+        crate::transport_probe::probe_rtt(overlay_ip)
+    }
+}
+
+/// mackesd-03 — APPLY the safe subset of the reconcile drift.
 ///
-/// Actual repair execution (pushing routes over the Nebula overlay,
-/// restarting peer services) is gated on the connectivity layer
-/// (12.14+) per the Phase 12.5 lock — this is an explicit, documented
-/// scope boundary, not a stub. The audit event records that the
-/// reconciler *would have* repaired the drift; the connectivity layer
-/// wires the take-action step when it ships.
+/// The ONLY drift category we auto-repair is an auto-repairable
+/// **missing edge** (a desired adjacency absent from observed
+/// telemetry) where THIS node (`node_id`) is one of the two endpoints.
+/// The repair is a fresh overlay re-probe of the OTHER endpoint: a TCP
+/// SYN through the Nebula tunnel both prompts Nebula to (re)establish
+/// the underlay tunnel for the pair (the real self-heal for a dropped
+/// hole-punch — the "transient network hiccup" the drift detector
+/// names) and re-measures reachability. It is:
+///
+///   * **Safe** — read-only on the peer (the SYN hits the discard
+///     port; a RST is a *successful* measurement), never restarts a
+///     service or pushes config.
+///   * **Idempotent** — a probe mutates no persistent state, so
+///     re-running the reconcile loop can't double-apply anything; once
+///     the tunnel is back the edge stops being drift and no further
+///     probe fires.
+///   * **Bounded** — at most `policy.max_per_tick` probes per tick;
+///     overflow is deferred (`warn` + audit) so a mass-drift event
+///     can't trigger a fleet-wide probe storm in one pass.
+///
+/// Every other case is left OBSERVE-ONLY and reported so the operator
+/// (or the gated 12.14+ connectivity layer) can act:
+///   * a missing edge not incident to this node → no safe local action;
+///   * a peer whose overlay IP can't be resolved (no bundle yet);
+///   * `policy.enabled == false` → the whole step is a no-op.
+///
+/// `missing` is `topology_diff.missing` — the detector's output is
+/// unchanged; this only adds the guardrailed apply step for the safe
+/// rows. Returns a per-edge [`RepairOutcome`] list (BTreeSet order, so
+/// it aligns index-for-index with `plan.repair_now`).
+#[must_use]
+pub fn apply_safe_repairs(
+    prober: &dyn EdgeProber,
+    node_id: &str,
+    workgroup_root: &Path,
+    missing: &BTreeSet<Edge>,
+    policy: &RepairPolicy,
+) -> RepairReport {
+    let mut report = RepairReport::default();
+
+    // Config-off fallback: observe-only, fire nothing. (`plan_tick`
+    // has already routed these rows to the inbox; we simply record the
+    // Disabled outcome so the audit detail is honest.)
+    if !policy.enabled {
+        for edge in missing {
+            report
+                .outcomes
+                .push((edge.clone(), RepairOutcome::Disabled));
+        }
+        return report;
+    }
+
+    for edge in missing {
+        // Only edges incident to THIS node have a safe local repair.
+        let Some(peer) = incident_peer(node_id, edge) else {
+            report.outcomes.push((
+                edge.clone(),
+                RepairOutcome::ManualRepairRequired(
+                    "missing edge not incident to this node; route push gated on 12.14+ connectivity layer",
+                ),
+            ));
+            continue;
+        };
+
+        // Blast-radius cap: stop taking *actions* past the cap; defer
+        // the rest to the next tick.
+        if report.attempted >= policy.max_per_tick {
+            report.cap_reached = true;
+            report
+                .outcomes
+                .push((edge.clone(), RepairOutcome::DeferredCapReached));
+            continue;
+        }
+
+        // Resolve the peer's overlay IP from its replicated bundle.
+        let Some(overlay_ip) = resolve_overlay_ip(workgroup_root, peer) else {
+            report.outcomes.push((
+                edge.clone(),
+                RepairOutcome::ManualRepairRequired(
+                    "peer overlay IP unresolved (no nebula-bundle.json yet)",
+                ),
+            ));
+            continue;
+        };
+
+        // AUDIT — before.
+        info!(
+            actor = %node_id,
+            edge = %format!("{} ↔ {}", edge.a, edge.b),
+            peer = %peer,
+            overlay_ip = %overlay_ip,
+            "auto-repair: re-probing overlay path to (re)establish adjacency",
+        );
+
+        let probe = prober.probe_overlay(&overlay_ip);
+        report.attempted += 1;
+        let rtt_ms = probe.rtt_ms.map(|v| v.max(0.0).round() as u64);
+        let outcome = RepairOutcome::Reprobed {
+            reachable: probe.reachable,
+            rtt_ms,
+        };
+
+        // AUDIT — after.
+        info!(
+            actor = %node_id,
+            edge = %format!("{} ↔ {}", edge.a, edge.b),
+            peer = %peer,
+            overlay_ip = %overlay_ip,
+            reachable = probe.reachable,
+            rtt_ms = ?rtt_ms,
+            "auto-repair: re-probe complete",
+        );
+
+        report.outcomes.push((edge.clone(), outcome));
+    }
+
+    if report.cap_reached {
+        warn!(
+            actor = %node_id,
+            cap = policy.max_per_tick,
+            attempted = report.attempted,
+            "auto-repair per-cycle cap reached; remaining drift deferred to next tick",
+        );
+    }
+
+    report
+}
+
+/// Summary of one [`apply_safe_repairs`] pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Per-edge outcome in BTreeSet order (aligns with
+    /// `plan.repair_now`).
+    pub outcomes: Vec<(Edge, RepairOutcome)>,
+    /// How many repair actions (probes) actually fired — the number
+    /// bounded by `policy.max_per_tick`.
+    pub attempted: usize,
+    /// True when the per-cycle cap truncated the work.
+    pub cap_reached: bool,
+}
+
+/// The other endpoint of `edge` when `node_id` is one of its two ends;
+/// `None` when this node isn't incident to the edge.
+fn incident_peer<'a>(node_id: &str, edge: &'a Edge) -> Option<&'a str> {
+    if edge.a == node_id {
+        Some(edge.b.as_str())
+    } else if edge.b == node_id {
+        Some(edge.a.as_str())
+    } else {
+        None
+    }
+}
+
+/// Resolve `peer`'s overlay IP from its replicated
+/// `<workgroup_root>/<peer>/mackesd/nebula-bundle.json`. `None` when
+/// the bundle is missing / unreadable — the caller then leaves the
+/// edge observe-only rather than probing a bogus address.
+fn resolve_overlay_ip(workgroup_root: &Path, peer: &str) -> Option<String> {
+    let path = crate::ca::bundle::bundle_path(workgroup_root, peer);
+    match crate::ca::bundle::read_bundle(&path) {
+        Ok(bundle) if !bundle.overlay_ip.is_empty() => Some(bundle.overlay_ip),
+        _ => None,
+    }
+}
+
+/// Emit one audit-log event per `repair_now` row — enriched with the
+/// applied repair's [`RepairOutcome`] (what drift → what action → what
+/// outcome) — and write a `tracing::info` line. Returns the emitted
+/// [`Event`]s so the caller can fire the 12.6.4 alert hooks AFTER the
+/// transaction commits (EFF-25 — alerts must never fire for a
+/// rolled-back event).
+///
+/// `outcomes` is [`apply_safe_repairs`]'s per-edge result, aligned
+/// index-for-index with `rows` (both derive from the same sorted
+/// `missing` set). The *safe* repair (an overlay re-probe of an
+/// incident peer) has already run in [`apply_safe_repairs`]; the
+/// heavier take-action (pushing routes over the Nebula overlay,
+/// restarting peer services) remains gated on the connectivity layer
+/// (12.14+) — an explicit, documented scope boundary, not a stub.
 ///
 /// # Errors
 ///
@@ -504,6 +850,7 @@ pub fn apply_repair_rows(
     conn: &mut Connection,
     node_id: &str,
     rows: &[DriftRow],
+    outcomes: &[(Edge, RepairOutcome)],
 ) -> Result<Vec<Event>> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -531,6 +878,12 @@ pub fn apply_repair_rows(
             .to_rfc3339();
         let mut emitted: Vec<Event> = Vec::with_capacity(rows.len());
         for (idx, row) in rows.iter().enumerate() {
+            // The safe-repair outcome for this row (aligned by index;
+            // absent only if a future detector emits a repair_now row
+            // with no matching missing edge — record it observe-only).
+            let outcome = outcomes.get(idx).map(|(_, o)| o.clone()).unwrap_or(
+                RepairOutcome::ManualRepairRequired("no aligned repair outcome for drift row"),
+            );
             // Build the structured Event payload; serialize once for
             // both the audit chain and the JSON column.
             let event = Event {
@@ -540,9 +893,9 @@ pub fn apply_repair_rows(
                 node_id: node_id.to_owned(),
                 timestamp_ms: now_ms_val,
                 detail: serde_json::json!({
-                    "action": "repair_now",
+                    "action": outcome.action(),
                     "drift": DriftRowJson::from(row),
-                    "intent": "auto-repair queued; transport push gated on 12.14+ connectivity layer",
+                    "outcome": repair_outcome_detail(&outcome),
                 }),
             };
             let payload = event
@@ -574,7 +927,8 @@ pub fn apply_repair_rows(
                 actor = %node_id,
                 detector = row.detector,
                 reason = %row.reason,
-                "auto-repair queued (take-action gated on 12.14+ connectivity layer)",
+                action = outcome.action(),
+                "auto-repair drift row committed to audit log",
             );
 
             prev_hash = hash;
@@ -582,6 +936,28 @@ pub fn apply_repair_rows(
         }
         Ok(emitted)
     })
+}
+
+/// JSON detail block for one [`RepairOutcome`] — the "outcome" leg of
+/// the audit event's `(what drift → what action → what outcome)`.
+fn repair_outcome_detail(outcome: &RepairOutcome) -> serde_json::Value {
+    match outcome {
+        RepairOutcome::Reprobed { reachable, rtt_ms } => serde_json::json!({
+            "kind": "reprobed",
+            "reachable": reachable,
+            "rtt_ms": rtt_ms,
+        }),
+        RepairOutcome::ManualRepairRequired(why) => serde_json::json!({
+            "kind": "manual_repair_required",
+            "reason": why,
+        }),
+        RepairOutcome::DeferredCapReached => serde_json::json!({
+            "kind": "deferred_cap_reached",
+        }),
+        RepairOutcome::Disabled => serde_json::json!({
+            "kind": "observe_only_disabled",
+        }),
+    }
 }
 
 /// Log every inbox row at `warn` level so operators see them in the
@@ -947,5 +1323,363 @@ mod tests {
         let s = serde_json::to_string(&outcome).unwrap();
         let back: TickOutcome = serde_json::from_str(&s).unwrap();
         assert_eq!(back.observed_heartbeats, 0);
+    }
+
+    // ---- mackesd-03: safe-repair apply step ---------------------------
+
+    /// A deterministic [`EdgeProber`] for the repair tests — records
+    /// every probe target so a test can assert the repair action ran
+    /// (or didn't), with no live network.
+    struct FakeProber {
+        reachable: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeProber {
+        fn new(reachable: bool) -> Self {
+            Self {
+                reachable,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl EdgeProber for FakeProber {
+        fn probe_overlay(&self, overlay_ip: &str) -> ProbeResult {
+            self.calls.lock().unwrap().push(overlay_ip.to_owned());
+            ProbeResult {
+                rtt_ms: if self.reachable { Some(7.0) } else { None },
+                reachable: self.reachable,
+                path: "overlay",
+            }
+        }
+    }
+
+    fn mk_edge(a: &str, b: &str) -> Edge {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        Edge {
+            a: lo.to_owned(),
+            b: hi.to_owned(),
+            kind: EdgeKind::NebulaDirect,
+        }
+    }
+
+    fn write_test_bundle(workgroup_root: &Path, peer: &str, overlay_ip: &str) {
+        let bundle = crate::ca::bundle::NebulaBundle {
+            mesh_id: "mesh".into(),
+            epoch: 1,
+            ca_cert_pem: String::new(),
+            peer_cert_pem: String::new(),
+            peer_key_pem: String::new(),
+            overlay_ip: overlay_ip.to_owned(),
+            mesh_cidr: "10.42.0.0/16".into(),
+            lighthouses: vec![],
+            ca_key_pem: None,
+            created_at: 0,
+        };
+        let path = crate::ca::bundle::bundle_path(workgroup_root, peer);
+        crate::ca::bundle::write_bundle(&path, &bundle).unwrap();
+    }
+
+    // (1) A detected SAFE drift row (auto-repairable missing edge
+    // incident to this node) is actually repaired: the repair action
+    // runs and the post-state records a reachable re-probe.
+    #[test]
+    fn safe_repair_reprobes_incident_missing_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_test_bundle(root, "peer:remote", "127.0.0.1");
+        let mut missing = BTreeSet::new();
+        missing.insert(mk_edge("peer:self", "peer:remote"));
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 16,
+        };
+        let report = apply_safe_repairs(&prober, "peer:self", root, &missing, &policy);
+        // The repair ACTION ran: exactly one probe, to the resolved IP.
+        assert_eq!(prober.call_count(), 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(prober.calls.lock().unwrap()[0], "127.0.0.1");
+        // Post-state: the edge's outcome is a reachable re-probe.
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            report.outcomes[0].1,
+            RepairOutcome::Reprobed {
+                reachable: true,
+                rtt_ms: Some(7),
+            },
+        );
+    }
+
+    // (2) Repair is idempotent: re-running the identical pass is
+    // deterministic (no accumulated state), and once the edge recovers
+    // (drops out of the missing set) the next reconcile pass is a
+    // genuine no-op — zero probes.
+    #[test]
+    fn safe_repair_is_idempotent_and_no_op_once_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_test_bundle(root, "peer:remote", "127.0.0.1");
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 16,
+        };
+        let mut missing = BTreeSet::new();
+        missing.insert(mk_edge("peer:self", "peer:remote"));
+
+        let prober = FakeProber::new(true);
+        let r1 = apply_safe_repairs(&prober, "peer:self", root, &missing, &policy);
+        assert_eq!(prober.call_count(), 1);
+
+        // Re-run the IDENTICAL pass — a probe mutates nothing, so the
+        // report is bit-for-bit the same (no double-applied state).
+        let prober_again = FakeProber::new(true);
+        let r1_again = apply_safe_repairs(&prober_again, "peer:self", root, &missing, &policy);
+        assert_eq!(r1, r1_again);
+
+        // Edge recovered → no longer in the missing set → the next
+        // reconcile pass takes NO action.
+        let empty: BTreeSet<Edge> = BTreeSet::new();
+        let prober2 = FakeProber::new(true);
+        let r2 = apply_safe_repairs(&prober2, "peer:self", root, &empty, &policy);
+        assert_eq!(prober2.call_count(), 0);
+        assert_eq!(r2.attempted, 0);
+        assert!(r2.outcomes.is_empty());
+    }
+
+    // (3) The per-cycle cap bounds the number of repairs: with 5
+    // incident missing edges and a cap of 2, exactly two probes fire
+    // and the remaining three are deferred.
+    #[test]
+    fn safe_repair_cap_bounds_repairs_per_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut missing = BTreeSet::new();
+        for i in 0..5 {
+            let peer = format!("peer:r{i}");
+            write_test_bundle(root, &peer, "127.0.0.1");
+            missing.insert(mk_edge("peer:self", &peer));
+        }
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 2,
+        };
+        let report = apply_safe_repairs(&prober, "peer:self", root, &missing, &policy);
+        assert_eq!(prober.call_count(), 2, "cap bounds probes to 2");
+        assert_eq!(report.attempted, 2);
+        assert!(report.cap_reached);
+        let deferred = report
+            .outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, RepairOutcome::DeferredCapReached))
+            .count();
+        assert_eq!(deferred, 3);
+    }
+
+    // (4) With auto-repair DISABLED via config, no repair action runs —
+    // observe-only is preserved even when a safe drift row is present.
+    #[test]
+    fn safe_repair_disabled_takes_no_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_test_bundle(root, "peer:remote", "127.0.0.1");
+        let mut missing = BTreeSet::new();
+        missing.insert(mk_edge("peer:self", "peer:remote"));
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: false,
+            max_per_tick: 16,
+        };
+        let report = apply_safe_repairs(&prober, "peer:self", root, &missing, &policy);
+        assert_eq!(prober.call_count(), 0);
+        assert_eq!(report.attempted, 0);
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].1, RepairOutcome::Disabled);
+    }
+
+    // (5a) An UNSAFE / observe-only case — a missing edge NOT incident
+    // to this node — is never auto-repaired: no probe, logged
+    // manual-repair-required.
+    #[test]
+    fn safe_repair_leaves_non_incident_missing_edge_observe_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut missing = BTreeSet::new();
+        missing.insert(mk_edge("peer:x", "peer:y")); // this node is neither
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 16,
+        };
+        let report = apply_safe_repairs(&prober, "peer:self", root, &missing, &policy);
+        assert_eq!(prober.call_count(), 0, "no probe for a non-incident edge");
+        assert!(matches!(
+            report.outcomes[0].1,
+            RepairOutcome::ManualRepairRequired(_)
+        ));
+    }
+
+    // (5a') An incident missing edge whose peer bundle is missing has
+    // no resolvable overlay IP → observe-only, no probe.
+    #[test]
+    fn safe_repair_unresolvable_peer_is_observe_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No bundle written for peer:remote → IP unresolved.
+        let mut missing = BTreeSet::new();
+        missing.insert(mk_edge("peer:self", "peer:remote"));
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 16,
+        };
+        let report = apply_safe_repairs(&prober, "peer:self", root, &missing, &policy);
+        assert_eq!(prober.call_count(), 0);
+        assert!(matches!(
+            report.outcomes[0].1,
+            RepairOutcome::ManualRepairRequired(_)
+        ));
+    }
+
+    // (5b) The ManualReview (extra-edge) drift category is never
+    // auto-repaired end-to-end: an observed-but-undesired adjacency
+    // routes to the inbox and fires zero probes.
+    #[test]
+    fn tick_never_reprobes_for_extra_edge_manual_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let workgroup_root = dir.path().join("qnm-shared");
+        std::fs::create_dir_all(&workgroup_root).unwrap();
+        let db_path = dir.path().join("mackesd.db");
+        let _ = crate::store::open(&db_path).unwrap();
+        // No desired config → an observed edge is "extra" → manual review.
+        make_links(&workgroup_root, "peer:self", "peer:b", Some(10));
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 16,
+        };
+        let outcome = tick_with(&workgroup_root, "peer:self", &db_path, &prober, &policy).unwrap();
+        assert_eq!(outcome.plan.inbox.len(), 1, "extra edge → inbox");
+        assert_eq!(outcome.plan.repair_now.len(), 0);
+        assert_eq!(
+            prober.call_count(),
+            0,
+            "manual-review drift is never probed"
+        );
+    }
+
+    // End-to-end through the injectable tick seam: a safe incident
+    // missing edge fires one re-probe AND the audit event records the
+    // reprobe action + outcome.
+    #[test]
+    fn tick_with_reprobes_incident_missing_edge_and_audits_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let workgroup_root = dir.path().join("qnm-shared");
+        std::fs::create_dir_all(&workgroup_root).unwrap();
+        let db_path = dir.path().join("mackesd.db");
+        let conn = crate::store::open(&db_path).unwrap();
+        let payload = serde_json::json!({
+            "nodes": [
+                {"id": "peer:self", "region": "r", "healthy": true, "is_host": true},
+                {"id": "peer:remote", "region": "r", "healthy": true, "is_host": false},
+            ],
+            "allow_east_west": [],
+        });
+        conn.execute(
+            "INSERT INTO desired_config (author, message, spec_json, state, created_at, applied_at) \
+             VALUES (?, ?, ?, 'applied', ?, ?)",
+            (
+                "tester",
+                "seed",
+                payload.to_string(),
+                "2026-05-19T00:00:00Z",
+                "2026-05-19T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        drop(conn);
+        write_test_bundle(&workgroup_root, "peer:remote", "127.0.0.1");
+
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: true,
+            max_per_tick: 16,
+        };
+        let outcome = tick_with(&workgroup_root, "peer:self", &db_path, &prober, &policy).unwrap();
+        assert_eq!(outcome.desired_edges, 1);
+        assert_eq!(outcome.plan.repair_now.len(), 1);
+        // The safe repair fired exactly one probe...
+        assert_eq!(prober.call_count(), 1);
+        // ...and the audit event names the action + the reprobe outcome.
+        let conn2 = crate::store::open(&db_path).unwrap();
+        let payload_json: String = conn2
+            .query_row(
+                "SELECT payload_json FROM events ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            payload_json.contains("reprobe_overlay"),
+            "audit detail must name the action: {payload_json}",
+        );
+        assert!(payload_json.contains("reprobed"));
+    }
+
+    // The disabled config path end-to-end: even with a desired edge
+    // missing, auto_repair=false routes it to the inbox and fires no
+    // probe (observe-only fallback preserved through the full tick).
+    #[test]
+    fn tick_with_disabled_routes_missing_edge_to_inbox_no_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let workgroup_root = dir.path().join("qnm-shared");
+        std::fs::create_dir_all(&workgroup_root).unwrap();
+        let db_path = dir.path().join("mackesd.db");
+        let conn = crate::store::open(&db_path).unwrap();
+        let payload = serde_json::json!({
+            "nodes": [
+                {"id": "peer:self", "region": "r", "healthy": true, "is_host": true},
+                {"id": "peer:remote", "region": "r", "healthy": true, "is_host": false},
+            ],
+            "allow_east_west": [],
+        });
+        conn.execute(
+            "INSERT INTO desired_config (author, message, spec_json, state, created_at, applied_at) \
+             VALUES (?, ?, ?, 'applied', ?, ?)",
+            (
+                "tester",
+                "seed",
+                payload.to_string(),
+                "2026-05-19T00:00:00Z",
+                "2026-05-19T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        drop(conn);
+        write_test_bundle(&workgroup_root, "peer:remote", "127.0.0.1");
+
+        let prober = FakeProber::new(true);
+        let policy = RepairPolicy {
+            enabled: false,
+            max_per_tick: 16,
+        };
+        let outcome = tick_with(&workgroup_root, "peer:self", &db_path, &prober, &policy).unwrap();
+        // Auto-repair off → the missing edge lands in the inbox, not
+        // repair_now, and no probe fires.
+        assert_eq!(outcome.plan.repair_now.len(), 0);
+        assert_eq!(outcome.plan.inbox.len(), 1);
+        assert_eq!(prober.call_count(), 0);
+    }
+
+    #[test]
+    fn repair_policy_default_matches_locked_consts() {
+        let p = RepairPolicy::default();
+        assert_eq!(p.enabled, DEFAULT_AUTO_REPAIR);
+        assert_eq!(p.max_per_tick, DEFAULT_MAX_REPAIRS_PER_TICK);
     }
 }
