@@ -347,6 +347,20 @@ pub(crate) struct ChatState {
     /// on the next successful send.
     last_error: Option<String>,
     last_poll: Option<Instant>,
+    /// perf-5 — per-contact conversation cursors: each constituent topic's latest
+    /// ULID at the last rebuild, in `keys_for_contact` order (keyed by contact
+    /// host, matching `convos`). The `state/chat/conversation/<key>` topics are
+    /// latest-wins **full-ring** blobs — the worker republishes the whole
+    /// `Vec<Message>` on every change — so a naive refresh re-decodes each
+    /// contact's entire history on every 2 s poll. Comparing the cheap per-topic
+    /// `latest_ulid` against this lets refresh REUSE the already-built
+    /// `Conversation` in place and skip the JSON re-parse whenever a contact's
+    /// blobs are unchanged; a changed blob (incl. a retention trim, which writes a
+    /// new-ULID ring) mismatches the cursor and rebuilds from scratch → resync.
+    convo_cursors: BTreeMap<String, Vec<Option<String>>>,
+    /// perf-5 — the room-log twin of [`Self::convo_cursors`], keyed by room id
+    /// (matching `room_convos`); each room has the single `room:<id>` topic.
+    room_cursors: BTreeMap<String, Vec<Option<String>>>,
 }
 
 impl Default for ChatState {
@@ -373,6 +387,8 @@ impl Default for ChatState {
             unread_only: false,
             last_error: None,
             last_poll: None,
+            convo_cursors: BTreeMap::new(),
+            room_cursors: BTreeMap::new(),
         }
     }
 }
@@ -419,45 +435,83 @@ impl ChatState {
             return;
         };
         let self_host = roster.self_host().to_string();
-        let mut convos = BTreeMap::new();
+        // perf-5 — keep `convos` ACROSS refreshes and rebuild only the
+        // conversations whose latest-wins ring blob actually moved this tick,
+        // instead of re-decoding every contact's full history on every 2 s poll.
+        // A conversation whose constituent topics' `latest_ulid`s all match the
+        // cursors from its last build is reused in place (no JSON re-parse); any
+        // change (incl. a retention trim, which republishes a new-ULID ring)
+        // mismatches and rebuilds from the current blobs → behaviour-identical.
+        let live_hosts: BTreeSet<String> = roster.contacts().map(|c| c.host.clone()).collect();
         for contact in roster.contacts() {
-            let mut conv = Conversation::new(contact.host.as_str());
-            for key in keys_for_contact(&self_host, &contact.host) {
-                if let Some(ring) = latest_json::<Vec<Message>>(&persist, &conversation_topic(&key))
-                {
-                    for msg in ring {
-                        conv.insert(msg);
-                    }
-                }
+            let topics: Vec<String> = keys_for_contact(&self_host, &contact.host)
+                .iter()
+                .map(|key| conversation_topic(key))
+                .collect();
+            let cursors: Vec<Option<String>> = topics
+                .iter()
+                .map(|topic| persist.latest_ulid(topic).ok().flatten())
+                .collect();
+            if !conversation_is_current(
+                self.convo_cursors.get(&contact.host),
+                &cursors,
+                self.convos.contains_key(&contact.host),
+            ) {
+                let conv = fold_rings(
+                    contact.host.as_str(),
+                    topics.iter().map(|topic| {
+                        latest_json::<Vec<Message>>(&persist, topic).unwrap_or_default()
+                    }),
+                );
+                self.convos.insert(contact.host.clone(), conv);
+                self.convo_cursors.insert(contact.host.clone(), cursors);
             }
             // Watermark a first-seen contact at its current length so existing
-            // backfill isn't flagged unread; keep an established watermark.
-            self.seen.entry(contact.host.clone()).or_insert(conv.len());
-            convos.insert(contact.host.clone(), conv);
+            // backfill isn't flagged unread; keep an established watermark. (A
+            // first-seen host always rebuilt above, so this length is the fresh
+            // one, exactly as the old full-rebuild refresh set it.)
+            let now_len = self.convos.get(&contact.host).map_or(0, Conversation::len);
+            self.seen.entry(contact.host.clone()).or_insert(now_len);
         }
-        self.convos = convos;
+        // Drop conversations for contacts no longer on the roster — the old
+        // full-rebuild dropped them implicitly by building a fresh map each tick.
+        // `seen` is intentionally NOT pruned (a rejoining contact keeps its
+        // established read watermark, matching the old `or_insert` behaviour).
+        self.convos.retain(|host, _| live_hosts.contains(host));
+        self.convo_cursors
+            .retain(|host, _| live_hosts.contains(host));
 
-        // Rooms (NOTIFY-CHAT-5): the registry mirror + each room's shared log.
+        // Rooms (NOTIFY-CHAT-5): the registry mirror + each room's shared log —
+        // the same per-conversation cursor reuse as the contact loop above.
         if let Some(rooms) = latest_json::<Vec<RoomDescriptor>>(&persist, ROOMS_TOPIC) {
             self.rooms = rooms;
         }
-        let mut room_convos = BTreeMap::new();
+        let live_rooms: BTreeSet<String> = self.rooms.iter().map(|d| d.id.clone()).collect();
         for descriptor in &self.rooms {
-            let mut conv = Conversation::new(descriptor.id.as_str());
-            if let Some(ring) = latest_json::<Vec<Message>>(
-                &persist,
-                &conversation_topic(&room_key(&descriptor.id)),
+            let topic = conversation_topic(&room_key(&descriptor.id));
+            let cursors = vec![persist.latest_ulid(&topic).ok().flatten()];
+            if !conversation_is_current(
+                self.room_cursors.get(&descriptor.id),
+                &cursors,
+                self.room_convos.contains_key(&descriptor.id),
             ) {
-                for msg in ring {
-                    conv.insert(msg);
-                }
+                let conv = fold_rings(
+                    descriptor.id.as_str(),
+                    std::iter::once(
+                        latest_json::<Vec<Message>>(&persist, &topic).unwrap_or_default(),
+                    ),
+                );
+                self.room_convos.insert(descriptor.id.clone(), conv);
+                self.room_cursors.insert(descriptor.id.clone(), cursors);
             }
-            self.seen
-                .entry(room_key(&descriptor.id))
-                .or_insert(conv.len());
-            room_convos.insert(descriptor.id.clone(), conv);
+            let now_len = self
+                .room_convos
+                .get(&descriptor.id)
+                .map_or(0, Conversation::len);
+            self.seen.entry(room_key(&descriptor.id)).or_insert(now_len);
         }
-        self.room_convos = room_convos;
+        self.room_convos.retain(|id, _| live_rooms.contains(id));
+        self.room_cursors.retain(|id, _| live_rooms.contains(id));
     }
 
     /// Unread count for `host` — new messages since the read watermark, clamped so
@@ -2301,6 +2355,40 @@ fn navigate_via_toast(bus_root: Option<&Path>, source_host: &str, headline: &str
     let _ = publish(bus_root, TOAST_TOPIC, &body);
 }
 
+/// perf-5 — fold a conversation's constituent latest-wins ring blobs (a
+/// contact's `dm:` ∪ `alert:` rings, or a room's single `room:<id>` ring) into
+/// one [`Conversation`], oldest-first and deduped by id ([`Conversation::insert`]
+/// is idempotent + canonically ordered, lock 8/22). This is the EXACT per-
+/// conversation build the old full-rebuild refresh did inline; `refresh` now only
+/// calls it when [`conversation_is_current`] reports a constituent blob moved, so
+/// an unchanged conversation is never re-decoded. Factored out as a pure seam so
+/// the incremental-vs-full-rebuild equivalence is unit-testable without a bus.
+fn fold_rings(id: &str, rings: impl IntoIterator<Item = Vec<Message>>) -> Conversation {
+    let mut conv = Conversation::new(id);
+    for ring in rings {
+        for msg in ring {
+            conv.insert(msg);
+        }
+    }
+    conv
+}
+
+/// perf-5 — the reuse predicate for one conversation: `true` when the already-
+/// built [`Conversation`] is still valid and must be reused as-is; `false` when
+/// it must be rebuilt. Reuse requires BOTH an existing conversation AND that
+/// every constituent topic's latest ULID (`now`) matches the cursors captured at
+/// the last build (`prev`). A first load (`prev` is `None` / `has_existing`
+/// false) rebuilds; a moved blob — a new message OR a retention trim, both of
+/// which republish a new-ULID ring — mismatches and rebuilds, so the model always
+/// resyncs to the current blobs (never appends onto a stale-trimmed ring).
+fn conversation_is_current(
+    prev: Option<&Vec<Option<String>>>,
+    now: &[Option<String>],
+    has_existing: bool,
+) -> bool {
+    has_existing && prev.map(Vec::as_slice) == Some(now)
+}
+
 /// Read the newest (latest-wins) message on `topic` and deserialize its body.
 fn latest_json<T: serde::de::DeserializeOwned>(persist: &Persist, topic: &str) -> Option<T> {
     // perf-4 — a bounded `read_latest` (ORDER BY ulid DESC LIMIT 1) returns the
@@ -2850,7 +2938,94 @@ const fn empty_copy(has_bus: bool) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mde_chat::{Message, NodeRole};
+    use mde_chat::{Message, MessageId, NodeRole};
+
+    /// A message with a FIXED id so dedup + canonical order are deterministic
+    /// across the perf-5 fold/rebuild tests (the real `Message::text` mints a
+    /// random-tailed id).
+    fn fixed_msg(id: &str, ts: i64, body: &str) -> Message {
+        let mut m = Message::text("nyc3", ts, body);
+        m.id = MessageId(id.to_string());
+        m
+    }
+
+    #[test]
+    fn fold_rings_merges_constituent_blobs_in_canonical_order_and_dedups() {
+        // perf-5 — the fold is the exact per-conversation build refresh does: a
+        // contact's dm: ∪ alert: rings merged oldest-first, deduped by id even
+        // when a message appears in both constituent blobs.
+        let dm = vec![fixed_msg("a", 30, "newest"), fixed_msg("dup", 20, "shared")];
+        let alert = vec![fixed_msg("dup", 20, "shared"), fixed_msg("b", 10, "oldest")];
+        let folded = fold_rings("nyc3", [dm, alert]);
+        let ids: Vec<&str> = folded.messages().iter().map(|m| m.id.as_str()).collect();
+        // Sorted by ts (10, 20, 30); the id present in both rings appears once.
+        assert_eq!(ids, vec!["b", "dup", "a"]);
+    }
+
+    #[test]
+    fn incremental_refresh_equals_a_full_rebuild_across_appends_trim_and_switch() {
+        // perf-5 — drive the SAME cursor-reuse / rebuild machinery `refresh` runs,
+        // over an in-memory sequence of latest-wins ring blobs (each with the ULID
+        // the worker would stamp), and prove the incrementally-maintained model is
+        // byte-identical to a from-scratch fold of the current blob at every tick.
+        let id = "room:sys:all-fleet";
+        // (cursor, ring-blob) as the worker republishes it latest-wins.
+        let steps: Vec<(&str, Vec<Message>)> = vec![
+            // first load — must build.
+            ("u1", vec![fixed_msg("a", 10, "one")]),
+            // append: a new message ⇒ new ULID ⇒ rebuild.
+            (
+                "u2",
+                vec![fixed_msg("a", 10, "one"), fixed_msg("b", 20, "two")],
+            ),
+            // idle tick: SAME cursor + blob ⇒ must REUSE (no rebuild).
+            (
+                "u2",
+                vec![fixed_msg("a", 10, "one"), fixed_msg("b", 20, "two")],
+            ),
+            // retention trim: oldest evicted + a newer message, new ULID ⇒ rebuild
+            // must RESYNC to the trimmed blob (not retain the evicted "a").
+            (
+                "u3",
+                vec![fixed_msg("b", 20, "two"), fixed_msg("c", 30, "three")],
+            ),
+        ];
+
+        let mut cursors: Option<Vec<Option<String>>> = None;
+        let mut model: Option<Conversation> = None;
+        let mut rebuilds = 0;
+        for (cur, ring) in &steps {
+            let now = vec![Some((*cur).to_string())];
+            let has_existing = model.is_some();
+            if !conversation_is_current(cursors.as_ref(), &now, has_existing) {
+                model = Some(fold_rings(id, std::iter::once(ring.clone())));
+                cursors = Some(now);
+                rebuilds += 1;
+            }
+            // Equivalence invariant: the maintained model == a full rebuild from
+            // the CURRENT blob, at every step (append AND trim).
+            let full = fold_rings(id, std::iter::once(ring.clone()));
+            assert_eq!(model.as_ref().unwrap(), &full, "diverged at cursor {cur}");
+        }
+        // Four ticks, but the idle tick reused → exactly three rebuilds.
+        assert_eq!(rebuilds, 3, "the unchanged tick must reuse, not rebuild");
+
+        // Topic switch: a freshly-selected conversation (no cached cursor, no
+        // existing model) always builds — it never inherits another key's cache.
+        assert!(
+            !conversation_is_current(None, &[Some("z9".to_string())], false),
+            "a first-load / switched-to conversation must rebuild"
+        );
+        // And an existing conversation with a MATCHING cursor is reused.
+        assert!(
+            conversation_is_current(
+                Some(&vec![Some("u3".to_string())]),
+                &[Some("u3".to_string())],
+                true,
+            ),
+            "an unchanged cursor with a live conversation must reuse"
+        );
+    }
 
     #[test]
     fn dm_key_is_order_independent_and_matches_the_worker() {
