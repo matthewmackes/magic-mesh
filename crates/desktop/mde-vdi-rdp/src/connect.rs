@@ -27,10 +27,11 @@
 //! validator would refuse essentially every real connection) and the mesh link
 //! is already carried over the mutually-authenticated Nebula overlay, which is
 //! the transport-trust floor. Validation being off does not make a cert *change*
-//! invisible, though: right after the TLS upgrade the server certificate's
-//! SHA-256 fingerprint is compared against a **trust-on-first-use** pin
-//! ([`crate::pin`]). A first connect records the pin and accepts; a later connect
-//! whose fingerprint **changed** is the MITM signal — it is logged loudly and
+//! invisible, though: right after the TLS upgrade the server's TLS **public
+//! key** (which a MITM cannot reproduce) is SHA-256 fingerprinted and compared
+//! against a **trust-on-first-use** pin ([`crate::pin`]). A first connect records
+//! the pin and accepts; a later connect whose fingerprint **changed** (i.e. the
+//! server presented a different key) is the MITM signal — it is logged loudly and
 //! surfaced to the shell as a [`CertPinChange`], while (by default) still letting
 //! the connection through so a legitimate self-signed rotation is not a hard
 //! outage. Setting `MDE_RDP_STRICT_PIN` flips a changed cert to a hard
@@ -218,11 +219,13 @@ pub struct Negotiated {
 }
 
 /// A detected TLS-certificate change for a host that was already pinned
-/// (vdi-vm-6). Produced only on a non-strict connect whose fingerprint differed
-/// from the trust-on-first-use pin; the connection was **still allowed** (the
-/// Nebula floor is the trust anchor) but this is surfaced so the shell can warn
-/// the operator that the change could be a MITM. Strict mode turns the same
-/// condition into a hard [`ConnectError::CertPinChanged`] instead.
+/// (vdi-vm-6).
+///
+/// Produced only on a non-strict connect whose fingerprint differed from the
+/// trust-on-first-use pin; the connection was **still allowed** (the Nebula floor
+/// is the trust anchor) but this is surfaced so the shell can warn the operator
+/// that the change could be a MITM. Strict mode turns the same condition into a
+/// hard [`ConnectError::CertPinChanged`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertPinChange {
     /// The `host:port` whose certificate changed.
@@ -568,13 +571,15 @@ impl RdpConnection {
             .ok_or(ConnectError::NoServerPublicKey)?
             .to_vec();
 
-        // vdi-vm-6: trust-on-first-use certificate pinning. Chain validation is
-        // off by design (self-signed RDP hosts + the Nebula floor), but a cert
-        // *change* is the MITM signal — detect it here, BEFORE `connect_finalize`
-        // sends any credentials, so strict mode can refuse a changed-cert peer
-        // without leaking the password. `server_cert` is the DER of the server's
-        // leaf certificate (the same bytes `extract_tls_server_public_key` parsed).
-        let cert_pin_change = Self::check_cert_pin(host, port, &server_cert)?;
+        // vdi-vm-6: trust-on-first-use pinning of the server's TLS public key.
+        // Chain validation is off by design (self-signed RDP hosts + the Nebula
+        // floor), but a *change* of the server's key is the MITM signal — a MITM
+        // cannot reproduce the real host's key. Detect it here, BEFORE
+        // `connect_finalize` sends any credentials, so strict mode can refuse a
+        // changed-key peer without leaking the password. Pinning the public key
+        // (RFC 7469 style) rather than the whole cert DER avoids a false alarm on
+        // a benign same-key certificate renewal while still catching every MITM.
+        let cert_pin_change = Self::check_cert_pin(host, port, &server_public_key)?;
 
         let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
         let mut framed = TokioFramed::new(tls_stream);
@@ -600,22 +605,26 @@ impl RdpConnection {
         Ok((framed, connection_result, cert_pin_change))
     }
 
-    /// Compare the host's TLS certificate fingerprint against the trust-on-
+    /// Compare the host's TLS public-key fingerprint against the trust-on-
     /// first-use pin store and apply the [`pin::pin_action`] policy (vdi-vm-6).
     ///
     /// Returns `Ok(Some(change))` when a non-strict connect saw a **changed**
-    /// certificate (surface it, but proceed — the Nebula link is the trust
-    /// floor), `Ok(None)` on a first-use or unchanged cert, and
+    /// key (surface it, but proceed — the Nebula link is the trust floor),
+    /// `Ok(None)` on a first-use or unchanged key, and
     /// `Err(ConnectError::CertPinChanged)` when strict mode
-    /// (`MDE_RDP_STRICT_PIN`) rejects a changed cert. All the branch-selecting
+    /// (`MDE_RDP_STRICT_PIN`) rejects a changed key. All the branch-selecting
     /// logic lives in the pure [`pin`] seams; this only does the I/O + logging.
+    // The store guard is deliberately held across `decision` + `record`: the
+    // read-then-pin must be atomic so two concurrent workers connecting to the
+    // same host cannot interleave and clobber each other's pin.
+    #[allow(clippy::significant_drop_tightening)]
     fn check_cert_pin(
         host: &str,
         port: u16,
-        server_cert: &[u8],
+        server_public_key: &[u8],
     ) -> Result<Option<CertPinChange>, ConnectError> {
         let key = pin::host_key(host, port);
-        let fingerprint = Fingerprint::from_der(server_cert);
+        let fingerprint = Fingerprint::from_der(server_public_key);
         let mut store = pin::lock_global();
         let outcome = store.decision(&key, &fingerprint);
         match pin::pin_action(&outcome, pin::strict_mode()) {

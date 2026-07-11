@@ -13,9 +13,12 @@
 //! # What this adds
 //!
 //! Hard validation being off does not mean cert *changes* have to be invisible.
-//! This module pins the SHA-256 fingerprint of each host's TLS certificate on the
-//! **first** connect (trust-on-first-use) and compares it on every later connect.
-//! A fingerprint that **changed** is the classic MITM signal; the connect layer
+//! This module pins the SHA-256 fingerprint of each host's TLS **public key** on
+//! the **first** connect (trust-on-first-use) and compares it on every later
+//! connect (RFC 7469-style key pinning: a MITM must present a different key, so a
+//! key change is the MITM signal, while a benign same-key certificate renewal
+//! does not false-alarm). A fingerprint that **changed** is the MITM signal; the
+//! connect layer
 //! logs it loudly and surfaces it to the shell, while — by default — still
 //! letting the connection through (the Nebula floor stays the trust anchor and a
 //! self-signed cert legitimately rotates when a VDI VM is rebuilt). A strict
@@ -36,16 +39,18 @@ use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
-/// The SHA-256 fingerprint of a server's DER-encoded TLS certificate.
+/// The SHA-256 fingerprint of a server's DER-encoded TLS credential (the connect
+/// layer feeds it the server's public key — see [`crate::connect`]).
 ///
-/// This is exactly the KDE-Connect / `mde-kdc-host` fingerprint shape (SHA-256 of
-/// the DER, rendered as upper-case hex with `:` between bytes) so the two pin
-/// stores read the same way to an operator.
+/// This is the same fingerprint shape as `mde-kdc-host` (SHA-256, rendered as
+/// upper-case hex with `:` between bytes) so the two pin stores read the same way
+/// to an operator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fingerprint([u8; 32]);
 
 impl Fingerprint {
-    /// Fingerprint the DER-encoded certificate the TLS upgrade handed back.
+    /// Fingerprint DER-encoded bytes (the server's TLS public key at the connect
+    /// call site) with SHA-256.
     #[must_use]
     pub fn from_der(der: &[u8]) -> Self {
         let digest = Sha256::digest(der);
@@ -135,8 +140,10 @@ pub fn pin_decision(stored: Option<&Fingerprint>, current: &Fingerprint) -> PinO
 }
 
 /// What the connect layer should do with a [`PinOutcome`], given whether strict
-/// reject-on-change is enabled. Pure, so both the accept-and-warn and the
-/// strict-reject branches are unit-tested without a server.
+/// reject-on-change is enabled.
+///
+/// Pure, so both the accept-and-warn and the strict-reject branches are
+/// unit-tested without a server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinAction {
     /// Proceed with the connection and do not surface anything (first-use or an
@@ -178,9 +185,11 @@ pub fn pin_action(outcome: &PinOutcome, strict: bool) -> PinAction {
     }
 }
 
-/// Parse the strict-mode flag from a raw env value. Truthy = `1`/`true`/`yes`/`on`
-/// (case-insensitive, trimmed). Anything else — including unset — is off, so the
-/// non-breaking TOFU posture is the default. Pure so it is tested without env.
+/// Parse the strict-mode flag from a raw env value.
+///
+/// Truthy = `1`/`true`/`yes`/`on` (case-insensitive, trimmed). Anything else —
+/// including unset — is off, so the non-breaking TOFU posture is the default.
+/// Pure so it is tested without env.
 #[must_use]
 pub fn strict_from_raw(raw: Option<&str>) -> bool {
     matches!(
@@ -190,6 +199,7 @@ pub fn strict_from_raw(raw: Option<&str>) -> bool {
 }
 
 /// Whether strict reject-on-change pinning is enabled (`MDE_RDP_STRICT_PIN`).
+///
 /// Default **off** — a changed cert is surfaced but not rejected, preserving the
 /// Nebula-authenticated trust floor and self-signed rotations.
 #[must_use]
@@ -218,7 +228,7 @@ pub struct PinStore {
 impl PinStore {
     /// An empty, memory-only store (no persistence). Useful in tests.
     #[must_use]
-    pub fn in_memory() -> Self {
+    pub const fn in_memory() -> Self {
         Self {
             pins: BTreeMap::new(),
             path: None,
@@ -307,9 +317,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The default backing path for the pin store: `$MDE_RDP_PIN_STORE` if set, else
-/// `$XDG_STATE_HOME/mde/rdp-known-hosts`, else `$HOME/.local/state/mde/rdp-known-hosts`.
-/// [`None`] (memory-only) when no home can be resolved.
+/// The default backing path for the pin store.
+///
+/// `$MDE_RDP_PIN_STORE` if set, else `$XDG_STATE_HOME/mde/rdp-known-hosts`, else
+/// `$HOME/.local/state/mde/rdp-known-hosts`. [`None`] (memory-only) when no home
+/// can be resolved.
 #[must_use]
 pub fn default_store_path() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("MDE_RDP_PIN_STORE") {
@@ -328,8 +340,9 @@ pub fn default_store_path() -> Option<PathBuf> {
     Some(base.join("mde").join("rdp-known-hosts"))
 }
 
-/// The process-global pin store, loaded once from [`default_store_path`]. Shared
-/// (and serialised) across all live RDP workers so concurrent connects to
+/// The process-global pin store, loaded once from [`default_store_path`].
+///
+/// Shared (and serialised) across all live RDP workers so concurrent connects to
 /// different hosts do not clobber each other's persisted pins.
 pub fn global_store() -> &'static Mutex<PinStore> {
     static STORE: OnceLock<Mutex<PinStore>> = OnceLock::new();
@@ -339,9 +352,11 @@ pub fn global_store() -> &'static Mutex<PinStore> {
     })
 }
 
-/// Lock the global store, recovering from a poisoned mutex (a panic in another
-/// worker while holding the lock must not wedge every later connect — the pin map
-/// is plain data, so the recovered guard is safe to use). Avoids `unwrap`.
+/// Lock the global store, recovering from a poisoned mutex.
+///
+/// A panic in another worker while holding the lock must not wedge every later
+/// connect — the pin map is plain data, so the recovered guard is safe to use.
+/// Avoids `unwrap`.
 pub fn lock_global() -> std::sync::MutexGuard<'static, PinStore> {
     global_store()
         .lock()
