@@ -1951,6 +1951,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a11y01_production_accesskit_stream_is_live_through_the_run_drm_seam() {
+        // a11y-01 PROOF ("it's actually reachable now"): drive the SAME production seam
+        // run_drm uses — `mde_egui::a11y::A11yBridge` (enable at startup + drain each
+        // frame) — against the REAL shell fixture, and assert a non-trivial AccessKit
+        // tree flows through it. Before a11y-01 this plumbing existed only under
+        // `#[cfg(test)]` calling `ctx.enable_accesskit()` by hand; the shipped bare-DRM
+        // seat enabled nothing and drained nothing. This guards the runtime path itself.
+        use mde_egui::a11y::{A11yBridge, AccessKitSink};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // A capturing sink standing in for a11y-02's future screen reader — it proves the
+        // seam is genuinely pluggable and that the real shell tree reaches a consumer.
+        struct Capture(Rc<RefCell<Option<egui::accesskit::TreeUpdate>>>);
+        impl AccessKitSink for Capture {
+            fn ingest(&mut self, update: egui::accesskit::TreeUpdate) {
+                *self.0.borrow_mut() = Some(update);
+            }
+        }
+
+        let captured = Rc::new(RefCell::new(None));
+        let mut bridge = A11yBridge::with_sink(Box::new(Capture(captured.clone())));
+
+        let ctx = egui::Context::default();
+        // Exactly what run_drm does at startup — the bridge, not the test, enables it.
+        bridge.enable(&ctx);
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = true; // render the shell body for a richer tree
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run(input, |ctx| shell.render(ctx));
+        // Exactly what run_drm does each frame.
+        bridge.drain(&mut out);
+
+        let captured = captured.borrow();
+        let update = captured
+            .as_ref()
+            .expect("the production A11yBridge drained an AccessKit tree off the live shell");
+        let root = update.tree.as_ref().expect("the tree carries a root").root;
+        assert!(
+            update.nodes.len() > 5,
+            "the shell exports a non-trivial a11y tree (root + top-level nodes), got {}",
+            update.nodes.len()
+        );
+        assert!(
+            update.nodes.iter().any(|(id, _)| *id == root),
+            "the tree's declared root node is present in the node set"
+        );
+        assert!(
+            out.platform_output.accesskit_update.is_none(),
+            "the runtime drain took the update out of platform_output rather than leaking it"
+        );
+    }
+
     /// WIN7-6's own `screen_rect` — a helper so its three tests below each
     /// build a fresh `RawInput` per frame without repeating the literal
     /// (`egui::RawInput` frames are consumed by `ctx.run`, so a multi-frame

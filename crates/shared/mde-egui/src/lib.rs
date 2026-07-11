@@ -18,11 +18,18 @@
 //!
 //! **Accessibility is opt-in**: the `accesskit` feature enables egui/eframe's
 //! AccessKit tree generation for shell surfaces that need screen-reader semantics.
+//! [`a11y`] carries the runtime consumer seam (a11y-01) — the [`a11y::AccessKitSink`]
+//! the bare-DRM present loop drains each frame into, plus the [`a11y::A11yBridge`] that
+//! turns tree generation on (gated, default OFF) so the shipped seat actually exports a
+//! tree instead of only doing so from `#[cfg(test)]`. The windowed eframe fallback
+//! ([`run_client`]) gets AccessKit for free from eframe's own AT-SPI adapter, which
+//! lazily activates on the first assistive-technology request.
 //!
 //! The crate has **zero retired-toolkit (Cosmic/iced) dependencies** — it depends
 //! only on `egui`/`eframe`. Both are re-exported so every surface resolves to the one
 //! harness-pinned egui version (no cross-surface version skew).
 
+pub mod a11y;
 pub mod code;
 pub mod display;
 pub mod fonts;

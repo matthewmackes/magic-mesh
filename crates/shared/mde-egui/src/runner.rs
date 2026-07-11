@@ -18,8 +18,16 @@ use crate::style::Style;
 /// - then hands control to `eframe`.
 ///
 /// `build` constructs the surface's [`App`] from the eframe [`CreationContext`]
-/// (use it to read storage, load fonts, etc.). Accessibility (accesskit) is
-/// deferred (E12 lock 11) and so is not wired here.
+/// (use it to read storage, load fonts, etc.).
+///
+/// **Accessibility (a11y-01)**: the windowed fallback gets AccessKit for free from
+/// eframe's own AT-SPI adapter. When this crate is built with the `accesskit` feature
+/// (the shell always enables it), eframe initialises an `accesskit_winit` adapter on the
+/// window and *lazily* calls `enable_accesskit()` on the egui context the moment an
+/// assistive-technology client requests the tree — so there is nothing to gate here and
+/// nothing to enable eagerly (unlike the bare-DRM [`crate::run_drm`] path, which has no
+/// winit adapter and enables AccessKit itself via [`crate::a11y::A11yBridge`]). The tree
+/// stays empty and zero-cost until a screen reader actually connects.
 ///
 /// Returns eframe's run result; the call blocks until the window closes.
 ///

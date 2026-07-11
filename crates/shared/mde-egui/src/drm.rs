@@ -996,6 +996,16 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let egui_ctx = egui::Context::default();
     crate::Style::install(&egui_ctx);
 
+    // a11y-01: the runtime AccessKit consumer seam. On a seat that opts in (MDE_A11Y=1,
+    // the same env idiom as MDE_DRM_ESC_QUIT below), this turns on egui's AccessKit tree
+    // generation and drains each rendered frame's tree into the sink — so the shipped
+    // bare-DRM seat actually exports an accessibility tree instead of only doing so from
+    // #[cfg(test)]. Default OFF (unset), and a genuine no-op when the crate is built
+    // without the `accesskit` feature. a11y-02's screen reader replaces the default sink
+    // via the same [`crate::a11y::AccessKitSink`] seam.
+    let mut a11y = crate::a11y::A11yBridge::from_env();
+    a11y.enable(&egui_ctx);
+
     // SURFACE-7 lock 11: detect the primary panel (native mode + physical size) and
     // drive a FRACTIONAL HiDPI egui scale from its DPI, so UI is crisp + correctly
     // sized on a high-PPI panel (a Surface Pro lands ~2.25) instead of the 1.0
@@ -1401,6 +1411,14 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         //    request_repaint_after throttling (seat-snapshot pump, VDI frame pacing)
         //    actually take effect. Input is never dropped: `events` is only discarded when
         //    it is empty (a non-empty `events` forces a render here).
+        // a11y-01: let the AccessKit consumer wake a render so the exported tree can't go
+        // stale while the loop is idle — the accessibility analogue of the seat-side
+        // force_render above (an AT client connecting, or the reader requesting a
+        // re-scan). A no-op unless AccessKit is enabled and the sink asked for a refresh.
+        if a11y.wants_render() {
+            force_render = true;
+        }
+
         let first_frame = prev.is_none();
         let repaint_due = next_repaint_at.is_some_and(|t| Instant::now() >= t);
         if !wake::should_render(first_frame, !events.is_empty(), force_render, repaint_due) {
@@ -1415,7 +1433,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             ..Default::default()
         };
         let cur = pointer;
-        let full_output = egui_ctx.run(raw_input, |ctx| {
+        let mut full_output = egui_ctx.run(raw_input, |ctx| {
             ui(ctx);
             // Software cursor: draw a small crosshair/dot at the pointer position.
             // The DRM backend has no OS cursor; we own the whole framebuffer.
@@ -1426,6 +1444,11 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             layer.circle_filled(cur, 4.0, egui::Color32::WHITE);
             layer.circle_stroke(cur, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
         });
+        // a11y-01: hand this frame's AccessKit tree to the consumer seam (a no-op unless
+        // AccessKit is enabled). Done before `shapes` / `textures_delta` are consumed
+        // below; it only takes `platform_output.accesskit_update`, leaving the rest of
+        // `full_output` intact.
+        a11y.drain(&mut full_output);
         // eframe's contract: egui reports how long until it next needs to paint via the
         // root viewport's `repaint_delay` (`Duration::MAX` == idle). Arm the next wake
         // from it (perf-1) — this is what gives request_repaint_after teeth. Read before
