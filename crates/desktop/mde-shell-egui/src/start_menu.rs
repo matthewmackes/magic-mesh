@@ -428,7 +428,7 @@ const TILE_GROUPS: [TileGroup; 7] = [
     },
     TileGroup {
         label: "Media",
-        surfaces: &[Surface::Music, Surface::Media, Surface::Voice],
+        surfaces: &[Surface::Music, Surface::Media],
     },
     TileGroup {
         label: "Files & Data",
@@ -440,7 +440,10 @@ const TILE_GROUPS: [TileGroup; 7] = [
     },
     TileGroup {
         label: "Comms",
-        surfaces: &[Surface::Chat, Surface::Phones],
+        // Voice (SIP calling) is a communications surface, not a media player:
+        // dock.rs `GROUPS` — the canonical taxonomy — groups it with Chat/Phones,
+        // so this tile grouping matches (kept in `Surface::ALL` relative order).
+        surfaces: &[Surface::Voice, Surface::Chat, Surface::Phones],
     },
     TileGroup {
         label: "System",
@@ -2154,10 +2157,10 @@ mod tests {
         let expect: [(&str, &[Surface]); 7] = [
             ("Mesh Control", &[Workbench, MeshView, InfraCode]),
             ("Desktop & Session", &[Desktop]),
-            ("Media", &[Music, Media, Voice]),
+            ("Media", &[Music, Media]),
             ("Files & Data", &[Files, Bookmarks, Storage]),
             ("Web & Tools", &[Browser, Terminal, Editor]),
-            ("Comms", &[Chat, Phones]),
+            ("Comms", &[Voice, Chat, Phones]),
             ("System", &[System, About]),
         ];
         assert_eq!(

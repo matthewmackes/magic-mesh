@@ -2405,7 +2405,14 @@ fn pick_app_cell_with_badge(
     badge: Option<BadgeKind>,
 ) -> bool {
     let selected = *active == surface;
-    let resp = ui.interact(rect, pick_cell_id(surface), egui::Sense::click());
+    // The app cells are icon-only (no visible caption), so the surface's own
+    // label rides a plain hover tooltip (house style, `Response::on_hover_text`)
+    // — a user can learn what an unlabelled cell does without any persistent
+    // label that would shift this fixed-grid layout. Delegated `pick_app_cell`
+    // routes through here, so both entry points get the tooltip.
+    let resp = ui
+        .interact(rect, pick_cell_id(surface), egui::Sense::click())
+        .on_hover_text(surface.label());
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
 
