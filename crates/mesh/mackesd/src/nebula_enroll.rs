@@ -647,10 +647,11 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
             reason: e.to_string(),
         })?;
     // Delegate to the transport-independent signing core (the same
-    // core the ONBOARD-2 network `/enroll` endpoint calls). On
-    // success the bundle is written to QNM-Shared + the bearer
-    // redeemed, preserving the file-flow's "deliver, then spend"
-    // ordering.
+    // core the ONBOARD-2 network `/enroll` endpoint calls), then
+    // ATOMICALLY consume the single-use bearer and write the bundle
+    // only if we won that consume (security-5 — spend-then-deliver, so
+    // two concurrent requests presenting the SAME bearer can never
+    // both be honored).
     let signed_node_id = csr.node_id.clone();
     let bundle = sign_csr_into_bundle(
         backend,
@@ -661,14 +662,27 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         lighthouses,
         allow_override,
     )?;
+    // ENT-1 single-use (security-5): the earlier `is_pending` gate in
+    // the core is only a pre-check; THIS atomic consume is the sole
+    // race-decider. Of any racers that all passed the pre-check,
+    // exactly one wins here (unlink is atomic) and delivers the
+    // bundle; a loser is refused before writing, so two racers never
+    // both clobber the shared bundle path. Closes the check-then-act
+    // TOCTOU. (Narrow residual: a `write_bundle` I/O failure AFTER a
+    // won consume burns the bearer without delivery — a legitimate
+    // retry then needs a fresh token; acceptable vs. the double-honor
+    // it replaces.)
+    if !crate::bearer_ledger::consume(workgroup_root, &csr.token.bearer) {
+        return Err(SignCsrError::BearerNotIssued {
+            node_id: csr.node_id.clone(),
+        });
+    }
     let bundle_path = crate::ca::bundle::bundle_path(workgroup_root, peer_id);
     crate::ca::bundle::write_bundle(&bundle_path, &bundle).map_err(|e| {
         SignCsrError::BundleWriteFailed {
             reason: e.to_string(),
         }
     })?;
-    // ENT-1 — single-use: the sign that honored the bearer spends it.
-    let _ = crate::bearer_ledger::redeem(workgroup_root, &csr.token.bearer);
     Ok(SignOutcome {
         peer_id: signed_node_id,
         overlay_ip: bundle.overlay_ip,
@@ -680,11 +694,15 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
 /// Transport-independent signing core (ONBOARD-2). Takes an
 /// already-parsed [`PendingEnrollment`] and returns the signed
 /// [`crate::ca::bundle::NebulaBundle`] **without** reading the CSR
-/// from disk, writing the bundle, or redeeming the bearer — those
-/// delivery steps belong to the caller, because they differ between
-/// the QNM-Shared file flow ([`sign_pending_csr`], which writes the
-/// bundle then redeems) and the network `/enroll` endpoint (which
-/// returns the bundle in the HTTPS response then redeems).
+/// from disk, consuming the bearer, or delivering the bundle — those
+/// steps belong to the caller, because they differ between the
+/// QNM-Shared file flow ([`sign_pending_csr`], which atomically
+/// consumes the bearer then writes the bundle) and the network
+/// `/enroll` endpoint (which atomically consumes the bearer then
+/// returns the bundle in the HTTPS response). Both gate delivery on
+/// winning [`crate::bearer_ledger::consume`] (security-5); the
+/// `is_pending` gate below is only a fast pre-check, never the
+/// single-use decision.
 ///
 /// Runs the identical authorization gates as the file flow, in the
 /// same order: ban-list → bearer ledger → 8-peer cap → sign. The

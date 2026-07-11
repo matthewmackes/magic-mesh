@@ -357,9 +357,25 @@ pub fn handle_enroll<B: crate::ca::NebulaCertBackend + ?Sized>(
         false,
     ) {
         Ok(bundle) => {
-            // ENT-1 single-use: the sign that honored the bearer spends
-            // it. Bundle is "delivered" by the HTTP response below.
-            let _ = crate::bearer_ledger::redeem(workgroup_root, &bearer);
+            // ENT-1 single-use (security-5): the core's `is_pending`
+            // gate was only a pre-check — ATOMICALLY consume the bearer
+            // HERE and deliver the bundle only if we won. Two concurrent
+            // requests presenting the SAME single-use bearer both reach
+            // this arm after passing the pre-check, but exactly one wins
+            // `consume` (unlink is atomic); the losers are refused below
+            // instead of both receiving a signed bundle. This closes the
+            // check-then-act TOCTOU. Consuming just before the response
+            // (which cannot fail) keeps it a strict consume-on-delivery.
+            if !crate::bearer_ledger::consume(workgroup_root, &bearer) {
+                tracing::warn!(
+                    peer_id = %csr.node_id,
+                    "enroll-endpoint: refused — single-use bearer already redeemed (concurrent race)",
+                );
+                return HttpResponse::json_error(
+                    401,
+                    "enrollment bearer already redeemed (single-use)",
+                );
+            }
             tracing::info!(
                 peer_id = %csr.node_id,
                 mesh_id = %bundle.mesh_id,

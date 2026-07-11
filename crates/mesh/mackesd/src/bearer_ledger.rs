@@ -103,12 +103,37 @@ pub fn is_lighthouse_bearer(workgroup_root: &Path, bearer: &str) -> bool {
         .is_some_and(|note| note.contains(LIGHTHOUSE_ROLE_NOTE))
 }
 
-/// Redeem `bearer` — single-use: returns `true` exactly once per
-/// issued bearer (the entry is deleted).
+/// Atomically consume `bearer` for its single use — the ledger's
+/// test-and-consume primitive (security-5).
+///
+/// Returns `true` to **exactly one** caller and `false` to every
+/// other (never-issued, already-consumed, or lost a concurrent
+/// race). Atomicity comes straight from `unlink(2)`: of N threads or
+/// processes racing to remove the same ledger entry, the kernel lets
+/// exactly one `remove_file` return `Ok` and the rest fail with
+/// `ENOENT`. There is no check-then-act window inside this call — the
+/// remove *is* the decision.
+///
+/// This is the single point that decides the single-use winner, so
+/// callers MUST **gate bundle delivery on a `true` return** (deliver
+/// iff you won the consume). Doing so closes the ENT-1 check-then-act
+/// TOCTOU: two requests presenting the same bearer can both pass an
+/// [`is_pending`] pre-check, but only one wins `consume`, so only one
+/// enrollment bundle is ever delivered. Consume BEFORE delivering, so
+/// two racers never both write a peer's shared bundle path — only the
+/// winner proceeds.
 #[must_use]
-pub fn redeem(workgroup_root: &Path, bearer: &str) -> bool {
+pub fn consume(workgroup_root: &Path, bearer: &str) -> bool {
     std::fs::remove_file(ledger_dir(workgroup_root).join(format!("{}.json", hash_hex(bearer))))
         .is_ok()
+}
+
+/// Redeem `bearer` — single-use: returns `true` exactly once per
+/// issued bearer (the entry is deleted). Historical name for, and
+/// identical to, [`consume`] (the atomic test-and-consume).
+#[must_use]
+pub fn redeem(workgroup_root: &Path, bearer: &str) -> bool {
+    consume(workgroup_root, bearer)
 }
 
 #[cfg(test)]
@@ -125,6 +150,74 @@ mod tests {
         assert!(redeem(tmp.path(), &bearer), "first redemption succeeds");
         assert!(!is_pending(tmp.path(), &bearer), "spent");
         assert!(!redeem(tmp.path(), &bearer), "replay refused (single-use)");
+    }
+
+    #[test]
+    fn consume_is_single_use_and_refuses_spent_or_unknown() {
+        // security-5: the atomic consume — a normal single redeem
+        // wins once; an already-consumed bearer and a never-issued
+        // one are both refused.
+        let tmp = tempfile::tempdir().unwrap();
+        let bearer = issue(tmp.path(), "box").unwrap();
+        assert!(
+            consume(tmp.path(), &bearer),
+            "first consume of an issued bearer wins"
+        );
+        assert!(
+            !consume(tmp.path(), &bearer),
+            "an already-consumed bearer is refused (single-use)"
+        );
+        assert!(
+            !consume(tmp.path(), "never-issued"),
+            "a never-issued bearer is refused"
+        );
+    }
+
+    #[test]
+    fn concurrent_consumers_of_one_bearer_have_exactly_one_winner() {
+        // security-5 acceptance: hammer a single issued bearer with N
+        // threads that all try to consume it at the same instant. The
+        // unlink-based test-and-consume must let EXACTLY ONE win — the
+        // TOCTOU the old split is_pending/redeem lost, where two racers
+        // both passed the check and both got honored.
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bearer = issue(tmp.path(), "race box").unwrap();
+
+        const N: usize = 64;
+        let barrier = Arc::new(Barrier::new(N));
+        let root = Arc::new(tmp.path().to_path_buf());
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let barrier = Arc::clone(&barrier);
+            let root = Arc::clone(&root);
+            let bearer = bearer.clone();
+            handles.push(std::thread::spawn(move || {
+                // Release all threads together to maximize contention
+                // on the one ledger entry.
+                barrier.wait();
+                consume(&root, &bearer)
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one racing redeemer may win the single-use bearer"
+        );
+        // The bearer is now spent for good — no later consume can win.
+        assert!(
+            !consume(root.as_path(), &bearer),
+            "a spent bearer is refused after the race"
+        );
+        assert!(
+            !is_pending(root.as_path(), &bearer),
+            "the spent entry is gone"
+        );
     }
 
     #[test]
