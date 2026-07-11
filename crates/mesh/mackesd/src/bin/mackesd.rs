@@ -2474,11 +2474,8 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile,
-        heartbeat::HeartbeatWorker, job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker,
-        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch,
-        reconcile::ReconcileWorker, ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
-        validation_suite, voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
+        mesh_router::MeshRouterWorker, reconcile::ReconcileWorker, voice_config::VoiceConfigWorker,
+        RestartPolicy, Spawn, Supervisor,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2688,389 +2685,7 @@ fn run_serve(
                 });
             }
         }
-        // MESH-MDNS-RELAY — native cross-segment mDNS service relay (browses
-        // the local LAN, publishes services to the mesh Bus). Rank 0: a relay
-        // control-plane worker, runs on every role.
-        if mackesd_core::worker_role::runs("mdns_relay", role_rank) {
-            sup.spawn(Spawn::new(MdnsRelayWorker::new(), RestartPolicy::OnFailure));
-            worker_names.lock().expect("worker_names mutex").push("mdns_relay".into());
-        }
-        // RETIRE-PY.4 (2026-06-07) — the GVFS `fs_sync` worker (supervised
-        // `python3 -m mackes.mesh_gvfs.daemon`, a retired Python MDE module
-        // absent in the monorepo) is removed. Mesh storage is served by
-        // Syncthing (E3); per-peer share access is via the Bus file-ops, so
-        // the second FUSE substrate is retired rather than rebuilt.
-        if mackesd_core::worker_role::runs("heartbeat", role_rank) {
-            sup.spawn(Spawn::new(
-                HeartbeatWorker::new(workgroup_root.clone(), node_id.clone())
-                    .with_interval(daemon_cfg.heartbeat_interval()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("heartbeat".into());
-        }
-        // BOOT-STATUS-1 — the boot_readiness worker: probes the fabric bring-up
-        // chain (Nebula → overlay IP → mackesd → bus → QNM mount → directory) and
-        // publishes an ordered snapshot to state/boot-readiness for the HOME
-        // boot-status dialog. All roles (headless nodes report the same chain).
-        if mackesd_core::worker_role::runs("boot_readiness", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::boot_readiness::BootReadinessWorker::new(
-                    workgroup_root.clone(),
-                    node_id.clone(),
-                    db_path.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("boot_readiness".into());
-        }
-        // XCP-6 (B2) — on an XCP-ng dom0, advertise hypervisor capacity
-        // (CPU/RAM/SR-free/running-VMs) to `compute/xcp-host/<node>` so any node
-        // can target it for a VM spawn. Self-gates on the dom0 marker, so it's a
-        // harmless no-op on every non-hypervisor node; spawned on all roles (a
-        // joined XCP host pins Server).
-        if mackesd_core::worker_role::runs("xcp_host", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::xcp_host::XcpHostWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("xcp_host".into());
-        }
-        // KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes
-        // the per-node KVM virtualization service catalog
-        // (`mackesd_core::kvm::KVM_SERVICES`, `systemctl is-active` each) every
-        // 30 s and publishes a whole-host health summary to `event/kvm/services`
-        // so the Datacenter panels + the alert lane see the live stack state.
-        // The KVM stack is universal — every mesh node runs the same libvirt +
-        // Podman set (docs/design/mesh-virt-management.md: "same stack on every
-        // machine") — so it gates through the rank-0-default worker resolver,
-        // i.e. it runs everywhere.
-        if mackesd_core::worker_role::runs("kvm_health", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::kvm_health::KvmHealthWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("kvm_health".into());
-        }
-        // MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator
-        // the Datacenter UI drives. Drains `action/vm/lifecycle` (create-from-
-        // image / start / stop / destroy / list, each addressed to a target
-        // node id) via an injectable LibvirtBackend that shells `virsh`/
-        // `qemu-img` through the bounded proc path, and publishes this node's VM
-        // instance roster to `event/vm/instances`. Universal like kvm_health —
-        // every node can host datacenter VMs — so it gates through the
-        // rank-0-default worker resolver (runs everywhere). node_id is both the
-        // event `host` stamp and the action target this worker matches.
-        if mackesd_core::worker_role::runs("vm_lifecycle", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::vm_lifecycle::VmLifecycleWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("vm_lifecycle".into());
-        }
-        // MV-4 — the container worker: the Podman container-lifecycle actuator (the
-        // container half of the mesh management layer, companion to MV-3
-        // vm_lifecycle). Drains `action/container/lifecycle` (run / stop / rm /
-        // list, each addressed to a target node id) via an injectable
-        // PodmanBackend that shells `podman` through the bounded proc path, and
-        // publishes this node's container roster to `event/podman/containers`.
-        // Universal like vm_lifecycle — every node can host datacenter containers —
-        // so it gates through the rank-0-default worker resolver (runs everywhere).
-        // node_id is both the event `host` stamp and the action target this worker
-        // matches.
-        if mackesd_core::worker_role::runs("container", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::container::ContainerWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("container".into());
-        }
-        // E12-20 — the storage worker: the privileged owner of the Workbench
-        // Storage plane (GParted for the mesh). Owns a typed StorageOp pending
-        // queue over a live UDisks2 zbus topology, validates each op at stage-time
-        // (advisory) + apply-time (authoritative), enforces the hard-wall
-        // interlocks (root/boot/EFI · mesh-storage backer · in-use VM/container)
-        // and the typed-arming echo IN the executor (a UI bug can't bypass), and
-        // publishes the `state/storage/<node>` topology mirror + drains
-        // `action/storage/<node>` verbs. Universal like vm_lifecycle/container —
-        // any node has disks — so it is pinned at rank 0 in the worker_role census
-        // (BUG-STORAGE-1: an EXPLICIT rank-0 entry, not the silent unknown-worker
-        // default, so a Workstation provably publishes its own mirror and the
-        // `role-workers` diagnostic lists it). node_id is the per-node topic
-        // namespace + the mirror `host` stamp.
-        if mackesd_core::worker_role::runs("storage", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::storage::StorageWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("storage".into());
-        }
-        // QC-2 — the openstack worker: the QUASAR-CLOUD supervision root
-        // (docs/design/quasar-cloud.md). Reads the fleet/one-state cloud
-        // doctrine for WHICH Kolla service containers this node hosts (the
-        // live etcd/Syncthing doctrine read is a typed IntegrationGated until
-        // QC-4 authors the record), converges desired vs running under Podman
-        // via the injectable PodmanRunner seam (start missing / restart
-        // killed / stop extra; starts honestly gated on the operator-mirrored
-        // image (QC-3 airgap lane) + the rendered Kolla config (QC-4)), and
-        // publishes the `state/openstack/<node>` mirror. Universal — the
-        // design's any-role-node premise (Q1/Q5/Q22) — so it is a deliberate
-        // rank-0 census entry like storage's; the doctrine, not the role,
-        // decides which services land here. node_id is the mirror `host`
-        // stamp; the workgroup root seeds the doctrine seam's Syncthing leg.
-        if mackesd_core::worker_role::runs("openstack", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::openstack::OpenstackWorker::new(
-                    node_id.clone(),
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("openstack".into());
-        }
-        // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero
-        // unit explorer (docs/design/unit-explorer.md). Unions three sources into
-        // one typed `Unit` stream and publishes `state/units/<node>`: the mesh
-        // mirror (peers + `/mesh/leader` + health it already reads), the union of
-        // every node's `state/openstack/<node>` mirror (QC-2, deduped by object id +
-        // host-tagged, consumed through the Bus read path — never an openstack
-        // file), and the surface-gated active LAN scan (EXPLORER-2's producer seam,
-        // a no-op today). Publish-on-change + heartbeat, plus the E9
-        // `action/units/get-stream` read verb any mesh client can call. Universal
-        // (rank 0) like storage/openstack — every node publishes its own unit view,
-        // no center. node_id is the mirror `host` stamp + self unit; workgroup_root
-        // seeds the peer-directory reader.
-        if mackesd_core::worker_role::runs("unit_aggregator", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::unit_aggregator::UnitAggregatorWorker::new(
-                    node_id.clone(),
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("unit_aggregator".into());
-        }
-        // MV-5a — the scheduler worker: the placement slice of the no-center
-        // scheduler. Drains `action/schedule/place`, folds each node's latest
-        // `event/kvm/services` capacity, chooses the target node (healthy pin →
-        // most-active → node_id tie-break), and forwards a host-targeted
-        // create/run onto `action/vm/lifecycle` / `action/container/lifecycle`
-        // (plus the decision to `event/schedule/placements`). Rank-0-default like
-        // vm_lifecycle/container (runs everywhere); an interim lowest-node-id
-        // single-actor election keeps N nodes from emitting duplicate placements.
-        // Failover re-election + etcd desired-state persistence are MV-5b.
-        if mackesd_core::worker_role::runs("scheduler", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::scheduler::SchedulerWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("scheduler".into());
-        }
-        // E12-5b — the session_broker worker: the mackesd side of the E12-5 VDI
-        // remote-desktop milestone. Drains `action/vdi/session`, folds each op
-        // into the live VDI-session roster (which peer serves which VM to which
-        // client + state) via a pure state machine, and — leader-gated —
-        // reconciles that roster into the shared roaming-session plane through the
-        // injectable SessionStore seam so any peer sees the active sessions.
-        // Rank-0-default like scheduler (runs everywhere); the shared leader lock
-        // keeps an N-node mesh from multi-writing. The live etcd/Syncthing
-        // cross-peer publish is integration-gated (typed error, §7).
-        if mackesd_core::worker_role::runs("session_broker", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::session_broker::SessionBrokerWorker::new(
-                    workgroup_root.clone(),
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("session_broker".into());
-        }
-        // VDI-VM-1 — the console_broker worker: the serving-side half that actually
-        // makes a LOCAL KVM VM's console reachable on the mesh. Every VM binds SPICE
-        // to 127.0.0.1 (vm_lifecycle's domain XML), so session_broker can track a
-        // local-VM session but there is no reachable endpoint to attach frames.
-        // For each VDI `Open` naming a VM this node serves, this worker resolves the
-        // live console (`virsh domdisplay`), relays that loopback port onto the
-        // Nebula overlay with a scoped socat (the compute_expose forward pattern),
-        // and publishes the overlay `host:port` back on the session record
-        // (`state/vdi/console`, keyed by session id) for the client shell to
-        // resolve. Serving-peer-gated (NOT leader-gated: the relay + loopback
-        // console are physically on the serving host); runs everywhere like
-        // session_broker. Honest-gates (never a fake endpoint) when the VM is off /
-        // has no graphics / socat|virsh|overlay is absent — §7.
-        if mackesd_core::worker_role::runs("console_broker", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::console_broker::ConsoleBrokerWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("console_broker".into());
-        }
-        // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
-        // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
-        // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —
-        // makes a user's desktops follow them to any Workstation (reconcile_roaming)
-        // and survive disconnect (on_disconnect default KeepRunning; on_node_loss
-        // holds reconnectable). Rank-0-default like session_broker (runs everywhere);
-        // the shared leader lock keeps an N-node mesh from multi-writing. REUSES the
-        // broker's VdiSession + SessionStore; sessions and monitor layouts persist
-        // through the replicated workgroup-root stores (MeshSessionStore +
-        // MeshLayoutStore), with future etcd-backed stores hidden behind the same
-        // seams.
-        if mackesd_core::worker_role::runs("session_roaming", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::session_roaming::SessionRoamingWorker::new(
-                    workgroup_root.clone(),
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("session_roaming".into());
-        }
-        // OW-11 (Bus half) — the service_onboard worker: `onboard service-add`
-        // reachable over the Bus. Drains `action/onboard/service-add`, runs the
-        // EXISTING onboard::service_add engine (plan + the injectable ServiceApply
-        // seam — §6 glue), and — leader-gated like session_broker so an N-node
-        // mesh answers each request once — publishes the typed result event on
-        // `event/onboard/service-add` for the shell's Services flow. Rank-0-default
-        // like session_broker (runs everywhere); real applies run over
-        // LiveServiceApply, whose typed IntegrationGated is the honest live answer
-        // today (§7).
-        if mackesd_core::worker_role::runs("service_onboard", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::service_onboard::ServiceOnboardWorker::new(
-                    workgroup_root.clone(),
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("service_onboard".into());
-        }
-        // OW-7 (Bus half) — the spawn_lighthouse_onboard worker: `onboard
-        // spawn-lighthouse` reachable over the Bus. Drains
-        // `action/onboard/spawn-lighthouse`, runs the EXISTING
-        // onboard::spawn_lighthouse engine (plan_spawn + the injectable Provisioner
-        // seam — §6 glue), and — leader-gated like service_onboard so an N-node mesh
-        // answers each request once — publishes the typed result event on
-        // `event/onboard/spawn-lighthouse` for the shell's Spawn Lighthouse flow.
-        // Rank-0-default like service_onboard (runs everywhere); real provisions run
-        // over LiveProvisioner, whose typed IntegrationGated is the honest live answer
-        // today (the live cloud/SSH provision + CA-migrate stays gated, §7).
-        if mackesd_core::worker_role::runs("spawn_lighthouse_onboard", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::spawn_lighthouse_onboard::SpawnLighthouseOnboardWorker::new(
-                    workgroup_root.clone(),
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("spawn_lighthouse_onboard".into());
-        }
-        // OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native
-        // receiver for the BusApply remote-push transport. Drains
-        // `action/onboard/apply` (a signed JobBundle + the claimed issuer) and
-        // applies it ONLY when addressed to this node, from a leadership-authorized
-        // issuer (the CA `nodes` registry resolves the issuer to a leader-eligible
-        // lighthouse identity key), validly signed/fresh/single-use — reusing the
-        // pure onboard::remote_push core (allow-listed Action enum, no raw shell —
-        // §9). Rank-0 default (any enrolled peer can be a target; each node applies
-        // only bundles addressed to it). Publishes the typed observed-state /
-        // rejection on `event/onboard/apply`; the live cross-node round-trip is
-        // operator/live-gated behind BusApply (§7).
-        if mackesd_core::worker_role::runs("onboard_apply", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::onboard_apply::OnboardApplyWorker::new(
-                    &workgroup_root,
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("onboard_apply".into());
-        }
-        // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
-        // bridges. Drains `action/vdi/clipboard`, applies a per-session policy
-        // (allow/deny + one-way + a size cap) via the pure relay decision
-        // (Forward/Drop/Truncate), and relays each clip into the connected VM desktop
-        // through the injectable ClipboardAccess seam (with an echo guard). Clipboard
-        // relay is per-session + node-local — every serving node must apply ITS
-        // session's clips — so it is NOT leader-gated (unlike session_broker) but is
-        // rank-0-default the same way (runs everywhere). The live OS/guest clipboard
-        // channel (SPICE/RDP vdagent / wl-clipboard) is integration-gated (typed
-        // error, §7); the pure model + relay pipeline ship green behind the seam.
-        if mackesd_core::worker_role::runs("clipboard_bridge", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::clipboard_bridge::ClipboardBridgeWorker::new(),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("clipboard_bridge".into());
-        }
-        // OV-7.a (v2.6) — health reconciler. Polls each known
-        // peer's QNM-Shared heartbeat.json every 5 s, applies the
-        // telemetry::health_state_from_age threshold table, writes
-        // back into nodes.health, and fires PeerStateChanged on
-        // transitions. Closes the gap between live heartbeats and
-        // the SQLite column that NebulaStatusService::build_peer_list
-        // projects. Spawn order: after HeartbeatWorker so peers
-        // have at least one observable heartbeat by the first
-        // reconcile tick.
-        if mackesd_core::worker_role::runs("health_reconciler", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::health_reconciler::HealthReconcilerWorker::new(
-                    workgroup_root.clone(),
-                    db_path.clone(),
-                    node_id.clone(),
-                    std::sync::Arc::clone(&nebula_signal_slot),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("health_reconciler".into());
-        }
+        spawn_compute_lifecycle_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root, &db_path, &daemon_cfg, &nebula_signal_slot);
         // AUD2-1 — the shared `kdc2_router_decision_us` histogram: the
         // mesh_router observes its per-tick decision time into it, and
         // the metrics_exporter snapshots it into mackesd.prom — without
@@ -3157,180 +2772,7 @@ fn run_serve(
                 );
             }
         }
-        // NF-21.1 — sshd overlay-bind worker. Polls
-        // /var/lib/mackesd/nebula/overlay-ip every 5 s; on change,
-        // writes the /etc/ssh/sshd_config.d/mackes-mesh.conf drop-in
-        // + reloads sshd so the daemon binds to the new overlay
-        // address. Quiet no-op on pre-enrollment peers (missing
-        // publish file). Replaces mesh_nebula.py::write_sshd_overlay_bind
-        // so the Python module can fully retire (DEAD-2.14 plan).
-        sup.spawn(Spawn::new(
-            SshdOverlayBindWorker::new(),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names.lock().expect("worker_names mutex").push("sshd_overlay_bind".into());
-        // SVC-2 (Q60) — SSH pubkey gossip: publish this box's user
-        // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
-        // published key into ~/.ssh/authorized_keys (managed block,
-        // write-on-change). Syncthing replication is the transport.
-        // PD-11 — the lifecycle executor: descriptor-gated container/VM
-        // start/stop requests from peers, via replicated request files.
-        if mackesd_core::worker_role::runs("lifecycle_exec", role_rank) {
-            sup.spawn(Spawn::new(
-                lifecycle_exec::LifecycleExecWorker::new(
-                    workgroup_root.clone(),
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("lifecycle_exec".into());
-        }
-        // DEVMGR-8 — the device-control executor: drains this box's replicated
-        // fleet/device-control/<self>/ for typed privileged-op requests the
-        // Device-Manager surface dispatches (enable/disable, reload module,
-        // rescan bus), gates each against this node's own published inventory
-        // (L9 rail), executes the FIXED sysfs/ip/modprobe seam, hash-chain audits
-        // it, and notifies on failure. Universal (rank 0) like lifecycle_exec.
-        if mackesd_core::worker_role::runs("device_control", role_rank) {
-            sup.spawn(Spawn::new(
-                device_control::DeviceControlExecWorker::new(
-                    workgroup_root.clone(),
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("device_control".into());
-        }
-        // PD-13 — presence-transition alerts: offline/online crossings
-        // become desktop notifications via the alert_relay pipeline.
-        if mackesd_core::worker_role::runs("presence_watch", role_rank) {
-            let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
-            sup.spawn(Spawn::new(
-                presence_watch::PresenceWatchWorker::new(
-                    workgroup_root.clone(),
-                    alerts,
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("presence_watch".into());
-        }
-        // SUBSTRATE-10 — etcd WATCH worker: opens watch streams on /mesh/peers/
-        // (a Delete = a keepalive lease expired = a peer dropped) + /mesh/leader
-        // (a Put with a new node_id = a leadership handover) and PUSHES instant
-        // alerts onto the same alert_relay lane presence_watch uses — no poll,
-        // no 5 s reconcile lag. Degrades cleanly off the coordination plane
-        // (empty endpoints / etcd unreachable → idle + back off, never panic).
-        if mackesd_core::worker_role::runs("etcd_watch", role_rank) {
-            let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::etcd_watch::EtcdWatchWorker::new(
-                    alerts,
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("etcd_watch".into());
-        }
-        // PD-9 / FPG — the reconcile driver: magic-fleet reconcile on a
-        // 15-min cadence + immediately on this host's nudge file.
-        if mackesd_core::worker_role::runs("fleet_reconcile", role_rank) {
-            sup.spawn(Spawn::new(
-                fleet_reconcile::FleetReconcileWorker::new(
-                    workgroup_root.clone(),
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("fleet_reconcile".into());
-        }
-        // PLANES-18 — mesh DNS: feed <host>.mesh into resolved +
-        // /etc/hosts on every node (rank 0 plumbing).
-        if mackesd_core::worker_role::runs("mesh_dns", role_rank) {
-            sup.spawn(Spawn::new(
-                mesh_dns::MeshDnsWorker::new(Some(db_path.clone())),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("mesh_dns".into());
-        }
-        // PLANES-15 — netstate engine mount: converge the baseline's
-        // network desired-state under a rollback checkpoint + overlay
-        // self-test (W77/W78), on every node.
-        if mackesd_core::worker_role::runs("netstate_apply", role_rank) {
-            sup.spawn(Spawn::new(
-                netstate_apply::NetstateApplyWorker::new(
-                    workgroup_root.clone(),
-                    Some(db_path.clone()),
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("netstate_apply".into());
-        }
-        // PLANES-19 — overlay-reachability validation suite: every node
-        // participates; the leader mints nightly/run-now + writes verdicts.
-        if mackesd_core::worker_role::runs("validation_suite", role_rank) {
-            sup.spawn(Spawn::new(
-                validation_suite::ValidationSuiteWorker::new(
-                    workgroup_root.clone(),
-                    Some(db_path.clone()),
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                    std::path::PathBuf::from(
-                        mackesd_core::workers::netdata_aggregator::DEFAULT_ROLE_HOST_MARKER,
-                    ),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("validation_suite".into());
-        }
-        // PLANES-9 — the local job executor (execution-tag gated, W84).
-        if mackesd_core::worker_role::runs("job_exec", role_rank) {
-            sup.spawn(Spawn::new(
-                job_exec::JobExecWorker::new(
-                    workgroup_root.clone(),
-                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("job_exec".into());
-        }
-        if mackesd_core::worker_role::runs("ssh_pubkey_gossip", role_rank) {
-            sup.spawn(Spawn::new(
-                ssh_pubkey_gossip::SshPubkeyGossipWorker::new(
-                    workgroup_root.clone(),
-                    node_id.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("ssh_pubkey_gossip".into());
-        }
-        // NF-21.3 — firewall_preset worker. Applies the Nebula
-        // firewalld preset (UDP/4242 inbound on all peers; TCP/443
-        // inbound additionally on lighthouses) on first tick + on
-        // every role-flip via the /var/lib/mackesd/nebula/role.host
-        // marker. Idempotent — firewall-cmd's ALREADY_ENABLED is
-        // treated as success. Replaces mesh_nebula.py::apply_nebula_firewall_preset
-        // so the Python helper can retire (DEAD-2.14 plan).
-        sup.spawn(Spawn::new(
-            FirewallPresetWorker::new(),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names.lock().expect("worker_names mutex").push("firewall_preset".into());
-        // CONNECT-3 — exposure-driven firewall enforcement (additive): opens the
-        // policy's ingress ports on the public zone for services bound to this
-        // node, so `expose` actually accepts public traffic. Never removes a rule
-        // (can't lock out SSH/Nebula). Same supervised shape as the preset worker.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::connect_firewall::ConnectFirewallWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names.lock().expect("worker_names mutex").push("connect_firewall".into());
+        spawn_mesh_plumbing_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root, &db_path);
         // mesh_router bootstraps with the per-transport
         // registry. Phase 12.18 D.2 (2026-05-23) — the NebulaHttps443
         // transport is registered at startup so the per-peer
@@ -3625,343 +3067,9 @@ fn run_serve(
             }
         }
 
-        // MON-4 (v2.6) — alert relay worker. Polls
-        // ~/.local/share/mde/alerts/*.json for events
-        // written by mde-alert-emit (MON-3) via Netdata's
-        // health_alarm_notify.conf custom-sender hook + fires
-        // an FDO desktop notification via notify-send per
-        // new event. Deduplicates by deterministic ULID.
-        // RestartPolicy::Always since the tick is passive +
-        // operator outage detection is the failure-tolerance
-        // goal.
-        //
-        // v6.0 Portal-1 — attach a PortalClient so CRITICAL
-        // alerts also navigate Portal-full to the Control
-        // (mesh-health) layer. Graceful-degrade: if the session
-        // bus or mde-portal aren't running at daemon startup
-        // the relay skips the portal call and surfaces the
-        // FDO notification alone.
-        // DBUS-2: the portal shell IPC is the Bus now. PortalClient is
-        // stateless (it appends to action/shell/<verb> per call), so the
-        // relay always attaches it — a CRITICAL alert's goto(control) is
-        // durable even if mde-portal is down at the time.
-        // E4.20 — the portal-era "navigate to Control on CRITICAL" publish was
-        // dropped: alerts already surface via `notify-send` → notifyd → the Win10
-        // Action Center, so the `action/shell/goto` Bus publish (whose only
-        // consumer was the retired portal) is redundant.
-        let alert_relay = mackesd_core::workers::alert_relay::AlertRelayWorker::new();
-        tracing::info!(
-            "alert_relay: PortalClient attached \
-             (CRITICAL alerts publish action/shell/goto control)"
-        );
-        sup.spawn(Spawn::new(alert_relay, RestartPolicy::Always));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("alert_relay".into());
+        spawn_datacenter_scheduler_workers(&mut sup, &worker_names, &node_id, &workgroup_root);
 
-        // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
-        // worker. Runs on every peer; silently no-ops until a
-        // `mde-update --coordinate <ver>` writes an intent file into
-        // `<mesh-home>/upgrade-intent/`. Then it runs `dnf upgrade
-        // mde-core` on its own schedule, marks itself ready, fires
-        // `mde-install --yes` once quorum + grace are met, and — when
-        // it holds the leader lease — cleans up fully-complete intent
-        // files after the +24h grace. No SQLite handle needed: the
-        // barrier state lives in the GFS-replicated intent files and
-        // the peer roster in the PEERVER peers dir.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::upgrade_intent_watcher::UpgradeIntentWatcher::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("upgrade_intent_watcher".into());
-
-        // FARM-AUTO-1 — build-farm orchestrator. Leader-gated; bridges the farm's
-        // etcd job lifecycle (FARM-AUTO-3 queue/results) onto the Bus as
-        // `event/farm/<jobid>` events so farm activity is visible mesh-wide.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::farm_orchestrator::FarmOrchestratorWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("farm_orchestrator".into());
-
-        // DATACENTER-5 — datacenter orchestrator. Leader-gated; samples the DC
-        // substrate (DigitalOcean now via doctl; Xen/XAPI + gateway as Phase-0
-        // deps land) and publishes `event/dc/<kind>/<id>` so the Workbench
-        // Datacenter plane sees hosts/VMs/droplets as first-class mesh state.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::datacenter_orchestrator::DatacenterOrchestratorWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("datacenter_orchestrator".into());
-
-        // DATACENTER-7 (audit half) — passive datacenter audit subscriber.
-        // Leader-gated; watches the `action/dc/*` Bus lanes and emits one
-        // append-only `event/dc/audit/<ulid>` record per request (deduped on
-        // ulid), without touching the action handlers — a pure side-observer.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::dc_auditor::DcAuditorWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("dc_auditor".into());
-
-        // DATACENTER-6 — passive async job-status tracker. Leader-gated; watches
-        // the `action/dc/*` Bus lanes + their `reply/<ulid>` replies and emits one
-        // `event/dc/job/<ulid>` event per status transition (pending→ok/error),
-        // without touching the action handlers — a pure side-observer.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::dc_jobs::DcJobsWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("dc_jobs".into());
-
-        // DATACENTER-24 — passive care-and-feeding health checker. Leader-gated;
-        // on a 30 s tick probes each configured Xen dom0's SSH reachability, the
-        // SUBSTRATE-V2 etcd `/health`, the mesh secret-store helper, the Nebula CA
-        // cert expiry, each dom0's VMs for crashes + its pool for degraded hosts,
-        // and emits one `event/dc/health/<check>` per check (deduped on status). It
-        // also folds each dom0's recent journal tail into the fleet_logs sink for
-        // the Datacenter Logs view — all without touching the substrate it
-        // watches (a pure side-observer).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::dc_health::DcHealthWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("dc_health".into());
-
-        // DATACENTER-23 — scheduled DR backups. Leader-gated; on a coarse (~5 min)
-        // tick decides via the pure `due` helper whether at least
-        // `MCNF_DR_INTERVAL_SECS` (default daily) have elapsed since the last run,
-        // and if so runs `automation/dr/dr-backup.sh` and publishes the outcome to
-        // `event/dc/dr/last` ({"status":"ok","path":…} | {"status":"fail",…}). The
-        // leader runs exactly one backup per interval mesh-wide.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::dr_scheduler::DrSchedulerWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("dr_scheduler".into());
-
-        // DATACENTER-12 (scheduled-snapshot executor) — the missing consumer of
-        // the Storage tab's "Save schedule". Leader-gated; reads each SR's latest
-        // `event/dc/snap-schedule/<sr>` config off the Bus, and on a coarse
-        // (~5 min) tick decides via the pure `due` helper whether each SR is due
-        // per its cadence. When due it takes the snapshot by REUSING the existing
-        // storage `xe vdi-snapshot` path over the mesh-key SSH (the same
-        // `xen_ssh_key`/`xen_dom0s` injection-guarded, dom0-allow-listed contract
-        // `ipc::storage_ops` uses), then enforces retention by destroying its OWN
-        // (prefix-tagged) oldest snapshots beyond the configured count — never an
-        // operator's hand-made snapshot. Emits a run result to
-        // `event/dc/snap-schedule-run/<sr>` and alerts on failure via the
-        // alert_relay lane. Without this worker the Storage tab's schedule was a
-        // config-only stub (config persisted, nothing ever executed it).
-        let snap_alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::dc_snap_scheduler::DcSnapSchedulerWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-                snap_alerts,
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("dc_snap_scheduler".into());
-
-        // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
-        // version running at each promotion stage (Build→Eagle→DO) to
-        // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
-        // the promotion matrix. Build version = newest release RPM (else
-        // `git describe`); Eagle/DO are honest `"unknown"` placeholders until
-        // those hosts are reachable.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::dc_promote::DcPromoteWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("dc_promote".into());
-
-        // ONBOARD-6 — continuous leader election. Renews the
-        // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
-        // node always holds leadership (previously only the upgrade watcher
-        // touched the lock, and only while an upgrade was in flight, so a
-        // steady-state mesh had NO LEADER and every leader-gated surface was
-        // dark). Runs on every node; the shared QNM-Shared mount makes them
-        // contend for the same lock.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::leader_election::LeaderElection::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("leader_election".into());
-
-        // FRONTDOOR-9 — the Copilot codex backend. Spawned on every node so
-        // failover is seamless, but LEADER-gated (Q73): only the elected node
-        // (the one renewed by `leader_election` above on the shared QNM-Shared
-        // lock) drains `action/copilot/ask`, reads the sealed codex API key from
-        // the mesh secret-store, runs `codex exec` per ask (external dependency,
-        // pulled at runtime — Q100), and replies on `reply/<ulid>`. ASK/SUGGEST
-        // ONLY (§9): it spawns the AI subprocess itself but never executes OS
-        // actions on the operator's behalf — typed/audited actions are the
-        // separate FRONTDOOR-11 worker. Degrades gracefully (logs + an "AI
-        // unavailable" reply, never a panic) when codex/key/network is down, so
-        // the rest of the Front Door keeps working (Q33).
-        //
-        // FRONTDOOR-10 (this worker, additional cadences) — the same worker also
-        // PROACTIVELY publishes (a) a compact Copilot STATUS to
-        // `state/copilot/status` on a cheap cadence (so the Front Door's Copilot
-        // tile — left a plain launcher by FD-4 because no topic existed — renders
-        // ready/thinking/offline), and (b) on a MODERATE leader-only timer, a
-        // ranked set of HIGH-IMPACT/HIGH-CONFIDENCE suggestions to
-        // `action/copilot/suggestions` for the GUI to render inline (Q7/Q61).
-        // Suggestions are PROPOSALS (FD-12 typed `ActionProposal`s) — never
-        // executed here, never published to FD-11's `action/exec/request` (§9).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::copilot::CopilotWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("copilot".into());
-
-        // FRONTDOOR-11 — the typed action worker (the execution half of the
-        // confirm gate, Q17 + Q26). Spawned on every node so failover is seamless,
-        // but LEADER-gated (Q73): only the elected node drains
-        // `action/exec/request` and acts, so a multi-node mesh executes + audits
-        // each action exactly once. It accepts a TYPED ActionRequest enum (an
-        // allowlisted KIND + typed params — NEVER a command string; §9 forbids a
-        // raw-shell channel) and maps each allowlisted KIND onto an EXISTING verb:
-        // the first cut allowlists `service_lifecycle`, dispatched via the PD-11
-        // `lifecycle` verb (a typed request the target's own `lifecycle_exec`
-        // validates against its live probe and runs locally — no push, no shell).
-        // Every action is hash-chain audited via the existing events plane (§8),
-        // and an unknown/disallowed action degrades to a typed rejection, never a
-        // panic (Q33).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::action::ActionWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("action".into());
-
-        // FILEMGR-5 — the mesh-mount worker owns the sshfs mount lifecycle over
-        // the Nebula overlay for the Files surface (design `file-manager-full.md`
-        // locks 11/13/15/17): it drains `action/mesh-mount/<host>` (typed verb —
-        // mount home / escalate to `/` / unmount), holds the node-sealed shared
-        // mesh SSH key (FILEMGR-6), and publishes `state/mesh-mount/*` with
-        // idle-unmount + reconnect-backoff + frozen-mount recovery. The live
-        // sshfs/fusermount impl is integration-gated behind the injectable
-        // `MountBackend` seam (§9 — no raw shell in the action layer; §7 — it
-        // returns an honest typed error headless, never a faked mount). A desktop
-        // feature (Workstation tier); idles gracefully with no mount requests.
-        if mackesd_core::worker_role::runs("mesh_mount", role_rank) {
-            let runtime_base = mackesd_core::workers::mesh_mount::resolve_runtime_base();
-            let repo_dir = mackesd_core::ipc::secret_store::repo_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::mesh_mount::MeshMountWorker::new(
-                    runtime_base,
-                    repo_dir,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("mesh_mount".into());
-        }
-
-        // TERM-7 — the mesh PTY-broker worker owns the remote-shell lifecycle
-        // over the Nebula overlay for the mde-term-egui terminal surface (design
-        // `mesh-terminal.md`): it drains `action/pty/<peer>` (typed verb —
-        // open/write/resize/close, each carrying the client-minted session id),
-        // opens a real remote shell via `ssh -tt` on the node-sealed shared mesh
-        // SSH key (FILEMGR-6, reused from mesh_mount), and publishes an append
-        // log on `state/pty/<id>` (base64 output chunks + the terminal exit) with
-        // idle-reap + dead-session reap. The live ssh impl is integration-gated
-        // behind the injectable `PtyBackend` seam (§9 — a typed argv, no
-        // shell-string injection; §7 — it returns an honest typed Gated/
-        // Unreachable state headless, never a faked session). A desktop feature
-        // (Workstation tier); idles gracefully with no pty requests on a headless
-        // box.
-        if mackesd_core::worker_role::runs("pty_broker", role_rank) {
-            let runtime_base = mackesd_core::workers::pty_broker::resolve_runtime_base();
-            let repo_dir = mackesd_core::ipc::secret_store::repo_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::pty_broker::PtyBrokerWorker::new(
-                    runtime_base,
-                    repo_dir,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("pty_broker".into());
-        }
+        spawn_broker_terminal_workers(&mut sup, &worker_names, role_rank, &workgroup_root);
 
         // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
         // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
@@ -4250,859 +3358,11 @@ fn run_serve(
                 .push("browser_tab_suspend".into());
         }
 
-        // KDC-MESH-6 — seat-side phone remote-input consumer. `kdc_host`
-        // publishes sanitized `action/seat/remote-input` rows after the paired
-        // phone/protocol checks; this worker owns the local injection seam and
-        // honest unavailable/error state when no uinput helper is configured.
-        if mackesd_core::worker_role::runs("seat_remote_input", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::seat_remote_input::SeatRemoteInputWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("seat_remote_input".into());
-        }
+        spawn_desktop_discovery_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root);
 
-        // CHOOSER-1 — the desktop-source discovery aggregator (design
-        // `desktop-chooser.md` §Architecture, locks 5/14): collects every
-        // desktop source — mesh-peer advertised (the replicated peers plane's
-        // RemoteAccess/vms rows), mDNS RDP/VNC/Spice on the local LAN (the
-        // mdns_relay machinery + its anti-loop TXT guard), local KVM guest
-        // consoles (the MV-3 LibvirtBackend seam), and manually-added
-        // endpoints — merges them into ONE deduped roster and publishes
-        // `state/desktops/sources` for the Chooser surface (CHOOSER-2).
-        // Drains typed `action/desktops/{add-source,remove-source,refresh}`
-        // verbs (§9). Live KVM enumeration is honestly gated (a typed Gated
-        // lane status when virsh is absent, §7 — never a faked source);
-        // reachability derives from roster presence / VM power state, never
-        // a blocking probe. A desktop feature (Workstation tier); idles
-        // gracefully on a headless box.
-        if mackesd_core::worker_role::runs("desktop_sources", role_rank) {
-            let store_root = mackesd_core::workers::desktop_sources::resolve_store_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::desktop_sources::DesktopSourcesWorker::new(
-                    node_id.clone(),
-                    workgroup_root.clone(),
-                    store_root,
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("desktop_sources".into());
-        }
+        spawn_fleet_compute_workers(&mut sup, &worker_names, role_rank, deploy_class, &node_id, &workgroup_root, &db_path);
 
-        // MEDIA-14 — the mesh media-source discovery aggregator (design
-        // `mesh-media-player.md`, row 26 "Mesh discovery"): folds two lanes into
-        // ONE deduped roster and publishes `state/media/sources` for the
-        // mde-media Sources panel (MEDIA-8). Lane 1 (mesh-registry) reads the
-        // replicated peers plane's `descriptors.media` Jellyfin/DLNA rows + each
-        // peer's `descriptors.mesh_fs` file share — the SAME plane desktop_sources
-        // reads, no new advertisement channel (§6 glue). Lane 2 (mDNS) browses
-        // `_jellyfin._tcp` on the local LAN via the mdns_relay machinery + its
-        // anti-loop TXT guard. Reachability derives from roster presence / peer
-        // health, never a blocking probe; music-only services (navidrome/mpd) are
-        // honestly excluded (mde-music's domain), and SSDP-only DLNA is surfaced
-        // as a `gated:` mDNS-lane note rather than faked (§7). A desktop feature
-        // (Workstation tier); idles gracefully on a headless box.
-        if mackesd_core::worker_role::runs("media_sources", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::media_sources::MediaSourcesWorker::new(
-                    node_id.clone(),
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("media_sources".into());
-        }
-
-        // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
-        // node so failover is seamless, but LEADER-gated internally (lock 7):
-        // only the elected node provisions per-node Vitelity sub-accounts, seals
-        // each node's SIP creds to its per-node key in the mesh secret store,
-        // reconciles Vitelity ⇄ roster idempotently + rate-limited, and holds
-        // the master API key (never distributed). Each node's reg-state is
-        // published to `state/voice/<node>` for the Voice panel fleet board
-        // (VOIP-GW-5). The live Vitelity transport is integration-gated (a typed
-        // error), never faked — a fresh mesh with no sealed master key simply
-        // shows every node `Provisioning` rather than a fake online (§7).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::voice_provision::VoiceProvisionWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("voice_provision".into());
-
-        // PRINT-2..PRINT-6 + PRINT-8 (v5.0.0) — auto CUPS print
-        // sharing + sync. Spawned on headless + full; SKIPPED on
-        // lighthouse (routing-only, no printers — Q8 lock). The
-        // profile is read from the installed-profile marker
-        // `mde-install` writes; missing marker → assume a printing
-        // profile (full/headless) and spawn. The worker itself is a
-        // silent no-op without cups/lpadmin, so an over-spawn on a
-        // box that happens to lack cups is harmless.
-        let print_profile = std::fs::read_to_string("/var/lib/mde/installed-profile")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if print_profile != "lighthouse" {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::cups_sync::CupsSyncWorker::new(),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("cups_sync".into());
-        } else {
-            tracing::info!("cups_sync: skipped (lighthouse profile)");
-        }
-
-        // FWMON-2..4 (v5.0.0) — firewall-denied event monitor.
-        // Reads kernel journal entries logged by firewalld's
-        // LogDenied=all setting (enabled by birthright's
-        // apply_firewall_log_denied step), filters overlay +
-        // established traffic, appends denials to
-        // <mesh-storage>/firewall/<host>.jsonl, and fires a Bus
-        // alert when one source crosses the threshold.
-        let fw_host = std::fs::read_to_string("/etc/hostname")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| node_id.clone());
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::firewall_monitor::FirewallMonitorWorker::new(fw_host.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("firewall_monitor".into());
-
-        // NOTIFY-SRC — SELinux AVC denials → the security alert lane. Without
-        // this the Alert Center never showed SELinux alerts (no source published
-        // them). auditd captures AVCs to audit.log, so the worker scrapes them
-        // via `ausearch --checkpoint` and publishes distinct denials to
-        // fleet/sec/selinux/<host>; the NOTIFY-DIST-2 mirror federates them.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::selinux_monitor::SelinuxMonitorWorker::new(fw_host.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("selinux_monitor".into());
-
-        // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
-        // Polls virsh + podman every 10 s; the per-peer inventory bus
-        // publish (`compute/inventory/<peer-nebula-addr>`) is on-change +
-        // a 60 s heartbeat per BUS-RUN-FULL-1 (docs/DECISIONS.md ADR-0005)
-        // — the cross-node fleet view reads the replicated
-        // compute-inventory.json file, the bus topic's only consumer is
-        // this node's own Workloads source. Silent no-op on peers without
-        // virsh/podman (lighthouse, container-stripped). The nebula
-        // address is auto-detected from the local nebula1 interface at
-        // tick time (empty hint = runtime detect).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::compute_registry::ComputeRegistryWorker::new(
-                fw_host.clone(),
-                String::new(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("compute_registry".into());
-
-        // ROUTER-3/4 — per-node, always-on router-registry: discover the node's
-        // primary router/firewall (lowest-metric default route + gateway MAC),
-        // cred-match `router/<mac>` + Vyatta `show version` fingerprint, and
-        // publish a RouterEntry to mesh/devices/router/<mac> + the QNM-Shared
-        // <host>/router-registry.json. Unconditional (any node may sit behind a
-        // router); a node with no default route is a safe no-op.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::router_registry::RouterRegistryWorker::new(
-                node_id.clone(),
-                fw_host.clone(),
-            )
-            .with_mount(workgroup_root.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("router_registry".into());
-
-        // MEDIA-7 — register the navidrome/media service into the mesh service
-        // registry. Capability-gated via runs_in("navidrome", deploy_class): it
-        // runs ONLY on a Lighthouse_Media node (MEDIA-1's Capability::Media) and
-        // is absent everywhere else. Publishes its registration (with a
-        // per-instance health field) to the per-peer Bus topic
-        // mesh/services/media/<peer> + the replicated QNM-Shared plane
-        // <host>/media-registry.json — the same registry plane the other
-        // published services use. The .with_mount honors --workgroup-root so the
-        // worker writes where the registry readers look.
-        if mackesd_core::worker_role::runs_in("navidrome", deploy_class) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::media_registry::MediaRegistryWorker::new(
-                    node_id.clone(),
-                    fw_host.clone(),
-                )
-                .with_mount(workgroup_root.clone()),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("media_registry".into());
-
-            // MEDIA-pkg-2 — self-heal the Navidrome systemd unit (restart-if-down,
-            // re-provision-if-missing via the RPM-shipped setup-media-navidrome).
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::navidrome_supervisor::NavidromeSupervisor::new(),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("navidrome_supervisor".into());
-        }
-
-        // MEDIA-15 — the mesh media server + DLNA/UPnP + aggregation (design
-        // `mesh-media-player.md`, rows 27 "Mesh library" + 30 "Server role"):
-        // the PRODUCER half MEDIA-14 discovers + MEDIA-8 renders. Scans this
-        // node's chosen shared folders into a `media-library.json` share
-        // manifest written to the replicated QNM-Shared plane
-        // (<host>/media-library.json — the SAME plane media-registry.json rides,
-        // no new channel), binds the mesh HTTP media server on MESH_MEDIA_PORT
-        // (9600) so the localhost descriptor probe folds `mde-media` into this
-        // peer's descriptors.media and peers' MEDIA-14 find it, and serves a
-        // DLNA/UPnP MediaServer (device description + DIDL-Lite; the SSDP
-        // multicast announce is the honestly-gated live leg — §7). Reads every
-        // peer's manifest off the plane + folds them into ONE deduped, per-node-
-        // attributed mesh library on `state/media/library` for the MEDIA-8
-        // Library panel. A desktop feature (Workstation tier); keyed by the
-        // hostname (fw_host) like media_registry so its manifest lands on the
-        // same replicated <host>/ dir the aggregators read. Idles gracefully on
-        // a headless box (empty share, empty library).
-        if mackesd_core::worker_role::runs("media_server", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::media_server::MediaServerWorker::new(
-                    node_id.clone(),
-                    fw_host.clone(),
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("media_server".into());
-        }
-
-        // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
-        // running launchable apps to <QNM-Shared>/<host>/running-apps.json
-        // every 10 s so every node's Applications-menu launcher can badge each
-        // entry with a live "running on <host>" indicator (same replicated
-        // plane as compute-inventory.json; the bus is per-node). Detects via
-        // process ↔ .desktop match — root reads every /proc/<pid>/cmdline, so
-        // no per-seat compositor probe is needed. The `.desktop` scan root
-        // mirrors the apps aggregator's home.
-        let apps_running_home = std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::apps_running::AppsRunningWorker::new(
-                fw_host.clone(),
-                apps_running_home,
-            )
-            // Write to the SAME resolved root the apps responder reads from
-            // (honors a `--workgroup-root` override) — otherwise the worker would
-            // publish under the default root while the reader looked elsewhere and
-            // no app ever got badged.
-            .with_mount(workgroup_root.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("apps_running".into());
-
-        // APPLAUNCH-5 — apps_installed: mirror this node's INSTALLED .desktop
-        // set to <QNM-Shared>/<host>/apps-installed.json every 60 s so the
-        // Front Door's Mesh filter can answer a focused peer's app set on
-        // demand (action/apps/peer-list) by reading the replicated file
-        // locally — a slow/dead peer never blocks the UI (lazy-mesh). Same
-        // replicated plane + scan root as apps_running; writes to the resolved
-        // workgroup_root so the responder reads what the worker publishes.
-        let apps_installed_home = std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::apps_installed::AppsInstalledWorker::new(
-                fw_host.clone(),
-                apps_installed_home,
-            )
-            .with_mount(workgroup_root.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("apps_installed".into());
-
-        // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
-        // spawns the worker; only the CA peer (presence of
-        // ~/.config/mde/nebula/ca.key) actually signs + replies, the
-        // others advance the cursor silently. compute_provision
-        // (VIRT-6) publishes to `action/compute/cert-sign-request`
-        // and awaits the reply via rpc::await_reply with the 30 s
-        // rpc::DEFAULT_RPC_TIMEOUT, retrying once before marking VM
-        // creation failed (per VIRT-5 acceptance bullet 4).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::cert_authority::CertAuthorityWorker::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("cert_authority".into());
-
-        // VIRT-7 (v5.0.0) — per-network firewalld port forwarding.
-        // Each peer subscribes to its own `compute/expose/<addr>` +
-        // `compute/unexpose/<addr>` topics and applies firewall-cmd
-        // rich rules per selected network. WAN zone is auto-detected
-        // at startup via nmcli + firewall-cmd. Publishes the active
-        // rule set to `compute/exposed/<addr>` for the Workbench.
-        // Silent no-op on lighthouse / container-stripped peers
-        // without firewall-cmd.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::compute_expose::ComputeExposeWorker::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("compute_expose".into());
-
-        // VIRT-8.a (v5.0.0) — cold VM migration source-side. Each
-        // peer drains `action/compute/migrate`; when own nebula IP
-        // == request.source_peer, runs the shutdown→rsync→publish
-        // migrate-ready→undefine flow over the Nebula overlay.
-        // Target-side handler (VIRT-8.b) ships with VIRT-6
-        // compute_provision and subscribes to
-        // `event/compute/migrate-ready`.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::compute_migrate::ComputeMigrateWorker::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("compute_migrate".into());
-
-        // VIRT-21 (v5.0.0) — compute_event_toast. Subscribes to every
-        // compute/event/<peer> topic and raises an FDO desktop toast on
-        // VM start/stop/crash so fleet lifecycle changes surface without
-        // keeping mde-virtual open.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::compute_event_toast::ComputeEventToastWorker::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("compute_event_toast".into());
-
-        // VIRT-6 (v5.0.0) — compute_provision. Drains this peer's
-        // `compute/create/<addr>` topic: ensures the mde-vms pool,
-        // allocates a per-peer /24 VM IP, runs requester-side
-        // nebula-cert keygen + the cert-sign RPC, builds the NoCloud
-        // seed, virt-installs the VM (with virtiofs MeshFS share when
-        // requested + mounted), acks on compute/create-ack/<ulid>, and
-        // fires an immediate inventory publish. workgroup_root + node_id
-        // locate this peer's nebula-bundle.json for the guest
-        // lighthouse roster.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::compute_provision::ComputeProvisionWorker::new(
-                fw_host.clone(),
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("compute_provision".into());
-
-        // XCP-3 — the A-plane provision flow. Drains
-        // `action/provision/spawn` and, for each request, drives the
-        // mackes-xcp Hypervisor layer over xe-over-SSH:
-        // `clone MDE-VM-golden → set_identity_seed (the fresh cloud-init
-        // seed: MDE-VM-<name> hostname, op key, regen host keys +
-        // machine-id) → start → resolve IP`, acking on
-        // `action/provision/spawn-ack/<ulid>`. This is the runtime caller
-        // that makes set_identity_seed reachable — a provisioned VM
-        // actually gets its identity seed. Idles cleanly on a node with no
-        // dom0 configured (MCNF_XEN_DOM0S empty → a clean error-ack); the
-        // dom0 allow-list is single-sourced from the datacenter env config.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::xcp_provision::XcpProvisionWorker::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("xcp_provision".into());
-
-        // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects
-        // the 9 items (docs/design/v6.0-mde-portal.md §7.1) hourly +
-        // writes ~/.local/share/mde/netassess/<host>/<iso>-<hash>.json
-        // with a 30-day rolling trim. Shell-outs degrade to None when
-        // a tool is absent (headless / air-gapped peers).
-        if let Some(data_dir) = dirs::data_dir() {
-            let netassess_base = data_dir.join("mde").join("netassess");
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::netassess::NetAssessWorker::new(fw_host.clone(), netassess_base)
-                    .with_mesh_context(workgroup_root.clone(), node_id.clone(), db_path.clone()),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("netassess".into());
-
-            // MESH-A-4.c.2 (v5.0.0) — surrounding-host discovery worker.
-            // Sweeps the LAN (mDNS + ARP-MAC + OUI) every 10 min and
-            // writes a per-peer snapshot under
-            // ~/.local/share/mde/surrounding/<host>/ (mesh-synced;
-            // every peer reads the union per R8-Q13).
-            let surrounding_base = data_dir.join("mde").join("surrounding");
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::surrounding_worker::SurroundingWorker::new(
-                    fw_host,
-                    surrounding_base,
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("surrounding_hosts".into());
-
-            // MESH-A-5.2 (v5.0.0) — mesh-coordinated firewall DROP:
-            // reconciles firewalld source-DROP rules against the
-            // mesh-synced Blocked-host consensus every minute.
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::mesh_firewall::MeshFirewallWorker::new(
-                    data_dir.join("mde").join("surrounding"),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("mesh_firewall".into());
-
-            // VOIP-4.b (v5.0.0) — broadcast this peer's Vitelity-link RTT to
-            // voip/link-rtt/<peer> every 60s for the dialer route override.
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::voip_rtt_worker::VoipRttWorker::new(),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("voip_rtt".into());
-        } else {
-            tracing::warn!("netassess: no XDG data dir; skipping network assessment worker");
-        }
-
-        // EPIC-MESH-PROBE (MESH-PROBE-4) — scheduled two-tier nmap
-        // probe worker. Resolves mesh-peer overlay IPs, scans them
-        // (fast 60s / deep 10min), writes this peer's
-        // probe-inventory.json into mesh-home, and announces
-        // probe/changed on the Bus when the inventory changes. The
-        // `mackesd probe scan/refresh` CLI shares the same engine.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::probe::ProbeWorker::new(workgroup_root.clone(), node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("probe".into());
-
-        // SUBAUDIT-D2 — hardware-probe producer. Gathers this node's
-        // PeerProbe (PCI/USB/kernel/power) + writes it to the replicated
-        // directory so every peer's Workbench Hardware panel renders the
-        // fleet. Was never built — the panel was permanently empty.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::hardware_probe::HardwareProbeWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("hardware_probe".into());
-
-        // E12-19 (Quasar host controls) — host_state. Mirrors this node's seat
-        // snapshot (published by the shell) to state/host/<node>/seat for the
-        // Workbench + remote peers, and authorizes remote typed verbs on
-        // action/host/<node>/verb behind the allowlist + safety interlocks
-        // (never-black-the-last-console, leader-aware power, two-phase confirm),
-        // forwarding an approved verb to the shell's local apply lane. Runs on
-        // every node.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::host_state::HostStateWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("host_state".into());
-
-        // SURFACE-3 — the per-node surface_enable worker. On a recognised
-        // Microsoft Surface it drains action/hardware/surface/<node>/enable
-        // (the Install tab's activate + MOK request), activates iptsd +
-        // applies the per-model config, walks the guided MOK enrollment
-        // (typed-armed reboot, honest firmware copy), and publishes the typed
-        // EnableResult to state/hardware/surface/<node>/enable. On a
-        // non-Surface node it idles (never touches the Bus). Live actions are
-        // integration-gated (honest typed errors, never faked).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::SurfaceEnableWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("surface_enable".into());
-
-        // SURFACE-4 — the per-node surface_verify worker. On a recognised
-        // Microsoft Surface it probes each profile-claimed subsystem into a
-        // tri-state board (Ok/Failed/Degraded + NeedsGesture, each with a real
-        // reason) published to state/hardware/surface/<node>/probes (the Test
-        // tab), and publishes the compact enablement summary (model, %, red
-        // count) to state/hardware/surface/<node> for the fleet rollup. On a
-        // non-Surface node it idles. Live probes are integration-gated (honest
-        // typed states headless, never faked green).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::SurfaceVerifyWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("surface_verify".into());
-
-        // SURFACE-5 — the per-node surface_firmware worker. On a recognised
-        // Microsoft Surface it publishes the fwupd/LVFS inventory (current +
-        // available versions per device) to state/hardware/surface/<node>/firmware
-        // (the Install tab's firmware panel), drains typed-armed apply requests
-        // on action/hardware/surface/<node>/fw-apply, and on a successful apply
-        // re-runs SURFACE-4's verify. An un-armed apply is refused; live fwupd
-        // calls are integration-gated (honest typed errors, never a faked
-        // update). On a non-Surface node it idles.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::SurfaceFirmwareWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("surface_firmware".into());
-
-        // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
-        // Pairs with `apply_netdata_monitor`'s baseline
-        // /etc/netdata/netdata.conf: when this peer wins
-        // leader-election it publishes its overlay IP to
-        // QNM-Shared so every other peer picks the same
-        // aggregator; on demote it stops publishing and the
-        // freshest pointer wins. Every tick re-reads the
-        // freshest pointer + rewrites the local netdata.conf
-        // `[stream]` block + reloads netdata when the
-        // aggregator IP changes. Fail-soft per the v2.6
-        // design lock: missing aggregator strips the
-        // `[stream]` block so netdata stays local-only with
-        // the 7-day dbengine retention. API key defaults to
-        // `mesh-${MDE_MESH_ID}-netdata` so every peer in the
-        // same mesh shares the value automatically without
-        // an extra wizard step (operators can override via
-        // MDE_NETDATA_API_KEY if they want a custom value).
-        match mackesd_core::store::open(&db_path) {
-            Ok(conn) => {
-                let netdata_store = Arc::new(tokio::sync::Mutex::new(conn));
-                let mesh_id_for_netdata = std::env::var("MDE_MESH_ID")
-                    .unwrap_or_else(|_| format!("mesh-{node_id}"));
-                let api_key = std::env::var("MDE_NETDATA_API_KEY")
-                    .unwrap_or_else(|_| format!("{mesh_id_for_netdata}-netdata"));
-                sup.spawn(Spawn::new(
-                    mackesd_core::workers::netdata_aggregator::NetdataAggregator::new(
-                        netdata_store,
-                        node_id.clone(),
-                        workgroup_root.clone(),
-                        api_key,
-                    ),
-                    RestartPolicy::Always,
-                ));
-                worker_names
-                    .lock()
-                    .expect("worker_names mutex")
-                    .push("netdata_aggregator".into());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    db_path = %db_path.display(),
-                    "netdata_aggregator: sqlite open failed; worker skipped"
-                );
-            }
-        }
-
-        // PLANES-24 W63 — scheduled one-puller mirror sync. Every node writes
-        // its dnf .repo to self-serve from the local file:// mount (W62); the
-        // leader additionally pulls upstream + indexes, Syncthing replicating
-        // the result. No DB handle needed — it works off the replicated root.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::mirror_syncd::MirrorSyncd::new(workgroup_root.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("mirror_syncd".into());
-
-        // NF-1.5 (v2.5) — TCP/443 covert listener. Binds the
-        // TLS 1.3 listener on :443 (default; env-overrideable),
-        // spawns the per-stream demux pump per accepted peer
-        // tunnel. Cert + key paths default to
-        // /etc/nebula/lighthouse.{crt,key}; overridable via
-        // MDE_HTTPS_TUNNEL_{CERT,KEY} env vars so operators
-        // running Let's-Encrypt-issued certs can point to the
-        // existing PEM chain. On peer-role boxes (no cert
-        // files), the worker fails its bind + the supervisor's
-        // OnFailure backoff effectively quarantines it.
-        match mackesd_core::workers::nebula_https_listener::NebulaHttpsListener::new() {
-            Ok(mut w) => {
-                if let Ok(p) = std::env::var("MDE_HTTPS_TUNNEL_CERT") {
-                    w = w.with_cert(PathBuf::from(p));
-                }
-                if let Ok(p) = std::env::var("MDE_HTTPS_TUNNEL_KEY") {
-                    w = w.with_key(PathBuf::from(p));
-                }
-                if let Ok(addr) = std::env::var("MDE_HTTPS_TUNNEL_BIND") {
-                    if let Ok(parsed) = addr.parse() {
-                        w = w.with_bind_addr(parsed);
-                    } else {
-                        tracing::warn!(
-                            value = %addr,
-                            "nebula-https-listener: MDE_HTTPS_TUNNEL_BIND parse failed; using default",
-                        );
-                    }
-                }
-                // Bug 6 (2026-06-06) — only run the relay :443 listener when a
-                // relay cert is actually present. A box with no lighthouse /
-                // Let's-Encrypt cert is not a relay; spawning anyway only fails
-                // the bind (and a per-user daemon can never bind a privileged
-                // port at all), which the OnFailure policy then respins ~4x/s.
-                //
-                // SUBAUDIT-D1 (2026-06-16) — the relay never ran *anywhere*
-                // because no node ever had /etc/nebula/lighthouse.crt. A
-                // public/lighthouse node now SELF-BOOTSTRAPS a self-signed relay
-                // cert so the :443 listener actually binds by default. Gated on
-                // relay-eligibility — the lighthouse role.host marker OR a pinned
-                // Lighthouse role — so a NAT'd workstation (e.g. .13) never
-                // generates a cert or binds :443.
-                let https_cert = std::env::var("MDE_HTTPS_TUNNEL_CERT").unwrap_or_else(|_| {
-                    mackesd_core::workers::nebula_https_listener::DEFAULT_CERT_PATH.to_string()
-                });
-                let https_key = std::env::var("MDE_HTTPS_TUNNEL_KEY").unwrap_or_else(|_| {
-                    mackesd_core::workers::nebula_https_listener::DEFAULT_KEY_PATH.to_string()
-                });
-                let relay_eligible = std::path::Path::new(
-                    mackesd_core::ipc::nebula::DEFAULT_ROLE_HOST_MARKER,
-                )
-                .exists()
-                    || matches!(mde_role::load(), Ok(mde_role::Role::Lighthouse));
-                if relay_eligible && !std::path::Path::new(&https_cert).exists() {
-                    let sans = vec![
-                        detect_primary_ipv4().unwrap_or_else(|_| "127.0.0.1".to_string()),
-                        "lighthouse.mesh.local".to_string(),
-                    ];
-                    match mackesd_core::nebula_enroll_endpoint::ensure_self_signed_cert(
-                        std::path::Path::new(&https_cert),
-                        std::path::Path::new(&https_key),
-                        &sans,
-                    ) {
-                        Ok(_) => tracing::info!(
-                            cert = %https_cert,
-                            "nebula-https-listener: self-bootstrapped a relay cert (SUBAUDIT-D1)",
-                        ),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "nebula-https-listener: relay cert bootstrap failed; relay stays down",
-                        ),
-                    }
-                }
-                if std::path::Path::new(&https_cert).exists() {
-                    sup.spawn(Spawn::new(w, RestartPolicy::OnFailure));
-                    worker_names
-                        .lock()
-                        .expect("worker_names mutex")
-                        .push("nebula_https_listener".into());
-                } else if relay_eligible {
-                    tracing::warn!(
-                        cert = %https_cert,
-                        "nebula-https-listener: relay-eligible but no cert after bootstrap — relay down",
-                    );
-                } else {
-                    tracing::info!(
-                        cert = %https_cert,
-                        "nebula-https-listener: not a relay node (no role.host marker / not Lighthouse) — skipped",
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "nebula-https-listener: construction failed; skipped",
-                );
-            }
-        }
-
-        // v4.0.1 AF-NET-2 (2026-05-23) — mesh-latency sniffer.
-        // Pings every enrolled non-local peer every 30 s and
-        // writes the result to ~/.cache/mde/mesh-latency.json.
-        // The WB-2.k.a Cairo topology canvas + panel Mesh-status
-        // tray badge both consume the file. Best-choice
-        // deviation from the TransportRegistry-routed approach
-        // — see worker doc-comment.
-        match mackesd_core::store::open(&db_path) {
-            Ok(conn) => {
-                let lat_store = Arc::new(tokio::sync::Mutex::new(conn));
-                let cache =
-                    mackesd_core::workers::mesh_latency::default_cache_path();
-                sup.spawn(Spawn::new(
-                    mackesd_core::workers::mesh_latency::MeshLatencyWorker::new(
-                        lat_store,
-                        node_id.clone(),
-                        cache,
-                    )
-                    .with_interval(daemon_cfg.mesh_latency_sweep()),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names.lock().expect("worker_names mutex").push("mesh_latency".into());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    db_path = %db_path.display(),
-                    "mesh-latency: sqlite open failed; worker skipped"
-                );
-            }
-        }
-
-        // MESHMAP-6 (2026-06-27) — real per-link byte counters. Maintains an
-        // nftables accounting table on the Nebula interface (one passive
-        // counter per peer overlay IP per direction), reads byte deltas every
-        // 5 s, and writes ~/.cache/mde/link-traffic.json. The mesh wallpaper /
-        // Peers-Map flow particles consume it as the REAL per-edge source,
-        // falling back to the per-node `sample_flows` proxy (MESHMAP-3) when
-        // the cache is absent (no nft / non-root / pre-delta). Rank-0 control-
-        // plane observer (runs everywhere, like mesh_latency); honest no-op on
-        // a box without nft (idles on the token, consumer keeps the proxy).
-        if mackesd_core::worker_role::runs("link-traffic", role_rank) {
-            match mackesd_core::store::open(&db_path) {
-                Ok(conn) => {
-                    let lt_store = Arc::new(tokio::sync::Mutex::new(conn));
-                    let lt_cache =
-                        mackesd_core::workers::link_traffic::default_cache_path();
-                    sup.spawn(Spawn::new(
-                        mackesd_core::workers::link_traffic::LinkTrafficWorker::new(
-                            lt_store,
-                            node_id.clone(),
-                            lt_cache,
-                        ),
-                        RestartPolicy::OnFailure,
-                    ));
-                    worker_names
-                        .lock()
-                        .expect("worker_names mutex")
-                        .push("link-traffic".into());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        db_path = %db_path.display(),
-                        "link-traffic: sqlite open failed; worker skipped"
-                    );
-                }
-            }
-        }
-
-        // TUNE-16.d (2026-05-30) — Q22 8-peer cap counter. Reads the
-        // enrolled peer count every 30 s, writes ~/.cache/mde/peer-cap.json,
-        // and publishes to mesh/peer-cap/updated. Phones count (enrolled
-        // as role='peer'); federated external-mesh peers don't appear in
-        // the local store and are naturally excluded.
-        match mackesd_core::store::open(&db_path) {
-            Ok(conn) => {
-                let cap_store = Arc::new(tokio::sync::Mutex::new(conn));
-                let cap_cache = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("mde")
-                    .join("peer-cap.json");
-                sup.spawn(Spawn::new(
-                    mackesd_core::workers::peer_cap::PeerCapWorker::new(cap_store, cap_cache),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names
-                    .lock()
-                    .expect("worker_names mutex")
-                    .push("peer-cap".into());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    db_path = %db_path.display(),
-                    "peer-cap: sqlite open failed; worker skipped"
-                );
-            }
-        }
-
-        // LIGHTHOUSE-8 — per-lighthouse deep-probe lane. Every ~15 s probes each
-        // lighthouse for Nebula handshake / public IP / overlay peer count /
-        // uptime / CA cert-expiry and publishes a LighthouseProbe to
-        // `compute/lighthouse-probe/<name>`; the Workbench Lighthouses tab
-        // renders it. The spawn is owned by the worker module
-        // (`Supervisor::spawn_lighthouse_probe`, sibling `Spawn::new` pattern +
-        // the rank-0 role gate); it self-resolves its workgroup root from
-        // `MDE_WORKGROUP_ROOT`, so no DB/handle plumbing is needed here.
-        if let Some(name) = sup.spawn_lighthouse_probe() {
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push(name.into());
-        }
+        spawn_probe_observability_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root, &db_path, &daemon_cfg);
 
         // v4.0.1 AF-* (2026-05-23) — register the
         // dev.mackes.MDE.Fleet.Files surface on the session bus
@@ -6098,251 +4358,7 @@ fn run_serve(
             }
         }
 
-        // v4.0.1 KDC2-3.3 wire-up (2026-05-23) — spawn the KDC host
-        // worker. Owns the pairing store at $XDG_CONFIG_HOME/mde/
-        // connect (default ~/.config/mde/connect), the shared
-        // DiscoveryRegistry, the outbound packet queue, and the
-        // dev.mackes.MDE.Connect D-Bus surface. Graceful-degrade
-        // on D-Bus failure — the worker keeps the host alive so
-        // the mesh-router can still dispatch through KDC, even if
-        // the operator-facing UI methods aren't reachable.
-        let kdc_config_dir = {
-            let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
-            let home_default = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|h| h.join(".config"));
-            xdg.or(home_default)
-                .map(|p| p.join("mde").join("connect"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/mde/connect"))
-        };
-        if mackesd_core::worker_role::runs("kdc_host", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::kdc_host::KdcHostWorker::new(kdc_config_dir),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("kdc_host".into());
-        }
-
-        // BUS-1.1 (v6.x Mackes Bus) — supervise the `mde-bus` daemon
-        // subprocess. Gracefully degrades when the binary is absent
-        // (dev box, RPM not yet installed) — the worker loops on a
-        // 30s tick waiting for the binary to appear. Once the BUS-1
-        // sub-epic ships, every mackesd peer carries the bus.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::bus_supervisor::BusSupervisor::new(),
-            RestartPolicy::Always,
-        ));
-        worker_names.lock().expect("worker_names mutex").push("bus_supervisor".into());
-
-        // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
-        // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
-        // text clip on the bus + appends to the mesh-global `clipboard/history.json`
-        // (last 50 unpinned + unlimited pinned). As the root system daemon it has
-        // no inherited $WAYLAND_DISPLAY, so it DISCOVERS the active seat0 graphical
-        // session (CLIP-SYNC-2) and spawns the capture as that user; a genuinely
-        // headless peer (Lighthouse/Server) finds no session and idles quietly, so
-        // it's cheap there. (This replaces the never-built `mde-clipd` daemon +
-        // `clipd_supervisor`: that binary never existed in the workspace; this
-        // worker is the sole, real clipboard capturer.)
-        if mackesd_core::worker_role::runs("clipboard_sync", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::clipboard_sync::build(workgroup_root.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("clipboard_sync".into());
-        }
-
-        // NOTIFY-CHAT-2 — the `chat` worker: live Bus send/recv (signs +
-        // relays on event/chat/message, persists to this node's Syncthing
-        // ring-log for offline backfill), folds every alert/event lane into a
-        // message from the originating host (lock 11), derives presence from
-        // the mesh-status snapshot + manual gossip, and republishes the
-        // state/chat/roster + state/chat/conversation/<key> read-model the
-        // Surface::Chat UI renders. Runs on EVERY node incl. headless (emit +
-        // relay, no UI) so alerts flow fleet-wide; unknown-worker rank-0
-        // default runs it everywhere. self_host is the bare hostname (the
-        // roster/DM identity), signed with the persisted node identity key.
-        // NOTE (E12-20 storage worker adds its own spawn line to this block —
-        // keep-both merge expected).
-        if mackesd_core::worker_role::runs("chat", role_rank) {
-            match mackesd_core::node_key::load_or_create(std::path::Path::new(
-                mackesd_core::node_key::DEFAULT_KEY_PATH,
-            )) {
-                Ok(signing_key) => {
-                    let self_host =
-                        node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
-                    sup.spawn(Spawn::new(
-                        mackesd_core::workers::chat::ChatWorker::new(
-                            workgroup_root.clone(),
-                            self_host,
-                            signing_key,
-                        ),
-                        RestartPolicy::OnFailure,
-                    ));
-                    worker_names.lock().expect("worker_names mutex").push("chat".into());
-                }
-                Err(e) => tracing::warn!(
-                    target: "mackesd::chat",
-                    error = %e,
-                    "chat worker: node signing key unavailable; not spawning",
-                ),
-            }
-        }
-
-        // CHAT-FIX-2 — the `notify` worker: the local-notification PRODUCER that
-        // makes Chat non-empty absent peer chatter. It watches this node's OWN
-        // event sources (mesh peer join/leave via the replicated directory,
-        // dnf/platform updates, systemctl --failed, df/SMART thresholds, journal
-        // WARN+) on bounded/edge-triggered polls and publishes typed notifications
-        // on `event/notify/<source>` — a lane the chat worker above folds
-        // (ALERT_LANE_PREFIXES) into this node's `alert:<self>` conversation the
-        // Surface::Chat UI renders as a timestamped feed + tray badge. Runs on
-        // EVERY node (rank 0), same self_host identity as the chat worker; every
-        // external source degrades honestly when its binary is absent.
-        if mackesd_core::worker_role::runs("notify", role_rank) {
-            let self_host = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::notify::NotifyWorker::new(
-                    workgroup_root.clone(),
-                    self_host,
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("notify".into());
-        }
-
-        // NODE-GRADE-1 — the `node_grade` worker: every node computes + publishes
-        // its OWN A–F capability grade (docs/design/node-grade.md). It scores five
-        // factors from telemetry the platform already gathers (§6, no new probes):
-        // CPU headroom (/proc/loadavg vs cores), RAM + disk free (/proc/meminfo,
-        // df /), role/worker health (the supervisor's live worker-status map +
-        // systemctl --failed), and mesh reachability (the replicated peer
-        // directory) — resource-heaviest weighted average → a smoothed 0–100 score
-        // + trend → an A–F band, published to
-        // `<workgroup_root>/node-grade/<hostname>.json` (the SEC-5 mesh-shunt
-        // own-row idiom) so every peer reads every node's grade. A debounced drop
-        // into D/F fires an `event/notify/node-grade` alert the chat worker folds
-        // into the Chat feed (CHAT-FIX-2). Universal (rank 0) like notify — every
-        // node grades itself; role_rank marks a lighthouse for the mesh factor and
-        // worker_status feeds the role factor.
-        if mackesd_core::worker_role::runs("node_grade", role_rank) {
-            let self_host = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::node_grade::NodeGradeWorker::new(
-                    self_host,
-                    workgroup_root.clone(),
-                    role_rank,
-                    Some(Arc::clone(&worker_status)),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("node_grade".into());
-        }
-
-        // TRANSFERS-1 — the `transfers` worker: the daemon-owned queue/ledger/verb/
-        // state-machine spine of the Transfers surface (docs/design/transfers-
-        // surface.md). Owns a typed TransferJob envelope, a persistent node-local
-        // ledger (survives restart, Q11), the submit/cancel/pause/resume/list verbs
-        // (Q14, driven by the `mackesd transfer …` CLI for §9 parity), and the
-        // parallel cap (Q12). Execution is delegated to an injectable LaneRunner seam
-        // the per-protocol lanes (TRANSFERS-2..6) implement — honestly gated for now
-        // (§7: a submitted job fails naming the un-wired lane, never a fake success).
-        // Workstation-tier (rank 1) — a desktop feature fronted by the File Browser,
-        // sibling of pty_broker/mesh_mount; it idles gracefully on a headless box /
-        // Lighthouse (an empty inbox + empty ledger). Store is node-local, so it
-        // needs neither the workgroup root nor the node id.
-        if mackesd_core::worker_role::runs("transfers", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::transfers::TransfersWorker::new(
-                    mackesd_core::workers::transfers::default_store_root(),
-                ),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("transfers".into());
-        }
-
-        // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
-        // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
-        // has shipped since v2.0.0 Phase B.6 but stayed dead;
-        // [[project_v1_3_0_fleet]] keeps the feature in scope so
-        // wiring is the right cleanup. The worker invokes
-        // `ansible-pull -U <MDE_ANSIBLE_PULL_URL> -i localhost,` on
-        // a 15-min cadence (matches the retired
-        // `mackes-ansible-pull.timer`). With MDE_ANSIBLE_PULL_URL
-        // unset the ansible-pull binary fails fast + the supervisor
-        // logs the error — the worker stays cheap to host.
-        // Bug 6 (2026-06-06) — without MDE_ANSIBLE_PULL_URL the worker only spawns
-        // `ansible-pull` to fail; a box with no fleet config-pull URL has nothing
-        // to do, so skip rather than respawn-on-failure into a periodic WARN.
-        let ansible_configured = std::env::var("MDE_ANSIBLE_PULL_URL")
-            .map(|u| !u.is_empty())
-            .unwrap_or(false);
-        if mackesd_core::worker_role::runs("ansible-pull", role_rank) {
-            if ansible_configured {
-                sup.spawn(Spawn::new(
-                    mackesd_core::workers::ansible_pull::build(),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names.lock().expect("worker_names mutex").push("ansible-pull".into());
-            } else {
-                tracing::info!(
-                    "ansible-pull: MDE_ANSIBLE_PULL_URL unset; fleet config-pull worker skipped"
-                );
-            }
-        }
-
-        // EPIC-SYNC-APP-CONFIG (Q26, 2026-05-28) — app-config sync is
-        // now a native-Rust worker (`workers::app_sync`); it discovers
-        // mesh media servers + writes Sublime Music / Delfin configs +
-        // the `~/Mackes Media/` launcher view directly, retiring the
-        // `python3 -m mackes.media_sync_daemon` subprocess (advances
-        // §11 #6). `OnFailure` keeps the 60 s tick alive across a
-        // transient write/probe error.
-        if mackesd_core::worker_role::runs("app-sync", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::app_sync::build(),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("app-sync".into());
-        }
-        // remmina-sync is a native Rust tick worker (RETIRE-PY.2): every 60 s
-        // it reads the mesh peer registry, TCP-probes SSH/RDP/VNC, and
-        // reconciles Remmina's "Mesh Peers" group. No `python3` is spawned.
-        if mackesd_core::worker_role::runs("remmina-sync", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::remmina_sync::build(),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("remmina-sync".into());
-        }
-
-        // MEDIA-8 — Workstation music auto-config (desktop-tier, like
-        // remmina-sync). Every 60 s it reads the published shared account off
-        // the replicated registry plane (<workgroup-root>/<host>/media-
-        // registry.json, written by a Lighthouse_Media node's media_registry
-        // worker) and idempotently writes the uid-1000 desktop user's
-        // airsonic-creds.json, so a fresh node's mde-music auto-browses the mesh
-        // library with no manual connect. NO mesh age key on Workstations — the
-        // shared account flows through the SERVICE REGISTRY, not the secret
-        // store. The .with_workgroup_root honors --workgroup-root so it reads
-        // where the registry writers write. Never clobbers a user-set creds file.
-        if mackesd_core::worker_role::runs("music_autoconfig", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
-                    .with_workgroup_root(workgroup_root.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("music_autoconfig".into());
-        }
+        spawn_messaging_sync_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root, &worker_status);
 
         // mackesd-06 — the reconcile worker now runs UNDER the supervisor (it was
         // a raw std::thread::spawn with NO restart-on-panic and NO supervision, so
@@ -6451,6 +4467,2185 @@ fn run_serve(
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+// run_serve extract: rank-0 compute/lifecycle workers (mdns_relay .. health_reconciler).
+#[allow(clippy::too_many_arguments)]
+fn spawn_compute_lifecycle_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+    db_path: &PathBuf,
+    daemon_cfg: &mackesd_core::config::daemon::MackesdConfig,
+    nebula_signal_slot: &mackesd_core::ipc::nebula::SignalSenderSlot,
+) {
+    use mackesd_core::workers::{
+        heartbeat::HeartbeatWorker, mdns_relay::MdnsRelayWorker, RestartPolicy, Spawn,
+    };
+    // MESH-MDNS-RELAY — native cross-segment mDNS service relay (browses
+    // the local LAN, publishes services to the mesh Bus). Rank 0: a relay
+    // control-plane worker, runs on every role.
+    if mackesd_core::worker_role::runs("mdns_relay", role_rank) {
+        sup.spawn(Spawn::new(MdnsRelayWorker::new(), RestartPolicy::OnFailure));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("mdns_relay".into());
+    }
+    // RETIRE-PY.4 (2026-06-07) — the GVFS `fs_sync` worker (supervised
+    // `python3 -m mackes.mesh_gvfs.daemon`, a retired Python MDE module
+    // absent in the monorepo) is removed. Mesh storage is served by
+    // Syncthing (E3); per-peer share access is via the Bus file-ops, so
+    // the second FUSE substrate is retired rather than rebuilt.
+    if mackesd_core::worker_role::runs("heartbeat", role_rank) {
+        sup.spawn(Spawn::new(
+            HeartbeatWorker::new(workgroup_root.clone(), node_id.clone())
+                .with_interval(daemon_cfg.heartbeat_interval()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("heartbeat".into());
+    }
+    // BOOT-STATUS-1 — the boot_readiness worker: probes the fabric bring-up
+    // chain (Nebula → overlay IP → mackesd → bus → QNM mount → directory) and
+    // publishes an ordered snapshot to state/boot-readiness for the HOME
+    // boot-status dialog. All roles (headless nodes report the same chain).
+    if mackesd_core::worker_role::runs("boot_readiness", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::boot_readiness::BootReadinessWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+                db_path.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("boot_readiness".into());
+    }
+    // XCP-6 (B2) — on an XCP-ng dom0, advertise hypervisor capacity
+    // (CPU/RAM/SR-free/running-VMs) to `compute/xcp-host/<node>` so any node
+    // can target it for a VM spawn. Self-gates on the dom0 marker, so it's a
+    // harmless no-op on every non-hypervisor node; spawned on all roles (a
+    // joined XCP host pins Server).
+    if mackesd_core::worker_role::runs("xcp_host", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::xcp_host::XcpHostWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("xcp_host".into());
+    }
+    // KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes
+    // the per-node KVM virtualization service catalog
+    // (`mackesd_core::kvm::KVM_SERVICES`, `systemctl is-active` each) every
+    // 30 s and publishes a whole-host health summary to `event/kvm/services`
+    // so the Datacenter panels + the alert lane see the live stack state.
+    // The KVM stack is universal — every mesh node runs the same libvirt +
+    // Podman set (docs/design/mesh-virt-management.md: "same stack on every
+    // machine") — so it gates through the rank-0-default worker resolver,
+    // i.e. it runs everywhere.
+    if mackesd_core::worker_role::runs("kvm_health", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::kvm_health::KvmHealthWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("kvm_health".into());
+    }
+    // MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator
+    // the Datacenter UI drives. Drains `action/vm/lifecycle` (create-from-
+    // image / start / stop / destroy / list, each addressed to a target
+    // node id) via an injectable LibvirtBackend that shells `virsh`/
+    // `qemu-img` through the bounded proc path, and publishes this node's VM
+    // instance roster to `event/vm/instances`. Universal like kvm_health —
+    // every node can host datacenter VMs — so it gates through the
+    // rank-0-default worker resolver (runs everywhere). node_id is both the
+    // event `host` stamp and the action target this worker matches.
+    if mackesd_core::worker_role::runs("vm_lifecycle", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::vm_lifecycle::VmLifecycleWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("vm_lifecycle".into());
+    }
+    // MV-4 — the container worker: the Podman container-lifecycle actuator (the
+    // container half of the mesh management layer, companion to MV-3
+    // vm_lifecycle). Drains `action/container/lifecycle` (run / stop / rm /
+    // list, each addressed to a target node id) via an injectable
+    // PodmanBackend that shells `podman` through the bounded proc path, and
+    // publishes this node's container roster to `event/podman/containers`.
+    // Universal like vm_lifecycle — every node can host datacenter containers —
+    // so it gates through the rank-0-default worker resolver (runs everywhere).
+    // node_id is both the event `host` stamp and the action target this worker
+    // matches.
+    if mackesd_core::worker_role::runs("container", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::container::ContainerWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("container".into());
+    }
+    // E12-20 — the storage worker: the privileged owner of the Workbench
+    // Storage plane (GParted for the mesh). Owns a typed StorageOp pending
+    // queue over a live UDisks2 zbus topology, validates each op at stage-time
+    // (advisory) + apply-time (authoritative), enforces the hard-wall
+    // interlocks (root/boot/EFI · mesh-storage backer · in-use VM/container)
+    // and the typed-arming echo IN the executor (a UI bug can't bypass), and
+    // publishes the `state/storage/<node>` topology mirror + drains
+    // `action/storage/<node>` verbs. Universal like vm_lifecycle/container —
+    // any node has disks — so it is pinned at rank 0 in the worker_role census
+    // (BUG-STORAGE-1: an EXPLICIT rank-0 entry, not the silent unknown-worker
+    // default, so a Workstation provably publishes its own mirror and the
+    // `role-workers` diagnostic lists it). node_id is the per-node topic
+    // namespace + the mirror `host` stamp.
+    if mackesd_core::worker_role::runs("storage", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::storage::StorageWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("storage".into());
+    }
+    // QC-2 — the openstack worker: the QUASAR-CLOUD supervision root
+    // (docs/design/quasar-cloud.md). Reads the fleet/one-state cloud
+    // doctrine for WHICH Kolla service containers this node hosts (the
+    // live etcd/Syncthing doctrine read is a typed IntegrationGated until
+    // QC-4 authors the record), converges desired vs running under Podman
+    // via the injectable PodmanRunner seam (start missing / restart
+    // killed / stop extra; starts honestly gated on the operator-mirrored
+    // image (QC-3 airgap lane) + the rendered Kolla config (QC-4)), and
+    // publishes the `state/openstack/<node>` mirror. Universal — the
+    // design's any-role-node premise (Q1/Q5/Q22) — so it is a deliberate
+    // rank-0 census entry like storage's; the doctrine, not the role,
+    // decides which services land here. node_id is the mirror `host`
+    // stamp; the workgroup root seeds the doctrine seam's Syncthing leg.
+    if mackesd_core::worker_role::runs("openstack", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::openstack::OpenstackWorker::new(
+                node_id.clone(),
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("openstack".into());
+    }
+    // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero
+    // unit explorer (docs/design/unit-explorer.md). Unions three sources into
+    // one typed `Unit` stream and publishes `state/units/<node>`: the mesh
+    // mirror (peers + `/mesh/leader` + health it already reads), the union of
+    // every node's `state/openstack/<node>` mirror (QC-2, deduped by object id +
+    // host-tagged, consumed through the Bus read path — never an openstack
+    // file), and the surface-gated active LAN scan (EXPLORER-2's producer seam,
+    // a no-op today). Publish-on-change + heartbeat, plus the E9
+    // `action/units/get-stream` read verb any mesh client can call. Universal
+    // (rank 0) like storage/openstack — every node publishes its own unit view,
+    // no center. node_id is the mirror `host` stamp + self unit; workgroup_root
+    // seeds the peer-directory reader.
+    if mackesd_core::worker_role::runs("unit_aggregator", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::unit_aggregator::UnitAggregatorWorker::new(
+                node_id.clone(),
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("unit_aggregator".into());
+    }
+    // MV-5a — the scheduler worker: the placement slice of the no-center
+    // scheduler. Drains `action/schedule/place`, folds each node's latest
+    // `event/kvm/services` capacity, chooses the target node (healthy pin →
+    // most-active → node_id tie-break), and forwards a host-targeted
+    // create/run onto `action/vm/lifecycle` / `action/container/lifecycle`
+    // (plus the decision to `event/schedule/placements`). Rank-0-default like
+    // vm_lifecycle/container (runs everywhere); an interim lowest-node-id
+    // single-actor election keeps N nodes from emitting duplicate placements.
+    // Failover re-election + etcd desired-state persistence are MV-5b.
+    if mackesd_core::worker_role::runs("scheduler", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::scheduler::SchedulerWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("scheduler".into());
+    }
+    // E12-5b — the session_broker worker: the mackesd side of the E12-5 VDI
+    // remote-desktop milestone. Drains `action/vdi/session`, folds each op
+    // into the live VDI-session roster (which peer serves which VM to which
+    // client + state) via a pure state machine, and — leader-gated —
+    // reconciles that roster into the shared roaming-session plane through the
+    // injectable SessionStore seam so any peer sees the active sessions.
+    // Rank-0-default like scheduler (runs everywhere); the shared leader lock
+    // keeps an N-node mesh from multi-writing. The live etcd/Syncthing
+    // cross-peer publish is integration-gated (typed error, §7).
+    if mackesd_core::worker_role::runs("session_broker", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::session_broker::SessionBrokerWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("session_broker".into());
+    }
+    // VDI-VM-1 — the console_broker worker: the serving-side half that actually
+    // makes a LOCAL KVM VM's console reachable on the mesh. Every VM binds SPICE
+    // to 127.0.0.1 (vm_lifecycle's domain XML), so session_broker can track a
+    // local-VM session but there is no reachable endpoint to attach frames.
+    // For each VDI `Open` naming a VM this node serves, this worker resolves the
+    // live console (`virsh domdisplay`), relays that loopback port onto the
+    // Nebula overlay with a scoped socat (the compute_expose forward pattern),
+    // and publishes the overlay `host:port` back on the session record
+    // (`state/vdi/console`, keyed by session id) for the client shell to
+    // resolve. Serving-peer-gated (NOT leader-gated: the relay + loopback
+    // console are physically on the serving host); runs everywhere like
+    // session_broker. Honest-gates (never a fake endpoint) when the VM is off /
+    // has no graphics / socat|virsh|overlay is absent — §7.
+    if mackesd_core::worker_role::runs("console_broker", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::console_broker::ConsoleBrokerWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("console_broker".into());
+    }
+    // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
+    // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
+    // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —
+    // makes a user's desktops follow them to any Workstation (reconcile_roaming)
+    // and survive disconnect (on_disconnect default KeepRunning; on_node_loss
+    // holds reconnectable). Rank-0-default like session_broker (runs everywhere);
+    // the shared leader lock keeps an N-node mesh from multi-writing. REUSES the
+    // broker's VdiSession + SessionStore; sessions and monitor layouts persist
+    // through the replicated workgroup-root stores (MeshSessionStore +
+    // MeshLayoutStore), with future etcd-backed stores hidden behind the same
+    // seams.
+    if mackesd_core::worker_role::runs("session_roaming", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::session_roaming::SessionRoamingWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("session_roaming".into());
+    }
+    // OW-11 (Bus half) — the service_onboard worker: `onboard service-add`
+    // reachable over the Bus. Drains `action/onboard/service-add`, runs the
+    // EXISTING onboard::service_add engine (plan + the injectable ServiceApply
+    // seam — §6 glue), and — leader-gated like session_broker so an N-node
+    // mesh answers each request once — publishes the typed result event on
+    // `event/onboard/service-add` for the shell's Services flow. Rank-0-default
+    // like session_broker (runs everywhere); real applies run over
+    // LiveServiceApply, whose typed IntegrationGated is the honest live answer
+    // today (§7).
+    if mackesd_core::worker_role::runs("service_onboard", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::service_onboard::ServiceOnboardWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("service_onboard".into());
+    }
+    // OW-7 (Bus half) — the spawn_lighthouse_onboard worker: `onboard
+    // spawn-lighthouse` reachable over the Bus. Drains
+    // `action/onboard/spawn-lighthouse`, runs the EXISTING
+    // onboard::spawn_lighthouse engine (plan_spawn + the injectable Provisioner
+    // seam — §6 glue), and — leader-gated like service_onboard so an N-node mesh
+    // answers each request once — publishes the typed result event on
+    // `event/onboard/spawn-lighthouse` for the shell's Spawn Lighthouse flow.
+    // Rank-0-default like service_onboard (runs everywhere); real provisions run
+    // over LiveProvisioner, whose typed IntegrationGated is the honest live answer
+    // today (the live cloud/SSH provision + CA-migrate stays gated, §7).
+    if mackesd_core::worker_role::runs("spawn_lighthouse_onboard", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::spawn_lighthouse_onboard::SpawnLighthouseOnboardWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("spawn_lighthouse_onboard".into());
+    }
+    // OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native
+    // receiver for the BusApply remote-push transport. Drains
+    // `action/onboard/apply` (a signed JobBundle + the claimed issuer) and
+    // applies it ONLY when addressed to this node, from a leadership-authorized
+    // issuer (the CA `nodes` registry resolves the issuer to a leader-eligible
+    // lighthouse identity key), validly signed/fresh/single-use — reusing the
+    // pure onboard::remote_push core (allow-listed Action enum, no raw shell —
+    // §9). Rank-0 default (any enrolled peer can be a target; each node applies
+    // only bundles addressed to it). Publishes the typed observed-state /
+    // rejection on `event/onboard/apply`; the live cross-node round-trip is
+    // operator/live-gated behind BusApply (§7).
+    if mackesd_core::worker_role::runs("onboard_apply", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::onboard_apply::OnboardApplyWorker::new(
+                &workgroup_root,
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("onboard_apply".into());
+    }
+    // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
+    // bridges. Drains `action/vdi/clipboard`, applies a per-session policy
+    // (allow/deny + one-way + a size cap) via the pure relay decision
+    // (Forward/Drop/Truncate), and relays each clip into the connected VM desktop
+    // through the injectable ClipboardAccess seam (with an echo guard). Clipboard
+    // relay is per-session + node-local — every serving node must apply ITS
+    // session's clips — so it is NOT leader-gated (unlike session_broker) but is
+    // rank-0-default the same way (runs everywhere). The live OS/guest clipboard
+    // channel (SPICE/RDP vdagent / wl-clipboard) is integration-gated (typed
+    // error, §7); the pure model + relay pipeline ship green behind the seam.
+    if mackesd_core::worker_role::runs("clipboard_bridge", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::clipboard_bridge::ClipboardBridgeWorker::new(),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("clipboard_bridge".into());
+    }
+    // OV-7.a (v2.6) — health reconciler. Polls each known
+    // peer's QNM-Shared heartbeat.json every 5 s, applies the
+    // telemetry::health_state_from_age threshold table, writes
+    // back into nodes.health, and fires PeerStateChanged on
+    // transitions. Closes the gap between live heartbeats and
+    // the SQLite column that NebulaStatusService::build_peer_list
+    // projects. Spawn order: after HeartbeatWorker so peers
+    // have at least one observable heartbeat by the first
+    // reconcile tick.
+    if mackesd_core::worker_role::runs("health_reconciler", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::health_reconciler::HealthReconcilerWorker::new(
+                workgroup_root.clone(),
+                db_path.clone(),
+                node_id.clone(),
+                std::sync::Arc::clone(&nebula_signal_slot),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("health_reconciler".into());
+    }
+}
+
+// run_serve extract: mesh gossip/reconcile plumbing workers (sshd_overlay_bind .. connect_firewall).
+fn spawn_mesh_plumbing_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+    db_path: &PathBuf,
+) {
+    use mackesd_core::workers::{
+        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile, job_exec,
+        lifecycle_exec, mesh_dns, netstate_apply, presence_watch, ssh_pubkey_gossip,
+        sshd_overlay_bind::SshdOverlayBindWorker, validation_suite, RestartPolicy, Spawn,
+    };
+    // NF-21.1 — sshd overlay-bind worker. Polls
+    // /var/lib/mackesd/nebula/overlay-ip every 5 s; on change,
+    // writes the /etc/ssh/sshd_config.d/mackes-mesh.conf drop-in
+    // + reloads sshd so the daemon binds to the new overlay
+    // address. Quiet no-op on pre-enrollment peers (missing
+    // publish file). Replaces mesh_nebula.py::write_sshd_overlay_bind
+    // so the Python module can fully retire (DEAD-2.14 plan).
+    sup.spawn(Spawn::new(
+        SshdOverlayBindWorker::new(),
+        RestartPolicy::OnFailure,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("sshd_overlay_bind".into());
+    // SVC-2 (Q60) — SSH pubkey gossip: publish this box's user
+    // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
+    // published key into ~/.ssh/authorized_keys (managed block,
+    // write-on-change). Syncthing replication is the transport.
+    // PD-11 — the lifecycle executor: descriptor-gated container/VM
+    // start/stop requests from peers, via replicated request files.
+    if mackesd_core::worker_role::runs("lifecycle_exec", role_rank) {
+        sup.spawn(Spawn::new(
+            lifecycle_exec::LifecycleExecWorker::new(
+                workgroup_root.clone(),
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("lifecycle_exec".into());
+    }
+    // DEVMGR-8 — the device-control executor: drains this box's replicated
+    // fleet/device-control/<self>/ for typed privileged-op requests the
+    // Device-Manager surface dispatches (enable/disable, reload module,
+    // rescan bus), gates each against this node's own published inventory
+    // (L9 rail), executes the FIXED sysfs/ip/modprobe seam, hash-chain audits
+    // it, and notifies on failure. Universal (rank 0) like lifecycle_exec.
+    if mackesd_core::worker_role::runs("device_control", role_rank) {
+        sup.spawn(Spawn::new(
+            device_control::DeviceControlExecWorker::new(
+                workgroup_root.clone(),
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("device_control".into());
+    }
+    // PD-13 — presence-transition alerts: offline/online crossings
+    // become desktop notifications via the alert_relay pipeline.
+    if mackesd_core::worker_role::runs("presence_watch", role_rank) {
+        let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+        sup.spawn(Spawn::new(
+            presence_watch::PresenceWatchWorker::new(
+                workgroup_root.clone(),
+                alerts,
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("presence_watch".into());
+    }
+    // SUBSTRATE-10 — etcd WATCH worker: opens watch streams on /mesh/peers/
+    // (a Delete = a keepalive lease expired = a peer dropped) + /mesh/leader
+    // (a Put with a new node_id = a leadership handover) and PUSHES instant
+    // alerts onto the same alert_relay lane presence_watch uses — no poll,
+    // no 5 s reconcile lag. Degrades cleanly off the coordination plane
+    // (empty endpoints / etcd unreachable → idle + back off, never panic).
+    if mackesd_core::worker_role::runs("etcd_watch", role_rank) {
+        let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::etcd_watch::EtcdWatchWorker::new(
+                alerts,
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("etcd_watch".into());
+    }
+    // PD-9 / FPG — the reconcile driver: magic-fleet reconcile on a
+    // 15-min cadence + immediately on this host's nudge file.
+    if mackesd_core::worker_role::runs("fleet_reconcile", role_rank) {
+        sup.spawn(Spawn::new(
+            fleet_reconcile::FleetReconcileWorker::new(
+                workgroup_root.clone(),
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("fleet_reconcile".into());
+    }
+    // PLANES-18 — mesh DNS: feed <host>.mesh into resolved +
+    // /etc/hosts on every node (rank 0 plumbing).
+    if mackesd_core::worker_role::runs("mesh_dns", role_rank) {
+        sup.spawn(Spawn::new(
+            mesh_dns::MeshDnsWorker::new(Some(db_path.clone())),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("mesh_dns".into());
+    }
+    // PLANES-15 — netstate engine mount: converge the baseline's
+    // network desired-state under a rollback checkpoint + overlay
+    // self-test (W77/W78), on every node.
+    if mackesd_core::worker_role::runs("netstate_apply", role_rank) {
+        sup.spawn(Spawn::new(
+            netstate_apply::NetstateApplyWorker::new(
+                workgroup_root.clone(),
+                Some(db_path.clone()),
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("netstate_apply".into());
+    }
+    // PLANES-19 — overlay-reachability validation suite: every node
+    // participates; the leader mints nightly/run-now + writes verdicts.
+    if mackesd_core::worker_role::runs("validation_suite", role_rank) {
+        sup.spawn(Spawn::new(
+            validation_suite::ValidationSuiteWorker::new(
+                workgroup_root.clone(),
+                Some(db_path.clone()),
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+                std::path::PathBuf::from(
+                    mackesd_core::workers::netdata_aggregator::DEFAULT_ROLE_HOST_MARKER,
+                ),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("validation_suite".into());
+    }
+    // PLANES-9 — the local job executor (execution-tag gated, W84).
+    if mackesd_core::worker_role::runs("job_exec", role_rank) {
+        sup.spawn(Spawn::new(
+            job_exec::JobExecWorker::new(
+                workgroup_root.clone(),
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("job_exec".into());
+    }
+    if mackesd_core::worker_role::runs("ssh_pubkey_gossip", role_rank) {
+        sup.spawn(Spawn::new(
+            ssh_pubkey_gossip::SshPubkeyGossipWorker::new(workgroup_root.clone(), node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("ssh_pubkey_gossip".into());
+    }
+    // NF-21.3 — firewall_preset worker. Applies the Nebula
+    // firewalld preset (UDP/4242 inbound on all peers; TCP/443
+    // inbound additionally on lighthouses) on first tick + on
+    // every role-flip via the /var/lib/mackesd/nebula/role.host
+    // marker. Idempotent — firewall-cmd's ALREADY_ENABLED is
+    // treated as success. Replaces mesh_nebula.py::apply_nebula_firewall_preset
+    // so the Python helper can retire (DEAD-2.14 plan).
+    sup.spawn(Spawn::new(
+        FirewallPresetWorker::new(),
+        RestartPolicy::OnFailure,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("firewall_preset".into());
+    // CONNECT-3 — exposure-driven firewall enforcement (additive): opens the
+    // policy's ingress ports on the public zone for services bound to this
+    // node, so `expose` actually accepts public traffic. Never removes a rule
+    // (can't lock out SSH/Nebula). Same supervised shape as the preset worker.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::connect_firewall::ConnectFirewallWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::OnFailure,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("connect_firewall".into());
+}
+
+// run_serve extract: leader-gated datacenter/scheduler/frontdoor workers (alert_relay .. action).
+fn spawn_datacenter_scheduler_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    // MON-4 (v2.6) — alert relay worker. Polls
+    // ~/.local/share/mde/alerts/*.json for events
+    // written by mde-alert-emit (MON-3) via Netdata's
+    // health_alarm_notify.conf custom-sender hook + fires
+    // an FDO desktop notification via notify-send per
+    // new event. Deduplicates by deterministic ULID.
+    // RestartPolicy::Always since the tick is passive +
+    // operator outage detection is the failure-tolerance
+    // goal.
+    //
+    // v6.0 Portal-1 — attach a PortalClient so CRITICAL
+    // alerts also navigate Portal-full to the Control
+    // (mesh-health) layer. Graceful-degrade: if the session
+    // bus or mde-portal aren't running at daemon startup
+    // the relay skips the portal call and surfaces the
+    // FDO notification alone.
+    // DBUS-2: the portal shell IPC is the Bus now. PortalClient is
+    // stateless (it appends to action/shell/<verb> per call), so the
+    // relay always attaches it — a CRITICAL alert's goto(control) is
+    // durable even if mde-portal is down at the time.
+    // E4.20 — the portal-era "navigate to Control on CRITICAL" publish was
+    // dropped: alerts already surface via `notify-send` → notifyd → the Win10
+    // Action Center, so the `action/shell/goto` Bus publish (whose only
+    // consumer was the retired portal) is redundant.
+    let alert_relay = mackesd_core::workers::alert_relay::AlertRelayWorker::new();
+    tracing::info!(
+        "alert_relay: PortalClient attached \
+             (CRITICAL alerts publish action/shell/goto control)"
+    );
+    sup.spawn(Spawn::new(alert_relay, RestartPolicy::Always));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("alert_relay".into());
+
+    // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
+    // worker. Runs on every peer; silently no-ops until a
+    // `mde-update --coordinate <ver>` writes an intent file into
+    // `<mesh-home>/upgrade-intent/`. Then it runs `dnf upgrade
+    // mde-core` on its own schedule, marks itself ready, fires
+    // `mde-install --yes` once quorum + grace are met, and — when
+    // it holds the leader lease — cleans up fully-complete intent
+    // files after the +24h grace. No SQLite handle needed: the
+    // barrier state lives in the GFS-replicated intent files and
+    // the peer roster in the PEERVER peers dir.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::upgrade_intent_watcher::UpgradeIntentWatcher::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("upgrade_intent_watcher".into());
+
+    // FARM-AUTO-1 — build-farm orchestrator. Leader-gated; bridges the farm's
+    // etcd job lifecycle (FARM-AUTO-3 queue/results) onto the Bus as
+    // `event/farm/<jobid>` events so farm activity is visible mesh-wide.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::farm_orchestrator::FarmOrchestratorWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("farm_orchestrator".into());
+
+    // DATACENTER-5 — datacenter orchestrator. Leader-gated; samples the DC
+    // substrate (DigitalOcean now via doctl; Xen/XAPI + gateway as Phase-0
+    // deps land) and publishes `event/dc/<kind>/<id>` so the Workbench
+    // Datacenter plane sees hosts/VMs/droplets as first-class mesh state.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::datacenter_orchestrator::DatacenterOrchestratorWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("datacenter_orchestrator".into());
+
+    // DATACENTER-7 (audit half) — passive datacenter audit subscriber.
+    // Leader-gated; watches the `action/dc/*` Bus lanes and emits one
+    // append-only `event/dc/audit/<ulid>` record per request (deduped on
+    // ulid), without touching the action handlers — a pure side-observer.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::dc_auditor::DcAuditorWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("dc_auditor".into());
+
+    // DATACENTER-6 — passive async job-status tracker. Leader-gated; watches
+    // the `action/dc/*` Bus lanes + their `reply/<ulid>` replies and emits one
+    // `event/dc/job/<ulid>` event per status transition (pending→ok/error),
+    // without touching the action handlers — a pure side-observer.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::dc_jobs::DcJobsWorker::new(workgroup_root.clone(), node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("dc_jobs".into());
+
+    // DATACENTER-24 — passive care-and-feeding health checker. Leader-gated;
+    // on a 30 s tick probes each configured Xen dom0's SSH reachability, the
+    // SUBSTRATE-V2 etcd `/health`, the mesh secret-store helper, the Nebula CA
+    // cert expiry, each dom0's VMs for crashes + its pool for degraded hosts,
+    // and emits one `event/dc/health/<check>` per check (deduped on status). It
+    // also folds each dom0's recent journal tail into the fleet_logs sink for
+    // the Datacenter Logs view — all without touching the substrate it
+    // watches (a pure side-observer).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::dc_health::DcHealthWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("dc_health".into());
+
+    // DATACENTER-23 — scheduled DR backups. Leader-gated; on a coarse (~5 min)
+    // tick decides via the pure `due` helper whether at least
+    // `MCNF_DR_INTERVAL_SECS` (default daily) have elapsed since the last run,
+    // and if so runs `automation/dr/dr-backup.sh` and publishes the outcome to
+    // `event/dc/dr/last` ({"status":"ok","path":…} | {"status":"fail",…}). The
+    // leader runs exactly one backup per interval mesh-wide.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::dr_scheduler::DrSchedulerWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("dr_scheduler".into());
+
+    // DATACENTER-12 (scheduled-snapshot executor) — the missing consumer of
+    // the Storage tab's "Save schedule". Leader-gated; reads each SR's latest
+    // `event/dc/snap-schedule/<sr>` config off the Bus, and on a coarse
+    // (~5 min) tick decides via the pure `due` helper whether each SR is due
+    // per its cadence. When due it takes the snapshot by REUSING the existing
+    // storage `xe vdi-snapshot` path over the mesh-key SSH (the same
+    // `xen_ssh_key`/`xen_dom0s` injection-guarded, dom0-allow-listed contract
+    // `ipc::storage_ops` uses), then enforces retention by destroying its OWN
+    // (prefix-tagged) oldest snapshots beyond the configured count — never an
+    // operator's hand-made snapshot. Emits a run result to
+    // `event/dc/snap-schedule-run/<sr>` and alerts on failure via the
+    // alert_relay lane. Without this worker the Storage tab's schedule was a
+    // config-only stub (config persisted, nothing ever executed it).
+    let snap_alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::dc_snap_scheduler::DcSnapSchedulerWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+            snap_alerts,
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("dc_snap_scheduler".into());
+
+    // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
+    // version running at each promotion stage (Build→Eagle→DO) to
+    // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
+    // the promotion matrix. Build version = newest release RPM (else
+    // `git describe`); Eagle/DO are honest `"unknown"` placeholders until
+    // those hosts are reachable.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::dc_promote::DcPromoteWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("dc_promote".into());
+
+    // ONBOARD-6 — continuous leader election. Renews the
+    // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
+    // node always holds leadership (previously only the upgrade watcher
+    // touched the lock, and only while an upgrade was in flight, so a
+    // steady-state mesh had NO LEADER and every leader-gated surface was
+    // dark). Runs on every node; the shared QNM-Shared mount makes them
+    // contend for the same lock.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::leader_election::LeaderElection::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("leader_election".into());
+
+    // FRONTDOOR-9 — the Copilot codex backend. Spawned on every node so
+    // failover is seamless, but LEADER-gated (Q73): only the elected node
+    // (the one renewed by `leader_election` above on the shared QNM-Shared
+    // lock) drains `action/copilot/ask`, reads the sealed codex API key from
+    // the mesh secret-store, runs `codex exec` per ask (external dependency,
+    // pulled at runtime — Q100), and replies on `reply/<ulid>`. ASK/SUGGEST
+    // ONLY (§9): it spawns the AI subprocess itself but never executes OS
+    // actions on the operator's behalf — typed/audited actions are the
+    // separate FRONTDOOR-11 worker. Degrades gracefully (logs + an "AI
+    // unavailable" reply, never a panic) when codex/key/network is down, so
+    // the rest of the Front Door keeps working (Q33).
+    //
+    // FRONTDOOR-10 (this worker, additional cadences) — the same worker also
+    // PROACTIVELY publishes (a) a compact Copilot STATUS to
+    // `state/copilot/status` on a cheap cadence (so the Front Door's Copilot
+    // tile — left a plain launcher by FD-4 because no topic existed — renders
+    // ready/thinking/offline), and (b) on a MODERATE leader-only timer, a
+    // ranked set of HIGH-IMPACT/HIGH-CONFIDENCE suggestions to
+    // `action/copilot/suggestions` for the GUI to render inline (Q7/Q61).
+    // Suggestions are PROPOSALS (FD-12 typed `ActionProposal`s) — never
+    // executed here, never published to FD-11's `action/exec/request` (§9).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::copilot::CopilotWorker::new(workgroup_root.clone(), node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("copilot".into());
+
+    // FRONTDOOR-11 — the typed action worker (the execution half of the
+    // confirm gate, Q17 + Q26). Spawned on every node so failover is seamless,
+    // but LEADER-gated (Q73): only the elected node drains
+    // `action/exec/request` and acts, so a multi-node mesh executes + audits
+    // each action exactly once. It accepts a TYPED ActionRequest enum (an
+    // allowlisted KIND + typed params — NEVER a command string; §9 forbids a
+    // raw-shell channel) and maps each allowlisted KIND onto an EXISTING verb:
+    // the first cut allowlists `service_lifecycle`, dispatched via the PD-11
+    // `lifecycle` verb (a typed request the target's own `lifecycle_exec`
+    // validates against its live probe and runs locally — no push, no shell).
+    // Every action is hash-chain audited via the existing events plane (§8),
+    // and an unknown/disallowed action degrades to a typed rejection, never a
+    // panic (Q33).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::action::ActionWorker::new(workgroup_root.clone(), node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("action".into());
+}
+
+// run_serve extract: Workstation broker/terminal workers (mesh_mount, pty_broker).
+fn spawn_broker_terminal_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    workgroup_root: &PathBuf,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    // FILEMGR-5 — the mesh-mount worker owns the sshfs mount lifecycle over
+    // the Nebula overlay for the Files surface (design `file-manager-full.md`
+    // locks 11/13/15/17): it drains `action/mesh-mount/<host>` (typed verb —
+    // mount home / escalate to `/` / unmount), holds the node-sealed shared
+    // mesh SSH key (FILEMGR-6), and publishes `state/mesh-mount/*` with
+    // idle-unmount + reconnect-backoff + frozen-mount recovery. The live
+    // sshfs/fusermount impl is integration-gated behind the injectable
+    // `MountBackend` seam (§9 — no raw shell in the action layer; §7 — it
+    // returns an honest typed error headless, never a faked mount). A desktop
+    // feature (Workstation tier); idles gracefully with no mount requests.
+    if mackesd_core::worker_role::runs("mesh_mount", role_rank) {
+        let runtime_base = mackesd_core::workers::mesh_mount::resolve_runtime_base();
+        let repo_dir = mackesd_core::ipc::secret_store::repo_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::mesh_mount::MeshMountWorker::new(
+                runtime_base,
+                repo_dir,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("mesh_mount".into());
+    }
+
+    // TERM-7 — the mesh PTY-broker worker owns the remote-shell lifecycle
+    // over the Nebula overlay for the mde-term-egui terminal surface (design
+    // `mesh-terminal.md`): it drains `action/pty/<peer>` (typed verb —
+    // open/write/resize/close, each carrying the client-minted session id),
+    // opens a real remote shell via `ssh -tt` on the node-sealed shared mesh
+    // SSH key (FILEMGR-6, reused from mesh_mount), and publishes an append
+    // log on `state/pty/<id>` (base64 output chunks + the terminal exit) with
+    // idle-reap + dead-session reap. The live ssh impl is integration-gated
+    // behind the injectable `PtyBackend` seam (§9 — a typed argv, no
+    // shell-string injection; §7 — it returns an honest typed Gated/
+    // Unreachable state headless, never a faked session). A desktop feature
+    // (Workstation tier); idles gracefully with no pty requests on a headless
+    // box.
+    if mackesd_core::worker_role::runs("pty_broker", role_rank) {
+        let runtime_base = mackesd_core::workers::pty_broker::resolve_runtime_base();
+        let repo_dir = mackesd_core::ipc::secret_store::repo_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::pty_broker::PtyBrokerWorker::new(
+                runtime_base,
+                repo_dir,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("pty_broker".into());
+    }
+}
+
+// run_serve extract: desktop/media discovery + seat input workers (seat_remote_input, desktop_sources, media_sources).
+fn spawn_desktop_discovery_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    // KDC-MESH-6 — seat-side phone remote-input consumer. `kdc_host`
+    // publishes sanitized `action/seat/remote-input` rows after the paired
+    // phone/protocol checks; this worker owns the local injection seam and
+    // honest unavailable/error state when no uinput helper is configured.
+    if mackesd_core::worker_role::runs("seat_remote_input", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::seat_remote_input::SeatRemoteInputWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("seat_remote_input".into());
+    }
+
+    // CHOOSER-1 — the desktop-source discovery aggregator (design
+    // `desktop-chooser.md` §Architecture, locks 5/14): collects every
+    // desktop source — mesh-peer advertised (the replicated peers plane's
+    // RemoteAccess/vms rows), mDNS RDP/VNC/Spice on the local LAN (the
+    // mdns_relay machinery + its anti-loop TXT guard), local KVM guest
+    // consoles (the MV-3 LibvirtBackend seam), and manually-added
+    // endpoints — merges them into ONE deduped roster and publishes
+    // `state/desktops/sources` for the Chooser surface (CHOOSER-2).
+    // Drains typed `action/desktops/{add-source,remove-source,refresh}`
+    // verbs (§9). Live KVM enumeration is honestly gated (a typed Gated
+    // lane status when virsh is absent, §7 — never a faked source);
+    // reachability derives from roster presence / VM power state, never
+    // a blocking probe. A desktop feature (Workstation tier); idles
+    // gracefully on a headless box.
+    if mackesd_core::worker_role::runs("desktop_sources", role_rank) {
+        let store_root = mackesd_core::workers::desktop_sources::resolve_store_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::desktop_sources::DesktopSourcesWorker::new(
+                node_id.clone(),
+                workgroup_root.clone(),
+                store_root,
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("desktop_sources".into());
+    }
+
+    // MEDIA-14 — the mesh media-source discovery aggregator (design
+    // `mesh-media-player.md`, row 26 "Mesh discovery"): folds two lanes into
+    // ONE deduped roster and publishes `state/media/sources` for the
+    // mde-media Sources panel (MEDIA-8). Lane 1 (mesh-registry) reads the
+    // replicated peers plane's `descriptors.media` Jellyfin/DLNA rows + each
+    // peer's `descriptors.mesh_fs` file share — the SAME plane desktop_sources
+    // reads, no new advertisement channel (§6 glue). Lane 2 (mDNS) browses
+    // `_jellyfin._tcp` on the local LAN via the mdns_relay machinery + its
+    // anti-loop TXT guard. Reachability derives from roster presence / peer
+    // health, never a blocking probe; music-only services (navidrome/mpd) are
+    // honestly excluded (mde-music's domain), and SSDP-only DLNA is surfaced
+    // as a `gated:` mDNS-lane note rather than faked (§7). A desktop feature
+    // (Workstation tier); idles gracefully on a headless box.
+    if mackesd_core::worker_role::runs("media_sources", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::media_sources::MediaSourcesWorker::new(
+                node_id.clone(),
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("media_sources".into());
+    }
+}
+
+// run_serve extract: fleet compute/virt/network-assessment workers (voice_provision .. voip_rtt); owns fw_host.
+fn spawn_fleet_compute_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    deploy_class: mackesd_core::worker_role::DeployClass,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+    db_path: &PathBuf,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
+    // node so failover is seamless, but LEADER-gated internally (lock 7):
+    // only the elected node provisions per-node Vitelity sub-accounts, seals
+    // each node's SIP creds to its per-node key in the mesh secret store,
+    // reconciles Vitelity ⇄ roster idempotently + rate-limited, and holds
+    // the master API key (never distributed). Each node's reg-state is
+    // published to `state/voice/<node>` for the Voice panel fleet board
+    // (VOIP-GW-5). The live Vitelity transport is integration-gated (a typed
+    // error), never faked — a fresh mesh with no sealed master key simply
+    // shows every node `Provisioning` rather than a fake online (§7).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::voice_provision::VoiceProvisionWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("voice_provision".into());
+
+    // PRINT-2..PRINT-6 + PRINT-8 (v5.0.0) — auto CUPS print
+    // sharing + sync. Spawned on headless + full; SKIPPED on
+    // lighthouse (routing-only, no printers — Q8 lock). The
+    // profile is read from the installed-profile marker
+    // `mde-install` writes; missing marker → assume a printing
+    // profile (full/headless) and spawn. The worker itself is a
+    // silent no-op without cups/lpadmin, so an over-spawn on a
+    // box that happens to lack cups is harmless.
+    let print_profile = std::fs::read_to_string("/var/lib/mde/installed-profile")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if print_profile != "lighthouse" {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::cups_sync::CupsSyncWorker::new(),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("cups_sync".into());
+    } else {
+        tracing::info!("cups_sync: skipped (lighthouse profile)");
+    }
+
+    // FWMON-2..4 (v5.0.0) — firewall-denied event monitor.
+    // Reads kernel journal entries logged by firewalld's
+    // LogDenied=all setting (enabled by birthright's
+    // apply_firewall_log_denied step), filters overlay +
+    // established traffic, appends denials to
+    // <mesh-storage>/firewall/<host>.jsonl, and fires a Bus
+    // alert when one source crosses the threshold.
+    let fw_host = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| node_id.clone());
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::firewall_monitor::FirewallMonitorWorker::new(fw_host.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("firewall_monitor".into());
+
+    // NOTIFY-SRC — SELinux AVC denials → the security alert lane. Without
+    // this the Alert Center never showed SELinux alerts (no source published
+    // them). auditd captures AVCs to audit.log, so the worker scrapes them
+    // via `ausearch --checkpoint` and publishes distinct denials to
+    // fleet/sec/selinux/<host>; the NOTIFY-DIST-2 mirror federates them.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::selinux_monitor::SelinuxMonitorWorker::new(fw_host.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("selinux_monitor".into());
+
+    // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
+    // Polls virsh + podman every 10 s; the per-peer inventory bus
+    // publish (`compute/inventory/<peer-nebula-addr>`) is on-change +
+    // a 60 s heartbeat per BUS-RUN-FULL-1 (docs/DECISIONS.md ADR-0005)
+    // — the cross-node fleet view reads the replicated
+    // compute-inventory.json file, the bus topic's only consumer is
+    // this node's own Workloads source. Silent no-op on peers without
+    // virsh/podman (lighthouse, container-stripped). The nebula
+    // address is auto-detected from the local nebula1 interface at
+    // tick time (empty hint = runtime detect).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::compute_registry::ComputeRegistryWorker::new(
+            fw_host.clone(),
+            String::new(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("compute_registry".into());
+
+    // ROUTER-3/4 — per-node, always-on router-registry: discover the node's
+    // primary router/firewall (lowest-metric default route + gateway MAC),
+    // cred-match `router/<mac>` + Vyatta `show version` fingerprint, and
+    // publish a RouterEntry to mesh/devices/router/<mac> + the QNM-Shared
+    // <host>/router-registry.json. Unconditional (any node may sit behind a
+    // router); a node with no default route is a safe no-op.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::router_registry::RouterRegistryWorker::new(
+            node_id.clone(),
+            fw_host.clone(),
+        )
+        .with_mount(workgroup_root.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("router_registry".into());
+
+    // MEDIA-7 — register the navidrome/media service into the mesh service
+    // registry. Capability-gated via runs_in("navidrome", deploy_class): it
+    // runs ONLY on a Lighthouse_Media node (MEDIA-1's Capability::Media) and
+    // is absent everywhere else. Publishes its registration (with a
+    // per-instance health field) to the per-peer Bus topic
+    // mesh/services/media/<peer> + the replicated QNM-Shared plane
+    // <host>/media-registry.json — the same registry plane the other
+    // published services use. The .with_mount honors --workgroup-root so the
+    // worker writes where the registry readers look.
+    if mackesd_core::worker_role::runs_in("navidrome", deploy_class) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::media_registry::MediaRegistryWorker::new(
+                node_id.clone(),
+                fw_host.clone(),
+            )
+            .with_mount(workgroup_root.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("media_registry".into());
+
+        // MEDIA-pkg-2 — self-heal the Navidrome systemd unit (restart-if-down,
+        // re-provision-if-missing via the RPM-shipped setup-media-navidrome).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::navidrome_supervisor::NavidromeSupervisor::new(),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("navidrome_supervisor".into());
+    }
+
+    // MEDIA-15 — the mesh media server + DLNA/UPnP + aggregation (design
+    // `mesh-media-player.md`, rows 27 "Mesh library" + 30 "Server role"):
+    // the PRODUCER half MEDIA-14 discovers + MEDIA-8 renders. Scans this
+    // node's chosen shared folders into a `media-library.json` share
+    // manifest written to the replicated QNM-Shared plane
+    // (<host>/media-library.json — the SAME plane media-registry.json rides,
+    // no new channel), binds the mesh HTTP media server on MESH_MEDIA_PORT
+    // (9600) so the localhost descriptor probe folds `mde-media` into this
+    // peer's descriptors.media and peers' MEDIA-14 find it, and serves a
+    // DLNA/UPnP MediaServer (device description + DIDL-Lite; the SSDP
+    // multicast announce is the honestly-gated live leg — §7). Reads every
+    // peer's manifest off the plane + folds them into ONE deduped, per-node-
+    // attributed mesh library on `state/media/library` for the MEDIA-8
+    // Library panel. A desktop feature (Workstation tier); keyed by the
+    // hostname (fw_host) like media_registry so its manifest lands on the
+    // same replicated <host>/ dir the aggregators read. Idles gracefully on
+    // a headless box (empty share, empty library).
+    if mackesd_core::worker_role::runs("media_server", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::media_server::MediaServerWorker::new(
+                node_id.clone(),
+                fw_host.clone(),
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("media_server".into());
+    }
+
+    // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
+    // running launchable apps to <QNM-Shared>/<host>/running-apps.json
+    // every 10 s so every node's Applications-menu launcher can badge each
+    // entry with a live "running on <host>" indicator (same replicated
+    // plane as compute-inventory.json; the bus is per-node). Detects via
+    // process ↔ .desktop match — root reads every /proc/<pid>/cmdline, so
+    // no per-seat compositor probe is needed. The `.desktop` scan root
+    // mirrors the apps aggregator's home.
+    let apps_running_home =
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/root"), PathBuf::from);
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::apps_running::AppsRunningWorker::new(
+            fw_host.clone(),
+            apps_running_home,
+        )
+        // Write to the SAME resolved root the apps responder reads from
+        // (honors a `--workgroup-root` override) — otherwise the worker would
+        // publish under the default root while the reader looked elsewhere and
+        // no app ever got badged.
+        .with_mount(workgroup_root.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("apps_running".into());
+
+    // APPLAUNCH-5 — apps_installed: mirror this node's INSTALLED .desktop
+    // set to <QNM-Shared>/<host>/apps-installed.json every 60 s so the
+    // Front Door's Mesh filter can answer a focused peer's app set on
+    // demand (action/apps/peer-list) by reading the replicated file
+    // locally — a slow/dead peer never blocks the UI (lazy-mesh). Same
+    // replicated plane + scan root as apps_running; writes to the resolved
+    // workgroup_root so the responder reads what the worker publishes.
+    let apps_installed_home =
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/root"), PathBuf::from);
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::apps_installed::AppsInstalledWorker::new(
+            fw_host.clone(),
+            apps_installed_home,
+        )
+        .with_mount(workgroup_root.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("apps_installed".into());
+
+    // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
+    // spawns the worker; only the CA peer (presence of
+    // ~/.config/mde/nebula/ca.key) actually signs + replies, the
+    // others advance the cursor silently. compute_provision
+    // (VIRT-6) publishes to `action/compute/cert-sign-request`
+    // and awaits the reply via rpc::await_reply with the 30 s
+    // rpc::DEFAULT_RPC_TIMEOUT, retrying once before marking VM
+    // creation failed (per VIRT-5 acceptance bullet 4).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::cert_authority::CertAuthorityWorker::new(),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("cert_authority".into());
+
+    // VIRT-7 (v5.0.0) — per-network firewalld port forwarding.
+    // Each peer subscribes to its own `compute/expose/<addr>` +
+    // `compute/unexpose/<addr>` topics and applies firewall-cmd
+    // rich rules per selected network. WAN zone is auto-detected
+    // at startup via nmcli + firewall-cmd. Publishes the active
+    // rule set to `compute/exposed/<addr>` for the Workbench.
+    // Silent no-op on lighthouse / container-stripped peers
+    // without firewall-cmd.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::compute_expose::ComputeExposeWorker::new(),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("compute_expose".into());
+
+    // VIRT-8.a (v5.0.0) — cold VM migration source-side. Each
+    // peer drains `action/compute/migrate`; when own nebula IP
+    // == request.source_peer, runs the shutdown→rsync→publish
+    // migrate-ready→undefine flow over the Nebula overlay.
+    // Target-side handler (VIRT-8.b) ships with VIRT-6
+    // compute_provision and subscribes to
+    // `event/compute/migrate-ready`.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::compute_migrate::ComputeMigrateWorker::new(),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("compute_migrate".into());
+
+    // VIRT-21 (v5.0.0) — compute_event_toast. Subscribes to every
+    // compute/event/<peer> topic and raises an FDO desktop toast on
+    // VM start/stop/crash so fleet lifecycle changes surface without
+    // keeping mde-virtual open.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::compute_event_toast::ComputeEventToastWorker::new(),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("compute_event_toast".into());
+
+    // VIRT-6 (v5.0.0) — compute_provision. Drains this peer's
+    // `compute/create/<addr>` topic: ensures the mde-vms pool,
+    // allocates a per-peer /24 VM IP, runs requester-side
+    // nebula-cert keygen + the cert-sign RPC, builds the NoCloud
+    // seed, virt-installs the VM (with virtiofs MeshFS share when
+    // requested + mounted), acks on compute/create-ack/<ulid>, and
+    // fires an immediate inventory publish. workgroup_root + node_id
+    // locate this peer's nebula-bundle.json for the guest
+    // lighthouse roster.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::compute_provision::ComputeProvisionWorker::new(
+            fw_host.clone(),
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("compute_provision".into());
+
+    // XCP-3 — the A-plane provision flow. Drains
+    // `action/provision/spawn` and, for each request, drives the
+    // mackes-xcp Hypervisor layer over xe-over-SSH:
+    // `clone MDE-VM-golden → set_identity_seed (the fresh cloud-init
+    // seed: MDE-VM-<name> hostname, op key, regen host keys +
+    // machine-id) → start → resolve IP`, acking on
+    // `action/provision/spawn-ack/<ulid>`. This is the runtime caller
+    // that makes set_identity_seed reachable — a provisioned VM
+    // actually gets its identity seed. Idles cleanly on a node with no
+    // dom0 configured (MCNF_XEN_DOM0S empty → a clean error-ack); the
+    // dom0 allow-list is single-sourced from the datacenter env config.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::xcp_provision::XcpProvisionWorker::new(),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("xcp_provision".into());
+
+    // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects
+    // the 9 items (docs/design/v6.0-mde-portal.md §7.1) hourly +
+    // writes ~/.local/share/mde/netassess/<host>/<iso>-<hash>.json
+    // with a 30-day rolling trim. Shell-outs degrade to None when
+    // a tool is absent (headless / air-gapped peers).
+    if let Some(data_dir) = dirs::data_dir() {
+        let netassess_base = data_dir.join("mde").join("netassess");
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::netassess::NetAssessWorker::new(fw_host.clone(), netassess_base)
+                .with_mesh_context(workgroup_root.clone(), node_id.clone(), db_path.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("netassess".into());
+
+        // MESH-A-4.c.2 (v5.0.0) — surrounding-host discovery worker.
+        // Sweeps the LAN (mDNS + ARP-MAC + OUI) every 10 min and
+        // writes a per-peer snapshot under
+        // ~/.local/share/mde/surrounding/<host>/ (mesh-synced;
+        // every peer reads the union per R8-Q13).
+        let surrounding_base = data_dir.join("mde").join("surrounding");
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::surrounding_worker::SurroundingWorker::new(
+                fw_host,
+                surrounding_base,
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("surrounding_hosts".into());
+
+        // MESH-A-5.2 (v5.0.0) — mesh-coordinated firewall DROP:
+        // reconciles firewalld source-DROP rules against the
+        // mesh-synced Blocked-host consensus every minute.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::mesh_firewall::MeshFirewallWorker::new(
+                data_dir.join("mde").join("surrounding"),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("mesh_firewall".into());
+
+        // VOIP-4.b (v5.0.0) — broadcast this peer's Vitelity-link RTT to
+        // voip/link-rtt/<peer> every 60s for the dialer route override.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::voip_rtt_worker::VoipRttWorker::new(),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("voip_rtt".into());
+    } else {
+        tracing::warn!("netassess: no XDG data dir; skipping network assessment worker");
+    }
+}
+
+// run_serve extract: probe/observability/relay workers (probe .. lighthouse_probe).
+fn spawn_probe_observability_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+    db_path: &PathBuf,
+    daemon_cfg: &mackesd_core::config::daemon::MackesdConfig,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    use std::sync::Arc;
+    // EPIC-MESH-PROBE (MESH-PROBE-4) — scheduled two-tier nmap
+    // probe worker. Resolves mesh-peer overlay IPs, scans them
+    // (fast 60s / deep 10min), writes this peer's
+    // probe-inventory.json into mesh-home, and announces
+    // probe/changed on the Bus when the inventory changes. The
+    // `mackesd probe scan/refresh` CLI shares the same engine.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::probe::ProbeWorker::new(workgroup_root.clone(), node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("probe".into());
+
+    // SUBAUDIT-D2 — hardware-probe producer. Gathers this node's
+    // PeerProbe (PCI/USB/kernel/power) + writes it to the replicated
+    // directory so every peer's Workbench Hardware panel renders the
+    // fleet. Was never built — the panel was permanently empty.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::hardware_probe::HardwareProbeWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("hardware_probe".into());
+
+    // E12-19 (Quasar host controls) — host_state. Mirrors this node's seat
+    // snapshot (published by the shell) to state/host/<node>/seat for the
+    // Workbench + remote peers, and authorizes remote typed verbs on
+    // action/host/<node>/verb behind the allowlist + safety interlocks
+    // (never-black-the-last-console, leader-aware power, two-phase confirm),
+    // forwarding an approved verb to the shell's local apply lane. Runs on
+    // every node.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::host_state::HostStateWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        ),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("host_state".into());
+
+    // SURFACE-3 — the per-node surface_enable worker. On a recognised
+    // Microsoft Surface it drains action/hardware/surface/<node>/enable
+    // (the Install tab's activate + MOK request), activates iptsd +
+    // applies the per-model config, walks the guided MOK enrollment
+    // (typed-armed reboot, honest firmware copy), and publishes the typed
+    // EnableResult to state/hardware/surface/<node>/enable. On a
+    // non-Surface node it idles (never touches the Bus). Live actions are
+    // integration-gated (honest typed errors, never faked).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::SurfaceEnableWorker::new(node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("surface_enable".into());
+
+    // SURFACE-4 — the per-node surface_verify worker. On a recognised
+    // Microsoft Surface it probes each profile-claimed subsystem into a
+    // tri-state board (Ok/Failed/Degraded + NeedsGesture, each with a real
+    // reason) published to state/hardware/surface/<node>/probes (the Test
+    // tab), and publishes the compact enablement summary (model, %, red
+    // count) to state/hardware/surface/<node> for the fleet rollup. On a
+    // non-Surface node it idles. Live probes are integration-gated (honest
+    // typed states headless, never faked green).
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::SurfaceVerifyWorker::new(node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("surface_verify".into());
+
+    // SURFACE-5 — the per-node surface_firmware worker. On a recognised
+    // Microsoft Surface it publishes the fwupd/LVFS inventory (current +
+    // available versions per device) to state/hardware/surface/<node>/firmware
+    // (the Install tab's firmware panel), drains typed-armed apply requests
+    // on action/hardware/surface/<node>/fw-apply, and on a successful apply
+    // re-runs SURFACE-4's verify. An un-armed apply is refused; live fwupd
+    // calls are integration-gated (honest typed errors, never a faked
+    // update). On a non-Surface node it idles.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::SurfaceFirmwareWorker::new(node_id.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("surface_firmware".into());
+
+    // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
+    // Pairs with `apply_netdata_monitor`'s baseline
+    // /etc/netdata/netdata.conf: when this peer wins
+    // leader-election it publishes its overlay IP to
+    // QNM-Shared so every other peer picks the same
+    // aggregator; on demote it stops publishing and the
+    // freshest pointer wins. Every tick re-reads the
+    // freshest pointer + rewrites the local netdata.conf
+    // `[stream]` block + reloads netdata when the
+    // aggregator IP changes. Fail-soft per the v2.6
+    // design lock: missing aggregator strips the
+    // `[stream]` block so netdata stays local-only with
+    // the 7-day dbengine retention. API key defaults to
+    // `mesh-${MDE_MESH_ID}-netdata` so every peer in the
+    // same mesh shares the value automatically without
+    // an extra wizard step (operators can override via
+    // MDE_NETDATA_API_KEY if they want a custom value).
+    match mackesd_core::store::open(&db_path) {
+        Ok(conn) => {
+            let netdata_store = Arc::new(tokio::sync::Mutex::new(conn));
+            let mesh_id_for_netdata =
+                std::env::var("MDE_MESH_ID").unwrap_or_else(|_| format!("mesh-{node_id}"));
+            let api_key = std::env::var("MDE_NETDATA_API_KEY")
+                .unwrap_or_else(|_| format!("{mesh_id_for_netdata}-netdata"));
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::netdata_aggregator::NetdataAggregator::new(
+                    netdata_store,
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                    api_key,
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("netdata_aggregator".into());
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                db_path = %db_path.display(),
+                "netdata_aggregator: sqlite open failed; worker skipped"
+            );
+        }
+    }
+
+    // PLANES-24 W63 — scheduled one-puller mirror sync. Every node writes
+    // its dnf .repo to self-serve from the local file:// mount (W62); the
+    // leader additionally pulls upstream + indexes, Syncthing replicating
+    // the result. No DB handle needed — it works off the replicated root.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::mirror_syncd::MirrorSyncd::new(workgroup_root.clone()),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("mirror_syncd".into());
+
+    // NF-1.5 (v2.5) — TCP/443 covert listener. Binds the
+    // TLS 1.3 listener on :443 (default; env-overrideable),
+    // spawns the per-stream demux pump per accepted peer
+    // tunnel. Cert + key paths default to
+    // /etc/nebula/lighthouse.{crt,key}; overridable via
+    // MDE_HTTPS_TUNNEL_{CERT,KEY} env vars so operators
+    // running Let's-Encrypt-issued certs can point to the
+    // existing PEM chain. On peer-role boxes (no cert
+    // files), the worker fails its bind + the supervisor's
+    // OnFailure backoff effectively quarantines it.
+    match mackesd_core::workers::nebula_https_listener::NebulaHttpsListener::new() {
+        Ok(mut w) => {
+            if let Ok(p) = std::env::var("MDE_HTTPS_TUNNEL_CERT") {
+                w = w.with_cert(PathBuf::from(p));
+            }
+            if let Ok(p) = std::env::var("MDE_HTTPS_TUNNEL_KEY") {
+                w = w.with_key(PathBuf::from(p));
+            }
+            if let Ok(addr) = std::env::var("MDE_HTTPS_TUNNEL_BIND") {
+                if let Ok(parsed) = addr.parse() {
+                    w = w.with_bind_addr(parsed);
+                } else {
+                    tracing::warn!(
+                        value = %addr,
+                        "nebula-https-listener: MDE_HTTPS_TUNNEL_BIND parse failed; using default",
+                    );
+                }
+            }
+            // Bug 6 (2026-06-06) — only run the relay :443 listener when a
+            // relay cert is actually present. A box with no lighthouse /
+            // Let's-Encrypt cert is not a relay; spawning anyway only fails
+            // the bind (and a per-user daemon can never bind a privileged
+            // port at all), which the OnFailure policy then respins ~4x/s.
+            //
+            // SUBAUDIT-D1 (2026-06-16) — the relay never ran *anywhere*
+            // because no node ever had /etc/nebula/lighthouse.crt. A
+            // public/lighthouse node now SELF-BOOTSTRAPS a self-signed relay
+            // cert so the :443 listener actually binds by default. Gated on
+            // relay-eligibility — the lighthouse role.host marker OR a pinned
+            // Lighthouse role — so a NAT'd workstation (e.g. .13) never
+            // generates a cert or binds :443.
+            let https_cert = std::env::var("MDE_HTTPS_TUNNEL_CERT").unwrap_or_else(|_| {
+                mackesd_core::workers::nebula_https_listener::DEFAULT_CERT_PATH.to_string()
+            });
+            let https_key = std::env::var("MDE_HTTPS_TUNNEL_KEY").unwrap_or_else(|_| {
+                mackesd_core::workers::nebula_https_listener::DEFAULT_KEY_PATH.to_string()
+            });
+            let relay_eligible =
+                std::path::Path::new(mackesd_core::ipc::nebula::DEFAULT_ROLE_HOST_MARKER).exists()
+                    || matches!(mde_role::load(), Ok(mde_role::Role::Lighthouse));
+            if relay_eligible && !std::path::Path::new(&https_cert).exists() {
+                let sans = vec![
+                    detect_primary_ipv4().unwrap_or_else(|_| "127.0.0.1".to_string()),
+                    "lighthouse.mesh.local".to_string(),
+                ];
+                match mackesd_core::nebula_enroll_endpoint::ensure_self_signed_cert(
+                    std::path::Path::new(&https_cert),
+                    std::path::Path::new(&https_key),
+                    &sans,
+                ) {
+                    Ok(_) => tracing::info!(
+                        cert = %https_cert,
+                        "nebula-https-listener: self-bootstrapped a relay cert (SUBAUDIT-D1)",
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "nebula-https-listener: relay cert bootstrap failed; relay stays down",
+                    ),
+                }
+            }
+            if std::path::Path::new(&https_cert).exists() {
+                sup.spawn(Spawn::new(w, RestartPolicy::OnFailure));
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("nebula_https_listener".into());
+            } else if relay_eligible {
+                tracing::warn!(
+                    cert = %https_cert,
+                    "nebula-https-listener: relay-eligible but no cert after bootstrap — relay down",
+                );
+            } else {
+                tracing::info!(
+                    cert = %https_cert,
+                    "nebula-https-listener: not a relay node (no role.host marker / not Lighthouse) — skipped",
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "nebula-https-listener: construction failed; skipped",
+            );
+        }
+    }
+
+    // v4.0.1 AF-NET-2 (2026-05-23) — mesh-latency sniffer.
+    // Pings every enrolled non-local peer every 30 s and
+    // writes the result to ~/.cache/mde/mesh-latency.json.
+    // The WB-2.k.a Cairo topology canvas + panel Mesh-status
+    // tray badge both consume the file. Best-choice
+    // deviation from the TransportRegistry-routed approach
+    // — see worker doc-comment.
+    match mackesd_core::store::open(&db_path) {
+        Ok(conn) => {
+            let lat_store = Arc::new(tokio::sync::Mutex::new(conn));
+            let cache = mackesd_core::workers::mesh_latency::default_cache_path();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::mesh_latency::MeshLatencyWorker::new(
+                    lat_store,
+                    node_id.clone(),
+                    cache,
+                )
+                .with_interval(daemon_cfg.mesh_latency_sweep()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("mesh_latency".into());
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                db_path = %db_path.display(),
+                "mesh-latency: sqlite open failed; worker skipped"
+            );
+        }
+    }
+
+    // MESHMAP-6 (2026-06-27) — real per-link byte counters. Maintains an
+    // nftables accounting table on the Nebula interface (one passive
+    // counter per peer overlay IP per direction), reads byte deltas every
+    // 5 s, and writes ~/.cache/mde/link-traffic.json. The mesh wallpaper /
+    // Peers-Map flow particles consume it as the REAL per-edge source,
+    // falling back to the per-node `sample_flows` proxy (MESHMAP-3) when
+    // the cache is absent (no nft / non-root / pre-delta). Rank-0 control-
+    // plane observer (runs everywhere, like mesh_latency); honest no-op on
+    // a box without nft (idles on the token, consumer keeps the proxy).
+    if mackesd_core::worker_role::runs("link-traffic", role_rank) {
+        match mackesd_core::store::open(&db_path) {
+            Ok(conn) => {
+                let lt_store = Arc::new(tokio::sync::Mutex::new(conn));
+                let lt_cache = mackesd_core::workers::link_traffic::default_cache_path();
+                sup.spawn(Spawn::new(
+                    mackesd_core::workers::link_traffic::LinkTrafficWorker::new(
+                        lt_store,
+                        node_id.clone(),
+                        lt_cache,
+                    ),
+                    RestartPolicy::OnFailure,
+                ));
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("link-traffic".into());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    db_path = %db_path.display(),
+                    "link-traffic: sqlite open failed; worker skipped"
+                );
+            }
+        }
+    }
+
+    // TUNE-16.d (2026-05-30) — Q22 8-peer cap counter. Reads the
+    // enrolled peer count every 30 s, writes ~/.cache/mde/peer-cap.json,
+    // and publishes to mesh/peer-cap/updated. Phones count (enrolled
+    // as role='peer'); federated external-mesh peers don't appear in
+    // the local store and are naturally excluded.
+    match mackesd_core::store::open(&db_path) {
+        Ok(conn) => {
+            let cap_store = Arc::new(tokio::sync::Mutex::new(conn));
+            let cap_cache = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("mde")
+                .join("peer-cap.json");
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::peer_cap::PeerCapWorker::new(cap_store, cap_cache),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("peer-cap".into());
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                db_path = %db_path.display(),
+                "peer-cap: sqlite open failed; worker skipped"
+            );
+        }
+    }
+
+    // LIGHTHOUSE-8 — per-lighthouse deep-probe lane. Every ~15 s probes each
+    // lighthouse for Nebula handshake / public IP / overlay peer count /
+    // uptime / CA cert-expiry and publishes a LighthouseProbe to
+    // `compute/lighthouse-probe/<name>`; the Workbench Lighthouses tab
+    // renders it. The spawn is owned by the worker module
+    // (`Supervisor::spawn_lighthouse_probe`, sibling `Spawn::new` pattern +
+    // the rank-0 role gate); it self-resolves its workgroup root from
+    // `MDE_WORKGROUP_ROOT`, so no DB/handle plumbing is needed here.
+    if let Some(name) = sup.spawn_lighthouse_probe() {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push(name.into());
+    }
+}
+
+// run_serve extract: kdc/messaging/fleet-sync tail workers (kdc_host .. music_autoconfig).
+fn spawn_messaging_sync_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+    worker_status: &mackesd_core::workers::WorkerStatusMap,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    use std::sync::Arc;
+    // v4.0.1 KDC2-3.3 wire-up (2026-05-23) — spawn the KDC host
+    // worker. Owns the pairing store at $XDG_CONFIG_HOME/mde/
+    // connect (default ~/.config/mde/connect), the shared
+    // DiscoveryRegistry, the outbound packet queue, and the
+    // dev.mackes.MDE.Connect D-Bus surface. Graceful-degrade
+    // on D-Bus failure — the worker keeps the host alive so
+    // the mesh-router can still dispatch through KDC, even if
+    // the operator-facing UI methods aren't reachable.
+    let kdc_config_dir = {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
+        let home_default = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|h| h.join(".config"));
+        xdg.or(home_default)
+            .map(|p| p.join("mde").join("connect"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/mde/connect"))
+    };
+    if mackesd_core::worker_role::runs("kdc_host", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::kdc_host::KdcHostWorker::new(kdc_config_dir),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("kdc_host".into());
+    }
+
+    // BUS-1.1 (v6.x Mackes Bus) — supervise the `mde-bus` daemon
+    // subprocess. Gracefully degrades when the binary is absent
+    // (dev box, RPM not yet installed) — the worker loops on a
+    // 30s tick waiting for the binary to appear. Once the BUS-1
+    // sub-epic ships, every mackesd peer carries the bus.
+    sup.spawn(Spawn::new(
+        mackesd_core::workers::bus_supervisor::BusSupervisor::new(),
+        RestartPolicy::Always,
+    ));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push("bus_supervisor".into());
+
+    // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
+    // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
+    // text clip on the bus + appends to the mesh-global `clipboard/history.json`
+    // (last 50 unpinned + unlimited pinned). As the root system daemon it has
+    // no inherited $WAYLAND_DISPLAY, so it DISCOVERS the active seat0 graphical
+    // session (CLIP-SYNC-2) and spawns the capture as that user; a genuinely
+    // headless peer (Lighthouse/Server) finds no session and idles quietly, so
+    // it's cheap there. (This replaces the never-built `mde-clipd` daemon +
+    // `clipd_supervisor`: that binary never existed in the workspace; this
+    // worker is the sole, real clipboard capturer.)
+    if mackesd_core::worker_role::runs("clipboard_sync", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::clipboard_sync::build(workgroup_root.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("clipboard_sync".into());
+    }
+
+    // NOTIFY-CHAT-2 — the `chat` worker: live Bus send/recv (signs +
+    // relays on event/chat/message, persists to this node's Syncthing
+    // ring-log for offline backfill), folds every alert/event lane into a
+    // message from the originating host (lock 11), derives presence from
+    // the mesh-status snapshot + manual gossip, and republishes the
+    // state/chat/roster + state/chat/conversation/<key> read-model the
+    // Surface::Chat UI renders. Runs on EVERY node incl. headless (emit +
+    // relay, no UI) so alerts flow fleet-wide; unknown-worker rank-0
+    // default runs it everywhere. self_host is the bare hostname (the
+    // roster/DM identity), signed with the persisted node identity key.
+    // NOTE (E12-20 storage worker adds its own spawn line to this block —
+    // keep-both merge expected).
+    if mackesd_core::worker_role::runs("chat", role_rank) {
+        match mackesd_core::node_key::load_or_create(std::path::Path::new(
+            mackesd_core::node_key::DEFAULT_KEY_PATH,
+        )) {
+            Ok(signing_key) => {
+                let self_host = node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string();
+                sup.spawn(Spawn::new(
+                    mackesd_core::workers::chat::ChatWorker::new(
+                        workgroup_root.clone(),
+                        self_host,
+                        signing_key,
+                    ),
+                    RestartPolicy::OnFailure,
+                ));
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("chat".into());
+            }
+            Err(e) => tracing::warn!(
+                target: "mackesd::chat",
+                error = %e,
+                "chat worker: node signing key unavailable; not spawning",
+            ),
+        }
+    }
+
+    // CHAT-FIX-2 — the `notify` worker: the local-notification PRODUCER that
+    // makes Chat non-empty absent peer chatter. It watches this node's OWN
+    // event sources (mesh peer join/leave via the replicated directory,
+    // dnf/platform updates, systemctl --failed, df/SMART thresholds, journal
+    // WARN+) on bounded/edge-triggered polls and publishes typed notifications
+    // on `event/notify/<source>` — a lane the chat worker above folds
+    // (ALERT_LANE_PREFIXES) into this node's `alert:<self>` conversation the
+    // Surface::Chat UI renders as a timestamped feed + tray badge. Runs on
+    // EVERY node (rank 0), same self_host identity as the chat worker; every
+    // external source degrades honestly when its binary is absent.
+    if mackesd_core::worker_role::runs("notify", role_rank) {
+        let self_host = node_id
+            .strip_prefix("peer:")
+            .unwrap_or(&node_id)
+            .to_string();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::notify::NotifyWorker::new(workgroup_root.clone(), self_host),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("notify".into());
+    }
+
+    // NODE-GRADE-1 — the `node_grade` worker: every node computes + publishes
+    // its OWN A–F capability grade (docs/design/node-grade.md). It scores five
+    // factors from telemetry the platform already gathers (§6, no new probes):
+    // CPU headroom (/proc/loadavg vs cores), RAM + disk free (/proc/meminfo,
+    // df /), role/worker health (the supervisor's live worker-status map +
+    // systemctl --failed), and mesh reachability (the replicated peer
+    // directory) — resource-heaviest weighted average → a smoothed 0–100 score
+    // + trend → an A–F band, published to
+    // `<workgroup_root>/node-grade/<hostname>.json` (the SEC-5 mesh-shunt
+    // own-row idiom) so every peer reads every node's grade. A debounced drop
+    // into D/F fires an `event/notify/node-grade` alert the chat worker folds
+    // into the Chat feed (CHAT-FIX-2). Universal (rank 0) like notify — every
+    // node grades itself; role_rank marks a lighthouse for the mesh factor and
+    // worker_status feeds the role factor.
+    if mackesd_core::worker_role::runs("node_grade", role_rank) {
+        let self_host = node_id
+            .strip_prefix("peer:")
+            .unwrap_or(&node_id)
+            .to_string();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::node_grade::NodeGradeWorker::new(
+                self_host,
+                workgroup_root.clone(),
+                role_rank,
+                Some(Arc::clone(&worker_status)),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("node_grade".into());
+    }
+
+    // TRANSFERS-1 — the `transfers` worker: the daemon-owned queue/ledger/verb/
+    // state-machine spine of the Transfers surface (docs/design/transfers-
+    // surface.md). Owns a typed TransferJob envelope, a persistent node-local
+    // ledger (survives restart, Q11), the submit/cancel/pause/resume/list verbs
+    // (Q14, driven by the `mackesd transfer …` CLI for §9 parity), and the
+    // parallel cap (Q12). Execution is delegated to an injectable LaneRunner seam
+    // the per-protocol lanes (TRANSFERS-2..6) implement — honestly gated for now
+    // (§7: a submitted job fails naming the un-wired lane, never a fake success).
+    // Workstation-tier (rank 1) — a desktop feature fronted by the File Browser,
+    // sibling of pty_broker/mesh_mount; it idles gracefully on a headless box /
+    // Lighthouse (an empty inbox + empty ledger). Store is node-local, so it
+    // needs neither the workgroup root nor the node id.
+    if mackesd_core::worker_role::runs("transfers", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::transfers::TransfersWorker::new(
+                mackesd_core::workers::transfers::default_store_root(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("transfers".into());
+    }
+
+    // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
+    // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
+    // has shipped since v2.0.0 Phase B.6 but stayed dead;
+    // [[project_v1_3_0_fleet]] keeps the feature in scope so
+    // wiring is the right cleanup. The worker invokes
+    // `ansible-pull -U <MDE_ANSIBLE_PULL_URL> -i localhost,` on
+    // a 15-min cadence (matches the retired
+    // `mackes-ansible-pull.timer`). With MDE_ANSIBLE_PULL_URL
+    // unset the ansible-pull binary fails fast + the supervisor
+    // logs the error — the worker stays cheap to host.
+    // Bug 6 (2026-06-06) — without MDE_ANSIBLE_PULL_URL the worker only spawns
+    // `ansible-pull` to fail; a box with no fleet config-pull URL has nothing
+    // to do, so skip rather than respawn-on-failure into a periodic WARN.
+    let ansible_configured = std::env::var("MDE_ANSIBLE_PULL_URL")
+        .map(|u| !u.is_empty())
+        .unwrap_or(false);
+    if mackesd_core::worker_role::runs("ansible-pull", role_rank) {
+        if ansible_configured {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::ansible_pull::build(),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("ansible-pull".into());
+        } else {
+            tracing::info!(
+                "ansible-pull: MDE_ANSIBLE_PULL_URL unset; fleet config-pull worker skipped"
+            );
+        }
+    }
+
+    // EPIC-SYNC-APP-CONFIG (Q26, 2026-05-28) — app-config sync is
+    // now a native-Rust worker (`workers::app_sync`); it discovers
+    // mesh media servers + writes Sublime Music / Delfin configs +
+    // the `~/Mackes Media/` launcher view directly, retiring the
+    // `python3 -m mackes.media_sync_daemon` subprocess (advances
+    // §11 #6). `OnFailure` keeps the 60 s tick alive across a
+    // transient write/probe error.
+    if mackesd_core::worker_role::runs("app-sync", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::app_sync::build(),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("app-sync".into());
+    }
+    // remmina-sync is a native Rust tick worker (RETIRE-PY.2): every 60 s
+    // it reads the mesh peer registry, TCP-probes SSH/RDP/VNC, and
+    // reconciles Remmina's "Mesh Peers" group. No `python3` is spawned.
+    if mackesd_core::worker_role::runs("remmina-sync", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::remmina_sync::build(),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("remmina-sync".into());
+    }
+
+    // MEDIA-8 — Workstation music auto-config (desktop-tier, like
+    // remmina-sync). Every 60 s it reads the published shared account off
+    // the replicated registry plane (<workgroup-root>/<host>/media-
+    // registry.json, written by a Lighthouse_Media node's media_registry
+    // worker) and idempotently writes the uid-1000 desktop user's
+    // airsonic-creds.json, so a fresh node's mde-music auto-browses the mesh
+    // library with no manual connect. NO mesh age key on Workstations — the
+    // shared account flows through the SERVICE REGISTRY, not the secret
+    // store. The .with_workgroup_root honors --workgroup-root so it reads
+    // where the registry writers write. Never clobbers a user-set creds file.
+    if mackesd_core::worker_role::runs("music_autoconfig", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
+                .with_workgroup_root(workgroup_root.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("music_autoconfig".into());
+    }
 }
 
 /// DAR-19 / XPA-5 — resolve the host an `enroll-token` v3 token should embed
