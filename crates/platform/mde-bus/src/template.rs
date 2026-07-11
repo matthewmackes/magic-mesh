@@ -9,6 +9,13 @@
 //! Acceptable under [[project_open_mesh_directive]] and documented
 //! both here and in `docs/design/v6.x-mackes-bus.md` § 10.
 //!
+//! SECURITY (security-3): the `exec` shell-out primitive is a
+//! fleet-wide arbitrary-command (RCE) capability. It is gated behind
+//! the **non-default** `template-exec` cargo feature and is NOT
+//! registered in the default build — no shipped template uses it. The
+//! curated mesh variables and the path-scoped `include_file` function
+//! remain available unconditionally.
+//!
 //! Mesh variables (curated set, locked Round 10):
 //! - `peer.hostname` — `/proc/sys/kernel/hostname`
 //! - `peer.overlay_ip` — `/var/lib/mackesd/nebula/overlay-ip` (empty when not enrolled)
@@ -92,6 +99,11 @@ impl Renderer {
         // Register the two custom functions. Tera's `register_function`
         // takes a `Fn(&HashMap<String, Value>) -> tera::Result<Value>`.
         let inc_root = include_root.clone();
+        // SECURITY (security-3): the shell-exec template primitive is a
+        // flat-trust, fleet-wide arbitrary-command capability. It is
+        // registered ONLY when the non-default `template-exec` feature is
+        // enabled, so the default build cannot resolve `exec(...)` at all.
+        #[cfg(feature = "template-exec")]
         tera.register_function(
             "exec",
             move |args: &HashMap<String, TeraValue>| -> tera::Result<TeraValue> {
@@ -238,6 +250,11 @@ fn read_mem_used_mb(path: &std::path::Path) -> Option<u64> {
     Some(kb_used / 1024)
 }
 
+/// The shell-exec template primitive. Gated behind the non-default
+/// `template-exec` feature (security-3): shells out via `sh -c <cmd>`
+/// and captures stdout. A flat-trust, fleet-wide arbitrary-command
+/// capability — never compiled into the default build.
+#[cfg(feature = "template-exec")]
 fn exec_function(args: &HashMap<String, TeraValue>) -> tera::Result<TeraValue> {
     let cmd = args
         .get("cmd")
@@ -390,7 +407,34 @@ mod tests {
         assert_eq!(out, "u=5859");
     }
 
+    // SECURITY (security-3): with the default feature set, the
+    // shell-exec primitive must NOT be registered. Tera cannot resolve
+    // `exec(...)`, so rendering fails and the command never runs.
     #[test]
+    #[cfg(not(feature = "template-exec"))]
+    fn exec_function_absent_in_default_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = Renderer::with(fake_sources(tmp.path()), tmp.path().join("inc"));
+        let result = r.render(r#"x={{ exec(cmd="echo hello") }}"#);
+        assert!(
+            result.is_err(),
+            "expected render to fail with `exec` unregistered, got Ok: {result:?}"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        // The command must NOT have executed — output is never "x=hello".
+        assert!(
+            !msg.contains("x=hello"),
+            "exec appears to have run despite being feature-gated: {msg}"
+        );
+        // Tera surfaces an unknown-function error naming `exec`.
+        assert!(
+            msg.contains("exec") || msg.to_lowercase().contains("function"),
+            "expected an unknown-function error for `exec`, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "template-exec")]
     fn exec_function_captures_stdout() {
         let tmp = tempfile::tempdir().unwrap();
         let r = Renderer::with(fake_sources(tmp.path()), tmp.path().join("inc"));
@@ -400,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "template-exec")]
     fn exec_function_truncates_oversize_output() {
         let tmp = tempfile::tempdir().unwrap();
         let r = Renderer::with(fake_sources(tmp.path()), tmp.path().join("inc"));

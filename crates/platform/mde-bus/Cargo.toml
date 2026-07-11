@@ -78,6 +78,19 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # index-range scan rather than a sort.
 ulid = { version = "1", features = ["serde"] }
 
+[features]
+default = []
+# Registers the Tera `exec(cmd="…")` template function, which shells out
+# via `sh -c <arg>` and captures stdout. This is a FLAT-TRUST, fleet-wide
+# arbitrary-command (RCE) primitive: any peer holding the shared mesh
+# passcode could publish a template that runs commands on every
+# render-target peer. It is OFF by default so the primitive is not even
+# compiled into the default build; enable it only for a specific consumer
+# with an audited, legitimate need (currently: none). See
+# `crates/platform/mde-bus/src/template.rs` and
+# `docs/design/v6.x-mackes-bus.md` § 10.
+template-exec = []
+
 [dev-dependencies]
 tempfile = "3"
 
