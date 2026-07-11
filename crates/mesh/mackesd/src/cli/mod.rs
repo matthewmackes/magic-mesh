@@ -28,6 +28,7 @@ pub mod events;
 pub mod evil_twin_check;
 pub mod fleet_push_setting;
 pub mod fleet_status;
+pub mod found;
 pub mod generate_passcode;
 pub mod healthz;
 pub mod hop_advertise;
