@@ -14,17 +14,12 @@
 //! generic modifier-diff — live in [`mde_vdi_core`]; this module re-exports the
 //! scancode surface unchanged and wires the RDP-specific event shape on top.
 
-use crate::egui::{Event, Key, MouseWheelUnit, PointerButton, Vec2};
+use crate::egui::{Event, MouseWheelUnit, PointerButton, Vec2};
 use mde_vdi_core::{clamp_u16, dominant_axis, ModKey, ModifierTracker};
 
 // The set-1 scancode identity + map are the single source in mde-vdi-core; RDP
 // re-exports them unchanged so `mde_vdi_rdp::{Scancode, scancode_for}` keep working.
 pub use mde_vdi_core::{scancode_for, Scancode};
-
-/// Set-1 scancodes for the three core modifier keys the session synthesises from
-/// egui's `Modifiers` snapshot — re-exported from [`mde_vdi_core`] (RDP + SPICE
-/// share these identities).
-pub(crate) use mde_vdi_core::{ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE};
 
 /// A mouse button, protocol-neutral.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,9 +197,10 @@ pub fn map_text(text: &str) -> Vec<RdpInputEvent> {
 mod tests {
     use super::{
         map_button, map_event, map_text, scancode_for, ModifierState, MouseButton, RdpInputEvent,
-        Scancode, ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE,
+        Scancode,
     };
     use crate::egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, Vec2};
+    use mde_vdi_core::{ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE};
 
     #[test]
     fn scancode_map_is_the_shared_core_source() {

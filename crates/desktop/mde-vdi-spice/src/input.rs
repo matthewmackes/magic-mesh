@@ -14,18 +14,13 @@
 //! in [`crate::connect`]; keeping the egui→intent mapping pure here means the
 //! egui-facing surface is real and tested independent of the wire sender.
 
-use crate::egui::{Event, Key, MouseWheelUnit, PointerButton, Vec2};
+use crate::egui::{Event, MouseWheelUnit, PointerButton, Vec2};
 use mde_vdi_core::{clamp_u16, dominant_axis, ModKey, ModifierTracker};
 
 // The set-1 scancode identity + map are the single source in mde-vdi-core; SPICE
 // re-exports them unchanged so `mde_vdi_spice::{Scancode, scancode_for}` keep
 // working, and adds only the SPICE wire packing ([`to_spice`]) on top.
 pub use mde_vdi_core::{scancode_for, Scancode};
-
-/// Set-1 scancodes for the three core modifier keys the session synthesises from
-/// egui's `Modifiers` snapshot — re-exported from [`mde_vdi_core`] (RDP + SPICE
-/// share these identities).
-pub(crate) use mde_vdi_core::{ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE};
 
 /// Pack a set-1 [`Scancode`] into the `u32` word `spice-client`'s
 /// [`send_key_down`](spice_client::SpiceClient) puts on the wire.
@@ -206,9 +201,10 @@ pub fn map_event(event: &Event) -> Option<SpiceInputEvent> {
 mod tests {
     use super::{
         map_button, map_event, scancode_for, to_spice, ModifierState, MouseButton, Scancode,
-        SpiceInputEvent, ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE,
+        SpiceInputEvent,
     };
     use crate::egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, Vec2};
+    use mde_vdi_core::{ALT_SCANCODE, CTRL_SCANCODE, SHIFT_SCANCODE};
 
     #[test]
     fn scancode_map_is_the_shared_core_source() {
