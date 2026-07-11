@@ -1102,6 +1102,61 @@ impl Spawn {
     }
 }
 
+/// test-obs-10 — a sink for NAMED worker-health alerts (currently a
+/// circuit-breaker trip). The production sink writes the alert to the mesh Bus;
+/// tests inject a recording sink so the Trip → alert path is observable without
+/// a live Bus. Publishing is a rare, best-effort side effect — a failed publish
+/// is logged, never fatal.
+pub trait BreakerAlertSink: Send + Sync {
+    /// Publish one already-built alert.
+    fn publish(&self, alert: &notify::AlertMsg);
+}
+
+/// test-obs-10 — production [`BreakerAlertSink`]: writes the alert to the mesh
+/// Bus on its own topic. Opens the Bus `Persist` per trip (trips are rare) so
+/// the supervisor holds only a cheap `PathBuf`, never a live handle.
+pub struct BusBreakerAlertSink {
+    bus_root: std::path::PathBuf,
+}
+
+impl BusBreakerAlertSink {
+    /// Wrap an explicit Bus spool root.
+    #[must_use]
+    pub fn new(bus_root: std::path::PathBuf) -> Self {
+        Self { bus_root }
+    }
+}
+
+impl BreakerAlertSink for BusBreakerAlertSink {
+    fn publish(&self, alert: &notify::AlertMsg) {
+        match mde_bus::persist::Persist::open(self.bus_root.clone()) {
+            Ok(persist) => {
+                if let Err(e) = persist.write(
+                    &alert.topic,
+                    mde_bus::hooks::config::Priority::Default,
+                    None,
+                    Some(&alert.body),
+                ) {
+                    warn!(topic = %alert.topic, error = %e, "test-obs-10: breaker-trip alert publish failed");
+                }
+            }
+            Err(e) => warn!(
+                bus_root = %self.bus_root.display(),
+                error = %e,
+                "test-obs-10: breaker-trip alert — bus open failed",
+            ),
+        }
+    }
+}
+
+/// test-obs-10 — the default production alert sink: the mesh Bus at
+/// [`mde_bus::default_data_dir`]. `None` when no Bus root resolves — the alert
+/// then degrades to the journal `error!` line, exactly as before this change.
+fn default_breaker_alert_sink() -> Option<Arc<dyn BreakerAlertSink>> {
+    let root = mde_bus::default_data_dir()?;
+    Some(Arc::new(BusBreakerAlertSink::new(root)))
+}
+
 /// Minimal in-process supervisor. Phase A scope: spawn each worker
 /// once, log restarts, broadcast shutdown via a watch channel,
 /// `join_all` on stop. Phase B re-wraps this in `task-supervisor` for
@@ -1113,6 +1168,10 @@ pub struct Supervisor {
     /// EFF-24 — optional live status registry; when set, every spawn
     /// records lifecycle transitions into it.
     status: Option<WorkerStatusMap>,
+    /// test-obs-10 — sink for the NAMED circuit-breaker-trip alert.
+    /// Defaults to the mesh Bus ([`default_breaker_alert_sink`]); tests
+    /// inject a recorder via [`Supervisor::set_breaker_alert_sink`].
+    alert_sink: Option<Arc<dyn BreakerAlertSink>>,
 }
 
 impl Default for Supervisor {
@@ -1133,6 +1192,7 @@ impl Supervisor {
             shutdown_rx: rx,
             join: JoinSet::new(),
             status: None,
+            alert_sink: default_breaker_alert_sink(),
         }
     }
 
@@ -1140,6 +1200,13 @@ impl Supervisor {
     /// before the first `spawn` so every worker is tracked.
     pub fn set_status_map(&mut self, map: WorkerStatusMap) {
         self.status = Some(map);
+    }
+
+    /// test-obs-10 — override the circuit-breaker-trip alert sink. Production
+    /// keeps the default mesh-Bus sink; tests inject a recorder so the
+    /// Trip → alert path is asserted without a live Bus.
+    pub fn set_breaker_alert_sink(&mut self, sink: Arc<dyn BreakerAlertSink>) {
+        self.alert_sink = Some(sink);
     }
 
     /// LIGHTHOUSE-8 — register the per-lighthouse deep-probe worker following the
@@ -1187,6 +1254,8 @@ impl Supervisor {
         let shutdown = token;
         // EFF-24 — register + maintain the live status row.
         let status = self.status.clone();
+        // test-obs-10 — the breaker-trip alert sink, moved into the task.
+        let alert_sink = self.alert_sink.clone();
         update_status(&status, name, |w| w.alive = true);
         self.join.spawn(async move {
             // ENT-6 — closed-state restart-policy state for this worker.
@@ -1376,6 +1445,26 @@ impl Supervisor {
                             w.breaker_tripped = true;
                             w.breaker_trips += 1;
                         });
+                        // test-obs-10 — a trip also surfaces a NAMED alert on
+                        // the Bus so an operator can tell WHICH worker died and
+                        // that it is a breaker-open (not transient) failure,
+                        // rather than an anonymous "N journal warnings" blob.
+                        // Fired only on the fresh Trip decision — half-open
+                        // relapses take the `trial` path above, not this arm —
+                        // so exactly one alert per trip.
+                        if let Some(sink) = &alert_sink {
+                            let reason = match &outcome {
+                                Err(e) => format!(
+                                    "{rapid_failures} failures within {}s (last error: {e})",
+                                    BREAKER_WINDOW.as_secs()
+                                ),
+                                Ok(()) => format!(
+                                    "{rapid_failures} rapid restarts within {}s",
+                                    BREAKER_WINDOW.as_secs()
+                                ),
+                            };
+                            sink.publish(&notify::breaker_trip_alert(name, &reason));
+                        }
                         cooldown = COOLDOWN_INITIAL;
                         let mut cool_tok = shutdown.clone();
                         tokio::select! {
@@ -1456,6 +1545,35 @@ impl Supervisor {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// test-obs-10 — records every published breaker-trip alert so a test can
+    /// assert the Trip → alert path fired (and exactly how often) without a
+    /// live Bus.
+    #[derive(Default)]
+    struct RecordingSink {
+        alerts: std::sync::Mutex<Vec<notify::AlertMsg>>,
+    }
+
+    impl BreakerAlertSink for RecordingSink {
+        fn publish(&self, alert: &notify::AlertMsg) {
+            self.alerts.lock().unwrap().push(alert.clone());
+        }
+    }
+
+    impl RecordingSink {
+        fn recorded(&self) -> Vec<notify::AlertMsg> {
+            self.alerts.lock().unwrap().clone()
+        }
+    }
+
+    /// test-obs-10 — attach a fresh recording sink and hand back its handle so
+    /// the test can read what the Trip path published. Keeps the trip tests
+    /// hermetic (no writes to the real mesh Bus the default sink targets).
+    fn recording_sink(sup: &mut Supervisor) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        sup.set_breaker_alert_sink(Arc::clone(&sink) as Arc<dyn BreakerAlertSink>);
+        sink
+    }
 
     struct CountdownWorker {
         remaining: Arc<AtomicUsize>,
@@ -1548,6 +1666,9 @@ mod tests {
     #[tokio::test]
     async fn on_failure_policy_restarts_until_ok() {
         let mut sup = Supervisor::new();
+        // test-obs-10 — a normal restart (one failure, then Ok) is NOT a trip,
+        // so it must publish NO named breaker alert.
+        let sink = recording_sink(&mut sup);
         let attempts = Arc::new(AtomicUsize::new(0));
         sup.spawn(Spawn::new(
             FailOnce {
@@ -1560,6 +1681,11 @@ mod tests {
         // Final attempt should have returned Ok.
         assert!(outcomes[0].1.is_ok());
         assert!(attempts.load(Ordering::SeqCst) >= 2);
+        // test-obs-10 — a plain restart never fires the breaker alert.
+        assert!(
+            sink.recorded().is_empty(),
+            "a normal restart must not emit a breaker-trip alert",
+        );
     }
 
     struct PanicOnce {
@@ -1741,6 +1867,7 @@ mod tests {
         let mut sup = Supervisor::new();
         let status = new_status_map();
         sup.set_status_map(Arc::clone(&status));
+        let sink = recording_sink(&mut sup);
         let attempts = Arc::new(AtomicUsize::new(0));
         sup.spawn(Spawn::new(
             FlakyThenPark {
@@ -1779,6 +1906,23 @@ mod tests {
                 "one genuine breaker trip recorded on trips_total",
             );
         }
+        // test-obs-10 — the single trip surfaced exactly ONE named alert on the
+        // worker's stable topic, carrying its name + the breaker-open fact.
+        let alerts = sink.recorded();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "one trip ⇒ exactly one named breaker alert"
+        );
+        assert_eq!(alerts[0].topic, "fleet/health/breaker/flaky-park");
+        assert!(
+            alerts[0].body.contains("flaky-park"),
+            "alert names the worker"
+        );
+        assert!(
+            alerts[0].body.contains("breaker_open"),
+            "alert flags breaker-open"
+        );
         sup.shutdown_and_join().await.unwrap();
     }
 
@@ -1792,6 +1936,7 @@ mod tests {
         let mut sup = Supervisor::new();
         let status = new_status_map();
         sup.set_status_map(Arc::clone(&status));
+        let sink = recording_sink(&mut sup);
         let attempts = Arc::new(AtomicUsize::new(0));
         sup.spawn(Spawn::new(
             FlakyThenPark {
@@ -1810,6 +1955,13 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             BREAKER_TRIP as usize + 3,
             "re-attempted after each relapse rather than dying",
+        );
+        // test-obs-10 — only the FRESH trip alerts; half-open relapses take the
+        // trial path, not the Trip arm, so it is still exactly one alert.
+        assert_eq!(
+            sink.recorded().len(),
+            1,
+            "one alert per trip even across relapses",
         );
         sup.shutdown_and_join().await.unwrap();
     }

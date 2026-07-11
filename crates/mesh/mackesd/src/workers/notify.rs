@@ -74,6 +74,13 @@ use super::{ShutdownToken, Worker};
 pub const NOTIFY_TOPIC_PREFIX: &str = "event/notify/";
 /// Prefix for daemon-owned status rollups consumed by the shell pips.
 pub const NOTIFY_SEGMENT_TOPIC_PREFIX: &str = "state/notify/segment/";
+/// test-obs-10 — topic prefix for the NAMED per-worker circuit-breaker-trip
+/// alert. A trip publishes on `fleet/health/breaker/<worker>`, mirroring the
+/// SELinux/MON-4 `fleet/sec/selinux/<host>` lane convention
+/// (`fleet/<domain>/<kind>/<key>`) so the affected worker is named IN the topic —
+/// not lost in the anonymous "N journal warnings" blob a trip used to coalesce
+/// into. See [`breaker_trip_alert`].
+pub const BREAKER_ALERT_TOPIC_PREFIX: &str = "fleet/health/breaker/";
 /// Criticals on the affected local seat fire the edge cue.
 pub const CRITICAL_POLICY_OWN_SEAT: &str = "own-seat-light-show";
 /// Remote criticals stay pull-first: pip + Chat.
@@ -277,6 +284,65 @@ struct NotifyBody<'a> {
     summary: &'a str,
     host: &'a str,
     ts_unix_ms: i64,
+}
+
+/// test-obs-10 — a fully-addressed Bus message the pure alert seam returns:
+/// the topic plus the serialized JSON body. Returning this (rather than writing
+/// straight into a live [`Persist`]) is what makes the breaker-trip alert
+/// testable without a Bus — the caller does the single `persist.write`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertMsg {
+    /// The Bus topic to publish on (e.g. `fleet/health/breaker/mesh_router`).
+    pub topic: String,
+    /// The serialized alert-shaped JSON body.
+    pub body: String,
+}
+
+/// test-obs-10 — the on-Bus body a circuit-breaker trip serializes to. Shaped
+/// like [`NotifyBody`] (a `severity`/`summary` an alert-folding consumer can
+/// classify) plus the machine-readable `worker`/`reason`/`breaker_open` fields
+/// that name exactly WHICH worker died, WHY, and that this is the breaker-OPEN
+/// state (distinct from a transient restart).
+#[derive(Debug, Serialize)]
+struct BreakerAlertBody<'a> {
+    severity: &'a str,
+    source: &'a str,
+    worker: &'a str,
+    summary: &'a str,
+    reason: &'a str,
+    /// The "permanent (breaker-open) failure" fact — `true` at the trip.
+    breaker_open: bool,
+}
+
+/// test-obs-10 — build the NAMED circuit-breaker-trip alert for `worker`.
+///
+/// A trip used to surface only as a journal `error!` line, which the journal
+/// source ([`coalesce_journal`]) folded into an anonymous "N journal warnings"
+/// blob — an operator could not tell WHICH worker died or that it was a
+/// breaker-open trip (vs a transient restart). This emits a distinct, named
+/// alert on `fleet/health/breaker/<worker>` ([`BREAKER_ALERT_TOPIC_PREFIX`])
+/// carrying the worker name, the trip `reason`, and the breaker-open fact.
+///
+/// Pure: no clock, no Bus — the caller publishes the returned [`AlertMsg`]. A
+/// timestamp is intentionally omitted so the message is deterministic under test.
+#[must_use]
+pub fn breaker_trip_alert(worker: &str, reason: &str) -> AlertMsg {
+    let topic = format!("{BREAKER_ALERT_TOPIC_PREFIX}{worker}");
+    let summary = format!(
+        "worker '{worker}' died — circuit breaker OPEN (permanent until recovery): {reason}"
+    );
+    let body = BreakerAlertBody {
+        severity: Severity::Critical.tag(),
+        source: "breaker",
+        worker,
+        summary: &summary,
+        reason,
+        breaker_open: true,
+    };
+    // A struct of owned primitives never fails to serialize; fall back to an
+    // empty body rather than panic in the (unreachable) error arm.
+    let body = serde_json::to_string(&body).unwrap_or_default();
+    AlertMsg { topic, body }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1167,6 +1233,29 @@ mod tests {
         assert!(n.summary.contains("error-level")); // one "failed" line
         assert!(coalesce_journal("").is_none());
         assert!(coalesce_journal("   \n\n").is_none());
+    }
+
+    // ── test-obs-10: the NAMED breaker-trip alert seam ──────────────────
+
+    #[test]
+    fn breaker_trip_alert_names_worker_topic_and_reason() {
+        let reason = "8 failures within 120s (last error: link down)";
+        let alert = breaker_trip_alert("mesh_router", reason);
+        // Topic carries the worker name (fleet/<domain>/<kind>/<key>).
+        assert_eq!(alert.topic, "fleet/health/breaker/mesh_router");
+        assert_eq!(
+            alert.topic,
+            format!("{BREAKER_ALERT_TOPIC_PREFIX}mesh_router")
+        );
+        // Body names the worker, the reason, the breaker-open fact + severity.
+        let body: serde_json::Value = serde_json::from_str(&alert.body).expect("valid alert JSON");
+        assert_eq!(body["worker"], "mesh_router");
+        assert_eq!(body["reason"], reason);
+        assert_eq!(body["breaker_open"], serde_json::json!(true));
+        assert_eq!(body["source"], "breaker");
+        assert_eq!(body["severity"], Severity::Critical.tag());
+        assert!(body["summary"].as_str().unwrap().contains("mesh_router"));
+        assert!(body["summary"].as_str().unwrap().contains("link down"));
     }
 
     // ── bounded / coalescing log ────────────────────────────────────────
