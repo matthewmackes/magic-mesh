@@ -6806,6 +6806,29 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("session_broker".into());
         }
+        // VDI-VM-1 — the console_broker worker: the serving-side half that actually
+        // makes a LOCAL KVM VM's console reachable on the mesh. Every VM binds SPICE
+        // to 127.0.0.1 (vm_lifecycle's domain XML), so session_broker can track a
+        // local-VM session but there is no reachable endpoint to attach frames.
+        // For each VDI `Open` naming a VM this node serves, this worker resolves the
+        // live console (`virsh domdisplay`), relays that loopback port onto the
+        // Nebula overlay with a scoped socat (the compute_expose forward pattern),
+        // and publishes the overlay `host:port` back on the session record
+        // (`state/vdi/console`, keyed by session id) for the client shell to
+        // resolve. Serving-peer-gated (NOT leader-gated: the relay + loopback
+        // console are physically on the serving host); runs everywhere like
+        // session_broker. Honest-gates (never a fake endpoint) when the VM is off /
+        // has no graphics / socat|virsh|overlay is absent — §7.
+        if mackesd_core::worker_role::runs("console_broker", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::console_broker::ConsoleBrokerWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("console_broker".into());
+        }
         // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
         // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
         // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —

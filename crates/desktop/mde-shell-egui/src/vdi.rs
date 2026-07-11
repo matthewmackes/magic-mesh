@@ -113,6 +113,103 @@ impl DesktopEndpoint {
     }
 }
 
+/// The retained Bus topic the serving peer's `console_broker` (VDI-VM-1) publishes
+/// brokered console endpoints to. MUST equal
+/// `mackesd::workers::console_broker::CONSOLE_TOPIC` (a cross-check test pins it).
+pub(crate) const CONSOLE_TOPIC: &str = "state/vdi/console";
+
+/// The shell's read mirror of `console_broker`'s brokered-console status — only the
+/// fields the transport needs. serde ignores the rest (e.g. the record's `protocol`
+/// tag: the transport uses the operator's chosen protocol, the record only supplies
+/// the dialable `host:port`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum BrokeredConsoleStatus {
+    /// A reachable overlay endpoint was brokered.
+    Brokered {
+        /// The Nebula overlay address the serving peer's relay listens on.
+        host: String,
+        /// The overlay port.
+        port: u16,
+    },
+    /// No reachable endpoint could be brokered — the honest reason.
+    Unbrokerable {
+        /// The reason surfaced to the operator.
+        reason: String,
+    },
+}
+
+/// The shell's read mirror of one `console_broker` record on [`CONSOLE_TOPIC`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct BrokeredConsoleRecord {
+    /// The session this console serves — the globally-unique correlation key the
+    /// shell matches against its minted [`BrokerSessionLifecycle::id`].
+    session_id: String,
+    /// The brokered endpoint, or the honest reason none could be brokered.
+    status: BrokeredConsoleStatus,
+}
+
+/// The outcome of resolving a brokered console endpoint from the session record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConsoleResolution {
+    /// No record yet — the serving peer's broker hasn't published one (keep
+    /// waiting; the connect stays in an honest "resolving" state).
+    Pending,
+    /// A dialable overlay endpoint the transport attaches to.
+    Ready(DesktopEndpoint),
+    /// The broker honestly reported it CANNOT make a reachable endpoint — the shell
+    /// greys the lane and never attaches a doomed transport (§7).
+    Unbrokerable(String),
+}
+
+/// Resolve the brokered console endpoint for `session_id` from the raw
+/// [`CONSOLE_TOPIC`] record bodies (the latest matching record wins — the broker
+/// republishes when a session's console state changes). Pure + headless-testable;
+/// the Bus read that feeds it is `read_console_bodies`.
+pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> ConsoleResolution {
+    let mut out = ConsoleResolution::Pending;
+    for body in bodies {
+        let Ok(rec) = serde_json::from_str::<BrokeredConsoleRecord>(body) else {
+            continue;
+        };
+        if rec.session_id != session_id {
+            continue;
+        }
+        out = match rec.status {
+            BrokeredConsoleStatus::Brokered { host, port } => DesktopEndpoint::new(host, port)
+                .map_or_else(
+                    || {
+                        ConsoleResolution::Unbrokerable(
+                            "the broker published an unusable endpoint".to_string(),
+                        )
+                    },
+                    ConsoleResolution::Ready,
+                ),
+            BrokeredConsoleStatus::Unbrokerable { reason } => {
+                ConsoleResolution::Unbrokerable(reason)
+            }
+        };
+    }
+    out
+}
+
+/// Read the raw brokered-console record bodies off [`CONSOLE_TOPIC`] — a
+/// non-blocking local spool scan (empty when there's no Bus dir / nothing
+/// published), mirroring the Chooser's `BusDesktopSources::latest` read idiom.
+#[cfg(feature = "live-vdi")]
+fn read_console_bodies(bus_root: Option<&std::path::Path>) -> Vec<String> {
+    let Some(root) = bus_root else {
+        return Vec::new();
+    };
+    let Ok(persist) = mde_bus::persist::Persist::open(root.to_path_buf()) else {
+        return Vec::new();
+    };
+    persist
+        .list_since(CONSOLE_TOPIC, None)
+        .map(|msgs| msgs.into_iter().filter_map(|m| m.body).collect())
+        .unwrap_or_default()
+}
+
 /// A desktop target the Chooser (CHOOSER-2, née the E12-5b picker) handed to the
 /// surface: the desktop the operator chose, plus the direct endpoint if discovery
 /// published one. Recorded so the surface reflects the pending connect by name
@@ -836,6 +933,15 @@ pub(crate) struct VdiState {
     /// Broker lifecycle currently marked active by the live transport.
     #[cfg(feature = "live-vdi")]
     active_broker_session: Option<BrokerSessionLifecycle>,
+    /// VDI-VM-1 — set once brokered-console resolution honestly gated (the serving
+    /// peer reported it can't broker a reachable endpoint). Pins the honest status
+    /// and stops the per-frame poll from re-reading a doomed session.
+    #[cfg(feature = "live-vdi")]
+    broker_resolution_gated: bool,
+    /// VDI-VM-1 — throttle for the per-frame brokered-endpoint spool read while a
+    /// mesh connect resolves (the connecting backdrop repaints continuously).
+    #[cfg(feature = "live-vdi")]
+    broker_resolve_at: Option<std::time::Instant>,
 }
 
 impl VdiState {
@@ -869,6 +975,8 @@ impl VdiState {
         #[cfg(feature = "live-vdi")]
         {
             self.live_status = None;
+            self.broker_resolution_gated = false;
+            self.broker_resolve_at = None;
             self.publish_broker_close_if_active();
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
@@ -881,37 +989,118 @@ impl VdiState {
             }
             self.texture = None;
             self.incoming = None;
-            match request.protocol {
-                VdiProtocol::Rdp => match LiveRdpHandle::spawn(&request) {
-                    Ok(handle) => {
-                        self.live_status = Some("Opening live RDP transport".to_string());
-                        self.live_rdp = Some(handle);
-                    }
-                    Err(reason) => {
-                        self.live_status = Some(format!("Live RDP gated: {reason}"));
-                    }
-                },
-                VdiProtocol::Vnc => match LiveVncHandle::spawn(&request) {
-                    Ok(handle) => {
-                        self.live_status = Some("Opening live VNC transport".to_string());
-                        self.live_vnc = Some(handle);
-                    }
-                    Err(reason) => {
-                        self.live_status = Some(format!("Live VNC gated: {reason}"));
-                    }
-                },
-                VdiProtocol::Spice => match LiveSpiceHandle::spawn(&request) {
-                    Ok(handle) => {
-                        self.live_status = Some("Opening live SPICE transport".to_string());
-                        self.live_spice = Some(handle);
-                    }
-                    Err(reason) => {
-                        self.live_status = Some(format!("Live SPICE gated: {reason}"));
-                    }
-                },
+            // VDI-VM-1 — a mesh-brokered connect with no discovery-time endpoint (a
+            // local/peer VM whose loopback console has no advertised port) must first
+            // resolve the endpoint the serving peer's `console_broker` publishes back
+            // on the session record. Hold it in an honest "resolving" state; the
+            // per-frame `poll_brokered_endpoint` attaches + spawns once it lands (or
+            // pins the honest gate if the console can't be brokered). Direct
+            // endpoints (manual/mDNS/external, or an already-resolved mesh row) spawn
+            // straight away.
+            if request.target.endpoint.is_none() && request.broker_session.is_some() {
+                self.live_status = Some(
+                    "Resolving the brokered console endpoint over the mesh\u{2026}".to_string(),
+                );
+            } else {
+                self.spawn_live_transport(&request);
             }
         }
         self.requested = Some(request);
+    }
+
+    /// Spawn the live decoder transport for `request` (RDP / VNC / SPICE), routing
+    /// the honest gate into `live_status` on failure. Shared by the direct-endpoint
+    /// path ([`Self::request_connect`]) and the brokered-endpoint resolve path
+    /// ([`Self::poll_brokered_endpoint`]).
+    #[cfg(feature = "live-vdi")]
+    fn spawn_live_transport(&mut self, request: &ConnectRequest) {
+        match request.protocol {
+            VdiProtocol::Rdp => match LiveRdpHandle::spawn(request) {
+                Ok(handle) => {
+                    self.live_status = Some("Opening live RDP transport".to_string());
+                    self.live_rdp = Some(handle);
+                }
+                Err(reason) => {
+                    self.live_status = Some(format!("Live RDP gated: {reason}"));
+                }
+            },
+            VdiProtocol::Vnc => match LiveVncHandle::spawn(request) {
+                Ok(handle) => {
+                    self.live_status = Some("Opening live VNC transport".to_string());
+                    self.live_vnc = Some(handle);
+                }
+                Err(reason) => {
+                    self.live_status = Some(format!("Live VNC gated: {reason}"));
+                }
+            },
+            VdiProtocol::Spice => match LiveSpiceHandle::spawn(request) {
+                Ok(handle) => {
+                    self.live_status = Some("Opening live SPICE transport".to_string());
+                    self.live_spice = Some(handle);
+                }
+                Err(reason) => {
+                    self.live_status = Some(format!("Live SPICE gated: {reason}"));
+                }
+            },
+        }
+    }
+
+    /// VDI-VM-1 — while a mesh-brokered connect has no dialable endpoint yet,
+    /// resolve it from the serving peer's `console_broker` record (a local VM's
+    /// loopback console, relayed onto the overlay and published back on the session
+    /// record). On a reachable endpoint, attach it + spawn the transport; on an
+    /// honest broker gate, pin the reason and stop (never a doomed transport, §7);
+    /// otherwise keep the honest "resolving" status. Throttled to twice a second so
+    /// the breathing connecting backdrop doesn't spin the spool read.
+    #[cfg(feature = "live-vdi")]
+    fn poll_brokered_endpoint(&mut self) {
+        if self.broker_resolution_gated {
+            return;
+        }
+        // Only while genuinely resolving: a pending mesh-brokered request with no
+        // endpoint and no live transport attached yet.
+        let Some(request) = self.requested.as_ref() else {
+            return;
+        };
+        if request.target.endpoint.is_some() {
+            return;
+        }
+        let Some(broker) = request.broker_session.clone() else {
+            return;
+        };
+        if self.live_rdp.is_some() || self.live_vnc.is_some() || self.live_spice.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.broker_resolve_at {
+            if now.duration_since(prev) < Duration::from_millis(500) {
+                return;
+            }
+        }
+        self.broker_resolve_at = Some(now);
+
+        let bodies = read_console_bodies(broker.bus_root.as_deref());
+        match resolve_brokered_console(&bodies, &broker.id) {
+            ConsoleResolution::Ready(endpoint) => {
+                if let Some(request) = self.requested.as_mut() {
+                    request.target.endpoint = Some(endpoint);
+                }
+                if let Some(request) = self.requested.clone() {
+                    self.spawn_live_transport(&request);
+                }
+            }
+            ConsoleResolution::Unbrokerable(reason) => {
+                self.live_status = Some(format!(
+                    "This desktop can't be reached over the mesh: {reason}. Nothing was attached."
+                ));
+                self.broker_resolution_gated = true;
+            }
+            ConsoleResolution::Pending => {
+                self.live_status = Some(
+                    "Resolving the brokered console endpoint over the mesh\u{2026}".to_string(),
+                );
+            }
+        }
     }
 
     /// The picked target, if any — the shell reads it to decide whether the Desktop
@@ -936,6 +1125,8 @@ impl VdiState {
             }
             self.publish_broker_close_if_active();
             self.live_status = None;
+            self.broker_resolution_gated = false;
+            self.broker_resolve_at = None;
             self.texture = None;
             self.incoming = None;
         }
@@ -1112,6 +1303,10 @@ const DESKTOP_TEX: TextureOptions = TextureOptions::LINEAR;
 pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     #[cfg(feature = "live-vdi")]
     {
+        // VDI-VM-1 — resolve a mesh-brokered console endpoint from the session
+        // record before draining transport events (a just-resolved endpoint spawns
+        // its transport here, and its events are picked up next frame).
+        state.poll_brokered_endpoint();
         state.poll_live_rdp();
         state.poll_live_vnc();
         state.poll_live_spice();
@@ -1637,6 +1832,84 @@ mod tests {
             DesktopEndpoint::new("10.42.0.9", 3389).map(|endpoint| endpoint.label()),
             Some("10.42.0.9:3389".to_string())
         );
+    }
+
+    // ── VDI-VM-1: resolving the brokered console endpoint from the session record ──
+
+    #[test]
+    fn console_topic_matches_the_broker() {
+        // MUST equal mackesd::workers::console_broker::CONSOLE_TOPIC.
+        assert_eq!(CONSOLE_TOPIC, "state/vdi/console");
+    }
+
+    fn brokered_body(session: &str, host: &str, port: u16) -> String {
+        format!(
+            r#"{{"session_id":"{session}","serving_node":"peer:oak","vm_id":"win11","status":{{"state":"brokered","protocol":"spice","host":"{host}","port":{port}}}}}"#
+        )
+    }
+
+    fn unbrokerable_body(session: &str, reason: &str) -> String {
+        format!(
+            r#"{{"session_id":"{session}","serving_node":"peer:oak","vm_id":"dev","status":{{"state":"unbrokerable","reason":"{reason}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn resolve_pending_when_no_record_for_the_session() {
+        // A record for another session must not resolve ours.
+        let bodies = vec![brokered_body("other", "10.42.0.7", 5900)];
+        assert_eq!(
+            resolve_brokered_console(&bodies, "mine"),
+            ConsoleResolution::Pending
+        );
+        assert_eq!(
+            resolve_brokered_console(&[], "mine"),
+            ConsoleResolution::Pending
+        );
+    }
+
+    #[test]
+    fn resolve_ready_yields_the_overlay_endpoint() {
+        let bodies = vec![brokered_body("s1", "10.42.0.7", 5900)];
+        match resolve_brokered_console(&bodies, "s1") {
+            ConsoleResolution::Ready(ep) => {
+                assert_eq!(ep.host, "10.42.0.7");
+                assert_eq!(ep.port, 5900);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_unbrokerable_surfaces_the_honest_reason() {
+        let bodies = vec![unbrokerable_body("s1", "VM off")];
+        assert_eq!(
+            resolve_brokered_console(&bodies, "s1"),
+            ConsoleResolution::Unbrokerable("VM off".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_latest_record_wins() {
+        // The broker republishes on state change: an initial gate, then a broker.
+        let bodies = vec![
+            unbrokerable_body("s1", "nebula overlay not up"),
+            brokered_body("s1", "10.42.0.7", 5931),
+        ];
+        assert!(matches!(
+            resolve_brokered_console(&bodies, "s1"),
+            ConsoleResolution::Ready(ep) if ep.port == 5931
+        ));
+    }
+
+    #[test]
+    fn resolve_ignores_malformed_and_zero_port_records() {
+        // A garbage body is skipped; a port-0 brokered record is honestly unusable.
+        let bodies = vec!["not json".to_string(), brokered_body("s1", "10.42.0.7", 0)];
+        assert!(matches!(
+            resolve_brokered_console(&bodies, "s1"),
+            ConsoleResolution::Unbrokerable(_)
+        ));
     }
 
     #[cfg(feature = "live-vdi")]

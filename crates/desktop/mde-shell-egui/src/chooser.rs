@@ -332,6 +332,13 @@ impl DesktopSource {
     /// The dialable endpoint for a selected protocol, if discovery published one.
     /// The worker keeps the host separate from the protocol offer's port, and this
     /// fold preserves that typed shape for the live VDI transport.
+    ///
+    /// `None` for a mesh-brokered VM whose console has no advertised port (a local
+    /// or peer VM binds SPICE to loopback — [`ProtocolOffer::port`] is absent).
+    /// That endpoint is NOT guessed here: the serving peer's console broker
+    /// (VDI-VM-1) relays the loopback console onto the overlay and publishes the
+    /// overlay `host:port` back on the session record, and the Desktop surface
+    /// resolves it from there ([`crate::vdi::resolve_brokered_console`]).
     fn endpoint_for(&self, protocol: VdiProtocol) -> Option<DesktopEndpoint> {
         let port = self
             .protocols
@@ -340,6 +347,17 @@ impl DesktopSource {
             .and_then(|offer| offer.port)
             .or_else(|| port_from_host(&self.host))?;
         DesktopEndpoint::new(host_without_matching_port(&self.host, port), port)
+    }
+
+    /// Whether a connect to this source must resolve its dialable endpoint from the
+    /// serving peer's broker record rather than a discovery-time port: a
+    /// mesh-brokered source (peer seat / peer VM / local VM) whose chosen protocol
+    /// carries no advertised port. Drives the honest connect note so the operator is
+    /// told the console endpoint is being brokered, not that frames are already live
+    /// (§7) — and the honesty gate: a VM that can't be brokered surfaces the truth at
+    /// the transport rather than presenting a connectable card that can't attach.
+    fn needs_broker_resolution(&self, protocol: VdiProtocol) -> bool {
+        self.origin.is_mesh_brokered() && self.endpoint_for(protocol).is_none()
     }
 }
 
@@ -2086,9 +2104,17 @@ impl ChooserState {
                     self.bus_root.clone(),
                 ));
             }
+            // VDI-VM-1 — a port-less brokered VM console has its overlay endpoint
+            // resolved from the serving peer's broker record (not a discovery port),
+            // so say so honestly rather than implying frames are already live (§7).
+            let broker_detail = if source.needs_broker_resolution(protocol) {
+                " (resolving the console endpoint from the serving peer's broker record)"
+            } else {
+                ""
+            };
             self.note = Some(format!(
-                "Requested {} from {} via {} ({} \u{00B7} {}) — brokering over the mesh; \
-                 authenticating with {auth_summary}.",
+                "Requested {} from {} via {} ({} \u{00B7} {}) — brokering over the mesh\
+                 {broker_detail}; authenticating with {auth_summary}.",
                 source.name,
                 source.node,
                 protocol.label(),
@@ -3412,6 +3438,32 @@ mod tests {
     fn topic_matches_the_worker_contract() {
         // Cross-check: MUST equal mackesd::workers::desktop_sources::SOURCES_TOPIC.
         assert_eq!(SOURCES_TOPIC, "state/desktops/sources");
+    }
+
+    #[test]
+    fn needs_broker_resolution_flags_a_portless_brokered_vm() {
+        // VDI-VM-1 — a mesh-brokered VM with a port-less Spice offer resolves its
+        // endpoint from the serving peer's broker record, not a discovery port.
+        let vm = source("peer-vm:oak:win11", "oak", &[Protocol::Spice]);
+        assert!(vm.endpoint_for(VdiProtocol::Spice).is_none());
+        assert!(vm.needs_broker_resolution(VdiProtocol::Spice));
+
+        // A mesh source that DID advertise a port resolves directly — no broker read.
+        let mut seat = source("peer:oak", "oak", &[Protocol::Vnc]);
+        seat.protocols = vec![ProtocolOffer {
+            protocol: Protocol::Vnc,
+            port: Some(5900),
+        }];
+        assert!(!seat.needs_broker_resolution(VdiProtocol::Vnc));
+
+        // An off-mesh (manual) endpoint is never broker-resolved.
+        let mut manual = source("manual:10.0.0.5:5900:vnc", "10.0.0.5", &[Protocol::Vnc]);
+        manual.origin = SourceOrigin::Manual;
+        manual.protocols = vec![ProtocolOffer {
+            protocol: Protocol::Vnc,
+            port: Some(5900),
+        }];
+        assert!(!manual.needs_broker_resolution(VdiProtocol::Vnc));
     }
 
     #[test]

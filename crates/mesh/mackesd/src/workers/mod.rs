@@ -750,6 +750,17 @@ pub mod clipboard_bridge;
 // Reachability derives from roster presence / VM power state — never a
 // blocking probe (design lock 14).
 pub mod desktop_sources;
+// VDI-VM-1 — the console_broker worker: makes a LOCAL KVM VM's loopback SPICE/VNC
+// console reachable on the mesh. Every VM binds its graphics to 127.0.0.1
+// (vm_lifecycle's domain XML), so a peer can open a broker session for a local VM
+// yet never has a reachable `host:port` to dial. Serving-peer-gated: for each VDI
+// `Open` naming a VM this node serves, it resolves the live console via `virsh
+// domdisplay`, relays that loopback port onto the Nebula overlay with a scoped
+// `socat` (the compute_expose forwarding pattern), and publishes the overlay
+// endpoint back on the session record (`state/vdi/console`, keyed by session id)
+// for the client shell to resolve. Honest-gates (never a fake endpoint) when the
+// VM is off / has no graphics / socat|virsh|overlay is absent — §7.
+pub mod console_broker;
 // MEDIA-14 — the media_sources worker: the mesh-side (§6) media-source
 // discovery aggregator behind the mde-media Sources panel (docs/design/
 // mesh-media-player.md, row 26). Folds two lanes into one deduped roster
