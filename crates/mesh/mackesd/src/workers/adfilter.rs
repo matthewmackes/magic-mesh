@@ -373,10 +373,8 @@ impl AdfilterWorker {
     /// Is this node the directory leader (reuses the shared leader lock)? Only the
     /// leader refreshes lists + compiles the shared blob (one compiler mesh-wide).
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node),
-            Ok(crate::leader::AcquireResult::Acquired)
-        )
+        crate::leader_gate::LeaderGate::from_lock_path(self.leader_lock.clone(), self.node.clone())
+            .is_leader()
     }
 
     /// Restore this node's authoritative own store from `local_root` (offline-

@@ -504,10 +504,11 @@ impl DcPromoteWorker {
     /// Only the directory leader publishes (no-fixed-center: any eligible node
     /// can be it, the elected one publishes). Reuses the shared leader lock.
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
+        crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
         )
+        .is_leader()
     }
 }
 

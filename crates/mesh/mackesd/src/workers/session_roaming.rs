@@ -1467,10 +1467,11 @@ impl SessionRoamingWorker {
     /// Only the elected node converges the shared plane (no-fixed-center: any
     /// eligible node can be it, the elected one writes). Reuses the shared lock.
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
+        crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
         )
+        .is_leader()
     }
 
     /// Leader-only: read the shared session plane + the live-node set, plan this

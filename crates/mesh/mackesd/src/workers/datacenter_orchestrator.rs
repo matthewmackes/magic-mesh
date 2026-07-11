@@ -1281,15 +1281,22 @@ impl DatacenterOrchestratorWorker {
         }
     }
 
-    /// Does this node currently hold `zone`'s leader lease? Each zone has its own
-    /// lock file, so the two elections are fully independent (no-fixed-center: any
-    /// eligible node can be it, the elected one publishes).
+    /// Does this node currently hold `zone`'s leader lease? Routed through the
+    /// substrate-aware [`crate::leader_gate::LeaderGate`] (mackesd-01/-04) so a
+    /// cut-over fleet doesn't split-brain and multi-publish each zone's deltas from
+    /// every node's local Syncthing copy of the per-zone lock.
+    ///
+    /// Pre-cutover (no etcd endpoints) this is byte-for-byte the old per-zone fs
+    /// election: each zone keeps its own lock file, so the two elections stay fully
+    /// independent (Xen from an on-LAN node, DO from anywhere). On an etcd fleet the
+    /// gate observes the single `/mesh/leader` key, so both zones resolve to the one
+    /// mesh leader — the `Zone::eligible` gate still applies, so Xen only publishes
+    /// when that leader is on-LAN. Per-zone etcd elections would need a per-zone key
+    /// in `substrate::leader` (there is only `/mesh/leader` today) — out of scope for
+    /// this exactly-once fix; single-publisher is the correction over N-way publish.
     fn leads(&self, zone: Zone) -> bool {
         let lock = self.workgroup_root.join(zone.lock_name());
-        matches!(
-            crate::leader::try_acquire(&lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
-        )
+        crate::leader_gate::LeaderGate::from_lock_path(lock, self.node_id.clone()).is_leader()
     }
 
     fn tick_once(&mut self) {
@@ -1827,6 +1834,55 @@ mod tests {
         assert_ne!(Zone::Xen.lock_name(), Zone::Do.lock_name());
         assert!(Zone::Xen.lock_name().contains("xen"));
         assert!(Zone::Do.lock_name().contains("do"));
+    }
+
+    // ── mackesd-01/-04: `leads` now routes each zone through the substrate-aware
+    //    LeaderGate (the inline try_acquire is gone). This is the one non-`is_leader`
+    //    swap — proven at the worker boundary that it delegates, keeps per-zone fs
+    //    behavior pre-cutover, and takes the fail-closed etcd branch once endpoints
+    //    exist. (On an etcd fleet both zones observe the single `/mesh/leader`; see
+    //    the `leads` doc comment for that intentional single-publisher collapse.)
+
+    #[test]
+    fn leads_uses_the_per_zone_fs_lease_pre_cutover() {
+        // No etcd endpoints in the test env ⇒ `leads` delegates to LeaderGate's fs
+        // path per zone: uncontended ⇒ leader; a peer holding one zone's lease ⇒
+        // follower for THAT zone only — the two zone elections stay independent.
+        let tmp = tempfile::tempdir().unwrap();
+        let w = DatacenterOrchestratorWorker::new(tmp.path().to_path_buf(), "peer:self".into());
+        assert!(w.leads(Zone::Do), "uncontended DO lease ⇒ leader");
+        let xen_lock = tmp.path().join(Zone::Xen.lock_name());
+        assert!(matches!(
+            crate::leader::try_acquire(&xen_lock, "peer:other"),
+            Ok(crate::leader::AcquireResult::Acquired)
+        ));
+        assert!(!w.leads(Zone::Xen), "peer holds Xen ⇒ follower for Xen");
+        assert!(
+            w.leads(Zone::Do),
+            "DO election is independent ⇒ still leader"
+        );
+    }
+
+    #[test]
+    fn leads_takes_the_etcd_branch_and_fails_closed_when_endpoints_present() {
+        // The per-zone gate `leads` builds, forced onto the etcd branch: unreachable
+        // endpoints ⇒ observe `/mesh/leader`, fail closed (NOT leader), and NEVER
+        // acquire the per-zone fs lock (the split-brain source the cut-over fleet hit).
+        let tmp = tempfile::tempdir().unwrap();
+        let w = DatacenterOrchestratorWorker::new(tmp.path().to_path_buf(), "peer:self".into());
+        let xen_lock = tmp.path().join(Zone::Xen.lock_name());
+        let gate =
+            crate::leader_gate::LeaderGate::from_lock_path(xen_lock.clone(), w.node_id.clone())
+                .with_endpoints(vec!["http://127.0.0.1:1".into()]);
+        assert!(gate.uses_etcd(), "endpoints present ⇒ etcd branch");
+        assert!(
+            !gate.is_leader(),
+            "unreachable etcd ⇒ fail-closed, not leader"
+        );
+        assert!(
+            !xen_lock.exists(),
+            "etcd branch must NOT fall back to the per-zone fs acquire"
+        );
     }
 
     // ---- DATACENTER-5: storage / net / gateway rollup ---------------------------

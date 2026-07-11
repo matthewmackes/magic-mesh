@@ -197,10 +197,11 @@ impl FarmOrchestratorWorker {
     /// the elected one coordinates). Reuses the same leader lock other workers do,
     /// so a 3-node mesh publishes each farm event once.
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
+        crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
         )
+        .is_leader()
     }
 
     fn etcd_range_keys(prefix: &str) -> Vec<String> {

@@ -398,10 +398,11 @@ impl ActionWorker {
     /// eligible node can be it, the elected one acts). Reuses the shared leader
     /// lock — synchronous, called once per observed request.
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
+        crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
         )
+        .is_leader()
     }
 
     /// Write the hash-chain audit row for one action (request + outcome) through
@@ -1087,5 +1088,59 @@ mod tests {
             crate::audit::verify(&rows),
             crate::audit::VerifyOutcome::Intact { verified: 2, .. }
         ));
+    }
+
+    // ── mackesd-01/-04: is_leader now routes through the substrate-aware LeaderGate ──
+    //
+    // action is representative of the standard `is_leader` swap shared by dc_health,
+    // dc_jobs, dc_promote, farm_orchestrator, service_onboard, session_roaming (and,
+    // via `self.node`, adfilter). The core split-brain regression is proven centrally
+    // in leader_gate; here we prove the worker DELEGATES to it — fs behavior preserved
+    // pre-cutover, etcd branch taken (and fail-closed) once endpoints exist.
+
+    #[test]
+    fn is_leader_true_on_the_uncontended_fs_lease() {
+        // No etcd endpoints in the test env ⇒ is_leader delegates to LeaderGate's fs
+        // path; an uncontended lease ⇒ this node leads (old try_acquire behavior kept).
+        let tmp = tempfile::tempdir().unwrap();
+        let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into());
+        assert!(w.is_leader());
+    }
+
+    #[test]
+    fn is_leader_false_when_another_node_holds_the_fs_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into());
+        // A peer grabs the shared lease first ⇒ we are a follower.
+        assert!(matches!(
+            crate::leader::try_acquire(&w.leader_lock, "peer:other"),
+            Ok(crate::leader::AcquireResult::Acquired)
+        ));
+        assert!(!w.is_leader());
+    }
+
+    #[test]
+    fn is_leader_takes_the_etcd_branch_and_fails_closed_when_endpoints_present() {
+        // The gate the worker's is_leader builds (from its OWN leader_lock + node_id):
+        // with etcd endpoints present but unreachable it observes `/mesh/leader`, fails
+        // closed (NOT leader), and — crucially — never falls back to acquiring the
+        // per-node fs lock that caused the split-brain. Mirrors leader_gate's
+        // etcd_path_fails_closed_and_never_touches_the_fs_lock, at the worker boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into());
+        let gate = crate::leader_gate::LeaderGate::from_lock_path(
+            w.leader_lock.clone(),
+            w.node_id.clone(),
+        )
+        .with_endpoints(vec!["http://127.0.0.1:1".into()]);
+        assert!(gate.uses_etcd(), "endpoints present ⇒ etcd branch");
+        assert!(
+            !gate.is_leader(),
+            "unreachable etcd ⇒ fail-closed, not leader"
+        );
+        assert!(
+            !w.leader_lock.exists(),
+            "etcd branch must NOT fall back to the per-node fs acquire"
+        );
     }
 }
