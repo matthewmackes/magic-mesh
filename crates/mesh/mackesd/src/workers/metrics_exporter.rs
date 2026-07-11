@@ -364,6 +364,14 @@ fn cert_counters(ca_cert_path: &std::path::Path, now_unix: i64) -> Vec<Counter> 
 /// registry. A breaker trip error-logs every tick it persists (the
 /// headless journal alert — deliberately repeated so a log pipeline's
 /// time-window alerts keep firing while the condition holds).
+///
+/// test-obs-9 — beyond the point-in-time gauges (`mackesd_workers_alive`
+/// / `_total` / `_breaker_tripped`), this also emits the two CUMULATIVE
+/// per-worker FAILURE counters the supervisor increments live at its real
+/// restart + trip sites (`workers/mod.rs`): `mackesd_worker_restarts_total`
+/// and `mackesd_breaker_trips_total`, both labelled `{worker=…}`. These
+/// monotonic totals are the scrapeable signal alerting rules `rate()` over
+/// (a gauge that clears on recovery can't drive a "worker keeps dying" alert).
 fn worker_counters(map: &crate::workers::WorkerStatusMap) -> Vec<Counter> {
     let (alive, total, tripped) = crate::workers::workers_ready(map);
     if tripped > 0 {
@@ -379,7 +387,7 @@ fn worker_counters(map: &crate::workers::WorkerStatusMap) -> Vec<Counter> {
         value,
         labels: BTreeMap::new(),
     };
-    vec![
+    let mut out = vec![
         mk(
             "mackesd_workers_alive",
             "Workers currently alive",
@@ -395,7 +403,34 @@ fn worker_counters(map: &crate::workers::WorkerStatusMap) -> Vec<Counter> {
             "ENT-6 circuit-breaker trips (worker stays down until restart)",
             u64::from(tripped),
         ),
-    ]
+    ];
+    // test-obs-9 — snapshot the per-worker cumulative failure totals
+    // (brief lock; strings built after release).
+    let per_worker: Vec<(&'static str, u32, u32)> = {
+        let g = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.values()
+            .map(|w| (w.name, w.restarts, w.breaker_trips))
+            .collect()
+    };
+    for (name, restarts, trips) in per_worker {
+        let mut labels = BTreeMap::new();
+        labels.insert("worker".to_owned(), name.to_owned());
+        out.push(Counter {
+            name: "mackesd_worker_restarts_total",
+            help: "Cumulative worker restarts since daemon start",
+            value: u64::from(restarts),
+            labels: labels.clone(),
+        });
+        out.push(Counter {
+            name: "mackesd_breaker_trips_total",
+            help: "Cumulative circuit-breaker trips (closed->open) since daemon start",
+            value: u64::from(trips),
+            labels,
+        });
+    }
+    out
 }
 
 /// EFF-26 — threshold below which free space warns.
@@ -640,6 +675,67 @@ mod tests {
         if prom.contains("mackesd_disk_available_bytes") {
             assert!(prom.contains(r#"path=""#));
         }
+    }
+
+    #[test]
+    fn tick_once_exports_per_worker_failure_counters() {
+        // test-obs-9 — a populated worker registry renders the two
+        // cumulative FAILURE counters the supervisor maintains at its
+        // real restart/trip sites, as labelled Prometheus counters with
+        // stable names — and the header de-dupe holds across the many
+        // per-worker series.
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("mackesd.db");
+        let _ = crate::store::open(&db).expect("open file store");
+        let status = crate::workers::new_status_map();
+        {
+            let mut g = status.lock().unwrap();
+            g.insert(
+                "chat",
+                crate::workers::WorkerStatus {
+                    name: "chat",
+                    alive: true,
+                    restarts: 3,
+                    breaker_tripped: false,
+                    breaker_trips: 1,
+                    last_exit_ok: Some(false),
+                },
+            );
+            g.insert(
+                "heartbeat",
+                crate::workers::WorkerStatus {
+                    name: "heartbeat",
+                    alive: true,
+                    restarts: 0,
+                    breaker_tripped: false,
+                    breaker_trips: 0,
+                    last_exit_ok: None,
+                },
+            );
+        }
+        tick_once(&TickInputs {
+            db_path: db,
+            textfile_dir: dir.path().to_path_buf(),
+            worker_status: Some(status),
+            ..TickInputs::default()
+        });
+        let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("written");
+        // Header emitted exactly once per metric name despite two series.
+        assert_eq!(
+            prom.matches("# TYPE mackesd_worker_restarts_total counter")
+                .count(),
+            1,
+        );
+        assert_eq!(
+            prom.matches("# TYPE mackesd_breaker_trips_total counter")
+                .count(),
+            1,
+        );
+        // The wired totals land as labelled series.
+        assert!(prom.contains(r#"mackesd_worker_restarts_total{worker="chat"} 3"#));
+        assert!(prom.contains(r#"mackesd_breaker_trips_total{worker="chat"} 1"#));
+        assert!(prom.contains(r#"mackesd_worker_restarts_total{worker="heartbeat"} 0"#));
+        assert!(prom.contains(r#"mackesd_breaker_trips_total{worker="heartbeat"} 0"#));
     }
 
     #[test]

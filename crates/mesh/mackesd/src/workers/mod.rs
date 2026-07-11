@@ -55,6 +55,13 @@ pub struct WorkerStatus {
     /// a still-broken worker keeps it set while it backs off to the
     /// cooldown cap.
     pub breaker_tripped: bool,
+    /// Cumulative count of genuine breaker TRIPS (closed→open
+    /// transitions) since daemon start. Unlike `breaker_tripped` (a
+    /// live gauge that clears on recovery), this only grows — it is the
+    /// scrapeable `mackesd_breaker_trips_total{worker=…}` failure
+    /// signal the metrics exporter surfaces (test-obs-9). Half-open
+    /// relapses are deliberately NOT counted here (same trip episode).
+    pub breaker_trips: u32,
     /// Outcome of the most recent `run()` exit: `Some(true)` clean,
     /// `Some(false)` error/panic, `None` while still on first run.
     pub last_exit_ok: Option<bool>,
@@ -86,6 +93,7 @@ fn update_status(
             alive: false,
             restarts: 0,
             breaker_tripped: false,
+            breaker_trips: 0,
             last_exit_ok: None,
         }));
     }
@@ -1360,7 +1368,14 @@ impl Supervisor {
                             "ENT-6/mackesd-05: circuit breaker tripped — cooling down before \
                              a half-open recovery trial",
                         );
-                        update_status(&status, name, |w| w.breaker_tripped = true);
+                        // test-obs-9 — the real, scrapeable failure signal: a
+                        // genuine closed→open trip bumps the cumulative
+                        // per-worker counter the metrics exporter surfaces as
+                        // `mackesd_breaker_trips_total{worker=…}`.
+                        update_status(&status, name, |w| {
+                            w.breaker_tripped = true;
+                            w.breaker_trips += 1;
+                        });
                         cooldown = COOLDOWN_INITIAL;
                         let mut cool_tok = shutdown.clone();
                         tokio::select! {
@@ -1756,6 +1771,13 @@ mod tests {
             let g = status.lock().unwrap();
             let w = g.get("flaky-park").unwrap();
             assert!(w.restarts >= 1, "the trial counts as a restart");
+            // test-obs-9 — the genuine closed→open trip bumped the
+            // cumulative failure counter exactly once (the half-open
+            // trial recovered, so no relapse re-open followed).
+            assert_eq!(
+                w.breaker_trips, 1,
+                "one genuine breaker trip recorded on trips_total",
+            );
         }
         sup.shutdown_and_join().await.unwrap();
     }

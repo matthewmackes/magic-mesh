@@ -142,16 +142,31 @@ pub fn kdc2_router_decision_us() -> Histogram {
     )
 }
 
-/// Render a counter as Prometheus text-format.
-fn render_counter(out: &mut String, c: &Counter) {
+/// Render a counter's `# HELP`/`# TYPE` header rows. Emitted at most
+/// once per metric NAME by [`write_textfile`] — Prometheus rejects a
+/// second HELP line for the same metric.
+fn render_counter_header(out: &mut String, c: &Counter) {
     let _ = writeln!(out, "# HELP {} {}", c.name, c.help);
     let _ = writeln!(out, "# TYPE {} counter", c.name);
+}
+
+/// Render one counter series (a single label set) row. A metric name
+/// may have many of these (one per label set).
+fn render_counter_series(out: &mut String, c: &Counter) {
     if c.labels.is_empty() {
         let _ = writeln!(out, "{} {}", c.name, c.value);
     } else {
         let labels = render_labels(&c.labels);
         let _ = writeln!(out, "{}{} {}", c.name, labels, c.value);
     }
+}
+
+/// Render a counter as Prometheus text-format (header + single series).
+/// Used for lone counters; [`write_textfile`] instead de-dupes headers
+/// across same-named series.
+fn render_counter(out: &mut String, c: &Counter) {
+    render_counter_header(out, c);
+    render_counter_series(out, c);
 }
 
 /// Render a histogram (Prometheus text format requires `_bucket`,
@@ -204,8 +219,19 @@ pub fn write_textfile(
     let tmp_path = dir.join("mackesd.prom.tmp");
 
     let mut body = String::new();
+    // Emit each counter's `# HELP`/`# TYPE` header exactly once per
+    // metric NAME, then every series row. A labelled failure counter
+    // (e.g. `mackesd_worker_restarts_total{worker=…}`, test-obs-9) has
+    // many series under one name; Prometheus rejects a repeated HELP
+    // line, so headers must be de-duped by name (this also covers the
+    // multi-`disk_paths` case that previously repeated its header).
+    let mut counter_headers: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
     for c in counters {
-        render_counter(&mut body, c);
+        if counter_headers.insert(c.name) {
+            render_counter_header(&mut body, c);
+        }
+        render_counter_series(&mut body, c);
     }
     for h in histograms {
         render_histogram(&mut body, h);
@@ -397,5 +423,44 @@ mod tests {
         assert!(content.contains("x_total 1"));
         // No `.tmp` leftover.
         assert!(!dir.path().join("mackesd.prom.tmp").exists());
+    }
+
+    #[test]
+    fn write_textfile_dedupes_header_across_same_named_series() {
+        // test-obs-9 — many label sets under ONE metric name (a
+        // labelled failure counter) must render the `# HELP`/`# TYPE`
+        // header exactly once, then every series row. A repeated HELP
+        // line is a Prometheus parse error and would make the textfile
+        // collector drop the whole file.
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |worker: &str, value: u64| {
+            let mut labels = BTreeMap::new();
+            labels.insert("worker".to_owned(), worker.to_owned());
+            Counter {
+                name: "mackesd_worker_restarts_total",
+                help: "Cumulative worker restarts",
+                value,
+                labels,
+            }
+        };
+        let counters = vec![mk("chat", 2), mk("heartbeat", 5)];
+        let path = write_textfile(dir.path(), &counters, &[]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .matches("# HELP mackesd_worker_restarts_total")
+                .count(),
+            1,
+            "HELP must appear exactly once per metric name",
+        );
+        assert_eq!(
+            content
+                .matches("# TYPE mackesd_worker_restarts_total counter")
+                .count(),
+            1,
+            "TYPE must appear exactly once per metric name",
+        );
+        assert!(content.contains(r#"mackesd_worker_restarts_total{worker="chat"} 2"#));
+        assert!(content.contains(r#"mackesd_worker_restarts_total{worker="heartbeat"} 5"#));
     }
 }
