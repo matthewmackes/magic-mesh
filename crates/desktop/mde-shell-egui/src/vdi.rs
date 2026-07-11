@@ -891,6 +891,131 @@ fn run_live_spice(
     }
 }
 
+// ───────────────────── vdi-vm-4 / shell-ux-1: session state ──────────────────
+//
+// A live transport can DROP (the server closes, or a pump errors) at any time.
+// Before this, a drop froze the desktop at its last frame with no recovery and no
+// honest status (shell-ux-1). Now a drop that is NOT a user-initiated close drives
+// a small session-state machine: the shell auto-reconnects to the SAME endpoint
+// with bounded retries + capped backoff (vdi-vm-4), and paints an honest overlay
+// with Retry / pick-a-different affordances the whole time (shell-ux-1).
+//
+// The user-close vs transport-drop distinction is STRUCTURAL, not a flag: a clean
+// close ([`VdiState::clear_target`] / [`VdiState::request_connect`]) TAKES the live
+// handle before any poll re-reads it AND resets the phase to `Live`, so a drop is
+// only ever driven by [`VdiState::on_transport_drop`] for an INSTALLED handle whose
+// worker thread died on its own — a real drop. (The transports confirm this: their
+// worker sends `Error`/`Ended` ONLY on a pump error / server termination; a
+// shell-requested stop returns with NO event, and by then its handle is gone.)
+
+/// The bounded auto-reconnect budget (vdi-vm-4): after this many failed re-dials the
+/// session gives up and shows the honest Failed overlay instead of retrying forever.
+#[cfg(feature = "live-vdi")]
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// vdi-vm-4 / shell-ux-1 — the live desktop session's connection phase. A transport
+/// drop walks `Live → Reconnecting{attempt} → … → Failed{reason}`; a fresh frame
+/// from a re-dialed transport walks it back to `Live`. Drives BOTH the auto-
+/// reconnect scheduler and the honest overlay, so the two can never diverge.
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum SessionPhase {
+    /// The transport is live, or connecting normally on the initial dial — no
+    /// overlay, no pending reconnect.
+    #[default]
+    Live,
+    /// A drop was detected; the shell is auto-reconnecting to the SAME endpoint.
+    /// `attempt` is 1-based; `reason` is the honest last drop reason.
+    Reconnecting { attempt: u32, reason: String },
+    /// Auto-reconnect exhausted its budget (or a re-dial could not even start) — the
+    /// honest failure reason, surfaced with Retry / pick-a-different.
+    Failed { reason: String },
+}
+
+/// vdi-vm-4 — capped exponential backoff before reconnect `attempt` (1-based): 0.5s,
+/// 1s, 2s, 4s, then held at 8s. Bounds the reconnect storm against a flapping peer.
+#[cfg(feature = "live-vdi")]
+fn reconnect_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    let ms = 500u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms.min(8_000))
+}
+
+/// vdi-vm-4 — the pure transition on a detected transport drop. A drop from `Live`
+/// opens attempt 1; each further drop while `Reconnecting` bumps the attempt until
+/// `max` is spent, then the session is `Failed` with the honest reason. `Failed` is
+/// terminal (an explicit operator Retry resets it — [`VdiState::retry_now`]).
+#[cfg(feature = "live-vdi")]
+fn next_phase_on_drop(current: &SessionPhase, reason: String, max: u32) -> SessionPhase {
+    match current {
+        SessionPhase::Live => SessionPhase::Reconnecting { attempt: 1, reason },
+        SessionPhase::Reconnecting { attempt, .. } if *attempt < max => {
+            SessionPhase::Reconnecting {
+                attempt: attempt + 1,
+                reason,
+            }
+        }
+        SessionPhase::Reconnecting { .. } | SessionPhase::Failed { .. } => {
+            SessionPhase::Failed { reason }
+        }
+    }
+}
+
+/// shell-ux-1 — an affordance the failure / reconnect overlay offers. Both are real
+/// re-entries the session already owns a seam for (re-dial the retained request, or
+/// fall back to the Chooser), never a dead-end.
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayAction {
+    /// Reconnect now — reset the attempt ladder and re-dial the SAME endpoint
+    /// immediately, skipping the pending backoff.
+    Retry,
+    /// Abandon this desktop and return to the Chooser to pick a different one.
+    PickDifferent,
+}
+
+/// shell-ux-1 — the honest status the overlay paints OVER the (possibly frozen) last
+/// frame. Derived purely from the [`SessionPhase`] so it can never diverge from the
+/// real session state, and so it is unit-testable without egui paint.
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionOverlay {
+    /// The heading (in-progress reconnect vs terminal failure).
+    title: String,
+    /// The honest detail — the reconnect attempt + real drop reason, or the failure
+    /// reason. Never a generic message (shell-ux-1).
+    detail: String,
+    /// Terminal-failure face (tints the heading DANGER) vs the reconnect face.
+    failed: bool,
+    /// The affordances offered — always Retry + pick-a-different, so neither face is
+    /// a dead-end.
+    actions: Vec<OverlayAction>,
+}
+
+/// shell-ux-1 — build the overlay for `phase`, or `None` when the session is `Live`
+/// (the desktop paints normally). Pure; the panel renders the returned model and the
+/// tests assert its honest content + affordances directly.
+#[cfg(feature = "live-vdi")]
+fn session_overlay(phase: &SessionPhase, max: u32) -> Option<SessionOverlay> {
+    match phase {
+        SessionPhase::Live => None,
+        SessionPhase::Reconnecting { attempt, reason } => Some(SessionOverlay {
+            title: "Reconnecting to the desktop\u{2026}".to_string(),
+            detail: format!(
+                "Attempt {attempt} of {max} on the same endpoint \u{2014} the connection dropped: {reason}"
+            ),
+            failed: false,
+            actions: vec![OverlayAction::Retry, OverlayAction::PickDifferent],
+        }),
+        SessionPhase::Failed { reason } => Some(SessionOverlay {
+            title: "Desktop disconnected".to_string(),
+            detail: format!("Could not reconnect after {max} attempts \u{2014} {reason}"),
+            failed: true,
+            actions: vec![OverlayAction::Retry, OverlayAction::PickDifferent],
+        }),
+    }
+}
+
 /// The Desktop surface's state: the active session (if any), the desktop texture
 /// the framebuffer is uploaded into, the decode → upload hand-off slot, and the
 /// picked target the discovery picker requested before a live session attaches.
@@ -942,6 +1067,18 @@ pub(crate) struct VdiState {
     /// mesh connect resolves (the connecting backdrop repaints continuously).
     #[cfg(feature = "live-vdi")]
     broker_resolve_at: Option<std::time::Instant>,
+    /// vdi-vm-4 / shell-ux-1 — the live session's connection phase. `Live` while the
+    /// transport is up (or on the initial dial); a transport drop that is NOT a user
+    /// close walks it through `Reconnecting{attempt}` to `Failed`, and a fresh frame
+    /// walks it back to `Live`. Drives the auto-reconnect scheduler + the honest
+    /// overlay so they can never disagree.
+    #[cfg(feature = "live-vdi")]
+    session_phase: SessionPhase,
+    /// vdi-vm-4 — when the next bounded re-dial is due (set on a drop with the capped
+    /// [`reconnect_backoff`], cleared once the re-dial fires / the session recovers /
+    /// the operator closes). The per-frame [`Self::poll_reconnect`] fires at it.
+    #[cfg(feature = "live-vdi")]
+    reconnect_at: Option<std::time::Instant>,
 }
 
 impl VdiState {
@@ -977,6 +1114,12 @@ impl VdiState {
             self.live_status = None;
             self.broker_resolution_gated = false;
             self.broker_resolve_at = None;
+            // A fresh operator-initiated connect is a clean start, never a reconnect:
+            // reset the phase to `Live` and cancel any pending re-dial before the new
+            // handle is installed, so a leftover `Reconnecting`/`Failed` from a prior
+            // session cannot bleed into (or auto-reconnect) this one (vdi-vm-4).
+            self.session_phase = SessionPhase::Live;
+            self.reconnect_at = None;
             self.publish_broker_close_if_active();
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
@@ -1127,10 +1270,128 @@ impl VdiState {
             self.live_status = None;
             self.broker_resolution_gated = false;
             self.broker_resolve_at = None;
+            // A user-initiated close is NOT a transport drop: reset the phase to
+            // `Live` and cancel any pending re-dial so backing out never enters (or
+            // resumes) auto-reconnect (vdi-vm-4, requirement 3).
+            self.session_phase = SessionPhase::Live;
+            self.reconnect_at = None;
             self.texture = None;
             self.incoming = None;
         }
         self.requested = None;
+    }
+
+    /// vdi-vm-4 — a transport drop that is NOT a user-initiated close. Walks the
+    /// session phase forward ([`next_phase_on_drop`]): a first drop opens
+    /// `Reconnecting{1}` and schedules a bounded backoff re-dial; each further drop
+    /// bumps the attempt; the last drop `Failed`s the session with the honest reason
+    /// and stops retrying. The caller has already taken the dead handle.
+    #[cfg(feature = "live-vdi")]
+    fn on_transport_drop(&mut self, reason: String) {
+        let next = next_phase_on_drop(&self.session_phase, reason, MAX_RECONNECT_ATTEMPTS);
+        match &next {
+            SessionPhase::Reconnecting { attempt, .. } => {
+                self.reconnect_at = Some(std::time::Instant::now() + reconnect_backoff(*attempt));
+            }
+            SessionPhase::Failed { reason } => {
+                self.live_status = Some(format!(
+                    "Desktop disconnected \u{2014} {reason}. Could not reconnect after {MAX_RECONNECT_ATTEMPTS} attempts."
+                ));
+                self.reconnect_at = None;
+            }
+            SessionPhase::Live => {
+                self.reconnect_at = None;
+            }
+        }
+        self.session_phase = next;
+    }
+
+    /// vdi-vm-4 — a fresh frame from a (re-dialed) transport: the desktop is live
+    /// again, so walk the phase back to `Live` and cancel any pending re-dial.
+    #[cfg(feature = "live-vdi")]
+    fn note_live_frame(&mut self) {
+        if self.session_phase != SessionPhase::Live {
+            self.session_phase = SessionPhase::Live;
+        }
+        self.reconnect_at = None;
+    }
+
+    /// vdi-vm-4 — fire a due bounded re-dial: once `reconnect_at` elapses while the
+    /// session is `Reconnecting`, re-dial the SAME retained [`ConnectRequest`] (the
+    /// endpoint + credentials are already on it). A re-dial that cannot even start
+    /// (the gate reason lands in `live_status`) counts as another drop, so the ladder
+    /// keeps advancing toward the honest `Failed` instead of stalling.
+    #[cfg(feature = "live-vdi")]
+    fn poll_reconnect(&mut self) {
+        let Some(at) = self.reconnect_at else {
+            return;
+        };
+        if std::time::Instant::now() < at {
+            return;
+        }
+        self.reconnect_at = None;
+        if !matches!(self.session_phase, SessionPhase::Reconnecting { .. }) {
+            return;
+        }
+        let Some(request) = self.requested.clone() else {
+            self.session_phase = SessionPhase::Failed {
+                reason: "no retained desktop connection to reconnect".to_string(),
+            };
+            return;
+        };
+        self.spawn_live_transport(&request);
+        if !self.has_live_transport() {
+            let reason = self
+                .live_status
+                .clone()
+                .unwrap_or_else(|| "the re-dial could not start".to_string());
+            self.on_transport_drop(reason);
+        }
+    }
+
+    /// shell-ux-1 — the operator pressed **Retry / Reconnect** on the overlay: reset
+    /// the attempt ladder and re-dial the SAME retained endpoint immediately (skipping
+    /// any pending backoff), carrying the last honest drop reason so the overlay stays
+    /// truthful until the re-dial produces a frame. Resets a terminal `Failed`.
+    #[cfg(feature = "live-vdi")]
+    fn retry_now(&mut self) {
+        let reason = match &self.session_phase {
+            SessionPhase::Failed { reason } | SessionPhase::Reconnecting { reason, .. } => {
+                reason.clone()
+            }
+            SessionPhase::Live => String::new(),
+        };
+        if let Some(live) = self.live_rdp.take() {
+            live.stop();
+        }
+        if let Some(live) = self.live_vnc.take() {
+            live.stop();
+        }
+        if let Some(live) = self.live_spice.take() {
+            live.stop();
+        }
+        self.reconnect_at = None;
+        let Some(request) = self.requested.clone() else {
+            self.session_phase = SessionPhase::Failed {
+                reason: "no retained desktop connection to reconnect".to_string(),
+            };
+            return;
+        };
+        self.session_phase = SessionPhase::Reconnecting { attempt: 1, reason };
+        self.spawn_live_transport(&request);
+        if !self.has_live_transport() {
+            let reason = self
+                .live_status
+                .clone()
+                .unwrap_or_else(|| "the re-dial could not start".to_string());
+            self.on_transport_drop(reason);
+        }
+    }
+
+    /// Whether any live transport handle is currently installed.
+    #[cfg(feature = "live-vdi")]
+    fn has_live_transport(&self) -> bool {
+        self.live_rdp.is_some() || self.live_vnc.is_some() || self.live_spice.is_some()
     }
 
     #[cfg(feature = "live-vdi")]
@@ -1139,7 +1400,8 @@ impl VdiState {
             return;
         };
         let mut publish_active = false;
-        let mut publish_disconnect = false;
+        let mut got_frame = false;
+        let mut drop_reason = None;
         while let Ok(event) = live.event_rx.try_recv() {
             match event {
                 LiveRdpEvent::Connected(target) => {
@@ -1148,22 +1410,31 @@ impl VdiState {
                 }
                 LiveRdpEvent::Frame(frame) => {
                     self.incoming = Some(frame);
+                    got_frame = true;
                 }
                 LiveRdpEvent::Error(reason) => {
-                    self.live_status = Some(reason);
-                    publish_disconnect = true;
+                    self.live_status = Some(reason.clone());
+                    drop_reason = Some(reason);
                 }
                 LiveRdpEvent::Ended(reason) => {
                     self.live_status = Some(format!("RDP session ended: {reason}"));
-                    publish_disconnect = true;
+                    drop_reason = Some(reason);
                 }
             }
+        }
+        // A fresh frame means the desktop is live again (recovering a reconnect).
+        if got_frame {
+            self.note_live_frame();
         }
         if publish_active {
             self.publish_broker_active();
         }
-        if publish_disconnect {
+        // The worker thread has died on its own — take the dead handle and drive the
+        // session through the auto-reconnect phase machine (vdi-vm-4).
+        if let Some(reason) = drop_reason {
+            self.live_rdp = None;
             self.publish_broker_disconnect_if_active();
+            self.on_transport_drop(reason);
         }
     }
 
@@ -1173,7 +1444,8 @@ impl VdiState {
             return;
         };
         let mut publish_active = false;
-        let mut publish_disconnect = false;
+        let mut got_frame = false;
+        let mut drop_reason = None;
         while let Ok(event) = live.event_rx.try_recv() {
             match event {
                 LiveVncEvent::Connected(target) => {
@@ -1182,22 +1454,28 @@ impl VdiState {
                 }
                 LiveVncEvent::Frame(frame) => {
                     self.incoming = Some(frame);
+                    got_frame = true;
                 }
                 LiveVncEvent::Error(reason) => {
-                    self.live_status = Some(reason);
-                    publish_disconnect = true;
+                    self.live_status = Some(reason.clone());
+                    drop_reason = Some(reason);
                 }
                 LiveVncEvent::Ended(reason) => {
                     self.live_status = Some(format!("VNC session ended: {reason}"));
-                    publish_disconnect = true;
+                    drop_reason = Some(reason);
                 }
             }
+        }
+        if got_frame {
+            self.note_live_frame();
         }
         if publish_active {
             self.publish_broker_active();
         }
-        if publish_disconnect {
+        if let Some(reason) = drop_reason {
+            self.live_vnc = None;
             self.publish_broker_disconnect_if_active();
+            self.on_transport_drop(reason);
         }
     }
 
@@ -1207,7 +1485,8 @@ impl VdiState {
             return;
         };
         let mut publish_active = false;
-        let mut publish_disconnect = false;
+        let mut got_frame = false;
+        let mut drop_reason = None;
         while let Ok(event) = live.event_rx.try_recv() {
             match event {
                 LiveSpiceEvent::Connected(target) => {
@@ -1216,22 +1495,28 @@ impl VdiState {
                 }
                 LiveSpiceEvent::Frame(frame) => {
                     self.incoming = Some(frame);
+                    got_frame = true;
                 }
                 LiveSpiceEvent::Error(reason) => {
-                    self.live_status = Some(reason);
-                    publish_disconnect = true;
+                    self.live_status = Some(reason.clone());
+                    drop_reason = Some(reason);
                 }
                 LiveSpiceEvent::Ended(reason) => {
                     self.live_status = Some(format!("SPICE session ended: {reason}"));
-                    publish_disconnect = true;
+                    drop_reason = Some(reason);
                 }
             }
+        }
+        if got_frame {
+            self.note_live_frame();
         }
         if publish_active {
             self.publish_broker_active();
         }
-        if publish_disconnect {
+        if let Some(reason) = drop_reason {
+            self.live_spice = None;
             self.publish_broker_disconnect_if_active();
+            self.on_transport_drop(reason);
         }
     }
 
@@ -1307,6 +1592,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
         // record before draining transport events (a just-resolved endpoint spawns
         // its transport here, and its events are picked up next frame).
         state.poll_brokered_endpoint();
+        // vdi-vm-4 — fire a due bounded re-dial BEFORE draining transport events, so a
+        // just-re-dialed transport's events are picked up on the next frame.
+        state.poll_reconnect();
         state.poll_live_rdp();
         state.poll_live_vnc();
         state.poll_live_spice();
@@ -1354,6 +1642,17 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 u16::try_from(desktop_px[1]).unwrap_or(u16::MAX),
             );
             forward_input(ui, state, rect, desktop_size);
+            // shell-ux-1 — if the session dropped, paint the honest reconnect / failure
+            // overlay OVER this (now frozen) last frame, with working Retry and
+            // Pick-a-different affordances wired to real session seams (vdi-vm-4).
+            #[cfg(feature = "live-vdi")]
+            if let Some(overlay) = session_overlay(&state.session_phase, MAX_RECONNECT_ATTEMPTS) {
+                match paint_session_overlay(ui, rect, &overlay) {
+                    Some(OverlayAction::Retry) => state.retry_now(),
+                    Some(OverlayAction::PickDifferent) => state.clear_target(),
+                    None => {}
+                }
+            }
         }
         None => {
             // No live desktop texture: the empty Desktop surface paints the BRAND-1
@@ -1418,6 +1717,88 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             }
         }
     }
+}
+
+/// shell-ux-1 — paint the honest reconnect / failure overlay OVER the (frozen) last
+/// desktop frame that fills `body`, and return the affordance the operator pressed
+/// this frame, if any. The content is the pure [`SessionOverlay`] model (asserted by
+/// the unit tests); this function only renders it and reports the button press, so
+/// the panel can route it to a real seam ([`VdiState::retry_now`] /
+/// [`VdiState::clear_target`]). Never a dead-end (§7).
+#[cfg(feature = "live-vdi")]
+fn paint_session_overlay(
+    ui: &mut egui::Ui,
+    body: egui::Rect,
+    overlay: &SessionOverlay,
+) -> Option<OverlayAction> {
+    use egui::RichText;
+    use mde_egui::Style;
+
+    // Dim the frozen desktop so the honest status reads clearly over it.
+    ui.painter().rect_filled(
+        body,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(180),
+    );
+
+    let accent = if overlay.failed {
+        Style::DANGER
+    } else {
+        Style::ACCENT
+    };
+    let mut chosen = None;
+    egui::Area::new(egui::Id::new("vdi-session-overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(body.center() - egui::vec2(220.0, 80.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::NONE
+                .fill(Style::SURFACE)
+                .stroke(egui::Stroke::new(1.0, Style::BORDER))
+                .corner_radius(Style::RADIUS)
+                .inner_margin(Style::SP_L)
+                .show(ui, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(
+                        RichText::new(&overlay.title)
+                            .size(Style::TITLE)
+                            .strong()
+                            .color(accent),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    ui.label(
+                        RichText::new(&overlay.detail)
+                            .size(Style::BODY)
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.add_space(Style::SP_M);
+                    ui.horizontal(|ui| {
+                        for action in &overlay.actions {
+                            let (label, fill) = match action {
+                                OverlayAction::Retry => (
+                                    if overlay.failed {
+                                        "Reconnect"
+                                    } else {
+                                        "Retry now"
+                                    },
+                                    Style::ACCENT,
+                                ),
+                                OverlayAction::PickDifferent => {
+                                    ("Pick a different desktop", Style::SURFACE_HI)
+                                }
+                            };
+                            let button = egui::Button::new(
+                                RichText::new(label).size(Style::SMALL).color(Style::TEXT),
+                            )
+                            .fill(fill);
+                            if ui.add(button).clicked() {
+                                chosen = Some(*action);
+                            }
+                            ui.add_space(Style::SP_S);
+                        }
+                    });
+                });
+        });
+    chosen
 }
 
 /// Map an egui pointer position (egui **points**, panel/screen space) to a guest
@@ -1910,6 +2291,183 @@ mod tests {
             resolve_brokered_console(&bodies, "s1"),
             ConsoleResolution::Unbrokerable(_)
         ));
+    }
+
+    // ────────── vdi-vm-4 / shell-ux-1: session drop → reconnect → overlay ──────────
+    //
+    // The auto-reconnect + honest-overlay state machine, tested through the pure
+    // seams (never egui paint): the phase ladder + capped backoff, the overlay model,
+    // and that a user-initiated close never enters (or resumes) Reconnecting.
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn drop_ladder_walks_live_through_reconnecting_to_failed_at_max() {
+        // A drop from Live opens attempt 1; each further drop bumps the attempt up to
+        // `max`; the next drop Fails the session with the honest last reason.
+        let max = 5;
+        let mut phase = SessionPhase::Live;
+        for attempt in 1..=max {
+            phase = next_phase_on_drop(&phase, format!("drop {attempt}"), max);
+            assert_eq!(
+                phase,
+                SessionPhase::Reconnecting {
+                    attempt,
+                    reason: format!("drop {attempt}"),
+                },
+                "the {attempt}th drop should be Reconnecting attempt {attempt}"
+            );
+        }
+        // The (max+1)th drop exhausts the budget → Failed with the honest reason.
+        phase = next_phase_on_drop(&phase, "final drop".to_string(), max);
+        assert_eq!(
+            phase,
+            SessionPhase::Failed {
+                reason: "final drop".to_string()
+            }
+        );
+        // Failed is terminal: a further drop stays Failed (only an explicit Retry
+        // resets it — VdiState::retry_now).
+        assert!(matches!(
+            next_phase_on_drop(&phase, "again".to_string(), max),
+            SessionPhase::Failed { .. }
+        ));
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn reconnect_backoff_is_capped_exponential() {
+        assert_eq!(reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(reconnect_backoff(2), Duration::from_millis(1_000));
+        assert_eq!(reconnect_backoff(3), Duration::from_millis(2_000));
+        assert_eq!(reconnect_backoff(4), Duration::from_millis(4_000));
+        assert_eq!(reconnect_backoff(5), Duration::from_millis(8_000));
+        // Held at the 8s cap beyond the ladder, so the storm stays bounded.
+        assert_eq!(reconnect_backoff(9), Duration::from_millis(8_000));
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_transport_drop_schedules_a_redial_and_a_frame_returns_to_live() {
+        // The state-side integration of the ladder: a drop opens Reconnecting{1} AND
+        // schedules a bounded re-dial; a fresh frame from the re-dialed transport
+        // walks the session back to Live and cancels the pending re-dial.
+        let mut state = VdiState::default();
+        state.on_transport_drop("server closed the connection".to_string());
+        assert!(
+            matches!(
+                state.session_phase,
+                SessionPhase::Reconnecting { attempt: 1, .. }
+            ),
+            "a first drop opens Reconnecting attempt 1"
+        );
+        assert!(
+            state.reconnect_at.is_some(),
+            "a drop schedules a bounded re-dial"
+        );
+        state.note_live_frame();
+        assert_eq!(
+            state.session_phase,
+            SessionPhase::Live,
+            "a fresh frame returns the session to Live"
+        );
+        assert!(
+            state.reconnect_at.is_none(),
+            "recovering cancels the pending re-dial"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn session_overlay_offers_a_retry_when_failed_and_nothing_when_live() {
+        // Live paints the desktop normally — no overlay.
+        assert!(session_overlay(&SessionPhase::Live, 5).is_none());
+
+        // Reconnecting: honest attempt + reason, a Retry affordance, not the failed face.
+        let reconnecting = session_overlay(
+            &SessionPhase::Reconnecting {
+                attempt: 2,
+                reason: "peer reset".to_string(),
+            },
+            5,
+        )
+        .expect("a reconnect overlay");
+        assert!(!reconnecting.failed);
+        assert!(reconnecting.actions.contains(&OverlayAction::Retry));
+        assert!(reconnecting.actions.contains(&OverlayAction::PickDifferent));
+        assert!(
+            reconnecting.detail.contains('2') && reconnecting.detail.contains("peer reset"),
+            "the reconnect overlay names the attempt + honest reason: {}",
+            reconnecting.detail
+        );
+
+        // Failed: the failed face, still with a working Retry (never a dead-end, §7).
+        let failed = session_overlay(
+            &SessionPhase::Failed {
+                reason: "host unreachable".to_string(),
+            },
+            5,
+        )
+        .expect("a failure overlay");
+        assert!(failed.failed);
+        assert!(failed.actions.contains(&OverlayAction::Retry));
+        assert!(failed.actions.contains(&OverlayAction::PickDifferent));
+        assert!(
+            failed.detail.contains("host unreachable"),
+            "the failure overlay surfaces the honest reason: {}",
+            failed.detail
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_user_initiated_close_never_enters_reconnecting() {
+        // Even mid-reconnect, a user close (Return to chrome / Pick-a-different →
+        // clear_target) resets the phase to Live and cancels the re-dial: backing out
+        // must never auto-reconnect (requirement 3). The distinction is structural —
+        // the close resets the phase before any poll can drive another drop.
+        let mut state = VdiState::default();
+        state.on_transport_drop("dropped".to_string());
+        assert!(matches!(
+            state.session_phase,
+            SessionPhase::Reconnecting { .. }
+        ));
+        assert!(state.reconnect_at.is_some());
+
+        state.clear_target();
+        assert_eq!(
+            state.session_phase,
+            SessionPhase::Live,
+            "a user close resets the session phase to Live"
+        );
+        assert!(
+            state.reconnect_at.is_none(),
+            "a user close cancels any pending re-dial"
+        );
+        assert!(
+            session_overlay(&state.session_phase, MAX_RECONNECT_ATTEMPTS).is_none(),
+            "and shows no overlay"
+        );
+
+        // A fresh operator connect is likewise a clean start, not a reconnect: even
+        // after a drop put us mid-reconnect, requesting a new desktop resets to Live.
+        state.on_transport_drop("dropped again".to_string());
+        assert!(matches!(
+            state.session_phase,
+            SessionPhase::Reconnecting { .. }
+        ));
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("node-a", "web1"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("node-a"),
+        ));
+        assert_eq!(
+            state.session_phase,
+            SessionPhase::Live,
+            "a fresh connect resets the phase to Live, never Reconnecting"
+        );
+        assert!(state.reconnect_at.is_none());
     }
 
     #[cfg(feature = "live-vdi")]
