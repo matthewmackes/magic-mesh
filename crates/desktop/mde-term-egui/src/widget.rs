@@ -769,7 +769,7 @@ impl TerminalWidget {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let alpha = (flash * BELL_FLASH_PEAK).clamp(0.0, 255.0) as u8;
             ui.painter_at(rect)
-                .rect_filled(rect, 0.0, egui::Color32::from_white_alpha(alpha));
+                .rect_filled(rect, 0.0, Style::bell_flash(alpha));
         }
 
         if live {
@@ -2337,11 +2337,13 @@ mod tests {
         let colors = tessellate_colors(&screen, plain_spec);
         let has = |c: egui::Color32| colors.contains(&c);
         // The exact 24-bit fg glyph + bg rect colours land in the mesh vertices.
-        assert!(
-            has(egui::Color32::from_rgb(17, 133, 219)),
-            "24-bit fg exact"
-        );
-        assert!(has(egui::Color32::from_rgb(201, 42, 99)), "24-bit bg exact");
+        // Both expectations are *derived from the engine-parsed `Rgb` cell* via the
+        // same `cell_colors` resolution the renderer uses, so fed SGR bytes → Rgb
+        // cell → vertex colour is asserted end to end with no literal in between
+        // (mirrors `fed_grid_renders_palette_colors_and_attrs_into_primitives`).
+        let (tc_fg, tc_bg) = palette::cell_colors(tc, &Palette::from_tokens());
+        assert!(has(tc_fg), "24-bit fg exact");
+        assert!(has(tc_bg), "24-bit bg exact");
         // The 256-colour cube slot 208 resolves to its faithful xterm RGB.
         assert!(
             has(palette::indexed(208)),
