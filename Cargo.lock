@@ -4407,16 +4407,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mde-cosmic-applet"
-version = "0.1.0"
-dependencies = [
- "mackes-mesh-types",
- "mde-bus",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "mde-disclaimer"
 version = "12.0.0"
 
@@ -4558,6 +4548,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-lighthouse-health"
+version = "0.1.0"
+dependencies = [
+ "mackes-mesh-types",
+ "mde-bus",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mde-media-core"
 version = "12.0.0"
 dependencies = [
@@ -4624,8 +4624,8 @@ name = "mde-panel-egui"
 version = "12.0.0"
 dependencies = [
  "mde-bus",
- "mde-cosmic-applet",
  "mde-egui",
+ "mde-lighthouse-health",
 ]
 
 [[package]]
@@ -4662,11 +4662,11 @@ dependencies = [
  "mde-bookmarks-egui",
  "mde-bus",
  "mde-chat",
- "mde-cosmic-applet",
  "mde-editor-egui",
  "mde-egui",
  "mde-files",
  "mde-files-egui",
+ "mde-lighthouse-health",
  "mde-media-egui",
  "mde-mesh-view",
  "mde-music-egui",

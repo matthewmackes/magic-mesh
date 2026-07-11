@@ -27,7 +27,7 @@ the majority of in-scope findings; the OPEN set is dominated by the a11y cluster
 | shell-ux-9 (807) | mde-theme/src/brand/logo.rs (consumers) | OPEN (brand-inflight) | phones_hub.rs:58, device_manager.rs:1433 | "Quasar Mesh"/"Magic-Mesh Quasar" user strings not routed through brand consts |
 | shell-ux-8 (940) | mde-shell-egui/src/main.rs | OPEN | main.rs show_mesh_map ~:517 | Explorer still not a Surface enum member; mounted only as Mesh-Map lens toggle |
 | perf-8 (949) | mde-shell-egui/src/web/mod.rs | OPEN | web/mod.rs:2963 tab.last_frame = Some(img.clone()) | full ColorImage still deep-cloned per frame; no Arc<ColorImage> share |
-| arch-13 (958) | crates/platform/mde-cosmic-applet/ | OPEN | crate still present | not folded into mackes-mesh-types / renamed; cosmic-named member alive |
+| arch-13 (958) | crates/platform/mde-lighthouse-health/ | DONE | renamed | d13bd93f: mde-cosmic-applet → mde-lighthouse-health, last cosmic-era crate name retired (lock regen'd) |
 | a11y-02 (1013) | mde-egui/src/drm.rs | OPEN (a11y low-pri, TTS dropped) | a11y.rs consumer seam exists; no screen-reader/TTS | AccessKit tree now generated (a11y-01) but no in-process screen reader; operator dropped TTS path |
 | browser-3 (135) | mde-web-cef/src/cef_browser.rs | PARTIAL | cef_browser.rs ~2760-2773 | WebRTC block hardened (60a2d0fb) + residual documented (browser-5); airtight all-frame/permission-handler blocked by prebuilt-CEF ABI |
 | perf-7 (428) | mde-vdi-spice/src/pixel.rs; vdi.rs | PARTIAL | vdi.rs handle.set; mde-vdi-core (no ImageDelta) | idle-frame emission now gated by dirty-check (eff6dad2), but changed frames still full-frame upload; no partial sub-rect ImageDelta |
