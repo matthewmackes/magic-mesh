@@ -29,9 +29,9 @@
 //!   backend, so the request→action wiring is testable against `FakePodman`
 //!   without Podman.
 //! - Publishing mirrors `vm_lifecycle` exactly: the `event/podman/containers` body
-//!   is fired through the `mde-bus` CLI + [`crate::proc_reap::fire_and_reap`], and
-//!   every podman shell-out is bounded by the EFF-20 timeout so a wedged podman
-//!   can't pin a runtime thread.
+//!   is written in-process through [`crate::bus_publish`] (perf-10 / arch-6 — no
+//!   fork+exec of the `mde-bus` CLI per roster), and every podman shell-out is
+//!   bounded by the EFF-20 timeout so a wedged podman can't pin a runtime thread.
 //!
 //! ## Why leaner than the libvirt backend
 //!
@@ -721,17 +721,19 @@ pub fn apply_action(backend: &dyn PodmanBackend, action: &ContainerAction) -> Re
 
 // ─────────────────────────── bus + worker ───────────────────────────
 
-/// Publish a [`ContainerReport`] to [`CONTAINERS_TOPIC`] via the `mde-bus` CLI —
-/// the same fire-and-reap path `vm_lifecycle` uses. Best-effort: a missing
-/// `mde-bus` binary (pre-RPM dev box) is swallowed, and the detached reaper
-/// prevents a zombie pile.
-fn publish_containers(report: &ContainerReport) {
-    let Ok(body) = serde_json::to_string(report) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", CONTAINERS_TOPIC, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+/// Publish a [`ContainerReport`] to [`CONTAINERS_TOPIC`] in-process (perf-10 /
+/// arch-6) — no fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite
+/// open + a [`crate::proc_reap`] reaper thread) per roster. Byte-identical stored
+/// row to the old `mde-bus publish <topic> --body-flag <json>`. `bus_root` is
+/// [`ContainerWorker::publish_bus_root`] — the MDE_BUS_ROOT-honouring root the
+/// fork+exec'd CLI resolved via the inherited env (NOT the worker's
+/// `dirs::data_dir()`-based ACTION-read root, which the live daemon's
+/// `MDE_BUS_ROOT=/run/mde-bus` diverges from). Best-effort: an absent root /
+/// failed open / write error is swallowed.
+fn publish_containers(bus_root: Option<&Path>, report: &ContainerReport) {
+    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
+        crate::bus_publish::publish_json(&mut persist, CONTAINERS_TOPIC, report);
+    }
 }
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
@@ -833,6 +835,18 @@ impl ContainerWorker {
         self.bus_root_override.clone().or_else(default_bus_root)
     }
 
+    /// The root the in-process roster publish targets (perf-10). A test's
+    /// `with_bus_root` override wins (so a driven `run` publishes into the temp
+    /// store, never the real one); production falls back to
+    /// [`crate::bus_publish::default_bus_root`] — the MDE_BUS_ROOT-honouring root
+    /// the fork+exec'd `mde-bus` used, NOT the `dirs`-based [`default_bus_root`]
+    /// this worker READS actions from.
+    fn publish_bus_root(&self) -> Option<PathBuf> {
+        self.bus_root_override
+            .clone()
+            .or_else(crate::bus_publish::default_bus_root)
+    }
+
     /// Drain + apply new actions addressed to this node. Returns `true` when any
     /// action ran (so the caller force-publishes the fresh roster).
     async fn drain_and_apply(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
@@ -867,7 +881,12 @@ impl ContainerWorker {
     /// Snapshot the roster (`podman ps`) + publish it, gated so the podman call
     /// stays off the hot path: query only when `force` (an action just changed
     /// state) or the heartbeat has elapsed since `last_at`.
-    async fn publish_snapshot(&self, last_at: &mut Option<Instant>, force: bool) {
+    async fn publish_snapshot(
+        &self,
+        publish_root: Option<&Path>,
+        last_at: &mut Option<Instant>,
+        force: bool,
+    ) {
         let now = Instant::now();
         let due = force
             || match last_at {
@@ -891,7 +910,7 @@ impl ContainerWorker {
             containers,
             published_at_ms: now_ms(),
         };
-        publish_containers(&report);
+        publish_containers(publish_root, &report);
         *last_at = Some(now);
     }
 }
@@ -904,10 +923,12 @@ impl Worker for ContainerWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let bus_root = self.bus_root();
+        let publish_root = self.publish_bus_root();
         // Publish an immediate roster on start so a panel doesn't wait a full
         // heartbeat for the first row.
         let mut last_pub: Option<Instant> = None;
-        self.publish_snapshot(&mut last_pub, true).await;
+        self.publish_snapshot(publish_root.as_deref(), &mut last_pub, true)
+            .await;
         // Skip any backlog so a restart doesn't re-run stale lifecycle commands.
         let mut cursor = bus_root.as_deref().and_then(prime_cursor);
         let mut tick = tokio::time::interval(self.poll);
@@ -920,7 +941,7 @@ impl Worker for ContainerWorker {
                     } else {
                         false
                     };
-                    self.publish_snapshot(&mut last_pub, acted).await;
+                    self.publish_snapshot(publish_root.as_deref(), &mut last_pub, acted).await;
                 }
                 () = shutdown.wait() => break,
             }

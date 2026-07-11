@@ -1662,13 +1662,18 @@ fn now_ms() -> u64 {
 
 /// Publish a JSON body to `topic` via the `mde-bus` CLI (same fire-and-reap path as
 /// [`super::storage`]). Best-effort.
-fn publish_json<T: serde::Serialize>(topic: &str, body: &T) {
-    let Ok(json) = serde_json::to_string(body) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", topic, "--body-flag", &json]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+/// Publish a JSON mirror/progress body to `topic` in-process (perf-10 / arch-6)
+/// — no fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite open +
+/// a [`crate::proc_reap`] reaper thread) per message. Byte-identical stored row
+/// to the old `mde-bus publish <topic> --body-flag <json>` (the compact
+/// `serde_json` of `body`). `bus_root` is the owning [`super::storage`] worker's
+/// bus root, which honours `MDE_BUS_ROOT` — the SAME root the fork+exec'd CLI
+/// resolved via the inherited env. Best-effort; a `None` root / failed open /
+/// write error is swallowed.
+fn publish_json<T: serde::Serialize>(bus_root: Option<&Path>, topic: &str, body: &T) {
+    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
+        crate::bus_publish::publish_json(&mut persist, topic, body);
+    }
 }
 
 /// The default `~/Local` image directory.
@@ -1838,7 +1843,7 @@ impl VirtualStorage {
     }
 
     /// Publish the virtual mirror when forced or the heartbeat elapsed.
-    fn publish_if_due(&self, force: bool) {
+    fn publish_if_due(&self, bus_root: &Path, force: bool) {
         let due = {
             let last = self.last_pub.lock().expect("last_pub mutex");
             force || last.is_none_or(|at| Instant::now().duration_since(at) >= self.heartbeat)
@@ -1854,13 +1859,18 @@ impl VirtualStorage {
             topology,
             published_at_ms: now_ms(),
         };
-        publish_json(&state_topic(&self.node_id), &state);
+        publish_json(Some(bus_root), &state_topic(&self.node_id), &state);
         *self.last_pub.lock().expect("last_pub mutex") = Some(Instant::now());
     }
 
     /// Handle one Apply verb: re-enumerate live, check arming, run the queue, stream
     /// per-op progress. Returns `true` when any op applied (so the caller republishes).
-    fn handle_apply(&self, armed_target: &str, queue: &VirtualStorageQueue) -> bool {
+    fn handle_apply(
+        &self,
+        bus_root: &Path,
+        armed_target: &str,
+        queue: &VirtualStorageQueue,
+    ) -> bool {
         let target = match check_arming(queue, armed_target) {
             Ok(t) => t,
             Err(e) => {
@@ -1887,7 +1897,7 @@ impl VirtualStorage {
                     state,
                     published_at_ms: now_ms(),
                 };
-                publish_json(&topic, &progress);
+                publish_json(Some(bus_root), &topic, &progress);
             }
         });
         if !outcome.is_success() {
@@ -1915,14 +1925,14 @@ impl VirtualStorage {
                     armed_target,
                     queue,
                 } => {
-                    if self.handle_apply(&armed_target, &queue) {
+                    if self.handle_apply(bus_root, &armed_target, &queue) {
                         changed = true;
                     }
                 }
                 VirtualStorageRequest::Refresh => changed = true,
             }
         }
-        self.publish_if_due(changed);
+        self.publish_if_due(bus_root, changed);
         cursor
     }
 

@@ -50,8 +50,7 @@ pub(crate) mod testkit;
 pub mod unit;
 pub mod verb;
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,16 +102,17 @@ fn default_bus_root() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("mde").join("bus"))
 }
 
-/// Publish a JSON body to `topic` via the `mde-bus` CLI — the same fire-and-reap
-/// path the `openstack`/`storage` workers use. Best-effort: a missing `mde-bus`
-/// binary (pre-RPM dev box) is swallowed.
-fn publish_json<T: serde::Serialize>(topic: &str, body: &T) {
-    let Ok(json) = serde_json::to_string(body) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", topic, "--body-flag", &json]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+/// Publish a JSON state-mirror body to `topic` in-process (perf-10 / arch-6) —
+/// no fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite open + a
+/// [`crate::proc_reap`] reaper thread) per publish. Byte-identical stored row to
+/// the old `mde-bus publish <topic> --body-flag <json>`. Writes through the SAME
+/// `self.bus_root` this worker already answers `action/units/get-stream`
+/// requests on, so the mirror + the RPC replies share one bus root. Best-effort;
+/// a `None` root / failed open / write is swallowed.
+fn publish_json<T: serde::Serialize>(bus_root: Option<&Path>, topic: &str, body: &T) {
+    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
+        crate::bus_publish::publish_json(&mut persist, topic, body);
+    }
 }
 
 /// Drain net-new `action/units/get-stream` requests since `cursor` and answer
@@ -272,7 +272,7 @@ impl UnitAggregatorWorker {
             .is_none_or(|prev| !prev.same_ignoring_time(&state));
         let heartbeat_due = last_pub_at.is_none_or(|at| now.duration_since(at) >= self.heartbeat);
         if changed || heartbeat_due {
-            publish_json(&state_topic(&self.host), &state);
+            publish_json(self.bus_root.as_deref(), &state_topic(&self.host), &state);
             *last_pub_at = Some(now);
         }
         *last = Some(state);

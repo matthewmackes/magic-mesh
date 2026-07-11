@@ -59,7 +59,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
@@ -2378,18 +2377,9 @@ fn now_ms() -> u64 {
 /// path `container`/`vm_lifecycle` use. Best-effort: a missing `mde-bus` binary
 /// (pre-RPM dev box) is swallowed.
 fn publish_json<T: serde::Serialize>(bus_root: Option<&Path>, topic: &str, body: &T) {
-    let Ok(json) = serde_json::to_string(body) else {
-        return;
-    };
-    if let Some(root) = bus_root {
-        if let Ok(persist) = Persist::open(root.to_path_buf()) {
-            let _ = persist.write(topic, Priority::Default, None, Some(&json));
-            return;
-        }
+    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
+        crate::bus_publish::publish_json(&mut persist, topic, body);
     }
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", topic, "--body-flag", &json]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
