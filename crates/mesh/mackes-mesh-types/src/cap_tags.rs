@@ -42,6 +42,10 @@ pub enum CapabilityTag {
     /// capacity (DATACENTER-17). Pins the Server tier; the `xcp_host`
     /// worker self-gates on the dom0 marker.
     Hypervisor,
+    /// Node advertises the media-surface capability (MEDIA-1): a media
+    /// lighthouse / media-role node (a strict subset of the lighthouse set,
+    /// not a distinct role). Mirrors `mde_role::Capability::Media`.
+    Media,
 }
 
 impl CapabilityTag {
@@ -49,7 +53,13 @@ impl CapabilityTag {
     /// any surface should iterate (the fleet `tags --json` census, profile
     /// validation, the Node-roles editor) instead of hand-maintaining a
     /// parallel list that silently drops a tag (DATACENTER-17 added a 4th).
-    pub const ALL: [Self; 4] = [Self::Hop, Self::Execution, Self::Headless, Self::Hypervisor];
+    pub const ALL: [Self; 5] = [
+        Self::Hop,
+        Self::Execution,
+        Self::Headless,
+        Self::Hypervisor,
+        Self::Media,
+    ];
 
     /// Stable wire token.
     #[must_use]
@@ -59,6 +69,7 @@ impl CapabilityTag {
             Self::Execution => "execution",
             Self::Headless => "headless",
             Self::Hypervisor => "hypervisor",
+            Self::Media => "media",
         }
     }
 
@@ -71,6 +82,7 @@ impl CapabilityTag {
             "execution" => Some(Self::Execution),
             "headless" => Some(Self::Headless),
             "hypervisor" => Some(Self::Hypervisor),
+            "media" => Some(Self::Media),
             _ => None,
         }
     }
