@@ -63,8 +63,9 @@ refresh and drops the tunnel.
 ```bash
 meshctl repair              # reconcile this node to the elected fleet baseline
 ```
-The Workbench **Controller → Remediation** panel shows detected drift and the
-matched playbook.
+`meshctl repair` reconciles this node to the elected fleet baseline; detected
+drift and the matched remediation are recorded on the audit timeline
+(`mackesd audit-log`) and surfaced in the shell's Workbench.
 
 ## Upgrades
 

@@ -2,10 +2,12 @@
 
 The operational rulebook is [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md) — read its
 locks (§1–§8) before changing anything load-bearing. The short version: the
-substrate (Nebula / etcd / Syncthing / Bus / max-crypto) and the look (IBM Carbon,
-single-sourced in `mde-theme`) are **locked**; new code is glue over the
-existing crates, and a feature isn't done until it's runtime-reachable with
-no stubs (§7).
+substrate (Nebula / etcd / Syncthing / Bus / max-crypto) is **locked**, and the UI
+is **egui-native** — one shell that owns the DRM/KMS seat directly (no Wayland
+compositor); the single source of look is the shared `Style` in `mde-egui` plus
+`mde-theme::brand` (QBRAND), and strict IBM Carbon as a token/lint gate is retired
+(§4). New code is glue over the existing crates, and a feature isn't done until
+it's runtime-reachable with no stubs (§7).
 
 ## Build prerequisites
 
@@ -31,7 +33,10 @@ sudo dnf install -y gcc gcc-c++ cmake mold pkg-config \
   file header).
 - The vendored Opus tree needs `CMAKE_POLICY_VERSION_MINIMUM=3.5`;
   `.cargo/config.toml` sets it, CI sets it explicitly.
-- All 24 crates are workspace members; nothing is excluded from the build.
+- The workspace has ~40 crates (see `Cargo.toml` `members`); the two
+  browser-engine crates (`mde-web-cef`, `mde-web-preview`) are **separate excluded
+  workspaces** with their own `Cargo.lock`, built on their own (the RPM cut builds
+  `mde-web-preview` separately before `generate-rpm`).
 - **Offload heavy/parallel builds to the farm:** `install-helpers/xcp-build.sh
   cargo …` (routes to the farm); status via `install-helpers/farm.sh status`.
 
@@ -81,8 +86,11 @@ floor, and a CycloneDX SBOM artifact.
 - **Worker shell-outs go through `workers::proc`** (kill-on-timeout); a bare
   `Command::output()` on a tick path pins a runtime thread when the child
   hangs (EFF-20).
-- **libcosmic is pinned by rev** — all three consumers share one rev; bump
-  all together (policy in the root `Cargo.toml` header, EFF-35).
+- **UI is egui-native** — surfaces render through `mde-egui` (eframe/wgpu; the
+  shell owns the DRM/KMS seat directly, no Wayland compositor) using the shared
+  `Style` + `mde-theme::brand`. The two excluded browser engines (`mde-web-cef`
+  CEF/Chromium, `mde-web-preview` Servo) are pinned in their own workspaces and
+  bumped on their own cadence (Servo tracked monthly).
 - **Crypto floor** (§3): Ed25519 / AES-256-GCM / ChaCha20-Poly1305 / RSA-4096
   own keys / rustls. `cargo deny` bans openssl outright.
 

@@ -1,5 +1,18 @@
 # MCNF — Worklist
 
+> **⚠️ NAVIGABILITY — needs an operator decision (do not restructure ad hoc).** This
+> file has grown past **~1.49 MB**, with individual entries as single physical lines up
+> to ~78 KB. At this size GitHub won't render it, agents can't read it whole (the
+> standing rule is already "**grep it, never read it whole**"), and same-line appends by
+> parallel farm agents are a recurring merge hazard. **Proposed approach (for operator
+> approval — NOT yet applied):** split by *lifecycle, not by rewrite* — move
+> shipped/closed epochs (the E1–E11 era, the 10.x/11.x sections) **verbatim** into
+> `docs/worklist-archive/<epoch>.md`, keeping task IDs greppable across both locations;
+> adopt a hard convention for live entries (a status line + wrapped follow-up bullets
+> instead of one mega-line); keep this live file under ~200 KB; add a tiny max-line-length
+> lint to hold it. Tracked as review finding `docs-consistency-10`. Until the operator
+> approves the archive split, leave the structure as-is.
+
 The single durable tracker. Tasks lifted from `docs/COMPLIANCE.md` (sweeps 1 & 2, 2026-06-09).
 Status: `[ ]` open · `[>]` in progress · `[✓]` done. Each task carries its finding id + verdict.
 Ordered by priority — security lock first, then largest structural debt, then mechanical/doc cleanup.

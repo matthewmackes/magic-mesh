@@ -37,12 +37,12 @@ password in `$XCP_PASS`. Full operator authorization for both dom0s + all VMs.
 
 ## Dev-host build toolchain (the "build environment online" baseline)
 
-The dev host builds the **entire workspace incl. the cosmic/iced GUI** locally.
+The dev host builds the **entire workspace incl. the egui/DRM GUI** locally.
 Required packages (installed): `gcc-c++`, `cmake`, `mold`, system `libopus`
 (`dnf --enablerepo=crb install opus-devel` on EL9), `alsa-lib-devel`,
 `libxkbcommon-devel`, `gtk3-devel`. **Caveat:** this host's gcc 11.5 rejects
 `-fuse-ld=mold` (the committed `.cargo/config.toml`), so build with
-`RUSTFLAGS="-C link-arg=-fuse-ld=gold"`. `mde-workbench` builds + links in ~30 s.
+`RUSTFLAGS="-C link-arg=-fuse-ld=gold"`. `mde-shell-egui` builds + links in ~30 s.
 
 ## Automation stack (target — the Farm Automation Manager)
 

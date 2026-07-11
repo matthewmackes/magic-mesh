@@ -1,10 +1,10 @@
 # MCNF — Operator's Day-2 Guide
 
 The lifecycle of a running mesh, in the order you'll live it. Deep runbooks
-live in [`docs/help/`](docs/help/) (installed to `/usr/share/mde/help/`,
-browsable in the Workbench **Help** panel); this page is the map. The trust
-model and its limits: [`DISCLAIMER.md`](DISCLAIMER.md) ·
-[`SUPPORT.md`](SUPPORT.md).
+live in [`docs/help/`](docs/help/) (installed to `/usr/share/mde/help/`, and in
+the repo); the shell's own in-product help is the Workbench **Help ▸ Plane
+Guide**. This page is the map. The trust model and its limits:
+[`DISCLAIMER.md`](DISCLAIMER.md) · [`SUPPORT.md`](SUPPORT.md).
 
 ## 0. Install + first boot
 
@@ -12,8 +12,9 @@ model and its limits: [`DISCLAIMER.md`](DISCLAIMER.md) ·
 
 One RPM (ISO or `dnf install <release URL>`; the RPM drops the
 `[magic-mesh]` dnf repo + signing key, so `dnf upgrade` works afterward).
-First boot: the role chooser pins **Lighthouse ⊂ Server ⊂ Workstation**
-(upgrade-only, never downgrade). Per-role expectations:
+First boot: the role chooser pins one of the two roles — **Lighthouse →
+Workstation** (upgrade-only, never downgrade; a headless box is a Workstation
+without a display). Per-role expectations:
 [`docs/help/node-setup.md`](docs/help/node-setup.md).
 
 ## 1. Stand up the mesh + enroll peers

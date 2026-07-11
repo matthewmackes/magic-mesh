@@ -9,11 +9,11 @@ go for help.
 | Dimension | Supported | Notes |
 |-----------|-----------|-------|
 | Peers | **1–8 in one mesh** | The §8 trust-envelope lock. Split larger fleets into separate workgroups. |
-| Roles | Lighthouse, Server, Workstation | One signed RPM; chosen at install (`meshctl install --role <r>`). |
-| OS | Fedora (Cosmic spin) | The Magic-on-Cosmic ISO + the GitHub-hosted RPM (Releases asset / GitHub Pages dnf repo) are the supported install paths. |
+| Roles | Lighthouse, Workstation (2 roles) | One signed RPM; role is a config flag chosen at install (`meshctl install --role <r>`). A headless box is a Workstation without a local display. |
+| OS | Fedora | The Quasar ISO / immutable bootc image + the GitHub-hosted RPM (Releases asset / GitHub Pages dnf repo) are the supported install paths. |
 | Transport | Nebula overlay only | No unencrypted fallback; underlay stays firewalled. |
 | Storage | Syncthing replicated volume | Backups remain the operator's responsibility. |
-| Desktop | Cosmic | The GUI is strictly IBM Carbon (Gray 10/90/100). |
+| Desktop | egui thin-client VDI shell | A single egui shell owns the DRM/KMS seat directly (no Wayland compositor); the desktop you use is a VM brokered over the mesh. |
 | Language | **en-US only** | All GUIs, CLI output, logs, and docs are English. Localization is deliberately out of envelope for a ≤8-peer workgroup product (EFF-49); revisit only if the envelope ever widens. |
 
 Running **beyond 8 peers**, on non-Fedora hosts, or in regulated / safety-critical
@@ -26,9 +26,9 @@ independent review.
   repository. There is **no SLA, paid support tier, incident-response retainer, or
   recovery service** unless separately agreed in writing.
 - **Self-service operations.** The platform is designed so one operator runs it
-  with `meshctl` and the Workbench. The lifecycle gestures are documented in
-  `docs/help/` (installed to `/usr/share/mde/help/`, browsable in the Workbench
-  Help panel).
+  with `meshctl` and the shell's Workbench. The lifecycle gestures are documented
+  in `docs/help/` (installed to `/usr/share/mde/help/`); the shell's in-product
+  help is the Workbench **Help ▸ Plane Guide**.
 - **You own recovery.** Keep backups. The lighthouse-loss runbook is
   `docs/help/mesh-recovery.md`.
 

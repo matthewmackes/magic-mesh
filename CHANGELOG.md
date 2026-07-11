@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to MCNF (Mackes Cosmic Nebula Fedora) are documented here. The 10.0.x series is codenamed "Magic Mesh"; historical entries below predate the 2026-06-17 rebrand. The format follows
+All notable changes to MCNF (magic-mesh) are documented here. The **11.4.x → 12.0** line is the **E12 "Quasar" pivot** to the egui-native, DRM-native thin-client VDI desktop (the libcosmic/iced + strict-IBM-Carbon stack retired); the 12.x codename spelling ("Quazar" vs "Quasar") is a pending operator decision — see [`docs/NEEDS-OPERATOR.md`](docs/NEEDS-OPERATOR.md). The 10.0.x series is codenamed "Magic Mesh"; historical entries below predate the 2026-06-17 rebrand. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is the
 single workspace version (`[workspace.package] version`, every crate
 inherits). Release tags are **`magic-mesh-v<version>`**; the RPM NEVRA pairs
@@ -12,6 +12,18 @@ v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
 ## [Unreleased]
+
+_Accumulating since the `magic-mesh-v12.0.0` tag (2026-07-02) toward the next
+operator-gated cut — a broad 12.0.x feature wave: the first-class **dual-engine
+browser** (`mde-web-cef` Chromium/CEF + the sandboxed `mde-web-preview` Servo
+helper, `mde-adblock`, the `mde-bookmarks` CRDT), the **media player**
+(`mde-media-core` libmpv + `mde-media-egui`, `mde-jellyfin`), the **terminal**
+(`mde-term-egui`) and **editor** (`mde-editor-egui`) surfaces, **QBRAND**
+compile-time build identity + branding, the **Spice VDI** client (`mde-vdi-spice`,
+CHOOSER-5), and the **QC-15 cloud cutover** (cloud-hypervisor deleted; libvirt/
+QEMU-KVM + Nova/OpenStack is the VM plane) with the Browser-DD daemon workers +
+KDC-MESH remote input._
+
 ### Added
 - **BOOKMARKS-9 — the Servo browser packaged + documented (ships securely).**
   - The `mde-web-preview` Servo helper is a first-class RPM asset
@@ -45,6 +57,66 @@ starts at the first packaged release line.
   fixes, minding the API churn of a young engine. The helper runs the SpiderMonkey
   JIT on untrusted web content, so a stale pin is a security-relevant defect;
   bump it with the rest of the fleet.
+
+## [12.0.0] "Quasar" — 2026-07-02
+> **Identity cut (`release(E12-14)`, commit `37f28936`; tag `magic-mesh-v12.0.0`).**
+> The **E12 "Quasar" pivot** — the egui-native, DRM-native thin-client VDI desktop —
+> is now the platform's identity. Version bumped `11.4.5 → 12.0.0`; the codename is
+> `12.0.0 "Quasar"` (the exact spelling "Quazar"/"Quasar" is a pending operator
+> decision — see `docs/NEEDS-OPERATOR.md`). The large 12.0.x feature wave that
+> followed the tag is under **[Unreleased]** above.
+### Changed
+- The egui shell **is** the platform: the retired libcosmic/iced + strict-IBM-Carbon
+  stack is gone (completed across 11.4.x); the About/greeter/chrome now carry the
+  12.0 Quasar identity.
+
+## [11.4.5] — 2026-07-01
+> Rolling DRM-shell cutover cut (deployed to fleet machines; **not** git-tagged).
+> Completes the E12-14 toolkit retirement and lands the notification-interface pivot.
+### Changed
+- **E12-14c — the iced GUIs are retired; the egui shell is the Workbench.** The iced
+  `mde-workbench` is deleted (the egui shell *is* the Workbench); `mde-card` folds into
+  `mackesd_core::card` (one consumer, no crate); `mde-theme` is re-scoped to the egui
+  `brand` module; the retired toolkit's name is purged from every crate + manifest.
+### Added
+- **NOTIFY-CHAT — one notification interface.** An ICQ-style mesh chat (`mde-chat`)
+  replaces and **removes** the standalone Notifications + Clipboard surfaces and
+  `mde-notify`: every host (local, remote, VM guest) is a roster contact whose system
+  alerts + clipboard copies arrive as signed messages from that contact (a mackesd
+  `chat` worker folds every alert lane).
+- **E12-15 — `mde-seat`**, the seat hardware-access foundation library.
+### Fixed
+- A DRM-shell fix (the 11.4.5 bump).
+
+## [11.4.4] — 2026-07-01
+Rolling DRM-shell cutover cut (fleet-deployed, untagged). Version rollup.
+
+## [11.4.3] — 2026-07-01
+### Added
+- **E12-3 — full keyboard + modifier support in the DRM backend** (the egui/DRM seat
+  handles the complete key + modifier set).
+
+## [11.4.2] — 2026-07-01
+Rolling DRM-shell cutover cut (fleet-deployed, untagged). Version rollup.
+
+## [11.4.1] — 2026-07-01
+### Fixed
+- **E12-3 — DRM-seat shell wiring + packaged: closes the 11.4.0 GUI gap.** The
+  DRM-seat egui shell is wired and **added to the RPM assets**, so a Workstation
+  again boots to a working desktop (11.4.0 had stripped the old GUIs without the
+  replacement present — see below).
+
+## [11.4.0] — 2026-07-01
+> Rolling DRM-shell cutover cut (fleet-deployed, untagged). Begins the hard cutover
+> to the egui/DRM shell.
+### Removed
+- **E12-14b — the old iced GUIs are stripped** (Files/Music/Voice + the cosmic
+  applet).
+### Fixed
+- ⚠️ **Known GUI regression (fixed in 11.4.1).** The strip removed the iced GUIs
+  but the egui shell replacement was **not yet in the RPM assets**, so 11.4.0
+  shipped without a working desktop (the workspace built green the whole time —
+  compiling ≠ shipping). Corrected in 11.4.1 by wiring + packaging the DRM shell.
 
 ## [11.3.1] — 2026-07-01
 Patch: a security-relevant fix found by live-verifying 11.3.0 on the fleet.
@@ -694,5 +766,9 @@ First packaged release.
   (Ed25519); GPG-signed RPM + `SHA256SUMS`/`.asc`; full GPL-3.0 text shipped
   + a `SECURITY.md` disclosure policy.
 
-[Unreleased]: https://github.com/matthewmackes/magic-mesh/compare/magic-mesh-v10.0.0...HEAD
+[Unreleased]: https://github.com/matthewmackes/magic-mesh/compare/magic-mesh-v12.0.0...HEAD
+[12.0.0]: https://github.com/matthewmackes/magic-mesh/releases/tag/magic-mesh-v12.0.0
 [10.0.0]: https://github.com/matthewmackes/magic-mesh/releases/tag/magic-mesh-v10.0.0
+
+<!-- 11.4.0–11.4.5 were rolling DRM-shell cutover cuts deployed to fleet machines but not git-tagged; they carry no release-tag link. -->
+

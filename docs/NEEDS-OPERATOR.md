@@ -58,8 +58,13 @@ operator-provided cred/host — drop any and the loop wires + live-verifies it:
   or a DO droplet — the build VMs can't be used without disrupting their farm role).
 - **OW-7 spawn-lighthouse (cloud)** — _needs:_ a **DigitalOcean API token** so
   `LiveProvisioner` can push-provision + enroll a droplet.
-- **OW-8 first-desktop** — _needs:_ a **live cloud-hypervisor host** (api-socket) + a
-  golden VM disk so `LiveFirstDesktop` can clone → boot → open the broker session.
+- **OW-8 first-desktop** — _needs:_ a reachable **Nova/Heat placement** (the mackesd
+  `openstack` worker converged on the node) + a **golden image in the Glance catalog**
+  so `LiveNovaPlacement` can place → boot → open the broker session, plus the live
+  Bus/DRM seat leg. *(Corrected 2026-07-11: **QC-15 deleted mde-kvm/cloud-hypervisor
+  outright** — `first_desktop.rs` now drives `workers::session_broker::LiveNovaPlacement`,
+  not a cloud-hypervisor api-socket + golden disk. Cf. the WORKLIST OW-8 supersession
+  note and the E12-9 correction already on line 69.)*
 - **OW-11 service-add** — _needs:_ **DO Spaces creds** (Music → Navidrome, overlaps
   MEDIA-2) + an **external SIP account** (Voice) so `LiveServiceApply` can provision /
   register.
@@ -80,3 +85,14 @@ Control plane rebuild is de-risked to its last mile. State to resume:
 - **FINAL BLOCKER:** `mackesd enroll --token` on the fresh node published a CSR but the LH never signed ("no bundle in 30s"). The 11.3.1 `enroll-token` embeds `mesh:magic-mesh@10.42.0.1:4242` (overlay + nebula port), but a non-overlay bootstrap needs the LH's public IP at the **enroll port `:4243`** (as the original seed token `@167.71.247.150:4243` did). Need the fresh-box bootstrap-enroll path against the live 11.3.1 LHs — connects to worklist **LH-JOIN-QNM-1**.
 - **Reversible:** destroy `a68ab38b` + the `cidata` VDI to clean up; LH external-addr changes are corrective (safe to keep).
 - **Proper IaC follow-on:** bake a control-plane golden (magic-mesh RPM installed) so `tofu apply` produces an enroll-ready VM (DAR-34/49); the CONTROLVM-9 cidata-delivery fix belongs in the `control-vm` tofu root.
+
+## Naming & consistency (operator decisions — from the 2026-07-10 platform review)
+
+_These are genuine product/naming decisions, not coding-agent work. Recorded here from the docs-consistency drain so the sweep does not proceed on a guess. **No strings were mass-renamed.**_
+
+- **NAMING-1: brand spelling "Quazar" (Z) vs "Quasar" (S) — needs an operator ruling before any sweep** _(review `docs-consistency-2` / `shell-ux-9`)._
+  - **The split.** The operator-locked branding (`docs/design/quasar-branding.md`, QBRAND lock **#9/#10**, 2026-07-03) already declares the canonical codename spelling **"Quazar"** and the user-facing name **"MDE Quazar — Mackes Display Environment"**, "supersedes the earlier Quasar spelling". The brand crate implements it (`crates/shared/mde-theme/src/brand/build.rs` `12 => "Quazar"`; `about.rs` `PRODUCT_NAME` "MDE Quazar"). **But** the fleet still ships the old **"Quasar"** spelling widely, and two authorities disagree with the lock: `AI_GOVERNANCE.md:12` still says the About/greeter shows `MCNF 12.0 "Quasar"`, and `quasar-branding.md` itself still says `12.0.0 "Quasar"` in locks #6 + its Architecture section.
+  - **Where each spelling lives (grep, worktree-wide excl. `.git`/nested `.claude`):** **"Quazar" (Z) = 69** occurrences across **22 files** (shell UI `about.rs`/`backdrop.rs`/`splash.rs`/`system.rs`, the `mde-theme/src/brand/*` crate, `docs/design/quasar-branding.md`, `assets/brand/quasar/`, WORKLIST). **"Quasar" (S) = 333** occurrences across the shipped UI strings the review names — "Quasar Mesh" (the KDE-Connect endpoint a paired phone displays: `mde-kdc-host/src/fanout.rs`, `mackesd/src/workers/kdc_host.rs`), "Quasar Browser" (`web.rs`), "Quasar Editor" (`mde-editor-egui/src/panel.rs`), "Quasar tmux config" (`mde-term-egui/src/tmux_ui.rs`), the Console provenance chip (`console.rs`), the exported device report (`device_manager.rs`) — plus the design docs, the `magic-mesh-v12.0.0` release, and the kickstart. (The review's crates-only count was 164 "Quasar" vs 34 "Quazar".)
+  - **The decision needed.** Confirm **"Quazar"** as canonical (honoring the existing lock) **or** revert the lock to **"Quasar"** — then decide **how far the sweep extends**: user-facing strings only, or also the `assets/brand/quasar/` directory, the `docs/design/quasar-*.md` filenames, etc. Also fix `AI_GOVERNANCE.md:12` and the residual `12.0.0 "Quasar"` lines in `quasar-branding.md` to match. **`magic-mesh` stays the package/repo/infra id either way** (the GNOME-vs-gnome-shell split, QBRAND #10). Once decided, route every user-visible string through `mde_theme::brand` constants + a lint (QBRAND #4) so it cannot re-drift. **Until then, leave the strings as-is.**
+
+- **NAMING-2: one VM vocabulary + panel-ownership badging — a follow-up cleanup** _(review `docs-consistency-8`)._ The docs now state the intended split (Cloud plane = **"instances"**, Fleet ▸ Datacenter = **"VMs"**; Nova-managed domains are read-only in Datacenter — see `docs/help/cloud-self-service.md`). The remaining work is UI-side and not done here: badge Nova-managed rows in the Datacenter panel and cross-link the two surfaces, and resolve the product-scope tension the rescope doc flags (`docs/design/e12-9-10-libvirt-rescope.md` §Current architecture / quasar-cloud.md **Q38**: two independent VM-creation paths writing the same `/var/lib/mde-vms` dir-pool). Needs an owner for the Q38 scope call.

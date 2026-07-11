@@ -1,10 +1,10 @@
 # Per-Node-Type Setup
 
-Every MCNF node is one of three roles. They nest by capability:
-**Lighthouse ⊂ Server ⊂ Workstation** — a Server runs everything a Lighthouse
-does plus more, and a Workstation runs everything a Server does plus the desktop.
-Pin a role with `meshctl install --role <role>` (or the ISO's install-time
-chooser).
+Every MCNF node runs the **same byte-identical stack**; **role is a configuration
+flag, not a build**. There are **two rank-ordered roles**:
+**Lighthouse (rank 0) → Workstation (rank 1)**. Pin a role with
+`meshctl install --role <role>` (or the ISO's install-time chooser); re-roling is
+upgrade-only (a downgrade fails closed).
 
 ## Bootstrap a new mesh (the first Lighthouse)
 
@@ -17,43 +17,36 @@ meshctl mesh init            # mint the CA + this lighthouse's cert, bring up ne
 meshctl doctor               # confirm nebula1 is up and mackesd is active
 ```
 
-A Lighthouse is the relay, the Nebula CA, and the leader control plane. At least
-one must be reachable for new peers to enroll and for the fleet to elect a leader.
-For resilience, promote a second node to Lighthouse once the mesh has a few peers
-(losing your only lighthouse is the one painful case — see `mesh-recovery.md`).
+A Lighthouse is the relay, the Nebula CA/signer, and the leader control plane. At
+least one must be reachable for new peers to enroll and for the fleet to elect a
+leader. For resilience, promote a second node to Lighthouse once the mesh has a
+few peers (losing your only lighthouse is the one painful case — see
+`mesh-recovery.md`).
 
-## Add a Server
+## Add a Workstation
 
-A Server adds fleet automation (Ansible-on-each-node, jobs, netstate/firewall
-convergence) and a Syncthing replicated-storage replica.
+A Workstation is the full Quasar egui thin client. It brokers and displays VM
+desktops (libvirt/QEMU-KVM through Nova), runs Podman, and carries fleet
+automation (Ansible-on-each-node, jobs, netstate/firewall convergence) plus a
+Syncthing replicated-storage replica. Enroll it with a single-use token:
 
 ```bash
 # On a lighthouse: mint a single-use enrollment token.
 mackesd enroll-token --mesh-id <mesh>   # prints a token
 
 # On the new node:
-meshctl provision --role server --token <token>
+meshctl provision --role workstation --token <token>
 meshctl doctor
 ```
 
-Tag a Server with the `execution` capability if it should run fleet jobs:
+Once enrolled, a Workstation with a display boots the egui/DRM shell; a
+**headless** Workstation (no display) runs the daemon stack only and serves its
+VMs/containers to the mesh. Tag a node with the `execution` capability if it
+should run fleet jobs:
 
 ```bash
 mackesd tag --set execution
 ```
-
-## Add a Workstation
-
-A Workstation is a Server plus the Cosmic desktop, voice/media services, and the
-KDC. Same enrollment flow:
-
-```bash
-meshctl provision --role workstation --token <token>
-```
-
-Log into Cosmic; the MCNF applet shows the mesh-health pip and quick
-actions, and the Workbench is the console for Peers, Health, Config, Jobs, and
-the network planes.
 
 ## Capability tags (optional, any role)
 
@@ -68,7 +61,7 @@ mackesd tag --set execution,hop   # replace the tag set (audit-logged)
 - `hop` — may advertise underlay subnets / act as a gateway (`mackesd
   hop-advertise --subnets <cidr>`; add `--exit` for a full exit, which only
   activates once a validation run passes).
-- `headless` — no desktop expected.
+- `headless` — a Workstation with no local display expected (daemon stack only).
 
 ## Verify any node
 
@@ -79,3 +72,7 @@ meshctl test connectivity   # overlay reachability
 meshctl test dns            # <host>.mesh resolution wired
 meshctl test firewall       # nebula1 in the trusted zone
 ```
+
+On a Workstation with a display, the shell's **Workbench** (the five-plane mesh
+console the chrome bar expands into) is the graphical view of Peers, This Node,
+Cloud, Network, Fleet, and Provisioning.

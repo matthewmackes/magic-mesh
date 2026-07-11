@@ -28,7 +28,7 @@ only lighthouse is gone, go to **Case B**.
    ```bash
    meshctl fleet status
    ```
-2. If no surviving node is a lighthouse, promote a healthy Server:
+2. If no surviving node is a lighthouse, promote a healthy Workstation:
    ```bash
    # On the chosen node:
    meshctl install --role lighthouse
@@ -83,8 +83,9 @@ you're restoring is the **CA**.
 - **Add a second lighthouse now** so you never repeat Case B.
 - Confirm Syncthing replication health (`systemctl status syncthing` on each peer;
   the mesh-health watchdog also alerts on an out-of-sync file plane).
-- The Workbench **Controller → Audit** panel records the lifecycle operations
-  (re-mint, re-enroll, leadership change) on the hash-chained audit timeline.
+- The lifecycle operations (re-mint, re-enroll, leadership change) are recorded
+  on the hash-chained audit timeline — `mackesd audit-log` / `mackesd
+  audit-verify` (also surfaced in the shell's Workbench).
 
 ## What you cannot recover
 

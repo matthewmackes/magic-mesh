@@ -9,7 +9,7 @@
 There are **two build surfaces**, both real and both supported:
 
 1. **The local dev host** (`172.20.145.192`, Rocky 9.8) — builds the *entire*
-   workspace incl. the cosmic/iced GUI in ~seconds-to-a-minute. Best for tight
+   workspace incl. the egui/DRM GUI in ~seconds-to-a-minute. Best for tight
    edit→build→verify loops. **Caveat: gcc 11.5 rejects `mold`** → use the gold
    override (below).
 2. **The build farm** (four Fedora VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — fully
@@ -44,7 +44,7 @@ RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo build --workspace
 RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo test -p mde-theme   # token changes
 ```
 
-`mde-workbench` (the heaviest cosmic/iced crate) builds + links in ~30 s this way.
+`mde-shell-egui` (the heaviest egui crate) builds + links in ~30 s this way.
 
 **Offload to the farm** (no local linker caveat; gcc 15 + mold):
 
@@ -85,9 +85,11 @@ sudo dnf --enablerepo=crb install -y opus-devel        # <-- CRB, EL9-specific
 # mold is present but UNUSED here (gcc 11.5) — build with the gold override.
 ```
 
-Why these: gtk3 + libxkbcommon = the cosmic/iced GUI; alsa-lib + opus = the audio
-chain; protobuf = etcd-client; openssl-devel only for the build (the product is
-rustls-only, openssl is cargo-deny-banned at link).
+Why these: libxkbcommon (+ the wgpu/DRM stack) = the egui GUI; alsa-lib + opus =
+the audio chain; protobuf = etcd-client; openssl-devel only for the build (the
+product is rustls-only, openssl is cargo-deny-banned at link). *(`gtk3-devel` is a
+legacy cosmic/iced leftover in the install line — no longer needed; the tree has
+zero gtk deps in `Cargo.lock`.)*
 
 ---
 
@@ -108,7 +110,7 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 > ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. The real farm is **4 build VMs: .50 / .90 / .130 / .170** (there are no live `.51`/`.52` IPs — probing them gives "No route to host"). The non-BigBoy build hostnames are descriptive (`mcnf-build-home-services`, `mcnf-build-kvm-xcp1`, `mcnf-build-xen-194`); BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2 = 9** (not 7).
 
-> **Standing rule (operator 2026-06-30): BigBoy takes the longest / most-complex build.** The single heaviest job always routes to **XEN-BIGBOY** (`172.20.0.130`, 12 vCPU / ~20 GiB — the high-capacity node): a full `cargo --workspace` build/test/clippy, the biggest egui crates (`mde-shell-egui`/`mde-workbench`), a cold cosmic/iced/wgpu compile, or the RPM release build (`MCNF_BUILD_SHAPE=big` / an explicit `MCNF_BUILD_HOST=172.20.0.130`). The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs. This composes with the per-node concurrency cap: spread the *count* to honor caps, but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI build on a small node while BigBoy runs a trivial one.
+> **Standing rule (operator 2026-06-30): BigBoy takes the longest / most-complex build.** The single heaviest job always routes to **XEN-BIGBOY** (`172.20.0.130`, 12 vCPU / ~20 GiB — the high-capacity node): a full `cargo --workspace` build/test/clippy, the biggest egui crate (`mde-shell-egui`), a cold egui/eframe/wgpu compile, or the RPM release build (`MCNF_BUILD_SHAPE=big` / an explicit `MCNF_BUILD_HOST=172.20.0.130`). The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs. This composes with the per-node concurrency cap: spread the *count* to honor caps, but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI build on a small node while BigBoy runs a trivial one.
 
 ### Credentials (locations only — never in-repo)
 - **Mesh SSH key:** `~/.ssh/mackes_mesh_ed25519` (+ `.pub`) — dom0s + build-VM `mm`.

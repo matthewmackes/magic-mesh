@@ -4,6 +4,21 @@
 pre-locks) + 10 hero-image questions (H1–H10) + standing directive **D-W1** ·
 **Status:** locked, lifted into `docs/WORKLIST.md` (### PLANES) · governance: new §9
 
+> **⚠️ Supersession banner (2026-07-03 — QUASAR-CLOUD, `docs/design/quasar-cloud.md`;
+> governance `AI_GOVERNANCE.md` §9): the Controller plane was renamed the Cloud
+> plane.** The shipped IA is exactly **five** planes —
+> **This Node · Cloud · Network · Fleet · Provisioning** (`Plane::ALL`,
+> `crates/desktop/mde-shell-egui/src/workbench.rs`) — with the **Peers directory as
+> the Front Door** and the desktop-personal panels grouped below (neither is a
+> top-level plane in the enum). **Read every "Controller" below as "Cloud":** the
+> Q70 lock made `OpenStack` the control brain this plane described (instances ·
+> volumes+snapshots · images · networks · stacks, self-served by every member),
+> while the doctrines here — renderers-not-authorities, typed Bus verbs, one-state,
+> no-RBAC — carry forward unchanged (the one added exception: hard per-user
+> Keystone quotas). The elected-leader "Controller" *view* survives, collapsed,
+> inside the Cloud plane. The plane-lock text below is preserved as the original
+> W1–W100 survey record.
+
 The operator's tree — Host Agent/Node Daemon, Controller, Provisioning Plane, Network
 Plane, Distributed Plane — mapped onto the platform and placed in the Workbench as its
 top-level mesh IA. **D-W1 (standing): reuse mesh tooling first, Red Hat best practices
@@ -30,8 +45,10 @@ second.** Greenfield: no legacy or tech debt carried (operator, W78 reply).
 
 ## The IA (W4–W16)
 
-Nav top-to-bottom: **Peers (Front Door) · This Node · Controller · Network · Fleet ·
-Provisioning · Desktop** (personal panels grouped last). Full tree from day one with
+Nav top-to-bottom: **Peers (Front Door) · This Node · Cloud** (was Controller) **·
+Network · Fleet · Provisioning · Desktop** (personal panels grouped last). The
+five top-level planes in the shipped enum are This Node · Cloud · Network · Fleet ·
+Provisioning; Peers is the Front Door and Desktop is the personal-panel group. Full tree from day one with
 guided empty states on unbuilt panels (W16, L3 pattern). Deep-link ids: clean break
 (W11). Existing panels absorbed (W4): Mesh Services→This Node/Health · Drift→
 Controller/Remediation · Fleet Revisions→Controller/Config · Playbooks→Controller/Jobs
@@ -49,7 +66,7 @@ self-restart via systemd (W24). **Config**: revision vs newest + apply log + Rec
 now (W22); version + repo source + update-now via typed job (W28). **Logs/metrics**:
 journald mesh-unit view + Netdata strip (W23). **Full CLI parity** for all six (W27).
 
-### Controller (W29–W52)
+### Cloud — formerly Controller (W29–W52)
 **Jobs**: job = Ansible playbook ref + vars + targets (W29), schedules in v1 (W30)
 fired by the FPG leader (W35); targets = tags/roles/peers resolved at launch (W31);
 the TARGET runs it locally as a signed bundle — no push-SSH (W32); Syncthing-synced

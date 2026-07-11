@@ -1,16 +1,17 @@
 # Install Guide
 
-MCNF ships as **one signed RPM** with an install-time role chooser. There is
-no separate package per node type — the role you pick decides what runs.
+MCNF (magic-mesh) ships as **one signed RPM** (plus an immutable bootc/ostree
+image) with an install-time role chooser. There is no separate package per node
+type — one byte-identical stack ships, and the role you pick is a configuration
+flag that decides which systemd units run.
 
 ## 1. Get the bits
 
 Two supported paths:
 
-- **Magic-on-Cosmic ISO** — boot it, and the installer's `%post` role chooser
-  pins the node's role during install. Best for a fresh machine.
-- **GitHub RPM** on an existing Fedora (Cosmic) host — one-shot, the latest
-  release asset:
+- **Quasar ISO / bootc image** — boot it, and the installer's role chooser pins
+  the node's role during install. Best for a fresh machine.
+- **GitHub RPM** on an existing Fedora host — one-shot, the latest release asset:
 
   ```bash
   sudo dnf install \
@@ -23,26 +24,33 @@ Two supported paths:
   on), so a plain `sudo dnf upgrade` picks up later releases. There is no
   separate release/bootstrap RPM and no COPR.
 
-The RPM installs every binary (`mackesd`, `meshctl`, `magic-fleet`, `mde-bus`,
-`mde-workbench`, `mde-files`, …) under `/usr/bin`, the systemd units, the Carbon
-icon set, and the help docs under `/usr/share/mde/help/`.
+The package installs the control-plane binaries (`mackesd`, `meshctl`,
+`magic-fleet`, `mde-bus`, …), the **egui/DRM desktop shell** (`mde-shell-egui`)
+and its surfaces, the systemd units, the role-scoped assets, and the help docs
+under `/usr/share/mde/help/`. The desktop is DRM-native — it owns the KMS seat
+directly and does **not** require a Wayland compositor.
 
 ## 2. Pick this node's role
 
 ```bash
-meshctl install --role lighthouse   # or: server | workstation
+meshctl install --role lighthouse   # or: workstation
 ```
 
 `meshctl install` pins the role (so the role-gated systemd units self-gate) and
 then runs `meshctl doctor` to preflight the prerequisites (nebula, nebula-cert,
-ansible, firewalld). Roles nest by capability:
+ansible, firewalld, libvirt). There are **two roles**:
 
-- **Lighthouse** — the relay + CA + leader control plane. Start here: the first
-  node in a new mesh is a lighthouse.
-- **Server** — everything a lighthouse runs, plus fleet automation + the
-  Syncthing storage replica.
-- **Workstation** — everything a server runs, plus the Cosmic desktop, voice,
-  media, and KDC.
+- **Lighthouse** — the always-on relay + Nebula CA/signer + leader control plane
+  (and media server). No local desktop. Start here: the first node in a new mesh
+  is a lighthouse.
+- **Workstation** — the full Quasar egui thin client: it brokers and displays VM
+  desktops and runs libvirt/QEMU-KVM + Podman. A **headless** box is a
+  Workstation with no local display (daemon stack only, serving VMs/containers to
+  the mesh) — "headless" is a capability, not a separate role.
+
+Role is a flag: a box is re-roled with `meshctl install --role <role>` (upgrade
+only — Lighthouse → Workstation is fine; downgrades fail closed) without a
+reinstall.
 
 ## 3. Bootstrap or join
 
@@ -53,7 +61,7 @@ ansible, firewalld). Roles nest by capability:
   ```bash
   meshctl join --token <token>
   # or, to also pin the role in one step:
-  meshctl provision --role server --token <token>
+  meshctl provision --role workstation --token <token>
   ```
 
 ## 4. Verify
@@ -68,7 +76,9 @@ A healthy node shows the `mackesd` service active and an overlay IP on `nebula1`
 
 ## Notes
 
-- The envelope is **≤8 peers** in one mesh (see `DISCLAIMER.md`). Split larger
-  groups into separate workgroups.
-- All node management is `meshctl` + the Workbench. Run `meshctl --help` for the
-  full lifecycle command set.
+- The infrastructure envelope is a small flat-trust workgroup (see
+  `DISCLAIMER.md`); VM desktop guests are first-class members on top of it. Split
+  larger groups into separate workgroups.
+- All node management is `meshctl` + the shell's **Workbench** (the five-plane
+  mesh console the chrome bar expands into). Run `meshctl --help` for the full
+  lifecycle command set.

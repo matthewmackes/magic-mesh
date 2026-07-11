@@ -12,6 +12,28 @@ For access from outside the mesh, use a VDI desktop.
 > exact widget layout is decided at implementation. One plane serves everyone —
 > operators and members alike; there is no separate "My Cloud".
 
+## "Instance" vs "VM": which panel owns your machine
+
+The shell has two VM surfaces over the same libvirt/QEMU-KVM hosts, and they use
+different nouns on purpose:
+
+- **Cloud plane → *instances*.** This is the self-service cloud (Nova/OpenStack).
+  If you launched it here, manage it here — boot/stop/rebuild/delete, volumes,
+  snapshots, and Heat stacks. This is the surface for your own machines.
+- **Fleet ▸ Datacenter → *VMs*.** This is the raw per-node libvirt view (an
+  operator/infrastructure lens onto every domain each host runs). It exists for
+  local, unmanaged domains and for seeing what physically runs where.
+
+**Ownership rule:** a Nova-launched instance is also a libvirt domain, so it can
+appear in **both** panels. The Cloud plane owns its lifecycle; treat such
+Nova-managed domains as **read-only in Fleet ▸ Datacenter** and drive them from
+the Cloud plane. Datacenter directly owns only unmanaged/local domains.
+
+> The engineering unification of the two code paths and any UI-string / badging
+> cleanup (marking Nova-managed rows in Datacenter, cross-linking the two panels)
+> is tracked as a follow-up — see the naming/UI note in
+> [`docs/NEEDS-OPERATOR.md`](../NEEDS-OPERATOR.md).
+
 ## Launch an instance
 
 Open the Cloud plane and start the launch picker. It walks four choices:
