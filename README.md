@@ -25,9 +25,9 @@ Editor, Bookmarks, Mesh View, Chat) are **panels inside the one shell**.
 
 > Split out of the [MackesWorkstation](https://github.com/matthewmackes/MackesWorkstation)
 > monorepo (the labwc/Windows-era *MackesDE* desktop, now end-of-life) by the
-> **E11 "MCNF" pivot**, then re-based onto the egui/DRM/VDI stack by **E12**.
-> The retired libcosmic/iced + strict-IBM-Carbon epoch lives in git history and
-> in [`docs/design/cosmic-magic-mesh-egui.md`](docs/design/cosmic-magic-mesh-egui.md).
+> **E11 "MCNF" pivot**, then re-based onto the egui/DRM/VDI stack by **E12
+> "Quasar"**. The design docs for the current stack live in
+> [`docs/design/`](docs/design/).
 
 ---
 
@@ -224,14 +224,14 @@ The load-bearing identity (full detail in [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md)
 - **Mesh:** Nebula encrypted overlay · **no fixed center** · etcd + Syncthing
   substrate.
 - **Toolkit:** **egui-native** — one egui shell on eframe/wgpu that **owns the
-  DRM/KMS seat directly, no Wayland compositor**; libcosmic/iced is retired (§4).
+  DRM/KMS seat directly, no Wayland compositor** (§4).
 - **Bus, not D-Bus:** surfaces and `mackesd` talk over `mde-bus`; FDO interop
   (`org.freedesktop.*`, `org.mpris.*`) only.
 - **Security:** maximum crypto — Ed25519 / AES-256-GCM / ChaCha20-Poly1305 /
   RSA-4096 KDC identity; rustls, never OpenSSL.
 - **Look:** the single source of look is the shared **`Style`/`Visuals` module**
-  in `mde-egui`, with branding in `mde-theme::brand` (QBRAND); strict IBM Carbon
-  as a token/lint gate is retired (§4).
+  in `mde-egui`, with branding in `mde-theme::brand` (QBRAND) — the one look
+  discipline across the whole platform (§4).
 - **Boundary:** three layered tiers, dependencies point only inward (gated).
 - **Envelope:** designed for a **workgroup-scale flat-trust** deployment (§8) —
   not a zero-trust / hyperscale product. Cloud compute nodes scale further; the

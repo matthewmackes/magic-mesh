@@ -154,8 +154,8 @@ accepted, documented trade-off — [`DISCLAIMER.md`](../DISCLAIMER.md).
 
 - **No Wayland compositor** — the egui shell owns the DRM/KMS seat directly (E12).
 - **No native host apps** — a browser/office/game runs inside a VM guest.
-- **No libcosmic/iced, no strict-Carbon token gate** — egui-native, shared
-  `Style` (§4). The retired epoch lives in git history + `design/`.
+- **No third-party desktop toolkit, no external design-token gate** — egui-native,
+  one shared `Style` module is the whole look discipline (§4).
 - No `mde <subcommand>` dispatcher — separate binaries.
 - No central server, no SaaS, no telemetry egress.
 - No OpenSSL (rustls; `cargo deny` bans it), no Gluster/LizardFS/Ceph (etcd +
