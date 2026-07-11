@@ -211,6 +211,112 @@ Another AI/operator can rebuild the whole thing from this repo:
 
 ---
 
+## 7. Fedora target matrix & the glibc compatibility contract
+
+> **Why this section exists (build-deploy-4).** Different parts of the build/
+> deploy chain pin **different Fedora releases** (42 / 43 / 44), and RPMs are
+> **glibc-forward-compatible only** — so "which build feeds which target" is a
+> real correctness constraint, not a cosmetic detail. It used to live only in
+> operator memory + scattered one-line comments; this table is the single source
+> of truth. Every version below is quoted from its file at the line cited — do
+> not restate a Fedora number here without updating the cited file too.
+
+### 7.1 The contract (read this first)
+
+A magic-mesh RPM carries an **auto-generated `Requires: libc.so.6(GLIBC_x.y)`**
+whose version is the **highest glibc symbol version actually referenced by any
+ELF it ships** (not simply the build host's glibc). `dnf install` then **refuses
+on any Fedora whose glibc is older than that ceiling**. There is no backward
+shim: an RPM built where a shipped binary pulls in a newer symbol will not
+install on an older release.
+
+- Proven in-repo: an RPM built on the **Fedora 44** toolchain auto-required
+  **`GLIBC_2.43`** and would not `dnf install` on Fedora 43; rebuilding inside a
+  `fedora:43` container dropped the requirement to unversioned `libc.so.6`
+  (`install-helpers/build-rpm-fedora43.sh:4-9`; `docs/WORKLIST.md:476`, ONBOARD-7).
+- Corollary (**the invariant**): **every `fedora-N` channel directory must be
+  fed an RPM built on a glibc no newer than Fedora N's.** The channel baseurl is
+  `fedora-$releasever-$basearch` (`packaging/repo/magic-mesh.repo`), so each
+  fleet node pulls the RPM under its own `$releasever` — and that RPM must have
+  been built on ≤ that node's Fedora.
+- The risk is **latent, not deterministic**: whether a too-new RPM actually
+  fails depends on which glibc symbols the shipped binaries happen to reference,
+  so a native cut can install today and brick after a dependency/OS bump pulls in
+  a newer symbol. Do not rely on "it installed last time."
+
+**glibc numbers:** only **F44 → provides `GLIBC_2.43`** is pinned in-repo (the
+ONBOARD-7 evidence above). The exact glibc minor for **F43** and **F42** is *not*
+recorded in this repo and was not pinned offline — treat them as "the glibc that
+ships with Fedora 43 / 42" (both older than 2.43), and confirm the exact number
+against the distro before relying on it.
+
+### 7.2 The matrix (component → Fedora → why → constraint)
+
+| Component | Fedora | Source (file:line) | Why that version | glibc / install constraint |
+|---|---|---|---|---|
+| **bootc immutable image base** | **42** | `packaging/bootc/Containerfile:53` (`ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42`) | "matches the fleet's RPM channel … mesh-service container is FROM fedora:42 too" (`Containerfile:50-52`); `--build-arg BOOTC_BASE=…` for an F43+ rebase (`:52`) | The **oldest** live target → the effective glibc **floor**. Anything installed *into* this image (RPM + layered dnf pkgs) must not require a glibc newer than F42's. |
+| **Canonical container RPM cut** | **43** (default) | `install-helpers/build-rpm-fedora43.sh:43` (`FEDORA="${1:-43}"`) | Builds the RPM inside a `fedora:43` container so its glibc `Requires` match F43 and it installs on F43 lighthouses / older cloud images (`:4-9`) | Produces an RPM installable on **F43 and newer** (forward-compat). Positional arg overrides the version. |
+| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**44** per WORKLIST) | `docs/BUILD-ENVIRONMENT.md:15,17` ("four Fedora VMs … gcc 15"); farm VMs are F44 per `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)") | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc (F44 → `GLIBC_2.43`)** → the artifact may **not** install on F42/F43 unless its shipped ELFs stay ≤ that target's symbols. ⚠ un-enforced. |
+| **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
+| **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
+| **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/WORKLIST.md:1132`). |
+| **DO lighthouse droplet** | **43** | `infra/tofu/zone1-do/variables.tf:16` (`default = "fedora-43-x64"`) | Lighthouse cloud image; "must have a live dnf channel for its releasever — fedora-42 has none" (`install-helpers/do-lighthouse-up.sh:19-20`) | Needs the F43-container RPM (`build-rpm-fedora43.sh`) or a channel `fedora-43` dir. |
+| **Local dev host** | **EL9 / Rocky 9.8** (not Fedora) | `docs/BUILD-ENVIRONMENT.md:11,71` | Orchestration + tight local build loops; gcc 11.5 (gold linker) | Builds workspace binaries, **not** release RPMs (its glibc is EL9's, unrelated to the Fedora channel). |
+
+### 7.3 Known inconsistencies — flagged, NOT changed (needs-owner-confirmation)
+
+Per the change discipline (a bootc base bump is load-bearing), **no version
+default was altered** while documenting this. The following divergences are real;
+each is left in place and flagged for the owner rather than "aligned" blindly:
+
+1. **F42 image base vs F43 canonical RPM vs F44 farm/CI — no enforced baseline.**
+   The glibc-forward rule (7.1) says the canonical RPM should be built on the
+   **oldest** live target (today **F42**, the bootc base), yet the canonical
+   script defaults to **F43** and native/CI cuts run on **F44**. Whether this
+   spread is deliberate (F43 chosen as the lighthouse floor, F42 image tolerated
+   via the local lane below) or drift is **not determinable from the code** — it
+   is maintained by operator memory. **Owner call needed:** pick one canonical
+   build baseline and enforce it. This is exactly the P1 finding
+   `build-deploy-4` in `docs/review/PLATFORM-REVIEW-2026-07-10.md` (§719-725),
+   whose recommendation — a committed `FLEET-BASELINE` file driving the RPM
+   version + a `verify-rpm.sh` gate asserting `rpm -qpR | grep GLIBC ≤ baseline`
+   — is **not yet implemented**. Do not bump the bootc base or the script default
+   to "fix" this without that owner decision.
+
+2. **No `fedora-42` channel directory, but the bootc `repo` lane targets it.**
+   The F42 bootc image's default-adjacent `repo` lane (`dnf -y install magic-mesh`,
+   `Containerfile:86`) resolves `$releasever=42` against a channel that only
+   builds `fedora-43`/`fedora-44` dirs, so it **404s** (`No match for argument:
+   magic-mesh`). This is *known and currently handled*, not silently broken:
+   production bootc builds use the **`local` lane** (stage a farm-built RPM into
+   `packaging/bootc/rpms/`), and the channel lane is gated on the operator
+   `/release` publish (`packaging/bootc/README.md:175-181`;
+   `install-helpers/do-lighthouse-up.sh:19-20`). **Caveat that keeps this on the
+   list:** the local lane stages a **farm-built (F44)** RPM into an **F42** image —
+   which only installs while that build's ELFs stay ≤ F42's glibc symbols (7.1);
+   nothing enforces it. QC-1 (2026-07-10) installed fine, but that is luck of the
+   symbol set, not a guarantee.
+
+3. **`build-rpm-fedora43.sh:4` calls the dev host "The F44 dev host".** The
+   canonical dev host is **Rocky 9.8 / EL9** (`docs/BUILD-ENVIRONMENT.md:11`), not
+   F44. The script's glibc mechanism is still correct (a newer-glibc *native*
+   build — today the **F44 farm VM**, not the EL9 dev host — is what over-pins the
+   RPM), but the "F44 dev host" wording is stale. Minor; flagged so a reader does
+   not trust it as the current dev-host fact.
+
+4. **The farm VM Fedora version is not pinned in this doc.** §1/§3 describe the
+   farm VMs only as "four Fedora VMs … gcc 15"; the F44 figure used above comes
+   from `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)"), not from a pinned field
+   here. Since the native RPM cut inherits the farm VM's glibc, the farm VM's
+   Fedora release is load-bearing and should be pinned explicitly (in the golden
+   template / ansible) once the baseline in (1) is chosen.
+
+> **Reviewer line-number note:** `docs/review/PLATFORM-REVIEW-2026-07-10.md:720`
+> cites `dnf-channel-up.sh:31` for the `FEDORAS='43 44'` default; in the current
+> tree that assignment is on **line 30**. The value is unchanged.
+
+---
+
 ## See also
 - [`AI_GOVERNANCE.md §10`](../AI_GOVERNANCE.md) — the directive pointing here.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — build prereqs, test rules, commit gates.
