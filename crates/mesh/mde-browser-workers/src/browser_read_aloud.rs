@@ -7,7 +7,8 @@
 //! status. Missing voice assets or an unconfigured command are surfaced as
 //! `Unavailable`, never as fake playback.
 
-#![cfg(feature = "async-services")]
+// arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
+// code; `mackesd` pulls it in only under its own `async-services` feature.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
-use super::{ShutdownToken, Worker};
+use mde_worker_core::{ShutdownToken, Worker};
 
 /// Browser-owned read-aloud request topic.
 pub const ACTION_TOPIC: &str = "action/browser/read-aloud";

@@ -8,7 +8,8 @@
 //! all archive download, SHA-256 verification, extraction, and symlink promotion;
 //! this worker owns the independent timed trigger and fleet-visible result.
 
-#![cfg(feature = "async-services")]
+// arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
+// code; `mackesd` pulls it in only under its own `async-services` feature.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
-use super::{ShutdownToken, Worker};
+use mde_worker_core::{ShutdownToken, Worker};
 
 /// Retained-latest topic prefix carrying this node's browser runtime posture.
 pub const STATE_PREFIX: &str = "state/browser-security-update/";

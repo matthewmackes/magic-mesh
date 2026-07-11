@@ -54,6 +54,7 @@ members = [
     "crates/mesh/mackes-xcp",
     "crates/mesh/mackesd",
     "crates/mesh/mde-worker-core",
+    "crates/mesh/mde-browser-workers",
     "crates/mesh/mde-enroll",
     "crates/mesh/magic-fleet",
     "crates/services/mde-adblock",

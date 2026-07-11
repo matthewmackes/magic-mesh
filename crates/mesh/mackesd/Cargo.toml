@@ -91,6 +91,11 @@ mde-kdc-proto = { path = "../../kdc/mde-kdc-proto" }
 # `workers::mod` re-exports both types. Optional under async-services (the whole
 # worker pool is async-services-gated).
 mde-worker-core = { path = "../mde-worker-core", optional = true }
+# arch-7 (2026-07-11) — the per-seat browser workers, factored out of this bin
+# crate. `workers::mod` re-exports each module (`pub use
+# mde_browser_workers::browser_*;`) so the supervisor spawn sites reach them
+# under the same paths. Optional under async-services (the worker pool gate).
+mde-browser-workers = { path = "../mde-browser-workers", optional = true }
 # SWAY-4 (v6.0 Q89/Q94) — marks_state worker uses Persist + rpc::reply_topic
 # to serve action/marks/* Bus action topics. Optional (async-services gate).
 mde-bus = { path = "../../platform/mde-bus", optional = true }
@@ -340,6 +345,7 @@ x11 = []
 # off. Locked 2026-05-19.
 async-services = [
     "dep:mde-worker-core",
+    "dep:mde-browser-workers",
     "dep:tokio",
     "dep:task-supervisor",
     "dep:zbus",
