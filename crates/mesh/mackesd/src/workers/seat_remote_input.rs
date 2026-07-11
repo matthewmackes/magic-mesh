@@ -23,10 +23,21 @@ use super::{ShutdownToken, Worker};
 /// KDC-owned remote-input handoff topic.
 pub const ACTION_TOPIC: &str = "action/seat/remote-input";
 
+/// Seated-user arm/disarm consent topic (security-7). The shell publishes an
+/// explicit `arm` grant with a bounded TTL here when the seated user consents
+/// to phone remote input; injection is refused unless a live arm is present.
+pub const ARM_TOPIC: &str = "action/seat/remote-input-arm";
+
 /// Retained-latest status topic prefix for this node.
 pub const STATE_PREFIX: &str = "state/seat-remote-input/";
 
-/// Per-event injection result topic prefix for this node.
+/// Retained-latest "is this seat being remotely driven" indicator prefix
+/// (security-7). A shell overlay subscribes to `{INDICATOR_PREFIX}{node}` so
+/// the seated user can see, in the moment, that their keyboard/mouse is (or is
+/// not) under phone control.
+pub const INDICATOR_PREFIX: &str = "state/seat/remote-input/";
+
+/// Per-event injection result / audit topic prefix for this node.
 pub const RESULT_PREFIX: &str = "event/seat-remote-input/";
 
 /// Default poll cadence. Phone touchpad input is interactive, so stay below the
@@ -39,6 +50,15 @@ const MAX_DELTA: f64 = 4096.0;
 const DEFAULT_HELPER: &str = "/usr/libexec/mackesd/seat-remote-input";
 const ENV_HELPER: &str = "MDE_SEAT_REMOTE_INPUT_COMMAND";
 const INJECT_CMD_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Hard ceiling on a single arm grant's lifetime. A longer request is clamped
+/// so a forged/over-broad arm cannot leave the seat drivable indefinitely.
+const MAX_ARM_TTL_MS: u64 = 300_000;
+/// Arm lifetime used when a grant omits an explicit `ttl_ms`.
+const DEFAULT_ARM_TTL_MS: u64 = 120_000;
+/// Window after the last injected event during which the indicator reports
+/// `active` (a phone is live-driving the seat right now), not merely `armed`.
+const ACTIVE_WINDOW_MS: u64 = 2_000;
 
 type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -141,12 +161,69 @@ pub struct RemoteInputStatus {
     pub injected: u64,
     /// Requests rejected as malformed.
     pub rejected: u64,
+    /// Well-formed requests refused by the arm/consent gate (security-7):
+    /// the seat was un-armed, the arm had expired, or the injection's phone
+    /// did not match the armed phone.
+    pub dropped: u64,
     /// Valid requests whose injector failed or was unavailable.
     pub failed: u64,
     /// Timestamp of the most recent accepted request.
     pub last_event_ms: Option<u64>,
     /// Timestamp of the most recent status publication.
     pub updated_ms: u64,
+}
+
+/// Authoritative "remote-input active" indicator for the seated user's shell
+/// (security-7). Published on `{INDICATOR_PREFIX}{node}` on every arm, disarm,
+/// TTL expiry, and active-window transition so a shell overlay can honestly
+/// show whether — and by whom — this seat is being remotely driven.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteInputIndicator {
+    /// Node whose seat this indicator describes.
+    pub node: String,
+    /// True while a live arm grant permits phone injection into this seat.
+    pub armed: bool,
+    /// True while armed AND a phone injected within the active window — i.e. a
+    /// phone is driving the seat right now, not merely permitted to.
+    pub active: bool,
+    /// Controlling source label from the arm grant, when armed.
+    pub source: Option<String>,
+    /// Phone id the arm grant is bound to, when the seated user named one.
+    pub phone: Option<String>,
+    /// Wall-clock ms at which the current arm auto-disarms, when armed.
+    pub armed_until_ms: Option<u64>,
+    /// Timestamp of this indicator publication.
+    pub updated_ms: u64,
+}
+
+/// Live arm grant: phone injection is permitted until `armed_until_ms`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArmState {
+    /// Wall-clock ms at which this grant auto-disarms.
+    armed_until_ms: u64,
+    /// Controlling source label recorded for the indicator/audit.
+    source: String,
+    /// Phone the grant is bound to, when the seated user named one.
+    phone: Option<String>,
+}
+
+/// Parsed arm-control command drained from [`ARM_TOPIC`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArmCommand {
+    /// Arm the seat for remote input for `ttl_ms` (clamped to `MAX_ARM_TTL_MS`).
+    Arm {
+        /// Requested arm lifetime in ms.
+        ttl_ms: u64,
+        /// Controlling source label.
+        source: String,
+        /// Optional phone binding: only this phone may then inject.
+        phone: Option<String>,
+    },
+    /// Explicitly disarm the seat now.
+    Disarm {
+        /// Source that requested the disarm.
+        source: String,
+    },
 }
 
 /// Error from the seat input injector.
@@ -248,6 +325,14 @@ pub struct SeatRemoteInputWorker {
     bus_root_override: Option<PathBuf>,
     injector: Arc<dyn SeatInputInjector>,
     status: RemoteInputStatus,
+    /// Current arm/consent grant, if the seat is armed for remote input.
+    arm: Option<ArmState>,
+    /// Bus cursor for the arm-control topic.
+    arm_cursor: Option<String>,
+    /// Timestamp of the last successful injection, for the `active` indicator.
+    last_injected_ms: Option<u64>,
+    /// Last-published indicator, so we only re-publish on a real transition.
+    last_indicator: Option<RemoteInputIndicator>,
 }
 
 impl SeatRemoteInputWorker {
@@ -279,10 +364,15 @@ impl SeatRemoteInputWorker {
                 accepted: 0,
                 injected: 0,
                 rejected: 0,
+                dropped: 0,
                 failed: 0,
                 last_event_ms: None,
                 updated_ms,
             },
+            arm: None,
+            arm_cursor: None,
+            last_injected_ms: None,
+            last_indicator: None,
         }
     }
 
@@ -337,6 +427,42 @@ impl SeatRemoteInputWorker {
 
     fn apply_request(&mut self, persist: &Persist, request: RemoteInputRequest) {
         let now = self.now_ms();
+
+        // security-7 consent gate: injection is refused unless the seated user
+        // has ARMED this seat for remote input and that grant is still live. An
+        // un-armed or expired seat drops the event with a durable audit row —
+        // it never reaches the root-capable uinput helper. This is the primary
+        // control: the local Bus carries no cryptographic identity
+        // (THREAT_MODEL §6.2.3), so a forged injection alone is inert.
+        let arm = self.arm.clone().filter(|a| now < a.armed_until_ms);
+        let Some(arm) = arm else {
+            self.record_drop(
+                persist,
+                &request,
+                now,
+                "dropped_unarmed",
+                "seat not armed for remote input",
+            );
+            return;
+        };
+
+        // Source sanity: when the seated user bound the arm to a specific phone,
+        // an injection claiming a different phone is dropped. The Bus gives no
+        // authenticated identity, so this only binds the observable arm to the
+        // phone the user consented to — it is not a cryptographic check.
+        if let Some(bound) = arm.phone.as_deref() {
+            if bound != request.phone {
+                self.record_drop(
+                    persist,
+                    &request,
+                    now,
+                    "dropped_source_mismatch",
+                    "injection phone does not match armed phone",
+                );
+                return;
+            }
+        }
+
         self.status.accepted = self.status.accepted.saturating_add(1);
         self.status.last_request_id = Some(request.id.clone());
         self.status.last_phone = Some(request.phone.clone());
@@ -349,7 +475,9 @@ impl SeatRemoteInputWorker {
                 self.status.injected = self.status.injected.saturating_add(1);
                 self.status.state = "injected".to_owned();
                 self.status.last_error = None;
+                self.last_injected_ms = Some(now);
                 self.publish_event(persist, &request, now, "injected", None);
+                self.refresh_indicator(persist);
             }
             Err(InputInjectError::Unavailable(e)) => {
                 self.status.failed = self.status.failed.saturating_add(1);
@@ -364,6 +492,177 @@ impl SeatRemoteInputWorker {
                 self.publish_event(persist, &request, now, "error", Some(&e));
             }
         }
+        self.publish_status(persist);
+    }
+
+    /// Record a consent-gated drop: no injection happened, but leave a durable
+    /// audit row and updated status so the refusal is observable.
+    fn record_drop(
+        &mut self,
+        persist: &Persist,
+        request: &RemoteInputRequest,
+        now: u64,
+        result: &str,
+        reason: &str,
+    ) {
+        self.status.dropped = self.status.dropped.saturating_add(1);
+        self.status.state = "dropped".to_owned();
+        self.status.last_request_id = Some(request.id.clone());
+        self.status.last_phone = Some(request.phone.clone());
+        self.status.last_kind = Some(request.event.kind_name().to_owned());
+        self.status.last_error = Some(reason.to_owned());
+        self.status.last_event_ms = Some(now);
+        self.status.updated_ms = now;
+        tracing::warn!(
+            target: "mackesd::seat_remote_input",
+            request_id = %request.id,
+            phone = %request.phone,
+            result,
+            "dropped remote-input injection: {reason}"
+        );
+        self.publish_event(persist, request, now, result, Some(reason));
+        self.publish_status(persist);
+    }
+
+    /// Drain seated-user arm/disarm consent grants from [`ARM_TOPIC`].
+    fn drain_arm(&mut self, persist: &Persist) {
+        let msgs = match persist.list_since(ARM_TOPIC, self.arm_cursor.as_deref()) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::debug!(target: "mackesd::seat_remote_input", error = %e, "arm list_since failed");
+                return;
+            }
+        };
+        for msg in msgs {
+            self.arm_cursor = Some(msg.ulid.clone());
+            let body = msg.body.unwrap_or_default();
+            match parse_arm(&body) {
+                Ok(ArmCommand::Arm {
+                    ttl_ms,
+                    source,
+                    phone,
+                }) => {
+                    let now = self.now_ms();
+                    let ttl = ttl_ms.min(MAX_ARM_TTL_MS);
+                    let armed_until_ms = now.saturating_add(ttl);
+                    self.arm = Some(ArmState {
+                        armed_until_ms,
+                        source: source.clone(),
+                        phone: phone.clone(),
+                    });
+                    tracing::info!(
+                        target: "mackesd::seat_remote_input",
+                        %source, armed_until_ms,
+                        "seat armed for remote input"
+                    );
+                    self.publish_arm_audit(
+                        persist,
+                        "arm",
+                        &source,
+                        phone.as_deref(),
+                        Some(armed_until_ms),
+                        now,
+                    );
+                    self.refresh_indicator(persist);
+                }
+                Ok(ArmCommand::Disarm { source }) => {
+                    if self.arm.take().is_some() {
+                        let now = self.now_ms();
+                        tracing::info!(target: "mackesd::seat_remote_input", %source, "seat disarmed");
+                        self.publish_arm_audit(persist, "disarm", &source, None, None, now);
+                        self.refresh_indicator(persist);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: "mackesd::seat_remote_input", error = %e, "ignored malformed arm control");
+                }
+            }
+        }
+    }
+
+    /// Auto-disarm once the live grant's TTL has elapsed, auditing the lapse.
+    fn expire_arm(&mut self, persist: &Persist) {
+        let now = self.now_ms();
+        let expired = self.arm.as_ref().is_some_and(|a| now >= a.armed_until_ms);
+        if expired {
+            let source = self
+                .arm
+                .as_ref()
+                .map(|a| a.source.clone())
+                .unwrap_or_default();
+            self.arm = None;
+            tracing::info!(target: "mackesd::seat_remote_input", %source, "seat arm expired (TTL)");
+            self.publish_arm_audit(persist, "disarm_ttl", &source, None, None, now);
+            self.refresh_indicator(persist);
+        }
+    }
+
+    /// Publish the authoritative remote-input indicator, but only when a real
+    /// transition (armed/active/source/phone/expiry) has occurred.
+    fn refresh_indicator(&mut self, persist: &Persist) {
+        let now = self.now_ms();
+        let live = self.arm.as_ref().filter(|a| now < a.armed_until_ms);
+        let active = live.is_some()
+            && self
+                .last_injected_ms
+                .is_some_and(|t| now.saturating_sub(t) <= ACTIVE_WINDOW_MS);
+        let indicator = RemoteInputIndicator {
+            node: self.node.clone(),
+            armed: live.is_some(),
+            active,
+            source: live.map(|a| a.source.clone()),
+            phone: live.and_then(|a| a.phone.clone()),
+            armed_until_ms: live.map(|a| a.armed_until_ms),
+            updated_ms: now,
+        };
+        let changed = self.last_indicator.as_ref().map_or(true, |prev| {
+            prev.armed != indicator.armed
+                || prev.active != indicator.active
+                || prev.source != indicator.source
+                || prev.phone != indicator.phone
+                || prev.armed_until_ms != indicator.armed_until_ms
+        });
+        if changed {
+            let topic = format!("{INDICATOR_PREFIX}{}", self.node);
+            if let Ok(body) = serde_json::to_string(&indicator) {
+                let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+            }
+            self.last_indicator = Some(indicator);
+        }
+    }
+
+    /// Durable audit row for an arm-state transition.
+    fn publish_arm_audit(
+        &self,
+        persist: &Persist,
+        action: &str,
+        source: &str,
+        phone: Option<&str>,
+        armed_until_ms: Option<u64>,
+        now: u64,
+    ) {
+        let topic = format!("{RESULT_PREFIX}{}", self.node);
+        let body = serde_json::json!({
+            "op": "seat_remote_input_arm",
+            "source": "seat_remote_input",
+            "node": self.node,
+            "action": action,
+            "arm_source": source,
+            "phone": phone,
+            "armed_until_ms": armed_until_ms,
+            "updated_ms": now,
+        })
+        .to_string();
+        let _ = persist.write(&topic, Priority::Default, None, Some(&body));
+    }
+
+    /// One consume-drain-publish cycle: refresh arm state, expire stale grants,
+    /// drain pending injections through the consent gate, and republish state.
+    fn tick_once(&mut self, persist: &Persist) {
+        self.drain_arm(persist);
+        self.expire_arm(persist);
+        self.drain_requests(persist);
+        self.refresh_indicator(persist);
         self.publish_status(persist);
     }
 
@@ -425,17 +724,23 @@ impl Worker for SeatRemoteInputWorker {
             }
         };
         self.publish_status(&persist);
+        // Publish the initial (disarmed) indicator so a shell overlay has a
+        // baseline "not being driven" state to render from.
+        self.refresh_indicator(&persist);
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.drain_requests(&persist);
-                    self.publish_status(&persist);
+                    self.tick_once(&persist);
                 }
                 () = shutdown.wait() => break,
             }
         }
+        // Fail closed on shutdown: drop any live arm and clear its indicator so
+        // a restart never inherits a stale "armed" grant.
+        self.arm = None;
+        self.refresh_indicator(&persist);
         self.publish_status(&persist);
         Ok(())
     }
@@ -525,6 +830,46 @@ fn parse_request(body: &str, id: &str) -> Result<RemoteInputRequest, String> {
     })
 }
 
+fn parse_arm(body: &str) -> Result<ArmCommand, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("arm JSON: {e}"))?;
+    let op = v
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing op".to_owned())?;
+    let source = required_string(&v, "source", MAX_PHONE_CHARS)?;
+    if source.is_empty() {
+        return Err("empty source".to_owned());
+    }
+    match op {
+        "arm" | "seat_remote_input_arm" => {
+            let ttl_ms = v
+                .get("ttl_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(DEFAULT_ARM_TTL_MS);
+            if ttl_ms == 0 {
+                return Err("zero ttl".to_owned());
+            }
+            let phone = match v.get("phone") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(_) => {
+                    let p = required_string(&v, "phone", MAX_PHONE_CHARS)?;
+                    if !valid_phone(&p) {
+                        return Err("invalid phone".to_owned());
+                    }
+                    Some(p)
+                }
+            };
+            Ok(ArmCommand::Arm {
+                ttl_ms,
+                source,
+                phone,
+            })
+        }
+        "disarm" | "seat_remote_input_disarm" => Ok(ArmCommand::Disarm { source }),
+        _ => Err("unsupported arm op".to_owned()),
+    }
+}
+
 fn required_string(v: &serde_json::Value, key: &str, max_chars: usize) -> Result<String, String> {
     let value = v
         .get(key)
@@ -588,6 +933,7 @@ fn default_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
     use mde_bus::hooks::config::Priority;
@@ -599,6 +945,43 @@ mod tests {
     struct RecordingInjector {
         calls: Mutex<Vec<SeatRemoteInputEvent>>,
         error: Option<InputInjectError>,
+    }
+
+    /// Deterministic advanceable clock for TTL/expiry tests.
+    fn clock(start: u64) -> (Arc<AtomicU64>, NowFn) {
+        let c = Arc::new(AtomicU64::new(start));
+        let reader = c.clone();
+        (c, Arc::new(move || reader.load(Ordering::SeqCst)))
+    }
+
+    /// An unbound arm grant with the given TTL.
+    fn arm_body(ttl_ms: u64) -> String {
+        serde_json::json!({
+            "op": "arm",
+            "source": "shell:seat-user",
+            "ttl_ms": ttl_ms,
+        })
+        .to_string()
+    }
+
+    fn live_arm() -> Option<ArmState> {
+        Some(ArmState {
+            armed_until_ms: u64::MAX,
+            source: "shell:test".to_owned(),
+            phone: None,
+        })
+    }
+
+    fn latest_indicator(persist: &Persist, node: &str) -> RemoteInputIndicator {
+        let topic = format!("{INDICATOR_PREFIX}{node}");
+        let rows = persist.list_since(&topic, None).expect("indicator rows");
+        let body = rows
+            .last()
+            .expect("an indicator row")
+            .body
+            .clone()
+            .expect("body");
+        serde_json::from_str(&body).expect("indicator JSON")
     }
 
     impl SeatInputInjector for RecordingInjector {
@@ -711,6 +1094,7 @@ mod tests {
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
             .with_now_fn(Arc::new(|| 777));
+        worker.arm = live_arm();
         let request = parse_request(&move_body(), "req-1").expect("request");
 
         worker.apply_request(&persist, request);
@@ -754,6 +1138,7 @@ mod tests {
         });
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
             .with_now_fn(Arc::new(|| 888));
+        worker.arm = live_arm();
         let request = parse_request(&move_body(), "req-1").expect("request");
 
         worker.apply_request(&persist, request);
@@ -790,6 +1175,9 @@ mod tests {
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
             .with_now_fn(Arc::new(|| 999));
+        // Armed so the well-formed request is dispatched (not consent-dropped),
+        // keeping this test focused on malformed-rejection + no-replay.
+        worker.arm = live_arm();
 
         worker.drain_requests(&persist);
         worker.drain_requests(&persist);
@@ -800,6 +1188,138 @@ mod tests {
             .list_since("event/seat-remote-input/node-a", None)
             .expect("events");
         assert_eq!(events.len(), 1, "cursor prevents replay");
+    }
+
+    #[test]
+    fn unarmed_seat_drops_injection_and_audits() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .expect("write injection");
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
+            .with_now_fn(Arc::new(|| 1000));
+
+        // No arm grant present.
+        worker.tick_once(&persist);
+
+        assert!(
+            injector.calls.lock().unwrap().is_empty(),
+            "un-armed seat must not reach the uinput injector"
+        );
+        assert_eq!(worker.status.dropped, 1);
+        assert_eq!(worker.status.injected, 0);
+        assert_eq!(worker.status.accepted, 0);
+
+        let event_body = persist
+            .list_since("event/seat-remote-input/node-a", None)
+            .expect("event")[0]
+            .body
+            .clone()
+            .expect("body");
+        let event: serde_json::Value = serde_json::from_str(&event_body).expect("event JSON");
+        assert_eq!(event["result"], "dropped_unarmed");
+        assert_eq!(event["error"], "seat not armed for remote input");
+    }
+
+    #[test]
+    fn armed_seat_delivers_phone_injection() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
+            .expect("write arm");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .expect("write injection");
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
+            .with_now_fn(Arc::new(|| 1000));
+
+        worker.tick_once(&persist);
+
+        assert_eq!(
+            *injector.calls.lock().unwrap(),
+            vec![SeatRemoteInputEvent::Move { dx: 12.5, dy: -2.0 }],
+            "armed seat delivers the injection"
+        );
+        assert_eq!(worker.status.injected, 1);
+        assert_eq!(worker.status.dropped, 0);
+    }
+
+    #[test]
+    fn arm_auto_disarms_after_ttl() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let (clk, now_fn) = clock(1_000);
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
+            .with_now_fn(now_fn);
+
+        // Arm for 5s, then inject once inside the window -> delivered.
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(5_000)))
+            .expect("write arm");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .expect("write injection 1");
+        worker.tick_once(&persist);
+        assert_eq!(worker.status.injected, 1);
+        assert!(worker.arm.is_some());
+
+        // Advance past the TTL, inject again -> auto-disarmed, dropped.
+        clk.store(1_000 + 5_000 + 1, Ordering::SeqCst);
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .expect("write injection 2");
+        worker.tick_once(&persist);
+
+        assert_eq!(
+            worker.status.injected, 1,
+            "no injection after the TTL lapses"
+        );
+        assert_eq!(worker.status.dropped, 1);
+        assert_eq!(injector.calls.lock().unwrap().len(), 1);
+        assert!(worker.arm.is_none(), "grant auto-disarmed");
+        assert!(!latest_indicator(&persist, "node-a").armed);
+    }
+
+    #[test]
+    fn indicator_published_on_arm_and_cleared_on_disarm() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
+            .with_now_fn(Arc::new(|| 1_000));
+
+        // Baseline: worker publishes a disarmed indicator up front.
+        worker.refresh_indicator(&persist);
+        assert!(!latest_indicator(&persist, "node-a").armed);
+
+        // Arm -> indicator reports armed + the controlling source.
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
+            .expect("write arm");
+        worker.tick_once(&persist);
+        let armed = latest_indicator(&persist, "node-a");
+        assert!(armed.armed);
+        assert_eq!(armed.source.as_deref(), Some("shell:seat-user"));
+        assert_eq!(armed.armed_until_ms, Some(1_000 + 60_000));
+
+        // Disarm -> indicator cleared.
+        persist
+            .write(
+                ARM_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::json!({"op":"disarm","source":"shell:seat-user"}).to_string()),
+            )
+            .expect("write disarm");
+        worker.tick_once(&persist);
+        let cleared = latest_indicator(&persist, "node-a");
+        assert!(!cleared.armed);
+        assert_eq!(cleared.source, None);
     }
 
     #[test]
