@@ -2388,9 +2388,9 @@ fn badge_for(
             Some(BadgeKind::Count(status.mesh.peers_online))
         }
         Surface::System if status.mesh.seen => Some(BadgeKind::Health(match status.mesh.health {
-            mde_cosmic_applet::LighthouseHealth::AllHealthy => BadgeTone::Healthy,
-            mde_cosmic_applet::LighthouseHealth::Degraded => BadgeTone::Degraded,
-            mde_cosmic_applet::LighthouseHealth::None => BadgeTone::Offline,
+            mde_lighthouse_health::LighthouseHealth::AllHealthy => BadgeTone::Healthy,
+            mde_lighthouse_health::LighthouseHealth::Degraded => BadgeTone::Degraded,
+            mde_lighthouse_health::LighthouseHealth::None => BadgeTone::Offline,
         })),
         _ => None,
     }
@@ -4913,7 +4913,7 @@ mod tests {
             MeshSummary {
                 peers_total: 5,
                 peers_online: 4,
-                health: mde_cosmic_applet::LighthouseHealth::Degraded,
+                health: mde_lighthouse_health::LighthouseHealth::Degraded,
                 seen: true,
             },
             None,
@@ -5123,7 +5123,7 @@ mod tests {
             MeshSummary {
                 peers_total: 4,
                 peers_online: 3,
-                health: mde_cosmic_applet::LighthouseHealth::AllHealthy,
+                health: mde_lighthouse_health::LighthouseHealth::AllHealthy,
                 seen: true,
             },
             None,

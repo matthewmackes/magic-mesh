@@ -211,7 +211,7 @@ jobs:
             --features mackesd/async-services \
             --exclude mde-workbench --exclude mde-files --exclude mde-voice-hud \
             --exclude mde-music --exclude mde-iced-components \
-            --exclude mde-cosmic-applet --exclude mde-role-chooser \
+            --exclude mde-lighthouse-health --exclude mde-role-chooser \
             --ignore-filename-regex '(/bin/[^/]+\.rs|/main\.rs)$' \
             --fail-under-lines 80 \
             --summary-only \

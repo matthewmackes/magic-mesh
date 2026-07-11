@@ -159,9 +159,9 @@
 
 use std::time::Duration;
 
-use mde_cosmic_applet::LighthouseHealth;
 use mde_egui::egui;
 use mde_egui::{Motion, Style};
+use mde_lighthouse_health::LighthouseHealth;
 
 use crate::chrome::MeshSummary;
 use crate::console::{self, ConsoleState};

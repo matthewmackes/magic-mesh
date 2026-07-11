@@ -1,5 +1,5 @@
 //! `mde-panel-egui` — the MCNF E12 "Quasar" egui **panel client** (E12-7), the
-//! egui replacement for the retired Cosmic-era cosmic-applet.
+//! egui replacement for the retired Cosmic-era applet.
 //!
 //! The panel shows two things, both off live mesh state:
 //!
@@ -18,7 +18,7 @@
 //! and no GPU here**, so the whole model is unit-tested in isolation.
 //!
 //! Reuse, not reimplementation (§6): the pip's parsing + worst-of decision is the
-//! cosmic-applet's [`lighthouse_health_from_snapshot`] (itself built on
+//! mde-lighthouse-health crate's [`lighthouse_health_from_snapshot`] (itself built on
 //! `mackes-mesh-types`' `LIGHTHOUSE_ROLE`), and the quick action's state is
 //! `mde_bus`'s [`DndState`]. This crate is the egui glue that renders them.
 //!
@@ -29,11 +29,11 @@ use mde_egui::Style;
 
 use mde_bus::dnd::DndState;
 
-// Reuse the cosmic-applet's render-agnostic LIGHTHOUSE-7 model: the snapshot
+// Reuse mde-lighthouse-health's render-agnostic LIGHTHOUSE-7 model: the snapshot
 // parser + the worst-of health enum. `LighthouseHealth` is re-exported so the
 // eframe shell can match on it (and the unit tests assert the Style mapping).
-use mde_cosmic_applet::lighthouse_health_from_snapshot;
-pub use mde_cosmic_applet::LighthouseHealth;
+use mde_lighthouse_health::lighthouse_health_from_snapshot;
+pub use mde_lighthouse_health::LighthouseHealth;
 
 /// The Do-Not-Disturb quick action's button label.
 ///

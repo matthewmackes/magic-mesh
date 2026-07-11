@@ -105,7 +105,7 @@ qrcode = { version = "0.14", default-features = false }
 # applet's Cosmic-era panel shell (E12 retires that toolkit) — only the pure logic
 # layer compiles in. platform tier; the edge points inward (§6), the same reuse
 # the egui panel client (mde-panel-egui) makes.
-mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-features = false }
+mde-lighthouse-health = { path = "../../platform/mde-lighthouse-health", default-features = false }
 
 # E12-3b EMBED — the three polished mesh-control surfaces are mounted as in-shell
 # panels (Quasar §5: panels in the one shell, not separate clients). Each is a

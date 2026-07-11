@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use mde_egui::egui::{self, Align2, Color32, FontId, RichText};
 use mde_egui::{Motion, Style};
 
-use mde_cosmic_applet::LighthouseHealth;
+use mde_lighthouse_health::LighthouseHealth;
 use mde_media_egui::{MediaSurface, TransportAction};
 use mde_seat::{Battery, BatteryState, MixerClient, PwGraph, SeatError, SeatSnapshot};
 use mde_theme::brand::icons::IconId;

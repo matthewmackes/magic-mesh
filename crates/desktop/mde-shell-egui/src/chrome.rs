@@ -28,7 +28,7 @@ use mde_egui::egui;
 use serde::Deserialize;
 
 use mackes_mesh_types::peers::default_workgroup_root;
-use mde_cosmic_applet::{lighthouse_health_from_snapshot, LighthouseHealth};
+use mde_lighthouse_health::{lighthouse_health_from_snapshot, LighthouseHealth};
 
 /// The world-readable mesh-status snapshot the root timer writes. The shell
 /// reads peers + lighthouse health from it exactly like the panel client — the

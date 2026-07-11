@@ -45,7 +45,7 @@ exclude = [
 members = [
     "crates/platform/mde-bus",
     "crates/platform/mde-role",
-    "crates/platform/mde-cosmic-applet",
+    "crates/platform/mde-lighthouse-health",
     "crates/platform/mde-role-chooser",
     "crates/mesh/mackes-config",
     "crates/mesh/mackes-mesh-types",

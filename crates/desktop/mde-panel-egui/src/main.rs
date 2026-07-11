@@ -27,12 +27,12 @@ use mde_panel_egui::{PanelModel, DND_LABEL};
 const APP_ID: &str = "org.magicmesh.Panel";
 
 /// Poll cadence for the live sources: a new snapshot or a peer's DND flip
-/// surfaces within this window. Matches the cosmic-applet's 5 s refresh.
+/// surfaces within this window. Matches mde-lighthouse-health's 5 s refresh.
 const REFRESH: Duration = Duration::from_secs(5);
 
 /// The world-readable mesh-status snapshot the root timer writes. The panel runs
 /// as the desktop user and cannot read the root-only peer directory, so this is
-/// the mesh-health read path (the same source the cosmic-applet's LIGHTHOUSE-7
+/// the mesh-health read path (the same source mde-lighthouse-health's LIGHTHOUSE-7
 /// pip used).
 const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
 

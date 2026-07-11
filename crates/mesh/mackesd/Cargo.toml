@@ -514,7 +514,7 @@ assets = [
     # now render as egui panels in mde-shell-egui — the file manager (mde-files),
     # music player (mde-music), voice HUD (mde-voice-hud), and the cosmic-applet.
     # Their /usr/bin binaries + their autostart/launcher .desktop files no longer
-    # ship (mde-files/mde-voice-hud/mde-cosmic-applet are now lib-only; mde-music
+    # ship (mde-files/mde-voice-hud/mde-lighthouse-health are now lib-only; mde-music
     # is deleted). The mde-musicd DAEMON stays — it drives the shell's Music panel.
     { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },
     # APPLAUNCH-9 (2026-06-27) — the mde-apps-applet launcher binary was RETIRED:

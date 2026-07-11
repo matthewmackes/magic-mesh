@@ -1,4 +1,6 @@
-//! GUI-6 (Q46/47) — the MCNF cosmic-applet's logic layer.
+//! GUI-6 (Q46/47) — the MCNF lighthouse-health logic layer (LIGHTHOUSE-7).
+//! (arch-13: renamed from `mde-cosmic-applet`; the crate is render-agnostic and
+//! has no Cosmic-toolkit ties — only the retired name lingered.)
 //!
 //! This module is the **render-agnostic, fully-tested core** — the
 //! lighthouse-health panel indicator (LIGHTHOUSE-7). E12-14b stripped the
@@ -9,7 +11,7 @@
 
 // ──────────────────── LIGHTHOUSE-7 — panel health indicator ────────────────
 //
-// A worst-of green/red lighthouse-health indicator for the Cosmic panel applet
+// A worst-of green/red lighthouse-health indicator for the panel applet surface
 // (LIGHTHOUSE-7's "applet" surface): a single dot that is green only when every
 // lighthouse is up, red the moment any one is degraded/offline, and absent when
 // the snapshot names no lighthouses. Clicking it deep-links into the Workbench

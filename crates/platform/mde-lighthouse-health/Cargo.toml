@@ -1,10 +1,10 @@
 [package]
-name = "mde-cosmic-applet"
+name = "mde-lighthouse-health"
 version = "0.1.0"
 edition = "2021"
 # EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
 license.workspace = true
-description = "MCNF cosmic-applet core: mesh health pip + quick actions over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Render-agnostic logic layer, lib-only since E12-14b stripped the Cosmic-era panel-shell bin; the egui panel/shell reuse it."
+description = "MCNF lighthouse-health core (LIGHTHOUSE-7): the render-agnostic mesh lighthouse-health pip model over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Lib-only since E12-14b stripped the Cosmic-era panel-shell bin; the egui panel/shell reuse it. (arch-13: renamed from the retired-toolkit name mde-cosmic-applet — the crate is render-agnostic, no Cosmic ties remain.)"
 
 [lib]
 path = "src/lib.rs"
