@@ -64,7 +64,7 @@ operator-provided cred/host — drop any and the loop wires + live-verifies it:
   Bus/DRM seat leg. *(Corrected 2026-07-11: **QC-15 deleted mde-kvm/cloud-hypervisor
   outright** — `first_desktop.rs` now drives `workers::session_broker::LiveNovaPlacement`,
   not a cloud-hypervisor api-socket + golden disk. Cf. the WORKLIST OW-8 supersession
-  note and the E12-9 correction already on line 69.)*
+  note and the E12-9 remote-audio DESCOPED correction below.)*
 - **OW-11 service-add** — _needs:_ **DO Spaces creds** (Music → Navidrome, overlaps
   MEDIA-2) + an **external SIP account** (Voice) so `LiveServiceApply` can provision /
   register.
