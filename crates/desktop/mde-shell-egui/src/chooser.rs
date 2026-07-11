@@ -2675,6 +2675,20 @@ fn source_card(
     let controls = scoped.inner;
     let response = scoped.response.on_hover_text(card_tooltip(source));
 
+    // a11y-05 — the card's own accesskit `Button` node (role + name + state +
+    // bounds + Click), keyed by the response id so egui merges it onto this
+    // sensing scope. Pure metadata: registered every frame, never alters the
+    // paint above.
+    install_card_accessibility(
+        ui.ctx(),
+        response.id,
+        source,
+        favorite,
+        pending,
+        recent,
+        response.rect,
+    );
+
     // CHOOSER-8 — the per-card context menu (right click). A menu pick takes
     // precedence over the inline controls + the primary click.
     let mut menu_action = None;
@@ -3237,6 +3251,100 @@ fn edit_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
     ui.add_space(Style::SP_XS);
 }
 
+// ── accesskit (a11y-05 / shell-ux-6) ─────────────────────────────────────────
+//
+// The Desktop Chooser's grid is the shell's primary entry-navigation surface,
+// yet every [`source_card`] is a hand-rolled `scope_builder(...).sense(click)`
+// container painted with raw [`egui::Painter`] calls — egui only auto-generates
+// accesskit nodes for real widgets (`Button`/`TextEdit`) via
+// `Response::widget_info`, never for these raw sensing scopes (the same gap
+// dock.rs/console.rs closed for their own cells under WIN7-5/WIN7-7). So a
+// screen reader walking this grid heard nothing. This section gives each
+// pickable card its own `Role::Button` node keyed by the card response's id —
+// the identical shape (`role` + fixed identity `label` + current `value` +
+// `bounds` + `Click` action) `console.rs`'s `install_row_accessibility` and
+// `dock.rs`'s `install_cell_accessibility` already use, restated module-locally
+// per this crate's established per-module-copy convention. Selected/offline/
+// pinned state rides in the `value` string, exactly as dock.rs carries its
+// pin/notification state in the accesskit value (no `set_disabled`/
+// `set_selected` — the crate's whole shell keeps to the five setters).
+
+/// Convert an egui rect to an accesskit one (the `console.rs`/`dock.rs` helper,
+/// restated module-locally — the established per-module-copy idiom).
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+/// The accessible **name** of a desktop card — its display identity, the same
+/// string the card paints in bold ([`card_body`]). A screen reader announces
+/// "button, {name}, {state}", so the name is the identity and the reading rides
+/// in the value ([`card_a11y_state`]).
+fn card_a11y_name(source: &DesktopSource) -> String {
+    source.name.clone()
+}
+
+/// The accessible **state/value** of a desktop card — mirrors the visible
+/// caption ([`card_body`]) so the two can never drift: the greyed card's worker
+/// `reason` when offline, else "{reachability} · {origin}[ · recently used]",
+/// plus the VM power reading, and the pinned / connecting markers the card
+/// paints as a corner dot / accent border. Screen-reader users get exactly what
+/// a sighted operator reads off the card.
+fn card_a11y_state(source: &DesktopSource, favorite: bool, pending: bool, recent: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // The primary caption line — the offline reason replaces the status/origin
+    // caption exactly as the painted `muted_note` does (lock 14).
+    match source.reason.as_deref() {
+        Some(reason) if !source.connectable() => parts.push(reason.to_owned()),
+        _ => {
+            parts.push(source.reachability.label().to_owned());
+            parts.push(source.origin.label().to_owned());
+            if recent {
+                parts.push("recently used".to_owned());
+            }
+        }
+    }
+    if let Some(power) = source.power_state.as_deref() {
+        parts.push(format!("vm {power}"));
+    }
+    if favorite {
+        parts.push("pinned".to_owned());
+    }
+    if pending {
+        parts.push("connecting".to_owned());
+    }
+    parts.join(" \u{00B7} ")
+}
+
+/// Install one desktop card's accesskit `Button` node, keyed by the card
+/// response's own id so egui merges it onto the sensing scope (the same
+/// id-keyed merge dock.rs relies on for its raw cells). A no-op-shaped call
+/// when the `accesskit` feature is off (egui returns `None` and the builder is
+/// never invoked); a pure metadata write when on — never touches rendering.
+fn install_card_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    source: &DesktopSource,
+    favorite: bool,
+    pending: bool,
+    recent: bool,
+    rect: egui::Rect,
+) {
+    let name = card_a11y_name(source);
+    let state = card_a11y_state(source, favorite, pending, recent);
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(name);
+        node.set_value(state);
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
 // ───────────────────────────── tests ─────────────────────────────
 
 #[cfg(test)]
@@ -3431,6 +3539,50 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(png)
         )
+    }
+
+    // ── a11y-05: the desktop-card accessible name/state seam ──
+
+    #[test]
+    fn card_a11y_name_is_the_display_identity() {
+        let state = parse_sources(FIXTURE).expect("fixture parses");
+        // The accessible name is exactly the bold display name the card paints.
+        assert_eq!(card_a11y_name(&state.sources[0]), "oak");
+        assert_eq!(card_a11y_name(&state.sources[2]), "OfficePC");
+    }
+
+    #[test]
+    fn card_a11y_state_mirrors_the_visible_caption_and_carries_markers() {
+        let state = parse_sources(FIXTURE).expect("fixture parses");
+        let oak = &state.sources[0]; // reachable mesh peer, no power
+        assert_eq!(
+            card_a11y_state(oak, false, false, false),
+            "reachable \u{00B7} mesh peer",
+            "the base value mirrors the painted status \u{00B7} origin caption",
+        );
+        assert_eq!(
+            card_a11y_state(oak, false, false, true),
+            "reachable \u{00B7} mesh peer \u{00B7} recently used",
+            "the recents marker matches the caption's CHOOSER-9 tail",
+        );
+        assert_eq!(
+            card_a11y_state(oak, true, true, false),
+            "reachable \u{00B7} mesh peer \u{00B7} pinned \u{00B7} connecting",
+            "the pin dot + pending border ride the value as trailing markers",
+        );
+    }
+
+    #[test]
+    fn card_a11y_state_uses_the_offline_reason_and_vm_power() {
+        let state = parse_sources(FIXTURE).expect("fixture parses");
+        // win11 is unreachable → the worker reason replaces the status/origin
+        // caption (lock 14), and the VM power reading is appended — exactly the
+        // two lines the greyed card paints.
+        let win11 = &state.sources[1];
+        assert_eq!(
+            card_a11y_state(win11, false, false, false),
+            "vm shut off \u{00B7} vm shut off",
+        );
     }
 
     // ── the wire mirror ──
