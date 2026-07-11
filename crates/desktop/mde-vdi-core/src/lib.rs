@@ -17,6 +17,10 @@
 //! * [`pixel`] — the [`RgbaSurface`]: the persistent, tightly-packed RGBA8 desktop
 //!   store (opaque-black init + [`egui::ColorImage`] hand-off) each transport's
 //!   `Framebuffer` wraps and paints into with its own protocol-specific blit.
+//! * [`damage`] — the per-frame damage rectangles ([`DamageRect`] / [`DamageLog`] /
+//!   [`FrameDamage`]) a transport records as it blits, plus the pure slice math
+//!   ([`sub_color_image`]) the shell partial-uploads with, so a changed frame moves
+//!   only its damaged sub-rectangles to the GPU instead of the whole framebuffer.
 //!
 //! What legitimately **differs** stays in each transport crate: VNC's X11 keysym
 //! map + DES challenge + RFB pixel format, SPICE's surface-format tags + scancode
@@ -32,9 +36,11 @@
 // share exactly one egui resolution.
 pub use mde_egui::egui;
 
+pub mod damage;
 pub mod input;
 pub mod pixel;
 
+pub use damage::{paint_sub_image, sub_color_image, DamageLog, DamageRect, FrameDamage};
 pub use input::{
     clamp_u16, dominant_axis, scancode_for, ModKey, ModifierTracker, Scancode, ALT_SCANCODE,
     CTRL_SCANCODE, SHIFT_SCANCODE,

@@ -34,6 +34,7 @@ use crate::link::{
 };
 use crate::pixel::{Framebuffer, FramebufferError, PixelFormat};
 use crate::tier::RdpTierSettings;
+use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
 
 /// The egui-facing RDP desktop: a framebuffer the shell renders + an input queue
 /// the wire pump drains.
@@ -42,6 +43,11 @@ pub struct RdpSession {
     framebuffer: Framebuffer,
     /// Set whenever the framebuffer changed since the last [`RdpSession::frame`].
     dirty: bool,
+    /// The changed rectangles accumulated since the last frame — the partial-upload
+    /// hint the shell reads via [`RdpSession::frame_with_damage`] (perf-7). Purely
+    /// additive: `dirty` still gates whether a frame is emitted, so a stale or empty
+    /// log only ever degrades the shell to a (correct) full upload.
+    damage: DamageLog,
     /// Input intents awaiting the wire pump, in arrival order.
     pending: Vec<RdpInputEvent>,
     /// Last absolute pointer position pushed (desktop pixels).
@@ -77,6 +83,7 @@ impl RdpSession {
             config,
             framebuffer,
             dirty: true,
+            damage: DamageLog::new(),
             pending: Vec::new(),
             pointer: (0, 0),
             modifiers: ModifierState::default(),
@@ -126,6 +133,10 @@ impl RdpSession {
         self.framebuffer
             .apply_rect(x, y, w, h, format, src, src_stride)?;
         self.dirty = true;
+        // Record exactly the blitted region so the shell can partial-upload it. The
+        // framebuffer already rejected out-of-bounds rects above, so this is a real,
+        // in-surface damage rectangle (empty rects are ignored by the log).
+        self.damage.push(DamageRect::new(x, y, w, h));
         Ok(())
     }
 
@@ -140,16 +151,35 @@ impl RdpSession {
     ) -> Result<(), FramebufferError> {
         self.framebuffer.apply_full(format, src)?;
         self.dirty = true;
+        // A whole-desktop replace: the changed region is the entire surface, so the
+        // shell must do a full upload.
+        self.damage.mark_full();
         Ok(())
     }
 
     /// The latest desktop as an [`egui::ColorImage`], or `None` if nothing changed
-    /// since the previous call. Clears the dirty flag.
+    /// since the previous call. Clears the dirty flag. Equivalent to
+    /// [`RdpSession::frame_with_damage`] ignoring the damage hint.
     pub fn frame(&mut self) -> Option<ColorImage> {
+        self.frame_with_damage().map(|(image, _)| image)
+    }
+
+    /// The latest desktop plus which rectangles changed since the previous call, or
+    /// `None` if nothing changed. Clears the dirty flag + drains the damage log.
+    ///
+    /// The damage is a hint for a partial GPU upload ([`FrameDamage::Rects`]); the
+    /// first frame (and any path with no reliable geometry) reports
+    /// [`FrameDamage::Full`], so the shell always has a correct upload to fall back
+    /// to. `dirty` — not the damage log — decides whether a frame is emitted, so
+    /// this never skips a frame `frame` would have produced.
+    pub fn frame_with_damage(&mut self) -> Option<(ColorImage, FrameDamage)> {
         if self.dirty {
             self.dirty = false;
-            Some(self.framebuffer.to_color_image())
+            let damage = self.damage.take().unwrap_or(FrameDamage::Full);
+            Some((self.framebuffer.to_color_image(), damage))
         } else {
+            // Keep the log in step with the (unchanged) dirty flag.
+            self.damage.clear();
             None
         }
     }
@@ -378,6 +408,47 @@ mod tests {
         assert_eq!(img.pixels[0], Color32::from_rgb(0xFF, 0, 0));
         assert_eq!(img.pixels[1], Color32::from_rgb(0, 0, 0xFF));
         assert!(s.frame().is_none(), "no further change");
+    }
+
+    #[test]
+    fn first_frame_reports_full_damage() {
+        use mde_vdi_core::FrameDamage;
+        let mut s = session();
+        let (img, damage) = s.frame_with_damage().expect("first frame");
+        assert_eq!(img.size, [200, 200]);
+        assert_eq!(
+            damage,
+            FrameDamage::Full,
+            "the initial upload is whole-frame"
+        );
+        assert!(s.frame_with_damage().is_none(), "cleared");
+    }
+
+    #[test]
+    fn apply_rect_reports_its_rectangle_as_damage() {
+        use mde_vdi_core::{DamageRect, FrameDamage};
+        let mut s = session();
+        let _ = s.frame_with_damage(); // consume the initial full frame
+        let src = [0x00, 0x00, 0xFF, 0xFF]; // one BGRA red pixel
+        s.apply_rect(3, 5, 1, 1, PixelFormat::Bgra, &src, 4)
+            .expect("apply");
+        let (_img, damage) = s.frame_with_damage().expect("frame");
+        assert_eq!(
+            damage,
+            FrameDamage::Rects(vec![DamageRect::new(3, 5, 1, 1)]),
+            "the exact blitted region is the damage"
+        );
+    }
+
+    #[test]
+    fn apply_full_frame_reports_full_damage() {
+        use mde_vdi_core::FrameDamage;
+        let mut s = session();
+        let _ = s.frame_with_damage();
+        let src = vec![0x00u8; 200 * 200 * 4];
+        s.apply_full_frame(PixelFormat::Bgra, &src).expect("full");
+        let (_img, damage) = s.frame_with_damage().expect("frame");
+        assert_eq!(damage, FrameDamage::Full, "a full replace uploads whole");
     }
 
     #[test]

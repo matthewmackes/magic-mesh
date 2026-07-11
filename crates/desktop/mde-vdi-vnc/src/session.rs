@@ -40,6 +40,7 @@ use crate::link::{
 use crate::pixel::{Framebuffer, PixelFormat};
 use crate::tier::VncTierSettings;
 use crate::wire::{RfbClientMessage, RfbControlMessage};
+use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
 
 /// The egui-facing RFB desktop: a framebuffer the shell renders + an input queue
 /// the transport drains.
@@ -49,6 +50,11 @@ pub struct VncSession {
     framebuffer: Framebuffer,
     /// Set whenever the framebuffer changed since the last [`VncSession::frame`].
     dirty: bool,
+    /// The changed rectangles accumulated since the last frame — the partial-upload
+    /// hint the shell reads via [`VncSession::frame_with_damage`] (perf-7). Purely
+    /// additive: `dirty` still gates whether a frame is emitted, so a stale or empty
+    /// log only ever degrades the shell to a (correct) full upload.
+    damage: DamageLog,
     /// Wire-ready input messages awaiting the transport, in arrival order.
     pending: Vec<RfbClientMessage>,
     /// Last absolute pointer position pushed (framebuffer pixels).
@@ -95,6 +101,7 @@ impl VncSession {
             format: PixelFormat::rgba8888(),
             framebuffer,
             dirty: true,
+            damage: DamageLog::new(),
             pending: Vec::new(),
             pointer: (0, 0),
             buttons: 0,
@@ -171,6 +178,12 @@ impl VncSession {
         let rects = decode_framebuffer_update(&mut reader, &mut self.framebuffer, self.format)?;
         if rects > 0 {
             self.dirty = true;
+            // The batch decoder blits its rectangles internally without surfacing
+            // their geometry here, so mark the whole surface changed — the shell
+            // falls back to a full upload for this path. The per-rectangle
+            // [`VncSession::apply_rect`] entry the live transport uses does carry
+            // exact geometry (below).
+            self.damage.mark_full();
         }
         Ok(rects)
     }
@@ -188,6 +201,15 @@ impl VncSession {
         let mut reader = Reader::new(payload);
         decode_rect(rect, &mut reader, &mut self.framebuffer, self.format)?;
         self.dirty = true;
+        // Record exactly the decoded rectangle so the shell can partial-upload it
+        // (empty rects are ignored by the log). `CopyRect` moves pixels *into* this
+        // destination rectangle, so the destination bounds are the changed region.
+        self.damage.push(DamageRect::new(
+            usize::from(rect.x),
+            usize::from(rect.y),
+            usize::from(rect.width),
+            usize::from(rect.height),
+        ));
         Ok(())
     }
 
@@ -197,15 +219,32 @@ impl VncSession {
         self.framebuffer
             .resize(usize::from(width), usize::from(height));
         self.dirty = true;
+        // A resize reallocates the desktop; the shell must full-`set` (which resizes
+        // the GPU texture) rather than partial-upload into the old dimensions.
+        self.damage.mark_full();
     }
 
     /// The latest desktop as an [`egui::ColorImage`], or `None` if nothing changed
-    /// since the previous call. Clears the dirty flag.
+    /// since the previous call. Clears the dirty flag. Equivalent to
+    /// [`VncSession::frame_with_damage`] ignoring the damage hint.
     pub fn frame(&mut self) -> Option<ColorImage> {
+        self.frame_with_damage().map(|(image, _)| image)
+    }
+
+    /// The latest desktop plus which rectangles changed since the previous call, or
+    /// `None` if nothing changed. Clears the dirty flag + drains the damage log.
+    ///
+    /// The damage is a hint for a partial GPU upload ([`FrameDamage::Rects`]); the
+    /// first frame, a resize, and the batch-decode path report [`FrameDamage::Full`],
+    /// so the shell always has a correct full upload to fall back to. `dirty` — not
+    /// the damage log — decides whether a frame is emitted.
+    pub fn frame_with_damage(&mut self) -> Option<(ColorImage, FrameDamage)> {
         if self.dirty {
             self.dirty = false;
-            Some(self.framebuffer.to_color_image())
+            let damage = self.damage.take().unwrap_or(FrameDamage::Full);
+            Some((self.framebuffer.to_color_image(), damage))
         } else {
+            self.damage.clear();
             None
         }
     }
@@ -522,6 +561,55 @@ mod tests {
             .expect("rect"); // green
         let img = s.frame().expect("frame");
         assert_eq!(img.pixels[0], Color32::from_rgb(0, 0xFF, 0));
+    }
+
+    #[test]
+    fn first_frame_reports_full_damage() {
+        use mde_vdi_core::FrameDamage;
+        let mut s = session();
+        let (img, damage) = s.frame_with_damage().expect("first frame");
+        assert_eq!(img.size, [16, 16]);
+        assert_eq!(damage, FrameDamage::Full);
+        assert!(s.frame_with_damage().is_none(), "cleared");
+    }
+
+    #[test]
+    fn apply_rect_reports_its_rectangle_as_damage() {
+        use mde_vdi_core::{DamageRect, FrameDamage};
+        let mut s = session();
+        let _ = s.frame_with_damage(); // consume the initial full frame
+        let rect = Rectangle {
+            x: 4,
+            y: 6,
+            width: 2,
+            height: 3,
+            encoding: 0,
+        };
+        // 2x3 raw pixels (each [B,G,R,pad]) — content is irrelevant to the geometry.
+        let payload = vec![0x00u8; 2 * 3 * 4];
+        s.apply_rect(&rect, &payload).expect("rect");
+        let (_img, damage) = s.frame_with_damage().expect("frame");
+        assert_eq!(
+            damage,
+            FrameDamage::Rects(vec![DamageRect::new(4, 6, 2, 3)]),
+            "the exact decoded rectangle is the damage"
+        );
+    }
+
+    #[test]
+    fn batch_update_and_resize_report_full_damage() {
+        use mde_vdi_core::FrameDamage;
+        let mut s = session();
+        let _ = s.frame_with_damage();
+        // The batch decoder does not surface per-rect geometry → full upload.
+        let body = raw_update(2, &[[0, 0, 0xFF, 0], [0xFF, 0, 0, 0]]);
+        s.apply_framebuffer_update(&body).expect("update");
+        let (_img, damage) = s.frame_with_damage().expect("frame");
+        assert_eq!(damage, FrameDamage::Full, "batch path is whole-frame");
+        // A resize reallocates the desktop → full upload (texture must resize).
+        s.resize(32, 24);
+        let (_img, damage) = s.frame_with_damage().expect("resized frame");
+        assert_eq!(damage, FrameDamage::Full, "resize is whole-frame");
     }
 
     #[test]

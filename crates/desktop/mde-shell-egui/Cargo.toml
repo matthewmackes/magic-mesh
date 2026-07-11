@@ -155,6 +155,11 @@ mde-editor-egui = { path = "../mde-editor-egui" }
 mde-vdi-rdp = { path = "../mde-vdi-rdp" }
 mde-vdi-vnc = { path = "../mde-vdi-vnc" }
 mde-vdi-spice = { path = "../mde-vdi-spice" }
+# perf-7 — the transport-neutral damage-rect types + the partial-upload slice math
+# (`FrameDamage`, `sub_color_image`) the `vdi` panel uses to move only the changed
+# sub-rectangles of a live desktop to the GPU. Same `mde-egui` toolkit resolution
+# as the three backends, so `FrameDamage` names the one shared `ColorImage`.
+mde-vdi-core = { path = "../mde-vdi-core" }
 
 # NOTIFY-CHAT-3 — the Surface::Chat ICQ UI renders the pure `mde-chat` model
 # (Roster / Contact / Presence / Message / MessageKind) it reads off the Bus

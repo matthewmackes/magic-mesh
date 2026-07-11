@@ -28,6 +28,7 @@ use crate::config::{ConfigError, SpiceConfig};
 use crate::egui::{ColorImage, Event};
 use crate::input::{map_event, ModifierState, SpiceInputEvent};
 use crate::pixel::{Framebuffer, FramebufferError, SurfaceFormat};
+use mde_vdi_core::{DamageLog, FrameDamage};
 
 /// The egui-facing SPICE desktop: a framebuffer the shell renders + an input
 /// queue the transport drains.
@@ -36,6 +37,11 @@ pub struct SpiceSession {
     framebuffer: Framebuffer,
     /// Set whenever the framebuffer changed since the last [`SpiceSession::frame`].
     dirty: bool,
+    /// The upload hint the shell reads via [`SpiceSession::frame_with_damage`]
+    /// (perf-7). SPICE hands back a whole primary surface each update, so every
+    /// change is [`FrameDamage::Full`]; the field keeps the API uniform with the
+    /// rect-tracking RDP/VNC backends. Purely additive — `dirty` still gates frames.
+    damage: DamageLog,
     /// Wire-ready input intents awaiting the transport, in arrival order.
     pending: Vec<SpiceInputEvent>,
     /// Last absolute pointer position pushed (framebuffer pixels).
@@ -62,6 +68,7 @@ impl SpiceSession {
             config,
             framebuffer,
             dirty: true,
+            damage: DamageLog::new(),
             pending: Vec::new(),
             pointer: (0, 0),
             modifiers: ModifierState::default(),
@@ -119,17 +126,33 @@ impl SpiceSession {
             .apply_surface(w, h, format, &surface.data)?;
         if changed {
             self.dirty = true;
+            // A SPICE update replaces the whole primary surface, so the changed
+            // region is the entire desktop — the shell does a full upload.
+            self.damage.mark_full();
         }
         Ok(changed)
     }
 
     /// The latest desktop as an [`egui::ColorImage`], or `None` if nothing changed
-    /// since the previous call. Clears the dirty flag.
+    /// since the previous call. Clears the dirty flag. Equivalent to
+    /// [`SpiceSession::frame_with_damage`] ignoring the damage hint.
     pub fn frame(&mut self) -> Option<ColorImage> {
+        self.frame_with_damage().map(|(image, _)| image)
+    }
+
+    /// The latest desktop plus which region changed since the previous call, or
+    /// `None` if nothing changed. Clears the dirty flag + drains the damage log.
+    ///
+    /// SPICE replaces the whole primary surface on each update, so a changed frame
+    /// always reports [`FrameDamage::Full`]. `dirty` — not the damage log — decides
+    /// whether a frame is emitted.
+    pub fn frame_with_damage(&mut self) -> Option<(ColorImage, FrameDamage)> {
         if self.dirty {
             self.dirty = false;
-            Some(self.framebuffer.to_color_image())
+            let damage = self.damage.take().unwrap_or(FrameDamage::Full);
+            Some((self.framebuffer.to_color_image(), damage))
         } else {
+            self.damage.clear();
             None
         }
     }
@@ -239,6 +262,21 @@ mod tests {
         assert_eq!(img.pixels[0], Color32::from_rgb(0xFF, 0, 0), "red pixel");
         assert_eq!(img.pixels[1], Color32::from_rgb(0, 0, 0), "black pixel");
         assert!(s.frame().is_none(), "no further change");
+    }
+
+    #[test]
+    fn frames_report_full_damage() {
+        use mde_vdi_core::FrameDamage;
+        let mut s = session();
+        // The initial black desktop uploads whole.
+        let (_img, damage) = s.frame_with_damage().expect("first frame");
+        assert_eq!(damage, FrameDamage::Full);
+        // A decoded surface replaces the whole primary → whole-frame upload.
+        s.apply_surface(&surface(2, 1, [0xFF, 0x00, 0x00, 0xFF]))
+            .expect("surface");
+        let (_img, damage) = s.frame_with_damage().expect("frame after surface");
+        assert_eq!(damage, FrameDamage::Full, "SPICE always uploads whole");
+        assert!(s.frame_with_damage().is_none(), "no further change");
     }
 
     #[test]

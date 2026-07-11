@@ -9,8 +9,9 @@
 //! mapper.
 //!
 //! ```text
-//!   session.frame() ─▶ ColorImage ─▶ TextureHandle ─▶ ui paints the body
-//!   ui.input events ─────────────────────────────────▶ session.send_input()
+//!   session.frame_with_damage() ─▶ (ColorImage, FrameDamage) ─▶ TextureHandle
+//!                                     └▶ set_partial only the changed rects (perf-7)
+//!   ui.input events ────────────────────────────────────────▶ session.send_input()
 //! ```
 //!
 //! This unit is the **first caller** of the two decoder crates — it gives their
@@ -20,6 +21,7 @@
 
 use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
 
+use mde_vdi_core::{sub_color_image, FrameDamage};
 use mde_vdi_rdp::RdpSession;
 use mde_vdi_spice::SpiceSession;
 use mde_vdi_vnc::VncSession;
@@ -65,12 +67,14 @@ enum Session {
 }
 
 impl Session {
-    /// The latest decoded desktop, or `None` if nothing changed since last frame.
-    fn frame(&mut self) -> Option<egui::ColorImage> {
+    /// The latest decoded desktop plus which rectangles changed since the last
+    /// frame ([`FrameDamage`]), or `None` if nothing changed. The shell partial-
+    /// uploads the damaged sub-rectangles instead of the whole framebuffer (perf-7).
+    fn frame_with_damage(&mut self) -> Option<(egui::ColorImage, FrameDamage)> {
         match self {
-            Session::Rdp(s) => s.frame(),
-            Session::Vnc(s) => s.frame(),
-            Session::Spice(s) => s.frame(),
+            Session::Rdp(s) => s.frame_with_damage(),
+            Session::Vnc(s) => s.frame_with_damage(),
+            Session::Spice(s) => s.frame_with_damage(),
         }
     }
 
@@ -432,7 +436,7 @@ impl ConnectRequest {
 #[cfg(feature = "live-vdi")]
 enum LiveRdpEvent {
     Connected(String),
-    Frame(egui::ColorImage),
+    Frame(egui::ColorImage, FrameDamage),
     /// The host's TLS certificate changed since it was pinned (vdi-vm-6) — a
     /// non-fatal MITM warning; the session stays live (the Nebula link is the
     /// trust floor). Strict mode instead surfaces as [`LiveRdpEvent::Error`].
@@ -451,7 +455,7 @@ struct LiveRdpHandle {
 #[cfg(feature = "live-vdi")]
 enum LiveVncEvent {
     Connected(String),
-    Frame(egui::ColorImage),
+    Frame(egui::ColorImage, FrameDamage),
     Error(String),
     Ended(String),
 }
@@ -466,7 +470,7 @@ struct LiveVncHandle {
 #[cfg(feature = "live-vdi")]
 enum LiveSpiceEvent {
     Connected(String),
-    Frame(egui::ColorImage),
+    Frame(egui::ColorImage, FrameDamage),
     Error(String),
     Ended(String),
 }
@@ -733,8 +737,8 @@ fn run_live_rdp(
     if let Some(change) = conn.cert_pin_change() {
         let _ = event_tx.send(LiveRdpEvent::CertWarning(change.operator_message()));
     }
-    if let Some(frame) = session.frame() {
-        let _ = event_tx.send(LiveRdpEvent::Frame(frame));
+    if let Some((frame, damage)) = session.frame_with_damage() {
+        let _ = event_tx.send(LiveRdpEvent::Frame(frame, damage));
     }
 
     loop {
@@ -758,8 +762,8 @@ fn run_live_rdp(
         match conn.pump_once(&mut session, Duration::from_millis(50)) {
             Ok(PumpOutcome::Processed { painted_rects }) => {
                 if painted_rects > 0 {
-                    if let Some(frame) = session.frame() {
-                        let _ = event_tx.send(LiveRdpEvent::Frame(frame));
+                    if let Some((frame, damage)) = session.frame_with_damage() {
+                        let _ = event_tx.send(LiveRdpEvent::Frame(frame, damage));
                     }
                 }
             }
@@ -803,8 +807,8 @@ fn run_live_vnc(
         "{target} (RFB {}.{}, {}x{}, {:?})",
         negotiated.major, negotiated.minor, negotiated.width, negotiated.height, negotiated.name
     )));
-    if let Some(frame) = session.frame() {
-        let _ = event_tx.send(LiveVncEvent::Frame(frame));
+    if let Some((frame, damage)) = session.frame_with_damage() {
+        let _ = event_tx.send(LiveVncEvent::Frame(frame, damage));
     }
 
     loop {
@@ -828,8 +832,8 @@ fn run_live_vnc(
         match conn.pump_once(&mut session, Duration::from_millis(50)) {
             Ok(VncPumpOutcome::Processed { rects, .. }) => {
                 if rects > 0 {
-                    if let Some(frame) = session.frame() {
-                        let _ = event_tx.send(LiveVncEvent::Frame(frame));
+                    if let Some((frame, damage)) = session.frame_with_damage() {
+                        let _ = event_tx.send(LiveVncEvent::Frame(frame, damage));
                     }
                 }
             }
@@ -869,8 +873,8 @@ fn run_live_spice(
         }
     };
     let _ = event_tx.send(LiveSpiceEvent::Connected(target));
-    if let Some(frame) = session.frame() {
-        let _ = event_tx.send(LiveSpiceEvent::Frame(frame));
+    if let Some((frame, damage)) = session.frame_with_damage() {
+        let _ = event_tx.send(LiveSpiceEvent::Frame(frame, damage));
     }
 
     loop {
@@ -895,8 +899,8 @@ fn run_live_spice(
 
         match conn.pump_frame(&mut session) {
             Ok(true) => {
-                if let Some(frame) = session.frame() {
-                    let _ = event_tx.send(LiveSpiceEvent::Frame(frame));
+                if let Some((frame, damage)) = session.frame_with_damage() {
+                    let _ = event_tx.send(LiveSpiceEvent::Frame(frame, damage));
                 }
             }
             Ok(false) => {}
@@ -1092,6 +1096,13 @@ pub(crate) struct VdiState {
     /// `vdi_panel` drains it into `texture`. This is the single-threaded shape of
     /// the decode → UI hand-off the gated wire transport fills off-thread.
     incoming: Option<egui::ColorImage>,
+    /// Which rectangles changed in `incoming` (perf-7). Written next to `incoming`
+    /// by whoever produced the frame; the upload drains both together and
+    /// `set_partial`s only the damaged sub-rectangles. `None` (or
+    /// [`FrameDamage::Full`]) means "no reliable rect info" → a full `set`. Kept as a
+    /// parallel slot so the existing `incoming` writers/tests that don't carry damage
+    /// still compile and safely fall back to a full upload.
+    incoming_damage: Option<FrameDamage>,
     /// Raised when the operator presses the reserved Esc chord over the desktop —
     /// the shell reads it to release the fullscreen desktop back to the chrome.
     return_to_chrome: bool,
@@ -1207,6 +1218,7 @@ impl VdiState {
             }
             self.texture = None;
             self.incoming = None;
+            self.incoming_damage = None;
             // VDI-VM-1 — a mesh-brokered connect with no discovery-time endpoint (a
             // local/peer VM whose loopback console has no advertised port) must first
             // resolve the endpoint the serving peer's `console_broker` publishes back
@@ -1358,6 +1370,7 @@ impl VdiState {
             self.negotiated_size = None;
             self.texture = None;
             self.incoming = None;
+            self.incoming_damage = None;
         }
         self.requested = None;
     }
@@ -1583,8 +1596,9 @@ impl VdiState {
                     self.live_status = Some(format!("Live RDP connected to {target}"));
                     publish_active = true;
                 }
-                LiveRdpEvent::Frame(frame) => {
+                LiveRdpEvent::Frame(frame, damage) => {
                     self.incoming = Some(frame);
+                    self.incoming_damage = Some(damage);
                     got_frame = true;
                 }
                 LiveRdpEvent::CertWarning(message) => {
@@ -1631,8 +1645,9 @@ impl VdiState {
                     self.live_status = Some(format!("Live VNC connected to {target}"));
                     publish_active = true;
                 }
-                LiveVncEvent::Frame(frame) => {
+                LiveVncEvent::Frame(frame, damage) => {
                     self.incoming = Some(frame);
+                    self.incoming_damage = Some(damage);
                     got_frame = true;
                 }
                 LiveVncEvent::Error(reason) => {
@@ -1672,8 +1687,9 @@ impl VdiState {
                     self.live_status = Some(format!("Live SPICE connected to {target}"));
                     publish_active = true;
                 }
-                LiveSpiceEvent::Frame(frame) => {
+                LiveSpiceEvent::Frame(frame, damage) => {
                     self.incoming = Some(frame);
+                    self.incoming_damage = Some(damage);
                     got_frame = true;
                 }
                 LiveSpiceEvent::Error(reason) => {
@@ -1761,6 +1777,58 @@ impl VdiState {
 /// crisper than nearest when the negotiated desktop size doesn't match the panel.
 const DESKTOP_TEX: TextureOptions = TextureOptions::LINEAR;
 
+/// Upload one decoded desktop frame into `texture` (perf-7).
+///
+/// * **No texture yet** (the first frame) → allocate it from the whole image.
+/// * **Concrete per-rectangle damage AND an unchanged texture size** →
+///   [`TextureHandle::set_partial`] each damaged sub-rectangle, moving only the
+///   changed pixels to the GPU. The size guard is essential: `set_partial` cannot
+///   resize a texture, so a dimension change must go through the reallocating full
+///   `set`.
+/// * **Anything else** ([`FrameDamage::Full`], no damage, a size change, or an
+///   empty rect list) → a full [`TextureHandle::set`] of the whole image.
+///
+/// Correctness over optimisation: a full `set` is always valid, so every uncertain
+/// path degrades to it and no upload a full `set` would have done is ever skipped.
+/// The `(offset, sub_image)` pairs handed to `set_partial` come from the same
+/// [`sub_color_image`] slice the unit tests prove pixel-identical to a full upload.
+fn upload_frame(
+    ctx: &egui::Context,
+    texture: &mut Option<TextureHandle>,
+    img: egui::ColorImage,
+    damage: Option<FrameDamage>,
+) {
+    match texture.as_mut() {
+        // First frame / freshly-(re)allocated texture: allocate from the whole image.
+        None => {
+            *texture = Some(ctx.load_texture("vdi-desktop", img, DESKTOP_TEX));
+        }
+        Some(handle) => {
+            // Partial-upload only with concrete rectangles AND a matching texture
+            // size — a resize (or any size mismatch) must reallocate through the
+            // full `set` below, because `set_partial` cannot resize a texture.
+            let rects = match &damage {
+                Some(FrameDamage::Rects(rects))
+                    if !rects.is_empty() && handle.size() == img.size =>
+                {
+                    rects
+                }
+                _ => {
+                    handle.set(img, DESKTOP_TEX);
+                    return;
+                }
+            };
+            for rect in rects {
+                // Each rect is clamped to the frame bounds; a fully-clipped one
+                // yields None and is skipped (a full `set` would not draw it either).
+                if let Some((offset, sub)) = sub_color_image(&img, *rect) {
+                    handle.set_partial(offset, sub, DESKTOP_TEX);
+                }
+            }
+        }
+    }
+}
+
 /// Render the Desktop surface into `ui`: upload any new framebuffer, paint it to
 /// fill the body, and forward this frame's egui input to the guest. With no
 /// session attached it draws the honest "no desktop" EmptyState instead.
@@ -1782,22 +1850,23 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
         state.poll_live_spice();
     }
 
-    // 1. Pull the newest decoded frame off the live session into the upload slot.
+    // 1. Pull the newest decoded frame — plus which rectangles changed (perf-7) —
+    //    off the live session into the upload slot.
     if let Some(session) = state.session.as_mut() {
-        if let Some(img) = session.frame() {
+        if let Some((img, damage)) = session.frame_with_damage() {
             state.incoming = Some(img);
+            state.incoming_damage = Some(damage);
         }
     }
 
-    // 2. Upload a pending frame: allocate the texture on the first one, then set
-    //    it in place on every frame after.
+    // 2. Upload a pending frame. The texture is allocated on the first frame; after
+    //    that, a frame carrying per-rectangle damage moves only its changed
+    //    sub-rectangles to the GPU with `set_partial`, and everything else
+    //    (first frame, a resize, a whole-surface / batch replace, or no reliable
+    //    damage info) falls back to a full `set` — never a skipped upload.
     if let Some(img) = state.incoming.take() {
-        match state.texture.as_mut() {
-            Some(handle) => handle.set(img, DESKTOP_TEX),
-            None => {
-                state.texture = Some(ui.ctx().load_texture("vdi-desktop", img, DESKTOP_TEX));
-            }
-        }
+        let damage = state.incoming_damage.take();
+        upload_frame(ui.ctx(), &mut state.texture, img, damage);
     }
 
     // 3. Paint the desktop (or the EmptyState) and drive input.
@@ -2885,6 +2954,62 @@ mod tests {
             "the attached frame was not uploaded to a texture"
         );
         assert!(drew, "the desktop image produced no draw primitives");
+    }
+
+    #[test]
+    fn upload_frame_allocates_then_partial_updates_then_resizes() {
+        // The perf-7 upload seam: the first frame allocates the texture, a
+        // same-size damaged frame partial-uploads (size preserved), and a Full /
+        // resized frame falls back to a full `set` that reallocates. This proves
+        // the wiring + the size-guard fallback; the pixel-equivalence of the slice
+        // itself is proven in `mde_vdi_core::damage`.
+        use egui::Color32;
+        use mde_vdi_core::DamageRect;
+
+        let solid = |w: usize, h: usize, c: Color32| egui::ColorImage {
+            size: [w, h],
+            pixels: vec![c; w * h],
+        };
+
+        let ctx = egui::Context::default();
+        let mut tex: Option<TextureHandle> = None;
+
+        // First frame: no texture yet → allocate from the whole image.
+        upload_frame(&ctx, &mut tex, solid(4, 3, Color32::BLACK), None);
+        assert_eq!(tex.as_ref().expect("allocated").size(), [4, 3]);
+
+        // Same-size frame with rect damage → the partial path runs and the texture
+        // keeps its size (set_partial cannot and must not resize).
+        upload_frame(
+            &ctx,
+            &mut tex,
+            solid(4, 3, Color32::WHITE),
+            Some(FrameDamage::Rects(vec![DamageRect::new(1, 1, 2, 1)])),
+        );
+        assert_eq!(tex.as_ref().unwrap().size(), [4, 3], "partial keeps size");
+
+        // A resized Full frame → the size guard forces a full `set`, which resizes.
+        upload_frame(
+            &ctx,
+            &mut tex,
+            solid(6, 5, Color32::BLACK),
+            Some(FrameDamage::Full),
+        );
+        assert_eq!(tex.as_ref().unwrap().size(), [6, 5], "full set resizes");
+
+        // A rect-damaged frame whose size disagrees with the texture also degrades
+        // to a full `set` (never a partial upload into the wrong dimensions).
+        upload_frame(
+            &ctx,
+            &mut tex,
+            solid(8, 8, Color32::WHITE),
+            Some(FrameDamage::Rects(vec![DamageRect::new(0, 0, 2, 2)])),
+        );
+        assert_eq!(
+            tex.as_ref().unwrap().size(),
+            [8, 8],
+            "size mismatch forces a full set"
+        );
     }
 
     #[test]
