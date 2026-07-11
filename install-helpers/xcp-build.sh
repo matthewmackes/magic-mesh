@@ -19,6 +19,7 @@
 #   xcp-build.sh shell                interactive ssh into the build VM
 #   xcp-build.sh route <cargo args>   print the shape-routed host + reason (dry; no sync/build)
 #   xcp-build.sh --route-test         run the routing self-test (offline; no farm contact)
+#   xcp-build.sh --check-features     print the canonical RPM feature set + --locked policy (build-deploy-3)
 #
 # Env overrides: MCNF_BUILD_HOST (for example 172.20.0.130), MCNF_BUILD_USER (mm),
 #   MCNF_BUILD_SLOT (unset) — an isolated remote workspace+target on the SAME host
@@ -47,6 +48,12 @@ DEFAULT_BUILD_HOST="172.20.0.50"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# build-deploy-3 — the RPM cut's cargo feature list + the --locked policy live in
+# ONE shared fragment so this farm cut path and build-rpm-fedora43.sh cannot
+# drift. Sourced here (host side): the `rpm` recipe builds its remote command
+# string locally, so $MDE_RPM_* expand on this host before being sent to the VM.
+# shellcheck source=install-helpers/rpm-features.sh disable=SC1091
+source "$REPO/install-helpers/rpm-features.sh"
 TOFU_DIR="${MCNF_TOFU_DIR:-$REPO/infra/tofu}"
 # Per-slot remote dir lets concurrent agents share one VM (each its own target/).
 # Base is `magic-mesh-farm` (NOT the bare `magic-mesh`): the build VMs carry a
@@ -396,6 +403,14 @@ route_self_test() {
 case "${1:-}" in
   --route-test | route-test) route_self_test; exit $? ;;
   route) shift; resolve_host "$@"; exit 0 ;; # resolve_host already logged host+reason
+  # build-deploy-3 self-check: print the canonical RPM cut knobs THIS path uses.
+  # Both cut paths source install-helpers/rpm-features.sh, so this doubles as the
+  # authoritative value for build-rpm-fedora43.sh — diff the two to prove parity.
+  --check-features)
+    echo "MDE_RPM_SHELL_FEATURES=$MDE_RPM_SHELL_FEATURES"
+    echo "MDE_RPM_LOCKED=$MDE_RPM_LOCKED"
+    exit 0
+    ;;
 esac
 
 # Every farm-contacting subcommand resolves its host from the job shape first.
@@ -459,7 +474,10 @@ case "${1:-}" in
     # playback, no real A/V — the live-verified 2026-07-03 Eagle finding);
     # `release_shell_configuration_enables_the_real_media_engine`
     # (mde-shell-egui) fails loudly if this feature is ever dropped here.
-    remote "cargo build --workspace --release && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release -p mde-shell-egui --features drm,live-helper,live-vdi,media-mpv && cargo generate-rpm -p crates/mesh/mackesd"
+    # build-deploy-3 — feature list + --locked come from rpm-features.sh (sourced
+    # above); $MDE_RPM_* expand HERE on the local host, so the literal flags land
+    # in the remote command string identical to build-rpm-fedora43.sh's.
+    remote "cargo build --workspace --release $MDE_RPM_LOCKED && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"

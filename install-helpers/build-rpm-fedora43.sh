@@ -86,19 +86,23 @@ cargo install cargo-generate-rpm --locked >/tmp/cgr.log 2>&1 || { tail -20 /tmp/
 
 export CARGO_TARGET_DIR=/src/target-f43
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
+# build-deploy-3 — the mde-shell-egui feature list + the --locked policy come
+# from ONE canonical fragment, shared with xcp-build.sh, so the two RPM cut paths
+# cannot drift. The repo is bind-mounted at /src, so it is present in-container.
+source /src/install-helpers/rpm-features.sh
 # XPA-6 — MODE (full|server) is passed in via `podman run -e MODE=…`.
 if [ "${MODE:-full}" = "server" ]; then
   echo "[f43] building HEADLESS crates only (release) — no libcosmic GUIs"
   # Just the daemon + mesh-substrate crates. mde-enroll yields BOTH the
   # mde-enroll + magic-setup bins; mde-bus is the shared-bus daemon. None pull
   # libcosmic/iced, so the long GUI compile is skipped entirely.
-  cargo build --release --locked \
+  cargo build --release $MDE_RPM_LOCKED \
       -p mackesd -p magic-fleet -p mde-enroll -p mde-bus
   echo "[f43] generating headless RPM (--variant server)"
   cargo generate-rpm -p crates/mesh/mackesd --variant server
 else
   echo "[f43] building workspace (release) — this is the long part"
-  cargo build --workspace --release --locked
+  cargo build --workspace --release $MDE_RPM_LOCKED
   # BOOKMARKS-9 — the Servo browser helper (mde-web-preview) is its OWN workspace
   # root (excluded from the parent workspace: Servo drags a conflicting native
   # sqlite link — see the crate manifest), so `--workspace` above did NOT build it.
@@ -115,7 +119,7 @@ else
       mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel \
       libxkbcommon-devel >/tmp/dnf-servo.log 2>&1 || { tail -20 /tmp/dnf-servo.log; exit 1; }
   echo "[f43] building the Servo browser helper (mde-web-preview) — heavy; needs network"
-  cargo build --release --locked \
+  cargo build --release $MDE_RPM_LOCKED \
       --manifest-path crates/desktop/mde-web-preview/Cargo.toml || {
     echo "GATED[BOOKMARKS-9/servo]: mde-web-preview (Servo) failed to build."
     echo "  The full magic-mesh RPM ships the browser helper, so this is a hard stop."
@@ -131,7 +135,7 @@ else
   # also emits mde-web-cef-renderer, the native bridge process shipped under
   # /usr/libexec/mackesd for the Chrome-engine handoff.
   echo "[f43] building the Chromium/CEF browser helper + renderer bridge (mde-web-cef)"
-  cargo build --release --locked \
+  cargo build --release $MDE_RPM_LOCKED \
       --manifest-path crates/desktop/mde-web-cef/Cargo.toml
   # E12-3 DRM + BOOKMARKS-6 live path — re-link the ONE shell binary with the
   # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat,
@@ -144,8 +148,8 @@ else
   # shipping FakeMpv (simulated playback, no real A/V — the live-verified
   # 2026-07-03 Eagle finding). The workspace build compiled all deps; this
   # only re-links one bin.
-  echo "[f43] re-linking mde-shell-egui --features drm,live-helper,live-vdi,media-mpv"
-  cargo build --release --locked -p mde-shell-egui --features drm,live-helper,live-vdi,media-mpv
+  echo "[f43] re-linking mde-shell-egui --features $MDE_RPM_SHELL_FEATURES"
+  cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features "$MDE_RPM_SHELL_FEATURES"
   echo "[f43] generating RPM"
   cargo generate-rpm -p crates/mesh/mackesd
 fi
