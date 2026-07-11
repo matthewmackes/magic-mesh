@@ -290,34 +290,15 @@ pub fn default_qnm_shared_root() -> std::path::PathBuf {
     mackes_mesh_types::peers::default_workgroup_root()
 }
 
-/// The canonical deployed shared-storage directory (SUBSTRATE-V2: a plain
-/// Syncthing-replicated dir, no FUSE — see [`shared_root_writable`]).
-pub const CANONICAL_QNM_MOUNT: &str = "/mnt/mesh-storage";
-
-/// AUDIT-MESH-15 guard: is it SAFE to write under `root`?
-///
-/// Under SUBSTRATE-V2 `/mnt/mesh-storage` ([`CANONICAL_QNM_MOUNT`]) is a plain
-/// Syncthing-replicated directory — writable **iff the dir actually exists**. A
-/// missing/unprovisioned share (early boot, before the first Syncthing sync)
-/// must NOT be written, or the shared-state writers (the heartbeat, the `chat`
-/// worker's replicated conversation logs, `ssh-pubkey gossip`, the clipboard
-/// history) would silently land on a bare local dir. Any other root (a
-/// dev `~/QNM-Shared`, a tempdir) is always writable, so dev/test is unaffected.
-#[must_use]
-pub fn shared_root_writable(root: &std::path::Path) -> bool {
-    shared_root_writable_core(root, root.is_dir())
-}
-
-/// Pure core of [`shared_root_writable`] — testable without touching the fs.
-/// The canonical shared dir is writable iff it actually exists (`root_is_dir`);
-/// every other root is always writable.
-#[must_use]
-pub fn shared_root_writable_core(root: &std::path::Path, root_is_dir: bool) -> bool {
-    if root != std::path::Path::new(CANONICAL_QNM_MOUNT) {
-        return true;
-    }
-    root_is_dir
-}
+// arch-7 (2026-07-11) — the canonical shared-storage mount constant + the
+// AUDIT-MESH-15 write-safety guard moved into `mackes-mesh-types::mesh_storage`
+// so worker crates factored out of this daemon (`mde-browser-workers`) reuse
+// the one audited guard rather than re-deriving it. Re-exported here so the
+// ~17 in-crate `crate::CANONICAL_QNM_MOUNT` / `crate::shared_root_writable`
+// call sites resolve unchanged.
+pub use mackes_mesh_types::mesh_storage::{
+    shared_root_writable, shared_root_writable_core, CANONICAL_QNM_MOUNT,
+};
 
 /// v2.0.0 Phase 0.6 — env-var rename shim.
 ///
@@ -355,38 +336,8 @@ pub fn env_with_legacy_fallback(new_name: &str, legacy_name: &str) -> Option<Str
     }
 }
 
-#[cfg(test)]
-mod shared_root_tests {
-    use super::{shared_root_writable, shared_root_writable_core};
-    use std::path::Path;
-
-    #[test]
-    fn non_canonical_roots_are_always_writable() {
-        // Dev/test paths (tempdirs, ~/QNM-Shared) are never the poison case.
-        assert!(shared_root_writable(Path::new("/home/mm/QNM-Shared")));
-        assert!(shared_root_writable(Path::new("/tmp/anything")));
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(shared_root_writable(tmp.path()));
-        // ...regardless of whether the dir exists.
-        assert!(shared_root_writable_core(Path::new("/tmp/x"), false));
-    }
-
-    #[test]
-    fn canonical_writable_iff_dir_exists() {
-        // SUBSTRATE-V2: the plain Syncthing dir is writable iff it exists —
-        // fixes the post-cutover silent-drop of every shared-state write
-        // (heartbeat / chat logs / ssh-gossip / clipboard).
-        assert!(shared_root_writable_core(
-            Path::new("/mnt/mesh-storage"),
-            true
-        ));
-        // ...but never a bare/unprovisioned share (dir absent).
-        assert!(!shared_root_writable_core(
-            Path::new("/mnt/mesh-storage"),
-            false
-        ));
-    }
-}
+// arch-7 — the `shared_root_writable` unit tests moved with the functions into
+// `mackes-mesh-types::mesh_storage`.
 
 #[cfg(test)]
 mod env_shim_tests {

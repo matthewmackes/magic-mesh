@@ -7,7 +7,8 @@
 //! the same cache records into the Syncthing-backed workgroup root so peers can
 //! reuse the cache without any external account or browser telemetry.
 
-#![cfg(feature = "async-services")]
+// arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
+// code; `mackesd` pulls it in only under its own `async-services` feature.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +20,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use sha2::{Digest, Sha256};
 
-use super::{ShutdownToken, Worker};
+use mde_worker_core::{ShutdownToken, Worker};
 
 /// Browser-owned offline cache action topic.
 pub const ACTION_TOPIC: &str = "action/browser/offline-cache";
@@ -147,7 +148,7 @@ impl BrowserOfflineCacheWorker {
 
     fn share_writable(&self) -> bool {
         self.share_gate.as_ref().map_or_else(
-            || crate::shared_root_writable(&self.share_root),
+            || mackes_mesh_types::mesh_storage::shared_root_writable(&self.share_root),
             |g| g.load(Ordering::SeqCst),
         )
     }

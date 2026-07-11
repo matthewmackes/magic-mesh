@@ -9,7 +9,8 @@
 //! Browser snapshot shape so the startup-restore parser can consume them directly;
 //! no wrapper envelope is inserted between sync and restore.
 
-#![cfg(feature = "async-services")]
+// arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
+// code; `mackesd` pulls it in only under its own `async-services` feature.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
-use super::{ShutdownToken, Worker};
+use mde_worker_core::{ShutdownToken, Worker};
 
 /// Browser-owned session snapshot action topic.
 pub const ACTION_TOPIC: &str = "action/browser/session-sync";
@@ -137,7 +138,7 @@ impl BrowserSessionSyncWorker {
 
     fn share_writable(&self) -> bool {
         self.share_gate.as_ref().map_or_else(
-            || crate::shared_root_writable(&self.share_root),
+            || mackes_mesh_types::mesh_storage::shared_root_writable(&self.share_root),
             |g| g.load(Ordering::SeqCst),
         )
     }

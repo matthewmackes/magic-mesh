@@ -41,6 +41,11 @@ pub mod lighthouse;
 // The replicated directory carries only binary health; these live operational
 // facts need a per-lighthouse probe lane (LIGHTHOUSE follow-on, now filled).
 pub mod lighthouse_probe;
+// arch-7 (2026-07-11) — the canonical shared-storage mount constant +
+// the AUDIT-MESH-15 write-safety guard, relocated out of the `mackesd` bin
+// crate so worker crates factored out of the daemon (mde-browser-workers)
+// reuse the one audited guard. `mackesd` re-exports at its crate root.
+pub mod mesh_storage;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;
 // IAC-1 (2026-07-04) — the OpenStack service-directory + API-health schema: the
