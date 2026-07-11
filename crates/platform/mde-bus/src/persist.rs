@@ -189,6 +189,35 @@ pub struct Persist {
     index_inode: Option<u64>,
 }
 
+/// perf-3 — process-wide set of `index.sqlite` paths this process has already
+/// fully initialized (schema exec + shared-spool chmod + the BOOT-REC-3
+/// write-probe). `Persist::open` is called from ~89 mde-shell-egui render-path
+/// sites several times a second; after the FIRST open of a given path in this
+/// process the init work is redundant (the schema CREATEs are `IF NOT EXISTS`,
+/// WAL journal-mode persists in the DB header, and the read-only boot latch is
+/// a one-shot cold-boot race), so later opens fast-path. `Mutex<Option<_>>` so
+/// the static is `const`-constructible without a lazy-init crate.
+static INITIALIZED_PATHS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+/// perf-3 — record that this process has fully initialized `db_path`.
+fn mark_initialized(db_path: &Path) {
+    INITIALIZED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(db_path.to_path_buf());
+}
+
+/// perf-3 — whether this process has already fully initialized `db_path`.
+fn is_initialized(db_path: &Path) -> bool {
+    INITIALIZED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|s| s.contains(db_path))
+}
+
 impl Persist {
     /// Open (or create) the per-peer index + ensure the bus
     /// root exists. Safe to call repeatedly — schema CREATEs
@@ -199,9 +228,27 @@ impl Persist {
     /// mkdir'd or [`PersistError::Sql`] when opening the
     /// database or running the schema fails.
     pub fn open(bus_root: PathBuf) -> Result<Self, PersistError> {
+        let db_path = bus_root.join("index.sqlite");
+        // perf-3 fast path — after this process has fully initialized `db_path`
+        // once, skip the redundant schema exec + shared-spool chmod + BOOT-REC-3
+        // write-probe and hand back a cheap bare connection. Guarded on the DB
+        // file still existing (a vanished DB must fall through so the schema is
+        // recreated, not opened as an empty un-schema'd file). The guard is
+        // PROCESS-wide, so every distinct process still runs the full first-open
+        // init once — preserving the cross-uid chmod + boot-race self-heal
+        // semantics; only intra-process repeat opens are fast-pathed.
+        if is_initialized(&db_path) {
+            if let Some(index_inode) = file_inode(&db_path) {
+                let conn = Self::open_conn_bare(&db_path)?;
+                return Ok(Self {
+                    bus_root,
+                    conn,
+                    index_inode: Some(index_inode),
+                });
+            }
+        }
         std::fs::create_dir_all(&bus_root)
             .map_err(|e| PersistError::Io(format!("mkdir {}: {e}", bus_root.display())))?;
-        let db_path = bus_root.join("index.sqlite");
         let mut conn = Self::open_conn(&db_path)?;
         // SETUP-fix — a SHARED spool (MDE_BUS_ROOT) is read+written by both the
         // root mackesd daemon AND the uid-1000 desktop GUIs, so the spool dir +
@@ -268,6 +315,8 @@ impl Persist {
             }
         }
         let index_inode = file_inode(&db_path);
+        // perf-3 — mark this path initialized so subsequent opens fast-path.
+        mark_initialized(&db_path);
         Ok(Self {
             bus_root,
             conn,
@@ -318,6 +367,23 @@ impl Persist {
             .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| PersistError::Sql(format!("schema: {e}")))?;
+        Ok(conn)
+    }
+
+    /// perf-3 — open the SQLite index WITHOUT the schema exec, for the fast path
+    /// in [`Self::open`] once the schema is known-applied for this path in this
+    /// process. WAL journal-mode is persisted in the DB header (it survives
+    /// across connections), so a bare open still gets WAL; we set the same
+    /// per-connection `busy_timeout` + `synchronous = NORMAL` as [`Self::open_conn`]
+    /// so a fast-path write behaves identically. Skips the `CREATE TABLE/INDEX
+    /// IF NOT EXISTS` + WAL pragma + write-probe that dominate open cost.
+    fn open_conn_bare(db_path: &std::path::Path) -> Result<Connection, PersistError> {
+        let conn = Connection::open(db_path)
+            .map_err(|e| PersistError::Sql(format!("open {}: {e}", db_path.display())))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")
+            .map_err(|e| PersistError::Sql(format!("synchronous: {e}")))?;
         Ok(conn)
     }
 
@@ -580,6 +646,51 @@ impl Persist {
                 out.push(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
             }
         }
+        Ok(out)
+    }
+
+    /// perf-4 — the newest message on `topic`, or `None` when the topic has no
+    /// messages. Returns the SAME row that `list_since(topic, None).last()`
+    /// would (ULID order == write order), but as a bounded `ORDER BY ulid DESC
+    /// LIMIT 1` index probe instead of loading the whole retained history (up to
+    /// ~20k rows / ~8 MiB per topic) just to discard all but the tail. This is
+    /// the latest-wins read the shell render path wants.
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on query or row-decode failure.
+    pub fn read_latest(&self, topic: &str) -> Result<Option<StoredMessage>, PersistError> {
+        Ok(self.read_tail(topic, 1)?.pop())
+    }
+
+    /// perf-4 — the newest `n` messages on `topic`, returned OLDEST-first — the
+    /// same rows + order as the tail of `list_since(topic, None)`, but bounded by
+    /// `n` via `ORDER BY ulid DESC LIMIT n` so a chatty retained topic isn't
+    /// fully loaded. `n == 0` yields an empty vec.
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on query or row-decode failure.
+    pub fn read_tail(&self, topic: &str, n: usize) -> Result<Vec<StoredMessage>, PersistError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                 FROM messages WHERE topic = ?1 ORDER BY ulid DESC LIMIT ?2",
+            )
+            .map_err(|e| PersistError::Sql(format!("prepare read_tail: {e}")))?;
+        let rows = stmt
+            .query_map(
+                params![topic, i64::try_from(n).unwrap_or(i64::MAX)],
+                row_to_message,
+            )
+            .map_err(|e| PersistError::Sql(format!("query read_tail: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+        }
+        // The DESC query yields newest-first; reverse to OLDEST-first so callers
+        // see `list_since`'s ascending order and `read_latest` finds the newest
+        // as the LAST element (matching the old `.last()`).
+        out.reverse();
         Ok(out)
     }
 
@@ -990,6 +1101,81 @@ mod tests {
     fn open_creates_db_and_root() {
         let (tmp, _p) = open_tmp();
         assert!(tmp.path().join("index.sqlite").exists());
+    }
+
+    #[test]
+    fn open_fast_paths_after_first_init() {
+        // perf-3 — the first open of a path runs full init and records it in the
+        // process-wide guard; subsequent opens take the fast path (bare
+        // connection, no schema/write-probe) yet still return a usable handle.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bus");
+        let db = root.join("index.sqlite");
+        assert!(
+            !is_initialized(&db),
+            "path is not initialized before the first open"
+        );
+        let p1 = Persist::open(root.clone()).unwrap();
+        p1.write("t/x", Priority::Default, None, Some("a")).unwrap();
+        drop(p1);
+        // First open populated the guard.
+        assert!(
+            is_initialized(&db),
+            "the guard is populated after the first open"
+        );
+        // Second open fast-paths and is still fully usable for reads AND writes.
+        let p2 = Persist::open(root.clone()).unwrap();
+        assert_eq!(p2.list_since("t/x", None).unwrap().len(), 1);
+        p2.write("t/y", Priority::Default, None, Some("b")).unwrap();
+        assert_eq!(p2.list_since("t/y", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_falls_back_to_slow_path_when_db_vanishes() {
+        // perf-3 — the fast path is gated on the DB file still existing: if the
+        // index is unlinked out from under a marked path, the next open must
+        // slow-path (recreate + schema), not open an empty un-schema'd file.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bus");
+        let db = root.join("index.sqlite");
+        let p1 = Persist::open(root.clone()).unwrap();
+        p1.write("t/x", Priority::Default, None, Some("a")).unwrap();
+        drop(p1);
+        assert!(is_initialized(&db));
+        // Nuke the index (+ sidecars) — the guard still says "initialized".
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+        // Next open must recreate a schema'd DB and accept writes.
+        let p2 = Persist::open(root.clone()).unwrap();
+        p2.write("t/z", Priority::Default, None, Some("c")).unwrap();
+        assert_eq!(p2.list_since("t/z", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn read_latest_matches_list_since_last() {
+        // perf-4 — read_latest returns the SAME row as loading-all-then-.last()
+        // on a multi-row topic, and read_tail returns the same tail slice.
+        let (_tmp, p) = open_tmp();
+        // Empty topic → None, exactly like list_since(...).last().
+        assert!(p.read_latest("t/x").unwrap().is_none());
+        assert!(p.read_tail("t/x", 3).unwrap().is_empty());
+        for i in 0..5 {
+            p.write("t/x", Priority::Default, None, Some(&format!("m{i}")))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let all = p.list_since("t/x", None).unwrap();
+        let expected_last = all.last().cloned().unwrap();
+        let got = p.read_latest("t/x").unwrap().unwrap();
+        assert_eq!(got, expected_last, "read_latest == list_since(None).last()");
+        // read_tail(n) == the last n of list_since, oldest-first.
+        let tail = p.read_tail("t/x", 3).unwrap();
+        assert_eq!(tail, all[all.len() - 3..].to_vec());
+        // n larger than the row count yields the whole topic (no panic).
+        assert_eq!(p.read_tail("t/x", 99).unwrap(), all);
+        // read_latest is topic-scoped.
+        assert!(p.read_latest("t/other").unwrap().is_none());
     }
 
     #[test]

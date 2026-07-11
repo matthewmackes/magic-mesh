@@ -2303,8 +2303,11 @@ fn navigate_via_toast(bus_root: Option<&Path>, source_host: &str, headline: &str
 
 /// Read the newest (latest-wins) message on `topic` and deserialize its body.
 fn latest_json<T: serde::de::DeserializeOwned>(persist: &Persist, topic: &str) -> Option<T> {
-    let msgs = persist.list_since(topic, None).ok()?;
-    let body = msgs.last()?.body.as_deref()?;
+    // perf-4 — a bounded `read_latest` (ORDER BY ulid DESC LIMIT 1) returns the
+    // exact same row the old `list_since(topic, None).last()` did, without
+    // loading the whole retained history on every render.
+    let msg = persist.read_latest(topic).ok()??;
+    let body = msg.body.as_deref()?;
     serde_json::from_str::<T>(body).ok()
 }
 

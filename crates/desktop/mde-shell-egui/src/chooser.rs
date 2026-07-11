@@ -1095,14 +1095,15 @@ impl DesktopSourcesClient for BusDesktopSources {
     fn latest(&self) -> Option<DesktopSourcesState> {
         let root = self.bus_root.clone()?;
         let persist = mde_bus::persist::Persist::open(root).ok()?;
-        // The worker writes one record per change (+ heartbeat); the newest
-        // (last, ULID ascending) is the live roster.
+        // The worker writes one record per change (+ heartbeat) and ALWAYS
+        // carries a body, so the newest row is the live roster. perf-4 — read
+        // just that newest row (bounded `read_latest`) instead of loading the
+        // whole retained history and taking the last body; behaviour-identical
+        // to the old `list_since(None).filter_map(body).next_back()`.
         persist
-            .list_since(SOURCES_TOPIC, None)
+            .read_latest(SOURCES_TOPIC)
             .ok()?
-            .into_iter()
-            .filter_map(|m| m.body)
-            .next_back()
+            .and_then(|m| m.body)
             .as_deref()
             .and_then(parse_sources)
     }
