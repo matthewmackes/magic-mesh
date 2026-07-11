@@ -3510,7 +3510,7 @@ fn preview_empty(ui: &mut Ui) {
         ui.label(
             RichText::new("Nothing to preview yet")
                 .size(Style::BODY)
-                .color(Style::TEXT_DIM),
+                .color(Style::TEXT),
         );
         ui.add_space(Style::SP_XS);
         ui.label(
@@ -3545,7 +3545,7 @@ fn empty_state(ui: &mut Ui) -> bool {
         ui.label(
             RichText::new(NO_FILE_TITLE)
                 .size(Style::HEADING)
-                .color(Style::TEXT_DIM),
+                .color(Style::TEXT),
         );
         ui.add_space(Style::SP_S);
         ui.label(
