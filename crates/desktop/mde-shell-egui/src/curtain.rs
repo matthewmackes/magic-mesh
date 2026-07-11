@@ -1188,9 +1188,14 @@ fn glance_dot(ui: &mut egui::Ui, tone: Color32) {
 /// The mute-toggle speaker glyph (the tray's volume-flyout affordance): the
 /// muted variant + a WARN tint while muted, hover fill, no tooltip. Returns
 /// `true` on a click.
+///
+/// The interactive cell is a comfortable [`Style::SP_XL`] (32px) square — the
+/// same edge the dock's picker cells (`APP_CELL_H`) sit on — so the lock face's
+/// mute target clears the pointer/touch minimum; the speaker glyph stays its
+/// glanceable [`GLANCE_ICON`] size, centred inside the larger hit rect.
 fn mute_button(ui: &mut egui::Ui, muted: bool) -> bool {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(Style::SP_L, Style::SP_L), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(Style::SP_XL, Style::SP_XL), egui::Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
