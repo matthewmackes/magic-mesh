@@ -12,7 +12,7 @@ use mde_egui::eframe::{self, App, CreationContext};
 use mde_egui::egui::{
     self, Align, Context, CursorIcon, Layout, Response, RichText, ScrollArea, Sense,
 };
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 
 use mde_musicd::airsonic::{Album, Client, Song};
 use mde_musicd::creds;
@@ -155,10 +155,11 @@ impl MusicApp {
 
     /// The album library listing (or its loading/empty/error state).
     fn render_library(&mut self, ui: &mut egui::Ui) {
+        // The listing's view title, on the same HEADING rung the open-album view
+        // gives its album name — so the two top-level views read as parallel.
         ui.label(
             RichText::new("Library")
-                .size(Style::BODY)
-                .strong()
+                .size(Style::HEADING)
                 .color(Style::TEXT),
         );
         ui.add_space(Style::SP_XS);
@@ -168,13 +169,13 @@ impl MusicApp {
         let mut to_open: Option<Album> = None;
         match &self.state.albums {
             Fetch::Idle | Fetch::Loading => {
-                ui.colored_label(Style::TEXT_DIM, "Loading library…");
+                centered_state(ui, true, "Loading library…");
             }
             Fetch::Failed(e) => {
                 ui.colored_label(Style::DANGER, format!("Couldn't load the library: {e}"));
             }
             Fetch::Ready(albums) if albums.is_empty() => {
-                ui.colored_label(Style::TEXT_DIM, "This server has no albums yet.");
+                centered_state(ui, false, "This server has no albums yet.");
             }
             Fetch::Ready(albums) => {
                 ScrollArea::vertical()
@@ -226,13 +227,13 @@ impl MusicApp {
 
             match &open.tracks {
                 Fetch::Idle | Fetch::Loading => {
-                    ui.colored_label(Style::TEXT_DIM, "Loading tracks…");
+                    centered_state(ui, true, "Loading tracks…");
                 }
                 Fetch::Failed(e) => {
                     ui.colored_label(Style::DANGER, format!("Couldn't load tracks: {e}"));
                 }
                 Fetch::Ready(songs) if songs.is_empty() => {
-                    ui.colored_label(Style::TEXT_DIM, "This album has no tracks.");
+                    centered_state(ui, false, "This album has no tracks.");
                 }
                 Fetch::Ready(songs) => {
                     ScrollArea::vertical()
@@ -355,10 +356,60 @@ fn render_setup_needed(ui: &mut egui::Ui, detail: &str) {
     });
 }
 
+/// A **designed transient state** — a centred message, with the brand-accent
+/// spinner above it while `busy` — for the library / album loading and empty
+/// branches, so an in-flight or empty surface reads as a deliberate state rather
+/// than a lone dim line pinned to the top-left corner (§7 — an honest "nothing
+/// yet", never a mockup). Draws only through the shared `Style`: the spinner
+/// takes [`Style::ACCENT`] (the one progress token, CRAFT §7) and the message the
+/// dim secondary tone — no raw colour, no literal size.
+fn centered_state(ui: &mut egui::Ui, busy: bool, message: &str) {
+    ui.add_space(Style::SP_XL);
+    ui.vertical_centered(|ui| {
+        if busy {
+            ui.add(egui::Spinner::new().color(Style::ACCENT).size(Style::SP_L));
+            ui.add_space(Style::SP_S);
+        }
+        ui.label(
+            RichText::new(message)
+                .size(Style::BODY)
+                .color(Style::TEXT_DIM),
+        );
+    });
+}
+
+/// Fade a **hover wash** behind a just-built list row, animated through the shared
+/// FAST motion so the row lifts on hover instead of snapping (CRAFT §4 — hover
+/// changes state, so it animates). `band` is the painter slot reserved *before*
+/// the row content (the repo's reserved-shape idiom — it renders behind the row);
+/// `id` keys the per-row animation. Consumes only shared tokens: the
+/// hovered-surface fill ([`Style::SURFACE_HI`]) faded by the eased 0→1 progress,
+/// at the locked radius — no raw colour, no literal duration.
+fn hover_wash(
+    ui: &egui::Ui,
+    band: egui::layers::ShapeIdx,
+    id: impl std::hash::Hash,
+    response: &Response,
+) {
+    let t = Motion::animate(ui.ctx(), id, response.hovered(), Motion::FAST);
+    if t > 0.0 {
+        ui.painter().set(
+            band,
+            egui::Shape::rect_filled(
+                response.rect,
+                Style::RADIUS,
+                Style::SURFACE_HI.gamma_multiply(t),
+            ),
+        );
+    }
+}
+
 /// One clickable album row: title over the `artist · tracks · year` subtitle, in
 /// a bordered surface that turns the cursor to a pointing hand on hover. Rendered
 /// through the shared `Style` visuals (no raw colours).
 fn album_row(ui: &mut egui::Ui, album: &Album) -> Response {
+    // Reserve the wash slot so it paints BEHIND the row content (the repo idiom).
+    let band = ui.painter().add(egui::Shape::Noop);
     let group = ui.group(|ui| {
         ui.set_min_width(ui.available_width());
         ui.vertical(|ui| {
@@ -374,10 +425,12 @@ fn album_row(ui: &mut egui::Ui, album: &Album) -> Response {
             }
         });
     });
-    group
+    let response = group
         .response
         .interact(Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_cursor(CursorIcon::PointingHand);
+    hover_wash(ui, band, ("album-row", album.id.as_str()), &response);
+    response
 }
 
 /// One clickable track row: track number, title, and right-aligned duration.
@@ -387,6 +440,8 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
     let number = song
         .track
         .map_or_else(|| (index + 1).to_string(), |t| t.to_string());
+    // Reserve the wash slot so it paints BEHIND the row content (the repo idiom).
+    let band = ui.painter().add(egui::Shape::Noop);
     let group = ui.group(|ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -412,10 +467,12 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
             });
         });
     });
-    group
+    let response = group
         .response
         .interact(Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_cursor(CursorIcon::PointingHand);
+    hover_wash(ui, band, ("track-row", song.id.as_str()), &response);
+    response
 }
 
 #[cfg(test)]
