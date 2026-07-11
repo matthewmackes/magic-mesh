@@ -51,6 +51,10 @@ const LINK_ACTIVE_W: f32 = 2.0;
 const PULSE_DOT_R: f32 = 3.0;
 /// Gap between the hostname label and the version sub-label stacked beneath it.
 const LABEL_LINE_GAP: f32 = 1.0;
+/// Namespacing salt for a node's per-axis position-easing animation ids, so the
+/// eased x/y a node glides along never collide with another surface's shared
+/// `Motion::animate_value` keys.
+const POS_ANIM_SALT: &str = "mde-mesh-view::node-pos";
 
 // ── Empty-state glyph (the no-nodes canvas) ─────────────────────────────────
 // A dim hub-and-spoke emblem shown when the mesh has no nodes. Sizes are
@@ -64,6 +68,11 @@ const EMPTY_GLYPH_SPOKES: usize = 5;
 const EMPTY_GLYPH_HUB_R: f32 = Style::SP_S;
 /// Satellite disc radius of the empty-state glyph.
 const EMPTY_GLYPH_SAT_R: f32 = Style::SP_XS;
+/// One full "listening" scan sweep of the empty-state glyph (seconds) — a calm
+/// radar-like ripple breathing out from the hub. Derived from the shared Motion
+/// table and deliberately slower than the leader heartbeat, so an idle canvas
+/// reads as *quietly discovering* the mesh rather than as an alarm.
+const EMPTY_SCAN_SECS: f64 = Motion::SLOW as f64 * 8.0;
 
 impl Role {
     /// Drawn disc radius for this role. Public so a caller overlaying its own
@@ -157,15 +166,44 @@ impl<'a> MeshView<'a> {
         let desired = ui.available_size().max(Vec2::splat(Self::MIN_CANVAS));
         let (response, painter) = ui.allocate_painter(desired, Sense::hover());
         let area = response.rect;
+        let time = ui.input(|i| i.time);
 
         // No nodes ⇒ nothing to place or animate: draw the honest "waiting for
-        // mesh" canvas instead of a blank rect or fabricated peers (§6/§7).
+        // mesh" canvas instead of a blank rect or fabricated peers (§6/§7). Its
+        // scan ripple keeps repainting only while motion is allowed.
         if self.state.nodes.is_empty() {
-            Self::paint_empty_state(&painter, area);
+            self.paint_empty_state(&painter, area, time);
+            if !self.reduce_motion {
+                ui.ctx().request_repaint();
+            }
             return response;
         }
 
-        let centres = layout::place(self.state, area, self.margin);
+        // Freshly computed layout slots, then eased so a re-pack (peer join /
+        // leave, a filter change) glides each node to its new slot on the SLOW
+        // structural cadence instead of teleporting. egui seeds a newly seen id
+        // at its target, so a just-appeared node lands in place and only a node
+        // that actually moved animates; frozen to the raw slot under reduced
+        // motion (WCAG 2.3.3). Links read these same centres, so an edge stays
+        // pinned to its endpoints throughout the glide.
+        let targets = layout::place(self.state, area, self.margin);
+        let ctx = ui.ctx().clone();
+        let centres: Vec<Pos2> = if self.reduce_motion {
+            targets
+        } else {
+            self.state
+                .nodes
+                .iter()
+                .zip(&targets)
+                .map(|(n, t)| {
+                    let id = n.id.as_str();
+                    Pos2::new(
+                        Motion::animate_value(&ctx, (POS_ANIM_SALT, id, 0u8), t.x, Motion::SLOW),
+                        Motion::animate_value(&ctx, (POS_ANIM_SALT, id, 1u8), t.y, Motion::SLOW),
+                    )
+                })
+                .collect()
+        };
         let index: HashMap<&str, usize> = self
             .state
             .nodes
@@ -173,8 +211,6 @@ impl<'a> MeshView<'a> {
             .enumerate()
             .map(|(i, n)| (n.id.as_str(), i))
             .collect();
-
-        let time = ui.input(|i| i.time);
 
         // 1) Links (and their activity pulses) under the nodes.
         for link in &self.state.links {
@@ -253,13 +289,29 @@ impl<'a> MeshView<'a> {
     /// when the [`MeshState`] has no nodes, so an un-populated canvas reads as
     /// *waiting for the mesh* — never a blank rect, never fabricated peers
     /// (§6/§7). Every colour, space and type value comes from [`Style`].
-    fn paint_empty_state(painter: &egui::Painter, area: Rect) {
+    fn paint_empty_state(&self, painter: &egui::Painter, area: Rect, time: f64) {
         // Centre the glyph + title + subtitle block: the glyph's full height
         // plus the two stacked text lines and the gaps between them.
         let block_h =
             EMPTY_GLYPH_R * 2.0 + Style::SP_M + Style::HEADING + Style::SP_XS + Style::BODY;
         let cx = area.center().x;
         let glyph_c = Pos2::new(cx, area.center().y - block_h * 0.5 + EMPTY_GLYPH_R);
+
+        // A calm "listening" scan ripple breathing out from the hub, under the
+        // emblem: one expanding, fading ring on the shared scan cadence, so the
+        // idle canvas reads as actively discovering the mesh rather than a dead
+        // placeholder. Painted in the same accent the live view pulses its links
+        // and leader ring with, so the empty and populated states share one
+        // motion language. Frozen (no ripple) under reduced motion (WCAG 2.3.3).
+        if !self.reduce_motion {
+            let phase = (time / EMPTY_SCAN_SECS).fract() as f32;
+            let ripple_r = EMPTY_GLYPH_HUB_R + phase * (EMPTY_GLYPH_R - EMPTY_GLYPH_HUB_R);
+            painter.circle_stroke(
+                glyph_c,
+                ripple_r,
+                Stroke::new(NODE_STROKE_W, Style::ACCENT.gamma_multiply(1.0 - phase)),
+            );
+        }
 
         // Dim hub-and-spoke emblem — hairline links out to unfilled discs in one
         // muted tone, so it reads as an icon of an idle mesh, not as peer data.
@@ -383,6 +435,14 @@ mod tests {
         // No nodes ⇒ the honest "waiting for mesh" EmptyState path (§6/§7),
         // exercised end-to-end (glyph geometry + both text lines).
         render(&MeshState::default(), false, 0.0);
+    }
+
+    #[test]
+    fn empty_state_is_static_under_reduced_motion() {
+        // No nodes + reduced motion ⇒ the honest "waiting for mesh" EmptyState
+        // with its scan ripple frozen (the static empty branch), still a real
+        // painted frame — the glyph + both text lines, no animation.
+        render(&MeshState::default(), true, 2.0);
     }
 
     #[test]
