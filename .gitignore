@@ -34,3 +34,7 @@ install-helpers/__pycache__/
 
 # Session scratchpad (temporary working files)
 scratchpad/
+
+# stray local build/deploy staging (not repo content) — prevents accidental git add -A
+/usr/
+/.state-migration-backups/
