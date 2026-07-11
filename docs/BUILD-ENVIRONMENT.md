@@ -6,15 +6,10 @@
 > `AI_GOVERNANCE.md §10`) rather than relearning it from scratch. Every item below
 > was learned the hard way; the "Gotchas index" exists so no one repeats that.
 
-There are **two build surfaces**, both real and both supported:
+There are **two surfaces**, but only one does heavy builds:
 
-1. **The local dev host** (`172.20.145.192`, Rocky 9.8) — builds the *entire*
-   workspace incl. the egui/DRM GUI in ~seconds-to-a-minute. Best for tight
-   edit→build→verify loops. **Caveat: gcc 11.5 rejects `mold`** → use the gold
-   override (below).
-2. **The build farm** (four Fedora VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — fully
-   OpenTofu/Ansible-managed (see "Build farm" §). Best for offloaded/parallel
-   builds, the release gates, and RPM cuts. gcc 15 there, so `mold` works as-is.
+1. **The build farm** (four Fedora VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
+2. **The local dev host** (`172.20.145.192`, Rocky 9.8) — **fmt / metadata / probe only.** Heavy local `cargo` is **hard-disabled** here by `cargo-farm-guard.sh` (installed ahead of the real `cargo` via `install-helpers/install-drain-guardrails.sh`): local `target/` dirs fill the disk and wedge the drain, so `build`/`test`/`check`/`clippy`/`run` exit 97 and redirect you to the farm. `fmt` still runs locally (`rustup run 1.94.0 rustfmt`). This host's gcc 11.5 rejects `mold` anyway — see §5 for the fresh-box gold-linker override.
 
 **AI directive:** all AI agents must use the build farm for build/test/gate work
 unless the command is only a tiny local syntax/probe check. Parallelize
@@ -33,26 +28,27 @@ unless a reboot is genuinely required for the test or recovery path.
 
 ## 1. Quick start — build right now
 
-**On the local dev host** (`/root/magic-mesh`), the committed `.cargo/config.toml`
-selects `mold`, which this host's **gcc 11.5 rejects** (`-fuse-ld=mold` needs
-gcc ≥ 12 / clang). Override to the gold linker:
+**Everything heavy goes to the farm** (the only real build path; gcc 15 + mold,
+no linker caveat):
 
 ```sh
-cd /root/magic-mesh
-source ~/.cargo/env                              # rustup isn't on the default PATH
-RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo build --workspace
-RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo test -p mde-theme   # token changes
-```
-
-`mde-shell-egui` (the heaviest egui crate) builds + links in ~30 s this way.
-
-**Offload to the farm** (no local linker caveat; gcc 15 + mold):
-
-```sh
-install-helpers/xcp-build.sh cargo build -p <crate>   # rsync tree → .50 → build
+install-helpers/xcp-build.sh cargo build -p <crate>   # rsync tree → farm → build
 install-helpers/xcp-build.sh gates                    # fmt + clippy + test
-install-helpers/farm.sh status                        # both nodes ready?
+MCNF_BUILD_HOST=172.20.0.130 \
+  install-helpers/xcp-build.sh cargo build --workspace   # long pole → BigBoy (.130)
+install-helpers/farm-topology.sh table                # all 4 nodes: verified util table
 ```
+
+Heavy local `cargo` (`build`/`test`/`check`/`clippy`/`run`) is **guard-disabled**
+on this dev host (`cargo-farm-guard.sh`, see the intro): those commands exit 97
+and point you at `xcp-build.sh`. Only `fmt` + metadata run locally —
+`rustup run 1.94.0 rustfmt` (or `cargo +1.94.0 fmt`) for token/format changes.
+
+> A **fresh, unguarded** EL9 box can still build the workspace locally; its
+> gcc 11.5 rejects `-fuse-ld=mold` (needs gcc ≥ 12 / clang; the committed
+> `.cargo/config.toml` selects mold), so override to the gold linker
+> (`RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo build --workspace`) — see §5.
+> `mde-shell-egui` (the heaviest egui crate) links in ~30 s that way.
 
 ---
 
@@ -124,7 +120,7 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 ## 4. The build farm (IaC-managed)
 
-The three build VMs are **declared as code** and built by OpenTofu through Xen
+The four build VMs are **declared as code** and built by OpenTofu through Xen
 Orchestra (XO drives XAPI, so the `xe`-over-ssh foot-guns are gone). This is the
 **DEVOPS-SUBSTRATE** Farm Automation Manager; the `install-helpers/*xcp*` /
 `farm.sh` bash scripts are the working stopgap underneath.
@@ -139,7 +135,7 @@ golden template (XCP-2) ──tofu (clone via XO)──▶ cloud-init NM-fix ─
 | Toolchain/config | `infra/ansible/` | `ansible-playbook infra/ansible/build-vm-toolchain.yml` |
 | Golden template | `install-helpers/setup-xcp-golden-template.sh` → `MDE-VM-golden` (UEFI, both pools) | one-time per pool |
 | Mgmt + console + API | **Xen Orchestra** (`http://172.20.145.192:8080`, podman) | UI / REST |
-| Drive builds | `install-helpers/xcp-build.sh` (rsync + cargo on `.50`) | `xcp-build.sh cargo …` |
+| Drive builds | `install-helpers/xcp-build.sh` (rsync + cargo on a farm node; route with `MCNF_BUILD_HOST`) | `xcp-build.sh cargo …` |
 
 `tofu` state is **local + gitignored**; the XO token is off-repo (`env.sh` sources
 it from `/root/.mcnf-xo-token`). Farm internals + the recovery playbook live in
@@ -183,7 +179,7 @@ Another AI/operator can rebuild the whole thing from this repo:
    `install-helpers/setup-xcp-golden-template.sh --xcp-host <dom0> --name MDE-VM-golden`.
 3. `cd infra/tofu && source env.sh && tofu init && tofu apply` → the build VMs.
 4. `cd infra/ansible && ansible-playbook build-vm-toolchain.yml` → the toolchain.
-5. `install-helpers/farm.sh status` → both nodes `ready`; smoke with
+5. `install-helpers/farm.sh status` → all four nodes `ready`; smoke with
    `install-helpers/xcp-build.sh cargo build -p mde-bus`.
 
 **C. First-time dom0 onboarding** (key + overlay): `install-helpers/onboard-xcp-host.sh`
@@ -256,12 +252,12 @@ against the distro before relying on it.
 |---|---|---|---|---|
 | **bootc immutable image base** | **42** | `packaging/bootc/Containerfile:53` (`ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42`) | "matches the fleet's RPM channel … mesh-service container is FROM fedora:42 too" (`Containerfile:50-52`); `--build-arg BOOTC_BASE=…` for an F43+ rebase (`:52`) | The **oldest** live target → the effective glibc **floor**. Anything installed *into* this image (RPM + layered dnf pkgs) must not require a glibc newer than F42's. |
 | **Canonical container RPM cut** | **43** (default) | `install-helpers/build-rpm-fedora43.sh:43` (`FEDORA="${1:-43}"`) | Builds the RPM inside a `fedora:43` container so its glibc `Requires` match F43 and it installs on F43 lighthouses / older cloud images (`:4-9`) | Produces an RPM installable on **F43 and newer** (forward-compat). Positional arg overrides the version. |
-| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**44** per WORKLIST) | `docs/BUILD-ENVIRONMENT.md:15,17` ("four Fedora VMs … gcc 15"); farm VMs are F44 per `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)") | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc (F44 → `GLIBC_2.43`)** → the artifact may **not** install on F42/F43 unless its shipped ELFs stay ≤ that target's symbols. ⚠ un-enforced. |
+| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**44** per WORKLIST) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora VMs … gcc 15"); farm VMs are F44 per `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)") | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc (F44 → `GLIBC_2.43`)** → the artifact may **not** install on F42/F43 unless its shipped ELFs stay ≤ that target's symbols. ⚠ un-enforced. |
 | **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
 | **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
 | **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/WORKLIST.md:1132`). |
 | **DO lighthouse droplet** | **43** | `infra/tofu/zone1-do/variables.tf:16` (`default = "fedora-43-x64"`) | Lighthouse cloud image; "must have a live dnf channel for its releasever — fedora-42 has none" (`install-helpers/do-lighthouse-up.sh:19-20`) | Needs the F43-container RPM (`build-rpm-fedora43.sh`) or a channel `fedora-43` dir. |
-| **Local dev host** | **EL9 / Rocky 9.8** (not Fedora) | `docs/BUILD-ENVIRONMENT.md:11,71` | Orchestration + tight local build loops; gcc 11.5 (gold linker) | Builds workspace binaries, **not** release RPMs (its glibc is EL9's, unrelated to the Fedora channel). |
+| **Local dev host** | **EL9 / Rocky 9.8** (not Fedora) | `docs/BUILD-ENVIRONMENT.md:12,67` | Orchestration + tight local build loops; gcc 11.5 (gold linker) | Builds workspace binaries, **not** release RPMs (its glibc is EL9's, unrelated to the Fedora channel). |
 
 ### 7.3 Known inconsistencies — flagged, NOT changed (needs-owner-confirmation)
 
@@ -298,7 +294,7 @@ each is left in place and flagged for the owner rather than "aligned" blindly:
    symbol set, not a guarantee.
 
 3. **`build-rpm-fedora43.sh:4` calls the dev host "The F44 dev host".** The
-   canonical dev host is **Rocky 9.8 / EL9** (`docs/BUILD-ENVIRONMENT.md:11`), not
+   canonical dev host is **Rocky 9.8 / EL9** (`docs/BUILD-ENVIRONMENT.md:12`), not
    F44. The script's glibc mechanism is still correct (a newer-glibc *native*
    build — today the **F44 farm VM**, not the EL9 dev host — is what over-pins the
    RPM), but the "F44 dev host" wording is stale. Minor; flagged so a reader does

@@ -37,12 +37,16 @@ password in `$XCP_PASS`. Full operator authorization for both dom0s + all VMs.
 
 ## Dev-host build toolchain (the "build environment online" baseline)
 
-The dev host builds the **entire workspace incl. the egui/DRM GUI** locally.
-Required packages (installed): `gcc-c++`, `cmake`, `mold`, system `libopus`
-(`dnf --enablerepo=crb install opus-devel` on EL9), `alsa-lib-devel`,
-`libxkbcommon-devel`, `gtk3-devel`. **Caveat:** this host's gcc 11.5 rejects
-`-fuse-ld=mold` (the committed `.cargo/config.toml`), so build with
-`RUSTFLAGS="-C link-arg=-fuse-ld=gold"`. `mde-shell-egui` builds + links in ~30 s.
+The dev host carries the **full workspace toolchain** — so `fmt`, metadata, and a
+from-scratch reproduction all work locally. Required packages (installed):
+`gcc-c++`, `cmake`, `mold`, system `libopus` (`dnf --enablerepo=crb install
+opus-devel` on EL9), `alsa-lib-devel`, `libxkbcommon-devel`, `gtk3-devel`.
+**But heavy local `cargo` (`build`/`test`/`check`/`clippy`) is guard-disabled
+here** (`cargo-farm-guard.sh`, see the CI-gate section below) — those route to
+the farm via `install-helpers/xcp-build.sh`. On a **fresh, unguarded** box the
+workspace does build locally; this host's gcc 11.5 rejects `-fuse-ld=mold` (the
+committed `.cargo/config.toml`), so use `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`
+(`mde-shell-egui` links in ~30 s that way).
 
 ## Automation stack (target — the Farm Automation Manager)
 

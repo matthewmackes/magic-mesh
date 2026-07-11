@@ -24,9 +24,12 @@ sudo dnf install -y gcc gcc-c++ cmake mold pkg-config \
 **EL9 / Rocky 9 (the actual dev host `172.20.145.192`) — two things bite:**
 1. `opus-devel` is in **CRB**, not the default repos:
    `sudo dnf --enablerepo=crb install -y opus-devel`.
-2. gcc 11.5 **rejects `mold`** (`.cargo/config.toml` selects it). Build with the
-   gold linker: `RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo build --workspace`.
-   (The farm VMs run gcc 15, so mold works there — no override.)
+2. Heavy local `cargo` (`build`/`test`/`clippy`) is **guard-disabled** on this
+   dev host (`cargo-farm-guard.sh`) — build on the farm:
+   `install-helpers/xcp-build.sh cargo build --workspace`. (A fresh, unguarded
+   EL9 box does build locally, but its gcc 11.5 rejects `mold` — `.cargo/config.toml`
+   selects it — so it needs `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`. The farm VMs
+   run gcc 15, so mold works there with no override.)
 
 - Rust: MSRV **1.85** (the floor, CI-enforced); `rust-toolchain.toml` pins
   **1.94** as the dev ceiling (softbuffer 0.4.8 breaks on 1.95 — see the
@@ -41,6 +44,10 @@ sudo dnf install -y gcc gcc-c++ cmake mold pkg-config \
   cargo …` (routes to the farm); status via `install-helpers/farm.sh status`.
 
 ## Test rules
+
+Run these on the farm (`install-helpers/xcp-build.sh cargo test …`, or
+`xcp-build.sh gates` for the full pyramid) — local `cargo test` is guard-disabled.
+The parallelism rules the farm applies:
 
 ```bash
 cargo test --workspace --exclude mackesd          # parallel — everything else
@@ -57,6 +64,11 @@ Carbon token / palette / metric changes additionally require
 assertion (§4).
 
 ## Gates (all must pass before a commit lands)
+
+The cargo gates run on the **farm** — `install-helpers/xcp-build.sh gates` bundles
+build + clippy + test (local `cargo` is guard-disabled by `cargo-farm-guard.sh`);
+the `lint-*.sh` / `cargo deny` steps run locally. The always-on
+`install-helpers/ci-gate.sh` runs the whole set on every `origin/master` advance.
 
 ```bash
 cargo build --workspace --locked
