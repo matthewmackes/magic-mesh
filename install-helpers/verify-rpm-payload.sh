@@ -29,7 +29,8 @@
 #   install-helpers/verify-rpm-payload.sh                # dry-run BOTH checks (default)
 #   install-helpers/verify-rpm-payload.sh all            # same as no args
 #   install-helpers/verify-rpm-payload.sh payload        # RPM-payload check, dry-run (no RPM)
-#   install-helpers/verify-rpm-payload.sh payload a.rpm  # validate a REAL built RPM's file list
+#   install-helpers/verify-rpm-payload.sh payload a.rpm  # validate a REAL built RPM's file list (also size-checks it)
+#   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
 #   install-helpers/verify-rpm-payload.sh surfaces       # surface-reachability check only
 #   install-helpers/verify-rpm-payload.sh --self-test    # exercise the parser on good+broken fixtures
 #   install-helpers/verify-rpm-payload.sh --help
@@ -64,7 +65,17 @@
 #
 # Real-RPM semantics (`payload <rpm>`): runs `rpm -qlp <rpm>` and asserts every
 # expected install path is in the payload (globs are checked best-effort by dest
-# prefix; the key bins are checked exactly).
+# prefix; the key bins are checked exactly), then ALSO size-checks the file.
+#
+# Size semantics (`size <rpm>`, build-deploy-12): the public dnf channel is served
+# from GitHub Pages (packaging/repo/magic-mesh.repo), a git branch, so the pushed
+# .rpm FILE is subject to GitHub's ~100 MiB hard per-file block. The monolithic RPM
+# is already ~one growth step from that cliff. This check measures the COMPRESSED
+# .rpm file (wc -c — the bytes actually pushed, not the uncompressed payload) and
+# FAILs if it exceeds MCNF_RPM_SIZE_LIMIT_MIB (default 90 MiB — headroom under even
+# the strict 100 MB=95.37 MiB reading). Wire it into the release cut so the channel
+# can never be silently broken. See docs/design/rpm-size-split.md for the durable
+# fix (a co-installable magic-mesh-browser sub-package).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # EXEMPT surface crates — mde-*-egui crates under crates/desktop that are NOT dock
@@ -84,6 +95,7 @@
 #   DESKTOP_DIR  surface-crate dir    (default crates/desktop)
 #   REPO_ROOT    tree root for assets (default: the git worktree this script is in)
 #   MCNF_FAKE_RPM_LIST  a file whose lines stand in for `rpm -qlp` (real-RPM test hook)
+#   MCNF_RPM_SIZE_LIMIT_MIB  size-gate ceiling in MiB (default 90; build-deploy-12)
 set -uo pipefail
 shopt -s globstar nullglob
 
@@ -100,6 +112,11 @@ EXEMPT_SURFACES=("mde-panel-egui")
 
 # The three replacement binaries the (a)-class regression is really about.
 readonly KEY_BINS=("mde-shell-egui" "mackesd" "mde-web-preview")
+
+# build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
+# so the pushed .rpm file hits GitHub's ~100 MiB hard per-file block. Fail a cut with
+# headroom (default 90 MiB) so a growth step is caught at cut time, not publish time.
+RPM_SIZE_LIMIT_MIB="${MCNF_RPM_SIZE_LIMIT_MIB:-90}"
 
 FAILS=0
 ok()   { printf '[OK]   %s\n' "$*"; }
@@ -223,6 +240,28 @@ rpm_file_list() {
   fi
 }
 
+# ── check_rpm_size <rpm> ──────────────────────────────────────────────────────
+# build-deploy-12 — assert the COMPRESSED .rpm file fits under the GitHub-Pages
+# channel ceiling. Measures the real file (wc -c: the bytes actually pushed), not
+# the uncompressed payload. FAILs over MCNF_RPM_SIZE_LIMIT_MIB (default 90 MiB).
+check_rpm_size() {
+  local rpm="$1"
+  hdr "payload size — ${rpm} (limit ${RPM_SIZE_LIMIT_MIB} MiB; GitHub channel ~100 MiB ceiling)"
+  if [ ! -f "$rpm" ]; then
+    fail "size           RPM not found for size check: $rpm"
+    return
+  fi
+  local bytes limit_bytes mib
+  bytes="$(wc -c <"$rpm" | tr -d '[:space:]')"
+  limit_bytes=$(( RPM_SIZE_LIMIT_MIB * 1024 * 1024 ))
+  mib="$(awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }')"
+  if [ "$bytes" -le "$limit_bytes" ]; then
+    ok "size           ${rpm##*/} is ${mib} MiB (within the ${RPM_SIZE_LIMIT_MIB} MiB cut limit)"
+  else
+    fail "size           ${rpm##*/} is ${mib} MiB — EXCEEDS the ${RPM_SIZE_LIMIT_MIB} MiB cut limit (the gh-pages channel breaks at GitHub's ~100 MiB per-file block; split the payload — see docs/design/rpm-size-split.md — or promote the sovereign channel before publishing)"
+  fi
+}
+
 check_payload_rpm() {
   local rpm="$1"
   hdr "payload (real RPM) — $rpm"
@@ -272,6 +311,12 @@ check_payload_rpm() {
       fi
     fi
   done < <(parse_assets "$CARGO_TOML")
+
+  # Validating a REAL RPM also asserts it fits the channel ceiling (build-deploy-12).
+  # Skip under the fake-list self-test hook (no real file to measure).
+  if [ -z "${MCNF_FAKE_RPM_LIST:-}" ] && [ -f "$rpm" ]; then
+    check_rpm_size "$rpm"
+  fi
 }
 
 check_payload() {
@@ -447,6 +492,33 @@ TOML
     fail "self-test: orphan surface was not caught"; st_fail=1
   fi
 
+  # ---- fixture D: the RPM-size gate (build-deploy-12) ------------------------
+  # A real RPM can't be cut on the airgapped tree, so exercise the byte-threshold
+  # logic on a fixed-size file (5 MiB of zeros stands in for the .rpm).
+  local fakerpm="$tmp/fake.rpm"
+  head -c $((5 * 1024 * 1024)) /dev/zero >"$fakerpm"
+  # under a generous limit → PASS + exit 0
+  out="$(MCNF_RPM_SIZE_LIMIT_MIB=90 bash "$0" size "$fakerpm" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && grep -q "within the 90 MiB cut limit" <<<"$out"; then
+    ok "self-test: a 5 MiB RPM passes the 90 MiB size gate"
+  else
+    fail "self-test: small RPM did not pass the size gate"; st_fail=1
+  fi
+  # over a tight limit → FAIL + exit non-zero
+  out="$(MCNF_RPM_SIZE_LIMIT_MIB=2 bash "$0" size "$fakerpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "EXCEEDS the 2 MiB cut limit" <<<"$out"; then
+    ok "self-test: a 5 MiB RPM fails a 2 MiB size gate (the channel-ceiling guard fires)"
+  else
+    fail "self-test: oversize RPM was not caught by the size gate"; st_fail=1
+  fi
+  # a missing file FAILs cleanly (not a crash)
+  out="$(bash "$0" size "$tmp/nonexistent.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "RPM not found for size check" <<<"$out"; then
+    ok "self-test: a missing RPM path fails the size gate cleanly"
+  else
+    fail "self-test: missing-RPM size check did not fail cleanly"; st_fail=1
+  fi
+
   hdr "SELF-TEST RESULT"
   if [ "$st_fail" -eq 0 ]; then
     ok "self-test: all assertions passed"
@@ -466,6 +538,7 @@ main() {
     -h|--help|help) usage; exit 0 ;;
     --self-test|self-test) self_test; exit $? ;;
     payload)  shift; check_payload "${1:-}" ;;
+    size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")   check_payload_dryrun; check_surfaces ;;
     *) printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;
