@@ -46,6 +46,12 @@
 //! egui itself is re-exported from the shared `mde-egui` harness so every surface
 //! resolves to the one harness-pinned egui (no cross-surface version skew, §4).
 
+// P2 perf-12: this crate decodes UNTRUSTED remote input (the SPICE wire framebuffer /
+// image / channel stream). A stray `.unwrap()`/`.expect()` on a decode path is a
+// remote-triggerable panic (DoS-adjacent), so deny both in non-test code. Test code
+// keeps them for terse assertions.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 // Re-export the toolkit through the harness so the shell and this backend share
 // exactly one egui resolution.
 pub use mde_egui::egui;

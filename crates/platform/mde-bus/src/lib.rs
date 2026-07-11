@@ -23,6 +23,12 @@
 //! (BUS-1.4), subscription manifest (BUS-1.7), the full CLI (BUS-1.8),
 //! and the retention engine (BUS-1.9) on top of these primitives.
 
+// P2 perf-12: the Bus wire/frame path (RPC framing, topic/template parsing, and the
+// webhook receivers under `hooks/`) parses UNTRUSTED remote input. A stray
+// `.unwrap()`/`.expect()` on that path is a remote-triggerable panic (DoS-adjacent),
+// so deny both in non-test code. Test code keeps them for terse assertions.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod audit;
 pub mod broker;
 pub mod cli;

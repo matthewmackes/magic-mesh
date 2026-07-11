@@ -79,6 +79,10 @@ impl PeerRegistry {
 
     /// Insert or replace the record for one peer (keyed by
     /// instance name).
+    // perf-12: the `PeerRegistry` mutex only poisons if another thread panicked while
+    // holding it — a static "cannot happen" invariant, not a remote-reachable decode
+    // path — so the documented `.expect()` stays (see also `remove`/`snapshot`/`len`).
+    #[allow(clippy::expect_used)]
     pub fn upsert(&self, peer: BusPeer) {
         let mut g = self.inner.lock().expect("PeerRegistry mutex");
         g.insert(peer.instance.clone(), peer);
@@ -86,6 +90,7 @@ impl PeerRegistry {
 
     /// Drop a peer by instance name (received on
     /// `ServiceRemoved`).
+    #[allow(clippy::expect_used)] // perf-12: mutex-poison static invariant (see `upsert`).
     pub fn remove(&self, instance: &str) {
         let mut g = self.inner.lock().expect("PeerRegistry mutex");
         g.remove(instance);
@@ -94,6 +99,7 @@ impl PeerRegistry {
     /// Snapshot the registry — useful for the CLI `mde-bus
     /// peers` command (BUS-1.8) and for debug logging.
     #[must_use]
+    #[allow(clippy::expect_used)] // perf-12: mutex-poison static invariant (see `upsert`).
     pub fn snapshot(&self) -> Vec<BusPeer> {
         let g = self.inner.lock().expect("PeerRegistry mutex");
         let mut v: Vec<BusPeer> = g.values().cloned().collect();
@@ -103,6 +109,7 @@ impl PeerRegistry {
 
     /// Current number of registered peers.
     #[must_use]
+    #[allow(clippy::expect_used)] // perf-12: mutex-poison static invariant (see `upsert`).
     pub fn len(&self) -> usize {
         self.inner.lock().expect("PeerRegistry mutex").len()
     }

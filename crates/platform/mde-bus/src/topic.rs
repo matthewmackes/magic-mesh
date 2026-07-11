@@ -154,6 +154,12 @@ impl Registry {
     /// freshly-created) topic. Equivalent to calling
     /// [`Self::create`] with a bare default if the topic did not
     /// exist.
+    // perf-12: the untrusted `name` is validated by `validate_publish_name(name)?`
+    // above; the trailing `.expect()` is a post-insert map invariant (we just inserted
+    // the key when vacant, so `get` cannot be `None`) — a static invariant, not a
+    // remote-reachable failure. Kept over an `entry()` rewrite to avoid allocating the
+    // key string on the hot already-present path.
+    #[allow(clippy::expect_used)]
     pub fn ensure(&mut self, name: &str) -> Result<&Topic, TopicError> {
         Self::validate_publish_name(name)?;
         // `entry().or_insert_with` would give us a `&mut Topic`, but

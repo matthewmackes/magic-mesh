@@ -32,6 +32,12 @@
 //! `mde-egui` harness so every surface resolves to the one harness-pinned egui (no
 //! cross-surface version skew, §4).
 
+// P2 perf-12: the transport-neutral core the VDI backends share turns UNTRUSTED wire
+// framebuffers into egui surfaces (pixel blit / damage / coordinate clamp). A stray
+// `.unwrap()`/`.expect()` on that path is a remote-triggerable panic (DoS-adjacent),
+// so deny both in non-test code. Test code keeps them for terse assertions.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 // Re-export the toolkit through the harness so this core and the three backends
 // share exactly one egui resolution.
 pub use mde_egui::egui;
