@@ -684,6 +684,15 @@ assets = [
     { source = "packaging/selinux/mde-web-preview.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.fc", mode = "644" },
     { source = "install-helpers/setup-selinux-web-preview.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-preview", mode = "755" },
     { source = "packaging/systemd/mde-web-preview-selinux.service", dest = "/usr/lib/systemd/system/mde-web-preview-selinux.service", mode = "644" },
+    # security-1 — the confined ENFORCING SELinux domain for the Chromium/CEF
+    # browser helper (mde_web_cef_t): the launcher + the renderer bridge. Same
+    # defense-in-depth shape as the Servo domain above, over the renderer's
+    # in-process OS sandbox (mde-web-sandbox); self-skips where SELinux is
+    # disabled or the policy toolchain is absent — never a permissive stub.
+    { source = "packaging/selinux/mde-web-cef.te", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.te", mode = "644" },
+    { source = "packaging/selinux/mde-web-cef.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.fc", mode = "644" },
+    { source = "install-helpers/setup-selinux-web-cef.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-cef", mode = "755" },
+    { source = "packaging/systemd/mde-web-cef-selinux.service", dest = "/usr/lib/systemd/system/mde-web-cef-selinux.service", mode = "644" },
     # BOOKMARKS-9 — the bundled ad-filter SEED lists (the offline fallback the
     # mde-adblock engine compiles before a node's first upstream sync). These are
     # the SAME bytes `mde-adblock` `include_str!`s into the shipped shell binary
@@ -805,7 +814,7 @@ systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
 # VM images. Do NOT run it from dnf's %post, even with --no-block: starting the
 # oneshots can still race the open RPM transaction. Enable only; policy loading
 # is deferred to boot or an explicit post-install retry outside dnf.
-systemctl enable magic-mesh-selinux-policy.service mde-web-preview-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service >/dev/null 2>&1 || :
+systemctl enable magic-mesh-selinux-policy.service mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service >/dev/null 2>&1 || :
 # MUSIC-DAEMON-AUTOSTART — enable the mde-musicd USER service for every user so
 # the music library has its action/music/* responder in the desktop session
 # (the GUI talks to it over the bus). It self-gates on Workstation rank

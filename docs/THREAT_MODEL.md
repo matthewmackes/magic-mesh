@@ -17,12 +17,16 @@ numbered section using the same shape (trust boundary → attack surface →
 mitigations → accepted residual risks → out of scope): **§6, phone-to-desktop
 remote-input injection** (KDC-MESH-6: `workers/seat_remote_input.rs` +
 `install-helpers/seat-remote-input.py`), **§7, WebAuthn / passkey
-ceremonies** (BROWSER-DD-6: `workers/browser_passkeys.rs`), and **§8, the
+ceremonies** (BROWSER-DD-6: `workers/browser_passkeys.rs`), **§8, the
 CEF/Chromium engine's own privacy hardening** (BROWSER-DD-1:
-`crates/desktop/mde-web-cef`) — narrower in scope than §1-5 (which describe
-the confinement `sandbox.rs` gives the **Servo** engine specifically; CEF has
-no equivalent sandbox module, per §7.4 point 4). Each section is the security
-contract for that worker; change its trust model and update its section.
+`crates/desktop/mde-web-cef`), **§9, the CEF DevTools remote-debugging port**
+(security-4), and **§10, the CEF/Chromium OS confinement** (security-1). §1-5
+describe the confinement `sandbox.rs` gives the **Servo** engine specifically;
+**§10** documents the EQUIVALENT OS confinement now applied to the **CEF**
+engine — the shared `mde-web-sandbox` crate (factored from Servo's `sandbox.rs`),
+installed on the CEF renderer before `cef_initialize`, wrapping the whole
+multi-process Chromium tree. Each section is the security contract for that
+worker; change its trust model and update its section.
 
 ---
 
@@ -30,7 +34,8 @@ contract for that worker; change its trust model and update its section.
 
 | Component | Tier | Trust |
 |-----------|------|-------|
-| `mde-web-preview` (bin) | desktop-shell helper, **out-of-process** | **UNTRUSTED** — runs attacker-influenced web content (JS, layout, media). Confined. |
+| `mde-web-preview` (bin) | desktop-shell helper, **out-of-process** | **UNTRUSTED** — runs attacker-influenced web content (JS, layout, media). Confined (§3.1). |
+| `mde-web-cef` (launcher) + `mde-web-cef-renderer` (bridge) (bins) | desktop-shell helper, **out-of-process**, **multi-process** (Chromium/CEF forks its own renderer/GPU/utility subprocesses) | **UNTRUSTED** — runs attacker-influenced web content. Confined by the SAME OS-sandbox class as `mde-web-preview` (§10), which wraps the entire subprocess tree. Chromium's OWN internal sandbox stays off (`--no-sandbox`) — see §10 for why, and why the OS sandbox is the honest confinement. |
 | `mde-web-preview-client` (lib) | desktop-shell, in the shell process | Trusted. Spawns + drives the helper over a per-session socket; maps the shm frame **read-only**. |
 | `mde-adblock` (lib) | services | Trusted, pure. Judges each subresource request (block-before-fetch) + builds the cosmetic stylesheet. |
 | `browser_policy` worker (mackesd) | mesh service | Trusted. Fleet-wide governance: refuses to spawn on a disallowed role, forces the ad-blocker, enforces the URL allowlist. |
@@ -503,14 +508,15 @@ credential.
    `find_credential` deterministically returns the alphabetically-first one
    — no account picker. Fine for a single-account site; silently chooses for
    the user on a multi-account one.
-4. **The CEF/Chromium engine lane is outside this document's trust table.**
-   Ceremonies can originate from `engine: "servo"` **or** `engine: "cef"`.
-   `mde-web-cef` has its own sandbox-related code (`cef_abi.rs`,
-   `cef_init.rs`, `renderer.rs`) but §1's trust table above only describes
-   Servo/`mde-web-preview`. Not introduced by this diff, but the passkey
-   worker is the first place this document needed to say "or CEF" out loud —
-   the CEF lane's confinement is unaudited here and shouldn't be assumed
-   identical to §3.
+4. **The CEF/Chromium engine lane now has an OS confinement (§10), but with a
+   named residual gap.** Ceremonies can originate from `engine: "servo"` **or**
+   `engine: "cef"`. As of security-1, `mde-web-cef`'s renderer installs the
+   shared `mde-web-sandbox` OS sandbox before `cef_initialize` (§10), so the CEF
+   lane is now in §1's trust table and confined by the same class as Servo. The
+   residual gap is that **Chromium's OWN internal sandbox stays off**
+   (`--no-sandbox`) — see §10.3. The OS sandbox contains the whole Chromium
+   process tree regardless, but live-seat verification of that confinement is
+   still required (§10.4).
 5. **Local Bus trust, same caveat as §6.4's.** Anything running as the
    desktop user that can write `action/browser/passkey` can trigger a real
    signed ceremony for any `rp_id` it can also satisfy the origin check for
@@ -535,10 +541,10 @@ sealed store mirrors silently by design, not for manual export).
 
 Scope: `crates/desktop/mde-web-cef`'s `chromium_privacy_switches()`
 (`cef_init.rs`) and its renderer-level companion in `cef_browser.rs`. This is
-narrower than §1-5: it is not a full CEF confinement audit — §7.4 point 4
-already flags that CEF has no sandbox module equivalent to Servo's
-`sandbox.rs`, and that remains true and unaudited here. This section
-documents one specific, verified privacy-hardening finding and its fix.
+narrower than §1-5: it is not a full CEF confinement audit. The CEF OS
+confinement itself is now documented in **§10** (security-1: the shared
+`mde-web-sandbox` sandbox applied to the renderer); this section documents one
+specific, verified WebRTC privacy-hardening finding and its fix.
 
 ### 8.1 The finding (2026-07-10)
 
@@ -639,9 +645,10 @@ mechanism that would let a script win the race against a page's own inline
 
 ### 8.4 Out of scope
 
-A full CEF confinement audit equivalent to §3 (Servo's `sandbox.rs`) — CEF
-has no such module today; this section documents the WebRTC-specific finding
-above, not a new confinement layer. Enabling real WebRTC as a feature
+A full CEF confinement audit equivalent to §3 (Servo's `sandbox.rs`); the CEF
+OS confinement now lives in **§10** (security-1). This section documents the
+WebRTC-specific finding above, not that confinement layer. Enabling real WebRTC
+as a feature
 (BROWSER-DD-9, `docs/design/browser-dd9-webrtc-rescope.md`) is a separate,
 much larger, not-yet-started item — this fix is a hardening correctness fix
 for the *current* (WebRTC-off) posture, not a step toward shipping it.
@@ -687,3 +694,128 @@ When an operator *does* opt in on a trusted host, the endpoint is still an
 unauthenticated loopback CDP port for that session (the pinned CEF ABI has no
 per-session-token knob); the mitigation is that it is off by default, off in
 every shipped build, and reachable only by an explicit, deliberate action.
+
+---
+
+## 10. CEF/Chromium engine — the OS confinement (security-1)
+
+Scope: `crates/desktop/mde-web-cef` (the launcher `/usr/bin/mde-web-cef` + the
+renderer bridge `/usr/libexec/mackesd/mde-web-cef-renderer`), the shared
+`crates/desktop/mde-web-sandbox` crate, and the confined SELinux domain
+`packaging/selinux/mde-web-cef.te`.
+
+### 10.1 The finding
+
+The CEF/Chromium browser helper ran attacker-influenced web content with
+Chromium's own sandbox disabled (`--no-sandbox`, `cef_settings_t.no_sandbox=1`)
+**and** no OS sandbox and no SELinux domain — on a node that also holds the
+Nebula CA and mesh SSH keys. A single renderer RCE (assume "when", not "if" —
+§2) could read `$HOME`, `~/.ssh`, `/etc/nebula`, `/etc/mackesd`, `/var/lib/*`
+and the mesh-storage tree directly. Meanwhile the Servo helper
+(`mde-web-preview`) was already fully confined (§3). This was the largest gap in
+the browser lane's trust story.
+
+### 10.2 The fix — the OS sandbox, applied to the CEF renderer
+
+The renderer installs the SAME OS-sandbox class Servo gets, **before** it
+`dlopen`s `libcef.so` or calls `cef_initialize` — reusing the confinement,
+factored out of Servo's `sandbox.rs` into the shared **`mde-web-sandbox`** crate
+(not copy-pasted). Applied in `renderer.rs` for the top-level browser process
+(`apply_os_sandbox`), it is:
+
+- a **user + mount + IPC + UTS + cgroup + PID namespace** set (no network ns, on
+  purpose — egress stays, the ad-filter is the network-hygiene layer, §3.6);
+- **uid/gid maps** to a throwaway identity;
+- a **`pivot_root`'d read-only rootfs** that binds ONLY the read-only system
+  runtime (`/usr` etc.), the system CA bundle + DNS files, the GPU render node,
+  and the vendored CEF runtime bundle (`/opt/mde/cef`, read-only, so the browser
+  can load `libcef.so` and re-exec its subprocess bridge). There is **NO
+  `$HOME`, no `/root`, no `/var`, no `~/.ssh`, no `/etc/nebula`, no
+  `/etc/mackesd`, no mesh-storage** — they are simply absent from the new root;
+- **`no_new_privs`**, a **fully-dropped capability set** (bounding + ambient +
+  inheritable + permitted + effective), and the **seccomp-bpf escape denylist**
+  (ptrace, the mount family, `unshare`/`setns`, module loading, `bpf`,
+  `perf_event_open`, key management, `kexec`, clock-set, …);
+- **cgroup v2 memory/CPU caps** (2 GiB / ~2 cores — a higher ceiling than the
+  single-process Servo tab because the cap binds the WHOLE Chromium tree).
+
+**Multi-process reconciliation (the crux).** Chromium is multi-process: the
+browser process forks + re-`exec`s the renderer bridge with `--type=renderer`
+(and `--type=gpu-process`/`--type=utility`) for each subprocess. The OS sandbox
+is applied ONCE, on the top-level browser process, and every subprocess inherits
+it automatically — `no_new_privs` preserves the seccomp filter across `execve`,
+and the namespaces + `pivot_root`'d rootfs + dropped caps + cgroup are inherited
+by fork/exec. So the renderer subprocess that actually runs untrusted JS is
+confined too. The renderer detects a CEF subprocess (`--type=…` present) and
+does **not** re-apply the sandbox (that would `EPERM` — the very syscalls it
+would need are on our own denylist). A confinement failure on the top-level
+process is **fatal** (`CEF_OS_SANDBOX_FAILED`, exit 78) — the helper never runs
+web content unconfined.
+
+The SELinux domain `mde_web_cef_t` (defense-in-depth, §3.2's shape) confines
+both binaries wherever a node runs SELinux Enforcing; it self-skips where
+SELinux is disabled (the platform standard), leaving the OS sandbox as the
+operative confinement.
+
+### 10.3 Accepted residual risk — Chromium's OWN internal sandbox stays OFF
+
+`--no-sandbox` is **kept**. Chromium's own internal sandbox (its
+unprivileged-userns / setuid-`chrome-sandbox` layers) is **not** re-enabled, and
+this is a deliberate, documented limitation, not an oversight:
+
+- Chromium's namespace sandbox has its zygote `unshare`/`clone` a NESTED user
+  namespace and then `mount`/`pivot_root`/`umount2` to build each renderer's
+  restricted view. Those mount-family syscalls are **exactly** what MCNF's OS
+  seccomp denylist `EPERM`s (post-setup). Re-enabling Chromium's sandbox would
+  require **removing** the mount/`pivot_root`/`unshare` denials — i.e. gutting
+  the OS sandbox's seccomp layer — which is a strictly worse trade.
+- `no_new_privs` + seccomp block the mount family **regardless of capabilities**
+  (seccomp is checked before the capability check), so even the full cap set a
+  nested userns would grant does not help.
+- The setuid `chrome-sandbox` helper is not installed setuid-root on these
+  nodes, and would not work under the sandbox's throwaway uid map anyway.
+- The pinned prebuilt CEF 149 binary cannot be rebuilt to change this
+  (from-source GN flags are unavailable — this crate links a vendored payload).
+
+**Net honest posture:** Chromium's *internal* sandbox is off, but the *entire*
+Chromium process tree (browser + every renderer/GPU/utility subprocess) runs
+inside MCNF's OS sandbox, so untrusted web content still cannot reach `$HOME`,
+SSH keys, the Nebula CA, or mesh data. MCNF's outer seccomp filter also partly
+substitutes for the per-renderer seccomp layer that `--no-sandbox` turns off
+inside Chromium — it just covers the whole tree from outside rather than
+per-process from inside. Do **not** read "sandboxed" as "Chromium-sandboxed"
+here; it means OS-sandboxed.
+
+### 10.4 Verification status — live-seat check REQUIRED (deferred)
+
+A sandbox cannot be fully proven headlessly. What IS verified: the crate builds
+and its pure planners are unit-tested — the CEF policy (`web_cef` — host, 2 GiB
+ceiling, distinct rootfs path), the seccomp denylist construction, the
+uid/gid-map and rootfs bind plans, and the CEF-specific extra-bind planner
+(`cef_extra_readonly_binds` — exposes only the runtime + vetted extensions,
+never a key/home path). The seccomp denylist is the SAME one Servo runs a full
+browser engine under.
+
+**Still required, and deferred to the operator (live seat .13 / .138):**
+
+1. Launch a real CEF tab on a seat with the pinned `/opt/mde/cef` bundle present
+   and confirm it renders (the `CEF_OS_SANDBOX applied=1 …` line prints, then a
+   frame arrives). CEF may need a `root_cache_path`/cache dir the sandbox's
+   writable `/tmp` must satisfy — a cache-path failure would surface here.
+2. Confirm from **inside** the browser process (e.g. a `file://` probe / a
+   crafted page, or `nsenter` into the renderer's mount ns) that `~/.ssh`, the
+   Nebula CA (`/etc/nebula`), and `/etc/mackesd` are **NOT readable** — the core
+   confinement claim.
+3. Confirm Chromium's multi-process children actually start under the OS sandbox
+   (no `EPERM`-induced crash from the seccomp denylist tripping a syscall
+   Chromium — unlike Servo — needs; if one does, the fix is to remove that
+   single syscall from the shared denylist, not to weaken the whole layer).
+4. On a SELinux-Enforcing node, `audit2allow` any residual AVC for
+   `mde_web_cef_t` (a prebuilt Chromium is mmap-/syscall-heavy; the shipped
+   `.te` is the known-necessary least-privilege set, not a headlessly-proven
+   byte-perfect policy).
+
+Until (1)-(3) are done on a live seat, the OS confinement is **implemented and
+unit-exercised but not runtime-proven**; the honest claim is "the same
+confinement class as Servo, applied — pending live verification", not "proven
+confined".

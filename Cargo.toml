@@ -31,7 +31,17 @@ resolver = "2"
 # ships as a vendored native runtime on the farm, not as part of the main daemon
 # lockfile. Build it standalone while the runtime lane comes up:
 #   cargo build --manifest-path crates/desktop/mde-web-cef/Cargo.toml
-exclude = ["crates/desktop/mde-web-preview", "crates/desktop/mde-web-cef"]
+#
+# mde-web-sandbox (security-1) is the SHARED OS-confinement library those two
+# helpers reuse (userns + seccomp + dropped caps + pivot_root RO rootfs). It is
+# EXCLUDED for the same reason they are: it links the native-syscall crates
+# (nix/seccompiler/caps) and needs `unsafe`, which the parent workspace forbids.
+# It is never built standalone — only as a path dependency of the helpers.
+exclude = [
+    "crates/desktop/mde-web-preview",
+    "crates/desktop/mde-web-cef",
+    "crates/desktop/mde-web-sandbox",
+]
 members = [
     "crates/platform/mde-bus",
     "crates/platform/mde-role",
