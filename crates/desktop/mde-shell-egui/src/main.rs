@@ -351,9 +351,11 @@ struct Shell {
     /// The Discovery hero-card surface (EXPLORER-3) — the cinematic one-unit-at-a-
     /// time view over every discovered unit (mesh peers · LAN hosts · `OpenStack`
     /// objects), folded from the aggregator's `state/units/*` mirrors (EXPLORER-1).
-    /// A thin renderer (§6): it reads the Bus, never scans. Mounted as the Mesh
-    /// Map surface's **Explorer** lens (the [`explorer::LENS_KEY`] toggle) pending
-    /// the dedicated dock entry; polled only while that lens is visible (#24).
+    /// A thin renderer (§6): it reads the Bus, never scans. Reachable two ways
+    /// (shell-ux-8): as the first-class [`Surface::Explorer`] (its own dock/menu
+    /// entry) AND as the Mesh Map surface's **Explorer** lens (the
+    /// [`explorer::LENS_KEY`] toggle, which also serves the NODE-GRADE-2 node-focus
+    /// jump). Polled only while one of those is in view (#24).
     explorer: explorer::ExplorerState,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
@@ -558,7 +560,9 @@ impl Shell {
     /// shelf over every discovered unit. The lens persists in egui memory under
     /// [`explorer::LENS_KEY`] so [`Self::poll_mesh_map`] reads the same choice; it
     /// defaults to the map, so OW-10's all-green auto-open still lands on the map.
-    /// (Mounted here pending the dedicated dock picker entry — a clean seam.)
+    /// The Explorer now also stands alone as [`Surface::Explorer`] (its dedicated
+    /// dock/menu entry, shell-ux-8); this in-map lens is kept for side-by-side
+    /// toggling and drives the NODE-GRADE-2 node-focus jump.
     fn show_mesh_map(&mut self, ui: &mut egui::Ui) {
         let mesh_view = &mut self.mesh_view;
         let explorer = &mut self.explorer;
@@ -581,6 +585,20 @@ impl Shell {
             } else {
                 mesh_view.show(ui);
             }
+        });
+    }
+
+    /// The standalone **Explorer** surface ([`Surface::Explorer`], shell-ux-8) —
+    /// the same EXPLORER-3 Discovery hero card the Mesh Map lens renders, promoted
+    /// to a first-class dock/menu surface so the platform's richest inventory view
+    /// is discoverable on its own. Scoped under its own [`egui::Ui::push_id`] like
+    /// every mounted surface so its egui ids can't collide in the shell's one
+    /// `Context`. Polled while in view by [`Self::render`]; the Mesh Map's Explorer
+    /// lens stays as a second, side-by-side path (the node-focus deep-link's home).
+    fn show_explorer(&mut self, ui: &mut egui::Ui) {
+        let explorer = &mut self.explorer;
+        ui.push_id("shell-explorer", |ui| {
+            explorer.show(ui);
         });
     }
 
@@ -614,6 +632,7 @@ impl Shell {
                 );
             }
             Surface::MeshView => self.show_mesh_map(ui),
+            Surface::Explorer => self.show_explorer(ui),
             Surface::Desktop => {
                 // MENUBAR-ALL — the shared top bar (DESKTOP), mounted above whichever
                 // face renders below (the Chooser or the brokered desktop). Its two
@@ -1016,6 +1035,12 @@ impl Shell {
         // The Mesh Map surface (+ its EXPLORER-3 Explorer lens) refolds while in view.
         if self.nav.expanded && self.nav.surface == Surface::MeshView {
             self.poll_mesh_map(ctx);
+        }
+        // The standalone Explorer surface (shell-ux-8) tails the SAME `state/units/*`
+        // Discovery mirrors while it is the surface in view — the reachable half of
+        // the #24 scan-active gate, exactly as the Mesh Map's Explorer lens does.
+        if self.nav.expanded && self.nav.surface == Surface::Explorer {
+            self.explorer.poll(ctx);
         }
 
         // The Desktop Chooser (CHOOSER-2) tails the CHOOSER-1 worker's

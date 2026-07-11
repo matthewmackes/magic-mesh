@@ -61,7 +61,7 @@
 //! sweep) job, not re-litigated here.
 //!
 //! **WIN7-3 update:** the left pane described above as an empty placeholder is
-//! now the real live-tile grid (locks #6/#7/#8/#23): all 17 [`Surface::ALL`]
+//! now the real live-tile grid (locks #6/#7/#8/#23): all 18 [`Surface::ALL`]
 //! entries, grouped into lock #8's 7 function-based groups (Mesh Control ·
 //! Desktop & Session · Media · Files & Data · Web & Tools · Comms · System —
 //! [`TILE_GROUPS`]), each a uniform [`TILE_W`]×[`TILE_H`] tile (lock #6 — one
@@ -138,7 +138,7 @@
 //! search-box spot); it auto-focuses when the menu opens so "open, then just
 //! type" filters live. An empty query is the unchanged grouped grid (zero
 //! behaviour change); the moment anything is typed, [`search_matches`] ranks
-//! the 17 tileable surfaces (case-insensitive: a label prefix beats a label
+//! the 18 tileable surfaces (case-insensitive: a label prefix beats a label
 //! substring beats a group-name hit) and [`search_results`] paints that flat
 //! list in place of the grid — Up/Down move a highlight, Enter launches (the top
 //! match by default), a row click launches that row, Esc clears the query
@@ -188,7 +188,7 @@ const HAIRLINE_W: f32 = 1.0;
 /// composition `dock.rs`'s own (module-private) `CELL_W` icon-cell token
 /// already uses, restated here per this module's own established
 /// per-file-restatement idiom (see [`HAIRLINE_W`] above). Every one of the
-/// 17 tiles shares this ONE size (lock #6 — no small/wide/large variants).
+/// 18 tiles shares this ONE size (lock #6 — no small/wide/large variants).
 const TILE_H: f32 = Style::SP_XL + Style::SP_M;
 
 /// One tile's width — `SP_XL · 2.5` (80pt): wider than tall, so a full
@@ -272,10 +272,10 @@ const TILE_GRID_CONTENT_H: f32 = 7.0 * (GROUP_HEADING_H + TILE_H) + 6.0 * GROUP_
 const SEARCH_H: f32 = Style::SP_L;
 
 /// One search-result row's height — a compact list row (leading icon · label ·
-/// dim group name), `SP_L + SP_XS` (28pt). Sized so all 17 tileable surfaces
+/// dim group name), `SP_L + SP_XS` (28pt). Sized so all 18 tileable surfaces
 /// fit the results area at once even when a one-letter query matches every
-/// one (17 · 28 = 476pt, comfortably inside the ~532pt results band — pinned
-/// by a test below).
+/// one (18 · 28 = 504pt, inside the ~532pt results band with one row of
+/// headroom to spare — pinned by a test below).
 const RESULT_ROW_H: f32 = Style::SP_L + Style::SP_XS;
 
 /// The search-result row's leading icon size — [`Style::SP_M`] (16px), smaller
@@ -414,8 +414,8 @@ struct TileGroup {
 /// The 7 function-based groups in their locked order (lock #8), each listing
 /// its surfaces in [`Surface::ALL`] relative order. Unlike the app picker's
 /// `GROUPS` (which pulls the Workbench/System/Desktop out to standalone
-/// cells), every one of the 17 [`Surface::ALL`] entries sits inside exactly
-/// one group here — lock #8 places all 17, none outside. Drives the tile
+/// cells), every one of the 18 [`Surface::ALL`] entries sits inside exactly
+/// one group here — lock #8 places all 18, none outside. Drives the tile
 /// render + the shell tests (the one grouping authority for this pane).
 const TILE_GROUPS: [TileGroup; 7] = [
     TileGroup {
@@ -447,7 +447,13 @@ const TILE_GROUPS: [TileGroup; 7] = [
     },
     TileGroup {
         label: "System",
-        surfaces: &[Surface::System, Surface::About],
+        // Explorer (discover every mesh/LAN/cloud unit) tiles here beside About —
+        // whose body IS the Device-Manager hardware inventory — as the pane's
+        // inventory/inspection pair. The canonical picker (`dock.rs` GROUPS) files
+        // it under Mesh with the Mesh Map; the two taxonomies group per their own
+        // concern (lock #8), so this pane's functional grouping keeps it with the
+        // inventory surfaces rather than adding a fourth mesh tile that would wrap.
+        surfaces: &[Surface::System, Surface::About, Surface::Explorer],
     },
 ];
 
@@ -934,7 +940,7 @@ fn tile_id(surface: Surface) -> egui::Id {
 /// fabricated rotation. Zero counts/absent data are honest silence (the
 /// `dock.rs` "zero paints no badge" convention, restated per-fact here) —
 /// e.g. Files shows nothing while idle, not "0 transferring".
-#[allow(clippy::too_many_lines)] // one match arm per Surface::ALL variant (17), same shape as badge_for
+#[allow(clippy::too_many_lines)] // one match arm per Surface::ALL variant (18), same shape as badge_for
 fn tile_facts(surface: Surface, inputs: &TileFactInputs) -> Vec<String> {
     match surface {
         Surface::Chat => {
@@ -1067,10 +1073,12 @@ fn tile_facts(surface: Surface, inputs: &TileFactInputs) -> Vec<String> {
             .terminal_tabs
             .filter(|&n| n > 0)
             .map_or_else(Vec::new, |n| vec![format!("{n} tabs")]),
-        // Editor / About: no genuinely live fact exists anywhere in the
-        // codebase today (verified, not assumed) — the honest static tile,
-        // matching §7 over forcing a rotation with nothing real to show.
-        Surface::Editor | Surface::About => Vec::new(),
+        // Editor / About / Explorer: no genuinely live fact exists anywhere in
+        // the codebase today (verified, not assumed) — the honest static tile,
+        // matching §7 over forcing a rotation with nothing real to show. (The
+        // Explorer's discovered-unit count is not plumbed to this pane's
+        // `TileFactInputs`; wiring one is a follow-on, not this promotion.)
+        Surface::Editor | Surface::About | Surface::Explorer => Vec::new(),
         // Timers deliberately sits OUTSIDE Surface::ALL/TILE_GROUPS (lock
         // #20 — the clock strip is its ONE home, never a picker/tile
         // entry), so this arm is never actually reached by `left_pane`'s
@@ -1139,7 +1147,7 @@ fn severity_rank(rollup: Option<&status::SegmentRollup>) -> u8 {
 /// concept (System's Device/Power segment rollups, MeshView's mesh health,
 /// Chat/Files' accent-on-nonzero-count, the SAME tone language `dock.rs`'s
 /// own badges already use for the identical surfaces/data), `None`
-/// everywhere else — most of the 17 surfaces are plain counts with no
+/// everywhere else — most of the 18 surfaces are plain counts with no
 /// health concept at all, and painting a tint for those would be an
 /// invented severity, not a reused one (§7). `None` is also the honest
 /// "nothing has landed yet" answer (pre-poll / never-visited-this-session),
@@ -1365,7 +1373,7 @@ fn search_field(
     resp.changed()
 }
 
-/// Rank the 17 tileable [`Surface::ALL`] entries against `query`
+/// Rank the 18 tileable [`Surface::ALL`] entries against `query`
 /// (case-insensitive), best match first: a label *prefix* hit (rank 0)
 /// outranks a label *substring* hit (rank 1), which outranks a hit on the
 /// surface's *group name* only (rank 2 — so typing a category like "media"
@@ -1622,7 +1630,7 @@ fn tile_accesskit_id(surface: Surface) -> egui::Id {
 /// `install_segment_accessibility` already uses (its own `.set_value` carries
 /// the segment's current severity summary while `.set_label` stays the fixed
 /// "{Segment} status"). Deliberately NOT individually `Live::Polite`: a
-/// screen reader hearing every one of up to 17 tiles announce itself on the
+/// screen reader hearing every one of up to 18 tiles announce itself on the
 /// same rotation clock would be a spam regression, not an accessibility win
 /// — [`install_tiles_live_summary`] is the ONE live-announcing node for the
 /// whole grid, mirroring NOTIF-11's own shape exactly (one live
@@ -2146,13 +2154,13 @@ mod tests {
     // ── WIN7-3: live tiles (locks #6/#7/#8/#23) ──────────────────────────────
 
     #[test]
-    fn the_17_surfaces_are_grouped_into_lock_8s_7_function_based_groups() {
+    fn the_18_surfaces_are_grouped_into_lock_8s_7_function_based_groups() {
         // Lock #8's exact taxonomy + order — the `dock.rs`
         // `the_locked_group_taxonomy_and_order` precedent, restated for this
         // pane's own (different) grouping table.
         use Surface::{
-            About, Bookmarks, Browser, Chat, Desktop, Editor, Files, InfraCode, Media, MeshView,
-            Music, Phones, Storage, System, Terminal, Voice, Workbench,
+            About, Bookmarks, Browser, Chat, Desktop, Editor, Explorer, Files, InfraCode, Media,
+            MeshView, Music, Phones, Storage, System, Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 7] = [
             ("Mesh Control", &[Workbench, MeshView, InfraCode]),
@@ -2161,7 +2169,7 @@ mod tests {
             ("Files & Data", &[Files, Bookmarks, Storage]),
             ("Web & Tools", &[Browser, Terminal, Editor]),
             ("Comms", &[Voice, Chat, Phones]),
-            ("System", &[System, About]),
+            ("System", &[System, About, Explorer]),
         ];
         assert_eq!(
             super::TILE_GROUPS.len(),
@@ -2176,7 +2184,7 @@ mod tests {
             );
         }
         // Unlike the app picker (which pulls Workbench/System/Desktop out to
-        // standalone cells), lock #8 places ALL 17 Surface::ALL entries
+        // standalone cells), lock #8 places ALL 18 Surface::ALL entries
         // inside a group — none sit outside. The compile-time guard above
         // already enforces "exactly once"; re-prove it here at runtime too
         // (the dock.rs belt-and-suspenders convention).
@@ -2246,8 +2254,8 @@ mod tests {
     }
 
     #[test]
-    fn all_17_tiles_render_at_one_uniform_size_and_stay_within_the_left_pane() {
-        // Lock #6 — one uniform tile size for all 17, no variants — proven
+    fn all_18_tiles_render_at_one_uniform_size_and_stay_within_the_left_pane() {
+        // Lock #6 — one uniform tile size for all 18, no variants — proven
         // on REAL rendered rects (the addressable-cell idiom via
         // `tile_id`), not just on the shared constants two tiles happen to
         // both reference.
@@ -2845,7 +2853,7 @@ mod tests {
     fn the_search_field_tucks_below_the_tile_grid_without_overlap() {
         // Constant-geometry assertion (the WIN7-2 `PANEL_H`/`PANEL_W`
         // precedent, no GPU): the 7-group grid must bottom out strictly above
-        // the search band, and all 17 result rows must fit the results area at
+        // the search band, and all 18 result rows must fit the results area at
         // once (worst case — a one-letter query matching every surface).
         let grid_bottom = super::PANE_PAD + super::TILE_GRID_CONTENT_H;
         let search_top = PANEL_H - super::PANE_PAD - super::SEARCH_H;
@@ -2855,8 +2863,8 @@ mod tests {
         );
         let results_rows_h = search_top - Style::SP_XS - super::PANE_PAD;
         assert!(
-            17.0 * super::RESULT_ROW_H <= results_rows_h,
-            "all 17 result rows must fit the results band"
+            18.0 * super::RESULT_ROW_H <= results_rows_h,
+            "all 18 result rows must fit the results band"
         );
     }
 
@@ -3009,8 +3017,7 @@ mod tests {
 
     #[test]
     fn opening_the_menu_shows_the_full_grid_and_no_result_list() {
-        // Empty-query invariant on the REAL render: with nothing typed, every
-        // one of the 17 tiles is registered (the grouped grid), and NO search
+        // Empty-query invariant on the REAL render: with nothing typed, XXX (the grouped grid), and NO search
         // result row exists — the grid is untouched when not searching.
         let ctx = egui::Context::default();
         Style::install(&ctx);

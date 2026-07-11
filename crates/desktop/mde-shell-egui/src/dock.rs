@@ -63,6 +63,13 @@ pub enum Surface {
     /// mesh-status snapshot the Workbench planes read. An all-green onboard
     /// self-test auto-opens it (OW-10).
     MeshView,
+    /// The **Explorer** — the EXPLORER-epic discovery surface (`crate::explorer`):
+    /// a cinematic one-unit-at-a-time hero view over every discovered unit (mesh
+    /// peers · off-mesh LAN hosts · `OpenStack` objects), folded from the
+    /// aggregator's `state/units/*` mirrors. A first-class dock surface (its Mesh
+    /// sibling beside the Mesh Map); it is ALSO reachable as the Mesh Map's
+    /// segmented Explorer lens, which powers the NODE-GRADE-2 node-focus jump.
+    Explorer,
     /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
     /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
     Desktop,
@@ -149,9 +156,10 @@ impl Surface {
     /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
     /// relative order within each group (L7); a compile-time guard keeps the two
     /// tables in sync.
-    pub(crate) const ALL: [Surface; 17] = [
+    pub(crate) const ALL: [Surface; 18] = [
         Surface::Workbench,
         Surface::MeshView,
+        Surface::Explorer,
         Surface::InfraCode,
         Surface::Desktop,
         Surface::Music,
@@ -178,6 +186,11 @@ impl Surface {
         match self {
             Surface::Workbench => IconId::Workbench,
             Surface::MeshView => IconId::MeshView,
+            // The Explorer wears the stacked-cards **Instances** glyph — the
+            // "a deck of discovered units you page through" reading fits the
+            // hero-card filmstrip, and it stays distinct from the Mesh Map's
+            // topology glyph beside it in the Mesh group.
+            Surface::Explorer => IconId::Instances,
             // The IaC surface wears the **Server** (infrastructure/rack) badge —
             // the OpenStack IaaS control plane reads as "infrastructure".
             Surface::InfraCode => IconId::Server,
@@ -223,6 +236,7 @@ impl Surface {
         match self {
             Surface::Workbench => "Workbench",
             Surface::MeshView => "Mesh Map",
+            Surface::Explorer => "Explorer",
             Surface::InfraCode => "Infra as Code",
             Surface::Desktop => "Desktop",
             Surface::Music => "Music",
@@ -290,7 +304,7 @@ struct Group {
 /// standalone anchor, and **System** (Settings) + **Desktop** (Show-Desktop) are
 /// VDOCK-4's bottom system-quad cells; every other surface appears here exactly
 /// once (About lives in System's group) — the union with those three reproduces
-/// all 17 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
+/// all 18 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
 /// grouping authority).
 const GROUPS: [Group; 6] = [
     Group {
@@ -316,7 +330,7 @@ const GROUPS: [Group; 6] = [
     Group {
         label: "Mesh",
         accent: Style::ACCENT_MESH,
-        surfaces: &[Surface::MeshView],
+        surfaces: &[Surface::MeshView, Surface::Explorer],
     },
     Group {
         label: "System",
@@ -332,7 +346,7 @@ const GROUPS: [Group; 6] = [
     },
 ];
 
-const PICKER_FOCUS_ORDER: [Surface; 16] = [
+const PICKER_FOCUS_ORDER: [Surface; 17] = [
     Surface::Workbench,
     Surface::Voice,
     Surface::Chat,
@@ -343,6 +357,7 @@ const PICKER_FOCUS_ORDER: [Surface; 16] = [
     Surface::Terminal,
     Surface::Editor,
     Surface::MeshView,
+    Surface::Explorer,
     Surface::Files,
     Surface::Storage,
     Surface::About,
@@ -3990,10 +4005,11 @@ mod tests {
         // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
         // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
         // and the About surface (the platform-identity screen, QBRAND-6).
-        assert_eq!(Surface::ALL.len(), 17);
+        assert_eq!(Surface::ALL.len(), 18);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
+            Surface::Explorer,
             Surface::InfraCode,
             Surface::Desktop,
             Surface::Music,
@@ -4029,6 +4045,7 @@ mod tests {
         let cases = [
             (Surface::Workbench, IconId::Workbench),
             (Surface::MeshView, IconId::MeshView),
+            (Surface::Explorer, IconId::Instances),
             (Surface::InfraCode, IconId::Server),
             (Surface::Desktop, IconId::Desktop),
             (Surface::Music, IconId::Music),
@@ -4056,8 +4073,9 @@ mod tests {
                 "{surface:?} maps to the blank wordmark"
             );
         }
-        // The map is injective — 17 surfaces, 17 distinct glyph names (IaC wears
-        // the Server badge, unshared by any other surface).
+        // The map is injective — 18 surfaces, 18 distinct glyph names (IaC wears
+        // the Server badge, Explorer the stacked-cards Instances glyph, each
+        // unshared by any other surface).
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
         names.sort_unstable();
         names.dedup();
@@ -4075,6 +4093,7 @@ mod tests {
         let cases = [
             (Surface::Workbench, "Workbench"),
             (Surface::MeshView, "Mesh Map"),
+            (Surface::Explorer, "Explorer"),
             (Surface::InfraCode, "Infra as Code"),
             (Surface::Desktop, "Desktop"),
             (Surface::Music, "Music"),
@@ -4096,7 +4115,7 @@ mod tests {
             assert_eq!(surface.label(), label, "{surface:?} → wrong label");
             assert!(!label.is_empty(), "{surface:?} has a blank label");
         }
-        // Injective over Surface::ALL — 17 surfaces, 17 distinct labels.
+        // Injective over Surface::ALL — 18 surfaces, 18 distinct labels.
         let mut labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
         labels.sort_unstable();
         labels.dedup();
@@ -4148,14 +4167,14 @@ mod tests {
         // System surface (right-side Settings button), and Desktop (far-right
         // Show-Desktop sliver).
         use Surface::{
-            About, Bookmarks, Browser, Chat, Editor, Files, InfraCode, Media, MeshView, Music,
-            Phones, Storage, Terminal, Voice, Workbench,
+            About, Bookmarks, Browser, Chat, Editor, Explorer, Files, InfraCode, Media, MeshView,
+            Music, Phones, Storage, Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 6] = [
             ("Comms", &[Voice, Chat, Phones]),
             ("Workloads", &[InfraCode]),
             ("Terminals", &[Browser, Bookmarks, Terminal, Editor]),
-            ("Mesh", &[MeshView]),
+            ("Mesh", &[MeshView, Explorer]),
             ("System", &[Files, Storage, About]),
             ("Media", &[Music, Media]),
         ];
@@ -5055,7 +5074,7 @@ mod tests {
     fn timers_home_is_the_clock_cell_not_the_picker() {
         // Lock #20 — Timers deliberately sits OUTSIDE `Surface::ALL` (the picker
         // ordering authority) and every group: its one launcher is the clock
-        // strip, so the picker/glyph tables stay exactly the 16 picker surfaces.
+        // strip, so the picker/glyph tables stay exactly the 17 picker surfaces.
         assert!(
             !Surface::ALL.contains(&Surface::Timers),
             "Timers is not a picker surface — the clock strip is its home"

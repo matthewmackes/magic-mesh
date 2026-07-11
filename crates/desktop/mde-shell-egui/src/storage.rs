@@ -3304,6 +3304,11 @@ mod menubar_coverage {
                 reason: "bare — the Mesh Map canvas renders headerless; a bar \
                          (layout toggles, fold source) is a MENUBAR-SWEEP follow-on",
             },
+            Surface::Explorer => Coverage::Exempt {
+                reason: "bare — the Explorer discovery hero card renders headerless \
+                         (filters/actions live on the card itself); a shared bar is \
+                         a MENUBAR-SWEEP follow-on",
+            },
             Surface::Music => Coverage::Exempt {
                 reason: "bare — mde-music-egui mounts with its own header; folding \
                          it onto the shared bar is a MENUBAR-SWEEP follow-on",
@@ -3409,6 +3414,7 @@ mod menubar_coverage {
             bare,
             [
                 Surface::MeshView,
+                Surface::Explorer,
                 Surface::Music,
                 Surface::Media,
                 Surface::Files,
