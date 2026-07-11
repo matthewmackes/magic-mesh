@@ -4761,8 +4761,13 @@ version = "12.0.0"
 dependencies = [
  "mde-adblock",
  "mde-egui",
+ "mde-web-wire",
  "nix",
 ]
+
+[[package]]
+name = "mde-web-wire"
+version = "12.0.0"
 
 [[package]]
 name = "mdns-sd"
