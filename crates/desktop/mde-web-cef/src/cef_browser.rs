@@ -2734,6 +2734,32 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 /// `chromium_privacy_switches()`, verified real) is the second layer: even a
 /// same-tick `RTCPeerConnection` that gets past this script still cannot leak a
 /// raw local IP over non-proxied UDP.
+///
+/// Cross-engine posture (browser-5). The shell runs CEF and Servo
+/// interchangeably on the same seat (CEF is the default when its runtime is
+/// present; the `mde-web-preview` Servo helper is the fallback), so a given
+/// user's WebRTC guarantee depends on which engine rendered the page. The two
+/// engines are deliberately brought as close as each platform allows:
+/// * Servo turns WebRTC off at the engine level — `secure_preferences()` sets
+///   `dom_webrtc_enabled = false`, so `RTCPeerConnection` never exists and there
+///   is no bypass. This is the *reference* posture; it must not be weakened.
+/// * CEF has no equivalent hard off switch on a prebuilt binary (see the
+///   `chromium_privacy_switches()` doc), so it reaches parity for the *actual
+///   harm* — the raw-local-IP leak — via the engine-level
+///   `--force-webrtc-ip-handling-policy` switch above, and removes the JS API
+///   surface only best-effort via this shim.
+///
+/// Residual gap flagged for the operator (CEF-only, and minimized, not closed):
+/// because this ABI has no early `OnContextCreated` hook, a hostile page's own
+/// inline script can touch the WebRTC *API surface* (e.g. construct an
+/// `RTCPeerConnection`) in the sub-tick before this shim's first injection lands.
+/// That surviving connection still cannot leak a raw local IP — the engine-level
+/// ip-handling switch blocks non-proxied UDP regardless — so the residual is API
+/// *presence*, not the IP leak Servo defends against. Fully closing it needs
+/// either the build-time `enable_webrtc=false` GN flag (unavailable on the
+/// vendored CEF) or a native `CefPermissionHandler` deny (no ABI vtable offset
+/// verified from the pinned CEF 149 headers). Revisit if either becomes
+/// available.
 const fn webrtc_block_script() -> &'static str {
     // browser-3: the removal is applied to EVERY reachable frame, not just the
     // main frame. `strip(w)` deletes the JS-reachable WebRTC surface on a target
@@ -2750,6 +2776,13 @@ const fn webrtc_block_script() -> &'static str {
     "(function(){function strip(w){try{delete w.RTCPeerConnection;}catch(_e){}try{delete w.webkitRTCPeerConnection;}catch(_e){}try{delete w.RTCDataChannel;}catch(_e){}try{delete w.RTCSessionDescription;}catch(_e){}try{delete w.RTCIceCandidate;}catch(_e){}try{if(w.MediaDevices&&w.MediaDevices.prototype){delete w.MediaDevices.prototype.getUserMedia;delete w.MediaDevices.prototype.getDisplayMedia;}}catch(_e){}try{if(w.navigator&&w.navigator.mediaDevices){delete w.navigator.mediaDevices.getUserMedia;delete w.navigator.mediaDevices.getDisplayMedia;}}catch(_e){}try{delete w.navigator.getUserMedia;}catch(_e){}try{delete w.navigator.webkitGetUserMedia;}catch(_e){}try{delete w.navigator.mozGetUserMedia;}catch(_e){}}function sweep(w){try{strip(w);}catch(_e){}var kids=null;try{kids=w.frames;}catch(_e){kids=null;}if(kids){for(var i=0;i<kids.length;i++){var cw=null;try{cw=kids[i];}catch(_e){cw=null;}if(cw&&cw!==w){try{sweep(cw);}catch(_e){}}}}}sweep(window);try{if(!window.__mdeWebrtcBlockObserver&&window.MutationObserver&&document&&document.documentElement){window.__mdeWebrtcBlockObserver=new MutationObserver(function(){try{sweep(window);}catch(_e){}});window.__mdeWebrtcBlockObserver.observe(document.documentElement,{childList:true,subtree:true});}}catch(_e){}})();"
 }
 
+/// Install the page WebAuthn/passkey interception bridge (browser-5 parity note).
+///
+/// This is NOT a CEF-only capability: the Servo helper ships an equivalent bridge
+/// (`mde-web-preview::engine::poll_passkey_request` / `passkey_bridge_drain_script`),
+/// and both route ceremonies to the same daemon-owned passkey worker. Passkey
+/// posture is therefore at parity across the two interchangeable engines — keep it
+/// that way when either bridge changes.
 fn passkey_bridge_script() -> String {
     format!(
         r#"(function(){{
