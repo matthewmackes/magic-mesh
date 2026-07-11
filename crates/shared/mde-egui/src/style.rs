@@ -89,6 +89,21 @@ impl Style {
     /// Carbon elevation — **layer-02**: a card resting on [`LAYER_01`](Self::LAYER_01).
     pub const LAYER_02: Color32 = Self::SURFACE_HI;
 
+    // ── Overlays & capture (soft-Carbon depth, lock 2) ──────────────────────
+    /// The dimming **scrim** painted under a modal / over a frozen surface — a
+    /// translucent black so the layer beneath reads as pushed back without a
+    /// gaussian-blur pass (lock 2: subtle-alpha dim, never a heavy wash). The one
+    /// shared scrim tone every overlay dims with (the VDI reconnect overlay over a
+    /// frozen desktop today), so a leaked `from_black_alpha` never re-decides "how
+    /// dark is a scrim" at a call site (§4).
+    pub const SCRIM: Color32 = Color32::from_black_alpha(0xB4);
+    /// The blank-canvas fill of a **headless capture** (screenshot rasterizer): a
+    /// neutral near-black held **strictly darker than every real surface tone** the
+    /// shell paints, so a genuinely blank capture is obvious in the PNG itself, not
+    /// only via a pixel scan. Its own token — not [`BG`](Self::BG) — precisely
+    /// *because* it must not collide with a real surface (asserted by the tests).
+    pub const CAPTURE_CLEAR: Color32 = Color32::from_rgb(0x12, 0x12, 0x12);
+
     /// Primary text.
     pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xEC);
     /// Secondary / dimmed text.
@@ -351,6 +366,53 @@ impl Style {
         }
         blend(RAMP[idx], RAMP[idx + 1], pos - lo)
     }
+
+    /// The translucent **accent selection wash** — the fill of a drag-select /
+    /// region-capture marquee drawn over content (the browser capture-region
+    /// rectangle). The brand [`ACCENT`](Self::ACCENT) at a light alpha, paired with
+    /// the marquee's 1 px `ACCENT` ring so a selection reads as one accent
+    /// affordance. Derived from the accent (not a bespoke hue) so a theme re-tint
+    /// carries the wash with it — before this it was an off-palette IBM-blue literal
+    /// minted at the call site (§4).
+    #[must_use]
+    pub fn selection_wash() -> Color32 {
+        Self::ACCENT.gamma_multiply(0.16)
+    }
+
+    // ── Colour algebra (pixel-DATA helpers, sibling to `blend`) ─────────────
+    // The per-pixel colour math the shell's software surfaces need but which is
+    // *not* a design token: routed through the shared kit so no surface crate
+    // mints a raw `Color32` for pixel work (§4 / CRAFT §1 — add the primitive
+    // here with a test, never approximate it locally).
+
+    /// Fold a colour toward black by scaling its RGB channels by `k` ∈ `[0, 1]`
+    /// **while forcing full opacity** — the lock curtain's idle dim, which must
+    /// stay opaque (a dimmed curtain must never become a window onto the desktop).
+    /// `k = 1.0` returns the colour opaque; `k = 0.0` returns opaque black.
+    #[must_use]
+    pub fn scale_rgb_opaque(c: Color32, k: f32) -> Color32 {
+        let s = |v: u8| scale_channel(v, k);
+        Color32::from_rgba_premultiplied(s(c.r()), s(c.g()), s(c.b()), u8::MAX)
+    }
+
+    /// Luminance-key a colour's alpha: keep the RGB, set alpha to the brightest
+    /// channel (unmultiplied), so a sprite's dark surround fades to transparent and
+    /// its bright core stays solid — the splash head-dot glow key.
+    #[must_use]
+    pub fn key_alpha_to_luma(c: Color32) -> Color32 {
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), c.r().max(c.g()).max(c.b()))
+    }
+}
+
+/// Scale one 8-bit channel by `k`, clamped to `0..=255` (`k` is clamped to
+/// `[0, 1]` first) — the byte kernel behind [`Style::scale_rgb_opaque`].
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "k is clamped to [0,1], so v·k stays in 0..=255"
+)]
+fn scale_channel(v: u8, k: f32) -> u8 {
+    (f32::from(v) * k.clamp(0.0, 1.0)).round() as u8
 }
 
 /// Linear-interpolate two colours in gamma space at `t` ∈ `[0, 1]` — a small local
@@ -522,6 +584,104 @@ mod tests {
         assert_ne!(Style::LAYER_01, Style::LAYER_02);
         assert_eq!(Style::LAYER_01, Style::SURFACE);
         assert_eq!(Style::LAYER_02, Style::SURFACE_HI);
+    }
+
+    #[test]
+    fn scrim_is_a_translucent_black() {
+        // The shared overlay dim (lock 2): a black at partial alpha — dark enough
+        // to push a layer back, never fully opaque (it must still reveal the
+        // dimmed surface beneath).
+        assert_eq!(
+            (Style::SCRIM.r(), Style::SCRIM.g(), Style::SCRIM.b()),
+            (0, 0, 0),
+            "the scrim is a black wash"
+        );
+        assert!(
+            Style::SCRIM.a() > 0 && Style::SCRIM.a() < 255,
+            "the scrim is translucent, not opaque: a={}",
+            Style::SCRIM.a()
+        );
+    }
+
+    #[test]
+    fn capture_clear_is_darker_than_every_surface() {
+        // The headless-capture blank fill must sit strictly below every real
+        // surface tone so a blank capture reads as blank in the PNG — and never
+        // aliases onto an actual surface token.
+        let luma = |c: egui::Color32| u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b());
+        for surface in [Style::BG, Style::SURFACE, Style::SURFACE_HI, Style::BORDER] {
+            assert!(
+                luma(Style::CAPTURE_CLEAR) < luma(surface),
+                "CAPTURE_CLEAR must be darker than every surface tone"
+            );
+            assert_ne!(
+                Style::CAPTURE_CLEAR,
+                surface,
+                "CAPTURE_CLEAR must not collide with a real surface token"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_wash_is_a_translucent_accent() {
+        // The drag-select marquee fill: the brand accent at a light alpha, so it
+        // shares the accent hue with the marquee's ring and re-tints with the theme.
+        let wash = Style::selection_wash();
+        assert!(
+            wash.a() > 0 && wash.a() < 255,
+            "the selection wash is a light translucent fill: a={}",
+            wash.a()
+        );
+        assert!(
+            wash.b() > wash.r(),
+            "the wash keeps the accent's blue-forward hue"
+        );
+    }
+
+    #[test]
+    fn scale_rgb_opaque_dims_rgb_but_stays_opaque() {
+        // The curtain idle dim: RGB folds toward black, alpha never drops (a dimmed
+        // curtain must stay a solid sheet, not a window).
+        let full = Style::scale_rgb_opaque(egui::Color32::WHITE, 1.0);
+        assert_eq!(
+            full,
+            egui::Color32::WHITE,
+            "k=1 leaves the colour untouched"
+        );
+
+        let half = Style::scale_rgb_opaque(egui::Color32::WHITE, 0.5);
+        assert_eq!(half.a(), 255, "the dim stays fully opaque");
+        assert!(
+            half.r() < 255 && half.r() > 0,
+            "k=0.5 dims the channels: r={}",
+            half.r()
+        );
+
+        let dark = Style::scale_rgb_opaque(egui::Color32::WHITE, 0.0);
+        assert_eq!(
+            dark,
+            egui::Color32::from_rgb(0, 0, 0),
+            "k=0 folds to opaque black"
+        );
+    }
+
+    #[test]
+    fn key_alpha_to_luma_keys_alpha_to_the_brightest_channel() {
+        // The splash head-dot key: alpha follows the brightest channel, so a bright
+        // core stays solid and a dark surround fades out.
+        let bright = Style::key_alpha_to_luma(egui::Color32::from_rgb(30, 255, 60));
+        assert_eq!(bright.a(), 255, "a fully-bright channel keys to opaque");
+        assert_eq!(
+            (bright.r(), bright.g(), bright.b()),
+            (30, 255, 60),
+            "an opaque result preserves the RGB unchanged"
+        );
+
+        let mid = Style::key_alpha_to_luma(egui::Color32::from_rgb(100, 50, 0));
+        assert_eq!(mid.a(), 100, "alpha keys to the brightest channel");
+
+        let dark = Style::key_alpha_to_luma(egui::Color32::from_rgb(0, 0, 0));
+        assert_eq!(dark.a(), 0, "a black surround keys fully transparent");
     }
 
     #[test]
