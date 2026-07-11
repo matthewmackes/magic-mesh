@@ -33,7 +33,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::lighthouse;
@@ -44,10 +44,6 @@ use super::{ShutdownToken, Worker};
 
 /// Default probe cadence — every 15 s (the unit spec).
 pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Default `mde-bus` CLI name (resolved on `PATH`; overridable via `MDE_BUS_BIN`
-/// for a dev tree, mirroring `bus_supervisor`).
-const DEFAULT_BUS_BIN: &str = "mde-bus";
 
 /// LIGHTHOUSE-8 worker — probes every lighthouse each tick + publishes a
 /// [`LighthouseProbe`] per lighthouse to the bus.
@@ -115,7 +111,7 @@ impl Worker for LighthouseProbeWorker {
                     .unwrap_or_default();
                     self.update_uptime(&mut probes, &seen);
                     for probe in &probes {
-                        publish_probe(DEFAULT_BUS_BIN, probe);
+                        publish_probe(probe);
                     }
                 }
                 _ = shutdown.wait() => break,
@@ -252,19 +248,30 @@ fn read_directory_peers(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
     peers::read_peers(&peers::peers_dir(workgroup_root))
 }
 
-/// Publish one probe to `compute/lighthouse-probe/<name>` via the `mde-bus`
-/// CLI (the same fire-and-reap path `compute_registry` / `voip_rtt` use). The
-/// JSON body is the serialized [`LighthouseProbe`]; the workbench reads it back
-/// off the bus spool. Best-effort: a missing/un-invocable `mde-bus` is a no-op.
-fn publish_probe(bus_bin: &str, probe: &LighthouseProbe) {
-    let topic = LighthouseProbe::topic(&probe.name);
-    let Ok(body) = serde_json::to_string(probe) else {
-        return;
-    };
-    let bin = std::env::var("MDE_BUS_BIN").unwrap_or_else(|_| bus_bin.to_string());
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+/// Publish one probe to `compute/lighthouse-probe/<name>` in-process (perf-10 /
+/// arch-6) — no fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite
+/// open + a [`crate::proc_reap`] reaper thread) per probe. The JSON body is the
+/// serialized [`LighthouseProbe`]; the workbench reads it back off the bus spool.
+/// Byte-identical stored row to the old `mde-bus publish <topic> --body-flag
+/// <json>`. Targets [`crate::bus_publish::default_bus_root`] (honours
+/// `MDE_BUS_ROOT` — the SAME root the fork+exec'd CLI resolved via the inherited
+/// env; this drops the old `MDE_BUS_BIN` binary-override seam, which no longer
+/// has meaning once there is no binary to invoke). Best-effort.
+fn publish_probe(probe: &LighthouseProbe) {
+    publish_probe_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &LighthouseProbe::topic(&probe.name),
+        probe,
+    );
+}
+
+/// Root-injectable body of [`publish_probe`] — fresh-opens the Bus at `bus_root`
+/// and writes the compact `serde_json` of `probe` (the exact body the old
+/// `--body-flag` carried). Best-effort; tests pass a temp root.
+fn publish_probe_to(bus_root: Option<&Path>, topic: &str, probe: &LighthouseProbe) {
+    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
+        crate::bus_publish::publish_json(&mut persist, topic, probe);
+    }
 }
 
 /// Wall-clock epoch milliseconds.
