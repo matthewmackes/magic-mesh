@@ -56,7 +56,7 @@ Each finding: **[priority · fix-effort · fix-risk]** location — problem → 
 #### `build-deploy-1` Live root password committed to git and pushed to GitHub ⚠︎UNVERIFIED
 **[P0 · S · risk low]** — `docs/WORKLIST.md:4149 (tracked at HEAD; remote = https://github.com/matthewmackes/magic-mesh.git)`
 
-- **Problem:** The plaintext credential 'mm/<REDACTED — see secret store; rotate: this was public>' — the real root/login password for the physical seat machines (172.20.146.2, and per operator notes also .138 and Eagle) — is embedded in the SEAT-1 acceptance text of docs/WORKLIST.md, committed at HEAD and pushed to the GitHub origin. The same repo's gh-pages branch hosts the fleet's public dnf channel (packaging/repo/magic-mesh.repo baseurl=https://matthewmackes.github.io/magic-mesh/...), which requires GitHub Pages and strongly implies public visibility of the repository containing the password.
+- **Problem:** The plaintext credential 'mm/<REDACTED>' — the real root/login password for the physical seat machines (172.20.146.2, and per operator notes also .138 and Eagle) — is embedded in the SEAT-1 acceptance text of docs/WORKLIST.md, committed at HEAD and pushed to the GitHub origin. The same repo's gh-pages branch hosts the fleet's public dnf channel (packaging/repo/magic-mesh.repo baseurl=https://matthewmackes.github.io/magic-mesh/...), which requires GitHub Pages and strongly implies public visibility of the repository containing the password.
 - **Why it matters:** A fleet-machine root password in a (likely public) GitHub repo is a direct compromise vector for the seat pool, and it persists in git history forever even after the line is edited out. This also normalizes credentials-in-worklist, so more will accumulate.
 - **Recommendation:** Rotate the password on all machines that use it immediately. Remove the credential from WORKLIST.md and scrub history (git filter-repo / BFG) or accept the rotation as the mitigation. Add a pre-commit/CI secret scan (gitleaks or a simple grep deny-list) to the gate scripts (verify-gates.sh / the /ship path) so worklist acceptance notes can never carry credentials again; store seat credentials in the existing age-encrypted store (automation/secrets/mcnf-secret.sh).
 - **Expected benefit:** Eliminates a standing P0 credential exposure and prevents recurrence of the credentials-in-docs pattern.
@@ -1462,8 +1462,21 @@ _The front-door docs still describe the deleted COSMIC/iced/Carbon product, the 
 - Validation: Run the line-length lint; confirm sampled IDs resolve across live + archive.
 - Closes: `docs-consistency-10`
 
+## Verification note
+
+The 85 confirmed findings each passed an independent adversarial verify agent. A verifier batch covering the **build-deploy** dimension (and a few security/test-obs findings) was cut off by a session rate-limit and the re-verify resume later hung on synthesis; those findings (marked ⚠︎UNVERIFIED below) are single-pass reviewer output with cited evidence. The coordinator independently spot-verified the highest-severity of them against real files — confirmed: `build-deploy-1` (public credential leak), `build-deploy-6` (unsigned HOLD RPMs indexed into the prod channel), `build-deploy-8` (SELinux disabled in kickstart vs enforced in the RPM), `build-deploy-11` (retired cosmic/carbon assets still shipped), `test-obs-1` (CI dead ~26 days). Treat the ⚠︎UNVERIFIED set as high-confidence-but-not-adversarially-checked.
+
 ## Execution status (this session)
 
-- ✅ `mackesd-01/-04` split-brain leader election — closed via a substrate-aware `LeaderGate` and routing all ~17 affected workers (commits `a802399c`, `eade525f`).
-- [in progress] Browser-security hardening batch (`security-2/-4`, `browser-3/-4/-6`).
-- ⏸ `security-1` default-engine flip / CEF OS-sandbox — deferred: genuine product decision (CEF compatibility vs Servo confinement) reserved for the operator.
+Landed + pushed to master:
+- ✅ **P0 `build-deploy-1`** — leaked live root password redacted from tracked docs (`2f6759ea`). **Residual operator actions: ROTATE the password on .2/.138/Eagle (it was public); decide on a git-history scrub** (still in 3 historical commits on the public repo).
+- ✅ `mackesd-01/-04` split-brain leader election — closed via a substrate-aware fail-closed `LeaderGate` routing all ~17 affected workers (`a802399c`, `eade525f`).
+- ✅ Browser-security hardening — `security-4` (CDP port feature-gated), `browser-3` (WebRTC block covers subframes), `browser-4` (credential-API passthrough), `security-2` (WebAuthn gesture gate + honest UP bit), `browser-6` (public-suffix rp_id check) (`60a2d0fb`).
+- ✅ `vdi-vm-2` — guest pointer input now transformed panel→desktop pixels across all three transports; clicks land correctly (`054732c8`).
+- ✅ `mackesd-02` — the hazardous inline shell-outs (`dr_scheduler`, `compute_migrate`, `dc_snap_scheduler`) moved off the runtime + bounded by timeouts (`3f647ed2`).
+
+Deferred to the operator (decisions genuinely theirs):
+- ⏸ **`test-obs-1` (P0)** — dead CI gate: re-enable GitHub Actions (billing/account) vs. a farm-side gate (BigBoy cron → Bus alert). Awaiting approach decision.
+- ⏸ `security-1` — CEF default-engine flip / OS-sandbox: product tradeoff (CEF site-compat vs Servo confinement) + a large sandbox effort.
+
+Everything else in the worklist above is captured for prioritized follow-up.
