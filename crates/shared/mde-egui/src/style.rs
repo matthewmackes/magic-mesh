@@ -379,6 +379,19 @@ impl Style {
         Self::ACCENT.gamma_multiply(0.16)
     }
 
+    /// The translucent **visual-bell flash** tint — the brief attention wash a
+    /// terminal paints over its pane when the shell rings the bell with audio
+    /// muted (TERM-12). A premultiplied **white** at the supplied `alpha`: the
+    /// pane momentarily lightens then decays back as the surface eases `alpha`
+    /// down each frame (`0` fully transparent, `255` solid white). The flash is
+    /// the tonal *opposite* of the [`SCRIM`](Self::SCRIM) dim — an attention
+    /// **lift**, not a push-back — so it earns its own token rather than
+    /// re-deciding "the bell is white" at the call site (§4).
+    #[must_use]
+    pub fn bell_flash(alpha: u8) -> Color32 {
+        Color32::from_white_alpha(alpha)
+    }
+
     // ── Colour algebra (pixel-DATA helpers, sibling to `blend`) ─────────────
     // The per-pixel colour math the shell's software surfaces need but which is
     // *not* a design token: routed through the shared kit so no surface crate
@@ -636,6 +649,41 @@ mod tests {
             wash.b() > wash.r(),
             "the wash keeps the accent's blue-forward hue"
         );
+    }
+
+    #[test]
+    fn bell_flash_is_a_translucent_white_that_scales_with_alpha() {
+        // TERM-12: the visual-bell flash is a premultiplied white wash whose
+        // alpha the surface eases down each frame — fully transparent at 0, solid
+        // white at full, and a tonal lift (not the SCRIM's black push-back) in
+        // between.
+        assert_eq!(
+            Style::bell_flash(0).a(),
+            0,
+            "a zero-intensity flash is fully transparent"
+        );
+        assert_eq!(
+            Style::bell_flash(255),
+            egui::Color32::WHITE,
+            "a full flash is solid white"
+        );
+
+        let mid = Style::bell_flash(90);
+        assert_eq!(mid.a(), 90, "the flash alpha passes through");
+        assert!(
+            mid.r() == mid.g() && mid.g() == mid.b(),
+            "the flash is an achromatic white: {},{},{}",
+            mid.r(),
+            mid.g(),
+            mid.b()
+        );
+        assert!(mid.r() > 0, "a non-zero flash tints the pane");
+        assert!(
+            Style::bell_flash(200).r() > mid.r(),
+            "a stronger flash is a brighter lift"
+        );
+        // A lift where the scrim dims — the opposite tonal intent.
+        assert_ne!(mid, Style::SCRIM, "the bell flash is not the scrim dim");
     }
 
     #[test]
