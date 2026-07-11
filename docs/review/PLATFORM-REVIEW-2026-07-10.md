@@ -1474,6 +1474,8 @@ Landed + pushed to master:
 - ✅ Browser-security hardening — `security-4` (CDP port feature-gated), `browser-3` (WebRTC block covers subframes), `browser-4` (credential-API passthrough), `security-2` (WebAuthn gesture gate + honest UP bit), `browser-6` (public-suffix rp_id check) (`60a2d0fb`).
 - ✅ `vdi-vm-2` — guest pointer input now transformed panel→desktop pixels across all three transports; clicks land correctly (`054732c8`).
 - ✅ `mackesd-02` — the hazardous inline shell-outs (`dr_scheduler`, `compute_migrate`, `dc_snap_scheduler`) moved off the runtime + bounded by timeouts (`3f647ed2`).
+- ✅ `browser-1` — browser pointer input transformed into frame pixels (shared with region-capture) + debounced viewport resize + frame channel pre-sized to the seat (`55ac3714`).
+- ✅ `perf-2` — the blocking seat snapshot (pw-dump + ddcutil I2C probe) moved to a background pump thread; render thread drains latest-wins; DDC detect cached on the DRM layout key (`65639f78`).
 
 Deferred to the operator (decisions genuinely theirs):
 - ⏸ **`test-obs-1` (P0)** — dead CI gate: re-enable GitHub Actions (billing/account) vs. a farm-side gate (BigBoy cron → Bus alert). Awaiting approach decision.
