@@ -4197,6 +4197,7 @@ dependencies = [
  "mde-kdc-host",
  "mde-kdc-proto",
  "mde-role",
+ "mde-seal",
  "mde-theme",
  "mde-voice-config",
  "mde-worker-core",
@@ -4642,6 +4643,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-seal"
+version = "12.0.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "rand 0.8.6",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mde-seat"
 version = "12.0.0"
 dependencies = [
@@ -4673,7 +4684,6 @@ dependencies = [
  "mde-seat",
  "mde-term-egui",
  "mde-theme",
- "mde-vdi-core",
  "mde-vdi-rdp",
  "mde-vdi-spice",
  "mde-vdi-vnc",
