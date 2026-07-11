@@ -501,8 +501,11 @@ fn bookmark_detail(
         );
     }
     ui.add_space(Style::SP_XS);
+    // The URL is data — render it monospace (mono-first, lock #3) so it reads as
+    // an address, not prose.
     ui.label(
         RichText::new(&bookmark.url)
+            .monospace()
             .color(Style::ACCENT)
             .size(Style::SMALL),
     );
@@ -611,7 +614,10 @@ fn browser_seam(ui: &mut egui::Ui, m: &Manager) {
                 format!("Queued to open ({}):", intent.len()),
             );
             for url in intent.iter().take(8) {
-                ui.colored_label(Style::ACCENT, RichText::new(url).size(Style::SMALL));
+                ui.colored_label(
+                    Style::ACCENT,
+                    RichText::new(url).monospace().size(Style::SMALL),
+                );
             }
         }
     });
@@ -687,7 +693,13 @@ fn empty_state(ui: &mut egui::Ui, m: &Manager) {
         } else {
             ("This folder is empty", "Drag bookmarks here, or add one with +.")
         };
-        ui.label(RichText::new(title).color(Style::TEXT).size(Style::BODY).strong());
+        // The empty-state hero title: one type tier up from body, in the honest
+        // emphasis tone (Inter has no bold cut, so brightness is the weight cue).
+        ui.label(
+            RichText::new(title)
+                .color(Style::TEXT_STRONG)
+                .size(Style::TITLE),
+        );
         ui.add_space(Style::SP_XS);
         mde_egui::muted_note(ui, body);
     });
