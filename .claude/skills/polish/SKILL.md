@@ -68,7 +68,10 @@ rescue unit (delete or rehome), not a polish target.
 
 **Quasar dark** — Carbon-inspired, not Carbon-strict. Carbon's sensibilities
 (the gray ramp, the 8px rhythm, restraint, density) are the foundation; the
-rendering idiom is egui/wgpu-native. The locks:
+rendering idiom is egui/wgpu-native. Where these locks are silent, workers
+follow the craft standards in **`CRAFT.md`** (this folder) — geometry
+discipline, window/menu construction, the five interaction states, and the
+per-unit review pass. The locks always win over CRAFT.md. The locks:
 
 1. **One theme: dark only.** The Gray-100-derived Quasar dark palette in
    `mde_egui::style`. No light theme, no theme switcher.
