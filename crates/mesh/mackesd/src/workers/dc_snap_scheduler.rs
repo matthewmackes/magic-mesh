@@ -68,6 +68,16 @@ pub const SNAP_LABEL_PREFIX: &str = "mcnf-sched-snap";
 /// the run lane compact.
 pub const DETAIL_LEN: usize = 200;
 
+/// Generous-but-finite overall bound for one SSH `xe …` invocation. The SSH args
+/// already cap *connection* setup at 8 s (`ConnectTimeout`); this bounds the
+/// WHOLE command so a connection that establishes then stalls mid-`xe` (a slow
+/// `vdi-snapshot` on a large SR, a wedged dom0) is killed rather than blocking.
+/// A snapshot of a large SR can legitimately take a couple of minutes. On expiry
+/// the child is killed and the op degrades to a `fail` run record / a skipped
+/// prune, exactly like a non-zero `xe` exit (mackesd-02: `run_pass` also runs off
+/// the async runtime thread — see `run()` — so it can't starve the watchdog).
+pub const SSH_XE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Bus topic the schedule config for `sr` is published to (the panel's write).
 #[must_use]
 pub fn schedule_topic(sr: &str) -> String {
@@ -376,20 +386,22 @@ fn now_minute() -> u64 {
 /// command (or a `for`-loop over `xe …`), already injection-guarded by the pure
 /// command-builders above.
 fn ssh_xe(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("ssh")
-        .args([
-            "-i",
-            key,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            &format!("root@{dom0}"),
-            remote,
-        ])
-        .output()
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args([
+        "-i",
+        key,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        &format!("root@{dom0}"),
+        remote,
+    ]);
+    // Bound the whole command (not just connect setup) so a stalled `xe` is
+    // killed at SSH_XE_TIMEOUT instead of blocking indefinitely (mackesd-02).
+    super::proc::output_with_timeout(cmd, SSH_XE_TIMEOUT)
 }
 
 /// Drop one failure alert into the `alert_relay` watch dir (best-effort — a dir or
@@ -654,16 +666,34 @@ impl Worker for DcSnapSchedulerWorker {
                 return Ok(());
             }
         };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "dc_snap_scheduler: persist open failed; worker idle");
-                return Ok(());
-            }
-        };
+        // Validate the bus root once (same "worker idle on a persistent open
+        // failure" behavior as before). Per-tick work reopens its own `Persist`
+        // inside `spawn_blocking` — `Persist` is `!Sync` so it can't cross the
+        // blocking await, and `Persist::open` is cheap (mackesd-02).
+        if let Err(e) = Persist::open(bus_root.clone()) {
+            tracing::debug!(error = %e, "dc_snap_scheduler: persist open failed; worker idle");
+            return Ok(());
+        }
         loop {
             if self.is_leader() {
-                run_pass(&persist, &self.alerts_dir);
+                // run_pass shells `ssh … xe vdi-snapshot/vdi-destroy` serially
+                // across every due SR — potentially minutes of blocking work.
+                // Run it OFF the runtime thread so it can neither pin a worker nor
+                // starve the watchdog beat (mackesd-02 / WATCHDOG-2).
+                let bus_root_tick = bus_root.clone();
+                let alerts_dir = self.alerts_dir.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    match Persist::open(bus_root_tick) {
+                        Ok(persist) => run_pass(&persist, &alerts_dir),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "dc_snap_scheduler: tick persist open failed; skipping");
+                        }
+                    }
+                })
+                .await
+                {
+                    tracing::warn!(error = %e, "dc_snap_scheduler: snapshot pass task join failed");
+                }
             }
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
@@ -683,6 +713,17 @@ mod tests {
     fn topics_format_under_the_dc_lanes() {
         assert_eq!(schedule_topic("sr-1"), "event/dc/snap-schedule/sr-1");
         assert_eq!(run_topic("sr-1"), "event/dc/snap-schedule-run/sr-1");
+    }
+
+    // ---- mackesd-02: bounded SSH `xe` invocation ----
+
+    #[test]
+    fn ssh_xe_timeout_is_generous_but_finite() {
+        // A snapshot of a large SR legitimately needs a couple of minutes, so the
+        // bound must be large — but finite so a stalled `xe` can't block a thread
+        // forever (mackesd-02). It must also exceed the 8 s SSH connect cap.
+        assert!(SSH_XE_TIMEOUT >= Duration::from_secs(60));
+        assert!(SSH_XE_TIMEOUT > Duration::from_secs(8));
     }
 
     // ---- due-decision logic (cadence elapsed vs not) ----

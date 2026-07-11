@@ -47,6 +47,16 @@ pub const DR_SCRIPT_REL: &str = "automation/dr/dr-backup.sh";
 /// DR lane compact.
 pub const DETAIL_LEN: usize = 200;
 
+/// Generous-but-finite hard bound for one DR backup run. A fleet rsync/tar can
+/// legitimately take many minutes, so this is deliberately large; it exists only
+/// so a truly-wedged backup (a hung rsync, a dead mount) can't pin a thread —
+/// and, before mackesd-02's fix, a whole tokio runtime worker — forever.
+/// WATCHDOG-2 floors the runtime at 4 worker threads and the watchdog liveness
+/// beat rides the same runtime, so an unbounded inline backup could starve the
+/// beat and make the node look dead. On expiry the child is killed and the run
+/// degrades to a `fail` publish, exactly like any other failed backup.
+pub const DR_BACKUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// The configured minimum interval between backups in seconds (`MCNF_DR_INTERVAL_SECS`,
 /// else [`DEFAULT_INTERVAL_SECS`]). A malformed/zero value falls back to the default.
 #[must_use]
@@ -105,14 +115,43 @@ fn fail_body(detail: &str) -> String {
     .to_string()
 }
 
+/// Build the `bash -lc <script>` command that runs the DR backup script.
+fn backup_command(script_path: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.args(["-lc", script_path]);
+    cmd
+}
+
+/// Run the DR backup command bounded by `timeout`, on a blocking thread so it
+/// never pins the async runtime (mackesd-02 / WATCHDOG-2). A backup that runs
+/// longer than `timeout` is killed and surfaces as
+/// [`std::io::ErrorKind::TimedOut`]; a `tokio` join failure (a panic in the
+/// blocking task) is folded into a plain I/O error so callers never see a panic.
+async fn run_backup_bounded(
+    script_path: &str,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    let script = script_path.to_string();
+    match tokio::task::spawn_blocking(move || {
+        super::proc::output_with_timeout(backup_command(&script), timeout)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join) => Err(std::io::Error::other(format!(
+            "dr-backup task failed: {join}"
+        ))),
+    }
+}
+
 /// Run the DR backup script once and publish its outcome. Best-effort: a missing
-/// script / shell, a non-zero exit, or a spawn failure each degrade to a `fail`
-/// publish and never panic.
-fn run_backup(script_path: &str) {
-    let out = std::process::Command::new("bash")
-        .args(["-lc", script_path])
-        .output();
-    match out {
+/// script / shell, a non-zero exit, a spawn failure, or the backup exceeding
+/// [`DR_BACKUP_TIMEOUT`] each degrade to a `fail` publish and never panic. The
+/// backup runs on a blocking thread (never inline on the async runtime), bounded
+/// by the timeout, so a hung backup can neither pin a runtime worker nor starve
+/// the watchdog beat (mackesd-02).
+async fn run_backup(script_path: &str) {
+    match run_backup_bounded(script_path, DR_BACKUP_TIMEOUT).await {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let last = stdout
@@ -133,7 +172,11 @@ fn run_backup(script_path: &str) {
             let tail = stderr.trim();
             publish(&fail_body(&format!("dr-backup exit {code}: {tail}")));
         }
-        Err(e) => publish(&fail_body(&format!("dr-backup spawn failed: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => publish(&fail_body(&format!(
+            "dr-backup timed out after {}s",
+            DR_BACKUP_TIMEOUT.as_secs()
+        ))),
+        Err(e) => publish(&fail_body(&format!("dr-backup failed: {e}"))),
     }
 }
 
@@ -206,7 +249,7 @@ impl Worker for DrSchedulerWorker {
         loop {
             if self.is_leader() && self.is_due(Instant::now()) {
                 let script = self.script_path.to_string_lossy().to_string();
-                run_backup(&script);
+                run_backup(&script).await;
                 self.last_run = Some(Instant::now());
             }
             tokio::select! {
@@ -275,5 +318,41 @@ mod tests {
         // We can't safely mutate process env in parallel tests; just assert the
         // default constant is what the docs promise (daily).
         assert_eq!(DEFAULT_INTERVAL_SECS, 86_400);
+    }
+
+    #[test]
+    fn dr_backup_timeout_is_generous_but_finite() {
+        // A fleet backup legitimately needs minutes, so the bound must be large
+        // (>= a few minutes) — but it must be finite so a wedged backup can't pin
+        // a thread forever (mackesd-02).
+        assert!(DR_BACKUP_TIMEOUT >= Duration::from_secs(300));
+        assert!(DR_BACKUP_TIMEOUT.as_secs() > 0);
+    }
+
+    #[tokio::test]
+    async fn run_backup_bounded_returns_output_for_fast_script() {
+        // The bounded/spawn_blocking route returns the real command output for a
+        // fast backup — same `bash -lc <script>` invocation as production.
+        let out = run_backup_bounded("echo dr-backup-marker", Duration::from_secs(5))
+            .await
+            .expect("fast backup returns output");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("dr-backup-marker"));
+    }
+
+    #[tokio::test]
+    async fn run_backup_bounded_times_out_on_hung_backup() {
+        // A hung backup is killed at the deadline and surfaces as a typed
+        // TimedOut error (→ a `fail` publish), NOT a hang. Proves the backup is
+        // bounded rather than able to pin a runtime worker forever.
+        let start = Instant::now();
+        let r = run_backup_bounded("sleep 60", Duration::from_millis(150)).await;
+        let err = r.expect_err("a hung backup must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // Returned promptly at the deadline, not after the 60 s sleep.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait for the hung child"
+        );
     }
 }

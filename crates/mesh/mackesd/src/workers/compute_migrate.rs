@@ -74,6 +74,15 @@ pub const DEFAULT_SHUTDOWN_POLL: Duration = Duration::from_secs(2);
 /// Target-side VM storage directory rsync ships disks into.
 pub const DEFAULT_TARGET_VM_DIR: &str = "/var/lib/mde-vms/";
 
+/// Generous-but-finite hard bound for the disk-ship `rsync`. A VM disk can be
+/// many GiB and legitimately take minutes over the Nebula overlay, so this is
+/// deliberately large; it exists only so a wedged rsync (a dead target peer, a
+/// black-holed overlay) is killed rather than blocking forever. On expiry the
+/// migration degrades to a [`MigrationOutcome::RsyncFailure`], exactly like a
+/// non-zero rsync exit. (mackesd-02: the migration also runs off the async
+/// runtime thread — see `run()` — so a slow ship can't starve the watchdog.)
+pub const RSYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Migration-request payload per design doc §3.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MigrateRequest {
@@ -328,14 +337,18 @@ fn run_virsh_status(args: &[String]) -> bool {
 }
 
 fn run_rsync(args: &[String]) -> Result<(), String> {
-    let status = Command::new("rsync")
-        .args(args)
-        .status()
-        .map_err(|e| format!("rsync spawn: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("rsync exited {status}"))
+    let mut cmd = Command::new("rsync");
+    cmd.args(args);
+    // Bounded so a wedged rsync (dead peer / black-holed overlay) is killed at
+    // RSYNC_TIMEOUT instead of blocking indefinitely (mackesd-02).
+    match super::proc::status_with_timeout(cmd, RSYNC_TIMEOUT) {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("rsync exited {status}")),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "rsync timed out after {}s",
+            RSYNC_TIMEOUT.as_secs()
+        )),
+        Err(e) => Err(format!("rsync spawn: {e}")),
     }
 }
 
@@ -528,15 +541,28 @@ fn resolve_nebula_addr(worker: &ComputeMigrateWorker) -> String {
     local_nebula_addr(&worker.nebula_interface)
 }
 
-fn poll_once(persist: &Persist, worker: &ComputeMigrateWorker, cursor: &mut Option<String>) {
+/// Drain the new source-side migrate requests since `cursor`, advancing the
+/// cursor past every message (source or not — same at-least-once semantics as
+/// before) and returning the `(request_ulid, request)` pairs this peer is the
+/// SOURCE for. Pure Bus I/O — no shell-out — so the heavy [`run_migration`]
+/// (which polls virsh for up to [`DEFAULT_SHUTDOWN_TIMEOUT`] and rsyncs a
+/// multi-GiB disk) runs on `spawn_blocking` in the run loop instead of inline on
+/// the async runtime, and `Persist` (which is `!Sync`) never crosses an `.await`
+/// (mackesd-02).
+fn drain_source_jobs(
+    persist: &Persist,
+    worker: &ComputeMigrateWorker,
+    cursor: &mut Option<String>,
+) -> Vec<(String, MigrateRequest)> {
     let msgs = match persist.list_since(ACTION_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "compute_migrate: list_since failed");
-            return;
+            return Vec::new();
         }
     };
     let own_ip = resolve_nebula_addr(worker);
+    let mut jobs = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
@@ -556,42 +582,30 @@ fn poll_once(persist: &Persist, worker: &ComputeMigrateWorker, cursor: &mut Opti
             );
             continue;
         }
-        let outcome = run_migration(&req);
-        match outcome {
-            MigrationOutcome::Ok { domain_xml } => {
-                let event = build_migrate_ready_event(
-                    &req,
-                    target_disk_path_for(&req.disk_path, DEFAULT_TARGET_VM_DIR),
-                    msg.ulid.clone(),
-                    domain_xml,
-                );
-                publish_migrate_ready(persist, &event);
-            }
-            other => {
-                tracing::warn!(
-                    ulid = %msg.ulid,
-                    vm_id = %req.vm_id,
-                    outcome = ?other,
-                    "compute_migrate: migration failed"
-                );
-            }
-        }
+        jobs.push((msg.ulid.clone(), req));
     }
+    jobs
 }
 
-/// VIRT-8.b — target-side poll: drain `event/compute/migrate-ready`,
-/// act on events addressed to this peer (`target_peer == own`),
-/// define + start the migrated VM, and publish `migrate-failed` on
-/// error. Non-target events advance the cursor + skip.
-fn poll_target_once(persist: &Persist, worker: &ComputeMigrateWorker, cursor: &mut Option<String>) {
+/// VIRT-8.b — target-side drain: read `event/compute/migrate-ready`, advance the
+/// cursor past every message, and return the events addressed to this peer
+/// (`target_peer == own`). The heavy define/start (`run_migrate_target`) then
+/// runs on `spawn_blocking` in the run loop (mackesd-02), keeping `Persist` off
+/// the `.await`.
+fn drain_target_jobs(
+    persist: &Persist,
+    worker: &ComputeMigrateWorker,
+    cursor: &mut Option<String>,
+) -> Vec<MigrateReadyEvent> {
     let msgs = match persist.list_since(MIGRATE_READY_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "compute_migrate: migrate-ready list_since failed");
-            return;
+            return Vec::new();
         }
     };
     let own_ip = resolve_nebula_addr(worker);
+    let mut jobs = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
@@ -605,13 +619,9 @@ fn poll_target_once(persist: &Persist, worker: &ComputeMigrateWorker, cursor: &m
         if !is_target_peer(&event, &own_ip) {
             continue;
         }
-        if let Err(e) = run_migrate_target(&event) {
-            tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target define/start failed");
-            publish_migrate_failed(persist, &event, &e);
-        } else {
-            tracing::info!(vm_id = %event.vm_id, "compute_migrate: migrated VM defined + started on target");
-        }
+        jobs.push(event);
     }
+    jobs
 }
 
 fn default_bus_root() -> Option<PathBuf> {
@@ -646,10 +656,54 @@ impl Worker for ComputeMigrateWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    // Source side: action/compute/migrate.
-                    poll_once(&persist, self, &mut source_cursor);
-                    // Target side (VIRT-8.b): event/compute/migrate-ready.
-                    poll_target_once(&persist, self, &mut target_cursor);
+                    // Source side (action/compute/migrate): drain requests
+                    // synchronously (cheap Bus read), then run each migration OFF
+                    // the runtime thread. run_migration polls virsh for up to
+                    // DEFAULT_SHUTDOWN_TIMEOUT and rsyncs a multi-GiB disk over the
+                    // overlay — minutes of blocking work that must not pin a
+                    // runtime worker or starve the watchdog beat (mackesd-02).
+                    for (ulid, req) in drain_source_jobs(&persist, self, &mut source_cursor) {
+                        let req_run = req.clone();
+                        match tokio::task::spawn_blocking(move || run_migration(&req_run)).await {
+                            Ok(MigrationOutcome::Ok { domain_xml }) => {
+                                let event = build_migrate_ready_event(
+                                    &req,
+                                    target_disk_path_for(&req.disk_path, DEFAULT_TARGET_VM_DIR),
+                                    ulid,
+                                    domain_xml,
+                                );
+                                publish_migrate_ready(&persist, &event);
+                            }
+                            Ok(other) => {
+                                tracing::warn!(
+                                    ulid = %ulid,
+                                    vm_id = %req.vm_id,
+                                    outcome = ?other,
+                                    "compute_migrate: migration failed"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, vm_id = %req.vm_id, "compute_migrate: migration task join failed");
+                            }
+                        }
+                    }
+                    // Target side (VIRT-8.b): event/compute/migrate-ready. Define
+                    // + start each migrated VM off-runtime too.
+                    for event in drain_target_jobs(&persist, self, &mut target_cursor) {
+                        let event_run = event.clone();
+                        match tokio::task::spawn_blocking(move || run_migrate_target(&event_run)).await {
+                            Ok(Ok(())) => {
+                                tracing::info!(vm_id = %event.vm_id, "compute_migrate: migrated VM defined + started on target");
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target define/start failed");
+                                publish_migrate_failed(&persist, &event, &e);
+                            }
+                            Err(e) => {
+                                tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target task join failed");
+                            }
+                        }
+                    }
                 }
                 _ = shutdown.wait() => break,
             }
@@ -993,5 +1047,41 @@ mod tests {
     #[test]
     fn migrate_ready_topic_under_event_prefix() {
         assert!(MIGRATE_READY_TOPIC.starts_with("event/"));
+    }
+
+    // ── mackesd-02: rsync bound + off-runtime drain seam ──
+
+    #[test]
+    fn rsync_timeout_is_generous_but_finite() {
+        // A multi-GiB disk ship legitimately needs minutes, so the bound must be
+        // large — but finite so a wedged rsync can't block forever (mackesd-02).
+        assert!(RSYNC_TIMEOUT >= Duration::from_secs(300));
+        assert!(RSYNC_TIMEOUT.as_secs() > 0);
+    }
+
+    #[test]
+    fn drain_source_jobs_returns_only_this_peers_requests_and_advances_cursor() {
+        // The sync drain seam (which lets run_migration move to spawn_blocking)
+        // returns only the requests this peer is the SOURCE for, and advances the
+        // cursor past EVERY message — so a hung/slow migration off-runtime never
+        // re-drives already-consumed messages.
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let mine = r#"{"source_peer":"10.42.0.1","target_peer":"10.42.0.2","vm_id":"vm-mine","disk_path":"/var/lib/mde-vms/vm-mine.qcow2"}"#;
+        let other = r#"{"source_peer":"10.42.0.9","target_peer":"10.42.0.2","vm_id":"vm-other","disk_path":"/d"}"#;
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(mine))
+            .unwrap();
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(other))
+            .unwrap();
+        let worker = ComputeMigrateWorker::new().with_nebula_addr_hint("10.42.0.1".into());
+        let mut cursor = None;
+        let jobs = drain_source_jobs(&persist, &worker, &mut cursor);
+        assert_eq!(jobs.len(), 1, "only the source-peer request is returned");
+        assert_eq!(jobs[0].1.vm_id, "vm-mine");
+        // Cursor advanced past BOTH messages → a second drain is empty.
+        assert!(cursor.is_some());
+        assert!(drain_source_jobs(&persist, &worker, &mut cursor).is_empty());
     }
 }
