@@ -73,6 +73,6 @@ meshctl test dns            # <host>.mesh resolution wired
 meshctl test firewall       # nebula1 in the trusted zone
 ```
 
-On a Workstation with a display, the shell's **Workbench** (the five-plane mesh
-console the chrome bar expands into) is the graphical view of Peers, This Node,
-Cloud, Network, Fleet, and Provisioning.
+On a Workstation with a display, the egui shell's graphical mesh-control planes —
+reached from the dock — are the visual view of the fleet: **This Node**, **Cloud**,
+**Network**, **Fleet**, and **Provisioning**.

@@ -1,9 +1,9 @@
 # MCNF — Operator's Day-2 Guide
 
 The lifecycle of a running mesh, in the order you'll live it. Deep runbooks
-live in [`docs/help/`](docs/help/) (installed to `/usr/share/mde/help/`, and in
-the repo); the shell's own in-product help is the Workbench **Help ▸ Plane
-Guide**. This page is the map. The trust model and its limits:
+live in [`docs/help/`](docs/help/) — in the repo, and installed on every node at
+`/usr/share/mde/help/`. Read them there or here: the egui shell does not render
+these runbooks in-product. This page is the map. The trust model and its limits:
 [`DISCLAIMER.md`](DISCLAIMER.md) · [`SUPPORT.md`](SUPPORT.md).
 
 ## 0. Install + first boot
@@ -58,7 +58,7 @@ mackesd ca export --output /safe/offsite/ca-bundle.enc   # same passphrase env
 | Surface | What |
 |---|---|
 | `mackesd healthz` | store view: node-health buckets, audit chain |
-| Bus healthz (Workbench Overview) | + live workers, breaker, the `ready` verdict |
+| Bus `healthz` response | live workers, breaker, the `ready` verdict |
 | `meshctl doctor` / `meshctl fleet status` | binaries, service, overlay, fleet |
 | `journalctl -u mackesd | grep mackesd::alert` | every alert, severity-mapped (the headless surface) |
 | `/var/lib/node_exporter/textfile_collector/mackesd.prom` | Prometheus gauges: node health, CA days-remaining, router latency histogram, workers/breaker, disk headroom, backup posture |
@@ -69,13 +69,13 @@ mackesd ca export --output /safe/offsite/ca-bundle.enc   # same passphrase env
 - **The platform:** `sudo dnf upgrade magic-mesh` (the repo + key shipped in
   step 0 make this work). Workers restart with the daemon; the role pin and
   store carry over.
-- **Fleet desired-state:** author a revision (Workbench → Fleet, or the
-  `action/fleet/push-revision` Bus verb); every node's reconcile worker
+- **Fleet desired-state:** author a revision with the
+  `action/fleet/push-revision` Bus verb; every node's reconcile worker
   elects the head and converges itself — no push-SSH, no center.
 
 ## 5. Roll back
 
-- **Fleet revision:** `action/fleet/rollback` (Workbench → Fleet) — the log
+- **Fleet revision:** the `action/fleet/rollback` Bus verb — the log
   keeps prior revisions; nodes converge to the elected head as usual.
 - **A bad config experiment on one node:** node-local exceptions
   (`magic-fleet reconcile --except <file>`) keep a node out of a baseline
