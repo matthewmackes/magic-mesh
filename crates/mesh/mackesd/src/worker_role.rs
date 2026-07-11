@@ -152,6 +152,31 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // it always had, now EXPLICIT + counted. Pairs with `notify` (CHAT-FIX-2), the
     // producer whose events it folds.
     ("chat", 0),
+    // ── ARCH-5 (drift guard) — universal (rank-0) workers that were spawned in
+    //    `run_serve` gated on `worker_role::runs(...)` but OMITTED from this census,
+    //    so they silently rode the "unknown worker ⇒ rank 0" default: they DID run
+    //    everywhere (correct) but `mackesd role-workers` never listed them — the exact
+    //    BUG-STORAGE-1 omission, repeated. The new
+    //    `worker_spawns_and_the_census_do_not_drift` reconcile test now REFUSES that
+    //    silent default: every `runs(...)`-gated worker must be a deliberate census
+    //    entry. Pinned at rank 0 = the rank they already resolved to via the default,
+    //    so runtime behavior is UNCHANGED; they are now EXPLICIT + listed. Each spawn
+    //    site documents its own "rank-0 / runs-everywhere / universal" intent
+    //    (self-marker-gated where relevant).
+    ("boot_readiness", 0), // BOOT-STATUS-1 — fabric bring-up snapshot, all roles
+    ("xcp_host", 0),       // XCP-6 — hypervisor-capacity advertiser, self-gates on the dom0 marker
+    ("kvm_health", 0),     // MV-2 — per-node KVM service health, universal virt stack
+    ("vm_lifecycle", 0),   // MV — per-node libvirt VM executor, every node hosts VMs
+    ("container", 0),      // MV — per-node Podman container executor, every node hosts containers
+    ("scheduler", 0),      // MV-5 — placement scheduler (single-actor election), runs everywhere
+    ("session_broker", 0), // VDI — session-roster broker, leader-gated internally, runs everywhere
+    ("session_roaming", 0), // VDI — roaming-session reconciler, runs everywhere
+    ("console_broker", 0), // VDI — live-console overlay relay, serving-peer-gated, runs everywhere
+    ("clipboard_bridge", 0), // VDI — per-session clipboard relay, node-local, runs everywhere
+    ("service_onboard", 0), // onboard — action/onboard/service-add engine, leader-gated, runs everywhere
+    ("spawn_lighthouse_onboard", 0), // onboard — action/onboard/spawn-lighthouse engine, leader-gated
+    ("onboard_apply", 0),            // onboard — addressed remote-bundle applier, runs everywhere
+    ("lighthouse_probe", 0), // LIGHTHOUSE-8 — per-lighthouse deep-probe lane (gated in workers/mod.rs), rank-0
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -473,6 +498,311 @@ pub fn workers_for_class(class: DeployClass) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ARCH-5 — the drift guard between the two worker registries.
+    //
+    // Worker registration is split across TWO registries that have drifted before
+    // (BUG-STORAGE-1): this static role census (`WORKER_TIERS` + `WORKER_CAPABILITIES`)
+    // vs. the ~136 imperative `sup.spawn(...)` / `worker_names.push(...)` sites in
+    // `run_serve` (`bin/mackesd.rs`) plus the role gates (`worker_role::runs(...)`)
+    // scattered across the crate. Nothing at runtime enforces that the two agree, so a
+    // worker could be:
+    //   • spawned-but-uncensused → its `runs(...)` gate silently resolves to
+    //     `min_rank => 0` (runs on every role, possibly the wrong tier) AND it is
+    //     hidden from `mackesd role-workers` (the exact BUG-STORAGE-1 failure), or
+    //   • censused-but-never-spawned → a phantom row that makes `role-workers` lie.
+    //
+    // `worker_spawns_and_the_census_do_not_drift` READS the crate source at test time
+    // and reconciles the registries so any FUTURE drift fails the build with the
+    // offending worker named. Airgapped-safe: pure source parsing, no live env.
+    // (This does NOT unify the two registries — that is a larger refactor; it only
+    // makes their divergence detectable and forces every spawn to be a deliberate,
+    // classified decision.)
+
+    /// Workers spawned in `run_serve` that are deliberately NOT in the role-tier
+    /// census: they spawn UNCONDITIONALLY on every role (mesh/nebula control plane,
+    /// bus responders, datacenter/compute workers that self-gate on a runtime marker),
+    /// or are capability-gated under the `navidrome` key (`media_registry` /
+    /// `navidrome_supervisor`). None of them consult `WORKER_TIERS`, so they cannot
+    /// mis-tier — but listing them here keeps the full-roster reconcile honest: every
+    /// spawned worker must be classified as EITHER a deliberate tier entry OR an
+    /// explicit not-tier-gated entry, so a NEW spawn that is neither fails the guard.
+    /// A future tiering pass may promote an entry from here into `WORKER_TIERS`.
+    const NON_TIERED_WORKERS: &[&str] = &[
+        "action",
+        "alert_relay",
+        "apps_bus_responder",
+        "apps_installed",
+        "apps_running",
+        "bus_retention_gc",
+        "cert_authority",
+        "clipboard_bus_responder",
+        "compute_event_toast",
+        "compute_expose",
+        "compute_migrate",
+        "compute_provision",
+        "compute_registry",
+        "connect_bus_responder",
+        "connect_firewall",
+        "copilot",
+        "cups_sync",
+        "datacenter_orchestrator",
+        "dc_auditor",
+        "dc_bus_responder",
+        "dc_health",
+        "dc_jobs",
+        "dc_power_bus_responder",
+        "dc_promote",
+        "dc_snap_scheduler",
+        "ddns_bus_responder",
+        "ddns_reconcile",
+        "directory_bus_responder",
+        "dr_scheduler",
+        "farm_orchestrator",
+        "files_bus_responder",
+        "firewall_monitor",
+        "fleet_bus_responder",
+        "host_ops_bus_responder",
+        "host_state",
+        "jobs_bus_responder",
+        "leader_election",
+        "media_registry",
+        "mesh_firewall",
+        "mirror_syncd",
+        "navidrome_supervisor",
+        "nebula_bus_responder",
+        "nebula_ca_backup",
+        "nebula_csr_watcher",
+        "nebula_enroll_listener",
+        "nebula_https_listener",
+        "netassess",
+        "netdata_aggregator",
+        "peer-cap",
+        "probe",
+        "route_bus_responder",
+        "router_registry",
+        "selinux_monitor",
+        "settings_bus_responder",
+        "shell_bus_responder",
+        "surface_enable",
+        "surface_firmware",
+        "surface_verify",
+        "surrounding_hosts",
+        "tofu_bus_responder",
+        "upgrade_intent_watcher",
+        "voice_provision",
+        "voip_bus_responder",
+        "voip_rtt",
+        "vpn_bus_responder",
+        "xcp_provision",
+    ];
+
+    /// Worker(s) whose `worker_names.push(...)` uses a runtime-computed name rather
+    /// than a string literal, so the source scan cannot see them. Currently only the
+    /// LIGHTHOUSE-8 probe, spawned via `Supervisor::spawn_lighthouse_probe()` which
+    /// returns the worker's own `name()` (`"lighthouse_probe"`). Listed so the phantom
+    /// guard does not false-flag its (deliberate) census entry.
+    const DYNAMIC_SPAWNS: &[&str] = &["lighthouse_probe"];
+
+    fn crate_src_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn read_source(rel: &str) -> String {
+        let p = crate_src_dir().join(rel);
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("ARCH-5 drift guard: cannot read {}: {e}", p.display()))
+    }
+
+    /// Every `*.rs` under the crate `src/` tree.
+    fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let rd = std::fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!("ARCH-5 drift guard: cannot read dir {}: {e}", dir.display())
+        });
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(rust_sources(&p));
+            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// Drop whole-line comments so doc/inline mentions of `runs(...)` don't register
+    /// as gate sites (e.g. the `//!` module docs in `media_registry.rs`).
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Extract each worker-name literal that immediately follows `needle`
+    /// (e.g. `.push("` or `runs("`), reading up to the closing quote. Only lowercase
+    /// worker tokens (`[a-z0-9_-]`) are accepted, so multi-word / non-worker strings
+    /// are ignored.
+    fn scan_names(src: &str, needle: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = src.as_bytes();
+        let mut i = 0usize;
+        while i < src.len() {
+            let Some(pos) = src[i..].find(needle) else {
+                break;
+            };
+            let start = i + pos + needle.len();
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            let tok = &src[start..j];
+            if !tok.is_empty()
+                && tok
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            {
+                out.push(tok.to_string());
+            }
+            i = j + 1;
+        }
+        out
+    }
+
+    /// Every worker name passed to a PRODUCTION `worker_role::runs(...)` /
+    /// `runs_in(...)` gate anywhere in the crate. Skips this module (its `runs(...)`
+    /// calls are test fixtures like `"some-future-worker"`) and comment lines.
+    fn collect_gate_names() -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let mut n_files = 0usize;
+        for path in rust_sources(&crate_src_dir()) {
+            if path.file_name().and_then(|s| s.to_str()) == Some("worker_role.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read rs source");
+            let code = strip_line_comments(&src);
+            for name in scan_names(&code, "runs(\"") {
+                set.insert(name);
+            }
+            for name in scan_names(&code, "runs_in(\"") {
+                set.insert(name);
+            }
+            n_files += 1;
+        }
+        assert!(
+            n_files >= 3,
+            "ARCH-5 drift guard: only scanned {n_files} source files — the walker is broken"
+        );
+        set
+    }
+
+    #[test]
+    fn worker_spawns_and_the_census_do_not_drift() {
+        use std::collections::BTreeSet;
+
+        let census: BTreeSet<&str> = WORKER_TIERS.iter().map(|(n, _)| *n).collect();
+        let caps: BTreeSet<&str> = WORKER_CAPABILITIES.iter().map(|(n, _)| *n).collect();
+        let non_tiered: BTreeSet<&str> = NON_TIERED_WORKERS.iter().copied().collect();
+        let dynamic: BTreeSet<&str> = DYNAMIC_SPAWNS.iter().copied().collect();
+
+        // The definitive spawn roster: every `worker_names.push("X")` literal in
+        // run_serve (`bin/mackesd.rs`), plus the runtime-named dynamic spawns.
+        let bin = read_source("bin/mackesd.rs");
+        let pushed: BTreeSet<String> = scan_names(&bin, ".push(\"").into_iter().collect();
+        assert!(
+            pushed.len() >= 120,
+            "ARCH-5 drift guard: only {} `.push(\"…\")` worker sites found — the source scan \
+             is broken (expected ~136)",
+            pushed.len()
+        );
+
+        // Every role gate (`runs`/`runs_in`) across the crate.
+        let gated = collect_gate_names();
+        assert!(
+            gated.len() >= 40,
+            "ARCH-5 drift guard: only {} `runs(…)` gate sites found — the source scan is \
+             broken (expected ~60)",
+            gated.len()
+        );
+
+        // (1) Silent-default guard — the BUG-STORAGE-1 root cause. Every worker GATED
+        //     on the role census must actually BE in the census (or capabilities). A
+        //     gate on an uncensused name silently resolves `min_rank => 0`, so the
+        //     worker runs on every role AND is hidden from `mackesd role-workers`.
+        let mut gated_uncensused: Vec<&str> = gated
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !census.contains(n) && !caps.contains(n))
+            .collect();
+        gated_uncensused.sort_unstable();
+        assert!(
+            gated_uncensused.is_empty(),
+            "ARCH-5 DRIFT: these workers are gated on `worker_role::runs(…)` but are MISSING \
+             from WORKER_TIERS/WORKER_CAPABILITIES, so they silently default to rank 0 and \
+             never appear in `mackesd role-workers` (the BUG-STORAGE-1 bug). Add each to the \
+             census with a deliberate tier: {gated_uncensused:?}"
+        );
+
+        // (2) Phantom guard — every census entry must actually be spawned in run_serve
+        //     (a literal push, or a known runtime-named dynamic spawn). Catches a
+        //     census row whose spawn was renamed/deleted (a lie in `role-workers`).
+        let mut phantom: Vec<&str> = census
+            .iter()
+            .copied()
+            .filter(|n| !pushed.contains(*n) && !dynamic.contains(n))
+            .collect();
+        phantom.sort_unstable();
+        assert!(
+            phantom.is_empty(),
+            "ARCH-5 DRIFT: these WORKER_TIERS entries are never spawned in run_serve \
+             (renamed/deleted spawn — remove the census row, or add to DYNAMIC_SPAWNS if it \
+             is spawned under a runtime-computed name): {phantom:?}"
+        );
+
+        // (3) Full-roster accountability — every spawned worker must be classified:
+        //     a deliberate tier entry (WORKER_TIERS), a capability worker, or an
+        //     explicit not-tier-gated entry (NON_TIERED_WORKERS). A brand-new spawn
+        //     that is none of these fails here, forcing a deliberate decision.
+        let mut unaccounted: Vec<&str> = pushed
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !census.contains(n) && !caps.contains(n) && !non_tiered.contains(n))
+            .collect();
+        unaccounted.sort_unstable();
+        assert!(
+            unaccounted.is_empty(),
+            "ARCH-5 DRIFT: these workers are spawned in run_serve but classified NOWHERE. Add \
+             each to WORKER_TIERS (if role-tiered) or NON_TIERED_WORKERS (if it spawns \
+             unconditionally on every role): {unaccounted:?}"
+        );
+
+        // (4) Allowlist hygiene — no stale NON_TIERED_WORKERS entry (each must still be
+        //     spawned), and it stays disjoint from the tier census.
+        let mut stale: Vec<&str> = non_tiered
+            .iter()
+            .copied()
+            .filter(|n| !pushed.contains(*n))
+            .collect();
+        stale.sort_unstable();
+        assert!(
+            stale.is_empty(),
+            "ARCH-5: these NON_TIERED_WORKERS entries are no longer spawned in run_serve — \
+             remove them: {stale:?}"
+        );
+        let mut both: Vec<&str> = non_tiered
+            .iter()
+            .copied()
+            .filter(|n| census.contains(n))
+            .collect();
+        both.sort_unstable();
+        assert!(
+            both.is_empty(),
+            "ARCH-5: these workers are in BOTH WORKER_TIERS and NON_TIERED_WORKERS — pick one: \
+             {both:?}"
+        );
+    }
+
     #[test]
     fn the_table_is_the_full_17_worker_census() {
         // Guards against a worker added to run_serve without a deliberate tier
@@ -561,7 +891,16 @@ mod tests {
         // +1 browser_share shifts split 30/24 → 30/25, len 54 → 55.
         // +1 seat_remote_input shifts split 30/25 → 30/26, len 55 → 56.
         // +1 browser_passkeys shifts split 30/26 → 30/27, len 56 → 57.
-        assert_eq!(WORKER_TIERS.len(), 57);
+        // ARCH-5 (drift guard) +14 universal rank-0 workers that were riding the
+        // silent "unknown worker ⇒ rank 0" default (spawned + `runs(...)`-gated but
+        // uncensused → hidden from `mackesd role-workers`, the BUG-STORAGE-1 class):
+        // boot_readiness, xcp_host, kvm_health, vm_lifecycle, container, scheduler,
+        // session_broker, session_roaming, console_broker, clipboard_bridge,
+        // service_onboard, spawn_lighthouse_onboard, onboard_apply, lighthouse_probe.
+        // All rank 0 (behavior-preserving), so the split shifts 30/27 → 44/27,
+        // len 57 → 71. The `worker_spawns_and_the_census_do_not_drift` test now keeps
+        // the census + the run_serve spawn sites from silently diverging again.
+        assert_eq!(WORKER_TIERS.len(), 71);
     }
 
     #[test]
@@ -584,8 +923,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            30,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + device_control (DEVMGR-8, universal per-node device-control executor)"
+            44,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + device_control (DEVMGR-8, universal per-node device-control executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
         );
         assert_eq!(
             count(1),
@@ -852,8 +1191,10 @@ mod tests {
         // browser_security_update + browser_tab_suspend owners, plus the
         // KDC-MESH-6 seat_remote_input consumer) for the full 57 (the retired
         // Server tier folded into Workstation in the 2-role model).
-        assert_eq!(lh.len(), 30);
-        assert_eq!(ws.len(), 57);
+        // ARCH-5 (drift guard) +14 universal rank-0 workers censused (30 → 44),
+        // so both roles grow by 14: lh 30 → 44, ws 57 → 71.
+        assert_eq!(lh.len(), 44);
+        assert_eq!(ws.len(), 71);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -919,15 +1260,16 @@ mod tests {
         // worker, the EXPLORER-1 universal unit_aggregator, the CHAT-FIX-2
         // universal notify producer, the NODE-GRADE-1 universal node_grade
         // self-grade, the KDC-MESH-3 universal kdc_host, the CHAT-FIX-1 universal
-        // chat worker + the DEVMGR-8 universal device_control executor) + navidrome.
-        assert_eq!(set.len(), 31);
+        // chat worker + the DEVMGR-8 universal device_control executor + the ARCH-5
+        // 14 universal rank-0 workers) + navidrome.
+        assert_eq!(set.len(), 45);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 30);
+        assert_eq!(workers_for_class(plain_lh).len(), 44);
     }
 
     #[test]
