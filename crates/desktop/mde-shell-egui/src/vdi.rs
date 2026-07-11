@@ -371,15 +371,23 @@ pub(crate) struct ConnectRequest {
     /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
     /// off-mesh endpoints leave this empty.
     pub broker_session: Option<BrokerSessionLifecycle>,
-    /// vdi-vm-8 — the initial guest desktop size hint in **device pixels** (the
-    /// shell's real output size at connect time), so an RDP/SPICE guest renders at
-    /// near-native resolution instead of a hardcoded 1024×768 that egui upscales
+    /// vdi-vm-8 — the guest desktop size hint in **device pixels** (the shell's real
+    /// output size at connect time, [`body_device_px`]), so an RDP/SPICE guest renders
+    /// at near-native resolution instead of a hardcoded 1024×768 that egui upscales
     /// (blurry on modern seats). RDP/SPICE pass it at connect ([`with_resolution`] /
     /// [`with_size`]); VNC's size is server-negotiated so it is ignored there. When
     /// absent (bus-driven / test paths) the transport falls back to its prior
-    /// hardcoded size. Dynamic re-negotiation on panel resize is a deferred
-    /// follow-up — the pointer transform keeps clicks correct meanwhile.
+    /// hardcoded size.
     ///
+    /// On a MATERIAL panel resize *after* connect (a seat / monitor resolution change,
+    /// not a chrome toggle) an RDP/SPICE session is re-dialed at the new panel size —
+    /// the only live re-negotiation the thin transports expose (a fresh connect;
+    /// `note_resize_target` + `poll_resize_renegotiate`). The LINEAR upscale bridges
+    /// the sub-second re-dial gap and remains the fallback for smaller deltas and for
+    /// VNC (server-authoritative). The pointer transform keeps clicks correct
+    /// throughout.
+    ///
+    /// [`body_device_px`]: crate::vdi::body_device_px
     /// [`with_resolution`]: mde_vdi_rdp::RdpConfig::with_resolution
     /// [`with_size`]: mde_vdi_spice::SpiceConfig::with_size
     pub preferred_size: Option<(u16, u16)>,
@@ -961,6 +969,48 @@ fn next_phase_on_drop(current: &SessionPhase, reason: String, max: u32) -> Sessi
     }
 }
 
+/// vdi-vm-8 — a live RDP/SPICE desktop is re-negotiated (re-dialed at the panel's
+/// current size) only once the guest's real desktop diverges from the panel by more
+/// than this many device pixels on either axis. Set well above the dock / menubar
+/// chrome deltas — which the LINEAR upscale absorbs imperceptibly — so a chrome
+/// toggle never triggers a disruptive re-dial; only a real seat / monitor resolution
+/// change does.
+#[cfg(feature = "live-vdi")]
+const RESIZE_RENEGOTIATE_THRESHOLD_PX: u16 = 128;
+
+/// vdi-vm-8 — the new panel size must hold steady this long before a resize re-dial
+/// fires, so dragging / animating a resize collapses to a SINGLE re-negotiation
+/// instead of a reconnect storm.
+#[cfg(feature = "live-vdi")]
+const RESIZE_SETTLE: Duration = Duration::from_millis(600);
+
+/// vdi-vm-8 — two target sizes within this many device pixels count as "the same"
+/// pending resize target, so sub-pixel layout jitter keeps the settle timer running
+/// rather than restarting it every frame.
+#[cfg(feature = "live-vdi")]
+const RESIZE_TARGET_TOLERANCE_PX: u16 = 8;
+
+/// vdi-vm-8 — a debounced resize re-negotiation in flight: the panel size to re-dial
+/// at and the instant its settle window elapses. Armed by
+/// [`VdiState::note_resize_target`] and fired by [`VdiState::poll_resize_renegotiate`].
+#[cfg(feature = "live-vdi")]
+#[derive(Debug, Clone, Copy)]
+struct PendingResize {
+    /// When the settle window elapses and the re-dial may fire.
+    at: std::time::Instant,
+    /// The panel size (device px) the transport will be re-dialed at.
+    target: (u16, u16),
+}
+
+/// vdi-vm-8 — whether two desktop sizes differ by more than `tol` device pixels on
+/// either axis. The pure predicate behind both the resize trigger (guest vs panel
+/// beyond [`RESIZE_RENEGOTIATE_THRESHOLD_PX`]) and the "already dialed / same pending
+/// target" checks (within [`RESIZE_TARGET_TOLERANCE_PX`]).
+#[cfg(feature = "live-vdi")]
+const fn size_diverges(a: (u16, u16), b: (u16, u16), tol: u16) -> bool {
+    a.0.abs_diff(b.0) > tol || a.1.abs_diff(b.1) > tol
+}
+
 /// shell-ux-1 — an affordance the failure / reconnect overlay offers. Both are real
 /// re-entries the session already owns a seam for (re-dial the retained request, or
 /// fall back to the Chooser), never a dead-end.
@@ -1079,6 +1129,18 @@ pub(crate) struct VdiState {
     /// the operator closes). The per-frame [`Self::poll_reconnect`] fires at it.
     #[cfg(feature = "live-vdi")]
     reconnect_at: Option<std::time::Instant>,
+    /// vdi-vm-8 — the size (device px) the current live transport was dialed at (the
+    /// last `preferred_size` passed to [`Self::spawn_live_transport`]). Lets a resize
+    /// check avoid re-arming for a geometry already requested but not yet repainted by
+    /// the guest. `None` on the fallback / bus-driven paths that pass no size.
+    #[cfg(feature = "live-vdi")]
+    negotiated_size: Option<(u16, u16)>,
+    /// vdi-vm-8 — a debounced resize re-negotiation in flight for a live RDP/SPICE
+    /// desktop: set when the panel drifts materially from the guest's real size and
+    /// cleared once it settles back or the session leaves `Live`. Fired by
+    /// [`Self::poll_resize_renegotiate`]. VNC (server-authoritative) never arms it.
+    #[cfg(feature = "live-vdi")]
+    pending_resize: Option<PendingResize>,
 }
 
 impl VdiState {
@@ -1120,6 +1182,10 @@ impl VdiState {
             // session cannot bleed into (or auto-reconnect) this one (vdi-vm-4).
             self.session_phase = SessionPhase::Live;
             self.reconnect_at = None;
+            // vdi-vm-8 — a fresh operator connect renegotiates from scratch; drop any
+            // in-flight resize re-dial and the prior dialed size.
+            self.pending_resize = None;
+            self.negotiated_size = None;
             self.publish_broker_close_if_active();
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
@@ -1157,6 +1223,9 @@ impl VdiState {
     /// ([`Self::poll_brokered_endpoint`]).
     #[cfg(feature = "live-vdi")]
     fn spawn_live_transport(&mut self, request: &ConnectRequest) {
+        // vdi-vm-8 — record the size this dial negotiates at so a later resize check
+        // doesn't re-arm for a geometry already requested (see `note_resize_target`).
+        self.negotiated_size = request.preferred_size;
         match request.protocol {
             VdiProtocol::Rdp => match LiveRdpHandle::spawn(request) {
                 Ok(handle) => {
@@ -1275,6 +1344,9 @@ impl VdiState {
             // resumes) auto-reconnect (vdi-vm-4, requirement 3).
             self.session_phase = SessionPhase::Live;
             self.reconnect_at = None;
+            // vdi-vm-8 — backing out cancels any pending resize re-dial too.
+            self.pending_resize = None;
+            self.negotiated_size = None;
             self.texture = None;
             self.incoming = None;
         }
@@ -1345,6 +1417,100 @@ impl VdiState {
                 .live_status
                 .clone()
                 .unwrap_or_else(|| "the re-dial could not start".to_string());
+            self.on_transport_drop(reason);
+        }
+    }
+
+    /// vdi-vm-8 — observe this frame's real panel size (`panel_px`, device px) against
+    /// the guest's real desktop size (`guest_px`, the live texture size) and arm /
+    /// disarm a debounced resize re-negotiation. The RDP/SPICE thin transports fix
+    /// their desktop size at dial time and expose no in-session resize, so the only
+    /// way to fit a materially-resized panel is a fresh dial at the new size — armed
+    /// here, fired by [`Self::poll_resize_renegotiate`] once the size settles. VNC is
+    /// server-authoritative and resizes itself, so it never arms this; smaller deltas
+    /// stay on the LINEAR upscale (imperceptible, no disruptive re-dial).
+    #[cfg(feature = "live-vdi")]
+    fn note_resize_target(&mut self, panel_px: (u16, u16), guest_px: (u16, u16)) {
+        // Only an RDP/SPICE session re-negotiates by re-dialing; VNC excludes itself.
+        let renegotiable = self.live_rdp.is_some() || self.live_spice.is_some();
+        if !renegotiable || self.session_phase != SessionPhase::Live {
+            self.pending_resize = None;
+            return;
+        }
+        // Already dialed (or dialing) at ~this size — the guest just hasn't repainted
+        // at the new geometry yet; the upscale bridges it. Don't re-arm.
+        if let Some(neg) = self.negotiated_size {
+            if !size_diverges(neg, panel_px, RESIZE_TARGET_TOLERANCE_PX) {
+                self.pending_resize = None;
+                return;
+            }
+        }
+        // The guest's real desktop already matches the panel closely enough — the paint
+        // is ~1:1, so there is nothing worth a disruptive re-dial.
+        if !size_diverges(guest_px, panel_px, RESIZE_RENEGOTIATE_THRESHOLD_PX) {
+            self.pending_resize = None;
+            return;
+        }
+        // Arm (or keep) the settle timer toward the current panel size: a materially
+        // different target restarts it; a target within tolerance keeps it counting.
+        match self.pending_resize {
+            Some(p) if !size_diverges(p.target, panel_px, RESIZE_TARGET_TOLERANCE_PX) => {}
+            _ => {
+                self.pending_resize = Some(PendingResize {
+                    at: std::time::Instant::now() + RESIZE_SETTLE,
+                    target: panel_px,
+                });
+            }
+        }
+    }
+
+    /// vdi-vm-8 — fire a settled resize re-negotiation: once the pending target's
+    /// settle window elapses while the session is still `Live`, re-dial the SAME
+    /// retained request at the new panel size. This is a DELIBERATE, operator-invisible
+    /// re-negotiation, NOT a vdi-vm-4 drop: the phase stays `Live`, the attempt ladder
+    /// is untouched, and the last frame + texture stay painted (LINEAR-upscaled to the
+    /// new panel) so the sub-second re-dial gap shows the old desktop stretched rather
+    /// than the connecting backdrop. A re-dial that cannot even start degrades into the
+    /// honest vdi-vm-4 drop ladder rather than silently losing the session.
+    #[cfg(feature = "live-vdi")]
+    fn poll_resize_renegotiate(&mut self) {
+        let Some(pending) = self.pending_resize else {
+            return;
+        };
+        if std::time::Instant::now() < pending.at {
+            return;
+        }
+        self.pending_resize = None;
+        // Guard: only re-dial a still-live RDP/SPICE session (a drop this frame may have
+        // flipped us out of `Live`, or swapped in a VNC-only handle).
+        if self.session_phase != SessionPhase::Live
+            || !(self.live_rdp.is_some() || self.live_spice.is_some())
+        {
+            return;
+        }
+        let Some(request) = self
+            .requested
+            .clone()
+            .map(|r| r.with_preferred_size(Some(pending.target)))
+        else {
+            return;
+        };
+        // Stop the current transport and re-dial at the new geometry; KEEP texture /
+        // incoming so the last frame bridges the gap (the upscale fallback covers it).
+        if let Some(live) = self.live_rdp.take() {
+            live.stop();
+        }
+        if let Some(live) = self.live_spice.take() {
+            live.stop();
+        }
+        self.spawn_live_transport(&request);
+        // Persist the new size so a later vdi-vm-4 re-dial keeps the resized geometry.
+        self.requested = Some(request);
+        if !self.has_live_transport() {
+            let reason = self
+                .live_status
+                .clone()
+                .unwrap_or_else(|| "the resize re-dial could not start".to_string());
             self.on_transport_drop(reason);
         }
     }
@@ -1595,6 +1761,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
         // vdi-vm-4 — fire a due bounded re-dial BEFORE draining transport events, so a
         // just-re-dialed transport's events are picked up on the next frame.
         state.poll_reconnect();
+        // vdi-vm-8 — fire a settled resize re-negotiation on the same schedule, so a
+        // just-re-dialed (resized) transport's first frame is drained next frame too.
+        state.poll_resize_renegotiate();
         state.poll_live_rdp();
         state.poll_live_vnc();
         state.poll_live_spice();
@@ -1642,6 +1811,17 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 u16::try_from(desktop_px[1]).unwrap_or(u16::MAX),
             );
             forward_input(ui, state, rect, desktop_size);
+            // vdi-vm-8 — refine the live desktop geometry to the panel's REAL pixel size
+            // (device px). On a MATERIAL panel resize (a seat / monitor resolution
+            // change) an RDP/SPICE session is re-dialed at the true panel size so the
+            // desktop fits ~1:1; smaller deltas stay on the LINEAR upscale below, and
+            // VNC is left to the server. `size` is the panel's egui-points extent.
+            #[cfg(feature = "live-vdi")]
+            {
+                let panel_px =
+                    target_desktop_size(size, ui.ctx().pixels_per_point(), seat_max_px(ui.ctx()));
+                state.note_resize_target(panel_px, desktop_size);
+            }
             // shell-ux-1 — if the session dropped, paint the honest reconnect / failure
             // overlay OVER this (now frozen) last frame, with working Retry and
             // Pick-a-different affordances wired to real session seams (vdi-vm-4).
@@ -1871,16 +2051,47 @@ fn remap_pointer_event(
     }
 }
 
-/// The shell's current output size in guest **device pixels** — the vdi-vm-8
-/// initial desktop-size hint for a live RDP/SPICE connect. Reads the egui screen
-/// rect (points) scaled by `pixels_per_point`. The desktop panel is at most this
-/// large (it sits under the dock + menubar), so a guest negotiated at this size is
-/// never upscaled — the worst case is a crisp downscale, and the pointer transform
-/// keeps clicks exact regardless.
-pub(crate) fn body_device_px(ctx: &egui::Context) -> (u16, u16) {
+/// vdi-vm-8 — the pure geometry seam: the guest desktop size to negotiate from a
+/// panel's real size. `available` is the panel size in egui **points**, `ppp` the
+/// output's pixels-per-point, and `max` the seat-resolution ceiling in **device
+/// pixels**. The panel points are scaled to device pixels (`available * ppp`),
+/// rounded, and each axis clamped to `[1, max]` so the shell never asks a guest for
+/// MORE pixels than the seat can display (nor for zero). At `ppp == 1` the result
+/// equals the (rounded, clamped) panel — the DPI-aware 1:1 target the pointer
+/// transform then maps against, so panel↔desktop scale is ~1:1 (composes with
+/// vdi-vm-2). Kept pure so the clamp / round / DPI behaviour is unit-tested off-UI.
+pub(crate) fn target_desktop_size(available: egui::Vec2, ppp: f32, max: (u16, u16)) -> (u16, u16) {
+    let px = available * ppp;
+    let (mw, mh) = max;
+    (
+        to_desktop_dim(px.x).min(mw.max(1)),
+        to_desktop_dim(px.y).min(mh.max(1)),
+    )
+}
+
+/// vdi-vm-8 — the seat resolution ceiling in **device pixels**: the full egui output
+/// rect scaled by `pixels_per_point`. Used as the `max` clamp for
+/// [`target_desktop_size`] so no negotiated desktop exceeds what the seat can show.
+fn seat_max_px(ctx: &egui::Context) -> (u16, u16) {
     let ppp = ctx.pixels_per_point();
-    let size = ctx.screen_rect().size() * ppp;
-    (to_desktop_dim(size.x), to_desktop_dim(size.y))
+    let s = ctx.screen_rect().size() * ppp;
+    (to_desktop_dim(s.x), to_desktop_dim(s.y))
+}
+
+/// The shell's current output size in guest **device pixels** — the vdi-vm-8 desktop
+/// size hint for a live RDP/SPICE connect. At connect time the Desktop *panel* is not
+/// mounted yet (the connect is dispatched from the Chooser / menu chrome), so this
+/// estimates from the full egui output rect, which the desktop panel is a sub-rect of
+/// (it sits under the dock + menubar). Routed through [`target_desktop_size`] with the
+/// seat resolution as both estimate and ceiling. The live path
+/// (`VdiState::note_resize_target`) refines to the true panel size on a material
+/// resize; the worst case here is a crisp downscale the pointer transform keeps exact.
+pub(crate) fn body_device_px(ctx: &egui::Context) -> (u16, u16) {
+    target_desktop_size(
+        ctx.screen_rect().size(),
+        ctx.pixels_per_point(),
+        seat_max_px(ctx),
+    )
 }
 
 /// Round + clamp a device-pixel extent into `[1, u16::MAX]` — a desktop dimension
@@ -3030,6 +3241,228 @@ mod tests {
         // Below the SPICE minimum (16) clamps up; above the max (8192) clamps down.
         assert_eq!(super::spice_initial_size(Some((8, 8))), (16, 16));
         assert_eq!(super::spice_initial_size(Some((9000, 9000))), (8192, 8192));
+    }
+
+    #[test]
+    fn target_desktop_size_is_dpi_aware_and_clamps_to_the_seat() {
+        // A generous ceiling so only the DPI + round behaviour shows.
+        let uncapped = (u16::MAX, u16::MAX);
+        // ppp == 1 → the target equals the (rounded) panel — the 1:1 goal (vdi-vm-8).
+        assert_eq!(
+            target_desktop_size(vec2(1600.0, 900.0), 1.0, uncapped),
+            (1600, 900)
+        );
+        // HiDPI: ppp == 2 doubles the device pixels the guest is asked for.
+        assert_eq!(
+            target_desktop_size(vec2(800.0, 600.0), 2.0, uncapped),
+            (1600, 1200)
+        );
+        // Fractional points round to the nearest device pixel per axis.
+        assert_eq!(
+            target_desktop_size(vec2(1279.4, 720.6), 1.0, uncapped),
+            (1279, 721)
+        );
+        // The seat ceiling clamps each axis DOWN (never ask for more than the seat).
+        assert_eq!(
+            target_desktop_size(vec2(4000.0, 4000.0), 1.0, (1920, 1080)),
+            (1920, 1080)
+        );
+        // A collapsed panel — or a degenerate zero ceiling — still yields ≥ 1px/axis.
+        assert_eq!(target_desktop_size(vec2(0.0, 0.0), 1.0, uncapped), (1, 1));
+        assert_eq!(target_desktop_size(vec2(1.0, 1.0), 1.0, (0, 0)), (1, 1));
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn size_diverges_flags_a_change_beyond_tolerance_on_either_axis() {
+        assert!(!size_diverges((1920, 1080), (1920, 1080), 0));
+        // Within tolerance on both axes → not a divergence.
+        assert!(!size_diverges((1920, 1080), (1900, 1064), 128));
+        // Either axis alone past tolerance → a divergence.
+        assert!(size_diverges((1920, 1080), (1024, 1080), 128));
+        assert!(size_diverges((1920, 1080), (1920, 700), 128));
+        // The boundary is strict: exactly `tol` is NOT divergence; `tol + 1` is.
+        assert!(!size_diverges((100, 100), (108, 100), 8));
+        assert!(size_diverges((100, 100), (109, 100), 8));
+    }
+
+    // ─────────────────── vdi-vm-8: resize re-negotiation (RDP/SPICE) ──────────────
+    //
+    // These construct live transport HANDLES directly (no worker thread) to exercise
+    // the arm / disarm + fire decisions off-network. A handle's channels' far ends are
+    // dropped; the resize logic never touches them, so the tests stay hermetic.
+
+    #[cfg(feature = "live-vdi")]
+    fn dummy_rdp_handle() -> LiveRdpHandle {
+        let (input_tx, _in) = mpsc::channel();
+        let (stop_tx, _stop) = mpsc::channel();
+        let (_ev, event_rx) = mpsc::channel();
+        LiveRdpHandle {
+            input_tx,
+            stop_tx,
+            event_rx,
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn dummy_vnc_handle() -> LiveVncHandle {
+        let (input_tx, _in) = mpsc::channel();
+        let (stop_tx, _stop) = mpsc::channel();
+        let (_ev, event_rx) = mpsc::channel();
+        LiveVncHandle {
+            input_tx,
+            stop_tx,
+            event_rx,
+        }
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn rdp_connect_request() -> ConnectRequest {
+        ConnectRequest::new(
+            RequestedTarget::new("node-a", "win11"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("node-a"),
+        )
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn live_rdp_state() -> VdiState {
+        let mut state = VdiState::default();
+        state.live_rdp = Some(dummy_rdp_handle());
+        state.requested = Some(rdp_connect_request());
+        state // session_phase defaults to Live
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_material_panel_growth_arms_a_resize_redial() {
+        let mut state = live_rdp_state();
+        // Guest negotiated small (1024×768); the panel is now 1920×1080 → past the
+        // threshold, so a re-dial toward the panel size is armed.
+        state.note_resize_target((1920, 1080), (1024, 768));
+        let pending = state
+            .pending_resize
+            .expect("a material resize should arm a re-dial");
+        assert_eq!(pending.target, (1920, 1080));
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn expired() -> std::time::Instant {
+        std::time::Instant::now() - Duration::from_millis(1)
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_panel_matching_the_guest_clears_any_pending_resize() {
+        let mut state = live_rdp_state();
+        state.pending_resize = Some(PendingResize {
+            at: expired(),
+            target: (1, 1),
+        });
+        // Panel within the threshold of the guest's real size → nothing to re-negotiate.
+        state.note_resize_target((1900, 1064), (1920, 1080));
+        assert!(
+            state.pending_resize.is_none(),
+            "a ~matching panel must disarm the pending re-dial"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_size_already_dialed_is_not_re_armed_while_the_guest_catches_up() {
+        let mut state = live_rdp_state();
+        state.negotiated_size = Some((1920, 1080));
+        // The guest hasn't repainted at the new size yet (still 1024×768) but we already
+        // dialed 1920×1080 — the upscale bridges it, so don't re-arm a second re-dial.
+        state.note_resize_target((1920, 1080), (1024, 768));
+        assert!(
+            state.pending_resize.is_none(),
+            "already dialed at this size ⇒ wait for the guest, don't re-arm"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_vnc_only_session_never_arms_a_resize_redial() {
+        let mut state = VdiState::default();
+        state.live_vnc = Some(dummy_vnc_handle());
+        state.requested = Some(rdp_connect_request());
+        state.note_resize_target((1920, 1080), (1024, 768));
+        assert!(
+            state.pending_resize.is_none(),
+            "VNC is server-authoritative — the shell never re-dials it for size"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn poll_resize_before_the_settle_window_is_a_noop() {
+        let mut state = live_rdp_state();
+        state.pending_resize = Some(PendingResize {
+            at: std::time::Instant::now() + Duration::from_secs(30),
+            target: (1920, 1080),
+        });
+        state.poll_resize_renegotiate();
+        assert!(
+            state.pending_resize.is_some(),
+            "before the settle window elapses nothing fires"
+        );
+        assert!(
+            state.live_rdp.is_some(),
+            "and the live transport is untouched"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_settled_resize_redial_that_cannot_start_degrades_to_the_reconnect_ladder() {
+        let mut state = live_rdp_state();
+        // The retained request carries no dialable endpoint, so the re-dial gates out
+        // synchronously (no worker thread) — it must fall into the honest vdi-vm-4
+        // ladder rather than silently drop the session.
+        state.pending_resize = Some(PendingResize {
+            at: expired(),
+            target: (1920, 1080),
+        });
+        state.poll_resize_renegotiate();
+        assert!(
+            state.pending_resize.is_none(),
+            "the settled re-dial is consumed"
+        );
+        assert!(
+            matches!(state.session_phase, SessionPhase::Reconnecting { .. }),
+            "a re-dial that cannot start degrades into the reconnect ladder"
+        );
+        // The retained request now carries the resized geometry for the ladder's re-dial.
+        assert_eq!(
+            state.requested.as_ref().and_then(|r| r.preferred_size),
+            Some((1920, 1080))
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn a_settled_resize_is_a_noop_once_the_session_left_live() {
+        let mut state = live_rdp_state();
+        // A drop this frame flipped the phase; a stale settled resize must not fire.
+        state.session_phase = SessionPhase::Failed {
+            reason: "gone".to_string(),
+        };
+        state.pending_resize = Some(PendingResize {
+            at: expired(),
+            target: (1920, 1080),
+        });
+        state.poll_resize_renegotiate();
+        assert!(
+            state.pending_resize.is_none(),
+            "the stale pending resize is dropped"
+        );
+        assert!(
+            state.live_rdp.is_some(),
+            "and the (dead-but-not-yet-reaped) transport is left for the drop path"
+        );
     }
 
     #[cfg(feature = "live-vdi")]
