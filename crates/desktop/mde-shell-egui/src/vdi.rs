@@ -1934,11 +1934,8 @@ fn paint_session_overlay(
     use mde_egui::Style;
 
     // Dim the frozen desktop so the honest status reads clearly over it.
-    ui.painter().rect_filled(
-        body,
-        egui::CornerRadius::ZERO,
-        egui::Color32::from_black_alpha(180),
-    );
+    ui.painter()
+        .rect_filled(body, egui::CornerRadius::ZERO, Style::SCRIM);
 
     let accent = if overlay.failed {
         Style::DANGER
