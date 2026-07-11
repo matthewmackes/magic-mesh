@@ -45,3 +45,14 @@ pub fn run(cmd: EventsCmd, db_path: PathBuf) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Lowercase hex string of a fixed byte slice. Avoids the
+/// hex crate dep for one helper.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}

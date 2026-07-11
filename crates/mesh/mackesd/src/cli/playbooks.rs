@@ -86,6 +86,9 @@ fn enumerate_playbook_roles(root: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// Curated descriptions per the Phase 1.3.0 lock. Mirrors the
+/// `playbook_from_name` helper in the Iced playbooks panel so
+/// the CLI and the GUI agree.
 fn playbook_description(name: &str) -> &'static str {
     match name {
         "system-update" => "Apply pending dnf upgrades (gated, never runs on default tag)",

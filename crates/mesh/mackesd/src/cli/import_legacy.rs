@@ -84,3 +84,43 @@ pub fn run(dry_run: bool, db_path: PathBuf) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Heuristic: extract peer name candidates from a list of legacy
+/// artifacts (Phase 12.13.2). Pure helper so the importer's "what
+/// would I insert" question has a single source of truth that's
+/// unit-testable without disk I/O.
+fn derive_legacy_node_names(
+    artifacts: &[&mackesd_core::legacy_inventory::LegacyArtifact],
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut out = BTreeSet::new();
+    for a in artifacts {
+        // Filenames like `peer:anvil.json` or directories named after
+        // peers (`~/QNM-Shared/anvil/...`) reveal candidate names.
+        let path_str = a.path.display().to_string();
+        for token in path_str.split(['/', '\\', '_', '.']) {
+            if let Some(rest) = token.strip_prefix("peer:") {
+                if !rest.is_empty() && rest.chars().all(legacy_name_char) {
+                    out.insert(rest.to_owned());
+                }
+            }
+        }
+        // Also harvest the top-level directory under QNM-Shared
+        // (`~/QNM-Shared/<peer>/...`).
+        if path_str.contains("QNM-Shared") {
+            if let Some(idx) = path_str.find("QNM-Shared/") {
+                let after = &path_str[idx + "QNM-Shared/".len()..];
+                if let Some(seg) = after.split('/').next() {
+                    if !seg.is_empty() && seg.chars().all(legacy_name_char) {
+                        out.insert(seg.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn legacy_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}

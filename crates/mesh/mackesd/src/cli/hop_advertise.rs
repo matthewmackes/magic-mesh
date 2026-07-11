@@ -46,3 +46,20 @@ pub fn run(subnets: Option<String>, exit: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// This node's Nebula overlay IP via `ip -4 addr show nebula1`, if up.
+fn local_overlay_ip() -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["-4", "addr", "show", "nebula1"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("inet ")
+            .and_then(|rest| rest.split('/').next())
+            .map(str::to_string)
+    })
+}
