@@ -71,6 +71,59 @@ whole class of bugs.
 - `setup-build-vm-toolchain.sh` — SSH-driven toolchain install on a build VM.
 - `xcp-authorize-farm-key.sh` — install the farm key on a dom0 (passwordless `xe`).
 - `xcp-build.sh` — rsync the tree to a build VM + run cargo there, pull artifacts.
+- `ci-gate.sh` / `enable-ci-gate.sh` — the always-on farm CI gate (see below).
+
+## Continuous integration — the always-on farm CI gate
+
+The workspace's ONLY real build path is this farm (`xcp-build.sh`); local `cargo`
+is a no-op shim, and the old GitHub Actions runner (`.github/workflows/ci.yml`)
+has been dead for weeks because it cannot build the workspace without the farm.
+That left **no always-on gate** for the ~41 crates / ~8,400 tests — the root of
+the recurring "green-tests-but-shipped-broken" pattern (review finding
+`test-obs-1`, P0). `install-helpers/ci-gate.sh` is that gate.
+
+**What it runs** (routed to BigBoy `172.20.0.130`, the long-pole node, on a
+dedicated warm slot `magic-mesh-farm-ci`), fail-fast like `xcp-build.sh gates`:
+
+1. `cargo +1.94.0 fmt --all --check` — the pinned-toolchain format gate.
+2. `cargo +1.94.0 clippy --all-targets`.
+3. the test pyramid: `cargo test --workspace --exclude mackesd --exclude
+   mde-term-egui` at full parallelism, then `mackesd` and `mde-term-egui` one at
+   a time with `-- --test-threads=1` (those two carry real-PTY suites that hang
+   under cargo's default parallelism on the farm).
+
+**Where the result goes** (best-effort Bus publish, same helper as
+`automation/testbed/nightly.sh` — local `mde-bus` else sshpass to the shell node;
+a publish miss never fails the gate, the result is always in
+`automation/.state/ci-gate-status.json`):
+
+- every run publishes the machine-readable result on `event/ci/gate`
+  (`{overall, fmt, clippy, test, tests_passed, tests_failed, sha, finished,
+  alert}`) — GREEN is a quiet healthy heartbeat with a last-run timestamp;
+- a RED gate additionally raises a **KIRON operator toast** on `event/toast/show`
+  (`severity:critical`, `flag:"BUILD"`).
+
+**Liveness (dead-man switch).** A silently-stopped gate must not look green — the
+exact way the old CI failed. `ci-gate.sh liveness` (its own timer, no farm I/O)
+reads the last-run marker and alerts on `event/ci/gate` + a warning toast if the
+gate has produced no result within `MCNF_CI_MAX_STALE_DAYS` (default 2).
+
+**Master-push trigger.** `ci-gate.sh poll` compares `origin/master` HEAD to the
+last-gated SHA and only runs the heavy gate when master advanced (a cheap no-op
+otherwise), so the 20-minute timer behaves like a push trigger without a webhook.
+
+**Enable (operator, one command).** The AI authors but does not self-start this
+self-perpetuating farm job:
+
+```
+sudo bash install-helpers/enable-ci-gate.sh
+```
+
+That installs the four `packaging/systemd/mcnf-ci-gate*.{service,timer}` units,
+enables both timers, and fires one liveness check. Point the Bus at the operator's
+live shell node if it is not Eagle: add `Environment=MCNF_CI_BUS_HOST=<ip>` to
+`mcnf-ci-gate.service`. Reverse with `systemctl disable --now mcnf-ci-gate.timer
+mcnf-ci-gate-liveness.timer`. Force a gate now: `install-helpers/ci-gate.sh run`.
 
 ## The "dark VM" root cause (PROVEN — read this first)
 

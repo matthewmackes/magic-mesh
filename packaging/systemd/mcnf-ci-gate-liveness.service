@@ -1,0 +1,13 @@
+# test-obs-1 (P0) — the CI gate's dead-man switch. Independent of the gate run so
+# that a silently-STOPPED gate cannot look green: it reads the last-run marker and
+# raises an alert if the gate has not produced a result within the staleness
+# window (this is exactly how the old CI failed silently). No farm I/O — cheap.
+# Driven by mcnf-ci-gate-liveness.timer.
+[Unit]
+Description=MCNF CI gate liveness (alert if the gate has gone stale)
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+WorkingDirectory=/root/magic-mesh
+ExecStart=/bin/bash -lc '/root/magic-mesh/install-helpers/ci-gate.sh liveness'

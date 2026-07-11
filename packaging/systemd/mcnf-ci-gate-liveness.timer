@@ -1,0 +1,14 @@
+# Check CI-gate freshness a few times a day. This timer is deliberately SEPARATE
+# from mcnf-ci-gate.timer: if the gate timer is stopped, this one still fires and
+# surfaces the staleness. Keep it enabled whenever the gate is enabled.
+[Unit]
+Description=MCNF CI gate liveness check timer
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

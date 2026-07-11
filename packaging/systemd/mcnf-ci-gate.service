@@ -1,0 +1,19 @@
+# test-obs-1 (P0) — the always-on farm CI gate. Polls origin/master and, when it
+# advances, runs fmt + clippy + the full test pyramid on the farm (BigBoy) and
+# publishes the pass/fail to the Bus. Off the critical path; results → Bus. The
+# ONLY real build path is the farm, so this replaces the ~26-day-dead GitHub
+# Actions runner. Driven by mcnf-ci-gate.timer.
+[Unit]
+Description=MCNF CI gate (fmt + clippy + workspace tests on the farm; result → Bus)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+WorkingDirectory=/root/magic-mesh
+# `poll`: cheap no-op when master is unchanged; full farm gate when it advances.
+ExecStart=/bin/bash -lc '/root/magic-mesh/install-helpers/ci-gate.sh poll'
+# A full cold workspace build + clippy + ~8,400 tests can run long on the farm.
+TimeoutStartSec=14400
+Nice=15

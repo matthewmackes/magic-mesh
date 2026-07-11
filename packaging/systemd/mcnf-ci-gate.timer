@@ -1,0 +1,15 @@
+# Drive the CI gate on a short interval. Each tick is a lightweight poll of
+# origin/master HEAD vs the last-gated SHA (git ls-remote-class cost); the heavy
+# farm gate only runs when master actually advanced — so a 20-minute cadence
+# behaves like a master-push trigger without a webhook.
+[Unit]
+Description=MCNF CI gate — poll origin/master and gate on advance
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=20min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
