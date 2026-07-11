@@ -3,14 +3,16 @@
 //! The authoritative shared session directory still lives behind the broker's
 //! integration-gated `SessionStore`. Until that lands, the shell can still read the
 //! same public Bus wire the broker drains (`action/vdi/session`) and render this
-//! seat's non-closed sessions as taskbar-style rail entries. This is a mirror of
-//! the JSON boundary only, not a dependency on `mackesd`.
+//! seat's non-closed sessions as taskbar-style rail entries. It deserialises the
+//! shared [`mackes_mesh_types::vdi_session::SessionRequest`] (arch-2) off the JSON
+//! boundary — a lightweight shared-types dependency, never a dependency on
+//! `mackesd`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use mackes_mesh_types::vdi_session::SessionRequest;
 use mde_bus::persist::Persist;
-use serde::Deserialize;
 
 use crate::dock::SessionRailEntry;
 
@@ -32,25 +34,9 @@ struct RailSession {
     state: SessionState,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum SessionRequest {
-    Open {
-        id: String,
-        serving_peer: String,
-        vm_id: String,
-        client_peer: String,
-    },
-    Active {
-        id: String,
-    },
-    Disconnect {
-        id: String,
-    },
-    Close {
-        id: String,
-    },
-}
+// The `SessionRequest` verbs read off `action/vdi/session` are the shared
+// `mackes_mesh_types::vdi_session::SessionRequest` (arch-2) — imported above, not a
+// local mirror. Only `Deserialize` is exercised here (this side reads the wire).
 
 /// Shell-side projection of local VDI sessions for the bottom rail.
 #[derive(Debug, Default)]

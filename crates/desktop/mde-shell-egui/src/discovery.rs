@@ -10,14 +10,16 @@
 //!
 //! ## One wire contract (§6 glue)
 //!
-//! **The Connect request** reuses the broker's *wire contract*, not its Rust
-//! type. §6 keeps the shell in the desktop tier — it leans inward only on
-//! `mde-bus`, never the `mackesd` daemon crate (whose `SessionRequest` is gated
-//! behind the heavy `async-services` feature: tokio / zbus / etcd). So, exactly
-//! as [`crate::datacenter`]'s `Lifecycle` mirrors the VM-lifecycle action, the
-//! local [`SessionRequest`] serialises to the identical `action/vdi/session`
-//! body the broker's `parse_request` decodes — reusing the contract, not
-//! inventing a parallel one (a round-trip test pins the shape).
+//! **The Connect request** is the shared
+//! [`mackes_mesh_types::vdi_session::SessionRequest`] (arch-2, 2026-07-11) — the
+//! ONE definition the broker also uses, no longer a hand-maintained mirror. §6
+//! keeps the shell in the desktop tier: it leans on the lightweight shared-types
+//! crate, never the `mackesd` daemon crate (whose broker is gated behind the heavy
+//! `async-services` feature: tokio / zbus / etcd). So, exactly as
+//! [`crate::datacenter`]'s `Lifecycle` mirrors the VM-lifecycle action, this path
+//! publishes the identical `action/vdi/session` body the broker's `parse_request`
+//! decodes — one type, never a parallel copy (a wire-shape test in
+//! `mackes-mesh-types` pins the bytes).
 //!
 //! The broker's roaming-session store is live and Syncthing-backed; the shell
 //! publishes `open` plus live transport lifecycle (`active` / `disconnect` /
@@ -25,8 +27,7 @@
 
 use std::path::Path;
 
-use serde::Serialize;
-
+use mackes_mesh_types::vdi_session::SessionRequest;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -35,54 +36,11 @@ use mde_bus::persist::Persist;
 /// broker folds these verbs into the roaming-session roster.
 const ACTION_TOPIC: &str = "action/vdi/session";
 
-// ───────────────────────── session lifecycle wire mirror ─────────────────────────
-
-/// The shell's local mirror of the broker's `SessionRequest` verbs it emits.
-/// See the module doc for why this is a wire mirror rather than a direct
-/// dependency on the daemon's type (§6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum SessionRequest {
-    /// Open a new session for `vm_id` on `serving_peer`, driven by `client_peer`
-    /// (this node's shell). Serialises to the `SessionRequest::Open` body shape.
-    Open {
-        /// The session id to mint (the roster key).
-        id: String,
-        /// The peer that will serve the VM (a scheduler node id).
-        serving_peer: String,
-        /// The target desktop. A VM desktop names the libvirt domain (the UUID
-        /// isn't on the discovery wire), a **host** desktop names the peer
-        /// itself — the broker's `VmId` is a plain string that accepts both; a
-        /// later compute-registry UUID drops in without touching the wire.
-        vm_id: String,
-        /// The peer whose shell drives the desktop — this node.
-        client_peer: String,
-    },
-    /// Mark a brokered desktop session live after the transport connects.
-    Active {
-        /// The session id minted by the matching `Open`.
-        id: String,
-    },
-    /// Mark a live brokered desktop session disconnected after the transport ends.
-    Disconnect {
-        /// The session id minted by the matching `Open`.
-        id: String,
-    },
-    /// Close a brokered desktop session when the operator abandons it.
-    Close {
-        /// The session id minted by the matching `Open`.
-        id: String,
-    },
-}
-
-impl SessionRequest {
-    /// Serialise to the `action/vdi/session` request body. A fixed derive-backed
-    /// shape ⇒ serialisation can't realistically fail; an empty body (never
-    /// produced here) would simply be rejected by the broker's parser.
-    fn to_body(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-}
+// ───────────────────────── session lifecycle wire path ─────────────────────────
+//
+// The `SessionRequest` verbs are the shared
+// `mackes_mesh_types::vdi_session::SessionRequest` (arch-2) — imported above, not
+// mirrored here. See the module doc for the §6 layering rationale.
 
 /// The minted `Open` body plus its session id, so callers can attach the same id
 /// to subsequent live transport lifecycle messages.
@@ -254,9 +212,10 @@ mod tests {
 
     #[test]
     fn the_open_request_serialises_to_the_snake_case_tagged_shape() {
-        // Pin the wire contract: internally `op`-tagged, snake_case — byte-for-byte
-        // what the broker's `#[serde(tag = "op", rename_all = "snake_case")]`
-        // `SessionRequest` expects, so this mirror can't silently drift from it.
+        // Pin the wire contract as this emitter produces it: internally `op`-tagged,
+        // snake_case — byte-for-byte what the broker's `parse_request` decodes. Since
+        // arch-2 this is the shared `SessionRequest`, so drift is structurally
+        // impossible; this pins the emitter (`mint_session_id` + fields) end to end.
         let body = SessionRequest::Open {
             id: mint_session_id("vm-y", 42),
             serving_peer: "peer-x".to_string(),

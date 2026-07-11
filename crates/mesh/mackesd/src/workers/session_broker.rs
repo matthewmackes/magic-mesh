@@ -133,36 +133,15 @@ pub struct VdiSession {
 
 /// A session lifecycle request drained off [`ACTION_TOPIC`] — the wire verb the
 /// shell / connect flow publishes. Internally tagged on `op`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum SessionRequest {
-    /// Open a new session (state [`SessionState::Requested`]).
-    Open {
-        /// The session id to mint.
-        id: SessionId,
-        /// The peer that will serve the VM.
-        serving_peer: NodeId,
-        /// The target VM (libvirt UUID).
-        vm_id: VmId,
-        /// The peer whose shell drives it.
-        client_peer: NodeId,
-    },
-    /// The connect completed — mark the session [`SessionState::Active`].
-    Active {
-        /// The session id.
-        id: SessionId,
-    },
-    /// The link dropped — mark the session [`SessionState::Disconnected`].
-    Disconnect {
-        /// The session id.
-        id: SessionId,
-    },
-    /// The session ended — mark it [`SessionState::Closed`] (terminal).
-    Close {
-        /// The session id.
-        id: SessionId,
-    },
-}
+///
+/// arch-2 (2026-07-11) — the type itself now lives in
+/// [`mackes_mesh_types::vdi_session`] so the shell's `discovery` / `session_rail`
+/// mirrors reuse it instead of maintaining byte-compatible copies; it's re-exported
+/// here so existing `session_broker::SessionRequest` paths (and `console_broker`,
+/// `onboard::first_desktop`) keep resolving unchanged. The wire shape is
+/// byte-identical: the broker's [`SessionId`] / [`NodeId`] / [`VmId`] are all
+/// `= String` aliases, so the shared `String`-typed fields serialise the same.
+pub use mackes_mesh_types::vdi_session::SessionRequest;
 
 /// Parse a [`SessionRequest`] body.
 ///

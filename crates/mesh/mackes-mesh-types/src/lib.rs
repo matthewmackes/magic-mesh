@@ -68,6 +68,12 @@ pub mod route_trace;
 // consumer of tags (Peer / Workspace / Container members reference
 // mesh-domain identifiers).
 pub mod tags;
+// arch-2 (2026-07-11) — the VDI session-lifecycle wire verb (`action/vdi/session`
+// `SessionRequest`), hoisted out of the `mackesd` session broker so the shell's
+// `discovery` / `session_rail` mirrors reuse the one type instead of maintaining
+// byte-compatible copies. Lands here (like `mesh_storage` / `device_control`) so
+// the desktop tier never depends on the heavy daemon crate.
+pub mod vdi_session;
 /// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
 pub mod vpn;
 /// VPN-GW-3 — selective egress: fwmark/ip-rule policy routing + nftables
