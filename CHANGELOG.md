@@ -14,17 +14,51 @@ starts at the first packaged release line.
 ## [Unreleased]
 
 _Accumulating since the `magic-mesh-v12.0.0` tag (2026-07-02) toward the next
-operator-gated cut — a broad 12.0.x feature wave: the first-class **dual-engine
-browser** (`mde-web-cef` Chromium/CEF + the sandboxed `mde-web-preview` Servo
-helper, `mde-adblock`, the `mde-bookmarks` CRDT), the **media player**
-(`mde-media-core` libmpv + `mde-media-egui`, `mde-jellyfin`), the **terminal**
-(`mde-term-egui`) and **editor** (`mde-editor-egui`) surfaces, **QBRAND**
-compile-time build identity + branding, the **Spice VDI** client (`mde-vdi-spice`,
-CHOOSER-5), and the **QC-15 cloud cutover** (cloud-hypervisor deleted; libvirt/
-QEMU-KVM + Nova/OpenStack is the VM plane) with the Browser-DD daemon workers +
-KDC-MESH remote input._
+operator-gated cut — a broad, still-open 12.0.x wave that fills out the Quasar
+desktop. It spans a full **native application suite** (terminal, editor, media
+player, files, dual-engine browser), an OpenStack-based **cloud + VDI plane** with
+multi-protocol remote desktops, a Windows-style **desktop shell**, a mesh-wide
+**discovery + device** surface, **KDE-Connect-over-overlay** phone integration, the
+**QBRAND** identity, and a resilience/perf/security/CI hardening pass. The pillars
+below are grouped from the 12.0.x epic streams (TERM/TMUX, EDITOR, MEDIA, FILEMGR,
+BOOKMARKS/web, QC "QUASAR-CLOUD"/IAC/CHOOSER, VDI, NAVBAR/WIN7/VDOCK/SETTINGS/
+CURTAIN, EXPLORER, DEVMGR, KDC-MESH, QBRAND, POWER); this section will collapse
+into the version entry at the next cut._
 
 ### Added
+- **Native application suite — the surfaces that make it a desktop.**
+  - **Terminal (`mde-term-egui`, TERM-1..16)** — an `alacritty_terminal`-core VT
+    engine with scrollback, nested split panes + tabs, SGR/1006 mouse + true-color
+    + ligatures, scrollback search, broadcast/grouped input, mesh-synced saved
+    layouts, and a `mackesd` mesh PTY broker for remote shells (persistence +
+    reattach + idle reap); mounted as `Surface::Terminal`. A **tmux control-mode**
+    integration (`tmux -CC`, TMUX-FC-1..8) layers native session/window/pane chrome,
+    layout presets, and persistence over the Bus PTY broker.
+  - **Editor (`mde-editor-egui`, EDITOR/EDTB/EDITOR-LSP/EDITOR-COLLAB)** — a `ropey`
+    buffer + custom egui text widget, tree-sitter highlighting, tabs/splits,
+    multi-cursor, a fuzzy finder + command palette, a project tree, an LSP client
+    (goto-definition / find-references / rename / format), mesh collaborative
+    share-sessions + follow mode, a Word-97-style menu bar + toolbars, hunspell
+    spell-check, code folding + symbol outline, an integrated terminal dock, and
+    CUPS print.
+  - **Media player (`mde-media-core` libmpv + `mde-media-egui`, MEDIA-1..18)** — a
+    DRM overlay video plane, PipeWire audio with an EQ/loudness/ReplayGain/gapless
+    af-graph, VA-API hwdec, subtitles + multi-track, playlists + a local library
+    index + resume, network streams (yt-dlp) + v4l2 capture, a `mde-jellyfin`
+    client with offline cache, a `mackesd` mesh media server (DLNA/UPnP discovery +
+    source aggregation), playback session roaming, and sync-play party mode + cast;
+    mounted as `Surface::Media`.
+  - **Files (`mde-files-egui`, FILEMGR-1..12)** — a real FileOps backend with an
+    async op queue + conflict engine, operation dialogs, a preview pane +
+    thumbnails, archive create/extract/browse, a mesh sidebar tree over a
+    `mackesd` sshfs overlay-mount worker, direct P2P transfer routing, and
+    Send-To / Send-in-Chat / shared-clipboard integration.
+  - **Browser (`mde-web-cef` Chromium/CEF + the sandboxed `mde-web-preview` Servo
+    helper, `mde-adblock`, the `mde-bookmarks` CRDT, BOOKMARKS-1..10)** — a CRDT
+    bookmark tree synced over Syncthing with Firefox/Chromium/Netscape importers, an
+    out-of-process OS-sandboxed Servo helper (shm texture bridge), a mesh-wide
+    ad-filter engine + fleet-enforced browser policy worker, send-tab sync +
+    session restore + speed dial, and mesh integration (Send-in-Chat, add-from-page).
 - **BOOKMARKS-9 — the Servo browser packaged + documented (ships securely).**
   - The `mde-web-preview` Servo helper is a first-class RPM asset
     (`/usr/bin/mde-web-preview`) in the base (Workstation) `magic-mesh` package,
@@ -49,7 +83,81 @@ KDC-MESH remote input._
   - New **`docs/THREAT_MODEL.md`** — the browser attack surface, the sandbox +
     SELinux confinement layers, and the accepted residual risks (unrestricted
     egress, Servo fidelity, monthly-tracked churn).
+- **Cloud + VDI plane — the OpenStack "QUASAR-CLOUD" cutover (QC-2..QC-23, IAC-1..5,
+  CHOOSER-1..9).** A `mackesd` `openstack` supervision worker renders + seals Kolla
+  config from a live doctrine reader over an airgapped image lane, standing up real
+  Neutron/OVN flat-mesh networking, Cinder LVM + object-tier backup, a Glance local
+  store + DIB image pipeline, capacity-derived flavors + per-user quotas, and typed
+  `action/cloud/*` Bus verbs. The shell's **Cloud plane** replaces the old Controller
+  plane; a **Desktop Chooser** (node-grouped card grid, always-ask protocol picker,
+  live preview thumbnails, mesh-identity SSO + sealed external creds) fronts it, and
+  **QC-14** places brokered desktops as Nova instances. An **Infra-as-Code** surface
+  (Overview/Resources/Heat tabs; Heat/Horizon/Octavia/Designate) rides the same
+  OpenStack client.
+- **Multi-protocol remote desktops.** First-class **Spice** (`mde-vdi-spice`,
+  CHOOSER-5), **VNC** with RFB security type 2 (VNC Authentication), and a live
+  **RDP** transport. `mackesd` brokers local VM consoles onto the mesh overlay
+  (`vdi-vm-1`), transforms guest pointer input into desktop pixels (`vdi-vm-2`),
+  persists VDI sessions in the mesh store, and gates cold-migration undefine behind a
+  target-commit ack (`vdi-vm-5`); TESTVM-1..4 add an Alpine + xrdp degradation path.
+- **Windows-style desktop shell.** A pixel-per-Win10 bottom taskbar (NAVBAR-W10-1..6,
+  NAVBAR-1..3) with a Carbon tray glyph set, micro-flyouts, and a brand-watermark
+  backdrop; a two-pane **Start Menu** with a live-tile grid + rotation, type-to-launch
+  search, and a Critical edge-cue auto-close (WIN7-1..8); a left **vertical dock** (app
+  picker + status/system 2×2 quads + a Timers & Alarms surface, VDOCK-1..5); a grouped
+  bottom **picker** (PICKER-1..2); a **lock curtain** with real seat-user PAM auth,
+  boot/idle/lid triggers, and lock-screen media (CURTAIN-1..4); a master-detail
+  **Settings** shell (SETTINGS-1..5); and shell-embedded per-surface menu bars across
+  every app (MENU/MENUBAR-ALL).
+- **Mesh discovery + device management.** The **Explorer** "Hero" discovery surface
+  (a `unit_aggregator` worker + Unit model, an active LAN scan, edge derivation + a Bus
+  edge stream, hero cards + telemetry sparklines, an IPAM prefix/IP table, a mosaic
+  overview, universal search/pin/multi-select, EXPLORER-1..18); a **Device Manager**
+  (per-node hardware inventory from `hardware_probe`, a host rail + by-node /
+  by-connection views, export/print, an armed privileged device-exec seam, and
+  debounced fleet-wide device-fault notify, DEVMGR-1..11); and a **node self-grade**
+  worker + an A–F dock badge (NODE-GRADE-1..3).
+- **KDE-Connect over the mesh (KDC-MESH-1..9) + Transfers.** Nebula-overlay-only
+  transport with directed discovery, mesh-wide pairing + a universal `kdc_host` role,
+  bidirectional notifications, remote input, run-commands (incl. OpenStack lifecycle +
+  battery/telephony), two-way any-node file transfer + a service directory, and a
+  **Phones hub** surface. A `mackesd` **transfers** worker (queue/ledger/typed verbs) +
+  a Transfers tab land the transfer lanes (TRANSFERS-1/8).
+- **QBRAND — the Quasar identity (QBRAND-1..11).** Compile-time build identity, an
+  embedded Quasar SVG icon set + tintable rasterizer, the product logo lockup, a DRM
+  boot-splash with real init progress, a chrome build tag + per-node role badges, the
+  official wallpaper backdrop, and an About surface. **Intel One Mono** becomes the
+  platform font (PLAT-FONT-2).
+- **Power + seat (POWER-3..5, E12-9/10/17).** An `mde-seat` power backend v2
+  (profiles/thresholds/telemetry/lid), a Power Settings panel, a DRM-native idle + lid
+  honorer, a Hibernate verb + an honest on-AC line-power read, local audio, USB/VFIO
+  passthrough (libvirt), and an actionable Bluetooth panel.
+- **CI + packaging hardening.** An always-on **farm CI gate** (test-obs-1:
+  fmt + clippy + tests published to the Bus) and a **`verify-rpm-payload.sh`** static
+  gate against "compiles ≠ ships" + dead surfaces.
+
+### Changed
+- **Control plane → Cloud plane (QC-15).** cloud-hypervisor is deleted; libvirt/
+  QEMU-KVM under Nova/OpenStack is the VM plane, and the shell's Controller plane is
+  replaced by the Cloud plane.
+- **`mackesd` resilience.** Leader-election split-brain is closed by a substrate-aware
+  `LeaderGate` (all leader-gated workers routed through it); the worker supervisor
+  gains half-open circuit-breaker recovery (mackesd-05) and bounds + off-runtimes its
+  slow worker shell-outs (mackesd-02); CLI verb handlers are extracted into `src/cli/`
+  modules (arch-1). The RPM cut feature list is de-duplicated under a `--locked`
+  policy (build-deploy-3), with a Fedora target matrix + glibc compat contract
+  (build-deploy-4).
+- **Performance.** An event-driven DRM present loop + per-BO framebuffer cache
+  (perf-1), the seat snapshot moved off the render thread (perf-2), a fast-path
+  `Persist::open` + bounded Bus `read_latest`/`read_tail` (perf-3/4), Spice
+  dirty-checked frames + an adaptive pump, and the CEF helper's 125 Hz idle spin
+  eliminated.
+
 ### Security
+- **Browser confinement + hardening.** The CEF/Chromium helper runs in an OS sandbox
+  (security-1); the CDP port, WebRTC block, and passkey consent / `rp_id` paths are
+  hardened (5 fixes). A **P0** fix redacts a leaked live root password from tracked docs
+  (build-deploy-1), and injected content was scrubbed from a 2026-07-06 commit chain.
 - **Servo pin + update cadence.** The browser engine is pinned to the
   `servo = "0.3"` crates.io publication (its own excluded workspace + `Cargo.lock`,
   so the pin is reproducible + tamper-evident per build). Cadence: **track Servo
