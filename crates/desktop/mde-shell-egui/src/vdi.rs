@@ -274,6 +274,18 @@ pub(crate) struct ConnectRequest {
     /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
     /// off-mesh endpoints leave this empty.
     pub broker_session: Option<BrokerSessionLifecycle>,
+    /// vdi-vm-8 — the initial guest desktop size hint in **device pixels** (the
+    /// shell's real output size at connect time), so an RDP/SPICE guest renders at
+    /// near-native resolution instead of a hardcoded 1024×768 that egui upscales
+    /// (blurry on modern seats). RDP/SPICE pass it at connect ([`with_resolution`] /
+    /// [`with_size`]); VNC's size is server-negotiated so it is ignored there. When
+    /// absent (bus-driven / test paths) the transport falls back to its prior
+    /// hardcoded size. Dynamic re-negotiation on panel resize is a deferred
+    /// follow-up — the pointer transform keeps clicks correct meanwhile.
+    ///
+    /// [`with_resolution`]: mde_vdi_rdp::RdpConfig::with_resolution
+    /// [`with_size`]: mde_vdi_spice::SpiceConfig::with_size
+    pub preferred_size: Option<(u16, u16)>,
 }
 
 impl ConnectRequest {
@@ -293,12 +305,21 @@ impl ConnectRequest {
             monitors,
             auth,
             broker_session: None,
+            preferred_size: None,
         }
     }
 
     /// Attach the broker session lifecycle id minted by discovery.
     pub(crate) fn with_broker_session(mut self, broker: BrokerSessionLifecycle) -> Self {
         self.broker_session = Some(broker);
+        self
+    }
+
+    /// Attach the initial desktop size hint (device pixels) for RDP/SPICE
+    /// negotiation (vdi-vm-8). `None` keeps the transport's fallback size.
+    #[must_use]
+    pub(crate) const fn with_preferred_size(mut self, size: Option<(u16, u16)>) -> Self {
+        self.preferred_size = size;
         self
     }
 }
@@ -359,13 +380,14 @@ impl LiveRdpHandle {
             return Err("RDP requires a username in the sealed desktop credential".into());
         }
 
+        let (width, height) = rdp_initial_resolution(request.preferred_size);
         let config = RdpConfig::new(
             endpoint.host.clone(),
             credential.username.clone(),
             credential.secret.expose().to_owned(),
         )
         .with_port(endpoint.port)
-        .with_resolution(1024, 768);
+        .with_resolution(width, height);
         let (input_tx, input_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -496,9 +518,10 @@ fn live_spice_config(request: &ConnectRequest) -> Result<SpiceConfig, String> {
     let Some(endpoint) = request.target.endpoint.clone() else {
         return Err("discovery has not published a dialable endpoint for this desktop".into());
     };
+    let (width, height) = spice_initial_size(request.preferred_size);
     let mut config = SpiceConfig::new(endpoint.host)
         .with_port(endpoint.port)
-        .with_size(1024, 768);
+        .with_size(width, height);
     match &request.auth {
         DesktopAuth::Sealed { credential, .. } => {
             if !credential.secret.expose().is_empty() {
@@ -519,6 +542,37 @@ fn live_spice_config(request: &ConnectRequest) -> Result<SpiceConfig, String> {
         }
     }
     Ok(config)
+}
+
+/// Clamp a vdi-vm-8 device-pixel size hint into a legal RDP desktop resolution.
+///
+/// `RdpConfig` requires 200..=8192 px per axis and an **even** width, so the hint
+/// is clamped and the width forced even. Falls back to the prior hardcoded
+/// 1024×768 when the shell published no hint (bus-driven / headless connect).
+#[cfg(feature = "live-vdi")]
+fn rdp_initial_resolution(preferred: Option<(u16, u16)>) -> (u16, u16) {
+    match preferred {
+        Some((w, h)) => (
+            w.clamp(RdpConfig::MIN_DIM, RdpConfig::MAX_DIM) & !1u16,
+            h.clamp(RdpConfig::MIN_DIM, RdpConfig::MAX_DIM),
+        ),
+        None => (1024, 768),
+    }
+}
+
+/// Clamp a vdi-vm-8 device-pixel size hint into a legal SPICE framebuffer size.
+///
+/// `SpiceConfig` allows 16..=8192 px per axis. Falls back to 1024×768 when the
+/// shell published no hint.
+#[cfg(feature = "live-vdi")]
+fn spice_initial_size(preferred: Option<(u16, u16)>) -> (u16, u16) {
+    match preferred {
+        Some((w, h)) => (
+            w.clamp(SpiceConfig::MIN_DIM, SpiceConfig::MAX_DIM),
+            h.clamp(SpiceConfig::MIN_DIM, SpiceConfig::MAX_DIM),
+        ),
+        None => (1024, 768),
+    }
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1085,6 +1139,12 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     match state.texture.as_ref() {
         Some(texture) => {
             let tex_id = texture.id();
+            // The uploaded framebuffer IS the guest desktop at its own negotiated
+            // resolution, so the texture size is exactly the guest desktop size — the
+            // denominator the pointer transform needs to turn a panel click into a
+            // guest pixel (vdi-vm-2). Read it before the immutable `texture` borrow
+            // ends so `forward_input` can re-borrow `state` mutably.
+            let desktop_px = texture.size();
             // Allocate the interactive body rect first, then paint the texture over
             // it, so the desktop both fills the panel and captures pointer input.
             let size = ui.available_size();
@@ -1094,7 +1154,11 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             if resp.clicked() {
                 resp.request_focus();
             }
-            forward_input(ui, state);
+            let desktop_size = (
+                u16::try_from(desktop_px[0]).unwrap_or(u16::MAX),
+                u16::try_from(desktop_px[1]).unwrap_or(u16::MAX),
+            );
+            forward_input(ui, state, rect, desktop_size);
         }
         None => {
             // No live desktop texture: the empty Desktop surface paints the BRAND-1
@@ -1161,13 +1225,113 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     }
 }
 
+/// Map an egui pointer position (egui **points**, panel/screen space) to a guest
+/// **desktop pixel**, given the desktop texture's painted `rect` (also in points)
+/// and the guest `desktop_size` in pixels.
+///
+/// The remote framebuffer is painted to *fill* `rect`, which sits below/right of
+/// the dock + menubar chrome, so its top-left origin is non-zero. A pointer at
+/// fraction `f` across the rect corresponds to the same fraction across the guest
+/// desktop, so the transform
+///
+/// 1. subtracts the rect's top-left origin (`pos - rect.min`),
+/// 2. divides by the rect size for the `0..1` fraction, then
+/// 3. multiplies by `desktop_size` to land in guest pixels.
+///
+/// Because *both* the pointer and `rect` are reported in egui points, the panel's
+/// `pixels_per_point` cancels in the fraction — the mapping is DPI-independent and
+/// correct whether the desktop was negotiated at the panel's native size (a crisp
+/// 1:1 paint) or a smaller hardcoded size egui upscales (vdi-vm-8). The result is
+/// clamped to the real guest bounds `[0, w-1] × [0, h-1]` (never `u16::MAX`), so a
+/// drag that slips a pixel past the panel edge still lands on a real edge pixel.
+fn map_pointer_to_desktop(
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    desktop_size: (u16, u16),
+) -> egui::Pos2 {
+    let (w, h) = desktop_size;
+    let fraction = |v: f32, min: f32, extent: f32| {
+        if extent > 0.0 {
+            (v - min) / extent
+        } else {
+            0.0
+        }
+    };
+    let fx = fraction(pos.x, rect.min.x, rect.width());
+    let fy = fraction(pos.y, rect.min.y, rect.height());
+    let last_x = f32::from(w.saturating_sub(1));
+    let last_y = f32::from(h.saturating_sub(1));
+    egui::pos2(
+        (fx * f32::from(w)).clamp(0.0, last_x),
+        (fy * f32::from(h)).clamp(0.0, last_y),
+    )
+}
+
+/// Rewrite a pointer event's position from panel space into guest desktop pixels
+/// via [`map_pointer_to_desktop`]. Every non-pointer event (key, wheel, text,
+/// focus, touch) is returned unchanged, so ONLY the coordinate bug is fixed and
+/// every other input semantic (button mapping, scroll, key events) is preserved.
+fn remap_pointer_event(
+    event: egui::Event,
+    rect: egui::Rect,
+    desktop_size: (u16, u16),
+) -> egui::Event {
+    match event {
+        egui::Event::PointerMoved(pos) => {
+            egui::Event::PointerMoved(map_pointer_to_desktop(pos, rect, desktop_size))
+        }
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers,
+        } => egui::Event::PointerButton {
+            pos: map_pointer_to_desktop(pos, rect, desktop_size),
+            button,
+            pressed,
+            modifiers,
+        },
+        other => other,
+    }
+}
+
+/// The shell's current output size in guest **device pixels** — the vdi-vm-8
+/// initial desktop-size hint for a live RDP/SPICE connect. Reads the egui screen
+/// rect (points) scaled by `pixels_per_point`. The desktop panel is at most this
+/// large (it sits under the dock + menubar), so a guest negotiated at this size is
+/// never upscaled — the worst case is a crisp downscale, and the pointer transform
+/// keeps clicks exact regardless.
+pub(crate) fn body_device_px(ctx: &egui::Context) -> (u16, u16) {
+    let ppp = ctx.pixels_per_point();
+    let size = ctx.screen_rect().size() * ppp;
+    (to_desktop_dim(size.x), to_desktop_dim(size.y))
+}
+
+/// Round + clamp a device-pixel extent into `[1, u16::MAX]` — a desktop dimension
+/// is always at least one pixel, and a non-finite input degrades to `1`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "value is rounded then clamped into [1, u16::MAX]; non-finite maps to 1"
+)]
+fn to_desktop_dim(v: f32) -> u16 {
+    if v.is_finite() {
+        v.round().clamp(1.0, f32::from(u16::MAX)) as u16
+    } else {
+        1
+    }
+}
+
 /// Forward this frame's egui input to the attached guest, reserving the Esc chord.
 ///
 /// Esc releases the desktop back to the mesh-control chrome instead of reaching
-/// the guest, so the operator is never trapped in a fullscreen session. Every
-/// other event is handed to the session, which maps the ones it understands
-/// (pointer / button / wheel / key / text) and drops the rest.
-fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
+/// the guest, so the operator is never trapped in a fullscreen session. Pointer
+/// positions are transformed from egui panel space into guest desktop pixels
+/// (`rect` + `desktop_size`) in this ONE shared place, so all three transports
+/// receive identically-mapped coordinates (vdi-vm-2). Every other event is handed
+/// through unchanged; the session maps the ones it understands (pointer / button /
+/// wheel / key / text) and drops the rest.
+fn forward_input(ui: &egui::Ui, state: &mut VdiState, rect: egui::Rect, desktop_size: (u16, u16)) {
     let has_live = {
         #[cfg(feature = "live-vdi")]
         {
@@ -1193,6 +1357,10 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
             state.return_to_chrome = true;
             continue;
         }
+        // Transform pointer coordinates into guest desktop pixels BEFORE handing the
+        // event to any transport, so every transport applies the same mapping and
+        // clicks land on the pixel under the cursor (vdi-vm-2).
+        let event = remap_pointer_event(event, rect, desktop_size);
         if let Some(session) = state.session.as_mut() {
             session.send_input(&event);
         }
@@ -1803,10 +1971,17 @@ mod tests {
         let Some(Session::Spice(session)) = &state.session else {
             panic!("SPICE session was detached");
         };
-        assert_eq!(
-            session.pointer_position(),
-            (200, 120),
-            "the pointer event was not forwarded to the SPICE guest"
+        // The pointer position is now transformed from egui panel space into guest
+        // desktop pixels (vdi-vm-2), so it lands in-bounds rather than the raw
+        // (200, 120) pass-through the old bug forwarded verbatim. The exact value
+        // depends on egui's panel layout; the pure-transform tests below pin the
+        // math down to the pixel.
+        let (px, py) = session.pointer_position();
+        let (dw, dh) = session.desktop_size();
+        assert!(
+            px < dw && py < dh && (px, py) != (0, 0),
+            "the pointer event was not forwarded + transformed into guest pixels: \
+             got ({px},{py}) for a {dw}x{dh} desktop"
         );
         assert!(
             session.pending_input().contains(&SpiceInputEvent::Key {
@@ -1828,6 +2003,202 @@ mod tests {
             }),
             "Esc leaked through to the SPICE guest"
         );
+    }
+
+    // ───────────────── vdi-vm-2: pointer coordinate transform ────────────────
+    //
+    // The bug forwarded raw egui panel coordinates as guest desktop pixels — no
+    // rect-origin subtraction, no scale, clamped to u16::MAX. These pin down the
+    // shared transform every transport now flows through.
+
+    #[test]
+    fn pointer_maps_panel_space_into_guest_desktop_pixels() {
+        // A panel with a NON-ZERO origin (dock + menubar above/left) whose size is
+        // different from the guest desktop — the exact shape the bug ignored.
+        let rect = Rect::from_min_size(pos2(100.0, 40.0), vec2(800.0, 600.0));
+        let desktop = (1600u16, 1200u16); // 2× the panel per axis
+
+        // Top-left corner of the panel → guest origin.
+        assert_eq!(
+            map_pointer_to_desktop(pos2(100.0, 40.0), rect, desktop),
+            pos2(0.0, 0.0)
+        );
+        // Panel centre → guest centre.
+        assert_eq!(
+            map_pointer_to_desktop(pos2(500.0, 340.0), rect, desktop),
+            pos2(800.0, 600.0)
+        );
+        // A quarter across the panel → a quarter across the guest.
+        assert_eq!(
+            map_pointer_to_desktop(pos2(300.0, 190.0), rect, desktop),
+            pos2(400.0, 300.0)
+        );
+        // Bottom-right corner → the LAST guest pixel (w-1 / h-1), not w / h.
+        assert_eq!(
+            map_pointer_to_desktop(pos2(900.0, 640.0), rect, desktop),
+            pos2(1599.0, 1199.0)
+        );
+    }
+
+    #[test]
+    fn pointer_transform_clamps_outside_the_panel_to_guest_bounds() {
+        let rect = Rect::from_min_size(pos2(50.0, 30.0), vec2(500.0, 400.0));
+        let desktop = (250u16, 200u16);
+        // Above/left of the panel clamps to the guest origin (never negative).
+        assert_eq!(
+            map_pointer_to_desktop(pos2(0.0, 0.0), rect, desktop),
+            pos2(0.0, 0.0)
+        );
+        // Far below/right clamps to the last guest pixel (never u16::MAX).
+        assert_eq!(
+            map_pointer_to_desktop(pos2(9000.0, 9000.0), rect, desktop),
+            pos2(249.0, 199.0)
+        );
+    }
+
+    #[test]
+    fn pointer_transform_is_identity_when_panel_matches_desktop_at_origin() {
+        // Origin (0,0), panel size == desktop size → 1:1 pass-through.
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 768.0));
+        let desktop = (1024u16, 768u16);
+        assert_eq!(
+            map_pointer_to_desktop(pos2(200.0, 120.0), rect, desktop),
+            pos2(200.0, 120.0)
+        );
+        assert_eq!(
+            map_pointer_to_desktop(pos2(0.0, 0.0), rect, desktop),
+            pos2(0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn pointer_transform_downscales_a_large_panel_onto_a_small_desktop() {
+        // Panel bigger than the guest (guest hardcoded to 1024×768, egui upscales) —
+        // a click still maps to the correct guest pixel, which is what makes clicks
+        // land correctly even under upscaling (vdi-vm-8's must-have).
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0));
+        let desktop = (1024u16, 768u16);
+        // Panel centre → guest centre (512, 384).
+        assert_eq!(
+            map_pointer_to_desktop(pos2(960.0, 540.0), rect, desktop),
+            pos2(512.0, 384.0)
+        );
+    }
+
+    #[test]
+    fn pointer_transform_survives_a_degenerate_zero_size_panel() {
+        // A zero-extent rect (pre-layout / collapsed) must not divide by zero.
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(0.0, 0.0));
+        assert_eq!(
+            map_pointer_to_desktop(pos2(50.0, 50.0), rect, (640, 480)),
+            pos2(0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn remap_rewrites_pointer_events_and_passes_others_through() {
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(400.0, 400.0));
+        let desktop = (800u16, 800u16); // 2× the panel
+
+        // PointerMoved is rewritten into guest pixels.
+        match remap_pointer_event(egui::Event::PointerMoved(pos2(300.0, 300.0)), rect, desktop) {
+            egui::Event::PointerMoved(p) => assert_eq!(p, pos2(400.0, 400.0)),
+            other => panic!("expected PointerMoved, got {other:?}"),
+        }
+
+        // PointerButton keeps its button / pressed / modifiers; only the pos remaps.
+        let button_ev = egui::Event::PointerButton {
+            pos: pos2(100.0, 100.0),
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        match remap_pointer_event(button_ev, rect, desktop) {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } => {
+                assert_eq!(pos, pos2(0.0, 0.0));
+                assert_eq!(button, egui::PointerButton::Secondary);
+                assert!(pressed);
+            }
+            other => panic!("expected PointerButton, got {other:?}"),
+        }
+
+        // A key event passes through byte-for-byte (no coordinate touched).
+        let key_ev = egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        assert_eq!(remap_pointer_event(key_ev.clone(), rect, desktop), key_ev);
+
+        // A wheel event (carries no position) passes through unchanged.
+        let wheel_ev = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 2.0),
+            modifiers: egui::Modifiers::default(),
+        };
+        assert_eq!(
+            remap_pointer_event(wheel_ev.clone(), rect, desktop),
+            wheel_ev
+        );
+    }
+
+    #[test]
+    fn body_device_px_scales_the_screen_rect_by_pixels_per_point() {
+        // vdi-vm-8 — the initial-size hint is the output size in DEVICE pixels.
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |_| {});
+        let ppp = ctx.pixels_per_point();
+        let (w, h) = body_device_px(&ctx);
+        assert_eq!(w, (1920.0 * ppp).round() as u16);
+        assert_eq!(h, (1080.0 * ppp).round() as u16);
+        assert!(
+            w >= 1 && h >= 1,
+            "a device size is always at least one pixel"
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn rdp_initial_resolution_clamps_to_a_legal_even_desktop() {
+        // No hint → the prior hardcoded fallback.
+        assert_eq!(super::rdp_initial_resolution(None), (1024, 768));
+        // In-range even size passes through.
+        assert_eq!(
+            super::rdp_initial_resolution(Some((1920, 1080))),
+            (1920, 1080)
+        );
+        // Odd width is forced even (RDP requires it).
+        assert_eq!(
+            super::rdp_initial_resolution(Some((1921, 1080))),
+            (1920, 1080)
+        );
+        // Below the RDP minimum (200) clamps up; above the max (8192) clamps down.
+        assert_eq!(super::rdp_initial_resolution(Some((100, 100))), (200, 200));
+        assert_eq!(
+            super::rdp_initial_resolution(Some((9000, 9000))),
+            (8192, 8192)
+        );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn spice_initial_size_clamps_to_the_framebuffer_range() {
+        assert_eq!(super::spice_initial_size(None), (1024, 768));
+        assert_eq!(super::spice_initial_size(Some((1920, 1080))), (1920, 1080));
+        // Below the SPICE minimum (16) clamps up; above the max (8192) clamps down.
+        assert_eq!(super::spice_initial_size(Some((8, 8))), (16, 16));
+        assert_eq!(super::spice_initial_size(Some((9000, 9000))), (8192, 8192));
     }
 
     #[cfg(feature = "live-vdi")]

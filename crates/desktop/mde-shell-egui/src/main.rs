@@ -610,6 +610,10 @@ impl Shell {
                         })
                         .inner;
                     if let Some(request) = picked {
+                        // vdi-vm-8 — negotiate the guest desktop at the seat's real
+                        // device-pixel size instead of a hardcoded 1024×768.
+                        let request =
+                            request.with_preferred_size(Some(vdi::body_device_px(ui.ctx())));
                         self.vdi.request_connect(request);
                     }
                 } else {
@@ -1065,7 +1069,8 @@ impl Shell {
         // Workbench and parks its state in egui memory; after Workbench renders, a
         // dialable Nova console descriptor can queue one native VDI attach here.
         if let Some(request) = workbench::cloud_plane::take_console_attach(ctx) {
-            self.vdi.request_connect(request);
+            self.vdi
+                .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
             self.nav.expanded = true;
             self.nav.surface = Surface::Desktop;
         }
@@ -1275,7 +1280,8 @@ impl Shell {
         self.nav.surface = self.vdock.active();
         if let Some(id) = self.vdock.take_desktop_source_pick() {
             if let Some(request) = self.chooser.connect_source_id(&id) {
-                self.vdi.request_connect(request);
+                self.vdi
+                    .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
             }
             self.nav.surface = Surface::Desktop;
         }
@@ -1286,7 +1292,9 @@ impl Shell {
         if self.vdock.take_desktop_reconnect() {
             if desktop_reconnect_should_query_recents(has_visible_desktop_session) {
                 if let Some(request) = self.chooser.connect_last_recent() {
-                    self.vdi.request_connect(request);
+                    self.vdi.request_connect(
+                        request.with_preferred_size(Some(vdi::body_device_px(ctx))),
+                    );
                 }
             }
             self.nav.surface = Surface::Desktop;
