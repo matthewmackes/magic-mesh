@@ -85,6 +85,12 @@ mde-kdc-proto = { path = "../../kdc/mde-kdc-proto" }
 # Cards (Q7): the nmap parser emits Host cards with Service children
 # via `crate::card::probe` (the subsystem folded in from the retired
 # mde-card crate under E12-14c; serde + sha2 were already deps here).
+# arch-7 (2026-07-11) — the shared worker-pool contract (`Worker` +
+# `ShutdownToken`), extracted out of this bin crate so worker implementations
+# can be factored into their own crates without depending back on the daemon.
+# `workers::mod` re-exports both types. Optional under async-services (the whole
+# worker pool is async-services-gated).
+mde-worker-core = { path = "../mde-worker-core", optional = true }
 # SWAY-4 (v6.0 Q89/Q94) — marks_state worker uses Persist + rpc::reply_topic
 # to serve action/marks/* Bus action topics. Optional (async-services gate).
 mde-bus = { path = "../../platform/mde-bus", optional = true }
@@ -333,6 +339,7 @@ x11 = []
 # consumers that just want the existing sync read-API can leave it
 # off. Locked 2026-05-19.
 async-services = [
+    "dep:mde-worker-core",
     "dep:tokio",
     "dep:task-supervisor",
     "dep:zbus",

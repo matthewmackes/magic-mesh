@@ -115,47 +115,14 @@ pub fn workers_ready(map: &WorkerStatusMap) -> (u32, u32, u32) {
     (alive, total, tripped)
 }
 
-/// Shutdown signal handed to every worker. Workers should `select!`
-/// on the underlying `watch::Receiver` so they exit promptly when
-/// the supervisor requests stop. Cloning is cheap (it's a watch
-/// receiver under the hood).
-#[derive(Clone, Debug)]
-pub struct ShutdownToken {
-    pub(crate) rx: watch::Receiver<bool>,
-}
-
-impl ShutdownToken {
-    /// Construct a token from a raw watch receiver. Crate-private —
-    /// the supervisor's [`Supervisor::token`] is the public surface
-    /// for normal callers; this constructor lets sibling worker
-    /// modules build a token from a freshly-paired sender/receiver
-    /// pair in their unit tests.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn from_receiver(rx: watch::Receiver<bool>) -> Self {
-        Self { rx }
-    }
-
-    /// `true` once shutdown has been requested. Workers should poll
-    /// or `await` on [`Self::changed`] for prompt notification.
-    #[must_use]
-    pub fn is_shutdown(&self) -> bool {
-        *self.rx.borrow()
-    }
-
-    /// Async wait for shutdown. Resolves the first time the
-    /// supervisor flips the flag to `true`. Returns immediately if
-    /// shutdown was already requested.
-    pub async fn wait(&mut self) {
-        if self.is_shutdown() {
-            return;
-        }
-        // `changed()` errors only when the sender is dropped — at
-        // which point we're shutting down anyway, so treat it as
-        // shutdown-requested.
-        let _ = self.rx.changed().await;
-    }
-}
+// arch-7 (2026-07-11) — the shared worker-pool contract (`Worker` +
+// `ShutdownToken`) moved into the `mde-worker-core` crate so worker
+// IMPLEMENTATIONS can live in their own crates (e.g. the per-seat browser
+// workers in `mde-browser-workers`) without a circular dependency back on this
+// bin crate. Re-exported here so every in-crate worker + the ~120 call sites
+// keep referencing `super::{Worker, ShutdownToken}` / `crate::workers::Worker`
+// unchanged.
+pub use mde_worker_core::{ShutdownToken, Worker};
 
 // v2.0.0 Phase B workers reparented under workers/. Each is a thin
 // adapter over an existing sync implementation today; they grow real
@@ -923,25 +890,8 @@ pub use crate::surface::verify::SurfaceVerifyWorker;
 #[cfg(feature = "async-services")]
 pub use crate::surface::firmware::SurfaceFirmwareWorker;
 
-/// Every worker registered with the supervisor implements this
-/// trait. The trait is `async_trait` because the supervisor stores
-/// `Box<dyn Worker>`, which native async-fn-in-trait doesn't yet
-/// support.
-#[async_trait::async_trait]
-pub trait Worker: Send + 'static {
-    /// Short, stable identifier used in logs + `mackesd healthz`
-    /// output. Should be `kebab-case` and match the matching
-    /// `crates/mackesd/src/workers/<name>.rs` module name (e.g.
-    /// `clipboard_sync`, `mdns`, `notifications-server`).
-    fn name(&self) -> &'static str;
-
-    /// Body of the worker. Runs on the tokio runtime until
-    /// `shutdown.wait().await` resolves OR the body returns. Errors
-    /// returned here surface to the supervisor's restart logic
-    /// (Phase B); for Phase A the supervisor simply logs and exits
-    /// the join.
-    async fn run(&mut self, shutdown: ShutdownToken) -> anyhow::Result<()>;
-}
+// arch-7 — the `Worker` trait moved to `mde-worker-core` and is re-exported
+// above (`pub use mde_worker_core::{ShutdownToken, Worker};`).
 
 // ── ENT-6: supervisor restart policy constants ──────────────────────
 
@@ -1244,9 +1194,7 @@ impl Supervisor {
     /// our channel.
     #[must_use]
     pub fn token(&self) -> ShutdownToken {
-        ShutdownToken {
-            rx: self.shutdown_rx.clone(),
-        }
+        ShutdownToken::from_receiver(self.shutdown_rx.clone())
     }
 
     /// Spawn a worker. The supervisor honors `Spawn::policy` for
