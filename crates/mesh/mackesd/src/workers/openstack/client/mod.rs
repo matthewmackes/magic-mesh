@@ -35,6 +35,11 @@
 //! fabricated catalog.
 
 pub mod config;
+/// IAC-1 — contract tests pinning the client's request shapes + response parsers
+/// against canonical OpenStack API fixtures (test-obs-5), plus an env-gated live
+/// integration skeleton.
+#[cfg(test)]
+mod contract;
 pub mod health;
 pub mod heat;
 pub mod keystone;

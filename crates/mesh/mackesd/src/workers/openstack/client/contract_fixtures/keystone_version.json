@@ -1,0 +1,17 @@
+{
+  "versions": {
+    "values": [
+      {
+        "id": "v3.14",
+        "status": "stable",
+        "updated": "2020-04-07T00:00:00Z",
+        "links": [
+          { "href": "http://10.0.0.5:5000/v3/", "rel": "self" }
+        ],
+        "media-types": [
+          { "base": "application/json", "type": "application/vnd.openstack.identity-v3+json" }
+        ]
+      }
+    ]
+  }
+}

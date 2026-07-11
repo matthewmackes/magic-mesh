@@ -1,0 +1,30 @@
+{
+  "stack": {
+    "id": "3095aefc-09fb-4bc7-b1f0-f21a304e864c",
+    "stack_name": "mesh-overlay-net",
+    "description": "the mesh overlay network stack",
+    "creation_time": "2026-07-05T00:00:00Z",
+    "updated_time": "2026-07-06T12:30:00Z",
+    "deletion_time": null,
+    "stack_status": "UPDATE_COMPLETE",
+    "stack_status_reason": "Stack UPDATE completed successfully",
+    "stack_owner": null,
+    "parent": null,
+    "disable_rollback": true,
+    "timeout_mins": 60,
+    "capabilities": [],
+    "notification_topics": [],
+    "parameters": {
+      "OS::project_id": "263fd9e5069d4d47b26d3b4b3f13af18",
+      "OS::stack_id": "3095aefc-09fb-4bc7-b1f0-f21a304e864c",
+      "OS::stack_name": "mesh-overlay-net"
+    },
+    "outputs": [
+      { "output_key": "network_id", "output_value": "d32019d3-bc6e-4319-9c1d-6722fc136a22", "description": "the created network id" },
+      { "output_key": "subnet_cidr", "output_value": "10.0.0.0/24" }
+    ],
+    "links": [
+      { "href": "http://10.0.0.5:8004/v1/263fd9e5069d4d47b26d3b4b3f13af18/stacks/mesh-overlay-net/3095aefc-09fb-4bc7-b1f0-f21a304e864c", "rel": "self" }
+    ]
+  }
+}
