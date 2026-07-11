@@ -1197,10 +1197,11 @@ impl VoiceProvisionWorker {
     /// Only the elected leader provisions + holds the master key (lock 7).
     /// Reuses the shared leader lock — a cheap synchronous check per pass.
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
+        crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
         )
+        .is_leader()
     }
 
     /// Resolve the secret store for this pass (the injected one in tests, else

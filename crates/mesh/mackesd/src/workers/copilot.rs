@@ -1214,10 +1214,11 @@ impl CopilotWorker {
     /// center: any eligible node can be it, the elected one answers). Reuses the
     /// shared leader lock — synchronous, called once per tick.
     fn is_leader(&self) -> bool {
-        matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
-            Ok(crate::leader::AcquireResult::Acquired)
+        crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
         )
+        .is_leader()
     }
 
     /// Resolve the codex API key from the mesh secret-store. `Ok(Some(key))` when
@@ -1241,8 +1242,13 @@ impl CopilotWorker {
     /// awaiting codex).
     fn assemble_mesh_context(&self) -> MeshContext {
         let mut ctx = MeshContext::default();
-        // Leader lease — a pure lockfile read.
-        ctx.leader = crate::leader::read_current_lease(&self.leader_lock).map(|l| l.node_id);
+        // Leader lease — the current mesh leader, from whichever substrate is
+        // authoritative (etcd `/mesh/leader` on a cut-over fleet, else the fs lease).
+        ctx.leader = crate::leader_gate::LeaderGate::from_lock_path(
+            self.leader_lock.clone(),
+            self.node_id.clone(),
+        )
+        .current_leader_id();
         let Ok(conn) = crate::store::open(&self.db_path) else {
             // No store yet (fresh node) → just the leader line, if any.
             return ctx;

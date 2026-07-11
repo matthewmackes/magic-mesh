@@ -47,6 +47,11 @@ pub mod fleet;
 pub mod health;
 pub mod identity;
 pub mod leader;
+// SUBSTRATE-V2 (mackesd-01/-04) — the shared, substrate-aware leadership gate the
+// leader-gated ACTION workers consult (etcd election on a cut-over fleet, fs lock
+// pre-cutover). Gated with the worker pool since its etcd branch rides `substrate`.
+#[cfg(feature = "async-services")]
+pub mod leader_gate;
 pub mod legacy_inventory;
 pub mod lighthouse_addr;
 pub mod lighthouse_lifecycle;
