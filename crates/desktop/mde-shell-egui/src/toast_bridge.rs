@@ -272,6 +272,10 @@ pub(crate) struct ToastBridge {
     /// The notification-sound seam (production spawns the event sound; tests
     /// record).
     chime: Box<dyn Chime>,
+    /// test-obs-3 — latch so a persistent alert-lane read failure logs ONCE per
+    /// error streak rather than every `REFRESH` tick (the poll cadence would else
+    /// spam journald). Reset on the next successful read.
+    read_error_logged: bool,
 }
 
 impl Default for ToastBridge {
@@ -284,6 +288,7 @@ impl Default for ToastBridge {
             host: ToastHost::new(),
             suppress: Suppress::default(),
             chime: Box::new(SystemChime),
+            read_error_logged: false,
         }
     }
 }
@@ -355,15 +360,30 @@ impl ToastBridge {
             return;
         }
         self.last_poll = Some(Instant::now());
+        // No configured bus root is the honest "no bus on this seat" case (§7),
+        // not an error — stay silent.
         let Some(root) = self.bus_root.clone() else {
             return;
         };
-        let Ok(persist) = Persist::open(root) else {
-            return;
+        // A set-but-unopenable spool, or a failed read, means the alert lane is
+        // DOWN: the operator's Critical alerts silently won't arrive. Surface it
+        // (once per streak — this runs every REFRESH) instead of swallowing it.
+        let persist = match Persist::open(root.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.log_read_error("open the alert-lane spool", &root, &e);
+                return;
+            }
         };
-        let Ok(msgs) = persist.list_since(TOAST_TOPIC, self.cursor.as_deref()) else {
-            return;
+        let msgs = match persist.list_since(TOAST_TOPIC, self.cursor.as_deref()) {
+            Ok(m) => m,
+            Err(e) => {
+                self.log_read_error("read the alert lane", &root, &e);
+                return;
+            }
         };
+        // A clean read clears the latch so the next failure logs afresh.
+        self.read_error_logged = false;
         for msg in msgs {
             self.cursor = Some(msg.ulid.clone());
             let Some(body) = msg.body.as_deref() else {
@@ -373,6 +393,24 @@ impl ToastBridge {
                 self.admit(toast);
             }
         }
+    }
+
+    /// test-obs-3 — log an alert-lane read failure ONCE per contiguous error
+    /// streak (the drain runs every `REFRESH`, so an unconditional log would spam
+    /// journald). The latch is cleared by the next successful read in
+    /// [`drain`](Self::drain). `error` level because a down alert lane means the
+    /// operator's Critical notifications silently won't arrive.
+    fn log_read_error(&mut self, op: &str, root: &std::path::Path, err: &impl std::fmt::Display) {
+        if self.read_error_logged {
+            return;
+        }
+        self.read_error_logged = true;
+        tracing::error!(
+            target: "shell::toast",
+            bus_root = %root.display(),
+            error = %err,
+            "could not {op}; alert lane down — Critical alerts may be dropped",
+        );
     }
 
     /// Apply suppression (lock 10) then ring (lock 8). A suppressed Info/Warning

@@ -330,8 +330,15 @@ impl PowerHonor {
                 lock_requested = true;
             } else if let Err(e) = system.honor_power(verb) {
                 // A refused/absent logind is surfaced honestly to the journal, never
-                // a pretend-success and never a panic (§7).
-                eprintln!("power-honor: {} failed: {e}", verb.label());
+                // a pretend-success and never a panic (§7). test-obs-3: structured
+                // now, so the auto idle/lid power path is filterable off-seat.
+                tracing::error!(
+                    target: "shell::power",
+                    verb = verb.label(),
+                    source = "idle-lid",
+                    error = %e,
+                    "automatic power verb failed",
+                );
             }
         }
         // Keep a wake scheduled while an idle timeout is armed but unfired, so the

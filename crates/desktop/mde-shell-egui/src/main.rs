@@ -37,6 +37,7 @@ mod hotkeys;
 mod iac;
 mod keyboard;
 mod lock_signal;
+mod logging;
 mod mesh_view;
 mod network;
 mod pam_auth;
@@ -1375,7 +1376,18 @@ impl Shell {
         match self.vdock.take_request() {
             Some(dock::DockRequest::Lock) => self.curtain.lock(),
             Some(dock::DockRequest::Power(verb)) => {
-                let _ = self.system.honor_power(verb);
+                // A refused/absent logind is an honest no-op (§7) — but now it is
+                // also a logged one, so a seat that silently won't suspend/reboot
+                // leaves a trail instead of vanishing.
+                if let Err(e) = self.system.honor_power(verb) {
+                    tracing::error!(
+                        target: "shell::power",
+                        verb = verb.label(),
+                        source = "dock",
+                        error = %e,
+                        "power verb refused by the seat",
+                    );
+                }
             }
             None => {}
         }
@@ -1487,7 +1499,17 @@ impl Shell {
             Some(console::ConsoleRequest::SpawnTab { name, argv }) => {
                 self.nav.expanded = true;
                 self.nav.surface = Surface::Terminal;
-                let _ = self.terminal.spawn_tab(name, &argv);
+                // The surface raises its own honest error chip on a refused spawn
+                // (§7); log alongside it so a failed console launch is also
+                // diagnosable off-seat, not just a chip that scrolls away.
+                if !self.terminal.spawn_tab(name.clone(), &argv) {
+                    tracing::warn!(
+                        target: "shell::terminal",
+                        tab = %name,
+                        argv = ?argv,
+                        "console SpawnTab did not open a terminal tab",
+                    );
+                }
             }
             // CONSOLE-4 — the rail Power section: Lock drops the in-process
             // curtain (exactly like Super+L); a Power verb drives the seat
@@ -1496,7 +1518,15 @@ impl Shell {
             // never a raw `systemctl` (§6).
             Some(console::ConsoleRequest::Lock) => self.curtain.lock(),
             Some(console::ConsoleRequest::Power(verb)) => {
-                let _ = self.system.honor_power(verb);
+                if let Err(e) = self.system.honor_power(verb) {
+                    tracing::error!(
+                        target: "shell::power",
+                        verb = verb.label(),
+                        source = "console",
+                        error = %e,
+                        "power verb refused by the seat",
+                    );
+                }
             }
             None => {}
         }
@@ -1629,6 +1659,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // test-obs-3 — stand up the ONE process-wide structured logger before the seat
+    // comes up, so every failure from here on lands in a persistent, filterable
+    // sink (journald/stderr) instead of vanishing on the bare DRM seat. Kept after
+    // `--version` so that stays a clean, log-free one-liner. Filter via
+    // `MDE_LOG`/`RUST_LOG`; format via `MDE_LOG_FORMAT` (auto text-on-TTY,
+    // JSON-under-systemd), matching the mackesd daemon's subscriber verbatim.
+    logging::init();
+    tracing::info!(
+        target: "shell::boot",
+        version = %mde_theme::brand::build::full(),
+        drm = cfg!(feature = "drm"),
+        "mde-shell-egui starting",
+    );
+
     // E12-3 — the shell OWNS the DRM/KMS seat directly (no compositor, no display
     // manager) when built `--features drm` and a seat is available. It falls back to
     // the windowed eframe client only when there is no DRM master (a dev host, or a
@@ -1642,8 +1686,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match mde_egui::run_drm("org.magicmesh.Shell", |ctx| boot.frame(ctx)) {
             Ok(()) => return Ok(()),
             Err(mde_egui::drm::DrmError::NoDrmMaster(why)) => {
-                eprintln!(
-                    "mde-shell-egui: no DRM seat ({why}); falling back to the windowed client"
+                tracing::warn!(
+                    target: "shell::boot",
+                    reason = %why,
+                    "no DRM seat; falling back to the windowed client",
                 );
             }
             Err(e) => return Err(Box::new(e)),

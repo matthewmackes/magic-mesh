@@ -95,7 +95,11 @@ impl LogindLockSource {
             .name("curtain-logind-lock".to_owned())
             .spawn(move || listen(&tx, &ctx))
         {
-            eprintln!("curtain: could not spawn the logind lock listener: {e}");
+            tracing::error!(
+                target: "shell::curtain",
+                error = %e,
+                "could not spawn the logind lock listener; lock-session inert",
+            );
         }
         Self { rx }
     }
@@ -122,7 +126,13 @@ fn listen(tx: &mpsc::Sender<LockSignal>, ctx: &egui::Context) {
     let conn = match zbus::blocking::Connection::system() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("curtain: logind lock listener — no system bus ({e}); lock-session inert");
+            // No system bus is the expected host-gated case on a dev host (§7), so
+            // warn rather than error — but still leave a trail: lock-session is inert.
+            tracing::warn!(
+                target: "shell::curtain",
+                error = %e,
+                "logind lock listener — no system bus; lock-session inert",
+            );
             return;
         }
     };
@@ -133,14 +143,22 @@ fn listen(tx: &mpsc::Sender<LockSignal>, ctx: &egui::Context) {
     {
         Ok(b) => b.build(),
         Err(e) => {
-            eprintln!("curtain: logind lock listener — bad match rule ({e})");
+            tracing::error!(
+                target: "shell::curtain",
+                error = %e,
+                "logind lock listener — bad match rule; lock-session inert",
+            );
             return;
         }
     };
     let iter = match zbus::blocking::MessageIterator::for_match_rule(rule, &conn, None) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("curtain: logind lock listener — could not subscribe ({e})");
+            tracing::error!(
+                target: "shell::curtain",
+                error = %e,
+                "logind lock listener — could not subscribe; lock-session inert",
+            );
             return;
         }
     };

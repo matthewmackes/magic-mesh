@@ -197,6 +197,18 @@ mde-web-preview-client = { path = "../mde-web-preview-client" }
 # off the system OpenSSL surface while matching the workspace's reqwest 0.12 users.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
+# test-obs-3 — the shell's structured-logging framework. Before this, the 100K-LOC
+# desktop tier had NO logger: failures on the DRM seat surfaced only as transient
+# toasts or ad-hoc `eprintln!`, so a crash on the bare seat left no persistent,
+# filterable trail. `tracing` is the ONE workspace logging choice (mackesd + mde-bus
+# + the VDI crates all emit `tracing`), so the shell matches it verbatim rather than
+# introducing a second framework. `logging::init()` stands up a single process-wide
+# `fmt` subscriber at startup (text on a TTY, JSON under systemd/journald — the exact
+# `mackesd` idiom), filtered by `MDE_LOG`/`RUST_LOG`. The `json` feature is the same
+# one mackesd already pulls, so cargo unifies to one artifact — no new build surface.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
 [dev-dependencies]
 # The Browser-surface render tests drive a real session over the client's
 # in-process fake helper (a socketpair peer publishing a genuine MWP1 shm frame),
