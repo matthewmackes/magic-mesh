@@ -4432,6 +4432,7 @@ dependencies = [
  "glow",
  "input",
  "khronos-egl",
+ "libc",
  "udev",
 ]
 

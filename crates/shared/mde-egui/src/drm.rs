@@ -27,9 +27,10 @@
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -606,6 +607,237 @@ fn drm_char(code: u32, shift: bool) -> Option<char> {
     })
 }
 
+/// The bare-seat present loop's **wake policy** (perf-1), factored out pure so it can
+/// be unit-tested headlessly — the live present path itself can only be exercised on
+/// a real seat.
+///
+/// The loop is **event-driven**: it blocks in `poll(2)` on the libinput fd until input
+/// arrives, egui's requested repaint deadline expires, or a periodic task (accelerometer
+/// sample / touch long-press tick) is due — then renders *only* when there is something
+/// to show. This mirrors eframe's winit contract (`ControlFlow` Wait vs WaitUntil vs
+/// Poll, decided from egui's [`egui::ViewportOutput::repaint_delay`]): a `Duration::MAX`
+/// delay means "idle — sleep until an fd wakes us" and drops the CPU to ~0, a
+/// `Duration::ZERO` delay means "repaint continuously" (a streaming VDI session, a
+/// spinner), and a finite delay arms a bounded wait. Before this, the loop rendered the
+/// full UI every vblank forever, so every `request_repaint_after` in the shell was dead.
+mod wake {
+    use std::time::Duration;
+
+    /// Upper bound (ms) on a *finite* poll wait. Caps the `c_int` timeout and bounds
+    /// the worst-case latency of a finite deadline; 1 s is far longer than any real UI
+    /// repaint delay. The genuinely-idle case (`None`/`None`) still blocks indefinitely
+    /// — this only caps requests that named a finite deadline.
+    const MAX_FINITE_MS: u128 = 1000;
+
+    /// egui's requested repaint delay → the loop's repaint deadline, as a `Duration`
+    /// from *now*. `None` = idle (egui's `Duration::MAX` sentinel: no repaint wanted);
+    /// `Some(d)` = repaint due in `d` (`Some(ZERO)` = due immediately, i.e. continuous
+    /// repaint).
+    #[must_use]
+    pub fn repaint_deadline(repaint_delay: Duration) -> Option<Duration> {
+        if repaint_delay == Duration::MAX {
+            None
+        } else {
+            Some(repaint_delay)
+        }
+    }
+
+    /// The `poll(2)` timeout (ms) for this iteration, from the time until the next
+    /// repaint (`None` = egui idle) and the time until the soonest periodic task
+    /// (`None` = none pending). Returns:
+    /// * `-1` → block indefinitely until an fd is ready (both deadlines idle — the
+    ///   true-idle path that lets the CPU reach ~0);
+    /// * `0`  → do not block (a deadline is already due / continuous repaint);
+    /// * `>0` → block up to that many ms (the sooner of the two deadlines, rounded up
+    ///   so a sub-ms deadline can never collapse to a 0-ms busy poll, capped at
+    ///   [`MAX_FINITE_MS`]).
+    #[must_use]
+    pub fn poll_timeout_ms(
+        until_repaint: Option<Duration>,
+        until_periodic: Option<Duration>,
+    ) -> i32 {
+        let deadline = match (until_repaint, until_periodic) {
+            (None, None) => return -1, // genuinely idle: sleep until an fd is ready
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+        };
+        if deadline.is_zero() {
+            return 0;
+        }
+        // Round any sub-ms remainder UP to a whole ms (so we wake no earlier than the
+        // deadline — never a hair early to re-poll), then clamp into [1, MAX_FINITE_MS]
+        // so a sub-ms deadline can't collapse to a 0-ms (busy) poll and a huge one can't
+        // overflow the c_int timeout. The clamped result fits i32 by construction.
+        let ms = deadline
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .clamp(1, MAX_FINITE_MS);
+        ms as i32
+    }
+
+    /// Whether to render + present this iteration. The loop renders on the first frame,
+    /// on any input event, on a forced seat-side state change (a rotation / formfactor
+    /// transition / host-key the shell must see but that produced no egui event), or when
+    /// the repaint deadline has elapsed — and otherwise goes back to sleep, leaving the
+    /// last frame on screen (no idle repaint). This is the switch that makes the shell's
+    /// repaint throttling (seat-snapshot pump, VDI frame pacing) actually take effect.
+    #[must_use]
+    pub const fn should_render(
+        first_frame: bool,
+        has_input: bool,
+        force_render: bool,
+        repaint_due: bool,
+    ) -> bool {
+        first_frame || has_input || force_render || repaint_due
+    }
+
+    /// The DRM framebuffer cached for a GBM buffer-object (keyed by its stable `gbm_bo`
+    /// pointer), inserting one via `make` on a miss. The GBM scanout surface hands out a
+    /// small fixed ring of buffer-objects whose `gbm_bo` pointers are stable across
+    /// lock/release cycles, so this attaches exactly one framebuffer per buffer-object
+    /// and reuses it for every page-flip — the standard BO-userdata idiom — instead of
+    /// add/rm-framebuffer every frame (perf-1). A `make` error is not cached, so the
+    /// next frame retries.
+    pub fn cached_or_try_insert<F: Copy, E>(
+        cache: &mut Vec<(usize, F)>,
+        key: usize,
+        make: impl FnOnce() -> Result<F, E>,
+    ) -> Result<F, E> {
+        if let Some(&(_, fb)) = cache.iter().find(|&&(k, _)| k == key) {
+            return Ok(fb);
+        }
+        let fb = make()?;
+        cache.push((key, fb));
+        Ok(fb)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{cached_or_try_insert, poll_timeout_ms, repaint_deadline, should_render};
+        use std::time::Duration;
+
+        #[test]
+        fn idle_blocks_indefinitely() {
+            // egui idle + no periodic task ⇒ poll blocks forever (CPU→0), never spins.
+            // This is the perf-1 keystone: the idle path must NOT be a bounded busy wait.
+            assert_eq!(poll_timeout_ms(None, None), -1);
+        }
+
+        #[test]
+        fn max_delay_is_idle() {
+            assert_eq!(repaint_deadline(Duration::MAX), None);
+        }
+
+        #[test]
+        fn zero_delay_polls_without_blocking() {
+            // Continuous repaint (streaming VDI / spinner): due now, don't block.
+            assert_eq!(repaint_deadline(Duration::ZERO), Some(Duration::ZERO));
+            assert_eq!(poll_timeout_ms(Some(Duration::ZERO), None), 0);
+        }
+
+        #[test]
+        fn finite_delay_waits_that_long() {
+            assert_eq!(
+                repaint_deadline(Duration::from_millis(16)),
+                Some(Duration::from_millis(16))
+            );
+            assert_eq!(poll_timeout_ms(Some(Duration::from_millis(16)), None), 16);
+        }
+
+        #[test]
+        fn periodic_bounds_an_idle_ui() {
+            // Idle UI but an accelerometer sample is due in 200 ms: wake to service it
+            // (auto-rotate keeps working) without ever rendering while idle.
+            assert_eq!(poll_timeout_ms(None, Some(Duration::from_millis(200))), 200);
+        }
+
+        #[test]
+        fn soonest_deadline_wins() {
+            assert_eq!(
+                poll_timeout_ms(
+                    Some(Duration::from_millis(16)),
+                    Some(Duration::from_millis(200))
+                ),
+                16
+            );
+            assert_eq!(
+                poll_timeout_ms(
+                    Some(Duration::from_millis(500)),
+                    Some(Duration::from_millis(33))
+                ),
+                33
+            );
+        }
+
+        #[test]
+        fn sub_millisecond_rounds_up_no_spin() {
+            // A 500 µs deadline must round up to 1 ms, never collapse to a 0-ms busy poll.
+            assert_eq!(poll_timeout_ms(Some(Duration::from_micros(500)), None), 1);
+        }
+
+        #[test]
+        fn finite_wait_is_capped() {
+            assert_eq!(poll_timeout_ms(Some(Duration::from_secs(3600)), None), 1000);
+        }
+
+        #[test]
+        fn render_policy() {
+            // Idle: nothing to do ⇒ don't render.
+            assert!(!should_render(false, false, false, false));
+            // Any single trigger forces an immediate render.
+            assert!(should_render(true, false, false, false)); // first frame / modeset
+            assert!(should_render(false, true, false, false)); // input event
+            assert!(should_render(false, false, true, false)); // rotation/formfactor/host-key
+            assert!(should_render(false, false, false, true)); // repaint deadline elapsed
+        }
+
+        #[test]
+        fn fb_cache_adds_once_per_bo() {
+            // The framebuffer is created once per buffer-object and reused thereafter;
+            // a second lookup for the same BO must NOT call `make` again.
+            let mut cache: Vec<(usize, u32)> = Vec::new();
+            let mut calls = 0u32;
+            let mut mk = |fb: u32| -> Result<u32, ()> {
+                calls += 1;
+                Ok(fb)
+            };
+            // First BO (key 0xA): miss → inserts fb 100.
+            assert_eq!(cached_or_try_insert(&mut cache, 0xA, || mk(100)), Ok(100));
+            // Same BO again: hit → returns 100 WITHOUT calling make (999 never used).
+            assert_eq!(cached_or_try_insert(&mut cache, 0xA, || mk(999)), Ok(100));
+            // A different BO (key 0xB): miss → inserts fb 200.
+            assert_eq!(cached_or_try_insert(&mut cache, 0xB, || mk(200)), Ok(200));
+            // make() ran exactly twice (the two distinct BOs), not three times.
+            assert_eq!(calls, 2);
+            assert_eq!(cache.len(), 2);
+        }
+
+        #[test]
+        fn fb_cache_does_not_cache_errors() {
+            let mut cache: Vec<(usize, u32)> = Vec::new();
+            let err = cached_or_try_insert::<u32, &str>(&mut cache, 0xC, || Err("boom"));
+            assert_eq!(err, Err("boom"));
+            assert!(cache.is_empty());
+            // A subsequent success for the same key inserts cleanly.
+            assert_eq!(
+                cached_or_try_insert(&mut cache, 0xC, || Ok::<u32, &str>(7)),
+                Ok(7)
+            );
+            assert_eq!(cache.len(), 1);
+        }
+    }
+}
+
+/// How often the bare-seat loop wakes to sample the accelerometer while otherwise idle
+/// (only when a sensor is present) so auto-rotate keeps working without pinning the CPU.
+const ACCEL_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How often the loop wakes to advance time-driven touch gestures (the long-press fire)
+/// while a finger is down, so a held-still finger still long-presses even with no new
+/// contact events.
+const GESTURE_TICK_INTERVAL: Duration = Duration::from_millis(33);
+
 /// Run an MCNF egui surface on the bare DRM/KMS seat (no compositor).
 ///
 /// `ui` paints the surface each frame against an [`egui::Context`] (the shared
@@ -794,9 +1026,29 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(pw, ph));
     let mut pointer = egui::pos2(pw / 2.0, ph / 2.0);
     let start = std::time::Instant::now();
-    // The previous frame's scanout buffer + framebuffer, freed only after the next
-    // flip completes (GBM hands out a small ring of buffers).
-    let mut prev: Option<(gbm::BufferObject<()>, drm::control::framebuffer::Handle)> = None;
+    // The previous frame's scanout buffer, released back to the surface ring only after
+    // the next flip completes (GBM hands out a small ring of buffers). Its framebuffer is
+    // NOT tracked here — it lives in `fb_cache`, keyed by the buffer-object, and is reused
+    // across flips instead of being rebuilt every frame (perf-1).
+    let mut prev: Option<gbm::BufferObject<()>> = None;
+    // perf-1: one DRM framebuffer per GBM buffer-object, keyed by its stable `gbm_bo`
+    // pointer. The surface ring is a handful of buffers, so this stays tiny; destroyed en
+    // masse at teardown.
+    let mut fb_cache: Vec<(usize, drm::control::framebuffer::Handle)> = Vec::new();
+    // The framebuffer pixel geometry is fixed for the surface's chosen format — compute it
+    // once, not per frame.
+    let (fb_depth, fb_bpp) = match gbm_format {
+        gbm::Format::Xrgb2101010 | gbm::Format::Argb2101010 => (30u32, 32u32),
+        gbm::Format::Rgb565 | gbm::Format::Bgr565 => (16, 16),
+        _ => (24, 32),
+    };
+    // perf-1 event-driven wake state: when egui next needs to paint (`None` = idle, egui
+    // asked for no repaint). Seeded to "now" so the first iteration renders immediately
+    // (the modeset frame) without blocking in poll.
+    let mut next_repaint_at: Option<Instant> = Some(Instant::now());
+    // Count of down touch contacts — while > 0 the loop wakes on a short cadence so a
+    // held-still finger's long-press still fires (`gestures.tick`) with no new events.
+    let mut touch_active: u32 = 0;
     let mut quit = false;
     // Esc is a normal key on a shipped desktop — it must NEVER tear the seat down
     // (any dialog/field owns it). Quitting the DRM session on Esc is a dev-only
@@ -852,6 +1104,43 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let mut last_accel = std::time::Instant::now();
 
     while !quit {
+        // 0. perf-1 WAKE GATE — block until there is a reason to wake, instead of
+        //    spinning at refresh rate. Sleep until: input is readable on the libinput
+        //    fd, egui's repaint deadline expires, or a periodic task (accel sample /
+        //    touch long-press tick) is due. When egui is idle and nothing periodic is
+        //    pending, this blocks indefinitely and the CPU reaches ~0 (eframe's
+        //    ControlFlow::Wait). The present path below still paces rendering to vblank.
+        let now = Instant::now();
+        let until_repaint = next_repaint_at.map(|t| t.saturating_duration_since(now));
+        let until_accel = accel
+            .as_ref()
+            .map(|_| ACCEL_SAMPLE_INTERVAL.saturating_sub(last_accel.elapsed()));
+        let until_touch = (touch_active > 0).then_some(GESTURE_TICK_INTERVAL);
+        let until_periodic = match (until_accel, until_touch) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let timeout = wake::poll_timeout_ms(until_repaint, until_periodic);
+        let mut pfd = libc::pollfd {
+            fd: libinput.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a single fully-initialised pollfd over a valid, owned fd
+        // (libinput's epoll fd, live for the loop). poll only reads `events` and writes
+        // `revents`, and blocks up to `timeout` ms. Its result is advisory — every wake
+        // reason is re-derived below — so an error/EINTR wake is harmless (one idle pass).
+        let _ = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout) };
+
+        // A seat-side state change this iteration that the shell must see promptly even
+        // though it produced no egui input event — a display rotation (scanout changed),
+        // a formfactor transition (tablet/laptop → the shell's dock/tablet bar), or a
+        // host-key press (Super/media keys the shell dispatches). Any of these forces a
+        // render so the idle-gate below can't strand it until the next input.
+        let mut force_render = false;
+
         // 1. drain libinput → egui events
         libinput
             .dispatch()
@@ -898,24 +1187,35 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                     let norm = |pos: f64, span: u32| (pos as f32 / span as f32).clamp(0.0, 1.0);
                     let contact = match te {
-                        TouchEvent::Down(d) => Some(RawContact::Down {
-                            slot: slot_of(d.slot(), d.seat_slot()),
-                            u: norm(d.x_transformed(wp), wp),
-                            v: norm(d.y_transformed(hp), hp),
-                            force: None,
-                        }),
+                        TouchEvent::Down(d) => {
+                            // A finger went down — keep the loop waking on a short cadence
+                            // so a held-still long-press still fires (perf-1).
+                            touch_active += 1;
+                            Some(RawContact::Down {
+                                slot: slot_of(d.slot(), d.seat_slot()),
+                                u: norm(d.x_transformed(wp), wp),
+                                v: norm(d.y_transformed(hp), hp),
+                                force: None,
+                            })
+                        }
                         TouchEvent::Motion(m) => Some(RawContact::Move {
                             slot: slot_of(m.slot(), m.seat_slot()),
                             u: norm(m.x_transformed(wp), wp),
                             v: norm(m.y_transformed(hp), hp),
                             force: None,
                         }),
-                        TouchEvent::Up(u) => Some(RawContact::Up {
-                            slot: slot_of(u.slot(), u.seat_slot()),
-                        }),
-                        TouchEvent::Cancel(c) => Some(RawContact::Cancel {
-                            slot: slot_of(c.slot(), c.seat_slot()),
-                        }),
+                        TouchEvent::Up(u) => {
+                            touch_active = touch_active.saturating_sub(1);
+                            Some(RawContact::Up {
+                                slot: slot_of(u.slot(), u.seat_slot()),
+                            })
+                        }
+                        TouchEvent::Cancel(c) => {
+                            touch_active = touch_active.saturating_sub(1);
+                            Some(RawContact::Cancel {
+                                slot: slot_of(c.slot(), c.seat_slot()),
+                            })
+                        }
                         _ => None,
                     };
                     if let Some(contact) = contact {
@@ -958,6 +1258,9 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     // are NOT emitted as egui events, so the guest never sees them.
                     if crate::hostkeys::is_host_key(code) {
                         crate::hostkeys::push_host_key(code, pressed);
+                        // Host keys aren't forwarded to egui, so force a render for the
+                        // shell to dispatch them (launcher/media keys) even when idle.
+                        force_render = true;
                     }
                     let modifiers = egui::Modifiers {
                         alt,
@@ -988,6 +1291,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         switches.tablet_mode = t.switch_state() == LiSwitchState::On;
                         if let Some(f) = formfactor.observe(switches.raw_formfactor()) {
                             push_formfactor(f);
+                            force_render = true;
                         }
                     }
                 }
@@ -1009,6 +1313,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                             switches.cover_attached = kbd_count > 0;
                             if let Some(f) = formfactor.observe(switches.raw_formfactor()) {
                                 push_formfactor(f);
+                                force_render = true;
                             }
                         }
                     }
@@ -1056,7 +1361,13 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         // SURFACE-9 (lock 15): drain the shell's rotation commands (Config tab /
         // hotkey) — a lock freezes auto-rotate, a manual override forces + holds an
         // orientation, applied to BOTH scanout + touch immediately.
-        for cmd in take_rotation_commands() {
+        let rotation_cmds = take_rotation_commands();
+        if !rotation_cmds.is_empty() {
+            // A shell-side rotation command arrived — force a render so the scanout /
+            // lock state is reflected even if egui was otherwise idle.
+            force_render = true;
+        }
+        for cmd in rotation_cmds {
             match cmd {
                 RotateCommand::Lock(locked) => auto.set_user_lock(locked),
                 RotateCommand::Manual(rotation) => {
@@ -1070,18 +1381,33 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         // frame — it is a sysfs read and the orientation is slow), fold it to an
         // orientation, and on a debounced change rotate display + touch as one. Inert +
         // honest when there is no sensor (`accel` is `None`) or auto-rotate is locked.
-        if last_accel.elapsed().as_millis() >= 200 {
-            last_accel = std::time::Instant::now();
+        if last_accel.elapsed() >= ACCEL_SAMPLE_INTERVAL {
+            last_accel = Instant::now();
             if let Some(sensor) = accel.as_mut() {
                 if let Ok((ax, ay, az)) = sensor.read() {
                     if let Some(rotation) = auto.observe(orientation_from_accel(ax, ay, az)) {
                         drive_rotation(&gbm, rot_prop, &mut touch, rotation);
+                        force_render = true;
                     }
                 }
             }
         }
 
-        // 2. run + paint the egui frame
+        // 2. decide whether this iteration has anything to present (perf-1). Render on
+        //    the first frame (the modeset), on any input, on a forced seat-side state
+        //    change (rotation / formfactor / host-key), or when egui's repaint deadline
+        //    has elapsed; otherwise fall through to the next poll WITHOUT rendering,
+        //    leaving the last frame on screen. This is what makes the shell's
+        //    request_repaint_after throttling (seat-snapshot pump, VDI frame pacing)
+        //    actually take effect. Input is never dropped: `events` is only discarded when
+        //    it is empty (a non-empty `events` forces a render here).
+        let first_frame = prev.is_none();
+        let repaint_due = next_repaint_at.is_some_and(|t| Instant::now() >= t);
+        if !wake::should_render(first_frame, !events.is_empty(), force_render, repaint_due) {
+            continue;
+        }
+
+        // 3. run + paint the egui frame
         let raw_input = egui::RawInput {
             screen_rect: Some(screen),
             time: Some(start.elapsed().as_secs_f64()),
@@ -1100,6 +1426,17 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             layer.circle_filled(cur, 4.0, egui::Color32::WHITE);
             layer.circle_stroke(cur, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
         });
+        // eframe's contract: egui reports how long until it next needs to paint via the
+        // root viewport's `repaint_delay` (`Duration::MAX` == idle). Arm the next wake
+        // from it (perf-1) — this is what gives request_repaint_after teeth. Read before
+        // `shapes` is moved into `tessellate` below. A missing ROOT viewport (never
+        // happens in practice) falls back to ZERO, i.e. the old always-repaint behavior.
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::ZERO, |vo| vo.repaint_delay);
+        next_repaint_at =
+            wake::repaint_deadline(repaint_delay).and_then(|d| Instant::now().checked_add(d));
         let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         painter.paint_and_update_textures(
             [wp, hp],
@@ -1109,21 +1446,21 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         );
         egl.swap_buffers(display, surface).map_err(egl_err)?;
 
-        // 3. scan the new front buffer out — set_crtc on the first frame, page-flip
+        // 4. scan the new front buffer out — set_crtc on the first frame, page-flip
         //    after (waiting for the flip to complete before recycling buffers).
         let bo = unsafe {
             gbm_surface
                 .lock_front_buffer()
                 .map_err(|e| DrmError::Present(format!("lock_front_buffer: {e}")))?
         };
-        let (fb_depth, fb_bpp) = match gbm_format {
-            gbm::Format::Xrgb2101010 | gbm::Format::Argb2101010 => (30u32, 32u32),
-            gbm::Format::Rgb565 | gbm::Format::Bgr565 => (16, 16),
-            _ => (24, 32),
-        };
-        let fb = gbm
-            .add_framebuffer(&bo, fb_depth, fb_bpp)
-            .map_err(|e| DrmError::Present(format!("add_framebuffer: {e}")))?;
+        // perf-1: reuse the framebuffer already built for this buffer-object (the surface
+        // recycles a small ring of BOs; their `gbm_bo` pointers are stable), rather than
+        // add_framebuffer/rm_framebuffer every frame. The FB stays valid for the BO's
+        // lifetime and is destroyed with the rest at teardown.
+        let fb = wake::cached_or_try_insert(&mut fb_cache, bo.as_raw() as usize, || {
+            gbm.add_framebuffer(&bo, fb_depth, fb_bpp)
+                .map_err(|e| DrmError::Present(format!("add_framebuffer: {e}")))
+        })?;
         if prev.is_none() {
             // First frame: the atomic-modeset core lights every head onto this
             // framebuffer (each at its viewport) and blanks any unclaimed CRTC.
@@ -1149,17 +1486,22 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                 }
             }
         }
-        if let Some((prev_bo, prev_fb)) = prev.take() {
-            let _ = gbm.destroy_framebuffer(prev_fb);
+        // Release the previous scanout buffer back to the surface ring now that the flip
+        // to the new one has completed. Its framebuffer stays cached (keyed by the BO) for
+        // when the ring hands the same buffer-object back — no per-frame FB churn (perf-1).
+        if let Some(prev_bo) = prev.take() {
             drop(prev_bo);
         }
-        prev = Some((bo, fb));
+        prev = Some(bo);
     }
 
     // teardown (best-effort; the OS reclaims the rest on exit)
-    if let Some((bo, fb)) = prev.take() {
-        let _ = gbm.destroy_framebuffer(fb);
+    if let Some(bo) = prev.take() {
         drop(bo);
+    }
+    // Destroy the framebuffers cached across the surface's buffer-object ring (perf-1).
+    for (_, fb) in fb_cache {
+        let _ = gbm.destroy_framebuffer(fb);
     }
     painter.destroy();
     Ok(())
