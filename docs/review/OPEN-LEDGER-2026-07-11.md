@@ -13,7 +13,7 @@ the majority of in-scope findings; the OPEN set is dominated by the a11y cluster
 |---|---|---|---|---|
 | arch-2 (301) | mde-shell-egui/src/discovery.rs | OPEN | discovery.rs:45, session_rail.rs:37 | SessionRequest still defined 3× (broker + 2 shell mirrors); not folded into mackes-mesh-types |
 | arch-11 (401) | mde-shell-egui/src/ | OPEN | 91 Persist::open sites across src/ | no BusReader/BusClient seam exists; perf-3 fast-path (19737698) cut per-open cost but shared seam absent |
-| test-obs-7 (518) | .github/workflows/ci.yml | OPEN | repo root: no .config/nextest.toml | serial-only constraint still docs-only; no nextest override / serial_test landed |
+| test-obs-7 (518) | .config/nextest.toml | DONE | .config/nextest.toml | machine-enforced serial-process-env group for mackesd + mde-term-egui (nextest runner); CI keeps its explicit --test-threads=1 |
 | arch-10 (543) | mde-shell-egui/src/cloud_plane.rs | OPEN | cloud_plane.rs:1058 state_handle / :74 STATE_KEY | CloudPlaneState still parked in egui temp data store; not hoisted to Shell field |
 | perf-12 (552) | workspace-wide (measurement) | OPEN | no clippy::unwrap_used in mde-vdi-*/mde-bus | scoped panic-lint recommendation not applied (informational finding, low value) |
 | docs-consistency-10 (561) | docs/WORKLIST.md | OPEN | WORKLIST.md still 1,491,176 bytes | no docs/worklist-archive/ split; no line-length lint |

@@ -1,0 +1,33 @@
+# cargo-nextest configuration — machine-enforced serial execution for the
+# process-global-state test suites (test-obs-7 / EFF-18).
+#
+# WHY: the `mackesd` suite calls `std::env::set_var` (MDE_ROLE_PATH,
+# XDG_CACHE_HOME, CREDENTIALS_DIRECTORY, ...) while sibling tests READ the
+# environment. Under the default parallel harness these races corrupt glibc's
+# `environ` and the suite hangs indefinitely — so the whole crate MUST run
+# single-threaded. `mde-term-egui` has the same requirement for a different
+# reason (its tests drive a real PTY that must not be multiplexed).
+#
+# Until now this constraint lived only in `.github/workflows/ci.yml`
+# (`cargo test -p mackesd ... -- --test-threads=1`) and `CONTRIBUTING.md` —
+# tribal knowledge that farm agents have repeatedly tripped over (silent hangs
+# mid-`cargo test` on multi-core nodes). This file makes it machine-enforced for
+# anyone running `cargo nextest`: the serial group caps concurrency at one test
+# at a time within each listed package.
+#
+# NOTE: the repo's CI still runs `cargo test` (not nextest) and keeps its own
+# explicit `-- --test-threads=1`; this config is the standard-runner enforcement
+# the review's test-obs-7 asked for, and future-proofs a nextest migration.
+
+[test-groups]
+serial-process-env = { max-threads = 1 }
+
+# mackesd — env::set_var vs sibling env reads corrupt glibc `environ` in parallel.
+[[profile.default.overrides]]
+filter = 'package(mackesd)'
+test-group = 'serial-process-env'
+
+# mde-term-egui — real-PTY tests must not run concurrently.
+[[profile.default.overrides]]
+filter = 'package(mde-term-egui)'
+test-group = 'serial-process-env'
