@@ -1,7 +1,7 @@
 //! BOOKMARKS-8 — the mackesd **browser-policy worker** (fleet-wide governance of
 //! the browser + ad-blocker, ENFORCED mesh-side — not just in the UI).
 //!
-//! Builds on the landed [`super::adfilter`] worker (the ad-block stats the fleet
+//! Builds on the landed `adfilter` worker (the ad-block stats the fleet
 //! view surfaces) and the pure [`mde_adblock`] model, and adds the *governance*
 //! plane BOOKMARKS-7 deliberately left to a follow-on: an operator-authored
 //! [`BrowserPolicyDoc`] replicated over Syncthing, folded for **this node's role**,
@@ -9,14 +9,14 @@
 //!
 //! ## What this worker owns
 //!
-//! * **Policy replication** (the same substrate the [`super::adfilter`] +
-//!   [`super::bookmarks`] workers use). Every node writes ONLY its own
+//! * **Policy replication** (the same substrate the `adfilter` +
+//!   `bookmarks` workers use). Every node writes ONLY its own
 //!   `<share>/browser-policy/<node>/doc.json` (single-writer → Syncthing never
 //!   sees a write conflict) and *reads* every peer's doc, converging on the
 //!   **newest-authored** doc mesh-wide (a policy is a coherent singleton the
 //!   operator edits atomically, so whole-doc last-writer-wins is the merge).
 //! * **Per-role fold** ([`BrowserPolicyDoc::enforced_for`]). The converged doc is
-//!   folded for this box's [`crate::worker_role::role_name`] into an
+//!   folded for this box's `worker_role::role_name` into an
 //!   [`EnforcedPolicy`]: is the browser allowed on this role, is the ad-blocker
 //!   forced on (a one-way ratchet — the base or the role can force it, neither can
 //!   un-force it), the merged URL navigation allowlist, and the merged custom
@@ -45,16 +45,17 @@
 //!
 //! ## §6 / §7 posture — nothing faked
 //!
-//! Like [`super::adfilter`], this worker has no external transport to fake:
+//! Like `adfilter`, this worker has no external transport to fake:
 //! Syncthing does the replication out of band and the worker's job is real file
 //! I/O against the shared dir — it runs unchanged on a headless farm box. The one
 //! environmental condition is whether the canonical shared mount is present, the
-//! existing [`crate::shared_root_writable`] guard (AUDIT-MESH-15): when it is not,
+//! existing `shared_root_writable` guard (AUDIT-MESH-15): when it is not,
 //! the worker keeps its node-local doc + data and publishes an honest offline
 //! status, never a faked converge nor a write into a bare unprovisioned mount.
 //! Timestamps are injected (`now_fn`) so the model stays deterministic under test.
 
-#![cfg(feature = "async-services")]
+// arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
+// code; `mackesd` pulls it in only under its own `async-services` feature.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -65,7 +66,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
-use super::{ShutdownToken, Worker};
+use mde_worker_core::{ShutdownToken, Worker};
 
 /// Retained-latest topic prefix carrying this node's [`BrowserPolicyStatus`]
 /// (`state/browser-policy/<node>`).
@@ -165,7 +166,7 @@ pub struct BrowserPolicyDoc {
     #[serde(default = "RolePolicy::permissive")]
     pub default: RolePolicy,
     /// Per-role overrides, keyed by the canonical role name
-    /// ([`crate::worker_role::role_name`]: `lighthouse` / `workstation`).
+    /// (`worker_role::role_name`: `lighthouse` / `workstation`).
     #[serde(default)]
     pub roles: BTreeMap<String, RolePolicy>,
     /// When this doc was authored (unix ms) — the whole-doc LWW key the mesh
@@ -552,7 +553,7 @@ pub struct BrowserPolicyWorker {
 
 impl BrowserPolicyWorker {
     /// Construct with production defaults. `role` is the box's deployment role name
-    /// ([`crate::worker_role::role_name`]); `local_root` is a node-local durable dir
+    /// (`worker_role::role_name`); `local_root` is a node-local durable dir
     /// ([`resolve_local_root`]); `share_root` is the mesh workgroup root.
     #[must_use]
     pub fn new(node: String, role: String, local_root: PathBuf, share_root: PathBuf) -> Self {
@@ -623,7 +624,7 @@ impl BrowserPolicyWorker {
     /// wins when set; otherwise the AUDIT-MESH-15 canonical-mount guard.
     fn share_writable(&self) -> bool {
         self.share_gate.as_ref().map_or_else(
-            || crate::shared_root_writable(&self.share_root),
+            || mackes_mesh_types::mesh_storage::shared_root_writable(&self.share_root),
             |g| g.load(Ordering::SeqCst),
         )
     }

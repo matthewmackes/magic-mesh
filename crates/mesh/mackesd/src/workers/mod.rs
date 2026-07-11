@@ -159,11 +159,11 @@ pub mod adfilter;
 // sync + hides the surface but retains the node-local data (no destructive wipe).
 // Publishes state/browser-policy/<node> for the Workbench fleet view. No external
 // transport to fake — file I/O against the same share the adfilter worker uses.
-pub mod browser_policy;
-// BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
-// action/browser/passkey handoffs, persists pending challenges locally, mirrors
-// them into the Syncthing-backed workgroup root, and publishes honest pending or
-// error state without minting fake credentials.
+pub use mde_browser_workers::browser_policy; // arch-7: moved to mde-browser-workers
+                                             // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
+                                             // action/browser/passkey handoffs, persists pending challenges locally, mirrors
+                                             // them into the Syncthing-backed workgroup root, and publishes honest pending or
+                                             // error state without minting fake credentials.
 pub mod browser_passkeys;
 // BROWSER-DD-12 — Browser external-protocol owner. Drains
 // action/browser/protocol handoffs for external schemes Browser refused to
