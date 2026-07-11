@@ -1797,6 +1797,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             // guest pixel (vdi-vm-2). Read it before the immutable `texture` borrow
             // ends so `forward_input` can re-borrow `state` mutably.
             let desktop_px = texture.size();
+            // a11y-05 — the accessible description of the desktop about to paint,
+            // read off the retained request before the mutable re-borrow below.
+            let desktop_label = desktop_a11y_value(state);
             // Allocate the interactive body rect first, then paint the texture over
             // it, so the desktop both fills the panel and captures pointer input.
             let size = ui.available_size();
@@ -1806,6 +1809,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             if resp.clicked() {
                 resp.request_focus();
             }
+            // a11y-05 — the remote-desktop landmark (a named `Role::Group` region)
+            // so a screen reader announces which desktop is focused. Pure metadata.
+            install_desktop_accessibility(ui.ctx(), resp.id, desktop_label, rect);
             let desktop_size = (
                 u16::try_from(desktop_px[0]).unwrap_or(u16::MAX),
                 u16::try_from(desktop_px[1]).unwrap_or(u16::MAX),
@@ -2265,6 +2271,54 @@ fn build_desktop_status(
     }
 }
 
+// ── accesskit (a11y-05 / shell-ux-6) ─────────────────────────────────────────
+//
+// The live remote desktop is one raw-painted cell: [`vdi_panel`] allocates the
+// body rect (`Sense::click_and_drag`) and paints the guest framebuffer over it,
+// so egui auto-generates no accesskit node — a screen reader landing on the
+// Desktop surface heard nothing. The guest's OWN pixels are opaque to a host
+// reader (that is the guest OS's own a11y stack), but the shell can announce
+// the landmark: which remote desktop is focused, and that input routes into it.
+// This installs a `Role::Group` landmark on the desktop cell — a named region
+// (not a `Button`: a click focuses the desktop, it doesn't fire a discrete
+// action) carrying the connected-desktop description as its value.
+
+/// Convert an egui rect to an accesskit one (the shell-wide per-module helper).
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+/// The accessible description of the live desktop cell — the connected desktop's
+/// name + the chosen protocol from the retained request, so a screen reader
+/// announces which remote desktop is focused. Falls back to a plain "Connected
+/// desktop" when no request record is retained (a bus-driven session).
+fn desktop_a11y_value(state: &VdiState) -> String {
+    match state.requested.as_ref() {
+        Some(req) => format!("{} via {}", req.target.name, req.protocol.label()),
+        None => "Connected desktop".to_string(),
+    }
+}
+
+/// Install the live desktop cell's accesskit landmark node.
+fn install_desktop_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    value: impl Into<String>,
+    rect: egui::Rect,
+) {
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Group);
+        node.set_label("Remote desktop");
+        node.set_value(value.into());
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
 /// A small deterministic RGBA gradient standing in for a decoded desktop frame —
 /// the render test drives the upload + paint path without a live server.
 #[cfg(test)]
@@ -2321,6 +2375,22 @@ mod tests {
             drew,
             "the no-desktop BRAND-1 logo backdrop produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn desktop_a11y_value_names_the_connected_desktop_and_protocol() {
+        // Default (no retained request) reads the honest generic landmark value.
+        let mut state = VdiState::default();
+        assert_eq!(desktop_a11y_value(&state), "Connected desktop");
+        // With a picked connect, the landmark names the desktop + its protocol.
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("oak", "win11"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("oak"),
+        ));
+        assert_eq!(desktop_a11y_value(&state), "win11 via RDP");
     }
 
     #[test]
