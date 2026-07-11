@@ -4191,6 +4191,7 @@ dependencies = [
  "magic-fleet",
  "mde-adblock",
  "mde-bookmarks",
+ "mde-browser-workers",
  "mde-bus",
  "mde-chat",
  "mde-kdc-host",
@@ -4198,7 +4199,9 @@ dependencies = [
  "mde-role",
  "mde-theme",
  "mde-voice-config",
+ "mde-worker-core",
  "mdns-sd",
+ "p256",
  "rand 0.8.6",
  "rcgen",
  "reqwest",
@@ -4339,8 +4342,32 @@ name = "mde-bookmarks-egui"
 version = "12.0.0"
 dependencies = [
  "mde-bookmarks",
+ "mde-bus",
  "mde-egui",
+ "serde",
+ "serde_json",
+ "tempfile",
  "uuid 1.23.4",
+]
+
+[[package]]
+name = "mde-browser-workers"
+version = "12.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "dirs",
+ "mackes-mesh-types",
+ "mde-adblock",
+ "mde-bus",
+ "mde-worker-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4632,6 +4659,7 @@ version = "12.0.0"
 dependencies = [
  "base64",
  "mackes-mesh-types",
+ "mde-bookmarks-egui",
  "mde-bus",
  "mde-chat",
  "mde-cosmic-applet",
@@ -4646,14 +4674,18 @@ dependencies = [
  "mde-term-egui",
  "mde-theme",
  "mde-vdi-rdp",
+ "mde-vdi-spice",
  "mde-vdi-vnc",
  "mde-voice-egui",
  "mde-web-preview-client",
  "png 0.18.1",
  "qrcode",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "zbus 5.16.0",
 ]
 
@@ -4682,6 +4714,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-vdi-core"
+version = "12.0.0"
+dependencies = [
+ "mde-egui",
+]
+
+[[package]]
 name = "mde-vdi-rdp"
 version = "12.0.0"
 dependencies = [
@@ -4695,6 +4734,8 @@ dependencies = [
  "ironrdp-tls",
  "ironrdp-tokio",
  "mde-egui",
+ "mde-vdi-core",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
@@ -4704,6 +4745,7 @@ name = "mde-vdi-spice"
 version = "12.0.0"
 dependencies = [
  "mde-egui",
+ "mde-vdi-core",
  "spice-client",
  "tokio",
  "tracing",
@@ -4714,6 +4756,7 @@ name = "mde-vdi-vnc"
 version = "12.0.0"
 dependencies = [
  "mde-egui",
+ "mde-vdi-core",
 ]
 
 [[package]]
@@ -4768,6 +4811,15 @@ dependencies = [
 [[package]]
 name = "mde-web-wire"
 version = "12.0.0"
+
+[[package]]
+name = "mde-worker-core"
+version = "12.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "tokio",
+]
 
 [[package]]
 name = "mdns-sd"
