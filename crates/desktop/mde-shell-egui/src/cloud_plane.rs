@@ -1856,6 +1856,14 @@ fn render_instances_tab(ui: &mut egui::Ui, state: &mut CloudPlaneState) {
             }
         }
     });
+    // docs-consistency-8 — name this lens distinctly from the Fleet plane's raw
+    // per-node KVM view: these are OpenStack tenant *instances* (Nova), not the
+    // libvirt guests the Fleet plane lists per node as "VMs".
+    mde_egui::muted_note(
+        ui,
+        "OpenStack tenant instances (Nova). Raw per-node KVM guests live in the Fleet plane.",
+    );
+    ui.add_space(Style::SP_XS);
     if state.picker.open {
         render_launch_picker(ui, state);
         ui.add_space(Style::SP_S);

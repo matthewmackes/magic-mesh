@@ -730,6 +730,18 @@ impl DatacenterState {
             ui.add_space(Style::SP_S);
         }
 
+        // docs-consistency-8 — name this lens so it reads distinctly from the
+        // Cloud plane: the Fleet view is the raw per-node libvirt/KVM (and
+        // Podman) reality, NOT the OpenStack tenant cloud (whose Nova
+        // *instances* live in the Cloud plane). Same word discipline both ways:
+        // here a guest is a "VM"; in the Cloud plane it is an "instance".
+        mde_egui::muted_note(
+            ui,
+            "Raw per-node libvirt/KVM and Podman reality across the fleet. \
+             OpenStack tenant instances live in the Cloud plane.",
+        );
+        ui.add_space(Style::SP_XS);
+
         if nodes.is_empty() && browser.is_empty() {
             ui.add_space(Style::SP_S);
             ui.colored_label(Style::TEXT_DIM, "Waiting for KVM host health…");
