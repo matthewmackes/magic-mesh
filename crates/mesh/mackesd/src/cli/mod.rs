@@ -36,6 +36,7 @@ pub mod identity;
 pub mod images;
 pub mod import_legacy;
 pub mod inventory_legacy;
+pub mod join;
 pub mod leave;
 pub mod log_emit;
 pub mod mesh_firewall_plan;
