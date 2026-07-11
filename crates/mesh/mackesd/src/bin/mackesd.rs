@@ -3071,292 +3071,7 @@ fn run_serve(
 
         spawn_broker_terminal_workers(&mut sup, &worker_names, role_rank, &workgroup_root);
 
-        // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
-        // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
-        // `action/bookmarks/*` (add/edit/move/delete/add-folder/rename — minting
-        // real mde-bookmarks CRDT ops), writes this node's append-only op segment
-        // into the encrypted Syncthing share (`workgroup_root`, the same
-        // /mnt/mesh-storage substrate ssh-gossip/chat use), replay-merges every
-        // peer's segment into one converged collection, snapshot+prunes for
-        // bounded growth, and publishes `state/bookmarks/*`. Offline-first: edits
-        // apply to a node-local durable store immediately and auto-resume when the
-        // share reappears. No external transport to fake (§7) — the honest gate is
-        // `shared_root_writable`, published as an offline SyncStatus, never a faked
-        // converge. A desktop feature (Workstation tier); idles gracefully with no
-        // requests on a headless box.
-        if mackesd_core::worker_role::runs("bookmarks", role_rank) {
-            let local_root = mackesd_core::workers::bookmarks::resolve_local_root();
-            let user = mackesd_core::workers::bookmarks::resolve_user();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::bookmarks::BookmarksWorker::new(
-                    node_id.clone(),
-                    user,
-                    local_root,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("bookmarks".into());
-        }
-
-        // BOOKMARKS-7 — the mesh-wide ad-blocker worker (the Syncthing replication +
-        // leader compile behind the pure mde-adblock engine). Every node writes its
-        // own serialized filter-store blob into the encrypted Syncthing share
-        // (`workgroup_root`, the same /mnt/mesh-storage substrate bookmarks/ssh-gossip
-        // use) and LWW-merges every peer's into one converged store; the elected
-        // leader compiles that store into the shared engine blob the mde-web-preview
-        // browser reads + refreshes the enabled lists from an airgap-safe local mirror
-        // (honest Staleness fallback, never fabricated — §7). Drains
-        // action/adfilter/{allow,block} into the mesh-synced per-site allowlist
-        // (block-on-by-default) + publishes state/adfilter/<node>. Offline-first: the
-        // node-local store survives a down share, and nothing is written into a bare
-        // unprovisioned mount (`shared_root_writable`). A desktop feature (Workstation
-        // tier); idles gracefully on a headless box with no browser + no requests.
-        if mackesd_core::worker_role::runs("adfilter", role_rank) {
-            let local_root = mackesd_core::workers::adfilter::resolve_local_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::adfilter::AdfilterWorker::new(
-                    node_id.clone(),
-                    local_root,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("adfilter".into());
-        }
-
-        // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker (fleet
-        // governance ENFORCED mesh-side, not just in the UI). Every node writes its
-        // own operator-authored policy doc into the encrypted Syncthing share
-        // (`workgroup_root`, the same substrate the adfilter/bookmarks workers use)
-        // and converges on the newest-authored doc mesh-wide; it folds that doc for
-        // THIS node's deployment role and enforces at the browser launch/spawn seam
-        // — draining action/browser/{launch,navigate,set-adblock} to refuse a
-        // launch on a disallowed role, inject the forced ad-blocker + URL allowlist
-        // + custom lists on a granted launch, and reject out-of-policy navigate /
-        // adblock-off actions. Draining action/browser-policy/set authors the fleet
-        // policy. Disable stops the browser-data sync + hides the surface but
-        // retains the node-local data (no destructive wipe). Publishes
-        // state/browser-policy/<node> for the Workbench fleet view. Offline-first:
-        // the node-local doc + data survive a down share, and nothing is written
-        // into a bare unprovisioned mount (`shared_root_writable`). A desktop-
-        // governance feature (Workstation tier); idles gracefully on a headless box.
-        if mackesd_core::worker_role::runs("browser_policy", role_rank) {
-            let local_root = mackesd_core::workers::browser_policy::resolve_local_root();
-            let role = mackesd_core::worker_role::role_name(role_rank).to_string();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_policy::BrowserPolicyWorker::new(
-                    node_id.clone(),
-                    role,
-                    local_root,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_policy".into());
-        }
-
-        // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Browser
-        // publishes strict ceremony metadata to `action/browser/passkey`; this
-        // worker validates RP/origin/challenge shape, persists pending
-        // challenges locally, mirrors them into the Syncthing-backed workgroup
-        // root, and publishes honest pending/error state without minting fake
-        // credentials. A Workstation-tier browser security feature; it idles on
-        // headless boxes with no Browser publishes.
-        if mackesd_core::worker_role::runs("browser_passkeys", role_rank) {
-            let local_root = mackesd_core::workers::browser_passkeys::resolve_local_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_passkeys::BrowserPasskeysWorker::new(
-                    node_id.clone(),
-                    local_root,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_passkeys".into());
-        }
-
-        // BROWSER-DD-7 — the browser session-sync owner. The shell publishes
-        // deduped `action/browser/session-sync` snapshots for tabs/settings/
-        // downloads/speed-dial; this worker validates those restore-compatible
-        // JSON bodies, persists the latest local copy, and mirrors it into the
-        // Syncthing-backed workgroup root at
-        // browser-session-sync/<host>/latest.json. The file body stays the exact
-        // Browser snapshot shape so startup restore consumes it directly. A
-        // Workstation-tier browser feature; it idles on headless boxes with no
-        // Browser publishes and never writes into a missing canonical share.
-        if mackesd_core::worker_role::runs("browser_session_sync", role_rank) {
-            let local_root =
-                mackesd_core::workers::browser_session_sync::resolve_local_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_session_sync::BrowserSessionSyncWorker::new(
-                    node_id.clone(),
-                    local_root,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_session_sync".into());
-        }
-
-        // BROWSER-DD-11 — Browser read-aloud/TTS owner. The shell publishes
-        // bounded `action/browser/read-aloud` page-text requests; this worker
-        // validates them, invokes the configured offline TTS command when present
-        // (`MDE_BROWSER_TTS_COMMAND` / `MDE_TTS_COMMAND`), and publishes honest
-        // spoken/unavailable/error state. A Workstation-tier browser feature; it
-        // idles on headless boxes with no Browser publishes.
-        if mackesd_core::worker_role::runs("browser_read_aloud", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_read_aloud::BrowserReadAloudWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_read_aloud".into());
-        }
-
-        // BROWSER-DD-11 — Browser voice-command/dictation STT owner. The shell
-        // publishes active-tab context to `action/browser/voice-command`; this
-        // worker validates it, invokes the configured offline STT/capture command
-        // when present (`MDE_BROWSER_STT_COMMAND` / `MDE_STT_COMMAND`), emits a
-        // bounded transcript event, and publishes honest unavailable/error state.
-        if mackesd_core::worker_role::runs("browser_voice_command", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_voice_command::BrowserVoiceCommandWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_voice_command".into());
-        }
-
-        // BROWSER-DD-12 — Browser external-protocol owner. The shell refuses to
-        // navigate `mailto:`/`magnet:` URLs and publishes
-        // `action/browser/protocol`; this worker validates those handoffs and
-        // emits retained route status/events for Email/Transfers owners.
-        if mackesd_core::worker_role::runs("browser_protocol", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_protocol::BrowserProtocolWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_protocol".into());
-        }
-
-        // BROWSER-DD-12 — Browser platform-share owner. The shell publishes
-        // `action/browser/share` for Peer/Email/QR platform targets; this worker
-        // validates those handoffs and emits retained route status/events
-        // without faking downstream delivery.
-        if mackesd_core::worker_role::runs("browser_share", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_share::BrowserShareWorker::new(node_id.clone()),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_share".into());
-        }
-
-        // BROWSER-DD-12 — Browser private offline/mesh translation owner. The
-        // shell publishes bounded page text to `action/browser/translate`; this
-        // worker validates the private-only request, invokes the configured
-        // local/mesh translation command when present
-        // (`MDE_BROWSER_TRANSLATE_COMMAND` / `MDE_TRANSLATE_COMMAND`), emits a
-        // bounded result event, and publishes honest unavailable/error state.
-        if mackesd_core::worker_role::runs("browser_translate", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_translate::BrowserTranslateWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_translate".into());
-        }
-
-        // BROWSER-DD-12 — Browser offline/mesh cache owner. The shell publishes
-        // explicit private page snapshots to `action/browser/offline-cache`; this
-        // worker validates them, writes a local durable cache record, and mirrors
-        // it into the Syncthing-backed workgroup root. The browser helper remains
-        // no-store; the cache is daemon-owned and private to the mesh.
-        if mackesd_core::worker_role::runs("browser_offline_cache", role_rank) {
-            let local_root =
-                mackesd_core::workers::browser_offline_cache::resolve_local_root();
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_offline_cache::BrowserOfflineCacheWorker::new(
-                    node_id.clone(),
-                    local_root,
-                    workgroup_root.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_offline_cache".into());
-        }
-
-        // BROWSER-DD-12 — Browser CEF security-update status owner. It watches
-        // the packaged fast-update manifest plus the active CEF runtime and
-        // publishes an honest current/missing/mismatch posture for the
-        // independent browser-engine update path.
-        if mackesd_core::worker_role::runs("browser_security_update", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_security_update::BrowserSecurityUpdateWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_security_update".into());
-        }
-
-        // BROWSER-DD-12 — Browser idle-tab suspend owner. The shell already
-        // stops inactive helpers and publishes `action/browser/tab-suspend`;
-        // this worker validates those handoffs and publishes retained
-        // suspend status/events for diagnostics and future orchestration.
-        if mackesd_core::worker_role::runs("browser_tab_suspend", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::browser_tab_suspend::BrowserTabSuspendWorker::new(
-                    node_id.clone(),
-                ),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("browser_tab_suspend".into());
-        }
+        spawn_browser_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root);
 
         spawn_desktop_discovery_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root);
 
@@ -5597,6 +5312,300 @@ fn spawn_broker_terminal_workers(
             .lock()
             .expect("worker_names mutex")
             .push("pty_broker".into());
+    }
+}
+
+// run_serve round-3: the browser-worker spawn group (bookmarks + adfilter +
+// browser_policy + the BROWSER-DD-* CEF workers, now that arch-7 moved those
+// workers into mde-browser-workers, re-exported via workers/mod.rs). Extracted
+// VERBATIM — identical spawn order + `worker_names.push(...)` registrations +
+// role gates, so the WORKER_TIERS census + the ARCH-5 drift guard
+// (`worker_spawns_and_the_census_do_not_drift`) stay byte-identical.
+fn spawn_browser_workers(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    node_id: &String,
+    workgroup_root: &PathBuf,
+) {
+    use mackesd_core::workers::{RestartPolicy, Spawn};
+    // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
+    // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
+    // `action/bookmarks/*` (add/edit/move/delete/add-folder/rename — minting
+    // real mde-bookmarks CRDT ops), writes this node's append-only op segment
+    // into the encrypted Syncthing share (`workgroup_root`, the same
+    // /mnt/mesh-storage substrate ssh-gossip/chat use), replay-merges every
+    // peer's segment into one converged collection, snapshot+prunes for
+    // bounded growth, and publishes `state/bookmarks/*`. Offline-first: edits
+    // apply to a node-local durable store immediately and auto-resume when the
+    // share reappears. No external transport to fake (§7) — the honest gate is
+    // `shared_root_writable`, published as an offline SyncStatus, never a faked
+    // converge. A desktop feature (Workstation tier); idles gracefully with no
+    // requests on a headless box.
+    if mackesd_core::worker_role::runs("bookmarks", role_rank) {
+        let local_root = mackesd_core::workers::bookmarks::resolve_local_root();
+        let user = mackesd_core::workers::bookmarks::resolve_user();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::bookmarks::BookmarksWorker::new(
+                node_id.clone(),
+                user,
+                local_root,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("bookmarks".into());
+    }
+
+    // BOOKMARKS-7 — the mesh-wide ad-blocker worker (the Syncthing replication +
+    // leader compile behind the pure mde-adblock engine). Every node writes its
+    // own serialized filter-store blob into the encrypted Syncthing share
+    // (`workgroup_root`, the same /mnt/mesh-storage substrate bookmarks/ssh-gossip
+    // use) and LWW-merges every peer's into one converged store; the elected
+    // leader compiles that store into the shared engine blob the mde-web-preview
+    // browser reads + refreshes the enabled lists from an airgap-safe local mirror
+    // (honest Staleness fallback, never fabricated — §7). Drains
+    // action/adfilter/{allow,block} into the mesh-synced per-site allowlist
+    // (block-on-by-default) + publishes state/adfilter/<node>. Offline-first: the
+    // node-local store survives a down share, and nothing is written into a bare
+    // unprovisioned mount (`shared_root_writable`). A desktop feature (Workstation
+    // tier); idles gracefully on a headless box with no browser + no requests.
+    if mackesd_core::worker_role::runs("adfilter", role_rank) {
+        let local_root = mackesd_core::workers::adfilter::resolve_local_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::adfilter::AdfilterWorker::new(
+                node_id.clone(),
+                local_root,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("adfilter".into());
+    }
+
+    // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker (fleet
+    // governance ENFORCED mesh-side, not just in the UI). Every node writes its
+    // own operator-authored policy doc into the encrypted Syncthing share
+    // (`workgroup_root`, the same substrate the adfilter/bookmarks workers use)
+    // and converges on the newest-authored doc mesh-wide; it folds that doc for
+    // THIS node's deployment role and enforces at the browser launch/spawn seam
+    // — draining action/browser/{launch,navigate,set-adblock} to refuse a
+    // launch on a disallowed role, inject the forced ad-blocker + URL allowlist
+    // + custom lists on a granted launch, and reject out-of-policy navigate /
+    // adblock-off actions. Draining action/browser-policy/set authors the fleet
+    // policy. Disable stops the browser-data sync + hides the surface but
+    // retains the node-local data (no destructive wipe). Publishes
+    // state/browser-policy/<node> for the Workbench fleet view. Offline-first:
+    // the node-local doc + data survive a down share, and nothing is written
+    // into a bare unprovisioned mount (`shared_root_writable`). A desktop-
+    // governance feature (Workstation tier); idles gracefully on a headless box.
+    if mackesd_core::worker_role::runs("browser_policy", role_rank) {
+        let local_root = mackesd_core::workers::browser_policy::resolve_local_root();
+        let role = mackesd_core::worker_role::role_name(role_rank).to_string();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_policy::BrowserPolicyWorker::new(
+                node_id.clone(),
+                role,
+                local_root,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_policy".into());
+    }
+
+    // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Browser
+    // publishes strict ceremony metadata to `action/browser/passkey`; this
+    // worker validates RP/origin/challenge shape, persists pending
+    // challenges locally, mirrors them into the Syncthing-backed workgroup
+    // root, and publishes honest pending/error state without minting fake
+    // credentials. A Workstation-tier browser security feature; it idles on
+    // headless boxes with no Browser publishes.
+    if mackesd_core::worker_role::runs("browser_passkeys", role_rank) {
+        let local_root = mackesd_core::workers::browser_passkeys::resolve_local_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_passkeys::BrowserPasskeysWorker::new(
+                node_id.clone(),
+                local_root,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_passkeys".into());
+    }
+
+    // BROWSER-DD-7 — the browser session-sync owner. The shell publishes
+    // deduped `action/browser/session-sync` snapshots for tabs/settings/
+    // downloads/speed-dial; this worker validates those restore-compatible
+    // JSON bodies, persists the latest local copy, and mirrors it into the
+    // Syncthing-backed workgroup root at
+    // browser-session-sync/<host>/latest.json. The file body stays the exact
+    // Browser snapshot shape so startup restore consumes it directly. A
+    // Workstation-tier browser feature; it idles on headless boxes with no
+    // Browser publishes and never writes into a missing canonical share.
+    if mackesd_core::worker_role::runs("browser_session_sync", role_rank) {
+        let local_root = mackesd_core::workers::browser_session_sync::resolve_local_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_session_sync::BrowserSessionSyncWorker::new(
+                node_id.clone(),
+                local_root,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_session_sync".into());
+    }
+
+    // BROWSER-DD-11 — Browser read-aloud/TTS owner. The shell publishes
+    // bounded `action/browser/read-aloud` page-text requests; this worker
+    // validates them, invokes the configured offline TTS command when present
+    // (`MDE_BROWSER_TTS_COMMAND` / `MDE_TTS_COMMAND`), and publishes honest
+    // spoken/unavailable/error state. A Workstation-tier browser feature; it
+    // idles on headless boxes with no Browser publishes.
+    if mackesd_core::worker_role::runs("browser_read_aloud", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_read_aloud::BrowserReadAloudWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_read_aloud".into());
+    }
+
+    // BROWSER-DD-11 — Browser voice-command/dictation STT owner. The shell
+    // publishes active-tab context to `action/browser/voice-command`; this
+    // worker validates it, invokes the configured offline STT/capture command
+    // when present (`MDE_BROWSER_STT_COMMAND` / `MDE_STT_COMMAND`), emits a
+    // bounded transcript event, and publishes honest unavailable/error state.
+    if mackesd_core::worker_role::runs("browser_voice_command", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_voice_command::BrowserVoiceCommandWorker::new(
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_voice_command".into());
+    }
+
+    // BROWSER-DD-12 — Browser external-protocol owner. The shell refuses to
+    // navigate `mailto:`/`magnet:` URLs and publishes
+    // `action/browser/protocol`; this worker validates those handoffs and
+    // emits retained route status/events for Email/Transfers owners.
+    if mackesd_core::worker_role::runs("browser_protocol", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_protocol::BrowserProtocolWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_protocol".into());
+    }
+
+    // BROWSER-DD-12 — Browser platform-share owner. The shell publishes
+    // `action/browser/share` for Peer/Email/QR platform targets; this worker
+    // validates those handoffs and emits retained route status/events
+    // without faking downstream delivery.
+    if mackesd_core::worker_role::runs("browser_share", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_share::BrowserShareWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_share".into());
+    }
+
+    // BROWSER-DD-12 — Browser private offline/mesh translation owner. The
+    // shell publishes bounded page text to `action/browser/translate`; this
+    // worker validates the private-only request, invokes the configured
+    // local/mesh translation command when present
+    // (`MDE_BROWSER_TRANSLATE_COMMAND` / `MDE_TRANSLATE_COMMAND`), emits a
+    // bounded result event, and publishes honest unavailable/error state.
+    if mackesd_core::worker_role::runs("browser_translate", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_translate::BrowserTranslateWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_translate".into());
+    }
+
+    // BROWSER-DD-12 — Browser offline/mesh cache owner. The shell publishes
+    // explicit private page snapshots to `action/browser/offline-cache`; this
+    // worker validates them, writes a local durable cache record, and mirrors
+    // it into the Syncthing-backed workgroup root. The browser helper remains
+    // no-store; the cache is daemon-owned and private to the mesh.
+    if mackesd_core::worker_role::runs("browser_offline_cache", role_rank) {
+        let local_root = mackesd_core::workers::browser_offline_cache::resolve_local_root();
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_offline_cache::BrowserOfflineCacheWorker::new(
+                node_id.clone(),
+                local_root,
+                workgroup_root.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_offline_cache".into());
+    }
+
+    // BROWSER-DD-12 — Browser CEF security-update status owner. It watches
+    // the packaged fast-update manifest plus the active CEF runtime and
+    // publishes an honest current/missing/mismatch posture for the
+    // independent browser-engine update path.
+    if mackesd_core::worker_role::runs("browser_security_update", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_security_update::BrowserSecurityUpdateWorker::new(
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_security_update".into());
+    }
+
+    // BROWSER-DD-12 — Browser idle-tab suspend owner. The shell already
+    // stops inactive helpers and publishes `action/browser/tab-suspend`;
+    // this worker validates those handoffs and publishes retained
+    // suspend status/events for diagnostics and future orchestration.
+    if mackesd_core::worker_role::runs("browser_tab_suspend", role_rank) {
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::browser_tab_suspend::BrowserTabSuspendWorker::new(
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("browser_tab_suspend".into());
     }
 }
 
