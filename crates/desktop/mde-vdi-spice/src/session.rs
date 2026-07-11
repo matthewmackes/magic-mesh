@@ -95,22 +95,32 @@ impl SpiceSession {
 
     // ── Decode side (fed by the transport or by tests) ──────────────────────
 
-    /// Fold a `spice-client` decoded display surface into the desktop and mark it
-    /// dirty. This is the exact entry point the live display-channel pump feeds
-    /// ([`crate::connect`]); a test feeds a synthetic [`DisplaySurface`] (its
-    /// fields are public) so the connect→frame seam is proven without a server.
+    /// Fold a `spice-client` decoded display surface into the desktop, marking it
+    /// dirty **only if the surface actually changed the framebuffer**. This is the
+    /// exact entry point the live display-channel pump feeds ([`crate::connect`]);
+    /// a test feeds a synthetic [`DisplaySurface`] (its fields are public) so the
+    /// connect→frame seam is proven without a server.
+    ///
+    /// Returns `true` when the desktop changed (a new [`SpiceSession::frame`] is
+    /// now available), `false` when the decoded surface was byte-identical to the
+    /// one already shown — in which case nothing is dirtied and no re-upload is
+    /// warranted. A changed frame therefore always uploads; an unchanged repaint
+    /// never does.
     ///
     /// # Errors
     /// [`FramebufferError`] for a zero-dimension or truncated surface — a
     /// malformed surface degrades rather than panicking.
-    pub fn apply_surface(&mut self, surface: &DisplaySurface) -> Result<(), FramebufferError> {
+    pub fn apply_surface(&mut self, surface: &DisplaySurface) -> Result<bool, FramebufferError> {
         let w = surface.width as usize;
         let h = surface.height as usize;
         let format = SurfaceFormat::from_tag(surface.format);
-        self.framebuffer
+        let changed = self
+            .framebuffer
             .apply_surface(w, h, format, &surface.data)?;
-        self.dirty = true;
-        Ok(())
+        if changed {
+            self.dirty = true;
+        }
+        Ok(changed)
     }
 
     /// The latest desktop as an [`egui::ColorImage`], or `None` if nothing changed
@@ -229,6 +239,40 @@ mod tests {
         assert_eq!(img.pixels[0], Color32::from_rgb(0xFF, 0, 0), "red pixel");
         assert_eq!(img.pixels[1], Color32::from_rgb(0, 0, 0), "black pixel");
         assert!(s.frame().is_none(), "no further change");
+    }
+
+    #[test]
+    fn an_identical_surface_does_not_produce_a_new_frame() {
+        // The dirty-check at the session seam: re-decoding the same desktop must
+        // NOT dirty the session, so the shell does not re-upload an unchanged
+        // texture. `apply_surface` reports the change (`true`/`false`) too.
+        let mut s = session();
+        let _ = s.frame(); // consume the initial black frame
+        let px = [0x10, 0x20, 0x30, 0xFF];
+        assert!(
+            s.apply_surface(&surface(4, 4, px)).expect("first surface"),
+            "first surface is a change"
+        );
+        assert!(s.frame().is_some(), "a changed surface yields a frame");
+
+        assert!(
+            !s.apply_surface(&surface(4, 4, px))
+                .expect("identical surface"),
+            "an identical surface reports no change"
+        );
+        assert!(
+            s.frame().is_none(),
+            "an identical surface must not produce a new frame (no re-upload)"
+        );
+
+        // A genuine change after the skipped repaint still uploads.
+        assert!(s
+            .apply_surface(&surface(4, 4, [0xAA, 0xBB, 0xCC, 0xFF]))
+            .expect("changed surface"));
+        assert!(
+            s.frame().is_some(),
+            "a changed frame after a skip must always upload"
+        );
     }
 
     #[test]

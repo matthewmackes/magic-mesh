@@ -114,22 +114,21 @@ impl SpiceTransport {
     }
 
     /// Pull the display channel's latest decoded primary surface and fold it into
-    /// `session`. Returns `true` if a surface was applied (a new frame is now
-    /// available via [`SpiceSession::frame`]), `false` if the channel has no
-    /// surface yet.
+    /// `session`. Returns `true` only if the desktop actually **changed** (a new
+    /// frame is now available via [`SpiceSession::frame`]), `false` if the channel
+    /// has no surface yet **or** the polled surface is byte-identical to the one
+    /// already shown — the dirty-check ([`SpiceSession::apply_surface`]) so a
+    /// static desktop costs no normalise/copy and no texture upload.
     ///
     /// # Errors
     /// [`ConnectError::Surface`] if the decoded surface is malformed.
     pub async fn pump_frame(&self, session: &mut SpiceSession) -> Result<bool, ConnectError> {
-        match self.client.get_display_surface(PRIMARY_CHANNEL).await {
-            Some(surface) => {
-                session
-                    .apply_surface(&surface)
-                    .map_err(ConnectError::Surface)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        let Some(surface) = self.client.get_display_surface(PRIMARY_CHANNEL).await else {
+            return Ok(false);
+        };
+        session
+            .apply_surface(&surface)
+            .map_err(ConnectError::Surface)
     }
 
     /// Drain the session's queued input intents onto the SPICE inputs channel.
@@ -186,6 +185,73 @@ impl SpiceTransport {
     }
 }
 
+/// Adaptive poll cadence for the blocking pump.
+///
+/// The original transport slept a fixed 50 ms before *every* poll — a hard 20 fps
+/// ceiling and a ≥50 ms input-to-frame latency floor. This paces the poll
+/// instead: snap to the short [`PumpPace::ACTIVE`] interval whenever the desktop
+/// is repainting (or input was just sent), and geometrically back off toward
+/// [`PumpPace::IDLE_CAP`] while it is static — so a live desktop is responsive
+/// without a busy-spin over a quiet one. The idle cap is exactly the old 50 ms
+/// sleep, so a resumed poll is never *slower* than the pre-change transport; the
+/// pacing only ever lowers latency.
+///
+/// Pure and unit-tested: [`BlockingSpiceTransport::pump_frame`] just threads
+/// [`PumpPace::interval`] into `tokio::time::sleep` and feeds the poll's
+/// changed/unchanged outcome back through [`PumpPace::observe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PumpPace {
+    interval: std::time::Duration,
+}
+
+impl PumpPace {
+    /// The fast cadence while the desktop is actively changing (~125 Hz) — the
+    /// latency floor a live, interactive desktop settles to.
+    const ACTIVE: std::time::Duration = std::time::Duration::from_millis(8);
+    /// The slow cadence a static desktop backs off to (~20 Hz). Equal to the old
+    /// fixed sleep, so an idle poll is never slower than the pre-change transport.
+    const IDLE_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Start fast, so the first frame and any freshly-sent input are picked up
+    /// promptly.
+    const fn new() -> Self {
+        Self {
+            interval: Self::ACTIVE,
+        }
+    }
+
+    /// The interval to sleep before the next poll.
+    const fn interval(self) -> std::time::Duration {
+        self.interval
+    }
+
+    /// Fold in whether the last poll produced a *changed* frame.
+    fn observe(&mut self, changed: bool) {
+        self.interval = Self::next_interval(self.interval, changed);
+    }
+
+    /// Freshly-sent input means an imminent repaint — poll fast for it so input
+    /// latency does not pay the idle back-off.
+    const fn quicken(&mut self) {
+        self.interval = Self::ACTIVE;
+    }
+
+    /// The pure pacing decision (unit-tested): a change snaps to [`Self::ACTIVE`];
+    /// otherwise the interval doubles but is clamped to [`Self::IDLE_CAP`].
+    #[must_use]
+    fn next_interval(prev: std::time::Duration, changed: bool) -> std::time::Duration {
+        if changed {
+            return Self::ACTIVE;
+        }
+        let grown = prev.saturating_mul(2);
+        if grown > Self::IDLE_CAP {
+            Self::IDLE_CAP
+        } else {
+            grown
+        }
+    }
+}
+
 /// A blocking facade over [`SpiceTransport`].
 ///
 /// It owns a small current-thread tokio runtime so the sync egui shell (the
@@ -195,6 +261,8 @@ pub struct BlockingSpiceTransport {
     runtime: tokio::runtime::Runtime,
     transport: SpiceTransport,
     event_loop: tokio::task::JoinHandle<()>,
+    /// Adaptive poll cadence — replaces the old fixed 50 ms sleep.
+    pace: PumpPace,
 }
 
 impl BlockingSpiceTransport {
@@ -217,25 +285,40 @@ impl BlockingSpiceTransport {
             runtime,
             transport,
             event_loop,
+            pace: PumpPace::new(),
         })
     }
 
     /// Pump one frame (blocking). See [`SpiceTransport::pump_frame`].
     ///
+    /// Sleeps the current adaptive [`PumpPace`] interval before polling (short
+    /// while the desktop is live, backing off to the old 50 ms cap while it is
+    /// static) instead of the old blind fixed 50 ms — lifting the hard 20 fps
+    /// ceiling and the input-to-frame latency floor without busy-spinning. The
+    /// poll's changed/unchanged outcome re-paces the next call.
+    ///
     /// # Errors
     /// Propagates [`SpiceTransport::pump_frame`].
     pub fn pump_frame(&mut self, session: &mut SpiceSession) -> Result<bool, ConnectError> {
-        self.runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let interval = self.pace.interval();
+        let changed = self.runtime.block_on(async {
+            tokio::time::sleep(interval).await;
             self.transport.pump_frame(session).await
-        })
+        })?;
+        self.pace.observe(changed);
+        Ok(changed)
     }
 
     /// Flush queued input (blocking). See [`SpiceTransport::flush_input`].
     ///
+    /// Freshly-sent input implies an imminent repaint, so this also quickens the
+    /// pump pace — the next poll runs at the fast cadence rather than paying the
+    /// idle back-off, keeping input-to-frame latency low even after a quiet spell.
+    ///
     /// # Errors
     /// Propagates [`SpiceTransport::flush_input`].
     pub fn flush_input(&mut self, session: &mut SpiceSession) -> Result<(), ConnectError> {
+        self.pace.quicken();
         self.runtime.block_on(self.transport.flush_input(session))
     }
 }
@@ -248,13 +331,72 @@ impl Drop for BlockingSpiceTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{spice_button, MouseButton};
+    use super::{spice_button, MouseButton, PumpPace};
     use spice_client::MouseButton as SpiceMouseButton;
+    use std::time::Duration;
 
     #[test]
     fn buttons_map_to_spice() {
         assert_eq!(spice_button(MouseButton::Left), SpiceMouseButton::Left);
         assert_eq!(spice_button(MouseButton::Right), SpiceMouseButton::Right);
         assert_eq!(spice_button(MouseButton::Middle), SpiceMouseButton::Middle);
+    }
+
+    #[test]
+    fn pace_starts_fast_and_is_faster_than_the_old_fixed_sleep() {
+        // The whole point: the live cadence lifts the old hard 20 fps / 50 ms
+        // floor, and the pump begins fast so the first paint is picked up promptly.
+        assert_eq!(PumpPace::new().interval(), PumpPace::ACTIVE);
+        assert!(PumpPace::ACTIVE < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn pace_decision_is_a_pure_function() {
+        // A change always snaps to the fast cadence, from any prior interval.
+        assert_eq!(
+            PumpPace::next_interval(PumpPace::IDLE_CAP, true),
+            PumpPace::ACTIVE
+        );
+        assert_eq!(
+            PumpPace::next_interval(PumpPace::ACTIVE, true),
+            PumpPace::ACTIVE
+        );
+        // An idle poll grows the interval geometrically...
+        let grown = PumpPace::next_interval(PumpPace::ACTIVE, false);
+        assert!(grown > PumpPace::ACTIVE && grown <= PumpPace::IDLE_CAP);
+        // ...but is clamped to the idle cap and never past it.
+        assert_eq!(
+            PumpPace::next_interval(PumpPace::IDLE_CAP, false),
+            PumpPace::IDLE_CAP
+        );
+        // The idle cadence never regresses past the old fixed 50 ms floor.
+        assert!(PumpPace::next_interval(PumpPace::IDLE_CAP, false) <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn pace_observe_backs_off_when_idle_and_snaps_back_on_change() {
+        let mut p = PumpPace::new();
+        assert_eq!(p.interval(), PumpPace::ACTIVE);
+        // Many idle polls settle at the cap (never a busy-spin, never past 50 ms).
+        for _ in 0..12 {
+            p.observe(false);
+        }
+        assert_eq!(p.interval(), PumpPace::IDLE_CAP);
+        // A changed frame snaps the cadence back to fast immediately.
+        p.observe(true);
+        assert_eq!(p.interval(), PumpPace::ACTIVE);
+    }
+
+    #[test]
+    fn pace_quicken_protects_input_latency_after_idle() {
+        // After backing off to idle, sending input must restore the fast cadence
+        // so the input's repaint is not gated by the idle back-off.
+        let mut p = PumpPace::new();
+        for _ in 0..12 {
+            p.observe(false);
+        }
+        assert_eq!(p.interval(), PumpPace::IDLE_CAP);
+        p.quicken();
+        assert_eq!(p.interval(), PumpPace::ACTIVE);
     }
 }

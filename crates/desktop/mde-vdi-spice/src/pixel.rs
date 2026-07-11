@@ -106,6 +106,29 @@ impl core::fmt::Display for FramebufferError {
 
 impl std::error::Error for FramebufferError {}
 
+/// FNV-1a 64 over a byte slice — the change-detector fingerprint a decoded
+/// surface is hashed to so an unchanged repaint is dropped before it costs a
+/// full-surface normalise/copy + a texture upload (see
+/// [`Framebuffer::apply_surface`]). Cheap (one streaming pass, no allocation) and
+/// the same hash the live proof records as pixel evidence; a 64-bit collision on
+/// two genuinely different frames is astronomically unlikely, so a false "no
+/// change" (a dropped frame) is not a practical risk.
+#[inline]
+#[must_use]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The identity of the last surface folded in: `(width, height, format, hash)`.
+/// A decoded surface with the same tuple leaves the desktop pixel-identical, so
+/// [`Framebuffer::apply_surface`] skips the copy and reports "no change".
+type SurfaceSignature = (usize, usize, SurfaceFormat, u64);
+
 /// A persistent RGBA8 desktop surface the display channel's frames accumulate
 /// into.
 ///
@@ -113,13 +136,19 @@ impl std::error::Error for FramebufferError {}
 /// is a direct hand-off to egui. Construct it once at the negotiated desktop
 /// size; replace it whole from each decoded surface with
 /// [`Framebuffer::apply_surface`] (SPICE hands the display channel a whole
-/// primary surface, not the RFB-style sub-rectangles VNC accumulates).
+/// primary surface, not the RFB-style sub-rectangles VNC accumulates). The
+/// `rgba` backing is reused across every same-size frame (only a resize
+/// reallocates), and each apply is fingerprinted so an unchanged repaint costs
+/// only the hash — no copy, no egui image, no upload.
 #[derive(Clone)]
 pub struct Framebuffer {
     width: usize,
     height: usize,
     /// Tightly packed RGBA8, exactly `width * height * 4` bytes.
     rgba: Vec<u8>,
+    /// Fingerprint of the surface currently stored, or `None` before the first
+    /// [`Framebuffer::apply_surface`] (the constructed opaque-black desktop).
+    signature: Option<SurfaceSignature>,
 }
 
 impl Framebuffer {
@@ -139,6 +168,7 @@ impl Framebuffer {
             width,
             height,
             rgba,
+            signature: None,
         }
     }
 
@@ -167,6 +197,13 @@ impl Framebuffer {
     /// unit tests drive — the surface `spice-client` decodes is already the whole
     /// primary framebuffer, so there is no sub-rectangle blit to accumulate.
     ///
+    /// Returns `true` if the desktop actually changed (the caller must mark the
+    /// framebuffer dirty and re-upload), `false` if the decoded surface is
+    /// byte-identical to the one already stored — in which case the whole-surface
+    /// normalise/copy is skipped and no texture upload is warranted. The `rgba`
+    /// backing is reused in place for every same-size frame; only a resize
+    /// reallocates.
+    ///
     /// # Errors
     /// [`FramebufferError`] if a dimension is zero or `src` is shorter than
     /// `w * h * 4` — a malformed surface degrades rather than panicking.
@@ -176,7 +213,7 @@ impl Framebuffer {
         h: usize,
         format: SurfaceFormat,
         src: &[u8],
-    ) -> Result<(), FramebufferError> {
+    ) -> Result<bool, FramebufferError> {
         let bpp = SurfaceFormat::BYTES_PER_PIXEL;
         if w == 0 || h == 0 {
             return Err(FramebufferError::EmptySurface { size: (w, h) });
@@ -187,6 +224,13 @@ impl Framebuffer {
                 got: src.len(),
                 need,
             });
+        }
+        // Fingerprint the source before touching the stored buffer: an unchanged
+        // repaint (same size, format, and bytes) leaves the desktop identical, so
+        // it costs only this hash — no copy, no egui image, no upload.
+        let signature: SurfaceSignature = (w, h, format, fnv1a64(&src[..need]));
+        if self.signature == Some(signature) {
+            return Ok(false);
         }
         if self.width != w || self.height != h {
             self.width = w;
@@ -202,7 +246,8 @@ impl Framebuffer {
             let px = [s[0], s[1], s[2], s[3]];
             d.copy_from_slice(&format.to_rgba(px));
         }
-        Ok(())
+        self.signature = Some(signature);
+        Ok(true)
     }
 
     /// Convert the current surface into an [`egui::ColorImage`] for upload to a
@@ -321,5 +366,92 @@ mod tests {
             .apply_surface(4, 4, SurfaceFormat::Rgba, &too_small)
             .expect_err("must reject");
         assert!(matches!(err, FramebufferError::ShortSource { .. }));
+    }
+
+    #[test]
+    fn first_apply_changes_then_an_identical_repaint_is_skipped() {
+        // The core dirty-check: the first surface changes the desktop, but a
+        // byte-identical repaint reports "no change" so the caller can skip the
+        // texture upload entirely.
+        let mut fb = Framebuffer::new(2, 1);
+        let src = [
+            0xFF, 0x00, 0x00, 0xFF, // red
+            0x00, 0x00, 0xFF, 0xFF, // blue
+        ];
+        assert!(
+            fb.apply_surface(2, 1, SurfaceFormat::Rgba, &src)
+                .expect("first surface"),
+            "first surface must register as a change"
+        );
+        assert!(
+            !fb.apply_surface(2, 1, SurfaceFormat::Rgba, &src)
+                .expect("identical repaint"),
+            "an identical repaint must report no change (no re-upload)"
+        );
+        // The desktop is still the applied frame after the skipped repaint.
+        assert_eq!(fb.to_color_image().pixels[0], Color32::from_rgb(0xFF, 0, 0));
+    }
+
+    #[test]
+    fn a_differing_frame_registers_a_change() {
+        let mut fb = Framebuffer::new(1, 1);
+        assert!(fb
+            .apply_surface(1, 1, SurfaceFormat::Rgba, &[0xFF, 0x00, 0x00, 0xFF])
+            .expect("red"));
+        // One byte different → a real change, never skipped.
+        assert!(
+            fb.apply_surface(1, 1, SurfaceFormat::Rgba, &[0x00, 0xFF, 0x00, 0xFF])
+                .expect("green"),
+            "a changed pixel must register as a change"
+        );
+        assert_eq!(fb.to_color_image().pixels[0], Color32::from_rgb(0, 0xFF, 0));
+    }
+
+    #[test]
+    fn same_size_frames_reuse_the_rgba_allocation() {
+        // A same-size change must reuse the backing buffer in place, never
+        // reallocate — a live desktop is not per-frame allocation churn.
+        let mut fb = Framebuffer::new(2, 2);
+        let first = vec![0x11u8; 2 * 2 * 4];
+        assert!(fb
+            .apply_surface(2, 2, SurfaceFormat::Rgba, &first)
+            .expect("a"));
+        let ptr_before = fb.rgba_bytes().as_ptr();
+        let second = vec![0x22u8; 2 * 2 * 4];
+        assert!(fb
+            .apply_surface(2, 2, SurfaceFormat::Rgba, &second)
+            .expect("b"));
+        assert_eq!(
+            ptr_before,
+            fb.rgba_bytes().as_ptr(),
+            "a same-size frame must reuse the RGBA backing, not reallocate"
+        );
+    }
+
+    #[test]
+    fn a_repaint_at_a_new_size_registers_a_change() {
+        // Resizing away from and back to a size must not be mistaken for "no
+        // change" — the signature carries the dimensions, so identical bytes at a
+        // different size still repaint.
+        let mut fb = Framebuffer::new(2, 2);
+        let two = vec![0x00u8; 2 * 2 * 4];
+        assert!(fb
+            .apply_surface(2, 2, SurfaceFormat::Rgba, &two)
+            .expect("2x2"));
+        let four = vec![0x00u8; 4 * 4 * 4];
+        assert!(
+            fb.apply_surface(4, 4, SurfaceFormat::Rgba, &four)
+                .expect("4x4"),
+            "a resize is always a change"
+        );
+        assert_eq!(fb.size(), [4, 4]);
+    }
+
+    #[test]
+    fn fnv1a64_separates_content() {
+        // The change-detector must distinguish a one-byte difference.
+        assert_ne!(super::fnv1a64(&[0u8; 4]), super::fnv1a64(&[0, 0, 0, 1]));
+        // Deterministic for identical input.
+        assert_eq!(super::fnv1a64(b"quasar"), super::fnv1a64(b"quasar"));
     }
 }
