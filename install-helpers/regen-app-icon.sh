@@ -18,7 +18,6 @@
 # Regenerates (PIL LANCZOS — the same method that cut the official rasters):
 #   * assets/brand/quasar/app-icon-<N>.png   N = 16 22 24 32 48 64 128 256 512
 #   * assets/brand/app-icon.png              (512² brand master)
-#   * assets/brand/monogram.png              (256² monogram / Plymouth watermark)
 #   * assets/brand/favicon.ico               (real multi-res .ico: 16+32+48)
 # Requires python3 + Pillow (PIL).
 set -euo pipefail
@@ -69,10 +68,6 @@ for n in sizes:
 
 dst = os.path.join(brand, "app-icon.png")
 crops[512].save(dst, "PNG", optimize=True)
-print(f"wrote {dst}")
-
-dst = os.path.join(brand, "monogram.png")
-crops[256].save(dst, "PNG", optimize=True)
 print(f"wrote {dst}")
 
 # Multi-res favicon from the 16/32/48 crops (not one image auto-resized).

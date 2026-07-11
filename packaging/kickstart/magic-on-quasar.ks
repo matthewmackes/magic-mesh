@@ -149,7 +149,7 @@ if [ "$HEADLESS" = 1 ]; then
   # display-less box (incl. a headless *Workstation* role, mde.headless) never
   # targets graphical or lights a user surface. Re-roling later is the documented
   # unmask + set-default graphical.target — no reinstall (§5).
-  systemctl mask mde-shell-egui.service magic-mesh-brand.service || true
+  systemctl mask mde-shell-egui.service || true
   systemctl --global mask mde-musicd.service || true
   systemctl set-default multi-user.target || true
 else
@@ -157,7 +157,7 @@ else
   # enabled mde-shell-egui.service + podman.socket (45-mcnf-quasar.preset) and set
   # graphical.target; re-assert for symmetry with the headless branch and to stay
   # correct after a factory `systemctl preset-all`.
-  systemctl unmask mde-shell-egui.service magic-mesh-brand.service || true
+  systemctl unmask mde-shell-egui.service || true
   systemctl enable mde-shell-egui.service podman.socket || true
   systemctl set-default graphical.target || true
 fi
@@ -175,7 +175,7 @@ manager, no compositor.
 
   Workstation (seat):  boots straight into the egui shell.
   Headless / Server / Lighthouse: mesh daemons only. Re-role to a seat with
-        systemctl unmask mde-shell-egui.service magic-mesh-brand.service
+        systemctl unmask mde-shell-egui.service
         systemctl set-default graphical.target
         mackesd role-pin workstation        # no reinstall, §5
 

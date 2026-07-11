@@ -69,7 +69,7 @@ grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \
-         magic-setup.service magic-mesh-brand.service mesh-health.timer \
+         magic-setup.service mesh-health.timer \
          cloud-init-local.service cloud-init.service cloud-config.service \
          cloud-final.service qemu-guest-agent.service openvswitch.service; do
     state="$(systemctl is-enabled "$u" 2>/dev/null || true)"

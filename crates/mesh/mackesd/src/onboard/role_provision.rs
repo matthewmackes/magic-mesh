@@ -48,8 +48,8 @@ pub struct PlannedUnit {
 ///   timer (a unit test pins that superset relationship).
 /// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell, the
 ///   voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
-///   worker's tier), the Chromium/CEF + optional Widevine/Browser-TTS/STT/
-///   translation runtime setup gates, and the one-way Carbon desktop branding.
+///   worker's tier), and the Chromium/CEF + optional Widevine/Browser-TTS/STT/
+///   translation runtime setup gates.
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
@@ -58,7 +58,7 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("syncthing.service", 0),
     ("mesh-health.timer", 0),
     ("mesh-status.timer", 0),
-    // ── Rank 1 — Workstation-only: the voice stack + desktop branding.
+    // ── Rank 1 — Workstation-only: the DRM-seat shell + voice/browser stack.
     ("mde-shell-egui.service", 1),
     ("kamailio-mde.service", 1),
     ("rtpengine-mde.service", 1),
@@ -67,7 +67,6 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("mde-browser-tts-voice-setup.service", 1),
     ("mde-browser-stt-model-setup.service", 1),
     ("mde-browser-translate-model-setup.service", 1),
-    ("magic-mesh-brand.service", 1),
 ];
 
 /// The pure role→unit-actions mapping.
@@ -227,7 +226,6 @@ mod tests {
             "mde-browser-tts-voice-setup.service",
             "mde-browser-stt-model-setup.service",
             "mde-browser-translate-model-setup.service",
-            "magic-mesh-brand.service",
         ] {
             assert_eq!(
                 action_for(&p, u).action,
@@ -1055,10 +1053,6 @@ mod tests {
                 include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service"),
             ),
             (
-                "magic-mesh-brand.service",
-                include_str!("../../../../../packaging/systemd/magic-mesh-brand.service"),
-            ),
-            (
                 "mde-musicd.service",
                 include_str!("../../../../../packaging/systemd/mde-musicd.service"),
             ),
@@ -1210,11 +1204,11 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the 9 Workstation units.
+        // Lighthouse masks exactly the 8 Workstation units.
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            9,
-            "lighthouse masks the rank-1 shell + voice + browser runtime/CDM/TTS/STT/translate + brand units"
+            8,
+            "lighthouse masks the rank-1 shell + voice + browser runtime/CDM/TTS/STT/translate units"
         );
     }
 

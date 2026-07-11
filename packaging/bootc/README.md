@@ -78,7 +78,7 @@ The image enables **`mde-shell-egui.service`** (new, this directory) +
 post-install's all-roles set: `mackesd.service`, `nebula.service` (+ the
 `nebula.service.d/10-mesh-recovery.conf` drop-in), `mesh-health.timer`,
 `mesh-status.timer`, `magic-setup.service` (first-run wizard),
-`magic-mesh-brand.service`, the first-boot fetch oneshots
+the first-boot fetch oneshots
 (`mesh-shell-setup` / `mesh-broker-setup` / `mesh-netdata-setup`) and the
 `mde-musicd.service` user unit. `etcd.service` + `syncthing.service` ship
 condition-gated (they only start where `setup-etcd.sh` /
@@ -104,7 +104,7 @@ Nothing is masked by default — **every role boots this same image**:
   that must never light a seat):
 
   ```sh
-  systemctl mask mde-shell-egui.service magic-mesh-brand.service
+  systemctl mask mde-shell-egui.service
   systemctl --global mask mde-musicd.service
   systemctl set-default multi-user.target
   ```
@@ -162,7 +162,7 @@ alongside the RPM channel publish (/release).
   live with an RFC-2606 `.invalid` registry → `GATED[E12-13/base-image]`,
   rc 3.
 - Every doctrine claim grep-verified at source: role regex ≡
-  `magic-mesh-brand.service`; bus/workgroup env pins ≡ `mackesd.service`;
+  `mde-shell-egui.service`; bus/workgroup env pins ≡ `mackesd.service`;
   the enabled-unit set ≡ the RPM `post_install_script`; tmpfiles + `/etc`
   unit + `.repo` destinations ≡ the `generate-rpm` assets.
 

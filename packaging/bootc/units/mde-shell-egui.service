@@ -15,8 +15,8 @@
 #   * workstation      — ExecCondition passes → shell on the seat.
 #   * lighthouse/headless — ExecCondition fails → clean skip (exit 0, no seat).
 #     Hard-off (Option 1 masking, belt-and-braces): systemctl mask mde-shell-egui.service
-# The typed role-gate mirrors magic-mesh-brand.service exactly, so the two
-# Workstation-gated units can never disagree about what "workstation" means.
+# The typed role-gate is shared with every rank-1 Workstation unit, so they can
+# never disagree about what "workstation" means.
 
 [Unit]
 Description=MCNF Quasar egui shell (DRM seat, no compositor)
@@ -39,7 +39,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# Workstation-role gate (same typed gate as magic-mesh-brand.service).
+# Workstation-role gate (the shared typed rank-1 gate).
 ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
 ExecStart=/usr/bin/mde-shell-egui
 # Own the physical VT so getty never fights the DRM master.

@@ -224,7 +224,7 @@ COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-
 
 # Workstation-role wiring. The RPM post-install already enabled the all-roles
 # set (mackesd, nebula, mesh-health.timer, mesh-status.timer, the first-boot
-# setup oneshots, magic-setup, magic-mesh-brand + the mde-musicd user unit);
+# setup oneshots, magic-setup + the mde-musicd user unit);
 # this adds the VDI seat + the podman API socket (the preset above is the
 # declared policy, the enable materializes it in the image /etc now) and boots
 # to graphical. NOTHING is masked by default (§5): the seat unit self-gates on
