@@ -4673,6 +4673,7 @@ dependencies = [
  "mde-seat",
  "mde-term-egui",
  "mde-theme",
+ "mde-vdi-core",
  "mde-vdi-rdp",
  "mde-vdi-spice",
  "mde-vdi-vnc",
