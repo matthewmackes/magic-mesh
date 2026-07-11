@@ -42,7 +42,42 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 FEDORA="${1:-43}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE="registry.fedoraproject.org/fedora:${FEDORA}"
+
+# build-deploy-7 — reproducible-cut pins (single source, overridable per cut).
+# cargo-generate-rpm is pinned to the canonical version (docs/BUILD-ENVIRONMENT.md
+# §2 + install-helpers/setup-build-vm-toolchain.sh + infra/ansible
+# build-vm-toolchain.yml all pin 0.21.0 — the farm VMs already run it, so the
+# container cut must match). Bump all four sites together. RUSTUP_INIT_SHA256 lets
+# the operator checksum-pin the rustup installer (empty = warn + proceed). Both
+# are exported into the fedora container via `podman run -e` below.
+CGR_VERSION="${CGR_VERSION:-0.21.0}"
+RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-}"
+
+# build-deploy-7 — base-image pinning (hermeticity). A bare `fedora:43` tag is
+# MUTABLE: the Fedora registry re-publishes it on every point-release, so two
+# cuts weeks apart can pull different base layers (different glibc/gcc/system libs
+# the Servo/CEF helpers link against) and the "reproducible" cut is not. For a
+# fully reproducible cut, pin the base by DIGEST. We CANNOT resolve a digest here
+# on the airgapped farm (no registry egress at author time), so this is an
+# OPERATOR TODO rather than an invented value:
+#   1. On a networked host, resolve the current fedora:43 digest:
+#        skopeo inspect docker://registry.fedoraproject.org/fedora:43 | jq -r .Digest
+#        # or: podman pull fedora:43 && podman image inspect fedora:43 -f '{{.Digest}}'
+#   2. Pin it — either export per cut, or set the default below:
+#        BASE_IMAGE_DIGEST=sha256:<hex> install-helpers/build-rpm-fedora43.sh
+#      and record the digest in the release evidence log.
+# Mirrors the repo's existing pin discipline (rust-toolchain.toml pins rustc;
+# vendor-birthright-blobs.sh sha256-verifies every fetched blob). NOTE: the bootc
+# lane's base (packaging/bootc/Containerfile: quay.io/fedora/fedora-bootc:42) has
+# the SAME open gap — pin both when you resolve digests.
+BASE_IMAGE_DIGEST="${BASE_IMAGE_DIGEST:-}"
+if [ -n "$BASE_IMAGE_DIGEST" ]; then
+  IMAGE="registry.fedoraproject.org/fedora:${FEDORA}@${BASE_IMAGE_DIGEST}"
+else
+  IMAGE="registry.fedoraproject.org/fedora:${FEDORA}"
+  echo "!! build-deploy-7: base image is TAG-pinned (fedora:${FEDORA}), not digest-pinned — this cut is NOT fully reproducible." >&2
+  echo "   Set BASE_IMAGE_DIGEST=sha256:… to pin (see header comment for how to resolve it)." >&2
+fi
 command -v podman >/dev/null || { echo "podman required" >&2; exit 1; }
 
 # BIRTHRIGHT-2 — stage the bundled air-gapped first-boot blobs on the host
@@ -63,6 +98,9 @@ echo "[f43] installing build deps"
 # with `collect2: fatal error: cannot find 'ld'` / mold not found (hit on the
 # 2026-06-20 11.0 fc43 build). binutils gives the `ld` fallback; protobuf-compiler
 # is the etcd-client (SUBSTRATE-V2) build-time protoc dep.
+# build-deploy-7 — these dnf deps are intentionally NOT version-pinned: the base
+# image fixes their versions, so a DIGEST-pinned base (BASE_IMAGE_DIGEST above)
+# makes this set reproducible. Pin the base rather than every package here.
 dnf install -y --setopt=install_weak_deps=False \
     gcc gcc-c++ cmake pkg-config git curl findutils which gzip tar xz \
     mold binutils protobuf-compiler \
@@ -76,13 +114,32 @@ export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
 # resolves a version. Read the channel out of the repo so it never drifts.
 CHANNEL="$(sed -n "s/^channel *= *\"\([^\"]*\)\".*/\1/p" /src/rust-toolchain.toml | head -1)"
 CHANNEL="${CHANNEL:-1.94.0}"
-curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$CHANNEL" --profile minimal >/tmp/rustup.log 2>&1
+# build-deploy-7 — the TOOLCHAIN version is pinned (read from the committed
+# rust-toolchain.toml above → 1.94.0), so rustc/cargo are reproducible. The
+# residual gap is the rustup INSTALLER script itself, fetched live from
+# sh.rustup.rs. Fetch it to a file and verify its sha256 when the operator has
+# pinned one (resolve once on a networked host:
+#   curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sha256sum
+# then export RUSTUP_INIT_SHA256=<hex>). Empty = warn + proceed so the cut still
+# works airgapped-first. Mirrors vendor-birthright-blobs.sh sha256 discipline.
+curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+if [ -n "${RUSTUP_INIT_SHA256:-}" ]; then
+  echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init.sh" | sha256sum -c - \
+    || { echo "!! build-deploy-7: rustup-init.sh sha256 MISMATCH — refusing the cut"; exit 1; }
+else
+  echo "!! build-deploy-7: rustup-init.sh fetched live WITHOUT a checksum pin (set RUSTUP_INIT_SHA256=<hex> to verify)." >&2
+fi
+sh /tmp/rustup-init.sh -y --default-toolchain "$CHANNEL" --profile minimal >/tmp/rustup.log 2>&1
 export PATH=/root/.cargo/bin:$PATH
 cd /src
 echo "[f43] toolchain: $(rustc --version)"
 
-echo "[f43] installing cargo-generate-rpm"
-cargo install cargo-generate-rpm --locked >/tmp/cgr.log 2>&1 || { tail -20 /tmp/cgr.log; exit 1; }
+echo "[f43] installing cargo-generate-rpm ${CGR_VERSION:-0.21.0}"
+# build-deploy-7 — pin the packager to an EXACT version (CGR_VERSION, exported
+# from the host default 0.21.0). --version makes the cut reproducible; --locked
+# builds cargo-generate-rpm from its own pinned Cargo.lock. This matches the
+# provisioning pin in setup-build-vm-toolchain.sh so container + farm cuts agree.
+cargo install cargo-generate-rpm --version "${CGR_VERSION:-0.21.0}" --locked >/tmp/cgr.log 2>&1 || { tail -20 /tmp/cgr.log; exit 1; }
 
 export CARGO_TARGET_DIR=/src/target-f43
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
@@ -166,6 +223,8 @@ echo "==> building in $IMAGE (mode=$MODE; release + RPM; reuses ~/.cargo caches)
 podman run --rm \
     --security-opt label=disable \
     -e "MODE=$MODE" \
+    -e "CGR_VERSION=$CGR_VERSION" \
+    -e "RUSTUP_INIT_SHA256=$RUSTUP_INIT_SHA256" \
     -v "$REPO:/src" \
     -v "$HOME/.cargo/registry:/root/.cargo/registry" \
     -v "$HOME/.cargo/git:/root/.cargo/git" \

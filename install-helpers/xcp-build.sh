@@ -441,6 +441,20 @@ case "${1:-}" in
 
   rpm)
     do_sync
+    # build-deploy-7 — cargo-generate-rpm is NOT installed per-cut on this path;
+    # it is pinned at VM-PROVISIONING time to CGR_VERSION by
+    # setup-build-vm-toolchain.sh + infra/ansible build-vm-toolchain.yml (pinned by
+    # construction, matching build-rpm-fedora43.sh's container pin). Read the VM's
+    # actual version into the cut log + warn (NON-FATAL, keeps the cut working) on
+    # drift so a re-toolchained VM can't silently cut with a different packager.
+    CGR_VERSION="${CGR_VERSION:-0.21.0}"
+    got_cgr="$(remote "cargo install --list 2>/dev/null" | sed -n 's/^cargo-generate-rpm v\([0-9.]*\).*/\1/p' | head -1 || true)"
+    log "cargo-generate-rpm on $BUILD_HOST: ${got_cgr:-unknown} (pinned $CGR_VERSION)"
+    case "${got_cgr:-}" in
+      "$CGR_VERSION") : ;;
+      "") warn "build-deploy-7: could not read cargo-generate-rpm version on $BUILD_HOST (proceeding)" ;;
+      *)  warn "build-deploy-7: cargo-generate-rpm on $BUILD_HOST is $got_cgr, expected $CGR_VERSION — re-run setup-build-vm-toolchain.sh to re-pin" ;;
+    esac
     # Stage the air-gapped vendored assets the generate-rpm `assets` array ships
     # — without these the VM has no vendor/birthright/ and generate-rpm dies
     # "Asset file not found" (BUILD-PLATFORM-4 RPM-cut gap, 2026-06-22). Mirror
@@ -460,6 +474,12 @@ case "${1:-}" in
     # + BUG-VIDEO-1 / MEDIA-2 phase 1 `mpv-libs-devel` (docs/gpu_encoder.md):
     # links the real libmpv2 engine for the `media-mpv` re-link below —
     # without it the shell would silently fall back to FakeMpv.
+    # build-deploy-7 — these -devel deps are NOT version-pinned (unpinned dnf per
+    # cut = residual non-hermeticity flagged for the operator). Unlike the fedora
+    # container cut, the farm VM's package state PERSISTS across cuts, so it drifts
+    # only when the VM's Fedora is updated; the intended set is provisioned once by
+    # setup-build-vm-toolchain.sh. Full hermeticity here wants a versioned builder
+    # image / LAN mirror snapshot (see docs/review PLATFORM-REVIEW build-deploy-7).
     remote "sudo dnf install -y --setopt=install_weak_deps=False clang llvm python3 fontconfig-devel freetype-devel harfbuzz-devel mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel libxkbcommon-devel mpv-libs-devel"
     # E12-3 DRM: after the workspace build, re-link mde-shell-egui with --features drm
     # so it owns the bare KMS/DRM seat (no Wayland compositor). The workspace build
