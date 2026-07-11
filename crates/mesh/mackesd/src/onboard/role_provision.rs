@@ -1011,7 +1011,7 @@ mod tests {
             );
             assert!(
                 farm_script.contains(&format!(
-                    "CARGO_TARGET_DIR=\\\"\\$PWD/target\\\" cargo build --release --locked --manifest-path {manifest}"
+                    "CARGO_TARGET_DIR=\\\"\\$PWD/target\\\" cargo build --release $MDE_RPM_LOCKED --manifest-path {manifest}"
                 )),
                 "farm RPM builder must build excluded helper {manifest} into target/release before generate-rpm"
             );
