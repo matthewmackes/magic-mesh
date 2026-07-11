@@ -34,6 +34,9 @@
 //!   the pointer button model).
 //! * [`wire`] — the [`RfbClientMessage`] (`PointerEvent` / `KeyEvent`) and
 //!   [`RfbControlMessage`] (`SetPixelFormat` / `SetEncodings`) byte encoders.
+//! * [`des`] — the pure-Rust single-DES + RFB "VNC Authentication" (security
+//!   type 2) challenge/response, so a password-protected endpoint can complete
+//!   the handshake without any external crypto dependency.
 //! * [`session`] — [`VncSession`] tying decode + input together.
 //! * The **adaptive codec (E12-10)**: [`link`] holds the protocol-neutral
 //!   link-quality estimator + the hysteresis [`QualityTier`] ladder (a weak
@@ -60,6 +63,7 @@ pub use mde_egui::egui;
 pub mod config;
 #[cfg(feature = "live-connect")]
 pub mod connect;
+pub mod des;
 pub mod encoding;
 pub mod input;
 pub mod link;
@@ -71,6 +75,7 @@ pub mod wire;
 pub use config::{ConfigError, VncConfig};
 #[cfg(feature = "live-connect")]
 pub use connect::{ConnectError, Negotiated, PumpOutcome, VncConnection};
+pub use des::vnc_auth_response;
 pub use encoding::{
     decode_framebuffer_update, decode_rect, parse_pixel_format, parse_rectangle_header,
     DecodeError, Encoding, Reader, Rectangle,

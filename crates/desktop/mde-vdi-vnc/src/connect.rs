@@ -8,10 +8,13 @@
 //! unit-tested egui input mapper fills.
 //!
 //! The transport supports the encodings this crate decodes (`Raw`, `CopyRect`,
-//! `RRE`, `Hextile`) and keeps authentication honest: RFB security type `None` works
-//! today, which is the XCP-ng console path gated by mesh/dom0 reachability. VNC
-//! password auth is reported as an unsupported security mode until a DES
-//! challenge implementation lands.
+//! `RRE`, `Hextile`). Two RFB security types are negotiated: type `None` (1) —
+//! the XCP-ng `Xvnc` console path gated by mesh/dom0 reachability — and type
+//! `VNC Authentication` (2), the DES challenge/response implemented in
+//! [`crate::des`]. When the server offers type 2 and the [`VncConfig`] carries a
+//! password (sourced from the sealed cred vault, lock 22) the client completes
+//! the challenge; if type 2 is the only offer and no password is configured the
+//! connect fails cleanly with [`ConnectError::PasswordRequired`].
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -47,12 +50,17 @@ pub enum ConnectError {
     },
     /// The peer did not speak a supported RFB version.
     Protocol(String),
-    /// The server requires a security type this transport does not implement.
+    /// The server offered no security type this transport implements (it speaks
+    /// only `None` (1) and `VNC Authentication` (2)).
     UnsupportedSecurity {
         /// RFB security type IDs offered by the server.
         offered: Vec<u8>,
-        /// Whether the caller supplied a password that would require VNC auth.
-        password_supplied: bool,
+    },
+    /// The server requires `VNC Authentication` (type 2) but no password was
+    /// configured for this endpoint.
+    PasswordRequired {
+        /// RFB security type IDs offered by the server.
+        offered: Vec<u8>,
     },
     /// Security negotiation failed with a server-supplied reason.
     Security(String),
@@ -67,17 +75,16 @@ impl fmt::Display for ConnectError {
             Self::Resolve { host, port } => write!(f, "no address resolved for {host}:{port}"),
             Self::Io { phase, source } => write!(f, "VNC {phase} failed: {source}"),
             Self::Protocol(reason) => write!(f, "RFB protocol error: {reason}"),
-            Self::UnsupportedSecurity {
-                offered,
-                password_supplied,
-            } => {
-                let hint = if *password_supplied {
-                    "VNC password auth is not implemented yet"
-                } else {
-                    "server did not offer security type None"
-                };
-                write!(f, "unsupported RFB security types {offered:?}: {hint}")
-            }
+            Self::UnsupportedSecurity { offered } => write!(
+                f,
+                "unsupported RFB security types {offered:?}: this client speaks only \
+                 None (1) and VNC Authentication (2)"
+            ),
+            Self::PasswordRequired { offered } => write!(
+                f,
+                "RFB security types {offered:?} require a VNC password, but none was \
+                 configured for this endpoint"
+            ),
             Self::Security(reason) => write!(f, "RFB security failed: {reason}"),
             Self::Decode(e) => write!(f, "RFB framebuffer decode failed: {e}"),
         }
@@ -173,7 +180,7 @@ impl VncConnection {
                 source,
             })?;
 
-        let (major, minor) = handshake(&mut stream, config.password.is_some())?;
+        let (major, minor) = handshake(&mut stream, config.password.as_deref().map(str::as_bytes))?;
         let init = client_server_init(&mut stream, config.shared)?;
         session.resize(init.width, init.height);
         if init.format.is_supported() {
@@ -396,7 +403,65 @@ fn connect_tcp(config: &VncConfig) -> Result<TcpStream, ConnectError> {
     })
 }
 
-fn handshake(stream: &mut TcpStream, password_supplied: bool) -> Result<(u32, u32), ConnectError> {
+/// RFB security type: no authentication.
+const SEC_NONE: u8 = 1;
+/// RFB security type: VNC Authentication (DES challenge/response).
+const SEC_VNC_AUTH: u8 = 2;
+
+/// Pick the RFB security type to use from the server's offer.
+///
+/// Prefers authenticated `VNC Authentication` when a password is available,
+/// otherwise falls back to `None`. Errors cleanly when the server requires a
+/// password we do not have, or offers nothing we implement.
+fn select_security_type(offered: &[u8], have_password: bool) -> Result<u8, ConnectError> {
+    if have_password && offered.contains(&SEC_VNC_AUTH) {
+        return Ok(SEC_VNC_AUTH);
+    }
+    if offered.contains(&SEC_NONE) {
+        return Ok(SEC_NONE);
+    }
+    if offered.contains(&SEC_VNC_AUTH) {
+        return Err(ConnectError::PasswordRequired {
+            offered: offered.to_vec(),
+        });
+    }
+    Err(ConnectError::UnsupportedSecurity {
+        offered: offered.to_vec(),
+    })
+}
+
+/// Run the RFB `VNC Authentication` (type 2) exchange: read the 16-byte
+/// challenge, DES-encrypt it with the password, and write the 16-byte response.
+fn perform_vnc_auth(stream: &mut TcpStream, password: &[u8]) -> Result<(), ConnectError> {
+    let raw = read_n(stream, 16, "VNC auth challenge")?;
+    let mut challenge = [0u8; 16];
+    challenge.copy_from_slice(&raw);
+    let response = crate::des::vnc_auth_response(password, &challenge);
+    stream
+        .write_all(&response)
+        .map_err(|source| ConnectError::Io {
+            phase: "write VNC auth response",
+            source,
+        })
+}
+
+/// Read the 4-byte `SecurityResult`; on failure read the server's reason string
+/// (only RFB 3.8 sends one) or synthesise a generic message.
+fn read_security_result(stream: &mut TcpStream, minor: u32) -> Result<(), ConnectError> {
+    let result = be32(&read_n(stream, 4, "SecurityResult")?);
+    if result == 0 {
+        return Ok(());
+    }
+    if minor >= 8 {
+        Err(ConnectError::Security(read_reason(stream)?))
+    } else {
+        Err(ConnectError::Security(
+            "authentication failed (server rejected the VNC password)".to_string(),
+        ))
+    }
+}
+
+fn handshake(stream: &mut TcpStream, password: Option<&[u8]>) -> Result<(u32, u32), ConnectError> {
     let banner = read_n(stream, 12, "ProtocolVersion banner")?;
     let text = String::from_utf8_lossy(&banner);
     if !text.starts_with("RFB ") {
@@ -433,33 +498,44 @@ fn handshake(stream: &mut TcpStream, password_supplied: bool) -> Result<(u32, u3
             return Err(ConnectError::Security(read_reason(stream)?));
         }
         let types = read_n(stream, usize::from(count), "security-type list")?;
-        if !types.contains(&1) {
-            return Err(ConnectError::UnsupportedSecurity {
-                offered: types,
-                password_supplied,
-            });
-        }
-        stream.write_all(&[1]).map_err(|source| ConnectError::Io {
-            phase: "write security-type choice",
-            source,
-        })?;
-        if minor >= 8 {
-            let result = be32(&read_n(stream, 4, "SecurityResult")?);
-            if result != 0 {
-                return Err(ConnectError::Security(read_reason(stream)?));
+        let chosen = select_security_type(&types, password.is_some())?;
+        stream
+            .write_all(&[chosen])
+            .map_err(|source| ConnectError::Io {
+                phase: "write security-type choice",
+                source,
+            })?;
+        match chosen {
+            SEC_VNC_AUTH => {
+                perform_vnc_auth(stream, password.unwrap_or_default())?;
+                // The server always sends SecurityResult after VNC auth,
+                // regardless of the negotiated 3.7/3.8 minor.
+                read_security_result(stream, minor)?;
             }
+            // RFB 3.8 sends SecurityResult even for type None; 3.7 does not.
+            _ if minor >= 8 => read_security_result(stream, minor)?,
+            _ => {}
         }
     } else {
+        // RFB 3.3: the server dictates a single security type.
         let sec = be32(&read_n(stream, 4, "3.3 security type")?);
-        if sec == 0 {
-            return Err(ConnectError::Security(read_reason(stream)?));
-        }
-        if sec != 1 {
-            let offered = vec![u8::try_from(sec).unwrap_or(u8::MAX)];
-            return Err(ConnectError::UnsupportedSecurity {
-                offered,
-                password_supplied,
-            });
+        match sec {
+            0 => return Err(ConnectError::Security(read_reason(stream)?)),
+            s if s == u32::from(SEC_NONE) => {}
+            s if s == u32::from(SEC_VNC_AUTH) => {
+                let Some(secret) = password else {
+                    return Err(ConnectError::PasswordRequired {
+                        offered: vec![SEC_VNC_AUTH],
+                    });
+                };
+                perform_vnc_auth(stream, secret)?;
+                read_security_result(stream, minor)?;
+            }
+            other => {
+                return Err(ConnectError::UnsupportedSecurity {
+                    offered: vec![u8::try_from(other).unwrap_or(u8::MAX)],
+                });
+            }
         }
     }
     Ok((major, minor))
@@ -678,12 +754,79 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_security_message_names_password_auth_gap() {
-        let err = ConnectError::UnsupportedSecurity {
-            offered: vec![2],
-            password_supplied: true,
-        };
-        assert!(err.to_string().contains("password auth is not implemented"));
+    fn select_security_prefers_vnc_auth_when_password_present() {
+        // Password present + both types offered → authenticate (type 2).
+        assert_eq!(
+            super::select_security_type(&[1, 2], true).expect("a supported type is offered"),
+            2
+        );
+        // Only VNC auth offered, password present → type 2.
+        assert_eq!(
+            super::select_security_type(&[2], true).expect("a supported type is offered"),
+            2
+        );
+    }
+
+    #[test]
+    fn select_security_falls_back_to_none_without_password() {
+        // No password → prefer the no-auth path even when auth is on offer.
+        assert_eq!(
+            super::select_security_type(&[1, 2], false).expect("None is offered"),
+            1
+        );
+        assert_eq!(
+            super::select_security_type(&[1], false).expect("None is offered"),
+            1
+        );
+    }
+
+    #[test]
+    fn select_security_errors_when_auth_required_but_no_password() {
+        let err = super::select_security_type(&[2], false)
+            .expect_err("type 2 with no password must fail");
+        assert!(
+            matches!(err, ConnectError::PasswordRequired { ref offered } if offered == &[2]),
+            "expected PasswordRequired, got {err:?}"
+        );
+        assert!(err.to_string().contains("require a VNC password"));
+    }
+
+    #[test]
+    fn select_security_errors_when_no_supported_type_is_offered() {
+        // 19 = VeNCrypt; not implemented here.
+        let err =
+            super::select_security_type(&[19], true).expect_err("an unknown-only offer must fail");
+        assert!(
+            matches!(err, ConnectError::UnsupportedSecurity { ref offered } if offered == &[19]),
+            "expected UnsupportedSecurity, got {err:?}"
+        );
+        assert!(err.to_string().contains("unsupported RFB security types"));
+    }
+
+    #[test]
+    fn live_connection_completes_vnc_password_auth() {
+        let password = "swordfish";
+        let challenge: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x00,
+        ];
+        let (config, server) = spawn_vnc_auth_rfb_server(challenge);
+        let mut session =
+            VncSession::new(config.with_password(password)).expect("test config is valid");
+        let conn = VncConnection::connect(&mut session).expect("VNC-auth handshake succeeds");
+        assert_eq!(conn.negotiated().name, "mcnf-test");
+        conn.shutdown();
+
+        let (chosen, response) = server.join().expect("test RFB server exits cleanly");
+        assert_eq!(
+            chosen, 2,
+            "client must select VNC Authentication when a password is present"
+        );
+        assert_eq!(
+            response,
+            crate::des::vnc_auth_response(password.as_bytes(), &challenge),
+            "client must return the DES challenge/response for the server's challenge"
+        );
     }
 
     #[test]
@@ -764,6 +907,48 @@ mod tests {
                 .expect("write raw framebuffer update");
             read_one_client_message(&mut stream, &mut captured);
             captured
+        });
+        (
+            VncConfig::new("127.0.0.1").with_port(port).shared(true),
+            handle,
+        )
+    }
+
+    fn spawn_vnc_auth_rfb_server(
+        challenge: [u8; 16],
+    ) -> (VncConfig, thread::JoinHandle<(u8, [u8; 16])>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test RFB listener");
+        let port = listener.local_addr().expect("read listener address").port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept RFB client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set server read timeout");
+
+            stream
+                .write_all(b"RFB 003.008\n")
+                .expect("write protocol banner");
+            let _ = read_exact(&mut stream, 12);
+            // Offer both None and VNC Authentication: selection must prefer 2.
+            stream
+                .write_all(&[2, 1, 2])
+                .expect("offer None + VNC Authentication");
+            let chosen = read_exact(&mut stream, 1)[0];
+            stream
+                .write_all(&challenge)
+                .expect("write VNC auth challenge");
+            let mut response = [0u8; 16];
+            response.copy_from_slice(&read_exact(&mut stream, 16));
+            stream
+                .write_all(&0u32.to_be_bytes())
+                .expect("write security success");
+            let _ = read_exact(&mut stream, 1); // ClientInit shared flag
+            stream.write_all(&server_init()).expect("write ServerInit");
+            // Best-effort drain of the client's initial control messages so its
+            // writes complete before the socket closes.
+            let mut sink = [0u8; 256];
+            let _ = stream.read(&mut sink);
+            (chosen, response)
         });
         (
             VncConfig::new("127.0.0.1").with_port(port).shared(true),
