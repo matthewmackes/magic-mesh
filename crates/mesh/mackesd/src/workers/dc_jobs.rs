@@ -140,12 +140,27 @@ impl DcJobs {
 
 // ---- thin I/O: watch the action lanes, emit job-status events via the Bus ----
 
-/// Publish one job-status record onto the Bus (best-effort, fire-and-reap — same
-/// lane shape as the dc_auditor's records).
+/// Publish one job-status record onto the Bus in-process (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI per record. Byte-identical stored row to the
+/// old `mde-bus publish <topic> --body-flag <body>`.
+///
+/// Targets [`crate::bus_publish::default_bus_root`] (which honours
+/// `MDE_BUS_ROOT`) — the SAME root the fork+exec'd CLI resolved, NOT the
+/// worker's own MDE_BUS_ROOT-blind [`default_bus_root`] read root (they diverge
+/// on the live daemon; see [`crate::workers::dc_auditor`]).
 fn publish(rec: &JobRecord) {
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", &rec.topic(), "--body-flag", &rec.body()]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
+}
+
+/// Root-injectable body of [`publish`] — fresh-opens the Bus at `bus_root` and
+/// writes the record in-process (mirrors the CLI's per-call open). Best-effort;
+/// tests pass a temp root.
+fn publish_to(bus_root: Option<&std::path::Path>, rec: &JobRecord) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, &rec.topic(), &rec.body());
+    }
 }
 
 /// Read the current reply body for a request ulid, if any. The reply lane
@@ -269,6 +284,34 @@ impl Worker for DcJobsWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// perf-10 / arch-6 — `publish_to` writes the job-status record in-process
+    /// (no fork+exec of `mde-bus`) with EXACTLY the row a
+    /// `mde-bus publish event/dc/job/<ulid> --body-flag <body>` produced.
+    #[test]
+    fn publish_to_writes_cli_equivalent_row_in_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = JobRecord {
+            action: "dc/vm-power".to_string(),
+            ulid: "ulid-9".to_string(),
+            status: "ok",
+        };
+
+        publish_to(Some(tmp.path()), &rec);
+
+        let reader = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let topic = job_topic(&rec.ulid);
+        let rows = reader.list_since(&topic, None).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one job-status record published");
+        let row = &rows[0];
+        assert_eq!(row.topic, topic);
+        assert_eq!(row.priority, "default");
+        assert!(row.title.is_none());
+        assert!(row.actions.is_empty());
+        assert!(row.reply_to.is_none());
+        // Byte-identical to the record's `body()` — what `--body-flag` carried.
+        assert_eq!(row.body.as_deref(), Some(rec.body().as_str()));
+    }
 
     #[test]
     fn job_topic_formats_under_event_dc_job() {

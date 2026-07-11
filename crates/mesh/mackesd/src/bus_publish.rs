@@ -68,10 +68,33 @@ pub fn publish_json<T: serde::Serialize>(
             return None;
         }
     };
+    write_body(persist, topic, &body)
+}
+
+/// Publish an ALREADY-SERIALIZED `body` string to `topic` in-process,
+/// byte-identical to `mde-bus publish <topic> --body-flag <body>`. Returns the
+/// [`StoredMessage`] on success, `None` on a swallowed write failure
+/// (best-effort).
+///
+/// This is the raw-string sibling of [`publish_json`]. Many workers hand-build
+/// the JSON body up front (`serde_json::json!(…).to_string()`, a `format!`
+/// template, or a `Record::body()` accessor) and shelled out passing that string
+/// verbatim to `--body-flag`. Feeding such a string to [`publish_json`] would
+/// serialize it a SECOND time (wrapping the whole document in quotes + escaping
+/// every `"`), so those call sites must use this helper, which writes the string
+/// through unchanged — exactly what the CLI's `--body-flag` did.
+pub fn publish_body(persist: &mut Persist, topic: &str, body: &str) -> Option<StoredMessage> {
+    write_body(persist, topic, body)
+}
+
+/// Shared tail of [`publish_json`] / [`publish_body`]: follow a rotated index,
+/// then write the row with the CLI-default envelope (default priority, no
+/// title/actions/reply), swallowing a write error at `debug` (best-effort).
+fn write_body(persist: &mut Persist, topic: &str, body: &str) -> Option<StoredMessage> {
     // Follow a rotated index (retention recreate / BOOT-REC-3 unlink) — a no-op
     // fast stat when nothing changed.
     persist.reopen_if_index_changed();
-    match persist.write(topic, Priority::Default, None, Some(&body)) {
+    match persist.write(topic, Priority::Default, None, Some(body)) {
         Ok(msg) => Some(msg),
         Err(e) => {
             tracing::debug!(
@@ -79,6 +102,27 @@ pub fn publish_json<T: serde::Serialize>(
                 topic,
                 error = %e,
                 "bus publish write failed",
+            );
+            None
+        }
+    }
+}
+
+/// Open a long-lived [`Persist`] handle at `bus_root` for the in-process publish
+/// path, best-effort. Returns `None` (with a `debug` note) when the root is
+/// absent (pre-RPM dev box / tests pass `None`) or the open fails — the caller
+/// then graceful-degrades exactly as the old fork+exec path did when `mde-bus`
+/// was missing (the publish becomes a swallowed no-op).
+#[must_use]
+pub fn open_bus(bus_root: Option<std::path::PathBuf>) -> Option<Persist> {
+    let root = bus_root?;
+    match Persist::open(root) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::debug!(
+                target: "mackesd::bus_publish",
+                error = %e,
+                "bus open failed; in-process publish disabled this run",
             );
             None
         }
@@ -157,5 +201,53 @@ mod tests {
         .expect("second");
         let rows = persist.list_since("event/kvm/services", None).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    /// [`publish_body`] writes an ALREADY-SERIALIZED JSON string through
+    /// unchanged — byte-identical to `--body-flag <body>`, NOT re-serialized.
+    /// This is the property the string-body call sites (dc_* records,
+    /// selinux/firewall alerts, clipboard) rely on.
+    #[test]
+    fn publish_body_writes_string_verbatim_not_reserialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // The exact JSON a `format!`/`json!().to_string()` call site built.
+        let body = r#"{"host":"node-a","alert":true,"count":3}"#;
+
+        let mut persist = Persist::open(root.clone()).unwrap();
+        let stored =
+            publish_body(&mut persist, "event/firewall/node-a", body).expect("in-process publish");
+
+        // Stored body is the string VERBATIM — a `publish_json` on the same
+        // string would instead store `"{\"host\":\"node-a\",…}"` (quoted +
+        // escaped), which would NOT equal `body`.
+        assert_eq!(stored.body.as_deref(), Some(body));
+        assert_ne!(
+            stored.body.as_deref(),
+            Some(serde_json::to_string(body).unwrap().as_str()),
+            "publish_body must NOT double-encode the string",
+        );
+        assert_eq!(stored.topic, "event/firewall/node-a");
+        assert_eq!(stored.priority, "default");
+        assert!(stored.title.is_none());
+        assert!(stored.actions.is_empty());
+        assert!(stored.reply_to.is_none());
+
+        // Read back through a fresh handle: exactly one row, identical body.
+        let reader = Persist::open(root).unwrap();
+        let rows = reader.list_since("event/firewall/node-a", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body.as_deref(), Some(body));
+    }
+
+    /// [`open_bus`] returns `None` for a `None` root (test / pre-RPM parity) and
+    /// `Some` for a real root, so a caller's publish graceful-degrades to a
+    /// swallowed no-op exactly as the old fork+exec did when `mde-bus` was
+    /// absent.
+    #[test]
+    fn open_bus_none_root_disables_publish() {
+        assert!(open_bus(None).is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(open_bus(Some(tmp.path().to_path_buf())).is_some());
     }
 }

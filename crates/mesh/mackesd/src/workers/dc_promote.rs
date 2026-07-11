@@ -305,12 +305,25 @@ pub fn save_prod_arm(path: &Path, armed: bool) -> Result<(), String> {
 
 // ---- thin I/O: determine the build version, emit the matrix via the Bus ----
 
-/// Publish one promotion record onto the Bus (best-effort, fire-and-reap — same
-/// lane shape as the dc_auditor's records).
+/// Publish one promotion record onto the Bus in-process (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI per record. Byte-identical stored row to the
+/// old `mde-bus publish <topic> --body-flag <body>`.
+///
+/// Targets [`crate::bus_publish::default_bus_root`] (which honours
+/// `MDE_BUS_ROOT`) — the SAME root the fork+exec'd CLI resolved, NOT the
+/// worker's own MDE_BUS_ROOT-blind [`default_bus_root`] read root (they diverge
+/// on the live daemon; see [`crate::workers::dc_auditor`]).
 fn publish(rec: &PromoteRecord) {
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", &rec.topic(), "--body-flag", &rec.body()]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
+}
+
+/// Root-injectable body of [`publish`] — fresh-opens the Bus at `bus_root` and
+/// writes the record in-process (mirrors the CLI's per-call open). Best-effort;
+/// tests pass a temp root.
+fn publish_to(bus_root: Option<&Path>, rec: &PromoteRecord) {
+    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
+        crate::bus_publish::publish_body(&mut persist, &rec.topic(), &rec.body());
+    }
 }
 
 /// The newest `magic-mesh-*.rpm` version under `dir`, parsed from the filename.

@@ -242,12 +242,31 @@ impl DcAuditor {
 
 // ---- thin I/O: watch the action lanes, emit audit records via the Bus ----
 
-/// Publish one audit record onto the Bus (best-effort, fire-and-reap — same lane
-/// shape as the datacenter_orchestrator's events).
+/// Publish one audit record onto the Bus in-process (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite open + a
+/// [`crate::proc_reap`] reaper thread) per record. Byte-identical stored row to
+/// the old `mde-bus publish <topic> --body-flag <body>`.
+///
+/// The publish targets [`crate::bus_publish::default_bus_root`] (which honours
+/// `MDE_BUS_ROOT`) — the SAME root the fork+exec'd CLI resolved via the
+/// inherited environment. This is deliberately NOT the worker's own
+/// [`default_bus_root`] READ root (`dirs::data_dir()`-based, MDE_BUS_ROOT-blind):
+/// on the live daemon (`mackesd.service` pins `MDE_BUS_ROOT=/run/mde-bus`) the
+/// two diverge, and the CLI published to the MDE_BUS_ROOT spool.
 fn publish(rec: &AuditRecord) {
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", &rec.topic(), "--body-flag", &rec.body()]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
+}
+
+/// Root-injectable body of [`publish`] — fresh-opens the Bus at `bus_root` and
+/// writes the record in-process (mirrors the CLI's per-call open). Best-effort:
+/// an absent root or a failed open/write is swallowed, exactly as the old
+/// fire-and-reap swallowed a missing `mde-bus` binary. Tests pass a temp root.
+fn publish_to(bus_root: Option<&std::path::Path>, rec: &AuditRecord) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, &rec.topic(), &rec.body());
+    }
 }
 
 /// One poll pass: enumerate every `action/dc/*` topic and feed each message
@@ -367,6 +386,48 @@ mod tests {
     #[test]
     fn audit_topic_formats_under_event_dc_audit() {
         assert_eq!(audit_topic("01HZX5"), "event/dc/audit/01HZX5");
+    }
+
+    /// perf-10 / arch-6 — `publish_to` writes the audit record in-process (no
+    /// fork+exec of `mde-bus`) with EXACTLY the row a
+    /// `mde-bus publish event/dc/audit/<ulid> --body-flag <body>` produced: the
+    /// topic, default priority, no title/actions/reply, and the record's
+    /// `body()` string verbatim.
+    #[test]
+    fn publish_to_writes_cli_equivalent_row_in_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Build an audit record the dedup core would have emitted.
+        let rec = AuditRecord {
+            action: "dc/vm-power".to_string(),
+            ulid: "ulid-1".to_string(),
+            actor: "peer:eagle".to_string(),
+            target: "web1".to_string(),
+            result: ActionResult::Issued,
+            ts: "1700000000000".to_string(),
+            body_summary: r#"{"uuid":"web1","op":"on"}"#.to_string(),
+        };
+
+        publish_to(Some(tmp.path()), &rec);
+
+        // Read the row back through a fresh handle, as any Bus consumer does.
+        let reader = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let audit_topic = super::audit_topic(&rec.ulid);
+        let rows = reader.list_since(&audit_topic, None).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one audit record published");
+        let row = &rows[0];
+        assert_eq!(row.topic, audit_topic);
+        assert_eq!(row.priority, "default");
+        assert!(row.title.is_none());
+        assert!(row.actions.is_empty());
+        assert!(row.reply_to.is_none());
+        // Byte-identical to the record's `body()` — what `--body-flag` carried.
+        assert_eq!(row.body.as_deref(), Some(rec.body().as_str()));
+
+        // `None` root (pre-RPM box / disabled) publishes nothing, best-effort.
+        let tmp2 = tempfile::tempdir().unwrap();
+        publish_to(None, &rec);
+        let reader2 = Persist::open(tmp2.path().to_path_buf()).unwrap();
+        assert!(reader2.list_since(&audit_topic, None).unwrap().is_empty());
     }
 
     #[test]
