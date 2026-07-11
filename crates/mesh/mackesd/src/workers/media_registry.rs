@@ -31,7 +31,6 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -57,12 +56,29 @@ pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(300);
 /// reaper, never fatal.
 pub fn publish_registration(reg: &MediaRegistration) {
     let topic = mesh_media::media_registry_topic(&reg.node_id);
-    let Ok(body) = serde_json::to_string(reg) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_registration_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        reg,
+    );
+}
+
+/// Root-injectable in-process publish for [`publish_registration`] (perf-10 /
+/// arch-6) — no fork+exec of the `mde-bus` CLI per registration. Fresh-opens the
+/// Bus at `bus_root` (the CLI-equivalent [`crate::bus_publish::default_bus_root`]
+/// in production, honouring `MDE_BUS_ROOT`) and writes the compact `serde_json`
+/// of `reg` — the exact body the old `--body-flag` carried. Best-effort; tests
+/// pass a temp root.
+fn publish_registration_to(
+    bus_root: Option<&std::path::Path>,
+    topic: &str,
+    reg: &MediaRegistration,
+) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_json(&mut persist, topic, reg);
+    }
 }
 
 /// Mirror a node's media registration to the replicated QNM-Shared registry
@@ -257,6 +273,38 @@ impl Worker for MediaRegistryWorker {
 mod tests {
     use super::*;
     use crate::mesh_media::{HEALTH_DOWN, NAVIDROME_KIND};
+
+    /// perf-10 / arch-6 — `publish_registration_to` writes the registration
+    /// in-process (no fork+exec of `mde-bus`) with EXACTLY the row a
+    /// `mde-bus publish mesh/services/media/<node> --body-flag <json>` produced:
+    /// the topic, default priority, no title/actions/reply, and a body that is
+    /// the compact `serde_json` of the registration (typed `publish_json` path).
+    #[test]
+    fn publish_registration_to_writes_cli_equivalent_row_in_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = mesh_media::registration("peer:eagle", mesh_media::NAVIDROME_PORT, "up");
+        let topic = mesh_media::media_registry_topic(&reg.node_id);
+
+        publish_registration_to(Some(tmp.path()), &topic, &reg);
+
+        let reader = mde_bus::persist::Persist::open(tmp.path().to_path_buf()).unwrap();
+        let rows = reader.list_since(&topic, None).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one registration published");
+        let row = &rows[0];
+        assert_eq!(row.topic, topic);
+        assert_eq!(row.priority, "default");
+        assert!(row.title.is_none());
+        assert!(row.actions.is_empty());
+        assert!(row.reply_to.is_none());
+        // Body is the compact serialization `--body-flag` carried, and decodes
+        // back to the original typed registration.
+        assert_eq!(
+            row.body.as_deref(),
+            Some(serde_json::to_string(&reg).unwrap().as_str())
+        );
+        let back: MediaRegistration = serde_json::from_str(row.body.as_deref().unwrap()).unwrap();
+        assert_eq!(back, reg);
+    }
 
     #[test]
     fn build_registration_probes_health_and_pins_kind() {

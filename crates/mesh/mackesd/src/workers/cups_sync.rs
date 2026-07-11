@@ -492,14 +492,20 @@ impl CupsSyncWorker {
             .unwrap_or_default()
     }
 
+    /// PRINT-8 — announce a local printer change on `event/printers/<host>`
+    /// in-process (perf-10 / arch-6). Replaces a raw `mde-bus publish … .spawn()`
+    /// (a fork+exec + fresh SQLite open that was never even reaped) with a bare
+    /// `Persist::write`. Byte-identical stored row; targets
+    /// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT` — the
+    /// root the spawned CLI resolved via the inherited env). Best-effort.
     fn publish_event(&self) {
         let topic = format!("event/printers/{}", self.hostname);
-        let _ = Command::new("mde-bus")
-            .arg("publish")
-            .arg(&topic)
-            .arg("--body-flag")
-            .arg(format!(r#"{{"host":"{}","changed":true}}"#, self.hostname))
-            .spawn();
+        let body = format!(r#"{{"host":"{}","changed":true}}"#, self.hostname);
+        if let Some(mut persist) =
+            crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
+        {
+            crate::bus_publish::publish_body(&mut persist, &topic, &body);
+        }
     }
 
     /// PRINT-8.b — poll `action/printers/{sync-now,list}` for operator

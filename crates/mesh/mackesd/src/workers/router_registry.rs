@@ -50,12 +50,25 @@ pub fn router_topic(mac: &str) -> String {
 /// reaped, never fatal.
 pub fn publish_entry(entry: &RouterEntry) {
     let topic = router_topic(&entry.id);
-    let Ok(body) = serde_json::to_string(entry) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_entry_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        entry,
+    );
+}
+
+/// Root-injectable in-process publish for [`publish_entry`] (perf-10 / arch-6) —
+/// no fork+exec of the `mde-bus` CLI per router entry. Fresh-opens the Bus at
+/// `bus_root` (the CLI-equivalent [`crate::bus_publish::default_bus_root`] in
+/// production, honouring `MDE_BUS_ROOT`) and writes the compact `serde_json` of
+/// `entry` — the exact body the old `--body-flag` carried. Best-effort; tests
+/// pass a temp root.
+fn publish_entry_to(bus_root: Option<&std::path::Path>, topic: &str, entry: &RouterEntry) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_json(&mut persist, topic, entry);
+    }
 }
 
 /// Mirror a router entry to the replicated QNM-Shared plane at

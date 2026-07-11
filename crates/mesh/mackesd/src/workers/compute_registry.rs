@@ -450,12 +450,29 @@ fn run_podman(args: &[&str]) -> String {
 /// registry worker.
 pub fn publish_inventory(peer: &str, inv: &Inventory) {
     let topic = format!("compute/inventory/{peer}");
-    let Ok(body) = serde_json::to_string(inv) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_json_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        inv,
+    );
+}
+
+/// Root-injectable in-process publish shared by [`publish_inventory`] +
+/// [`publish_event`] (perf-10 / arch-6) — no fork+exec of the `mde-bus` CLI per
+/// document. Fresh-opens the Bus at `bus_root` (the CLI-equivalent
+/// [`crate::bus_publish::default_bus_root`] in production, honouring
+/// `MDE_BUS_ROOT`) and writes the compact `serde_json` of `payload` — the exact
+/// body the old `--body-flag` carried. Best-effort; tests pass a temp root.
+fn publish_json_to<T: serde::Serialize>(
+    bus_root: Option<&std::path::Path>,
+    topic: &str,
+    payload: &T,
+) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_json(&mut persist, topic, payload);
+    }
 }
 
 /// BUS-RUN-FULL-1 — decide whether this tick should publish the bus
@@ -570,12 +587,11 @@ pub fn event_topic(peer: &str) -> String {
 /// `mde-bus` CLI (mirrors [`publish_inventory`]).
 pub fn publish_event(peer: &str, ev: &ComputeEvent) {
     let topic = event_topic(peer);
-    let Ok(body) = serde_json::to_string(ev) else {
-        return;
-    };
-    let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_json_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        ev,
+    );
 }
 
 /// Collect VM entries via virsh. `prev` carries cumulative

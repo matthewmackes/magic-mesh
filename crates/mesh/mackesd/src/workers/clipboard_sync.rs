@@ -313,14 +313,23 @@ fn publish_clip(entry: &ClipEntry) {
         "time": entry.time,
     })
     .to_string();
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.arg("publish")
-        .arg(CLIP_TOPIC)
-        .arg("--body-flag")
-        .arg(&body)
-        // Persist + audit without needing the broker up (pre-enrollment).
-        .arg("--no-broker");
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_clip_to(crate::bus_publish::default_bus_root().as_deref(), &body);
+}
+
+/// Root-injectable in-process write for [`publish_clip`] (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI per clip. The old shell-out passed
+/// `--no-broker` (persist-only, so a clip is recorded + audited without the
+/// broker up), which is EXACTLY what the in-process
+/// [`crate::bus_publish::publish_body`] does — a bare `Persist::write`, no broker
+/// POST — so this is byte-identical AND broker-semantics-identical. Targets
+/// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT`).
+/// Best-effort; tests pass a temp root.
+fn publish_clip_to(bus_root: Option<&std::path::Path>, body: &str) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, CLIP_TOPIC, body);
+    }
 }
 
 /// The clipboard-sync worker. Holds the replicated root + this node's
