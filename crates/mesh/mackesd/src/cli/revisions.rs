@@ -67,3 +67,63 @@ pub fn run(cmd: RevisionsCmd, db_path: PathBuf) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Read a revision's `spec_json` payload by id.
+fn load_revision_payload(conn: &rusqlite::Connection, revision_id: &str) -> anyhow::Result<String> {
+    let rev: i64 = revision_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("revision id must be an integer (got {revision_id})"))?;
+    let payload: String = conn
+        .query_row(
+            "SELECT spec_json FROM desired_config WHERE revision_id = ?",
+            [rev],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("loading revision {revision_id}"))?;
+    Ok(payload)
+}
+
+/// List every revision (descending by id).
+fn list_revisions(conn: &rusqlite::Connection) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT revision_id, author, message, state, created_at \
+             FROM desired_config ORDER BY revision_id DESC",
+        )
+        .context("preparing revisions list")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "revision_id":  r.get::<_, i64>(0)?.to_string(),
+                "author":       r.get::<_, String>(1)?,
+                "summary":      r.get::<_, String>(2)?,
+                "state":        r.get::<_, String>(3)?,
+                "created_at":   r.get::<_, String>(4)?,
+            }))
+        })
+        .context("executing revisions list")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("materializing revisions list")?;
+    Ok(rows)
+}
+
+fn print_revisions_table(rows: &[serde_json::Value]) {
+    if rows.is_empty() {
+        println!("(no revisions)");
+        return;
+    }
+    for row in rows {
+        let rid = row
+            .get("revision_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let st = row.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+        let aut = row.get("author").and_then(|v| v.as_str()).unwrap_or("?");
+        let cre = row
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let sm = row.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        println!("{rid:>6}  [{st}]  {aut:<16}  {cre}  {sm}");
+    }
+}

@@ -55,3 +55,46 @@ pub fn run(cmd: PlaybooksCmd) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// `$QNM_SHARED_ROOT/.qnm-sync/playbooks/roles/` — same
+/// resolution the Iced playbooks panel uses.
+fn playbooks_root() -> PathBuf {
+    let base = std::env::var("QNM_SHARED_ROOT").map(PathBuf::from).ok();
+    let base = base.unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join("QNM-Shared"))
+            .unwrap_or_else(|_| PathBuf::from("/var/empty"))
+    });
+    base.join(".qnm-sync").join("playbooks").join("roles")
+}
+
+/// Walk roles/ for subdirectories. Returns role names (bare
+/// basenames); empty on any I/O error so the panel + CLI can
+/// surface the empty-state message.
+fn enumerate_playbook_roles(root: &std::path::Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in rd.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn playbook_description(name: &str) -> &'static str {
+    match name {
+        "system-update" => "Apply pending dnf upgrades (gated, never runs on default tag)",
+        "mesh-state-snapshot" => "Snapshot QNM-Shared state for offline review",
+        "selinux-permissive-toggle" => "Flip SELinux to permissive (op-tagged, never default)",
+        "container-runtime-setup" => "Install + configure podman / docker runtime",
+        "xfconf-baseline" => "Apply baseline xfconf keys (default-tagged)",
+        "bloat-removal" => "Remove the curated bloat package list",
+        "apps-install" => "Install the curated MDE app list",
+        _ => "Custom role",
+    }
+}

@@ -35,3 +35,42 @@ pub fn run(cmd: NodesCmd, db_path: PathBuf) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+fn nodes_to_json(nodes: &[mackesd_core::store::NodeRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "node_id":    n.node_id,
+                    "name":       n.name,
+                    "public_key": n.public_key,
+                    "role":       n.role,
+                    "health":     n.health,
+                    "region":     n.region,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn print_nodes_table(nodes: &[mackesd_core::store::NodeRow]) {
+    if nodes.is_empty() {
+        println!("(no peers enrolled)");
+        return;
+    }
+    println!(
+        "{:<24} {:<24} {:<12} {:<12} {:<10}",
+        "node_id", "name", "role", "health", "region"
+    );
+    for n in nodes {
+        println!(
+            "{:<24} {:<24} {:<12} {:<12} {:<10}",
+            n.node_id,
+            n.name,
+            n.role,
+            n.health,
+            n.region.as_deref().unwrap_or("-"),
+        );
+    }
+}
