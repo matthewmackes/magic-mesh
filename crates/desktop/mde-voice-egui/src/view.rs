@@ -7,8 +7,10 @@
 //! done. Status text reuses the SIP state machine's own `RegistrationState`/
 //! `CallState` labels (§6 — no re-worded copy).
 
+use std::f32::consts::TAU;
+
 use mde_egui::egui::{self, Color32, RichText};
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 
 use mde_voice_hud::sip::CallState;
 
@@ -89,6 +91,10 @@ fn dialer_tab(ui: &mut egui::Ui, app: &mut VoiceApp) {
 fn incoming_card(ui: &mut egui::Ui, state: &VoiceState, cmds: &mut Vec<Command>) {
     ui.vertical_centered(|ui| {
         ui.add_space(Style::SP_L);
+        // The breathing ringing emblem — a live pulse on the shared Motion cadence
+        // so a ringing call reads as urgent, not a frozen card (§4 micro-interaction).
+        ringing_emblem(ui);
+        ui.add_space(Style::SP_S);
         ui.label(
             RichText::new("Incoming call")
                 .size(Style::HEADING)
@@ -96,17 +102,26 @@ fn incoming_card(ui: &mut egui::Ui, state: &VoiceState, cmds: &mut Vec<Command>)
         );
         ui.add_space(Style::SP_XS);
         if let CallState::Incoming { from } = &state.call {
-            ui.label(RichText::new(from).size(Style::BODY).color(Style::ACCENT));
+            // The caller identity is data — mono, one rung up, so it reads as the
+            // card's key fact rather than a caption (mono-first, lock #3).
+            ui.label(
+                RichText::new(from)
+                    .monospace()
+                    .size(Style::TITLE)
+                    .color(Style::ACCENT),
+            );
         }
-        ui.add_space(Style::SP_M);
+        ui.add_space(Style::SP_L);
         ui.horizontal(|ui| {
             let answer = egui::Button::new(RichText::new("Answer").color(Style::BG).strong())
-                .fill(Style::OK);
+                .fill(Style::OK)
+                .min_size(CALL_ACTION_MIN);
             if ui.add(answer).clicked() {
                 cmds.push(Command::Answer);
             }
             ui.add_space(Style::SP_S);
-            if ui.button("Decline").clicked() {
+            let decline = egui::Button::new("Decline").min_size(CALL_ACTION_MIN);
+            if ui.add(decline).clicked() {
                 cmds.push(Command::Decline);
             }
         });
@@ -117,14 +132,18 @@ fn incoming_card(ui: &mut egui::Ui, state: &VoiceState, cmds: &mut Vec<Command>)
 fn active_card(ui: &mut egui::Ui, state: &VoiceState, cmds: &mut Vec<Command>) {
     ui.vertical_centered(|ui| {
         ui.add_space(Style::SP_L);
+        // The live call state is a status metric — mono, so it reads as a readout
+        // rather than prose (mono-first, lock #3).
         ui.label(
             RichText::new(state.call.label())
+                .monospace()
                 .size(Style::HEADING)
                 .color(tone_color(call_tone(&state.call))),
         );
         ui.add_space(Style::SP_M);
         let hang = egui::Button::new(RichText::new("Hang up").color(Style::BG).strong())
-            .fill(Style::DANGER);
+            .fill(Style::DANGER)
+            .min_size(CALL_ACTION_MIN);
         if ui.add(hang).clicked() {
             cmds.push(Command::HangUp);
         }
@@ -149,6 +168,9 @@ fn dialer(ui: &mut egui::Ui, state: &VoiceState, dial: &mut String, cmds: &mut V
         let field = ui.add(
             egui::TextEdit::singleline(dial)
                 .hint_text("mesh peer name, or a number")
+                // The dialed target is data (a number / peer id) — mono, so digits
+                // and ids line up and read as an entry field (mono-first, lock #3).
+                .font(egui::TextStyle::Monospace)
                 .desired_width(Style::SP_XL * 8.0),
         );
         submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -181,6 +203,54 @@ fn dialer(ui: &mut egui::Ui, state: &VoiceState, dial: &mut String, cmds: &mut V
 }
 
 // ── Small render helpers ────────────────────────────────────────────────────
+
+/// The comfortable minimum footprint of a primary call-lifecycle action button
+/// (Answer / Decline / Hang up) — a wide, ≥`SP_XL`-tall target on the spacing
+/// grid so the urgent verbs are easy to hit. egui floors a button's height at the
+/// density's `interact_size` *before* applying this min, so it only ever grows a
+/// mouse target and never shrinks a larger touch one (a11y hit-target axis).
+const CALL_ACTION_MIN: egui::Vec2 = egui::Vec2::new(Style::SP_XL * 3.0, Style::SP_XL);
+
+/// One full ringing-pulse heartbeat, in seconds, derived from the shared
+/// [`Motion`] table so the ring cadence stays on the harness timing scale rather
+/// than a bespoke literal (§4). A ringing call is urgent-but-calm — a slow
+/// breathing ripple, deliberately *not* the D/F-grade [`Motion::blink`] alarm.
+const RING_PULSE_SECS: f64 = Motion::SLOW as f64 * 3.0;
+
+/// The steady radius of the ringing emblem's accent core dot (spacing-grid-shaped).
+const RING_CORE_R: f32 = Style::SP_S;
+/// How far the emblem's ripple travels outward from the core at a pulse's peak.
+const RING_RIPPLE_TRAVEL: f32 = Style::SP_M;
+
+/// A breathing **ringing emblem** — an accent core dot with an outward ripple that
+/// expands and fades on the shared [`Motion`] cadence — so a ringing call *reads*
+/// as live rather than a static card. The ripple phase comes from the egui clock
+/// through [`RING_PULSE_SECS`] (derived from [`Motion::SLOW`], no literal), and the
+/// frame repaints only while the emblem is on screen (i.e. only while ringing), so
+/// an idle DRM seat never spins on it (§4 / CRAFT repaint hygiene).
+fn ringing_emblem(ui: &mut egui::Ui) {
+    // A smooth 0→1→0 breath (cosine ease) — the same shape mde-mesh-view's leader
+    // heartbeat and mde-panel's pip pulse ride, so the platform breathes one way.
+    let phase = (ui.input(|i| i.time) / RING_PULSE_SECS).fract() as f32;
+    let breath = 0.5 - 0.5 * (phase * TAU).cos();
+
+    let diameter = (RING_CORE_R + RING_RIPPLE_TRAVEL) * 2.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+
+    // The ripple grows from the core outward and fades as it goes, so it reads as a
+    // wave leaving the dot — a 1 px stroke (geometry discipline), alpha on the
+    // inverse breath (bright at the core, gone at the edge).
+    let ripple_r = RING_CORE_R + RING_RIPPLE_TRAVEL * breath;
+    let ripple = Style::ACCENT.gamma_multiply(1.0 - breath);
+    painter.circle_stroke(center, ripple_r, egui::Stroke::new(1.0, ripple));
+    // The steady accent core.
+    painter.circle_filled(center, RING_CORE_R, Style::ACCENT);
+
+    // Keep the breath alive — but only while the ringing card is on screen.
+    ui.ctx().request_repaint();
+}
 
 /// Map a render-agnostic [`Tone`] to its shared `Style` colour.
 const fn tone_color(tone: Tone) -> Color32 {
