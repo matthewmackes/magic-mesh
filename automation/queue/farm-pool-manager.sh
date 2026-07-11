@@ -40,11 +40,23 @@ cmd_status() {
 
 # Install + start the agent service on each node (idempotent).
 cmd_ensure_agents() {
+  # Source of truth for the unit is THIS control host's repo ($REPO — the tree the
+  # manager itself runs from, the same current source xcp-build.sh's do_sync and
+  # farm-enqueue rsync to the nodes), NOT the node's ~/magic-mesh copy. That copy is
+  # only current if farm-enqueue happened to run first (a temporal coupling), and the
+  # build VMs additionally carry a stale Forgejo-mirror clone at ~/magic-mesh whose
+  # origin/master sits at an old commit. Reading the unit from there can install a
+  # STALE unit (or silently no-op on a missing clone). So ship the CURRENT unit
+  # ourselves, then install from that fresh copy.
+  local unit="$REPO/packaging/systemd/mcnf-farm-agent.service"
+  [ -f "$unit" ] || { echo "unit not found: $unit" >&2; exit 1; }
   for n in $NODES; do
     timeout 4 bash -c "cat </dev/null >/dev/tcp/$n/22" 2>/dev/null || { echo "skip $n (down)"; continue; }
     echo "==> ensure agent on $n"
-    # The tree (incl. automation/) is synced by farm-enqueue; install + start the unit.
-    "${SSH[@]}" "mm@$n" 'sudo cp ~/magic-mesh/packaging/systemd/mcnf-farm-agent.service /etc/systemd/system/ 2>/dev/null &&
+    # rsync the current unit to the node (same current-source pattern as
+    # xcp-build.sh do_sync / farm-enqueue's tree rsync), then install from it.
+    rsync -az -e "${SSH[*]}" "$unit" "mm@$n:/tmp/mcnf-farm-agent.service" \
+      && "${SSH[@]}" "mm@$n" 'sudo cp /tmp/mcnf-farm-agent.service /etc/systemd/system/mcnf-farm-agent.service &&
       sudo systemctl daemon-reload && sudo systemctl enable --now mcnf-farm-agent 2>&1 | tail -1 &&
       echo "  $(hostname): $(systemctl is-active mcnf-farm-agent)"' 2>&1
   done
