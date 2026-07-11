@@ -2555,7 +2555,19 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 /// real) is the second layer: even a same-tick `RTCPeerConnection` that gets
 /// past this script still cannot leak a raw local IP over non-proxied UDP.
 const fn webrtc_block_script() -> &'static str {
-    "(function(){try{delete window.RTCPeerConnection;}catch(_e){}try{delete window.webkitRTCPeerConnection;}catch(_e){}try{delete window.RTCDataChannel;}catch(_e){}try{delete window.RTCSessionDescription;}catch(_e){}try{delete window.RTCIceCandidate;}catch(_e){}try{if(window.MediaDevices&&MediaDevices.prototype){delete MediaDevices.prototype.getUserMedia;delete MediaDevices.prototype.getDisplayMedia;}}catch(_e){}try{if(navigator.mediaDevices){delete navigator.mediaDevices.getUserMedia;delete navigator.mediaDevices.getDisplayMedia;}}catch(_e){}try{delete navigator.getUserMedia;}catch(_e){}try{delete navigator.webkitGetUserMedia;}catch(_e){}try{delete navigator.mozGetUserMedia;}catch(_e){}})();"
+    // browser-3: the removal is applied to EVERY reachable frame, not just the
+    // main frame. `strip(w)` deletes the JS-reachable WebRTC surface on a target
+    // window; `sweep(w)` recurses through `w.frames` so a child (or nested)
+    // same-origin iframe — the trivial main-frame-only bypass — is covered too.
+    // A `MutationObserver` re-sweeps on DOM mutation so a *newly inserted* iframe
+    // is patched as soon as it appears, between the 250ms poll ticks. Cross-origin
+    // subframes are unreachable from JS by same-origin policy (property access on
+    // them throws and is swallowed) — the `--force-webrtc-ip-handling-policy`
+    // switch remains the backstop for that residual, see this file's cef_init
+    // companion. A native `CefPermissionHandler`/ICE-layer deny would be airtight
+    // but the pinned CEF 149 ABI exposes no permission-handler or frame-enumeration
+    // vtable offset verified from the farm headers, so it is not attempted here.
+    "(function(){function strip(w){try{delete w.RTCPeerConnection;}catch(_e){}try{delete w.webkitRTCPeerConnection;}catch(_e){}try{delete w.RTCDataChannel;}catch(_e){}try{delete w.RTCSessionDescription;}catch(_e){}try{delete w.RTCIceCandidate;}catch(_e){}try{if(w.MediaDevices&&w.MediaDevices.prototype){delete w.MediaDevices.prototype.getUserMedia;delete w.MediaDevices.prototype.getDisplayMedia;}}catch(_e){}try{if(w.navigator&&w.navigator.mediaDevices){delete w.navigator.mediaDevices.getUserMedia;delete w.navigator.mediaDevices.getDisplayMedia;}}catch(_e){}try{delete w.navigator.getUserMedia;}catch(_e){}try{delete w.navigator.webkitGetUserMedia;}catch(_e){}try{delete w.navigator.mozGetUserMedia;}catch(_e){}}function sweep(w){try{strip(w);}catch(_e){}var kids=null;try{kids=w.frames;}catch(_e){kids=null;}if(kids){for(var i=0;i<kids.length;i++){var cw=null;try{cw=kids[i];}catch(_e){cw=null;}if(cw&&cw!==w){try{sweep(cw);}catch(_e){}}}}}sweep(window);try{if(!window.__mdeWebrtcBlockObserver&&window.MutationObserver&&document&&document.documentElement){window.__mdeWebrtcBlockObserver=new MutationObserver(function(){try{sweep(window);}catch(_e){}});window.__mdeWebrtcBlockObserver.observe(document.documentElement,{childList:true,subtree:true});}}catch(_e){}})();"
 }
 
 fn passkey_bridge_script() -> String {
@@ -2646,6 +2658,13 @@ try{{
         return btoa(s).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
       }}catch(_){{return '';}}
     }}
+    function hasUserGesture(){{
+      try{{
+        var ua=navigator.userActivation;
+        if(ua&&typeof ua.isActive==='boolean')return ua.isActive;
+      }}catch(_){{}}
+      return false;
+    }}
     function ceremony(kind,options){{
       var pk=(options&&options.publicKey)||{{}};
       var rp=(pk.rp&&pk.rp.id)||location.hostname;
@@ -2658,11 +2677,13 @@ try{{
         out.allow_credentials=pk.allowCredentials.slice(0,64).map(function(c){{return b64url(c&&c.id);}}).filter(Boolean);
       }}
       if(typeof pk.timeout==='number')out.timeout_ms=Math.max(0,Math.floor(pk.timeout));
+      out.user_present=hasUserGesture();
       return out;
     }}
     function enqueue(kind,options){{
       var item=ceremony(kind,options);
       if(!item.challenge_b64url)return Promise.reject(new DOMException('Passkey challenge missing','NotAllowedError'));
+      if(!item.user_present)return Promise.reject(new DOMException('Passkey ceremony requires a user gesture','NotAllowedError'));
       item.client_request_id='mde-pk-'+Date.now().toString(36)+'-'+(++window.__mdeBrowserPasskeySeq).toString(36);
       var q=window.__mdeBrowserPasskeyQueue;
       q.push(item);
@@ -2670,8 +2691,18 @@ try{{
       return new Promise(function(resolve,reject){{window.__mdeBrowserPasskeyPending[item.client_request_id]={{resolve:resolve,reject:reject,ceremony:kind}};}});
     }}
     var creds=navigator.credentials||(navigator.credentials={{}});
-    creds.create=function(options){{return enqueue('create',options);}};
-    creds.get=function(options){{return enqueue('get',options);}};
+    var origCreate=(typeof creds.create==='function')?creds.create.bind(creds):null;
+    var origGet=(typeof creds.get==='function')?creds.get.bind(creds):null;
+    creds.create=function(options){{
+      if(options&&options.publicKey)return enqueue('create',options);
+      if(origCreate)return origCreate(options);
+      return Promise.reject(new DOMException('Unsupported credential type','NotSupportedError'));
+    }};
+    creds.get=function(options){{
+      if(options&&options.publicKey)return enqueue('get',options);
+      if(origGet)return origGet(options);
+      return Promise.reject(new DOMException('Unsupported credential type','NotSupportedError'));
+    }};
   }}
   var q=window.__mdeBrowserPasskeyQueue;
   for(var n=0;n<4&&q.length;n++)emit(q.shift());
@@ -3502,6 +3533,15 @@ mod tests {
         assert!(script.contains("navigator.credentials"));
         assert!(script.contains("creds.create=function"));
         assert!(script.contains("creds.get=function"));
+        // browser-4: capture the originals so non-publicKey requests fall
+        // through instead of being hijacked into a passkey ceremony.
+        assert!(script.contains("origCreate"));
+        assert!(script.contains("origGet"));
+        // security-2(a): only dispatch behind a real user gesture (transient
+        // activation), and thread the presence signal to the daemon.
+        assert!(script.contains("hasUserGesture"));
+        assert!(script.contains("navigator.userActivation"));
+        assert!(script.contains("user_present"));
         assert!(script.contains(CEF_PASSKEY_BEACON_PREFIX));
         assert!(script.contains("challenge_b64url"));
         assert!(script.contains("allow_credentials"));
@@ -3529,23 +3569,59 @@ mod tests {
     }
 
     #[test]
+    fn passkey_shim_feature_detects_credential_type_and_gates_on_a_gesture() {
+        // browser-4: a plain `navigator.credentials.get({password:true})`
+        // (password-manager autofill), `{federated:...}`, or WebOTP `{otp:...}`
+        // request has no `publicKey` member, so the shim must NOT convert it into
+        // a passkey ceremony — it calls through to the captured original instead.
+        let script = passkey_bridge_script();
+        // The publicKey guard precedes the passkey `enqueue`, and the else-branch
+        // is a call-through to the original implementation.
+        assert!(script.contains("if(options&&options.publicKey)return enqueue('get',options)"));
+        assert!(script.contains("if(options&&options.publicKey)return enqueue('create',options)"));
+        assert!(script.contains("if(origGet)return origGet(options)"));
+        assert!(script.contains("if(origCreate)return origCreate(options)"));
+        // The `enqueue` path (publicKey only) is the sole caller of the passkey
+        // beacon queue, so a non-publicKey get can never reach it. Prove the
+        // guard sits before the queue push, not after.
+        let get_guard = script
+            .find("if(options&&options.publicKey)return enqueue('get',options)")
+            .expect("get guard present");
+        let enqueue_impl = script
+            .find("function enqueue(kind,options)")
+            .expect("enqueue defined");
+        assert!(
+            enqueue_impl < get_guard,
+            "enqueue is defined before the guarded call site"
+        );
+
+        // security-2(a): the ceremony only dispatches with transient activation,
+        // and a gesture-less call is rejected rather than auto-signed.
+        assert!(script.contains("if(ua&&typeof ua.isActive==='boolean')return ua.isActive"));
+        assert!(script.contains("out.user_present=hasUserGesture()"));
+        assert!(script.contains(
+            "if(!item.user_present)return Promise.reject(new DOMException('Passkey ceremony requires a user gesture','NotAllowedError'))"
+        ));
+    }
+
+    #[test]
     fn webrtc_block_script_removes_the_reachable_webrtc_surface() {
         // `--disable-webrtc` (cef_init.rs) is confirmed non-functional (see
         // its doc comment); this renderer-level shim is the real mitigation,
         // so pin exactly which JS-reachable entry points it removes.
         let script = webrtc_block_script();
-        assert!(script.contains("delete window.RTCPeerConnection"));
-        assert!(script.contains("delete window.webkitRTCPeerConnection"));
-        assert!(script.contains("delete window.RTCDataChannel"));
-        assert!(script.contains("delete window.RTCSessionDescription"));
-        assert!(script.contains("delete window.RTCIceCandidate"));
-        assert!(script.contains("MediaDevices.prototype.getUserMedia"));
-        assert!(script.contains("MediaDevices.prototype.getDisplayMedia"));
-        assert!(script.contains("navigator.mediaDevices.getUserMedia"));
-        assert!(script.contains("navigator.mediaDevices.getDisplayMedia"));
-        assert!(script.contains("delete navigator.getUserMedia"));
-        assert!(script.contains("delete navigator.webkitGetUserMedia"));
-        assert!(script.contains("delete navigator.mozGetUserMedia"));
+        assert!(script.contains("delete w.RTCPeerConnection"));
+        assert!(script.contains("delete w.webkitRTCPeerConnection"));
+        assert!(script.contains("delete w.RTCDataChannel"));
+        assert!(script.contains("delete w.RTCSessionDescription"));
+        assert!(script.contains("delete w.RTCIceCandidate"));
+        assert!(script.contains("w.MediaDevices.prototype.getUserMedia"));
+        assert!(script.contains("w.MediaDevices.prototype.getDisplayMedia"));
+        assert!(script.contains("w.navigator.mediaDevices.getUserMedia"));
+        assert!(script.contains("w.navigator.mediaDevices.getDisplayMedia"));
+        assert!(script.contains("delete w.navigator.getUserMedia"));
+        assert!(script.contains("delete w.navigator.webkitGetUserMedia"));
+        assert!(script.contains("delete w.navigator.mozGetUserMedia"));
         assert!(
             !script.contains("<script"),
             "webrtc block runs as a direct IIFE, not injected markup"
@@ -3553,7 +3629,28 @@ mod tests {
         // Every deletion is individually try/catch-guarded so one already-gone
         // global (e.g. re-running after the page itself deleted something)
         // cannot abort the rest of the shim.
-        assert_eq!(script.matches("catch(_e){}").count(), 10);
+        assert_eq!(script.matches("catch(_e){}").count(), 14);
+    }
+
+    #[test]
+    fn webrtc_block_script_covers_subframes_not_just_the_main_frame() {
+        // browser-3: a page's trivial bypass was a child iframe (its own
+        // unpatched JS context). The shim now recurses through `frames` and
+        // re-sweeps on DOM mutation, so a same-origin child/nested/late-inserted
+        // iframe is stripped too — not only `get_main_frame`.
+        let script = webrtc_block_script();
+        // The strip logic is parameterised over a target window `w` and applied
+        // to every reachable frame, rather than hard-coded to `window`.
+        assert!(script.contains("function strip(w)"));
+        assert!(script.contains("function sweep(w)"));
+        // Recurse across child frames.
+        assert!(script.contains("w.frames"));
+        assert!(script.contains("sweep(cw)"));
+        // Cover frames inserted after the first pass.
+        assert!(script.contains("MutationObserver"));
+        assert!(script.contains("childList:true,subtree:true"));
+        // The entry point sweeps from the top window (which recurses down).
+        assert!(script.contains("sweep(window)"));
     }
 
     #[test]

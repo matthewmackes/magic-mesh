@@ -5836,6 +5836,14 @@ fn browser_passkey_body(engine: BrowserEngine, helper_body: &str) -> Result<Stri
     if let Some(value) = optional_trimmed_str(&helper, "client_request_id") {
         obj.insert("client_request_id".to_owned(), serde_json::json!(value));
     }
+    // security-2: forward the shim's user-presence (user-gesture) signal so the
+    // daemon sets the WebAuthn User Present bit only when a human interaction was
+    // actually observed, rather than hardcoding it. Absent => not present.
+    let user_present = helper
+        .get("user_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    obj.insert("user_present".to_owned(), serde_json::json!(user_present));
     if let Some(timeout_ms) = helper.get("timeout_ms").and_then(serde_json::Value::as_u64) {
         obj.insert("timeout_ms".to_owned(), serde_json::json!(timeout_ms));
     }
@@ -17967,7 +17975,8 @@ mod tests {
                 "client_request_id":"mde-pk-test-1",
                 "user_handle_b64url":"user_handle_123",
                 "user_name":"MDE User",
-                "timeout_ms":60000
+                "timeout_ms":60000,
+                "user_present":true
             }"#,
         )
         .expect("passkey body");
@@ -17980,6 +17989,24 @@ mod tests {
         assert_eq!(v["client_request_id"], "mde-pk-test-1");
         assert_eq!(v["user_name"], "MDE User");
         assert_eq!(v["timeout_ms"], 60000);
+        // security-2: the user-presence signal is forwarded to the daemon.
+        assert_eq!(v["user_present"], true);
+
+        // A helper event with no presence signal forwards user_present=false, so
+        // the daemon will not set the UP bit.
+        let no_presence = browser_passkey_body(
+            BrowserEngine::Cef,
+            r#"{
+                "ceremony":"get",
+                "origin":"https://login.example/",
+                "rp_id":"login.example",
+                "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456"
+            }"#,
+        )
+        .expect("passkey body");
+        let no_presence: serde_json::Value =
+            serde_json::from_str(&no_presence).expect("valid JSON");
+        assert_eq!(no_presence["user_present"], false);
         assert!(browser_passkey_body(
             BrowserEngine::Servo,
             r#"{"ceremony":"delete","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456"}"#

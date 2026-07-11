@@ -7,6 +7,22 @@
 //! hardware-key readiness probe plus CTAP HID packet framing needed for a live
 //! hardware exchange. CTAP2 credential commands, phone-as-authenticator, and live
 //! relying-party E2E proof remain separate owners.
+//!
+//! ## User-presence posture (security-2)
+//!
+//! The authenticator-data User Present (`UP`) bit is set **only** when the
+//! ceremony carried a real presence signal (`PasskeyRequest::user_present`,
+//! populated from a shim-observed user gesture / transient activation) — never
+//! hardcoded. A ceremony with no verified presence honestly signs `UP=0`, which
+//! a relying party rejects, rather than fabricating "a human was here".
+//!
+//! DEFERRED: this presence signal is *page-asserted* (the injected shim runs in
+//! the page's own JS context, so a hostile same-origin page could in principle
+//! forge it for its own `rp_id`). A trustworthy, unforgeable presence gate — a
+//! shell-rendered consent prompt the page cannot script — is intentionally out
+//! of scope for this hardening pass (it is a sizable new UI). Until it lands,
+//! `UP` reflects the best available honest signal (a checked gesture) instead of
+//! a constant, and the shim refuses to auto-dispatch a gesture-less ceremony.
 
 #![cfg(feature = "async-services")]
 
@@ -113,6 +129,16 @@ pub struct PasskeyRequest {
     pub allow_credentials: Vec<String>,
     /// Optional browser-suggested timeout.
     pub timeout_ms: Option<u64>,
+    /// Whether a user-presence step (a real user gesture / transient
+    /// activation, reported by the injected shim) accompanied this ceremony.
+    ///
+    /// security-2: the authenticator-data User Present (`UP`) bit is set **only**
+    /// when this is true, rather than hardcoded. Defaults to `false` when the
+    /// producer omits the signal, so an absent/forged-empty request yields an
+    /// honest UP=0 (which a relying party rejects) instead of a fabricated
+    /// "human was here". This is a page-asserted signal, not yet an unforgeable
+    /// shell consent prompt — see the module note on the deferred consent UI.
+    pub user_present: bool,
 }
 
 /// Durable pending ceremony record. This intentionally contains no private key
@@ -634,7 +660,11 @@ impl BrowserPasskeysWorker {
             body["sign_count"] = serde_json::Value::from(assertion.sign_count);
         } else if op == "browser_passkey_created" {
             let payload = assertion_payload(&pending.request, credential.sign_count);
-            let auth_data = registration_authenticator_data(&pending.request.rp_id, credential)?;
+            let auth_data = registration_authenticator_data(
+                &pending.request.rp_id,
+                credential,
+                pending.request.user_present,
+            )?;
             let attestation_object = none_attestation_object(&auth_data);
             body["client_data_json_b64url"] =
                 serde_json::Value::String(b64url(payload.client_data_json.as_bytes()));
@@ -723,6 +753,14 @@ fn parse_request(body: &str, id: &str) -> Result<PasskeyRequest, String> {
     if !valid_rp_id(&rp_id) || !rp_matches_origin(&rp_id, &origin_host) {
         return Err("rp_id does not match origin".to_owned());
     }
+    // browser-6: reject an rp_id that is itself a public suffix (e.g. a page at
+    // `attacker.github.io` requesting `rp_id = "github.io"`, which would match
+    // every `*.github.io` tenant). Combined with the label-boundary check above,
+    // requiring a non-public-suffix rp_id also guarantees the rp_id covers at
+    // least the origin's registrable domain (eTLD+1).
+    if is_public_suffix(&rp_id) {
+        return Err("rp_id is a public suffix".to_owned());
+    }
     let challenge_b64url = required_string(&v, "challenge_b64url", MAX_CHALLENGE_CHARS)?;
     if !valid_b64url_token(&challenge_b64url, 22, MAX_CHALLENGE_CHARS) {
         return Err("invalid challenge_b64url".to_owned());
@@ -748,6 +786,11 @@ fn parse_request(body: &str, id: &str) -> Result<PasskeyRequest, String> {
     if timeout_ms.is_some_and(|ms| !(1_000..=600_000).contains(&ms)) {
         return Err("timeout_ms out of range".to_owned());
     }
+    // security-2: presence signal from the shim. Absent => not present.
+    let user_present = v
+        .get("user_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     Ok(PasskeyRequest {
         id,
@@ -765,6 +808,7 @@ fn parse_request(body: &str, id: &str) -> Result<PasskeyRequest, String> {
         user_name,
         allow_credentials,
         timeout_ms,
+        user_present,
     })
 }
 
@@ -894,6 +938,171 @@ fn rp_matches_origin(rp_id: &str, origin_host: &str) -> bool {
         || origin_host
             .strip_suffix(rp_id)
             .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// Curated Public Suffix List snapshot (interim; see the note below).
+///
+/// browser-6: `rp_matches_origin`'s label-boundary suffix check alone let a page
+/// at `attacker.github.io` claim `rp_id = "github.io"` and thereby match every
+/// `*.github.io` tenant — a cross-tenant credential-phishing hole. The real fix
+/// is a public-suffix check: an `rp_id` that is itself a public suffix must be
+/// rejected. Bundling the full Mozilla PSL (or pulling a `publicsuffix`/`psl`
+/// crate) is not viable on the airgapped daemon build today, so this is a
+/// curated snapshot of the highest-value suffixes — common multi-tenant hosting
+/// domains (the direct attack surface) plus common country-code second-level
+/// registries. Every single-label TLD (`com`, `io`, `test`, …) is already a
+/// public suffix via the implicit default `*` rule, so only multi-label rules
+/// are listed. Entries may use a leading `*` label (wildcard) or a `!` prefix
+/// (exception), matching PSL semantics. The list is deliberately conservative:
+/// a missing entry fails *safe* (merely less restrictive on an exotic suffix),
+/// never by blocking a legitimate registrable domain. Refresh it from
+/// <https://publicsuffix.org/list/public_suffix_list.dat> when the daemon can
+/// vendor the full list.
+const PUBLIC_SUFFIX_RULES: &[&str] = &[
+    // Multi-tenant hosting / PaaS suffixes (the browser-6 attack surface).
+    "github.io",
+    "gitlab.io",
+    "bitbucket.io",
+    "pages.dev",
+    "workers.dev",
+    "r2.dev",
+    "netlify.app",
+    "vercel.app",
+    "web.app",
+    "firebaseapp.com",
+    "appspot.com",
+    "cloudfunctions.net",
+    "herokuapp.com",
+    "herokussl.com",
+    "now.sh",
+    "surge.sh",
+    "glitch.me",
+    "repl.co",
+    "readthedocs.io",
+    "blogspot.com",
+    "azurewebsites.net",
+    "azurestaticapps.net",
+    "cloudapp.net",
+    "cloudfront.net",
+    "s3.amazonaws.com",
+    "elasticbeanstalk.com",
+    "translate.goog",
+    "myshopify.com",
+    // Common country-code second-level registries.
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.uk",
+    "me.uk",
+    "net.uk",
+    "ltd.uk",
+    "plc.uk",
+    "sch.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "edu.au",
+    "gov.au",
+    "id.au",
+    "co.jp",
+    "or.jp",
+    "ne.jp",
+    "ac.jp",
+    "go.jp",
+    "co.kr",
+    "or.kr",
+    "com.cn",
+    "net.cn",
+    "org.cn",
+    "gov.cn",
+    "edu.cn",
+    "com.br",
+    "net.br",
+    "org.br",
+    "gov.br",
+    "com.mx",
+    "com.ar",
+    "com.co",
+    "co.in",
+    "net.in",
+    "org.in",
+    "co.za",
+    "org.za",
+    "co.nz",
+    "net.nz",
+    "org.nz",
+    "govt.nz",
+    "ac.nz",
+    "com.sg",
+    "com.hk",
+    "com.tw",
+    "com.tr",
+    "co.il",
+    "com.ua",
+    "com.pl",
+    "co.id",
+    "co.th",
+    "com.my",
+    "com.ph",
+    "com.vn",
+    // Canonical PSL wildcard + exception example (exercises both rule kinds).
+    "*.ck",
+    "!www.ck",
+];
+
+/// Whether `domain` is itself a public suffix — an eTLD under which anyone may
+/// register — per the curated snapshot plus the implicit default `*` rule that
+/// makes every single-label domain a public suffix.
+///
+/// browser-6: a WebAuthn `rp_id` that is a public suffix must be rejected, so a
+/// page cannot scope a credential to a shared multi-tenant suffix.
+fn is_public_suffix(domain: &str) -> bool {
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    public_suffix_label_count(&labels) == labels.len()
+}
+
+/// Number of right-hand labels of `labels` that form its public suffix, applying
+/// PSL rule precedence (exception rules win; otherwise the longest matching
+/// rule; otherwise the default `*` = one label).
+fn public_suffix_label_count(labels: &[&str]) -> usize {
+    let mut best_normal = 0usize;
+    let mut best_exception = 0usize;
+    for rule in PUBLIC_SUFFIX_RULES {
+        let (is_exception, body) = match rule.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, *rule),
+        };
+        let rule_labels: Vec<&str> = body.split('.').collect();
+        if rule_labels.is_empty() || rule_labels.len() > labels.len() {
+            continue;
+        }
+        let offset = labels.len() - rule_labels.len();
+        let matches = rule_labels
+            .iter()
+            .enumerate()
+            .all(|(i, rl)| *rl == "*" || rl.eq_ignore_ascii_case(labels[offset + i]));
+        if !matches {
+            continue;
+        }
+        if is_exception {
+            best_exception = best_exception.max(rule_labels.len());
+        } else {
+            best_normal = best_normal.max(rule_labels.len());
+        }
+    }
+    if best_exception > 0 {
+        // Exception rule: the public suffix is the rule minus its leftmost label.
+        best_exception - 1
+    } else if best_normal > 0 {
+        best_normal
+    } else {
+        // Default `*` rule: the rightmost label.
+        1
+    }
 }
 
 fn valid_b64url_token(value: &str, min_chars: usize, max_chars: usize) -> bool {
@@ -1385,6 +1594,27 @@ struct AssertionEvent {
     sign_count: u32,
 }
 
+/// Attested-credential-data (`AT`) flag bit, set on registration authenticator
+/// data because the attested credential *is* appended.
+const AUTH_FLAG_AT: u8 = 0x40;
+
+/// Build the WebAuthn authenticator-data flags byte from what actually happened.
+///
+/// security-2: `UP` (bit 0, user present) and `UV` (bit 2, user verified) are set
+/// only when a real presence / verification step occurred — never hardcoded — so
+/// the signed assertion does not attest a human interaction that never took
+/// place. Callers OR in [`AUTH_FLAG_AT`] for registration.
+const fn authenticator_flags(user_present: bool, user_verified: bool) -> u8 {
+    let mut flags = 0u8;
+    if user_present {
+        flags |= 0x01;
+    }
+    if user_verified {
+        flags |= 0x04;
+    }
+    flags
+}
+
 fn assertion_payload(request: &PasskeyRequest, sign_count: u32) -> AssertionPayload {
     let ceremony_type = if request.ceremony == "create" {
         "webauthn.create"
@@ -1403,10 +1633,13 @@ fn assertion_payload(request: &PasskeyRequest, sign_count: u32) -> AssertionPayl
     hash.copy_from_slice(&client_data_hash);
     let mut authenticator_data = Vec::with_capacity(37);
     authenticator_data.extend_from_slice(&Sha256::digest(request.rp_id.as_bytes()));
-    // Flags byte: UP (bit 0) only. No per-ceremony user-verification (PIN/biometric/
-    // confirmation prompt) exists yet in this pipeline (THREAT_MODEL.md #7.4.1) — the
-    // UV bit (bit 2) must stay 0 rather than falsely attest a check that never ran.
-    authenticator_data.push(0x01);
+    // Flags byte. security-2: the User Present (`UP`, bit 0) bit is set only when
+    // a presence step actually accompanied the ceremony (`request.user_present`),
+    // not hardcoded — a ceremony with no verified presence honestly signs UP=0
+    // (which a relying party rejects) rather than forging "a human was here".
+    // The User Verified (`UV`, bit 2) bit stays 0: no per-ceremony verification
+    // (PIN/biometric) exists in this pipeline (THREAT_MODEL.md §7.4.1).
+    authenticator_data.push(authenticator_flags(request.user_present, false));
     authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
     let mut signing_bytes = authenticator_data.clone();
     signing_bytes.extend_from_slice(&hash);
@@ -1421,6 +1654,7 @@ fn assertion_payload(request: &PasskeyRequest, sign_count: u32) -> AssertionPayl
 fn registration_authenticator_data(
     rp_id: &str,
     credential: &PlatformCredentialRecord,
+    user_present: bool,
 ) -> Result<Vec<u8>, String> {
     let credential_id = b64url_decode(&credential.credential_id_b64url)?;
     let public_key_sec1 = b64url_decode(&credential.public_key_sec1_b64url)?;
@@ -1430,9 +1664,10 @@ fn registration_authenticator_data(
     let cose_key = cose_es256_public_key(&public_key_sec1)?;
     let mut out = Vec::with_capacity(32 + 1 + 4 + 16 + 2 + credential_id.len() + cose_key.len());
     out.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    // Flags byte: UP + AT (attested credential data included), no UV — see the
-    // matching comment in `assertion_payload`.
-    out.push(0x41);
+    // Flags byte: AT (attested credential data is included) is always set on
+    // registration; UP is set only when a real presence step occurred, no UV —
+    // see the matching comment in `assertion_payload` (security-2).
+    out.push(authenticator_flags(user_present, false) | AUTH_FLAG_AT);
     out.extend_from_slice(&credential.sign_count.to_be_bytes());
     out.extend_from_slice(&[0_u8; 16]);
     out.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
@@ -1584,7 +1819,8 @@ mod tests {
             "client_request_id": "mde-pk-worker-1",
             "user_handle_b64url": user_handle(),
             "user_name": "alice@example.test",
-            "timeout_ms": 60_000
+            "timeout_ms": 60_000,
+            "user_present": true
         })
         .to_string()
     }
@@ -1599,7 +1835,8 @@ mod tests {
             "origin": "https://login.example.test/",
             "rp_id": "login.example.test",
             "challenge_b64url": challenge(),
-            "allow_credentials": ["credential_id_123456"]
+            "allow_credentials": ["credential_id_123456"],
+            "user_present": true
         })
         .to_string()
     }
@@ -2246,6 +2483,7 @@ mod tests {
             "rp_id": "example.test",
             "challenge_b64url": challenge(),
             "allow_credentials": [credential.credential_id_b64url],
+            "user_present": true,
         })
         .to_string();
         let get = parse_request(&get_body, "02GET").expect("get");
@@ -2347,6 +2585,7 @@ mod tests {
             "challenge_b64url": challenge(),
             "allow_credentials": [created["credential_id_b64url"].as_str().unwrap()],
             "client_request_id": "mde-pk-worker-2",
+            "user_present": true,
         })
         .to_string();
         let get = parse_request(&get_body, "02GET").expect("get");
@@ -2427,5 +2666,153 @@ mod tests {
         worker.drain_requests(&persist);
         assert_eq!(worker.status.rejected, 1);
         assert_eq!(worker.status.accepted, 1);
+    }
+
+    #[test]
+    fn authenticator_flags_reflect_only_what_actually_happened() {
+        // security-2: the flags byte is derived, never hardcoded.
+        assert_eq!(authenticator_flags(false, false), 0x00);
+        assert_eq!(authenticator_flags(true, false), 0x01);
+        assert_eq!(authenticator_flags(false, true), 0x04);
+        assert_eq!(authenticator_flags(true, true), 0x05);
+        // Registration always adds AT (attested credential data present).
+        assert_eq!(authenticator_flags(true, false) | AUTH_FLAG_AT, 0x41);
+        assert_eq!(authenticator_flags(false, false) | AUTH_FLAG_AT, 0x40);
+    }
+
+    #[test]
+    fn absent_user_presence_signs_an_honest_up_zero_flag() {
+        // security-2: with no presence signal the UP bit is 0 (honest — a relying
+        // party rejects it), not a fabricated 1. A present signal sets UP=1.
+        let no_presence = serde_json::json!({
+            "op": "browser_passkey",
+            "source": "browser",
+            "host": "node-a",
+            "engine": "cef",
+            "ceremony": "get",
+            "origin": "https://login.example.test/",
+            "rp_id": "example.test",
+            "challenge_b64url": challenge(),
+            "allow_credentials": ["credential_id_123456"],
+        })
+        .to_string();
+        let request = parse_request(&no_presence, "01NOUP").expect("request");
+        assert!(!request.user_present);
+        let payload = assertion_payload(&request, 1);
+        assert_eq!(payload.authenticator_data[32], 0x00);
+
+        let present = parse_request(&get_body(), "02UP").expect("request");
+        assert!(present.user_present);
+        assert_eq!(assertion_payload(&present, 1).authenticator_data[32], 0x01);
+    }
+
+    #[test]
+    fn registration_without_presence_marks_attested_data_but_not_user_present() {
+        // security-2: end-to-end — a create ceremony with no presence signal
+        // yields registration authData flags = AT only (0x40), never UP.
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let key_path = key_path(&local);
+        let mut worker = BrowserPasskeysWorker::new(
+            "node-a".to_owned(),
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        )
+        .with_key_path(key_path)
+        .with_share_gate(Arc::new(AtomicBool::new(true)));
+        let create_body = serde_json::json!({
+            "op": "browser_passkey",
+            "source": "browser",
+            "host": "node-a",
+            "engine": "cef",
+            "ceremony": "create",
+            "origin": "https://login.example.test/account",
+            "rp_id": "example.test",
+            "challenge_b64url": challenge(),
+            "user_handle_b64url": user_handle(),
+            "user_name": "alice@example.test",
+        })
+        .to_string();
+        let create = parse_request(&create_body, "01NOUP").expect("create");
+        assert!(!create.user_present);
+        worker.apply_request(&persist, create);
+        let created = event_with_op(&persist, "browser_passkey_created");
+        let auth_data =
+            b64url_decode(created["authenticator_data_b64url"].as_str().unwrap()).unwrap();
+        assert_eq!(auth_data[32], 0x40);
+    }
+
+    #[test]
+    fn public_suffix_detection_matches_psl_semantics() {
+        // Single-label TLDs and listed multi-tenant suffixes are public suffixes.
+        assert!(is_public_suffix("com"));
+        assert!(is_public_suffix("io"));
+        assert!(is_public_suffix("github.io"));
+        assert!(is_public_suffix("co.uk"));
+        assert!(is_public_suffix("ck"));
+        // Registrable domains (eTLD+1 and below) are not.
+        assert!(!is_public_suffix("example.com"));
+        assert!(!is_public_suffix("attacker.github.io"));
+        assert!(!is_public_suffix("example.co.uk"));
+        assert!(!is_public_suffix("login.example.test"));
+        // Wildcard + exception canonical example.
+        assert!(is_public_suffix("foo.ck"));
+        assert!(!is_public_suffix("www.ck"));
+    }
+
+    #[test]
+    fn rp_id_that_is_a_public_suffix_is_rejected() {
+        // browser-6: attacker.github.io must not scope a credential to the shared
+        // github.io suffix (which would match every *.github.io tenant).
+        let attack = serde_json::json!({
+            "op": "browser_passkey",
+            "source": "browser",
+            "host": "node-a",
+            "engine": "cef",
+            "ceremony": "get",
+            "origin": "https://attacker.github.io/",
+            "rp_id": "github.io",
+            "challenge_b64url": challenge(),
+            "user_present": true,
+        })
+        .to_string();
+        assert!(parse_request(&attack, "01PSL").is_err());
+
+        // A normal registrable domain still works from its subdomain origin.
+        let ok = serde_json::json!({
+            "op": "browser_passkey",
+            "source": "browser",
+            "host": "node-a",
+            "engine": "cef",
+            "ceremony": "get",
+            "origin": "https://foo.example.com/",
+            "rp_id": "example.com",
+            "challenge_b64url": challenge(),
+            "user_present": true,
+        })
+        .to_string();
+        assert_eq!(
+            parse_request(&ok, "02PSL")
+                .expect("registrable rp_id")
+                .rp_id,
+            "example.com"
+        );
+
+        // A github.io tenant can still use its own full subdomain as the rp_id.
+        let tenant = serde_json::json!({
+            "op": "browser_passkey",
+            "source": "browser",
+            "host": "node-a",
+            "engine": "cef",
+            "ceremony": "get",
+            "origin": "https://attacker.github.io/",
+            "rp_id": "attacker.github.io",
+            "challenge_b64url": challenge(),
+            "user_present": true,
+        })
+        .to_string();
+        assert!(parse_request(&tenant, "03PSL").is_ok());
     }
 }

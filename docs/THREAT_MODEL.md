@@ -350,8 +350,8 @@ despite the similar name, is a different, unrelated worker (BROWSER-DD-12's
 | Component | Tier | Trust |
 |-----------|------|-------|
 | Page JavaScript (`navigator.credentials`) | inside the browser engine | **UNTRUSTED** page content — confined the same as any other script (§3) when the engine is Servo. |
-| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Defines `navigator.credentials.create`/`.get` in page context itself and ships the ceremony to the shell over the existing IPC/beacon channel. See the CEF note in §7.4. |
-| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Forwards the ceremony to the local Bus **verbatim** — there is no confirmation UI at this layer (§7.4). |
+| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Intercepts `navigator.credentials.create`/`.get` **only when `options.publicKey` is present** (browser-4), calling through to the original for `{password}`/`{federated}`/`{otp}` requests; requires a user gesture (`navigator.userActivation`, security-2) before dispatch and ships the ceremony + presence signal to the shell over the existing IPC/beacon channel. See the CEF note in §7.4. |
+| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Forwards the ceremony to the local Bus, threading the shim's `user_present` gesture signal through — but there is still no unforgeable confirmation prompt at this layer (§7.4, item 1: deferred). |
 | `browser_passkeys` worker (Workstation, rank 1) | mackesd | Trusted. Validates the request shape + RP-ID/origin binding, mints or uses a P-256 keypair, signs, mirrors to the Syncthing share. |
 | Sealed credential store (`credentials/sealed/*.age`, local + Syncthing-shared workgroup root) | at rest | Confidentiality rests on the **mesh-wide age identity** (`/root/.mcnf-age-key`) — the same trust root already used for VPN tunnel secrets and XCP dom0 passwords, not a per-device or per-user secret (§7.4). |
 | Hardware FIDO2 keys / phone-as-authenticator | — | **Not wired to a live ceremony.** Only a HID readiness probe + CTAPHID_INIT diagnostic exist; the worker's own doc comment says CTAP2 credential commands and phone-as-authenticator "remain separate owners." |
@@ -399,10 +399,23 @@ drive this entire pipeline; see §7.4 for what does, and does not, gate it.
   `127.0.0.1`), lowercased, no embedded userinfo, no IPv6-literal shortcut.
 - `rp_matches_origin` requires an exact match or a **label-boundary** suffix
   match: `origin_host.strip_suffix(rp_id)` must end in `.`. `evilexample.com`
-  does **not** match `rp_id = "example.com"`; `login.example.com` does. This
-  is the correct WebAuthn "RP ID must be a registrable-domain suffix of the
-  origin" rule, and it is enforced daemon-side, not merely trusted from the
-  page.
+  does **not** match `rp_id = "example.com"`; `login.example.com` does.
+- **Public-suffix check (browser-6, 2026-07-10).** The label-boundary match
+  alone was not the full WebAuthn "registrable-domain suffix" rule: a page at
+  `attacker.github.io` could claim `rp_id = "github.io"` and pass, matching
+  every `*.github.io` tenant. `parse_request` now also rejects an `rp_id` that
+  is itself a **public suffix** (`is_public_suffix` / `PUBLIC_SUFFIX_RULES` in
+  `browser_passkeys.rs`). Combined with the label-boundary check, requiring a
+  non-public-suffix `rp_id` guarantees it covers at least the origin's
+  registrable domain (eTLD+1). A `github.io` tenant can still use its own full
+  `attacker.github.io` as the `rp_id`; it just cannot claim the shared suffix.
+  The PSL data is an **interim curated snapshot** (common multi-tenant hosting
+  suffixes + common ccTLD second-levels; single-label TLDs are covered by the
+  implicit default `*` rule), not the full Mozilla list, because the airgapped
+  daemon build cannot vendor a PSL crate today — refresh from
+  <https://publicsuffix.org/list/> when it can. It fails **safe**: a missing
+  entry is merely less restrictive on an exotic suffix, never blocks a
+  legitimate registrable domain.
 - Every field is bounded and charset-checked before use (host/rp_id/origin/
   challenge/credential-id lengths; b64url charset; `create` requires both a
   user handle and a name).
@@ -440,31 +453,40 @@ credential.
 
 ### 7.4 Accepted residual risks — including one that is not yet mitigated
 
-1. **No user-presence / user-verification gate exists.** This is the
-   load-bearing gap, not a conscious tradeoff like the rest of this list:
-   nothing between a page's `navigator.credentials.create()`/`.get()` call
-   and a completed, signed ceremony asks the seated human anything.
-   `handle_passkey_event` (`mde-shell-egui/src/web.rs`) forwards the shim's
-   event to the Bus unconditionally; the shim itself (both
-   `mde-web-preview/src/engine.rs` and `mde-web-cef/src/cef_browser.rs`)
-   has no check for a user gesture before dispatching. Yet
-   `assertion_payload`/`registration_authenticator_data` in
-   `browser_passkeys.rs` unconditionally set **both** the User Present (`UP`)
-   and User Verified (`UV`) authenticator-data flag bits (`0x05` on
-   assertion, `0x45` on registration) on every ceremony — claiming to every
-   relying party that a human was present and verified when no local check
-   ever happened. The one visible side effect, `capture_notice` ("Passkey:
-   sent ceremony to daemon"), is a post-hoc transient status line shared
-   with routine, non-security chrome messages (e.g. "Translate: sent page
-   text...") — not a yes/no prompt, and easy to miss. **Net effect: any page
-   can silently obtain a valid, "user-verified" WebAuthn assertion for its
-   own origin the instant it calls the API**, with no click, PIN, or
-   biometric — materially different from what every relying party's
-   `userVerification: "required"` policy assumes. `docs/WORKLIST.md`'s own
-   BROWSER-DD-6 entry is still unchecked ("passwordless login works
-   end-to-end" not yet claimed done), consistent with this being unfinished
-   rather than hidden — but the worker is already spawned in `mackesd.rs`
-   and reachable today, so it needs disclosure now, not just at "done."
+1. **Honest presence flags + a gesture gate; unforgeable consent UI still
+   deferred (security-2, 2026-07-10).** *Was:* the daemon hardcoded both the
+   User Present (`UP`) and User Verified (`UV`) authenticator-data bits on
+   every ceremony, and the shim dispatched with no user-gesture check — so any
+   page could silently obtain a valid, "user-verified" assertion for its own
+   origin the instant it called the API, with no click, PIN, or biometric.
+   *Now, in three parts:*
+   - **UV** was already dropped to honest-`0` earlier this session (no
+     per-ceremony verification exists, so `UV` is never asserted).
+   - **`UP` is no longer hardcoded.** `authenticator_flags()` in
+     `browser_passkeys.rs` sets the `UP` bit **only** when the ceremony carried
+     a real presence signal (`PasskeyRequest::user_present`); a ceremony with
+     no verified presence honestly signs `UP=0`, which a relying party rejects,
+     instead of forging "a human was here." Assertion flags are now `0x01`
+     (present) / `0x00` (absent); registration `0x41` / `0x40` (`AT` always
+     set).
+   - **The shim requires a user gesture.** `cef_browser.rs`'s
+     `passkey_bridge_script` checks `navigator.userActivation.isActive` (WebAuthn
+     transient activation) before dispatching and rejects a gesture-less
+     ceremony with `NotAllowedError`; it threads the gesture as `user_present`
+     through `handle_passkey_event` (`web.rs`) to the daemon.
+   - **DEFERRED / residual:** the presence signal is still *page-asserted* — the
+     shim runs in the page's own JS context, so a hostile **same-origin** page
+     could forge `userActivation` for its **own** `rp_id` (it cannot mint
+     presence for another origin — §7.3.1 + the browser-6 PSL check bind
+     `rp_id` to the origin). A trustworthy, unforgeable presence gate — a
+     shell-rendered consent prompt the page cannot script — is intentionally
+     out of scope for this hardening pass (a sizable new UI) and remains the
+     open item. The `capture_notice` ("Passkey: sent ceremony to daemon") is
+     still a post-hoc transient status line, not that prompt. The net effect
+     is materially improved (auto-dispatch on page load is blocked; a
+     presence-less request signs an honest, RP-rejected `UP=0`), but a
+     click-jacked or scripted same-origin gesture is not yet defeated —
+     disclosed here, not silently claimed done.
 2. **Mesh-wide key-sealing root, not a per-device secret.** `seal_private_key`
    keys its passphrase off `age_key_path()` (`/root/.mcnf-age-key` by
    default) — the same identity distributed "to leader-eligible nodes like
@@ -577,6 +599,13 @@ to CEF tabs, with no working mitigation beyond the (real, but narrower)
   same `cef_frame_t::execute_java_script` mechanism this codebase already
   uses for the passkey-ceremony shim (`passkey_bridge_script`) and every
   other renderer-side privacy/feature injection in that file.
+- **Extended the removal to every reachable frame (browser-3, 2026-07-10).**
+  The removal originally ran only in `get_main_frame`, so a page could bypass
+  it with a child iframe (its own unpatched JS context). `webrtc_block_script`
+  now parameterises the strip over a target window and `sweep`s recursively
+  through `w.frames`, and installs a `MutationObserver` to re-sweep on DOM
+  mutation so a **newly inserted same-origin iframe** is patched between poll
+  ticks. This closes the trivial same-origin child-iframe bypass.
 
 ### 8.3 Accepted residual risk — defense-in-depth, not airtight
 
@@ -593,10 +622,17 @@ mechanism that would let a script win the race against a page's own inline
   for the passkey bridge).
 - A fresh document commit (e.g. same-tab in-page navigation to a new origin)
   gets an unpatched JS context until the next poll tick re-applies the shim.
+- **Cross-origin subframes remain unreachable from JS** by same-origin policy
+  (property access on them throws and is swallowed). The definitive airtight
+  fix is a native `CefPermissionHandler::OnRequestMediaAccessPermission` deny
+  and/or an ICE-layer block, but the hand-rolled pinned CEF 149 ABI exposes no
+  permission-handler or frame-enumeration vtable offset verified from the farm
+  headers, so it is not attempted here; the JS `sweep` covers the *reachable*
+  (same-origin) frames and the switch below is the backstop for the rest.
 - `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` is the backstop
   for exactly this gap: even a same-tick `RTCPeerConnection` that wins the
-  race still cannot leak a raw local IP over non-proxied UDP without a
-  configured proxy.
+  race, or one in a cross-origin subframe, still cannot leak a raw local IP
+  over non-proxied UDP without a configured proxy.
 - Camera/mic OS-device permission for the CEF helper process is a separate,
   still-unaudited question (§7.4 point 4) — this section covers WebRTC
   transport/API-surface hardening only, not device-permission plumbing.
@@ -609,3 +645,45 @@ above, not a new confinement layer. Enabling real WebRTC as a feature
 (BROWSER-DD-9, `docs/design/browser-dd9-webrtc-rescope.md`) is a separate,
 much larger, not-yet-started item — this fix is a hardening correctness fix
 for the *current* (WebRTC-off) posture, not a step toward shipping it.
+
+---
+
+## 9. CEF/Chromium engine — the DevTools remote-debugging port (security-4)
+
+Scope: `crates/desktop/mde-web-cef`'s `cef_init.rs` — the `cef_settings_t`
+`remote_debugging_port` field and the `--remote-debugging-port` command-line
+switch.
+
+### 9.1 The finding (2026-07-10)
+
+`CefSettings::windowless_no_sandbox()` set `remote_debugging_port = 9222`, and
+`CefInitPaths::command_line_switches()` emitted `--remote-debugging-port=9222`,
+**unconditionally on every CEF launch**. That opens the Chromium DevTools
+Protocol (CDP) endpoint on `127.0.0.1:9222` in every shipped build. CDP is an
+**unauthenticated** control channel: any local process (or anything that can
+reach loopback, e.g. a mis-scoped port-forward) can attach and drive the
+browser — navigate it, read cookies and the full DOM of any open tab, and run
+arbitrary JavaScript in any origin's context. This runs on a node that also
+holds the Nebula CA and mesh SSH keys, so it is a serious local-privilege /
+credential-exposure surface, not just a debug convenience.
+
+### 9.2 The fix
+
+- The port is now resolved through `remote_debugging_port()`, which returns
+  `0` (**disabled**) on the default/shipped path. Neither the settings field
+  nor the command-line switch carries a live port unless explicitly opted in.
+- Opt-in is by the **`cef-devtools` build feature** (must never be enabled in a
+  release/RPM build) or the **`MDE_CEF_REMOTE_DEBUG`** environment variable at
+  launch (which may also pin a specific loopback port in `1024..=65535`). The
+  env decision overrides the feature default in both directions.
+- Regression tests pin the default-off posture
+  (`default_launch_never_exposes_the_cdp_debug_port`) and the opt-in plumbing
+  (`remote_debug_env_flag_parses_the_opt_in_shapes`,
+  `remote_debug_resolution_defaults_off_and_honors_overrides`).
+
+### 9.3 Accepted residual risk
+
+When an operator *does* opt in on a trusted host, the endpoint is still an
+unauthenticated loopback CDP port for that session (the pinned CEF ABI has no
+per-session-token knob); the mitigation is that it is off by default, off in
+every shipped build, and reachable only by an explicit, deliberate action.
