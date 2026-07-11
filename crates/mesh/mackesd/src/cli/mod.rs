@@ -45,6 +45,7 @@ pub mod migrate;
 pub mod mirrors;
 pub mod nebula;
 pub mod netstate;
+pub mod node_admin;
 pub mod nodes;
 pub mod onboard;
 pub mod peers;
