@@ -68,6 +68,8 @@ use serde::{Deserialize, Serialize};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::bus_reader::BusReader;
+
 use crate::toast_bridge::TOAST_TOPIC;
 
 /// Topic prefix for the per-node topology mirror (`state/storage/<node>`).
@@ -1018,8 +1020,10 @@ impl StorageState {
             self.nodes = Vec::new();
             return;
         };
-        let Ok(persist) = Persist::open(root) else {
-            return; // keep the last-known projection on a transient open failure
+        // arch-11: open through the shared BusReader seam. The no-root case above
+        // clears the roster; a transient open failure keeps the last projection.
+        let Some(persist) = BusReader::new(Some(root)).open() else {
+            return;
         };
         let topics = persist.list_topics().unwrap_or_default();
         let mut bodies = Vec::new();
@@ -1439,6 +1443,8 @@ impl StorageState {
             return;
         };
         let body = req.to_body();
+        // arch-11: writer — the shared BusReader seam is read-only; this publish
+        // keeps Persist::open because it needs the write Result to set `last_error`.
         match Persist::open(root.clone())
             .and_then(|p| p.write(&action_topic(node), Priority::Default, None, Some(&body)))
         {
@@ -1474,6 +1480,8 @@ impl StorageState {
             "action_verb": format!("shell/goto/{surface}"),
         })
         .to_string();
+        // arch-11: best-effort writer — kept on Persist::open (the shared
+        // BusReader seam is read-only).
         let _ = Persist::open(root.clone())
             .and_then(|p| p.write(TOAST_TOPIC, Priority::Default, None, Some(&body)));
     }
@@ -1494,6 +1502,8 @@ impl StorageState {
                          every apply is typed-armed to exactly one disk.",
         })
         .to_string();
+        // arch-11: best-effort writer — kept on Persist::open (the shared
+        // BusReader seam is read-only).
         let _ = Persist::open(root.clone())
             .and_then(|p| p.write(TOAST_TOPIC, Priority::Default, None, Some(&body)));
     }

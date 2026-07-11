@@ -53,7 +53,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
+// arch-11: prod now opens via the BusReader seam; only the tests still name
+// `Persist` (through `use super::*`), so the import is test-only.
+#[cfg(test)]
 use mde_bus::persist::Persist;
+
+use crate::bus_reader::BusReader;
 use mde_editor_egui::collab_session::{CollabMessage, FrameKind, COLLAB_TOPIC_PREFIX};
 use mde_egui::egui::{self, Color32, Pos2, Rect, TextureHandle};
 use mde_egui::Style;
@@ -530,27 +535,26 @@ impl CoEditWatch {
     /// indexed spool read per topic; a missing Bus is a silent no-op (never a
     /// panic — the honest off-mesh state).
     fn drain(&mut self, now_ms: i64) {
-        if let Some(root) = self.bus_root.clone() {
-            if let Ok(persist) = Persist::open(root) {
-                let topics = persist.list_topics().unwrap_or_default();
-                for topic in topics
-                    .into_iter()
-                    .filter(|t| t.starts_with(COLLAB_TOPIC_PREFIX))
-                {
-                    let cursor = self.cursors.entry(topic.clone()).or_default();
-                    let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
-                        continue;
-                    };
-                    let mut fresh = Vec::with_capacity(msgs.len());
-                    for msg in msgs {
-                        *cursor = Some(msg.ulid);
-                        if let Some(body) = msg.body {
-                            fresh.push((body, msg.ts_unix_ms));
-                        }
+        // arch-11: open through the shared BusReader seam.
+        if let Some(persist) = BusReader::new(self.bus_root.clone()).open() {
+            let topics = persist.list_topics().unwrap_or_default();
+            for topic in topics
+                .into_iter()
+                .filter(|t| t.starts_with(COLLAB_TOPIC_PREFIX))
+            {
+                let cursor = self.cursors.entry(topic.clone()).or_default();
+                let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
+                    continue;
+                };
+                let mut fresh = Vec::with_capacity(msgs.len());
+                for msg in msgs {
+                    *cursor = Some(msg.ulid);
+                    if let Some(body) = msg.body {
+                        fresh.push((body, msg.ts_unix_ms));
                     }
-                    for (body, ts_ms) in fresh {
-                        self.admit(&topic, &body, ts_ms);
-                    }
+                }
+                for (body, ts_ms) in fresh {
+                    self.admit(&topic, &body, ts_ms);
                 }
             }
         }
@@ -684,10 +688,8 @@ impl SelfTestWatch {
     /// Drain new verdicts after the cursor, decoding each through the wire mirror. The
     /// first drain only primes the baseline; later all-green verdicts raise the edge.
     fn drain(&mut self) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let Ok(msgs) = persist.list_since(SELF_TEST_TOPIC, self.cursor.as_deref()) else {

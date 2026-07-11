@@ -64,6 +64,7 @@ use crate::auth::{
     self, AuthStage, CredentialPrompt, CredentialStore, DesktopAuth, MeshCredentialStore,
     SealOutcome,
 };
+use crate::bus_reader::BusReader;
 use crate::dock::DesktopRailSource;
 use crate::vdi::{
     BrokerSessionLifecycle, ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan,
@@ -530,6 +531,8 @@ fn publish_power(bus_root: Option<&Path>, last_error: &mut Option<String>, req: 
         *last_error = Some("No mesh Bus directory — VM power actions unavailable.".to_string());
         return;
     };
+    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
+    // Persist::open because it needs the write Result to set `last_error`.
     match mde_bus::persist::Persist::open(root.to_path_buf()).and_then(|p| {
         p.write(
             LIFECYCLE_TOPIC,
@@ -687,6 +690,8 @@ fn publish_source_action(
         *last_error = Some(format!("No mesh Bus directory — {noun} unavailable."));
         return;
     };
+    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
+    // Persist::open because it needs the write Result to set `last_error`.
     match mde_bus::persist::Persist::open(root.to_path_buf())
         .and_then(|p| p.write(topic, mde_bus::hooks::config::Priority::Default, None, body))
     {
@@ -1093,8 +1098,8 @@ impl BusDesktopSources {
 
 impl DesktopSourcesClient for BusDesktopSources {
     fn latest(&self) -> Option<DesktopSourcesState> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
+        // arch-11: open through the shared BusReader seam.
+        let persist = BusReader::new(self.bus_root.clone()).open()?;
         // The worker writes one record per change (+ heartbeat) and ALWAYS
         // carries a body, so the newest row is the live roster. perf-4 — read
         // just that newest row (bounded `read_latest`) instead of loading the

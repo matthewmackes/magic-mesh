@@ -144,6 +144,8 @@ impl HostMirrorPublisher {
         let Ok(body) = serde_json::to_string(&mirror) else {
             return;
         };
+        // arch-11: best-effort writer — kept on Persist::open (the shared
+        // BusReader seam is read-only).
         let _ = Persist::open(root)
             .and_then(|p| p.write(LOCAL_SNAPSHOT_TOPIC, Priority::Default, None, Some(&body)));
     }

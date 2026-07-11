@@ -95,6 +95,8 @@ use serde::{Deserialize, Serialize};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use crate::bus_reader::BusReader;
 use mde_egui::egui::{
     self, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind,
     UiBuilder, Vec2,
@@ -568,10 +570,8 @@ struct BusUnits {
 
 impl UnitsClient for BusUnits {
     fn read(&self) -> Vec<UnitsState> {
-        let Some(root) = self.bus_root.clone() else {
-            return Vec::new();
-        };
-        let Ok(persist) = Persist::open(root) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return Vec::new();
         };
         let topics = persist.list_topics().unwrap_or_default();
@@ -645,6 +645,8 @@ impl ActionSink for BusActions {
             .bus_root
             .clone()
             .ok_or_else(|| "No mesh Bus directory — join this node to a mesh first.".to_string())?;
+        // arch-11: writer — the shared BusReader seam is read-only; this publish
+        // keeps Persist::open because it surfaces the write error to the caller.
         Persist::open(root)
             .and_then(|p| p.write(topic, Priority::Default, None, Some(body)))
             .map(|_| ())

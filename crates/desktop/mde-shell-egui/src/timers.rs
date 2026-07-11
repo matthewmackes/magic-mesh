@@ -382,6 +382,8 @@ impl TimersState {
         let Some(root) = self.bus_root.as_ref() else {
             return;
         };
+        // arch-11: writer (publishes an alert) — kept on Persist::open; the shared
+        // BusReader seam is read-only.
         let Ok(persist) = Persist::open(root.clone()) else {
             return;
         };

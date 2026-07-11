@@ -368,6 +368,8 @@ impl ToastBridge {
         // A set-but-unopenable spool, or a failed read, means the alert lane is
         // DOWN: the operator's Critical alerts silently won't arrive. Surface it
         // (once per streak — this runs every REFRESH) instead of swallowing it.
+        // arch-11: NOT the fail-soft BusReader seam — this reader needs the open
+        // error to log the down alert-lane, so it keeps its own Persist::open.
         let persist = match Persist::open(root.clone()) {
             Ok(p) => p,
             Err(e) => {

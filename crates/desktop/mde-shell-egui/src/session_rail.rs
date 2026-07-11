@@ -12,7 +12,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use mackes_mesh_types::vdi_session::SessionRequest;
+// arch-11: prod now opens via the BusReader seam; only the tests still name
+// `Persist` (through `use super::*`), so the import is test-only.
+#[cfg(test)]
 use mde_bus::persist::Persist;
+
+use crate::bus_reader::BusReader;
 
 use crate::dock::SessionRailEntry;
 
@@ -103,10 +108,8 @@ impl SessionRailState {
     }
 
     fn poll(&mut self) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let Ok(msgs) = persist.list_since(ACTION_TOPIC, self.cursor.as_deref()) else {

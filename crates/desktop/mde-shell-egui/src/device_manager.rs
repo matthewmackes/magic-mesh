@@ -140,6 +140,8 @@ use mackes_mesh_types::device_inventory::{
 use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use crate::bus_reader::BusReader;
 use mde_egui::egui::{self, Id, RichText};
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{field, muted_note, status_dot, ChipTone, StatusChip, Style};
@@ -696,10 +698,8 @@ struct UnitsStateMirror {
 /// mirrors overlap). `None` / no spool reads empty — the honest solo-host state.
 /// The same `list_topics` + latest-body idiom the explorer surface uses.
 fn read_units(bus_root: Option<&Path>) -> Vec<UnitMirror> {
-    let Some(root) = bus_root else {
-        return Vec::new();
-    };
-    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+    // arch-11: open through the shared BusReader seam.
+    let Some(persist) = BusReader::new(bus_root.map(Path::to_path_buf)).open() else {
         return Vec::new();
     };
     let topics = persist.list_topics().unwrap_or_default();
@@ -2588,6 +2588,8 @@ fn raise_toast(severity: &str, headline: &str) {
     let Some(root) = mde_bus::client_data_dir() else {
         return;
     };
+    // arch-11: writer (raises a toast) — kept on Persist::open; the shared
+    // BusReader seam is read-only.
     let Ok(persist) = Persist::open(root) else {
         return;
     };

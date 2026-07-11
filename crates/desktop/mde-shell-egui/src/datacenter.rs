@@ -42,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::bus_reader::BusReader;
+
 /// Per-node KVM service-health summary topic (MV-2 `kvm_health`).
 const SERVICES_TOPIC: &str = "event/kvm/services";
 /// Per-node VM roster topic (MV-3 `vm_lifecycle`).
@@ -549,6 +551,8 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, action: &Li
         return;
     };
     let body = action.to_body();
+    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
+    // Persist::open because it needs the write Result to set `last_error`.
     match Persist::open(root.to_path_buf())
         .and_then(|p| p.write(ACTION_TOPIC, Priority::Default, None, Some(&body)))
     {
@@ -682,8 +686,10 @@ impl DatacenterState {
             self.nodes = Vec::new();
             return;
         };
-        let Ok(persist) = Persist::open(root) else {
-            // Keep the last-known projection on a transient open failure.
+        // arch-11: open through the shared BusReader seam. The no-root case above
+        // clears the roster (honest off-mesh empty); a transient open failure
+        // keeps the last-known projection.
+        let Some(persist) = BusReader::new(Some(root)).open() else {
             return;
         };
         let health = read_bodies(&persist, SERVICES_TOPIC);

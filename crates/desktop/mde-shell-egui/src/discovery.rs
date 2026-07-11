@@ -99,6 +99,8 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, body: &str)
         *last_error = Some("No mesh Bus directory — can't request a desktop session.".to_string());
         return;
     };
+    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
+    // Persist::open because it needs the write Result to set `last_error`.
     match Persist::open(root.to_path_buf())
         .and_then(|p| p.write(ACTION_TOPIC, Priority::Default, None, Some(body)))
     {

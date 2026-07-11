@@ -74,6 +74,8 @@ impl FormfactorPublisher {
         let Ok(body) = serde_json::to_string(&msg) else {
             return;
         };
+        // arch-11: best-effort writer — kept on Persist::open (the shared
+        // BusReader seam is read-only).
         let _ = Persist::open(root)
             .and_then(|p| p.write(FORMFACTOR_TOPIC, Priority::Default, None, Some(&body)));
     }

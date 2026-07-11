@@ -43,6 +43,8 @@ use serde::{Deserialize, Serialize};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::bus_reader::BusReader;
+
 /// Poll cadence — the surface workers publish on 2–30 s ticks, so a modest read
 /// cadence keeps the card fresh without spinning. Matches the This Node plane.
 const REFRESH: Duration = Duration::from_secs(5);
@@ -491,10 +493,8 @@ impl SurfaceCardState {
     /// Discover the node + re-read all state lanes. A missing Bus / topic leaves
     /// the field untouched (the card stays gated or keeps its last read).
     fn refresh(&mut self) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         if self.node.is_none() {
@@ -548,6 +548,8 @@ impl SurfaceCardState {
             self.last_error = Some("No mesh Bus \u{2014} can't send the request.".to_string());
             return;
         };
+        // arch-11: writer — the shared BusReader seam is read-only; this publish
+        // keeps Persist::open because it needs the write Result to set `last_error`.
         match Persist::open(root).and_then(|p| p.write(topic, Priority::Default, None, Some(body)))
         {
             Ok(_) => {

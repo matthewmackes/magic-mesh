@@ -39,6 +39,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
 
+use crate::bus_reader::BusReader;
+
 /// How often the hub refreshes the roster + the service directory while in view.
 const REFRESH: Duration = Duration::from_secs(2);
 
@@ -494,8 +496,9 @@ impl PhonesHubState {
 
     // ── Bus plumbing ─────────────────────────────────────────────────────────
 
+    // arch-11: opens through the shared [`BusReader`] seam.
     fn persist(&self) -> Option<Persist> {
-        Persist::open(self.bus_root.clone()?).ok()
+        BusReader::new(self.bus_root.clone()).open()
     }
 
     fn publish(&self, topic: &str, body: Option<&str>) -> Option<String> {

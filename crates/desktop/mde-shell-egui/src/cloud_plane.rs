@@ -62,6 +62,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
 
+use crate::bus_reader::BusReader;
+
 use crate::auth::DesktopAuth;
 use crate::vdi::{
     ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol,
@@ -354,8 +356,9 @@ impl<T> Lane<T> {
 }
 
 /// Open the Bus persist mirror at `bus_root`, if reachable.
+/// arch-11: opens through the shared [`BusReader`] seam.
 fn open_persist(bus_root: Option<&PathBuf>) -> Option<Persist> {
-    Persist::open(bus_root?.clone()).ok()
+    BusReader::new(bus_root.cloned()).open()
 }
 
 /// Read the reply on `reply/<ulid>`, if one has landed (oldest wins — the RPC

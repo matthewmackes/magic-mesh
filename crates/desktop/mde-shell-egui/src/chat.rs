@@ -34,6 +34,8 @@ use std::{
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use crate::bus_reader::BusReader;
 use mde_chat::{
     AlertAction, AlertActionKind, Contact, Conversation, Message, MessageKind, NotifyPrefs,
     Presence, RoomDescriptor, RoomKind, Roster, Severity,
@@ -417,10 +419,8 @@ impl ChatState {
     /// mirrors. The worker republishes the FULL ring array on each change, so the
     /// newest message on a `state/chat/*` topic is the current state.
     fn refresh(&mut self) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         if let Some(roster) = latest_json::<Roster>(&persist, ROSTER_TOPIC) {
@@ -2327,6 +2327,8 @@ fn publish(bus_root: Option<&Path>, topic: &str, body: &str) -> Result<(), Strin
     let Some(root) = bus_root else {
         return Err("No local Bus — the mesh daemon may be down.".to_string());
     };
+    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
+    // Persist::open because it needs the open/write error text for the caller.
     let persist = Persist::open(root.to_path_buf())
         .map_err(|e| format!("Couldn't open the local Bus: {e}"))?;
     persist

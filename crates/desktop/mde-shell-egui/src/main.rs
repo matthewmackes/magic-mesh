@@ -20,6 +20,7 @@ mod about;
 mod auth;
 mod backdrop;
 mod bt_pairing;
+mod bus_reader;
 mod chat;
 mod chooser;
 mod chrome;

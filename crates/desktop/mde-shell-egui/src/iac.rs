@@ -57,6 +57,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
 
+use crate::bus_reader::BusReader;
+
 /// The QC-11 Bus read verb this surface consumes (IAC-1) — the Keystone service
 /// directory + per-endpoint API health, served on `reply/<request-ulid>`.
 const CATALOG_ACTION: &str = "action/cloud/get-catalog";
@@ -1051,8 +1053,9 @@ impl InfraCodeState {
     }
 
     /// Open the Bus persist mirror at the client data dir, if reachable.
+    /// arch-11: opens through the shared [`BusReader`] seam.
     fn persist(&self) -> Option<Persist> {
-        Persist::open(self.bus_root.clone()?).ok()
+        BusReader::new(self.bus_root.clone()).open()
     }
 }
 

@@ -37,6 +37,8 @@ use serde::{Deserialize, Serialize};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::bus_reader::BusReader;
+
 /// The worker's request topic — the exact wire topic
 /// `mackesd::workers::spawn_lighthouse_onboard::ACTION_TOPIC` drains.
 const ACTION_TOPIC: &str = "action/onboard/spawn-lighthouse";
@@ -240,10 +242,8 @@ impl SpawnLighthouseFlowState {
     /// pending id resolves the wait. Ids are unique per request, so a stale
     /// event can never satisfy a new wait.
     fn check_events(&mut self) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let Ok(msgs) = persist.list_since(EVENT_TOPIC, self.event_cursor.as_deref()) else {
@@ -283,6 +283,8 @@ impl SpawnLighthouseFlowState {
                 Some("No mesh Bus directory \u{2014} can't request the spawn.".to_string());
             return None;
         };
+        // arch-11: writer — the shared BusReader seam is read-only; publishes keep
+        // Persist::open because they need the write Result to set `last_error`.
         match Persist::open(root)
             .and_then(|p| p.write(ACTION_TOPIC, Priority::Default, None, Some(&body)))
         {
