@@ -3874,6 +3874,9 @@ fn search_hit_row(ui: &mut egui::Ui, unit: &Unit, selected: bool) -> bool {
         // (EXPLORER-18, O11) — the same ring as a mosaic tile / filmstrip thumb.
         focus_ring(ui.painter(), resp.rect);
     }
+    // a11y-05 — the search hit's accesskit node (name + kind/reachability). A
+    // hit row carries no pin/mark set.
+    install_unit_accessibility(ui.ctx(), resp.id, unit, false, false, resp.rect);
     resp.clicked()
 }
 
@@ -3928,7 +3931,17 @@ fn edge_chip(ui: &mut egui::Ui, chip: &ChipItem) -> bool {
         galley,
         Style::TEXT,
     );
-    resp.on_hover_text(&chip.name).clicked()
+    let resp = resp.on_hover_text(&chip.name);
+    // a11y-05 — the edge jump-chip's accesskit node: the neighbour's name +
+    // its kind (the two facts the pill paints).
+    install_cell_accessibility(
+        ui.ctx(),
+        resp.id,
+        chip.name.clone(),
+        format!("{} \u{00B7} neighbour", chip.kind.label()),
+        resp.rect,
+    );
+    resp.clicked()
 }
 
 /// A thin vertical cluster divider + label between filmstrip sections (#8, plus
@@ -4017,6 +4030,9 @@ fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (bo
         })
         .response;
     let resp = resp.on_hover_text(&unit.name);
+    // a11y-05 — the thumbnail's accesskit node (a filmstrip thumb has no mark
+    // set, so `marked` is false; the pin marker rides the value).
+    install_unit_accessibility(ui.ctx(), resp.id, unit, pinned, false, resp.rect);
     (resp.clicked(), resp.secondary_clicked())
 }
 
@@ -4248,6 +4264,9 @@ fn mosaic_tile(
     } else {
         "Right-click to pin · Ctrl-click / Space marks"
     });
+    // a11y-05 — the tile's accesskit node (name + kind/reachability/health +
+    // pinned/marked), keyed by the cell response id. Pure metadata.
+    install_unit_accessibility(ui.ctx(), resp.id, unit, pinned, marked, rect);
     (rect, resp.clicked(), resp.secondary_clicked())
 }
 
@@ -4425,8 +4444,17 @@ fn ipam_address_row(ui: &mut egui::Ui, occ: &IpamOccupant, gw: Ipv4Addr, zebra: 
         band,
         egui::Shape::rect_filled(resp.rect, Style::RADIUS * 0.5, fill),
     );
-    resp.on_hover_text(format!("Jump to {}", occ.name))
-        .clicked()
+    let resp = resp.on_hover_text(format!("Jump to {}", occ.name));
+    // a11y-05 — the IPAM occupant row's accesskit node: the occupant name +
+    // its kind/address (+ gateway marker for the conventional .1).
+    install_cell_accessibility(
+        ui.ctx(),
+        resp.id,
+        occ.name.clone(),
+        occupant_a11y_value(occ, is_gw),
+        resp.rect,
+    );
+    resp.clicked()
 }
 
 /// The prefix capacity meter: a thin bar with the used fraction of the /24 filled
@@ -4784,6 +4812,112 @@ const fn health_label(health: Health) -> &'static str {
     }
 }
 
+// ── accesskit (a11y-05 / shell-ux-6) ─────────────────────────────────────────
+//
+// The fleet Explorer's pickable items — the mosaic tiles, the filmstrip
+// thumbnails, the `/` search-hit rows, the edge jump-chips, and the IPAM
+// occupant rows — are every one a hand-rolled `allocate_exact_size(click)` /
+// `scope_builder(...).sense(click)` / `.interact(click)` cell painted with raw
+// `Painter` calls. egui auto-generates accesskit nodes only for real widgets
+// via `Response::widget_info`, never for these raw cells (the same gap dock.rs
+// / console.rs closed for their own under WIN7-5/WIN7-7), so a screen reader
+// walking the mesh heard nothing. This section gives each pickable item its own
+// `Role::Button` node keyed by the cell's response id (so egui merges it onto
+// the cell), with the unit/occupant name as the accessible label and its
+// kind / reachability / health (+ pinned / marked / gateway) reading as the
+// value — the established per-module `install_*_accessibility` idiom
+// (role + label + value + bounds + Click), state carried in the value string
+// exactly as dock.rs/console.rs already do.
+
+/// Convert an egui rect to an accesskit one (the `console.rs`/`dock.rs` helper,
+/// restated module-locally — the established per-module-copy idiom).
+fn accesskit_rect(rect: Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+/// The accessible **name** of a unit cell — its big display name (the same
+/// string the tile / thumbnail / search row paints).
+fn unit_a11y_label(unit: &Unit) -> String {
+    unit.name.clone()
+}
+
+/// The accessible **state/value** of a unit cell — the kind badge, the
+/// reachability/address line ([`reachability_line`]), the health tier when a
+/// source reports one ([`health_label`]), and the pinned/marked markers the
+/// cell paints as corner glyphs. Mirrors what a sighted operator reads off the
+/// tile so the two can't drift.
+fn unit_a11y_state(unit: &Unit, pinned: bool, marked: bool) -> String {
+    let mut parts = vec![
+        unit.kind.label().to_owned(),
+        reachability_line(&unit.reachability, unit.address.as_deref()),
+    ];
+    if let Some(h) = unit.health {
+        parts.push(health_label(h).to_owned());
+    }
+    if pinned {
+        parts.push("pinned".to_owned());
+    }
+    if marked {
+        parts.push("marked".to_owned());
+    }
+    parts.join(" \u{00B7} ")
+}
+
+/// The accessible **value** of an IPAM occupant row — its kind, its address,
+/// and the gateway marker for the conventional `.1` (the same facts the row
+/// paints across its columns).
+fn occupant_a11y_value(occ: &IpamOccupant, is_gateway: bool) -> String {
+    let mut value = format!("{} \u{00B7} {}", occ.kind.label(), occ.addr);
+    if is_gateway {
+        value.push_str(" \u{00B7} gateway");
+    }
+    value
+}
+
+/// Install one raw-painted cell's accesskit `Button` node, keyed by the cell's
+/// own response id so egui merges it onto the cell (the dock.rs id-keyed merge).
+/// Shared by every pickable item this module paints so the role/label/value/
+/// bounds/action shape can never drift between the tiles, thumbnails, rows, and
+/// chips.
+fn install_cell_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    rect: Rect,
+) {
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label.into());
+        node.set_value(value.into());
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+/// Install a unit-bearing cell's accesskit node (tile / thumbnail / search row).
+fn install_unit_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    unit: &Unit,
+    pinned: bool,
+    marked: bool,
+    rect: Rect,
+) {
+    install_cell_accessibility(
+        ctx,
+        id,
+        unit_a11y_label(unit),
+        unit_a11y_state(unit, pinned, marked),
+        rect,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4933,6 +5067,52 @@ mod tests {
             last_seen_ms: last,
             extras: UnitExtras::default(),
         }
+    }
+
+    // ── a11y-05: the pickable-cell accessible name/state seam ──
+
+    #[test]
+    fn unit_a11y_label_is_the_display_name() {
+        let u = unit("peer:node-a", UnitKind::Peer, "node-a", now_ms());
+        assert_eq!(unit_a11y_label(&u), "node-a");
+    }
+
+    #[test]
+    fn unit_a11y_state_reads_kind_reachability_health_and_markers() {
+        let mut peer = unit("peer:node-a", UnitKind::Peer, "node-a", now_ms());
+        peer.address = Some("10.42.0.1".to_string());
+        assert_eq!(
+            unit_a11y_state(&peer, false, false),
+            "Peer \u{00B7} In mesh \u{00B7} 10.42.0.1 \u{00B7} Healthy",
+            "kind + reachability/address + health, mirroring the painted tile",
+        );
+        assert_eq!(
+            unit_a11y_state(&peer, true, true),
+            "Peer \u{00B7} In mesh \u{00B7} 10.42.0.1 \u{00B7} Healthy \u{00B7} pinned \u{00B7} marked",
+            "the pin + EXPLORER-17 mark glyphs ride the value as trailing markers",
+        );
+        // A cloud unit with no reported health omits the tier — never a faked
+        // "healthy" (§7).
+        let vol = unit("vol:v1", UnitKind::Volume, "vol-1", now_ms());
+        assert_eq!(
+            unit_a11y_state(&vol, false, false),
+            "Volume \u{00B7} Cloud object \u{00B7} node-a",
+        );
+    }
+
+    #[test]
+    fn occupant_a11y_value_reads_kind_address_and_gateway() {
+        let occ = IpamOccupant {
+            addr: "10.42.0.1".parse().unwrap(),
+            unit_id: "peer:node-a".to_string(),
+            name: "node-a".to_string(),
+            kind: UnitKind::Peer,
+        };
+        assert_eq!(occupant_a11y_value(&occ, false), "Peer \u{00B7} 10.42.0.1");
+        assert_eq!(
+            occupant_a11y_value(&occ, true),
+            "Peer \u{00B7} 10.42.0.1 \u{00B7} gateway",
+        );
     }
 
     #[test]
