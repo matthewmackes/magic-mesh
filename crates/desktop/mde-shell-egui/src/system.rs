@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
-use mde_egui::{field, muted_note, OsdKind, OsdLevel, Severity, Style, Toast};
+use mde_egui::{field, muted_note, Motion, OsdKind, OsdLevel, Severity, Style, Toast};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -154,6 +154,12 @@ pub(crate) struct SystemState {
     /// step composes with the panel DPI instead of clobbering it (SETTINGS-5). `None`
     /// until the first poll observes the base.
     zoom_base: Option<f32>,
+    /// The seat's baseline egui `animation_time`, captured ONCE on the first appearance
+    /// apply so the reduce-motion preference (a11y-07) can restore the real motion
+    /// cadence when it turns back OFF — rather than a guessed constant. Same
+    /// capture-once idiom as [`zoom_base`](Self::zoom_base). `None` until the first poll
+    /// observes the base.
+    animation_base: Option<f32>,
 }
 
 impl Default for SystemState {
@@ -180,6 +186,7 @@ impl Default for SystemState {
             mesh: MeshFacts::default(),
             appearance: AppearanceConfig::load(),
             zoom_base: None,
+            animation_base: None,
         }
     }
 }
@@ -282,11 +289,13 @@ impl SystemState {
     }
 
     /// Apply the persisted Personalization → Theme appearance (SETTINGS-5) to the live
-    /// context: re-tint the interactive accent and hold the whole-UI text-scale zoom.
-    /// Cheap-guarded — a no-op frame costs one field read and never re-mutates — and
-    /// self-correcting: if a formfactor [`Style::install_with_density`] re-install reset
-    /// the accent to the brand blue, the next poll re-applies the pick. Both effects are
-    /// real runtime state (the egui visuals + zoom), never a dead toggle (§7).
+    /// context: re-tint the interactive accent, hold the whole-UI text-scale zoom, and
+    /// damp motion under the reduce-motion preference (a11y-07). Cheap-guarded — a no-op
+    /// frame costs one field read and never re-mutates — and self-correcting: if a
+    /// formfactor [`Style::install_with_density`] re-install reset the accent to the
+    /// brand blue, the next poll re-applies the pick. Every effect is real runtime state
+    /// (the egui visuals + zoom + animation time + the shared `Motion` global), never a
+    /// dead toggle (§7).
     fn apply_appearance(&mut self, ctx: &egui::Context) {
         // Accent — re-tint only when the live accent drifts from the pick (a settings
         // change, a fresh context, OR a formfactor re-install reset it to the brand).
@@ -301,6 +310,25 @@ impl SystemState {
         let want_zoom = base * self.appearance.text_scale.factor();
         if (ctx.zoom_factor() - want_zoom).abs() > f32::EPSILON {
             ctx.set_zoom_factor(want_zoom);
+        }
+        // Reduce-motion (a11y-07) — drive BOTH damping seams from the one persisted flag
+        // so the whole shell settles instantly, not just part of it: the shared `Motion`
+        // easings (an explicit-duration path egui's `animation_time` can't reach) via the
+        // process-global, AND egui's own `animation_time` (which the menu bar +
+        // ambient explorer already honour, and egui's built-in `animate_bool` reads).
+        // The baseline cadence is captured once, like the zoom base, so turning the
+        // preference OFF restores the seat's real animation time rather than a guess.
+        Motion::set_reduce_motion(self.appearance.reduce_motion);
+        let anim_base = *self
+            .animation_base
+            .get_or_insert_with(|| ctx.style().animation_time);
+        let want_anim = if self.appearance.reduce_motion {
+            0.0
+        } else {
+            anim_base
+        };
+        if (ctx.style().animation_time - want_anim).abs() > f32::EPSILON {
+            ctx.style_mut(|s| s.animation_time = want_anim);
         }
     }
 
@@ -1278,6 +1306,14 @@ struct AppearanceConfig {
     /// The whole-UI text-scale step (the EXPLORER-18 accessibility zoom).
     #[serde(default)]
     text_scale: TextScale,
+    /// Reduce motion (a11y-07): a motion / vestibular-comfort toggle. When set, the
+    /// shell's eased animations settle instantly instead of gliding — driven live
+    /// through [`SystemState::apply_appearance`], which flips the shared
+    /// [`Motion::set_reduce_motion`] global (the explicit-duration easings the shell
+    /// paints with) AND zeroes egui's `animation_time` (the signal the menu bar and
+    /// ambient explorer already honour). Default `false` (motion on, current behaviour).
+    #[serde(default)]
+    reduce_motion: bool,
 }
 
 impl AppearanceConfig {
@@ -2478,11 +2514,26 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
             }
         });
     });
+    ui.add_space(Style::SP_M);
+    // Reduce motion — the a11y-07 motion / vestibular-comfort toggle; the pick settles
+    // every eased transition instantly. Reuses the shell's checkbox toggle idiom.
+    ui.label(
+        RichText::new("Motion")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    ui.checkbox(
+        &mut appearance.reduce_motion,
+        RichText::new("Reduce motion").size(Style::BODY),
+    );
     ui.add_space(Style::SP_S);
     muted_note(
         ui,
         "Accent re-tints every surface's highlights; text size scales the whole \
-         interface. The platform is dark-only — there is no light theme.",
+         interface. Reduce motion settles animations instantly for motion sensitivity. \
+         The platform is dark-only — there is no light theme.",
     );
 }
 
@@ -3695,16 +3746,25 @@ mod tests {
         );
         assert_eq!(AppearanceConfig::default().accent, AccentChoice::Brand);
         assert_eq!(AppearanceConfig::default().text_scale, TextScale::Default);
+        assert!(
+            !AppearanceConfig::default().reduce_motion,
+            "reduce-motion defaults OFF (motion on, the current behaviour)"
+        );
 
         let cfg = AppearanceConfig {
             accent: AccentChoice::Green,
             text_scale: TextScale::Larger,
+            reduce_motion: true,
         };
         cfg.save_to(&path).expect("save");
         let back = AppearanceConfig::load_from(&path);
         assert_eq!(back, cfg, "the appearance round-trips through disk");
         assert_eq!(back.accent, AccentChoice::Green);
         assert_eq!(back.text_scale, TextScale::Larger);
+        assert!(
+            back.reduce_motion,
+            "the reduce-motion pick round-trips through disk"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3729,6 +3789,10 @@ mod tests {
             TextScale::Default,
             "the absent field folds to its default"
         );
+        assert!(
+            !cfg.reduce_motion,
+            "the absent reduce-motion field folds to its default (OFF)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3745,6 +3809,7 @@ mod tests {
             appearance: AppearanceConfig {
                 accent: AccentChoice::Green,
                 text_scale: TextScale::Default,
+                reduce_motion: false,
             },
             ..SystemState::default()
         };
@@ -3781,6 +3846,7 @@ mod tests {
             appearance: AppearanceConfig {
                 accent: AccentChoice::default(),
                 text_scale: TextScale::Larger,
+                reduce_motion: false,
             },
             ..SystemState::default()
         };
@@ -3806,6 +3872,52 @@ mod tests {
             (ctx2.zoom_factor() - base2).abs() < f32::EPSILON,
             "a Default text-scale must not perturb the DPI base zoom"
         );
+    }
+
+    #[test]
+    fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
+        // a11y-07: a persisted reduce-motion pick is a REAL runtime effect on poll (§7 —
+        // no dead toggle). One poll zeroes egui's `animation_time` (the signal the menu
+        // bar + ambient explorer + egui's built-in animate_bool honour) AND flips the
+        // shared Motion global (the explicit-duration easings the shell paints with).
+        // The Motion flag is process-global, so restore it at the end for sibling tests.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let base = ctx.style().animation_time;
+        assert!(base > 0.0, "the baseline cadence genuinely eases");
+
+        let mut st = SystemState {
+            appearance: AppearanceConfig {
+                reduce_motion: true,
+                ..AppearanceConfig::default()
+            },
+            ..SystemState::default()
+        };
+        st.poll(&ctx);
+        assert_eq!(
+            ctx.style().animation_time,
+            0.0,
+            "reduce-motion zeroes egui's animation_time live"
+        );
+        assert!(
+            Motion::reduce_motion(),
+            "…and flips the shared Motion global the eased helpers read"
+        );
+
+        // Turning it back OFF restores the captured baseline cadence and clears the
+        // global — motion resumes, proving the toggle is bidirectional, not one-way.
+        st.appearance.reduce_motion = false;
+        st.poll(&ctx);
+        assert!(
+            (ctx.style().animation_time - base).abs() < f32::EPSILON,
+            "clearing reduce-motion restores the real baseline cadence"
+        );
+        assert!(
+            !Motion::reduce_motion(),
+            "…and clears the shared Motion global"
+        );
+
+        Motion::set_reduce_motion(false); // belt-and-braces restore for sibling tests
     }
 
     // ── Categorical accent + Carbon layers (SETTINGS-2) ───────────────────────

@@ -4,7 +4,20 @@
 //! is now just egui's built-in `animate_bool` driven by a handful of named
 //! durations, so every surface eases the same way without a separate framework.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use egui::Context;
+
+/// Process-global **reduce-motion** preference (a11y-07): a motion / vestibular-comfort
+/// toggle. When set, the shared eased helpers ([`Motion::animate`] /
+/// [`Motion::animate_value`]) collapse to their settled endpoint immediately instead of
+/// gliding. `false` by default (motion on — the current behaviour). The shell drives it
+/// from its persisted appearance config at startup and on every change; it is read on
+/// the hot per-frame animate path, so a plain `Relaxed` atomic is the right weight (a
+/// UI-comfort flag, not a synchronisation edge). Deliberately global — every surface
+/// paints through the one shared `Motion` table, so one flag damps them all without
+/// threading a parameter through every widget.
+static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
 
 /// The shared motion table. Durations are in **seconds** (egui's animation unit).
 pub struct Motion;
@@ -38,13 +51,36 @@ impl Motion {
     /// One-shot status attention pulse duration for worsening only (NOTIF-1/Q26).
     pub const STATUS_PULSE: f32 = 0.48;
 
+    /// Set the process-global **reduce-motion** preference (a11y-07). The shell calls
+    /// this from its appearance apply seam — at startup and on every toggle change —
+    /// with the persisted value, so every [`animate`](Self::animate) /
+    /// [`animate_value`](Self::animate_value) caller settles instantly rather than
+    /// easing. Idempotent; `Relaxed` is sufficient for a UI-comfort flag.
+    pub fn set_reduce_motion(on: bool) {
+        REDUCE_MOTION.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether **reduce-motion** (a11y-07) is currently in force — the flag the eased
+    /// helpers consult to short-circuit to their endpoint. `false` (motion on) by
+    /// default. Note the hard-blink alarm ([`blink`](Self::blink)) deliberately
+    /// ignores this: an alarm outranks the comfort preference (NODE-GRADE-2 #16).
+    #[must_use]
+    pub fn reduce_motion() -> bool {
+        REDUCE_MOTION.load(Ordering::Relaxed)
+    }
+
     /// Animate a boolean toward `on`, returning the eased `0.0..=1.0` progress.
     ///
     /// Thin wrapper over egui's [`Context::animate_bool_with_time`] (which eases
     /// with a smooth cubic), keyed by a stable `id`. Pass one of [`Motion::FAST`]
     /// / [`Motion::BASE`] / [`Motion::SLOW`] for `secs` so timing stays on the
-    /// shared table rather than a bespoke literal.
+    /// shared table rather than a bespoke literal. Under [`reduce_motion`](Self::reduce_motion)
+    /// the ease is skipped and the settled endpoint (`1.0` for `on`, else `0.0`) is
+    /// reported at once — no travel, and no per-frame repaint request (a11y-07).
     pub fn animate(ctx: &Context, id: impl std::hash::Hash, on: bool, secs: f32) -> f32 {
+        if Self::reduce_motion() {
+            return if on { 1.0 } else { 0.0 };
+        }
         ctx.animate_bool_with_time(egui::Id::new(id), on, secs)
     }
 
@@ -60,7 +96,12 @@ impl Motion {
     /// quantities: eased **spatial** transitions — a mesh node gliding to its new
     /// layout slot as peers join or leave, rather than teleporting. egui repaints
     /// only while the value is still travelling, so a settled value stays idle.
+    /// Under [`reduce_motion`](Self::reduce_motion) the glide is skipped and the
+    /// `target` is returned immediately — the node lands in place (a11y-07).
     pub fn animate_value(ctx: &Context, id: impl std::hash::Hash, target: f32, secs: f32) -> f32 {
+        if Self::reduce_motion() {
+            return target;
+        }
         ctx.animate_value_with_time(egui::Id::new(id), target, secs)
     }
 
@@ -175,6 +216,45 @@ mod tests {
         assert_eq!(first, 42.0, "first sight of an id lands on the target");
         let held = Motion::animate_value(&ctx, "motion-value-test", 42.0, Motion::SLOW);
         assert_eq!(held, 42.0, "an unchanged target stays put");
+    }
+
+    #[test]
+    fn reduce_motion_collapses_animations_to_their_endpoint() {
+        // a11y-07: with reduce-motion set, the eased helpers report the SETTLED
+        // endpoint on the very first frame — no ease-in, whatever the duration. The
+        // flag is process-global (every surface shares the one Motion table), so set
+        // it, assert, and restore it so sibling tests (same process) keep the
+        // default-off behaviour. The endpoint values themselves also stay in range for
+        // any concurrent sibling, so this never races them into a false failure.
+        let ctx = egui::Context::default();
+        assert!(!Motion::reduce_motion(), "reduce-motion is off by default");
+
+        Motion::set_reduce_motion(true);
+        assert!(Motion::reduce_motion(), "the setter takes effect");
+        assert_eq!(
+            Motion::animate(&ctx, "rm-bool-on", true, Motion::SLOW),
+            1.0,
+            "a bool animation toward ON lands on 1.0 at once, not the eased ramp"
+        );
+        assert_eq!(
+            Motion::animate(&ctx, "rm-bool-off", false, Motion::SLOW),
+            0.0,
+            "…and toward OFF lands on 0.0 at once"
+        );
+        // A scalar lands on the target immediately even when the target CHANGES — the
+        // case a fresh id can't cover (a fresh id lands on first sight regardless).
+        let _ = Motion::animate_value(&ctx, "rm-val", 0.0, Motion::SLOW);
+        assert_eq!(
+            Motion::animate_value(&ctx, "rm-val", 100.0, Motion::SLOW),
+            100.0,
+            "a scalar animation lands on a CHANGED target immediately under reduce-motion"
+        );
+
+        Motion::set_reduce_motion(false);
+        assert!(
+            !Motion::reduce_motion(),
+            "restored to the default for sibling tests"
+        );
     }
 
     #[test]
