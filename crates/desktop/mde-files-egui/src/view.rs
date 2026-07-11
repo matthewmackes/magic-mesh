@@ -36,7 +36,7 @@ use mde_egui::egui::{
     TextureHandle, TextureOptions,
 };
 use mde_egui::menubar::{MenuBar as SharedMenuBar, MenuBarModel};
-use mde_egui::{field, muted_note, status_dot, Style};
+use mde_egui::{field, muted_note, status_dot, Motion, Style};
 
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::{Progress, Resolution};
@@ -1611,7 +1611,7 @@ fn list_view(
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
         rects.push((e.idx, rect));
-        paint_entry_bg(ui, rect, e.selected, resp.hovered());
+        paint_entry_bg(ui, resp.id, rect, e.selected, resp.hovered());
         let cy = rect.center().y;
         let tag_x = rect.left() + Style::SP_S;
         let name_x = tag_x + Style::SP_L;
@@ -1664,7 +1664,7 @@ fn grid_view(
             let (rect, resp) =
                 ui.allocate_exact_size(egui::vec2(TILE_W, TILE_H), Sense::click_and_drag());
             rects.push((e.idx, rect));
-            paint_entry_bg(ui, rect, e.selected, resp.hovered());
+            paint_entry_bg(ui, resp.id, rect, e.selected, resp.hovered());
             // FILEMGR-10 — a decoded thumbnail fills the tile art area; until
             // (or unless) one exists, the honest type tag stays the icon.
             want_thumb(ui, e, rect, actions);
@@ -1714,7 +1714,7 @@ fn details_view(
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
         rects.push((e.idx, rect));
-        paint_entry_bg(ui, rect, e.selected, resp.hovered());
+        paint_entry_bg(ui, resp.id, rect, e.selected, resp.hovered());
         let cols = detail_columns(rect);
         let cy = rect.center().y;
         // Name (clipped to its column).
@@ -2959,13 +2959,23 @@ fn empty_state(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize) {
     });
 }
 
-fn paint_entry_bg(ui: &egui::Ui, rect: Rect, selected: bool, hovered: bool) {
+fn paint_entry_bg(ui: &egui::Ui, id: egui::Id, rect: Rect, selected: bool, hovered: bool) {
+    // Selection is a persistent state — its accent wash reads immediately so a
+    // selected row is unmistakable the instant selection lands (and instant
+    // through arrow-key navigation, where a lagging wash would trail the cursor).
     if selected {
         ui.painter()
             .rect_filled(rect, Style::RADIUS, Style::ACCENT.gamma_multiply(0.30));
-    } else if hovered {
+        return;
+    }
+    // Hover is the transient affordance, so it cross-fades on the shared FAST
+    // micro-interaction tier (CRAFT §4/§6.1 — a hover must never snap; scanning a
+    // long listing should read as calm, not a strobe). `Motion::animate` schedules
+    // its own repaints only while the fade is live, so an idle listing stays quiet.
+    let t = Motion::animate(ui.ctx(), id, hovered, Motion::FAST);
+    if t > 0.0 {
         ui.painter()
-            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI.gamma_multiply(t));
     }
 }
 
