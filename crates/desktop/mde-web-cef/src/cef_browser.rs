@@ -12,6 +12,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::os::raw::c_int;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
@@ -509,6 +510,113 @@ pub fn run_windowless_text_probe(
     })
 }
 
+/// Pump interval while the tab is actively loading, painting, or receiving
+/// input. Unchanged from the original 125 Hz spin so input/paint latency is not
+/// regressed while active.
+const PUMP_ACTIVE: Duration = Duration::from_millis(8);
+/// Pump interval once the tab has gone quiet. An idle tab no longer spins at
+/// 125 Hz; it wakes ~4x/s (and immediately on any socket control frame, since
+/// the loop waits with `poll()` on the session fd rather than a blind sleep).
+/// This is also the passkey outbound-drain heartbeat, so it doubles as the idle
+/// floor rather than adding a second timer.
+const PUMP_IDLE: Duration = Duration::from_millis(250);
+/// Grace period of no paints/frames before the pump backs off to [`PUMP_IDLE`],
+/// so a brief lull mid-interaction does not thrash the interval.
+const PUMP_IDLE_AFTER: Duration = Duration::from_millis(200);
+/// How long after the last activity a freshly-navigated document is still
+/// treated as "settling", during which the per-context shims are re-applied (at
+/// [`ShimInjector::SETTLE_INTERVAL`]) so a slow document commit is still covered
+/// even though the pinned CEF ABI exposes no load/context-ready callback.
+const SHIM_SETTLE: Duration = Duration::from_millis(1000);
+/// Cadence of the passkey outbound-queue drain. The ceremony beacon/queue design
+/// is inherently poll-based (a page-initiated `credentials.get()` enqueues a
+/// request native must pick up), so a lightweight drain keeps running — but it no
+/// longer recompiles the multi-KB bridge shim on every tick.
+const PASSKEY_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// perf-6: pick the next pump/poll interval from how active the tab is.
+///
+/// While awaiting the first paint or within [`PUMP_IDLE_AFTER`] of the last
+/// paint/frame/navigation the tab is "active" and pumped at [`PUMP_ACTIVE`];
+/// sustained quiet backs the pump off to [`PUMP_IDLE`] so an idle tab stops
+/// spinning at 125 Hz. Input latency is preserved because the loop waits on the
+/// session fd with `poll()`, which returns immediately when a control frame lands
+/// regardless of the interval.
+fn pump_interval(idle_for: Duration, awaiting_first_paint: bool) -> Duration {
+    if awaiting_first_paint || idle_for < PUMP_IDLE_AFTER {
+        PUMP_ACTIVE
+    } else {
+        PUMP_IDLE
+    }
+}
+
+/// browser-8: decides when to (re)inject the per-context security shims (WebRTC
+/// block + passkey bridge) so they land once per navigation generation instead of
+/// on a blind 250 ms timer.
+///
+/// The pinned CEF ABI exposes no `OnContextCreated`/load-end callback, only an
+/// `is_navigation` flag on the resource handler, so navigation is modelled as a
+/// monotonic `generation` counter. A new generation always injects once. While
+/// that generation is still `settling` (document committing / first paints
+/// arriving) it re-injects at most once per [`Self::SETTLE_INTERVAL`] so a slow
+/// commit is covered. Once the context is stable it never re-injects — the
+/// per-document WebRTC `MutationObserver` keeps new subframes covered on its own.
+#[derive(Debug, Default)]
+struct ShimInjector {
+    injected_generation: Option<u64>,
+    last_inject: Option<Instant>,
+}
+
+impl ShimInjector {
+    /// Bounded re-inject cadence while a fresh document is settling.
+    const SETTLE_INTERVAL: Duration = Duration::from_millis(250);
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when the shims should be injected this tick, recording the
+    /// decision so the same stable context is never re-injected on a timer.
+    fn should_inject(&mut self, generation: u64, settling: bool, now: Instant) -> bool {
+        if self.injected_generation != Some(generation) {
+            self.injected_generation = Some(generation);
+            self.last_inject = Some(now);
+            return true;
+        }
+        if settling {
+            let due = self
+                .last_inject
+                .is_none_or(|last| now.duration_since(last) >= Self::SETTLE_INTERVAL);
+            if due {
+                self.last_inject = Some(now);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Wait up to `timeout` for the session fd to become readable, so a control
+/// frame wakes the loop immediately instead of after a fixed sleep. `poll()`
+/// also reports `POLLHUP`/`POLLERR`, so a closed peer wakes us to observe EOF.
+/// The return value is intentionally ignored: the next `sock::recv` classifies
+/// data/would-block/EOF.
+fn wait_for_readable(fd: RawFd, timeout: Duration) {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = c_int::try_from(timeout.as_millis())
+        .unwrap_or(c_int::MAX)
+        .max(1);
+    // SAFETY: `pfd` is a single valid `pollfd` for the borrowed session fd; the
+    // call only reads `events`/`fd` and writes `revents`.
+    unsafe {
+        libc::poll(std::ptr::addr_of_mut!(pfd), 1, millis);
+    }
+}
+
 /// Serve one CEF tab over the BOOKMARKS-6 session socket until the shell closes
 /// the socket. This currently supports initial load + frame publication; decoded
 /// control frames are drained so the stream stays aligned while navigation/input
@@ -547,55 +655,87 @@ pub fn run_windowless_tab(
     notify_browser_view_ready(browser);
     // Best-effort earliest injection, ahead of the poll loop below (§
     // `webrtc_block_script` doc comment covers why this cannot be airtight).
-    poll_webrtc_block(browser);
+    inject_context_shims(browser);
 
     let mut first_paint = None;
     let started = Instant::now();
     let mut rbuf = Vec::new();
-    let mut last_passkey_poll = Instant::now()
-        .checked_sub(Duration::from_millis(250))
-        .unwrap_or_else(Instant::now);
-    let mut last_webrtc_block_poll = Instant::now()
-        .checked_sub(Duration::from_millis(250))
-        .unwrap_or_else(Instant::now);
+    let fd = stream.as_raw_fd();
+
+    // browser-8: inject the per-context security shims (WebRTC block + passkey
+    // bridge) once per navigation generation instead of on a fixed 250 ms timer.
+    let mut shims = ShimInjector::new();
+    let mut last_nav = callbacks.navigations();
+    let mut last_passkey_drain = Instant::now();
+
+    // perf-6: adaptive pump. `last_activity` tracks the last paint / control
+    // frame / navigation so the pump runs fast while the tab is active and backs
+    // off when idle instead of spinning at 125 Hz forever.
+    let mut last_activity = Instant::now();
+    let mut prev_paints = callbacks.paints();
+
     loop {
         abi.do_message_loop_work();
         match sock::recv(stream) {
             Ok(RecvOutcome::Data { bytes, .. }) => {
                 rbuf.extend_from_slice(&bytes);
                 drain_control_frames(&mut rbuf, browser, &callbacks);
+                last_activity = Instant::now();
             }
             Ok(RecvOutcome::WouldBlock) => {}
             Ok(RecvOutcome::Eof) => break,
             Err(_) => break,
         }
-        if first_paint.is_none() && callbacks.paints() > 0 {
+
+        let paints = callbacks.paints();
+        if paints != prev_paints {
+            prev_paints = paints;
+            last_activity = Instant::now();
+        }
+        if first_paint.is_none() && paints > 0 {
             first_paint = Some(CefBrowserProbe {
                 url: url.text().to_owned(),
                 width,
                 height,
                 created: callbacks.created(),
-                paints: callbacks.paints(),
+                paints,
                 last_paint_width: callbacks.last_paint_width(),
                 last_paint_height: callbacks.last_paint_height(),
             });
         }
-        if last_passkey_poll.elapsed() >= Duration::from_millis(250) {
-            poll_passkey_bridge(browser);
-            last_passkey_poll = Instant::now();
+
+        let nav = callbacks.navigations();
+        if nav != last_nav {
+            last_nav = nav;
+            last_activity = Instant::now();
         }
-        if last_webrtc_block_poll.elapsed() >= Duration::from_millis(250) {
-            poll_webrtc_block(browser);
-            last_webrtc_block_poll = Instant::now();
+
+        let now = Instant::now();
+        let idle_for = now.duration_since(last_activity);
+        let awaiting_first_paint = first_paint.is_none();
+        // A freshly-navigated document is still "settling" while awaiting the
+        // first paint or within SHIM_SETTLE of the last activity; re-inject the
+        // shims through the commit, then leave the stable context alone.
+        let settling = awaiting_first_paint || idle_for < SHIM_SETTLE;
+        if shims.should_inject(nav, settling, now) {
+            inject_context_shims(browser);
         }
-        if first_paint.is_none() && started.elapsed() > Duration::from_secs(15) {
+        // Keep draining page-initiated passkey ceremonies (cheap; no shim
+        // recompile) — this is genuine outbound polling, not shim re-injection.
+        if last_passkey_drain.elapsed() >= PASSKEY_DRAIN_INTERVAL {
+            poll_passkey_drain(browser);
+            last_passkey_drain = now;
+        }
+
+        if awaiting_first_paint && started.elapsed() > Duration::from_secs(15) {
             abi.shutdown();
             return Err(CefBrowserError::TimedOut {
                 created: callbacks.created(),
                 paints: callbacks.paints(),
             });
         }
-        thread::sleep(Duration::from_millis(8));
+
+        wait_for_readable(fd, pump_interval(idle_for, awaiting_first_paint));
     }
 
     let probe = first_paint.unwrap_or(CefBrowserProbe {
@@ -1007,6 +1147,10 @@ impl CefBrowserCallbacks {
         self.state.paints.load(Ordering::SeqCst)
     }
 
+    fn navigations(&self) -> u64 {
+        self.state.navigations()
+    }
+
     fn last_paint_width(&self) -> i32 {
         self.state.last_paint_width.load(Ordering::SeqCst) as i32
     }
@@ -1059,6 +1203,10 @@ struct CefBrowserState {
     height: AtomicI32,
     created: AtomicUsize,
     paints: AtomicUsize,
+    /// Monotonic count of main/sub-frame navigations, bumped from the resource
+    /// handler's `is_navigation` flag (browser-8). Drives per-context shim
+    /// re-injection without a wall-clock timer.
+    nav_seq: AtomicU64,
     last_paint_width: AtomicUsize,
     last_paint_height: AtomicUsize,
     pointer_x: AtomicI32,
@@ -1093,6 +1241,7 @@ impl CefBrowserState {
             height: AtomicI32::new(i32::try_from(height).unwrap_or(i32::MAX)),
             created: AtomicUsize::new(0),
             paints: AtomicUsize::new(0),
+            nav_seq: AtomicU64::new(0),
             last_paint_width: AtomicUsize::new(0),
             last_paint_height: AtomicUsize::new(0),
             pointer_x: AtomicI32::new(0),
@@ -1111,6 +1260,17 @@ impl CefBrowserState {
             .store(i32::try_from(width).unwrap_or(i32::MAX), Ordering::SeqCst);
         self.height
             .store(i32::try_from(height).unwrap_or(i32::MAX), Ordering::SeqCst);
+    }
+
+    /// Record that a fresh document context is being loaded (browser-8). Called
+    /// from the resource handler when CEF flags a request as a navigation.
+    fn record_navigation(&self) {
+        self.nav_seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current navigation generation observed by the pump loop.
+    fn navigations(&self) -> u64 {
+        self.nav_seq.load(Ordering::SeqCst)
     }
 
     fn update_pointer(&self, x: f32, y: f32) -> (i32, i32) {
@@ -1443,7 +1603,7 @@ unsafe extern "C" fn get_resource_request_handler(
     _browser: *mut c_void,
     _frame: *mut c_void,
     _request: *mut c_void,
-    _is_navigation: c_int,
+    is_navigation: c_int,
     _is_download: c_int,
     _request_initiator: *const c_void,
     disable_default_handling: *mut c_int,
@@ -1454,7 +1614,16 @@ unsafe extern "C" fn get_resource_request_handler(
             *disable_default_handling = 0;
         }
     }
-    with_state(self_, |state| state.resource_request_ptr()).unwrap_or(ptr::null_mut())
+    with_state(self_, |state| {
+        if is_navigation != 0 {
+            // browser-8: a real navigation opens a fresh JS context that needs
+            // the WebRTC/passkey shims re-injected. Signal the pump loop instead
+            // of re-running the shims on a blind 250 ms timer.
+            state.record_navigation();
+        }
+        state.resource_request_ptr()
+    })
+    .unwrap_or(ptr::null_mut())
 }
 
 unsafe extern "C" fn on_after_created(self_: *mut c_void, _browser: *mut c_void) {
@@ -2154,18 +2323,26 @@ fn request_page_scrape(
     );
 }
 
-fn poll_passkey_bridge(browser: *mut c_void) {
-    let Some(frame) = main_frame(browser) else {
-        return;
-    };
-    execute_java_script(frame, &passkey_bridge_script());
-}
-
-fn poll_webrtc_block(browser: *mut c_void) {
+/// Inject the per-context security shims (WebRTC block + passkey bridge) into
+/// the current document (browser-8). Called once per navigation generation and
+/// through a fresh document's settle window — not on a wall-clock timer.
+fn inject_context_shims(browser: *mut c_void) {
     let Some(frame) = main_frame(browser) else {
         return;
     };
     execute_java_script(frame, webrtc_block_script());
+    execute_java_script(frame, &passkey_bridge_script());
+}
+
+/// Drain any page-initiated passkey ceremonies queued since the last tick. This
+/// is a lightweight heartbeat (it just calls the installed
+/// `__mdeBrowserPasskeyDrain` closure) rather than recompiling the multi-KB
+/// bridge shim every 250 ms.
+fn poll_passkey_drain(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, passkey_drain_script());
 }
 
 fn complete_passkey(browser: *mut c_void, body: &str) {
@@ -2542,18 +2719,21 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 /// points instead, matching the CEF community's own recommended technique
 /// (remove the interfaces from the renderer's global scope at script-inject
 /// time) and this codebase's existing shim-injection pattern
-/// (`passkey_bridge_script`). Applied unconditionally on every
-/// `run_windowless_tab` poll tick (see `poll_webrtc_block`) — this is a
-/// baseline privacy default, not a per-tab, user-toggleable feature.
+/// (`passkey_bridge_script`). Injected once per navigation generation (and
+/// re-applied through a fresh document's settle window — see `ShimInjector` /
+/// `inject_context_shims`) rather than on a blind 250 ms timer; the installed
+/// `MutationObserver` keeps late subframes covered within a stable document.
+/// This is a baseline privacy default, not a per-tab, user-toggleable feature.
 ///
 /// This is defense-in-depth, not an airtight guarantee: this ABI has no
 /// `OnContextCreated`-equivalent early-injection hook, so a page's own inline
-/// script can still run before the first poll tick lands, and a fresh
+/// script can still run before the first injection lands, and a fresh
 /// document commit (e.g. an in-page navigation) gets an unpatched JS context
-/// until the next tick re-applies this. `--force-webrtc-ip-handling-policy=
-/// disable_non_proxied_udp` (kept in `chromium_privacy_switches()`, verified
-/// real) is the second layer: even a same-tick `RTCPeerConnection` that gets
-/// past this script still cannot leak a raw local IP over non-proxied UDP.
+/// until the navigation-driven re-injection re-applies this. `--force-webrtc-ip
+/// -handling-policy=disable_non_proxied_udp` (kept in
+/// `chromium_privacy_switches()`, verified real) is the second layer: even a
+/// same-tick `RTCPeerConnection` that gets past this script still cannot leak a
+/// raw local IP over non-proxied UDP.
 const fn webrtc_block_script() -> &'static str {
     // browser-3: the removal is applied to EVERY reachable frame, not just the
     // main frame. `strip(w)` deletes the JS-reachable WebRTC surface on a target
@@ -2703,6 +2883,7 @@ try{{
       if(origGet)return origGet(options);
       return Promise.reject(new DOMException('Unsupported credential type','NotSupportedError'));
     }};
+    window.__mdeBrowserPasskeyDrain=function(){{try{{var dq=window.__mdeBrowserPasskeyQueue;if(dq){{for(var n=0;n<4&&dq.length;n++)emit(dq.shift());}}}}catch(_){{}}}};
   }}
   var q=window.__mdeBrowserPasskeyQueue;
   for(var n=0;n<4&&q.length;n++)emit(q.shift());
@@ -2717,6 +2898,16 @@ fn passkey_complete_script(body: &str) -> String {
     format!(
         "(function(){{try{{var event=JSON.parse({body});if(window.__mdeBrowserPasskeyComplete)window.__mdeBrowserPasskeyComplete(event);}}catch(_){{}}}})();"
     )
+}
+
+/// browser-8: the lightweight passkey heartbeat. It only calls the drain closure
+/// installed once by [`passkey_bridge_script`], so the multi-KB bridge shim is no
+/// longer recompiled/re-executed every 250 ms — but page-initiated ceremonies are
+/// still delivered promptly. A no-op until the bridge has been installed for the
+/// current document (`__mdeBrowserPasskeyDrain` undefined), which is exactly when
+/// there is nothing to drain.
+const fn passkey_drain_script() -> &'static str {
+    "(function(){try{if(window.__mdeBrowserPasskeyDrain)window.__mdeBrowserPasskeyDrain();}catch(_){}})();"
 }
 
 fn decode_page_text_beacon(url: &str) -> Option<(u64, String)> {
@@ -3651,6 +3842,96 @@ mod tests {
         assert!(script.contains("childList:true,subtree:true"));
         // The entry point sweeps from the top window (which recurses down).
         assert!(script.contains("sweep(window)"));
+    }
+
+    #[test]
+    fn pump_interval_backs_off_when_idle_but_stays_fast_while_active() {
+        // perf-6: awaiting the first paint is always active regardless of the
+        // idle clock, so initial load latency is never regressed.
+        assert_eq!(pump_interval(Duration::from_secs(30), true), PUMP_ACTIVE);
+        // Recent activity (paint/frame/nav within the grace window) stays fast.
+        assert_eq!(pump_interval(Duration::ZERO, false), PUMP_ACTIVE);
+        assert_eq!(pump_interval(PUMP_IDLE_AFTER / 2, false), PUMP_ACTIVE);
+        // Sustained quiet backs off so an idle tab stops spinning at 125 Hz.
+        assert_eq!(pump_interval(PUMP_IDLE_AFTER, false), PUMP_IDLE);
+        assert_eq!(pump_interval(Duration::from_secs(5), false), PUMP_IDLE);
+        // The idle interval is a real, substantial back-off from the active spin.
+        assert!(PUMP_IDLE >= PUMP_ACTIVE * 10);
+    }
+
+    #[test]
+    fn shim_injector_injects_once_per_navigation_not_on_a_timer() {
+        // browser-8: the shims re-inject when the navigation generation advances,
+        // never on a bare wall-clock timer once the context is stable.
+        let mut injector = ShimInjector::new();
+        let t0 = Instant::now();
+        // First sight of a generation always injects once.
+        assert!(injector.should_inject(0, false, t0));
+        // Same generation, stable (not settling): no re-injection even much later.
+        assert!(!injector.should_inject(0, false, t0 + Duration::from_secs(10)));
+        assert!(!injector.should_inject(0, false, t0 + Duration::from_secs(60)));
+        // A real navigation (generation advanced) injects again.
+        assert!(injector.should_inject(1, false, t0 + Duration::from_secs(61)));
+        assert!(!injector.should_inject(1, false, t0 + Duration::from_secs(62)));
+    }
+
+    #[test]
+    fn shim_injector_reinjects_through_a_settling_document_then_stops() {
+        // A freshly-navigated document that is still settling gets a bounded
+        // re-inject (covers a slow commit under an ABI with no load callback),
+        // but the cadence is throttled to SETTLE_INTERVAL, not every tick.
+        let mut injector = ShimInjector::new();
+        let t0 = Instant::now();
+        // A new generation injects once.
+        assert!(injector.should_inject(2, true, t0));
+        // Immediately again while settling: throttled, not a per-tick spin.
+        assert!(!injector.should_inject(2, true, t0 + Duration::from_millis(10)));
+        assert!(!injector.should_inject(2, true, t0 + ShimInjector::SETTLE_INTERVAL / 2));
+        // Once the settle interval elapses, re-inject to cover the commit.
+        assert!(injector.should_inject(2, true, t0 + ShimInjector::SETTLE_INTERVAL));
+        // When the same generation stops settling, injection stops entirely.
+        assert!(!injector.should_inject(2, false, t0 + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn passkey_bridge_exposes_reusable_drain_and_heartbeat_is_lightweight() {
+        // browser-8: the heavy bridge shim installs a reusable drain closure once
+        // per context; the heartbeat script just invokes it instead of
+        // recompiling the whole shim every 250 ms.
+        let install = passkey_bridge_script();
+        assert!(install.contains("window.__mdeBrowserPasskeyDrain=function"));
+        assert!(install.contains("__mdeBrowserPasskeyQueue"));
+
+        let drain = passkey_drain_script();
+        assert!(drain.contains("window.__mdeBrowserPasskeyDrain"));
+        // The heartbeat is only the invocation, not the shim: it must not carry
+        // the credential-override installation that only needs to happen once.
+        assert!(!drain.contains("creds.get=function"));
+        assert!(!drain.contains("navigator.credentials"));
+        // Materially smaller than the shim it replaces on the timer path.
+        assert!(drain.len() * 4 < install.len());
+    }
+
+    #[test]
+    fn wait_for_readable_returns_promptly_when_the_fd_is_readable() {
+        use std::io::Write;
+        let (a, mut b) = UnixStream::pair().expect("socketpair");
+        a.set_nonblocking(true).expect("nonblocking");
+        b.write_all(b"x").expect("write");
+        // A readable fd must not block for the full timeout: poll returns at once.
+        let started = Instant::now();
+        wait_for_readable(a.as_raw_fd(), Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn record_navigation_advances_the_generation_seen_by_the_pump() {
+        let callbacks =
+            CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+        assert_eq!(callbacks.navigations(), 0);
+        callbacks.state.record_navigation();
+        callbacks.state.record_navigation();
+        assert_eq!(callbacks.navigations(), 2);
     }
 
     #[test]
