@@ -536,7 +536,11 @@ mod tests {
             .local_listen_addr()
             .await
             .expect("listener bound after start");
-        assert_eq!(bound.ip(), fixture_ip, "bind addr = the resolved overlay IP");
+        assert_eq!(
+            bound.ip(),
+            fixture_ip,
+            "bind addr = the resolved overlay IP"
+        );
         assert!(
             !bound.ip().is_unspecified(),
             "the overlay transport must never bind 0.0.0.0/::"
@@ -562,7 +566,10 @@ mod tests {
             .with_overlay_ip_path(missing)
             .with_listen_port(0);
         let (sink, mut stream) = EventStream::channel();
-        let err = transport.start(sink).await.expect_err("must be unavailable");
+        let err = transport
+            .start(sink)
+            .await
+            .expect_err("must be unavailable");
         assert!(
             matches!(err, HostError::OverlayUnresolved(_)),
             "unresolved overlay is a typed unavailable state, got {err:?}"
@@ -697,7 +704,9 @@ mod tests {
         let r = transport
             .send_to(&PeerId::from("ghost"), plugins::ping_packet(1, "x".into()))
             .await;
-        assert!(matches!(r, Err(HostError::Transport(ref m)) if m.contains("no_inbound_connection")));
+        assert!(
+            matches!(r, Err(HostError::Transport(ref m)) if m.contains("no_inbound_connection"))
+        );
         transport.shutdown().await;
     }
 }

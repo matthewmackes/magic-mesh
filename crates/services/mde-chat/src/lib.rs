@@ -43,11 +43,11 @@ mod message;
 mod notify;
 mod roster;
 
-pub use alert::{Severity, alert_flag, fold_alert};
+pub use alert::{alert_flag, fold_alert, Severity};
 pub use conversation::{
-    Conversation, Room, RoomDescriptor, RoomKind, SYS_ALL_FLEET_ID, severity_room_id,
-    system_room_descriptors,
+    severity_room_id, system_room_descriptors, Conversation, Room, RoomDescriptor, RoomKind,
+    SYS_ALL_FLEET_ID,
 };
-pub use message::{AlertAction, AlertActionKind, Message, MessageId, MessageKind, Signature, sign};
+pub use message::{sign, AlertAction, AlertActionKind, Message, MessageId, MessageKind, Signature};
 pub use notify::NotifyPrefs;
 pub use roster::{Contact, NodeRole, Presence, Roster};

@@ -588,8 +588,8 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
 #[allow(clippy::float_cmp, clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::{
-        BAR_HEIGHT, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip, display_title,
-        mnemonic_key, motion_secs, resolve_mnemonics,
+        display_title, mnemonic_key, motion_secs, resolve_mnemonics, ChipTone, Entry, Item, Menu,
+        MenuBar, MenuBarModel, StatusChip, BAR_HEIGHT,
     };
     use crate::{Motion, Style};
 
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn menu_bar_renders_headless_and_is_idle_without_a_click() {
-        use egui::{Rect, pos2, vec2};
+        use egui::{pos2, vec2, Rect};
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let menus = sample_menus();

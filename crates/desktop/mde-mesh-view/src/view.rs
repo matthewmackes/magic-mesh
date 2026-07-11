@@ -416,7 +416,10 @@ mod tests {
         // Current build → dim; older build → marked + WARN so it stands out;
         // absent version → an honest "—", never a fabricated build (§7).
         let current = MeshNode::new("a", "a", Role::Workstation, Health::Ok).version("12.0.0");
-        assert_eq!(version_line(&current), ("12.0.0".to_string(), Style::TEXT_DIM));
+        assert_eq!(
+            version_line(&current),
+            ("12.0.0".to_string(), Style::TEXT_DIM)
+        );
 
         let old = MeshNode::new("b", "b", Role::Workstation, Health::Warn)
             .version("11.4.1")

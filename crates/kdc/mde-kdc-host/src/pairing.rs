@@ -610,7 +610,10 @@ mod tests {
 
         // Convergence: an empty replace drops recognition (the pairing left the mesh).
         s.replace_synced(vec![]);
-        assert!(!s.is_paired("phone-x"), "recognition converges away with the mesh");
+        assert!(
+            !s.is_paired("phone-x"),
+            "recognition converges away with the mesh"
+        );
     }
 
     #[test]

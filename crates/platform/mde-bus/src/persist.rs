@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

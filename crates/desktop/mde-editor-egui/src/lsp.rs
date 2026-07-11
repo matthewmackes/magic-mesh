@@ -910,11 +910,7 @@ impl LspClient {
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character },
         });
-        self.send_request(
-            "textDocument/prepareRename",
-            params,
-            NavKind::PrepareRename,
-        )
+        self.send_request("textDocument/prepareRename", params, NavKind::PrepareRename)
     }
 
     /// Request `textDocument/rename` of the symbol at the caret to `new_name`.
@@ -1706,7 +1702,11 @@ done
             }
         });
         let we = parse_workspace_edit(&map);
-        assert_eq!(we.changes.len(), 2, "a cross-file rename touches both files");
+        assert_eq!(
+            we.changes.len(),
+            2,
+            "a cross-file rename touches both files"
+        );
         assert!(!we.is_empty());
 
         // The `documentChanges` shape, with a resource op that carries no text
@@ -1738,7 +1738,8 @@ done
         assert_eq!(pr.range.start_character, 4);
 
         // A bare Range (no placeholder).
-        let bare = json!({ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 5 } });
+        let bare =
+            json!({ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 5 } });
         let pr = parse_prepare_rename(&bare).expect("a bare range");
         assert!(pr.placeholder.is_none());
 

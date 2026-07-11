@@ -475,7 +475,10 @@ mod tests {
     #[test]
     fn splitting_a_leaf_makes_the_new_pane_its_sibling() {
         let mut tree = Pane::leaf(id(1));
-        assert!(tree.split(id(1), SplitDir::V, id(2)), "the target leaf split");
+        assert!(
+            tree.split(id(1), SplitDir::V, id(2)),
+            "the target leaf split"
+        );
         assert_eq!(tree.leaves(), vec![id(1), id(2)], "both panes are present");
         assert_eq!(tree.leaf_count(), 2);
         // The new pane lands in the b-slot (right of a V-cut).
@@ -548,7 +551,10 @@ mod tests {
         let (_, a_rect) = lay.leaves[0];
         let (_, b_rect) = lay.leaves[1];
         assert!(a_rect.max.x < b_rect.min.x, "a is left of b");
-        assert!((a_rect.width() - b_rect.width()).abs() < 8.0, "roughly even");
+        assert!(
+            (a_rect.width() - b_rect.width()).abs() < 8.0,
+            "roughly even"
+        );
     }
 
     #[test]
@@ -593,7 +599,7 @@ mod tests {
         tree.split(id(1), SplitDir::V, id(2)); // 1 | 2
         tree.split(id(1), SplitDir::H, id(3)); // 1 over 3, beside 2
         tree.split(id(2), SplitDir::H, id(4)); // 2 over 4
-        // Layout: top row [1,2], bottom row [3,4].
+                                               // Layout: top row [1,2], bottom row [3,4].
         assert_eq!(navigate(&tree, id(1), NavDir::Right), Some(id(2)));
         assert_eq!(navigate(&tree, id(1), NavDir::Down), Some(id(3)));
         assert_eq!(navigate(&tree, id(4), NavDir::Left), Some(id(3)));

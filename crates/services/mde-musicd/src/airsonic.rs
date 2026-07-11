@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(cmp_version("1.13.0", "1.16.1"), Ordering::Less);
         assert_eq!(cmp_version("1.16.1", "1.16.1"), Ordering::Equal);
         assert_eq!(cmp_version("1.9.0", "1.10.0"), Ordering::Less); // numeric, not lexical
-        // min_version never exceeds either input.
+                                                                    // min_version never exceeds either input.
         assert_eq!(min_version("1.16.1", "1.13.0"), "1.13.0");
         assert_eq!(min_version("1.13.0", "1.16.1"), "1.13.0");
         // A server that reports a newer version than our ceiling is clamped to us.

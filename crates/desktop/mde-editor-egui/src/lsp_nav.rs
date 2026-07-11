@@ -100,7 +100,10 @@ pub(crate) fn resolve_range(buffer: &Buffer, range: LspRange) -> Range<usize> {
 /// as `(char-range, text)` — the local rename prefill + validity check, always
 /// available with no server round-trip. `None` when the caret is not on a word.
 #[must_use]
-pub(crate) fn word_under_cursor(buffer: &Buffer, char_idx: usize) -> Option<(Range<usize>, String)> {
+pub(crate) fn word_under_cursor(
+    buffer: &Buffer,
+    char_idx: usize,
+) -> Option<(Range<usize>, String)> {
     let len = buffer.len_chars();
     let idx = char_idx.min(len);
     let rope = buffer.rope();
@@ -523,7 +526,7 @@ pub(crate) fn show_rename(ctx: &egui::Context, rename: &mut RenameBox) -> Option
 mod tests {
     use super::{
         apply_edits_on_disk, apply_edits_to_open_buffer, apply_edits_to_text, char_of,
-        char_to_lsp_pos, resolve_range, word_under_cursor, ReferencesPanel, RefRow, RenameBox,
+        char_to_lsp_pos, resolve_range, word_under_cursor, RefRow, ReferencesPanel, RenameBox,
     };
     use crate::buffer::Buffer;
     use crate::lsp::{Location, LspRange, TextEdit};
@@ -601,7 +604,10 @@ mod tests {
         let n = apply_edits_to_open_buffer(&mut view, &mut buf, &edits);
         assert_eq!(n, 1);
         assert_eq!(buf.rope().to_string(), "title here\n");
-        assert!(view.undo(&mut buf), "the applied edit is undoable in an open buffer");
+        assert!(
+            view.undo(&mut buf),
+            "the applied edit is undoable in an open buffer"
+        );
         assert_eq!(buf.rope().to_string(), "name here\n");
     }
 
@@ -653,12 +659,20 @@ mod tests {
         assert!(panel.is_open());
         assert_eq!(panel.rows().len(), 2);
         assert_eq!(panel.rows()[0].line, 1, "display line is 1-based");
-        assert_eq!(panel.rows()[0].preview, "let a = 1;", "the preview is trimmed");
+        assert_eq!(
+            panel.rows()[0].preview,
+            "let a = 1;",
+            "the preview is trimmed"
+        );
         assert_eq!(panel.selected_index(), 0);
         panel.step(true);
         assert_eq!(panel.selected_index(), 1);
         panel.step(true);
-        assert_eq!(panel.selected_index(), 1, "selection saturates at the last row");
+        assert_eq!(
+            panel.selected_index(),
+            1,
+            "selection saturates at the last row"
+        );
         panel.step(false);
         assert_eq!(panel.selected_index(), 0);
     }
