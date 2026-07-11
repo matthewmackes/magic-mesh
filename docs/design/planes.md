@@ -8,9 +8,12 @@ pre-locks) + 10 hero-image questions (H1–H10) + standing directive **D-W1** ·
 > governance `AI_GOVERNANCE.md` §9): the Controller plane was renamed the Cloud
 > plane.** The shipped IA is exactly **five** planes —
 > **This Node · Cloud · Network · Fleet · Provisioning** (`Plane::ALL`,
-> `crates/desktop/mde-shell-egui/src/workbench.rs`) — with the **Peers directory as
-> the Front Door** and the desktop-personal panels grouped below (neither is a
-> top-level plane in the enum). **Read every "Controller" below as "Cloud":** the
+> `crates/desktop/mde-shell-egui/src/workbench.rs`) — reached from the **dock** (the
+> shell's nav; the Workbench is its default surface) and switched by a selectable
+> rail inside the Workbench. The **peer directory** is not a plane — it renders
+> inside the Cloud plane and is drilled into from the Fleet plane; the
+> desktop-personal panels are their own dock surfaces (neither is a top-level plane
+> in the enum). **Read every "Controller" below as "Cloud":** the
 > Q70 lock made `OpenStack` the control brain this plane described (instances ·
 > volumes+snapshots · images · networks · stacks, self-served by every member),
 > while the doctrines here — renderers-not-authorities, typed Bus verbs, one-state,
@@ -45,11 +48,14 @@ second.** Greenfield: no legacy or tech debt carried (operator, W78 reply).
 
 ## The IA (W4–W16)
 
-Nav top-to-bottom: **Peers (Front Door) · This Node · Cloud** (was Controller) **·
-Network · Fleet · Provisioning · Desktop** (personal panels grouped last). The
-five top-level planes in the shipped enum are This Node · Cloud · Network · Fleet ·
-Provisioning; Peers is the Front Door and Desktop is the personal-panel group. Full tree from day one with
-guided empty states on unbuilt panels (W16, L3 pattern). Deep-link ids: clean break
+The **dock** is the shell's nav — a surface picker whose top standalone anchor is
+the Workbench (the default surface). Inside the Workbench the five planes sit in a
+selectable rail ordered by blast radius (local host → fleet-wide): **This Node ·
+Cloud** (was Controller) **· Network · Fleet · Provisioning** (`Plane::ALL`,
+`workbench.rs`). The **peer directory** is not a plane — it renders inside the Cloud
+plane's inventory and is drilled into from the Fleet plane (W7/W87); the
+desktop-personal panels are their own dock surfaces, not a plane. Full tree from day
+one with guided empty states on unbuilt panels (W16, L3 pattern). Deep-link ids: clean break
 (W11). Existing panels absorbed (W4): Mesh Services→This Node/Health · Drift→
 Controller/Remediation · Fleet Revisions→Controller/Config · Playbooks→Controller/Jobs
 · Mesh Control→Controller (own entry, W52) · fleet health→Fleet plane (W14) · Peers =
@@ -137,7 +143,7 @@ Every section whose primary engine is an external project carries a **hero**:
 version** (H8), **hover → stack card** (project, version, license, platform role, docs
 link — H9), **always rendered** ("not installed" honest caption when absent, H10).
 Set (H1): Ansible, etcd, Syncthing (the SUBSTRATE-6 substrate, replacing the
-retired LizardFS hero), Nebula, Fedora, Netdata, Podman, libvirt/KVM, Cosmic,
+retired LizardFS hero), Nebula, Fedora, Netdata, Podman, libvirt/KVM,
 systemd, Remmina, PipeWire, **rustls (TLS)**, VPN/tunnel tech. Assets: SVGs compiled
 into **mde-theme** behind a typed `Hero` enum (H6, §4 single-source); stroke color is
 a new **`hero_stroke` token**, palette-tested (H7).
