@@ -283,7 +283,9 @@ impl Style {
         v.widgets.hovered.weak_bg_fill = Self::SURFACE_HI;
         v.widgets.hovered.fg_stroke = text;
 
-        // Pressed / active.
+        // Pressed / active. The label paints in [`BG`](Self::BG) over the accent fill
+        // (below), so BG-text-over-accent must stay WCAG-legible for every selectable
+        // accent — guarded by `pressed_accent_text_stays_wcag_legible` (a11y, P3).
         v.widgets.active.fg_stroke = Stroke::new(1.0, Self::BG);
 
         // The interactive **accent** — the ONE re-tintable field group: the
@@ -521,6 +523,81 @@ impl GradeBand {
 mod tests {
     use super::{Density, GradeBand, Style};
     use crate::formfactor::Formfactor;
+
+    /// WCAG 2.1 **relative luminance** of an sRGB colour (`0.0..=1.0`; alpha ignored).
+    /// Each 8-bit channel is normalized, linearized through the sRGB EOTF, then weighted
+    /// `0.2126 R + 0.7152 G + 0.0722 B`. Pure data math — no GPU — matching this module's
+    /// render-agnostic contract (the tokens are data, testable without a render pass).
+    fn relative_luminance(c: egui::Color32) -> f32 {
+        let lin = |ch: u8| {
+            let s = f32::from(ch) / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+
+    /// The WCAG 2.1 **contrast ratio** between two sRGB colours: `(L_light + 0.05) /
+    /// (L_dark + 0.05)`, in `1.0..=21.0`. Symmetric — the brighter colour is always the
+    /// numerator, so argument order does not matter.
+    fn wcag_contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn pressed_accent_text_stays_wcag_legible() {
+        // The pressed/active widget paints its label in Style::BG
+        // (`install_with_density`: `v.widgets.active.fg_stroke = Stroke::new(1.0,
+        // Self::BG)`) over the accent fill (`v.widgets.active.bg_fill = accent`). A
+        // button label renders at Style::BODY (12 pt) — below WCAG's "large text" cut
+        // (18 pt, or 14 pt bold) — so the applicable AA legibility floor is the
+        // body-text 4.5:1, NOT the 3:1 large-text / UI-component relaxation. This
+        // preventive guard stops a future accent from dropping pressed-button text below
+        // readable contrast (the finding's ~5.4:1 Purple worst case clears it with room).
+        const AA_BODY: f32 = 4.5;
+
+        // Sanity anchors — the two known-good ratios named in the platform review.
+        let text_bg = wcag_contrast_ratio(Style::TEXT, Style::BG);
+        assert!(
+            (text_bg - 14.52).abs() < 0.1,
+            "TEXT/BG contrast drifted from the known 14.52:1 anchor: {text_bg:.2}"
+        );
+        let accent_bg = wcag_contrast_ratio(Style::ACCENT, Style::BG);
+        assert!(
+            (accent_bg - 5.71).abs() < 0.1,
+            "ACCENT/BG contrast drifted from the known 5.71:1 anchor: {accent_bg:.2}"
+        );
+
+        // Every accent the shell's Personalization → Theme picker (SETTINGS-5,
+        // `AccentChoice`) can select IS one of these shared tokens — Brand→ACCENT,
+        // Cyan→ACCENT_COMMS, Purple→ACCENT_WORKLOADS, Teal→ACCENT_TERMINALS,
+        // Green→ACCENT_MESH, Gold→ACCENT_SYSTEM, Magenta→ACCENT_MEDIA — so guarding the
+        // tokens here guards every selectable pressed accent, with no mde-egui→shell dep.
+        // ACCENT_HI is the brand pressed-ring lift, also behind BG-coloured text.
+        let accents = [
+            ("ACCENT (Brand)", Style::ACCENT),
+            ("ACCENT_HI", Style::ACCENT_HI),
+            ("ACCENT_COMMS (Cyan)", Style::ACCENT_COMMS),
+            ("ACCENT_WORKLOADS (Purple)", Style::ACCENT_WORKLOADS),
+            ("ACCENT_TERMINALS (Teal)", Style::ACCENT_TERMINALS),
+            ("ACCENT_MESH (Green)", Style::ACCENT_MESH),
+            ("ACCENT_SYSTEM (Gold)", Style::ACCENT_SYSTEM),
+            ("ACCENT_MEDIA (Magenta)", Style::ACCENT_MEDIA),
+        ];
+        for (name, accent) in accents {
+            let ratio = wcag_contrast_ratio(Style::BG, accent);
+            assert!(
+                ratio >= AA_BODY,
+                "pressed BG-text over {name} is only {ratio:.2}:1 — below the WCAG AA \
+                 body-text floor of {AA_BODY}:1; pressed-button labels would be unreadable"
+            );
+        }
+    }
 
     #[test]
     fn spacing_follows_the_8px_grid() {
