@@ -3014,12 +3014,17 @@ fn run_serve(
                         count = manifests.len(),
                         "tag_manifest: loaded operator manifests",
                     );
+                    // Best-effort in-process Bus publish (perf-10 / arch-6) — one
+                    // reused Persist handle for the whole startup batch instead
+                    // of a fork+exec of the `mde-bus` CLI (a process + fresh
+                    // SQLite open + a reaper thread) per manifest. Targets
+                    // `bus_publish::default_bus_root` (honours `MDE_BUS_ROOT` —
+                    // the SAME root the CLI resolved). A bus that isn't openable
+                    // yet at early startup is swallowed, never a daemon crash.
+                    let mut bus = mackesd_core::bus_publish::open_bus(
+                        mackesd_core::bus_publish::default_bus_root(),
+                    );
                     for m in &manifests {
-                        // Best-effort Bus publish — broker may not be
-                        // up yet during the early startup phase, but
-                        // the spawn-detached shell-out makes that a
-                        // silent no-op rather than a daemon crash.
-                        let topic = "event/config/tags/loaded".to_string();
                         let body = format!(
                             r#"{{"name":"{}","apps":{},"layout":"{}","autostart":{}}}"#,
                             m.name.replace('"', "\\\""),
@@ -3027,15 +3032,13 @@ fn run_serve(
                             m.layout.replace('"', "\\\""),
                             m.autostart,
                         );
-                        let mut cmd = std::process::Command::new("mde-bus");
-                        cmd.arg("publish")
-                            .arg(&topic)
-                            .arg("--body-flag")
-                            .arg(&body);
-                        mackesd_core::proc_reap::fire_and_reap(
-                            cmd,
-                            mackesd_core::proc_reap::DEFAULT_REAP_TIMEOUT,
-                        );
+                        if let Some(persist) = bus.as_mut() {
+                            mackesd_core::bus_publish::publish_body(
+                                persist,
+                                "event/config/tags/loaded",
+                                &body,
+                            );
+                        }
                     }
                 }
                 Err(e) => {

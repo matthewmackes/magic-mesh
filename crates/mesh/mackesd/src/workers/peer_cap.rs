@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use super::{ShutdownToken, Worker};
@@ -146,7 +145,7 @@ async fn tick_once(store: Arc<Mutex<rusqlite::Connection>>, cache_path: &PathBuf
     };
     let snapshot = PeerCapSnapshot::from_count(cap_used);
     write_cache(cache_path, &snapshot).await;
-    publish_cap(&snapshot).await;
+    publish_cap(&snapshot);
 }
 
 async fn write_cache(path: &PathBuf, snapshot: &PeerCapSnapshot) {
@@ -166,30 +165,26 @@ async fn write_cache(path: &PathBuf, snapshot: &PeerCapSnapshot) {
     }
 }
 
-async fn publish_cap(snapshot: &PeerCapSnapshot) {
+/// Publish the peer-cap snapshot to [`CAP_TOPIC`] in-process (perf-10 / arch-6)
+/// — no fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite open +
+/// a reaper) per broadcast. Byte-identical stored row to the old `mde-bus publish
+/// <topic> --body-flag <body>` (the `cap_payload` string, written verbatim).
+/// Targets [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT` — the
+/// SAME root the fork+exec'd CLI resolved via the inherited env). The single
+/// bounded `INSERT` + file write is fast enough to run inline, so this no longer
+/// needs the EFF-20 timeout the wedgeable subprocess required. Best-effort: a
+/// missing root / failed open / write is logged + swallowed (graceful-degrade).
+fn publish_cap(snapshot: &PeerCapSnapshot) {
     let body = cap_payload(snapshot);
-    let mut cmd = Command::new("mde-bus");
-    cmd.arg("publish")
-        .arg(CAP_TOPIC)
-        .arg("--body-flag")
-        .arg(&body);
-    // EFF-20 — bound the publish so a wedged mde-bus can't leave this
-    // future pending forever.
-    match crate::workers::proc::status_with_timeout_async(
-        cmd,
-        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
-    )
-    .await
-    {
-        Ok(s) if s.success() => {
-            tracing::debug!(cap_used = snapshot.cap_used, "peer-cap published");
-        }
-        Ok(s) => {
-            tracing::warn!(exit = ?s.code(), "peer-cap: mde-bus publish exited non-zero");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "peer-cap: mde-bus unavailable (graceful-degrade)");
-        }
+    let Some(mut persist) = crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
+    else {
+        tracing::warn!("peer-cap: bus unavailable (graceful-degrade)");
+        return;
+    };
+    if crate::bus_publish::publish_body(&mut persist, CAP_TOPIC, &body).is_some() {
+        tracing::debug!(cap_used = snapshot.cap_used, "peer-cap published");
+    } else {
+        tracing::warn!("peer-cap: in-process bus publish failed");
     }
 }
 

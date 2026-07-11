@@ -56,7 +56,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use mde_bus::persist::Persist;
@@ -464,17 +463,23 @@ pub trait Publisher {
     fn publish(&self, topic: &str, body: &str);
 }
 
-/// Production [`Publisher`]: the `mde-bus publish` CLI fired through the detached
-/// [`crate::proc_reap::fire_and_reap`] reaper — the same path `vm_lifecycle` /
-/// `kvm_health` publish on. A missing binary (pre-RPM dev box) is swallowed.
+/// Production [`Publisher`]: an in-process [`crate::bus_publish`] write (perf-10
+/// / arch-6) — no fork+exec of the `mde-bus` CLI (a whole process + a fresh
+/// SQLite open + a [`crate::proc_reap`] reaper thread) per publish. Byte-identical
+/// stored row to the old `mde-bus publish <topic> --body-flag <body>`. Targets
+/// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT` — the SAME
+/// root the fork+exec'd CLI resolved via the inherited env). A `None` root /
+/// failed open / write is swallowed (pre-RPM dev-box parity).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BusPublisher;
 
 impl Publisher for BusPublisher {
     fn publish(&self, topic: &str, body: &str) {
-        let mut cmd = Command::new("mde-bus");
-        cmd.args(["publish", topic, "--body-flag", body]);
-        crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+        if let Some(mut persist) =
+            crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
+        {
+            crate::bus_publish::publish_body(&mut persist, topic, body);
+        }
     }
 }
 

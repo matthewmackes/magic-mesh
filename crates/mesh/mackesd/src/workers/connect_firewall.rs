@@ -261,7 +261,10 @@ pub fn unexpected_open_ports(
 
 /// CONNECT-3 — publish a Hub alert naming unexpected public-zone openings, on the
 /// same `event/firewall/<host>` alert lane the firewall monitor uses (so it
-/// surfaces in the Notification Hub). Best-effort fire-and-reap.
+/// surfaces in the Notification Hub). In-process (perf-10 / arch-6) — no
+/// fork+exec of the `mde-bus` CLI per alert. Byte-identical stored row to the old
+/// `mde-bus publish <topic> --body-flag <body>`; targets
+/// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT`). Best-effort.
 fn publish_unexpected_ports_alert(host: &str, unexpected: &[(u16, String)]) {
     let topic = format!("event/firewall/{host}");
     let list = unexpected
@@ -273,9 +276,22 @@ fn publish_unexpected_ports_alert(host: &str, unexpected: &[(u16, String)]) {
         r#"{{"host":"{host}","unexpected_public_ports":"{list}","count":{},"alert":true}}"#,
         unexpected.len()
     );
-    let mut cmd = std::process::Command::new("mde-bus");
-    cmd.args(["publish", &topic, "--body-flag", &body]);
-    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+    publish_alert_to(
+        crate::bus_publish::default_bus_root().as_deref(),
+        &topic,
+        &body,
+    );
+}
+
+/// Root-injectable in-process write for the CONNECT-3 alert. Fresh-opens the Bus
+/// at `bus_root` and writes the already-serialized `body` verbatim to `topic`.
+/// Best-effort; tests pass a temp root.
+fn publish_alert_to(bus_root: Option<&std::path::Path>, topic: &str, body: &str) {
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
+    {
+        crate::bus_publish::publish_body(&mut persist, topic, body);
+    }
 }
 
 /// The exposure-driven enforcement worker: opens the policy's ingress firewall
