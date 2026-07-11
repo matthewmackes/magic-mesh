@@ -1464,6 +1464,7 @@ fn rail_icon(
         ui.painter()
             .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
     }
+    paint_focus_ring(ui.painter(), rect, resp.has_focus());
     install_cell_accessibility(ui.ctx(), rail_icon_id(icon), label, value, rect);
     resp.clicked()
 }
@@ -1530,6 +1531,7 @@ fn rail_surface_cell(
         );
     }
     paint_rail_label(ui, rect, label, tint);
+    paint_focus_ring(&painter, rect, resp.has_focus());
     apply_picker_arrow_focus(ui, surface, &resp);
     paint_surface_context_menu(ui, surface, &resp, active, pinned);
     install_cell_accessibility(
@@ -1675,6 +1677,7 @@ fn session_entry(
             },
         );
     }
+    paint_focus_ring(&painter, rect, resp.has_focus());
     // WIN7-7, lock #14 — unconditional (unlike the visual text above, which
     // clips away entirely when the cell is too narrow): a screen reader
     // needs the session's name every time, not only when there happens to
@@ -1726,6 +1729,7 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
         );
     }
     paint_rail_label(ui, rect, "Status", tint);
+    paint_focus_ring(&painter, rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         status_detail_toggle_id(),
@@ -1776,6 +1780,7 @@ fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
         );
     }
     paint_rail_label(ui, rect, "Start", tint);
+    paint_focus_ring(&painter, rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         start_cell_id(),
@@ -1824,6 +1829,7 @@ fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
         );
     }
     paint_rail_label(ui, cell, "Pin", color);
+    paint_focus_ring(ui.painter(), cell, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         egui::Id::new("vdock-pin"),
@@ -1889,6 +1895,7 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
         tint,
     );
     paint_rail_label(ui, rect, "Clock", tint);
+    paint_focus_ring(&painter, rect, resp.has_focus());
     // WIN7-7, lock #14 — the clock's accessible VALUE is the same live
     // `HH:MM` reading its glyph paints (the task's own "does the clock
     // announce the time" question): a screen reader can navigate to the
@@ -2126,6 +2133,7 @@ fn desktop_source_toggle(
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
     }
+    paint_focus_ring(&painter, rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         desktop_source_toggle_id(),
@@ -2268,6 +2276,7 @@ fn desktop_source_row(ui: &egui::Ui, rect: egui::Rect, source: &DesktopRailSourc
         egui::FontId::proportional((Style::SMALL - 1.0).max(8.0)),
         Style::TEXT_DIM,
     );
+    paint_focus_ring(&painter, rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         desktop_source_row_id(source),
@@ -2435,6 +2444,7 @@ fn pick_app_cell_with_badge(
     if let Some(badge) = badge {
         paint_badge(ui, rect, surface, badge);
     }
+    paint_focus_ring(&painter, rect, resp.has_focus());
     apply_picker_arrow_focus(ui, surface, &resp);
     paint_surface_context_menu(ui, surface, &resp, active, pinned);
 
@@ -2623,6 +2633,7 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
         egui::FontId::proportional(Style::SMALL),
         Style::TEXT,
     );
+    paint_focus_ring(ui.painter(), rect, resp.has_focus());
     // WIN7-7, lock #14 — shared by both the (out-of-scope) app picker's own
     // context menu and the taskbar's Desktop cell's context menu
     // (`paint_surface_context_menu`'s two call sites); fixing it here covers
@@ -2650,6 +2661,7 @@ fn rail_more_cell(
         egui::FontId::proportional(Style::BODY),
         if active { Style::TEXT } else { Style::TEXT_DIM },
     );
+    paint_focus_ring(ui.painter(), rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         rail_more_id(),
@@ -2823,6 +2835,45 @@ pub(crate) fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
             && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)))
 }
 
+/// Keyboard-focus-ring stroke width (a11y-03 / WCAG 2.4.7). Matches the shell's
+/// established focus-ring width (`explorer.rs`/`console.rs` `FOCUS_RING_W = 2.5`)
+/// so every focus indicator across the shell reads at one consistent weight
+/// against the Quasar-dark ground on the raw-painted cells.
+const FOCUS_RING_W: f32 = 2.5;
+
+/// The rect a focusable cell's keyboard-focus ring strokes when `focused`, or
+/// `None` when the cell does not hold focus. Inset by half the stroke so a
+/// [`FOCUS_RING_W`]-wide ring sits fully INSIDE `cell` and never bleeds into a
+/// neighbouring cell. Pure geometry/decision seam — unit-testable without a live
+/// painter (the a11y-03 regression guard: rings the focused cell, NOT the rest).
+fn focus_ring_rect(cell: egui::Rect, focused: bool) -> Option<egui::Rect> {
+    focused.then(|| cell.shrink(FOCUS_RING_W / 2.0))
+}
+
+/// Paint the shared **keyboard-focus ring** on a raw-painted dock/taskbar/picker
+/// cell (a11y-03, WCAG 2.4.7 *Focus Visible*). Every focusable cell in this module
+/// is a hand-rolled `ui.interact(rect, id, Sense::click())` widget, so egui emits
+/// no default focus visual for it — Enter/Space/arrow navigation already works but
+/// the focused cell was invisible. This is the ONE focus indicator every focusable
+/// cell shares: when the cell holds keyboard focus, a high-contrast accent stroke
+/// around its edge shows a keyboard user which cell is focused.
+///
+/// The Quasar palette has no dedicated focus token, so the ring wears the lifted
+/// brand accent [`Style::ACCENT_HI`] — the same accent egui's own `selection.stroke`
+/// derives its focus/selection ring from (`mde_egui::Style::accent_visuals`), one
+/// rung brighter than the resting [`Style::ACCENT`] so it stays legible over the
+/// selection wash a selected cell already wears.
+fn paint_focus_ring(painter: &egui::Painter, cell: egui::Rect, focused: bool) {
+    if let Some(ring) = focus_ring_rect(cell, focused) {
+        painter.rect_stroke(
+            ring,
+            Style::RADIUS,
+            egui::Stroke::new(FOCUS_RING_W, Style::ACCENT_HI),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 /// Paint one **group** (#3/#4/#21) into the column at `origin`, `width` wide: the
 /// horizontal accent label (#4), the single-column icon cells ([`Surface::ALL`]
 /// order), the left-rail accent stripe beside them (#21), and the accent divider
@@ -2934,6 +2985,8 @@ fn pick_overflow(
         dots,
         color,
     );
+
+    paint_focus_ring(ui.painter(), more, resp.has_focus());
 
     if !state.overflow_open {
         return false;
@@ -3206,6 +3259,7 @@ fn grade_row(ui: &egui::Ui, row: &GradeRow, cell: egui::Rect) -> bool {
         Style::TEXT_DIM,
     );
 
+    paint_focus_ring(&painter, cell, resp.has_focus());
     resp.clicked()
 }
 
@@ -3252,6 +3306,8 @@ fn grade_overflow(
         dots,
         color,
     );
+
+    paint_focus_ring(ui.painter(), more, resp.has_focus());
 
     if !state.grades_overflow_open {
         return false;
@@ -3619,6 +3675,7 @@ fn sys_cell(ui: &egui::Ui, cell: SysCell, state: &DockState, rect: egui::Rect) -
             paint_badge(ui, rect, Surface::System, badge);
         }
     }
+    paint_focus_ring(&painter, rect, response.has_focus());
     response.clicked()
 }
 
@@ -3791,6 +3848,7 @@ fn power_row(ui: &mut egui::Ui, item: PowerItem) -> egui::Response {
         galley,
         color,
     );
+    paint_focus_ring(&painter, rect, response.has_focus());
     response
 }
 
@@ -3840,15 +3898,15 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 #[cfg(test)]
 mod tests {
     use super::{
-        clock_cell_id, desktop_source_row_id, desktop_source_toggle_id, dock, grade_band_height,
-        grade_overflow_id, grade_row_id, group_height, gutter_width, notification_rail,
-        notification_rail_with_sources, overflow_more_id, pick_cell_id, power_item_id,
-        rail_more_id, session_entry_id, start_cell_id, status_detail_toggle_id, surface_badge_id,
-        surface_context_item_id, sys_cell_id, sys_cell_tint, transfer_badge_id,
+        clock_cell_id, desktop_source_row_id, desktop_source_toggle_id, dock, focus_ring_rect,
+        grade_band_height, grade_overflow_id, grade_row_id, group_height, gutter_width,
+        notification_rail, notification_rail_with_sources, overflow_more_id, pick_cell_id,
+        power_item_id, rail_more_id, session_entry_id, start_cell_id, status_detail_toggle_id,
+        surface_badge_id, surface_context_item_id, sys_cell_id, sys_cell_tint, transfer_badge_id,
         visible_group_count, DesktopRailSource, DockRequest, DockState, PowerItem, PowerMenu,
         SessionRailEntry, Surface, SurfaceContextItem, SysCell, CELL_W, DOCK_AREA, DOCK_W,
-        GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H, NOTIFICATION_RAIL_H,
-        POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
+        FOCUS_RING_W, GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H,
+        NOTIFICATION_RAIL_H, POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
     };
     use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
     use crate::status::{self, StatusSegments};
@@ -3872,6 +3930,45 @@ mod tests {
     /// preserves the order `chrome::NodeGrades::fold` produced.
     fn grades(rows: Vec<GradeRow>) -> NodeGrades {
         NodeGrades { rows, seen: true }
+    }
+
+    /// a11y-03 (WCAG 2.4.7 *Focus Visible*): the shared keyboard-focus-ring seam
+    /// [`focus_ring_rect`] produces a ring rect ONLY for the focused cell, and never
+    /// for an unfocused one — the pure decision every raw-painted dock/taskbar/picker
+    /// cell routes its `resp.has_focus()` through before [`super::paint_focus_ring`]
+    /// strokes it. Exercised without a live painter so the "focused rings, rest don't"
+    /// contract is guarded directly.
+    #[test]
+    fn focus_ring_only_rings_the_focused_cell() {
+        let cell = egui::Rect::from_min_size(egui::pos2(40.0, 120.0), egui::vec2(48.0, 48.0));
+
+        // Unfocused: no ring at all (the WCAG regression this fix closes — the focus
+        // was invisible because nothing was painted).
+        assert_eq!(
+            focus_ring_rect(cell, false),
+            None,
+            "an unfocused cell must not paint a focus ring"
+        );
+
+        // Focused: a ring rect, inset by half the stroke so a FOCUS_RING_W-wide stroke
+        // lands fully INSIDE the cell (never bleeds into a neighbouring cell).
+        let ring = focus_ring_rect(cell, true).expect("a focused cell must ring");
+        let inset = FOCUS_RING_W / 2.0;
+        assert!(
+            (ring.min.x - (cell.min.x + inset)).abs() < f32::EPSILON
+                && (ring.min.y - (cell.min.y + inset)).abs() < f32::EPSILON
+                && (ring.max.x - (cell.max.x - inset)).abs() < f32::EPSILON
+                && (ring.max.y - (cell.max.y - inset)).abs() < f32::EPSILON,
+            "the ring must be the cell inset by half the stroke, got {ring:?}"
+        );
+        // And it stays within the cell on every edge (the "never bleeds" guarantee).
+        assert!(
+            cell.contains_rect(ring),
+            "the focus ring must sit inside its cell"
+        );
+        // The ring wears the theme's lifted brand accent (no dedicated focus token
+        // exists in the Quasar palette) — one rung brighter than the resting accent.
+        assert_ne!(Style::ACCENT_HI, Style::ACCENT);
     }
 
     #[test]
