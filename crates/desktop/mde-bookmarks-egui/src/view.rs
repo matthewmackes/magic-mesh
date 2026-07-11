@@ -18,7 +18,7 @@
 use mde_egui::egui::{
     self, Align, Align2, CursorIcon, Layout, Response, RichText, ScrollArea, Sense, TextEdit,
 };
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 
 use mde_bookmarks::{Bookmark, Folder, Item, Source};
 
@@ -710,7 +710,11 @@ fn empty_state(ui: &mut egui::Ui, m: &Manager) {
 fn list_row(ui: &mut egui::Ui, m: &Manager, item: &Item, actions: &mut Vec<Action>) {
     let id = item.id();
     let is_folder = matches!(item, Item::Folder(_));
-    ui.horizontal(|ui| {
+    // Reserve a paint slot so the row's hover / selection wash lands BEHIND the
+    // row content (grip · dot · label) and spans the full row width — the shared
+    // reserve-then-set idiom the shell uses for row backgrounds.
+    let bg_slot = ui.painter().add(egui::Shape::Noop);
+    let row = ui.horizontal(|ui| {
         let handle = grip(ui);
         if handle.dragged() {
             egui::DragAndDrop::set_payload(ui.ctx(), DragItem(id));
@@ -724,32 +728,64 @@ fn list_row(ui: &mut egui::Ui, m: &Manager, item: &Item, actions: &mut Vec<Actio
             },
         );
         let label = row_label(item);
-        let body = ui.add_sized(
+        // A bookmark row is data — a fixed-width kind tag, a title column, then
+        // the URL. Render it monospace (mono-first, lock #3) so the columns line
+        // up, and truncate to one line so a long URL degrades gracefully at any
+        // width rather than wrapping.
+        ui.add_sized(
             [ui.available_width(), Style::SP_L],
-            egui::SelectableLabel::new(
-                m.is_selected(id),
-                RichText::new(label).color(Style::TEXT).size(Style::BODY),
-            ),
-        );
-        if let Some(payload) = body.dnd_release_payload::<DragItem>() {
-            actions.push(Action::MoveBefore {
-                ids: m.drag_batch(payload.0),
-                target: id,
-            });
-        }
-        if body.double_clicked() {
-            actions.push(Action::Open(id));
-        } else if body.clicked() {
-            let mods = ui.input(|i| i.modifiers);
-            actions.push(if mods.command {
-                Action::SelectToggle(id)
-            } else if mods.shift {
-                Action::SelectRange(id)
-            } else {
-                Action::SelectOnly(id)
-            });
-        }
+            egui::Label::new(
+                RichText::new(label)
+                    .monospace()
+                    .color(Style::TEXT)
+                    .size(Style::BODY),
+            )
+            .truncate()
+            .sense(Sense::click()),
+        )
     });
+    let body = row.inner;
+    let row_rect = row.response.rect;
+    // A full-row hover wash, eased through the shared Motion table (FAST) so the
+    // highlight fades rather than snapping; the selection wash is the steady
+    // accent tint, matching the sibling file list's selected row.
+    let hover_t = Motion::animate(
+        ui.ctx(),
+        ("bm-row", id),
+        ui.rect_contains_pointer(row_rect),
+        Motion::FAST,
+    );
+    let wash = if m.is_selected(id) {
+        Some(Style::ACCENT.gamma_multiply(0.30))
+    } else if hover_t > 0.0 {
+        Some(Style::SURFACE_HI.gamma_multiply(hover_t))
+    } else {
+        None
+    };
+    if let Some(fill) = wash {
+        ui.painter().set(
+            bg_slot,
+            egui::Shape::rect_filled(row_rect, Style::RADIUS, fill),
+        );
+    }
+    if let Some(payload) = body.dnd_release_payload::<DragItem>() {
+        actions.push(Action::MoveBefore {
+            ids: m.drag_batch(payload.0),
+            target: id,
+        });
+    }
+    if body.double_clicked() {
+        actions.push(Action::Open(id));
+    } else if body.clicked() {
+        let mods = ui.input(|i| i.modifiers);
+        actions.push(if mods.command {
+            Action::SelectToggle(id)
+        } else if mods.shift {
+            Action::SelectRange(id)
+        } else {
+            Action::SelectOnly(id)
+        });
+    }
 }
 
 /// The empty area below the last row: a catch-all drop zone that appends a
