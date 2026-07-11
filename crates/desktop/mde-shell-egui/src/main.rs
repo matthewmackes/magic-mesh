@@ -157,6 +157,13 @@ struct Shell {
     /// same world-readable mesh-status snapshot (WB-Controller). Reads no `mackesd`
     /// IPC.
     controller: controller::ControllerState,
+    /// Cloud plane (QC-12) — the Controller plane's successor: the five cloud
+    /// resource kinds + launch picker + fleet-state presets, driven over the
+    /// typed QC-11 Bus verbs. Its mutable poll/picker/arming state is a plain
+    /// Shell field like every other surface (single-threaded UI state); the
+    /// Workbench borrows it while the Cloud plane is in view and the shell
+    /// drains its one-shot console-attach hand-off after the frame.
+    cloud_plane: workbench::cloud_plane::CloudPlaneState,
     /// Provisioning plane — the mesh's live onboarding / deployment posture
     /// (per-node deployment tier + role rollup, the fleet version target vs each
     /// node's build + update flag, and per-node enrollment readiness), folded from
@@ -401,6 +408,7 @@ impl Shell {
             surface_card: surface_card::SurfaceCardState::default(),
             network: network::NetworkState::default(),
             controller: controller::ControllerState::default(),
+            cloud_plane: workbench::cloud_plane::CloudPlaneState::default(),
             provisioning: provisioning::ProvisioningState::default(),
             services: services_flow::ServicesFlowState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
@@ -599,6 +607,7 @@ impl Shell {
                     &mut self.surface_card,
                     &self.network,
                     &self.controller,
+                    &mut self.cloud_plane,
                     &self.provisioning,
                     &mut self.services,
                     &mut self.spawn_lighthouse,
@@ -1136,9 +1145,9 @@ impl Shell {
         self.central_view(ctx);
 
         // QC-13 — Cloud row → Desktop SPICE handoff. The Cloud plane lives inside
-        // Workbench and parks its state in egui memory; after Workbench renders, a
+        // Workbench and its state is a Shell field; after Workbench renders, a
         // dialable Nova console descriptor can queue one native VDI attach here.
-        if let Some(request) = workbench::cloud_plane::take_console_attach(ctx) {
+        if let Some(request) = self.cloud_plane.take_console_attach() {
             self.vdi
                 .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
             self.nav.expanded = true;

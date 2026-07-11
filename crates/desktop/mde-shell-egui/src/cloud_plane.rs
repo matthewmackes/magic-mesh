@@ -36,21 +36,18 @@
 //! never demo rows, never a dead button (destructive ops always pass the typed
 //! arming echo first).
 //!
-//! ## Why the plane's state lives in egui memory
+//! ## Where the plane's state lives
 //!
-//! `workbench::show()` receives the old Controller plane's state read-only and
-//! its signature is frozen this wave (`main.rs` is owned by parallel units —
-//! the same collision the Storage surface documented). The Cloud plane needs
-//! mutable poll/picker/arming state, so it parks one
-//! `Arc<Mutex<CloudPlaneState>>` in the egui data store under [`STATE_KEY`]
-//! ([`state_handle`]) — the same store the Explorer lens toggle already rides —
-//! and the Workbench arm locks it for the frame. Pure logic (reply folds, HOT
-//! composition, preset records, the usage fold, the arming gate) is
-//! egui-free and unit-tested directly.
+//! [`CloudPlaneState`] is a plain field on the shell's `Shell` struct, like
+//! every other surface's state — single-threaded UI state the Workbench borrows
+//! (`&mut`) while the Cloud plane is in view, and the shell drains its one-shot
+//! console-attach hand-off ([`CloudPlaneState::take_console_attach`]) after the
+//! Workbench frame renders. Pure logic (reply folds, HOT composition, preset
+//! records, the usage fold, the arming gate) is egui-free and unit-tested
+//! directly.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -69,9 +66,6 @@ use crate::auth::DesktopAuth;
 use crate::vdi::{
     ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol,
 };
-
-/// The egui data-store key the plane's shared state handle parks under.
-pub const STATE_KEY: &str = "workbench-cloud-plane";
 
 /// The `action/cloud/` namespace every QC-11 verb request rides.
 const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
@@ -908,8 +902,8 @@ struct CloudArming {
 
 /// The Cloud plane's state: the verb lanes, the launch picker + per-kind New
 /// forms, the fleet-state presets, the typed-arming confirm, and the one
-/// in-flight mutation. Parked in egui memory via [`state_handle`] (see the
-/// module docs for why).
+/// in-flight mutation. A plain `Shell` field, borrowed by the Workbench while
+/// the plane is in view (see the module docs).
 pub struct CloudPlaneState {
     /// The Bus persist root (`None` = no Bus — an honest degrade).
     bus_root: Option<PathBuf>,
@@ -1052,29 +1046,15 @@ impl Default for CloudPlaneState {
     }
 }
 
-/// The plane's shared state handle, parked in the egui data store under
-/// [`STATE_KEY`] (see the module docs for why the state lives here).
-#[must_use]
-pub fn state_handle(ui: &egui::Ui) -> Arc<Mutex<CloudPlaneState>> {
-    let id = egui::Id::new(STATE_KEY);
-    ui.ctx().data_mut(|d| {
-        d.get_temp_mut_or_insert_with(id, || Arc::new(Mutex::new(CloudPlaneState::default())))
-            .clone()
-    })
-}
-
-/// Drain a native SPICE attach request produced by the Cloud plane, if the latest
-/// Nova console descriptor was directly dialable. The Cloud plane's state lives
-/// in egui memory under [`STATE_KEY`], so the shell calls this after rendering
-/// Workbench and routes the request into [`crate::vdi::VdiState`].
-pub(crate) fn take_console_attach(ctx: &egui::Context) -> Option<ConnectRequest> {
-    let id = egui::Id::new(STATE_KEY);
-    let handle = ctx.data_mut(|d| d.get_temp::<Arc<Mutex<CloudPlaneState>>>(id))?;
-    let attach = handle.lock().ok()?.console_attach.take();
-    attach
-}
-
 impl CloudPlaneState {
+    /// Drain a native SPICE attach request produced by the Cloud plane, if the
+    /// latest Nova console descriptor was directly dialable. The shell calls
+    /// this after rendering Workbench and routes the request into
+    /// [`crate::vdi::VdiState`].
+    pub(crate) fn take_console_attach(&mut self) -> Option<ConnectRequest> {
+        self.console_attach.take()
+    }
+
     /// Poll the Bus lanes on the shared cadence + keep the repaint heartbeat
     /// alive — called each frame while the plane is in view (the Explorer-lens
     /// visibility idiom: an off-screen plane costs nothing).

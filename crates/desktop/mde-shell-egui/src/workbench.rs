@@ -90,9 +90,9 @@ impl Plane {
 /// plane's content pane. `selected` is read and written, so a rail click changes
 /// the active plane. The This Node plane renders this host's live status from
 /// `thisnode` (WB-ThisNode), the Cloud plane (QC-12) renders the mesh cloud off
-/// the typed QC-11 Bus verbs (its mutable picker/arming state rides the egui
-/// data store — `cloud_plane::state_handle` — because this signature is frozen
-/// this wave; the old Controller view stays live inside it via `controller`),
+/// the typed QC-11 Bus verbs (its mutable picker/arming state is the Shell-owned
+/// `cloud` field, borrowed like every other surface; the old Controller view
+/// stays live inside it via `controller`),
 /// the Network plane from `network` (WB-Network), the Fleet plane's live
 /// per-node KVM reality from `datacenter` (MV-6), and the Provisioning plane's
 /// live deployment / version / enrollment posture from `provisioning`
@@ -119,6 +119,10 @@ pub fn show(
     surface_card: &mut crate::surface_card::SurfaceCardState,
     network: &crate::network::NetworkState,
     controller: &crate::controller::ControllerState,
+    // Mutable: the Cloud plane (QC-12) holds its own poll/picker/arming state,
+    // borrowed from the Shell field like every other surface (it embeds the
+    // read-only `controller` view collapsed inside it).
+    cloud: &mut cloud_plane::CloudPlaneState,
     provisioning: &crate::provisioning::ProvisioningState,
     // Mutable like `datacenter`: the Services flow publishes service-add
     // requests onto the Bus and holds the daemon's typed answer.
@@ -139,14 +143,10 @@ pub fn show(
         match action {
             menubar::MenuAction::Plane(plane) => *selected = plane,
             menubar::MenuAction::Cloud(verb) => {
-                // The same egui-memory state the Cloud plane body drives — a
+                // The same Shell-owned state the Cloud plane body drives — a
                 // menu pick opens the exact affordance the body's button opens
                 // (§6, one seam), and View lands on the plane it acted on.
-                let handle = cloud_plane::state_handle(ui);
-                handle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .apply_menu_verb(verb);
+                cloud.apply_menu_verb(verb);
                 *selected = Plane::Cloud;
             }
             menubar::MenuAction::FleetRefresh => datacenter.refresh_now(),
@@ -212,18 +212,12 @@ pub fn show(
                 }
                 // QC-12 — the Cloud plane (the Q70 lock: the Controller plane
                 // BECOMES the Cloud plane). Renders the mesh cloud off the typed
-                // QC-11 Bus verbs; its mutable picker/arming/poll state rides the
-                // egui data store because this signature is frozen this wave (see
-                // the cloud_plane module docs). The old Controller view stays
-                // live inside the plane, collapsed (§6 reuse — the leader lease
-                // the leader-hosted MariaDB follows is part of the cloud story).
-                Plane::Cloud => {
-                    let handle = cloud_plane::state_handle(ui);
-                    let mut cloud = handle
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    cloud_plane::show(ui, &mut cloud, controller);
-                }
+                // QC-11 Bus verbs; its mutable picker/arming/poll state is the
+                // Shell-owned `cloud` field, borrowed here like every other
+                // surface. The old Controller view stays live inside the plane,
+                // collapsed (§6 reuse — the leader lease the leader-hosted
+                // MariaDB follows is part of the cloud story).
+                Plane::Cloud => cloud_plane::show(ui, cloud, controller),
                 // WB-Network — the mesh fabric's live status (overlay IP + cipher,
                 // elected leader, the peer directory as network links, network
                 // service health, overlay routing) off the same snapshot.
