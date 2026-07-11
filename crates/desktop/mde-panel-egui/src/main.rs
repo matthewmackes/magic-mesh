@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, RichText};
-use mde_egui::{eframe, run_client, Motion, Style};
+use mde_egui::{eframe, run_client, status_dot, Motion, Style};
 
 use mde_bus::dnd;
 use mde_panel_egui::{PanelModel, DND_LABEL};
@@ -98,16 +98,18 @@ impl Panel {
         }
     }
 
-    /// Draw the whole panel (called inside the central panel).
+    /// Draw the whole panel (called inside the central panel, which supplies the
+    /// on-rhythm inset via its [`egui::Frame`] margin — so rows align on the frame
+    /// edge rather than a per-row `add_space` shim).
     fn show(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.add_space(Style::SP_M);
-            ui.heading(
-                RichText::new("MCNF · Mesh")
-                    .color(Style::TEXT)
-                    .size(Style::HEADING),
-            );
-        });
+        // Mono-first (design lock 3): the panel is brand/nav/status/metric text,
+        // so its heading rides the shared monospace face, not the prose sans.
+        ui.label(
+            RichText::new("MCNF · Mesh")
+                .monospace()
+                .color(Style::TEXT)
+                .size(Style::HEADING),
+        );
         ui.add_space(Style::SP_S);
 
         self.show_pip(ui);
@@ -131,7 +133,6 @@ impl Panel {
 
         let resp = ui
             .horizontal(|ui| {
-                ui.add_space(Style::SP_M);
                 if let Some(base) = pip.dot_color() {
                     let color = if pip.pulses() {
                         // Keep the pulse animating while degraded or connecting.
@@ -142,15 +143,24 @@ impl Panel {
                     } else {
                         base
                     };
-                    ui.label(RichText::new("\u{25CF}").color(color).size(Style::BODY));
+                    // The shared inline health/presence primitive (lock 9 — reuse
+                    // over a hand-rolled `●` glyph); the pulse rides in via `color`.
+                    status_dot(ui, color);
                     ui.add_space(Style::SP_XS);
                 }
-                let r = ui.label(RichText::new(label).color(label_color).size(Style::BODY));
+                // Mono-first (lock 3): the pip's status line and its count metric.
+                let r = ui.label(
+                    RichText::new(label)
+                        .monospace()
+                        .color(label_color)
+                        .size(Style::BODY),
+                );
                 let (healthy, total) = self.model.counts();
                 if total > 0 {
                     ui.add_space(Style::SP_S);
                     ui.label(
                         RichText::new(format!("{healthy}/{total} up"))
+                            .monospace()
                             .color(Style::TEXT_DIM)
                             .size(Style::SMALL),
                     );
@@ -167,50 +177,46 @@ impl Panel {
     /// The Do-Not-Disturb quick action: a real toggle (accent-selected when on)
     /// + a status line + any inline write error.
     fn show_dnd(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.add_space(Style::SP_M);
-            ui.label(
-                RichText::new("Quick action")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-        });
+        // Mono-first (lock 3) throughout: caption, toggle label, status, error —
+        // all nav/data text. Left inset comes from the panel frame margin, so no
+        // per-row `add_space` shim.
+        ui.label(
+            RichText::new("Quick action")
+                .monospace()
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
         ui.add_space(Style::SP_XS);
 
         let active = self.model.dnd_active();
         let clicked = ui
-            .horizontal(|ui| {
-                ui.add_space(Style::SP_M);
-                ui.selectable_label(active, RichText::new(DND_LABEL).size(Style::BODY))
-                    .clicked()
-            })
-            .inner;
+            .selectable_label(
+                active,
+                RichText::new(DND_LABEL).monospace().size(Style::BODY),
+            )
+            .clicked();
 
         ui.add_space(Style::SP_XS);
-        ui.horizontal(|ui| {
-            ui.add_space(Style::SP_M);
-            let color = if active {
-                Style::ACCENT
-            } else {
-                Style::TEXT_DIM
-            };
-            ui.label(
-                RichText::new(self.model.dnd_status())
-                    .color(color)
-                    .size(Style::SMALL),
-            );
-        });
+        let status_color = if active {
+            Style::ACCENT
+        } else {
+            Style::TEXT_DIM
+        };
+        ui.label(
+            RichText::new(self.model.dnd_status())
+                .monospace()
+                .color(status_color)
+                .size(Style::SMALL),
+        );
 
         if let Some(err) = &self.last_error {
             ui.add_space(Style::SP_XS);
-            ui.horizontal(|ui| {
-                ui.add_space(Style::SP_M);
-                ui.label(
-                    RichText::new(err.as_str())
-                        .color(Style::DANGER)
-                        .size(Style::SMALL),
-                );
-            });
+            ui.label(
+                RichText::new(err.as_str())
+                    .monospace()
+                    .color(Style::DANGER)
+                    .size(Style::SMALL),
+            );
         }
 
         if clicked {
@@ -226,10 +232,15 @@ impl eframe::App for Panel {
             self.last_poll = Instant::now();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(Style::SP_M);
-            self.show(ui);
-        });
+        // An explicit panel frame (CRAFT §3): the Quasar BG fill plus a single
+        // on-rhythm inner margin, so content is inset symmetrically on every edge
+        // instead of leaning on scattered per-row `add_space(SP_M)` shims.
+        let frame = egui::Frame::default()
+            .fill(Style::BG)
+            .inner_margin(Style::SP_M);
+        egui::CentralPanel::default()
+            .frame(frame)
+            .show(ctx, |ui| self.show(ui));
 
         // Keep the poll cadence alive even with no input.
         ctx.request_repaint_after(REFRESH);
