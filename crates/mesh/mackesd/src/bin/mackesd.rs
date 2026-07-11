@@ -2933,9 +2933,9 @@ fn run_serve(
     use mackesd_core::workers::{
         device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile,
         heartbeat::HeartbeatWorker, job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker,
-        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
-        sshd_overlay_bind::SshdOverlayBindWorker, validation_suite,
-        voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
+        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch,
+        reconcile::ReconcileWorker, ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
+        validation_suite, voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3048,10 +3048,11 @@ fn run_serve(
             }
         }
 
-        // v3.0.3 — async supervisor for Phase B workers. The
-        // legacy reconcile worker stays on its own std::thread
-        // because its sync rusqlite calls would block the tokio
-        // scheduler if hosted here; both supervisors coexist.
+        // v3.0.3 — async supervisor for Phase B workers. The legacy
+        // reconcile worker (mackesd-06) is now registered here too via
+        // ReconcileWorker: its blocking sync rusqlite tick still runs on
+        // a dedicated OS thread inside the worker (so it can't stall the
+        // tokio scheduler), but the supervisor owns its restart/breaker.
         let mut sup = Supervisor::new();
         // EFF-24 — the live per-worker status registry: the supervisor
         // records alive/restarts/breaker transitions; the Bus healthz
@@ -6797,18 +6798,20 @@ fn run_serve(
                 .push("music_autoconfig".into());
         }
 
-        // The reconcile worker runs on its own OS thread (kept on
-        // std::thread so its sync rusqlite calls don't block the
-        // tokio scheduler). Still surfaced via Shell.Workers so
-        // the operator sees the legacy worker alongside the async
-        // supervisor children.
+        // mackesd-06 — the reconcile worker now runs UNDER the supervisor (it was
+        // a raw std::thread::spawn with NO restart-on-panic and NO supervision, so
+        // a panic silently killed reconcile for the daemon's lifetime). Its
+        // blocking tick still runs on a dedicated OS thread INSIDE the worker
+        // (ReconcileWorker bridges shutdown + surfaces an inner-thread panic as an
+        // Err), so its sync rusqlite calls still never block the tokio scheduler —
+        // it just gets the same restart + back-off + breaker treatment as every
+        // sibling. Still surfaced via Shell.Workers (the worker_names roster) AND
+        // now the supervisor's status map.
         worker_names.lock().expect("worker_names mutex").push("reconcile".into());
-        let reconcile = mackesd_core::worker::spawn_reconcile_worker(
-            workgroup_root,
-            node_id,
-            db_path,
-            Arc::clone(&shutdown),
-        );
+        sup.spawn(Spawn::new(
+            ReconcileWorker::new(workgroup_root, node_id, db_path),
+            RestartPolicy::OnFailure,
+        ));
 
         // BULLETPROOF-2 — the daemon is up (supervisor + all responders +
         // workers spawned). Tell systemd we're READY (Type=notify gate) and
@@ -6877,22 +6880,15 @@ fn run_serve(
         }
 
         // Watch loop: wake every 250 ms to check the shutdown flag and stamp the
-        // watchdog liveness beacon (above). When shutdown flips, drop out so
-        // reconcile.join() can wait for the worker to finish its current tick.
-        // The async supervisor's workers see shutdown via the SIGTERM signal
+        // watchdog liveness beacon (above). When shutdown flips, drop out and
+        // drain the supervisor. The async supervisor's workers — including the
+        // reconcile worker (mackesd-06) — see shutdown via the SIGTERM signal
         // handler installed above (mackesd_core::workers::ShutdownToken wraps the
-        // same broadcast channel).
+        // same broadcast channel); a reconcile panic is now handled by the
+        // supervisor's per-worker restart, not by tearing down the whole daemon.
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             wd_beat.store(wd_base.elapsed().as_millis() as u64, Ordering::Relaxed);
-            if reconcile.is_finished() {
-                tracing::warn!(
-                    "mackesd serve: reconcile worker exited without \
-                     a shutdown request"
-                );
-                shutdown.store(true, Ordering::Relaxed);
-                break;
-            }
         }
         tracing::info!("mackesd serve: shutdown requested; joining workers");
         // Tell every async worker to stop, then drain their joins.
@@ -6903,10 +6899,8 @@ fn run_serve(
                 Err(e) => tracing::warn!(worker = %name, error = ?e, "joined with error"),
             }
         }
-        if let Err(e) = reconcile.join() {
-            tracing::error!("reconcile worker panicked: {e:?}");
-            return Err(anyhow::anyhow!("reconcile worker panicked"));
-        }
+        // mackesd-06 — reconcile is drained by sup.shutdown_and_join() above
+        // (it is a supervised worker now, not a standalone JoinHandle to join).
         tracing::info!("mackesd serve: all workers joined; exit");
         Ok::<(), anyhow::Error>(())
     })?;

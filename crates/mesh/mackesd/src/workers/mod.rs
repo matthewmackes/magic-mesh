@@ -245,6 +245,11 @@ pub mod browser_session_sync;
 // state for the shell.
 pub mod browser_read_aloud;
 pub mod heartbeat;
+// mackesd-06 — the legacy reconcile loop (`crate::worker`) brought UNDER
+// the supervisor: an async adapter that runs the same blocking tick on
+// its dedicated OS thread but gets restart-on-panic + breaker treatment
+// like every other worker (was a raw std::thread with no supervision).
+pub mod reconcile;
 // OV-7.a (v2.6) — Health reconciler. Reads each known peer's
 // QNM-Shared heartbeat.json on a 5 s tick, applies the
 // `telemetry::health_state_from_age` threshold table, writes
