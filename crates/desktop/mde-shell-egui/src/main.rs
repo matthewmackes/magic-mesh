@@ -703,6 +703,9 @@ impl Shell {
                 #[cfg(feature = "live-helper")]
                 {
                     let seat_present = self.system.snapshot().is_some();
+                    // Record the live seat size so the first helper spawn pre-sizes
+                    // its frame channel to the real screen (browser-1, item 3).
+                    self.web.note_seat_px(ui.ctx());
                     self.web.ensure_live_tab(seat_present);
                 }
                 let web = &mut self.web;

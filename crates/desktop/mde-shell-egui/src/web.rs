@@ -114,12 +114,20 @@ const NEW_TAB_URL: &str = "about:blank";
 #[cfg(feature = "live-helper")]
 const START_URL: &str = NEW_TAB_URL;
 
-/// The initial helper view geometry (device px); the scaled body fills the panel,
-/// and the helper repaints on the address bar's first navigation.
+/// The fallback helper view geometry (device px) when no live seat size is known
+/// yet (hermetic tests, first frame before the seat is probed). A live spawn
+/// pre-sizes to the seat instead — see [`WebState::note_seat_px`].
 #[cfg(feature = "live-helper")]
 const INIT_W: u32 = 1280;
 #[cfg(feature = "live-helper")]
 const INIT_H: u32 = 800;
+
+/// A per-axis ceiling (device px) for the pre-sized frame channel and for any live
+/// resize target (browser-1). The shm frame region is `w * h * 4` bytes, so this
+/// bounds one tab's channel to ~64 MiB even on an oversized seat; 4096 covers 4K
+/// UHD (3840×2160) at native 1:1, and a larger seat paints clamped — still
+/// click-correct via [`map_pointer_to_frame`], just gently upscaled.
+const MAX_CHANNEL_DIM: u32 = 4096;
 
 const CHROME_FONT: f32 = 10.0;
 const CHROME_BUTTON: f32 = 20.0;
@@ -251,6 +259,68 @@ struct Tab {
     /// Last helper frame retained on the CPU side for viewport capture. The GPU
     /// texture is not readable, so capture uses this exact pre-upload image.
     last_frame: Option<egui::ColorImage>,
+    /// Debounces panel-size changes into a single settled `session.resize` so a
+    /// drag-resize drives the helper's CSS viewport once, not every frame
+    /// (browser-1).
+    resizer: ViewportResizer,
+}
+
+/// How long a new panel device size must hold steady before it is committed to the
+/// helper as a `session.resize` — long enough that a drag-resize sends ONE settled
+/// resize instead of one per frame, short enough to feel immediate.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Debounces browser-panel viewport-size changes (browser-1, item 2).
+///
+/// The helper's page CSS viewport should track the real panel, but re-sending a
+/// resize every frame during a window drag would thrash the engine's relayout. So
+/// this tracks the last size actually committed to the helper plus a *candidate*
+/// that must hold steady for [`RESIZE_DEBOUNCE`] before it is committed. A size
+/// that flickers back to the committed value cancels the pending change; a no-op
+/// frame (size unchanged) never resizes.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ViewportResizer {
+    /// The size last committed to the helper (`None` = nothing sent yet).
+    sent: Option<(u32, u32)>,
+    /// A pending candidate size and the instant it was first observed.
+    pending: Option<((u32, u32), Instant)>,
+}
+
+impl ViewportResizer {
+    /// Fold this frame's `target` device size at time `now`. Returns `Some(size)`
+    /// exactly once — on the frame a *changed* size settles (held ≥ `debounce`) —
+    /// and `None` otherwise (unchanged, or still settling).
+    fn observe(
+        &mut self,
+        target: (u32, u32),
+        now: Instant,
+        debounce: Duration,
+    ) -> Option<(u32, u32)> {
+        if self.sent == Some(target) {
+            // Already at this size — cancel any pending change back to it.
+            self.pending = None;
+            return None;
+        }
+        match self.pending {
+            Some((sz, since)) if sz == target => {
+                if now.duration_since(since) >= debounce {
+                    self.sent = Some(target);
+                    self.pending = None;
+                    return Some(target);
+                }
+            }
+            // First sighting of a new candidate (or the candidate just changed):
+            // (re)start its debounce clock.
+            _ => self.pending = Some((target, now)),
+        }
+        None
+    }
+
+    /// Whether a change is still settling — the panel should keep repainting so the
+    /// debounce fires even with no further input.
+    const fn is_settling(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1099,6 +1169,13 @@ pub(crate) struct WebState {
     /// surface lifetime — a spawn *failure* must not respawn a process every frame.
     #[cfg(feature = "live-helper")]
     spawn_attempted: bool,
+    /// The live seat's output size in device pixels, refreshed each frame from the
+    /// egui context ([`Self::note_seat_px`]). A freshly spawned helper pre-sizes its
+    /// frame channel to this — the ceiling of any panel-driven resize — so an
+    /// enlarged paint never overflows the channel (browser-1, item 3). Defaults to
+    /// the `(INIT_W, INIT_H)` fallback until a real seat is seen.
+    #[cfg(feature = "live-helper")]
+    seat_px: (u32, u32),
 }
 
 impl Default for WebState {
@@ -1181,6 +1258,8 @@ impl Default for WebState {
             gate_notice: None,
             #[cfg(feature = "live-helper")]
             spawn_attempted: false,
+            #[cfg(feature = "live-helper")]
+            seat_px: (INIT_W, INIT_H),
         }
     }
 }
@@ -1376,6 +1455,7 @@ impl WebState {
             page_focused: false,
             texture: None,
             last_frame: None,
+            resizer: ViewportResizer::default(),
         });
         self.active = self.tabs.len() - 1;
         self.publish_session_snapshot();
@@ -3657,6 +3737,8 @@ impl WebState {
             tab.last_frame = None;
             tab.last_activity = Instant::now();
             tab.idle_suspended = false;
+            // A fresh helper re-negotiates its viewport from scratch.
+            tab.resizer = ViewportResizer::default();
         }
         self.publish_session_snapshot();
     }
@@ -3853,6 +3935,36 @@ impl WebState {
 /// compiled out of the default portable build.
 #[cfg(feature = "live-helper")]
 impl WebState {
+    /// Record the live seat's output size (device px) so the next helper spawn
+    /// pre-sizes its frame channel to it. Called each frame from the shell's Browser
+    /// arm just before [`Self::ensure_live_tab`], so the very first spawn already
+    /// knows the real seat.
+    ///
+    /// The channel is `w * h * 4` bytes of shm, so each axis is clamped to
+    /// [`MAX_CHANNEL_DIM`]. Pre-sizing to the seat (the ceiling of any panel-driven
+    /// resize, since the Browser panel never exceeds the screen) means a live
+    /// [`WebSession::resize`] that enlarges the CEF paint always fits the channel
+    /// instead of being silently dropped (`FrameChannelError::TooLarge`) — growing
+    /// the channel dynamically would need re-attaching a new fd across the pinned
+    /// CEF ABI, so pre-sizing is the chosen, documented alternative (browser-1).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "seat extent is rounded then clamped into [1, MAX_CHANNEL_DIM]"
+    )]
+    pub(crate) fn note_seat_px(&mut self, ctx: &egui::Context) {
+        let size = ctx.screen_rect().size() * ctx.pixels_per_point();
+        let clamp = |v: f32| -> u32 {
+            if v.is_finite() {
+                v.round().clamp(1.0, MAX_CHANNEL_DIM as f32) as u32
+            } else {
+                INIT_W
+            }
+        };
+        self.seat_px = (clamp(size.x), clamp(size.y));
+    }
+
     /// Ensure a live browser tab exists — spawn the sandboxed helper on first open.
     /// The shell's Browser arm calls this each frame with the live seat verdict. A
     /// no-op once a tab is open, and the real `Command::spawn` is attempted at most
@@ -3974,11 +4086,16 @@ impl WebState {
                 return None;
             }
         }
+        // Pre-size the helper's frame channel to the live seat (device px) so a
+        // later resize can grow the CEF paint up to the seat without overflowing
+        // the channel (browser-1, item 3); falls back to (INIT_W, INIT_H) until a
+        // real seat is seen via `note_seat_px`.
+        let (width, height) = self.seat_px;
         let spec = SpawnSpec {
             helper_bin,
             url,
-            width: INIT_W,
-            height: INIT_H,
+            width,
+            height,
         };
         match spawn(&spec) {
             Ok(session) => {
@@ -10345,8 +10462,64 @@ fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool 
     .clicked()
 }
 
+/// Map a pointer position from egui panel space into the helper frame's **device
+/// pixels** — the ONE transform both the live-input forward and the region-capture
+/// drag flow through (browser-1).
+///
+/// The decoded frame is painted to *fill* `image_rect`, which sits below the tab
+/// strip + nav chrome (so its origin is non-zero) and whose size — reported in egui
+/// points — differs from the frame's device-pixel size on any non-1:1 seat (`HiDPI`,
+/// maximized, 4K, a non-frame aspect). A pointer at fraction `f` across `image_rect`
+/// maps to the same fraction across the `frame_size` device grid, so the transform
+///
+/// 1. clamps the pointer into `image_rect`,
+/// 2. subtracts the rect origin and divides by the rect size for a `0..1` fraction
+///    (both pointer and rect are egui points, so `pixels_per_point` cancels — the
+///    mapping is DPI-independent), then
+/// 3. multiplies by `frame_size` to land in frame device pixels, bounded to
+///    `[0, frame_w] × [0, frame_h]`.
+///
+/// The old live path instead multiplied `pos - image_rect.min` by `pixels_per_point`
+/// against a *fixed* 1280×800 frame, so clicks landed at the wrong page coordinate
+/// on every seat whose displayed rect wasn't exactly 1280×800 device px.
+fn map_pointer_to_frame(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    frame_size: [usize; 2],
+) -> egui::Pos2 {
+    let clamped = pos.clamp(image_rect.min, image_rect.max);
+    let rel = clamped - image_rect.min;
+    egui::pos2(
+        rel.x * frame_size[0] as f32 / image_rect.width().max(1.0),
+        rel.y * frame_size[1] as f32 / image_rect.height().max(1.0),
+    )
+}
+
+/// The device-pixel size the helper's frame should track — the browser panel `rect`
+/// (egui points) scaled by `pixels_per_point`, clamped to [`MAX_CHANNEL_DIM`] so a
+/// resize can never exceed the pre-sized channel. Rounded to whole pixels and at
+/// least 1×1 (browser-1, item 2).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "device extent is scaled, rounded, then clamped into [1, MAX_CHANNEL_DIM]"
+)]
+fn frame_target_device_px(rect: egui::Rect, ppp: f32) -> (u32, u32) {
+    let dim = |v: f32| -> u32 {
+        if v.is_finite() {
+            (v * ppp).round().clamp(1.0, MAX_CHANNEL_DIM as f32) as u32
+        } else {
+            1
+        }
+    };
+    (dim(rect.width()), dim(rect.height()))
+}
+
 /// Paint the active tab's decoded frame to fill the body and forward this frame's
-/// egui input to the session (scaled by `pixels_per_point`).
+/// egui input to the session. Pointer geometry is mapped into frame device pixels
+/// via [`map_pointer_to_frame`], and the helper's viewport is re-sized (debounced)
+/// to track the real panel (browser-1).
 fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     let Some((tex_id, texture_size, frame_size)) = state.tabs.get(active).and_then(|tab| {
         let texture = tab.texture.as_ref()?;
@@ -10364,6 +10537,23 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     ui.painter().rect_filled(rect, 0.0, Style::SURFACE);
     egui::Image::new(egui::load::SizedTexture::new(tex_id, image_rect.size()))
         .paint_at(ui, image_rect);
+
+    // Drive the helper's CSS viewport to the real panel size (device px), debounced
+    // so a drag-resize sends ONE settled resize instead of one per frame — this
+    // makes the page track the panel instead of a fixed 1280×800 breakpoint
+    // (browser-1, item 2). Runs every frame, in capture mode too, so the tracked
+    // size never drifts. Repaint while settling so the debounce fires without input.
+    let ppp = ui.ctx().pixels_per_point();
+    let target = frame_target_device_px(rect, ppp);
+    if let Some(tab) = state.tabs.get_mut(active) {
+        if let Some((w, h)) = tab.resizer.observe(target, Instant::now(), RESIZE_DEBOUNCE) {
+            tab.session.resize(w, h);
+        }
+        if tab.resizer.is_settling() {
+            ui.ctx().request_repaint_after(RESIZE_DEBOUNCE);
+        }
+    }
+
     if state.capture_region_mode {
         handle_region_capture_drag(ui, state, &resp, image_rect, frame_size);
     }
@@ -10374,11 +10564,10 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     if state.capture_region_mode {
         return;
     }
-    // Forward only page-owned input. Pointer geometry must be page-local before
-    // the client scales it to helper device pixels; keyboard/text belongs to the
-    // page only after the image has focus, so address-bar/chrome typing does not
-    // leak into the helper.
-    let ppp = ui.ctx().pixels_per_point();
+    // Forward only page-owned input. Pointer geometry is mapped into frame device
+    // pixels (via `map_pointer_to_frame` inside `browser_input_event`); keyboard/text
+    // belongs to the page only after the image has focus, so address-bar/chrome
+    // typing does not leak into the helper.
     let mut page_focused = state.tabs.get(active).is_some_and(|tab| tab.page_focused)
         || resp.has_focus()
         || resp.clicked()
@@ -10394,7 +10583,7 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
                 }
             }
         }
-        if let Some(event) = browser_input_event(&event, image_rect, page_focused) {
+        if let Some(event) = browser_input_event(&event, image_rect, frame_size, page_focused) {
             if let Some(tab) = state.tabs.get_mut(active) {
                 tab.last_activity = Instant::now();
                 tab.idle_suspended = false;
@@ -10422,14 +10611,8 @@ fn handle_region_capture_drag(
         state.capture_notice = Some("Capture failed: no painted page".to_owned());
         return;
     }
-    let pointer_to_frame = |pos: egui::Pos2| -> egui::Pos2 {
-        let clamped = pos.clamp(image_rect.min, image_rect.max);
-        let rel = clamped - image_rect.min;
-        egui::pos2(
-            rel.x * frame_size[0] as f32 / image_rect.width().max(1.0),
-            rel.y * frame_size[1] as f32 / image_rect.height().max(1.0),
-        )
-    };
+    // The SAME transform the live-input path uses (browser-1 dedup).
+    let pointer_to_frame = |pos: egui::Pos2| map_pointer_to_frame(pos, image_rect, frame_size);
     if resp.drag_started() {
         if let Some(pos) = resp.interact_pointer_pos() {
             let pos = pointer_to_frame(pos);
@@ -11349,15 +11532,25 @@ fn install_browser_page_accessibility(
     });
 }
 
+/// Translate one egui event into the page-local event forwarded to the helper.
+///
+/// Pointer positions are mapped from panel space into frame device pixels via the
+/// shared [`map_pointer_to_frame`] (`rect` = the displayed image rect, `frame_size`
+/// = the current decoded frame). Only pointer positions are rewritten; wheel, keys,
+/// and text pass through unchanged (gated on page focus). A pointer that leaves the
+/// image while the page is focused reports `PointerGone` so the page's hover clears.
 fn browser_input_event(
     event: &egui::Event,
     rect: egui::Rect,
+    frame_size: [usize; 2],
     browser_focused: bool,
 ) -> Option<egui::Event> {
     match event {
         egui::Event::PointerMoved(pos) => {
             if rect.contains(*pos) {
-                Some(egui::Event::PointerMoved(*pos - rect.min.to_vec2()))
+                Some(egui::Event::PointerMoved(map_pointer_to_frame(
+                    *pos, rect, frame_size,
+                )))
             } else if browser_focused {
                 Some(egui::Event::PointerGone)
             } else {
@@ -11371,12 +11564,8 @@ fn browser_input_event(
             modifiers,
         } => {
             if rect.contains(*pos) || browser_focused {
-                let local = (*pos - rect.min.to_vec2()).clamp(
-                    egui::pos2(0.0, 0.0),
-                    egui::pos2(rect.width(), rect.height()),
-                );
                 Some(egui::Event::PointerButton {
-                    pos: local,
+                    pos: map_pointer_to_frame(*pos, rect, frame_size),
                     button: *button,
                     pressed: *pressed,
                     modifiers: *modifiers,
@@ -14541,9 +14730,17 @@ mod tests {
     #[test]
     fn browser_body_input_is_localized_and_keyboard_is_focus_gated() {
         let rect = Rect::from_min_size(pos2(20.0, 40.0), vec2(320.0, 200.0));
+        // Frame device size == rect points size (a 1:1 seat), so the mapped position
+        // equals the panel-local offset — pins the transform's identity case.
+        let frame = [320usize, 200usize];
 
-        let moved = browser_input_event(&egui::Event::PointerMoved(pos2(70.0, 90.0)), rect, false)
-            .expect("pointer inside page");
+        let moved = browser_input_event(
+            &egui::Event::PointerMoved(pos2(70.0, 90.0)),
+            rect,
+            frame,
+            false,
+        )
+        .expect("pointer inside page");
         assert_eq!(moved, egui::Event::PointerMoved(pos2(50.0, 50.0)));
 
         let key = egui::Event::Key {
@@ -14554,20 +14751,244 @@ mod tests {
             modifiers: egui::Modifiers::default(),
         };
         assert_eq!(
-            browser_input_event(&key, rect, false),
+            browser_input_event(&key, rect, frame, false),
             None,
             "address-bar/chrome keystrokes must not leak into the page"
         );
         assert_eq!(
-            browser_input_event(&key, rect, true),
+            browser_input_event(&key, rect, frame, true),
             Some(key),
             "click-focused page canvas receives keyboard events"
         );
         assert_eq!(
-            browser_input_event(&egui::Event::Text("mesh".to_owned()), rect, true),
+            browser_input_event(&egui::Event::Text("mesh".to_owned()), rect, frame, true),
             Some(egui::Event::Text("mesh".to_owned())),
             "committed text reaches the focused page canvas"
         );
+    }
+
+    // ─────────────── browser-1: pointer transform + viewport resize ──────────────
+    //
+    // The bug forwarded `(pointer - image_rect.min) * pixels_per_point` against a
+    // FIXED 1280×800 frame, so clicks missed on every seat whose displayed rect
+    // wasn't exactly 1280×800 device px. These pin the shared transform both the
+    // live-input and region-capture paths now flow through.
+
+    #[test]
+    fn map_pointer_to_frame_scales_panel_space_into_frame_pixels() {
+        // A non-zero origin (tab strip + nav chrome above/left) and a frame TWICE
+        // the panel per axis — the exact non-1280×800 shape the fixed frame ignored.
+        let rect = Rect::from_min_size(pos2(100.0, 40.0), vec2(800.0, 600.0));
+        let frame = [1600usize, 1200usize];
+        // Image top-left → frame origin.
+        assert_eq!(
+            map_pointer_to_frame(pos2(100.0, 40.0), rect, frame),
+            pos2(0.0, 0.0)
+        );
+        // Image centre → frame centre.
+        assert_eq!(
+            map_pointer_to_frame(pos2(500.0, 340.0), rect, frame),
+            pos2(800.0, 600.0)
+        );
+        // A quarter across the image → a quarter across the frame.
+        assert_eq!(
+            map_pointer_to_frame(pos2(300.0, 190.0), rect, frame),
+            pos2(400.0, 300.0)
+        );
+        // Image bottom-right → the frame's far edge.
+        assert_eq!(
+            map_pointer_to_frame(pos2(900.0, 640.0), rect, frame),
+            pos2(1600.0, 1200.0)
+        );
+    }
+
+    #[test]
+    fn map_pointer_to_frame_clamps_outside_the_image_and_survives_zero_size() {
+        let rect = Rect::from_min_size(pos2(50.0, 30.0), vec2(500.0, 400.0));
+        let frame = [250usize, 200usize];
+        // Above/left of the image clamps to the origin (never negative).
+        assert_eq!(
+            map_pointer_to_frame(pos2(0.0, 0.0), rect, frame),
+            pos2(0.0, 0.0)
+        );
+        // Far below/right clamps to the frame's far edge (never runs off).
+        assert_eq!(
+            map_pointer_to_frame(pos2(9000.0, 9000.0), rect, frame),
+            pos2(250.0, 200.0)
+        );
+        // A degenerate zero-size image must not divide by zero.
+        let zero = Rect::from_min_size(pos2(10.0, 10.0), vec2(0.0, 0.0));
+        assert_eq!(
+            map_pointer_to_frame(pos2(50.0, 50.0), zero, [640, 480]),
+            pos2(0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn browser_click_maps_through_the_shared_frame_transform() {
+        // A 4K frame displayed into a smaller, offset panel (the downscale case the
+        // fixed-1280×800 path got wrong). A click at the panel centre must land at
+        // the FRAME centre — proving the live path routes through the transform, not
+        // a `pos * ppp` scale — and must MATCH what the region-capture path computes
+        // for the same pointer (the dedup the review asked for: no divergence).
+        let rect = Rect::from_min_size(pos2(64.0, 128.0), vec2(960.0, 540.0));
+        let frame = [3840usize, 2160usize];
+        let centre = pos2(64.0 + 480.0, 128.0 + 270.0);
+        let ev = egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        match browser_input_event(&ev, rect, frame, true).expect("focused click forwards") {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } => {
+                assert_eq!(pos, pos2(1920.0, 1080.0), "click lands at the frame centre");
+                // Region-capture's `pointer_to_frame` IS `map_pointer_to_frame`, so
+                // both paths agree on the same pointer — one shared transform.
+                assert_eq!(pos, map_pointer_to_frame(centre, rect, frame));
+                assert_eq!(button, egui::PointerButton::Primary);
+                assert!(pressed);
+            }
+            other => panic!("expected PointerButton, got {other:?}"),
+        }
+        // A focused pointer leaving the image reports PointerGone (hover clears).
+        assert_eq!(
+            browser_input_event(
+                &egui::Event::PointerMoved(pos2(0.0, 0.0)),
+                rect,
+                frame,
+                true
+            ),
+            Some(egui::Event::PointerGone)
+        );
+    }
+
+    #[test]
+    fn frame_target_device_px_scales_by_ppp_and_clamps() {
+        let rect = Rect::from_min_size(pos2(8.0, 8.0), vec2(1000.0, 500.0));
+        assert_eq!(frame_target_device_px(rect, 1.0), (1000, 500));
+        // A HiDPI seat scales the panel into more device pixels.
+        assert_eq!(frame_target_device_px(rect, 2.0), (2000, 1000));
+        // Beyond the channel ceiling clamps (an oversized panel at 2×).
+        let huge = Rect::from_min_size(pos2(0.0, 0.0), vec2(3000.0, 3000.0));
+        assert_eq!(
+            frame_target_device_px(huge, 2.0),
+            (MAX_CHANNEL_DIM, MAX_CHANNEL_DIM)
+        );
+        // Never smaller than 1×1.
+        let z = Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
+        assert_eq!(frame_target_device_px(z, 1.0), (1, 1));
+    }
+
+    #[test]
+    fn viewport_resizer_debounces_a_changed_size_and_ignores_no_change() {
+        let mut r = ViewportResizer::default();
+        let t0 = Instant::now();
+        let d = Duration::from_millis(150);
+        // First sighting of a new size: still settling, no resize yet.
+        assert_eq!(r.observe((1200, 700), t0, d), None);
+        assert!(r.is_settling());
+        // Held steady but before the debounce elapses: still nothing.
+        assert_eq!(
+            r.observe((1200, 700), t0 + Duration::from_millis(100), d),
+            None
+        );
+        // Settled (held ≥ debounce): committed exactly once.
+        assert_eq!(
+            r.observe((1200, 700), t0 + Duration::from_millis(150), d),
+            Some((1200, 700))
+        );
+        assert!(!r.is_settling());
+        // The SAME size again is a no-op — an unchanged panel never re-resizes.
+        assert_eq!(r.observe((1200, 700), t0 + Duration::from_secs(1), d), None);
+    }
+
+    #[test]
+    fn viewport_resizer_restarts_the_clock_while_the_size_keeps_changing() {
+        let mut r = ViewportResizer::default();
+        let t0 = Instant::now();
+        let d = Duration::from_millis(150);
+        // A drag moves through many sizes: each new candidate restarts the debounce,
+        // so no resize fires mid-drag even past the first candidate's deadline.
+        assert_eq!(r.observe((1000, 600), t0, d), None);
+        assert_eq!(
+            r.observe((1010, 600), t0 + Duration::from_millis(100), d),
+            None
+        );
+        assert_eq!(
+            r.observe((1020, 600), t0 + Duration::from_millis(200), d),
+            None
+        );
+        assert!(r.is_settling());
+        // The drag settles on the final size; once THAT holds for the debounce it
+        // commits — a single settled resize for the whole drag.
+        let settled = t0 + Duration::from_millis(200);
+        assert_eq!(r.observe((1020, 600), settled + d, d), Some((1020, 600)));
+    }
+
+    #[test]
+    fn viewport_resizer_cancels_a_pending_change_that_reverts() {
+        let mut r = ViewportResizer::default();
+        let t0 = Instant::now();
+        let d = Duration::from_millis(150);
+        r.observe((800, 600), t0, d);
+        assert_eq!(r.observe((800, 600), t0 + d, d), Some((800, 600)));
+        // A transient candidate appears...
+        assert_eq!(
+            r.observe((801, 600), t0 + d + Duration::from_millis(10), d),
+            None
+        );
+        assert!(r.is_settling());
+        // ...but reverts to the committed size before settling: pending cancels, so
+        // no spurious resize.
+        assert_eq!(
+            r.observe((800, 600), t0 + d + Duration::from_millis(20), d),
+            None
+        );
+        assert!(!r.is_settling());
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn a_live_spawn_pre_sizes_the_channel_to_the_seat() {
+        use std::cell::Cell;
+        // A seat reporting a 1920×1080 screen: the spawn must pre-size the channel to
+        // it (item 3), NOT the fixed 1280×800 that would silently drop an enlarged
+        // paint on a bigger panel.
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |_| {});
+        let ppp = ctx.pixels_per_point();
+
+        let mut state = WebState::default();
+        state.note_seat_px(&ctx);
+        let seen = Cell::new((0u32, 0u32));
+        state.open_with(
+            true,
+            BrowserEngine::Servo,
+            START_URL.to_owned(),
+            std::env::current_exe().expect("test exe"),
+            |spec| {
+                seen.set((spec.width, spec.height));
+                let (session, _helper) = testkit::connect()?;
+                Ok(session)
+            },
+        );
+        let expect = ((1920.0 * ppp).round() as u32, (1080.0 * ppp).round() as u32);
+        assert_eq!(
+            seen.get(),
+            expect,
+            "the spawn pre-sizes the channel to the seat, not a fixed 1280×800"
+        );
+        assert_ne!(seen.get(), (INIT_W, INIT_H));
     }
 
     #[test]
@@ -15733,6 +16154,7 @@ mod tests {
             page_focused: false,
             texture: None,
             last_frame: None,
+            resizer: ViewportResizer::default(),
         });
         // The nav chrome (with the "N blocked" shield) renders without panicking.
         assert!(run_panel(&mut state), "the browser chrome produced no draw");
