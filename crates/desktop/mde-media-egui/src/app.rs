@@ -14,7 +14,7 @@ use mde_egui::egui::{
     self, Align, Align2, Context, CursorIcon, FontId, Layout, Response, RichText, ScrollArea,
     Sense, Slider,
 };
-use mde_egui::{muted_note, status_dot, Style};
+use mde_egui::{muted_note, status_dot, Motion, Style};
 
 use mde_jellyfin::{
     BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
@@ -960,27 +960,37 @@ fn player_view<E: MediaEngine>(
 
     ui.add_space(Style::SP_S);
 
-    // The transport row.
+    // The transport row — the primary play/pause is the one accent-filled action; the
+    // rest are icon buttons that name themselves on hover (CRAFT §6).
     ui.horizontal(|ui| {
-        if ui.button("⏮ Prev").clicked() {
+        if transport_button(ui, "⏮", "Previous track").clicked() {
             action = Some(TransportAction::Prev);
         }
-        if ui.button("⏪ 10s").clicked() {
+        if transport_button(ui, "⏪ 10s", "Back 10 seconds").clicked() {
             action = Some(TransportAction::SeekBy(-SKIP_SECS));
         }
-        if ui
-            .button(play_pause_label(controller.player().state()))
-            .clicked()
+        let state = controller.player().state();
+        let glyph = if state == PlayerState::Playing {
+            "⏸"
+        } else {
+            "▶"
+        };
+        if primary_transport_button(
+            ui,
+            &format!("{glyph}  {}", play_pause_label(state)),
+            "Play / pause",
+        )
+        .clicked()
         {
             action = Some(TransportAction::TogglePlay);
         }
-        if ui.button("10s ⏩").clicked() {
+        if transport_button(ui, "10s ⏩", "Forward 10 seconds").clicked() {
             action = Some(TransportAction::SeekBy(SKIP_SECS));
         }
-        if ui.button("Next ⏭").clicked() {
+        if transport_button(ui, "⏭", "Next track").clicked() {
             action = Some(TransportAction::Next);
         }
-        if ui.button("Stop").clicked() {
+        if transport_button(ui, "Stop", "Stop playback").clicked() {
             action = Some(TransportAction::Stop);
         }
     });
@@ -989,22 +999,22 @@ fn player_view<E: MediaEngine>(
 
     // Frame-step + snapshot (design Q12/Q15).
     ui.horizontal(|ui| {
-        if ui.button("◁ Frame").clicked() {
+        if transport_button(ui, "◁ Frame", "Step back one frame").clicked() {
             action = Some(TransportAction::FrameBack);
         }
-        if ui.button("Frame ▷").clicked() {
+        if transport_button(ui, "Frame ▷", "Step forward one frame").clicked() {
             action = Some(TransportAction::FrameForward);
         }
-        if ui.button("Snapshot").clicked() {
+        if transport_button(ui, "Snapshot", "Save a frame snapshot").clicked() {
             action = Some(TransportAction::Snapshot(ScreenshotMode::Subtitles));
         }
         // Chapter nav, only when the media is chaptered.
         if controller.player().chapter_count().is_some() {
             ui.add_space(Style::SP_M);
-            if ui.button("Chapter ◀").clicked() {
+            if transport_button(ui, "Chapter ◀", "Previous chapter").clicked() {
                 action = Some(TransportAction::ChapterPrev);
             }
-            if ui.button("Chapter ▶").clicked() {
+            if transport_button(ui, "Chapter ▶", "Next chapter").clicked() {
                 action = Some(TransportAction::ChapterNext);
             }
         }
@@ -1387,37 +1397,73 @@ fn player_stage<E: MediaEngine>(
         video.clear();
     }
 
-    let painter = ui.painter();
     match video.texture() {
         Some(texture) if loaded => {
             let tex_id = texture.id();
             egui::Image::new(egui::load::SizedTexture::new(tex_id, rect.size())).paint_at(ui, rect);
         }
         _ => {
-            painter.rect_filled(rect, Style::RADIUS, Style::BG);
-            let center_text = if loaded {
-                title.clone()
+            // The dark stage panel, then a *designed* transient state centred on it: an
+            // accent spinner while the engine buffers the pick, the title once it is
+            // loaded, or the honest "no media" prompt (§7 — never a faked frame).
+            ui.painter().rect_filled(rect, Style::RADIUS, Style::BG);
+            if controller.player().state() == PlayerState::Loading {
+                // A genuine motion cue for the buffering wait (the Spinner drives its
+                // own repaint), keyed on the live Loading state — not a frozen still.
+                let spinner_rect = egui::Rect::from_center_size(
+                    rect.center() - egui::vec2(0.0, Style::SP_M),
+                    egui::vec2(Style::SP_L, Style::SP_L),
+                );
+                ui.put(
+                    spinner_rect,
+                    egui::Spinner::new().color(Style::ACCENT).size(Style::SP_L),
+                );
+                ui.painter().text(
+                    rect.center() + egui::vec2(0.0, Style::SP_M),
+                    Align2::CENTER_CENTER,
+                    format!("Buffering {title}…"),
+                    FontId::proportional(Style::BODY),
+                    Style::TEXT_DIM,
+                );
             } else {
-                "No media loaded — pick a title in Library".to_owned()
-            };
-            let center_color = if loaded { Style::TEXT } else { Style::TEXT_DIM };
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                center_text,
-                FontId::proportional(Style::BODY),
-                center_color,
-            );
+                let (center_text, center_color) = if loaded {
+                    (title.clone(), Style::TEXT)
+                } else {
+                    (
+                        "No media loaded — pick a title in Library".to_owned(),
+                        Style::TEXT_DIM,
+                    )
+                };
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    center_text,
+                    FontId::proportional(Style::BODY),
+                    center_color,
+                );
+            }
         }
     }
 
-    // The OSD scrim + line, over the video, auto-hidden after the dwell.
+    // The OSD scrim + readout, over the video, **cross-fading** in/out on the dwell
+    // (CRAFT §8.2 — it eases rather than popping) with the timecode in the mono metric
+    // face (mono-first lock). Both the scrim and the text scale by the eased progress.
     let paused = controller.player().state() != PlayerState::Playing;
-    if loaded && osd_should_show(controller.ui().osd_idle_secs, paused) {
+    let osd_t = Motion::animate(
+        ui.ctx(),
+        "media-osd-fade",
+        loaded && osd_should_show(controller.ui().osd_idle_secs, paused),
+        Motion::BASE,
+    );
+    if osd_t > 0.0 {
         let osd_h = Style::SP_XL;
         let osd_rect =
             egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - osd_h), rect.max);
-        painter.rect_filled(osd_rect, Style::RADIUS, Style::BG.gamma_multiply(OSD_SCRIM));
+        ui.painter().rect_filled(
+            osd_rect,
+            Style::RADIUS,
+            Style::BG.gamma_multiply(OSD_SCRIM * osd_t),
+        );
         let position = controller.player().position();
         let osd = format!(
             "{}  ·  {}  ·  {}",
@@ -1425,12 +1471,12 @@ fn player_stage<E: MediaEngine>(
             title,
             format_time(position),
         );
-        painter.text(
+        ui.painter().text(
             egui::pos2(osd_rect.left() + Style::SP_S, osd_rect.center().y),
             Align2::LEFT_CENTER,
             osd,
-            FontId::proportional(Style::SMALL),
-            Style::TEXT,
+            FontId::monospace(Style::SMALL),
+            Style::TEXT.gamma_multiply(osd_t),
         );
     }
     response
@@ -1626,6 +1672,28 @@ fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.add_space(Style::SP_S);
 }
 
+/// A **transport-control button** — an icon/label button that names itself in a
+/// tooltip and shows the pointing-hand cursor (CRAFT §6: every icon-only control is
+/// keyboard/hover discoverable, and buttons show a hand). Consolidates the transport
+/// rows' repeated `button + on_hover_text + on_hover_cursor` idiom so every transport
+/// affordance reads identically. Draws through the shared `Style` (§4).
+fn transport_button(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
+    ui.button(label)
+        .on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// The **primary** transport action — the play/pause — rendered as the one
+/// accent-filled control (design lock: a single accent, reserved for the primary
+/// action, so the eye lands on it first in the transport row). Built from `Style`
+/// tokens only (§4): a [`Style::ACCENT`] fill under [`Style::TEXT_STRONG`] text, plus
+/// the shared transport tooltip + pointing-hand cursor.
+fn primary_transport_button(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
+    ui.add(egui::Button::new(RichText::new(label).color(Style::TEXT_STRONG)).fill(Style::ACCENT))
+        .on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1794,8 +1862,12 @@ mod tests {
         let mut video = VideoTextureCache::default();
         // Idle: the stage shows the "no media" prompt.
         render_with_video(&mut c, &mut video, player_view);
-        // Load + pump → Playing; the scrubber, transport, speed, A-B, tracks all draw.
+        // Load (before the pump) → Loading: the designed buffering state (the accent
+        // Spinner over the stage) is proven runtime-reachable (§7).
         c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
+        assert_eq!(c.player().state(), PlayerState::Loading);
+        render_with_video(&mut c, &mut video, player_view);
+        // Pump → Playing; the scrubber, transport, speed, A-B, tracks all draw.
         c.pump();
         c.ui_mut().osd_idle_secs = 0.0; // OSD visible
         render_with_video(&mut c, &mut video, player_view);
