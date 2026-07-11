@@ -48,6 +48,22 @@ impl Motion {
         ctx.animate_bool_with_time(egui::Id::new(id), on, secs)
     }
 
+    /// Animate a **scalar** toward `target`, returning the eased current value.
+    ///
+    /// Thin wrapper over egui's [`Context::animate_value_with_time`], keyed by a
+    /// stable `id`. The **first** frame an `id` is seen the stored value is
+    /// written straight to `target` — so a freshly-appearing value lands in
+    /// place with no ease-in from zero, and only a *subsequent* target change
+    /// glides. Pass one of [`Motion::FAST`] / [`Motion::BASE`] / [`Motion::SLOW`]
+    /// for `secs` so the cadence stays on the shared table rather than a bespoke
+    /// literal. The sibling of [`animate`](Self::animate) for continuous
+    /// quantities: eased **spatial** transitions — a mesh node gliding to its new
+    /// layout slot as peers join or leave, rather than teleporting. egui repaints
+    /// only while the value is still travelling, so a settled value stays idle.
+    pub fn animate_value(ctx: &Context, id: impl std::hash::Hash, target: f32, secs: f32) -> f32 {
+        ctx.animate_value_with_time(egui::Id::new(id), target, secs)
+    }
+
     /// The current phase of the shared **hard blink** (NODE-GRADE-2 #6/#16): `true`
     /// while the alarm should show, `false` while it is dark, flipping every
     /// [`BLINK`] seconds off the egui clock. A square wave, NOT an eased fade — an
@@ -146,6 +162,19 @@ mod tests {
         let ctx = egui::Context::default();
         let t = Motion::animate(&ctx, "motion-test", false, Motion::BASE);
         assert!((0.0..=1.0).contains(&t), "progress {t} out of range");
+    }
+
+    #[test]
+    fn animate_value_lands_on_target_on_first_sight() {
+        // Render-agnostic: the first time an id is seen the eased value is written
+        // straight to the target (no ease-in from zero), so a just-appeared node
+        // lands in place; re-reading the same target holds it steady. The call is
+        // pure/total on a fresh context.
+        let ctx = egui::Context::default();
+        let first = Motion::animate_value(&ctx, "motion-value-test", 42.0, Motion::SLOW);
+        assert_eq!(first, 42.0, "first sight of an id lands on the target");
+        let held = Motion::animate_value(&ctx, "motion-value-test", 42.0, Motion::SLOW);
+        assert_eq!(held, 42.0, "an unchanged target stays put");
     }
 
     #[test]
