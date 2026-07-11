@@ -1,5 +1,26 @@
 # OPEN-vs-DONE Ledger — reconciled 2026-07-11
 
+## SESSION COMPLETION — 2026-07-11 (supersedes the HEAD-1e815085 baseline below; origin now `1c0128bc`)
+
+The actionable-safe drain is COMPLETE. Landed after this ledger's baseline:
+- **arch-7** (P2-L #319) — 10/11 browser workers → new `mde-browser-workers` + `mde-worker-core` crates (browser_passkeys deferred — needs a shared `mde-seal` crypto crate first); **Cargo.lock regen'd** for the new members.
+- **shell-ux-7 (509)** PARTIAL→DONE — web/mod.rs god-file split to its natural end: 20,556→12,257 lines / 11 submodules (menubar, wire, capture, drawers + 6 earlier). The interwoven core has no clean seam left.
+- **shell-ux-8 (940)** OPEN→DONE — Explorer promoted to a first-class dock Surface.
+- **arch-2 (301)** OPEN→DONE — SessionRequest folded into `mackes-mesh-types::vdi_session` (wire byte-identical).
+- **arch-10 (543)** OPEN→DONE — CloudPlaneState hoisted to a Shell field; temp-data self-deadlock hazard removed.
+- **arch-13 (958)** OPEN→DONE — `mde-cosmic-applet`→`mde-lighthouse-health`.
+- **perf-8 (949)** OPEN→DONE — browser `last_frame` shared via Arc (zero per-frame ColorImage copy).
+- **test-obs-7 (518)** OPEN→DONE — `.config/nextest.toml` serial group (mackesd + mde-term-egui).
+- Plus the polish/P3 wave (contrast-guard, curtain hit-target, media/mesh-view/panel polish) + nova Fleet-plane Nova-VM teardown guard.
+
+REMAINING (NOT drained — by category, none are safe blind-autonomous work):
+- **OPERATOR-GATED:** .138 live-deploy (needs my pubkey installed); Quazar/Quasar NAMING-1 ruling (repo lock #9 says "Quazar"-Z — findings 764/807 wait on it); BigBoy .130 root-owned qcow2 build-slot cleanup.
+- **LOW-PRI a11y** (operator dropped the TTS output path; AccessKit tree exists, nothing consumes it): a11y-02/04/05/06/07/08, shell-ux-6.
+- **BIG/RISKY — need staging + review:** arch-11 (401, shared BusReader seam across 91 sites), perf-7 (428, VDI dirty sub-rect — needs live visual verify), run_serve extraction (mackesd P3-L).
+- **MARGINAL:** perf-12 (552, clippy lint — mostly already Result-based), docs-consistency-10 (561, WORKLIST.md archive), shell-ux-4/2 (dock — largely closed by the tooltip+group-drift commit).
+
+---
+
 Scope: every P2/P3 finding in PLATFORM-REVIEW-2026-07-10.md whose primary file is
 NOT under crates/mesh/mackesd/ (mackesd-owned findings marked DEFER-arch7 without
 deep-check). Verified against HEAD 1e815085 (~100 commits landed after the review).
@@ -11,10 +32,10 @@ the majority of in-scope findings; the OPEN set is dominated by the a11y cluster
 
 | id (report line) | primary file | status | current loc | evidence |
 |---|---|---|---|---|
-| arch-2 (301) | mde-shell-egui/src/discovery.rs | OPEN | discovery.rs:45, session_rail.rs:37 | SessionRequest still defined 3× (broker + 2 shell mirrors); not folded into mackes-mesh-types |
+| arch-2 (301) | mackes-mesh-types/src/vdi_session.rs | DONE | folded | 701b486b: SessionRequest folded into mackes-mesh-types, wire byte-identical |
 | arch-11 (401) | mde-shell-egui/src/ | OPEN | 91 Persist::open sites across src/ | no BusReader/BusClient seam exists; perf-3 fast-path (19737698) cut per-open cost but shared seam absent |
 | test-obs-7 (518) | .config/nextest.toml | DONE | .config/nextest.toml | machine-enforced serial-process-env group for mackesd + mde-term-egui (nextest runner); CI keeps its explicit --test-threads=1 |
-| arch-10 (543) | mde-shell-egui/src/cloud_plane.rs | OPEN | cloud_plane.rs:1058 state_handle / :74 STATE_KEY | CloudPlaneState still parked in egui temp data store; not hoisted to Shell field |
+| arch-10 (543) | mde-shell-egui/src/cloud_plane.rs | DONE | hoisted | 1796bfd4: CloudPlaneState → Shell field, temp-data self-deadlock hazard removed |
 | perf-12 (552) | workspace-wide (measurement) | OPEN | no clippy::unwrap_used in mde-vdi-*/mde-bus | scoped panic-lint recommendation not applied (informational finding, low value) |
 | docs-consistency-10 (561) | docs/WORKLIST.md | OPEN | WORKLIST.md still 1,491,176 bytes | no docs/worklist-archive/ split; no line-length lint |
 | shell-ux-4 (581) | mde-shell-egui/src/dock.rs | OPEN | dock.rs (0 on_hover_text; lock #11 at :24-25) | no hover-flyout label added; icon-only-no-tooltip lock intact |
@@ -25,13 +46,13 @@ the majority of in-scope findings; the OPEN set is dominated by the a11y cluster
 | shell-ux-2 (746) | mde-shell-egui/src/dock.rs | OPEN | dock.rs:295 GROUPS vs start_menu.rs:420 TILE_GROUPS | two divergent taxonomies persist; no Surface::group() single table |
 | docs-consistency-2 (764) | mde-kdc-host/src/fanout.rs | OPEN (brand-inflight) | fanout.rs:35 "Quasar Mesh"; AI_GOVERNANCE.md:12 | superseded s-spelling still shipped; governance doc still says MCNF 12.0 "Quasar" |
 | shell-ux-9 (807) | mde-theme/src/brand/logo.rs (consumers) | OPEN (brand-inflight) | phones_hub.rs:58, device_manager.rs:1433 | "Quasar Mesh"/"Magic-Mesh Quasar" user strings not routed through brand consts |
-| shell-ux-8 (940) | mde-shell-egui/src/main.rs | OPEN | main.rs show_mesh_map ~:517 | Explorer still not a Surface enum member; mounted only as Mesh-Map lens toggle |
-| perf-8 (949) | mde-shell-egui/src/web/mod.rs | OPEN | web/mod.rs:2963 tab.last_frame = Some(img.clone()) | full ColorImage still deep-cloned per frame; no Arc<ColorImage> share |
+| shell-ux-8 (940) | mde-shell-egui/src/main.rs | DONE | Surface::Explorer | 8f8ef21e: Explorer promoted to first-class dock surface |
+| perf-8 (949) | mde-shell-egui/src/web/mod.rs | DONE | Arc last_frame | 08ba3ced: browser last_frame shared via Arc, zero per-frame copy |
 | arch-13 (958) | crates/platform/mde-lighthouse-health/ | DONE | renamed | d13bd93f: mde-cosmic-applet → mde-lighthouse-health, last cosmic-era crate name retired (lock regen'd) |
 | a11y-02 (1013) | mde-egui/src/drm.rs | OPEN (a11y low-pri, TTS dropped) | a11y.rs consumer seam exists; no screen-reader/TTS | AccessKit tree now generated (a11y-01) but no in-process screen reader; operator dropped TTS path |
 | browser-3 (135) | mde-web-cef/src/cef_browser.rs | PARTIAL | cef_browser.rs ~2760-2773 | WebRTC block hardened (60a2d0fb) + residual documented (browser-5); airtight all-frame/permission-handler blocked by prebuilt-CEF ABI |
 | perf-7 (428) | mde-vdi-spice/src/pixel.rs; vdi.rs | PARTIAL | vdi.rs handle.set; mde-vdi-core (no ImageDelta) | idle-frame emission now gated by dirty-check (eff6dad2), but changed frames still full-frame upload; no partial sub-rect ImageDelta |
-| shell-ux-7 (509) | mde-shell-egui/src/web/mod.rs | PARTIAL | web/mod.rs still 19,060 lines | converted to web/ dir + 7 submodules extracted (889b6fc7 +6); core mod.rs still a monolith |
+| shell-ux-7 (509) | mde-shell-egui/src/web/mod.rs | DONE | 20556→12257, 11 submodules | menubar/wire/capture/drawers extracted; interwoven core has no clean seam |
 | shell-ux-6 (646) | mde-egui/src/drm.rs | PARTIAL (a11y low-pri) | drm.rs a11y seam added; system/storage/iac = 0 accesskit | AT consumer seam (a11y.rs) + 4 surfaces annotated (a11y-05), but system/storage/iac still unannotated + no shipped AT output |
 | a11y-05 (664) | mde-shell-egui/src/explorer.rs | PARTIAL (a11y low-pri) | curtain.rs = 0 accesskit | explorer/device_manager/chooser/vdi annotated (94020327,10059a11,b086406d,2439f1cc); lock-curtain (highest-pri unlock path) still unannotated |
 | vdi-vm-6 (171) | mde-vdi-rdp/src/connect.rs | DONE | TOFU cert pinning module | 2fb08ff6 + 0c91b67b: RDP TLS server-key pinning / TOFU replaces blanket no-verify |
