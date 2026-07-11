@@ -421,8 +421,9 @@ fn prepare(
     for j in 0..strip_h {
         for i in 0..head_w {
             let p = art.pixels[(BAND_Y0 + j) * ART_W + HEAD_X0 + i];
-            let a = p.r().max(p.g()).max(p.b());
-            head.pixels[j * head_w + i] = Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), a);
+            // Luminance-key the head-dot alpha in the shared kit — the dark
+            // surround fades out, the glow blends (§4: no colour minted here).
+            head.pixels[j * head_w + i] = Style::key_alpha_to_luma(p);
         }
     }
 

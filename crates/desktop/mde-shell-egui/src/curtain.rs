@@ -475,20 +475,11 @@ fn faint(c: Color32, dim: f32) -> Color32 {
 }
 
 /// Fold the sheet fill toward near-black for the idle dim, **keeping it fully
-/// opaque** — a dimmed curtain must never become a window onto the desktop.
+/// opaque** — a dimmed curtain must never become a window onto the desktop. The
+/// opaque channel-fold lives in the shared kit ([`Style::scale_rgb_opaque`]) so
+/// no colour is minted here (§4).
 fn near_black(c: Color32, dim: f32) -> Color32 {
-    let k = dim.mul_add(-BG_DROP, 1.0);
-    Color32::from_rgb(scale8(c.r(), k), scale8(c.g(), k), scale8(c.b(), k))
-}
-
-/// Scale one 8-bit channel by `k` (`0.0..=1.0`).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "k is clamped non-negative and ≤ 1, so v·k stays in 0..=255"
-)]
-fn scale8(v: u8, k: f32) -> u8 {
-    (f32::from(v) * k.clamp(0.0, 1.0)).round() as u8
+    Style::scale_rgb_opaque(c, dim.mul_add(-BG_DROP, 1.0))
 }
 
 // ─────────────────────────────── the curtain ───────────────────────────────

@@ -115,12 +115,13 @@ use std::path::Path;
 use mde_egui::egui::{
     self, epaint::Primitive, Color32, ColorImage, ImageData, Mesh, TextureId, TexturesDelta,
 };
+use mde_egui::Style;
 
-/// The canvas's initial fill — a neutral near-black distinct from every real
-/// Carbon-token surface color this shell paints (all lighter), so a genuinely
-/// blank capture is visually obvious in the PNG itself, not just caught by
-/// [`Canvas::is_blank`].
-const CLEAR: Color32 = Color32::from_rgb(18, 18, 18);
+/// The canvas's initial fill — the shared [`Style::CAPTURE_CLEAR`] neutral
+/// near-black, held distinct from (and darker than) every real surface color
+/// this shell paints, so a genuinely blank capture is visually obvious in the
+/// PNG itself, not just caught by [`Canvas::is_blank`].
+const CLEAR: Color32 = Style::CAPTURE_CLEAR;
 
 /// A software-rasterized frame: fully-opaque RGBA8 (see the compositing note on
 /// [`Capture::frame`]), row-major top-to-bottom, sized in PHYSICAL pixels
@@ -437,64 +438,34 @@ fn edge(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 }
 
-/// Linear interpolation between two premultiplied colors.
+/// Linear interpolation between two premultiplied colors, in gamma space —
+/// egui's own [`Color32::lerp_to_gamma`], so the software sampler blends texels
+/// exactly the way egui blends its colours (no colour minted here, §4).
 fn lerp2(a: Color32, b: Color32, t: f32) -> Color32 {
-    let mix = |x: u8, y: u8| {
-        (f32::from(x) + (f32::from(y) - f32::from(x)) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    Color32::from_rgba_premultiplied(
-        mix(a.r(), b.r()),
-        mix(a.g(), b.g()),
-        mix(a.b(), b.b()),
-        mix(a.a(), b.a()),
-    )
+    a.lerp_to_gamma(b, t)
 }
 
 /// Barycentric interpolation across three premultiplied vertex colors — the
 /// software equivalent of GPU Gouraud shading, exactly what egui's own
 /// antialiasing feather (a per-vertex alpha ramp on the outer edge of a shape)
-/// depends on to look smooth rather than a hard-edged silhouette.
+/// depends on to look smooth rather than a hard-edged silhouette. Expressed as
+/// the weighted sum of the three vertices via egui's gamma-space scale + add
+/// (weights are non-negative inside a triangle; clamped for float safety).
 fn lerp3(c0: Color32, w0: f32, c1: Color32, w1: f32, c2: Color32, w2: f32) -> Color32 {
-    let mix = |a: u8, b: u8, c: u8| {
-        (f32::from(a) * w0 + f32::from(b) * w1 + f32::from(c) * w2)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    Color32::from_rgba_premultiplied(
-        mix(c0.r(), c1.r(), c2.r()),
-        mix(c0.g(), c1.g(), c2.g()),
-        mix(c0.b(), c1.b(), c2.b()),
-        mix(c0.a(), c1.a(), c2.a()),
-    )
+    c0.gamma_multiply(w0.max(0.0)) + c1.gamma_multiply(w1.max(0.0)) + c2.gamma_multiply(w2.max(0.0))
 }
 
 /// Componentwise premultiplied modulation (`texture_sample * vertex_color`) —
-/// the same multiply a GPU fragment shader does; both inputs are already
-/// premultiplied sRGB8, so this is a plain per-channel product scaled back to
-/// the `0..=255` range.
+/// the same multiply a GPU fragment shader does; egui's `Color32 * Color32`
+/// is precisely that fast gamma-space per-channel product.
 fn modulate(tex: Color32, vertex: Color32) -> Color32 {
-    let mix = |a: u8, b: u8| ((u16::from(a) * u16::from(b) + 127) / 255) as u8;
-    Color32::from_rgba_premultiplied(
-        mix(tex.r(), vertex.r()),
-        mix(tex.g(), vertex.g()),
-        mix(tex.b(), vertex.b()),
-        mix(tex.a(), vertex.a()),
-    )
+    tex * vertex
 }
 
-/// Premultiplied-alpha "over": `dst = src + dst * (1 - src.a)`. Also correctly
-/// handles egui's "additive" colors (`src.a == 0`, per `Color32`'s own doc) as
-/// a natural special case — `inv` is `255` then, so this reduces to `dst =
-/// src + dst`, the additive-blend formula, with no separate branch needed.
+/// Premultiplied-alpha "over" (`src` composited onto `dst`) via egui's own
+/// [`Color32::blend`] — `dst.blend(src)` places `dst` behind `src`. It also
+/// folds egui's "additive" colors (`src.a == 0`) into the same path, reducing
+/// to `dst + src`, exactly as the additive-blend rule requires.
 fn over(dst: Color32, src: Color32) -> Color32 {
-    let inv = 255 - u16::from(src.a());
-    let mix = |d: u8| ((u16::from(d) * inv) / 255) as u8;
-    Color32::from_rgba_premultiplied(
-        src.r().saturating_add(mix(dst.r())),
-        src.g().saturating_add(mix(dst.g())),
-        src.b().saturating_add(mix(dst.b())),
-        src.a().saturating_add(mix(dst.a())),
-    )
+    dst.blend(src)
 }
