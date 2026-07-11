@@ -43,10 +43,36 @@ timezone UTC --utc
 # Mesh-administered fleet, platform standard: no interactive root login — the box
 # onboards over the mesh and magic-setup.service owns first-run. Mirrors heritage.
 rootpw --lock
-# SELinux DISABLED is the operator's platform standard (docs/THREAT_MODEL.md §5,
-# set 2026-06-20); the mde-web-preview confined domain self-skips where it is off.
-# (Heritage used --enforcing — that was the Cosmic-era default, corrected here.)
-selinux --disabled
+# SELinux PERMISSIVE at install — the QC-22 posture on-ramp (build-deploy-8
+# reconciliation, 2026-07-11). The prior `--disabled` here cited a 2026-06-20
+# "disabled" fleet standard as docs/THREAT_MODEL.md §5 — but §5 is "Out of scope /
+# non-goals" (nothing about SELinux) and that standard is SUPERSEDED for
+# Quasar-cloud nodes: THREAT_MODEL §3.2 (platform note) + §4.5 both state "shipped
+# nodes target SELinux Enforcing and load the MCNF policy modules through the
+# bounded boot-time policy oneshot." This kickstart installs QC (Quasar-cloud)
+# nodes, so it must NOT leave SELinux off — doing so silently defeated the whole
+# Enforcing stack the RPM ships:
+#   - The RPM SHIPS + ENABLES that stack: the SELINUX-1/QC-22 CIL policy modules +
+#     magic-mesh-selinux-policy.service (crates/mesh/mackesd/Cargo.toml SELINUX-1
+#     assets ~L675-682; post_install_script enables the oneshot ~L823) whose loader
+#     install-helpers/setup-selinux-policy.sh persists SELINUX=enforcing, loads
+#     magicmesh-base.cil, and — when the current boot is PERMISSIVE — runs
+#     `setenforce 1` (its L77). Plus two confined ENFORCING browser domains
+#     (mde_web_preview_t / mde_web_cef_t) that self-skip ONLY where SELinux is off.
+#   - `--disabled` installed the filesystem UNLABELED and defeated all of the
+#     above: the oneshot would still rewrite the config to enforcing, so the NEXT
+#     reboot would try to come up Enforcing on an unlabeled FS — a brick risk on an
+#     ISO seat, not a security win.
+# PERMISSIVE is the safe on-ramp the loader is DESIGNED to consume: the FS is
+# labeled at install, the oneshot promotes Permissive -> Enforcing after the base
+# policy loads, and any policy gap logs AVC denials instead of blocking boot on an
+# ISO-installed seat. (Heritage magic-on-cosmic.ks uses --enforcing directly.)
+# OPERATOR POSTURE DECISION (flag): this flips ISO-installed seats from SELinux-OFF
+# to on-track-to-Enforcing. If a hard-enforcing FIRST boot is wanted AND the policy
+# is boot-validated complete, change --permissive to --enforcing; if SELinux must
+# stay OFF fleet-wide, revert to --disabled AND update THREAT_MODEL §3.2/§4.5 + the
+# RPM SELINUX-1 assets to match (today those two lanes contradict a disabled node).
+selinux --permissive
 network --bootproto=dhcp --activate
 bootloader --location=mbr
 clearpart --all --initlabel
