@@ -1395,11 +1395,27 @@ const fn mount_phase_color(phase: MountPhase) -> Color32 {
 
 fn pane_view(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec<Action>) {
     // A press anywhere focuses the pane; a focused pane in dual mode gets an
-    // accent rule so it's clear which pane the toolbar + keyboard act on.
-    if b.is_dual() && b.active_pane_index() == pane_ix {
-        let top = ui.max_rect();
-        ui.painter()
-            .hline(top.x_range(), top.top(), Stroke::new(2.0, Style::ACCENT));
+    // accent rule so it's clear which pane the toolbar + keyboard act on. Both
+    // panes reserve the rule's strip so their listings stay top-aligned, and the
+    // 2px accent rule cross-fades between panes on the shared BASE tier (a focus
+    // shift is a state change, not a snap — CRAFT S4) rather than jumping the
+    // solid line from one column to the other.
+    if b.is_dual() {
+        let focused = b.active_pane_index() == pane_ix;
+        let t = Motion::animate(
+            ui.ctx(),
+            ("files-pane-focus", pane_ix),
+            focused,
+            Motion::BASE,
+        );
+        if t > 0.0 {
+            let top = ui.max_rect();
+            ui.painter().hline(
+                top.x_range(),
+                top.top(),
+                Stroke::new(2.0, Style::ACCENT.gamma_multiply(t)),
+            );
+        }
         ui.add_space(Style::SP_XS);
     }
     nav_row(ui, b, pane_ix, actions);
