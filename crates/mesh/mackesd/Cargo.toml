@@ -613,20 +613,23 @@ assets = [
     # a Workstation-role node by magic-mesh-brand.service (operator lock 2026-06-16).
     { source = "install-helpers/magic-mesh-brand.sh", dest = "/usr/libexec/mackesd/magic-mesh-brand", mode = "755" },
     { source = "packaging/systemd/magic-mesh-brand.service", dest = "/usr/lib/systemd/system/magic-mesh-brand.service", mode = "644" },
-    # MESH-LAYOUT (2026-06-19) — enforce the canonical Cosmic panel layout every
-    # session (operator: the .13 layout is the stock default for all desktops).
-    { source = "install-helpers/mde-enforce-layout.sh", dest = "/usr/libexec/mackesd/mde-enforce-layout", mode = "755" },
-    { source = "packaging/xdg/mde-enforce-layout.desktop", dest = "/etc/xdg/autostart/mde-enforce-layout.desktop", mode = "644" },
+    # build-deploy-11 — the MESH-LAYOUT Cosmic panel-layout enforcer (the
+    # mde-enforce-layout script + its /etc/xdg/autostart .desktop) was dropped as
+    # retired-Cosmic dead weight: the autostart is OnlyShowIn=COSMIC and the
+    # compositor-less egui-DRM seat has no COSMIC session to fire it, so it never
+    # ran. The mackes-carbon-icons / cosmic-layout / monogram / greeter-hero
+    # imagery below is NOT dropped: it is the input set magic-mesh-brand.sh (still
+    # shipped, %post-enabled, include_str!'d by onboard::role_provision) reads.
     { source = "assets/brand/mackes-carbon-icons.tar.xz", dest = "/usr/share/magic-mesh/brand/mackes-carbon-icons.tar.xz", mode = "644" },
     { source = "assets/brand/cosmic-layout/**/*",  dest = "/usr/share/magic-mesh/brand/cosmic-layout/", mode = "644" },
     { source = "assets/brand/monogram.png",        dest = "/usr/share/magic-mesh/brand/monogram.png",   mode = "644" },
     { source = "assets/brand/greeter-hero.png",    dest = "/usr/share/magic-mesh/brand/greeter-hero.png", mode = "644" },
-    # BRAND-11 — the branded MCNF 11 desktop wallpaper + its first-login seeder.
-    # The image lands in /usr/share/backgrounds (free; cosmic-bg owns the
-    # /usr/share/cosmic default, so we can't ship that — the autostart seeder
-    # writes the per-user Cosmic wallpaper config instead, seed-if-absent).
-    { source = "assets/brand/wallpaper/mcnf-11-winter-4k.png", dest = "/usr/share/backgrounds/mcnf-11-winter.png", mode = "644" },
-    { source = "install-helpers/mde-seed-wallpaper.sh", dest = "/usr/libexec/mackesd/mde-seed-wallpaper", mode = "755" },
+    # build-deploy-11 — the BRAND-11 mcnf-11-winter wallpaper + its mde-seed-wallpaper
+    # first-login seeder were dropped as retired-Cosmic dead weight: the seeder wrote
+    # the per-user COSMIC CosmicBackground config and its org.magicmesh.SeedWallpaper
+    # autostart .desktop no longer ships, so nothing invoked it; the egui shell draws
+    # its own wallpaper from /usr/share/backgrounds/magic-mesh/MDE-QUAZAR-WALLPAPER*.png
+    # (backdrop.rs), never mcnf-11-winter.
     # QBRAND-11 (packaging half) — the five official Quazar wallpapers ship as
     # a selectable set (design lock #12: WALLPAPER4 is the default desktop,
     # WALLPAPER1 doubles as the DRM boot-splash art); the egui shell loads

@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=MCNF Layout Enforcer
-Comment=Enforce the canonical MCNF Cosmic panel layout each session
-Exec=/usr/libexec/mackesd/mde-enforce-layout
-OnlyShowIn=COSMIC;
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
