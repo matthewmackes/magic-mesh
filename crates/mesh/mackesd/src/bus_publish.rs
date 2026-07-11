@@ -1,0 +1,161 @@
+//! In-process Bus publish (perf-10) — write directly through the local
+//! `mde_bus` [`Persist`] store instead of fork+exec'ing the `mde-bus` CLI once
+//! per message.
+//!
+//! **Why.** ~24 mackesd workers publish a tick summary to the *local* bus by
+//! `std::process::Command::new("mde-bus").args(["publish", …])` +
+//! [`crate::proc_reap::fire_and_reap`]. Every such publish paid for a whole new
+//! process, a fresh SQLite open (schema exec + chmod + write-probe), AND a
+//! dedicated 100 ms-poll reaper thread — for a write the daemon can do in-process
+//! against the very same store the CLI opens. This module is the shared
+//! in-process path: a long-lived worker opens one [`Persist`] handle and reuses
+//! it across ticks, so a publish is a single `INSERT` + atomic file write with no
+//! spawn, no reaper, no zombie.
+//!
+//! **Byte-identical to the CLI.** The `mde-bus publish <topic> --body-flag <json>`
+//! form the workers shelled out resolves to
+//! `Persist::write_full(topic, Priority::Default, None, Some(&body), &[], None)`
+//! (default priority, no title, no action buttons, no `reply_to`), which is
+//! exactly [`Persist::write`]. This helper serializes the payload with the same
+//! compact `serde_json::to_string` the call sites passed to `--body-flag`, so the
+//! stored row (topic, priority `"default"`, null title, JSON body, empty actions,
+//! null `reply_to`) is identical to a CLI publish. Retention, audit emission, and
+//! GFS replication all key off the stored row, so those are unchanged too.
+//!
+//! **Best-effort, matching CLI fire-and-forget.** A serialize failure or a
+//! store-write error is logged at `debug` and swallowed — the caller
+//! graceful-degrades exactly as it did when the `mde-bus` binary was absent on a
+//! pre-RPM dev box (the old `fire_and_reap` swallowed the spawn error).
+
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::{Persist, StoredMessage};
+
+/// The default bus root a CLI publish would use — honours `MDE_BUS_ROOT`
+/// (the live fleet's shared-spool pin, `90-mde-bus.conf`) FIRST, then the
+/// `~/.local/share/mde/bus` XDG fallback. This is [`mde_bus::default_data_dir`],
+/// the SAME resolver the fork+exec'd `mde-bus` inherited via the environment —
+/// using `dirs::data_dir()` directly (as a couple of older workers do) would
+/// silently diverge whenever `MDE_BUS_ROOT` is set.
+#[must_use]
+pub fn default_bus_root() -> Option<std::path::PathBuf> {
+    mde_bus::default_data_dir()
+}
+
+/// Publish `payload` (JSON-serialized) to `topic` in-process, byte-identical to
+/// `mde-bus publish <topic> --body-flag <json>`. Returns the [`StoredMessage`]
+/// on success, `None` on a swallowed serialize/write failure (best-effort).
+///
+/// Takes `&mut Persist` so it can [`Persist::reopen_if_index_changed`] before the
+/// write: a fork+exec CLI opened a fresh handle on every call and thus always
+/// followed a rotated `index.sqlite` inode (BUS-INODE-ORPHAN-1 / MUSIC-WEDGE-2).
+/// A long-held in-process handle must re-follow that inode explicitly to keep the
+/// same "always sees the live DB" property — the cheap stat is what preserves
+/// behaviour-parity with the per-call open the CLI did.
+pub fn publish_json<T: serde::Serialize>(
+    persist: &mut Persist,
+    topic: &str,
+    payload: &T,
+) -> Option<StoredMessage> {
+    let body = match serde_json::to_string(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                target: "mackesd::bus_publish",
+                topic,
+                error = %e,
+                "bus publish serialize failed",
+            );
+            return None;
+        }
+    };
+    // Follow a rotated index (retention recreate / BOOT-REC-3 unlink) — a no-op
+    // fast stat when nothing changed.
+    persist.reopen_if_index_changed();
+    match persist.write(topic, Priority::Default, None, Some(&body)) {
+        Ok(msg) => Some(msg),
+        Err(e) => {
+            tracing::debug!(
+                target: "mackesd::bus_publish",
+                topic,
+                error = %e,
+                "bus publish write failed",
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    struct Sample {
+        host: String,
+        n: u32,
+    }
+
+    /// The in-process publish stores the SAME row a CLI publish would: same
+    /// topic, same compact-JSON body, default priority, no title/actions/reply.
+    #[test]
+    fn publish_json_writes_the_cli_equivalent_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let payload = Sample {
+            host: "node-a".to_string(),
+            n: 7,
+        };
+
+        let mut persist = Persist::open(root.clone()).unwrap();
+        let stored =
+            publish_json(&mut persist, "event/kvm/services", &payload).expect("in-process publish");
+
+        // The body the CLI would carry in `--body-flag` is the exact same
+        // compact serialization.
+        let cli_body = serde_json::to_string(&payload).unwrap();
+        assert_eq!(stored.body.as_deref(), Some(cli_body.as_str()));
+        assert_eq!(stored.topic, "event/kvm/services");
+        assert_eq!(stored.priority, "default");
+        assert!(stored.title.is_none());
+        assert!(stored.actions.is_empty());
+        assert!(stored.reply_to.is_none());
+
+        // Read the row back through a FRESH handle (as any bus consumer does)
+        // and confirm exactly one message with the identical body landed.
+        let reader = Persist::open(root).unwrap();
+        let rows = reader.list_since("event/kvm/services", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body.as_deref(), Some(cli_body.as_str()));
+        // And it round-trips back to the original typed payload.
+        let back: Sample = serde_json::from_str(rows[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(back, payload);
+    }
+
+    /// Two publishes on one long-lived handle both land (proves the reused
+    /// handle keeps writing — the fork+exec path opened a new handle each time).
+    #[test]
+    fn reused_handle_publishes_repeatedly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        publish_json(
+            &mut persist,
+            "event/kvm/services",
+            &Sample {
+                host: "a".into(),
+                n: 1,
+            },
+        )
+        .expect("first");
+        publish_json(
+            &mut persist,
+            "event/kvm/services",
+            &Sample {
+                host: "a".into(),
+                n: 2,
+            },
+        )
+        .expect("second");
+        let rows = persist.list_since("event/kvm/services", None).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+}

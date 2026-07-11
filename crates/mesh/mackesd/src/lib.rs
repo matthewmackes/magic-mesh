@@ -236,6 +236,12 @@ pub mod ipc;
 pub mod substrate;
 #[cfg(feature = "async-services")]
 pub mod workers;
+// perf-10 — in-process Bus publish path (write directly through the local
+// `mde_bus::Persist` store) so tick-publishers stop fork+exec'ing the `mde-bus`
+// CLI (a process + a fresh SQLite open + a reaper thread) per message. Gated on
+// `async-services` because it pulls the optional `mde-bus` dep.
+#[cfg(feature = "async-services")]
+pub mod bus_publish;
 
 /// Crate-wide error type. Every public function returns
 /// `Result<T, mackesd_core::Error>` so callers don't have to import
