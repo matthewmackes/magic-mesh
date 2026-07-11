@@ -20,9 +20,21 @@
 //! **Runtime shape:** the shell and the tests are synchronous, so the
 //! connection owns one small current-thread tokio runtime behind a blocking
 //! facade. TLS is rustls (via `ironrdp-tls`); the workspace bans OpenSSL
-//! linkage (§3 substrate lock). Certificate validation is intentionally
-//! disabled by `ironrdp-tls` — RDP hosts overwhelmingly present self-signed
-//! certificates and the mesh link itself is already Nebula-authenticated.
+//! linkage (§3 substrate lock).
+//!
+//! **Certificate posture (vdi-vm-6):** chain validation stays **off by design**
+//! — RDP hosts overwhelmingly present self-signed certificates (a rejecting
+//! validator would refuse essentially every real connection) and the mesh link
+//! is already carried over the mutually-authenticated Nebula overlay, which is
+//! the transport-trust floor. Validation being off does not make a cert *change*
+//! invisible, though: right after the TLS upgrade the server certificate's
+//! SHA-256 fingerprint is compared against a **trust-on-first-use** pin
+//! ([`crate::pin`]). A first connect records the pin and accepts; a later connect
+//! whose fingerprint **changed** is the MITM signal — it is logged loudly and
+//! surfaced to the shell as a [`CertPinChange`], while (by default) still letting
+//! the connection through so a legitimate self-signed rotation is not a hard
+//! outage. Setting `MDE_RDP_STRICT_PIN` flips a changed cert to a hard
+//! [`ConnectError::CertPinChanged`] before any credentials are sent.
 //!
 //! Honest bounds: CredSSP is in-band NTLM only (a Kerberos KDC round trip
 //! surfaces as a typed error, not a silent retry), and a server-initiated
@@ -56,6 +68,7 @@ use tokio::net::TcpStream;
 use crate::config::RdpConfig;
 use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
+use crate::pin::{self, Fingerprint, PinAction, PinOutcome};
 use crate::pixel::{FramebufferError, PixelFormat};
 use crate::session::RdpSession;
 use crate::tier::RdpTierSettings;
@@ -86,6 +99,19 @@ pub enum ConnectError {
     /// The server's TLS certificate carried no extractable public key — the
     /// RDP security exchange cannot bind to the channel without it.
     NoServerPublicKey,
+    /// Strict pinning (`MDE_RDP_STRICT_PIN`) is on and the host's TLS certificate
+    /// fingerprint **changed** since it was pinned — a potential MITM. The
+    /// connection is refused before credentials are sent. (Default posture keeps
+    /// TOFU non-strict: the change is surfaced, not rejected — see
+    /// [`CertPinChange`].)
+    CertPinChanged {
+        /// The `host:port` whose certificate changed.
+        host: String,
+        /// The previously pinned fingerprint (hex).
+        stored: String,
+        /// The fingerprint the host just presented (hex).
+        current: String,
+    },
     /// The `ironrdp` connection sequence failed (negotiation, CredSSP,
     /// capability exchange, licensing...).
     Connector(ConnectorError),
@@ -115,6 +141,15 @@ impl core::fmt::Display for ConnectError {
             Self::NoServerPublicKey => {
                 write!(f, "server TLS certificate has no extractable public key")
             }
+            Self::CertPinChanged {
+                host,
+                stored,
+                current,
+            } => write!(
+                f,
+                "rdp host {host} TLS certificate CHANGED since it was pinned \
+                 (was {stored}, now {current}); strict pinning refused the connection"
+            ),
             Self::Connector(e) => write!(f, "rdp connection sequence failed: {e}"),
             Self::Session(e) => write!(f, "rdp active stage failed: {e}"),
             Self::Blit(e) => write!(f, "decoded update does not fit the session desktop: {e}"),
@@ -138,7 +173,10 @@ impl std::error::Error for ConnectError {
             Self::Connector(e) => Some(e),
             Self::Session(e) => Some(e),
             Self::Blit(e) => Some(e),
-            Self::NoServerPublicKey | Self::Timeout { .. } | Self::Reactivation => None,
+            Self::NoServerPublicKey
+            | Self::CertPinChanged { .. }
+            | Self::Timeout { .. }
+            | Self::Reactivation => None,
         }
     }
 }
@@ -177,6 +215,46 @@ pub struct Negotiated {
     pub io_channel_id: u16,
     /// The MCS user channel id (diagnostic evidence).
     pub user_channel_id: u16,
+}
+
+/// A detected TLS-certificate change for a host that was already pinned
+/// (vdi-vm-6). Produced only on a non-strict connect whose fingerprint differed
+/// from the trust-on-first-use pin; the connection was **still allowed** (the
+/// Nebula floor is the trust anchor) but this is surfaced so the shell can warn
+/// the operator that the change could be a MITM. Strict mode turns the same
+/// condition into a hard [`ConnectError::CertPinChanged`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertPinChange {
+    /// The `host:port` whose certificate changed.
+    pub host: String,
+    /// The previously pinned fingerprint (hex).
+    pub stored: String,
+    /// The newly presented (and now adopted) fingerprint (hex).
+    pub current: String,
+}
+
+impl CertPinChange {
+    fn new(host: String, stored: &Fingerprint, current: &Fingerprint) -> Self {
+        Self {
+            host,
+            stored: stored.to_hex(),
+            current: current.to_hex(),
+        }
+    }
+
+    /// A short, operator-facing banner for the shell's live-status line.
+    #[must_use]
+    pub fn operator_message(&self) -> String {
+        let short = |hex: &str| hex.split(':').take(4).collect::<Vec<_>>().join(":");
+        format!(
+            "⚠ RDP host {} presented a DIFFERENT TLS certificate than last time \
+             (pinned {}…, now {}…) — possible MITM; connection allowed on the \
+             Nebula-authenticated link",
+            self.host,
+            short(&self.stored),
+            short(&self.current),
+        )
+    }
 }
 
 /// CredSSP network client that honestly refuses out-of-band round trips: the
@@ -366,6 +444,10 @@ pub struct RdpConnection {
     active_stage: ActiveStage,
     image: DecodedImage,
     negotiated: Negotiated,
+    /// A TLS-certificate change detected against the trust-on-first-use pin at
+    /// connect time (vdi-vm-6). `Some` only on a non-strict connect whose
+    /// fingerprint differed from the pin — the shell surfaces it as a warning.
+    cert_pin_change: Option<CertPinChange>,
     started: Instant,
 }
 
@@ -392,7 +474,8 @@ impl RdpConnection {
             .build()
             .map_err(ConnectError::Runtime)?;
 
-        let (framed, connection_result) = runtime.block_on(Self::handshake(config, &host, port))?;
+        let (framed, connection_result, cert_pin_change) =
+            runtime.block_on(Self::handshake(config, &host, port))?;
 
         let negotiated = Negotiated {
             desktop_size: (
@@ -429,6 +512,7 @@ impl RdpConnection {
             active_stage,
             image,
             negotiated,
+            cert_pin_change,
             started: Instant::now(),
         })
     }
@@ -439,7 +523,14 @@ impl RdpConnection {
         config: ironrdp_connector::Config,
         host: &str,
         port: u16,
-    ) -> Result<(TlsFramed, ironrdp_connector::ConnectionResult), ConnectError> {
+    ) -> Result<
+        (
+            TlsFramed,
+            ironrdp_connector::ConnectionResult,
+            Option<CertPinChange>,
+        ),
+        ConnectError,
+    > {
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
             .await
             .map_err(|_| ConnectError::Timeout {
@@ -477,6 +568,14 @@ impl RdpConnection {
             .ok_or(ConnectError::NoServerPublicKey)?
             .to_vec();
 
+        // vdi-vm-6: trust-on-first-use certificate pinning. Chain validation is
+        // off by design (self-signed RDP hosts + the Nebula floor), but a cert
+        // *change* is the MITM signal — detect it here, BEFORE `connect_finalize`
+        // sends any credentials, so strict mode can refuse a changed-cert peer
+        // without leaking the password. `server_cert` is the DER of the server's
+        // leaf certificate (the same bytes `extract_tls_server_public_key` parsed).
+        let cert_pin_change = Self::check_cert_pin(host, port, &server_cert)?;
+
         let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
         let mut framed = TokioFramed::new(tls_stream);
         let mut network_client = NoNetworkClient;
@@ -498,13 +597,84 @@ impl RdpConnection {
         })?
         .map_err(ConnectError::Connector)?;
 
-        Ok((framed, connection_result))
+        Ok((framed, connection_result, cert_pin_change))
+    }
+
+    /// Compare the host's TLS certificate fingerprint against the trust-on-
+    /// first-use pin store and apply the [`pin::pin_action`] policy (vdi-vm-6).
+    ///
+    /// Returns `Ok(Some(change))` when a non-strict connect saw a **changed**
+    /// certificate (surface it, but proceed — the Nebula link is the trust
+    /// floor), `Ok(None)` on a first-use or unchanged cert, and
+    /// `Err(ConnectError::CertPinChanged)` when strict mode
+    /// (`MDE_RDP_STRICT_PIN`) rejects a changed cert. All the branch-selecting
+    /// logic lives in the pure [`pin`] seams; this only does the I/O + logging.
+    fn check_cert_pin(
+        host: &str,
+        port: u16,
+        server_cert: &[u8],
+    ) -> Result<Option<CertPinChange>, ConnectError> {
+        let key = pin::host_key(host, port);
+        let fingerprint = Fingerprint::from_der(server_cert);
+        let mut store = pin::lock_global();
+        let outcome = store.decision(&key, &fingerprint);
+        match pin::pin_action(&outcome, pin::strict_mode()) {
+            PinAction::Proceed => {
+                if matches!(outcome, PinOutcome::FirstUse) {
+                    tracing::info!(
+                        host = %key,
+                        fingerprint = %fingerprint.to_hex(),
+                        "rdp TLS certificate pinned (trust-on-first-use)"
+                    );
+                    store.record(key, fingerprint);
+                }
+                Ok(None)
+            }
+            PinAction::Warn { stored, current } => {
+                tracing::warn!(
+                    host = %key,
+                    stored = %stored.to_hex(),
+                    current = %current.to_hex(),
+                    "rdp TLS certificate CHANGED since it was pinned — accepting on the \
+                     Nebula-authenticated link, but this is a potential MITM signal \
+                     (set MDE_RDP_STRICT_PIN to reject instead)"
+                );
+                // Adopt-after-warn: re-pin so a legitimate self-signed rotation
+                // (e.g. a rebuilt VDI VM) does not re-warn on every reconnect.
+                store.record(key.clone(), current.clone());
+                Ok(Some(CertPinChange::new(key, &stored, &current)))
+            }
+            PinAction::Reject { stored, current } => {
+                tracing::error!(
+                    host = %key,
+                    stored = %stored.to_hex(),
+                    current = %current.to_hex(),
+                    "rdp TLS certificate CHANGED and strict pinning is on — refusing the \
+                     connection before credentials are sent (possible MITM)"
+                );
+                Err(ConnectError::CertPinChanged {
+                    host: key,
+                    stored: stored.to_hex(),
+                    current: current.to_hex(),
+                })
+            }
+        }
     }
 
     /// What the server actually granted (geometry, compression, tier).
     #[must_use]
     pub const fn negotiated(&self) -> &Negotiated {
         &self.negotiated
+    }
+
+    /// A TLS-certificate change detected against the trust-on-first-use pin at
+    /// connect time (vdi-vm-6), or `None` if the cert was first-use or unchanged.
+    /// The shell surfaces this as a non-fatal MITM warning; in strict mode the
+    /// same condition is a hard [`ConnectError::CertPinChanged`] instead, so this
+    /// is only ever `Some` on a connection that was allowed through.
+    #[must_use]
+    pub const fn cert_pin_change(&self) -> Option<&CertPinChange> {
+        self.cert_pin_change.as_ref()
     }
 
     /// Milliseconds since the connection came up — the session's probe clock.
@@ -685,10 +855,13 @@ impl RdpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{connector_config_for, push_fastpath_events, ConnectError, PumpOutcome};
+    use super::{
+        connector_config_for, push_fastpath_events, CertPinChange, ConnectError, PumpOutcome,
+    };
     use crate::config::RdpConfig;
     use crate::input::{MouseButton, RdpInputEvent, Scancode};
     use crate::link::QualityTier;
+    use crate::pin::Fingerprint;
     use crate::pixel::FramebufferError;
     use crate::tier::RdpTierSettings;
     use ironrdp_connector::Credentials;
@@ -853,6 +1026,27 @@ mod tests {
         };
         assert!(timeout.to_string().contains("TLS upgrade"));
         assert!(ConnectError::Reactivation.to_string().contains("reconnect"));
+        let pin_changed = ConnectError::CertPinChanged {
+            host: "10.42.0.9:3389".into(),
+            stored: "AA".into(),
+            current: "BB".into(),
+        };
+        let text = pin_changed.to_string();
+        assert!(text.contains("10.42.0.9:3389") && text.contains("CHANGED"));
+    }
+
+    #[test]
+    fn cert_pin_change_operator_message_names_the_host_and_the_risk() {
+        let change = CertPinChange::new(
+            "desktop.mesh:3389".into(),
+            &Fingerprint::from_der(b"old-cert"),
+            &Fingerprint::from_der(b"new-cert"),
+        );
+        let msg = change.operator_message();
+        assert!(msg.contains("desktop.mesh:3389"), "names the host");
+        assert!(msg.contains("MITM"), "flags the risk to the operator");
+        // The full fingerprints round-trip through the surfaced struct.
+        assert_eq!(change.stored, Fingerprint::from_der(b"old-cert").to_hex());
     }
 
     #[test]

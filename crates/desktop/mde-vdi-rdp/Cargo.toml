@@ -28,6 +28,10 @@ mde-vdi-core = { path = "../mde-vdi-core" }
 # Structured logs in the workspace JSON-line format.
 tracing = "0.1"
 
+# SHA-256 for TLS certificate pinning (vdi-vm-6, `pin` module). Same 0.10 line +
+# fingerprint shape as `mde-kdc-host` so the two pin stores read identically.
+sha2 = "0.10"
+
 # The pure-Rust IronRDP stack (Devolutions) — RDP-primary, lock 21. Coherent
 # release set resolved on the farm (see `cargo search ironrdp`). We use the
 # connection-sequence config + the input PDU builders + the session image/decoder

@@ -433,6 +433,10 @@ impl ConnectRequest {
 enum LiveRdpEvent {
     Connected(String),
     Frame(egui::ColorImage),
+    /// The host's TLS certificate changed since it was pinned (vdi-vm-6) — a
+    /// non-fatal MITM warning; the session stays live (the Nebula link is the
+    /// trust floor). Strict mode instead surfaces as [`LiveRdpEvent::Error`].
+    CertWarning(String),
     Error(String),
     Ended(String),
 }
@@ -724,6 +728,11 @@ fn run_live_rdp(
         }
     };
     let _ = event_tx.send(LiveRdpEvent::Connected(target));
+    // vdi-vm-6: surface a trust-on-first-use certificate change (possible MITM)
+    // as a non-fatal banner — the connection is already up on the Nebula link.
+    if let Some(change) = conn.cert_pin_change() {
+        let _ = event_tx.send(LiveRdpEvent::CertWarning(change.operator_message()));
+    }
     if let Some(frame) = session.frame() {
         let _ = event_tx.send(LiveRdpEvent::Frame(frame));
     }
@@ -1577,6 +1586,10 @@ impl VdiState {
                 LiveRdpEvent::Frame(frame) => {
                     self.incoming = Some(frame);
                     got_frame = true;
+                }
+                LiveRdpEvent::CertWarning(message) => {
+                    // Non-fatal: keep the session live, just raise the banner.
+                    self.live_status = Some(message);
                 }
                 LiveRdpEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());

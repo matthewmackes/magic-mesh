@@ -49,18 +49,20 @@ pub mod config;
 pub mod connect;
 pub mod input;
 pub mod link;
+pub mod pin;
 pub mod pixel;
 pub mod session;
 pub mod tier;
 
 pub use config::{ConfigError, RdpConfig};
 #[cfg(feature = "live-connect")]
-pub use connect::{ConnectError, Negotiated, PumpOutcome, RdpConnection};
+pub use connect::{CertPinChange, ConnectError, Negotiated, PumpOutcome, RdpConnection};
 pub use input::{map_event, map_text, scancode_for, MouseButton, RdpInputEvent, Scancode};
 pub use link::{
     LadderConfig, LinkEstimate, LinkEstimator, LinkGrade, LinkThresholds, QualityLadder,
     QualityMode, QualityTier, TierApplication, TierChange,
 };
+pub use pin::{pin_action, pin_decision, Fingerprint, PinAction, PinOutcome, PinStore};
 pub use pixel::{Framebuffer, FramebufferError, PixelFormat};
 pub use session::RdpSession;
 pub use tier::RdpTierSettings;
