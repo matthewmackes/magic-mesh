@@ -14,6 +14,7 @@ pub mod ca;
 pub mod captive_portal_check;
 pub mod classify_host;
 pub mod connect;
+pub mod converge;
 pub mod cutover_audit;
 pub mod ddns;
 pub mod decommission;
