@@ -13,6 +13,11 @@ path = "src/main.rs"
 [dependencies]
 mde-role = { path = "../mde-role" }
 # E12-8: the shared egui harness (run_client + Style) replaces the Cosmic-era toolkit.
+# arch-4 / §6 layered-tiers: this crate is filed under crates/platform/ but is a
+# genuine GUI surface (the OW-1 onboarding chooser, an eframe::App with no headless
+# path), so this one platform→gui edge is a CURATED exception in
+# install-helpers/lint-layered-tiers.sh (is_excepted_edge). Any other platform /
+# substrate crate reaching mde-egui is still a gate failure.
 mde-egui = { path = "../../shared/mde-egui" }
 # Renders the single-source project DISCLAIMER / mission (embedded from the
 # repo-root DISCLAIMER.md), shared with the installer + daemon banner.
