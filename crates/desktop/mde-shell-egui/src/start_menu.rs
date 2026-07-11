@@ -132,6 +132,30 @@
 //! asked for), and never again for the SAME critical once the operator has
 //! acknowledged it. This module's own `close` already no-ops while closed,
 //! so no new guard was needed here.
+//!
+//! **SHELL-UX-3 update:** type-to-launch search. A real [`egui::TextEdit`]
+//! ([`search_field`]) sits at the bottom of the left pane (Win7's own
+//! search-box spot); it auto-focuses when the menu opens so "open, then just
+//! type" filters live. An empty query is the unchanged grouped grid (zero
+//! behaviour change); the moment anything is typed, [`search_matches`] ranks
+//! the 17 tileable surfaces (case-insensitive: a label prefix beats a label
+//! substring beats a group-name hit) and [`search_results`] paints that flat
+//! list in place of the grid — Up/Down move a highlight, Enter launches (the top
+//! match by default), a row click launches that row, Esc clears the query
+//! (a second, now-empty Esc dismisses the menu). Every launch routes through
+//! the SAME [`StartMenuState::tile_activation`] seam a tile click already uses,
+//! so `main.rs`'s existing drain carries a searched launch with NO new
+//! plumbing (this whole feature is self-contained to `start_menu.rs`). The
+//! box is a focused text field, so the embedded Console's own keyboard nav
+//! politely steps aside (`console::handle_keys` bails while a text field owns
+//! the keyboard) — one Enter never both launches a result and fires a Console
+//! row. The one wrinkle Esc introduces (egui blurs the focused box on Esc, so
+//! Console briefly sees the shared Esc and self-closes) is absorbed by a
+//! one-frame guard in [`start_menu_panel`], keeping a query-clear from
+//! collapsing the whole menu. Accesskit (lock #14): the box carries a
+//! `SearchInput` role + label + live value, each result row a `Button` node
+//! (the selected one flagged), and the result set exports ONE `Live::Polite`
+//! summary (count + highlight) — the tile-grid live-region shape restated.
 
 use std::time::Duration;
 
@@ -236,6 +260,28 @@ const PANEL_H: f32 = console::PANEL_H;
 /// build.
 #[cfg(test)]
 const TILE_GRID_CONTENT_H: f32 = 7.0 * (GROUP_HEADING_H + TILE_H) + 6.0 * GROUP_GAP;
+
+// ── type-to-launch search (SHELL-UX-3) ──────────────────────────────────────
+
+/// The search field's row height — a single [`Style::SP_L`] (24pt) line that
+/// tucks into the left pane's bottom headroom BELOW the 7-group tile grid
+/// without overlapping the last tile row (the grid content bottoms out ~8pt
+/// above this band; pinned by a test below rather than trusted by eye). Win7's
+/// Start Menu puts its search box at exactly this spot — the bottom of the
+/// left pane, under the app list.
+const SEARCH_H: f32 = Style::SP_L;
+
+/// One search-result row's height — a compact list row (leading icon · label ·
+/// dim group name), `SP_L + SP_XS` (28pt). Sized so all 17 tileable surfaces
+/// fit the results area at once even when a one-letter query matches every
+/// one (17 · 28 = 476pt, comfortably inside the ~532pt results band — pinned
+/// by a test below).
+const RESULT_ROW_H: f32 = Style::SP_L + Style::SP_XS;
+
+/// The search-result row's leading icon size — [`Style::SP_M`] (16px), smaller
+/// than a tile's 24px [`TILE_ICON`] glyph because a result row is a list line,
+/// not a tile face.
+const RESULT_ICON: f32 = Style::SP_M;
 
 // ── live-tile facts (WIN7-4, lock #5) ───────────────────────────────────────
 
@@ -466,6 +512,25 @@ pub struct StartMenuState {
     /// gates on its own "seen"/`Option` bit, so a not-yet-refreshed bundle
     /// renders every tile at its plain static label, never a fake rotation.
     tile_inputs: TileFactInputs,
+    /// SHELL-UX-3 — the live type-to-launch query. Empty = the normal grouped
+    /// tile grid (no behaviour change); non-empty = the left pane shows a
+    /// ranked flat list of the tiles whose label (or group name) matches
+    /// ([`search_matches`]). The bound buffer of the bottom-of-left-pane
+    /// [`egui::TextEdit`] ([`search_field`]). Cleared on close so reopening
+    /// the menu always starts fresh (the `console.rs` "close resets" posture).
+    search_query: String,
+    /// SHELL-UX-3 — which entry of the current [`search_matches`] list carries
+    /// the keyboard highlight (Up/Down move it, Enter launches it). An index
+    /// into the *filtered* list, always clamped to its length at use so a
+    /// shrinking result set can never point past the end; reset to the top
+    /// match (`0`) whenever the query text changes.
+    search_highlight: usize,
+    /// SHELL-UX-3 — a one-shot request to focus the search box on the next
+    /// render (the `explorer.rs`/`chooser.rs` `focus_pending` idiom): set when
+    /// the menu opens (so "open, then type" filters live) and when Esc clears
+    /// a live query (so the emptied box keeps the keyboard), consumed once by
+    /// [`search_field`]'s `request_focus`.
+    search_focus_pending: bool,
 }
 
 impl StartMenuState {
@@ -485,9 +550,25 @@ impl StartMenuState {
 
     /// Toggle the panel open/closed — the Start-cell click and the Super-tap
     /// hotkey path both drain into this (lock #13, "both, not either/or").
+    /// SHELL-UX-3: opening arms the search box's auto-focus (so "open, then
+    /// type" filters live); closing wipes any live query so the next open
+    /// starts on the full grid, not a stale filter.
     pub(crate) fn toggle(&mut self) {
         self.open = !self.open;
         self.just_toggled = true;
+        if self.open {
+            self.search_focus_pending = true;
+        } else {
+            self.clear_search();
+        }
+    }
+
+    /// SHELL-UX-3 — drop any live query + highlight (called on every close and
+    /// when Esc dismisses a live search); leaves `search_focus_pending`
+    /// untouched so an Esc-clear can re-arm the emptied box's focus separately.
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_highlight = 0;
     }
 
     /// Close the panel (Esc / click-away / an embedded Console action closing
@@ -505,6 +586,7 @@ impl StartMenuState {
         if self.open {
             self.open = false;
             self.just_toggled = true;
+            self.clear_search();
         }
     }
 
@@ -608,26 +690,34 @@ pub fn start_menu_panel(
             // announce, the same honest-silence posture `install_tiles_live_summary`
             // already uses.
             install_start_menu_state_announcement(ui.ctx(), rect, state.open);
-            if state.open && esc_pressed(ui) {
-                state.close();
-            }
-            // WIN7-3 — a tile click records its surface and closes the WHOLE
-            // panel at once (lock #23), the same "activation closes the
-            // menu" outcome the embedded Console pane's self-closure below
-            // already gives its own rows.
-            if let Some(surface) = left_pane(ui, left_rect, &state.tile_inputs) {
-                state.tile_activation = Some(surface);
-                state.close();
-            }
+            // SHELL-UX-3 — type-to-launch search. The box lives at the bottom
+            // of the left pane (Win7's own spot); the tile grid renders above
+            // it untouched when the query is empty, and a ranked flat result
+            // list replaces the grid the moment anything is typed. Returns
+            // whether the search consumed this frame's Esc (a live query's
+            // Esc clears the query, it must NOT be read as a menu dismissal —
+            // see the self-closure guard below).
+            let search_ate_escape = start_menu_search(ui, left_rect, state);
             console::console_content(ui, right_rect, console);
+            search_ate_escape
         });
+    let search_ate_escape = area.inner;
 
     // An embedded Console action fired for real this frame (a routed link, a
     // spawned tab, a power verb) and already called `ConsoleState::close`
     // (unchanged console.rs behaviour) — propagate that self-closure to the
     // WHOLE panel so launching anything still closes the menu, matching the
     // pre-WIN7-2 behaviour (the module doc's self-closure note).
-    if state.open && !console.is_open() {
+    //
+    // SHELL-UX-3 guard: when a live search swallowed this frame's Esc to clear
+    // its query, egui had already surrendered the focused search box (its
+    // default filter lets Esc blur it), so the embedded Console — inert only
+    // *while* a text field owns the keyboard — briefly saw that same Esc and
+    // self-closed. That is a one-frame artifact of the shared Esc, not a real
+    // Console dismissal: skip the propagation this frame and next frame's
+    // `console.set_open(state.open)` mirror restores it, so clearing a query
+    // keeps the whole menu up (a SECOND, now-empty Esc is what closes it).
+    if state.open && !console.is_open() && !search_ate_escape {
         state.close();
     }
 
@@ -1127,6 +1217,289 @@ fn esc_pressed(ui: &egui::Ui) -> bool {
     ui.input(|i| i.key_pressed(egui::Key::Escape))
 }
 
+// ── type-to-launch search (SHELL-UX-3) ──────────────────────────────────────
+
+/// Render the left pane's search affordance for this frame and drive its
+/// keyboard: the always-visible search box at the pane's bottom edge, plus —
+/// while a query is live — the ranked result list that REPLACES the grouped
+/// tile grid above it (the right/Console pane is never touched, keeping this
+/// whole feature self-contained to the left pane). Launches route through the
+/// SAME [`StartMenuState::tile_activation`] seam a tile click already uses
+/// (set the surface, close the menu), so `main.rs`'s existing drain carries a
+/// searched launch with zero new plumbing — a keyboard Enter and a mouse
+/// click on a tile end in the identical outcome.
+///
+/// Returns whether the search consumed this frame's Esc (query non-empty →
+/// Esc cleared it rather than dismissing the menu); the caller uses that to
+/// suppress the one-frame Console self-closure the shared Esc would otherwise
+/// propagate (see [`start_menu_panel`]'s guard).
+#[allow(clippy::suboptimal_flops)] // layout arithmetic reads clearer than mul_add (the left_pane idiom)
+fn start_menu_search(ui: &mut egui::Ui, left_rect: egui::Rect, state: &mut StartMenuState) -> bool {
+    // The search field sits in the left pane's bottom headroom; the grid /
+    // result list get everything above it.
+    let search_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            left_rect.left() + PANE_PAD,
+            left_rect.bottom() - PANE_PAD - SEARCH_H,
+        ),
+        egui::vec2((left_rect.width() - PANE_PAD * 2.0).max(0.0), SEARCH_H),
+    );
+    let content_rect = egui::Rect::from_min_max(
+        left_rect.min,
+        egui::pos2(left_rect.right(), search_rect.top() - Style::SP_XS),
+    );
+
+    let query_changed = search_field(
+        ui,
+        search_rect,
+        &mut state.search_query,
+        &mut state.search_focus_pending,
+    );
+    if query_changed {
+        // A fresh keystroke re-ranks the list — snap the highlight back to the
+        // new top match rather than leaving it pointing at a now-shifted row.
+        state.search_highlight = 0;
+    }
+    install_search_accessibility(ui.ctx(), search_rect, &state.search_query);
+
+    let query = state.search_query.trim().to_owned();
+    if query.is_empty() {
+        // Empty query — the unchanged full grouped grid (WIN7-3 behaviour, no
+        // change), and Esc dismisses the whole menu exactly as before.
+        if let Some(surface) = left_pane(ui, left_rect, &state.tile_inputs) {
+            state.tile_activation = Some(surface);
+            state.close();
+        }
+        if state.open && esc_pressed(ui) {
+            state.close();
+        }
+        return false;
+    }
+
+    // A live query — the ranked result list replaces the grid in this pane.
+    let matches = search_matches(&query);
+    let (up, down, enter, esc) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    // Move the highlight BEFORE rendering so the painted row and any Enter this
+    // frame agree on which match is selected (clamped — a shrinking list can
+    // never leave the highlight past the end).
+    if !matches.is_empty() {
+        let mut sel = state.search_highlight.min(matches.len() - 1);
+        if down {
+            sel = (sel + 1).min(matches.len() - 1);
+        }
+        if up {
+            sel = sel.saturating_sub(1);
+        }
+        state.search_highlight = sel;
+    }
+    install_search_results_announcement(
+        ui.ctx(),
+        content_rect,
+        &query,
+        &matches,
+        state.search_highlight,
+    );
+    let clicked = search_results(ui, content_rect, &matches, state.search_highlight);
+
+    // Enter launches the highlighted match (the top match by default); a click
+    // on any row launches that one — both via the tile_activation seam.
+    let launch = clicked.or_else(|| {
+        (enter && !matches.is_empty())
+            .then(|| matches[state.search_highlight.min(matches.len() - 1)])
+    });
+    if let Some(surface) = launch {
+        state.tile_activation = Some(surface);
+        state.close();
+        return false;
+    }
+    if esc {
+        // Esc over a live query clears it (and re-arms the emptied box's focus
+        // so typing continues), never closing the menu — a second, now-empty
+        // Esc is what dismisses it. Report it so the caller suppresses the
+        // Console self-closure the shared Esc briefly triggered.
+        state.clear_search();
+        state.search_focus_pending = true;
+        return true;
+    }
+    false
+}
+
+/// The type-to-launch search field (SHELL-UX-3), placed at the bottom of the
+/// left pane via `ui.put` (the `chooser.rs`/`explorer.rs` `TextEdit` +
+/// `focus_pending` idiom). `return_key(None)` deliberately stops Enter from
+/// surrendering the box's focus: this module handles Enter itself to launch
+/// the highlight, and keeping the box focused keeps the embedded Console's own
+/// Enter/arrow nav inert (its `handle_keys` bails while a text field owns the
+/// keyboard), so one Enter never both launches a result AND fires a Console
+/// row. Auto-focuses on the frame `focus_pending` is armed (menu open / query
+/// cleared) so "open, then just type" works. Returns whether the query text
+/// changed this frame (the caller resets the highlight to the top match).
+fn search_field(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    query: &mut String,
+    focus_pending: &mut bool,
+) -> bool {
+    let resp = ui.put(
+        rect,
+        egui::TextEdit::singleline(query)
+            .hint_text("Search apps…")
+            .font(egui::FontId::proportional(Style::BODY))
+            .desired_width(rect.width())
+            .return_key(None),
+    );
+    if *focus_pending {
+        resp.request_focus();
+        *focus_pending = false;
+    }
+    resp.changed()
+}
+
+/// Rank the 17 tileable [`Surface::ALL`] entries against `query`
+/// (case-insensitive), best match first: a label *prefix* hit (rank 0)
+/// outranks a label *substring* hit (rank 1), which outranks a hit on the
+/// surface's *group name* only (rank 2 — so typing a category like "media"
+/// still surfaces its members); ties keep [`Surface::ALL`] order, so the
+/// ranking is stable and predictable, never RNG. A surface that matches
+/// nowhere is dropped; an empty/whitespace query yields no matches (the caller
+/// then shows the full grouped grid instead). Pure over the static surface
+/// tables — unit-tested without a GPU, and the ONE authority the render +
+/// keyboard both read so the painted list and Enter's target can't diverge.
+fn search_matches(query: &str) -> Vec<Surface> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(u8, usize, Surface)> = Vec::new();
+    for (idx, surface) in Surface::ALL.iter().copied().enumerate() {
+        let label = surface.label().to_lowercase();
+        let rank = if label.starts_with(&q) {
+            0
+        } else if label.contains(&q) {
+            1
+        } else if tile_group_label(surface).to_lowercase().contains(&q) {
+            2
+        } else {
+            continue;
+        };
+        scored.push((rank, idx, surface));
+    }
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, s)| s).collect()
+}
+
+/// Which [`TILE_GROUPS`] group a surface sits in (its label). Every
+/// [`Surface::ALL`] entry sits in exactly one group (the compile-time guard
+/// above), so the lookup always resolves for a searchable surface; the
+/// never-searched `Timers` (outside `ALL`) would fall to `""`.
+fn tile_group_label(surface: Surface) -> &'static str {
+    TILE_GROUPS
+        .iter()
+        .find(|g| g.surfaces.contains(&surface))
+        .map_or("", |g| g.label)
+}
+
+/// The ranked result list that replaces the grouped grid while a query is live
+/// (SHELL-UX-3): one compact row per match — leading glyph, the surface label,
+/// and its dim group name right-aligned — with the keyboard-highlighted row
+/// (and any hover) wearing the SAME `SURFACE_HI` fill the tiles use, plus an
+/// accent left stripe on the highlight so the Enter target reads at a glance.
+/// A click on a row returns its surface for the caller to launch (via the
+/// `tile_activation` seam), matching the tile grid's own click contract. An
+/// empty result set paints an honest "no match" note (§7 — never a silent
+/// blank). Direct-painter + `ui.interact` per row, the SAME addressable-cell
+/// style [`tile`] uses (so a test can read a row's rect back by id and click
+/// its centre).
+#[allow(clippy::suboptimal_flops)] // layout arithmetic reads clearer than mul_add (the tile() idiom)
+fn search_results(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    matches: &[Surface],
+    selected: usize,
+) -> Option<Surface> {
+    let painter = ui.painter().clone();
+    if matches.is_empty() {
+        painter.text(
+            egui::pos2(rect.left() + PANE_PAD, rect.top() + PANE_PAD),
+            egui::Align2::LEFT_TOP,
+            "No apps match your search",
+            egui::FontId::proportional(Style::BODY),
+            Style::TEXT_DIM,
+        );
+        return None;
+    }
+    let mut activated = None;
+    let x0 = rect.left() + PANE_PAD;
+    let w = (rect.width() - PANE_PAD * 2.0).max(0.0);
+    let mut y = rect.top() + PANE_PAD;
+    for (i, &surface) in matches.iter().enumerate() {
+        let row = egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(w, RESULT_ROW_H));
+        let resp = ui.interact(row, search_result_id(surface), egui::Sense::click());
+        let is_sel = i == selected;
+        let hovered = resp.hovered();
+        if is_sel || hovered {
+            painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
+        }
+        if is_sel {
+            painter.rect_filled(
+                egui::Rect::from_min_size(row.min, egui::vec2(Style::SP_XS / 2.0, row.height())),
+                0.0,
+                Style::ACCENT,
+            );
+        }
+        let tint = if is_sel || hovered {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        };
+        if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), RESULT_ICON, tint) {
+            let icon = egui::Rect::from_center_size(
+                egui::pos2(row.left() + Style::SP_S + RESULT_ICON / 2.0, row.center().y),
+                egui::vec2(RESULT_ICON, RESULT_ICON),
+            );
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+        }
+        painter.with_clip_rect(row).text(
+            egui::pos2(
+                row.left() + Style::SP_S + RESULT_ICON + Style::SP_S,
+                row.center().y,
+            ),
+            egui::Align2::LEFT_CENTER,
+            surface.label(),
+            egui::FontId::proportional(Style::BODY),
+            tint,
+        );
+        painter.text(
+            egui::pos2(row.right() - Style::SP_S, row.center().y),
+            egui::Align2::RIGHT_CENTER,
+            tile_group_label(surface),
+            egui::FontId::proportional(Style::SMALL),
+            Style::TEXT_DIM,
+        );
+        install_result_accessibility(ui.ctx(), surface, row, is_sel);
+        if response_activated(ui, &resp) {
+            activated = Some(surface);
+        }
+        y += RESULT_ROW_H;
+    }
+    activated
+}
+
+/// The stable id of one search-result row's interactive rect (the `tile_id`
+/// addressable-cell idiom, restated for the result list so tests can read a
+/// row's settled `Rect` back to click its centre).
+fn search_result_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("start-menu-search-result", surface))
+}
+
 // ── accesskit (lock #14) ─────────────────────────────────────────────────────
 
 /// Convert an egui rect to an accesskit one (the `status.rs` helper, restated
@@ -1313,6 +1686,101 @@ fn install_tiles_live_summary(
         node.set_live(egui::accesskit::Live::Polite);
         node.set_label("Start Menu live tiles");
         node.set_value(summary);
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
+// ── accesskit: search (SHELL-UX-3, lock #14) ────────────────────────────────
+
+/// The stable accesskit node id for the search box (distinct from egui's own
+/// auto-generated node for the `TextEdit` widget — this one carries the
+/// explicit `SearchInput` role + label + current value the shell contract
+/// wants, mirroring how `install_start_menu_state_announcement` layers an
+/// explicit node beside the widget tree).
+fn search_field_accesskit_id() -> egui::Id {
+    egui::Id::new("start-menu-search-accesskit")
+}
+
+/// Install the search box's own accesskit node (lock #14): a `SearchInput`
+/// role with a fixed label and the live query as its value — the SAME
+/// "label = identity, value = current reading" split the tile / segment nodes
+/// use, so a screen reader announces what the field is AND what has been typed
+/// into it. Emitted every frame the panel is up, so the value tracks live
+/// keystrokes.
+fn install_search_accessibility(ctx: &egui::Context, rect: egui::Rect, query: &str) {
+    let _ = ctx.accesskit_node_builder(search_field_accesskit_id(), |node| {
+        node.set_role(egui::accesskit::Role::SearchInput);
+        node.set_label("Start Menu search");
+        node.set_value(query);
+        node.set_bounds(accesskit_rect(rect));
+    });
+}
+
+/// The stable accesskit node id for one search-result row.
+fn search_result_accesskit_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("start-menu-search-result-accesskit", surface))
+}
+
+/// Install one result row's accesskit node (lock #14): a `Button` role +
+/// label + bounds + `Click` action (the per-tile shape), plus `set_selected`
+/// on the keyboard-highlighted row so an AT can report which match Enter would
+/// launch. The list's aggregate live announcement is
+/// [`install_search_results_announcement`] (the NOTIF-11 one-live-summary
+/// shape), not per-row `Live::Polite` — the same anti-spam posture the tile
+/// grid already uses.
+fn install_result_accessibility(
+    ctx: &egui::Context,
+    surface: Surface,
+    rect: egui::Rect,
+    selected: bool,
+) {
+    let _ = ctx.accesskit_node_builder(search_result_accesskit_id(surface), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(surface.label());
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+        if selected {
+            node.set_selected(true);
+        }
+    });
+}
+
+/// The stable id of the search results' one aggregate live region.
+fn search_results_region_id() -> egui::Id {
+    egui::Id::new("start-menu-search-results-region")
+}
+
+/// Announce the live-filtered result state (lock #14 — "the filtered-result
+/// state should be announceable"): a single `Live::Polite` summary carrying
+/// the match count and the currently-highlighted item, or an honest "no
+/// match" when nothing matches — the NOTIF-11 / [`install_tiles_live_summary`]
+/// one-live-summary-node shape, so the whole result set announces as one
+/// polite update on each keystroke rather than a storm of per-row nodes.
+/// Emitted only while a query is live (the caller only reaches this on the
+/// non-empty branch).
+fn install_search_results_announcement(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    query: &str,
+    matches: &[Surface],
+    selected: usize,
+) {
+    let value = if matches.is_empty() {
+        format!("No apps match {query}")
+    } else {
+        let sel = matches[selected.min(matches.len() - 1)];
+        format!(
+            "{} result{}, {} highlighted",
+            matches.len(),
+            plural_suffix(matches.len()),
+            sel.label()
+        )
+    };
+    let _ = ctx.accesskit_node_builder(search_results_region_id(), |node| {
+        node.set_role(egui::accesskit::Role::Status);
+        node.set_live(egui::accesskit::Live::Polite);
+        node.set_label("Start Menu search results");
+        node.set_value(value);
         node.set_bounds(accesskit_rect(rect));
     });
 }
@@ -2310,6 +2778,301 @@ mod tests {
                 .iter()
                 .any(|(_, n)| n.label() == Some("Start Menu status")),
             "nothing to announce once fully closed and settled"
+        );
+    }
+
+    // ── SHELL-UX-3: type-to-launch search ────────────────────────────────────
+
+    /// Feed typed text to the focused search box (the `Event::Text` a real key
+    /// press turns into once a text field owns the keyboard).
+    fn text(s: &str) -> egui::Event {
+        egui::Event::Text(s.to_string())
+    }
+
+    #[test]
+    fn a_query_filters_to_the_tiles_whose_label_matches() {
+        // The pure ranking authority both the render and Enter read (so the
+        // painted list and Enter's target can never diverge). Case-insensitive
+        // substring over Surface::label().
+        use Surface::{Phones, Terminal, Workbench};
+        assert_eq!(super::search_matches("phone"), vec![Phones]);
+        assert_eq!(super::search_matches("term"), vec![Terminal]);
+        assert_eq!(super::search_matches("workbench"), vec![Workbench]);
+        assert_eq!(
+            super::search_matches("PHONES"),
+            vec![Phones],
+            "matching is case-insensitive"
+        );
+        assert!(
+            super::search_matches("zzzz").is_empty(),
+            "a query that matches nothing yields no matches (an honest no-match, \
+             not a silent full grid)"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_query_matches_nothing_so_the_full_grid_shows() {
+        // Empty query == no search == the caller renders the unchanged grouped
+        // grid (no behaviour change when not searching).
+        assert!(super::search_matches("").is_empty());
+        assert!(super::search_matches("   ").is_empty());
+    }
+
+    #[test]
+    fn search_ranks_prefix_over_substring_over_group_name() {
+        use Surface::{InfraCode, MeshView, Music, Workbench};
+        // "mesh": a label PREFIX ("Mesh Map") outranks a GROUP-name-only hit
+        // ("Mesh Control" → Workbench/InfraCode); ties keep Surface::ALL order.
+        assert_eq!(
+            super::search_matches("mesh"),
+            vec![MeshView, Workbench, InfraCode],
+            "the label-prefix hit leads, then the group-only hits in ALL order"
+        );
+        // "i": the sole label-PREFIX ("Infra as Code") ranks above every
+        // label-SUBSTRING hit (Music/Media/Files/…), never buried among them.
+        let by_i = super::search_matches("i");
+        assert_eq!(by_i.first(), Some(&InfraCode), "the prefix match leads");
+        assert!(
+            by_i.len() > 1 && by_i.contains(&Music),
+            "substring matches are still included, just ranked below the prefix"
+        );
+    }
+
+    #[test]
+    fn the_search_field_tucks_below_the_tile_grid_without_overlap() {
+        // Constant-geometry assertion (the WIN7-2 `PANEL_H`/`PANEL_W`
+        // precedent, no GPU): the 7-group grid must bottom out strictly above
+        // the search band, and all 17 result rows must fit the results area at
+        // once (worst case — a one-letter query matching every surface).
+        let grid_bottom = super::PANE_PAD + super::TILE_GRID_CONTENT_H;
+        let search_top = PANEL_H - super::PANE_PAD - super::SEARCH_H;
+        assert!(
+            grid_bottom <= search_top,
+            "the tile grid ({grid_bottom}) must end above the search band ({search_top})"
+        );
+        let results_rows_h = search_top - Style::SP_XS - super::PANE_PAD;
+        assert!(
+            17.0 * super::RESULT_ROW_H <= results_rows_h,
+            "all 17 result rows must fit the results band"
+        );
+    }
+
+    #[test]
+    fn typing_then_enter_launches_the_top_match_via_tile_activation() {
+        // The end-to-end "open, then just type, then Enter" path: the box
+        // auto-focuses on open, typed text filters live, and Enter launches the
+        // top match through the SAME tile_activation seam a click uses — with
+        // NO main.rs change (main.rs already drains that seam).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2); // open + the search box auto-focuses
+        drive(&ctx, &mut s, &mut console, vec![text("phones")], SZ);
+        assert_eq!(
+            s.search_query, "phones",
+            "typing lands in the auto-focused box (no click into it)"
+        );
+        drive(&ctx, &mut s, &mut console, vec![key(egui::Key::Enter)], SZ);
+        assert_eq!(
+            s.take_tile_activation(),
+            Some(Surface::Phones),
+            "Enter launches the top match via the tile_activation seam"
+        );
+        assert!(!s.is_open(), "launching from search closes the whole menu");
+        assert!(
+            console.take_request().is_none(),
+            "the focused search box kept the embedded Console's own Enter nav inert \
+             (one Enter never both launches a result AND fires a Console row)"
+        );
+    }
+
+    #[test]
+    fn up_and_down_move_the_search_highlight_clamped_to_the_result_list() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2); // open + auto-focus the box
+        s.search_query = "m".to_string(); // a query with many matches
+        run(&ctx, &mut s, &mut console, 1); // settle the focused box's arrow filter
+        assert!(
+            super::search_matches("m").len() >= 3,
+            "the fixture query needs >=3 matches to exercise the highlight"
+        );
+        assert_eq!(
+            s.search_highlight, 0,
+            "the highlight starts on the top match"
+        );
+        drive(
+            &ctx,
+            &mut s,
+            &mut console,
+            vec![key(egui::Key::ArrowDown)],
+            SZ,
+        );
+        assert_eq!(s.search_highlight, 1, "Down advances the highlight");
+        drive(
+            &ctx,
+            &mut s,
+            &mut console,
+            vec![key(egui::Key::ArrowDown)],
+            SZ,
+        );
+        assert_eq!(s.search_highlight, 2);
+        drive(
+            &ctx,
+            &mut s,
+            &mut console,
+            vec![key(egui::Key::ArrowUp)],
+            SZ,
+        );
+        assert_eq!(s.search_highlight, 1, "Up moves back toward the top");
+        drive(
+            &ctx,
+            &mut s,
+            &mut console,
+            vec![key(egui::Key::ArrowUp)],
+            SZ,
+        );
+        drive(
+            &ctx,
+            &mut s,
+            &mut console,
+            vec![key(egui::Key::ArrowUp)],
+            SZ,
+        );
+        assert_eq!(
+            s.search_highlight, 0,
+            "Up clamps at the top, never negative"
+        );
+    }
+
+    #[test]
+    fn clicking_a_search_result_launches_it_via_tile_activation() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        s.search_query = "phone".to_string();
+        run(&ctx, &mut s, &mut console, 1); // register the result rows
+        let rect = ctx
+            .read_response(super::search_result_id(Surface::Phones))
+            .expect("the Phones result row is registered while searching")
+            .rect;
+        click(&ctx, &mut s, &mut console, rect.center(), SZ);
+        assert_eq!(
+            s.take_tile_activation(),
+            Some(Surface::Phones),
+            "clicking a result launches it through the tile_activation seam"
+        );
+        assert!(
+            !s.is_open(),
+            "launching from a result closes the whole menu"
+        );
+    }
+
+    #[test]
+    fn esc_clears_a_live_query_first_then_a_second_esc_closes_the_menu() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        s.search_query = "phone".to_string();
+        run(&ctx, &mut s, &mut console, 1);
+        assert!(s.is_open() && !s.search_query.is_empty());
+        // First Esc clears the query; the menu (and its embedded Console) stay
+        // up — the shared-Esc Console self-closure is absorbed by the guard.
+        drive(&ctx, &mut s, &mut console, vec![key(egui::Key::Escape)], SZ);
+        assert!(s.search_query.is_empty(), "Esc clears a live query");
+        assert!(
+            s.is_open(),
+            "clearing a live query does NOT dismiss the menu"
+        );
+        // Re-focus settles, then a second (now-empty) Esc dismisses the menu.
+        run(&ctx, &mut s, &mut console, 1);
+        drive(&ctx, &mut s, &mut console, vec![key(egui::Key::Escape)], SZ);
+        assert!(
+            !s.is_open(),
+            "a second, empty-query Esc closes the whole menu"
+        );
+    }
+
+    #[test]
+    fn opening_the_menu_shows_the_full_grid_and_no_result_list() {
+        // Empty-query invariant on the REAL render: with nothing typed, every
+        // one of the 17 tiles is registered (the grouped grid), and NO search
+        // result row exists — the grid is untouched when not searching.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        for surface in Surface::ALL {
+            assert!(
+                ctx.read_response(super::tile_id(surface)).is_some(),
+                "{surface:?} tile renders on the empty-query grid"
+            );
+            assert!(
+                ctx.read_response(super::search_result_id(surface))
+                    .is_none(),
+                "{surface:?} exports no result row while the query is empty"
+            );
+        }
+    }
+
+    #[test]
+    fn the_search_box_exports_a_searchinput_role_and_label_for_accesskit() {
+        // Lock #14 — the search box carries a proper role + label (the file's
+        // label-keyed-lookup test idiom).
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        let search = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Start Menu search"))
+            .expect("the search box exports an accesskit node");
+        assert_eq!(search.role(), egui::accesskit::Role::SearchInput);
+    }
+
+    #[test]
+    fn the_result_list_exports_one_live_polite_summary_of_the_filtered_state() {
+        // Lock #14 — the filtered-result state is announceable: ONE live-polite
+        // summary (count + highlight), the NOTIF-11 / tile-grid live-region
+        // shape restated for the result set.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        s.search_query = "phone".to_string();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        let region = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Start Menu search results"))
+            .expect("a live region summarizes the filtered results");
+        assert_eq!(region.role(), egui::accesskit::Role::Status);
+        assert_eq!(region.live(), Some(egui::accesskit::Live::Polite));
+        let value = region.value().expect("summary value");
+        assert!(
+            value.contains("Phones"),
+            "the summary names the highlighted match: {value}"
         );
     }
 }
