@@ -63,7 +63,7 @@ use mde_egui::egui::{
     self, pos2, vec2, Align2, Color32, Event, EventFilter, FontId, Key, Modifiers, Pos2, Rect,
     Response, ScrollArea, Sense, Stroke, Ui,
 };
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 
 use crate::buffer::Buffer;
 use crate::fold::Folds;
@@ -80,10 +80,6 @@ const TAB_SPACES: usize = 4;
 /// crisp beam at any DPI without hard-coding a pixel (§4 — token-derived, never a
 /// raw metric).
 const CARET_W: f32 = Style::SP_XS / 2.0;
-
-/// Half-second caret blink phase (the classic editor cadence). Time-derived from
-/// the egui frame clock, so it needs no wall-clock and stays test-free.
-const BLINK_HZ: f64 = 2.0;
 
 /// The default zoom (EDTB-1): 100% renders the editor at the shared
 /// [`Style::BODY`] size, exactly the pre-zoom EDITOR-3 metrics.
@@ -2573,7 +2569,9 @@ fn paint_carets(
     resp: &Response,
 ) {
     let focused = resp.has_focus();
-    let on = focused && blink_on(ui.input(|i| i.time));
+    // Blink the caret on the shared blink cadence (`Motion::BLINK`) rather than a
+    // local literal (§4) — the pure square-wave phase, not the alarm helper.
+    let on = focused && Motion::blink_at(ui.input(|i| i.time), Motion::BLINK);
     for c in &view.carets {
         let (vr, xcol) = view.caret_cell_at(buffer, c.cursor, wrap_cols);
         #[allow(clippy::cast_precision_loss)]
@@ -2595,16 +2593,11 @@ fn paint_carets(
         }
     }
     if focused {
-        // Keep frames coming so the caret actually blinks while idle.
-        ui.ctx().request_repaint_after(Duration::from_secs_f64(0.5));
+        // Keep frames coming so the caret actually blinks while idle, on the
+        // shared blink cadence (§4 — token-derived, never a raw duration).
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs_f32(Motion::BLINK));
     }
-}
-
-/// The caret-blink phase for frame time `time` (seconds): on for the first half
-/// of each blink period, off for the second.
-#[allow(clippy::cast_possible_truncation)]
-fn blink_on(time: f64) -> bool {
-    (time * BLINK_HZ).floor() as i64 % 2 == 0
 }
 
 /// The gutter width for a buffer of `lines` lines: enough glyphs for the widest
