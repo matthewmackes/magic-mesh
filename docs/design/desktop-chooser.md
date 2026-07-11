@@ -5,7 +5,7 @@ RDP are discovered, they must be presented via a Chooser." Locked via a 15-quest
 survey.*
 
 A shell surface that aggregates **every** discovered desktop source — remote mesh-peer
-desktops, local KVM/cloud-hypervisor VM consoles, and RDP/VNC/Spice endpoints — into
+desktops, local KVM (libvirt/QEMU-KVM) VM consoles, and RDP/VNC/Spice endpoints — into
 one live card grid and lets the operator pick + connect. It composes with the BRAND-1
 empty-desktop backdrop (cards float over the centered logo) and drives the existing
 VDI attach path (`vdi.rs` `ConnectRequest`/`Session`, `mde-vdi-rdp`/`-vnc` + a new
@@ -19,7 +19,7 @@ VDI attach path (`vdi.rs` `ConnectRequest`/`Session`, `mde-vdi-rdp`/`-vnc` + a n
 | 2 | Layout | **Grid of live-thumbnail cards** — name, node, protocol badge, status pip, click-to-connect. |
 | 3 | Grouping | **One unified view, grouped by node/host**, protocol as a per-card badge. |
 | 4 | Spice | **New `mde-vdi-spice` crate** (Spice→egui), matching `mde-vdi-rdp`/`-vnc`. |
-| 5 | Discovery | **All** — mesh registry (peers advertise desktops) + mDNS (LAN RDP/VNC/Spice) + local KVM enumeration (libvirt/cloud-hypervisor) + manual host:port add. |
+| 5 | Discovery | **All** — mesh registry (peers advertise desktops) + mDNS (LAN RDP/VNC/Spice) + local KVM enumeration (libvirt/QEMU-KVM) + manual host:port add. |
 | 6 | Protocol | **Always ask which protocol** when a source offers several. |
 | 7 | Thumbnails | **Periodic preview thumbnails** (peer-published / local-VM framebuffer snapshot / cheap probe) with a graceful protocol/OS-icon fallback. |
 | 8 | Auth | **Mesh-identity SSO for peers** + **saved creds sealed in the secret store** (reuse FILEMGR-6 sealing) for external RDP/VNC/Spice. |

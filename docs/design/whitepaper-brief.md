@@ -69,7 +69,7 @@ Below the stack, add a tagline: **"No fixed center: every node is author + enfor
 | Role | Adds | Typical host |
 |---|---|---|
 | **Lighthouse** | Nebula relay + CA authority + leader election + health/scan/observability control plane | Cloud VPS (headless) |
-| **Workstation** | Everything above + egui DRM-native desktop + all GUIs + cloud-hypervisor/Podman VM host | Daily-driver laptop or server |
+| **Workstation** | Everything above + egui DRM-native desktop + all GUIs + libvirt/QEMU-KVM/Podman VM+container host (OpenStack-orchestrated) | Daily-driver laptop or server |
 
 Key fact: **One signed RPM serves both roles.** A headless machine is a Workstation without a local display (full daemon stack, no egui seat — serves VMs/containers to the mesh). Role = a config flag, not a build — a box is re-roleable without reinstall.
 
@@ -90,7 +90,7 @@ Key fact: **One signed RPM serves both roles.** A headless machine is a Workstat
 - Music: Airsonic/Subsonic client + daemon (FLAC/MP3/Vorbis/AAC/Opus, MPRIS, internet radio)
 - Device sync: native KDE Connect host (pair, ring, clipboard, SMS, notifications) — RSA-4096, AES-256-GCM sessions
 - Remote access: unified SSH + RDP + VNC status/launcher per peer
-- Compute: Podman + cloud-hypervisor provisioning, VM image catalog + wizard
+- Compute: Podman + libvirt/QEMU-KVM via OpenStack (Nova), Glance image catalog + Cloud-plane wizard
 - Name discovery: `.mesh` DNS domain, cross-segment mDNS relay, peer service directory
 
 **SECURITY** (icon: shield/lock)
@@ -128,7 +128,7 @@ Runs their own infra across a handful of machines (laptop, NAS, cloud VPS). Want
 A family office, research lab, or boutique firm that needs shared files, voice calling, device pairing, and remote access across physical sites — without standing up Active Directory, a VPN concentrator, or a fleet-management SaaS. Any peer can administer; there is no root account to compromise. The trust model is explicit: flat trust among peers who already know each other.
 
 **The VDI / Thin-Client Operator**
-Runs VM desktops brokered through the mesh: cloud-hypervisor guests with virtio-gpu zero-copy into the egui shell, or remote RDP (ironrdp, primary) / VNC (fallback) desktops over Nebula. The host runs no native apps — browser, office, and games live inside VM guests. Sessions roam per-peer (etcd/Syncthing state). Ships as an immutable bootc image. USB passthrough, multi-monitor, and live migration in scope.
+Runs VM desktops brokered through the mesh: libvirt/QEMU-KVM guests placed by OpenStack Nova, reached via SPICE into the egui shell, or remote RDP (ironrdp, primary) / VNC (fallback) desktops over Nebula. The host runs no native apps — browser, office, and games live inside VM guests. Sessions roam per-peer (etcd/Syncthing state). Ships as an immutable bootc image. USB passthrough and multi-monitor in scope.
 
 ---
 

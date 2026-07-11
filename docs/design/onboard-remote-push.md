@@ -15,7 +15,7 @@ there is no way to *reach a target node and apply a bounded set of actions to it
 | Verb | `LiveX` seam | What it must push to the target |
 |---|---|---|
 | **OW-7** `spawn-lighthouse` | `LiveProvisioner::{push_enroll, migrate_ca}` | run `enroll` on a fresh box; move/cross-sign the CA |
-| **OW-8** `first-desktop` | `LiveFirstDesktop` | open a broker session on a VM host (cloud-hypervisor api-socket + Bus) |
+| **OW-8** `first-desktop` | `LiveFirstDesktop` | open a broker session via Nova cloud placement (`LiveNovaPlacement`) + Bus |
 | **OW-11** `service-add music` | `LiveServiceApply::provision_music` | pin the **Media role** + seal the `media-spaces` secret on a lighthouse (then its `navidrome_supervisor`/`media_registry` do the rest — [[worklist E12-POLISH]] proven live on LH1+LH2) |
 
 So OW-15 is **one shared executor**: `reach(target) → apply([RoleP­in | SecretSeal |

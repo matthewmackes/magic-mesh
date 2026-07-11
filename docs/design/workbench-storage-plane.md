@@ -6,6 +6,13 @@
 > citizens** beside physical block devices, staged through an authentic
 > pending-operations queue and executed by a privileged `mackesd` worker —
 > locally and, with full parity, on any mesh peer.
+>
+> **Correction 2026-07-10:** QC-15 deleted `mde-kvm`/cloud-hypervisor outright.
+> Lock 10 and the Architecture section below originally described virtual-disk
+> ops as reusing `mde-kvm`'s `VmSpec`/live-attach broker — the shipped
+> `workers/virtual_storage.rs` instead manages QEMU images at rest via
+> `qemu-img` only, with in-use walls now sourced from libvirt. Corrected inline
+> below; the lifecycle/UX decisions themselves are unaffected.
 
 ## The locks
 
@@ -20,7 +27,7 @@
 | 7 | Protection | **Hard typed refusals** (not confirms) for: the node's **root/boot/EFI** chain (the bootc host disk), the **/mnt/mesh-storage backing device**, and devices/images **backing running VMs or containers**. Shown as locked rows with the reason + a deep-link to the freeing action (VM shutdown in Instances, etc.). |
 | 8 | Apply gate | **Typed arming on every Apply**, destructive or not: the operator types the target device name (remote: peer + device) to arm. |
 | 9 | Mesh reach | **Full remote parity**: stage a queue against any peer's disks; the verbs run on THAT node's storage worker, and **the hard walls live in the executor**, not the UI. |
-| 10 | Virtual depth | **Full lifecycle.** KVM images (`~/Local`, raw/qcow2): create, resize, **snapshot/revert/delete-snapshot**, convert raw⇄qcow2, clone-from-golden, attach/detach to a `VmSpec` (reusing `mde-kvm` types — §6 glue, no parallel model). Podman: volume create/inspect/**prune**, image-store + per-container usage views. |
+| 10 | Virtual depth | **Full lifecycle.** KVM images (`~/Local`, raw/qcow2): create, resize, **snapshot/revert/delete-snapshot**, convert raw⇄qcow2, clone-from-golden — via `qemu-img`, images at rest (QC-15 retired the `mde-kvm`/cloud-hypervisor live-attach broker; in-use walls now source from libvirt, §6 glue, no parallel model). Podman: volume create/inspect/**prune**, image-store + per-container usage views. |
 
 ## Architecture
 
@@ -32,8 +39,8 @@ mde-shell-egui (Workbench)                 mackesd
 │  ├ segment bar + table        │─────────▶│  · op queue executor (staged →  │
 │  ├ pending-ops queue          │   Bus    │    Apply → per-op progress)     │
 │  ├ Apply (typed arming)       │◀─────────│  · hard-wall interlocks         │
-│  └ virtual disks: KVM images  │  state/  │  · KVM image ops (qemu-img,     │
-│    + podman volumes/usage     │  progress│    mde-kvm types) + podman API  │
+│  └ virtual disks: KVM images  │  state/  │  · KVM image ops (qemu-img) +   │
+│    + podman volumes/usage     │  progress│    podman API                   │
 └───────────────────────────────┘          │  · state/storage/<node> mirror  │
                                            │  · action/storage/<node> verbs  │
                                            └─────────────────────────────────┘
@@ -48,9 +55,9 @@ mde-shell-egui (Workbench)                 mackesd
   partition-shrink (ordered, each a progress step); grow is the reverse. Move is
   UDisks2/parted-mediated with an explicit "this rewrites data, slow" flag.
 - **Virtual ops reuse the owners**: KVM image ops call `qemu-img`-class tooling
-  through a typed runner and reuse `mde-kvm`'s `VmSpec`/`running_disk_path`
-  (attach/detach = spec edit through the existing broker); Podman ops go through
-  the podman socket API. The in-use walls query the CH broker (running VM) and
+  through a typed runner, managing images at rest (QC-15 retired the old
+  `mde-kvm`/cloud-hypervisor live-attach broker); Podman ops go through the
+  podman socket API. The in-use walls query **libvirt** (running VM) and
   podman (mounted volume) — the same sources the Instances panel uses (§6).
 - **§2/§6/§9 compliance**: UDisks2 is FDO D-Bus (allowed interop); the plane is
   desktop-shell, the worker platform-services, nothing in mesh-substrate grows a
@@ -82,9 +89,10 @@ mde-shell-egui (Workbench)                 mackesd
   through the same verbs. *(Serializes on E12-15's shell wiring; owns
   workbench.rs nav for this wave.)*
 - **E12-22 — virtual disks first-class.** The KVM image lifecycle (create/
-  resize/snapshot/revert/convert/clone/attach-detach via mde-kvm types) +
-  Podman storage (volumes, prune, usage) staged in the same queue, walled by
-  the same in-use checks.
+  resize/snapshot/revert/convert/clone, at rest via `qemu-img`; QC-15 retired
+  the `mde-kvm`/cloud-hypervisor attach-detach broker) + Podman storage
+  (volumes, prune, usage) staged in the same queue, walled by the same
+  in-use checks (now libvirt-sourced).
 - **E12-23 — filesystem depth + packaging.** The full fs set incl. btrfs
   subvolumes, LUKS flows, shrink/move choreography per fs; udisks2 + e2fsprogs/
   xfsprogs/btrfs-progs/exfatprogs/ntfs-3g/cryptsetup/qemu-img into the RPM
@@ -107,7 +115,7 @@ E12-20 (22 = kvm/podman lane, 23 = fs depth + packaging).
    render locked with reasons; the VM row's deep-link lands in Instances, and
    after shutdown the image unlocks.
 4. A qcow2 image: snapshot → risky change → revert works from the plane; a raw
-   golden clones to `~/Local` and attaches to a VmSpec that then boots.
+   golden clones to `~/Local` and attaches to a libvirt domain that then boots.
 5. Podman: a staged volume-prune shows exactly what dies before arming; usage
    views match `podman system df`.
 6. From node A, a staged queue against node B's USB disk applies (typed arming
@@ -118,8 +126,8 @@ E12-20 (22 = kvm/podman lane, 23 = fs depth + packaging).
 
 - **Risks**: shrink/move data-loss edges (mitigated: fs-check first, staged
   choreography, typed arming); UDisks2 coverage gaps for exotic ops (fall back
-  to typed tool-runners, never raw shell verbs); qcow2 snapshot semantics with
-  cloud-hypervisor (raw is CH-native — qcow2 ops are image-at-rest only, walls
-  keep them offline); podman socket availability on headless roles.
+  to typed tool-runners, never raw shell verbs); qcow2 snapshot semantics on
+  libvirt/QEMU-KVM (qcow2 ops are image-at-rest only via `qemu-img`, walls
+  keep in-use disks offline); podman socket availability on headless roles.
 - **Out of scope v1**: RAID/mdadm, LVM, ZFS, multipath, iSCSI/network block
   devices, SMART health (a Fleet-plane candidate later), whole-disk secure-erase.
