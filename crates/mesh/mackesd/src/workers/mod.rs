@@ -159,58 +159,69 @@ pub mod adfilter;
 // sync + hides the surface but retains the node-local data (no destructive wipe).
 // Publishes state/browser-policy/<node> for the Workbench fleet view. No external
 // transport to fake — file I/O against the same share the adfilter worker uses.
-pub use mde_browser_workers::browser_policy; // arch-7: moved to mde-browser-workers
-                                             // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
-                                             // action/browser/passkey handoffs, persists pending challenges locally, mirrors
-                                             // them into the Syncthing-backed workgroup root, and publishes honest pending or
-                                             // error state without minting fake credentials.
+pub use mde_browser_workers::browser_policy;
+// BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
+// action/browser/passkey handoffs, persists pending challenges locally, mirrors
+// them into the Syncthing-backed workgroup root, and publishes honest pending or
+// error state without minting fake credentials.
+//
+// arch-7 (2026-07-11) — the DELIBERATE remainder. The other 10 browser workers
+// moved to `mde-browser-workers` (re-exported below); passkeys stays here
+// because it seals platform passkey private keys with
+// `crate::ca::backup::{seal_bytes, unseal_bytes}` — the audited Argon2id +
+// XChaCha20-Poly1305 primitives that ALSO back the CA disaster-recovery bundle
+// and the VPN secret-store fallback. Moving it cleanly needs those primitives
+// (+ `ipc::secret_store::age_key_path`) factored into a shared `mde-seal`
+// crypto crate first — a separate, security-reviewed change with 3+ consumers,
+// not a browser-worker relocation. Until then this is the one browser worker
+// still living in the control-plane crate.
 pub mod browser_passkeys;
 // BROWSER-DD-12 — Browser external-protocol owner. Drains
 // action/browser/protocol handoffs for external schemes Browser refused to
 // navigate, validates mailto/email and magnet/transfers routes, and publishes
 // retained route status/events without faking the downstream surface.
-pub use mde_browser_workers::browser_protocol; // arch-7: moved to mde-browser-workers
-                                               // BROWSER-DD-12 — Browser platform-share owner. Drains
-                                               // action/browser/share handoffs, validates Peer/Email/QR routes, and publishes
-                                               // retained route status/events without faking downstream delivery.
-pub use mde_browser_workers::browser_share; // arch-7: moved to mde-browser-workers
-                                            // BROWSER-DD-11 — Browser voice-command/dictation STT owner. Drains
-                                            // action/browser/voice-command, invokes a locally configured offline STT/capture
-                                            // command when present, emits bounded transcript events, and publishes honest
-                                            // unavailable/error/transcribed state for the shell.
-pub use mde_browser_workers::browser_voice_command; // arch-7: moved to mde-browser-workers
-                                                    // BROWSER-DD-12 — Browser private offline/mesh translation owner. Drains
-                                                    // action/browser/translate, invokes a locally configured offline/mesh translation
-                                                    // command when present, emits bounded translation events, and publishes honest
-                                                    // unavailable/error/translated state for the shell.
-pub use mde_browser_workers::browser_translate; // arch-7: moved to mde-browser-workers
-                                                // BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
-                                                // cache snapshots, validates private offline/mesh payloads, writes local durable
-                                                // records, and mirrors them into the Syncthing-backed workgroup root.
-pub use mde_browser_workers::browser_offline_cache; // arch-7: moved to mde-browser-workers
-                                                    // BROWSER-DD-12 — Browser CEF security-update status owner. Watches the
-                                                    // packaged fast-update manifest and active CEF runtime, publishing an honest
-                                                    // current/missing/mismatch posture for the independent browser-engine update path.
-pub use mde_browser_workers::browser_security_update; // arch-7: moved to mde-browser-workers
-                                                      // BROWSER-DD-12 — Browser idle-tab suspend owner. Drains shell-published
-                                                      // action/browser/tab-suspend handoffs after the shell has stopped the inactive
-                                                      // helper, validates the payload, and publishes retained suspend status/events.
-pub use mde_browser_workers::browser_tab_suspend; // arch-7: moved to mde-browser-workers
-                                                  // KDC-MESH-6 — Seat-side consumer for phone-originated remote input. Drains the
-                                                  // KDC worker's action/seat/remote-input handoff, validates the event, and invokes
-                                                  // the configured uinput/seat helper when available.
+pub use mde_browser_workers::browser_protocol;
+// BROWSER-DD-12 — Browser platform-share owner. Drains
+// action/browser/share handoffs, validates Peer/Email/QR routes, and publishes
+// retained route status/events without faking downstream delivery.
+pub use mde_browser_workers::browser_share;
+// BROWSER-DD-11 — Browser voice-command/dictation STT owner. Drains
+// action/browser/voice-command, invokes a locally configured offline STT/capture
+// command when present, emits bounded transcript events, and publishes honest
+// unavailable/error/transcribed state for the shell.
+pub use mde_browser_workers::browser_voice_command;
+// BROWSER-DD-12 — Browser private offline/mesh translation owner. Drains
+// action/browser/translate, invokes a locally configured offline/mesh translation
+// command when present, emits bounded translation events, and publishes honest
+// unavailable/error/translated state for the shell.
+pub use mde_browser_workers::browser_translate;
+// BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
+// cache snapshots, validates private offline/mesh payloads, writes local durable
+// records, and mirrors them into the Syncthing-backed workgroup root.
+pub use mde_browser_workers::browser_offline_cache;
+// BROWSER-DD-12 — Browser CEF security-update status owner. Watches the
+// packaged fast-update manifest and active CEF runtime, publishing an honest
+// current/missing/mismatch posture for the independent browser-engine update path.
+pub use mde_browser_workers::browser_security_update;
+// BROWSER-DD-12 — Browser idle-tab suspend owner. Drains shell-published
+// action/browser/tab-suspend handoffs after the shell has stopped the inactive
+// helper, validates the payload, and publishes retained suspend status/events.
+pub use mde_browser_workers::browser_tab_suspend;
+// KDC-MESH-6 — Seat-side consumer for phone-originated remote input. Drains the
+// KDC worker's action/seat/remote-input handoff, validates the event, and invokes
+// the configured uinput/seat helper when available.
 pub mod seat_remote_input;
 // BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
 // action/browser/session-sync snapshots, validates the restore-compatible JSON
 // shape, persists the latest local copy, and mirrors it to the Syncthing-backed
 // workgroup root as browser-session-sync/<host>/latest.json. No external
 // transport to fake — Syncthing replicates the file plane.
-pub use mde_browser_workers::browser_session_sync; // arch-7: moved to mde-browser-workers
-                                                   // BROWSER-DD-11 — Browser read-aloud/TTS owner. Drains bounded
-                                                   // action/browser/read-aloud page-text requests, invokes a locally configured
-                                                   // offline TTS command when present, and publishes honest unavailable/error/spoken
-                                                   // state for the shell.
-pub use mde_browser_workers::browser_read_aloud; // arch-7: moved to mde-browser-workers
+pub use mde_browser_workers::browser_session_sync;
+// BROWSER-DD-11 — Browser read-aloud/TTS owner. Drains bounded
+// action/browser/read-aloud page-text requests, invokes a locally configured
+// offline TTS command when present, and publishes honest unavailable/error/spoken
+// state for the shell.
+pub use mde_browser_workers::browser_read_aloud;
 pub mod heartbeat;
 // mackesd-06 — the legacy reconcile loop (`crate::worker`) brought UNDER
 // the supervisor: an async adapter that runs the same blocking tick on
