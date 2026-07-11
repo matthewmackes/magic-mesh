@@ -33,6 +33,11 @@ pub const HEALTH_PREFIX: &str = "/mesh/health/";
 /// Prefix for the Syncthing device-ID registry (`/mesh/syncthing/<hostname>`),
 /// so each node auto-configures the full-mesh share without public discovery.
 pub const SYNCTHING_PREFIX: &str = "/mesh/syncthing/";
+/// Prefix for the VDI roaming-session plane (`/mesh/vdi/sessions/<session_id>`).
+/// Each session record is written under a keep-alive lease so a crashed
+/// converging node's rows auto-expire (E12-5/8) — the strongly-consistent,
+/// lease-backed analogue of the file store's replicated-directory scan.
+pub const SESSIONS_PREFIX: &str = "/mesh/vdi/sessions/";
 
 /// Leader lease TTL — the 60 s lease the campaign holds (matches the retired
 /// [`crate::leader::LEASE_DURATION`]).
@@ -40,6 +45,11 @@ pub const LEADER_LEASE_TTL_S: i64 = 60;
 /// Peer-record keepalive lease TTL — a peer's directory entry vanishes ~90 s
 /// after its heartbeat stops (the lease IS liveness).
 pub const PEER_LEASE_TTL_S: i64 = 90;
+/// VDI session-record keepalive lease TTL. Comfortably larger than the
+/// session-broker's 2 s convergence poll (so a live session is refreshed several
+/// times per lease window), yet short enough that a crashed converging node's
+/// sessions free within roughly a poll-and-a-lease-window.
+pub const SESSION_LEASE_TTL_S: i64 = 30;
 
 /// etcd key for a peer's directory entry.
 #[must_use]
@@ -57,6 +67,15 @@ pub fn health_key(hostname: &str) -> String {
 #[must_use]
 pub fn syncthing_key(hostname: &str) -> String {
     format!("{SYNCTHING_PREFIX}{hostname}")
+}
+
+/// etcd key for a VDI session record. The session id rides verbatim after the
+/// prefix — unlike the file store, etcd keys are hierarchical byte strings, so a
+/// `/` or `:` in an id needs no escaping (a prefix range still returns it and the
+/// id is recovered from the record's own JSON, not the key).
+#[must_use]
+pub fn session_key(id: &str) -> String {
+    format!("{SESSIONS_PREFIX}{id}")
 }
 
 /// Parse the endpoints file body into a clean list of client URLs. Accepts
@@ -179,15 +198,24 @@ mod tests {
         assert_eq!(peer_key("eagle"), "/mesh/peers/eagle");
         assert_eq!(health_key("eagle"), "/mesh/health/eagle");
         assert_eq!(syncthing_key("eagle"), "/mesh/syncthing/eagle");
+        assert_eq!(session_key("01J-ulid"), "/mesh/vdi/sessions/01J-ulid");
         assert_eq!(LEADER_KEY, "/mesh/leader");
         assert!(peer_key("x").starts_with(PEERS_PREFIX));
+        assert!(session_key("x").starts_with(SESSIONS_PREFIX));
     }
 
     #[test]
     fn lease_ttls_match_the_locked_durations() {
-        // Leader lease = the retired fs-lock's 60 s; peer keepalive = 90 s.
+        // Leader lease = the retired fs-lock's 60 s; peer keepalive = 90 s; VDI
+        // session lease > the 2 s convergence poll so a live session is refreshed
+        // several times per window.
         assert_eq!(LEADER_LEASE_TTL_S, 60);
         assert_eq!(PEER_LEASE_TTL_S, 90);
+        assert_eq!(SESSION_LEASE_TTL_S, 30);
+        assert!(
+            SESSION_LEASE_TTL_S > 2,
+            "lease must outlast the poll cadence"
+        );
     }
 
     #[tokio::test]

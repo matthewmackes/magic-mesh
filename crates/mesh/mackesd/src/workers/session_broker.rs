@@ -41,14 +41,18 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
+use etcd_client::{GetOptions, PutOptions};
 use mackes_mesh_types::openstack::HOT_TEMPLATE_VERSION;
 use mde_bus::persist::Persist;
 
 use super::openstack::verbs::{cloud_action_topic, HeatRequest};
 use super::scheduler::NodeId;
 use super::{ShutdownToken, Worker};
+use crate::substrate::etcd::{connect, session_key, SESSIONS_PREFIX, SESSION_LEASE_TTL_S};
+use crate::substrate::peers::block_on;
 
 /// Bus topic the worker drains for session lifecycle requests.
 ///
@@ -878,6 +882,300 @@ fn safe_session_file_stem(id: &str) -> String {
     }
 }
 
+// ──────────────────── etcd lease-backed store (E12-5/8) ────────────────────
+
+/// The etcd operations the [`EtcdSessionStore`] needs, factored behind a trait so
+/// the store's **lease logic** — grant-on-first-publish, keep-alive-on-refresh,
+/// revoke-on-remove, and expiry-frees-the-row — is unit-tested against an
+/// in-memory fake with a controllable clock, exactly as the store seam itself is
+/// faked for the broker. Production wires [`LiveSessionLeaseOps`] over the
+/// SUBSTRATE-V2 etcd client ([`crate::substrate::etcd`]).
+///
+/// Byte-oriented (the honest etcd boundary): the store owns the [`VdiSession`]
+/// serde; the ops move keys, JSON values, and lease ids.
+trait SessionLeaseOps: Send + Sync {
+    /// Grant a lease of `ttl_s` seconds and return its id (etcd auto-deletes every
+    /// key bound to the lease once it expires without a keep-alive).
+    fn grant_lease(&self, ttl_s: i64) -> Result<i64, SessionStoreError>;
+
+    /// Refresh (keep-alive) `lease_id`, resetting its TTL.
+    ///
+    /// # Errors
+    /// [`SessionStoreError::Failed`] when the lease is already gone (expired) or
+    /// etcd is unreachable — the store treats a lost lease as a signal to re-grant.
+    fn keep_alive(&self, lease_id: i64) -> Result<(), SessionStoreError>;
+
+    /// Put `value_json` at the session key for `id`, bound to `lease_id`.
+    fn put(&self, id: &str, value_json: &str, lease_id: i64) -> Result<(), SessionStoreError>;
+
+    /// Range-read every live session record's raw JSON value under the prefix
+    /// (rows whose lease has expired are already gone — that IS the auto-free).
+    fn list(&self) -> Result<Vec<String>, SessionStoreError>;
+
+    /// Remove the session `id`: revoke its `lease_id` (if known — which auto-deletes
+    /// the row) and delete the key (idempotent, covers a row written under a lease
+    /// this process no longer tracks).
+    fn revoke_and_delete(&self, id: &str, lease_id: Option<i64>) -> Result<(), SessionStoreError>;
+}
+
+/// The lease-backed [`SessionStore`]: the roaming-session plane on **etcd**.
+///
+/// The lease half of design lock 5 (the [`MeshSessionStore`] file plane is the
+/// fallback). Each published session is bound to an etcd lease; the store keeps
+/// its leases alive on every convergence tick (through [`SessionStore::list`],
+/// the once-per-tick call the leader makes), so a live session's row is
+/// continuously refreshed. When the converging node **crashes**, the keep-alive
+/// stops, the leases lapse, and etcd auto-deletes the rows — the crashed-seat
+/// session frees itself, with no file-scan the [`MeshSessionStore`] needed and no
+/// lingering `Active` row.
+///
+/// Lease ids live in a small in-memory registry keyed by session id. It is
+/// process-local: after a restart the store no longer knows the old lease ids, so
+/// those rows lapse on their own and the pure [`reconcile`] re-publishes the still
+/// desired ones under fresh leases (a brief, self-healing flap — the same
+/// stateless-across-restarts shape the etcd leader election uses).
+pub struct EtcdSessionStore {
+    /// The injected etcd-lease seam (production: [`LiveSessionLeaseOps`]).
+    ops: Box<dyn SessionLeaseOps>,
+    /// The TTL granted for a session's lease.
+    ttl_s: i64,
+    /// session id → the lease its row is bound to (this process's leases only).
+    leases: Mutex<BTreeMap<SessionId, i64>>,
+}
+
+impl EtcdSessionStore {
+    /// Construct the production store over the etcd `endpoints`
+    /// (`/etc/mackesd/etcd-endpoints`), using the [`SESSION_LEASE_TTL_S`] TTL.
+    #[must_use]
+    pub fn new(endpoints: Vec<String>) -> Self {
+        Self::with_ops(
+            Box::new(LiveSessionLeaseOps::new(endpoints)),
+            SESSION_LEASE_TTL_S,
+        )
+    }
+
+    /// Construct over an injected lease seam + TTL (tests).
+    fn with_ops(ops: Box<dyn SessionLeaseOps>, ttl_s: i64) -> Self {
+        Self {
+            ops,
+            ttl_s,
+            leases: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl SessionStore for EtcdSessionStore {
+    fn publish(&self, session: &VdiSession) -> Result<(), SessionStoreError> {
+        let value = serde_json::to_string(session).map_err(|e| SessionStoreError::Failed {
+            op: "publish",
+            reason: format!("serialize session {}: {e}", session.id),
+        })?;
+        let mut leases = self.leases.lock().expect("session lease registry mutex");
+        match leases.get(&session.id).copied() {
+            // A session we already track: keep its lease alive and re-put the
+            // (possibly updated) value under the SAME lease so the row stays put and
+            // the TTL resets. If the lease has already lapsed (keep-alive fails), fall
+            // through to a fresh grant so the row is re-bound to a live lease.
+            Some(lease_id) if self.ops.keep_alive(lease_id).is_ok() => {
+                self.ops.put(&session.id, &value, lease_id)?;
+            }
+            _ => {
+                let lease_id = self.ops.grant_lease(self.ttl_s)?;
+                self.ops.put(&session.id, &value, lease_id)?;
+                leases.insert(session.id.clone(), lease_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<VdiSession>, SessionStoreError> {
+        // Heartbeat: refresh every lease this node owns on each convergence tick, so
+        // a live session never lapses while the leader keeps converging. Best-effort
+        // — a keep-alive that fails means the lease already expired and the row is
+        // gone; `reconcile` will re-publish it under a new lease this same tick.
+        {
+            let leases = self.leases.lock().expect("session lease registry mutex");
+            for lease_id in leases.values().copied() {
+                let _ = self.ops.keep_alive(lease_id);
+            }
+        }
+        let mut rows = Vec::new();
+        for raw in self.ops.list()? {
+            match serde_json::from_str::<VdiSession>(&raw) {
+                Ok(s) => rows.push(s),
+                Err(e) => {
+                    tracing::warn!(error = %e, "etcd_session_store: skipping unparseable record");
+                }
+            }
+        }
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(rows)
+    }
+
+    fn remove(&self, id: &str) -> Result<(), SessionStoreError> {
+        let lease_id = self
+            .leases
+            .lock()
+            .expect("session lease registry mutex")
+            .remove(id);
+        self.ops.revoke_and_delete(id, lease_id)
+    }
+}
+
+/// Production [`SessionLeaseOps`]: the SUBSTRATE-V2 etcd v3 client. Connects
+/// per-op over the runtime-aware blocking bridge ([`block_on`]) exactly as
+/// [`crate::substrate::peers`] does (etcd lease ids are cluster-global, so a
+/// grant on one connection is kept-alive / put-under / revoked from the next).
+struct LiveSessionLeaseOps {
+    endpoints: Vec<String>,
+}
+
+impl LiveSessionLeaseOps {
+    const fn new(endpoints: Vec<String>) -> Self {
+        Self { endpoints }
+    }
+}
+
+/// The "etcd runtime could not be built" error for a bridged op (mirrors the
+/// `etcd runtime unavailable` string the substrate blocking façades return).
+fn runtime_unavailable(op: &'static str) -> SessionStoreError {
+    SessionStoreError::Failed {
+        op,
+        reason: "etcd runtime unavailable".to_string(),
+    }
+}
+
+impl SessionLeaseOps for LiveSessionLeaseOps {
+    fn grant_lease(&self, ttl_s: i64) -> Result<i64, SessionStoreError> {
+        block_on(async {
+            let mut c = connect(&self.endpoints)
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "grant_lease",
+                    reason: format!("connect: {e}"),
+                })?;
+            c.lease_grant(ttl_s, None)
+                .await
+                .map(|r| r.id())
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "grant_lease",
+                    reason: e.to_string(),
+                })
+        })
+        .ok_or_else(|| runtime_unavailable("grant_lease"))?
+    }
+
+    fn keep_alive(&self, lease_id: i64) -> Result<(), SessionStoreError> {
+        block_on(async {
+            let mut c = connect(&self.endpoints)
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "keep_alive",
+                    reason: format!("connect: {e}"),
+                })?;
+            let (mut keeper, mut stream) =
+                c.lease_keep_alive(lease_id)
+                    .await
+                    .map_err(|e| SessionStoreError::Failed {
+                        op: "keep_alive",
+                        reason: e.to_string(),
+                    })?;
+            keeper
+                .keep_alive()
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "keep_alive",
+                    reason: e.to_string(),
+                })?;
+            // The ack carries the refreshed TTL; a zero/absent TTL means etcd has
+            // already reaped the lease, so surface it as a failure → the store
+            // re-grants rather than putting under a dead lease.
+            match stream.message().await {
+                Ok(Some(resp)) if resp.ttl() > 0 => Ok(()),
+                Ok(_) => Err(SessionStoreError::Failed {
+                    op: "keep_alive",
+                    reason: format!("lease {lease_id} already expired"),
+                }),
+                Err(e) => Err(SessionStoreError::Failed {
+                    op: "keep_alive",
+                    reason: e.to_string(),
+                }),
+            }
+        })
+        .ok_or_else(|| runtime_unavailable("keep_alive"))?
+    }
+
+    fn put(&self, id: &str, value_json: &str, lease_id: i64) -> Result<(), SessionStoreError> {
+        let key = session_key(id);
+        let value = value_json.to_string();
+        block_on(async {
+            let mut c = connect(&self.endpoints)
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "put",
+                    reason: format!("connect: {e}"),
+                })?;
+            c.put(key, value, Some(PutOptions::new().with_lease(lease_id)))
+                .await
+                .map(|_| ())
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "put",
+                    reason: e.to_string(),
+                })
+        })
+        .ok_or_else(|| runtime_unavailable("put"))?
+    }
+
+    fn list(&self) -> Result<Vec<String>, SessionStoreError> {
+        block_on(async {
+            let mut c = connect(&self.endpoints)
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "list",
+                    reason: format!("connect: {e}"),
+                })?;
+            let resp = c
+                .get(SESSIONS_PREFIX, Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "list",
+                    reason: e.to_string(),
+                })?;
+            Ok(resp
+                .kvs()
+                .iter()
+                .filter_map(|kv| kv.value_str().ok().map(String::from))
+                .collect())
+        })
+        .ok_or_else(|| runtime_unavailable("list"))?
+    }
+
+    fn revoke_and_delete(&self, id: &str, lease_id: Option<i64>) -> Result<(), SessionStoreError> {
+        let key = session_key(id);
+        block_on(async {
+            let mut c = connect(&self.endpoints)
+                .await
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "remove",
+                    reason: format!("connect: {e}"),
+                })?;
+            // Revoke first (auto-deletes the bound row); an already-expired lease
+            // revoke errors harmlessly, so it's best-effort.
+            if let Some(l) = lease_id {
+                let _ = c.lease_revoke(l).await;
+            }
+            c.delete(key, None)
+                .await
+                .map(|_| ())
+                .map_err(|e| SessionStoreError::Failed {
+                    op: "remove",
+                    reason: e.to_string(),
+                })
+        })
+        .ok_or_else(|| runtime_unavailable("remove"))?
+    }
+}
+
 // ─────────────────────────── bus + worker ───────────────────────────
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
@@ -970,20 +1268,36 @@ pub struct SessionBrokerWorker {
 }
 
 impl SessionBrokerWorker {
-    /// Construct with production defaults: the etcd-first [`MeshSessionStore`] over
-    /// `workgroup_root`, the shared leader lock under it, and the default cadence.
+    /// Construct with production defaults: the **etcd-first** session store
+    /// (lease-backed [`EtcdSessionStore`] when the coordination plane is
+    /// provisioned, else the replicated-file [`MeshSessionStore`] fallback), the
+    /// shared leader lock under `workgroup_root`, and the default cadence.
     /// `node_id` is this node's mesh identity.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: NodeId) -> Self {
-        // Derive the lock path first, then move `workgroup_root` into the store.
         let leader_lock = workgroup_root.join(".mackesd-leader.lock");
         Self {
-            store: Box::new(MeshSessionStore::new(workgroup_root)),
+            store: Self::select_store(&workgroup_root),
             placement: Box::new(LiveNovaPlacement::new()),
             node_id,
             leader_lock,
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+        }
+    }
+
+    /// Pick the session store the SAME etcd-first-with-fs-fallback way the peer
+    /// directory does ([`crate::substrate::peers::read_directory`]): when
+    /// `/etc/mackesd/etcd-endpoints` is non-empty the sessions ride the
+    /// lease-backed [`EtcdSessionStore`] (a crashed node's rows auto-expire), else
+    /// the replicated-file [`MeshSessionStore`] carries them. Both satisfy the same
+    /// [`SessionStore`] seam, so the broker fold is identical either way.
+    fn select_store(workgroup_root: &Path) -> Box<dyn SessionStore + Send + Sync> {
+        let endpoints = crate::substrate::etcd::default_endpoints();
+        if endpoints.is_empty() {
+            Box::new(MeshSessionStore::new(workgroup_root.to_path_buf()))
+        } else {
+            Box::new(EtcdSessionStore::new(endpoints))
         }
     }
 
@@ -1518,6 +1832,223 @@ mod tests {
         assert_eq!(store.list().unwrap().len(), 1);
         store.remove("s1").unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    // ── the etcd lease-backed store (E12-5/8) ──
+
+    /// A fake [`SessionLeaseOps`] with a controllable clock — the injected etcd
+    /// seam that drives the [`EtcdSessionStore`]'s lease logic (grant / keep-alive /
+    /// revoke / expiry-frees) without a live etcd node. `advance` moves the
+    /// simulated wall clock; `reap` models etcd's background lease expiry (every
+    /// key bound to an expired lease auto-deletes).
+    #[derive(Clone, Default)]
+    struct FakeLeaseOps {
+        inner: Arc<Mutex<FakeEtcd>>,
+    }
+
+    #[derive(Default)]
+    struct FakeEtcd {
+        now_s: i64,
+        next_lease: i64,
+        /// lease id → (ttl, absolute deadline in `now_s`).
+        leases: BTreeMap<i64, (i64, i64)>,
+        /// session id → (json value, bound lease id).
+        rows: BTreeMap<String, (String, i64)>,
+        granted_ttls: Vec<i64>,
+        keep_alives: Vec<i64>,
+    }
+
+    impl FakeEtcd {
+        /// Delete every row whose lease deadline has passed — etcd's auto-free.
+        fn reap(&mut self) {
+            let now = self.now_s;
+            let dead: Vec<i64> = self
+                .leases
+                .iter()
+                .filter(|(_, (_, deadline))| *deadline <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &dead {
+                self.leases.remove(id);
+            }
+            self.rows.retain(|_, (_, lease)| !dead.contains(lease));
+        }
+    }
+
+    impl FakeLeaseOps {
+        fn advance(&self, secs: i64) {
+            self.inner.lock().expect("fake etcd").now_s += secs;
+        }
+        fn granted_ttls(&self) -> Vec<i64> {
+            self.inner.lock().expect("fake etcd").granted_ttls.clone()
+        }
+        fn keep_alive_count(&self) -> usize {
+            self.inner.lock().expect("fake etcd").keep_alives.len()
+        }
+        fn live_row_count(&self) -> usize {
+            let mut g = self.inner.lock().expect("fake etcd");
+            g.reap();
+            g.rows.len()
+        }
+    }
+
+    impl SessionLeaseOps for FakeLeaseOps {
+        fn grant_lease(&self, ttl_s: i64) -> Result<i64, SessionStoreError> {
+            let mut g = self.inner.lock().expect("fake etcd");
+            g.next_lease += 1;
+            let id = g.next_lease;
+            let deadline = g.now_s + ttl_s;
+            g.leases.insert(id, (ttl_s, deadline));
+            g.granted_ttls.push(ttl_s);
+            Ok(id)
+        }
+        fn keep_alive(&self, lease_id: i64) -> Result<(), SessionStoreError> {
+            let mut g = self.inner.lock().expect("fake etcd");
+            g.reap();
+            match g.leases.get(&lease_id).copied() {
+                Some((ttl, _)) => {
+                    let deadline = g.now_s + ttl;
+                    g.leases.insert(lease_id, (ttl, deadline));
+                    g.keep_alives.push(lease_id);
+                    Ok(())
+                }
+                None => Err(SessionStoreError::Failed {
+                    op: "keep_alive",
+                    reason: format!("lease {lease_id} expired"),
+                }),
+            }
+        }
+        fn put(&self, id: &str, value_json: &str, lease_id: i64) -> Result<(), SessionStoreError> {
+            self.inner
+                .lock()
+                .expect("fake etcd")
+                .rows
+                .insert(id.to_string(), (value_json.to_string(), lease_id));
+            Ok(())
+        }
+        fn list(&self) -> Result<Vec<String>, SessionStoreError> {
+            let mut g = self.inner.lock().expect("fake etcd");
+            g.reap();
+            Ok(g.rows.values().map(|(v, _)| v.clone()).collect())
+        }
+        fn revoke_and_delete(
+            &self,
+            id: &str,
+            lease_id: Option<i64>,
+        ) -> Result<(), SessionStoreError> {
+            let mut g = self.inner.lock().expect("fake etcd");
+            g.rows.remove(id);
+            if let Some(l) = lease_id {
+                g.leases.remove(&l);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn etcd_store_publish_binds_the_row_to_a_ttl_lease() {
+        let fake = FakeLeaseOps::default();
+        let store = EtcdSessionStore::with_ops(Box::new(fake.clone()), 30);
+        store
+            .publish(&sess("s1", SessionState::Active))
+            .expect("publish");
+        // The write set a TTL lease (not a bare put) — the crash-expiry mechanism.
+        assert_eq!(
+            fake.granted_ttls(),
+            vec![30],
+            "the row is bound to a 30 s TTL lease"
+        );
+        let rows = store.list().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "s1");
+        assert_eq!(rows[0].state, SessionState::Active, "value round-trips");
+    }
+
+    #[test]
+    fn etcd_store_keep_alive_renews_a_live_session_past_its_ttl() {
+        let fake = FakeLeaseOps::default();
+        let store = EtcdSessionStore::with_ops(Box::new(fake.clone()), 30);
+        store
+            .publish(&sess("s1", SessionState::Active))
+            .expect("publish");
+        // Three convergence ticks 20 s apart — 60 s total, twice a single 30 s TTL.
+        // Each tick's list() keep-alive resets the lease, so the live session never
+        // lapses (without renewal it would be gone by t=40 s).
+        for _ in 0..3 {
+            fake.advance(20);
+            let rows = store.list().expect("list keeps the lease alive");
+            assert_eq!(rows.len(), 1, "the live session survives via lease renewal");
+        }
+        assert!(
+            fake.keep_alive_count() >= 3,
+            "each convergence tick renewed the lease"
+        );
+    }
+
+    #[test]
+    fn etcd_store_expired_lease_frees_a_crashed_nodes_session() {
+        let fake = FakeLeaseOps::default();
+        // The converging node publishes a session...
+        let store = EtcdSessionStore::with_ops(Box::new(fake.clone()), 30);
+        store
+            .publish(&sess("s1", SessionState::Active))
+            .expect("publish");
+        assert_eq!(fake.live_row_count(), 1, "the session is in the plane");
+
+        // ...then CRASHES: no more list()/keep-alive. The wall clock passes the TTL.
+        fake.advance(31);
+
+        // A surviving peer (a fresh store over the SAME plane, with an empty lease
+        // registry — it never owned this lease) sees the row already auto-deleted.
+        // This is the whole point of E12-5/8: a crashed seat's session frees itself
+        // via lease expiry, where the file store would leave a lingering row.
+        let survivor = EtcdSessionStore::with_ops(Box::new(fake.clone()), 30);
+        assert!(
+            survivor.list().expect("list").is_empty(),
+            "the crashed node's session auto-expired"
+        );
+        assert_eq!(fake.live_row_count(), 0);
+    }
+
+    #[test]
+    fn etcd_store_republishes_under_a_fresh_lease_after_a_lost_lease() {
+        let fake = FakeLeaseOps::default();
+        let store = EtcdSessionStore::with_ops(Box::new(fake.clone()), 30);
+        store
+            .publish(&sess("s1", SessionState::Active))
+            .expect("first publish");
+        // The lease lapses (this node paused past the TTL); the registry still holds
+        // the now-dead lease id.
+        fake.advance(31);
+        // reconcile re-publishes the still-desired session: keep-alive on the dead
+        // lease fails, so the store re-grants rather than putting under a dead lease.
+        store
+            .publish(&sess("s1", SessionState::Active))
+            .expect("re-publish after loss");
+        assert_eq!(
+            fake.granted_ttls(),
+            vec![30, 30],
+            "a fresh lease was granted on the lost-lease path"
+        );
+        assert_eq!(
+            store.list().expect("list").len(),
+            1,
+            "the session is back in the plane under a live lease"
+        );
+    }
+
+    #[test]
+    fn etcd_store_remove_revokes_the_lease_and_deletes_the_row() {
+        let fake = FakeLeaseOps::default();
+        let store = EtcdSessionStore::with_ops(Box::new(fake.clone()), 30);
+        store
+            .publish(&sess("s1", SessionState::Active))
+            .expect("publish");
+        assert_eq!(fake.live_row_count(), 1);
+        store.remove("s1").expect("remove");
+        assert_eq!(fake.live_row_count(), 0, "the row is gone");
+        // Idempotent — removing an absent id (no tracked lease) still succeeds.
+        store.remove("s1").expect("remove is idempotent");
     }
 
     #[test]

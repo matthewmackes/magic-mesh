@@ -76,8 +76,9 @@ pub async fn delete_peer(client: &mut Client, hostname: &str) -> anyhow::Result<
 /// runtime can't be built.
 /// Shared substrate blocking bridge — runtime-aware so it is safe from BOTH a
 /// plain std::thread (heartbeat/responder) and an async worker on the executor
-/// (`mesh_dns`, health_reconciler). Used by `peers` and `leader`.
-pub(super) fn block_on<F>(fut: F) -> Option<F::Output>
+/// (`mesh_dns`, health_reconciler). Used by `peers`, `leader`, and the
+/// `workers::session_broker` lease-backed session store.
+pub(crate) fn block_on<F>(fut: F) -> Option<F::Output>
 where
     F: std::future::Future + Send,
     F::Output: Send,
