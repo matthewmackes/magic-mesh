@@ -48,8 +48,12 @@ pub struct WorkerStatus {
     pub alive: bool,
     /// Restart count since daemon start.
     pub restarts: u32,
-    /// True once the ENT-6 circuit breaker tripped (the supervisor
-    /// stopped restarting it).
+    /// True while the ENT-6 circuit breaker is OPEN — the worker
+    /// tripped and is cooling down between half-open recovery trials
+    /// (mackesd-05). Cleared once a trial proves stable (breaker
+    /// closes) so a transient trip stops counting against readiness;
+    /// a still-broken worker keeps it set while it backs off to the
+    /// cooldown cap.
     pub breaker_tripped: bool,
     /// Outcome of the most recent `run()` exit: `Some(true)` clean,
     /// `Some(false)` error/panic, `None` while still on first run.
@@ -969,6 +973,91 @@ pub fn advance_restart_state(
     (reset, failures, delay, decision)
 }
 
+// ── mackesd-05: half-open circuit-breaker recovery ──────────────────
+//
+// ENT-6 tripped the breaker and then left the worker PERMANENTLY dead
+// for the rest of the daemon's life — a transient cause (a dependency
+// briefly down) that tripped the breaker killed the worker until the
+// operator restarted mackesd. mackesd-05 adds the standard half-open
+// recovery: a tripped worker cools down, then gets a SINGLE trial
+// restart; a trial that stays healthy for [`STABILITY_WINDOW`] closes
+// the breaker (a full reset to the closed/healthy state), while one
+// that fails fast re-opens it with a longer — but capped — cooldown.
+// A genuinely-broken worker therefore backs off to at most one attempt
+// per [`COOLDOWN_CAP`] (never a hot spin, never permanently dead); a
+// transient trip heals itself without operator intervention. A
+// `RestartPolicy::Never` worker never reaches this path (it is not
+// restarted at all), so a deliberately one-shot worker is unaffected.
+
+/// First cooldown a tripped worker waits before its half-open trial.
+pub const COOLDOWN_INITIAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cooldown ceiling: a still-failing worker retries at most this
+/// slowly. Conservative so a hard-broken dependency can't be hammered.
+pub const COOLDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+/// Multiplier applied to the cooldown each time a half-open trial
+/// relapses (fails within [`STABILITY_WINDOW`]).
+pub const COOLDOWN_FACTOR: u32 = 3;
+/// A half-open trial must stay alive at least this long to be judged
+/// recovered (the breaker closes). Generous on purpose.
+pub const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// mackesd-05 — grow the open-state cooldown after a relapsed trial,
+/// saturating at [`COOLDOWN_CAP`]. Pure — unit-testable without tokio.
+#[must_use]
+pub fn grow_cooldown(cooldown: std::time::Duration) -> std::time::Duration {
+    cooldown
+        .checked_mul(COOLDOWN_FACTOR)
+        .unwrap_or(COOLDOWN_CAP)
+        .min(COOLDOWN_CAP)
+}
+
+/// mackesd-05 — the conceptual circuit-breaker phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerPhase {
+    /// Healthy. Rapid failures accrue toward a trip (ENT-6).
+    Closed,
+    /// Tripped and cooling down before the next half-open trial.
+    Open,
+    /// A single trial restart is in flight.
+    HalfOpen,
+}
+
+/// mackesd-05 — the verdict on a half-open trial, judged purely from
+/// how long the trial stayed alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialOutcome {
+    /// Alive >= [`STABILITY_WINDOW`]: the breaker closes (full reset).
+    Recovered,
+    /// Failed within [`STABILITY_WINDOW`]: the breaker re-opens with a
+    /// longer, capped cooldown.
+    Relapsed,
+}
+
+/// mackesd-05 — judge a half-open trial from its alive-duration. Pure.
+#[must_use]
+pub fn judge_trial(trial_alive: std::time::Duration) -> TrialOutcome {
+    if trial_alive >= STABILITY_WINDOW {
+        TrialOutcome::Recovered
+    } else {
+        TrialOutcome::Relapsed
+    }
+}
+
+/// mackesd-05 — apply a trial verdict to the breaker. Pure. Returns the
+/// next phase + the next open-state cooldown:
+///  * `Recovered` ⇒ (`Closed`, [`COOLDOWN_INITIAL`]) — breaker reset.
+///  * `Relapsed`  ⇒ (`Open`, grown+capped cooldown) — back off further.
+#[must_use]
+pub fn apply_trial_outcome(
+    outcome: TrialOutcome,
+    cooldown: std::time::Duration,
+) -> (BreakerPhase, std::time::Duration) {
+    match outcome {
+        TrialOutcome::Recovered => (BreakerPhase::Closed, COOLDOWN_INITIAL),
+        TrialOutcome::Relapsed => (BreakerPhase::Open, grow_cooldown(cooldown)),
+    }
+}
+
 /// Restart policy for a worker. Phase A only honors `Never` and
 /// `OnFailure` — Phase B integrates the `task-supervisor` crate to
 /// implement back-off + max-restarts + circuit-breaker semantics.
@@ -1092,11 +1181,17 @@ impl Supervisor {
         let status = self.status.clone();
         update_status(&status, name, |w| w.alive = true);
         self.join.spawn(async move {
-            // ENT-6 — restart-policy state for this worker.
+            // ENT-6 — closed-state restart-policy state for this worker.
             let mut delay = INITIAL_BACKOFF;
             let mut rapid_failures: u32 = 0;
             let mut window_start = std::time::Instant::now();
             let mut first_run = true;
+            // mackesd-05 — half-open recovery state. `cooldown` is the
+            // current open-state wait; `trial` marks that the UPCOMING
+            // run is a single half-open trial restart (we just cooled
+            // down from a trip or a relapse).
+            let mut cooldown = COOLDOWN_INITIAL;
+            let mut trial = false;
             // `break outcome` carries the worker's final result out
             // of the loop, so we don't need a pre-initialized
             // `last_result` slot (which would dead-code in the
@@ -1117,11 +1212,42 @@ impl Supervisor {
                 // the worker is silently dead for the daemon's lifetime.
                 // Catch the unwind so it flows through the same restart-policy
                 // + back-off + circuit-breaker path as an Err below.
-                let outcome = match futures_util::FutureExt::catch_unwind(
-                    std::panic::AssertUnwindSafe(worker.run(token_for_run)),
-                )
-                .await
-                {
+                let run_fut = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    worker.run(token_for_run),
+                ));
+                // mackesd-05 — measure the trial's alive-duration on the
+                // TOKIO clock (so paused-time tests and the
+                // STABILITY_WINDOW sleep share a clock), and — for a
+                // half-open trial — race a stability timer against the
+                // run so a trial that survives STABILITY_WINDOW clears
+                // the trip in the status map LIVE. That matters because
+                // most workers are tick-loops that never exit once the
+                // transient cause clears: without the live clear,
+                // healthz would show the recovered worker as tripped
+                // forever.
+                let trial_start = tokio::time::Instant::now();
+                let joined = if trial {
+                    tokio::pin!(run_fut);
+                    let stability = tokio::time::sleep(STABILITY_WINDOW);
+                    tokio::pin!(stability);
+                    let mut cleared = false;
+                    loop {
+                        tokio::select! {
+                            res = run_fut.as_mut() => break res,
+                            () = stability.as_mut(), if !cleared => {
+                                cleared = true;
+                                update_status(&status, name, |w| w.breaker_tripped = false);
+                                info!(
+                                    worker = %name,
+                                    "mackesd-05: half-open trial stable — clearing breaker",
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    run_fut.await
+                };
+                let outcome = match joined {
                     Ok(result) => result,
                     Err(panic) => {
                         let msg = panic
@@ -1156,15 +1282,61 @@ impl Supervisor {
                     info!(worker = %name, "shutdown requested; not restarting");
                     break outcome;
                 }
+                // mackesd-05 — resolve a half-open trial before the
+                // normal closed-state path. A trial that stayed alive
+                // >= STABILITY_WINDOW recovers (breaker closes, full
+                // reset); one that failed fast relapses (breaker
+                // re-opens with a longer, capped cooldown).
+                if trial {
+                    trial = false;
+                    let (next_phase, next_cooldown) =
+                        apply_trial_outcome(judge_trial(trial_start.elapsed()), cooldown);
+                    cooldown = next_cooldown;
+                    match next_phase {
+                        BreakerPhase::Closed => {
+                            // Recovered: reset to the closed/healthy state
+                            // and resume normal supervision.
+                            rapid_failures = 0;
+                            delay = INITIAL_BACKOFF;
+                            window_start = std::time::Instant::now();
+                            update_status(&status, name, |w| w.breaker_tripped = false);
+                            info!(
+                                worker = %name,
+                                "mackesd-05: half-open trial recovered — breaker closed",
+                            );
+                            continue;
+                        }
+                        BreakerPhase::Open | BreakerPhase::HalfOpen => {
+                            // Relapsed: cool down (longer), then try once
+                            // more. `apply_trial_outcome` only ever yields
+                            // `Closed`/`Open`; the `HalfOpen` arm is folded
+                            // in so the match stays exhaustive.
+                            update_status(&status, name, |w| w.breaker_tripped = true);
+                            warn!(
+                                worker = %name,
+                                cooldown_s = cooldown.as_secs(),
+                                "mackesd-05: half-open trial relapsed — re-opening breaker",
+                            );
+                            let mut cool_tok = shutdown.clone();
+                            tokio::select! {
+                                () = cool_tok.wait() => break outcome,
+                                () = tokio::time::sleep(cooldown) => {}
+                            }
+                            if shutdown.is_shutdown() {
+                                break outcome;
+                            }
+                            trial = true;
+                            continue;
+                        }
+                    }
+                }
                 // ENT-6 — bounded exponential back-off + circuit
                 // breaker (replaces the Phase-A fixed 250 ms retry):
                 // a worker that keeps dying restarts at 250 ms, 500 ms,
                 // 1 s … capped at BACKOFF_CAP; one that dies
                 // BREAKER_TRIP times within BREAKER_WINDOW trips the
-                // breaker — the supervisor STOPS restarting it and
-                // logs at ERROR (visible in doctor/journal) instead of
-                // spinning forever. A healthy run longer than
-                // BREAKER_WINDOW resets both counters.
+                // breaker. A healthy run longer than BREAKER_WINDOW
+                // resets both counters.
                 let now = std::time::Instant::now();
                 let (reset, failures, next_delay, decision) =
                     advance_restart_state(now.duration_since(window_start), rapid_failures, delay);
@@ -1175,17 +1347,30 @@ impl Supervisor {
                 delay = next_delay;
                 match decision {
                     RestartDecision::Trip => {
+                        // mackesd-05 — a trip no longer permanently kills
+                        // the worker (ENT-6 used to `break` here). Cool
+                        // down, then a SINGLE half-open trial restart
+                        // follows; the trip stays visible on healthz
+                        // (readiness=false) until a trial proves stable.
                         error!(
                             worker = %name,
                             failures = rapid_failures,
                             window_s = BREAKER_WINDOW.as_secs(),
-                            "ENT-6: circuit breaker tripped — worker will NOT be restarted \
-                             (restart mackesd to re-arm after fixing the cause)",
+                            cooldown_s = COOLDOWN_INITIAL.as_secs(),
+                            "ENT-6/mackesd-05: circuit breaker tripped — cooling down before \
+                             a half-open recovery trial",
                         );
-                        // EFF-24 — surface the trip in the status map
-                        // (drives readiness=false on healthz).
                         update_status(&status, name, |w| w.breaker_tripped = true);
-                        break outcome;
+                        cooldown = COOLDOWN_INITIAL;
+                        let mut cool_tok = shutdown.clone();
+                        tokio::select! {
+                            () = cool_tok.wait() => break outcome,
+                            () = tokio::time::sleep(cooldown) => {}
+                        }
+                        if shutdown.is_shutdown() {
+                            break outcome;
+                        }
+                        trial = true;
                     }
                     RestartDecision::Backoff(d) => tokio::time::sleep(d).await,
                 }
@@ -1464,6 +1649,176 @@ mod tests {
             }
         }
     }
+
+    // ── mackesd-05: half-open recovery — behavioral (paused-time) ───
+
+    /// Fails its first `fail_first` attempts, then stays alive until
+    /// shutdown. `fail_first == BREAKER_TRIP` ⇒ it trips, then the very
+    /// next (half-open trial) attempt is the stable one; a larger value
+    /// forces one or more relapses before it finally recovers.
+    struct FlakyThenPark {
+        fail_first: usize,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for FlakyThenPark {
+        fn name(&self) -> &'static str {
+            "flaky-park"
+        }
+        async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first {
+                anyhow::bail!("flaky attempt {n}")
+            }
+            // Stable: hold the run alive so the half-open stability
+            // window can elapse and the breaker closes.
+            shutdown.wait().await;
+            Ok(())
+        }
+    }
+
+    /// Always fails immediately — a genuinely-broken worker.
+    struct AlwaysErr {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for AlwaysErr {
+        fn name(&self) -> &'static str {
+            "always-err"
+        }
+        async fn run(&mut self, _shutdown: ShutdownToken) -> anyhow::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("always broken")
+        }
+    }
+
+    /// Drive the paused clock forward until `pred` holds or the budget
+    /// is exhausted. In paused-time tests `sleep` auto-advances to the
+    /// next timer, so this yields to the supervisor while stepping
+    /// virtual time. Returns whether `pred` was observed.
+    async fn drive_until(
+        status: &WorkerStatusMap,
+        name: &'static str,
+        budget: usize,
+        pred: impl Fn(&WorkerStatus) -> bool,
+    ) -> bool {
+        for _ in 0..budget {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let hit = {
+                let g = status.lock().unwrap();
+                g.get(name).map_or(false, |w| pred(w))
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tripped_worker_recovers_via_half_open() {
+        // mackesd-05 core: a transient trip is NOT permanently fatal.
+        // The worker trips after BREAKER_TRIP rapid failures, cools
+        // down, gets ONE trial restart, survives the stability window,
+        // and the breaker closes — all within the daemon's lifetime.
+        let mut sup = Supervisor::new();
+        let status = new_status_map();
+        sup.set_status_map(Arc::clone(&status));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        sup.spawn(Spawn::new(
+            FlakyThenPark {
+                fail_first: BREAKER_TRIP as usize,
+                attempts: attempts.clone(),
+            },
+            RestartPolicy::OnFailure,
+        ));
+        // Recovered == it went through the full trip cycle
+        // (restarts >= BREAKER_TRIP), the trial is alive, AND the
+        // breaker cleared. The `restarts` gate rules out the healthy
+        // pre-trip runs (which are also alive + not-tripped).
+        let recovered = drive_until(&status, "flaky-park", 200, |w| {
+            w.restarts >= BREAKER_TRIP && w.alive && !w.breaker_tripped
+        })
+        .await;
+        assert!(
+            recovered,
+            "tripped worker recovered through a half-open trial"
+        );
+        // BREAKER_TRIP failing runs + exactly ONE stable trial run.
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            BREAKER_TRIP as usize + 1,
+            "one half-open trial after the trip",
+        );
+        {
+            let g = status.lock().unwrap();
+            let w = g.get("flaky-park").unwrap();
+            assert!(w.restarts >= 1, "the trial counts as a restart");
+        }
+        sup.shutdown_and_join().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tripped_worker_relapses_then_recovers_never_permanently_dead() {
+        // A trip followed by a couple of fast relapses must still lead
+        // to re-attempts (never permanent death), and once the worker
+        // finally holds it recovers. `fail_first = BREAKER_TRIP + 2`
+        // forces two half-open relapses (each re-opening with a longer
+        // cooldown) before the stable trial.
+        let mut sup = Supervisor::new();
+        let status = new_status_map();
+        sup.set_status_map(Arc::clone(&status));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        sup.spawn(Spawn::new(
+            FlakyThenPark {
+                fail_first: BREAKER_TRIP as usize + 2,
+                attempts: attempts.clone(),
+            },
+            RestartPolicy::OnFailure,
+        ));
+        let recovered = drive_until(&status, "flaky-park", 400, |w| {
+            w.restarts >= BREAKER_TRIP && w.alive && !w.breaker_tripped
+        })
+        .await;
+        assert!(recovered, "worker recovered after relapsing twice");
+        // 8 initial fails + 2 relapsed trials + 1 stable trial.
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            BREAKER_TRIP as usize + 3,
+            "re-attempted after each relapse rather than dying",
+        );
+        sup.shutdown_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn never_policy_worker_is_never_restarted_or_tripped() {
+        // A `RestartPolicy::Never` worker must be untouched by the
+        // recovery machinery: it runs exactly once (even on Err) and
+        // never enters the breaker path.
+        let mut sup = Supervisor::new();
+        let status = new_status_map();
+        sup.set_status_map(Arc::clone(&status));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        sup.spawn(Spawn::new(
+            AlwaysErr {
+                attempts: attempts.clone(),
+            },
+            RestartPolicy::Never,
+        ));
+        let outcomes = sup.join_all().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.is_err(), "the single run returned Err");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "never-restart ⇒ exactly one run",
+        );
+        let g = status.lock().unwrap();
+        let w = g.get("always-err").unwrap();
+        assert!(!w.breaker_tripped, "a Never worker never trips");
+    }
 }
 
 #[cfg(test)]
@@ -1523,5 +1878,115 @@ mod ent6_tests {
         assert!(reset);
         assert_eq!(failures, 1);
         assert_eq!(decision, RestartDecision::Backoff(INITIAL_BACKOFF));
+    }
+}
+
+/// mackesd-05 — pure tests for the half-open recovery state machine,
+/// written in the same tokio-free style as `ent6_tests`.
+#[cfg(test)]
+mod mackesd05_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cooldown_grows_by_the_factor_and_saturates_at_the_cap() {
+        // 30s → 90s → 270s → 600s(cap) → 600s.
+        let mut cd = COOLDOWN_INITIAL;
+        assert_eq!(cd, Duration::from_secs(30));
+        cd = grow_cooldown(cd);
+        assert_eq!(cd, Duration::from_secs(90));
+        cd = grow_cooldown(cd);
+        assert_eq!(cd, Duration::from_secs(270));
+        cd = grow_cooldown(cd);
+        assert_eq!(cd, COOLDOWN_CAP, "saturates at the cap");
+        cd = grow_cooldown(cd);
+        assert_eq!(cd, COOLDOWN_CAP, "stays capped, never a hot spin");
+    }
+
+    #[test]
+    fn grow_cooldown_never_overflows() {
+        // A pathological near-MAX cooldown saturates instead of
+        // panicking on the multiply.
+        assert_eq!(grow_cooldown(Duration::MAX), COOLDOWN_CAP);
+    }
+
+    #[test]
+    fn a_trial_shorter_than_the_window_relapses() {
+        assert_eq!(
+            judge_trial(STABILITY_WINDOW - Duration::from_millis(1)),
+            TrialOutcome::Relapsed,
+        );
+        assert_eq!(judge_trial(Duration::ZERO), TrialOutcome::Relapsed);
+    }
+
+    #[test]
+    fn a_trial_that_survives_the_window_recovers() {
+        assert_eq!(judge_trial(STABILITY_WINDOW), TrialOutcome::Recovered);
+        assert_eq!(
+            judge_trial(STABILITY_WINDOW + Duration::from_secs(5)),
+            TrialOutcome::Recovered,
+        );
+    }
+
+    #[test]
+    fn recovery_closes_the_breaker_and_resets_the_cooldown() {
+        // Even after the cooldown had grown to the cap, recovering
+        // resets it to the initial value (a fresh transient later
+        // starts from the floor again).
+        let (phase, cd) = apply_trial_outcome(TrialOutcome::Recovered, COOLDOWN_CAP);
+        assert_eq!(phase, BreakerPhase::Closed);
+        assert_eq!(cd, COOLDOWN_INITIAL);
+    }
+
+    #[test]
+    fn relapse_reopens_the_breaker_with_a_longer_capped_cooldown() {
+        let (phase, cd) = apply_trial_outcome(TrialOutcome::Relapsed, COOLDOWN_INITIAL);
+        assert_eq!(phase, BreakerPhase::Open);
+        assert_eq!(cd, Duration::from_secs(90));
+        // From near the cap it grows no further than the cap.
+        let (phase, cd) = apply_trial_outcome(TrialOutcome::Relapsed, COOLDOWN_CAP);
+        assert_eq!(phase, BreakerPhase::Open);
+        assert_eq!(cd, COOLDOWN_CAP);
+    }
+
+    #[test]
+    fn full_cycle_trip_cooldown_relapse_then_recover() {
+        // Trace the state machine the supervisor loop drives:
+        // trip → open(initial) → trial fails → open(grown) → trial
+        // fails → open(grown) → trial holds → closed(reset).
+        let mut cooldown = COOLDOWN_INITIAL; // the trip's first cooldown
+
+        // First trial relapses.
+        let (phase, cd) = apply_trial_outcome(judge_trial(Duration::from_secs(1)), cooldown);
+        cooldown = cd;
+        assert_eq!(phase, BreakerPhase::Open);
+        assert_eq!(cooldown, Duration::from_secs(90));
+
+        // Second trial relapses — cooldown grows again.
+        let (phase, cd) = apply_trial_outcome(judge_trial(Duration::from_secs(2)), cooldown);
+        cooldown = cd;
+        assert_eq!(phase, BreakerPhase::Open);
+        assert_eq!(cooldown, Duration::from_secs(270));
+
+        // Third trial holds past the stability window — full reset.
+        let (phase, cd) = apply_trial_outcome(judge_trial(STABILITY_WINDOW), cooldown);
+        cooldown = cd;
+        assert_eq!(phase, BreakerPhase::Closed);
+        assert_eq!(cooldown, COOLDOWN_INITIAL, "recovery resets the cooldown");
+    }
+
+    #[test]
+    fn a_genuinely_broken_worker_backs_off_but_stays_bounded() {
+        // Repeated relapses can never exceed the cap, so a hard-broken
+        // worker retries at most once per COOLDOWN_CAP — never dead,
+        // never a spin.
+        let mut cooldown = COOLDOWN_INITIAL;
+        for _ in 0..50 {
+            let (phase, cd) = apply_trial_outcome(TrialOutcome::Relapsed, cooldown);
+            cooldown = cd;
+            assert_eq!(phase, BreakerPhase::Open);
+            assert!(cooldown <= COOLDOWN_CAP);
+        }
+        assert_eq!(cooldown, COOLDOWN_CAP);
     }
 }

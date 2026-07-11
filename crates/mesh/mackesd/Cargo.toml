@@ -296,6 +296,12 @@ etcd-client = { version = "0.19", optional = true }
 # Deterministic snapshot diffs for library-contract tests (12.11.5).
 insta    = { version = "1", features = ["json", "redactions"] }
 tempfile = "3"
+# mackesd-05 — `test-util` enables tokio's pausable clock so the
+# supervisor's half-open circuit-breaker recovery (minutes-long
+# cooldown + stability windows) can be driven in virtual time by the
+# `#[tokio::test(start_paused = true)]` supervisor tests. Test-only;
+# the production binary keeps `features = ["full"]` (no test-util).
+tokio = { version = "1", features = ["test-util"] }
 # (rcgen moved to [dependencies] — ONBOARD-2 needs it at runtime for
 # the `/enroll` endpoint's self-signed identity, not just in tests.)
 
