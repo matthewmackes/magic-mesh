@@ -1,5 +1,13 @@
-//! The typed, length-prefixed message set that travels on the per-session Unix
-//! socket — the socket half of the BOOKMARKS-6 seam.
+//! `mde-web-wire` — the typed, length-prefixed message set that travels on the
+//! per-session Unix socket: the socket half of the BOOKMARKS-6 browser seam.
+//!
+//! This is the SINGLE source of the wire contract, depended on by all three ends
+//! that speak it — the shell client (`mde-web-preview-client`) and both
+//! out-of-process engine helpers (`mde-web-preview` / Servo and `mde-web-cef` /
+//! Chromium). Previously the one `wire.rs` source lived in the client crate and
+//! was `#[path]`-included into each excluded helper, compiling the same file into
+//! three crates with no shared type identity; extracting it here gives one crate,
+//! one type identity, and no drift.
 //!
 //! Two directions, both framed identically on the wire:
 //!
@@ -100,7 +108,7 @@ impl Modifiers {
 
 /// An engine-neutral key.
 ///
-/// The shell maps [`egui::Key`](crate::egui::Key) onto this and the helper maps it
+/// The shell maps its toolkit's `egui::Key` onto this and the helper maps it
 /// onto Servo, so the wire never carries either toolkit's private key numbering.
 /// Keys neither side has a mapping for are dropped (best-effort input) — printable
 /// characters ride [`InputEvent::Text`] anyway.
@@ -785,7 +793,7 @@ pub enum EventMsg {
         /// The full request URL.
         url: String,
         /// The request's resource class (the ABP `$type`) as the compact wire
-        /// discriminant [`crate::filter::resource_from_wire`] maps back to
+        /// discriminant the shell's `resource_from_wire` maps back to
         /// `mde_adblock::ResourceType`.
         resource: u8,
     },

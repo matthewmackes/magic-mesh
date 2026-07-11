@@ -76,6 +76,7 @@ members = [
     "crates/desktop/mde-vdi-vnc",
     "crates/desktop/mde-vdi-spice",
     "crates/desktop/mde-web-preview-client",
+    "crates/desktop/mde-web-wire",
     "crates/desktop/mde-panel-egui",
     "crates/desktop/mde-seat",
     "crates/desktop/mde-term-egui",
