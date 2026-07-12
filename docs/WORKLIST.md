@@ -2195,6 +2195,15 @@ the plane and it **survives killing the current zone leader**.
 
 ## FRONTDOOR — the Magic Mesh Front Door / App Menu redesign (operator 2026-06-25; design: docs/design/front-door.md)
 
+> 🛑 **RETIRED / SUPERSEDED 2026-07-12 (worklist reconciliation).** This epic "refactors
+> `mde-workbench` in place" — but the **iced `mde-workbench` crate is RETIRED** (E12 Quasar
+> pivot to the DRM-native egui shell). Every open `[ ]` below targets that deleted crate, so
+> they can never complete as written and are **closed as superseded**. The launcher function
+> re-homed to the **egui shell**: `mde-shell-egui/src/start_menu.rs` (the Start grid) +
+> `dock/mod.rs` (the taskbar) under the **WIN10-HYBRID** epic (see PLANS-FOLDED). The one part
+> NOT carried over is the proactive **Copilot** (codex-on-leader AI tiles) — if still wanted,
+> that is a **fresh egui-shell epic**, not a resurrection of this iced one. Do not drain these.
+
 100-question survey locked 2026-06-25. Refactors `mde-workbench` in place into the
 primary mesh+OS interface: Win10-Start panel / iPadOS full-screen, custom wgpu render
 (kills the 4s), Carbon look, and a proactive **Copilot** (codex on the leader) living
@@ -4219,7 +4228,10 @@ Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSE
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
 now ships `media-mpv` **enabled** — the "mpv feature never built" blocker is resolved in the shipped
 binary; the remaining work is live-verify + the library UI.
-- [ ] verify real mpv frames render to the Media stage on a seat (mpv now in the shipped shell)
+- [~] verify real mpv frames render to the Media stage on a seat — **engine blocker RESOLVED**: the
+  shipped `mde-shell-egui` on live seat .15 **links `libmpv.so.2`** (verified 2026-07-12, `ldd`), so
+  the real mpv engine is in the shipped binary (not the old FakeMpv placeholder). Remaining = the
+  visual frame-render confirmation on .15's DRM display (operator eyes).
 - [ ] Netflix-style library grid + Carbon styling (replace the flat vertical text list)
 
 ### LIGHTHOUSE-TURNKEY — turn-key lighthouse lifecycle (#12 + #13)
