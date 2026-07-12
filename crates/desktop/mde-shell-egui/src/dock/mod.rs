@@ -835,20 +835,18 @@ impl DockState {
         self.taskbar_autohide
     }
 
-    /// The bottom taskbar's live height for the current density. The pointer
-    /// densities keep the compact [`NOTIFICATION_RAIL_H`]; the finger densities grow
-    /// to the labelled [`NOTIFICATION_RAIL_EXPANDED_H`] variant. (WIN10-HYBRID lands
-    /// the fixed 48px Win10 bar with the B5 taskbar recompose; this stays exhaustive
-    /// over the four densities so the shell compiles today.) Widened `pub(crate)`
-    /// (the `dock::response_activated`/`status::severity_color` cross-module-widening
-    /// idiom this crate already uses) so `start_menu.rs` can reserve the SAME height
-    /// above the taskbar for the Start Menu's slide-up anchor — the WIN7-DESKTOP-1
-    /// regression fix — rather than a second, possibly-drifting guess.
+    /// The bottom taskbar's height — the **fixed 48px** [`NOTIFICATION_RAIL_H`]
+    /// (WIN10-HYBRID). Density-independent: density scales spacing + the hit-target
+    /// floor, never this chrome dimension (design lock #7 / UX-24), so the same
+    /// Windows-10-sized bar drives under every density. Kept a `&self` method (not an
+    /// associated const) because it is called as `state.rail_height()` at ~5 sites and
+    /// `start_menu.rs` reads it to reserve the SAME height above the bar for the Start
+    /// grid's slide-up anchor — the WIN7-DESKTOP-1 regression fix — rather than a
+    /// second, possibly-drifting guess.
+    // Density-independent, but kept a `&self` method (called as `state.rail_height()`).
+    #[allow(clippy::unused_self)]
     pub(crate) const fn rail_height(&self) -> f32 {
-        match self.density {
-            Density::Compact | Density::Mouse => NOTIFICATION_RAIL_H,
-            Density::Comfortable | Density::Touch => NOTIFICATION_RAIL_EXPANDED_H,
-        }
+        NOTIFICATION_RAIL_H
     }
 
     /// Refresh the bottom **notification rail's** live inputs (NOTIF-3) — the shell calls
@@ -1265,12 +1263,15 @@ pub fn notification_rail_with_sources(
             }
             tray_x -= status_w + Style::SP_XS;
 
+            let pip_h = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
             let status_rect = egui::Rect::from_min_size(
-                egui::pos2(tray_x, local.top() + 2.0),
-                egui::vec2(
-                    status_w,
-                    rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0,
-                ),
+                // Vertically CENTER the pip band in the rail — the capped pip height
+                // (≤24px) is shorter than the 48px bar, so top-aligning it (the old
+                // `+2` that happened to centre a 14px pip in the 18px rail) leaves it
+                // floating high. Centring holds the pips on the same row as the cells
+                // at any rail height.
+                egui::pos2(tray_x, local.top() + (rail_h - pip_h) / 2.0),
+                egui::vec2(status_w, pip_h),
             );
             tray_x -= rail_h;
             if status_detail_toggle(ui, cell(tray_x), state) {
@@ -2093,14 +2094,14 @@ const OVERFLOW_H: f32 = Style::SP_L;
 /// micro-icons live in the full-width bottom taskbar.
 const BOTTOM_ZONE_H: f32 = DOCK_W;
 
-/// The full-width bottom taskbar's height in its compact (`Density::Compact`/
-/// `Mouse`) mode — the current denser chrome. (WIN10-HYBRID's B5 recompose replaces
-/// this with the fixed 48px Windows-10 bar; kept compact here so the density-decouple
-/// is a pure compile fix with no geometry churn.) On the [`Style::SP_XS`] grid
-/// [`SYS_QUAD_ICON`] uses; controls render at micro-icon scale inside it. This sits
-/// below [`Density::min_hit_target`]'s 24pt convention — a deliberate pre-existing
-/// exception this module made for this micro-icon tray.
-const NOTIFICATION_RAIL_H: f32 = Style::SP_M + Style::SP_XS / 2.0;
+/// The full-width bottom taskbar's height — a **fixed 48px** matching the Windows-10
+/// taskbar (WIN10-HYBRID; `SP_XL + SP_M` on the 8px grid). Density-independent
+/// (design lock #7 / UX-24 — density scales spacing + the hit-target floor, never
+/// this chrome dimension), so every density drives the same Win10-sized bar. At 48px
+/// each square cell is 48×48 and its icon reaches the full [`ICON_LOGICAL`] 24px cap;
+/// content reserves this as the bottom strut (`taskbar_strut_height`) rather than
+/// being overlaid.
+const NOTIFICATION_RAIL_H: f32 = Style::SP_XL + Style::SP_M;
 /// NAVBAR-8's expanded bar height: touch/expanded density grows the rail to a
 /// labelled Win10-style taskbar variant while compact density keeps the denser
 /// [`NOTIFICATION_RAIL_H`] rail. Deliberately left at the standard [`DOCK_W`]

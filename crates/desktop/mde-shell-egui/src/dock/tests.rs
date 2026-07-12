@@ -1126,8 +1126,10 @@ fn the_clock_strip_shows_the_live_time_and_routes_to_timers() {
         .expect("the clock strip is registered")
         .rect;
     assert!(
-        cell.width() < DOCK_W,
-        "the rail clock is a compact tray item"
+        cell.width() > 0.0 && cell.width() < sz.x / 6.0,
+        "the clock is a bounded tray item ({}px), not the whole bar — at the 48px \
+         Win10 height it is wider than a square cell to fit HH:MM (and date)",
+        cell.width()
     );
     assert!(
         cell.left() > DOCK_W,
@@ -1366,42 +1368,33 @@ fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
 }
 
 #[test]
-fn win7_1_the_default_taskbar_is_denser_than_the_shells_other_carbon_chrome() {
-    // Lock #12 — the relocated Win7 taskbar's default (Density::Mouse) chrome
-    // is deliberately tighter than the shell's other Carbon-baseline chrome:
-    // the 48px DOCK_W left-dock column and the 32px single-column picker
-    // cells. Pins the exact post-WIN7-1 value so a future change is a
-    // conscious edit here, not a silent drift. (WIN10-HYBRID's B5 recompose
-    // will move this to the fixed 48px Win10 bar and rewrite this assertion.)
+fn win10_the_taskbar_is_a_fixed_48px_height_across_densities() {
+    // WIN10-HYBRID — the bottom taskbar matches the Windows-10 taskbar: a fixed 48px
+    // height, density-independent (density scales spacing + the hit-target floor,
+    // never this chrome dimension — lock #7 / UX-24). Pins the value so a future
+    // change is a conscious edit here.
     assert!(
-        (NOTIFICATION_RAIL_H - 18.0).abs() < f32::EPSILON,
-        "WIN7-1 trims the compact taskbar 2px denser than its pre-WIN7-1 20px"
+        (NOTIFICATION_RAIL_H - 48.0).abs() < f32::EPSILON,
+        "the Win10 taskbar is a fixed 48px"
     );
+    for d in [
+        Density::Compact,
+        Density::Mouse,
+        Density::Comfortable,
+        Density::Touch,
+    ] {
+        let mut s = DockState::default();
+        s.set_density(d);
+        assert!(
+            (s.rail_height() - 48.0).abs() < f32::EPSILON,
+            "{d:?} density still drives the fixed 48px taskbar"
+        );
+    }
+    // At 48px the bar equals the DOCK_W left-dock column (both 48) — the left dock
+    // retires into this single taskbar in B4.
     assert!(
-        NOTIFICATION_RAIL_H < DOCK_W,
-        "the taskbar's default chrome is denser than the left dock column"
-    );
-    assert!(
-        NOTIFICATION_RAIL_H < super::APP_CELL_H,
-        "the taskbar's default chrome is denser than a standard picker cell"
-    );
-    // Density::Touch keeps the standard 48px expanded scale.
-    assert!(
-        (NOTIFICATION_RAIL_EXPANDED_H - 48.0).abs() < f32::EPSILON,
-        "the expanded/touch rail height is unchanged by the density pass"
-    );
-    // The four densities resolve to exactly the two anchor heights (A3 decouple).
-    let mut compact = DockState::default();
-    compact.set_density(Density::Compact);
-    let mut comfy = DockState::default();
-    comfy.set_density(Density::Comfortable);
-    assert!(
-        (compact.rail_height() - NOTIFICATION_RAIL_H).abs() < f32::EPSILON,
-        "Compact keeps the compact rail"
-    );
-    assert!(
-        (comfy.rail_height() - NOTIFICATION_RAIL_EXPANDED_H).abs() < f32::EPSILON,
-        "Comfortable rides the expanded rail"
+        (NOTIFICATION_RAIL_H - DOCK_W).abs() < f32::EPSILON,
+        "the taskbar and the (retiring) left dock column share the 48px module"
     );
 }
 
@@ -1543,8 +1536,8 @@ fn navbar8_shell_density_selects_compact_or_expanded_bottom_rail() {
         "expanded Start and Desktop still share one bottom rail"
     );
     assert!(
-        expanded_desktop.width() > compact_start.width(),
-        "expanded cells have room for the label variant"
+        (expanded_desktop.width() - compact_start.width()).abs() < 2.0,
+        "WIN10-HYBRID: the taskbar cells are the same 48px size regardless of density"
     );
 }
 
