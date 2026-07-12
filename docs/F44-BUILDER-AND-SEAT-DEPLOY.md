@@ -240,3 +240,38 @@ during hole-punch — use `-c2+`.
   other directly** (e.g. new seats ↔ the long-lived Eagle) even though both reach
   the lighthouse — a NAT-hairpin quirk; a coordinated reboot re-establishes it.
 
+## 8. Activating a FRESH seat: role-pin before anything runs (learned live 2026-07-12, seat .15)
+
+Installing the RPM does **not** make a seat run — the node is **role-gated fail-closed**.
+On a brand-new seat (`172.20.0.15` "Basement-Test-Workstation", F44, `mm`/`$LAB_PW`):
+
+1. **`mackesd` refuses to start unpinned** — `serve` exits with *"no deployment role
+   pinned (/var/lib/mde/role.toml absent) — refuses to start its worker pool (ENT-2
+   fail-closed)"*, and systemd hits the restart cap ("start request repeated too quickly").
+2. **The shell unit SKIPS (not fails)** — `mde-shell-egui.service` has
+   `ConditionPathExists=/var/lib/mde/role.toml`; with no role it logs *"skipped, unmet
+   condition check"* and never launches. Easy to misread as "installed but broken".
+
+**The one-liner that unblocks both** (needs root — writes `/var/lib/mde/`):
+```sh
+sudo mackesd role-pin workstation     # ranks: lighthouse 0 < workstation 1; upgrade-only
+sudo systemctl reset-failed mackesd && sudo systemctl start mackesd   # now active
+sudo systemctl start mde-shell-egui                                    # now grabs DRM tty1
+```
+The shell unit is `ExecStart=/usr/bin/mde-shell-egui` on `TTYPath=/dev/tty1`,
+`Conflicts=getty@tty1`, `After=mackesd.service`, `WantedBy=multi-user.target` — so once the
+role is pinned it also **auto-starts on the next boot**. Verify live: `systemctl show
+mde-shell-egui -p NRestarts` = 0 (stable, not crash-looping) and the boot journal line
+`"mde-shell-egui starting" … "drm":true`.
+
+**Fresh-seat install path (cleaner than force-rpm):** a seat with NO prior `magic-mesh`
+takes `sudo dnf install -y /tmp/<rpm>` directly — dnf resolves **all** deps from Fedora +
+RPM Fusion (enable it first: `dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm`,
+then `dnf install -y mpv-libs` to pre-stage the ffmpeg-8 sonames). The `rpm -Uvh
+--replacepkgs --force` dance in §2 is only for seats that already carry the same VR.
+DoD after install: `ldd /usr/bin/{mackesd,mde-shell-egui,mde-web-cef,mde-web-preview} |
+grep 'not found'` returns **nothing** (all ffmpeg-8/mpv sonames resolve).
+
+**Still standalone after this** — role-pin activates the local seat but does NOT join the
+mesh. For overlay membership (chat/peers), follow §7 (`mackesd join`) after the shell is up.
+
