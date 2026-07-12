@@ -201,9 +201,16 @@ impl Style {
     /// 32px.
     pub const SP_XL: f32 = 32.0;
 
-    /// Corner radius for surfaces (data; applied by surfaces at draw time so the
-    /// harness build stays free of egui's version-sensitive corner-radius type).
-    pub const RADIUS: f32 = 6.0;
+    // ── Corner-radius tiers (applied by surfaces at draw time as raw data, so the
+    //    harness build stays free of egui's version-sensitive corner-radius type) ──
+    /// Tight radius — buttons, chips, taskbar/cell inner fills.
+    pub const RADIUS_S: f32 = 4.0;
+    /// Mid radius — cards, menus, popovers (the historical default).
+    pub const RADIUS_M: f32 = 6.0;
+    /// Large radius — windows, sheets, dialogs, the lock curtain.
+    pub const RADIUS_L: f32 = 8.0;
+    /// Back-compat alias for the mid tier — the ~130 pre-tier call sites read this.
+    pub const RADIUS: f32 = Self::RADIUS_M;
 
     // ── Type scale (point sizes) ────────────────────────────────────────────
     /// Small / caption text.
@@ -518,10 +525,78 @@ impl GradeBand {
     }
 }
 
+/// A soft-shadow token (raw data; a surface builds `epaint::Shadow` from it at
+/// draw time, keeping this module free of egui's shadow type). The umbra is
+/// **always** a translucent black (`a() < 255`): depth is alpha + a soft blur,
+/// never an opaque fill and never a true gaussian-blur *pass* over the content
+/// behind (design lock #2 — "layered soft shadows … no blur pass").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowToken {
+    /// `(x, y)` cast offset in logical px.
+    pub offset: [f32; 2],
+    /// Blur radius in logical px (`epaint::Shadow::blur`).
+    pub blur: f32,
+    /// Spread in logical px (`epaint::Shadow::spread`).
+    pub spread: f32,
+    /// Umbra colour — a translucent black; the invariant is `a() < 255`.
+    pub umbra: Color32,
+}
+
+/// The elevation ladder — how far a surface sits off the page. Each tier maps to
+/// one [`ShadowToken`] via [`shadow`](Self::shadow); [`Flat`](Self::Flat) casts
+/// none. Higher tiers cast a larger, softer, slightly deeper shadow, but every
+/// umbra stays translucent. This is the single source of "how deep is a card /
+/// menu / dialog", so no surface hand-rolls a `Shadow`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elevation {
+    /// On the page — no shadow (inline chrome, list rows).
+    Flat,
+    /// A card / cell lifted off its surface.
+    Raised,
+    /// A floating overlay — menu, popover, tooltip, the taskbar Start grid.
+    Overlay,
+    /// A modal sheet / dialog / lock curtain — the deepest tier.
+    Modal,
+}
+
+impl Elevation {
+    /// The soft-shadow token for this tier (offset/blur grow with elevation; the
+    /// umbra stays translucent at every tier).
+    #[must_use]
+    pub const fn shadow(self) -> ShadowToken {
+        match self {
+            Self::Flat => ShadowToken {
+                offset: [0.0, 0.0],
+                blur: 0.0,
+                spread: 0.0,
+                umbra: Color32::from_black_alpha(0),
+            },
+            Self::Raised => ShadowToken {
+                offset: [0.0, 1.0],
+                blur: 2.0,
+                spread: 0.0,
+                umbra: Color32::from_black_alpha(0x30),
+            },
+            Self::Overlay => ShadowToken {
+                offset: [0.0, 4.0],
+                blur: 12.0,
+                spread: 0.0,
+                umbra: Color32::from_black_alpha(0x50),
+            },
+            Self::Modal => ShadowToken {
+                offset: [0.0, 8.0],
+                blur: 24.0,
+                spread: 0.0,
+                umbra: Color32::from_black_alpha(0x70),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants, clippy::float_cmp)]
 mod tests {
-    use super::{Density, GradeBand, Style};
+    use super::{Density, Elevation, GradeBand, Style};
     use crate::formfactor::Formfactor;
 
     /// WCAG 2.1 **relative luminance** of an sRGB colour (`0.0..=1.0`; alpha ignored).
@@ -606,6 +681,56 @@ mod tests {
         }
         // XS is the deliberate half-step.
         assert_eq!(Style::SP_XS, Style::SP_S / 2.0);
+    }
+
+    #[test]
+    fn radius_tiers_ascend_and_default_is_the_mid_tier() {
+        // Strictly ascending, each on the 2px sub-grid, mid == the back-compat alias.
+        assert!(
+            Style::RADIUS_S < Style::RADIUS_M && Style::RADIUS_M < Style::RADIUS_L,
+            "radius tiers must strictly ascend: {} < {} < {}",
+            Style::RADIUS_S,
+            Style::RADIUS_M,
+            Style::RADIUS_L,
+        );
+        for r in [Style::RADIUS_S, Style::RADIUS_M, Style::RADIUS_L] {
+            assert_eq!(r % 2.0, 0.0, "{r} is off the 2px sub-grid");
+        }
+        assert_eq!(
+            Style::RADIUS,
+            Style::RADIUS_M,
+            "RADIUS must alias the mid tier so pre-tier call sites are unchanged"
+        );
+    }
+
+    #[test]
+    fn elevation_ladder_is_soft_and_ascends() {
+        use Elevation::{Flat, Modal, Overlay, Raised};
+        // Flat casts nothing.
+        assert_eq!(Flat.shadow().umbra.a(), 0, "Flat must cast no shadow");
+        assert_eq!(Flat.shadow().blur, 0.0);
+        // The three real tiers grow in offset + blur and deepen in umbra …
+        let tiers = [Raised, Overlay, Modal];
+        for w in tiers.windows(2) {
+            let (lo, hi) = (w[0].shadow(), w[1].shadow());
+            assert!(
+                hi.offset[1] > lo.offset[1],
+                "shadow y-offset must grow with elevation"
+            );
+            assert!(hi.blur > lo.blur, "blur must grow with elevation");
+            assert!(
+                hi.umbra.a() > lo.umbra.a(),
+                "umbra must deepen with elevation"
+            );
+        }
+        // … but the umbra is ALWAYS translucent — depth is alpha, never opaque (lock #2).
+        for e in [Raised, Overlay, Modal] {
+            let a = e.shadow().umbra.a();
+            assert!(
+                a > 0 && a < 255,
+                "{e:?} umbra alpha {a} must be a soft (0,255)"
+            );
+        }
     }
 
     #[test]
