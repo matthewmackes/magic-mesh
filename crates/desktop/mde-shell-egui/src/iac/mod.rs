@@ -1372,49 +1372,70 @@ fn render_heat_reverse_output(ui: &mut egui::Ui, state: &InfraCodeState) {
     ui.add_space(Style::SP_XS);
 }
 
+/// The Heat card shadow — the surface-side conversion of the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token into an
+/// [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
+/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
+/// small integer fields; mints **no** colour of its own (the umbra comes straight
+/// from the token), so the Heat panel's forms and confirm dialogs read as genuinely
+/// lifted off the page while the look still comes only from `mde_egui` (§4).
+fn card_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// The create-stack form (#6) — name + HOT template; Create is typed-armed (#22).
 fn render_heat_create_form(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     if !state.heat.show_create {
         return;
     }
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(
-            RichText::new("New stack")
-                .size(Style::BODY)
-                .strong()
-                .color(Style::ACCENT_WORKLOADS),
-        );
-        ui.horizontal(|ui| {
+    egui::Frame::group(ui.style())
+        .shadow(card_shadow())
+        .show(ui, |ui| {
             ui.label(
-                RichText::new("Name")
+                RichText::new("New stack")
+                    .size(Style::BODY)
+                    .strong()
+                    .color(Style::ACCENT_WORKLOADS),
+            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Name")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.heat.create_name).hint_text("stack name"),
+                );
+            });
+            ui.label(
+                RichText::new("Template (HOT)")
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
             );
-            ui.add(egui::TextEdit::singleline(&mut state.heat.create_name).hint_text("stack name"));
+            ui.add(
+                egui::TextEdit::multiline(&mut state.heat.create_template)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(8)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("Create\u{2026}").color(Style::ACCENT))
+                    .clicked()
+                {
+                    state.arm_heat_create();
+                }
+                if ui.button("Cancel").clicked() {
+                    state.heat.show_create = false;
+                }
+            });
         });
-        ui.label(
-            RichText::new("Template (HOT)")
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
-        ui.add(
-            egui::TextEdit::multiline(&mut state.heat.create_template)
-                .font(egui::TextStyle::Monospace)
-                .desired_rows(8)
-                .desired_width(f32::INFINITY),
-        );
-        ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("Create\u{2026}").color(Style::ACCENT))
-                .clicked()
-            {
-                state.arm_heat_create();
-            }
-            if ui.button("Cancel").clicked() {
-                state.heat.show_create = false;
-            }
-        });
-    });
     ui.add_space(Style::SP_XS);
 }
 
@@ -1615,26 +1636,29 @@ fn render_heat_preview(ui: &mut egui::Ui, state: &InfraCodeState) {
     let Some(outcome) = state.heat.preview.clone() else {
         return;
     };
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(
-            RichText::new("Preview update (dry-run)")
-                .size(Style::SMALL)
-                .strong()
-                .color(Style::ACCENT_WORKLOADS),
-        );
-        match &outcome {
-            HeatOutcome::NotConfigured(reason) => {
-                mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+    egui::Frame::group(ui.style())
+        .shadow(card_shadow())
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("Preview update (dry-run)")
+                    .size(Style::SMALL)
+                    .strong()
+                    .color(Style::ACCENT_WORKLOADS),
+            );
+            match &outcome {
+                HeatOutcome::NotConfigured(reason) => {
+                    mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+                }
+                HeatOutcome::Failed(reason) => {
+                    ui.colored_label(
+                        Style::DANGER,
+                        RichText::new(format!("preview failed \u{2014} {reason}"))
+                            .size(Style::SMALL),
+                    );
+                }
+                HeatOutcome::Ready(preview) => render_preview_diff(ui, preview),
             }
-            HeatOutcome::Failed(reason) => {
-                ui.colored_label(
-                    Style::DANGER,
-                    RichText::new(format!("preview failed \u{2014} {reason}")).size(Style::SMALL),
-                );
-            }
-            HeatOutcome::Ready(preview) => render_preview_diff(ui, preview),
-        }
-    });
+        });
     ui.add_space(Style::SP_XS);
 }
 
@@ -1777,53 +1801,56 @@ fn render_heat_arming(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     // before the seam is driven.
     let mut act: Option<(bool, HeatOp, String, String, String)> = None;
     if let Some(arming) = state.heat.arming.as_mut() {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.colored_label(
-                Style::WARN,
-                RichText::new(format!(
-                    "Confirm {} stack",
-                    arming.op.label().to_lowercase()
-                ))
-                .size(Style::BODY)
-                .strong(),
-            );
-            mde_egui::muted_note(
-                ui,
-                format!(
+        egui::Frame::group(ui.style())
+            .shadow(card_shadow())
+            .show(ui, |ui| {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!(
+                        "Confirm {} stack",
+                        arming.op.label().to_lowercase()
+                    ))
+                    .size(Style::BODY)
+                    .strong(),
+                );
+                mde_egui::muted_note(
+                    ui,
+                    format!(
                     "Type the stack name \u{201C}{}\u{201D} to arm this {} \u{2014} it acts on the \
                      live cloud.",
                     arming.stack_name,
                     arming.op.label().to_lowercase()
                 ),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut arming.typed).hint_text(arming.stack_name.as_str()),
-            );
-            let is_armed = armed(&arming.typed, &arming.stack_name);
-            ui.horizontal(|ui| {
-                let confirm = ui.add_enabled(
-                    is_armed,
-                    egui::Button::new(RichText::new(arming.op.label()).color(Style::DANGER)),
                 );
-                if confirm.clicked() && is_armed {
-                    act = Some((
-                        true,
-                        arming.op,
-                        arming.stack_name.clone(),
-                        arming.stack_id.clone(),
-                        arming.template.clone(),
-                    ));
-                } else if ui.button("Cancel").clicked() {
-                    act = Some((
-                        false,
-                        arming.op,
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                    ));
-                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut arming.typed)
+                        .hint_text(arming.stack_name.as_str()),
+                );
+                let is_armed = armed(&arming.typed, &arming.stack_name);
+                ui.horizontal(|ui| {
+                    let confirm = ui.add_enabled(
+                        is_armed,
+                        egui::Button::new(RichText::new(arming.op.label()).color(Style::DANGER)),
+                    );
+                    if confirm.clicked() && is_armed {
+                        act = Some((
+                            true,
+                            arming.op,
+                            arming.stack_name.clone(),
+                            arming.stack_id.clone(),
+                            arming.template.clone(),
+                        ));
+                    } else if ui.button("Cancel").clicked() {
+                        act = Some((
+                            false,
+                            arming.op,
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                });
             });
-        });
         ui.add_space(Style::SP_S);
     }
     if let Some((confirmed, op, name, id, template)) = act {
@@ -1843,44 +1870,48 @@ fn render_arming(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     // before the seam is driven.
     let mut act: Option<(bool, &'static str, String, String)> = None;
     if let Some(arming) = state.arming.as_mut() {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.colored_label(
-                Style::WARN,
-                RichText::new(format!("Confirm {} instance", verb_label(arming.verb)))
-                    .size(Style::BODY)
-                    .strong(),
-            );
-            mde_egui::muted_note(
-                ui,
-                format!(
+        egui::Frame::group(ui.style())
+            .shadow(card_shadow())
+            .show(ui, |ui| {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!("Confirm {} instance", verb_label(arming.verb)))
+                        .size(Style::BODY)
+                        .strong(),
+                );
+                mde_egui::muted_note(
+                    ui,
+                    format!(
                     "Type the instance name \u{201C}{}\u{201D} to arm this {} \u{2014} it acts on \
                      the live cloud and cannot be undone.",
                     arming.target_name,
                     verb_label(arming.verb).to_lowercase()
                 ),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut arming.typed)
-                    .hint_text(arming.target_name.as_str()),
-            );
-            let is_armed = armed(&arming.typed, &arming.target_name);
-            ui.horizontal(|ui| {
-                let confirm = ui.add_enabled(
-                    is_armed,
-                    egui::Button::new(RichText::new(verb_label(arming.verb)).color(Style::DANGER)),
                 );
-                if confirm.clicked() && is_armed {
-                    act = Some((
-                        true,
-                        arming.verb,
-                        arming.instance_id.clone(),
-                        arming.target_name.clone(),
-                    ));
-                } else if ui.button("Cancel").clicked() {
-                    act = Some((false, arming.verb, String::new(), String::new()));
-                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut arming.typed)
+                        .hint_text(arming.target_name.as_str()),
+                );
+                let is_armed = armed(&arming.typed, &arming.target_name);
+                ui.horizontal(|ui| {
+                    let confirm = ui.add_enabled(
+                        is_armed,
+                        egui::Button::new(
+                            RichText::new(verb_label(arming.verb)).color(Style::DANGER),
+                        ),
+                    );
+                    if confirm.clicked() && is_armed {
+                        act = Some((
+                            true,
+                            arming.verb,
+                            arming.instance_id.clone(),
+                            arming.target_name.clone(),
+                        ));
+                    } else if ui.button("Cancel").clicked() {
+                        act = Some((false, arming.verb, String::new(), String::new()));
+                    }
+                });
             });
-        });
         ui.add_space(Style::SP_S);
     }
     if let Some((confirmed, verb, id, name)) = act {
