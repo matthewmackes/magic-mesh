@@ -1610,6 +1610,24 @@ fn queue_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControlle
 
 // ── PiP mini-player ────────────────────────────────────────────────────────────────
 
+/// The floating `PiP` mini-player's window shadow — the surface-side conversion of the
+/// shared [`Elevation::Overlay`](mde_egui::style::Elevation::Overlay) depth token into
+/// an [`egui::Shadow`] (the token module stays free of egui's shadow type). Every field
+/// comes straight from the token: offset/blur/spread cast onto epaint's small integer
+/// fields, and the umbra colour verbatim — no minted `Color32` (§4) — so the mini-player
+/// reads as a genuine floating overlay lifted off the surface behind it, and the depth
+/// is a translucent umbra (design lock #2), not egui's stock window shadow.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // token px values are small +ve.
+fn pip_overlay_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Overlay.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// The floating `PiP` mini-player (design Q31/Q32): a compact now-playing + play/pause
 /// window shown when [`crate::model::UiState::pip`] is on. A real, reachable window —
 /// not a stub.
@@ -1619,9 +1637,14 @@ pub fn pip_window<E: MediaEngine>(ctx: &Context, controller: &mut MediaControlle
     }
     let mut action: Option<TransportAction> = None;
     let mut close = false;
+    // The stock window frame, its depth re-sourced from the shared Overlay token so the
+    // floating mini-player casts the same soft overlay shadow as every other popover
+    // (same fill/stroke/margin — only the shadow changes, no layout change).
+    let window_frame = egui::Frame::window(&ctx.style()).shadow(pip_overlay_shadow());
     egui::Window::new("Mini-player")
         .resizable(false)
         .collapsible(false)
+        .frame(window_frame)
         .show(ctx, |ui| {
             ui.label(
                 RichText::new(now_playing_title(controller.player()))
@@ -1969,6 +1992,38 @@ mod tests {
         c.ui_mut().fullscreen = true;
         // The PiP window + header (with the toggles lit) render.
         render_with_video(&mut c, &mut VideoTextureCache::default(), player_view);
+    }
+
+    /// The floating PiP mini-player casts the shared `Elevation::Overlay` soft shadow
+    /// (Phase-C depth adoption): every field of [`pip_overlay_shadow`] comes straight
+    /// from the token — offset/blur/spread and, critically, the umbra colour (no minted
+    /// `Color32`, §4) — and the umbra stays translucent (design lock #2), so the window
+    /// reads as a genuine overlay, not egui's stock window shadow.
+    #[test]
+    fn pip_window_casts_the_overlay_depth_token() {
+        let overlay = mde_egui::style::Elevation::Overlay.shadow();
+        let shadow = pip_overlay_shadow();
+        assert_eq!(
+            shadow.offset,
+            [overlay.offset[0] as i8, overlay.offset[1] as i8],
+            "the PiP window shadow offset comes from the Overlay token"
+        );
+        assert_eq!(
+            shadow.blur, overlay.blur as u8,
+            "the PiP window shadow blur comes from the Overlay token"
+        );
+        assert_eq!(
+            shadow.spread, overlay.spread as u8,
+            "the PiP window shadow spread comes from the Overlay token"
+        );
+        assert_eq!(
+            shadow.color, overlay.umbra,
+            "the PiP window shadow umbra is the Overlay token's, not a minted colour"
+        );
+        assert!(
+            shadow.color.a() > 0 && shadow.color.a() < 255,
+            "the depth is a translucent umbra (lock #2), never an opaque fill"
+        );
     }
 
     #[test]
