@@ -1886,104 +1886,130 @@ fn render_instances_tab(ui: &mut egui::Ui, state: &mut CloudPlaneState) {
     }
 }
 
+/// Convert the shared [`Elevation::Raised`](mde_egui::style::Elevation::Raised)
+/// depth token into an [`egui::Shadow`] (the token module stays free of egui's
+/// shadow type). Reads the token's offset/blur/spread/umbra, casting the
+/// logical-px floats onto epaint's small integer fields; mints **no** colour of
+/// its own (the umbra comes straight from the token), so a Nova roster card reads
+/// as genuinely lifted off the page while the look still comes only from
+/// `mde_egui` (§4).
+fn card_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// One Nova roster card: status pip · name · facts · the lifecycle verbs
 /// (start/stop direct; reboot/delete typed-armed).
 fn render_instance_card(ui: &mut egui::Ui, state: &mut CloudPlaneState, row: &InstanceRow) {
-    ui.group(|ui| {
-        ui.horizontal(|ui| {
-            let color = instance_pip(&row.status);
-            ui.colored_label(color, RichText::new(DOT).size(Style::SMALL));
-            ui.add_space(Style::SP_XS);
-            ui.label(
-                RichText::new(&row.name)
-                    .color(Style::TEXT)
-                    .size(Style::BODY)
-                    .strong(),
-            );
-            ui.add_space(Style::SP_S);
-            ui.colored_label(color, RichText::new(row.status.as_str()).size(Style::SMALL));
-        });
-        let mut facts = Vec::new();
-        if let Some(flavor) = &row.flavor {
-            facts.push(flavor.clone());
-        }
-        if let Some(image) = &row.image {
-            facts.push(image.clone());
-        }
-        if let Some(networks) = &row.networks {
-            facts.push(networks.clone());
-        }
-        facts.push(format!("ssh key {MESH_KEYPAIR_NAME}"));
-        facts.push(row.id.clone());
-        mde_egui::muted_note(ui, facts.join(" \u{00B7} "));
-        ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("Console").size(Style::SMALL))
-                .clicked()
-            {
-                let body = serde_json::json!({ "instance": row.id }).to_string();
-                state.issue_mutation(
-                    INSTANCE_CONSOLE_VERB,
-                    &body,
-                    &format!("console for {}", row.name),
+    // A genuinely raised roster card: the same `Frame::group` `ui.group` builds
+    // (identical fill/stroke/radius/margin — no layout change), lifted off the
+    // page by the shared `Elevation::Raised` soft shadow.
+    egui::Frame::group(ui.style())
+        .shadow(card_shadow())
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let color = instance_pip(&row.status);
+                ui.colored_label(color, RichText::new(DOT).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(&row.name)
+                        .color(Style::TEXT)
+                        .size(Style::BODY)
+                        .strong(),
                 );
+                ui.add_space(Style::SP_S);
+                ui.colored_label(color, RichText::new(row.status.as_str()).size(Style::SMALL));
+            });
+            let mut facts = Vec::new();
+            if let Some(flavor) = &row.flavor {
+                facts.push(flavor.clone());
             }
-            if ui
-                .button(RichText::new("Ensure SSH key").size(Style::SMALL))
-                .clicked()
-            {
-                state.issue_mutation(
-                    ENSURE_MESH_KEYPAIR_VERB,
-                    "{}",
-                    &format!("mesh SSH keypair {MESH_KEYPAIR_NAME}"),
-                );
+            if let Some(image) = &row.image {
+                facts.push(image.clone());
             }
-            if ui
-                .button(RichText::new("Start").size(Style::SMALL))
-                .clicked()
-            {
-                let body = serde_json::json!({ "instance": row.id }).to_string();
-                state.issue_mutation("instance-start", &body, &format!("start of {}", row.name));
+            if let Some(networks) = &row.networks {
+                facts.push(networks.clone());
             }
-            if ui
-                .button(RichText::new("Stop").size(Style::SMALL))
-                .clicked()
-            {
-                let body = serde_json::json!({ "instance": row.id }).to_string();
-                state.issue_mutation("instance-stop", &body, &format!("stop of {}", row.name));
-            }
-            if ui
-                .button(RichText::new("Reboot").size(Style::SMALL))
-                .clicked()
-            {
-                state.arming = Some(CloudArming {
-                    action: ArmAction::Lifecycle {
-                        verb: "instance-reboot",
-                        instance_id: row.id.clone(),
-                    },
-                    target: row.name.clone(),
-                    typed: String::new(),
-                });
-            }
-            if ui
-                .button(
-                    RichText::new("Delete")
-                        .size(Style::SMALL)
-                        .color(Style::DANGER),
-                )
-                .clicked()
-            {
-                state.arming = Some(CloudArming {
-                    action: ArmAction::Lifecycle {
-                        verb: "instance-delete",
-                        instance_id: row.id.clone(),
-                    },
-                    target: row.name.clone(),
-                    typed: String::new(),
-                });
-            }
+            facts.push(format!("ssh key {MESH_KEYPAIR_NAME}"));
+            facts.push(row.id.clone());
+            mde_egui::muted_note(ui, facts.join(" \u{00B7} "));
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("Console").size(Style::SMALL))
+                    .clicked()
+                {
+                    let body = serde_json::json!({ "instance": row.id }).to_string();
+                    state.issue_mutation(
+                        INSTANCE_CONSOLE_VERB,
+                        &body,
+                        &format!("console for {}", row.name),
+                    );
+                }
+                if ui
+                    .button(RichText::new("Ensure SSH key").size(Style::SMALL))
+                    .clicked()
+                {
+                    state.issue_mutation(
+                        ENSURE_MESH_KEYPAIR_VERB,
+                        "{}",
+                        &format!("mesh SSH keypair {MESH_KEYPAIR_NAME}"),
+                    );
+                }
+                if ui
+                    .button(RichText::new("Start").size(Style::SMALL))
+                    .clicked()
+                {
+                    let body = serde_json::json!({ "instance": row.id }).to_string();
+                    state.issue_mutation(
+                        "instance-start",
+                        &body,
+                        &format!("start of {}", row.name),
+                    );
+                }
+                if ui
+                    .button(RichText::new("Stop").size(Style::SMALL))
+                    .clicked()
+                {
+                    let body = serde_json::json!({ "instance": row.id }).to_string();
+                    state.issue_mutation("instance-stop", &body, &format!("stop of {}", row.name));
+                }
+                if ui
+                    .button(RichText::new("Reboot").size(Style::SMALL))
+                    .clicked()
+                {
+                    state.arming = Some(CloudArming {
+                        action: ArmAction::Lifecycle {
+                            verb: "instance-reboot",
+                            instance_id: row.id.clone(),
+                        },
+                        target: row.name.clone(),
+                        typed: String::new(),
+                    });
+                }
+                if ui
+                    .button(
+                        RichText::new("Delete")
+                            .size(Style::SMALL)
+                            .color(Style::DANGER),
+                    )
+                    .clicked()
+                {
+                    state.arming = Some(CloudArming {
+                        action: ArmAction::Lifecycle {
+                            verb: "instance-delete",
+                            instance_id: row.id.clone(),
+                        },
+                        target: row.name.clone(),
+                        typed: String::new(),
+                    });
+                }
+            });
         });
-    });
 }
 
 /// The Nova status pip colour.
@@ -2435,6 +2461,32 @@ mod tests {
     use super::*;
     use mackes_mesh_types::openstack::ResourceRow;
     use mde_egui::egui::{pos2, vec2, Rect};
+
+    /// Phase-C depth adoption — each Nova roster card carries the shared
+    /// [`Elevation::Raised`](mde_egui::style::Elevation) soft shadow verbatim from
+    /// the token (no hand-rolled colour, design lock #2 / §4). The surface-side
+    /// [`card_shadow`] conversion must reproduce the token's offset/blur/spread
+    /// and its exact translucent umbra, and cast a real (non-zero) shadow so the
+    /// instance reads as genuinely lifted off the page.
+    #[test]
+    fn instance_card_wears_the_raised_elevation_token() {
+        let token = mde_egui::style::Elevation::Raised.shadow();
+        let shadow = card_shadow();
+        assert_eq!(
+            shadow.color, token.umbra,
+            "the roster card's umbra comes straight from the token — no minted colour"
+        );
+        assert_eq!(
+            shadow.offset,
+            [token.offset[0] as i8, token.offset[1] as i8]
+        );
+        assert_eq!(shadow.blur, token.blur as u8);
+        assert_eq!(shadow.spread, token.spread as u8);
+        assert!(
+            shadow.color.a() > 0 && shadow.color.a() < 255 && shadow.blur > 0,
+            "Raised casts a real, soft, translucent shadow — the card is lifted off the page"
+        );
+    }
 
     /// A throwaway dir under the system temp dir (this crate does not vendor
     /// `tempfile` — the device-manager `ScratchRoot` idiom), removed on drop.
