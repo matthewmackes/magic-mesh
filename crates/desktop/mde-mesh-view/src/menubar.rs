@@ -40,6 +40,7 @@ use std::collections::HashSet;
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar as SharedMenuBar, MenuBarModel};
+use mde_egui::style::Elevation;
 use mde_egui::{muted_note, ChipTone, StatusChip, Style};
 
 use crate::state::{Health, MeshNode, MeshState, Role};
@@ -431,6 +432,11 @@ impl MeshMenuBar {
             .open(&mut self.legend_open)
             .collapsible(false)
             .resizable(false)
+            // The legend is a floating reference popover — give its plate the shared
+            // [`Elevation::Overlay`] soft shadow so it reads as lifted off the map, in
+            // place of egui's ad-hoc default window shadow. Keeps the standard window
+            // frame's token fill/stroke/radius (SURFACE / BORDER); only the depth changes.
+            .frame(egui::Frame::window(&ctx.style()).shadow(overlay_shadow()))
             .show(ctx, |ui| {
                 legend_heading(ui, "Health");
                 legend_swatch(ui, Style::OK, "Healthy — reachable and well");
@@ -455,6 +461,22 @@ impl MeshMenuBar {
     }
 }
 
+/// Build the shared [`Elevation::Overlay`] soft shadow as an [`egui::Shadow`] — the
+/// surface-side conversion the token module defers (it stays free of egui's shadow
+/// type). Casts the token's logical-px floats onto epaint's small integer fields and
+/// mints **no** colour of its own (the umbra comes straight from the token), so the
+/// legend's depth still reads only from `mde_egui` (§4). A translucent umbra keeps it
+/// a soft layered shadow, never an opaque plate (lock #2).
+fn overlay_shadow() -> egui::Shadow {
+    let token = Elevation::Overlay.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// A dim section heading inside the legend window (the caption tier).
 fn legend_heading(ui: &mut egui::Ui, text: &str) {
     ui.label(
@@ -476,10 +498,12 @@ fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        apply, build_menus, build_status, MeshAction, MeshMenuBar, MeshOutcome, MeshViewOptions,
+        apply, build_menus, build_status, overlay_shadow, MeshAction, MeshMenuBar, MeshOutcome,
+        MeshViewOptions,
     };
     use crate::state::{Health, MeshLink, MeshNode, MeshState, Role};
     use mde_egui::menubar::{Entry, Item};
+    use mde_egui::style::Elevation;
     use mde_egui::{ChipTone, Style};
 
     /// A small mixed fixture: a leader lighthouse, a server, and two workstations
@@ -731,6 +755,35 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mesh-view bar produced no draw primitives"
+        );
+    }
+
+    // ── the legend popover borrows the shared overlay depth ──────────────────
+
+    #[test]
+    fn legend_popover_wears_the_shared_overlay_depth_token() {
+        // The Help ▸ Legend window is a floating reference popover, so its plate
+        // borrows the shared `Elevation::Overlay` soft shadow in place of egui's
+        // ad-hoc default window shadow. The conversion casts the token's floats onto
+        // epaint's ints but invents no shape or colour of its own, so the depth reads
+        // only from `mde_egui` (§4).
+        let token = Elevation::Overlay.shadow();
+        let shadow = overlay_shadow();
+        assert_eq!(
+            shadow.offset,
+            [token.offset[0] as i8, token.offset[1] as i8]
+        );
+        assert_eq!(shadow.blur, token.blur as u8);
+        assert_eq!(shadow.spread, token.spread as u8);
+        assert_eq!(
+            shadow.color, token.umbra,
+            "umbra comes straight from the token"
+        );
+        // A real, soft, translucent lift — never flat, never an opaque plate (lock #2).
+        assert!(shadow.blur > 0, "the overlay actually casts a shadow");
+        assert!(
+            shadow.color.a() > 0 && shadow.color.a() < 255,
+            "the umbra stays translucent"
         );
     }
 }
