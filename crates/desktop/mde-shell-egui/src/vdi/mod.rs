@@ -1987,6 +1987,24 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     }
 }
 
+/// The reconnect / failure overlay's depth — the surface-side conversion of the
+/// shared [`Elevation::Modal`](mde_egui::style::Elevation::Modal) depth token into
+/// an [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
+/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's small
+/// integer fields; mints **no** colour of its own (the umbra comes straight from the
+/// token), so the honest status sheet reads as a genuine modal lifted off the dimmed
+/// desktop while the look still comes only from `mde_egui` (§4, lock #2).
+#[cfg(feature = "live-vdi")]
+fn overlay_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Modal.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// shell-ux-1 — paint the honest reconnect / failure overlay OVER the (frozen) last
 /// desktop frame that fills `body`, and return the affordance the operator pressed
 /// this frame, if any. The content is the pure [`SessionOverlay`] model (asserted by
@@ -2020,6 +2038,7 @@ fn paint_session_overlay(
                 .fill(Style::SURFACE)
                 .stroke(egui::Stroke::new(1.0, Style::BORDER))
                 .corner_radius(Style::RADIUS)
+                .shadow(overlay_shadow())
                 .inner_margin(Style::SP_L)
                 .show(ui, |ui| {
                     ui.set_max_width(440.0);
