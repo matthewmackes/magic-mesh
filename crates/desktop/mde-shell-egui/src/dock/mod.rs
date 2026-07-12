@@ -606,6 +606,10 @@ pub struct DockState {
     /// formfactor/control-surface path. Mouse keeps the compact icon rail; Touch
     /// expands the rail into the 48px labelled variant.
     density: Density,
+    /// WIN10-HYBRID — the persisted taskbar **auto-hide** setting. Off by default:
+    /// the bar stays docked and reserves its bottom strut. See
+    /// [`set_taskbar_autohide`](Self::set_taskbar_autohide).
+    taskbar_autohide: bool,
 }
 
 /// A shell-level **request** the VDOCK-4 system quad records for the shell to drain
@@ -812,6 +816,23 @@ impl DockState {
     /// one compact/expanded mode instead of a second dock-local toggle.
     pub const fn set_density(&mut self, density: Density) {
         self.density = density;
+    }
+
+    /// Enable/disable the WIN10-HYBRID taskbar **auto-hide** setting (the shell feeds
+    /// this from its persisted appearance config). When on, the bar reserves no
+    /// bottom strut and reveals as a floating overlay on a bottom-edge hover (the B3
+    /// reveal). Default off — the bar stays docked and reserves its strut.
+    pub const fn set_taskbar_autohide(&mut self, on: bool) {
+        self.taskbar_autohide = on;
+    }
+
+    /// Whether the taskbar is currently **hidden** (auto-hide on and not being
+    /// revealed) — the predicate [`taskbar_strut_height`] keys off to drop the bottom
+    /// strut to `0.0` (R5). (B3 folds the transient bottom-edge-hover reveal in here;
+    /// today it tracks only the persisted auto-hide setting.)
+    #[must_use]
+    pub const fn taskbar_autohidden(&self) -> bool {
+        self.taskbar_autohide
     }
 
     /// The bottom taskbar's live height for the current density. The pointer
@@ -1332,6 +1353,24 @@ pub fn gutter_width(ctx: &egui::Context, state: &DockState) -> f32 {
         0.0
     } else {
         DOCK_W * t
+    }
+}
+
+/// WIN10-HYBRID **bottom strut** — the height the shell reserves at the bottom edge
+/// for the taskbar so surface content is never covered by it (the Windows-10 model:
+/// a maximized surface ends *above* the taskbar, unlike the pre-hybrid floating
+/// overlay). It is the taskbar's live [`rail_height`](DockState::rail_height).
+/// Unlike the auto-hiding left-dock gutter this is reserved whenever the bar is
+/// **docked**; when the bar is auto-hidden it returns `0.0` and the revealed bar
+/// floats as an overlay instead (R5 — the strut is never eased with the reveal, so
+/// content never jumps on a hover). Reserved by `main.rs::central_view` as an empty
+/// bottom `TopBottomPanel` mounted before the `CentralPanel`.
+#[must_use]
+pub fn taskbar_strut_height(state: &DockState) -> f32 {
+    if state.taskbar_autohidden() {
+        0.0
+    } else {
+        state.rail_height()
     }
 }
 

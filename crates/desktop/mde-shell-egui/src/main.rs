@@ -1598,6 +1598,19 @@ impl Shell {
         // full-screen-remote condition the KIRON focus-mute uses (`render`).
         let full_screen_remote_desktop =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
+        // WIN10-HYBRID bottom strut — reserve the taskbar's height at the bottom
+        // edge FIRST (before the left gutter) so it spans the full width and the
+        // surface content ends above it (never covered). In a full-screen remote
+        // desktop the bar floats as an overlay like the dock, so nothing is reserved.
+        let strut = reserved_taskbar_strut(full_screen_remote_desktop, &self.vdock);
+        if strut > 0.0 {
+            egui::TopBottomPanel::bottom("shell-taskbar-strut")
+                .exact_height(strut)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ctx, |_ui| {});
+        }
         let gutter = reserved_dock_gutter(full_screen_remote_desktop, ctx, &self.vdock);
         if gutter > 0.0 {
             egui::SidePanel::left("shell-dock-gutter")
@@ -1651,6 +1664,20 @@ fn reserved_dock_gutter(
         0.0
     } else {
         dock::gutter_width(ctx, vdock)
+    }
+}
+
+/// WIN10-HYBRID — the height the shell reserves at the bottom edge for the taskbar
+/// this frame ([`dock::taskbar_strut_height`], `0.0` when the bar is auto-hidden) so
+/// surface content is never covered by it — reserved ONLY when NOT in a full-screen
+/// remote desktop (there the bar floats as an overlay over the edge-to-edge remote,
+/// like the dock, so `vdi::body_device_px` still negotiates the full guest height).
+/// Split out so the gate is unit-testable.
+fn reserved_taskbar_strut(full_screen_remote_desktop: bool, vdock: &dock::DockState) -> f32 {
+    if full_screen_remote_desktop {
+        0.0
+    } else {
+        dock::taskbar_strut_height(vdock)
     }
 }
 
@@ -1740,8 +1767,8 @@ mod tests {
     use super::{
         chat, console, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
         media_header, media_panel, real_editor, real_media, real_terminal, reserved_dock_gutter,
-        screenshot, splash, start_menu, status, terminal_panel, Boot, Nav, Plane, Shell, Surface,
-        VideoTextureCache,
+        reserved_taskbar_strut, screenshot, splash, start_menu, status, terminal_panel, Boot, Nav,
+        Plane, Shell, Surface, VideoTextureCache,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -1833,6 +1860,30 @@ mod tests {
         assert!(
             reserved_dock_gutter(false, &ctx3, &hidden).abs() < f32::EPSILON,
             "a hidden dock reserves nothing — the content fills full width"
+        );
+    }
+
+    #[test]
+    fn the_taskbar_reserves_a_bottom_strut_except_when_autohidden_or_full_screen_remote() {
+        // WIN10-HYBRID — a docked taskbar off a full-screen remote reserves its live
+        // rail height as a bottom strut so surface content ends above it (no overlap).
+        let docked = dock::DockState::default();
+        assert!(
+            (reserved_taskbar_strut(false, &docked) - docked.rail_height()).abs() < f32::EPSILON,
+            "a docked taskbar reserves its rail height as the bottom strut"
+        );
+        // A full-screen remote desktop → NO strut: the bar overlays the edge-to-edge
+        // remote, so vdi::body_device_px still negotiates the full guest height.
+        assert!(
+            reserved_taskbar_strut(true, &docked).abs() < f32::EPSILON,
+            "in a full-screen remote desktop the taskbar overlays — no strut reserved"
+        );
+        // Auto-hidden → NO strut (the revealed bar floats as an overlay; R5).
+        let mut autohidden = dock::DockState::default();
+        autohidden.set_taskbar_autohide(true);
+        assert!(
+            reserved_taskbar_strut(false, &autohidden).abs() < f32::EPSILON,
+            "an auto-hidden taskbar reserves nothing — it floats on reveal"
         );
     }
 
