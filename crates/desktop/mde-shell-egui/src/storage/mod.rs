@@ -1350,15 +1350,21 @@ impl StorageState {
         // Disks — segment bar + partition table + advisory locked rows.
         let mut pick: Option<String> = None;
         for dev in devices {
-            ui.group(|ui| {
-                show_disk(
-                    ui,
-                    dev,
-                    self.selected_device.as_deref() == Some(dev.name.as_str()),
-                    self.view_geometry,
-                    &mut goto_instances,
-                );
-            });
+            // Each disk is a genuinely raised GParted-style card: the same
+            // `Frame::group` `ui.group` builds (identical fill/stroke/radius/margin
+            // — no layout change), lifted off the page by the shared
+            // `Elevation::Raised` soft shadow (design lock #2).
+            egui::Frame::group(ui.style())
+                .shadow(disk_card_shadow())
+                .show(ui, |ui| {
+                    show_disk(
+                        ui,
+                        dev,
+                        self.selected_device.as_deref() == Some(dev.name.as_str()),
+                        self.view_geometry,
+                        &mut goto_instances,
+                    );
+                });
             // A tap on the disk header selects it as the compose target (the same
             // select_device seam the View rail + menu drive).
             ui.add_space(Style::SP_XS);
@@ -1571,6 +1577,24 @@ fn fs_tone(filesystem: Option<&str>) -> Color32 {
             Style::OK
         }
     })
+}
+
+/// The disk-card soft shadow — the surface-side conversion of the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token into an
+/// [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
+/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
+/// small integer fields; mints **no** colour of its own (the umbra comes straight
+/// from the token), so each GParted-style disk card reads as genuinely lifted off
+/// the page — a translucent depth, design lock #2 — while the look still comes only
+/// from `mde_egui` (§4).
+fn disk_card_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
 }
 
 /// Render one disk: header (name / size / removable / table / lock), the segment

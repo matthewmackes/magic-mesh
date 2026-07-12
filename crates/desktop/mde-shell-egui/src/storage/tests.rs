@@ -456,6 +456,31 @@ fn selecting_a_new_peer_clears_the_queue() {
     assert_eq!(s.selected_node.as_deref(), Some("b"));
 }
 
+/// Phase-C depth adoption — each GParted-style disk card carries the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation) soft shadow verbatim from the
+/// token (no hand-rolled colour, design lock #2 / §4). The surface-side conversion
+/// must reproduce the token's offset/blur/spread and its exact translucent umbra,
+/// and cast a real (non-zero) shadow so the card reads as genuinely lifted.
+#[test]
+fn disk_card_wears_the_raised_elevation_token() {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    let shadow = disk_card_shadow();
+    assert_eq!(
+        shadow.color, token.umbra,
+        "the disk card's umbra comes straight from the token — no minted colour"
+    );
+    assert_eq!(
+        shadow.offset,
+        [token.offset[0] as i8, token.offset[1] as i8]
+    );
+    assert_eq!(shadow.blur, token.blur as u8);
+    assert_eq!(shadow.spread, token.spread as u8);
+    assert!(
+        shadow.color.a() > 0 && shadow.blur > 0,
+        "Raised casts a real, soft, translucent shadow — the card is lifted off the page"
+    );
+}
+
 /// MENU-6 — the **menubar coverage backstop**: no workspace ships bare again.
 ///
 /// Every routed [`Surface`](crate::dock::Surface) is enumerated against ONE
