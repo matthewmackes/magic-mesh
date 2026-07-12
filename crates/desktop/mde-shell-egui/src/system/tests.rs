@@ -877,6 +877,33 @@ fn the_page_and_section_card_sit_on_ascending_carbon_layers() {
         "the card must be a tonal step above the page (Carbon elevation)"
     );
 
+    // The section card also casts the shared Elevation::Raised soft shadow, so it reads
+    // as genuinely lifted off the page (not only a tonal step) — and the shadow is the
+    // token's, never a hand-rolled one (§4). The page base stays flat (no shadow).
+    let raised = mde_egui::style::Elevation::Raised.shadow();
+    assert_eq!(
+        card.shadow.offset,
+        [raised.offset[0] as i8, raised.offset[1] as i8],
+        "the card shadow offset comes from the Raised token"
+    );
+    assert_eq!(
+        card.shadow.blur, raised.blur as u8,
+        "the card shadow blur comes from the Raised token"
+    );
+    assert_eq!(
+        card.shadow.color, raised.umbra,
+        "the card shadow umbra is the Raised token's, not a minted colour"
+    );
+    assert!(
+        card.shadow.color.a() > 0 && card.shadow.color.a() < 255,
+        "the depth is a translucent umbra (lock #2), never an opaque fill"
+    );
+    assert_eq!(
+        page.shadow.color.a(),
+        0,
+        "the layer-01 page base stays flat — depth lifts only the raised card"
+    );
+
     // And the layered detail path actually paints headless — the section body
     // renders inside the layer-02 card without panicking, a full paint never blank.
     let mut st = SystemState::default();

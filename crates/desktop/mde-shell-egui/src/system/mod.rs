@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
+use mde_egui::style::Elevation;
 use mde_egui::{field, muted_note, Motion, OsdKind, OsdLevel, Severity, Style, Toast};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1471,16 +1472,34 @@ fn page_frame(margin: f32) -> egui::Frame {
     egui::Frame::NONE.fill(Style::LAYER_01).inner_margin(margin)
 }
 
+/// Build an [`egui::Shadow`] from the shared [`Elevation`] depth token — the surface-
+/// side conversion the token module defers (it stays free of egui's shadow type). Reads
+/// the token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
+/// small integer fields; mints **no** colour of its own (the umbra comes straight from
+/// the token), so the look still reads only from `mde_egui` (§4).
+fn elevation_shadow(elevation: Elevation) -> egui::Shadow {
+    let token = elevation.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// The Settings **section card** frame (SETTINGS-2) — Carbon **layer-02**: the
 /// selected section's body sits one elevation step above the layer-01 page, ringed by
-/// a hairline [`Style::BORDER`] with the shared corner radius. Every value is a
-/// [`Style`] token (fill / stroke / radius / pad — no raw literal, §4).
+/// a hairline [`Style::BORDER`] with the shared corner radius, and casts the shared
+/// [`Elevation::Raised`] soft shadow so it reads as genuinely lifted off the page (a
+/// translucent depth, lock #2). Every value is a token — fill / stroke / radius / pad /
+/// shadow (no raw literal, §4).
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(Style::LAYER_02)
         .stroke(egui::Stroke::new(1.0, Style::BORDER))
         .corner_radius(Style::RADIUS)
         .inner_margin(Style::SP_M)
+        .shadow(elevation_shadow(Elevation::Raised))
 }
 
 /// Render `add` inside a [`card_frame`] — the layer-02 section card that replaces the
