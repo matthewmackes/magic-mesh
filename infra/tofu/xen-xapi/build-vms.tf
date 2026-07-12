@@ -119,6 +119,25 @@ locals {
       vcpus    = 4
       mem_gib  = 11
     }
+    # F44 BUILDER (added 2026-07-12): the physical seats are Fedora 44 but the
+    # golden (and every other build VM) is Fedora 42, so an RPM built elsewhere
+    # links ffmpeg-7 sonames that do not exist on F44 (see
+    # docs/F44-BUILDER-AND-SEAT-DEPLOY.md). This VM was rolled NATIVELY on F44
+    # from the Fedora-Cloud image via install-helpers/setup-xcp-build-vm.sh (NOT
+    # cloned from the F42 golden), on the BigBoy pool @ 172.20.0.131. Like
+    # xen-194-0 it is NOT yet in tofu state — the http state backend
+    # (10.42.0.99:8390) is down; adopt when it returns with:
+    #   tofu import 'xenserver_vm.build_big["xen-bigboy-f44"]' cf288dfc-301f-ae18-9b5f-1da2b1ec7704
+    # `ignore_changes=[template_name,hard_drive,...]` means import won't try to
+    # re-clone/re-template it. To make it a first-class resource, add an F44
+    # golden + a per-VM template override (the golden is global today).
+    "xen-bigboy-f44" = {
+      dom0_key = "xen-bigboy"
+      name     = "mcnf-build-f44"
+      ip_cidr  = "172.20.0.131/16"
+      vcpus    = 10
+      mem_gib  = 24
+    }
   }
 
   # Pure shape→VM-set expansion (L1/L4), mirroring ../main.tf. For each dom0 the
