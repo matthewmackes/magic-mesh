@@ -158,7 +158,11 @@ impl LayoutManager {
             .order(Order::Foreground)
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, Style::SP_XL))
             .show(ctx, |ui| {
+                // The first reserved slot is the shared Overlay-elevation shadow,
+                // painted behind the plate so this floating popover reads as
+                // lifted off the grid (same card idiom as the remote picker). §4.
                 let margin = Style::SP_M;
+                let shadow = ui.painter().add(egui::Shape::Noop);
                 let bg = ui.painter().add(egui::Shape::Noop);
                 let border = ui.painter().add(egui::Shape::Noop);
 
@@ -175,6 +179,8 @@ impl LayoutManager {
                 intent = self.panel(&mut content);
 
                 let plate = content.min_rect().expand(margin);
+                ui.painter()
+                    .set(shadow, crate::overlay::overlay_shadow(plate));
                 ui.painter().set(
                     bg,
                     egui::Shape::rect_filled(plate, Style::RADIUS, Style::SURFACE),

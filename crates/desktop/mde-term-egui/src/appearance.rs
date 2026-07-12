@@ -161,9 +161,12 @@ impl AppearancePicker {
             .order(Order::Foreground)
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, Style::SP_XL))
             .show(ctx, |ui| {
-                // Reserve the plate + border behind the content, size them to the
-                // laid content, exactly as the remote picker's card does. §4.
+                // Reserve the shadow + plate + border behind the content, size
+                // them to the laid content, exactly as the remote picker's card
+                // does. §4. The first slot is the shared Overlay-elevation shadow
+                // so this floating popover reads as lifted off the grid.
                 let margin = Style::SP_M;
+                let shadow = ui.painter().add(egui::Shape::Noop);
                 let bg = ui.painter().add(egui::Shape::Noop);
                 let border = ui.painter().add(egui::Shape::Noop);
 
@@ -180,6 +183,8 @@ impl AppearancePicker {
                 close = Self::panel(&mut content, appearance);
 
                 let plate = content.min_rect().expand(margin);
+                ui.painter()
+                    .set(shadow, crate::overlay::overlay_shadow(plate));
                 ui.painter().set(
                     bg,
                     egui::Shape::rect_filled(plate, Style::RADIUS, Style::SURFACE),

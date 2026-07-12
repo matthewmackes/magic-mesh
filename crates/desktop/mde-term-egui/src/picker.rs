@@ -199,10 +199,13 @@ impl RemotePicker {
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, Style::SP_XL))
             .show(ctx, |ui| {
                 // The panel background is painted *behind* the content: reserve
-                // two shape slots now, lay the content, then set them to the
+                // shape slots now, lay the content, then set them to the
                 // content-sized plate + border (the codebase's immediate-mode
-                // idiom — same tokens as the quicklook card). §4.
+                // idiom — same tokens as the quicklook card). §4. The first slot
+                // is the shared Overlay-elevation shadow, painted behind the
+                // plate so this floating popover reads as lifted off the grid.
                 let margin = Style::SP_M;
+                let shadow = ui.painter().add(egui::Shape::Noop);
                 let bg = ui.painter().add(egui::Shape::Noop);
                 let border = ui.painter().add(egui::Shape::Noop);
 
@@ -219,6 +222,8 @@ impl RemotePicker {
                 picked = self.panel(&mut content, sessions);
 
                 let plate = content.min_rect().expand(margin);
+                ui.painter()
+                    .set(shadow, crate::overlay::overlay_shadow(plate));
                 ui.painter().set(
                     bg,
                     egui::Shape::rect_filled(plate, Style::RADIUS, Style::SURFACE),

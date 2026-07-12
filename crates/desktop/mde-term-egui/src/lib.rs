@@ -168,6 +168,7 @@ pub mod menubar;
 pub mod mesh_tmux;
 pub mod mouse;
 pub mod notify;
+mod overlay;
 pub mod palette;
 pub mod panel;
 pub mod picker;
