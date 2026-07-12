@@ -78,12 +78,17 @@ per-unit review pass. The locks always win over CRAFT.md. The locks:
 2. **Soft-Carbon depth.** Gently rounded corners (4–8px tiers), layered soft
    shadows, explicit elevation tiers. Not flat-and-sharp Carbon, not
    floaty-macOS. **Translucency is subtle only**: slight alpha + dim on
-   overlays/scrims — **no true gaussian-blur pass**.
+   overlays/scrims — **no true gaussian-blur pass**. *(WIN10-HYBRID revision
+   2026-07-12, see `docs/design/win10-taskbar.md`: the **taskbar + Start are
+   square**; surfaces keep the rounded 4/6/8px tiers. Depth tokens shipped in A1
+   as `RADIUS_S/M/L` + `Elevation`/`ShadowToken`.)*
 3. **Mono-first typography.** Monospace for headings, nav, data, metrics, IDs,
    code; a humanist sans only for long-form prose. The primary mono is
    **IBM Plex Mono**, embedded in `mde-egui` (deterministic on the immutable
-   image). Migrating `fonts.rs` off the current Fira Code default (and deciding
-   the prose sans + the fallback chain) is itself a polish unit.
+   image). ✅ **DONE (A5, 2026-07-12):** `fonts.rs` now embeds IBM Plex Mono as
+   the primary Monospace (replacing the old Intel One Mono) + registers named
+   `heading`/`nav` families → Plex Mono; Inter is kept as the Proportional prose
+   face (blast-radius containment). Per-surface typography opt-in is Phase C.
 4. **macOS-level motion — all of it, all shared.** Spring physics for
    panel/sheet transitions, inertial scrolling with rubber-band overscroll,
    micro-interactions (hover lift, press scale, focus glow, animated toggles),
@@ -101,6 +106,10 @@ per-unit review pass. The locks always win over CRAFT.md. The locks:
 7. **Auto DPI + density modes.** Honor per-display `pixels_per_point`; extend
    the existing `Density` (Mouse/Touch) toward compact/comfortable presets.
    Density scales **spacing only, never component dimensions** (UX-24).
+   ✅ **DONE (A3, 2026-07-12):** the 4-preset ladder
+   `Compact/Mouse/Comfortable/Touch` shipped (spacing 0.75/1.0/1.25/1.5),
+   spacing-only per UX-24; the taskbar height was decoupled from density (B1,
+   fixed 48px) so it no longer violated this lock.
 8. **Performance is NOT a gated axis.** No frame-time budget gate. Workers may
    *observe* frame time while working motion units; a hitch is a bug to file,
    not a polish dimension.
