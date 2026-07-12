@@ -32,6 +32,7 @@
 pub mod a11y;
 pub mod code;
 pub mod display;
+pub mod focus;
 pub mod fonts;
 pub mod formfactor;
 pub mod gestures;
