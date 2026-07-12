@@ -106,8 +106,28 @@ pub(crate) fn about_panel(ui: &mut egui::Ui) {
         });
 }
 
+/// The About card shadow — the surface-side conversion of the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token into an
+/// [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
+/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
+/// small integer fields; mints **no** colour of its own (the umbra comes straight
+/// from the token), so a build / legal card reads as genuinely lifted off the page
+/// while the look still comes only from `mde_egui` (§4).
+fn card_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// A titled section: a dim caption over a grouped card — the shared surface
-/// idiom (mirrors `system::section`).
+/// idiom (mirrors `system::section`). The stock group frame is lifted by the
+/// shared [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token —
+/// same fill/stroke/padding (no layout change), the card just casts the soft
+/// shadow so it reads as genuinely raised off the page (design lock #2).
 fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.label(
         RichText::new(title)
@@ -115,7 +135,9 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
             .size(Style::SMALL)
             .strong(),
     );
-    ui.group(body);
+    egui::Frame::group(ui.style())
+        .shadow(card_shadow())
+        .show(ui, body);
 }
 
 /// The build-identity card — the version fields broken out for scanning, then
@@ -215,8 +237,8 @@ fn lockup_size(available_width: f32, tex: [usize; 2]) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::{
-        about_panel, lockup_size, lockup_texture, named_or_dash, LEGAL_DOCS, LOCKUP_MAX_H,
-        LOCKUP_MAX_W, REPO_URL,
+        about_panel, card_shadow, lockup_size, lockup_texture, named_or_dash, LEGAL_DOCS,
+        LOCKUP_MAX_H, LOCKUP_MAX_W, REPO_URL,
     };
     use mde_egui::egui;
     use mde_egui::Style;
@@ -319,5 +341,37 @@ mod tests {
     fn codename_placeholder_when_the_epoch_is_unnamed() {
         assert_eq!(named_or_dash("Quazar"), "Quazar");
         assert_eq!(named_or_dash(""), "—");
+    }
+
+    #[test]
+    fn section_cards_carry_the_shared_raised_depth_token() {
+        // The build / legal cards adopt the shared `Elevation::Raised` depth token
+        // verbatim — the surface mints no colour of its own, so the umbra comes
+        // straight from the token and the shadow reads as a genuine lift (lock #2).
+        let token = mde_egui::style::Elevation::Raised.shadow();
+        let shadow = card_shadow();
+        assert_eq!(
+            shadow.color, token.umbra,
+            "shadow colour must be the token umbra"
+        );
+        assert_eq!(
+            shadow.blur, token.blur as u8,
+            "blur must come from the token"
+        );
+        assert_eq!(
+            shadow.spread, token.spread as u8,
+            "spread must come from the token"
+        );
+        assert_eq!(
+            shadow.offset,
+            [token.offset[0] as i8, token.offset[1] as i8],
+            "offset must come from the token"
+        );
+        // A Raised card genuinely lifts (a non-degenerate shadow, not the zero default).
+        assert_ne!(
+            shadow,
+            egui::Shadow::NONE,
+            "the Raised card must cast a shadow"
+        );
     }
 }
