@@ -1905,6 +1905,15 @@ fn clock_cell_id() -> egui::Id {
     egui::Id::new("vdock-clock")
 }
 
+/// The WIN10-HYBRID tray clock's second line — the civil date `M/D/YYYY` for the
+/// `now_unix` timestamp, formatted through the crate's ONE calendar
+/// ([`crate::chat::civil_from_days`], §6, so no second date fold leaks in). Pure —
+/// unit-testable without a painter.
+fn clock_date_text(now_unix: i64) -> String {
+    let (year, month, day) = crate::chat::civil_from_days(now_unix.div_euclid(86_400));
+    format!("{month}/{day}/{year}")
+}
+
 /// The **clock strip** (VDOCK-5, locks #16/#20) — the status cell whose glyph IS
 /// the live wall-clock `HH:MM` (painted text through the crate's one clock fold,
 /// `crate::timers::hhmm` — the brand set has no clock glyph and the design wants
@@ -1939,18 +1948,38 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
     };
     let now = crate::timers::now_unix();
     let time_text = crate::timers::hhmm(now);
-    painter.text(
-        if rect.height() >= NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
-            egui::pos2(rect.center().x, rect.top() + Style::SP_M)
-        } else {
-            rect.center()
-        },
-        egui::Align2::CENTER_CENTER,
-        &time_text,
-        egui::FontId::proportional(Style::SMALL.min((rect.height() - 6.0).max(8.0))),
-        tint,
-    );
-    paint_rail_label(ui, rect, "Clock", tint);
+    let time_font = egui::FontId::proportional(Style::SMALL.min((rect.height() - 6.0).max(8.0)));
+    if rect.height() >= NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
+        // WIN10-HYBRID — the Win10 tray clock is two lines: HH:MM over the date. On
+        // the 48px bar the date replaces the old single "Clock" label; the crate's ONE
+        // calendar (`chat::civil_from_days`) formats it so no second date fold leaks in.
+        painter.text(
+            egui::pos2(rect.center().x, rect.center().y - Style::SP_XS - 1.0),
+            egui::Align2::CENTER_CENTER,
+            &time_text,
+            time_font,
+            tint,
+        );
+        painter.text(
+            egui::pos2(rect.center().x, rect.center().y + Style::SP_S),
+            egui::Align2::CENTER_CENTER,
+            &clock_date_text(now),
+            egui::FontId::proportional(Style::SMALL - 1.0),
+            if selected {
+                Style::ACCENT
+            } else {
+                Style::TEXT_DIM
+            },
+        );
+    } else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &time_text,
+            time_font,
+            tint,
+        );
+    }
     paint_focus_ring(&painter, rect, resp.has_focus());
     // WIN7-7, lock #14 — the clock's accessible VALUE is the same live
     // `HH:MM` reading its glyph paints (the task's own "does the clock

@@ -1,11 +1,11 @@
 use super::{
-    clock_cell_id, desktop_source_row_id, desktop_source_toggle_id, dock, focus_ring_rect,
-    grade_band_height, grade_overflow_id, grade_row_id, group_height, gutter_width,
-    notification_rail, notification_rail_with_sources, overflow_more_id, pick_cell_id,
-    power_item_id, rail_more_id, session_entry_id, start_cell_id, status_detail_toggle_id,
-    surface_badge_id, surface_context_item_id, sys_cell_id, sys_cell_tint, transfer_badge_id,
-    visible_group_count, DesktopRailSource, DockRequest, DockState, PowerItem, PowerMenu,
-    SessionRailEntry, Surface, SurfaceContextItem, SysCell, CELL_W, DOCK_AREA, DOCK_W,
+    clock_cell_id, clock_date_text, desktop_source_row_id, desktop_source_toggle_id, dock,
+    focus_ring_rect, grade_band_height, grade_overflow_id, grade_row_id, group_height,
+    gutter_width, notification_rail, notification_rail_with_sources, overflow_more_id,
+    pick_cell_id, power_item_id, rail_more_id, session_entry_id, start_cell_id,
+    status_detail_toggle_id, surface_badge_id, surface_context_item_id, sys_cell_id, sys_cell_tint,
+    transfer_badge_id, visible_group_count, DesktopRailSource, DockRequest, DockState, PowerItem,
+    PowerMenu, SessionRailEntry, Surface, SurfaceContextItem, SysCell, CELL_W, DOCK_AREA, DOCK_W,
     FOCUS_RING_W, GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H,
     NOTIFICATION_RAIL_H, POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
 };
@@ -1107,6 +1107,17 @@ fn the_overflow_more_popup_routes_a_hidden_group_surface() {
 }
 
 // ── VDOCK-5: the clock strip (Timers & Alarms home, locks #16/#20) ─────────
+
+#[test]
+fn the_win10_clock_second_line_is_the_civil_date() {
+    // WIN10-HYBRID — the tray clock's second line is the M/D/YYYY civil date via the
+    // crate's ONE calendar. Anchor on the Unix epoch + a known later day.
+    assert_eq!(clock_date_text(0), "1/1/1970", "epoch is 1970-01-01");
+    // 2026-07-12 00:00 UTC = 20_646 days since the epoch.
+    assert_eq!(clock_date_text(20_646 * 86_400), "7/12/2026");
+    // Time-of-day within a day does not roll the date.
+    assert_eq!(clock_date_text(20_646 * 86_400 + 23 * 3600), "7/12/2026");
+}
 
 #[test]
 fn the_clock_strip_shows_the_live_time_and_routes_to_timers() {
