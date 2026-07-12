@@ -1371,7 +1371,8 @@ fn win7_1_the_default_taskbar_is_denser_than_the_shells_other_carbon_chrome() {
     // is deliberately tighter than the shell's other Carbon-baseline chrome:
     // the 48px DOCK_W left-dock column and the 32px single-column picker
     // cells. Pins the exact post-WIN7-1 value so a future change is a
-    // conscious edit here, not a silent drift.
+    // conscious edit here, not a silent drift. (WIN10-HYBRID's B5 recompose
+    // will move this to the fixed 48px Win10 bar and rewrite this assertion.)
     assert!(
         (NOTIFICATION_RAIL_H - 18.0).abs() < f32::EPSILON,
         "WIN7-1 trims the compact taskbar 2px denser than its pre-WIN7-1 20px"
@@ -1384,12 +1385,23 @@ fn win7_1_the_default_taskbar_is_denser_than_the_shells_other_carbon_chrome() {
         NOTIFICATION_RAIL_H < super::APP_CELL_H,
         "the taskbar's default chrome is denser than a standard picker cell"
     );
-    // Density::Touch is untouched — touch targets stay at the standard scale
-    // (the whole point of Density::Touch is BIGGER touch targets, so WIN7-1's
-    // density pass deliberately does not shrink it).
+    // Density::Touch keeps the standard 48px expanded scale.
     assert!(
         (NOTIFICATION_RAIL_EXPANDED_H - 48.0).abs() < f32::EPSILON,
         "the expanded/touch rail height is unchanged by the density pass"
+    );
+    // The four densities resolve to exactly the two anchor heights (A3 decouple).
+    let mut compact = DockState::default();
+    compact.set_density(Density::Compact);
+    let mut comfy = DockState::default();
+    comfy.set_density(Density::Comfortable);
+    assert!(
+        (compact.rail_height() - NOTIFICATION_RAIL_H).abs() < f32::EPSILON,
+        "Compact keeps the compact rail"
+    );
+    assert!(
+        (comfy.rail_height() - NOTIFICATION_RAIL_EXPANDED_H).abs() < f32::EPSILON,
+        "Comfortable rides the expanded rail"
     );
 }
 
