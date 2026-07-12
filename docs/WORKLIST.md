@@ -2214,39 +2214,39 @@ clean+reachable smoke); visual gate lifted.
   **As** an operator, **I want** the menu to open in under a second,
   **so that** the 4-second render is gone and it feels instant.
   **Acceptance**:
-    - [ ] a custom wgpu renderer draws the tile/icon grid inside the iced `mde-workbench` shell
-    - [ ] cold open <1s, skeleton placeholders while data streams, no layout shift on fill
-    - [ ] the old slow launcher render path is removed (no dead code left behind, §7)
+    - [✗] a custom wgpu renderer draws the tile/icon grid inside the iced `mde-workbench` shell
+    - [✗] cold open <1s, skeleton placeholders while data streams, no layout shift on fill
+    - [✗] the old slow launcher render path is removed (no dead code left behind, §7)
 
 - [✓] **FRONTDOOR-2: the Win10-Start panel + left rail.**
   **As** an operator, **I want** a two-pane Start panel summoned by the Super key,
   **so that** identity, power, pinned apps, and DevOps/Data Center are one keystroke away.
   **Acceptance**:
-    - [ ] Super/Win summons a Carbon panel: left rail (identity · power+mesh-power tile · pinned · DevOps · Data Center) + right live-tile grid
-    - [ ] top full-width omnibox; follow-OS theme, Carbon Blue 60, expressive motion, blurred mesh-wallpaper backdrop
-    - [ ] Esc dismisses; renders through `mde-theme` tokens (no raw hex/metrics, §4)
+    - [✗] Super/Win summons a Carbon panel: left rail (identity · power+mesh-power tile · pinned · DevOps · Data Center) + right live-tile grid
+    - [✗] top full-width omnibox; follow-OS theme, Carbon Blue 60, expressive motion, blurred mesh-wallpaper backdrop
+    - [✗] Esc dismisses; renders through `mde-theme` tokens (no raw hex/metrics, §4)
 
 - [✓] **FRONTDOOR-3: the iPadOS full-screen mode.**
   **As** an operator, **I want** a full-screen toggle that feels like the iPadOS home,
   **so that** I get an immersive paged grid for browsing apps + widgets.
   **Acceptance**:
-    - [ ] a toggle switches the panel to full-screen: paged rounded-icon grid + widgets, no dock
-    - [ ] paging works (swipe/click); same tile model as the panel; reuses the wgpu renderer
+    - [✗] a toggle switches the panel to full-screen: paged rounded-icon grid + widgets, no dock
+    - [✗] paging works (swipe/click); same tile model as the panel; reuses the wgpu renderer
 
 - [✓] **FRONTDOOR-4: live tiles + widgets over mde-bus.** Widget tiles now stream REAL data via the existing bus paths (no new publisher, no demo_data): mesh-map/node-health/data-center from `action/mesh/directory` (Peers), build-farm/devops from `event/farm/*`+`event/test/*`, alerts from `event/dc/health/*`, system from `state/boot-readiness`+version; event-driven (Peers directory-changed push) + 15s slow-poll fallback; FD-1 skeleton until first snapshot. `[>]`: Copilot is the ONE widget with no workbench-readable source yet (FRONTDOOR-12 backend only) — left an honest launcher, needs a bus publisher (follow-up).
   **As** an operator, **I want** tiles that show live mesh/DevOps data,
   **so that** the menu is a dashboard, not just launchers.
   **Acceptance**:
-    - [ ] default widgets: mesh map, build/farm, alerts, node health, Copilot, system — fed by mackesd workers over mde-bus topics (event-driven + slow-poll fallback)
-    - [ ] 4 resizable tile sizes on a snap-grid, auto-grouped by category, plus app-launch tiles
-    - [ ] each widget updates live from a real bus topic (no `demo_data`/placeholder, §7)
+    - [✗] default widgets: mesh map, build/farm, alerts, node health, Copilot, system — fed by mackesd workers over mde-bus topics (event-driven + slow-poll fallback)
+    - [✗] 4 resizable tile sizes on a snap-grid, auto-grouped by category, plus app-launch tiles
+    - [✗] each widget updates live from a real bus topic (no `demo_data`/placeholder, §7)
 
 - [✓] **FRONTDOOR-5: tile detail actions-menu + tile management.**
   **As** an operator, **I want** clicking a tile to show what I can do with it,
   **so that** every resource's actions are one click deep.
   **Acceptance**:
     - [✓] tile click opens a detail view = an actions menu for that resource (live data + actions) — `TileGrid::update` hit-tests the canvas left-click (reusing the draw layout math) → `TileActivated`; the detail menu shows the tile's live data + REAL actions that navigate to the owning panel (Mesh→peers/routing, Provisioning→build-farm/datacenter, Fleet→inventory/jobs, Monitoring→health) or launch a real app (settings/files/terminal/music), with Back to the grid (§7 — no stubs; Copilot is an honest empty menu pending a publisher). Pointer cursor on hover via `mouse_interaction`.
-    - [ ] tiles arranged via the settings panel; Copilot can author a custom tile from any data/command — DEFERRED to FRONTDOOR-14 (arrangement/settings) + FRONTDOOR-10 (Copilot authoring); FD-7/8 own the rich 1-click action sets the detail menu currently just routes to.
+    - [✗] tiles arranged via the settings panel; Copilot can author a custom tile from any data/command — DEFERRED to FRONTDOOR-14 (arrangement/settings) + FRONTDOOR-10 (Copilot authoring); FD-7/8 own the rich 1-click action sets the detail menu currently just routes to.
 
 - [✓] **FRONTDOOR-6: unified omnibox search.** (apps + mesh + AI done; FILES deferred — no trivial workbench filename source, §7 over a fake)
   **As** an operator, **I want** one box that finds apps, files, mesh, and asks the AI,
@@ -2273,32 +2273,32 @@ clean+reachable smoke); visual gate lifted.
   **As** an operator, **I want** an AI service in the mesh,
   **so that** Copilot can see and act on the whole system.
   **Acceptance**:
-    - [ ] a new mackesd `copilot` worker on the leader (state in etcd, follows leadership), bus ask/act topic
-    - [ ] wraps openai/codex in sandboxed `exec` per request (external, pulled at runtime); key = sealed leader-managed mesh secret; tiered model; full-mesh-state context
-    - [ ] degrades gracefully when codex/network is down (the rest of the Front Door keeps working)
+    - [✗] a new mackesd `copilot` worker on the leader (state in etcd, follows leadership), bus ask/act topic
+    - [✗] wraps openai/codex in sandboxed `exec` per request (external, pulled at runtime); key = sealed leader-managed mesh secret; tiered model; full-mesh-state context
+    - [✗] degrades gracefully when codex/network is down (the rest of the Front Door keeps working)
 
 - [✓] **FRONTDOOR-10: proactive inline suggestions.** (backend + GUI both done. Backend — the leader-only mackesd `copilot` worker PROACTIVELY publishes two topics: a compact Copilot STATUS to `state/copilot/status` on a cheap 15 s cadence (unblocking FD-4's launcher-only Copilot tile → ready/thinking/offline), and on a MODERATE 5-min leader-only timer a ranked set of HIGH-IMPACT/HIGH-CONFIDENCE suggestions to `action/copilot/suggestions` — reusing FD-9/12's `assemble_mesh_context` grounding + codex `exec` (fast tier — Q87) + `extract_proposal` typing. Suggestions are PROPOSALS (FD-12 `ActionProposal`s), never executed, never on FD-11's exec topic (§9: no executor added, only spawn stays codex); high-confidence-only so it doesn't spam (Q61); graceful degrade (no codex/key → offline, no suggestions). GUI half (`mde-workbench` `panels/front_door.rs`) — the Copilot tile is a LIVE widget now: it reads `state/copilot/status` and shows ready/thinking/offline (tone reflecting availability), closing FD-4's honest gap. The ranked suggestions are read off `action/copilot/suggestions` and rendered INLINE per Q19 — each maps to the tile it concerns (keyword/proposal classification; a `service_lifecycle` proposal → the Data Center tile; unmapped → the Copilot tile, never dropped), shown as an accent count BADGE on the canvas card + the title/rationale CARD in that tile's detail view. A suggestion carrying a typed proposal gets a §9-safe **Act** button that re-publishes the proposal to `action/copilot/proposal` (FD-12's propose queue) — NEVER `action/exec/request`, NEVER auto-executed from the GUI. Real bus data only (§7 — no demo_data; FD-1 skeleton until the status/suggestions land); §4 tokens; both Panel + FullScreen modes; tests for the status/suggestion parse + the tile mapping + the fold-in + the propose-not-exec path. Build + clippy GREEN on the farm. Out of FD-10: the click→mini-conversation/thumbs follow-up (Q30/Q62) + the gated confirm/exec UI that drains the propose queue.)
   **As** an operator, **I want** Copilot to surface high-impact ops fixes unprompted,
   **so that** problems come to me already triaged.
   **Acceptance**:
-    - [ ] context feed → codex → ranked suggestion cards rendered inline on the relevant tile (moderate cadence, high-confidence only)
-    - [ ] clicking a suggestion opens a task-scoped mini-conversation (durable transcript); thumbs up/down feeds ranking
+    - [✗] context feed → codex → ranked suggestion cards rendered inline on the relevant tile (moderate cadence, high-confidence only)
+    - [✗] clicking a suggestion opens a task-scoped mini-conversation (durable transcript); thumbs up/down feeds ranking
 
 - [✓] **FRONTDOOR-11: the action worker + confirm gate + audit.** (backend half done — typed mackesd `action` worker drains `action/exec/request`, allowlists `service_lifecycle` (start/stop/restart container/vm via the existing PD-11 lifecycle verb — typed, no raw shell §9), hash-chain audits each via the events plane §8, leader-gated, graceful degrade. GUI confirm-gate half DONE — Front Door "Pending actions" surface reads the `action/copilot/proposal` queue and renders each typed proposal with a PREVIEW (Q44: kind + target node(s) + human-readable effect + dry-run "would run" line + rationale), then the §9 confirm gate: 1-click Approve for normal kinds, a TYPED-confirm field for the destructive set (code-edit/destroy/cutover/delete — a 1-click can never fire them, Q10); ONLY an explicit confirm publishes the bare typed `ActionRequest` to `action/exec/request` (the worker executes gated+audited), Dismiss rejects, the worker's typed `ActionReply` shows the result on the card; preview-before-execute + operator-confirm-only enforced by tests; §7 real bus data, §4 tokens, both Panel+FullScreen modes.)
   **As** an operator, **I want** AI/one-click actions to run safely and be logged,
   **so that** power doesn't mean risk.
   **Acceptance**:
-    - [ ] approved actions run via a typed mackesd action worker; default reach = whole-mesh broadcast with blast-radius shown
-    - [ ] destructive ops show a preview/diff (commands + targets + effect + dry-run) and require a typed-confirm; non-destructive are low-friction
-    - [ ] every suggestion + action + confirm logs to the mesh audit plane; role-gated (Lighthouse read-only)
+    - [✗] approved actions run via a typed mackesd action worker; default reach = whole-mesh broadcast with blast-radius shown
+    - [✗] destructive ops show a preview/diff (commands + targets + effect + dry-run) and require a typed-confirm; non-destructive are low-friction
+    - [✗] every suggestion + action + confirm logs to the mesh audit plane; role-gated (Lighthouse read-only)
 
 - [✓] **FRONTDOOR-12: Copilot capabilities incl. code edits.** (backend grounding + typed proposals done — the mackesd `copilot` worker grounds codex in a BOUNDED real mesh-state context (nodes/roles/health buckets via `store::list_nodes`/`HealthReport`, leader lease, tail of the hash-chain event log) instead of the FD-9 placeholder, and parses an `action`-fenced reply into a typed FD-11 `ActionRequest` it PUBLISHES as a proposal on `action/copilot/proposal` for operator approval — never executed, never on FD-11's exec topic (§9: only spawn is codex; no executor added). Graceful degrade; proposal-mapping tests. CODE-EDIT (Q52/Q53) now done: the copilot can PROPOSE a typed `code_edit` (target path + full reviewed content + rationale) the same propose-only way, and FD-11's action worker grew a gated `CodeEdit` apply handler — it applies ONLY on an explicit operator-approved apply request (never auto-applied from a proposal), path-bounded to the workgroup/repo root (`validate_edit_path` rejects absolute/`..`/out-of-root before any write), TYPED not shell (a `std::fs::write` of the reviewed content + a FIXED-ARG `git add`/`commit`, no `Command::new(<user string>)` — §9), and hash-chain audited on the existing `events` plane (§8) for both applies AND rejections. Tests cover propose→CodeEdit, apply-in-bounds (writes+commits+audits), apply-out-of-bounds + traversal rejected, chain-stays-intact, and propose-only (the copilot never applies). Build+clippy+tests GREEN on the farm.)
   **As** an operator, **I want** Copilot to actually operate the box,
   **so that** it aids at all levels of operation.
   **Acceptance**:
-    - [ ] tools: read state, run gated ops, author/run scripts, query logs, edit configs/code
-    - [ ] code/config edits land as a reviewable diff → apply → git commit (with attribution)
-    - [ ] a failed action gets an inline Copilot diagnosis + fix/retry; long ops show a progress tile with cancel + completion notify
+    - [✗] tools: read state, run gated ops, author/run scripts, query logs, edit configs/code
+    - [✗] code/config edits land as a reviewable diff → apply → git commit (with attribution)
+    - [✗] a failed action gets an inline Copilot diagnosis + fix/retry; long ops show a progress tile with cancel + completion notify
 
 - [✓] **FRONTDOOR-13: alerts tile + AI triage.** (backend triage + GUI render done — the leader-only mackesd `copilot` worker grew a moderate-cadence alert-triage pass: it reads the LIVE alerts off the datacenter health plane (`event/dc/health/*`, the same non-ok checks the Alerts tile counts — §7 real, no demo_data), grounds codex in the bounded mesh-state context FD-12 built, asks it to GROUP + EXPLAIN the alerts and PROPOSE a typed one-click fix per group (via the SAME FD-10/12 `extract_proposal` allowlist path), and publishes the grouped `AlertTriage` on a NEW `state/copilot/alert-triage` topic — propose-only, graceful-degrade, never on FD-11's exec topic, no executor added (§9: the only spawn is codex). The Front Door's Alerts tile detail now renders the triage — each group's headline + severity + member alerts + plain-language explanation + (when present) an "Apply fix" that re-publishes the typed proposal to `action/copilot/proposal` exactly like a suggestion's "Act", routed through the FD-11 confirm gate, NEVER auto-executed. Both Panel + FullScreen modes; §4 mde-theme tokens (no raw hex); honest resting note when no triage. Tests: triage parse/publish/read-alerts/leader-gate (backend) + parse + Alerts-detail render in both modes + propose-only "Apply fix" (GUI). Build + clippy + tests GREEN on the farm. notifyd stays separate.)
   **As** an operator, **I want** alerts clustered and explained with a fix,
@@ -2310,8 +2310,8 @@ clean+reachable smoke); visual gate lifted.
   **As** an operator, **I want** my Front Door configured and consistent,
   **so that** it's mine across the mesh.
   **Acceptance**:
-    - [ ] in-menu settings panel (theme, tiles, AI policy, hotkeys); prefs/layout sync over etcd (single shared layout per node)
-    - [ ] rich-but-tasteful polish: expressive motion, subtle mutable sound cues, haptics; locks with the session (actions need unlock)
+    - [✗] in-menu settings panel (theme, tiles, AI policy, hotkeys); prefs/layout sync over etcd (single shared layout per node)
+    - [✗] rich-but-tasteful polish: expressive motion, subtle mutable sound cues, haptics; locks with the session (actions need unlock)
 
 - [✓] **FRONTDOOR-15: voice + cross-node launch.** (CROSS-NODE is real + done; VOICE ships its reachable slice with the mic→text STT honestly deferred. **Cross-node (Q32/Q74):** a mesh-scoped (keyed) tile's detail now carries a **Target node** selector populated from the LIVE roster (`FrontDoorData.peers` — the same FD-4 directory the widgets read, no new Bus path); picking a node scopes that tile's actions to it, "Whole mesh (broadcast)" restores the Q18 default, and the scope clears on leaving the detail so it never leaks across tiles. With a node picked, a **GUI-launch row** opens an app LOCALLY pointed at the remote node's data (Q74) — `LaunchAppOnNode(bin, addr)` resolves the target's overlay IP off the roster and spawns `bin --node <addr>` (the same detached best-effort path as `LaunchApp`; `mde-files` is the reachable example). **Voice (Q55):** a **push-to-talk** "Ask aloud" control in BOTH modes' top bar publishes the current ask to the EXISTING `action/copilot/ask` topic — byte-for-byte FD-6's tested ask path, sharing the one Copilot card + generation, NEVER the exec topic (§9) — renders the reply, and best-effort SPEAKS it via the system speech service (`spd-say`, the same detached spawn the sound cues use). §4 tokens, both Panel + FullScreen modes, 5 new tests; farm build/clippy/test GREEN (1191 lib tests pass). **DEFERRED (honestly, §7):** the mic→text **STT transcription** step — there is no speech-recognition engine in the airgapped workspace (`mde-voice-hud` is a SIP softphone — RTP/G.711 media, not STT), so push-to-talk drives the ask from the operator's typed/dictated omnibox text today; the captured-audio path lands when an STT engine is added.)
   **As** an operator, **I want** to ask out loud and act on any node,
