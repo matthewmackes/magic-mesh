@@ -553,7 +553,12 @@ impl FleetState {
                         let edit = edits
                             .entry(node.node_id.clone())
                             .or_insert_with(NodeEdit::new);
-                        ui.group(|ui| show_node(ui, node, edit, dids, &mut pending));
+                        // The stock group frame, lifted by the shared Raised depth
+                        // token — same fill/stroke/padding (no layout change), the
+                        // card just casts the soft shadow so it reads as lifted.
+                        egui::Frame::group(ui.style())
+                            .shadow(card_shadow())
+                            .show(ui, |ui| show_node(ui, node, edit, dids, &mut pending));
                         ui.add_space(Style::SP_S);
                     }
                 }
@@ -592,6 +597,24 @@ impl FleetState {
     fn with_cutover(mut self, status: CutoverStatus) -> Self {
         self.cutover = Some(status);
         self
+    }
+}
+
+/// The Fleet-card shadow — the surface-side conversion of the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token into an
+/// [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
+/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
+/// small integer fields; mints **no** colour of its own (the umbra comes straight
+/// from the token), so a node / cutover card reads as genuinely lifted off the
+/// board while the look still comes only from `mde_egui` (§4). Every board card
+/// shares this one Raised tier so they sit at a single, consistent depth.
+fn card_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
     }
 }
 
@@ -668,37 +691,41 @@ fn read_shared(persist: &Persist) -> Option<SharedOutboundView> {
 /// reprovision progress, and exactly which nodes still remain on the legacy
 /// model — a clear operator prompt through the flag day.
 fn show_cutover(ui: &mut egui::Ui, status: &CutoverStatus) {
-    ui.group(|ui| {
-        ui.horizontal(|ui| {
-            mde_egui::status_dot(ui, status.phase.tone());
+    // The banner is a lifted card too — the same Raised depth token as the node
+    // cards below it (no layout change, just the soft shadow).
+    egui::Frame::group(ui.style())
+        .shadow(card_shadow())
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                mde_egui::status_dot(ui, status.phase.tone());
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(status.phase.headline())
+                        .size(Style::BODY)
+                        .strong()
+                        .color(status.phase.tone()),
+                );
+            });
             ui.add_space(Style::SP_XS);
-            ui.label(
-                RichText::new(status.phase.headline())
-                    .size(Style::BODY)
-                    .strong()
-                    .color(status.phase.tone()),
-            );
-        });
-        ui.add_space(Style::SP_XS);
-        mde_egui::field(
-            ui,
-            "Reprovisioned",
-            &format!("{} of {} nodes", status.reprovisioned, status.total_nodes),
-            Style::TEXT,
-        );
-        if status.pending_nodes.is_empty() {
-            if status.phase == CutoverPhase::CutoverComplete {
-                mde_egui::muted_note(ui, "No node left on the legacy model.");
-            }
-        } else {
             mde_egui::field(
                 ui,
-                "Still legacy",
-                &status.pending_nodes.join(", "),
-                Style::WARN,
+                "Reprovisioned",
+                &format!("{} of {} nodes", status.reprovisioned, status.total_nodes),
+                Style::TEXT,
             );
-        }
-    });
+            if status.pending_nodes.is_empty() {
+                if status.phase == CutoverPhase::CutoverComplete {
+                    mde_egui::muted_note(ui, "No node left on the legacy model.");
+                }
+            } else {
+                mde_egui::field(
+                    ui,
+                    "Still legacy",
+                    &status.pending_nodes.join(", "),
+                    Style::WARN,
+                );
+            }
+        });
     ui.add_space(Style::SP_S);
 }
 
@@ -1052,6 +1079,30 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, action: &Pe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_shadow_reuses_the_shared_raised_depth_token() {
+        // The Fleet cards adopt the shared Elevation::Raised depth token — the
+        // shadow is that token's fields cast onto epaint's, minting NO colour of
+        // its own (the umbra comes straight from the token), so every board card
+        // reads as lifted purely through `mde_egui`.
+        let token = mde_egui::style::Elevation::Raised.shadow();
+        let shadow = card_shadow();
+        assert_eq!(
+            shadow.color, token.umbra,
+            "umbra must come straight from the token — no minted colour"
+        );
+        assert_eq!(
+            shadow.offset,
+            [token.offset[0] as i8, token.offset[1] as i8],
+            "offset is the token's, cast to epaint's i8"
+        );
+        assert_eq!(shadow.blur, token.blur as u8, "blur is the token's");
+        assert_eq!(shadow.spread, token.spread as u8, "spread is the token's");
+        // Depth is a soft, translucent umbra — never opaque (design lock #2).
+        let a = token.umbra.a();
+        assert!(a > 0 && a < 255, "umbra alpha {a} must be a soft (0,255)");
+    }
 
     fn err_row(id: &str, host: &str, reason: &str) -> NodeRow {
         NodeRow {
