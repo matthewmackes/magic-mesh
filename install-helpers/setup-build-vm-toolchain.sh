@@ -38,11 +38,17 @@ for i in $(seq 1 30); do
 done
 
 log "system dev libs (Fedora dnf)"
+# NOTE: the DRM shell (mde-shell-egui --features drm,live-vdi) links -linput/-lgbm/
+# -ludev directly, so libinput-devel/mesa-libgbm-devel/systemd-devel MUST be present
+# or the final relink dies `mold: fatal: library not found: input`. On F42 these came
+# in transitively; on a fresh Fedora-44 VM libinput-devel is NOT pulled by anything
+# else, so it is listed explicitly here (found live 2026-07-12 cutting the F44 RPM).
 "${SSH[@]}" 'sudo dnf install -y \
     gcc gcc-c++ cmake mold git rsync pkgconf-pkg-config genisoimage cloud-utils \
     protobuf-compiler openssl-devel \
     alsa-lib-devel opus-devel \
     gtk3-devel libxkbcommon-devel \
+    libinput-devel mesa-libgbm-devel systemd-devel \
     mpv-libs-devel'
 
 log "rustup + pinned Rust $RUST_VER + clippy/rustfmt"

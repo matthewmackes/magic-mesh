@@ -120,6 +120,12 @@ directly (cloud-init's netplan→NM render is broken on Fedora+Xen — the histo
 
 ## 4. Toolchain + build + cut
 
+**Toolchain gap found live (2026-07-12):** the DRM shell links `-linput`/`-lgbm`/
+`-ludev` directly. On a fresh F44 VM `libinput-devel` is **not** pulled by anything
+else, so the final relink dies `mold: fatal: library not found: input`. Fixed in
+`setup-build-vm-toolchain.sh` (now installs `libinput-devel mesa-libgbm-devel
+systemd-devel`); if you hit it on an older builder, `dnf install -y libinput-devel`.
+
 ```sh
 # 1. bake the toolchain (rust 1.94 + mpv-libs-devel + the -devel set):
 ./install-helpers/setup-build-vm-toolchain.sh --host 172.20.0.131 --user mm
@@ -171,3 +177,43 @@ override** (the golden is global today) — add an F44 golden
 | seats (.138/Eagle/.2) | password auth as user per §2, pw = `$LAB_PW` |
 | XO (deprecated) | `ws://172.20.145.192:8080`, `admin@mcnf.local`, see `/root/.mcnf-xo-admin` |
 | dev-host mesh pubkey | `ssh-ed25519 AAAAC3…jY1 mcnf-build-farm@rocky9-kvm2` |
+
+## 7. Adding a seat to the mesh (Nebula overlay)
+
+The live overlay is a **Nebula V2 mesh named `magic-mesh`**, subnet **10.42.0.0/17**.
+Lighthouses: **`10.42.0.1` → 165.227.188.238:4242** (also the **CA** + `/enroll`
+listener) and **`10.42.0.2` → 104.131.64.207:4242**. Assigned overlay IPs:
+`.1` LH1, `.2` LH2, `.3` Eagle, `.4` mcnf-ow-testnode, **`.5` seat-138, `.6` seat-2**.
+
+**Designed path — `mackesd join` (preferred, boot-durable, registers the node):**
+```sh
+# on a lighthouse (mackesd must be `serve`-ing — the /enroll listener is on :4243):
+mackesd add-peer --role workstation          # prints  mesh:magic-mesh@<lh-pub-ip>:4243#<bearer>?fp=<sha256>
+# on the seat (after installing the RPM — install alone does NOT join):
+mackesd join 'mesh:magic-mesh@<lh-pub-ip>:4243#<bearer>?fp=<sha256>' --role workstation
+```
+`mackesd join` does a fingerprint-pinned TLS `POST /enroll`, materializes
+`/etc/nebula/{ca.crt,host.crt,host.key,config.yaml}`, **removes the stock
+`config.yml`**, pins the role, and enables+starts `nebula.service` +
+`mackesd.service` + `mesh-health.timer`. Canonical one-shot:
+`install-helpers/rejoin-v11-mesh.sh <lh-PUBLIC-ip> workstation '<token>'` (override
+its stale default LH IP). Code: `crates/mesh/mackesd/src/cli/join.rs`,
+`nebula_enroll_client.rs`, `workers/nebula_supervisor.rs:394` (config write + stock
+removal), `nebula_enroll_endpoint.rs` (:4243 signer).
+
+**Manual path (fallback — overlay-only, used 2026-07-12 to bridge .138/.2):** sign a
+V2 peer cert on LH1 and place the bundle by hand. Gets the seat on the overlay but
+does NOT pin the role / register with mackesd — prefer `mackesd join`.
+```sh
+# on LH1 (the CA):
+nebula-cert sign -ca-crt /etc/nebula/ca.crt -ca-key /var/lib/mackesd/nebula-ca/ca.key \
+  -name "peer:<name>" -networks "10.42.0.<n>/17" -groups "role:peer" \
+  -out-crt /tmp/<name>.crt -out-key /tmp/<name>.key
+# on the seat: put ca.crt + host.crt + host.key + a member config.yaml in /etc/nebula/,
+# move the stock config.yml aside (nebula -config loads the WHOLE dir), then
+# systemctl restart nebula.  Member config = Eagle's minus the router unsafe_routes.
+```
+Verify: `ip -4 -o addr show nebula1` (a 10.42.0.x addr), `ping -c2 10.42.0.1`, and
+seat↔seat (`ping 10.42.0.6` from .138). Note: a brand-new peer's FIRST ICMP can drop
+during hole-punch — use `-c2+`.
+
