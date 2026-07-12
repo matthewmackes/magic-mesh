@@ -4191,3 +4191,49 @@ Replace today's duplicative status area (mesh told 4×, glyph+dot redundancy, no
 - [✓] **NOTIF-11: accesskit live-region for the pips/alerts.** DONE 2026-07-07. Enabled the shared `mde-egui` AccessKit feature for the shell and exported live accessibility nodes from the one status path: the whole 4-pip status strip now installs a polite `Role::Status` live region named "Notification status" with local grade plus Device/Mesh/Power/Alerts state; each segment pip installs a named `Role::Button` with its current state/action; and a live own-seat critical edge cue installs an assertive `Role::Alert` named "Critical alert". Added AccessKit-backed tests proving the live-region nodes, roles, names, values, and live modes exist when AccessKit is enabled. Farm evidence: `rustfmt --check crates/desktop/mde-shell-egui/src/status.rs crates/shared/mde-egui/src/lib.rs`; `./install-helpers/xcp-build.sh cargo test -p mde-shell-egui status::tests::status_bar_exports_accesskit_live_region_and_named_pips` (1 passed); `./install-helpers/xcp-build.sh cargo test -p mde-shell-egui status::tests::critical_edge_cue_exports_an_assertive_accesskit_alert` (1 passed); `./install-helpers/xcp-build.sh cargo test -p mde-shell-egui status` (35 passed). **Acceptance (operator a11y override, Q44):** the 4 pips + the Alerts state + a new critical are wired into accesskit as a live region a screen reader announces (name + state); tested the live-region nodes exist + update on state change.
 - [✓] **NOTIF-12: restyle the system quad to the pip language.** DONE 2026-07-07. The VDOCK-4 system quad now renders as compact glyph pips in the same language as the NOTIF status strip: inactive cells use the shared dim baseline, while hover/active states reveal semantic Carbon tones for Settings/info, Show-Desktop/success, Lock/warning, and Power/error. The routing/action seams are unchanged: Settings still opens System, Show-Desktop routes Desktop, Lock records the curtain-lock request, and Power opens the typed-armed power menu. Farm evidence: `./install-helpers/xcp-build.sh cargo test -p mde-shell-egui dock::tests::system_quad_cells_use_status_pip_tint_language` (1 passed) and `./install-helpers/xcp-build.sh cargo test -p mde-shell-egui dock` (40 passed, including `each_system_quad_cell_dispatches_its_route_or_action`). **Acceptance:** the VDOCK-4 system quad (Settings/Show-Desktop/Lock/Power) adopts the same glyph+tint Carbon language as the pips (Q49), **actions unchanged**; tested render + actions still dispatch.
 - [✓] **NOTIF-13: surface-complete gate (Q48).** **DONE 2026-07-07.** Added the shell-level fixture `notif13_fixture_mounts_status_chat_edge_and_accesskit_together`, which mounts one real shell frame over a temp Bus fixture with daemon segment rollups + a folded critical Chat alert. The frame proves the bar, Alerts pip, chevron, expanded status panel, own-seat critical edge cue, Chat Notifications lane, typed Ack/Safe action buttons, DND toggle, and AccessKit polite/assertive live regions together. Added narrow test seams only: `ChatState::with_bus_root`, `ChatState::select_notifications_for_test`, `notification_count_for_test`, stable Chat action/DND response IDs, and `DockState::open_status_panel_for_test`. Farm evidence: `rustfmt --edition 2024 --config skip_children=true --check crates/desktop/mde-shell-egui/src/chat.rs crates/desktop/mde-shell-egui/src/main.rs crates/desktop/mde-shell-egui/src/dock.rs`; `./install-helpers/xcp-build.sh cargo test -p mde-shell-egui notif13_fixture_mounts_status_chat_edge_and_accesskit_together` (1 passed); `MCNF_BUILD_HOST=172.20.0.130 ./install-helpers/xcp-build.sh cargo test -p mde-shell-egui` (792 passed); `git diff --check` clean. Live-seat evidence on Eagle `.13`: built and installed the current candidate `/root/mcnf-release-artifacts/magic-mesh-12.0.0-1.x86_64.rpm` (packaged `/usr/bin/mde-shell-egui` size `30068592`, timestamp `2026-07-06 22:18:44 -0400`); deliberately stopped the old `cosmic-session`/`cosmic-comp`/`Xwayland` seat owner; `systemctl start mde-shell-egui.service` passed the Workstation role gate and stayed `active (running)`; `fuser` showed `/usr/bin/mde-shell-egui` owning `/dev/dri/card1`, `/dev/tty1`, and `/dev/input/event*`; DRM debugfs showed eDP-1 connected and scanout active at `1920x1080` on pipe A with primary plane framebuffer `[FB:145]` allocated by `mde-shell-egui`; Bus fixture publishes landed valid latest rollups on `state/notify/segment/alerts` (`critical`, `source:"notif13-live-smoke"`, `critical_policy:"own-seat-light-show"`) and `state/notify/segment/device` (`warning`). No framebuffer capture utility was present on Eagle, so the pixel-level edge glow is proven by the fixture/accesskit/tessellation tests plus the live Bus+DRM scanout evidence rather than by a screenshot. **Acceptance:** an integration pass exercising the bar + expansion + edge-cue + Chat lane + actions + DND + accesskit together (fixtures); live-smoke on a seat that the calm bar renders + a fixture critical fires the edge-cue.
+
+## PLANS-FOLDED — `/plan`-tracked epics folded into the worklist (operator "add all plans" 2026-07-12)
+
+The GUI/feature work below lived in `/root/.claude/plans/*.md` (the `/plan` outputs) instead of
+inline above. Folded in here so the worklist indexes it. **Reconcile marker-vs-code before
+draining** (standing drift rule); the plan files hold the detailed spec.
+
+### WIN10-HYBRID — full GUI polish + Win10-structure bottom taskbar (Quazar identity)
+Plan: `.claude/plans/snappy-discovering-sphinx.md`; design: `docs/design/win10-taskbar.md`.
+**Supersedes NAVBAR** (this file's NAVBAR epic). Landed origin `f3811bc6`.
+- [x] Phase A — `mde-egui` shared tokens (depth `Elevation`/radii · 2px focus ring · 4-density · motion springs/inertial/micro-interactions · IBM Plex Mono)
+- [x] Phase B core — 48px bottom taskbar · bottom strut · left dock retired · two-line clock-with-date
+- [x] Phase C — depth/focus/motion adopted across 17 surfaces (4 farm-fanout waves, integration-green)
+- [x] Phase D — design-lock docs reconciled · F44 RPM `12.0.0-1` cut · **deployed + live-verified on seat 172.20.0.15** (DRM shell up, `"drm":true`)
+- [ ] B5-rest — Win10 tray recompose: ▲ overflow flyout · action-center→`Surface::Chat` · show-desktop nub · auto-hide bottom-edge reveal · running-icons-only · VDI hover thumbnails (needs live eyes — .15 is up)
+- [ ] mesh-enroll seat .15 into `magic-mesh` (`mackesd join`) — currently standalone
+
+### BROWSER-CHROME — pixel-faithful stock Chrome chrome over real Chromium (CEF)
+Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSER-DD**. Not started.
+- [ ] E1 (gate) — live CEF ABI validation on a seat (`mde-web-cef render-once` → non-garbage BGRA frame); gate runtime activation on it
+- [ ] E2 — provision the 311 MB CEF runtime bundle on seats; flip the default engine to CEF (Servo stays fallback)
+- [ ] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1
+- [ ] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface
+
+### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
+Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
+now ships `media-mpv` **enabled** — the "mpv feature never built" blocker is resolved in the shipped
+binary; the remaining work is live-verify + the library UI.
+- [ ] verify real mpv frames render to the Media stage on a seat (mpv now in the shipped shell)
+- [ ] Netflix-style library grid + Carbon styling (replace the flat vertical text list)
+
+### LIGHTHOUSE-TURNKEY — turn-key lighthouse lifecycle (#12 + #13)
+Plan: `.claude/plans/glistening-fluttering-bachman.md`. **Reconcile against the live 2-LH mesh**
+(`magic-mesh`, LH1/LH2) — may be substantially done; verify before draining.
+- [ ] every lighthouse full/equal on join (holds CA, can sign/enroll, `am_lighthouse:true`, etcd voter — automatic)
+- [ ] add/retire a lighthouse = one push-button op (no manual `etcdctl`/`scp`)
+
+### Folded as pointers (already covered / done — not re-opened)
+- Media Player impl (`i-would-like-to-ancient-thacker.md`) → the **MEDIA** epic above.
+- Dual-verify music ingestion (`media-verify-trigger.md`) → **implemented** in `install-helpers/ingest-music.sh`.
+
+### Explicitly EXCLUDED (not magic-mesh)
+The **Claude Code Proxy** web-console plans target a different project and are intentionally left out
+of this worklist: `smooth-rolling-perlis.md` (Sparkle GUI makeover), `giggly-humming-shore.md`
+(installer system), `status-foamy-russell.md` (status/dark-mode). The `*-agent-*.md` files are
+ephemeral subagent analysis artifacts, also excluded.
