@@ -2922,11 +2922,12 @@ pub(crate) fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
             && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)))
 }
 
-/// Keyboard-focus-ring stroke width (a11y-03 / WCAG 2.4.7). Matches the shell's
-/// established focus-ring width (`explorer.rs`/`console.rs` `FOCUS_RING_W = 2.5`)
-/// so every focus indicator across the shell reads at one consistent weight
-/// against the Quasar-dark ground on the raw-painted cells.
-const FOCUS_RING_W: f32 = 2.5;
+/// Keyboard-focus-ring stroke width (a11y-03 / WCAG 2.4.7) — the shared platform
+/// **2px** focus token ([`mde_egui::focus::FOCUS_RING_W`], design lock #5), so every
+/// focus indicator across the shell (taskbar cells, Explorer, Console) reads at one
+/// consistent weight against the Quasar-dark ground. Sourced from the one token
+/// rather than the old mirrored `2.5` local literals.
+const FOCUS_RING_W: f32 = mde_egui::focus::FOCUS_RING_W;
 
 /// The rect a focusable cell's keyboard-focus ring strokes when `focused`, or
 /// `None` when the cell does not hold focus. Inset by half the stroke so a

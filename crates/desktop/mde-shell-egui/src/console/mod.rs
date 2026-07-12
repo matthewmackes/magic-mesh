@@ -241,10 +241,10 @@ const CUSTOM_GROUP_LABEL: &str = "Custom";
 /// reserved so a raised notice never shifts the scrolled list.
 const NOTICE_H: f32 = Style::SP_XL;
 
-/// The keyboard focus ring's stroke — the EXPLORER-18 posture (design O11: the
-/// selection is always legible), mirrored here because the explorer's const is
-/// module-private.
-const FOCUS_RING_W: f32 = 2.5;
+/// The keyboard focus ring's stroke — the shared platform **2px** focus token
+/// ([`mde_egui::focus::FOCUS_RING_W`], design lock #5): one width shell-wide, no
+/// longer a mirrored local literal (the duplication the shared token retires).
+const FOCUS_RING_W: f32 = mde_egui::focus::FOCUS_RING_W;
 
 /// An entry row's glyph edge (`SP_M`, 16pt) — smaller than the dock's 24px app
 /// glyph, the row-scale icon.
