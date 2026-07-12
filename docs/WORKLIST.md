@@ -19,6 +19,35 @@ Ordered by priority — security lock first, then largest structural debt, then 
 
 **Operator decisions (2026-06-09):** A1/A2 → **DELETE** the labwc/sway surface · B1/H6/H3/H4 → **BUILD/WIRE** them · C1 → **implement Phase-G** · E1 → **retarget tests to Nebula**.
 
+## DRAIN RECONCILIATION — the real state of the open queue (2026-07-12, goal "Drain the Worklist")
+
+Reconciled every open `[ ]` against current master (`master` is 1422 commits ahead of the old
+`datacenter-control` integration branch; only **5** `todo!/unimplemented!` remain in non-test code —
+the master safe-code supply is exhausted). Result: the nominal-open count is **NOT** stale-drainable
+work; it is **retired-crate items + acceptance criteria gated on live infrastructure**. Breakdown of
+the ~90 remaining open:
+
+- **DRAINED this pass:** **FRONTDOOR** (25) → `[✗]` superseded (it refactors the RETIRED iced
+  `mde-workbench`; launcher re-homed to the egui shell). **MEDIA-VIDEO** mpv-engine blocker →
+  resolved (shipped shell on live seat .15 links `libmpv.so.2`). All `/plan` epics folded in
+  (see **PLANS-FOLDED**). Open 108→92.
+- **IN-PROGRESS (drainable code):** **WIN10-HYBRID #31** taskbar tray (farm worker, live).
+- **GATED on live cloud** (Nova/Kolla/etcd/Podman on the fleet — code done + unit-tested, acceptance
+  is the live deploy): **QUASAR-CLOUD** (28), **IAC-6** (1). Needs the operator's live cloud bring-up.
+- **GATED on live DO + operator secrets:** **MEDIA-LIGHTHOUSE** (20) — DO Spaces bucket + keys +
+  Navidrome + `music.mesh` HA on the live DO lighthouses.
+- **GATED on live routers / XCP hosts:** **Phase 1/2/4** (23) — router discovery+creds (Vyatta),
+  DHCP-IaC converge, XCP unattended installer.
+- **GATED on a live multi-node mesh** (runtime-observable acceptance): **DEVMGR-9** (6),
+  **BOOT-STATUS** (1), **BUS-RUN-FULL** (1), **LIGHTHOUSE-JOIN-QNM** (1), **ROLL-NEXT** (1).
+- **GATED on blocked infra:** **BUILD-PLATFORM-1** (1) — needs the `[!]` shared sccache backend.
+- **NEEDS operator decision / approval / eyes:** **BROWSER-CHROME** (4, CEF bundle + lock-revision
+  approval + 470 KB refactor), **LIGHTHOUSE-TURNKEY** (2, reconcile vs the live 2-LH mesh),
+  **MEDIA-VIDEO** visual render (1, eyes on .15), **WIN10-HYBRID** mesh-enroll .15 (1).
+
+**Bottom line:** the blind-drainable code is down to WIN10-HYBRID #31 (in flight). Everything else
+needs the live fleet (cloud/DO/router/mesh) or an operator decision — it is honestly open, not stale.
+
 ## E12 — Forked-COSMIC + Magic-Mesh → one egui-native mesh desktop OS (operator 2026-06-30; 4-round/16-Q `/plan` survey; design: docs/design/cosmic-magic-mesh-egui.md)
 
 The **headline pivot**: MCNF 12.0 "Quasar" becomes an **egui-native mesh thin-client desktop OS**. **REVISED 2026-06-30** (50-Q `/plan` survey; design: `docs/design/quasar-vdi-desktop.md` — supersedes the forked-compositor `cosmic-magic-mesh-egui.md`): the originally-proposed **fork of the COSMIC compositor is RETIRED**. Instead a **single egui shell owns the DRM/KMS seat directly (no compositor)** and **brokers VM desktops** — local **cloud-hypervisor** VMs + remote desktops on any mesh peer, rendered **egui-native** (ironrdp/vnc → an egui texture) over Nebula. The host runs **no native apps**; a browser/office/game lives **inside a VM guest**. The mesh-control surfaces (Workbench/Files/Music/Voice) are **panels in the one shell**, not separate clients. Carries forward from the first survey: **egui as the one toolkit + the `mde-egui` `Style`/Motion harness** (E12-1, landed). Locks (full table in the design doc): **egui owns DRM** (smithay DRM/GBM runner) · **VDI thin client** (fullscreen VM framed by a thin chrome bar that expands to Workbench) · **cloud-hypervisor** local VMs (virtio-gpu fast path, dual-homed mesh+LAN) · **RDP-primary / VNC-fallback** over Nebula · **sessions roam** per-peer (etcd/Syncthing) · **mackesd session-broker + vm-lifecycle workers** · **immutable bootc image** · **§8 envelope raised**, VM guests full flat-trust members · **everything in v1** (passthrough/USB/multi-mon/migration). Mesh substrate (§1), Bus (§2), crypto (§3), DoD (§7), planes (§9), build env (§10) carry forward. Build order: DRM runner → shell → VDI(RDP) → remote-over-mesh → local KVM → advanced → panels → bootc packaging → decommission iced/Carbon.
