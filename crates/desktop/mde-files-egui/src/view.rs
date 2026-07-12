@@ -36,6 +36,7 @@ use mde_egui::egui::{
     TextureHandle, TextureOptions,
 };
 use mde_egui::menubar::{MenuBar as SharedMenuBar, MenuBarModel};
+use mde_egui::style::Elevation;
 use mde_egui::{field, muted_note, status_dot, Motion, Style};
 
 use mde_files::model::{Mime, PeerStatus};
@@ -2440,6 +2441,20 @@ fn fmt_duration(secs: f64) -> String {
     }
 }
 
+/// Convert the shared [`Elevation`] ladder's shadow token into egui's
+/// `epaint::Shadow`, reusing the token's translucent umbra verbatim — depth
+/// stays single-sourced in `mde_egui::style`, no local colour is minted (§4).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // token px values are small +ve.
+fn elevation_shadow(elevation: Elevation) -> egui::Shadow {
+    let token = elevation.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
 /// FILEMGR-10 — the Space quick-look: a modal overlay dimming the shell and
 /// centering the built-in viewer at full size. Space / Escape / a backdrop
 /// click closes it. Same `preview_body` the pane draws — one viewer, two
@@ -2471,6 +2486,11 @@ fn quick_look_overlay(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>)
                 screen.center(),
                 egui::vec2(screen.width() * 0.72, screen.height() * 0.84),
             );
+            // The card is the deepest tier of the shared elevation ladder — a
+            // soft Modal shadow painted behind the fill lifts it off the dim
+            // backdrop (translucent umbra, lock #2; no layout change).
+            ui.painter()
+                .add(elevation_shadow(Elevation::Modal).as_shape(card, Style::RADIUS));
             ui.painter()
                 .rect_filled(card, Style::RADIUS, Style::SURFACE);
             ui.painter().rect_stroke(
@@ -3423,6 +3443,80 @@ mod tests {
         b.toggle_quick_look();
         assert!(b.quick_look_open());
         mount(&mut b);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // token px values are small +ve.
+    fn quick_look_card_casts_the_shared_modal_shadow() {
+        use mde_egui::style::Elevation;
+
+        // The conversion reuses the Modal token verbatim — the depth ladder
+        // stays single-sourced in mde_egui::style, no local colour is minted.
+        let token = Elevation::Modal.shadow();
+        let shadow = super::elevation_shadow(Elevation::Modal);
+        assert_eq!(
+            shadow.offset,
+            [token.offset[0] as i8, token.offset[1] as i8],
+            "the shadow offset comes from the Modal token"
+        );
+        assert_eq!(
+            shadow.blur, token.blur as u8,
+            "the shadow blur comes from the Modal token"
+        );
+        assert_eq!(
+            shadow.spread, token.spread as u8,
+            "the shadow spread comes from the Modal token"
+        );
+        assert_eq!(
+            shadow.color, token.umbra,
+            "the shadow umbra is the token's, not a minted colour"
+        );
+        assert!(
+            shadow.color.a() > 0 && shadow.color.a() < 255,
+            "the depth is a translucent umbra (lock #2), never an opaque fill"
+        );
+
+        // And an open quick-look really paints it: a blurred rect wearing the
+        // Modal umbra sits in the frame's shape list behind the card fill.
+        fn holds_shadow(shape: &egui::Shape, shadow: egui::epaint::Shadow) -> bool {
+            match shape {
+                egui::Shape::Rect(r) => {
+                    r.fill == shadow.color
+                        && (r.blur_width - f32::from(shadow.blur)).abs() < f32::EPSILON
+                }
+                egui::Shape::Vec(v) => v.iter().any(|s| holds_shadow(s, shadow)),
+                _ => false,
+            }
+        }
+        let mut b = browser();
+        b.click(0, 1);
+        b.toggle_quick_look();
+        assert!(b.quick_look_open());
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Kill egui's Area fade-in so frame 2 paints the umbra at full
+        // strength (the fade would otherwise scale its alpha mid-animation).
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
+            ..Default::default()
+        };
+        // Frame 1 is the overlay Area's sizing pass (egui hides a new Area's
+        // first frame); frame 2 paints it for real.
+        let _sizing = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::files_panel(ui, &mut b);
+            });
+        });
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::files_panel(ui, &mut b);
+            });
+        });
+        assert!(
+            out.shapes.iter().any(|c| holds_shadow(&c.shape, shadow)),
+            "the quick-look card must cast the shared Modal elevation shadow"
+        );
     }
 
     #[test]
