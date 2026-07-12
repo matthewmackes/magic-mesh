@@ -889,3 +889,34 @@ fn presence_status_and_mute_helpers_are_silent_without_a_bus() {
     assert!(publish_mute(None, "contact", "nyc3", true).is_err());
     assert!(publish_mute(None, "room", "ops", false).is_err());
 }
+
+/// The message / notification cards cast the shared `Elevation::Raised` soft
+/// shadow (Phase-C depth adoption): every field of [`card_shadow`] comes straight
+/// from the token — offset/blur/spread and, critically, the umbra colour (no
+/// minted `Color32`, §4) — and the umbra stays translucent (design lock #2).
+#[test]
+fn chat_card_shadow_is_the_raised_depth_token() {
+    let raised = mde_egui::style::Elevation::Raised.shadow();
+    let shadow = card_shadow();
+    assert_eq!(
+        shadow.offset,
+        [raised.offset[0] as i8, raised.offset[1] as i8],
+        "the card shadow offset comes from the Raised token"
+    );
+    assert_eq!(
+        shadow.blur, raised.blur as u8,
+        "the card shadow blur comes from the Raised token"
+    );
+    assert_eq!(
+        shadow.spread, raised.spread as u8,
+        "the card shadow spread comes from the Raised token"
+    );
+    assert_eq!(
+        shadow.color, raised.umbra,
+        "the card shadow umbra is the Raised token's, not a minted colour"
+    );
+    assert!(
+        shadow.color.a() > 0 && shadow.color.a() < 255,
+        "the depth is a translucent umbra (lock #2), never an opaque fill"
+    );
+}
