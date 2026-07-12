@@ -217,3 +217,26 @@ Verify: `ip -4 -o addr show nebula1` (a 10.42.0.x addr), `ping -c2 10.42.0.1`, a
 seat↔seat (`ping 10.42.0.6` from .138). Note: a brand-new peer's FIRST ICMP can drop
 during hole-punch — use `-c2+`.
 
+**Enrollment gotchas (learned live 2026-07-12 joining seat-138 + seat-2):**
+- **Set a distinct hostname BEFORE `mackesd join`.** Both seats shipped as
+  `localhost.localdomain`; the enroll endpoint keys identity on the cert name, so
+  the second join **deduped onto the first's identity + overlay IP** (a collision).
+  `hostnamectl set-hostname seat-138` / `seat-2` first. `--name` is ignored once the
+  role is already pinned, so the hostname is what actually names the cert.
+- **If a seat's path to the public `:4243` endpoint hangs** (TCP opens but the TLS
+  `POST /enroll` times out — a path-MTU issue on that seat's internet route),
+  **retarget the token at the lighthouse's OVERLAY IP**: `sed 's/@<lh-pub-ip>:/@10.42.0.1:/'`
+  — the fingerprint pin ignores hostname, and a seat already on the overlay reaches
+  `10.42.0.1:4243` fine. This unblocked seat-2.
+- **`mackesd peers` will NOT list a freshly-joined node** — the presence plane is
+  *integration-gated* in this build (the daemon logs "session store integration-gated
+  — needs the live etcd session-directory reader over Nebula"). Overlay membership
+  (reachable from the lighthouse + peers) is the real, verifiable state; the peers
+  view populates only for already-established members.
+- **After join, `systemctl restart nebula mackesd`** to converge the running
+  interface IP to the newly-issued cert and clear the "circuit breaker tripped"
+  transient. A full reboot (what the operator does) achieves the same.
+- **Same-LAN peers that enrolled at different times may fail to hole-punch each
+  other directly** (e.g. new seats ↔ the long-lived Eagle) even though both reach
+  the lighthouse — a NAT-hairpin quirk; a coordinated reboot re-establishes it.
+
