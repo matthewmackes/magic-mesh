@@ -14,6 +14,7 @@
 //! back into are `pub(super)`.
 
 use super::*;
+use mde_egui::style::Elevation;
 
 /// Synthesise this node's own hero unit for the honest empty state (#23) — a real
 /// self-reference (hostname, in-mesh), never a faked peer; health stays unknown
@@ -39,16 +40,47 @@ pub(super) fn self_placeholder(host: &str) -> Unit {
 /// The ONE high-contrast keyboard/D-pad **focus ring** (EXPLORER-18, O11):
 /// every navigable element — a mosaic tile, a filmstrip thumb, a search hit
 /// row — paints its selection through this single stroke, so "where am I"
-/// reads identically (thick [`FOCUS_RING_W`], `ACCENT_HI`) across the whole
-/// surface and can never fork per call site (§4). Painted last, over the
-/// element's own frame, so the ring is never buried under a category tint.
+/// reads identically across the whole surface and can never fork per call
+/// site (§4). Delegates to the **shared** platform painter
+/// [`mde_egui::focus::paint_focus_ring`] (the 2px `ACCENT_HI` token, design
+/// lock #5), so the Explorer's ring is the identical indicator every other
+/// shell surface wears. Painted last, over the element's own frame, so the
+/// ring is never buried under a category tint.
 pub(super) fn focus_ring(painter: &egui::Painter, rect: Rect) {
-    painter.rect_stroke(
-        rect,
-        Style::RADIUS,
-        Stroke::new(FOCUS_RING_W, Style::ACCENT_HI),
-        StrokeKind::Inside,
-    );
+    mde_egui::focus::paint_focus_ring(painter, rect, true);
+}
+
+/// The soft **depth shadow** a raised Explorer card casts (§4 depth tokens,
+/// lock #2): at rest the card sits at [`Elevation::Raised`]; a hover progress
+/// `t` ∈ `0..=1` eases it toward [`Elevation::Overlay`] — the hover-lift
+/// micro-interaction, expressed purely in shadow depth. Every field is a
+/// numeric blend of the two shared tokens and the umbra is gamma-blended
+/// between the tokens' own umbras, so **no** colour (or duration) is minted
+/// here and the seam stays unit-testable without a painter.
+pub(super) fn raise_shadow(t: f32) -> egui::Shadow {
+    let rest = Elevation::Raised.shadow();
+    let lift = Elevation::Overlay.shadow();
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    egui::Shadow {
+        offset: [
+            lerp(rest.offset[0], lift.offset[0]).round() as i8,
+            lerp(rest.offset[1], lift.offset[1]).round() as i8,
+        ],
+        blur: lerp(rest.blur, lift.blur).round() as u8,
+        spread: lerp(rest.spread, lift.spread).round() as u8,
+        color: rest.umbra.lerp_to_gamma(lift.umbra, t),
+    }
+}
+
+/// Paint the [`raise_shadow`] behind a raised card — called **before** the
+/// card's fill so the depth reads as a cast shadow under the card, never a
+/// wash over it. The hover progress comes from the reduce-motion-aware
+/// [`Motion::animate`] on the shared [`Motion::FAST`] cadence, shaped by
+/// [`Motion::hover_lift`]. Paint-only: the card's allocated rect is untouched,
+/// so hovering never shifts layout.
+pub(super) fn raise(painter: &egui::Painter, rect: Rect, id: impl std::hash::Hash, hovered: bool) {
+    let t = Motion::hover_lift(Motion::animate(painter.ctx(), id, hovered, Motion::FAST));
+    painter.add(raise_shadow(t).as_shape(rect, Style::RADIUS));
 }
 
 /// A Carbon filter/nav pill; returns whether it was clicked. Active = accent
@@ -242,6 +274,14 @@ pub(super) fn thumbnail(
             } else {
                 Style::BORDER
             };
+            // The shared raised-card depth (§4): the thumb rests at Raised and
+            // hover-lifts toward Overlay — cast under the fill, no layout shift.
+            raise(
+                ui.painter(),
+                rect,
+                ("explorer-thumb-raise", &unit.id),
+                hovered,
+            );
             ui.painter()
                 .rect_filled(rect, Style::RADIUS, Style::SURFACE);
             ui.painter().rect_stroke(
@@ -460,6 +500,9 @@ pub(super) fn mosaic_tile(
         ui.allocate_exact_size(Vec2::new(MOSAIC_TILE_W, MOSAIC_TILE_H), Sense::click());
     let hovered = resp.hovered();
     let painter = ui.painter();
+    // The shared raised-card depth (§4): the tile rests at Raised and
+    // hover-lifts toward Overlay — cast under the fill, no layout shift.
+    raise(painter, rect, ("explorer-tile-raise", &unit.id), hovered);
     painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
     // The frame: the mark accent, a hover accent, or a calm border — then the
     // shared thick focus ring OVER it for the selection (EXPLORER-18, O11 —

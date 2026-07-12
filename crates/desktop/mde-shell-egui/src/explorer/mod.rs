@@ -222,12 +222,6 @@ const MOSAIC_GAP: f32 = Style::SP_M;
 /// The mini status-ring diameter inside a mosaic tile — echoes the hero ring at
 /// tile scale (O1 "mini hero tiles").
 const MOSAIC_RING_D: f32 = Style::SP_XL * 1.5;
-/// The keyboard/D-pad focus-ring stroke width — the shared platform **2px** focus
-/// token ([`mde_egui::focus::FOCUS_RING_W`], design lock #5), so every navigable
-/// element across the whole shell wears the identical ring (EXPLORER-18, O11).
-/// Painted through the local [`focus_ring`] helper, which keeps this surface's
-/// rect/radius drawing semantics.
-const FOCUS_RING_W: f32 = mde_egui::focus::FOCUS_RING_W;
 /// The tile→hero zoom-in duration — the O3 shared-element reveal, pinned to the
 /// §4 Motion table's deliberate step (never a literal duration).
 const ZOOM_SECS: f32 = Motion::SLOW;

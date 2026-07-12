@@ -2661,9 +2661,10 @@ fn the_bulk_bar_renders_headless() {
 #[allow(clippy::assertions_on_constants)] // the token contract IS constant (the mde-egui style-test idiom)
 fn the_focus_ring_is_thick_high_contrast_and_never_camouflaged() {
     // O11 — a hairline can't carry couch-distance selection; the ring is a
-    // deliberately thick stroke…
+    // deliberately thick stroke… (the shared platform token, now that
+    // `focus_ring` delegates to `mde_egui::focus::paint_focus_ring`).
     assert!(
-        FOCUS_RING_W >= 2.0,
+        mde_egui::focus::FOCUS_RING_W >= 2.0,
         "the focus ring must be thicker than a hairline"
     );
     // …in a tone distinct from every frame it can sit over: the category
@@ -2718,6 +2719,75 @@ fn the_focus_ring_paints_the_selection_in_mosaic_and_hero() {
     assert!(
         painted(&painted_colors(&mut s), Style::ACCENT_HI),
         "the hero mode paints the focused filmstrip thumb's ring"
+    );
+}
+
+#[test]
+fn raised_cards_blend_the_shared_depth_tokens_rest_to_hover() {
+    use mde_egui::style::Elevation;
+    // At rest (t = 0) a raised card casts EXACTLY the shared Raised token —
+    // the surface-side epaint conversion reuses every field and the umbra
+    // comes straight from the token (§4: no minted colour).
+    let raised = Elevation::Raised.shadow();
+    let rest = raise_shadow(0.0);
+    assert_eq!(
+        rest.offset,
+        [raised.offset[0] as i8, raised.offset[1] as i8],
+        "the rest offset comes from the Raised token"
+    );
+    assert_eq!(rest.blur, raised.blur as u8, "the rest blur is the token's");
+    assert_eq!(
+        rest.spread, raised.spread as u8,
+        "the rest spread is the token's"
+    );
+    assert_eq!(
+        rest.color, raised.umbra,
+        "the rest umbra IS the Raised token's, not a minted colour"
+    );
+    // A full hover-lift (t = 1) reaches EXACTLY the shared Overlay token —
+    // the micro-interaction travels the token ladder, never a bespoke depth.
+    let overlay = Elevation::Overlay.shadow();
+    let lift = raise_shadow(1.0);
+    assert_eq!(
+        lift.offset,
+        [overlay.offset[0] as i8, overlay.offset[1] as i8],
+        "the lifted offset comes from the Overlay token"
+    );
+    assert_eq!(
+        lift.blur, overlay.blur as u8,
+        "the lifted blur is the token's"
+    );
+    assert_eq!(
+        lift.color, overlay.umbra,
+        "the lifted umbra IS the Overlay token's, not a minted colour"
+    );
+    // And every point of the ease keeps a translucent umbra — depth is alpha,
+    // never an opaque fill (design lock #2).
+    for i in 0..=10_u8 {
+        let a = raise_shadow(f32::from(i) / 10.0).color.a();
+        assert!(
+            a > 0 && a < 255,
+            "the umbra stays translucent across the ease (t={i}/10, a={a})"
+        );
+    }
+}
+
+#[test]
+fn the_raised_cards_cast_the_depth_umbra_in_mosaic_and_hero() {
+    // Presence, not just definition: the resting Raised umbra reaches the
+    // draw list under the mosaic tiles AND the filmstrip thumbs, so the depth
+    // adoption is actually painted (same probe as the focus-ring test).
+    let umbra = mde_egui::style::Elevation::Raised.shadow().umbra;
+    let mut s = ExplorerState::with_fake(addressed_state(), "me");
+    assert_eq!(s.mode, SurfaceMode::Mosaic);
+    assert!(
+        painted(&painted_colors(&mut s), umbra),
+        "the mosaic tiles cast the shared Raised depth shadow"
+    );
+    s.set_mode(SurfaceMode::Hero);
+    assert!(
+        painted(&painted_colors(&mut s), umbra),
+        "the filmstrip thumbs cast the shared Raised depth shadow"
     );
 }
 
