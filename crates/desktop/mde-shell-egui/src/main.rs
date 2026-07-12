@@ -1380,8 +1380,13 @@ impl Shell {
             self.notify_status.segments().clone(),
         );
         let desktop_sources = self.chooser.rail_sources();
-        let bar_clicked = dock::dock(ctx, &mut self.vdock)
-            | dock::notification_rail_with_sources(ctx, &mut self.vdock, &desktop_sources);
+        // WIN10-HYBRID (B4) — the left vertical dock is retired: launching folds into
+        // the single bottom taskbar, whose Start cell opens the Start-menu grid of all
+        // 18 Surface::ALL. Only the taskbar mounts now; the surface-picker dock
+        // (`dock::dock`) is no longer rendered. `DockState` stays — the taskbar owns
+        // it — and with the dock unshown its left gutter reserves nothing.
+        let bar_clicked =
+            dock::notification_rail_with_sources(ctx, &mut self.vdock, &desktop_sources);
         self.nav.surface = self.vdock.active();
         if let Some(id) = self.vdock.take_desktop_source_pick() {
             if let Some(request) = self.chooser.connect_source_id(&id) {
