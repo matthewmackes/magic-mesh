@@ -21,10 +21,17 @@ use crate::formfactor::Formfactor;
 /// Tablet↔Laptop flip, so the same UI grows under touch and reverts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Density {
-    /// Pointer density — the compact desktop metrics (laptop / windowed fallback).
+    /// **Compact** pointer density — tighter spacing for dense/expert layouts. A
+    /// user-selectable preset (not formfactor-driven); keeps the pointer 24pt hit
+    /// target, only the spacing tightens.
+    Compact,
+    /// **Mouse** — the compact desktop metrics (laptop / windowed fallback).
     #[default]
     Mouse,
-    /// Touch density — larger hit targets and wider spacing (tablet formfactor).
+    /// **Comfortable** — roomier spacing with the finger-sized hit target. A
+    /// user-selectable preset for reach/legibility without full touch metrics.
+    Comfortable,
+    /// **Touch** — larger hit targets and the widest spacing (tablet formfactor).
     Touch,
 }
 
@@ -46,8 +53,12 @@ impl Density {
     #[must_use]
     pub const fn min_hit_target(self) -> f32 {
         match self {
-            Self::Mouse => 24.0,
-            Self::Touch => 44.0,
+            // Pointer densities keep the compact 24pt control height; finger
+            // densities grow to the ~44pt touch target. Density scales the spacing
+            // *family* and the hit-target floor — never a component's own drawn
+            // dimension (design lock #7 / UX-24).
+            Self::Compact | Self::Mouse => 24.0,
+            Self::Comfortable | Self::Touch => 44.0,
         }
     }
 
@@ -56,7 +67,9 @@ impl Density {
     #[must_use]
     pub const fn spacing_scale(self) -> f32 {
         match self {
+            Self::Compact => 0.75,
             Self::Mouse => 1.0,
+            Self::Comfortable => 1.25,
             Self::Touch => 1.5,
         }
     }
@@ -1034,9 +1047,41 @@ mod tests {
 
     #[test]
     fn density_is_selected_by_formfactor() {
-        // The single mapping the shell keys off the SURFACE-9 signal.
+        // The single mapping the shell keys off the SURFACE-9 signal. Compact and
+        // Comfortable are user-selectable presets, so formfactor still resolves only
+        // to the two anchor densities.
         assert_eq!(Density::for_formfactor(Formfactor::Tablet), Density::Touch);
         assert_eq!(Density::for_formfactor(Formfactor::Laptop), Density::Mouse);
+    }
+
+    #[test]
+    fn four_density_presets_scale_spacing_monotonically() {
+        // Compact < Mouse < Comfortable < Touch in spacing; hit targets step
+        // pointer(24) → finger(44) once. Spacing is the only thing density moves —
+        // component dimensions never key off it (lock #7 / UX-24).
+        let ladder = [
+            Density::Compact,
+            Density::Mouse,
+            Density::Comfortable,
+            Density::Touch,
+        ];
+        for w in ladder.windows(2) {
+            assert!(
+                w[1].spacing_scale() > w[0].spacing_scale(),
+                "{:?} spacing must exceed {:?}",
+                w[1],
+                w[0]
+            );
+        }
+        assert_eq!(
+            Density::Compact.min_hit_target(),
+            Density::Mouse.min_hit_target()
+        );
+        assert_eq!(
+            Density::Comfortable.min_hit_target(),
+            Density::Touch.min_hit_target()
+        );
+        assert!(Density::Comfortable.min_hit_target() > Density::Mouse.min_hit_target());
     }
 
     #[test]
