@@ -612,7 +612,7 @@ impl PhonesHubState {
 
     /// The per-feature toggle card (design #13).
     fn feature_card(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.label(
                 RichText::new("Features")
                     .size(Style::TITLE)
@@ -638,7 +638,7 @@ impl PhonesHubState {
 
     /// One paired-phone card: identity, live signal + battery, and the gated actions.
     fn phone_card(&mut self, ui: &mut egui::Ui, d: &WireDevice) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Signal dot (the live overlay link) + name.
                 let (dot, dot_color) = if d.online {
@@ -771,7 +771,7 @@ impl PhonesHubState {
             return;
         };
         let is_local = node.node_host == self.self_host;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.label(
                 RichText::new(format!("{} \u{00B7} shared files", node.node_host))
                     .size(Style::TITLE)
@@ -824,7 +824,7 @@ impl PhonesHubState {
 
     /// The live deeper browse of THIS node over `action/connect/browse` (#11b).
     fn local_browse_card(&mut self, ui: &mut egui::Ui, node: &NodeMirror) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Live browse (this node)")
@@ -891,7 +891,7 @@ impl PhonesHubState {
             );
             return;
         }
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.label(
                 RichText::new("Commands your phone can trigger")
                     .size(Style::TITLE)
@@ -944,7 +944,7 @@ impl PhonesHubState {
     /// node's `<config>/runcommands.toml` (which the host reads, `load_runcommands`).
     /// Honest — it produces the config text to copy, never a faked cross-node write.
     fn composer_card(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.label(
                 RichText::new("Add a custom command")
                     .size(Style::TITLE)
@@ -1004,7 +1004,7 @@ impl PhonesHubState {
     fn pair_tab(&mut self, ui: &mut egui::Ui) {
         let name = self.endpoint_name();
         let local = self.nodes.iter().find(|n| n.node_host == self.self_host);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
             ui.label(
                 RichText::new("Pair a phone over the mesh")
                     .size(Style::TITLE)
@@ -1469,6 +1469,32 @@ fn render_pair_qr(ui: &mut egui::Ui, payload: &str) {
 
 // ── small render helpers ─────────────────────────────────────────────────────
 
+/// The Phones-hub card shadow — the surface-side conversion of the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token into an
+/// [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
+/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
+/// small-integer fields; mints **no** colour of its own (the umbra comes straight
+/// from the token), so a hub card reads as genuinely lifted off the page while the
+/// look still comes only from `mde_egui` (§4, design lock #2).
+fn card_shadow() -> egui::Shadow {
+    let token = mde_egui::style::Elevation::Raised.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
+/// A hub **card** frame — the stock [`egui::Frame::group`] lifted by the shared
+/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) soft shadow ([`card_shadow`]).
+/// Same fill / stroke / padding as the plain group it replaces (no layout change) —
+/// every hub card (features · phone · files · commands · pair) just casts the token's
+/// translucent umbra so it reads as genuinely lifted off the page (§4, design lock #2).
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style()).shadow(card_shadow())
+}
+
 /// A labeled read-only value row.
 fn labeled(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
@@ -1794,6 +1820,39 @@ mod tests {
     fn human_size_is_compact() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn hub_card_shadow_is_the_raised_depth_token() {
+        // Phase-C depth adoption: every hub card (features · phone · files ·
+        // commands · pair) casts the shared `Elevation::Raised` soft shadow so it
+        // reads as genuinely lifted off the page. Every field of `card_shadow`
+        // comes straight from the token — offset/blur/spread and, critically, the
+        // umbra colour (no minted `Color32`, §4) — and the umbra stays translucent
+        // (design lock #2), never an opaque fill.
+        let raised = mde_egui::style::Elevation::Raised.shadow();
+        let shadow = card_shadow();
+        assert_eq!(
+            shadow.offset,
+            [raised.offset[0] as i8, raised.offset[1] as i8],
+            "the card shadow offset comes from the Raised token"
+        );
+        assert_eq!(
+            shadow.blur, raised.blur as u8,
+            "the card shadow blur comes from the Raised token"
+        );
+        assert_eq!(
+            shadow.spread, raised.spread as u8,
+            "the card shadow spread comes from the Raised token"
+        );
+        assert_eq!(
+            shadow.color, raised.umbra,
+            "the card shadow umbra is the Raised token's, not a minted colour"
+        );
+        assert!(
+            shadow.color.a() > 0 && shadow.color.a() < 255,
+            "the depth is a translucent umbra (lock #2), never an opaque fill"
+        );
     }
 
     // ── test helpers ──────────────────────────────────────────────────────────
