@@ -707,8 +707,11 @@ mod tests {
         let dynamic: BTreeSet<&str> = DYNAMIC_SPAWNS.iter().copied().collect();
 
         // The definitive spawn roster: every `worker_names.push("X")` literal in
-        // run_serve (`bin/mackesd.rs`), plus the runtime-named dynamic spawns.
-        let bin = read_source("bin/mackesd.rs");
+        // run_serve (`bin/mackesd.rs`) and in its relocated spawn helpers
+        // (`bin/mackesd/spawn.rs` — the ARCH bin submodule holding the
+        // `spawn_*_workers` / `start_*_bus_responders` fns), plus the
+        // runtime-named dynamic spawns.
+        let bin = read_source("bin/mackesd.rs") + &read_source("bin/mackesd/spawn.rs");
         let pushed: BTreeSet<String> = scan_names(&bin, ".push(\"").into_iter().collect();
         assert!(
             pushed.len() >= 120,
