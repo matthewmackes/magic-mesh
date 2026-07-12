@@ -12,6 +12,7 @@ use mde_egui::eframe::{self, App, CreationContext};
 use mde_egui::egui::{
     self, Align, Context, CursorIcon, Layout, Response, RichText, ScrollArea, Sense,
 };
+use mde_egui::style::Elevation;
 use mde_egui::{Motion, Style};
 
 use mde_musicd::airsonic::{Album, Client, Song};
@@ -404,13 +405,38 @@ fn hover_wash(
     }
 }
 
+/// Build an [`egui::Shadow`] from the shared [`Elevation`] depth token — the
+/// surface-side conversion the token module defers (it stays free of egui's shadow
+/// type, per its own doc). Reads the token's offset/blur/spread/umbra, casting the
+/// logical-px floats onto epaint's small integer fields; mints **no** colour of its
+/// own (the umbra comes straight from the token), so the depth still reads only from
+/// `mde_egui` (§4) — the same conversion `mde-shell-egui`'s Settings card uses.
+fn elevation_shadow(elevation: Elevation) -> egui::Shadow {
+    let token = elevation.shadow();
+    egui::Shadow {
+        offset: [token.offset[0] as i8, token.offset[1] as i8],
+        blur: token.blur as u8,
+        spread: token.spread as u8,
+        color: token.umbra,
+    }
+}
+
+/// The list-card frame: the exact `Frame::group` egui's `ui.group` builds (same
+/// fill/stroke/margins), lifted onto the shared [`Elevation::Raised`] rung so a
+/// library album / album track reads as a card genuinely raised off the page (a
+/// translucent soft shadow, lock #2) instead of a flat bordered box. Adds only the
+/// shadow — no layout or behaviour change — and mints nothing of its own.
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style()).shadow(elevation_shadow(Elevation::Raised))
+}
+
 /// One clickable album row: title over the `artist · tracks · year` subtitle, in
 /// a bordered surface that turns the cursor to a pointing hand on hover. Rendered
 /// through the shared `Style` visuals (no raw colours).
 fn album_row(ui: &mut egui::Ui, album: &Album) -> Response {
     // Reserve the wash slot so it paints BEHIND the row content (the repo idiom).
     let band = ui.painter().add(egui::Shape::Noop);
-    let group = ui.group(|ui| {
+    let group = card_frame(ui).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.vertical(|ui| {
             ui.label(
@@ -442,7 +468,7 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
         .map_or_else(|| (index + 1).to_string(), |t| t.to_string());
     // Reserve the wash slot so it paints BEHIND the row content (the repo idiom).
     let band = ui.painter().add(egui::Shape::Noop);
-    let group = ui.group(|ui| {
+    let group = card_frame(ui).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(
@@ -623,5 +649,36 @@ mod tests {
         // 5000ms → 5s, clamped to the 180s tagged length.
         assert_eq!(np.elapsed_secs, 5);
         assert_eq!(np.duration_secs, 180);
+    }
+
+    #[test]
+    fn album_card_shadow_reuses_the_shared_raised_token() {
+        // The library/album cards adopt the shared elevation ladder verbatim: the
+        // conversion copies the Raised token's offset/blur/spread/umbra onto egui's
+        // Shadow and mints no colour of its own (§4), so the depth reads only from
+        // `mde_egui`. A translucent umbra keeps it a soft shadow, never an opaque
+        // fill (design lock #2).
+        use mde_egui::style::Elevation;
+        let token = Elevation::Raised.shadow();
+        let shadow = super::elevation_shadow(Elevation::Raised);
+        assert_eq!(
+            shadow.color, token.umbra,
+            "the umbra comes straight from the shared token"
+        );
+        assert_eq!(
+            shadow.offset,
+            [token.offset[0] as i8, token.offset[1] as i8],
+            "the cast preserves the token offset"
+        );
+        assert_eq!(shadow.blur, token.blur as u8, "the cast preserves the blur");
+        assert_eq!(
+            shadow.spread, token.spread as u8,
+            "the cast preserves the spread"
+        );
+        let alpha = shadow.color.a();
+        assert!(
+            alpha > 0 && alpha < 255,
+            "a Raised card casts a translucent soft shadow (lock #2), got alpha {alpha}"
+        );
     }
 }
