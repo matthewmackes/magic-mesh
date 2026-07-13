@@ -1812,32 +1812,33 @@ mod tests {
     // ── DOCK-OVERLAP: the vertical dock reserves a gutter so it never overlaps ──
 
     #[test]
-    fn the_dock_reserves_a_gutter_except_in_a_full_screen_remote_desktop() {
-        // A shown vertical dock, NOT in a full-screen remote desktop → the shell
-        // reserves the dock's slide width (DOCK_W once settled) as a left gutter so
-        // the dock never overlaps the surface. A fresh context reports the settled
-        // slide endpoint on first sight (egui's `animate_bool`), so the reserved
-        // width is DOCK_W. Each case uses its own context so the slide latch starts
-        // fresh at the right endpoint.
+    fn the_retired_left_dock_never_reserves_a_gutter() {
+        // DEDUPE-1 regression guard (review `dedupe-gutter-regression`): the vertical
+        // dock's `dock()` render was deleted, so the left gutter must be reserved
+        // NEVER — even when a stray Super-tap or the taskbar Pin flips
+        // `revealed`/`pinned` (making `shown()` true). Before the fix, a shown dock
+        // reserved a DOCK_W gutter, shifting the whole surface body 48px right behind a
+        // blank column that persisted after the Start Menu closed. Now it is always 0;
+        // the single bottom taskbar (`taskbar_strut_height`) is the only reserved chrome.
         let ctx = egui::Context::default();
         let mut shown = dock::DockState::default();
-        shown.toggle();
+        shown.toggle(); // the Super-tap gesture → revealed = true
+        assert!(shown.shown(), "precondition: toggle marks the dock shown");
         assert!(
-            (reserved_dock_gutter(false, &ctx, &shown) - dock::DOCK_W).abs() < f32::EPSILON,
-            "a shown dock off a full-screen remote reserves a DOCK_W gutter (no overlap)"
+            reserved_dock_gutter(false, &ctx, &shown).abs() < f32::EPSILON,
+            "a shown (revealed) dock must reserve NO gutter — the vertical dock is retired"
         );
 
-        // A full-screen remote desktop → NO gutter: the dock overlays the
-        // edge-to-edge remote on reveal (the remote stays full-screen).
+        // A full-screen remote desktop → also 0 (unchanged).
         let ctx2 = egui::Context::default();
         let mut shown2 = dock::DockState::default();
         shown2.toggle();
         assert!(
             reserved_dock_gutter(true, &ctx2, &shown2).abs() < f32::EPSILON,
-            "in a full-screen remote desktop the dock overlays — no gutter reserved"
+            "a full-screen remote reserves no gutter either"
         );
 
-        // A hidden dock → NO gutter (content fills the full width).
+        // A hidden dock → 0 (content fills the full width).
         let ctx3 = egui::Context::default();
         let hidden = dock::DockState::default();
         assert!(

@@ -786,8 +786,13 @@ pub fn notification_rail_with_sources(
     let reveal_t = if autohidden {
         let pointer = ctx.input(|i| i.pointer.latest_pos());
         let near_bottom = pointer.is_some_and(|p| p.y >= screen.bottom() - TASKBAR_HOT_EDGE_H);
-        // Ride-the-bar: while the pointer is over the shown bar it stays revealed.
-        let over_bar = pointer.is_some_and(|p| p.y >= screen.bottom() - rail_h);
+        // Ride-the-bar: while the pointer is over an ALREADY-revealed bar it stays up.
+        // Gated on `taskbar_revealed` so a RETRACTED bar only summons from the 4px hot
+        // edge (`near_bottom`) — otherwise `over_bar` (the full 48px band) would subsume
+        // the thin edge and pop the bar over content whenever the cursor neared the
+        // bottom (review `autohide-reveal-band`).
+        let over_bar =
+            state.taskbar_revealed && pointer.is_some_and(|p| p.y >= screen.bottom() - rail_h);
         let summon = near_bottom || over_bar;
         let revealed = taskbar_reveal(true, summon, state.taskbar_revealed);
         state.taskbar_revealed = summon;
@@ -1143,13 +1148,15 @@ pub fn notification_rail_with_sources(
 /// content then fills the full width. The shell reserves this as an empty left
 /// gutter ONLY when NOT in a full-screen remote desktop; there the dock floats as
 /// an overlay instead (`main.rs::central_view`).
-pub fn gutter_width(ctx: &egui::Context, state: &DockState) -> f32 {
-    let t = Motion::animate(ctx, DOCK_SLIDE_KEY, state.shown(), Motion::BASE);
-    if t <= 0.001 {
-        0.0
-    } else {
-        DOCK_W * t
-    }
+pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
+    // WIN10-HYBRID + DEDUPE-1: the left **vertical dock** is retired — its `dock()`
+    // render was deleted, so there is nothing to paint in a left gutter and it must
+    // NEVER be reserved (else a Super-tap or the taskbar Pin, which still flip
+    // `revealed`/`pinned`, would shift the whole surface body 48px right behind a blank
+    // column — the review `dedupe-gutter-regression`). The single 48px BOTTOM taskbar
+    // (`taskbar_strut_height`) is the only chrome the shell reserves now. The
+    // `revealed`/`pinned` state survives (harmlessly) only for a future auto-hide use.
+    0.0
 }
 
 /// WIN10-HYBRID **bottom strut** — the height the shell reserves at the bottom edge
