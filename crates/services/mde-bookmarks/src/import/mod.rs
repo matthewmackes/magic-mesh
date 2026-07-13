@@ -15,7 +15,11 @@
 
 mod chromium;
 mod firefox;
-mod netscape;
+// `pub(crate)` (not `pub`) so the exporter (`crate::export`) can call
+// `netscape::parse` directly in its round-trip tests, without widening the
+// crate's public API — the format parser stays an import-only implementation
+// detail to the outside world.
+pub(crate) mod netscape;
 mod normalize;
 mod parsed;
 mod plan;
