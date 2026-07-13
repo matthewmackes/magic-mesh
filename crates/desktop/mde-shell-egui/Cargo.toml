@@ -231,5 +231,10 @@ mde-web-preview-client = { path = "../mde-web-preview-client", features = ["test
 # round-trip test uses. Already in the workspace lock, no new lock line.
 tempfile = "3"
 
+# BOOKMARKS-BAR tests mint real `mde-bookmarks` `AddBookmark` ops (each carrying a
+# `Uuid` item id) to build a converged `Collection` fixture the bar folds/mirrors —
+# the same uuid the mde-bookmarks API returns. Already in the workspace lock.
+uuid = { version = "1", features = ["v4"] }
+
 [lints]
 workspace = true
