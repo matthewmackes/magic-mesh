@@ -1409,28 +1409,6 @@ impl Shell {
             }
             self.nav.surface = Surface::Desktop;
         }
-        // VDOCK-4 — drain the system-quad's pending request: Lock drops the
-        // in-process curtain (exactly like Super+L), a Power verb drives the seat
-        // honorer (its typed-armed consent is the operator's; a refusal is an
-        // honest no-op, §7).
-        match self.vdock.take_request() {
-            Some(dock::DockRequest::Lock) => self.curtain.lock(),
-            Some(dock::DockRequest::Power(verb)) => {
-                // A refused/absent logind is an honest no-op (§7) — but now it is
-                // also a logged one, so a seat that silently won't suspend/reboot
-                // leaves a trail instead of vanishing.
-                if let Err(e) = self.system.honor_power(verb) {
-                    tracing::error!(
-                        target: "shell::power",
-                        verb = verb.label(),
-                        source = "dock",
-                        error = %e,
-                        "power verb refused by the seat",
-                    );
-                }
-            }
-            None => {}
-        }
         // NODE-GRADE-2 (#7) — a tapped grade row asks to open that node's Explorer
         // hero. The dock can't reach the Explorer/nav (§6), so drain its request
         // here: route to the Mesh Map, flip on its Explorer lens, and focus the peer
@@ -2382,16 +2360,16 @@ mod tests {
         );
     }
 
-    /// Mount the shell's **vertical dock** chrome (VDOCK, the sole chrome) exactly
-    /// as `render`'s `mount_dock_chrome` does — the floating dock `Area` mounted
-    /// before the central view — so the surface-mount tests below reproduce the live
-    /// chrome-then-central order. The dock is revealed so its frame actually paints;
-    /// it mirrors `active` in and reads the picker selection back out.
+    /// Mount the shell's **taskbar** chrome exactly as `render`'s
+    /// `mount_dock_chrome` does — the floating bottom-taskbar `Area` mounted before
+    /// the central view — so the surface-mount tests below reproduce the live
+    /// chrome-then-central order. The taskbar is the shell's sole launcher chrome
+    /// now (WIN10-HYBRID B4 retired the left dock); it mirrors `active` in and reads
+    /// the taskbar's selection back out.
     fn mount_dock(ctx: &egui::Context, active: &mut Surface) {
         let mut vdock = dock::DockState::default();
-        vdock.toggle(); // reveal it so the dock frame paints
         vdock.set_active(*active);
-        let _ = dock::dock(ctx, &mut vdock);
+        let _ = dock::notification_rail_with_sources(ctx, &mut vdock, &[]);
         *active = vdock.active();
     }
 
@@ -2606,22 +2584,21 @@ mod tests {
         assert!(written.len() > 0, "write_png must produce a non-empty file");
     }
 
-    /// Paint the SAME three free functions `Shell::render` composes in
-    /// production for this exact slice (`dock::dock`, `dock::
-    /// notification_rail_with_sources`, `start_menu::start_menu_panel`) —
-    /// bypassing `Shell`/`Curtain` entirely, exactly like `dock.rs`'s own
-    /// standalone tests already drive `dock()` without a `Shell`. Going through
-    /// the full `Shell` would hit the CURTAIN-3 boot gate (`Shell::new_for_ctx`
-    /// starts locked under the shipped `require_login_at_boot` default), which
-    /// would hide the whole nav — including the Start Menu — behind the PAM
-    /// curtain on any host/CI sandbox with no persisted power-honor config.
+    /// Paint the SAME two free functions `Shell::render` composes in production for
+    /// this exact slice (`dock::notification_rail_with_sources`,
+    /// `start_menu::start_menu_panel`) — bypassing `Shell`/`Curtain` entirely,
+    /// exactly like `dock.rs`'s own standalone tests already drive the taskbar
+    /// without a `Shell`. Going through the full `Shell` would hit the CURTAIN-3 boot
+    /// gate (`Shell::new_for_ctx` starts locked under the shipped
+    /// `require_login_at_boot` default), which would hide the whole nav — including
+    /// the Start Menu — behind the PAM curtain on any host/CI sandbox with no
+    /// persisted power-honor config.
     fn paint_taskbar_and_start_menu(
         ctx: &egui::Context,
         vdock: &mut dock::DockState,
         menu: &mut start_menu::StartMenuState,
         console: &mut console::ConsoleState,
     ) {
-        let _ = dock::dock(ctx, vdock);
         let _ = dock::notification_rail_with_sources(ctx, vdock, &[]);
         // Mirrors main.rs's real `mount_start_menu` wiring (WIN7-DESKTOP-1
         // regression fix) so this fixture's Start Menu reserves the SAME live

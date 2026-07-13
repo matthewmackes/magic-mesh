@@ -39,12 +39,12 @@
 //! beneath (the "auto-hide + DRM seat" guarantee).
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
-use mde_egui::{Density, GradeBand, Motion, Style};
-use mde_seat::{PowerVerb, SeatSnapshot};
+use mde_egui::{Density, Motion, Style};
+use mde_seat::SeatSnapshot;
 use mde_theme::brand::icons::{icon_image, IconId};
 
-use crate::chrome::{GradeRow, MeshSummary, NodeGrades};
-use crate::status::{self, StatusSegments};
+use crate::chrome::{MeshSummary, NodeGrades};
+use crate::status::{self, StatusSegment, StatusSegments};
 
 /// Which surface fills the shell body.
 ///
@@ -276,167 +276,8 @@ const CELL_W: f32 = Style::SP_XL + Style::SP_M;
 /// Rasterized crisp at the physical pixel size by `icon_texture`.
 const ICON_LOGICAL: f32 = Style::SP_L;
 
-// ── PICKER-1: the app picker grouped into named sections ────────────────────
-
-/// A named section of the app picker (PICKER-1): an accent label + the group's
-/// 24px icon cells, keyed by the group's identity colour. The Workbench is NOT in
-/// any group — it leads the picker as the top standalone anchor.
-struct Group {
-    /// The section heading, painted in [`Self::accent`].
-    label: &'static str,
-    /// The group's identity colour — the label tint (design L4).
-    accent: egui::Color32,
-    /// The group's surfaces, kept in [`Surface::ALL`] relative order (lock L7).
-    surfaces: &'static [Surface],
-}
-
-// PICKER-2: the per-group accent colours are the shared categorical tokens on
-// `Style` (`ACCENT_COMMS`..`ACCENT_MEDIA`) — the SAME six hues EXPLORER-15
-// consumes for the unit explorer's per-category identity (design O8). One colour
-// language across the picker + the explorer, defined ONCE in the token module
-// (`mde_egui::Style`) and consumed by both; the raw hex lives only there (§4, no
-// raw colours here). The Carbon-blue hairline reuses the interactive-blue token
-// [`Style::ACCENT`].
-
-/// The six labelled groups in their locked top-to-bottom order (L5), each
-/// listing its surfaces in [`Surface::ALL`] relative order (L7). THREE surfaces
-/// sit outside every group: the **Workbench** leads the picker as the top
-/// standalone anchor, and **System** (Settings) + **Desktop** (Show-Desktop) are
-/// VDOCK-4's bottom system-quad cells; every other surface appears here exactly
-/// once (About lives in System's group) — the union with those three reproduces
-/// all 18 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
-/// grouping authority).
-const GROUPS: [Group; 6] = [
-    Group {
-        label: "Comms",
-        accent: Style::ACCENT_COMMS,
-        surfaces: &[Surface::Voice, Surface::Chat, Surface::Phones],
-    },
-    Group {
-        label: "Workloads",
-        accent: Style::ACCENT_WORKLOADS,
-        surfaces: &[Surface::InfraCode],
-    },
-    Group {
-        label: "Terminals",
-        accent: Style::ACCENT_TERMINALS,
-        surfaces: &[
-            Surface::Browser,
-            Surface::Bookmarks,
-            Surface::Terminal,
-            Surface::Editor,
-        ],
-    },
-    Group {
-        label: "Mesh",
-        accent: Style::ACCENT_MESH,
-        surfaces: &[Surface::MeshView, Surface::Explorer],
-    },
-    Group {
-        label: "System",
-        accent: Style::ACCENT_SYSTEM,
-        // The System *surface* is the right-side Settings button, not a member
-        // here; this group gathers the remaining system-adjacent surfaces.
-        surfaces: &[Surface::Files, Surface::Storage, Surface::About],
-    },
-    Group {
-        label: "Media",
-        accent: Style::ACCENT_MEDIA,
-        surfaces: &[Surface::Music, Surface::Media],
-    },
-];
-
-const PICKER_FOCUS_ORDER: [Surface; 17] = [
-    Surface::Workbench,
-    Surface::Voice,
-    Surface::Chat,
-    Surface::Phones,
-    Surface::InfraCode,
-    Surface::Browser,
-    Surface::Bookmarks,
-    Surface::Terminal,
-    Surface::Editor,
-    Surface::MeshView,
-    Surface::Explorer,
-    Surface::Files,
-    Surface::Storage,
-    Surface::About,
-    Surface::Music,
-    Surface::Media,
-    Surface::Desktop,
-];
-
-// Compile-time guard: the Workbench lead + VDOCK-4's two system-quad cells
-// (System/Settings + Desktop/Show-Desktop) + the six `GROUPS` place every
-// `Surface::ALL` entry EXACTLY once — so the picker can never silently drop or
-// duplicate a surface when either table changes (add a surface to `ALL` but forget
-// to group it, or list it twice, and the crate fails to compile). Keeps
-// `Surface::ALL` the authority the render is checked against. Fieldless enums cast
-// to their discriminant in const, so this compares by identity.
-const _: () = {
-    let mut i = 0;
-    while i < Surface::ALL.len() {
-        let target = Surface::ALL[i] as usize;
-        // Three surfaces are placed outside every group: Workbench (the top
-        // standalone lead), System + Desktop (VDOCK-4's system-quad cells).
-        let mut count = if Surface::Workbench as usize == target
-            || Surface::System as usize == target
-            || Surface::Desktop as usize == target
-        {
-            1
-        } else {
-            0
-        };
-        let mut g = 0;
-        while g < GROUPS.len() {
-            let surfaces = GROUPS[g].surfaces;
-            let mut s = 0;
-            while s < surfaces.len() {
-                if surfaces[s] as usize == target {
-                    count += 1;
-                }
-                s += 1;
-            }
-            g += 1;
-        }
-        assert!(
-            count == 1,
-            "every Surface::ALL entry must be placed exactly once across the Workbench lead + the System + Desktop system-quad cells + GROUPS",
-        );
-        i += 1;
-    }
-};
-
 /// The Carbon-blue group hairline width in logical points — a 1px rule (L3).
 const HAIRLINE_W: f32 = 1.0;
-
-/// The group-label point-size floor — the micro-label never shrinks below this,
-/// so it stays legible even when a long label wants to overflow the narrow column.
-const LABEL_MIN_PT: f32 = 8.0;
-
-/// The shared point size for every group label — starts at [`Style::SMALL`] and
-/// shrinks UNIFORMLY (all six labels together) just enough that the widest label
-/// fits within `avail` logical points (the narrow dock column's interior width).
-/// Floored at [`LABEL_MIN_PT`] for legibility.
-fn group_label_font(ui: &egui::Ui, avail: f32) -> egui::FontId {
-    let base = egui::FontId::proportional(Style::SMALL);
-    let widest = ui.fonts(|f| {
-        GROUPS
-            .iter()
-            .map(|g| {
-                f.layout_no_wrap(g.label.to_owned(), base.clone(), Style::TEXT)
-                    .size()
-                    .x
-            })
-            .fold(0.0_f32, f32::max)
-    });
-    let pt = if widest <= avail {
-        Style::SMALL
-    } else {
-        (Style::SMALL * avail / widest).max(LABEL_MIN_PT)
-    };
-    egui::FontId::proportional(pt)
-}
 
 /// Rasterize + upload a brand glyph, cached in egui memory so a given
 /// `(glyph, physical-size, tint)` triple is rasterized through `resvg` **once**
@@ -507,11 +348,6 @@ const DOCK_SLIDE_KEY: &str = "vdock-slide";
 /// The egui memory key for NOTIF-4's right-side status detail panel.
 const STATUS_PANEL_KEY: &str = "vdock-status-panel";
 
-/// The stable id of the dock's floating [`egui::Area`] layer, so the shell (and
-/// the passthrough test) can name its `LayerId` — `LayerId::new(Foreground,
-/// Id::new(DOCK_AREA))`.
-const DOCK_AREA: &str = "vdock-area";
-
 /// The stable id of the bottom notification rail layer.
 const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 
@@ -537,42 +373,27 @@ pub struct DockState {
     /// The pin (lock #9): while set, the dock stays on screen regardless of the
     /// reveal latch — the "hotkey + pin" hold-open.
     pinned: bool,
-    /// The **active surface** the app picker selects (VDOCK-2) — a picker cell
-    /// click writes it here; the shell body follows [`Self::active`]. Defaults to
+    /// The **active surface** the taskbar selects — a taskbar cell click writes it
+    /// here; the shell body follows [`Self::active`]. Defaults to
     /// [`Surface::Workbench`] (the shell opens on the Workbench).
     active: Surface,
-    /// Whether the '…' **overflow** more-popup is open (VDOCK-2, lock #22) — set by
-    /// the '…' cell, cleared on a route or a click-away.
-    overflow_open: bool,
-    /// Whether the NODE-GRADE-2 grade list's '…' expander is open (design #8) — set
-    /// by its '…' cell, cleared on a tap-route or a click-away. Distinct latch from
-    /// the app picker's [`Self::overflow_open`].
-    grades_overflow_open: bool,
+    /// WIN10-HYBRID #31 — whether the ▲ **tray-overflow** flyout is open (the Win10
+    /// hidden-icons popup): set by the ▲ cell, cleared on a route or a click-away.
+    tray_overflow_open: bool,
     /// NOTIF-4 — whether the bottom notification rail's detail panel is open.
     /// Toggled by the rail chevron and dismissed by Esc or click-away.
     status_panel_open: bool,
     /// The live inputs NOTIF-3's bottom **notification rail** folds each frame —
-    /// owned so `dock()` keeps its `(ctx, state)` signature; the shell refreshes it
-    /// via [`Self::set_status_inputs`] before each `dock()`. Defaults to the honest
-    /// pre-poll state.
+    /// owned so the taskbar keeps its `(ctx, state)` signature; the shell refreshes
+    /// it via [`Self::set_status_inputs`] each frame. Defaults to the honest pre-poll
+    /// state.
     status: StatusInputs,
-    /// VDOCK-4 — the system quad's **Power menu** (design #18): the anchored
-    /// Lock/Suspend/Reboot/Shutdown popup off the Power cell, plus the typed-arming
-    /// echo the two host-down verbs demand. Closed by default.
-    power: PowerMenu,
-    /// VDOCK-4 — a pending shell **request** the dock records for `main.rs` to
-    /// drain after [`dock`] (the Lock/Power system-quad cells + the Power menu). The
-    /// dock can't reach the shell's `Curtain`/seat, so it records the intent here
-    /// and the shell drives it via [`Self::take_request`] — the deferred wire
-    /// (VDOCK-3's `set_status_inputs` pattern), out of this dock.rs-only fence.
-    /// `None` until a cell/menu fires (one request outlives one frame).
-    pending: Option<DockRequest>,
-    /// A pending **node-focus** request the NODE-GRADE-2 grade list records when a
-    /// grade row is tapped (design #7): the hostname whose Explorer hero the shell
-    /// should open. The dock can't reach the shell's Explorer / nav (§6), so it
+    /// A pending **node-focus** request the notification panel's grade list records
+    /// when a grade row is tapped (design #7): the hostname whose Explorer hero the
+    /// shell should open. The dock can't reach the shell's Explorer / nav (§6), so it
     /// records the host here and `main.rs` drives the jump via
-    /// [`Self::take_node_focus`] (the deferred-wire idiom, like [`Self::pending`]).
-    /// A `String` (not `Copy`), so it rides its own field rather than [`DockRequest`].
+    /// [`Self::take_node_focus`] (the deferred-wire idiom).
+    /// A `String` (not `Copy`), so it rides its own field.
     pending_node_focus: Option<String>,
     /// WIN7-2 — whether the Start Menu panel is up, mirrored in by the shell
     /// each frame ([`Self::set_start_menu_open`]) so the Start cell wears its
@@ -610,22 +431,12 @@ pub struct DockState {
     /// the bar stays docked and reserves its bottom strut. See
     /// [`set_taskbar_autohide`](Self::set_taskbar_autohide).
     taskbar_autohide: bool,
-}
-
-/// A shell-level **request** the VDOCK-4 system quad records for the shell to drain
-/// after [`dock`] — the dock never reaches the `Curtain` or the seat itself (§6),
-/// so it hands the intent back and `main.rs` drives the real seam. `Copy` (its
-/// `PowerVerb` is), so recording one is a plain field assignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DockRequest {
-    /// Drop the shell curtain — the Lock cell + the Power menu's Lock item. The
-    /// shell drives `curtain.lock()` (the in-process lock, exactly like Super+L),
-    /// NOT logind's session Lock.
-    Lock,
-    /// Drive a real host power verb (Suspend / Reboot / `PowerOff`) — the Power menu's
-    /// host-down items, already the operator's typed-armed consent. The shell drives
-    /// `system.honor_power(verb)` (the honorer's confirm-bypass seam, §6).
-    Power(PowerVerb),
+    /// WIN10-HYBRID (B3) — the transient **reveal** latch for an auto-hidden bar:
+    /// the render sets it while the pointer summons the hot edge or rides the
+    /// revealed bar, and [`taskbar_reveal`] folds it with the live pointer to decide
+    /// whether the retracted bar slides up this frame. Meaningless while auto-hide is
+    /// off (the bar is always docked).
+    taskbar_revealed: bool,
 }
 
 /// The live inputs the bottom **notification rail** folds — bundled into ONE
@@ -876,36 +687,6 @@ impl DockState {
         };
     }
 
-    /// Record a curtain-lock request (VDOCK-4) — the Lock system-quad cell. The
-    /// dock never reaches the shell's `Curtain`; the shell drains this each frame
-    /// ([`Self::take_request`]).
-    const fn request_lock(&mut self) {
-        self.pending = Some(DockRequest::Lock);
-    }
-
-    /// Fire a Power-menu item's REAL action + close the menu (VDOCK-4). Lock records
-    /// a curtain request; every other item records its real [`PowerVerb`]. The
-    /// typed-arming gate is the caller's — this fires unconditionally, so it runs
-    /// only once Lock/Suspend are clicked, or a Reboot/Shutdown echo has armed.
-    fn fire_power(&mut self, item: PowerItem) {
-        // Lock → the shell curtain (NOT logind's session Lock, design #18); every
-        // other item → its real logind verb.
-        self.pending = Some(
-            item.power_verb()
-                .map_or(DockRequest::Lock, DockRequest::Power),
-        );
-        self.power.close();
-    }
-
-    /// Drain the pending shell **request** (VDOCK-4) — the shell calls this each
-    /// frame after [`dock`] and drives it: a [`DockRequest::Lock`] drops the
-    /// in-process curtain (`curtain.lock()`, exactly like Super+L), a
-    /// [`DockRequest::Power`] drives `system.honor_power(verb)` (§6). `None` (drained
-    /// once) otherwise. Wired by `main.rs::mount_dock_chrome` (VDOCK-6).
-    pub const fn take_request(&mut self) -> Option<DockRequest> {
-        self.pending.take()
-    }
-
     /// Record a **node-focus** request (NODE-GRADE-2, design #7) — a grade row tap
     /// asking the shell to open that host's Explorer hero. The dock can't reach the
     /// Explorer / nav (§6); the shell drains this each frame ([`Self::take_node_focus`]).
@@ -967,78 +748,6 @@ impl DockState {
     }
 }
 
-/// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome,
-/// the shell's sole surface launcher. A left-edge, full-height [`DOCK_W`]
-/// column: a solid Carbon-dark panel with a hairline right-edge divider (locks
-/// #1/#24, §4 tokens). Hidden off the left by default; the shell's Super-tap
-/// toggles it and the pin holds it open (`state`), sliding in/out from the left
-/// edge over the shared [`Motion`] table (~200ms, locks #13/#14).
-///
-/// Mounted as a floating [`egui::Area`] (NOT a [`egui::SidePanel`]) so it reserves
-/// **no gutter** — the central surface fills the full width whether the dock is in
-/// or out. When fully hidden **and settled** it mounts **no layer at all**, so
-/// egui hit-tests every pointer/key event straight to the surface beneath: the
-/// dock can never steal focus/input while hidden (the design's "auto-hide + DRM
-/// seat" risk; proven by the passthrough test).
-///
-/// VDOCK-1 built the FRAME + the slide/toggle mechanism; **VDOCK-2** fills the
-/// top **Workbench-lead** zone + the single-column **app-groups** middle; the
-/// NODE-GRADE-2 grade band sits above **VDOCK-4**'s **system quad** in the final
-/// row ([`paint_dock_frame`]). Returns `true` if a dock control routed this frame
-/// — a picker cell, a grade row (a node-focus request), or a system-quad cell (a
-/// route, the curtain lock, or the Power menu), recorded in [`DockState`] (the
-/// active surface + the pending lock/power/node-focus requests) which the shell
-/// reads back to surface the body / drive the seat. The auto-hide **pin**, the
-/// **Start** cell, the session rail, the status tray, and the **clock** are NOT
-/// part of this function — they render in the separate full-width bottom
-/// taskbar ([`notification_rail_with_sources`], WIN7-1).
-pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
-    let shown = state.shown();
-    // Slide-in-from-left over the shared Motion table (lock #14): `t` eases
-    // 0 (fully hidden, off the left edge) → 1 (fully in, flush at x=0).
-    let t = Motion::animate(ctx, DOCK_SLIDE_KEY, shown, Motion::BASE);
-
-    // Fully hidden + settled → mount NO layer. With no Area over the left edge,
-    // egui's hit-test routes every pointer/key event to the surface beneath (the
-    // background CentralPanel), so the hidden dock steals nothing (lock #9, the
-    // DRM-seat passthrough guarantee). The slide-out's final frame lands here once
-    // `t` decays to ~0.
-    if t <= 0.001 {
-        return false;
-    }
-
-    let screen = ctx.screen_rect();
-    // The slide offset: the panel's left edge rides from -DOCK_W (fully out) to 0
-    // (fully in). `constrain(false)` below lets the Area sit at negative x.
-    let offset_x = -(1.0 - t) * DOCK_W;
-    let mut clicked = false;
-    egui::Area::new(egui::Id::new(DOCK_AREA))
-        .order(egui::Order::Foreground)
-        // It SLIDES (lock #14) — never egui's default fade-in.
-        .fade_in(false)
-        // Allow the negative-x off-screen slide (the Area is constrained to the
-        // screen rect by default, which would clamp the slide to x=0).
-        .constrain(false)
-        .fixed_pos(egui::pos2(offset_x, screen.top()))
-        .show(ctx, |ui| {
-            // Claim the full-height column as the Area's content rect, so while the
-            // dock is visible its layer covers the whole column (egui routes clicks
-            // over it to the dock, not the surface behind). Off-screen portions of
-            // the claim simply can't be hit; the fully-hidden case returned above.
-            let (claim, _claim) =
-                ui.allocate_exact_size(egui::vec2(DOCK_W, screen.height()), egui::Sense::hover());
-            let rect = egui::Rect::from_min_size(claim.min, egui::vec2(DOCK_W, claim.height()));
-            clicked = paint_dock_frame(ui, rect, state);
-        });
-
-    // Keep frames flowing while the slide is in flight so the motion is smooth
-    // (the curtain's tween idiom) — a no-op once settled at either end.
-    if t > 0.001 && t < 0.999 {
-        ctx.request_repaint();
-    }
-    clicked
-}
-
 /// Render the bottom **taskbar** (WIN7-1) — test-only convenience over
 /// [`notification_rail_with_sources`] for callers with no live Desktop sources.
 #[cfg(test)]
@@ -1067,18 +776,43 @@ pub fn notification_rail_with_sources(
 ) -> bool {
     let screen = ctx.screen_rect();
     let rail_h = state.rail_height();
+    // WIN10-HYBRID (B3) — the auto-hide slide. When the bar is docked (auto-hide
+    // OFF) `reveal_t` is a hard 1.0 and `slide_off` a hard 0.0, so every rect below
+    // is byte-identical to the always-docked bar (the geometry tests never take the
+    // auto-hide branch). When auto-hidden the bar rides `slide_off` from fully
+    // retracted (off the bottom edge) to flush, summoned by the bottom hot edge or
+    // by the pointer riding the revealed bar ([`taskbar_reveal`]).
+    let autohidden = state.taskbar_autohidden();
+    let reveal_t = if autohidden {
+        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        let near_bottom = pointer.is_some_and(|p| p.y >= screen.bottom() - TASKBAR_HOT_EDGE_H);
+        // Ride-the-bar: while the pointer is over the shown bar it stays revealed.
+        let over_bar = pointer.is_some_and(|p| p.y >= screen.bottom() - rail_h);
+        let summon = near_bottom || over_bar;
+        let revealed = taskbar_reveal(true, summon, state.taskbar_revealed);
+        state.taskbar_revealed = summon;
+        Motion::animate(ctx, TASKBAR_REVEAL_KEY, revealed, Motion::BASE)
+    } else {
+        1.0
+    };
+    let slide_off = (1.0 - reveal_t) * rail_h;
     let rail_rect = egui::Rect::from_min_size(
-        egui::pos2(screen.left(), screen.bottom() - rail_h),
+        egui::pos2(screen.left(), screen.bottom() - rail_h + slide_off),
         egui::vec2(screen.width(), rail_h),
     );
     let panel_t = Motion::animate(ctx, STATUS_PANEL_KEY, state.status_panel_open, Motion::BASE);
     let panel_top = rail_rect.top() - STATUS_PANEL_GAP - STATUS_PANEL_H
         + (1.0 - panel_t.clamp(0.0, 1.0)) * Style::SP_XL;
-    let area_top = if panel_t > 0.001 {
+    let mut area_top = if panel_t > 0.001 {
         panel_top.min(rail_rect.top())
     } else {
         rail_rect.top()
     };
+    // Keep the Area covering at least the on-screen hot-edge sliver when the bar has
+    // slid (partly) off the bottom, else `area_rect`'s height would go negative.
+    if autohidden {
+        area_top = area_top.min(screen.bottom() - TASKBAR_HOT_EDGE_H);
+    }
     let area_rect = egui::Rect::from_min_size(
         egui::pos2(screen.left(), area_top),
         egui::vec2(screen.width(), screen.bottom() - area_top),
@@ -1141,19 +875,11 @@ pub fn notification_rail_with_sources(
             }
             x += rail_h;
 
-            let desktop = cell(x);
-            if rail_surface_cell(
-                ui,
-                Surface::Desktop,
-                &mut state.active,
-                &mut state.pinned,
-                desktop,
-                "Desktop",
-            ) {
-                state.desktop_reconnect = true;
-                clicked = true;
-            }
-            x += rail_h;
+            // DEDUPE-2 — the dedicated always-on Desktop cell is retired: it was
+            // redundant with the running-sessions run (below), the far-right
+            // show-desktop nub, and the Start tile's Desktop launcher. The source
+            // caret + its flyout stay as the Win10 "pick a desktop" affordance; the
+            // running-sessions run reclaims the retired cell's `rail_h` of x-space.
             let source_caret = egui::Rect::from_min_size(
                 egui::pos2(x, local.top()),
                 egui::vec2(DESKTOP_CARET_W, rail_h),
@@ -1173,13 +899,14 @@ pub fn notification_rail_with_sources(
             let tray_icon_w = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
             let status_w = tray_icon_w * status::StatusSegment::ALL.len() as f32;
             let clock_w = rail_h * 2.2;
-            // WIN10-HYBRID #31 — the right cluster now also carries the Win10
+            // WIN10-HYBRID #31 — the right cluster carries the Win10
             // **action-center** cell (a `rail_h`-wide Chat launcher + its `SP_XS`
-            // gap) and the far-right **show-desktop nub** (`SP_S` wide). Both
-            // widths are folded in here so `session_right` keeps reserving the
-            // WHOLE cluster and the running-sessions run can never grow under the
-            // new cells (the same overlap contract the clock/pips/detail already
-            // rely on — see the geometry test in `tests.rs`).
+            // gap), the ▲ **tray-overflow** cell (another `rail_h`), and the
+            // far-right **show-desktop nub** (`SP_S` wide). Every width is folded in
+            // here so `session_right` keeps reserving the WHOLE cluster and the
+            // running-sessions run can never grow under the new cells (the same
+            // overlap contract the clock/pips/detail already rely on — see the
+            // geometry test in `tests.rs`).
             let right_cluster_w = rail_h
                 + clock_w
                 + status_w
@@ -1188,6 +915,7 @@ pub fn notification_rail_with_sources(
                 + Style::SP_XS
                 + rail_h
                 + Style::SP_XS
+                + rail_h
                 + Style::SP_S;
             let session_right = (local.right() - Style::SP_XS - right_cluster_w).max(x);
             if state.status.sessions.is_empty() {
@@ -1305,6 +1033,14 @@ pub fn notification_rail_with_sources(
                 egui::pos2(tray_x, local.top() + (rail_h - pip_h) / 2.0),
                 egui::vec2(status_w, pip_h),
             );
+            // WIN10-HYBRID #31 — the ▲ **tray-overflow** cell sits immediately LEFT
+            // of the status pips (Win10's hidden-icons chevron).
+            tray_x -= rail_h;
+            let tray_overflow = cell(tray_x);
+            let opened_tray_overflow = tray_overflow_toggle(ui, tray_overflow, state);
+            if opened_tray_overflow {
+                clicked = true;
+            }
             tray_x -= rail_h;
             if status_detail_toggle(ui, cell(tray_x), state) {
                 clicked = true;
@@ -1359,12 +1095,39 @@ pub fn notification_rail_with_sources(
             }
             if state.desktop_sources_open
                 && !opened_desktop_sources
-                && desktop_source_flyout(ui, desktop, desktop_sources, state)
+                && desktop_source_flyout(ui, source_caret, desktop_sources, state)
             {
                 clicked = true;
             }
+            // WIN10-HYBRID #31 — the ▲ tray-overflow flyout: bottom-anchored off its
+            // ▲ cell, every status segment as a reachable row (routes `active`).
+            if state.tray_overflow_open
+                && !opened_tray_overflow
+                && tray_overflow_flyout(ui, tray_overflow, state)
+            {
+                clicked = true;
+            }
+            // WIN10-HYBRID (B3) — when auto-hidden and (partly) retracted, a thin
+            // accent hot-edge sliver at the screen's true bottom hints where the bar
+            // hides; it fades out as the bar slides up into view.
+            if autohidden && reveal_t < 0.999 {
+                let sliver = egui::Rect::from_min_size(
+                    egui::pos2(screen.left(), screen.bottom() - TASKBAR_HOT_EDGE_H),
+                    egui::vec2(screen.width(), TASKBAR_HOT_EDGE_H),
+                );
+                ui.painter().rect_filled(
+                    sliver,
+                    egui::CornerRadius::ZERO,
+                    Style::ACCENT.linear_multiply(1.0 - reveal_t),
+                );
+            }
         });
     if panel_t > 0.001 && panel_t < 0.999 {
+        ctx.request_repaint();
+    }
+    // Keep frames flowing while the auto-hide slide is in flight (a no-op once
+    // settled at either end, or whenever the bar is docked).
+    if autohidden && reveal_t > 0.001 && reveal_t < 0.999 {
         ctx.request_repaint();
     }
     clicked
@@ -1407,111 +1170,23 @@ pub fn taskbar_strut_height(state: &DockState) -> f32 {
     }
 }
 
-/// Paint the vertical dock's frame into `rect` and lay out its interior: the solid
-/// Carbon-dark panel + the hairline right-edge divider (lock #24, §4 tokens), the
-/// **VDOCK-2** top zone (the Workbench lead) and middle zone (the single-column
-/// app groups + '…' overflow), the NODE-GRADE-2 grade band, and the **VDOCK-4**
-/// system quad in the final `DOCK_W` row beneath it. The pin and the clock are
-/// NOT painted here — both live in the bottom taskbar
-/// ([`notification_rail_with_sources`], WIN7-1). Returns `true` if a picker cell,
-/// a grade row, or a system-quad cell routed/acted this frame.
-fn paint_dock_frame(ui: &mut egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
-    let painter = ui.painter().clone();
-    // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), a flat
-    // opaque fill so the dock reads as one solid chrome column.
-    painter.rect_filled(rect, egui::CornerRadius::ZERO, Style::SURFACE);
-    // The hairline right-edge divider (lock #24) — a 1px BORDER rule down the
-    // dock's right edge, the seam between the dock and the surface it floats over.
-    // (The old DOCK-ACCENT blue edge seam was removed by operator directive.)
-    painter.vline(
-        rect.right(),
-        rect.y_range(),
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
+/// The bottom **hot-edge** height (WIN10-HYBRID B3) — both the summon zone an
+/// auto-hidden bar watches for the pointer AND the sliver painted to hint where the
+/// bar hides. `SP_XS` on the 8px grid (a thin Win10-style edge).
+const TASKBAR_HOT_EDGE_H: f32 = Style::SP_XS;
 
-    let mut clicked = false;
+/// The egui memory key for the auto-hide reveal slide (the Motion latch that eases
+/// the retracted bar 0↔1). Private to the taskbar.
+const TASKBAR_REVEAL_KEY: &str = "taskbar-reveal";
 
-    // ── TOP zone — the Workbench lead remains the first left-rail launcher. The
-    // Start cell, Desktop shortcut, clock, and pin live in the bottom taskbar.
-    let wb = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
-    if pick_app_cell(
-        ui,
-        Surface::Workbench,
-        &mut state.active,
-        &mut state.pinned,
-        wb,
-    ) {
-        clicked = true;
-    }
-    painter.hline(
-        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
-        wb.bottom() + GROUP_DIVIDER_H / 2.0,
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
-
-    // ── MIDDLE zone (design #2/#3/#4/#10/#11/#21/#22/#23) — the app picker ──
-    // The six labelled groups stacked single-column top→bottom (Comms → … →
-    // Media), each a horizontal accent label (#4) + a left-rail accent stripe +
-    // accent divider (#21) over its icon-only 24px cells (#11/#23) in Surface::ALL
-    // order (#3). The zone is bounded above the BOTTOM_ZONE_H band reserved for
-    // VDOCK-5's clock strip + VDOCK-4's system quad; groups that
-    // overrun it fold into the '…' more-popup (#22).
-    // NODE-GRADE-2 — the per-node grade mini-list claims a band directly ABOVE the
-    // bottom zone (between the app groups and the clock strip), so the app zone
-    // now ends at the grade band's top. An empty grade set claims 0 (the band
-    // vanishes and the groups reclaim the space, so pre-poll the layout is unchanged).
-    let rail_h = state.rail_height();
-    let quads_top_zone = rect.bottom() - rail_h - BOTTOM_ZONE_H;
-    let grade_band_h = grade_band_height(&state.status.grades);
-    let grade_top = quads_top_zone - grade_band_h;
-    let middle_top = wb.bottom() + GROUP_DIVIDER_H;
-    let middle_bottom = grade_top;
-    let middle_h = (middle_bottom - middle_top).max(0.0);
-    let visible = visible_group_count(middle_h);
-    // Fit the labels to the column interior — the full width less an SP_XS side
-    // margin each side (SP_XS + SP_XS = SP_S total).
-    let font = group_label_font(ui, DOCK_W - Style::SP_S);
-    let mut y = middle_top;
-    for group in &GROUPS[..visible] {
-        let (h, routed) = pick_group(
-            ui,
-            group,
-            egui::pos2(rect.left(), y),
-            DOCK_W,
-            &font,
-            &state.status,
-            state.transfer_active_count,
-            &mut state.active,
-            &mut state.pinned,
-        );
-        if routed {
-            clicked = true;
-        }
-        y += h;
-    }
-    if visible < GROUPS.len() && pick_overflow(ui, rect, middle_bottom, visible, &font, state) {
-        clicked = true;
-    }
-
-    // ── GRADE band (NODE-GRADE-2 → design #4/#5/#6/#7/#8/#14/#15/#18/#19) — the
-    // per-node capability grade mini-list, painted between the app groups and the
-    // clock/system strip. Empty grades painted nothing (grade_band_h == 0).
-    if grade_band_h > 0.0 && paint_grade_band(ui, rect, grade_top, state) {
-        clicked = true;
-    }
-
-    // VDOCK-4 — the system quad in the reserved final DOCK_W row.
-    let sys_top = rect.bottom() - rail_h - DOCK_W;
-    painter.hline(
-        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
-        sys_top,
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
-    if system_quad(ui, state, egui::pos2(rect.left(), sys_top), DOCK_W) {
-        clicked = true;
-    }
-
-    clicked
+/// Whether an auto-hidden taskbar should be **revealed** this frame (WIN10-HYBRID
+/// B3) — a pure, headless decision seam. A docked bar (`autohidden == false`) is
+/// always shown; an auto-hidden one reveals on an **edge summon** (the pointer at
+/// the bottom hot edge) OR while it is **latched** open (riding the already-shown
+/// bar). Unit-tested as a truth table without a painter.
+#[must_use]
+const fn taskbar_reveal(autohidden: bool, pointer_near_bottom: bool, latched: bool) -> bool {
+    !autohidden || pointer_near_bottom || latched
 }
 
 /// The stable id of the Start Menu's trigger cell (WIN7-2; CONSOLE-1
@@ -1579,63 +1254,6 @@ fn rail_icon_rect(rect: egui::Rect, edge: f32) -> egui::Rect {
     egui::Rect::from_center_size(egui::pos2(rect.center().x, y), egui::vec2(edge, edge))
 }
 
-fn rail_surface_cell(
-    ui: &egui::Ui,
-    surface: Surface,
-    active: &mut Surface,
-    pinned: &mut bool,
-    rect: egui::Rect,
-    label: &str,
-) -> bool {
-    let selected = *active == surface;
-    let resp = ui.interact(rect, pick_cell_id(surface), egui::Sense::click());
-    let hovered = resp.hovered();
-    let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
-    }
-    if selected {
-        let bar =
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(ACTIVE_BAR_W, rect.height()));
-        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
-    }
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
-    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), edge, tint) {
-        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-        painter.image(
-            tex.id(),
-            rail_icon_rect(rect, edge),
-            uv,
-            egui::Color32::WHITE,
-        );
-    }
-    paint_rail_label(ui, rect, label, tint);
-    paint_focus_ring(&painter, rect, resp.has_focus());
-    apply_picker_arrow_focus(ui, surface, &resp);
-    paint_surface_context_menu(ui, surface, &resp, active, pinned);
-    install_cell_accessibility(
-        ui.ctx(),
-        pick_cell_id(surface),
-        label,
-        if selected { "Active" } else { "Not active" },
-        rect,
-    );
-    if response_activated(ui, &resp) {
-        *active = surface;
-        return true;
-    }
-    false
-}
-
 fn session_entry_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
     egui::Id::new((
         "bottom-rail-session",
@@ -1646,11 +1264,14 @@ fn session_entry_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
     ))
 }
 
-fn session_entry_width(ui: &egui::Ui, entry: &SessionRailEntry, rail_h: f32) -> f32 {
-    let text = format!("{} {}", entry.label, entry.protocol);
-    let font = egui::FontId::proportional(Style::SMALL);
-    let text_w = ui.fonts(|f| f.layout_no_wrap(text, font, Style::TEXT).rect.width());
-    (rail_h + text_w + Style::SP_S).clamp(rail_h * 2.0, 180.0)
+/// WIN10-HYBRID #31 — one running-session tile is a fixed **`rail_h` square** (an
+/// icons-only Win10 taskbar button); its full name rides the accesskit node, not a
+/// visible caption. Kept a function taking the same `(ui, entry, rail_h)` so its
+/// callers (the inline run + the overflow popup) share one width authority even
+/// though it no longer measures text. `ui`/`entry` are unused now but retained for
+/// that call-shape parity.
+fn session_entry_width(_ui: &egui::Ui, _entry: &SessionRailEntry, rail_h: f32) -> f32 {
+    rail_h
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1718,6 +1339,12 @@ fn rail_session_overflow(
     }
 }
 
+/// One running-session tile (WIN10-HYBRID #31) — an **icons-only** Win10 taskbar
+/// button: a centred [`IconId::Sessions`] glyph over the selection wash, with a
+/// Win10 **active underline** when it is the shown Desktop session. The full VM name
+/// is DROPPED from the paint (the tile is a fixed [`session_entry_width`] square) but
+/// still rides the accesskit node below, so a screen reader always hears it. A click
+/// returns `true` (the caller routes Desktop + latches the session id).
 fn session_entry(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -1737,33 +1364,24 @@ fn session_entry(
     } else {
         Style::TEXT_DIM
     };
-    let icon_edge = (rect.height() - 2.0).max(Style::SP_S);
-    let icon_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            rect.left() + Style::SP_XS,
-            rect.center().y - icon_edge / 2.0,
-        ),
-        egui::vec2(icon_edge, icon_edge),
-    );
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, icon_edge, tint) {
+    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, edge, tint) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-        painter.image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
-    }
-    let text_x = icon_rect.right() + Style::SP_XS;
-    if text_x < rect.right() {
-        let clip = egui::Rect::from_min_max(egui::pos2(text_x, rect.top()), rect.right_bottom());
-        let text = format!("{} {}", entry.label, entry.protocol);
-        painter.with_clip_rect(clip).text(
-            egui::pos2(text_x, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            egui::FontId::proportional(Style::SMALL),
-            if selected || resp.hovered() {
-                Style::TEXT
-            } else {
-                Style::TEXT_DIM
-            },
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, edge),
+            uv,
+            egui::Color32::WHITE,
         );
+    }
+    // The Win10 active-session **underline** — a full-width accent bar hugging the
+    // tile's bottom edge (the taskbar analogue of the picker's left-edge bar).
+    if selected {
+        let underline = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.bottom() - ACTIVE_BAR_W),
+            egui::vec2(rect.width(), ACTIVE_BAR_W),
+        );
+        painter.rect_filled(underline, egui::CornerRadius::ZERO, Style::ACCENT);
     }
     paint_focus_ring(&painter, rect, resp.has_focus());
     // WIN7-7, lock #14 — unconditional (unlike the visual text above, which
@@ -1832,10 +1450,210 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
     false
 }
 
+/// One tray-overflow flyout row's height — a compact `SP_L` line, dot + label.
+const TRAY_OVERFLOW_ROW_H: f32 = Style::SP_L;
+/// The tray-overflow flyout's fixed width — wide enough for a segment name + dot.
+const TRAY_OVERFLOW_W: f32 = Style::SP_XL * 4.0;
+
+/// Stable id for the ▲ tray-overflow toggle cell (WIN10-HYBRID #31) — its own tag,
+/// so it never collides with [`status_detail_toggle_id`]'s chevron cell.
+fn tray_overflow_id() -> egui::Id {
+    egui::Id::new("bottom-rail-tray-overflow")
+}
+
+/// Stable id for the tray-overflow flyout's floating `Area`.
+fn tray_overflow_popup_id() -> egui::Id {
+    egui::Id::new("bottom-rail-tray-overflow-popup")
+}
+
+/// Stable id for one tray-overflow flyout row, addressable per segment.
+fn tray_overflow_row_id(segment: StatusSegment) -> egui::Id {
+    egui::Id::new(("bottom-rail-tray-overflow-row", segment))
+}
+
+/// The tray-overflow flyout row's human label per segment. `status.rs`'s own
+/// `segment_label` + `route` maps are private and out of this lane's edit scope, so
+/// this restates the tiny (four-arm) name + route folds locally rather than widening
+/// `status.rs`'s surface — the same duplicate-a-small-private-map pattern the picker
+/// deletions leave elsewhere.
+const fn tray_segment_label(segment: StatusSegment) -> &'static str {
+    match segment {
+        StatusSegment::Device => "Device",
+        StatusSegment::Mesh => "Mesh",
+        StatusSegment::Power => "Power",
+        StatusSegment::Alerts => "Alerts",
+    }
+}
+
+/// The surface a tray-overflow row routes to (mirrors `status.rs`'s private
+/// `StatusSegment::route`; see [`tray_segment_label`]).
+const fn tray_segment_route(segment: StatusSegment) -> Surface {
+    match segment {
+        StatusSegment::Device | StatusSegment::Power => Surface::System,
+        StatusSegment::Mesh => Surface::MeshView,
+        StatusSegment::Alerts => Surface::Chat,
+    }
+}
+
+/// This segment's latest rollup out of the public [`StatusSegments`] fields — the
+/// severity source for the row's dot (the `StatusSegments::get` fold is private, so
+/// this restates it over the public fields).
+fn tray_segment_rollup(
+    segments: &StatusSegments,
+    segment: StatusSegment,
+) -> Option<&status::SegmentRollup> {
+    match segment {
+        StatusSegment::Device => segments.device.as_ref(),
+        StatusSegment::Mesh => segments.mesh.as_ref(),
+        StatusSegment::Power => segments.power.as_ref(),
+        StatusSegment::Alerts => segments.alerts.as_ref(),
+    }
+}
+
+/// The ▲ **tray-overflow** cell (WIN10-HYBRID #31) — Win10's hidden-icons chevron,
+/// immediately left of the status pips. A click toggles the bottom-anchored flyout
+/// of every status segment ([`tray_overflow_flyout`]). Wears the selection wash +
+/// ACCENT tint while open, else the shared tray hover/rest idiom. Every colour is a
+/// [`Style`] token (§4). Returns `true` on a toggle.
+fn tray_overflow_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(rect, tray_overflow_id(), egui::Sense::click());
+    let selected = state.tray_overflow_open;
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if selected {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::ChevronUp, edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, edge),
+            uv,
+            egui::Color32::WHITE,
+        );
+    }
+    paint_rail_label(ui, rect, "Tray", tint);
+    paint_focus_ring(&painter, rect, resp.has_focus());
+    install_cell_accessibility(
+        ui.ctx(),
+        tray_overflow_id(),
+        "Notifications overflow",
+        if selected { "Expanded" } else { "Collapsed" },
+        rect,
+    );
+    if response_activated(ui, &resp) {
+        state.tray_overflow_open = !state.tray_overflow_open;
+        return true;
+    }
+    false
+}
+
+/// The tray-overflow **flyout** (WIN10-HYBRID #31) — a bottom-anchored popup off the
+/// ▲ cell listing every [`StatusSegment::ALL`] entry as a reachable row (a severity
+/// dot + the segment name); a row click routes [`DockState::active`] to that
+/// segment's surface and closes the flyout, and a click-away dismisses it (the
+/// `rail_more_popup` / `desktop_source_flyout` idiom). Returns `true` when it routed
+/// or dismissed this frame.
+fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState) -> bool {
+    let rows = StatusSegment::ALL.len();
+    let popup_h = rows as f32 * TRAY_OVERFLOW_ROW_H + Style::SP_S;
+    let segments = state.status.segments.clone();
+    let inner = egui::Area::new(tray_overflow_popup_id())
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(anchor.left(), anchor.top() - Style::SP_XS))
+        .show(ui.ctx(), |ui| {
+            let (area, _) =
+                ui.allocate_exact_size(egui::vec2(TRAY_OVERFLOW_W, popup_h), egui::Sense::hover());
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let mut routed: Option<Surface> = None;
+            let mut y = area.top() + Style::SP_XS / 2.0;
+            for segment in StatusSegment::ALL {
+                let row = egui::Rect::from_min_size(
+                    egui::pos2(area.left() + Style::SP_XS, y),
+                    egui::vec2(TRAY_OVERFLOW_W - Style::SP_S, TRAY_OVERFLOW_ROW_H),
+                );
+                if tray_overflow_row(ui, row, segment, &segments) {
+                    routed = Some(tray_segment_route(segment));
+                }
+                y += TRAY_OVERFLOW_ROW_H;
+            }
+            ui.painter().set(
+                bg,
+                egui::Shape::rect_filled(area, Style::RADIUS, Style::SURFACE),
+            );
+            ui.painter().rect_stroke(
+                area,
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            routed
+        });
+    if let Some(surface) = inner.inner {
+        state.active = surface;
+        state.tray_overflow_open = false;
+        return true;
+    }
+    if inner.response.clicked_elsewhere() {
+        state.tray_overflow_open = false;
+        return true;
+    }
+    false
+}
+
+/// One tray-overflow flyout row: a severity dot (the SAME `status.rs` severity fold
+/// the tray pips read) + the segment name. Hover fills only. Returns `true` on a
+/// click or keyboard activation (the caller routes `active`).
+fn tray_overflow_row(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    segment: StatusSegment,
+    segments: &StatusSegments,
+) -> bool {
+    let resp = ui.interact(rect, tray_overflow_row_id(segment), egui::Sense::click());
+    let painter = ui.painter().clone();
+    if resp.hovered() {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let rollup = tray_segment_rollup(segments, segment);
+    let dot_c = egui::pos2(rect.left() + Style::SP_S, rect.center().y);
+    painter.circle_filled(dot_c, Style::SP_XS, status::severity_color(rollup));
+    painter.text(
+        egui::pos2(dot_c.x + Style::SP_S, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        tray_segment_label(segment),
+        egui::FontId::proportional(Style::SMALL),
+        if resp.hovered() {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    paint_focus_ring(&painter, rect, resp.has_focus());
+    install_cell_accessibility(
+        ui.ctx(),
+        tray_overflow_row_id(segment),
+        tray_segment_label(segment),
+        status::severity_label(rollup),
+        rect,
+    );
+    response_activated(ui, &resp)
+}
+
 /// Stable id for the taskbar **action-center** cell (WIN10-HYBRID #31) — the
 /// Win10 tray "action center" affordance. Keyed by its own tag so it never
-/// collides with the picker's Chat launcher ([`pick_cell_id`]) or the bare
-/// [`rail_icon`] Chat glyph.
+/// collides with the bare [`rail_icon`] Chat glyph.
 fn action_center_cell_id() -> egui::Id {
     egui::Id::new(("bottom-rail-action-center", IconId::Chat.name()))
 }
@@ -2219,47 +2037,10 @@ fn install_cell_accessibility(
     });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// VDOCK-2 — the vertical **app picker** (fills the dock's TOP + MIDDLE zones;
-// design `docs/design/vertical-dock.md`, locks #2/#3/#4/#10/#11/#21/#22/#23).
-//
-// The Workbench lead (top) + the six labelled app groups stacked single-column in
-// the middle — each with a horizontal accent label (#4), a left-rail accent stripe
-// + accent divider (#21), icon-only 24px cells (#11/#23), a left-edge active bar
-// (#10), and a '…' more-popup when the groups overrun the zone (#22). The picker's
-// GROUPS + surface→glyph map + accent tokens all carry over from the horizontal
-// `taskbar` (this is a re-layout, not a rebuild). Settings (the System surface) +
-// Show-Desktop are NOT in the picker — they belong to VDOCK-4's bottom system
-// quad; every other surface appears here exactly once (the same union the
-// compile-time guard above pins). A click routes into `DockState::active`.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// The single-column app-cell height (design #23) — a 24px glyph ([`ICON_LOGICAL`])
-/// centred in an [`Style::SP_XL`]-tall cell, on the 8px grid.
-const APP_CELL_H: f32 = Style::SP_XL;
-
-/// The horizontal accent-label row above each group (#4) — `SP_M` tall, its label
-/// sized to fit the narrow column by [`group_label_font`].
-const PICK_LABEL_H: f32 = Style::SP_M;
-
-/// The per-group **separation** band (#21) — an `SP_S` gap between one group's
-/// full accent outline box and the next, so each colored box reads as its own
-/// enclosed cluster.
-const GROUP_DIVIDER_H: f32 = Style::SP_S;
-
 /// The active cell's **left-edge accent bar** (lock #10) — an `SP_XS`-wide
 /// [`Style::ACCENT`] bar down the active surface's left edge (the vertical analog
 /// of the horizontal bar's bottom underline), at the cell's outer edge.
 const ACTIVE_BAR_W: f32 = Style::SP_XS;
-
-/// The '…' overflow cell height (#22) — the more-popup trigger at the bottom of
-/// the app zone. `SP_L`.
-const OVERFLOW_H: f32 = Style::SP_L;
-
-/// The bottom band reserved beneath the app zone: only VDOCK-4's system row
-/// remains in the left rail. Start, Desktop, Clock, Pin, and notification status
-/// micro-icons live in the full-width bottom taskbar.
-const BOTTOM_ZONE_H: f32 = DOCK_W;
 
 /// The full-width bottom taskbar's height — a **fixed 48px** matching the Windows-10
 /// taskbar (WIN10-HYBRID; `SP_XL + SP_M` on the 8px grid). Density-independent
@@ -2511,362 +2292,6 @@ fn desktop_source_row(ui: &egui::Ui, rect: egui::Rect, source: &DesktopRailSourc
             || (resp.hovered() && ui.input(|i| i.pointer.any_released())))
 }
 
-/// The stable per-surface id of a vertical-picker cell — the render + routing are
-/// unchanged, but tests read a cell's settled `Rect` back to click its exact
-/// centre (the addressable-cell idiom, so a picker cell never shares an id with a
-/// status/system-quad cell).
-fn pick_cell_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("vdock-pick-cell", surface))
-}
-
-/// The stable id of a group's horizontal accent label, so the harness can read its
-/// settled `Rect` back. Display-only (hover sense).
-fn pick_label_id(label: &str) -> egui::Id {
-    egui::Id::new(("vdock-pick-label", label))
-}
-
-/// The stable id of the '…' overflow cell (#22).
-fn overflow_more_id() -> egui::Id {
-    egui::Id::new("vdock-pick-overflow")
-}
-
-/// The rendered height of one group in the app zone: its accent label row + its
-/// single-column cells + its accent divider band.
-#[allow(
-    clippy::cast_precision_loss, // surface counts are tiny (≤3)
-    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
-)]
-fn group_height(group: &Group) -> f32 {
-    PICK_LABEL_H + group.surfaces.len() as f32 * APP_CELL_H + GROUP_DIVIDER_H
-}
-
-/// How many of the six [`GROUPS`] fit, top→down, in a `middle_h`-tall app zone
-/// (#22). If they all fit, all six render inline; otherwise the zone reserves its
-/// bottom [`OVERFLOW_H`] for the '…' cell and fits as many *whole* groups above it
-/// as it can — the rest fold into the more-popup.
-fn visible_group_count(middle_h: f32) -> usize {
-    let total: f32 = GROUPS.iter().map(group_height).sum();
-    if total <= middle_h {
-        return GROUPS.len();
-    }
-    let avail = (middle_h - OVERFLOW_H).max(0.0);
-    let mut used = 0.0;
-    let mut n = 0;
-    for group in &GROUPS {
-        let h = group_height(group);
-        if used + h > avail {
-            break;
-        }
-        used += h;
-        n += 1;
-    }
-    n
-}
-
-/// One single-column **app cell** (#2/#11/#23) — a 24px brand glyph centred in a
-/// `width`-wide × [`APP_CELL_H`]-tall cell, icon-only (no tooltip, #11). The active
-/// surface wears the left-edge [`Style::ACCENT`] bar (#10) + the subtle selection
-/// wash; a hover is a fill only. A click routes to the surface (sets `active`,
-/// returns `true` so the shell can surface the body). Every colour is a Style
-/// token (§4); shared by the Workbench lead, the middle groups, and the '…' popup.
-fn pick_app_cell(
-    ui: &egui::Ui,
-    surface: Surface,
-    active: &mut Surface,
-    pinned: &mut bool,
-    rect: egui::Rect,
-) -> bool {
-    pick_app_cell_with_badge(ui, surface, active, pinned, rect, None)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BadgeKind {
-    Count(usize),
-    Health(BadgeTone),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BadgeTone {
-    Healthy,
-    Degraded,
-    Offline,
-}
-
-fn badge_for(
-    surface: Surface,
-    status: &StatusInputs,
-    transfer_active_count: usize,
-) -> Option<BadgeKind> {
-    match surface {
-        Surface::Files if transfer_active_count > 0 => {
-            Some(BadgeKind::Count(transfer_active_count))
-        }
-        Surface::Chat if status.unread > 0 => Some(BadgeKind::Count(status.unread)),
-        Surface::MeshView if status.mesh.seen && status.mesh.peers_total > 0 => {
-            Some(BadgeKind::Count(status.mesh.peers_online))
-        }
-        Surface::System if status.mesh.seen => Some(BadgeKind::Health(match status.mesh.health {
-            mde_lighthouse_health::LighthouseHealth::AllHealthy => BadgeTone::Healthy,
-            mde_lighthouse_health::LighthouseHealth::Degraded => BadgeTone::Degraded,
-            mde_lighthouse_health::LighthouseHealth::None => BadgeTone::Offline,
-        })),
-        _ => None,
-    }
-}
-
-fn pick_app_cell_with_badge(
-    ui: &egui::Ui,
-    surface: Surface,
-    active: &mut Surface,
-    pinned: &mut bool,
-    rect: egui::Rect,
-    badge: Option<BadgeKind>,
-) -> bool {
-    let selected = *active == surface;
-    // The app cells are icon-only (no visible caption), so the surface's own
-    // label rides a plain hover tooltip (house style, `Response::on_hover_text`)
-    // — a user can learn what an unlabelled cell does without any persistent
-    // label that would shift this fixed-grid layout. Delegated `pick_app_cell`
-    // routes through here, so both entry points get the tooltip.
-    let resp = ui
-        .interact(rect, pick_cell_id(surface), egui::Sense::click())
-        .on_hover_text(surface.label());
-    let hovered = resp.hovered();
-    let painter = ui.painter().clone();
-
-    // Subtle fill: the selected cell wears the accent selection wash, a hovered one
-    // the raised SURFACE_HI (both Style tokens, §4).
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
-    }
-
-    // Active mark (lock #10): the accent bar down the cell's LEFT edge.
-    if selected {
-        let bar =
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(ACTIVE_BAR_W, rect.height()));
-        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
-    }
-
-    // Two-tone tint (the taskbar idiom): active reads solid ACCENT, a hovered one
-    // brightens to full TEXT, the rest sit dim at TEXT_DIM — the glyph is tinted at
-    // rasterization, so it's blitted with WHITE (no extra multiply). A load failure
-    // fails soft to the bare cell (§7).
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), ICON_LOGICAL, tint) {
-        let icon =
-            egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
-        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
-    }
-    if let Some(badge) = badge {
-        paint_badge(ui, rect, surface, badge);
-    }
-    paint_focus_ring(&painter, rect, resp.has_focus());
-    apply_picker_arrow_focus(ui, surface, &resp);
-    paint_surface_context_menu(ui, surface, &resp, active, pinned);
-
-    if response_activated(ui, &resp) {
-        *active = surface;
-        return true;
-    }
-    false
-}
-
-/// Apply this cell's own one-step `PICKER_FOCUS_ORDER` arrow-key navigation
-/// (NAVBAR-6). Makes this function the SOLE authority over arrow-key focus
-/// movement among the picker cells — matching what every existing behavioral
-/// test already assumed — by neutralizing TWO independent ways an arrow key
-/// press could otherwise move focus more than the intended one step.
-///
-/// WIN7-DESKTOP-1 regression fix (see `docs/WORKLIST.md`): investigating the
-/// taskbar-position fix's fallout found this function was never actually
-/// robust — it just happened to LOOK correct because the pre-fix bottom-rail
-/// Desktop cell (mispositioned at literal screen y≈0) coincidentally masked
-/// both bugs below; confirmed by reverting the taskbar-position fix in
-/// isolation and observing these SAME two mechanisms fire, unchanged.
-///
-/// 1. **Egui's own built-in spatial arrow-key nav races this function.**
-///    Vendored egui 0.31.1's `memory/mod.rs`, `Focus::begin_pass`/`end_pass`:
-///    `begin_pass` latches a cardinal `FocusDirection` for any arrow key the
-///    CURRENTLY-focused widget's `EventFilter` doesn't claim, and `end_pass`
-///    then unconditionally overwrites `focused_widget` with whatever its own
-///    `find_widget_in_direction` spatial search finds — a raw screen-position
-///    search that knows nothing about `PICKER_FOCUS_ORDER`. Pre-fix, that
-///    spatial search (from the app-picker column, searching "down") landed on
-///    the SAME cell this function's own table-driven logic wanted, by pure
-///    positional coincidence; post-fix there is nothing spatially "below" the
-///    true-bottom taskbar, so the search finds nothing and end_pass leaves
-///    focus wherever mechanism 2 below left it. Fixed by claiming vertical +
-///    horizontal arrows via `set_focus_lock_filter` — egui's own documented
-///    seam for "I handle these keys myself" — every frame this cell holds
-///    focus, so `begin_pass` never latches a direction in the first place.
-/// 2. **This function's OWN `request_focus` call can cascade in one frame.**
-///    `ui.input(|i| i.key_pressed(...))` doesn't consume the event — it stays
-///    "pressed" for the rest of the frame. So the cell focus just moved TO
-///    (rendered later this same frame, e.g. the next `PICKER_FOCUS_ORDER`
-///    entry) sees `resp.has_focus() == true` (this call just set it) AND the
-///    SAME still-pressed key, and moves focus again — and so on, potentially
-///    through the WHOLE table in one frame. Fixed by consuming every arrow
-///    key event the moment a move actually fires, so no widget rendered later
-///    this same frame can see it "pressed" again.
-fn apply_picker_arrow_focus(ui: &egui::Ui, surface: Surface, resp: &egui::Response) {
-    if !resp.has_focus() {
-        return;
-    }
-    ui.memory_mut(|m| {
-        m.set_focus_lock_filter(
-            pick_cell_id(surface),
-            egui::EventFilter {
-                horizontal_arrows: true,
-                vertical_arrows: true,
-                ..egui::EventFilter::default()
-            },
-        );
-    });
-    let dir = ui.input(|i| {
-        if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
-            Some(1)
-        } else if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
-            Some(-1)
-        } else {
-            None
-        }
-    });
-    if let Some(dir) = dir.and_then(|d| picker_focus_neighbor(surface, d)) {
-        ui.memory_mut(|m| m.request_focus(pick_cell_id(dir)));
-        // Consume every arrow key this frame (mechanism 2 above) — key-only
-        // matching (no modifier filter), mirroring `key_pressed`'s own match
-        // above exactly; `InputState::consume_key` needs an EXACT modifier
-        // match, which would silently stop claiming e.g. Shift+ArrowDown, a
-        // real (if narrow) behavior change this regression fix doesn't need.
-        ui.input_mut(|i| {
-            i.events.retain(|ev| {
-                !matches!(
-                    ev,
-                    egui::Event::Key { key, pressed: true, .. }
-                    if matches!(
-                        key,
-                        egui::Key::ArrowDown
-                            | egui::Key::ArrowRight
-                            | egui::Key::ArrowUp
-                            | egui::Key::ArrowLeft
-                    )
-                )
-            });
-        });
-    }
-}
-
-fn picker_focus_neighbor(surface: Surface, dir: i32) -> Option<Surface> {
-    let idx = PICKER_FOCUS_ORDER.iter().position(|&s| s == surface)?;
-    let next = if dir > 0 {
-        (idx + 1).min(PICKER_FOCUS_ORDER.len() - 1)
-    } else {
-        idx.saturating_sub(1)
-    };
-    PICKER_FOCUS_ORDER.get(next).copied()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SurfaceContextItem {
-    Pin,
-    Info,
-    Close,
-}
-
-fn surface_context_item_id(surface: Surface, item: SurfaceContextItem) -> egui::Id {
-    egui::Id::new(("vdock-surface-context", surface, item))
-}
-
-fn paint_surface_context_menu(
-    _ui: &egui::Ui,
-    surface: Surface,
-    resp: &egui::Response,
-    active: &mut Surface,
-    pinned: &mut bool,
-) {
-    let mut action = None;
-    resp.context_menu(|ui| {
-        if context_menu_row(
-            ui,
-            surface_context_item_id(surface, SurfaceContextItem::Pin),
-            if *pinned {
-                "Unpin from rail"
-            } else {
-                "Pin to rail"
-            },
-        ) {
-            action = Some(SurfaceContextItem::Pin);
-            ui.close_menu();
-        }
-        if context_menu_row(
-            ui,
-            surface_context_item_id(surface, SurfaceContextItem::Info),
-            "Info",
-        ) {
-            action = Some(SurfaceContextItem::Info);
-            ui.close_menu();
-        }
-        if surface_closable(surface)
-            && context_menu_row(
-                ui,
-                surface_context_item_id(surface, SurfaceContextItem::Close),
-                "Close",
-            )
-        {
-            action = Some(SurfaceContextItem::Close);
-            ui.close_menu();
-        }
-    });
-
-    match action {
-        Some(SurfaceContextItem::Pin) => {
-            *pinned = !*pinned;
-        }
-        Some(SurfaceContextItem::Info) => {
-            *active = Surface::About;
-        }
-        Some(SurfaceContextItem::Close) => {
-            if *active == surface {
-                *active = Surface::Workbench;
-            }
-        }
-        None => {}
-    }
-}
-
-fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
-    let width = ui.available_width().max(Style::SP_XL * 4.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, Style::SP_L), egui::Sense::hover());
-    let resp = ui.interact(rect, id, egui::Sense::click());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
-    }
-    ui.painter().text(
-        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(Style::SMALL),
-        Style::TEXT,
-    );
-    paint_focus_ring(ui.painter(), rect, resp.has_focus());
-    // WIN7-7, lock #14 — shared by both the (out-of-scope) app picker's own
-    // context menu and the taskbar's Desktop cell's context menu
-    // (`paint_surface_context_menu`'s two call sites); fixing it here covers
-    // the taskbar-reachable one without needing a picker-specific change.
-    install_cell_accessibility(ui.ctx(), id, label, "", rect);
-    response_activated(ui, &resp)
-}
-
 fn rail_more_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -2974,81 +2399,6 @@ fn rail_more_popup(
     }
 }
 
-fn surface_closable(surface: Surface) -> bool {
-    !matches!(
-        surface,
-        Surface::Workbench | Surface::System | Surface::Timers
-    )
-}
-
-fn transfer_badge_id(surface: Surface) -> egui::Id {
-    surface_badge_id(surface)
-}
-
-fn surface_badge_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("vdock-surface-badge", surface))
-}
-
-fn badge_label(count: usize) -> String {
-    if count > 99 {
-        "99+".to_owned()
-    } else {
-        count.to_string()
-    }
-}
-
-fn paint_badge(ui: &egui::Ui, cell: egui::Rect, surface: Surface, badge: BadgeKind) {
-    match badge {
-        BadgeKind::Count(count) => paint_count_badge(ui, cell, surface, count),
-        BadgeKind::Health(tone) => paint_health_badge(ui, cell, surface, tone),
-    }
-}
-
-fn paint_count_badge(ui: &egui::Ui, cell: egui::Rect, surface: Surface, count: usize) {
-    let label = badge_label(count);
-    let font = egui::FontId::proportional((Style::SMALL - 1.0).max(8.0));
-    let galley = ui.fonts(|f| f.layout_no_wrap(label, font, egui::Color32::WHITE));
-    let badge_size = egui::vec2(
-        (galley.rect.width() + Style::SP_XS).max(Style::SP_M),
-        Style::SP_M,
-    );
-    let rect = badge_rect(cell, badge_size);
-    ui.interact(rect, surface_badge_id(surface), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, badge_size.y / 2.0, Style::ACCENT);
-    ui.painter().galley(
-        egui::pos2(
-            rect.center().x - galley.rect.width() / 2.0,
-            rect.center().y - galley.rect.height() / 2.0,
-        ),
-        galley,
-        egui::Color32::WHITE,
-    );
-}
-
-fn paint_health_badge(ui: &egui::Ui, cell: egui::Rect, surface: Surface, tone: BadgeTone) {
-    let size = egui::vec2(Style::SP_S, Style::SP_S);
-    let rect = badge_rect(cell, size);
-    ui.interact(rect, surface_badge_id(surface), egui::Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), rect.width() / 2.0, badge_tone_color(tone));
-}
-
-fn badge_rect(cell: egui::Rect, size: egui::Vec2) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(cell.right() - size.x - 2.0, cell.top() + 2.0),
-        size,
-    )
-}
-
-fn badge_tone_color(tone: BadgeTone) -> egui::Color32 {
-    match tone {
-        BadgeTone::Healthy => Style::SUPPORT_SUCCESS,
-        BadgeTone::Degraded => Style::SUPPORT_WARNING,
-        BadgeTone::Offline => Style::SUPPORT_ERROR,
-    }
-}
-
 /// Whether `resp` should activate its target this frame: a click, or
 /// Enter/Space while it holds keyboard focus — the picker cell's activation
 /// contract. `pub(crate)` (not private) because WIN7-3's Start Menu tile
@@ -3099,504 +2449,6 @@ fn paint_focus_ring(painter: &egui::Painter, cell: egui::Rect, focused: bool) {
         );
     }
 }
-
-/// Paint one **group** (#3/#4/#21) into the column at `origin`, `width` wide: the
-/// horizontal accent label (#4), the single-column icon cells ([`Surface::ALL`]
-/// order), the left-rail accent stripe beside them (#21), and the accent divider
-/// (#21). Returns `(height, routed)` — the consumed height + whether a cell routed
-/// this frame. Shared by the middle zone and the '…' overflow popup.
-#[allow(
-    clippy::cast_precision_loss, // per-group cell counts are tiny (≤3)
-    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
-)]
-fn pick_group(
-    ui: &egui::Ui,
-    group: &Group,
-    origin: egui::Pos2,
-    width: f32,
-    font: &egui::FontId,
-    status: &StatusInputs,
-    transfer_active_count: usize,
-    active: &mut Surface,
-    pinned: &mut bool,
-) -> (f32, bool) {
-    let painter = ui.painter().clone();
-
-    // The horizontal accent label above the group (#4) — display-only (hover sense)
-    // so the harness can read its rect; painted in the group accent, centred.
-    let label_rect = egui::Rect::from_min_size(origin, egui::vec2(width, PICK_LABEL_H));
-    ui.interact(label_rect, pick_label_id(group.label), egui::Sense::hover());
-    let galley = ui.fonts(|f| f.layout_no_wrap(group.label.to_owned(), font.clone(), group.accent));
-    let lp = egui::pos2(
-        label_rect.center().x - galley.size().x / 2.0,
-        label_rect.center().y - galley.size().y / 2.0,
-    );
-    painter.galley(lp, galley, group.accent);
-
-    // The single-column icon cells (#2), stacked under the label in Surface::ALL
-    // order (#3/L7).
-    let cells_top = label_rect.bottom();
-    let mut routed = false;
-    for (i, &surface) in group.surfaces.iter().enumerate() {
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(origin.x, cells_top + i as f32 * APP_CELL_H),
-            egui::vec2(width, APP_CELL_H),
-        );
-        let badge = badge_for(surface, status, transfer_active_count);
-        if pick_app_cell_with_badge(ui, surface, active, pinned, cell, badge) {
-            routed = true;
-        }
-    }
-    let cells_bottom = cells_top + group.surfaces.len() as f32 * APP_CELL_H;
-
-    // A FULL 1px outline in the group's accent around the whole cell cluster
-    // (operator directive: each colored box gets a complete outside outline, all
-    // four sides — replacing the old half-enclosure left-rail stripe + bottom
-    // divider). Inset SP_XS from the column edges so the box reads as its own
-    // fully-enclosed group. Every colour is a Style token (§4).
-    let box_rect = egui::Rect::from_min_max(
-        egui::pos2(origin.x + Style::SP_XS, cells_top),
-        egui::pos2(origin.x + width - Style::SP_XS, cells_bottom),
-    );
-    painter.rect_stroke(
-        box_rect,
-        Style::RADIUS,
-        egui::Stroke::new(HAIRLINE_W, group.accent),
-        egui::StrokeKind::Inside,
-    );
-
-    (group_height(group), routed)
-}
-
-/// The '…' **more-popup** overflow (lock #22) — when the groups overrun the app
-/// zone, a '…' cell at the zone's bottom toggles a floating popup of the hidden
-/// groups (label + cells), each routing on click. Returns `true` when a popup cell
-/// routed this frame. Chosen over a scrollbar because a scrollbar would eat the
-/// 48px column's width; the '…' popup keeps the picker icon-clean.
-fn pick_overflow(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    middle_bottom: f32,
-    visible: usize,
-    font: &egui::FontId,
-    state: &mut DockState,
-) -> bool {
-    let more = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), middle_bottom - OVERFLOW_H),
-        egui::vec2(DOCK_W, OVERFLOW_H),
-    );
-    let resp = ui.interact(more, overflow_more_id(), egui::Sense::click());
-    let opened = resp.clicked();
-    if opened {
-        state.overflow_open = !state.overflow_open;
-    }
-    // The '…' glyph — brightens on hover / while the popup is open (Style tokens).
-    let color = if state.overflow_open || resp.hovered() {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    let dots = ui.fonts(|f| {
-        f.layout_no_wrap(
-            "…".to_owned(),
-            egui::FontId::proportional(Style::BODY),
-            color,
-        )
-    });
-    ui.painter().galley(
-        egui::pos2(
-            more.center().x - dots.size().x / 2.0,
-            more.center().y - dots.size().y / 2.0,
-        ),
-        dots,
-        color,
-    );
-
-    paint_focus_ring(ui.painter(), more, resp.has_focus());
-
-    if !state.overflow_open {
-        return false;
-    }
-
-    // The floating popup of the hidden groups — anchored to the right of the '…'
-    // cell and growing upward (the tray flyout idiom): a SURFACE panel + hairline
-    // border behind the same single-column groups.
-    let hidden = &GROUPS[visible..];
-    let popup_h: f32 = hidden.iter().map(group_height).sum();
-    let inner = egui::Area::new(egui::Id::new("vdock-overflow-popup"))
-        .order(egui::Order::Foreground)
-        .pivot(egui::Align2::LEFT_BOTTOM)
-        .fixed_pos(egui::pos2(more.right() + Style::SP_XS, more.bottom()))
-        .show(ui.ctx(), |ui| {
-            let (area, _) =
-                ui.allocate_exact_size(egui::vec2(DOCK_W, popup_h), egui::Sense::hover());
-            // Reserve a slot so the panel background paints BEHIND the cells (the
-            // tray/keyboard overlay idiom).
-            let bg = ui.painter().add(egui::Shape::Noop);
-            let mut routed = false;
-            let mut y = area.top();
-            for group in hidden {
-                let (h, r) = pick_group(
-                    ui,
-                    group,
-                    egui::pos2(area.left(), y),
-                    DOCK_W,
-                    font,
-                    &state.status,
-                    state.transfer_active_count,
-                    &mut state.active,
-                    &mut state.pinned,
-                );
-                y += h;
-                routed |= r;
-            }
-            let panel = area.expand(Style::SP_S);
-            ui.painter().set(
-                bg,
-                egui::Shape::rect_filled(panel, Style::RADIUS, Style::SURFACE),
-            );
-            ui.painter().rect_stroke(
-                panel,
-                Style::RADIUS,
-                ui.visuals().widgets.noninteractive.bg_stroke,
-                egui::StrokeKind::Inside,
-            );
-            routed
-        });
-
-    let routed = inner.inner;
-    if routed {
-        // A route closes the popup (the tray idiom).
-        state.overflow_open = false;
-    } else if !opened && inner.response.clicked_elsewhere() {
-        // Click-away dismissal — but not on the very click that opened it (that
-        // click lands outside the popup and would dismiss it in the same frame).
-        state.overflow_open = false;
-    }
-    routed
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// NODE-GRADE-2 — the **grade mini-list** (design `docs/design/node-grade.md`,
-// locks #4/#5/#6/#7/#8/#14/#15/#18/#19). A stacked A–F capability grade per mesh
-// node, painted in the dock's bottom zone ABOVE the NOTIF-3 status strip (a new
-// band between the app groups and the quads). The local node is pinned first with a
-// "you are here" marker (#18); peers sort worst-grade-first (#19). Each row is the
-// A–F letter in the shared green→red `mde_egui` ramp (#4) — hard-blinking for a D/F
-// alarm (#6/#16) — a tiny load bar for the 0–100 score (#5), and a ↑/→/↓ trend
-// arrow (#14). A tap opens that node's Explorer hero (#7); the worst-N show inline
-// with a '…' expander for the rest (#8). No header (#15); a stale/absent grade reads
-// a greyed "?" (§7). The fold + sort live in `chrome::NodeGrades`; this is the render.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// One grade mini-list row's height (design #5) — compact, on the 8px grid, tall
-/// enough to seat the ~18px grade-letter cell in the quad idiom. `SP_L` (24px).
-const GRADE_ROW_H: f32 = Style::SP_L;
-
-/// The worst-N grade rows shown inline before the rest fold into the '…' expander
-/// (#8) — the local node's pin plus the worst peers, bounded so the band never eats
-/// the narrow column on a busy mesh.
-const GRADE_MAX_ROWS: usize = 5;
-
-/// The grade letter's cell edge — the ~18px quad idiom (#5), matching the status
-/// quads' glyph edge so the three bottom clusters read on one grid.
-const GRADE_LETTER_W: f32 = SYS_QUAD_ICON;
-
-/// The trend-arrow cell width (#14) — a slim `SP_M` column at the row's right edge.
-const GRADE_ARROW_W: f32 = Style::SP_M;
-
-/// The grade load bar's height (#5) — a thin `SP_XS` rule, vertically centred.
-const GRADE_BAR_H: f32 = Style::SP_XS;
-
-/// The stable per-host id of a grade row, so the render + routing are addressable —
-/// tests read a row's settled `Rect` back to click it (the [`pick_cell_id`] idiom,
-/// kept distinct so a grade row never shares an id with a picker / quad cell).
-fn grade_row_id(host: &str) -> egui::Id {
-    egui::Id::new(("vdock-grade-row", host))
-}
-
-/// The stable id of the grade list's '…' expander cell (#8).
-fn grade_overflow_id() -> egui::Id {
-    egui::Id::new("vdock-grade-overflow")
-}
-
-/// The vertical space the grade mini-list claims above the status strip: the visible
-/// rows (capped at [`GRADE_MAX_ROWS`], #8) each [`GRADE_ROW_H`] tall, plus the '…'
-/// expander cell + a top separator gap when peers spill past the cap. `0` when there
-/// are no grades (pre-poll / empty), so the band vanishes and the app zone reclaims
-/// the space (the layout is then byte-identical to the pre-NODE-GRADE dock).
-#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)] // tiny row count; the band arithmetic reads clearer than mul_add
-fn grade_band_height(grades: &NodeGrades) -> f32 {
-    let total = grades.rows.len();
-    if total == 0 {
-        return 0.0;
-    }
-    let visible = total.min(GRADE_MAX_ROWS);
-    let overflow = if total > GRADE_MAX_ROWS {
-        OVERFLOW_H
-    } else {
-        0.0
-    };
-    GROUP_DIVIDER_H + visible as f32 * GRADE_ROW_H + overflow
-}
-
-/// Paint the grade mini-list band into the column between `grade_top` and the status
-/// quads. A BORDER hairline sets it apart from the app groups above (the pin-strip
-/// separator idiom) — no header (#15). Renders the worst-N rows inline, then the '…'
-/// expander when peers overflow (#8). Returns `true` if a row (or a popup row) tapped
-/// this frame (the caller records the tap-to-hero route, #7).
-#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)] // tiny row indices; layout math reads clearer than mul_add
-fn paint_grade_band(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    grade_top: f32,
-    state: &mut DockState,
-) -> bool {
-    let total = state.status.grades.rows.len();
-    let visible = total.min(GRADE_MAX_ROWS);
-    let has_overflow = total > GRADE_MAX_ROWS;
-
-    // The separating hairline (the pin-strip / system-quad rule idiom, §4 token).
-    ui.painter().hline(
-        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
-        grade_top + GROUP_DIVIDER_H / 2.0,
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
-
-    // The visible rows. The tap target is collected as an owned host so the immutable
-    // borrow of `state.status.grades` releases before `request_node_focus` writes.
-    let rows_top = grade_top + GROUP_DIVIDER_H;
-    let mut tapped: Option<String> = None;
-    for (i, row) in state.status.grades.rows.iter().take(visible).enumerate() {
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rows_top + i as f32 * GRADE_ROW_H),
-            egui::vec2(DOCK_W, GRADE_ROW_H),
-        );
-        if grade_row(ui, row, cell) {
-            tapped = Some(row.host.clone());
-        }
-    }
-    let mut clicked = tapped.is_some_and(|host| {
-        state.request_node_focus(&host);
-        true
-    });
-
-    if has_overflow {
-        let more_top = rows_top + visible as f32 * GRADE_ROW_H;
-        if grade_overflow(ui, rect, more_top, visible, state) {
-            clicked = true;
-        }
-    }
-    clicked
-}
-
-/// One grade mini-list row (design #4/#5/#14/#18): the local "you are here" marker
-/// (#18), the A–F letter in its green→red band colour (#4) — hard-blinking on/off for
-/// a D/F alarm (#6/#16) — a tiny load bar for the 0–100 score (#5), and the trend
-/// arrow (#14). A stale/unobservable node reads a greyed "?" (#17/§7), never a fake
-/// letter. A hover fills only (no tooltip). A click returns `true` (the caller records
-/// the tap-to-hero route, #7). Every colour is an `mde_egui` token (§4).
-#[allow(clippy::suboptimal_flops)] // the glyph-centring math reads clearer than mul_add
-fn grade_row(ui: &egui::Ui, row: &GradeRow, cell: egui::Rect) -> bool {
-    let resp = ui.interact(cell, grade_row_id(&row.host), egui::Sense::click());
-    let painter = ui.painter().clone();
-    if resp.hovered() {
-        painter.rect_filled(cell, Style::RADIUS, Style::SURFACE_HI);
-    }
-    // The local node's subtle "you are here" left-edge accent tick (#18) — the
-    // picker's active-bar idiom at the row's outer edge.
-    if row.is_local {
-        let bar =
-            egui::Rect::from_min_size(cell.left_top(), egui::vec2(ACTIVE_BAR_W, cell.height()));
-        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
-    }
-
-    // The band the score falls into — the ONE authority for the letter, its ramp
-    // colour, and whether it alarms (`mde_egui::GradeBand`, §4). A stale row never
-    // alarms (we can't observe it; it reads "?").
-    let band = GradeBand::from_score(f32::from(row.score));
-    let alarm = !row.stale && band.is_alert();
-    // A D/F alarm hard-blinks; when dark (or stale) the mark reads dim (#6/#16
-    // always-blink, reduce-motion ignored).
-    let lit = !alarm || Motion::blink(ui.ctx());
-
-    // ── the A–F letter (or a greyed "?" when stale) in the ~18px quad cell ──
-    let letter_rect = egui::Rect::from_min_size(
-        egui::pos2(cell.left() + Style::SP_XS, cell.top()),
-        egui::vec2(GRADE_LETTER_W, cell.height()),
-    );
-    let (glyph, letter_color) = if row.stale {
-        ("?".to_owned(), Style::TEXT_DIM)
-    } else if lit {
-        (band.letter().to_string(), band.color())
-    } else {
-        (band.letter().to_string(), Style::TEXT_DIM)
-    };
-    let galley = ui
-        .fonts(|f| f.layout_no_wrap(glyph, egui::FontId::proportional(Style::BODY), letter_color));
-    painter.galley(
-        egui::pos2(
-            letter_rect.center().x - galley.size().x / 2.0,
-            letter_rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        letter_color,
-    );
-
-    // ── the tiny load bar (the 0–100 score) ──
-    let bar_left = letter_rect.right() + Style::SP_XS;
-    let bar_right = cell.right() - GRADE_ARROW_W - Style::SP_XS;
-    let bar_track = egui::Rect::from_min_max(
-        egui::pos2(bar_left, cell.center().y - GRADE_BAR_H / 2.0),
-        egui::pos2(bar_right, cell.center().y + GRADE_BAR_H / 2.0),
-    );
-    painter.rect_filled(bar_track, Style::RADIUS, Style::SURFACE_HI);
-    if !row.stale && bar_track.width() > 0.0 {
-        let fill_w = bar_track.width() * (f32::from(row.score) / 100.0).clamp(0.0, 1.0);
-        let fill = egui::Rect::from_min_size(bar_track.min, egui::vec2(fill_w, bar_track.height()));
-        // The load bar rides the SAME green→red ramp as the letter, dimming in
-        // lock-step with the alarm blink so the whole row flashes as one (#5/#6).
-        let fill_color = if lit {
-            Style::grade_fill(f32::from(row.score))
-        } else {
-            Style::TEXT_DIM
-        };
-        painter.rect_filled(fill, Style::RADIUS, fill_color);
-    }
-
-    // ── the trend arrow (#14) ──
-    let arrow_rect = egui::Rect::from_min_size(
-        egui::pos2(cell.right() - GRADE_ARROW_W, cell.top()),
-        egui::vec2(GRADE_ARROW_W, cell.height()),
-    );
-    let arrow = ui.fonts(|f| {
-        f.layout_no_wrap(
-            row.trend.arrow().to_owned(),
-            egui::FontId::proportional(Style::SMALL),
-            Style::TEXT_DIM,
-        )
-    });
-    painter.galley(
-        egui::pos2(
-            arrow_rect.center().x - arrow.size().x / 2.0,
-            arrow_rect.center().y - arrow.size().y / 2.0,
-        ),
-        arrow,
-        Style::TEXT_DIM,
-    );
-
-    paint_focus_ring(&painter, cell, resp.has_focus());
-    resp.clicked()
-}
-
-/// The grade list's '…' **expander** (design #8) — when peers spill past
-/// [`GRADE_MAX_ROWS`], a '…' cell beneath the visible rows toggles a floating popup
-/// of the hidden (better-graded) peers, each still tapping through to its hero.
-/// Reuses the app picker's overflow idiom ([`pick_overflow`]): a SURFACE panel +
-/// hairline behind the same rows, anchored to the right and growing upward. Returns
-/// `true` when a popup row tapped this frame.
-#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)] // tiny row count; layout math reads clearer than mul_add
-fn grade_overflow(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    more_top: f32,
-    visible: usize,
-    state: &mut DockState,
-) -> bool {
-    let more = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), more_top),
-        egui::vec2(DOCK_W, OVERFLOW_H),
-    );
-    let resp = ui.interact(more, grade_overflow_id(), egui::Sense::click());
-    let opened = resp.clicked();
-    if opened {
-        state.grades_overflow_open = !state.grades_overflow_open;
-    }
-    let color = if state.grades_overflow_open || resp.hovered() {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    let dots = ui.fonts(|f| {
-        f.layout_no_wrap(
-            "…".to_owned(),
-            egui::FontId::proportional(Style::BODY),
-            color,
-        )
-    });
-    ui.painter().galley(
-        egui::pos2(
-            more.center().x - dots.size().x / 2.0,
-            more.center().y - dots.size().y / 2.0,
-        ),
-        dots,
-        color,
-    );
-
-    paint_focus_ring(ui.painter(), more, resp.has_focus());
-
-    if !state.grades_overflow_open {
-        return false;
-    }
-
-    // The hidden peer rows (past the worst-N cut) — cloned so the immutable grades
-    // borrow releases before `request_node_focus` writes state.
-    let hidden: Vec<GradeRow> = state
-        .status
-        .grades
-        .rows
-        .iter()
-        .skip(visible)
-        .cloned()
-        .collect();
-    let popup_h = hidden.len() as f32 * GRADE_ROW_H;
-    let mut tapped: Option<String> = None;
-    let inner = egui::Area::new(egui::Id::new("vdock-grade-overflow-popup"))
-        .order(egui::Order::Foreground)
-        .pivot(egui::Align2::LEFT_BOTTOM)
-        .fixed_pos(egui::pos2(more.right() + Style::SP_XS, more.bottom()))
-        .show(ui.ctx(), |ui| {
-            let (area, _) =
-                ui.allocate_exact_size(egui::vec2(DOCK_W, popup_h), egui::Sense::hover());
-            // Reserve a slot so the panel background paints BEHIND the rows.
-            let bg = ui.painter().add(egui::Shape::Noop);
-            for (i, row) in hidden.iter().enumerate() {
-                let cell = egui::Rect::from_min_size(
-                    egui::pos2(area.left(), area.top() + i as f32 * GRADE_ROW_H),
-                    egui::vec2(DOCK_W, GRADE_ROW_H),
-                );
-                if grade_row(ui, row, cell) {
-                    tapped = Some(row.host.clone());
-                }
-            }
-            let panel = area.expand(Style::SP_S);
-            ui.painter().set(
-                bg,
-                egui::Shape::rect_filled(panel, Style::RADIUS, Style::SURFACE),
-            );
-            ui.painter().rect_stroke(
-                panel,
-                Style::RADIUS,
-                ui.visuals().widgets.noninteractive.bg_stroke,
-                egui::StrokeKind::Inside,
-            );
-        });
-
-    if let Some(host) = tapped {
-        // A tap routes to the hero + closes the popup (the tray idiom).
-        state.request_node_focus(&host);
-        state.grades_overflow_open = false;
-        return true;
-    }
-    if !opened && inner.response.clicked_elsewhere() {
-        // Click-away dismissal — but not on the very click that opened it.
-        state.grades_overflow_open = false;
-    }
-    false
-}
-
-mod system_quad;
-use system_quad::*;
 
 #[cfg(test)]
 mod tests;
