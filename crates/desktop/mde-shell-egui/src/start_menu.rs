@@ -156,6 +156,29 @@
 //! `SearchInput` role + label + live value, each result row a `Button` node
 //! (the selected one flagged), and the result set exports ONE `Live::Polite`
 //! summary (count + highlight) — the tile-grid live-region shape restated.
+//!
+//! **SM-QOL-1 update:** three launcher quality-of-life features, all
+//! self-contained to this module (no `main.rs` seam change). (1) **Pinning /
+//! favourites** — [`StartMenuState::pinned`] renders a "Pinned" section at the
+//! TOP of the left pane (above the groups), empty until the operator pins
+//! something; a surface is pinned/unpinned from a tile's right-click menu.
+//! (2) **Arrow-key tile navigation** — the tile GRID (not just the search list
+//! + Console) now takes Up/Down/Left/Right keyboard focus across its 3-column
+//! rows AND the pinned section, reusing the dock's OWN focus idiom verbatim
+//! (`ui.interact` + `memory.request_focus` + `set_focus_lock_filter` +
+//! arrow-event consume, `dock::apply_picker_arrow_focus`) so `response_activated`
+//! (the shared click-vs-Enter/Space predicate) and the shared 2px focus ring
+//! (`mde_egui::focus::paint_focus_ring`) light up for free; a focused search box
+//! only surrenders the keyboard to the grid on the first Down/Up (the box eats
+//! Left/Right for its own cursor), and Escape from a focused tile closes the
+//! menu. Mouse-only behaviour is byte-for-byte unchanged (a grid tile only ever
+//! requests focus once an arrow key is pressed). (3) **Per-tile context menu** —
+//! each tile now carries a secondary-click menu (`Sense::click()` already senses
+//! it) offering **Open** (same as a click) and **Pin/Unpin** (toggles feature
+//! 1), the SAME `context_menu_row` shape `dock::paint_surface_context_menu`
+//! already uses; the panel's click-away dismissal is suppressed while that menu
+//! is open so choosing "Pin" keeps the menu up (only "Open" closes it, via the
+//! existing tile-activation seam).
 
 use std::time::Duration;
 
@@ -540,6 +563,18 @@ pub struct StartMenuState {
     /// a live query (so the emptied box keeps the keyboard), consumed once by
     /// [`search_field`]'s `request_focus`.
     search_focus_pending: bool,
+    /// SM-QOL-1 — the operator's pinned/favourite surfaces, rendered as a
+    /// "Pinned" section at the TOP of the left pane (above the 7 function
+    /// groups). A [`Vec`]-as-ordered-set (pin order is the render order); the
+    /// no-duplicate invariant is held by the ONE mutator [`toggle_pin`], driven
+    /// from a tile's right-click context menu ([`tile_context_menu`]). Empty by
+    /// default, so an operator who never pins sees exactly the WIN7-3 grid (zero
+    /// behaviour change) — the section only appears once something is pinned.
+    /// In-memory this pass: a follow-up should persist it beside the other
+    /// Start-Menu prefs (there is no per-seat Start-Menu store seam yet, and
+    /// this unit deliberately does NOT open a new `main.rs` storage seam for
+    /// it — the pins simply reset on restart until that lands).
+    pinned: Vec<Surface>,
 }
 
 impl StartMenuState {
@@ -706,11 +741,11 @@ pub fn start_menu_panel(
             // whether the search consumed this frame's Esc (a live query's
             // Esc clears the query, it must NOT be read as a menu dismissal —
             // see the self-closure guard below).
-            let search_ate_escape = start_menu_search(ui, left_rect, state);
+            let (search_ate_escape, menu_open) = start_menu_search(ui, left_rect, state);
             console::console_content(ui, right_rect, console);
-            search_ate_escape
+            (search_ate_escape, menu_open)
         });
-    let search_ate_escape = area.inner;
+    let (search_ate_escape, menu_open) = area.inner;
 
     // An embedded Console action fired for real this frame (a routed link, a
     // spawned tab, a power verb) and already called `ConsoleState::close`
@@ -732,8 +767,13 @@ pub fn start_menu_panel(
 
     // Click-away dismissal — but never on the very frame the trigger opened it
     // (that click/key lands outside the panel and must not self-dismiss; the
-    // Console/VDOCK-4 `just_toggled` guard).
-    if state.open && !state.just_toggled && area.response.clicked_elsewhere() {
+    // Console/VDOCK-4 `just_toggled` guard). SM-QOL-1: also never while a tile's
+    // own right-click context menu is open — that menu is a separate popup
+    // Area, so clicking one of its rows (e.g. "Pin to top") lands OUTSIDE this
+    // panel's rect and would otherwise read as a click-away and dismiss the
+    // whole menu. Choosing "Open" still closes it, but via the tile-activation
+    // seam (a real launch), not this click-away path.
+    if state.open && !state.just_toggled && !menu_open && area.response.clicked_elsewhere() {
         state.close();
     }
     state.just_toggled = false;
@@ -775,53 +815,339 @@ fn paint_frame(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
-/// The left pane (WIN7-3, locks #6/#7/#8; WIN7-4, lock #5): [`TILE_GROUPS`]'
-/// 7 headed sections, each a row of uniform [`TILE_W`]×[`TILE_H`] tiles in
-/// [`Surface::ALL`] order. Returns the clicked tile's surface, if any, for
-/// the caller to route + close the whole panel with (lock #23 — a single
-/// click activates, mirroring the embedded Console pane's own
-/// click-routes-and-closes behaviour). Reads the ONE frame clock
-/// (`ui.input(|i| i.time)`) once and threads it to every tile, so every
-/// rotating tile in the grid advances in lockstep off the SAME clock rather
-/// than each reading its own slightly-different sample.
+/// One addressable cell in the keyboard-nav grid (SM-QOL-1): a surface plus
+/// whether it renders in the top **Pinned** section vs. one of the function
+/// groups. The flag matters because a pinned surface ALSO still appears in its
+/// group below, so the two copies must carry DISTINCT interact/accesskit ids
+/// ([`nav_cell_id`]/[`tile_accesskit_id`]) — an egui id collision otherwise
+/// confuses interaction + focus between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NavCell {
+    surface: Surface,
+    pinned: bool,
+}
+
+/// One rendered section of the left pane (SM-QOL-1): a heading plus its tiles
+/// chunked into [`TILE_COLUMNS`]-wide rows. The optional Pinned section leads,
+/// then the 7 [`TILE_GROUPS`]. Built fresh each frame from the live pin set so
+/// the layout and the arrow-nav row math ([`nav_rows`]) can never diverge.
+struct NavSection {
+    heading: &'static str,
+    pinned: bool,
+    rows: Vec<Vec<Surface>>,
+}
+
+/// The pane's ordered sections for this frame: the Pinned section first (only
+/// when something is pinned — an empty pin set renders EXACTLY the WIN7-3 grid,
+/// zero behaviour change), then the 7 locked [`TILE_GROUPS`]. Each section's
+/// surfaces are chunked into [`TILE_COLUMNS`]-wide rows (today every group is a
+/// single row, but chunking keeps a future >3-member group — or a >3 pin set —
+/// wrapping to a second row instead of overlapping).
+fn nav_sections(pinned: &[Surface]) -> Vec<NavSection> {
+    let mut sections = Vec::new();
+    if !pinned.is_empty() {
+        sections.push(NavSection {
+            heading: "Pinned",
+            pinned: true,
+            rows: pinned
+                .chunks(TILE_COLUMNS)
+                .map(<[Surface]>::to_vec)
+                .collect(),
+        });
+    }
+    for group in &TILE_GROUPS {
+        sections.push(NavSection {
+            heading: group.label,
+            pinned: false,
+            rows: group
+                .surfaces
+                .chunks(TILE_COLUMNS)
+                .map(<[Surface]>::to_vec)
+                .collect(),
+        });
+    }
+    sections
+}
+
+/// Flatten [`nav_sections`] into the top-to-bottom rows of [`NavCell`]s the
+/// arrow-key math walks — sections concatenated in render order, each carrying
+/// its own Pinned-vs-group id namespace. `(row, col)` into this is the ONE
+/// address space both [`drive_grid_focus`] and the render loop agree on.
+fn nav_rows(sections: &[NavSection]) -> Vec<Vec<NavCell>> {
+    let mut rows = Vec::new();
+    for section in sections {
+        for row in &section.rows {
+            rows.push(
+                row.iter()
+                    .map(|&surface| NavCell {
+                        surface,
+                        pinned: section.pinned,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+/// The stable interact id of a nav cell — namespaced by section so a pinned
+/// copy and its group copy never collide ([`pinned_tile_id`] vs. [`tile_id`]).
+fn nav_cell_id(cell: NavCell) -> egui::Id {
+    if cell.pinned {
+        pinned_tile_id(cell.surface)
+    } else {
+        tile_id(cell.surface)
+    }
+}
+
+/// A grid movement direction (SM-QOL-1 arrow-key nav).
+#[derive(Debug, Clone, Copy)]
+enum Dir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// The neighbouring `(row, col)` of `(r, c)` in `rows` for `dir`, or `None` at
+/// an edge (the move clamps rather than wraps). Left/Right flow across row
+/// boundaries (end of a row → start of the next), respecting each row's real
+/// width (≤ [`TILE_COLUMNS`], and the Pinned/group rows can differ); Up/Down
+/// move one row and clamp the column to the target row's width so a jump from a
+/// full 3-wide row into a 1-wide group lands on that group's only tile.
+fn grid_neighbor(rows: &[Vec<NavCell>], r: usize, c: usize, dir: Dir) -> Option<(usize, usize)> {
+    match dir {
+        Dir::Right => {
+            if c + 1 < rows[r].len() {
+                Some((r, c + 1))
+            } else if r + 1 < rows.len() {
+                Some((r + 1, 0))
+            } else {
+                None
+            }
+        }
+        Dir::Left => {
+            if c > 0 {
+                Some((r, c - 1))
+            } else if r > 0 {
+                Some((r - 1, rows[r - 1].len() - 1))
+            } else {
+                None
+            }
+        }
+        Dir::Down => (r + 1 < rows.len()).then(|| (r + 1, c.min(rows[r + 1].len() - 1))),
+        Dir::Up => (r > 0).then(|| (r - 1, c.min(rows[r - 1].len() - 1))),
+    }
+}
+
+/// Which grid cell currently holds egui keyboard focus, if any — reads
+/// `memory.focused()` (last frame's resolved focus) and locates it in `rows` by
+/// [`nav_cell_id`]. `None` while the search box (or nothing) is focused.
+fn focused_grid_cell(ui: &egui::Ui, rows: &[Vec<NavCell>]) -> Option<(usize, usize)> {
+    let focused = ui.ctx().memory(egui::Memory::focused)?;
+    for (r, row) in rows.iter().enumerate() {
+        for (c, &cell) in row.iter().enumerate() {
+            if nav_cell_id(cell) == focused {
+                return Some((r, c));
+            }
+        }
+    }
+    None
+}
+
+/// Consume every arrow-key press left in this frame's event queue — the
+/// `dock::apply_picker_arrow_focus` idiom: `key_pressed` does NOT consume, so
+/// without this a widget rendered later the same frame could see the SAME still
+/// pressed arrow and move focus again (a one-key cascade through the grid).
+fn consume_grid_arrows(ui: &egui::Ui) {
+    ui.input_mut(|i| {
+        i.events.retain(|ev| {
+            !matches!(
+                ev,
+                egui::Event::Key { key, pressed: true, .. }
+                    if matches!(
+                        key,
+                        egui::Key::ArrowDown
+                            | egui::Key::ArrowRight
+                            | egui::Key::ArrowUp
+                            | egui::Key::ArrowLeft
+                    )
+            )
+        });
+    });
+}
+
+/// Drive the tile grid's keyboard focus for this frame (SM-QOL-1, feature 2) —
+/// the `dock::apply_picker_arrow_focus` idiom raised to a 2-D grid + the pinned
+/// section, called ONCE before the tiles render (so the newly-focused tile
+/// shows its ring + answers `has_focus()` this same frame). Two cases:
+///
+/// * **No grid cell focused** (the search box owns the keyboard, or nothing
+///   does): the FIRST Down/Up hands the keyboard to the grid at its first cell.
+///   Only Down/Up can enter — a focused single-line search box eats Left/Right
+///   for its own cursor, so those never reach us until the box has yielded.
+/// * **A grid cell is focused**: lock the arrows to it (so egui's own
+///   directional focus doesn't ALSO move it), then move to the [`grid_neighbor`]
+///   in the pressed direction and consume the arrow so no later widget re-reads
+///   it. Once the grid owns focus the box is blurred, so all four arrows flow.
+fn drive_grid_focus(ui: &egui::Ui, rows: &[Vec<NavCell>]) {
+    if rows.is_empty() {
+        return;
+    }
+    let (up, down, left, right) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::ArrowRight),
+        )
+    });
+    match focused_grid_cell(ui, rows) {
+        None => {
+            if up || down {
+                ui.ctx()
+                    .memory_mut(|m| m.request_focus(nav_cell_id(rows[0][0])));
+                consume_grid_arrows(ui);
+            }
+        }
+        Some((r, c)) => {
+            ui.ctx().memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    nav_cell_id(rows[r][c]),
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..egui::EventFilter::default()
+                    },
+                );
+            });
+            let dir = if right {
+                Some(Dir::Right)
+            } else if left {
+                Some(Dir::Left)
+            } else if down {
+                Some(Dir::Down)
+            } else if up {
+                Some(Dir::Up)
+            } else {
+                None
+            };
+            if let Some((nr, nc)) = dir.and_then(|d| grid_neighbor(rows, r, c, d)) {
+                ui.ctx()
+                    .memory_mut(|m| m.request_focus(nav_cell_id(rows[nr][nc])));
+                consume_grid_arrows(ui);
+            }
+        }
+    }
+}
+
+/// The outcome of one [`left_pane`] frame (SM-QOL-1): which tile the operator
+/// launched (a click, an Enter/Space on the focused tile, or a context-menu
+/// "Open"), whether Escape from a focused tile asked to close the whole menu,
+/// and whether a tile's right-click context menu is open (so the caller can
+/// suppress its click-away dismissal — see [`start_menu_panel`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct LeftPaneOutcome {
+    activated: Option<Surface>,
+    closed: bool,
+    menu_open: bool,
+}
+
+/// The left pane (WIN7-3, locks #6/#7/#8; WIN7-4, lock #5; SM-QOL-1): the
+/// optional **Pinned** section then [`TILE_GROUPS`]' 7 headed sections, each a
+/// row of uniform [`TILE_W`]×[`TILE_H`] tiles. Drives the grid's arrow-key
+/// keyboard focus ([`drive_grid_focus`]) before rendering, and applies a
+/// right-click Pin/Unpin AFTER the render loop (so the frame's read-only pin
+/// snapshot the layout was built from is already released). Reads the ONE frame
+/// clock (`ui.input(|i| i.time)`) once and threads it to every tile so every
+/// rotating tile advances in lockstep. `pinned` is `&mut` only so the deferred
+/// toggle can land; the layout itself reads a cheap [`Copy`]-element snapshot.
 #[allow(
     clippy::cast_precision_loss, // row/col indices are tiny (< TILE_COLUMNS)
     clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
 )]
-fn left_pane(ui: &egui::Ui, rect: egui::Rect, inputs: &TileFactInputs) -> Option<Surface> {
+fn left_pane(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    inputs: &TileFactInputs,
+    pinned: &mut Vec<Surface>,
+) -> LeftPaneOutcome {
     let time_secs = ui.input(|i| i.time);
     install_tiles_live_summary(ui.ctx(), rect, inputs, time_secs);
+
+    let snapshot = pinned.clone();
+    let sections = nav_sections(&snapshot);
+    let rows = nav_rows(&sections);
+    drive_grid_focus(ui, &rows);
+
+    // Escape while a grid tile holds focus closes the whole menu (feature 2) —
+    // the `esc_pressed` path can't, because a focused tile makes
+    // `memory.focused()` non-empty. Read after `drive_grid_focus` so an entry
+    // frame (which just took focus for the grid) is already "a tile is focused".
+    let closed =
+        focused_grid_cell(ui, &rows).is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+
     let mut activated = None;
+    let mut toggle = None;
+    let mut menu_open = false;
     let x0 = rect.left() + PANE_PAD;
     let mut y = rect.top() + PANE_PAD;
-    for group in &TILE_GROUPS {
+    for section in &sections {
         let heading_rect = egui::Rect::from_min_size(
             egui::pos2(x0, y),
             egui::vec2((rect.width() - PANE_PAD * 2.0).max(0.0), GROUP_HEADING_H),
         );
-        tile_group_heading(ui, heading_rect, group.label);
+        tile_group_heading(ui, heading_rect, section.heading);
         y += GROUP_HEADING_H;
 
-        for (i, &surface) in group.surfaces.iter().enumerate() {
-            let col = (i % TILE_COLUMNS) as f32;
-            let row = (i / TILE_COLUMNS) as f32;
-            let tile_rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    x0 + col * (TILE_W + TILE_GAP),
-                    y + row * (TILE_H + TILE_GAP),
-                ),
-                egui::vec2(TILE_W, TILE_H),
-            );
-            let facts = tile_facts(surface, inputs);
-            let tint = tile_status_tint(surface, inputs);
-            if tile(ui, surface, tile_rect, &facts, tint, time_secs) {
-                activated = Some(surface);
+        for (row_idx, row) in section.rows.iter().enumerate() {
+            for (col, &surface) in row.iter().enumerate() {
+                let tile_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        x0 + col as f32 * (TILE_W + TILE_GAP),
+                        y + row_idx as f32 * (TILE_H + TILE_GAP),
+                    ),
+                    egui::vec2(TILE_W, TILE_H),
+                );
+                let cell = NavCell {
+                    surface,
+                    pinned: section.pinned,
+                };
+                let facts = tile_facts(surface, inputs);
+                let tint = tile_status_tint(surface, inputs);
+                let is_pinned = section.pinned || snapshot.contains(&surface);
+                let out = tile(ui, cell, tile_rect, &facts, tint, time_secs, is_pinned);
+                match out.action {
+                    TileAction::Activate => activated = Some(surface),
+                    TileAction::TogglePin => toggle = Some(surface),
+                    TileAction::None => {}
+                }
+                menu_open |= out.menu_open;
             }
         }
-        let rows = group.surfaces.len().div_ceil(TILE_COLUMNS).max(1);
-        y += rows as f32 * (TILE_H + TILE_GAP) - TILE_GAP + GROUP_GAP;
+        let rows_n = section.rows.len().max(1);
+        y += rows_n as f32 * (TILE_H + TILE_GAP) - TILE_GAP + GROUP_GAP;
     }
-    activated
+
+    if let Some(surface) = toggle {
+        toggle_pin(pinned, surface);
+    }
+    LeftPaneOutcome {
+        activated,
+        closed,
+        menu_open,
+    }
+}
+
+/// Add or remove `surface` from the pin set (SM-QOL-1) — the ONE mutator, so
+/// the no-duplicate invariant lives in a single place. Pinning appends (pin
+/// order = render order); unpinning removes in place, preserving the rest.
+fn toggle_pin(pinned: &mut Vec<Surface>, surface: Surface) {
+    if let Some(idx) = pinned.iter().position(|&s| s == surface) {
+        pinned.remove(idx);
+    } else {
+        pinned.push(surface);
+    }
 }
 
 /// One tile-group heading — visually matches `console.rs`'s own
@@ -840,41 +1166,60 @@ fn tile_group_heading(ui: &egui::Ui, rect: egui::Rect, label: &str) {
     );
 }
 
-/// One live tile (WIN7-3, locks #6/#8/#23; WIN7-4, lock #5): a uniform
+/// What a tile asked for this frame (SM-QOL-1): nothing, launch the surface (a
+/// click, an Enter/Space on the focused tile, or the context-menu "Open"), or
+/// toggle the surface's pin membership (the context-menu "Pin"/"Unpin").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileAction {
+    None,
+    Activate,
+    TogglePin,
+}
+
+/// One tile's per-frame result: its [`TileAction`] plus whether its right-click
+/// context menu is open (so [`left_pane`] can aggregate it up to
+/// [`start_menu_panel`]'s click-away guard).
+#[derive(Debug, Clone, Copy)]
+struct TileOutcome {
+    action: TileAction,
+    menu_open: bool,
+}
+
+/// One live tile (WIN7-3, locks #6/#8/#23; WIN7-4, lock #5; SM-QOL-1): a uniform
 /// [`TILE_W`]×[`TILE_H`] cell wearing the surface's existing picker glyph
 /// (`Surface::icon_id`, the SAME [`icon_texture`] loader + the SAME 24px
 /// [`TILE_ICON`] size the app picker's own cells use) over its label slot,
 /// which now shows [`tile_display_text`]'s fold of `facts` instead of always
 /// `Surface::label()` (WIN7-3's own static behaviour, still exactly what
-/// renders when `facts` is empty). A hover brightens both the fill and the
-/// tint — the same two-tone contract the app picker's own cells already use
-/// (§4, one hover language, not a second one invented here). A click (or
-/// Enter/Space while focused — [`response_activated`], reused verbatim
-/// rather than reimplemented) returns `true` so [`left_pane`] can route +
-/// close the whole panel (lock #23). Exports its own accesskit `Button` node
-/// (lock #14) carrying the CURRENT display text as its value — not
-/// individually `Live::Polite` (see [`install_tile_accessibility`]'s own doc
-/// for why); [`install_tiles_live_summary`] is the grid's one live announcer.
+/// renders when `facts` is empty). A hover OR keyboard focus brightens both the
+/// fill and the tint — the same two-tone contract the app picker's own cells
+/// already use (§4). A focused tile also wears the shared 2px focus ring
+/// (`mde_egui::focus::paint_focus_ring`, the dock/Console focus idiom) so a
+/// keyboard user sees where they are. A click, an Enter/Space while focused
+/// ([`response_activated`], reused verbatim), or the context menu's "Open"
+/// yields [`TileAction::Activate`]; a secondary click opens a Pin/Unpin + Open
+/// context menu ([`tile_context_menu`]). Exports its own accesskit `Button`
+/// node (lock #14) carrying the CURRENT display text as its value.
 fn tile(
     ui: &egui::Ui,
-    surface: Surface,
+    cell: NavCell,
     rect: egui::Rect,
     facts: &[String],
     status_tint: Option<egui::Color32>,
     time_secs: f64,
-) -> bool {
-    let resp = ui.interact(rect, tile_id(surface), egui::Sense::click());
+    is_pinned: bool,
+) -> TileOutcome {
+    let surface = cell.surface;
+    let resp = ui.interact(rect, nav_cell_id(cell), egui::Sense::click());
     let hovered = resp.hovered();
+    let focused = resp.has_focus();
+    let lit = hovered || focused;
     let painter = ui.painter().clone();
 
-    if hovered {
+    if lit {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
-    let tint = if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
+    let tint = if lit { Style::TEXT } else { Style::TEXT_DIM };
 
     if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), TILE_ICON, tint) {
         let icon = egui::Rect::from_center_size(
@@ -914,15 +1259,114 @@ fn tile(
         tint,
     );
 
-    install_tile_accessibility(ui.ctx(), surface, rect, display_text);
-    response_activated(ui, &resp)
+    // SM-QOL-1 — the shared 2px keyboard-focus ring (the dock/Console idiom),
+    // drawn only when this tile holds keyboard focus.
+    mde_egui::focus::paint_focus_ring(&painter, rect, focused);
+
+    install_tile_accessibility(ui.ctx(), cell, rect, display_text);
+
+    let mut action = if response_activated(ui, &resp) {
+        TileAction::Activate
+    } else {
+        TileAction::None
+    };
+    let menu_open = tile_context_menu(&resp, surface, is_pinned, &mut action);
+    TileOutcome { action, menu_open }
 }
 
-/// The stable id of one tile's interactive rect (the `dock.rs` `pick_cell_id`
-/// idiom restated — tests read a tile's settled `Rect` back to click its
-/// exact centre, the addressable-cell idiom).
+/// The stable id of one grouped tile's interactive rect (the `dock.rs`
+/// `pick_cell_id` idiom restated — tests read a tile's settled `Rect` back to
+/// click its exact centre, the addressable-cell idiom).
 fn tile_id(surface: Surface) -> egui::Id {
     egui::Id::new(("start-menu-tile", surface))
+}
+
+/// The stable id of one PINNED-section tile's rect (SM-QOL-1) — a namespace
+/// distinct from [`tile_id`] so a surface pinned at the top and still shown in
+/// its group below carry two non-colliding interact ids.
+fn pinned_tile_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("start-menu-pinned-tile", surface))
+}
+
+/// One row of a tile's right-click context menu (SM-QOL-1, feature 3) — the
+/// stable ids let a test read a menu row's `Rect` back and click it, exactly
+/// as `dock`'s own `SurfaceContextItem` rows are tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TileContextItem {
+    Open,
+    Pin,
+}
+
+/// The stable id of one context-menu row (the `dock::surface_context_item_id`
+/// idiom).
+fn tile_context_item_id(surface: Surface, item: TileContextItem) -> egui::Id {
+    egui::Id::new(("start-menu-tile-context", surface, item))
+}
+
+/// A tile's secondary-click context menu (SM-QOL-1, feature 3): **Open** (same
+/// outcome as a left-click) and **Pin to top**/**Unpin from top** (toggles the
+/// pinned section). Mirrors `dock::paint_surface_context_menu` exactly —
+/// `resp.context_menu` opens it on a secondary click (`Sense::click()` already
+/// senses that), each row is a [`context_menu_row`], and the chosen action is
+/// written back through `action` (Open overrides the passed-through
+/// click/keyboard action; both end at [`TileAction::Activate`]). Returns
+/// whether the menu is open this frame so the caller can suppress the panel's
+/// click-away dismissal while it is (a menu-row click lands in a SEPARATE popup
+/// Area, outside the panel rect, and would otherwise read as a click-away).
+fn tile_context_menu(
+    resp: &egui::Response,
+    surface: Surface,
+    is_pinned: bool,
+    action: &mut TileAction,
+) -> bool {
+    let inner = resp.context_menu(|ui| {
+        if context_menu_row(
+            ui,
+            tile_context_item_id(surface, TileContextItem::Open),
+            "Open",
+        ) {
+            *action = TileAction::Activate;
+            ui.close_menu();
+        }
+        let pin_label = if is_pinned {
+            "Unpin from top"
+        } else {
+            "Pin to top"
+        };
+        if context_menu_row(
+            ui,
+            tile_context_item_id(surface, TileContextItem::Pin),
+            pin_label,
+        ) {
+            *action = TileAction::TogglePin;
+            ui.close_menu();
+        }
+    });
+    inner.is_some()
+}
+
+/// One context-menu row — restates `dock::context_menu_row` exactly (a
+/// hand-painted `Sense::click()` row with the shared hover wash + focus ring),
+/// since that helper is private to `dock`. All colours are `Style` tokens (§4);
+/// [`response_activated`] gives it the SAME click-vs-keyboard activation the
+/// tiles themselves use.
+fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
+    let width = ui.available_width().max(Style::SP_XL * 4.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, Style::SP_L), egui::Sense::hover());
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, resp.has_focus());
+    response_activated(ui, &resp)
 }
 
 /// Fold [`TileFactInputs`] into `surface`'s rotating live facts (WIN7-4,
@@ -1240,12 +1684,20 @@ fn esc_pressed(ui: &egui::Ui) -> bool {
 /// searched launch with zero new plumbing — a keyboard Enter and a mouse
 /// click on a tile end in the identical outcome.
 ///
-/// Returns whether the search consumed this frame's Esc (query non-empty →
-/// Esc cleared it rather than dismissing the menu); the caller uses that to
-/// suppress the one-frame Console self-closure the shared Esc would otherwise
-/// propagate (see [`start_menu_panel`]'s guard).
+/// Returns `(search_ate_escape, menu_open)`: whether the search consumed this
+/// frame's Esc (query non-empty → Esc cleared it rather than dismissing the
+/// menu — the caller uses that to suppress the one-frame Console self-closure
+/// the shared Esc would otherwise propagate, see [`start_menu_panel`]'s guard),
+/// and whether a tile's right-click context menu is open this frame (SM-QOL-1 —
+/// the caller suppresses its click-away dismissal so a menu-row click doesn't
+/// read as a click-away). The search branch never opens a tile menu, so its
+/// `menu_open` is always `false`.
 #[allow(clippy::suboptimal_flops)] // layout arithmetic reads clearer than mul_add (the left_pane idiom)
-fn start_menu_search(ui: &mut egui::Ui, left_rect: egui::Rect, state: &mut StartMenuState) -> bool {
+fn start_menu_search(
+    ui: &mut egui::Ui,
+    left_rect: egui::Rect,
+    state: &mut StartMenuState,
+) -> (bool, bool) {
     // The search field sits in the left pane's bottom headroom; the grid /
     // result list get everything above it.
     let search_rect = egui::Rect::from_min_size(
@@ -1275,16 +1727,25 @@ fn start_menu_search(ui: &mut egui::Ui, left_rect: egui::Rect, state: &mut Start
 
     let query = state.search_query.trim().to_owned();
     if query.is_empty() {
-        // Empty query — the unchanged full grouped grid (WIN7-3 behaviour, no
-        // change), and Esc dismisses the whole menu exactly as before.
-        if let Some(surface) = left_pane(ui, left_rect, &state.tile_inputs) {
+        // Empty query — the unchanged full grouped grid (WIN7-3 behaviour, plus
+        // SM-QOL-1's pinned section + arrow-key tile nav + per-tile context
+        // menu), and Esc dismisses the whole menu exactly as before. The two
+        // `&state` borrows below are disjoint fields (`tile_inputs` read-only,
+        // `pinned` mutated by a right-click Pin/Unpin), so they coexist.
+        let out = left_pane(ui, left_rect, &state.tile_inputs, &mut state.pinned);
+        if let Some(surface) = out.activated {
             state.tile_activation = Some(surface);
+            state.close();
+        } else if out.closed {
+            // SM-QOL-1 — Escape while a grid tile holds keyboard focus closes
+            // the whole menu (the `esc_pressed` gate below can't, since a
+            // focused tile makes `memory.focused()` non-empty).
             state.close();
         }
         if state.open && esc_pressed(ui) {
             state.close();
         }
-        return false;
+        return (false, out.menu_open);
     }
 
     // A live query — the ranked result list replaces the grid in this pane.
@@ -1328,7 +1789,7 @@ fn start_menu_search(ui: &mut egui::Ui, left_rect: egui::Rect, state: &mut Start
     if let Some(surface) = launch {
         state.tile_activation = Some(surface);
         state.close();
-        return false;
+        return (false, false);
     }
     if esc {
         // Esc over a live query clears it (and re-arms the emptied box's focus
@@ -1337,9 +1798,9 @@ fn start_menu_search(ui: &mut egui::Ui, left_rect: egui::Rect, state: &mut Start
         // Console self-closure the shared Esc briefly triggered.
         state.clear_search();
         state.search_focus_pending = true;
-        return true;
+        return (true, false);
     }
-    false
+    (false, false)
 }
 
 /// The type-to-launch search field (SHELL-UX-3), placed at the bottom of the
@@ -1615,9 +2076,15 @@ fn install_start_menu_state_announcement(ctx: &egui::Context, rect: egui::Rect, 
     });
 }
 
-/// The stable accesskit node id for one tile (WIN7-3, lock #14).
-fn tile_accesskit_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("start-menu-tile-accesskit", surface))
+/// The stable accesskit node id for one tile (WIN7-3, lock #14) — namespaced by
+/// section (SM-QOL-1) so a surface's Pinned copy and its group copy export two
+/// distinct nodes rather than colliding on one id.
+fn tile_accesskit_id(cell: NavCell) -> egui::Id {
+    if cell.pinned {
+        egui::Id::new(("start-menu-pinned-tile-accesskit", cell.surface))
+    } else {
+        egui::Id::new(("start-menu-tile-accesskit", cell.surface))
+    }
 }
 
 /// Install one tile's own accesskit node (lock #14 — "every tile", not just
@@ -1638,13 +2105,13 @@ fn tile_accesskit_id(surface: Surface) -> egui::Id {
 /// `segment_pip` nodes in `status.rs`).
 fn install_tile_accessibility(
     ctx: &egui::Context,
-    surface: Surface,
+    cell: NavCell,
     rect: egui::Rect,
     display_text: &str,
 ) {
-    let _ = ctx.accesskit_node_builder(tile_accesskit_id(surface), |node| {
+    let _ = ctx.accesskit_node_builder(tile_accesskit_id(cell), |node| {
         node.set_role(egui::accesskit::Role::Button);
-        node.set_label(surface.label());
+        node.set_label(cell.surface.label());
         node.set_value(display_text);
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
