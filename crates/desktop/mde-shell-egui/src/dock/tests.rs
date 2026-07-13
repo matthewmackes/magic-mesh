@@ -1033,3 +1033,206 @@ fn win7_7_the_session_overflow_more_cell_reports_the_real_hidden_count() {
          sessions folded out of the inline rail"
     );
 }
+
+// ── DEDUPE restore: live-taskbar routing coverage ─────────────────────────
+// The DEDUPE-1/2 sweep (5f4c18d0) deleted the retired vertical-dock/picker
+// code and, bundled with it, a handful of tests for STILL-LIVE bottom-taskbar
+// features that merely shared a now-deleted picker symbol/helper. These
+// re-add focused coverage for those live features using ONLY the surviving
+// live idiom — `drive_vdock`/`click_rail_cell` over the live
+// `notification_rail_with_sources`, addressing the live cell ids — with no
+// reference to any deleted picker symbol.
+
+#[test]
+fn the_clock_cell_shows_the_live_time_and_routes_to_timers() {
+    // Lock #20 — the clock-glyph cell paints the LIVE wall-clock HH:MM as its
+    // glyph (the time IS the icon), rides the taskbar's right tray cluster (no
+    // longer in the left rail), and a click opens the Timers & Alarms surface
+    // (its ONE home). (Was `the_clock_strip_shows_the_live_time_and_routes_to_timers`.)
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let sz = egui::vec2(1280.0, 900.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let cell = ctx
+        .read_response(clock_cell_id())
+        .expect("the clock cell is registered")
+        .rect;
+    assert!(
+        cell.width() > 0.0 && cell.width() < sz.x / 6.0,
+        "the clock is a bounded tray item ({}px), not the whole bar — at the \
+         48px Win10 height it is wider than a square cell to fit HH:MM (and date)",
+        cell.width()
+    );
+    assert!(
+        cell.left() > DOCK_W,
+        "the clock rides the right tray cluster, not the left rail"
+    );
+
+    // A click routes to Timers & Alarms (the surface's ONE home).
+    assert_ne!(s.active, Surface::Timers, "start off the Timers surface");
+    click_rail_cell(&ctx, &mut s, cell.center(), sz);
+    assert_eq!(
+        s.active,
+        Surface::Timers,
+        "clicking the clock opens Timers & Alarms (lock #20)"
+    );
+}
+
+#[test]
+fn the_status_segment_pips_route_to_their_surfaces() {
+    // NOTIF-3 wired end-to-end: the bottom taskbar's status pips route
+    // `DockState::active` (lock #15). Each of the four segments carries its own
+    // stable pip id and its own route — Device/Power → System, Mesh → MeshView,
+    // Alerts → Chat (`status::StatusSegment::route`). Mount the live rail, read
+    // each pip by its id, and prove the click lands on the right surface,
+    // resetting to the Workbench between pips so every route is proven
+    // independently rather than by luck of the prior click.
+    // (Was `a_status_segment_pip_routes_through_the_dock_bottom_zone`, which
+    // only exercised the single Alerts → Chat leg.)
+    use status::StatusSegment;
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle(); // reveal the taskbar so its cells (and the status strip) mount
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        3,
+        false,
+        Vec::new(),
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    // Prime so the segment pip rects register + settle under their stable ids.
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    for (segment, expected) in [
+        (StatusSegment::Device, Surface::System),
+        (StatusSegment::Mesh, Surface::MeshView),
+        (StatusSegment::Power, Surface::System),
+        (StatusSegment::Alerts, Surface::Chat),
+    ] {
+        let center = ctx
+            .read_response(status::segment_pip_id(segment))
+            .unwrap_or_else(|| panic!("the {segment:?} status pip is registered"))
+            .rect
+            .center();
+        s.set_active(Surface::Workbench);
+        click_rail_cell(&ctx, &mut s, center, sz);
+        assert_eq!(
+            s.active, expected,
+            "clicking the {segment:?} pip routes to {expected:?} (lock #15)"
+        );
+    }
+}
+
+#[test]
+fn the_status_chevron_opens_and_dismisses_the_detail_panel() {
+    // NOTIF-4 — the detail panel mounts from the bottom rail's status chevron
+    // (`status_detail_toggle`); Escape and click-away both dismiss it.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        0,
+        false,
+        Vec::new(),
+        grades(vec![grade("me", 95, true, false)]),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    assert!(!s.status_panel_open, "panel starts closed");
+    let caret = ctx
+        .read_response(status_detail_toggle_id())
+        .expect("bottom-rail status chevron renders")
+        .rect
+        .center();
+    click_rail_cell(&ctx, &mut s, caret, sz);
+    assert!(
+        s.status_panel_open,
+        "the status chevron opens the detail panel"
+    );
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    assert!(
+        ctx.read_response(status::status_panel_id()).is_some(),
+        "the status detail panel renders after opening"
+    );
+
+    drive_vdock(&ctx, &mut s, vec![key(egui::Key::Escape)], sz);
+    assert!(!s.status_panel_open, "Escape dismisses the panel");
+
+    s.open_status_panel_for_test();
+    assert!(s.status_panel_open, "the test seam reopens the panel");
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    click_rail_cell(&ctx, &mut s, egui::pos2(500.0, 500.0), sz);
+    assert!(!s.status_panel_open, "click-away dismisses the panel");
+}
+
+#[test]
+fn a_requested_desktop_session_renders_as_a_named_bottom_rail_entry() {
+    // NAVBAR-U3 / operator rail request — once the Desktop surface has a real
+    // requested target, the taskbar shows its own addressable session entry
+    // rather than only the generic Sessions fallback glyph. WIN10-HYBRID #31
+    // made the tile an icons-only rail-height square whose full name now rides
+    // the accesskit node (covered by `win7_7_a_real_session_entry_...`), so this
+    // pins the behaviour that distinguishes a real entry from the fallback:
+    // it is its OWN addressable rail cell, and clicking it focuses Desktop AND
+    // latches the broker session id the shell reconnects to.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        0,
+        true,
+        vec![entry.clone()],
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let rect = ctx
+        .read_response(session_entry_id(0, &entry))
+        .expect("the named session entry is registered as its own rail cell")
+        .rect;
+    assert!(
+        rect.width() > 0.0 && rect.height() > 0.0,
+        "the session entry renders as a real bottom-rail cell"
+    );
+    assert!(
+        rect.bottom() > sz.y / 2.0,
+        "the session entry rides the bottom taskbar (bottom {}), not the top half",
+        rect.bottom()
+    );
+
+    assert_ne!(s.active, Surface::Desktop, "starts off Desktop");
+    click_rail_cell(&ctx, &mut s, rect.center(), sz);
+    assert_eq!(
+        s.active,
+        Surface::Desktop,
+        "clicking the session entry focuses the Desktop surface"
+    );
+    assert_eq!(
+        s.take_desktop_session_focus().as_deref(),
+        Some("session-1"),
+        "the session entry latches its broker session id for the shell to reconnect"
+    );
+}
