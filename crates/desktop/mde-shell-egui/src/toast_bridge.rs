@@ -236,6 +236,15 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // `clock` alias keeps a "where did the clock go?" verb landing somewhere
         // honest (lock #5: the clock is now Timers & Alarms).
         "timers" | "alarms" | "clock" => Some(Surface::Timers),
+        // REACH-1 (2026-07-12) — the six surfaces that previously had no `shell/goto`
+        // verb, so an alert/chyron action targeting them silently no-op'd. Now every
+        // surface is reachable by name.
+        "explorer" => Some(Surface::Explorer),
+        "media" | "video" => Some(Surface::Media),
+        "terminal" | "term" => Some(Surface::Terminal),
+        "editor" | "code" => Some(Surface::Editor),
+        "phones" | "phone" => Some(Surface::Phones),
+        "about" => Some(Surface::About),
         _ => None,
     }
 }
@@ -605,6 +614,26 @@ mod tests {
     fn name_maps_are_case_insensitive() {
         assert_eq!(surface_by_name("SYSTEM"), Some(Surface::System));
         assert_eq!(plane_by_name("ThisNode"), Some(Plane::ThisNode));
+    }
+
+    #[test]
+    fn reach1_every_surface_has_a_goto_verb() {
+        // REACH-1 — the six surfaces that used to silently no-op a shell/goto now resolve.
+        assert_eq!(surface_by_name("explorer"), Some(Surface::Explorer));
+        assert_eq!(surface_by_name("media"), Some(Surface::Media));
+        assert_eq!(surface_by_name("terminal"), Some(Surface::Terminal));
+        assert_eq!(surface_by_name("editor"), Some(Surface::Editor));
+        assert_eq!(surface_by_name("phones"), Some(Surface::Phones));
+        assert_eq!(surface_by_name("about"), Some(Surface::About));
+        // and every Surface::ALL variant now resolves from its own (lowercased) name.
+        for s in Surface::ALL {
+            let verb = format!("{s:?}").to_ascii_lowercase();
+            assert_eq!(
+                surface_by_name(&verb),
+                Some(s),
+                "surface {s:?} has no shell/goto verb for '{verb}'",
+            );
+        }
     }
 
     #[test]
