@@ -203,17 +203,19 @@ impl HotkeyRouter {
     /// Fold one egui key press: a leader-chord named key fires its action **only**
     /// while the leader is held (lock 8 — otherwise it reaches the focused guest).
     /// A firing chord also marks the current Super hold as *used* so its release
-    /// is a hold, not a dock-toggling tap (lock 13).
-    fn on_egui_key(&mut self, key: egui::Key) -> Option<HotkeyAction> {
+    /// is a hold, not a dock-toggling tap (lock 13). A number key resolves to a
+    /// nav slot through [`nav_slot_for`], which reads the press's Shift bit to
+    /// pick the tier (REACH-2).
+    fn on_egui_key(&mut self, press: KeyPress) -> Option<HotkeyAction> {
         if !self.leader {
             return None;
         }
-        if let Some(slot) = nav_slot_for_key(key) {
+        if let Some(slot) = nav_slot_for(press.key, press.shift) {
             self.leader_used = true;
             self.nav_slot = Some(slot);
             return None;
         }
-        let action = leader_chord(key).and_then(action_for);
+        let action = leader_chord(press.key).and_then(action_for);
         if action.is_some() {
             self.leader_used = true;
         }
@@ -228,7 +230,7 @@ impl HotkeyRouter {
     pub(crate) fn dispatch(
         &mut self,
         host_keys: &[HostScan],
-        egui_presses: &[egui::Key],
+        egui_presses: &[KeyPress],
     ) -> Vec<HotkeyAction> {
         let mut actions = Vec::new();
         for scan in host_keys {
@@ -236,8 +238,8 @@ impl HotkeyRouter {
                 actions.push(a);
             }
         }
-        for key in egui_presses {
-            if let Some(a) = self.on_egui_key(*key) {
+        for press in egui_presses {
+            if let Some(a) = self.on_egui_key(*press) {
                 actions.push(a);
             }
         }
@@ -245,8 +247,20 @@ impl HotkeyRouter {
     }
 }
 
-const fn nav_slot_for_key(key: egui::Key) -> Option<NavSlot> {
-    Some(NavSlot(match key {
+/// Map a leader-held number key (+ its Shift state) to the surface slot it
+/// selects. Two tiers cover **all 18** `Surface::ALL` entries (REACH-2):
+///
+/// * plain **`Super`+`1`…`9`/`0`** → `Surface::ALL[0..=9]` (the Win10 taskbar
+///   convention, `Super+0` = the tenth slot);
+/// * **`Super`+`Shift`+`1`…`8`** → `Surface::ALL[10..=17]` — the eight surfaces
+///   beyond the first ten (Bookmarks · Terminal · Editor · Chat · Phones ·
+///   System · Storage · About).
+///
+/// `Super+Shift+9`/`Super+Shift+0` map past the last surface (slots 18/19); the
+/// [`NavSlot`] consumer (`apply_nav_slot`) indexes `Surface::ALL` bounds-safely,
+/// so an overshoot is a no-op rather than a panic or a wrap.
+const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
+    let digit = match key {
         egui::Key::Num1 => 0,
         egui::Key::Num2 => 1,
         egui::Key::Num3 => 2,
@@ -258,19 +272,43 @@ const fn nav_slot_for_key(key: egui::Key) -> Option<NavSlot> {
         egui::Key::Num9 => 8,
         egui::Key::Num0 => 9,
         _ => return None,
-    }))
+    };
+    // Shift shifts to the second tier: its ten-surface offset lands Num1..Num8 on
+    // ALL[10..=17]. The two overshooting shifted slots resolve to nothing downstream.
+    Some(NavSlot(if shift { digit + 10 } else { digit }))
+}
+
+/// One egui key **press** with the **Shift** state that came with it. Shift is
+/// the only egui-side modifier the router reads — the Super leader arrives
+/// host-first (evdev 125/126, [`decode_scan`]), so a chord is the leader latch
+/// crossed with a `(key, shift)` press. Shift selects the **second** Super-number
+/// nav tier (REACH-2): `Super+1..0` reaches `Surface::ALL[0..=9]`,
+/// `Super+Shift+1..8` reaches `ALL[10..=17]`, so all 18 surfaces are reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyPress {
+    /// The pressed egui key.
+    pub(crate) key: egui::Key,
+    /// Whether Shift was held for this press.
+    pub(crate) shift: bool,
 }
 
 /// The egui key **presses** in this frame's input (a press, not a release), the
-/// leader-chord half of the dispatch input. Kept tiny so the shell's render can
-/// build it inline from `ctx.input`.
-pub(crate) fn egui_key_presses(events: &[egui::Event]) -> Vec<egui::Key> {
+/// leader-chord half of the dispatch input, each carrying its Shift bit (the nav
+/// tier selector, REACH-2). Kept tiny so the shell's render can build it inline
+/// from `ctx.input`.
+pub(crate) fn egui_key_presses(events: &[egui::Event]) -> Vec<KeyPress> {
     events
         .iter()
         .filter_map(|e| match e {
             egui::Event::Key {
-                key, pressed: true, ..
-            } => Some(*key),
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => Some(KeyPress {
+                key: *key,
+                shift: modifiers.shift,
+            }),
             _ => None,
         })
         .collect()
@@ -283,6 +321,16 @@ mod tests {
 
     fn scan(code: u32, pressed: bool) -> HostScan {
         HostScan { code, pressed }
+    }
+
+    /// A plain (unshifted) egui key press.
+    fn press(key: egui::Key) -> KeyPress {
+        KeyPress { key, shift: false }
+    }
+
+    /// A Shift-held egui key press — the second Super-number nav tier (REACH-2).
+    fn shift_press(key: egui::Key) -> KeyPress {
+        KeyPress { key, shift: true }
     }
 
     #[test]
@@ -317,25 +365,28 @@ mod tests {
     fn a_named_key_reaches_the_guest_until_the_leader_is_held() {
         let mut r = HotkeyRouter::default();
         // Bare Tab: no action — it reaches the focused guest (lock 8).
-        assert!(r.dispatch(&[], &[egui::Key::Tab]).is_empty());
+        assert!(r.dispatch(&[], &[press(egui::Key::Tab)]).is_empty());
         assert!(!r.leader_armed());
 
         // Press the leader (Super, evdev 125), then Tab in the same frame → the
         // session-switch chord fires; the guest never sees the Tab.
-        let acts = r.dispatch(&[scan(125, true)], &[egui::Key::Tab]);
+        let acts = r.dispatch(&[scan(125, true)], &[press(egui::Key::Tab)]);
         assert_eq!(acts, vec![HotkeyAction::SessionSwitch]);
         assert!(r.leader_armed());
 
         // Still armed on a later frame: L → Lock, S → OpenSystem.
-        assert_eq!(r.dispatch(&[], &[egui::Key::L]), vec![HotkeyAction::Lock]);
         assert_eq!(
-            r.dispatch(&[], &[egui::Key::S]),
+            r.dispatch(&[], &[press(egui::Key::L)]),
+            vec![HotkeyAction::Lock]
+        );
+        assert_eq!(
+            r.dispatch(&[], &[press(egui::Key::S)]),
             vec![HotkeyAction::OpenSystem]
         );
 
         // Release the leader → the chord disarms; Tab reaches the guest again.
         assert!(r
-            .dispatch(&[scan(125, false)], &[egui::Key::Tab])
+            .dispatch(&[scan(125, false)], &[press(egui::Key::Tab)])
             .is_empty());
         assert!(!r.leader_armed());
     }
@@ -345,11 +396,11 @@ mod tests {
         let mut r = HotkeyRouter::default();
         let _ = r.dispatch(&[scan(126, true)], &[]); // right-Super arms too
         assert_eq!(
-            r.dispatch(&[], &[egui::Key::Backtick]),
+            r.dispatch(&[], &[press(egui::Key::Backtick)]),
             vec![HotkeyAction::MonitorFocusSwitch]
         );
         assert_eq!(
-            r.dispatch(&[], &[egui::Key::Escape]),
+            r.dispatch(&[], &[press(egui::Key::Escape)]),
             vec![HotkeyAction::ReturnToChrome]
         );
     }
@@ -358,7 +409,7 @@ mod tests {
     fn super_numbers_latch_taskbar_navigation_slots_without_toggling_the_dock() {
         let mut r = HotkeyRouter::default();
 
-        let acts = r.dispatch(&[scan(125, true)], &[egui::Key::Num1]);
+        let acts = r.dispatch(&[scan(125, true)], &[press(egui::Key::Num1)]);
         assert!(acts.is_empty(), "Super+1 is shell nav, not a host action");
         assert_eq!(r.take_nav_slot().map(NavSlot::index), Some(0));
         assert!(
@@ -371,7 +422,7 @@ mod tests {
             "a Super+number hold is not a clean Super tap"
         );
 
-        let _ = r.dispatch(&[scan(125, true)], &[egui::Key::Num0]);
+        let _ = r.dispatch(&[scan(125, true)], &[press(egui::Key::Num0)]);
         assert_eq!(
             r.take_nav_slot().map(NavSlot::index),
             Some(9),
@@ -398,7 +449,7 @@ mod tests {
 
         // A Super *hold* used as a leader (Super+Tab) fires the chord and must NOT
         // toggle the dock on release.
-        let acts = r.dispatch(&[scan(125, true)], &[egui::Key::Tab]);
+        let acts = r.dispatch(&[scan(125, true)], &[press(egui::Key::Tab)]);
         assert_eq!(acts, vec![HotkeyAction::SessionSwitch]);
         let _ = r.dispatch(&[scan(125, false)], &[]);
         assert!(
@@ -436,7 +487,11 @@ mod tests {
     }
 
     #[test]
-    fn egui_key_presses_keeps_presses_and_drops_releases_and_other_events() {
+    fn egui_key_presses_keeps_presses_with_their_shift_bit_and_drops_the_rest() {
+        let shifted = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
         let events = vec![
             egui::Event::Key {
                 key: egui::Key::L,
@@ -444,6 +499,14 @@ mod tests {
                 pressed: true,
                 repeat: false,
                 modifiers: egui::Modifiers::default(),
+            },
+            // A Shift-held press carries its shift bit through (REACH-2 tier 2).
+            egui::Event::Key {
+                key: egui::Key::Num1,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: shifted,
             },
             egui::Event::Key {
                 key: egui::Key::S,
@@ -454,6 +517,109 @@ mod tests {
             },
             egui::Event::PointerGone,
         ];
-        assert_eq!(egui_key_presses(&events), vec![egui::Key::L]);
+        assert_eq!(
+            egui_key_presses(&events),
+            vec![press(egui::Key::L), shift_press(egui::Key::Num1)]
+        );
+    }
+
+    #[test]
+    fn super_shift_numbers_reach_the_second_surface_tier() {
+        // REACH-2 — Super+Shift+1..8 selects Surface::ALL[10..=17], the eight
+        // surfaces the plain Super+1..0 tier can't reach.
+        for (key, want) in [
+            (egui::Key::Num1, 10),
+            (egui::Key::Num2, 11),
+            (egui::Key::Num3, 12),
+            (egui::Key::Num4, 13),
+            (egui::Key::Num5, 14),
+            (egui::Key::Num6, 15),
+            (egui::Key::Num7, 16),
+            (egui::Key::Num8, 17),
+        ] {
+            let mut r = HotkeyRouter::default();
+            let acts = r.dispatch(&[scan(125, true)], &[shift_press(key)]);
+            assert!(
+                acts.is_empty(),
+                "Super+Shift+num is shell nav, not a host action"
+            );
+            assert_eq!(
+                r.take_nav_slot().map(NavSlot::index),
+                Some(want),
+                "Super+Shift+{key:?} → Surface::ALL[{want}]"
+            );
+        }
+    }
+
+    #[test]
+    fn every_surface_index_is_keyboard_reachable_across_both_super_number_tiers() {
+        use std::collections::BTreeSet;
+
+        // Sweep both tiers and collect every surface index a chord can select.
+        let tier1 = [
+            (egui::Key::Num1, false),
+            (egui::Key::Num2, false),
+            (egui::Key::Num3, false),
+            (egui::Key::Num4, false),
+            (egui::Key::Num5, false),
+            (egui::Key::Num6, false),
+            (egui::Key::Num7, false),
+            (egui::Key::Num8, false),
+            (egui::Key::Num9, false),
+            (egui::Key::Num0, false),
+        ];
+        let tier2 = [
+            (egui::Key::Num1, true),
+            (egui::Key::Num2, true),
+            (egui::Key::Num3, true),
+            (egui::Key::Num4, true),
+            (egui::Key::Num5, true),
+            (egui::Key::Num6, true),
+            (egui::Key::Num7, true),
+            (egui::Key::Num8, true),
+        ];
+        let mut reached = BTreeSet::new();
+        for (key, shift) in tier1.into_iter().chain(tier2) {
+            let mut r = HotkeyRouter::default();
+            let kp = if shift { shift_press(key) } else { press(key) };
+            let _ = r.dispatch(&[scan(125, true)], &[kp]);
+            let slot = r
+                .take_nav_slot()
+                .expect("a Super-number chord latches a slot");
+            reached.insert(slot.index());
+        }
+        // REACH-2 — the two tiers together cover all 18 Surface::ALL indices.
+        let all: BTreeSet<usize> = (0..crate::dock::Surface::ALL.len()).collect();
+        assert_eq!(all.len(), 18, "Surface::ALL is the 18-surface set");
+        assert_eq!(
+            reached, all,
+            "every Surface::ALL index 0..=17 has a Super-number chord"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_shift_slot_is_a_safe_no_op() {
+        // Super+Shift+9/0 overshoot past the last surface (slots 18/19). They still
+        // latch (so the hold is a chord, not a dock-toggling tap), but indexing
+        // Surface::ALL yields nothing — a no-op, never a panic (REACH-2 bounds).
+        for key in [egui::Key::Num9, egui::Key::Num0] {
+            let mut r = HotkeyRouter::default();
+            let _ = r.dispatch(&[scan(125, true)], &[shift_press(key)]);
+            let slot = r
+                .take_nav_slot()
+                .expect("an overshooting shift chord still latches a slot");
+            assert!(slot.index() >= crate::dock::Surface::ALL.len());
+            assert!(
+                crate::dock::Surface::ALL.get(slot.index()).is_none(),
+                "slot {} is out of range and resolves to no surface",
+                slot.index()
+            );
+            // It consumed the hold, so releasing does not toggle the dock.
+            let _ = r.dispatch(&[scan(125, false)], &[]);
+            assert!(
+                !r.take_dock_toggle(),
+                "an overshooting shift chord is a hold, not a clean Super tap"
+            );
+        }
     }
 }
