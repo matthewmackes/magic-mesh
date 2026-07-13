@@ -303,10 +303,14 @@ impl Style {
         v.widgets.hovered.weak_bg_fill = Self::SURFACE_HI;
         v.widgets.hovered.fg_stroke = text;
 
-        // Pressed / active. The label paints in [`BG`](Self::BG) over the accent fill
-        // (below), so BG-text-over-accent must stay WCAG-legible for every selectable
-        // accent — guarded by `pressed_accent_text_stays_wcag_legible` (a11y, P3).
-        v.widgets.active.fg_stroke = Stroke::new(1.0, Self::BG);
+        // Pressed / active. A BRIGHT label over a DARKENED accent fill (the fill is
+        // derived in [`accent_visuals`](Self::accent_visuals)). This `fg_stroke` is
+        // ALSO exactly what egui returns from `Visuals::strong_text_color()` (it is
+        // hardcoded to `widgets.active.fg_stroke`), so it MUST stay bright — a dark
+        // value here paints every `.strong()` label across the shell in near-black,
+        // which reads as "disabled". Guarded by `strong_text_stays_bright` +
+        // `pressed_accent_text_stays_wcag_legible` (a11y, P3).
+        v.widgets.active.fg_stroke = Stroke::new(1.0, Self::TEXT_STRONG);
 
         // The interactive **accent** — the ONE re-tintable field group: the
         // hyperlink, the text-selection wash + ring, the hover ring, and the
@@ -341,9 +345,29 @@ impl Style {
         v.selection.bg_fill = accent.gamma_multiply(0.35);
         v.selection.stroke = Stroke::new(1.0, accent);
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
-        v.widgets.active.bg_fill = accent;
-        v.widgets.active.weak_bg_fill = accent;
+        // The pressed fill is the accent DARKENED toward BG so the bright active
+        // label (`TEXT_STRONG`, set in `install_with_density`) stays WCAG-legible on
+        // it, while a bright accent ring keeps the pressed state unmistakably
+        // accent-coloured. Opaque (blend, not `gamma_multiply`, which would fade the
+        // alpha into a translucent wash like `selection.bg_fill` above).
+        let pressed = Self::blend(accent, Self::BG, Self::PRESSED_FILL_DARKEN);
+        v.widgets.active.bg_fill = pressed;
+        v.widgets.active.weak_bg_fill = pressed;
         v.widgets.active.bg_stroke = Stroke::new(1.0, accent_hi);
+    }
+
+    /// Fraction the pressed/active fill is darkened toward [`BG`](Self::BG) from the
+    /// live accent (see [`accent_visuals`](Self::accent_visuals)). Chosen so the
+    /// bright pressed label clears WCAG AA body contrast on EVERY selectable accent
+    /// (verified by `pressed_accent_text_stays_wcag_legible`).
+    const PRESSED_FILL_DARKEN: f32 = 0.5;
+
+    /// Opaque linear blend of two colours: `t == 0` is `a`, `t == 1` is `b`. Keeps
+    /// full alpha (unlike [`Color32::gamma_multiply`], which scales alpha too).
+    #[must_use]
+    fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+        let mix = |x: u8, y: u8| (f32::from(x) * (1.0 - t) + f32::from(y) * t).round() as u8;
+        Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
     }
 
     /// Re-tint the live interactive **accent** on `ctx` to `accent` (SETTINGS-5 — the
@@ -638,15 +662,37 @@ mod tests {
     }
 
     #[test]
+    fn strong_text_stays_bright() {
+        // egui hardcodes `Visuals::strong_text_color()` to `widgets.active.fg_stroke`.
+        // Every `.strong()` label across the shell renders in that colour, so it MUST
+        // be bright on the dark canvas — a regression to a near-BG value paints strong
+        // text black and it reads as "disabled". Pin it well clear of the AA floor.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let strong = ctx.style().visuals.strong_text_color();
+        assert_eq!(
+            strong,
+            Style::TEXT_STRONG,
+            "strong_text_color must be the bright label token, not a dark/pressed colour"
+        );
+        let ratio = wcag_contrast_ratio(strong, Style::BG);
+        assert!(
+            ratio >= 7.0,
+            "strong text over BG is only {ratio:.2}:1 — strong/emphasised text must stay \
+             high-contrast (a near-BG value here blackens every .strong() label)"
+        );
+    }
+
+    #[test]
     fn pressed_accent_text_stays_wcag_legible() {
-        // The pressed/active widget paints its label in Style::BG
-        // (`install_with_density`: `v.widgets.active.fg_stroke = Stroke::new(1.0,
-        // Self::BG)`) over the accent fill (`v.widgets.active.bg_fill = accent`). A
-        // button label renders at Style::BODY (12 pt) — below WCAG's "large text" cut
-        // (18 pt, or 14 pt bold) — so the applicable AA legibility floor is the
-        // body-text 4.5:1, NOT the 3:1 large-text / UI-component relaxation. This
-        // preventive guard stops a future accent from dropping pressed-button text below
-        // readable contrast (the finding's ~5.4:1 Purple worst case clears it with room).
+        // The pressed/active widget paints its label in Style::TEXT_STRONG
+        // (`install_with_density`) over a DARKENED accent fill
+        // (`blend(accent, BG, PRESSED_FILL_DARKEN)`). A button label renders at
+        // Style::BODY (12 pt) — below WCAG's "large text" cut (18 pt, or 14 pt bold) —
+        // so the applicable AA legibility floor is the body-text 4.5:1, NOT the 3:1
+        // large-text / UI-component relaxation. This guard stops a future accent (or a
+        // change to the darken factor) from dropping the bright pressed label below
+        // readable contrast on its own fill.
         const AA_BODY: f32 = 4.5;
 
         // Sanity anchors — the two known-good ratios named in the platform review.
@@ -666,7 +712,6 @@ mod tests {
         // Cyan→ACCENT_COMMS, Purple→ACCENT_WORKLOADS, Teal→ACCENT_TERMINALS,
         // Green→ACCENT_MESH, Gold→ACCENT_SYSTEM, Magenta→ACCENT_MEDIA — so guarding the
         // tokens here guards every selectable pressed accent, with no mde-egui→shell dep.
-        // ACCENT_HI is the brand pressed-ring lift, also behind BG-coloured text.
         let accents = [
             ("ACCENT (Brand)", Style::ACCENT),
             ("ACCENT_HI", Style::ACCENT_HI),
@@ -678,11 +723,14 @@ mod tests {
             ("ACCENT_MEDIA (Magenta)", Style::ACCENT_MEDIA),
         ];
         for (name, accent) in accents {
-            let ratio = wcag_contrast_ratio(Style::BG, accent);
+            // The pressed label is TEXT_STRONG over the darkened accent fill.
+            let fill = Style::blend(accent, Style::BG, Style::PRESSED_FILL_DARKEN);
+            let ratio = wcag_contrast_ratio(Style::TEXT_STRONG, fill);
             assert!(
                 ratio >= AA_BODY,
-                "pressed BG-text over {name} is only {ratio:.2}:1 — below the WCAG AA \
-                 body-text floor of {AA_BODY}:1; pressed-button labels would be unreadable"
+                "pressed TEXT_STRONG label over the darkened {name} fill is only \
+                 {ratio:.2}:1 — below the WCAG AA body-text floor of {AA_BODY}:1; \
+                 pressed-button labels would be unreadable"
             );
         }
     }
@@ -1003,8 +1051,16 @@ mod tests {
         assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
         assert_eq!(ctx.style().spacing.indent, Style::SP_M);
         // The refactored install routes the accent through the shared derivation, so
-        // the whole interactive-accent field group lands on the brand accent.
-        assert_eq!(ctx.style().visuals.widgets.active.bg_fill, Style::ACCENT);
+        // the whole interactive-accent field group lands on the (darkened) brand accent,
+        // with a bright pressed label — the same colour egui reuses for strong text.
+        assert_eq!(
+            ctx.style().visuals.widgets.active.bg_fill,
+            Style::blend(Style::ACCENT, Style::BG, Style::PRESSED_FILL_DARKEN)
+        );
+        assert_eq!(
+            ctx.style().visuals.widgets.active.fg_stroke.color,
+            Style::TEXT_STRONG
+        );
         assert_eq!(ctx.style().visuals.selection.stroke.color, Style::ACCENT);
     }
 
@@ -1018,7 +1074,10 @@ mod tests {
         Style::set_accent(&ctx, Style::ACCENT_MESH);
         let s = ctx.style();
         assert_eq!(s.visuals.hyperlink_color, Style::ACCENT_MESH);
-        assert_eq!(s.visuals.widgets.active.bg_fill, Style::ACCENT_MESH);
+        assert_eq!(
+            s.visuals.widgets.active.bg_fill,
+            Style::blend(Style::ACCENT_MESH, Style::BG, Style::PRESSED_FILL_DARKEN)
+        );
         assert_eq!(
             s.visuals.widgets.hovered.bg_stroke.color,
             Style::ACCENT_MESH
