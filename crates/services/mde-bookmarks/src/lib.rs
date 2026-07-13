@@ -34,6 +34,10 @@
 //!     parse each format into the model via the existing CRDT ops, dedup by
 //!     normalized URL, and re-import idempotently under `Imported/<Browser>`.
 //!     **Never read logins/cookies/history** — bookmarks only (import/).
+//!   * [`to_netscape_html`] — the **export** leg (BOOKMARKS-3 round trip):
+//!     renders a converged [`Collection`] back into the same Netscape
+//!     bookmark-HTML shape the importer reads, so an exported file re-imports
+//!     losslessly on titles/urls/nesting (export.rs).
 //!
 //! **No CRDT/mesh I/O**: no Servo, no Syncthing, no Bus, no wall clock, no
 //! credentials — the live plumbing is the BOOKMARKS-2 worker's. The only I/O in
@@ -43,6 +47,7 @@
 #![forbid(unsafe_code)]
 
 mod crdt;
+mod export;
 mod favicon;
 mod hlc;
 mod import;
@@ -51,6 +56,7 @@ mod op;
 mod order;
 
 pub use crdt::{Collection, ItemState, Reg};
+pub use export::to_netscape_html;
 pub use favicon::{hash_bytes, FaviconStore};
 pub use hlc::{Author, Hlc, HlcClock, NodeId, UserId};
 pub use import::{
