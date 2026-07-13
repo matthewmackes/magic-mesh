@@ -115,6 +115,10 @@ mde-lighthouse-health = { path = "../../platform/mde-lighthouse-health", default
 mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
 mde-bookmarks-egui = { path = "../mde-bookmarks-egui" }
+# BOOKMARKS-BAR — the pure `mde-bookmarks` model (consumed WITHOUT its egui GUI,
+# like mde-files below), so the Browser surface can deserialize the daemon's
+# `state/bookmarks/collection` Collection snapshot into its own bookmarks-bar row.
+mde-bookmarks = { path = "../../services/mde-bookmarks" }
 mde-voice-egui = { path = "../mde-voice-egui" }
 # EDITOR-9 — the render-agnostic `mde-files` core (consumed WITHOUT its Cosmic-era
 # GUI, like mde-files-egui does), for the `EditorLaunchWatch` that drains the Files
