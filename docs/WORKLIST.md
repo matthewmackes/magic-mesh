@@ -4288,7 +4288,7 @@ Operator review: "verify one launcher per app/workspace, no duplication; restruc
 - [x] **MENU-1** (`3ad01aa7`) — Start-menu pinning/favorites + arrow-key grid nav + per-tile right-click.
 - [x] **REACH-1** (`34a77a8b`) — `shell/goto` verbs for the 6 previously-unreachable surfaces (Explorer/Media/Terminal/Editor/Phones/About); every `Surface::ALL` now resolves by name.
 - [x] **SEARCH-fuzzy** (`ea2d8a30`) — typo-tolerant subsequence ranking tier for Start-menu search (below exact prefix/substring).
-- [~] **REACH-2** — Super+Shift+number → surfaces 10-17 (all 18 keyboard-reachable); farm worker in flight.
+- [x] **REACH-2** — Super+Shift+number → surfaces 10-17 (all 18 keyboard-reachable); done (origin `faf0982b`): Super+Shift+1..8 !92 ALL[10..17], pure hotkeys.rs (main.rs already bounds-checks).
 - [ ] **SEARCH-omnibox** (deferred epic) — the full unified omnibox (apps + files + mesh + AI-ranked); needs its own plan (file indexing + peer data + main.rs input architecture). Survey answer was "full unified omnibox".
 
 **Live:** the whole restructure (bar REACH-2/omnibox) is deployed + verified on seat .15 (`12.0.0-1`, DRM shell, mesh 10.42.0.8). Integrated master verify: 1074 passed, 0 leaks.
