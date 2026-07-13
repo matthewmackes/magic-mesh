@@ -206,8 +206,13 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     }
 
     let mut action: Option<TransferVerb> = None;
+    let mut removed: Option<String> = None;
+    let mut clear_all = false;
+    let mut keep_dangerous = false;
+    let mut discard_dangerous = false;
     let worker_present = state.transfers.worker_present();
     let jobs = state.download_jobs.clone();
+    let pending_dangerous = state.pending_dangerous_download.clone();
     egui::Frame::NONE
         .fill(Style::SURFACE)
         .inner_margin(egui::Margin::symmetric(6, 4))
@@ -238,6 +243,14 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     {
                         state.refresh_downloads();
                     }
+                    if !jobs.is_empty()
+                        && ui
+                            .small_button("Clear all")
+                            .on_hover_text("Remove every download from this list")
+                            .clicked()
+                    {
+                        clear_all = true;
+                    }
                 });
             });
 
@@ -246,6 +259,49 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     Style::DANGER,
                     RichText::new(format!("! {notice}")).size(Style::SMALL),
                 );
+            }
+
+            if let Some(pending) = &pending_dangerous {
+                ui.separator();
+                egui::Frame::NONE
+                    .fill(Style::SURFACE_HI)
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("\u{26A0} This type of file can harm your device")
+                                    .size(Style::SMALL)
+                                    .color(Style::WARN),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(&pending.filename)
+                                .size(Style::SMALL)
+                                .color(Style::TEXT),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("Keep").size(Style::SMALL).color(Style::WARN),
+                                ))
+                                .on_hover_text("Download it anyway")
+                                .clicked()
+                            {
+                                keep_dangerous = true;
+                            }
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("Discard")
+                                        .size(Style::SMALL)
+                                        .color(Style::TEXT_DIM),
+                                ))
+                                .on_hover_text("Drop this download")
+                                .clicked()
+                            {
+                                discard_dangerous = true;
+                            }
+                        });
+                    });
             }
 
             if jobs.is_empty() {
@@ -301,6 +357,23 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("Remove")
+                            .on_hover_text("Remove from list")
+                            .clicked()
+                        {
+                            removed = Some(job.id.clone());
+                        }
+                        if let Some(url) = state.download_source_urls.get(&job.id) {
+                            if ui
+                                .small_button("Copy link")
+                                .on_hover_text("Copy the download's source URL")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(url.clone());
+                                state.capture_notice = Some("Download link copied".to_owned());
+                            }
+                        }
                         if !job.state.is_terminal()
                             && ui.small_button("Cancel").on_hover_text("Cancel").clicked()
                         {
@@ -325,8 +398,20 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             }
         });
 
+    if keep_dangerous {
+        state.keep_pending_dangerous_download();
+    }
+    if discard_dangerous {
+        state.discard_pending_dangerous_download();
+    }
     if let Some(verb) = action {
         state.dispatch_download_verb(verb);
+    }
+    if let Some(id) = removed {
+        state.dismiss_download(&id);
+    }
+    if clear_all {
+        state.dismiss_all_downloads();
     }
 }
 
