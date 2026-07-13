@@ -702,7 +702,8 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
     );
     assert_eq!(
         ctx.style().visuals.widgets.active.bg_fill,
-        Style::ACCENT_MESH
+        Style::pressed_fill(Style::ACCENT_MESH),
+        "the pressed fill re-tinted to the darkened chosen accent"
     );
 }
 

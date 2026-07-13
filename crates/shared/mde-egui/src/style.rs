@@ -350,16 +350,25 @@ impl Style {
         // it, while a bright accent ring keeps the pressed state unmistakably
         // accent-coloured. Opaque (blend, not `gamma_multiply`, which would fade the
         // alpha into a translucent wash like `selection.bg_fill` above).
-        let pressed = Self::blend(accent, Self::BG, Self::PRESSED_FILL_DARKEN);
+        let pressed = Self::pressed_fill(accent);
         v.widgets.active.bg_fill = pressed;
         v.widgets.active.weak_bg_fill = pressed;
         v.widgets.active.bg_stroke = Stroke::new(1.0, accent_hi);
     }
 
+    /// The pressed/active **fill** for an accent: the accent darkened toward
+    /// [`BG`](Self::BG) so the bright pressed label ([`TEXT_STRONG`](Self::TEXT_STRONG),
+    /// which is also egui's `strong_text_color`) stays WCAG AA legible on it for every
+    /// selectable accent. The canonical derivation, so a caller (or a test) never
+    /// re-hardcodes the darken factor. See [`accent_visuals`](Self::accent_visuals).
+    #[must_use]
+    pub fn pressed_fill(accent: Color32) -> Color32 {
+        Self::blend(accent, Self::BG, Self::PRESSED_FILL_DARKEN)
+    }
+
     /// Fraction the pressed/active fill is darkened toward [`BG`](Self::BG) from the
-    /// live accent (see [`accent_visuals`](Self::accent_visuals)). Chosen so the
-    /// bright pressed label clears WCAG AA body contrast on EVERY selectable accent
-    /// (verified by `pressed_accent_text_stays_wcag_legible`).
+    /// live accent. Chosen so the bright pressed label clears WCAG AA body contrast on
+    /// EVERY selectable accent (verified by `pressed_accent_text_stays_wcag_legible`).
     const PRESSED_FILL_DARKEN: f32 = 0.5;
 
     /// Opaque linear blend of two colours: `t == 0` is `a`, `t == 1` is `b`. Keeps
@@ -724,7 +733,7 @@ mod tests {
         ];
         for (name, accent) in accents {
             // The pressed label is TEXT_STRONG over the darkened accent fill.
-            let fill = Style::blend(accent, Style::BG, Style::PRESSED_FILL_DARKEN);
+            let fill = Style::pressed_fill(accent);
             let ratio = wcag_contrast_ratio(Style::TEXT_STRONG, fill);
             assert!(
                 ratio >= AA_BODY,
@@ -1055,7 +1064,7 @@ mod tests {
         // with a bright pressed label — the same colour egui reuses for strong text.
         assert_eq!(
             ctx.style().visuals.widgets.active.bg_fill,
-            Style::blend(Style::ACCENT, Style::BG, Style::PRESSED_FILL_DARKEN)
+            Style::pressed_fill(Style::ACCENT)
         );
         assert_eq!(
             ctx.style().visuals.widgets.active.fg_stroke.color,
@@ -1076,7 +1085,7 @@ mod tests {
         assert_eq!(s.visuals.hyperlink_color, Style::ACCENT_MESH);
         assert_eq!(
             s.visuals.widgets.active.bg_fill,
-            Style::blend(Style::ACCENT_MESH, Style::BG, Style::PRESSED_FILL_DARKEN)
+            Style::pressed_fill(Style::ACCENT_MESH)
         );
         assert_eq!(
             s.visuals.widgets.hovered.bg_stroke.color,
