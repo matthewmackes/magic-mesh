@@ -110,6 +110,96 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         });
 }
 
+/// The session-only History drawer (B3): most-recent-first visits, click to
+/// navigate, Clear to forget. In-memory only — nothing here is persisted.
+pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.history_open {
+        return;
+    }
+    let mut open_url: Option<String> = None;
+    let mut clear = false;
+    let mut close = false;
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("History")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new("this session only")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Close history")
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    if !state.history.is_empty()
+                        && ui
+                            .small_button("Clear")
+                            .on_hover_text("Forget this session's history")
+                            .clicked()
+                    {
+                        clear = true;
+                    }
+                });
+            });
+            if state.history.is_empty() {
+                ui.label(
+                    RichText::new("No pages visited this session")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for visit in state.history.visits() {
+                        let label = if visit.title.trim().is_empty() {
+                            visit.url.clone()
+                        } else {
+                            visit.title.clone()
+                        };
+                        let elided = if label.chars().count() > 72 {
+                            format!("{}\u{2026}", label.chars().take(71).collect::<String>())
+                        } else {
+                            label
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(elided).size(Style::SMALL))
+                                    .frame(false),
+                            )
+                            .on_hover_text(visit.url.clone())
+                            .clicked()
+                        {
+                            open_url = Some(visit.url.clone());
+                        }
+                    }
+                });
+        });
+    if close {
+        state.history_open = false;
+    }
+    if clear {
+        state.history.clear();
+    }
+    if let Some(url) = open_url {
+        state.load_target(url);
+        state.history_open = false;
+    }
+}
+
 pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.downloads_open {
         return;
