@@ -1838,33 +1838,65 @@ fn search_field(
 /// (case-insensitive), best match first: a label *prefix* hit (rank 0)
 /// outranks a label *substring* hit (rank 1), which outranks a hit on the
 /// surface's *group name* only (rank 2 — so typing a category like "media"
-/// still surfaces its members); ties keep [`Surface::ALL`] order, so the
-/// ranking is stable and predictable, never RNG. A surface that matches
-/// nowhere is dropped; an empty/whitespace query yields no matches (the caller
-/// then shows the full grouped grid instead). Pure over the static surface
-/// tables — unit-tested without a GPU, and the ONE authority the render +
-/// keyboard both read so the painted list and Enter's target can't diverge.
+/// still surfaces its members), which outranks a *fuzzy subsequence* hit on the
+/// label (rank 3 — the query's chars appear in order but not contiguous, so
+/// "edtr" still finds Editor and "meshmp" still finds Mesh Map). The fuzzy tier
+/// is purely additive below the three exact tiers, so no prefix/substring
+/// result is displaced; among fuzzy hits the tighter match wins ([`fuzzy_cost`]
+/// orders by fewer gaps then earlier start). Ties within any tier keep
+/// [`Surface::ALL`] order, so the ranking is stable and predictable, never RNG.
+/// A surface that matches nowhere is dropped; an empty/whitespace query yields
+/// no matches (the caller then shows the full grouped grid instead). Pure over
+/// the static surface tables — unit-tested without a GPU, and the ONE authority
+/// the render + keyboard both read so the painted list and Enter's target can't
+/// diverge.
 fn search_matches(query: &str) -> Vec<Surface> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return Vec::new();
     }
-    let mut scored: Vec<(u8, usize, Surface)> = Vec::new();
+    // The fuzzy cost `(span, start)` only discriminates within the fuzzy tier;
+    // the three exact tiers all carry the neutral `(0, 0)` so their tie-break
+    // stays exactly the old `Surface::ALL` index order.
+    let mut scored: Vec<(u8, (usize, usize), usize, Surface)> = Vec::new();
     for (idx, surface) in Surface::ALL.iter().copied().enumerate() {
         let label = surface.label().to_lowercase();
-        let rank = if label.starts_with(&q) {
-            0
+        let (rank, cost) = if label.starts_with(&q) {
+            (0, (0, 0))
         } else if label.contains(&q) {
-            1
+            (1, (0, 0))
         } else if tile_group_label(surface).to_lowercase().contains(&q) {
-            2
+            (2, (0, 0))
+        } else if let Some(cost) = fuzzy_cost(&label, &q) {
+            (3, cost)
         } else {
             continue;
         };
-        scored.push((rank, idx, surface));
+        scored.push((rank, cost, idx, surface));
     }
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, s)| s).collect()
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    scored.into_iter().map(|(.., s)| s).collect()
+}
+
+/// Case-insensitive *fuzzy subsequence* score of `q` against `label` (both
+/// already lowercased). Returns `Some((span, start))` when every char of `q`
+/// occurs in `label` in order (greedy, leftmost) — `span` = the last matched
+/// index minus the first, so a tighter match (fewer intervening gaps) scores
+/// lower, and `start` = the first matched index, breaking a span tie toward the
+/// earlier match. `None` when `q` is not a subsequence of `label`. Surface
+/// labels are ASCII, so byte offsets equal char positions here; empty `q` never
+/// reaches this helper ([`search_matches`] returns early) and would yield
+/// `None` regardless.
+fn fuzzy_cost(label: &str, q: &str) -> Option<(usize, usize)> {
+    let mut haystack = label.char_indices();
+    let mut first: Option<usize> = None;
+    let mut last = 0;
+    for needle in q.chars() {
+        let (at, _) = haystack.by_ref().find(|&(_, c)| c == needle)?;
+        first.get_or_insert(at);
+        last = at;
+    }
+    first.map(|start| (last - start, start))
 }
 
 /// Which [`TILE_GROUPS`] group a surface sits in (its label). Every
@@ -3313,6 +3345,73 @@ mod tests {
         assert!(
             by_i.len() > 1 && by_i.contains(&Music),
             "substring matches are still included, just ranked below the prefix"
+        );
+    }
+
+    #[test]
+    fn fuzzy_subsequence_finds_labels_no_substring_reaches() {
+        // SEARCH-fuzzy: the query's chars appear in ORDER but not contiguous, so
+        // the old substring tiers found nothing — the 4th tier does.
+        use Surface::{Editor, MeshView};
+        assert!(
+            super::search_matches("edtr").contains(&Editor),
+            "'edtr' is a subsequence of 'Editor' (e-d-i-t-o-r), so it fuzzy-matches"
+        );
+        assert!(
+            super::search_matches("meshmp").contains(&MeshView),
+            "'meshmp' is a subsequence of 'Mesh Map' across the space, so it fuzzy-matches"
+        );
+        assert!(
+            super::search_matches("mm").contains(&MeshView),
+            "'mm' is a subsequence of 'Mesh Map' (the two m's), so it fuzzy-matches"
+        );
+    }
+
+    #[test]
+    fn exact_prefix_still_outranks_a_fuzzy_hit() {
+        use Surface::{Bookmarks, Browser, Editor};
+        // The task's literal example: an exact PREFIX leads its result list, so
+        // the fuzzy tier never displaces it.
+        assert_eq!(
+            super::search_matches("edi").first(),
+            Some(&Editor),
+            "'edi' is a prefix of 'Editor' — the prefix hit still leads"
+        );
+        // A query carrying BOTH an exact hit and a fuzzy-only hit: the prefix
+        // ('Bookmarks') leads and the fuzzy subsequence ('Browser' = b..o, not a
+        // substring of "browser") is included but pinned to the bottom.
+        let bo = super::search_matches("bo");
+        assert_eq!(bo.first(), Some(&Bookmarks), "the label-prefix hit leads");
+        assert_eq!(
+            bo.last(),
+            Some(&Browser),
+            "the fuzzy-only hit is kept but ranks below every exact tier"
+        );
+    }
+
+    #[test]
+    fn a_query_matching_nothing_even_fuzzily_returns_empty() {
+        // No label contains a 'q' at all, so not even the fuzzy tier bites.
+        assert!(super::search_matches("qq").is_empty());
+        // Order matters: 'rotide' holds Editor's letters but out of order, so it
+        // is NOT a subsequence — an honest no-match, not a fuzzy false positive.
+        assert!(
+            super::search_matches("rotide").is_empty(),
+            "fuzzy matching is order-sensitive, not a bag-of-chars test"
+        );
+    }
+
+    #[test]
+    fn fuzzy_tie_break_prefers_the_tighter_match() {
+        use Surface::{Browser, Storage};
+        // 'sr' fuzzy-matches both 'Storage' (s..r, span 3) and 'Browser'
+        // (s..r, span 2). Neither is a substring, so both land in the fuzzy
+        // tier; the tighter (fewer-gaps) 'Browser' must sort first even though
+        // 'Storage' starts earlier.
+        assert_eq!(
+            super::search_matches("sr"),
+            vec![Browser, Storage],
+            "among fuzzy hits the tighter match (fewer gaps) leads"
         );
     }
 
