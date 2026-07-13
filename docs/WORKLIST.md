@@ -4244,7 +4244,7 @@ Plan: `.claude/plans/snappy-discovering-sphinx.md`; design: `docs/design/win10-t
 - [x] Phase C — depth/focus/motion adopted across 17 surfaces (4 farm-fanout waves, integration-green)
 - [x] Phase D — design-lock docs reconciled · F44 RPM `12.0.0-1` cut · **deployed + live-verified on seat 172.20.0.15** (DRM shell up, `"drm":true`)
 - [~] B5-rest — Win10 tray recompose. **DONE (origin `b309518b`, 2026-07-12): action-center→`Surface::Chat` cell + show-desktop nub** (routing + geometry-non-overlap tests, 1110/1110 green, 0 style leaks). **Remaining (visual — need live eyes on .15 after a redeploy):** ▲ overflow flyout · auto-hide bottom-edge reveal · running-icons-only · VDI hover thumbnails · Start-grid restyle (B6).
-- [ ] mesh-enroll seat .15 into `magic-mesh` (`mackesd join`) — currently standalone
+- [x] mesh-enroll seat .15 into `magic-mesh` — DONE 2026-07-12: `peer:Basement-Test-Workstation` at overlay `10.42.0.8`, boot-durable, bidirectionally verified vs LH1 (`mackesd add-peer` on the CA → `mackesd join` on .15).
 
 ### BROWSER-CHROME — pixel-faithful stock Chrome chrome over real Chromium (CEF)
 Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSER-DD**. Not started.
