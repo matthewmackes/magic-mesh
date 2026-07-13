@@ -1,13 +1,14 @@
 use super::{
-    clock_cell_id, clock_date_text, desktop_source_row_id, desktop_source_toggle_id, dock,
-    focus_ring_rect, grade_band_height, grade_overflow_id, grade_row_id, group_height,
-    gutter_width, notification_rail, notification_rail_with_sources, overflow_more_id,
-    pick_cell_id, power_item_id, rail_more_id, session_entry_id, start_cell_id,
-    status_detail_toggle_id, surface_badge_id, surface_context_item_id, sys_cell_id, sys_cell_tint,
-    transfer_badge_id, visible_group_count, DesktopRailSource, DockRequest, DockState, PowerItem,
-    PowerMenu, SessionRailEntry, Surface, SurfaceContextItem, SysCell, CELL_W, DOCK_AREA, DOCK_W,
-    FOCUS_RING_W, GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H,
-    NOTIFICATION_RAIL_H, POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
+    action_center_cell_id, clock_cell_id, clock_date_text, desktop_source_row_id,
+    desktop_source_toggle_id, dock, focus_ring_rect, grade_band_height, grade_overflow_id,
+    grade_row_id, group_height, gutter_width, notification_rail, notification_rail_with_sources,
+    overflow_more_id, pick_cell_id, power_item_id, rail_more_id, session_entry_id,
+    show_desktop_nub_id, start_cell_id, status_detail_toggle_id, surface_badge_id,
+    surface_context_item_id, sys_cell_id, sys_cell_tint, transfer_badge_id, visible_group_count,
+    DesktopRailSource, DockRequest, DockState, PowerItem, PowerMenu, SessionRailEntry, Surface,
+    SurfaceContextItem, SysCell, CELL_W, DOCK_AREA, DOCK_W, FOCUS_RING_W, GRADE_MAX_ROWS, GROUPS,
+    ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H, NOTIFICATION_RAIL_H, POWER_MENU, SYSTEM_QUAD,
+    SYS_QUAD_ICON,
 };
 use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegments};
@@ -1409,6 +1410,180 @@ fn win10_the_taskbar_is_a_fixed_48px_height_across_densities() {
     );
 }
 
+// ── WIN10-HYBRID #31: the Win10 tray affordances (action-center + nub) ─────
+// The right cluster grows two Win10 idioms: an **action-center** cell that
+// routes to the unified Chat notification feed, and a far-right **show-desktop
+// nub** that minimizes to the Desktop surface. These pin their routing targets
+// + the non-overlap contract that keeps them clear of the running-sessions run.
+
+/// Press-then-release a primary click at `pos` over the driven bottom rail,
+/// mirroring `clicking_the_pin_toggle_pins_the_dock_open` — prime, move+press
+/// one frame, release the next.
+fn click_rail_cell(ctx: &egui::Context, s: &mut DockState, pos: egui::Pos2, sz: egui::Vec2) {
+    let press = egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    };
+    let release = egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    };
+    drive_vdock(ctx, s, vec![egui::Event::PointerMoved(pos), press], sz);
+    drive_vdock(ctx, s, vec![release], sz);
+}
+
+#[test]
+fn win10_hybrid_31_the_action_center_cell_routes_to_chat() {
+    // The action-center tray cell IS the Win10 notification button: a click
+    // routes the shell body to the unified Chat feed (NOTIFY-CHAT).
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle(); // reveal the rail so its cells mount
+    let sz = egui::vec2(1280.0, 800.0);
+    // Prime two frames so egui registers the cell's rect.
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    assert_ne!(s.active, Surface::Chat, "start off the Chat surface");
+    let center = ctx
+        .read_response(action_center_cell_id())
+        .expect("the action-center cell is registered")
+        .rect
+        .center();
+    click_rail_cell(&ctx, &mut s, center, sz);
+    assert_eq!(
+        s.active,
+        Surface::Chat,
+        "clicking the action-center cell opens the Chat notification feed"
+    );
+}
+
+#[test]
+fn win10_hybrid_31_the_show_desktop_nub_routes_to_desktop() {
+    // The far-right show-desktop nub minimizes to the Desktop (VDI) surface,
+    // Win10's "show desktop" corner. The shell opens on the Workbench, so a nub
+    // click is an observable route away from it.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle(); // reveal the rail so its cells mount
+    let sz = egui::vec2(1280.0, 800.0);
+    // Prime two frames so egui registers the nub's rect (matching the pin/action
+    // tests — one frame is not enough for the click to land).
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    assert_ne!(
+        s.active,
+        Surface::Desktop,
+        "the shell opens on the Workbench, not the Desktop"
+    );
+    let center = ctx
+        .read_response(show_desktop_nub_id())
+        .expect("the show-desktop nub is registered")
+        .rect
+        .center();
+    click_rail_cell(&ctx, &mut s, center, sz);
+    assert_eq!(
+        s.active,
+        Surface::Desktop,
+        "clicking the show-desktop nub minimizes to the Desktop surface"
+    );
+}
+
+#[test]
+fn win10_hybrid_31_the_new_tray_cells_do_not_overlap_the_sessions_run() {
+    // The action-center cell + the show-desktop nub extend the right cluster;
+    // `right_cluster_w` must grow to match so the running-sessions run (bounded by
+    // `session_right`) never slides under them — the same overlap contract the
+    // clock/pips/detail already rely on. Driven at the locked 48px taskbar height.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    assert!(
+        (s.rail_height() - 48.0).abs() < f32::EPSILON,
+        "the default taskbar is the locked 48px"
+    );
+    let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        3, // unread > 0 → the action-center wears its accent cue
+        true,
+        vec![entry.clone()],
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let session = ctx
+        .read_response(session_entry_id(0, &entry))
+        .expect("session entry registered")
+        .rect;
+    let status_detail = ctx
+        .read_response(status_detail_toggle_id())
+        .expect("status-detail toggle registered")
+        .rect;
+    let action = ctx
+        .read_response(action_center_cell_id())
+        .expect("action-center registered")
+        .rect;
+    let nub = ctx
+        .read_response(show_desktop_nub_id())
+        .expect("show-desktop nub registered")
+        .rect;
+    let pin = ctx
+        .read_response(egui::Id::new("vdock-pin"))
+        .expect("pin registered")
+        .rect;
+    let clock = ctx
+        .read_response(clock_cell_id())
+        .expect("clock registered")
+        .rect;
+
+    // The leftmost right-cluster cell is the status-detail toggle; the sessions
+    // run must end to its left (session_right reserves the WHOLE cluster).
+    assert!(
+        session.right() <= status_detail.left() + 1.0,
+        "the sessions run clears the leftmost right-cluster cell"
+    );
+    assert!(
+        session.right() <= action.left() + 1.0,
+        "the sessions run never slides under the action-center cell"
+    );
+    // The new cells slot in cleanly: clock · action-center · pin · nub, and the
+    // nub hugs the taskbar's very right edge (Win10's show-desktop corner).
+    assert!(
+        clock.right() <= action.left() + 1.0,
+        "the action-center sits right of the clock"
+    );
+    assert!(
+        action.right() <= pin.left() + 1.0,
+        "the action-center sits left of the pin"
+    );
+    assert!(
+        pin.right() <= nub.left() + 1.0,
+        "the show-desktop nub trails past the pin"
+    );
+    assert!(
+        (nub.right() - sz.x).abs() < 1.0,
+        "the show-desktop nub is pinned to the taskbar's very right edge"
+    );
+    // All on the one 48px row.
+    for (label, r) in [("action-center", action), ("nub", nub)] {
+        assert!(
+            (r.center().y - session.center().y).abs() < 2.0,
+            "{label} shares the taskbar row"
+        );
+    }
+}
+
 // ── WIN7-DESKTOP-1 regression fix (post-WIN7-SHOT-1) ────────────────────
 // Every rail test above this point — including WIN7-1's own two — asserts
 // cells RELATIVE to each other (left-to-right order, same-row sharing via
@@ -1618,7 +1793,13 @@ fn navbar7_bottom_rail_more_popup_keeps_overflow_sessions_reachable() {
         NodeGrades::default(),
         StatusSegments::default(),
     );
-    let sz = egui::vec2(380.0, 720.0);
+    // A constrained rail: four sessions cannot all fit, so the trailing one folds
+    // into the More popup. WIN10-HYBRID #31 widened the right cluster by 60px (the
+    // action-center cell + the show-desktop nub), so the width that leaves the
+    // sessions run genuinely constrained — yet still clear of the cluster so the
+    // More cell stays clickable — moved out from the old 380px (which now clamps
+    // the sessions run to zero width, sliding the More cell under the tray pips).
+    let sz = egui::vec2(640.0, 720.0);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
 

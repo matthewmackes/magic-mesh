@@ -1173,8 +1173,22 @@ pub fn notification_rail_with_sources(
             let tray_icon_w = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
             let status_w = tray_icon_w * status::StatusSegment::ALL.len() as f32;
             let clock_w = rail_h * 2.2;
-            let right_cluster_w =
-                rail_h + clock_w + status_w + Style::SP_XS + rail_h + Style::SP_XS;
+            // WIN10-HYBRID #31 — the right cluster now also carries the Win10
+            // **action-center** cell (a `rail_h`-wide Chat launcher + its `SP_XS`
+            // gap) and the far-right **show-desktop nub** (`SP_S` wide). Both
+            // widths are folded in here so `session_right` keeps reserving the
+            // WHOLE cluster and the running-sessions run can never grow under the
+            // new cells (the same overlap contract the clock/pips/detail already
+            // rely on — see the geometry test in `tests.rs`).
+            let right_cluster_w = rail_h
+                + clock_w
+                + status_w
+                + Style::SP_XS
+                + rail_h
+                + Style::SP_XS
+                + rail_h
+                + Style::SP_XS
+                + Style::SP_S;
             let session_right = (local.right() - Style::SP_XS - right_cluster_w).max(x);
             if state.status.sessions.is_empty() {
                 if rail_icon(
@@ -1242,11 +1256,29 @@ pub fn notification_rail_with_sources(
                     state.rail_more_open = false;
                 }
             }
-            // The pin is the taskbar's rightmost control (trailing the clock, see
-            // the lock #3 note above) — this shell's own auto-hide affordance, not
-            // one of the four locked taskbar segments.
-            let mut tray_x = local.right() - Style::SP_XS - rail_h;
+            // WIN10-HYBRID #31 — the far-right **show-desktop nub**: Win10's
+            // corner "minimize to desktop" sliver, a thin hairline-separated strip
+            // pinned to the taskbar's very right edge (right of the pin).
+            let nub_rect = egui::Rect::from_min_size(
+                egui::pos2(local.right() - Style::SP_S, local.top()),
+                egui::vec2(Style::SP_S, rail_h),
+            );
+            if show_desktop_nub(ui, nub_rect, state) {
+                clicked = true;
+            }
+            // The pin is the taskbar's rightmost CELL (trailing the clock, see the
+            // lock #3 note above) — this shell's own auto-hide affordance, not one
+            // of the four locked taskbar segments. It now sits just left of the nub.
+            let mut tray_x = local.right() - Style::SP_S - rail_h;
             if pin_toggle(ui, cell(tray_x), state) {
+                clicked = true;
+            }
+            // WIN10-HYBRID #31 — the **action-center** cell (Win10's tray
+            // notification button): routes the body to the unified Chat feed
+            // (Chat IS the notification interface here, NOTIFY-CHAT). Sits
+            // immediately left of the pin.
+            tray_x -= rail_h + Style::SP_XS;
+            if action_center_cell(ui, cell(tray_x), state) {
                 clicked = true;
             }
             tray_x -= clock_w;
@@ -1795,6 +1827,112 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
     );
     if resp.clicked() {
         state.status_panel_open = !state.status_panel_open;
+        return true;
+    }
+    false
+}
+
+/// Stable id for the taskbar **action-center** cell (WIN10-HYBRID #31) — the
+/// Win10 tray "action center" affordance. Keyed by its own tag so it never
+/// collides with the picker's Chat launcher ([`pick_cell_id`]) or the bare
+/// [`rail_icon`] Chat glyph.
+fn action_center_cell_id() -> egui::Id {
+    egui::Id::new(("bottom-rail-action-center", IconId::Chat.name()))
+}
+
+/// The taskbar **action-center** cell (WIN10-HYBRID #31) — Win10's tray
+/// notification button. Chat IS this shell's unified notification feed
+/// (NOTIFY-CHAT: every mesh host is a contact, its alerts are its messages), so a
+/// click routes the body to [`Surface::Chat`]. It wears the ACCENT tint when Chat
+/// is already the active surface OR there are unread events (the "you have
+/// notifications" cue), and otherwise follows the shared tray-cell hover/rest
+/// idiom. Every colour is a [`Style`] token (§4). Returns `true` on a click.
+fn action_center_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(rect, action_center_cell_id(), egui::Sense::click());
+    let selected = state.active == Surface::Chat;
+    let unread = state.status.unread > 0;
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if selected || unread {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Chat, edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, edge),
+            uv,
+            egui::Color32::WHITE,
+        );
+    }
+    paint_rail_label(ui, rect, "Notifications", tint);
+    paint_focus_ring(&painter, rect, resp.has_focus());
+    install_cell_accessibility(
+        ui.ctx(),
+        action_center_cell_id(),
+        "Action center",
+        if unread {
+            "Unread notifications"
+        } else {
+            "No unread notifications"
+        },
+        rect,
+    );
+    if resp.clicked() {
+        state.active = Surface::Chat;
+        return true;
+    }
+    false
+}
+
+/// Stable id for the taskbar **show-desktop nub** (WIN10-HYBRID #31).
+fn show_desktop_nub_id() -> egui::Id {
+    egui::Id::new("bottom-rail-show-desktop")
+}
+
+/// The **show-desktop nub** (WIN10-HYBRID #31) — Win10's far-right-corner "show
+/// desktop" sliver: a thin ([`Style::SP_S`]-wide) hairline-separated vertical
+/// strip pinned to the taskbar's very right edge. A click minimizes to the
+/// desktop by routing the body to the [`Surface::Desktop`] VDI surface (this
+/// shell's "show desktop" target). The hairline gives it the Win10 corner
+/// separator; a subtle hover wash gives it presence. Every colour is a [`Style`]
+/// token (§4). Returns `true` on a click.
+fn show_desktop_nub(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(rect, show_desktop_nub_id(), egui::Sense::click());
+    let painter = ui.painter().clone();
+    if resp.hovered() {
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, Style::SURFACE_HI);
+    }
+    // The Win10 hairline that fences the show-desktop corner off from the tray.
+    painter.vline(
+        rect.left(),
+        rect.top()..=rect.bottom(),
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+    paint_focus_ring(&painter, rect, resp.has_focus());
+    install_cell_accessibility(
+        ui.ctx(),
+        show_desktop_nub_id(),
+        "Show desktop",
+        if state.active == Surface::Desktop {
+            "Desktop shown"
+        } else {
+            "Minimize to desktop"
+        },
+        rect,
+    );
+    if resp.clicked() {
+        state.active = Surface::Desktop;
         return true;
     }
     false
