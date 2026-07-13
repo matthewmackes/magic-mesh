@@ -4278,3 +4278,17 @@ The **Claude Code Proxy** web-console plans target a different project and are i
 of this worklist: `smooth-rolling-perlis.md` (Sparkle GUI makeover), `giggly-humming-shore.md`
 (installer system), `status-foamy-russell.md` (status/dark-mode). The `*-agent-*.md` files are
 ephemeral subagent analysis artifacts, also excluded.
+
+## LAUNCHER-RESTRUCTURE — dedupe + re-organize the app/workspace menu (operator /plan 2026-07-12, 50-Q; plan: .claude/plans/snappy-discovering-sphinx.md)
+
+Operator review: "verify one launcher per app/workspace, no duplication; restructure the menu." Audit found the live Start-grid already enforced one-tile-per-surface (compile-guarded); the real duplication was the **retired VDOCK picker** (a full 2nd launcher for all 18 surfaces, never rendered since B4). Executed via a Workflow (3 file-disjoint lanes) + salvage.
+- [x] **DEDUPE-1** (origin `5f4c18d0`) — deleted the dead vertical `dock()`/picker/`system_quad`(-542 lines)/power-menu/grade-band + the dead `DockRequest::Lock/Power` path; `TILE_GROUPS` (start_menu) is now the SOLE surface taxonomy. ~40 dead vertical-dock tests pruned; live taskbar suite kept.
+- [x] **DEDUPE-2** (`5f4c18d0`) — removed Desktop's redundant dedicated taskbar cell (Sessions + nub + Start tile cover it).
+- [x] **#31 tray** (`5f4c18d0`) — action-center→Chat, show-desktop nub, icons-only sessions, ▲ overflow, auto-hide reveal.
+- [x] **MENU-1** (`3ad01aa7`) — Start-menu pinning/favorites + arrow-key grid nav + per-tile right-click.
+- [x] **REACH-1** (`34a77a8b`) — `shell/goto` verbs for the 6 previously-unreachable surfaces (Explorer/Media/Terminal/Editor/Phones/About); every `Surface::ALL` now resolves by name.
+- [x] **SEARCH-fuzzy** (`ea2d8a30`) — typo-tolerant subsequence ranking tier for Start-menu search (below exact prefix/substring).
+- [~] **REACH-2** — Super+Shift+number → surfaces 10-17 (all 18 keyboard-reachable); farm worker in flight.
+- [ ] **SEARCH-omnibox** (deferred epic) — the full unified omnibox (apps + files + mesh + AI-ranked); needs its own plan (file indexing + peer data + main.rs input architecture). Survey answer was "full unified omnibox".
+
+**Live:** the whole restructure (bar REACH-2/omnibox) is deployed + verified on seat .15 (`12.0.0-1`, DRM shell, mesh 10.42.0.8). Integrated master verify: 1074 passed, 0 leaks.
