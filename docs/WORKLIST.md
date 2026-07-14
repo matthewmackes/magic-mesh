@@ -4248,7 +4248,7 @@ Plan: `.claude/plans/snappy-discovering-sphinx.md`; design: `docs/design/win10-t
 
 ### BROWSER-CHROME — pixel-faithful stock Chrome chrome over real Chromium (CEF)
 Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSER-DD**. Started.
-- [>] E1 (gate) — live CEF ABI validation on a seat (`mde-web-cef render-once`
+- [x] E1 (gate) — live CEF ABI validation on a seat (`mde-web-cef render-once`
   → non-garbage BGRA frame); gate runtime activation on it. **Render gate
   command fixed/proven 2026-07-14:** `mde-web-cef render-once` now initializes
   CEF and runs the one-shot windowless render path directly instead of requiring
@@ -4261,10 +4261,20 @@ Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSE
   `.15` proof used the new helper+bridge binaries against the installed
   `/opt/mde/cef` bundle and emitted the same `CEF_INITIALIZE_OK` +
   `CEF_BROWSER_PAINT_READY ... view=640x360 last_paint=640x360`; the installed
-  DRM shell on `.15` was active with `NRestarts=0`. Remaining before E1 closes:
-  redeploy the installed helper/runtime-setup package and run the packaged
-  activation path on the seat, rather than relying on copied debug binaries for
-  the proof.
+  DRM shell on `.15` was active with `NRestarts=0`. **Packaged F44 seat closure
+  2026-07-14:** after `f3c8d882` and `b4dad608`, cut a Fedora 44 full RPM on the
+  farm/container path at `/root/mcnf-release-artifacts/magic-mesh-12.0.0-1.f44.x86_64.rpm`
+  (SHA-256 `cd806b2e10affa66f482bffb94c5dcc223ec303d7bd0d083363632917cf7f5b7`,
+  build date `Tue Jul 14 16:19:12 2026`) and reinstalled it on `.15` with
+  `dnf --disablerepo=magic-mesh reinstall`. Installed payload contains
+  `/usr/bin/mde-web-cef`, `/usr/libexec/mackesd/mde-web-cef-renderer`,
+  `/usr/libexec/mackesd/install-cef-runtime`, and the shell service with
+  `Delegate=yes`. Running packaged `/usr/libexec/mackesd/install-cef-runtime`
+  on `.15` ended with `install-cef-runtime: render smoke passed`. Installed
+  `/usr/bin/mde-web-cef render-once` emitted `CEF_INITIALIZE_OK` +
+  `CEF_BROWSER_PAINT_READY` for both a data URL (`640x360`) and
+  `https://example.com/` (`800x600`). Restarted `mde-shell-egui.service`; it is
+  active/running with `NRestarts=0` and `Delegate=yes`.
 - [ ] E2 — provision the 311 MB CEF runtime bundle on seats; flip the default engine to CEF (Servo stays fallback)
 - [ ] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1
 - [ ] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface
