@@ -194,6 +194,12 @@ else
   echo "[f43] building the Chromium/CEF browser helper + renderer bridge (mde-web-cef)"
   cargo build --release $MDE_RPM_LOCKED \
       --manifest-path crates/desktop/mde-web-cef/Cargo.toml
+  # BROWSER-CHROME — ship the shell-equivalent CEF wire verifier. This is not a
+  # browser engine; it is the operational proof harness for `mde-web-cef tab`
+  # through the same mde-web-preview-client live-helper socket path the shell uses.
+  echo "[f43] building the CEF browser wire verifier (cef-verify)"
+  cargo build --release $MDE_RPM_LOCKED \
+      -p mde-web-preview-client --features live-helper --bin cef-verify
   # E12-3 DRM + BOOKMARKS-6 live path — re-link the ONE shell binary with the
   # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat,
   # `live-helper` so the Browser surface really spawns the sandboxed

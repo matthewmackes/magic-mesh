@@ -460,6 +460,11 @@ assets = [
     # browser surface).
     { source = "target/release/mde-web-cef",         dest = "/usr/bin/mde-web-cef",         mode = "755" },
     { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
+    # BROWSER-CHROME — operator/verifier harness for the shell-equivalent CEF tab
+    # path. It spawns `mde-web-cef tab` through `mde-web-preview-client`'s
+    # live-helper socket path and proves nav/title/paint events arrive over the
+    # same wire the shell consumes.
+    { source = "target/release/cef-verify",          dest = "/usr/libexec/mackesd/cef-verify", mode = "755" },
     # BROWSER-DD-1 — pinned Chromium/CEF runtime provisioning. The 311 MB CEF
     # binary payload is fetched/verified by the first-boot service, not embedded
     # directly in the RPM; the manifest pins the official Linux64 minimal tarball

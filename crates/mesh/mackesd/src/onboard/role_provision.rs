@@ -511,6 +511,10 @@ mod tests {
                 "target/release/mde-web-cef-renderer",
                 "/usr/libexec/mackesd/mde-web-cef-renderer",
             ),
+            (
+                "target/release/cef-verify",
+                "/usr/libexec/mackesd/cef-verify",
+            ),
         ] {
             assert!(
                 base_assets.iter().any(|asset| {
@@ -850,6 +854,13 @@ mod tests {
                 && installer.contains("CEF_BROWSER_PAINT_READY"),
             "installed CEF runtime installer must use installed manifest/cache paths and gate activation on a render smoke"
         );
+        assert!(
+            installer.contains("/usr/libexec/mackesd/cef-verify")
+                && installer.contains("VERIFY RESULT=PASS")
+                && installer.contains("VERIFY on_paint_ready")
+                && installer.contains("wire smoke passed"),
+            "installed CEF runtime installer must gate the shell-equivalent tab wire path when cef-verify is shipped"
+        );
     }
 
     #[test]
@@ -1023,8 +1034,22 @@ mod tests {
             "the CEF helper build step should be named in the RPM build log"
         );
         assert!(
+            script.contains("--bin cef-verify")
+                && script.contains("-p mde-web-preview-client --features live-helper"),
+            "full Fedora RPM builder must build the CEF wire verifier before generate-rpm"
+        );
+        assert!(
+            farm_script.contains("--bin cef-verify")
+                && farm_script.contains("-p mde-web-preview-client --features live-helper"),
+            "farm RPM builder must build the CEF wire verifier before generate-rpm"
+        );
+        assert!(
             include_str!("../../Cargo.toml").contains("mde-web-cef-renderer"),
             "the CEF renderer bridge must be built by the helper crate and shipped by the full RPM"
+        );
+        assert!(
+            include_str!("../../Cargo.toml").contains("target/release/cef-verify"),
+            "the CEF wire verifier must be shipped by the full RPM"
         );
     }
 
