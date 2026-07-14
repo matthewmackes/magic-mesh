@@ -800,8 +800,9 @@ browser engine under.
 
 1. Launch a real CEF tab on a seat with the pinned `/opt/mde/cef` bundle present
    and confirm it renders (the `CEF_OS_SANDBOX applied=1 …` line prints, then a
-   frame arrives). CEF may need a `root_cache_path`/cache dir the sandbox's
-   writable `/tmp` must satisfy — a cache-path failure would surface here.
+   frame arrives). The CEF settings now pin both `root_cache_path` and
+   `cache_path` under the sandbox's private writable `/tmp`, so this remains
+   ephemeral and cannot persist browser state into `$HOME` or `/var`.
 2. Confirm from **inside** the browser process (e.g. a `file://` probe / a
    crafted page, or `nsenter` into the renderer's mount ns) that `~/.ssh`, the
    Nebula CA (`/etc/nebula`), and `/etc/mackesd` are **NOT readable** — the core
