@@ -66,6 +66,9 @@ find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -name '*.surface.*' | grep
     && ok "seat preset installed" || bad "seat preset missing"
 grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "typed role gate present in seat unit" || bad "typed role gate missing from seat unit"
+grep -q '^Delegate=yes$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit delegates cgroups for browser sandbox caps" \
+    || bad "seat unit missing Delegate=yes for browser sandbox caps"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \

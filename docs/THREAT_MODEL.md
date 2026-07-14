@@ -737,7 +737,11 @@ factored out of Servo's `sandbox.rs` into the shared **`mde-web-sandbox`** crate
   (ptrace, the mount family, `unshare`/`setns`, module loading, `bpf`,
   `perf_event_open`, key management, `kexec`, clock-set, …);
 - **cgroup v2 memory/CPU caps** (2 GiB / ~2 cores — a higher ceiling than the
-  single-process Servo tab because the cap binds the WHOLE Chromium tree).
+  single-process Servo tab because the cap binds the WHOLE Chromium tree). The
+  shipped DRM-seat unit sets `Delegate=yes` so browser helpers can create those
+  per-tab child cgroups under the shell service; ad-hoc SSH/farm session scopes
+  that are not systemd-delegated log an honest degraded-cgroup warning while the
+  namespace/rootfs/seccomp layers still apply.
 
 **Multi-process reconciliation (the crux).** Chromium is multi-process: the
 browser process forks + re-`exec`s the renderer bridge with `--type=renderer`

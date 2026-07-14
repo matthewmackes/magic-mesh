@@ -1083,6 +1083,16 @@ mod tests {
     }
 
     #[test]
+    fn drm_seat_unit_delegates_cgroups_for_browser_sandbox_caps() {
+        let unit = include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service");
+
+        assert!(
+            unit.contains("Delegate=yes"),
+            "the DRM seat unit must delegate its cgroup subtree so browser helpers can create per-tab memory/CPU capped child cgroups"
+        );
+    }
+
+    #[test]
     fn mackesd_unit_raises_the_process_fd_budget() {
         let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
 
