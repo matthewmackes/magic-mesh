@@ -595,63 +595,54 @@ to CEF tabs, with no working mitigation beyond the (real, but narrower)
   enterprise policy `WebRtcIPHandling`); it constrains ICE candidate
   gathering to proxied/relayed transport, the correct mechanism for the
   local-IP-leak concern.
-- **Added** renderer-level removal of the JS-reachable WebRTC surface
-  (`cef_browser::webrtc_block_script`): deletes `window.RTCPeerConnection`,
-  `webkitRTCPeerConnection`, `RTCDataChannel`, `RTCSessionDescription`,
-  `RTCIceCandidate`, and `navigator.mediaDevices`/`MediaDevices.prototype`'s
+- **Added native CEF camera/microphone permission handling (2026-07-14).**
+  `CefPermissionHandler::OnRequestMediaAccessPermission` is now pinned in the
+  local ABI and bridged into the Browser's session-only permission prompt. CEF
+  receives exactly the requested device audio/video capture bitmask on allow,
+  or `0` on deny; desktop capture remains default-deny.
+- **Made browser-page WebRTC reachable in CEF by default (2026-07-14).**
+  Once the native media permission path existed, the old renderer-level WebRTC
+  remover became an operational blocker for DD-9/browser compatibility. CEF now
+  leaves `RTCPeerConnection`/`getUserMedia` reachable by default; the privacy
+  posture is the real Chromium IP-handling policy plus the explicit
+  camera/microphone permission prompt.
+- **Retained the renderer-level remover as an opt-in emergency block.**
+  Setting `MDE_CEF_WEBRTC_BLOCKED=1` restores the old best-effort JS API
+  removal (`cef_browser::webrtc_block_script`). That script still deletes
+  `window.RTCPeerConnection`, `webkitRTCPeerConnection`, `RTCDataChannel`,
+  `RTCSessionDescription`, `RTCIceCandidate`, and
+  `navigator.mediaDevices`/`MediaDevices.prototype`'s
   `getUserMedia`/`getDisplayMedia` (plus legacy vendor-prefixed
-  `getUserMedia`). Applied unconditionally — not a per-tab toggle — on every
-  `run_windowless_tab` session, on the same 250ms poll cadence and via the
-  same `cef_frame_t::execute_java_script` mechanism this codebase already
-  uses for the passkey-ceremony shim (`passkey_bridge_script`) and every
-  other renderer-side privacy/feature injection in that file.
-- **Extended the removal to every reachable frame (browser-3, 2026-07-10).**
-  The removal originally ran only in `get_main_frame`, so a page could bypass
-  it with a child iframe (its own unpatched JS context). `webrtc_block_script`
-  now parameterises the strip over a target window and `sweep`s recursively
-  through `w.frames`, and installs a `MutationObserver` to re-sweep on DOM
-  mutation so a **newly inserted same-origin iframe** is patched between poll
-  ticks. This closes the trivial same-origin child-iframe bypass.
+  `getUserMedia`), sweeping same-origin frames and late iframe insertions.
 
 ### 8.3 Accepted residual risk — defense-in-depth, not airtight
 
-Unlike a real command-line kill switch, `webrtc_block_script` is JS run
-*after* the renderer's JS context already exists, on a poll timer. This
-crate's hand-rolled CEF ABI has no `OnContextCreated`-equivalent hook (the
-mechanism that would let a script win the race against a page's own inline
-`<script>` deterministically), so:
+CEF WebRTC is now an enabled browser-compat feature, so the accepted residual
+risk has changed:
 
-- A page's own synchronous top-of-document inline script can still execute
-  and construct an `RTCPeerConnection` before the first poll tick lands (the
-  first tick fires immediately on browser creation, then every 250ms
-  thereafter — the identical structural gap this codebase already accepts
-  for the passkey bridge).
-- A fresh document commit (e.g. same-tab in-page navigation to a new origin)
-  gets an unpatched JS context until the next poll tick re-applies the shim.
-- **Cross-origin subframes remain unreachable from JS** by same-origin policy
-  (property access on them throws and is swallowed). The definitive airtight
-  fix is a native `CefPermissionHandler::OnRequestMediaAccessPermission` deny
-  and/or an ICE-layer block, but the hand-rolled pinned CEF 149 ABI exposes no
-  permission-handler or frame-enumeration vtable offset verified from the farm
-  headers, so it is not attempted here; the JS `sweep` covers the *reachable*
-  (same-origin) frames and the switch below is the backstop for the rest.
-- `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` is the backstop
-  for exactly this gap: even a same-tick `RTCPeerConnection` that wins the
-  race, or one in a cross-origin subframe, still cannot leak a raw local IP
-  over non-proxied UDP without a configured proxy.
-- Camera/mic OS-device permission for the CEF helper process is a separate,
-  still-unaudited question (§7.4 point 4) — this section covers WebRTC
-  transport/API-surface hardening only, not device-permission plumbing.
+- The local-IP-leak class is mitigated by
+  `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, not by deleting
+  the API. That switch remains load-bearing and must not be removed.
+- Camera/microphone access is user-mediated through the Browser permission
+  prompt and held session-only. A prompt denial returns `0` allowed media bits
+  to CEF.
+- The OS sandbox now exposes only the explicit local capture device nodes
+  needed for operational media (`/dev/snd`, `/dev/videoN`) when present, in
+  addition to `/dev/dri`; it still does not expose `$HOME`, `/root`, `/var`,
+  SSH/Nebula/Syncthing state, or broad `/dev`.
+- If `MDE_CEF_WEBRTC_BLOCKED=1` is used, the old JS remover is still not an
+  airtight kill switch: it runs after the JS context exists and has no
+  `OnContextCreated`-equivalent early hook. It is an emergency compatibility
+  lever, not the primary privacy guarantee.
 
 ### 8.4 Out of scope
 
 A full CEF confinement audit equivalent to §3 (Servo's `sandbox.rs`); the CEF
 OS confinement now lives in **§10** (security-1). This section documents the
-WebRTC-specific finding above, not that confinement layer. Enabling real WebRTC
-as a feature
-(BROWSER-DD-9, `docs/design/browser-dd9-webrtc-rescope.md`) is a separate,
-much larger, not-yet-started item — this fix is a hardening correctness fix
-for the *current* (WebRTC-off) posture, not a step toward shipping it.
+WebRTC-specific finding above, not that confinement layer. Full DD-9 is still
+broader than browser-page WebRTC: PiP, GPU/HW decode tuning, screen share,
+multi-party mesh conferencing, and product decisions around SIP/RTP reuse remain
+separate work.
 
 ---
 
