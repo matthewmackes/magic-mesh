@@ -314,6 +314,8 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
     let mut action: Option<TransferVerb> = None;
     let mut removed: Option<String> = None;
+    let mut open_download: Option<String> = None;
+    let mut reveal_download: Option<String> = None;
     let mut clear_all = false;
     let mut keep_dangerous = false;
     let mut discard_dangerous = false;
@@ -481,6 +483,22 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                 state.capture_notice = Some("Download link copied".to_owned());
                             }
                         }
+                        if job.state == TransferState::Done {
+                            if ui
+                                .small_button("Show")
+                                .on_hover_text("Show the completed download in its folder")
+                                .clicked()
+                            {
+                                reveal_download = Some(job.id.clone());
+                            }
+                            if ui
+                                .small_button("Open")
+                                .on_hover_text("Open the completed download")
+                                .clicked()
+                            {
+                                open_download = Some(job.id.clone());
+                            }
+                        }
                         if !job.state.is_terminal()
                             && ui.small_button("Cancel").on_hover_text("Cancel").clicked()
                         {
@@ -513,6 +531,12 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     }
     if let Some(verb) = action {
         state.dispatch_download_verb(verb);
+    }
+    if let Some(id) = open_download {
+        state.open_download(&id);
+    }
+    if let Some(id) = reveal_download {
+        state.reveal_download(&id);
     }
     if let Some(id) = removed {
         state.dismiss_download(&id);
