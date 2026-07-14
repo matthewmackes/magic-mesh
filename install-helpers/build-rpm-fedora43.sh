@@ -105,7 +105,7 @@ dnf install -y --setopt=install_weak_deps=False \
     gcc gcc-c++ cmake pkg-config git curl findutils which gzip tar xz \
     mold binutils protobuf-compiler \
     gtk3-devel alsa-lib-devel openssl-devel opus-devel \
-    mpv-libs-devel >/tmp/dnf.log 2>&1 || { tail -20 /tmp/dnf.log; exit 1; }
+    libinput-devel mpv-libs-devel >/tmp/dnf.log 2>&1 || { tail -20 /tmp/dnf.log; exit 1; }
 
 echo "[f43] installing rustup + the pinned toolchain"
 export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
