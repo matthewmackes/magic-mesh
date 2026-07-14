@@ -4275,7 +4275,16 @@ Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSE
   `/usr/bin/mde-web-cef render-once` emitted `CEF_INITIALIZE_OK` +
   `CEF_BROWSER_PAINT_READY` for both a data URL (`640x360`) and
   `https://example.com/` (`800x600`). Restarted `mde-shell-egui.service`; it is
-  active/running with `NRestarts=0` and `Delegate=yes`.
+  active/running with `NRestarts=0` and `Delegate=yes`. **Render-gate shutdown
+  hardening 2026-07-14:** a farm rerun found `render-once` could paint
+  (`CEF_BROWSER_PAINT_READY`) and still exit 139 during teardown; the bridge now
+  installs `cef_life_span_handler_t::on_before_close` and waits for that callback
+  before `cef_shutdown`. Patched `.50` proof: `render-once` against
+  `/home/mm/mde-cef-active` rendered `https://example.com/` at `800x600` and
+  exited 0; `cef-verify` delivered three `1280x800` frames plus URL/title over
+  the shell `WebSession` wire and returned `VERIFY RESULT=PASS`; the
+  `mde-shell-egui` live Browser UI smoke with `MDE_CEF_LIVE_UI_SMOKE=1` passed
+  against the same patched helper/runtime.
 - [x] E2 — provision the 311 MB CEF runtime bundle on seats; flip the default engine to CEF (Servo stays fallback). **Packaged default closure 2026-07-14:** the Fedora 44 full RPM provisions the pinned CEF runtime through `/usr/libexec/mackesd/install-cef-runtime` and now gates activation on both direct render smoke and shell-equivalent wire smoke via `/usr/libexec/mackesd/cef-verify`. On `.15`, the installed runtime setup passed both gates, the installed Gmail verifier run delivered painted frames over the same helper wire the shell consumes, and the installed shell is active/running with `Delegate=yes` and `NRestarts=0`. The shell selector already prefers CEF only when `/usr/bin/mde-web-cef` plus the complete `/opt/mde/cef` runtime are present; Servo remains the fallback when that gate is absent.
 - [x] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1. **V1 policy closure 2026-07-14:** production CEF launches now keep WebExtensions disabled even when a curated registry exists; `mde-web-cef` reports `CEF_EXTENSIONS_SKIPPED_V1 ... reason=native_adblock_passkeys_reader_ship_for_v1` and only the lab smoke path can opt back in with `MDE_CEF_WEBEXTENSIONS_LAB`. Browser chrome states the supported v1 path: native blocker, passkeys, reader mode, userscripts, and site styles.
 - [>] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface. **C0 slice 2026-07-14:** introduced `web/chrome_ui/`, wrapped the Browser tab/toolbar/bookmarks/find rows in a browser-local light visuals/font scope, removed the default shared MENUBAR-ALL top-strip call from `web_panel`, and moved the existing state-gated Browser command tree under the toolbar's Chrome-style menu button. The menubar coverage backstop now records Browser as a deliberate first-party chrome surface instead of a shared-bar surface. **Remaining:** extract tabstrip/toolbar/omnibox/new-tab rendering into `chrome_ui`, embed/use the actual Roboto chrome font, and complete the pixel-faithful Chrome pass.
