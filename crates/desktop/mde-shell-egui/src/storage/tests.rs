@@ -509,6 +509,8 @@ mod menubar_coverage {
     enum Coverage {
         /// The surface fronts the shared bar — its recorded title.
         Covered { title: &'static str },
+        /// The surface deliberately owns first-party chrome instead of the shared bar.
+        FirstPartyChrome { reason: &'static str },
         /// The surface is currently bare — the recorded reason + follow-on.
         Exempt { reason: &'static str },
     }
@@ -526,8 +528,10 @@ mod menubar_coverage {
             Surface::Desktop => Coverage::Covered {
                 title: "Desktop", // vdi.rs desktop_menubar, mounted by the shell
             },
-            Surface::Browser => Coverage::Covered {
-                title: "Browser", // MENU-3 (web.rs, the two-engine bar)
+            Surface::Browser => Coverage::FirstPartyChrome {
+                reason: "BROWSER-CHROME C0 — Browser retired the shared MENUBAR-ALL \
+                         top strip; first-party tabs, toolbar, omnibox, and menu \
+                         button own this surface's chrome",
             },
             Surface::Bookmarks => Coverage::Exempt {
                 reason: "bare — mde-bookmarks-egui mounts with its own manager \
@@ -620,6 +624,7 @@ mod menubar_coverage {
     #[test]
     fn every_routed_surface_records_a_menubar_posture() {
         let mut covered = 0usize;
+        let mut first_party = 0usize;
         let mut exempt = 0usize;
         for surface in every_routed() {
             match coverage(surface) {
@@ -630,6 +635,13 @@ mod menubar_coverage {
                     );
                     covered += 1;
                 }
+                Coverage::FirstPartyChrome { reason } => {
+                    assert!(
+                        reason.contains("BROWSER-CHROME"),
+                        "{surface:?}: first-party chrome records its owning epic"
+                    );
+                    first_party += 1;
+                }
                 Coverage::Exempt { reason } => {
                     assert!(
                         reason.contains("MENUBAR-SWEEP"),
@@ -639,8 +651,15 @@ mod menubar_coverage {
                 }
             }
         }
-        assert_eq!(covered + exempt, every_routed().len());
-        assert_eq!(covered, 8, "the covered set is the eight landed bars");
+        assert_eq!(covered + first_party + exempt, every_routed().len());
+        assert_eq!(
+            covered, 7,
+            "the shared covered set is the seven landed bars"
+        );
+        assert_eq!(
+            first_party, 1,
+            "Browser is the one routed first-party chrome surface"
+        );
         for (view, reason) in ROUTED_NON_SURFACE_VIEWS {
             assert!(
                 reason.contains("MENUBAR-SWEEP"),
