@@ -7,6 +7,7 @@
 //! shared [`WebState`] via `super::*`.
 
 use super::*;
+use super::{PaperSize, PrintOrientation};
 
 pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.print_settings_open {
@@ -89,6 +90,34 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 );
                 ui.checkbox(&mut state.cups_settings.duplex, "Duplex");
                 ui.checkbox(&mut state.cups_settings.grayscale, "Grayscale");
+                egui::ComboBox::from_label("Orientation")
+                    .selected_text(state.cups_settings.orientation.label())
+                    .show_ui(ui, |ui| {
+                        for o in [PrintOrientation::Portrait, PrintOrientation::Landscape] {
+                            ui.selectable_value(&mut state.cups_settings.orientation, o, o.label());
+                        }
+                    });
+                egui::ComboBox::from_label("Paper")
+                    .selected_text(state.cups_settings.paper_size.label())
+                    .show_ui(ui, |ui| {
+                        for p in [
+                            PaperSize::Default,
+                            PaperSize::A4,
+                            PaperSize::Letter,
+                            PaperSize::Legal,
+                        ] {
+                            ui.selectable_value(&mut state.cups_settings.paper_size, p, p.label());
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Pages").size(Style::SMALL));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.cups_settings.page_ranges)
+                            .hint_text("all")
+                            .desired_width(80.0),
+                    )
+                    .on_hover_text("Page range, e.g. 1-5,8 — empty prints all pages");
+                });
                 if ui
                     .add_enabled(
                         state.can_drive_page_tools(),
@@ -108,6 +137,84 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 );
             }
         });
+}
+
+/// The user-authored Site Styles editor (safe userscript slice — CSS only): add a
+/// host + CSS rule that folds into the injected userscript bundle, or remove one.
+/// Session-only, like the other browser chrome toggles.
+pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.site_styles_open {
+        return;
+    }
+    let mut remove: Option<usize> = None;
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Site Styles")
+                        .size(CHROME_FONT)
+                        .color(Style::TEXT),
+                );
+                ui.label(
+                    RichText::new("your CSS, injected on matching hosts (Userscripts must be on)")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Close site styles")
+                        .clicked()
+                    {
+                        state.site_styles_open = false;
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Host").size(Style::SMALL));
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.site_style_host_draft)
+                        .hint_text("example.com")
+                        .desired_width(140.0),
+                );
+                if ui
+                    .add(egui::Button::new(RichText::new("Add").size(Style::SMALL)))
+                    .clicked()
+                {
+                    state.add_user_site_style();
+                }
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut state.site_style_css_draft)
+                    .hint_text("body{max-width:80ch;margin-inline:auto}")
+                    .desired_rows(2)
+                    .desired_width(320.0),
+            );
+            if !state.user_site_styles.is_empty() {
+                ui.separator();
+                for (i, style) in state.user_site_styles.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} \u{2014} {}",
+                                style.host,
+                                ellipsize(&style.css, 36)
+                            ))
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                        );
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            }
+        });
+    if let Some(i) = remove {
+        state.remove_user_site_style(i);
+    }
 }
 
 /// The session-only History drawer (B3): most-recent-first visits, click to
