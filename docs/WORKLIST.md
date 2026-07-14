@@ -4247,8 +4247,24 @@ Plan: `.claude/plans/snappy-discovering-sphinx.md`; design: `docs/design/win10-t
 - [x] mesh-enroll seat .15 into `magic-mesh` — DONE 2026-07-12: `peer:Basement-Test-Workstation` at overlay `10.42.0.8`, boot-durable, bidirectionally verified vs LH1 (`mackesd add-peer` on the CA → `mackesd join` on .15).
 
 ### BROWSER-CHROME — pixel-faithful stock Chrome chrome over real Chromium (CEF)
-Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSER-DD**. Not started.
-- [ ] E1 (gate) — live CEF ABI validation on a seat (`mde-web-cef render-once` → non-garbage BGRA frame); gate runtime activation on it
+Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSER-DD**. Started.
+- [>] E1 (gate) — live CEF ABI validation on a seat (`mde-web-cef render-once`
+  → non-garbage BGRA frame); gate runtime activation on it. **Render gate
+  command fixed/proven 2026-07-14:** `mde-web-cef render-once` now initializes
+  CEF and runs the one-shot windowless render path directly instead of requiring
+  the diagnostic-only `MDE_CEF_BROWSER_PROBE=1` env. Farm `.50` proof against
+  `/home/mm/mde-cef-active` emitted `CEF_INITIALIZE_OK` and
+  `CEF_BROWSER_PAINT_READY ... view=640x360 last_paint=640x360` with no probe
+  env. The installer now gates runtime activation with the same render smoke
+  when the packaged helper and renderer bridge are present; farm `.50` proved
+  that path with `install-cef-runtime: render smoke passed`. Live bench seat
+  `.15` proof used the new helper+bridge binaries against the installed
+  `/opt/mde/cef` bundle and emitted the same `CEF_INITIALIZE_OK` +
+  `CEF_BROWSER_PAINT_READY ... view=640x360 last_paint=640x360`; the installed
+  DRM shell on `.15` was active with `NRestarts=0`. Remaining before E1 closes:
+  redeploy the installed helper/runtime-setup package and run the packaged
+  activation path on the seat, rather than relying on copied debug binaries for
+  the proof.
 - [ ] E2 — provision the 311 MB CEF runtime bundle on seats; flip the default engine to CEF (Servo stays fallback)
 - [ ] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1
 - [ ] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface

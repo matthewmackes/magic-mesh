@@ -845,8 +845,10 @@ mod tests {
         assert!(
             installer.contains("/usr/share/magic-mesh/browser/cef-linux64-minimal.env")
                 && installer.contains("/var/cache/magic-mesh/cef")
-                && installer.contains("need_cmd bzip2"),
-            "installed CEF runtime installer must use installed manifest/cache paths"
+                && installer.contains("need_cmd bzip2")
+                && installer.contains("render-once")
+                && installer.contains("CEF_BROWSER_PAINT_READY"),
+            "installed CEF runtime installer must use installed manifest/cache paths and gate activation on a render smoke"
         );
     }
 
