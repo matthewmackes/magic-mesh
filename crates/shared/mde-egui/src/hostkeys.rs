@@ -45,6 +45,12 @@ pub const HOST_KEY_CODES: &[u32] = &[
     113, // KEY_MUTE            → XF86AudioMute
     114, // KEY_VOLUMEDOWN      → XF86AudioLowerVolume
     115, // KEY_VOLUMEUP        → XF86AudioRaiseVolume
+    163, // KEY_NEXTSONG        → XF86AudioNext
+    164, // KEY_PLAYPAUSE       → XF86AudioPlay
+    165, // KEY_PREVIOUSSONG    → XF86AudioPrev
+    166, // KEY_STOPCD          → XF86AudioStop
+    200, // KEY_PLAYCD          → XF86AudioPlay
+    201, // KEY_PAUSECD         → XF86AudioPause
     207, // KEY_PLAY            → XF86AudioPlay
     224, // KEY_BRIGHTNESSDOWN  → XF86MonBrightnessDown
     225, // KEY_BRIGHTNESSUP    → XF86MonBrightnessUp
@@ -108,7 +114,9 @@ mod tests {
     #[test]
     fn host_key_set_covers_the_media_and_leader_codes_only() {
         // The XF86 media/system keys + the two Super keys are host keys…
-        for code in [113, 114, 115, 207, 224, 225, 237, 248, 125, 126] {
+        for code in [
+            113, 114, 115, 163, 164, 165, 166, 200, 201, 207, 224, 225, 237, 248, 125, 126,
+        ] {
             assert!(is_host_key(code), "code {code} should be a host key");
         }
         // …and an ordinary letter / Tab is NOT (it reaches the guest via egui).

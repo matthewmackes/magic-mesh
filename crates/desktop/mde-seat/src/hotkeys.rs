@@ -20,6 +20,14 @@ pub enum HotkeyAction {
     VolumeMute,
     /// Toggle media playback for the active media surface.
     MediaPlayPause,
+    /// Pause media playback for the active media surface.
+    MediaPause,
+    /// Stop media playback for the active media surface.
+    MediaStop,
+    /// Advance active media to the next item.
+    MediaNext,
+    /// Return active media to the previous item.
+    MediaPrevious,
     /// Toggle the active input (microphone) mute.
     MicMute,
     /// Raise the active output's brightness.
@@ -50,6 +58,10 @@ impl HotkeyAction {
             Self::VolumeDown => "Volume down",
             Self::VolumeMute => "Mute output",
             Self::MediaPlayPause => "Play/pause media",
+            Self::MediaPause => "Pause media",
+            Self::MediaStop => "Stop media",
+            Self::MediaNext => "Next media",
+            Self::MediaPrevious => "Previous media",
             Self::MicMute => "Mute microphone",
             Self::BrightnessUp => "Brightness up",
             Self::BrightnessDown => "Brightness down",
@@ -73,6 +85,10 @@ impl HotkeyAction {
                 | Self::VolumeDown
                 | Self::VolumeMute
                 | Self::MediaPlayPause
+                | Self::MediaPause
+                | Self::MediaStop
+                | Self::MediaNext
+                | Self::MediaPrevious
                 | Self::MicMute
                 | Self::BrightnessUp
                 | Self::BrightnessDown
@@ -110,6 +126,22 @@ pub static HOTKEYS: &[Hotkey] = &[
     Hotkey {
         chord: "XF86AudioPlay",
         action: HotkeyAction::MediaPlayPause,
+    },
+    Hotkey {
+        chord: "XF86AudioPause",
+        action: HotkeyAction::MediaPause,
+    },
+    Hotkey {
+        chord: "XF86AudioStop",
+        action: HotkeyAction::MediaStop,
+    },
+    Hotkey {
+        chord: "XF86AudioNext",
+        action: HotkeyAction::MediaNext,
+    },
+    Hotkey {
+        chord: "XF86AudioPrev",
+        action: HotkeyAction::MediaPrevious,
     },
     Hotkey {
         chord: "XF86AudioMicMute",
@@ -173,6 +205,10 @@ mod tests {
         // The dedicated media/system keys must be host-first (lock 8)…
         assert!(action_for("XF86AudioMute").unwrap().host_first());
         assert!(action_for("XF86AudioPlay").unwrap().host_first());
+        assert!(action_for("XF86AudioPause").unwrap().host_first());
+        assert!(action_for("XF86AudioStop").unwrap().host_first());
+        assert!(action_for("XF86AudioNext").unwrap().host_first());
+        assert!(action_for("XF86AudioPrev").unwrap().host_first());
         assert!(action_for("XF86MonBrightnessUp").unwrap().host_first());
         // …and the leader-chord actions must not be (they reach the guest first).
         assert!(!action_for("Super+Tab").unwrap().host_first());

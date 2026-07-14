@@ -72,6 +72,7 @@ mod workbench;
 use std::time::{Duration, Instant};
 
 use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
+use mde_web_preview_client::MediaTransportAction;
 
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
@@ -498,7 +499,24 @@ impl Shell {
                 self.nav.surface = Surface::System;
             }
             HotkeyAction::MediaPlayPause => {
-                self.web.toggle_active_tab_media_playback();
+                self.web
+                    .active_tab_media_transport(MediaTransportAction::PlayPause);
+            }
+            HotkeyAction::MediaPause => {
+                self.web
+                    .active_tab_media_transport(MediaTransportAction::Pause);
+            }
+            HotkeyAction::MediaStop => {
+                self.web
+                    .active_tab_media_transport(MediaTransportAction::Stop);
+            }
+            HotkeyAction::MediaNext => {
+                self.web
+                    .active_tab_media_transport(MediaTransportAction::Next);
+            }
+            HotkeyAction::MediaPrevious => {
+                self.web
+                    .active_tab_media_transport(MediaTransportAction::Previous);
             }
             HotkeyAction::Lock => {
                 // CURTAIN-1 — Super+L drops the lock curtain (design lock 2).

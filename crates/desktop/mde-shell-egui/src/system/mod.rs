@@ -783,7 +783,11 @@ impl SystemState {
             | HotkeyAction::MonitorFocusSwitch
             | HotkeyAction::ReturnToChrome
             | HotkeyAction::OpenSystem
-            | HotkeyAction::MediaPlayPause => None,
+            | HotkeyAction::MediaPlayPause
+            | HotkeyAction::MediaPause
+            | HotkeyAction::MediaStop
+            | HotkeyAction::MediaNext
+            | HotkeyAction::MediaPrevious => None,
         }
     }
 

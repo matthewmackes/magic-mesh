@@ -52,6 +52,14 @@ pub(crate) enum MediaKey {
     Mute,
     /// `XF86AudioPlay`.
     PlayPause,
+    /// `XF86AudioPause`.
+    Pause,
+    /// `XF86AudioStop`.
+    Stop,
+    /// `XF86AudioNext`.
+    Next,
+    /// `XF86AudioPrev`.
+    Previous,
     /// `XF86AudioMicMute`.
     MicMute,
     /// `XF86MonBrightnessUp`.
@@ -70,6 +78,10 @@ impl MediaKey {
             Self::VolumeDown => "XF86AudioLowerVolume",
             Self::Mute => "XF86AudioMute",
             Self::PlayPause => "XF86AudioPlay",
+            Self::Pause => "XF86AudioPause",
+            Self::Stop => "XF86AudioStop",
+            Self::Next => "XF86AudioNext",
+            Self::Previous => "XF86AudioPrev",
             Self::MicMute => "XF86AudioMicMute",
             Self::BrightnessUp => "XF86MonBrightnessUp",
             Self::BrightnessDown => "XF86MonBrightnessDown",
@@ -103,7 +115,11 @@ const fn decode_scan(scan: HostScan) -> Option<HostKey> {
         115 => HostKey::Media(MediaKey::VolumeUp),
         114 => HostKey::Media(MediaKey::VolumeDown),
         113 => HostKey::Media(MediaKey::Mute),
-        207 => HostKey::Media(MediaKey::PlayPause),
+        207 | 164 | 200 => HostKey::Media(MediaKey::PlayPause),
+        201 => HostKey::Media(MediaKey::Pause),
+        166 => HostKey::Media(MediaKey::Stop),
+        163 => HostKey::Media(MediaKey::Next),
+        165 => HostKey::Media(MediaKey::Previous),
         248 => HostKey::Media(MediaKey::MicMute),
         225 => HostKey::Media(MediaKey::BrightnessUp),
         224 => HostKey::Media(MediaKey::BrightnessDown),
@@ -344,6 +360,10 @@ mod tests {
             MediaKey::VolumeDown,
             MediaKey::Mute,
             MediaKey::PlayPause,
+            MediaKey::Pause,
+            MediaKey::Stop,
+            MediaKey::Next,
+            MediaKey::Previous,
             MediaKey::MicMute,
             MediaKey::BrightnessUp,
             MediaKey::BrightnessDown,
@@ -366,6 +386,16 @@ mod tests {
         assert_eq!(acts, vec![HotkeyAction::BluetoothToggle]);
         let acts = r.dispatch(&[scan(207, true)], &[]);
         assert_eq!(acts, vec![HotkeyAction::MediaPlayPause]);
+        let acts = r.dispatch(&[scan(164, true)], &[]);
+        assert_eq!(acts, vec![HotkeyAction::MediaPlayPause]);
+        let acts = r.dispatch(&[scan(201, true)], &[]);
+        assert_eq!(acts, vec![HotkeyAction::MediaPause]);
+        let acts = r.dispatch(&[scan(166, true)], &[]);
+        assert_eq!(acts, vec![HotkeyAction::MediaStop]);
+        let acts = r.dispatch(&[scan(163, true)], &[]);
+        assert_eq!(acts, vec![HotkeyAction::MediaNext]);
+        let acts = r.dispatch(&[scan(165, true)], &[]);
+        assert_eq!(acts, vec![HotkeyAction::MediaPrevious]);
     }
 
     #[test]
