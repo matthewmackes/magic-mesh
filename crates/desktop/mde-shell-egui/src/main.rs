@@ -497,6 +497,9 @@ impl Shell {
                 self.nav.expanded = true;
                 self.nav.surface = Surface::System;
             }
+            HotkeyAction::MediaPlayPause => {
+                self.web.toggle_active_tab_media_playback();
+            }
             HotkeyAction::Lock => {
                 // CURTAIN-1 — Super+L drops the lock curtain (design lock 2).
                 // The DM-less DRM shell IS this seat's locker, so Lock acts here

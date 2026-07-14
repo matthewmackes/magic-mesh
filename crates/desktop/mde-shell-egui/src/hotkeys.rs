@@ -50,6 +50,8 @@ pub(crate) enum MediaKey {
     VolumeDown,
     /// `XF86AudioMute`.
     Mute,
+    /// `XF86AudioPlay`.
+    PlayPause,
     /// `XF86AudioMicMute`.
     MicMute,
     /// `XF86MonBrightnessUp`.
@@ -67,6 +69,7 @@ impl MediaKey {
             Self::VolumeUp => "XF86AudioRaiseVolume",
             Self::VolumeDown => "XF86AudioLowerVolume",
             Self::Mute => "XF86AudioMute",
+            Self::PlayPause => "XF86AudioPlay",
             Self::MicMute => "XF86AudioMicMute",
             Self::BrightnessUp => "XF86MonBrightnessUp",
             Self::BrightnessDown => "XF86MonBrightnessDown",
@@ -100,6 +103,7 @@ const fn decode_scan(scan: HostScan) -> Option<HostKey> {
         115 => HostKey::Media(MediaKey::VolumeUp),
         114 => HostKey::Media(MediaKey::VolumeDown),
         113 => HostKey::Media(MediaKey::Mute),
+        207 => HostKey::Media(MediaKey::PlayPause),
         248 => HostKey::Media(MediaKey::MicMute),
         225 => HostKey::Media(MediaKey::BrightnessUp),
         224 => HostKey::Media(MediaKey::BrightnessDown),
@@ -339,6 +343,7 @@ mod tests {
             MediaKey::VolumeUp,
             MediaKey::VolumeDown,
             MediaKey::Mute,
+            MediaKey::PlayPause,
             MediaKey::MicMute,
             MediaKey::BrightnessUp,
             MediaKey::BrightnessDown,
@@ -359,6 +364,8 @@ mod tests {
         assert_eq!(acts, vec![HotkeyAction::BrightnessUp]);
         let acts = r.dispatch(&[scan(237, true)], &[]);
         assert_eq!(acts, vec![HotkeyAction::BluetoothToggle]);
+        let acts = r.dispatch(&[scan(207, true)], &[]);
+        assert_eq!(acts, vec![HotkeyAction::MediaPlayPause]);
     }
 
     #[test]

@@ -782,7 +782,8 @@ impl SystemState {
             HotkeyAction::SessionSwitch
             | HotkeyAction::MonitorFocusSwitch
             | HotkeyAction::ReturnToChrome
-            | HotkeyAction::OpenSystem => None,
+            | HotkeyAction::OpenSystem
+            | HotkeyAction::MediaPlayPause => None,
         }
     }
 

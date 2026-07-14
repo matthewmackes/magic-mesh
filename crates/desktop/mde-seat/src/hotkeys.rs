@@ -18,6 +18,8 @@ pub enum HotkeyAction {
     VolumeDown,
     /// Toggle master mute.
     VolumeMute,
+    /// Toggle media playback for the active media surface.
+    MediaPlayPause,
     /// Toggle the active input (microphone) mute.
     MicMute,
     /// Raise the active output's brightness.
@@ -47,6 +49,7 @@ impl HotkeyAction {
             Self::VolumeUp => "Volume up",
             Self::VolumeDown => "Volume down",
             Self::VolumeMute => "Mute output",
+            Self::MediaPlayPause => "Play/pause media",
             Self::MicMute => "Mute microphone",
             Self::BrightnessUp => "Brightness up",
             Self::BrightnessDown => "Brightness down",
@@ -69,6 +72,7 @@ impl HotkeyAction {
             Self::VolumeUp
                 | Self::VolumeDown
                 | Self::VolumeMute
+                | Self::MediaPlayPause
                 | Self::MicMute
                 | Self::BrightnessUp
                 | Self::BrightnessDown
@@ -102,6 +106,10 @@ pub static HOTKEYS: &[Hotkey] = &[
     Hotkey {
         chord: "XF86AudioMute",
         action: HotkeyAction::VolumeMute,
+    },
+    Hotkey {
+        chord: "XF86AudioPlay",
+        action: HotkeyAction::MediaPlayPause,
     },
     Hotkey {
         chord: "XF86AudioMicMute",
@@ -164,6 +172,7 @@ mod tests {
     fn xf86_media_keys_are_host_first_chords_are_not() {
         // The dedicated media/system keys must be host-first (lock 8)…
         assert!(action_for("XF86AudioMute").unwrap().host_first());
+        assert!(action_for("XF86AudioPlay").unwrap().host_first());
         assert!(action_for("XF86MonBrightnessUp").unwrap().host_first());
         // …and the leader-chord actions must not be (they reach the guest first).
         assert!(!action_for("Super+Tab").unwrap().host_first());
