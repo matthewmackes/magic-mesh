@@ -118,6 +118,18 @@ The VM comes up as `mm@172.20.0.131` (mesh key). The script writes an NM keyfile
 directly (cloud-init's netplan→NM render is broken on Fedora+Xen — the historic
 "dark VM" root cause) and sets `auto_poweron=true`.
 
+**Operational note from the 2026-07-15 browser deploy:** the F44 builder may be
+halted while the regular BigBoy farm VM (`mcnf-build-52` / `.130`) is running.
+The safe handoff is: confirm no active BigBoy farm slots, shut down
+`mcnf-build-52`, wait for BigBoy `memory-free` to rise to roughly 30 GiB, start
+`mcnf-build-f44`, and only then run `MCNF_BUILD_HOST=172.20.0.131
+./install-helpers/xcp-build.sh rpm`. On boot, `.131` can report `No route to
+host` for several polls and then `Connection refused` before SSH is ready; XAPI
+may also show no guest metrics during this window even though the VM is healthy.
+Give it at least a minute and verify with SSH before treating it as a dark VM.
+After the cut, shut down `mcnf-build-f44` and restart `mcnf-build-52` so the
+normal BigBoy farm capacity returns.
+
 ## 4. Toolchain + build + cut
 
 **Toolchain gap found live (2026-07-12):** the DRM shell links `-linput`/`-lgbm`/
@@ -274,4 +286,3 @@ grep 'not found'` returns **nothing** (all ffmpeg-8/mpv sonames resolve).
 
 **Still standalone after this** — role-pin activates the local seat but does NOT join the
 mesh. For overlay membership (chat/peers), follow §7 (`mackesd join`) after the shell is up.
-
