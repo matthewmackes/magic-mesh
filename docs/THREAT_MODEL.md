@@ -508,9 +508,9 @@ credential.
    shared `mde-web-sandbox` OS sandbox before `cef_initialize` (§10), so the CEF
    lane is now in §1's trust table and confined by the same class as Servo. The
    residual gap is that **Chromium's OWN internal sandbox stays off**
-   (`--no-sandbox`) — see §10.3. The OS sandbox contains the whole Chromium
-   process tree regardless, but live-seat verification of that confinement is
-   still required (§10.4).
+   (`--no-sandbox`) — see §10.3. Live `.15` runtime proof now shows the CEF
+   browser child and Chromium zygote/utility children inherit MCNF's OS sandbox
+   (§10.4).
 5. **Local Bus trust, same caveat as §6.4's.** Anything running as the
    desktop user that can write `action/browser/passkey` can trigger a real
    signed ceremony for any `rp_id` it can also satisfy the origin check for
@@ -775,37 +775,50 @@ inside Chromium — it just covers the whole tree from outside rather than
 per-process from inside. Do **not** read "sandboxed" as "Chromium-sandboxed"
 here; it means OS-sandboxed.
 
-### 10.4 Verification status — live-seat check REQUIRED (deferred)
+### 10.4 Verification status — live `.15` OS-sandbox proof
 
-A sandbox cannot be fully proven headlessly. What IS verified: the crate builds
-and its pure planners are unit-tested — the CEF policy (`web_cef` — host, 2 GiB
-ceiling, distinct rootfs path), the seccomp denylist construction, the
-uid/gid-map and rootfs bind plans, and the CEF-specific extra-bind planner
-(`cef_extra_readonly_binds` — exposes only the runtime + vetted extensions,
-never a key/home path). The seccomp denylist is the SAME one Servo runs a full
-browser engine under.
+A sandbox cannot be mathematically proven by a smoke test, but the CEF OS
+confinement is now runtime-proven on a live seat for the core claims above. The
+headless/unit side remains covered by crate builds and pure planner tests: the
+CEF policy (`web_cef` — host, 2 GiB ceiling, distinct rootfs path), the seccomp
+denylist construction, uid/gid-map and rootfs bind plans, and the CEF-specific
+extra-bind planner (`cef_extra_readonly_binds` — exposes only the runtime +
+vetted extensions, never a key/home path). The seccomp denylist is the SAME one
+Servo runs a full browser engine under.
 
-**Still required, and deferred to the operator (live seat .13 / .138):**
+**Live proof, 2026-07-15, `.15` (`Basement-Test-Workstation`, Fedora 44):**
 
-1. Launch a real CEF tab on a seat with the pinned `/opt/mde/cef` bundle present
-   and confirm it renders (the `CEF_OS_SANDBOX applied=1 …` line prints, then a
-   frame arrives). The CEF settings now pin both `root_cache_path` and
-   `cache_path` under the sandbox's private writable `/tmp`, so this remains
-   ephemeral and cannot persist browser state into `$HOME` or `/var`.
-2. Confirm from **inside** the browser process (e.g. a `file://` probe / a
-   crafted page, or `nsenter` into the renderer's mount ns) that `~/.ssh`, the
-   Nebula CA (`/etc/nebula`), and `/etc/mackesd` are **NOT readable** — the core
-   confinement claim.
-3. Confirm Chromium's multi-process children actually start under the OS sandbox
-   (no `EPERM`-induced crash from the seccomp denylist tripping a syscall
-   Chromium — unlike Servo — needs; if one does, the fix is to remove that
-   single syscall from the shared denylist, not to weaken the whole layer).
-4. On a SELinux-Enforcing node, `audit2allow` any residual AVC for
-   `mde_web_cef_t` (a prebuilt Chromium is mmap-/syscall-heavy; the shipped
-   `.te` is the known-necessary least-privilege set, not a headlessly-proven
-   byte-perfect policy).
+1. A held real `/usr/bin/mde-web-cef tab` launched against the installed pinned
+   `/opt/mde/cef` bundle and initialized CEF successfully. The log showed
+   `CEF_OS_SANDBOX applied=1 ... home_visible=0 seccomp=1 caps_dropped=1`,
+   `CEF_PRIVATE_RUNTIME_ENV ... tmpfs=1`, `CEF_INITIALIZE_OK`, and Chromium
+   subprocess bridge starts for zygote and network utility processes. The
+   installed verifier on the same deploy had already proven CEF render/input:
+   final title `mde-browser-verify-p1-k1-tm`, 4 painted `1280x800` frames, and
+   `VERIFY RESULT=PASS`.
+2. The sandbox fork layout was inspected from the host. The launcher and fork
+   supervisor are not the security evidence. The actual CEF browser child
+   (`mde-web-cef-renderer` child PID 566774 in that run) and all observed
+   Chromium zygote/utility descendants (PIDs 566787, 566788, 566808, 566817,
+   566818, 566827, 566829) had `NoNewPrivs: 1`, `Seccomp: 2`, and zero
+   `CapPrm`/`CapEff`/`CapBnd` masks.
+3. Those CEF/Chromium children inherited the same sandbox namespaces in that
+   run (`mnt:[4026532544]`, `user:[4026532535]`, `pid:[4026532552]`,
+   `ipc:[4026532551]`, `uts:[4026532549]`, `cgroup:[4026532558]`). The
+   `/proc/<pid>/root` view exposed `/opt/mde/cef/Release/libcef.so`, the
+   renderer bridge, and the private `/tmp/mde-web-cef/{home,cache}` tree, while
+   `/home`, `/root`, `/etc/nebula`, `/etc/mackesd`, `/mnt/mesh-storage`,
+   `/run/user/1000/bus`, and `/run/dbus/system_bus_socket` were absent.
+4. Chromium multi-process startup therefore works under the outer MCNF OS
+   sandbox: zygote and utility children started and stayed alive without an
+   `EPERM` crash from the shared seccomp denylist.
 
-Until (1)-(3) are done on a live seat, the OS confinement is **implemented and
-unit-exercised but not runtime-proven**; the honest claim is "the same
-confinement class as Servo, applied — pending live verification", not "proven
-confined".
+**Remaining validation:** ad-hoc SSH/user-session launches are not
+systemd-delegated and can honestly log `mde-web-sandbox: cgroup limits not
+applied ... Permission denied`; the namespace/rootfs/seccomp/cap layers above
+still apply. The production DRM-seat unit has `Delegate=yes`, so a separate
+shell-spawned proof should confirm the 2 GiB/~2-core cgroup cap from that exact
+service path. On a SELinux-Enforcing node, `audit2allow` any residual AVC for
+`mde_web_cef_t` (a prebuilt Chromium is mmap-/syscall-heavy; the shipped `.te`
+is the known-necessary least-privilege set, not a headlessly-proven byte-perfect
+policy).

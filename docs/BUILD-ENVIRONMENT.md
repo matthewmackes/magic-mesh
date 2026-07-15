@@ -53,6 +53,22 @@ mde-shell-egui.service`, then confirm `systemctl is-active
 mde-shell-egui.service`, `NRestarts=0`, and the journal version line. This is a
 service orchestration gotcha, not a Browser helper/runtime failure.
 
+**CEF sandbox live-inspection note (learned 2026-07-15):** when proving CEF OS
+confinement on a live seat, do not use the `/usr/bin/mde-web-cef` launcher PID
+or the immediate renderer fork supervisor as the security evidence. Hold a real
+`/usr/bin/mde-web-cef tab` open, then inspect the sandboxed
+`mde-web-cef-renderer` browser child and its Chromium `--type=zygote` /
+`--type=utility` descendants. The expected proof is `NoNewPrivs: 1`,
+`Seccomp: 2`, zero `CapPrm`/`CapEff`/`CapBnd`, absent `/home`, `/root`,
+`/etc/nebula`, `/etc/mackesd`, `/mnt/mesh-storage`, and host D-Bus sockets under
+`/proc/<pid>/root`, while `/opt/mde/cef` and the private
+`/tmp/mde-web-cef/{home,cache}` tree are visible. An ad-hoc SSH/user-session
+probe can log `mde-web-sandbox: cgroup limits not applied ... Permission
+denied` because that session is not systemd-delegated; the production
+DRM-shell-spawned path still needs its own delegated cgroup-cap proof if that is
+the claim being checked. Kill the held probe by its process group afterward and
+verify no CEF/verifier processes remain.
+
 **Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
 exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even
 when the source is fine. Put Servo tests/checks on BigBoy (`172.20.0.130`) when
