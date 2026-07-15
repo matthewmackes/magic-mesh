@@ -177,7 +177,10 @@ base array**.
   magic-mesh-browser` and keep a working desktop with the Browser surface honestly gated off.)
 - `server` variant → **no** browser recommend (headless roles already omit it).
 - `magic-mesh-browser` → `requires = { magic-mesh = "*" }` (the helpers are launched by the
-  shell; they are meaningless without the base) and keeps the CEF/bzip2 runtime `requires`.
+  shell; they are meaningless without the base), keeps the CEF/bzip2/runtime graphics
+  `requires`, and hard-requires `selinux-policy-devel` + `checkpolicy` so Enforcing
+  Workstation seats compile and load `mde_web_cef_t` / `mde_web_preview_t` instead of
+  silently leaving Browser helpers at `bin_t`.
 - **No `conflicts`** between base and browser — they co-install.
 - Note: RPM automatic ELF soname scanning still records shell-linked base requirements such as
   `libfontconfig.so.1`, `libfreetype.so.6`, `libharfbuzz.so.0`, `libvulkan.so.1`, and
@@ -206,6 +209,12 @@ Fedora 44 deploy cut proof (2026-07-15, `install-helpers/build-rpm-fedora43.sh 4
 
 Both F44 artifacts passed payload verification, `rpm -Uvh --test` on the Fedora
 44 `.15` Workstation, and installed together as co-installable split packages.
+Follow-up live Enforcing proof on `.15` found the Browser setup units must be
+started, not merely enabled, on already-booted installs; the Browser `%post`
+now queues `systemctl start --no-block $BROWSER_UNITS`. The SELinux policy
+loaders also stage hyphenated source files under underscore module names before
+calling the SELinux devel Makefile, matching `policy_module(mde_web_cef, ...)`
+and `policy_module(mde_web_preview, ...)`.
 
 ### 4.4 Cut-script change (the part that makes it real)
 

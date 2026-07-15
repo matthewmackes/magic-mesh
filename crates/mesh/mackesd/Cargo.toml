@@ -1008,6 +1008,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 BROWSER_UNITS="mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service"
 systemctl unmask $BROWSER_UNITS >/dev/null 2>&1 || :
 systemctl enable $BROWSER_UNITS >/dev/null 2>&1 || :
+systemctl start --no-block $BROWSER_UNITS >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
@@ -1017,7 +1018,7 @@ fi
 post_uninstall_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
 if [ "$1" = 0 ]; then
-  semodule -r mde-web-preview mde-web-cef >/dev/null 2>&1 || :
+  semodule -r mde_web_preview mde_web_cef >/dev/null 2>&1 || :
 fi
 """
 
@@ -1040,10 +1041,10 @@ mesa-dri-drivers = "*"
 mesa-vulkan-drivers = "*"
 vulkan-loader = "*"
 libxkbcommon = "*"
-
-[package.metadata.generate-rpm.variants.browser.recommends]
-# Browser SELinux loaders compile .te/.fc policy sources when the policy
-# toolchain is present and self-skip cleanly where it is not.
+# Browser SELinux loaders compile .te/.fc policy sources on Enforcing seats.
+# Keep the toolchain as a hard Browser dependency so a default Workstation
+# Browser install does not silently skip the mde_web_preview_t/mde_web_cef_t
+# domains after the loader units start.
 selinux-policy-devel = "*"
 checkpolicy = "*"
 

@@ -69,6 +69,23 @@ DRM-shell-spawned path still needs its own delegated cgroup-cap proof if that is
 the claim being checked. Kill the held probe by its process group afterward and
 verify no CEF/verifier processes remain.
 
+**Browser SELinux loader/Enforcing note (learned 2026-07-15):** do not claim a
+Browser SELinux domain until the installed binaries are labelled
+`mde_web_cef_exec_t` / `mde_web_preview_exec_t` and `semodule -l` shows
+`mde_web_cef` / `mde_web_preview`. The policy source filenames are hyphenated
+(`mde-web-cef.te`, `mde-web-preview.te`), but the module names declared by
+`policy_module()` use underscores; the loader scripts must stage the sources as
+`mde_web_cef.te` / `mde_web_preview.te` before calling
+`/usr/share/selinux/devel/Makefile`. On a live split Browser RPM install,
+enabling the setup units is insufficient because the boot-time units may already
+have skipped; the Browser `%post` must queue
+`systemctl start --no-block $BROWSER_UNITS`. For F44 Enforcing workstation
+proofs, verify `getenforce`, labels, loaded modules, run the installed
+`MDE_BROWSER_VERIFY_INPUT=1 /usr/libexec/mackesd/cef-verify` against both
+`/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview` from a fresh sandbox root,
+then confirm `ausearch -m AVC,USER_AVC` has no matches for each final verifier
+window and no helper processes remain.
+
 **Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
 exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even
 when the source is fine. Put Servo tests/checks on BigBoy (`172.20.0.130`) when
@@ -318,6 +335,9 @@ Another AI/operator can rebuild the whole thing from this repo:
 | native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
 | focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
+| Browser helper labels remain `bin_t` after installing `magic-mesh-browser` | SELinux setup units were enabled but never started on the already-booted seat, or the policy loader failed before relabeling | start the Browser setup units non-blocking from `%post`; verify `semodule -l` and `ls -Z /usr/bin/mde-web-cef /usr/bin/mde-web-preview /usr/libexec/mackesd/mde-web-cef-renderer` |
+| Browser SELinux loader reports no toolchain despite policy packages being installed | the module build can fail when the output stem is hyphenated but `policy_module()` declares an underscore module name | stage `mde-web-cef.te` as `mde_web_cef.te` and `mde-web-preview.te` as `mde_web_preview.te` before the SELinux devel Makefile |
+| Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the stale `/tmp/.mde-web-*-root` path survived a prior failed run | clear only the helper's `/tmp/.mde-web-*-root`, rerun the installed verifier, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh-root pass and no AVCs |
 
 ---
 

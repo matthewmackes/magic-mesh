@@ -812,13 +812,21 @@ Servo runs a full browser engine under.
 4. Chromium multi-process startup therefore works under the outer MCNF OS
    sandbox: zygote and utility children started and stayed alive without an
    `EPERM` crash from the shared seccomp denylist.
+5. SELinux Enforcing was separately closed on the same F44 seat after the split
+   Browser RPM loader fixes. Final fresh-root verifier passes ran with
+   `getenforce = Enforcing`, no permissive domain marker, loaded modules
+   `mde_web_cef` and `mde_web_preview`, and binary labels
+   `mde_web_cef_exec_t` / `mde_web_preview_exec_t`. CEF passed with final title
+   `mde-browser-verify-p1-k1-tm`, 4 painted `1280x800` frames, pointer/key/text
+   input observed, and no AVCs for the final window. Servo passed with 4 painted
+   `1280x800` frames and final page text `P:1 K:1 T:m`; its final window also
+   had no AVCs and no leftover helper processes.
 
 **Remaining validation:** ad-hoc SSH/user-session launches are not
 systemd-delegated and can honestly log `mde-web-sandbox: cgroup limits not
 applied ... Permission denied`; the namespace/rootfs/seccomp/cap layers above
 still apply. The production DRM-seat unit has `Delegate=yes`, so a separate
 shell-spawned proof should confirm the 2 GiB/~2-core cgroup cap from that exact
-service path. On a SELinux-Enforcing node, `audit2allow` any residual AVC for
-`mde_web_cef_t` (a prebuilt Chromium is mmap-/syscall-heavy; the shipped `.te`
-is the known-necessary least-privilege set, not a headlessly-proven byte-perfect
-policy).
+service path. If the CEF pin, Servo helper, or Browser sandbox rootfs plan
+changes, rerun the Enforcing AVC audit; do not assume this 2026-07-15 policy
+closure covers a new engine payload.

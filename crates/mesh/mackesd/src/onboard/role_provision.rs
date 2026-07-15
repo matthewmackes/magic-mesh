@@ -478,6 +478,9 @@ mod tests {
         let browser_script = browser["post_install_script"]
             .as_str()
             .expect("browser post install script");
+        let browser_uninstall_script = browser["post_uninstall_script"]
+            .as_str()
+            .expect("browser post uninstall script");
         let browser_assets = browser["assets"].as_array().expect("browser assets array");
 
         for guarded in [
@@ -501,13 +504,18 @@ mod tests {
         );
         assert!(
             browser_script.contains("systemctl enable $BROWSER_UNITS")
+                && browser_script.contains("systemctl start --no-block $BROWSER_UNITS")
                 && browser_script.contains("mde-web-preview-selinux.service")
                 && browser_script.contains("mde-web-cef-selinux.service"),
-            "Browser RPM post-install must enable Browser SELinux policy loaders outside dnf startup"
+            "Browser RPM post-install must enable and non-blocking queue Browser setup units so live installs do not wait for a reboot"
         );
         assert!(
             !script.contains("systemctl enable --now --no-block magic-mesh-selinux-policy.service"),
             "SELinux policy loaders must not start from dnf %post"
+        );
+        assert!(
+            !script.contains("systemctl start --no-block magic-mesh-selinux-policy.service"),
+            "base SELinux policy loader must not start from dnf %post"
         );
         assert!(
             !script.contains("/usr/libexec/mackesd/setup-selinux-policy >/dev/null"),
@@ -540,6 +548,25 @@ mod tests {
                 "Browser RPM must ship Browser SELinux loader unit {unit}"
             );
         }
+
+        let browser_requires = browser["requires"]
+            .as_table()
+            .expect("browser requires table");
+        for package in ["selinux-policy-devel", "checkpolicy"] {
+            assert_eq!(
+                browser_requires[package].as_str(),
+                Some("*"),
+                "Browser RPM must hard-require {package} so Enforcing seats can compile and load browser SELinux domains"
+            );
+        }
+        assert!(
+            browser_uninstall_script.contains("semodule -r mde_web_preview mde_web_cef"),
+            "Browser RPM uninstall must remove the underscore-named SELinux modules declared by policy_module(), not the hyphenated source filenames"
+        );
+        assert!(
+            !browser_uninstall_script.contains("semodule -r mde-web-preview mde-web-cef"),
+            "Browser RPM uninstall must not try to remove nonexistent hyphenated SELinux module names"
+        );
     }
 
     #[test]
