@@ -4552,6 +4552,14 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
     `cargo test -p mde-shell-egui accesskit` passed 14/14, and `.170`
     `cargo fmt -p mde-shell-egui --check` passed.
+  - **Browser body routing ownership slice 2026-07-15:** `chrome_ui` now owns the active Browser body
+    routing in `web/chrome_ui/body.rs`, including managed-policy, safe-browsing, cert, crash, loading,
+    new-tab, live-page, and prompt precedence. `web/mod.rs` keeps polling, texture upload, tab/nav chrome
+    layout, and session state ownership. Farm evidence: BigBoy `.130`
+    `cargo test -p mde-shell-egui browser` passed 120/120, `.50`
+    `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
+    `cargo test -p mde-shell-egui browser_body` passed 2/2, and `.170`
+    `cargo fmt -p mde-shell-egui --check` passed.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
