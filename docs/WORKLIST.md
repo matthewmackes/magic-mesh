@@ -4804,6 +4804,19 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130. A duplicate cold `.50` focused
     lane and a duplicate cold BigBoy browser lane were stopped after the warmed BigBoy lane had the needed
     coverage.
+  - **Browser tab bar / engine selector rebuild 2026-07-15:** the post-dock design is superseded by a
+    more composed Browser Material control: tab pills now own their favicon/fallback engine glyph, title,
+    and compact right-side CEF/Servo chip inside one capsule; pinned tabs retain page identity with only a
+    small corner accent. The engine dock now presents one stable `New tab` primary action with the selected
+    engine as supporting context, while the CEF and Servo segments show stack identity plus live per-engine
+    tab counts. Close/audio affordances were softened to circular transparent controls so the tab strip no
+    longer reads as detached boxes. Regression coverage locks the stable `New tab` action, selected-engine
+    context, per-engine count labels, raw `+CEF`/`+Servo` removal, and the Browser-local engine token model.
+    Farm evidence: `.50` `cargo fmt --check -p mde-shell-egui` passed, BigBoy `.130`
+    `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1, BigBoy `.130`
+    `cargo test -p mde-shell-egui engine_selector_uses_browser_local_labels_and_state -- --nocapture`
+    passed 1/1, warmed BigBoy `.130` `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 8/8,
+    and warmed BigBoy `.130` `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130.
   - **Browser chrome accelerator ownership slice 2026-07-15:** `chrome_ui` now owns the Browser-reserved
     tab-strip keyboard contract (`F11`/`Esc`, `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`,
     `Ctrl+Shift+Tab`, and `Ctrl+1..9`) alongside the tab strip and engine selector. `web_panel` still
