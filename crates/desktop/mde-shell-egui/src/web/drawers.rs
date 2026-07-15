@@ -16,15 +16,19 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
     let printers = state.cups_printers.clone();
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Print").size(CHROME_FONT).color(Style::TEXT));
+                ui.label(
+                    RichText::new("Print")
+                        .size(CHROME_FONT)
+                        .color(chrome_ui::CHROME_TEXT),
+                );
                 ui.label(
                     RichText::new("CUPS destination")
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -46,7 +50,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             if let Some(notice) = &state.cups_notice {
                 ui.colored_label(
-                    Style::DANGER,
+                    chrome_ui::CHROME_ERROR,
                     RichText::new(format!("! {notice}")).size(Style::SMALL),
                 );
             }
@@ -148,19 +152,19 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     }
     let mut remove: Option<usize> = None;
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Site Styles")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new("your CSS, injected on matching hosts (Userscripts must be on)")
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -203,7 +207,7 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                 ellipsize(&style.css, 36)
                             ))
                             .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
+                            .color(chrome_ui::CHROME_TEXT_DIM),
                         );
                         if ui.small_button("Remove").clicked() {
                             remove = Some(i);
@@ -227,19 +231,19 @@ pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     let mut clear = false;
     let mut close = false;
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("History")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new("this session only")
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -263,7 +267,7 @@ pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 ui.label(
                     RichText::new("No pages visited this session")
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 return;
             }
@@ -323,19 +327,19 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     let jobs = state.download_jobs.clone();
     let pending_dangerous = state.pending_dangerous_download.clone();
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Downloads")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new("browser_download ledger")
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -365,7 +369,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             if let Some(notice) = &state.download_notice {
                 ui.colored_label(
-                    Style::DANGER,
+                    chrome_ui::CHROME_ERROR,
                     RichText::new(format!("! {notice}")).size(Style::SMALL),
                 );
             }
@@ -373,25 +377,27 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             if let Some(pending) = &pending_dangerous {
                 ui.separator();
                 egui::Frame::NONE
-                    .fill(Style::SURFACE_HI)
+                    .fill(chrome_ui::prompt_fill())
                     .inner_margin(egui::Margin::symmetric(6, 4))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new("\u{26A0} This type of file can harm your device")
                                     .size(Style::SMALL)
-                                    .color(Style::WARN),
+                                    .color(chrome_ui::CHROME_WARN),
                             );
                         });
                         ui.label(
                             RichText::new(&pending.filename)
                                 .size(Style::SMALL)
-                                .color(Style::TEXT),
+                                .color(chrome_ui::CHROME_TEXT),
                         );
                         ui.horizontal(|ui| {
                             if ui
                                 .add(egui::Button::new(
-                                    RichText::new("Keep").size(Style::SMALL).color(Style::WARN),
+                                    RichText::new("Keep")
+                                        .size(Style::SMALL)
+                                        .color(chrome_ui::CHROME_WARN),
                                 ))
                                 .on_hover_text("Download it anyway")
                                 .clicked()
@@ -402,7 +408,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                 .add(egui::Button::new(
                                     RichText::new("Discard")
                                         .size(Style::SMALL)
-                                        .color(Style::TEXT_DIM),
+                                        .color(chrome_ui::CHROME_TEXT_DIM),
                                 ))
                                 .on_hover_text("Drop this download")
                                 .clicked()
@@ -431,7 +437,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                             ui.label(
                                 RichText::new(short_transfer_name(job))
                                     .size(Style::SMALL)
-                                    .color(Style::TEXT),
+                                    .color(chrome_ui::CHROME_TEXT),
                             );
                             ui.label(
                                 RichText::new(job.state.label())
@@ -442,14 +448,14 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                 ui.label(
                                     RichText::new("verify")
                                         .size(Style::SMALL)
-                                        .color(Style::TEXT_DIM),
+                                        .color(chrome_ui::CHROME_TEXT_DIM),
                                 );
                             }
                         });
                         ui.label(
                             RichText::new(job.route())
                                 .size(Style::SMALL)
-                                .color(Style::TEXT_DIM),
+                                .color(chrome_ui::CHROME_TEXT_DIM),
                         );
                         if let Some(progress) = job.progress {
                             ui.add(
@@ -460,7 +466,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         }
                         if let Some(err) = &job.error {
                             ui.colored_label(
-                                Style::DANGER,
+                                chrome_ui::CHROME_ERROR,
                                 RichText::new(format!("! {err}")).size(Style::SMALL),
                             );
                         }
@@ -551,19 +557,19 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     };
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("QR share")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new(result.request_id.chars().take(12).collect::<String>())
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -592,7 +598,7 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 ui.label(
                     RichText::new(page)
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -601,7 +607,7 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         result.host
                     ))
                     .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
                 );
             });
             ui.add_space(Style::SP_XS);
@@ -644,14 +650,14 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     };
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Translation")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -659,7 +665,7 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         result.source_lang, result.target_lang
                     ))
                     .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -689,7 +695,7 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 ui.label(
                     RichText::new(page)
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -699,7 +705,7 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         result.engine.label()
                     ))
                     .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
                 );
             });
             egui::ScrollArea::vertical()
@@ -708,7 +714,7 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     ui.label(
                         RichText::new(result.translation.as_str())
                             .size(Style::SMALL)
-                            .color(Style::TEXT),
+                            .color(chrome_ui::CHROME_TEXT),
                     );
                 });
         });
@@ -722,20 +728,20 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     }
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Spelling")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(RichText::new(result.summary()).size(Style::SMALL).color(
                     if result.error.is_some() {
-                        Style::WARN
+                        chrome_ui::CHROME_WARN
                     } else {
-                        Style::TEXT_DIM
+                        chrome_ui::CHROME_TEXT_DIM
                     },
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -759,7 +765,11 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
 
             if let Some(error) = result.error.as_deref() {
-                ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                ui.label(
+                    RichText::new(error)
+                        .size(Style::SMALL)
+                        .color(chrome_ui::CHROME_WARN),
+                );
                 return;
             }
 
@@ -772,7 +782,7 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                             ui.label(
                                 RichText::new(miss.word.as_str())
                                     .size(Style::SMALL)
-                                    .color(Style::WARN),
+                                    .color(chrome_ui::CHROME_WARN),
                             );
                             ui.label(
                                 RichText::new(format!(
@@ -780,19 +790,19 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                     miss.chars.start, miss.chars.end
                                 ))
                                 .size(Style::SMALL)
-                                .color(Style::TEXT_DIM),
+                                .color(chrome_ui::CHROME_TEXT_DIM),
                             );
                             if miss.suggestions.is_empty() {
                                 ui.label(
                                     RichText::new("no suggestions")
                                         .size(Style::SMALL)
-                                        .color(Style::TEXT_DIM),
+                                        .color(chrome_ui::CHROME_TEXT_DIM),
                                 );
                             } else {
                                 ui.label(
                                     RichText::new("suggest:")
                                         .size(Style::SMALL)
-                                        .color(Style::TEXT_DIM),
+                                        .color(chrome_ui::CHROME_TEXT_DIM),
                                 );
                                 for suggestion in miss.suggestions.iter().take(4) {
                                     if ui
@@ -830,7 +840,7 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         ui.label(
                             RichText::new(format!("{} more", result.misses.len() - 24))
                                 .size(Style::SMALL)
-                                .color(Style::TEXT_DIM),
+                                .color(chrome_ui::CHROME_TEXT_DIM),
                         );
                     }
                 });
@@ -842,19 +852,19 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     };
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Offline copy")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new(result.cache_id.chars().take(12).collect::<String>())
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -900,7 +910,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 ui.label(
                     RichText::new(page)
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -910,13 +920,13 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         result.engine.label()
                     ))
                     .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 if let Some(cached_ms) = result.cached_ms {
                     ui.label(
                         RichText::new(format!("cached {cached_ms}"))
                             .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
+                            .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
                 if let Some(viewport) = &result.viewport {
@@ -926,14 +936,14 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                             viewport.width, viewport.height
                         ))
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
                 if let Some(archive) = &result.archive_mhtml {
                     ui.label(
                         RichText::new(format!("MHTML {} bytes", archive.bytes))
                             .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
+                            .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
                 if !result.resources.is_empty() {
@@ -949,7 +959,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                             blocked
                         ))
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
             });
@@ -971,7 +981,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     ui.label(
                         RichText::new(result.text.as_str())
                             .size(Style::SMALL)
-                            .color(Style::TEXT),
+                            .color(chrome_ui::CHROME_TEXT),
                     );
                 });
         });
@@ -985,24 +995,19 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     }
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Browser engine update")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new(status.state.as_str())
                         .size(Style::SMALL)
-                        .color(match status.tone() {
-                            ChipTone::Ok => Style::OK,
-                            ChipTone::Warn | ChipTone::Danger => Style::WARN,
-                            ChipTone::Info => Style::ACCENT,
-                            ChipTone::Neutral => Style::TEXT_DIM,
-                        }),
+                        .color(chrome_ui::tone_color(status.tone())),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -1019,20 +1024,20 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 ui.label(
                     RichText::new(format!("updater {}", status.updater_state))
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 if let Some(chromium) = &status.expected_chromium_version {
                     ui.label(
                         RichText::new(format!("Chromium {chromium}"))
                             .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
+                            .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
                 if let Some(runtime) = &status.active_runtime {
                     ui.label(
                         RichText::new(runtime)
                             .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
+                            .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
             });
@@ -1044,7 +1049,11 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             .into_iter()
             .flatten()
             {
-                ui.label(RichText::new(detail).size(Style::SMALL).color(Style::WARN));
+                ui.label(
+                    RichText::new(detail)
+                        .size(Style::SMALL)
+                        .color(chrome_ui::CHROME_WARN),
+                );
             }
         });
 }
@@ -1062,14 +1071,14 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     }
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Browser speech")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -1088,16 +1097,20 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     ui.label(
                         RichText::new(status.chip_label())
                             .size(Style::SMALL)
-                            .color(speech_status_color(status.tone())),
+                            .color(chrome_ui::tone_color(status.tone())),
                     );
                     if let Some(title) = status.last_title.as_deref() {
                         ui.label(
                             RichText::new(title)
                                 .size(Style::SMALL)
-                                .color(Style::TEXT_DIM),
+                                .color(chrome_ui::CHROME_TEXT_DIM),
                         );
                     } else if let Some(url) = status.last_url.as_deref() {
-                        ui.label(RichText::new(url).size(Style::SMALL).color(Style::TEXT_DIM));
+                        ui.label(
+                            RichText::new(url)
+                                .size(Style::SMALL)
+                                .color(chrome_ui::CHROME_TEXT_DIM),
+                        );
                     }
                     ui.label(
                         RichText::new(format!(
@@ -1105,11 +1118,15 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                             status.accepted, status.spoken, status.rejected
                         ))
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 });
                 if let Some(error) = status.last_error.as_deref() {
-                    ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                    ui.label(
+                        RichText::new(error)
+                            .size(Style::SMALL)
+                            .color(chrome_ui::CHROME_WARN),
+                    );
                 }
             }
 
@@ -1118,16 +1135,20 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     ui.label(
                         RichText::new(status.chip_label())
                             .size(Style::SMALL)
-                            .color(speech_status_color(status.tone())),
+                            .color(chrome_ui::tone_color(status.tone())),
                     );
                     if let Some(url) = status.last_url.as_deref() {
-                        ui.label(RichText::new(url).size(Style::SMALL).color(Style::TEXT_DIM));
+                        ui.label(
+                            RichText::new(url)
+                                .size(Style::SMALL)
+                                .color(chrome_ui::CHROME_TEXT_DIM),
+                        );
                     }
                     if let Some(chars) = status.last_transcript_chars {
                         ui.label(
                             RichText::new(format!("{chars} transcript chars"))
                                 .size(Style::SMALL)
-                                .color(Style::TEXT_DIM),
+                                .color(chrome_ui::CHROME_TEXT_DIM),
                         );
                     }
                     ui.label(
@@ -1136,21 +1157,16 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                             status.accepted, status.transcribed, status.rejected
                         ))
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 });
                 if let Some(error) = status.last_error.as_deref() {
-                    ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                    ui.label(
+                        RichText::new(error)
+                            .size(Style::SMALL)
+                            .color(chrome_ui::CHROME_WARN),
+                    );
                 }
             }
         });
-}
-
-fn speech_status_color(tone: ChipTone) -> egui::Color32 {
-    match tone {
-        ChipTone::Ok => Style::OK,
-        ChipTone::Warn | ChipTone::Danger => Style::WARN,
-        ChipTone::Info => Style::ACCENT,
-        ChipTone::Neutral => Style::TEXT_DIM,
-    }
 }
