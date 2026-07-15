@@ -4790,6 +4790,16 @@ real enterprise browser rather than Carbon token compliance.
     BigBoy `cargo test -p mde-shell-egui tab_labels_and_hover_cards_name_each_tabs_engine -- --nocapture`
     passed 1/1. Fresh `.90` and `.170` lanes failed before compile with `/home` at 100% during rsync; only
     the disposable failed `tab-polish-*` slots were removed, and verification was rerouted to BigBoy.
+  - **Browser chrome accelerator ownership slice 2026-07-15:** `chrome_ui` now owns the Browser-reserved
+    tab-strip keyboard contract (`F11`/`Esc`, `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`,
+    `Ctrl+Shift+Tab`, and `Ctrl+1..9`) alongside the tab strip and engine selector. `web_panel` still
+    invokes the handler before polling/painting so these shortcuts are consumed before chrome widgets or
+    page-canvas input forwarding can see them; page typing remains protected while tab management stays
+    reachable. Farm evidence: `.50` `cargo fmt --check -p mde-shell-egui` passed; BigBoy `.130`
+    `cargo test -p mde-shell-egui ctrl_tab_cycles_tabs_and_ctrl_digits_jump_to_them -- --nocapture`
+    passed 1/1; `.50` `cargo test -p mde-shell-egui
+    ctrl_t_opens_a_new_tab_intent_and_never_leaks_into_the_page -- --nocapture` passed 1/1; warmed
+    BigBoy `.130` `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130.
   - **Browser Material action-button slice 2026-07-15:** Browser prompt bars and the password/capture
     controls now use one Browser-local `BrowserActionRole` helper for primary, secondary, warning, and
     quiet actions instead of hand-rolled/default egui button text. This keeps HTTP upgrade/continue/cancel,
