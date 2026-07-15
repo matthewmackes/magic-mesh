@@ -4655,6 +4655,13 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui browser_send_tab -- --nocapture` passed 12/12, `.170`
     `cargo fmt --check -p mde-shell-egui -p mde-browser-workers` passed, and BigBoy `.130`
     `cargo check -p mackesd --features async-services --lib` passed.
+    Live `.15` deploy/input proof after the F44 send-tabfix RPM: `mde-shell-egui.service` stayed
+    active, `/mnt/mesh-storage/browser-send-tab` contained zero JSON records, and installed
+    `/usr/libexec/mackesd/cef-verify` with `MDE_BROWSER_VERIFY_INPUT=1` passed against both
+    `/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview`. CEF observed nav + 3 painted
+    `1280x800` frames and final title `mde-browser-verify-p1-k1-tm`; Servo observed nav +
+    4 painted `1280x800` frames and final page text `P:1 K:1 T:m`. No leftover
+    `mde-web-cef`, `mde-web-preview`, or `cef-verify` processes remained after the probes.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
