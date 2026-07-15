@@ -153,6 +153,13 @@ MCNF_BUILD_HOST=172.20.0.131 ./install-helpers/xcp-build.sh rpm
 - DoD for a media build: `rpm -qpR <rpm> | grep swresample` must show `.so.6`
   (ffmpeg-8), and `rpm -qlp <rpm>` must list all four binaries
   (`mackesd`, `mde-shell-egui`, `mde-web-cef`, `mde-web-preview`).
+- Artifact-name gotcha found during the 2026-07-15 browser deploy: a native F44
+  `xcp-build.sh rpm` may pull a fresh `magic-mesh-12.0.0-1.x86_64.rpm` while an
+  older `magic-mesh-12.0.0-1.f44.x86_64.rpm` is still present in
+  `/root/mcnf-release-artifacts`. Do not trust the filename suffix. Verify
+  `rpm -qip <rpm>` build time and `rpm -qpR <rpm> | grep -E
+  'libavcodec|libswresample|libswscale'` before copying to a physical seat; F44
+  should show `.so.62`/`.so.6`/`.so.9`.
 
 ## 5. Terraform representation (the machines run terraform)
 
