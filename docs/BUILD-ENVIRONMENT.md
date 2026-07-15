@@ -108,6 +108,11 @@ created, then rerun the heavy job on BigBoy. Do not keep duplicate cold
 small-node filters running after an equivalent warmed BigBoy slot has already
 covered the assertion; cancel or clean the duplicate slot so the farm stays
 usable for the next gate.
+As of the 2026-07-15 Browser tab-polish pass, `.90` and `.170` both reported
+`/home` at 100% before compilation during fresh-slot rsync, largely due to the
+shared `~/magic-mesh-farm` plus stale heavy slots. Check `df -h /home` before
+using those lanes for new Browser/shell fanout; if they are full, clean only
+your disposable failed slot and route the shell test to a warmed BigBoy slot.
 
 **BigBoy slot hygiene note (learned 2026-07-15):** BigBoy's build VM currently
 has a 79G `/home`; it is the right long-pole target, but several cold heavy

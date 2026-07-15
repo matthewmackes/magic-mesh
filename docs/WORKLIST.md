@@ -4776,6 +4776,20 @@ real enterprise browser rather than Carbon token compliance.
     passed 1/1, BigBoy `.130` warmed-slot `cargo test -p mde-shell-egui browser -- --nocapture`
     passed 130/130, and BigBoy `.130` `cargo fmt --check -p mde-shell-egui` passed. A fresh `.90`
     duplicate hit the documented ENOSPC limit during dependency output and was rerouted to BigBoy.
+  - **Browser tab bar / engine selector fantastic pass 2026-07-15:** the Browser tab strip now uses
+    hand-painted Material tab capsules instead of generic egui button bodies: active/hover/pressed states
+    blend Browser-local state layers, each normal tab carries a compact per-engine badge, pinned tabs
+    degrade to a small accent dot, and the title text no longer repeats engine debug markers. The engine
+    selector is now a richer two-line capsule that names the operator-facing stack explicitly (`CEF`
+    over `Chromium`, `Servo` over `Rust engine`), with one primary active-engine `New tab` action and
+    selected underlines/focus rings. Regression coverage locks visible CEF/Chromium/Servo labels, removal
+    of raw `+CEF`/`+Servo`, badge-owned tab identity, and CEF/Chromium hover text. Farm evidence: `.50`
+    `cargo fmt --check -p mde-shell-egui` passed; BigBoy `.130` slot `tab-polish-bigboy`
+    `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130; warmed BigBoy
+    `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1; direct warmed
+    BigBoy `cargo test -p mde-shell-egui tab_labels_and_hover_cards_name_each_tabs_engine -- --nocapture`
+    passed 1/1. Fresh `.90` and `.170` lanes failed before compile with `/home` at 100% during rsync; only
+    the disposable failed `tab-polish-*` slots were removed, and verification was rerouted to BigBoy.
   - **Browser Material action-button slice 2026-07-15:** Browser prompt bars and the password/capture
     controls now use one Browser-local `BrowserActionRole` helper for primary, secondary, warning, and
     quiet actions instead of hand-rolled/default egui button text. This keeps HTTP upgrade/continue/cancel,
