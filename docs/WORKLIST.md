@@ -4686,7 +4686,16 @@ real enterprise browser rather than Carbon token compliance.
     `cargo check -p mde-web-preview-client --features live-helper --bins` passed, `.170`
     `cargo test -p mde-web-preview-client --features live-helper --bin cef-verify args_ --
     --nocapture` passed 3/3, and fmt passed for both the main workspace packages and the standalone
-    `mde-web-cef` manifest.
+    `mde-web-cef` manifest. Live Power Mode proof: direct `.50` run from
+    `~/magic-mesh-farm-browser-power-live` with
+    `MDE_CEF_LIVE_UI_SMOKE=1 MDE_CEF_BROWSER_POWER_MODE=1 MDE_CEF_ROOT=$HOME/mde-cef-active
+    MDE_WEB_CEF_BIN=$PWD/crates/desktop/mde-web-cef/target/debug/mde-web-cef
+    MDE_CEF_BRIDGE_BIN=$PWD/crates/desktop/mde-web-cef/target/debug/mde-web-cef-renderer
+    cargo test -p mde-shell-egui --features live-helper
+    cef_live_browser_ui_renders_and_operates_a_real_page_when_farm_smoke_is_enabled -- --nocapture`
+    passed 1/1, printed `CEF_BROWSER_POWER_MODE enabled=1`, reached `CEF_INITIALIZE_OK`,
+    drove Browser UI pointer/key/text to `P:1 K:1 T:m`, and painted `1280x800`; headless farm
+    EGL/GPU-process errors were non-fatal fallback noise.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
