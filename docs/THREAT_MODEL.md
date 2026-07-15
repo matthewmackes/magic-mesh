@@ -355,17 +355,17 @@ despite the similar name, is a different, unrelated worker (BROWSER-DD-12's
 | Component | Tier | Trust |
 |-----------|------|-------|
 | Page JavaScript (`navigator.credentials`) | inside the browser engine | **UNTRUSTED** page content — confined the same as any other script (§3) when the engine is Servo. |
-| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Intercepts `navigator.credentials.create`/`.get` **only when `options.publicKey` is present** (browser-4), calling through to the original for `{password}`/`{federated}`/`{otp}` requests; requires a user gesture (`navigator.userActivation`, security-2) before dispatch and ships the ceremony + presence signal to the shell over the existing IPC/beacon channel. See the CEF note in §7.4. |
-| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Forwards the ceremony to the local Bus, threading the shim's `user_present` gesture signal through — but there is still no unforgeable confirmation prompt at this layer (§7.4, item 1: deferred). |
+| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Intercepts `navigator.credentials.create`/`.get` **only when `options.publicKey` is present** (browser-4), calling through to the original for `{password}`/`{federated}`/`{otp}` requests; ships bounded public ceremony metadata plus a bridge-minted `client_request_id` to the shell over the existing IPC/beacon channel. CEF also checks `navigator.userActivation` before dispatch; the shell prompt below is the production presence gate. |
+| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Holds each ceremony as `PendingPasskeyConsent`, renders an Approve/Deny prompt the page cannot script, rejects denial/duplicates back to the page with `CompletePasskey { error }`, and only after approval publishes `action/browser/passkey` with `user_present=true`, `shell_consent=true`, and `presence_source=browser_shell_prompt`. |
 | `browser_passkeys` worker (Workstation, rank 1) | mackesd | Trusted. Validates the request shape + RP-ID/origin binding, mints or uses a P-256 keypair, signs, mirrors to the Syncthing share. |
 | Sealed credential store (`credentials/sealed/*.age`, local + Syncthing-shared workgroup root) | at rest | Confidentiality rests on the **mesh-wide age identity** (`/root/.mcnf-age-key`) — the same trust root already used for VPN tunnel secrets and XCP dom0 passwords, not a per-device or per-user secret (§7.4). |
 | Hardware FIDO2 keys / phone-as-authenticator | — | **Not wired to a live ceremony.** Only a HID readiness probe + CTAPHID_INIT diagnostic exist; the worker's own doc comment says CTAP2 credential commands and phone-as-authenticator "remain separate owners." |
 
 ```
 page JS  navigator.credentials.create()/get()
-   -> injected shim (engine process, Servo or CEF)   [no user-gesture check found]
-   -> beacon/IPC -> mde-shell-egui::web.rs            [forwarded verbatim, no consent UI]
-   -> Bus action/browser/passkey
+   -> injected shim (engine process, Servo or CEF)   [metadata only; no key material]
+   -> beacon/IPC -> mde-shell-egui::web.rs            [shell Approve/Deny gate]
+   -> Bus action/browser/passkey                      [only after approval]
    -> browser_passkeys worker
         create: mint P-256 keypair, seal private key, mirror public+sealed record over Syncthing
         get:    locate stored credential by rp_id (+ allow_credentials), unseal, sign
@@ -380,8 +380,9 @@ drive this entire pipeline; see §7.4 for what does, and does not, gate it.
 ### 7.2 Attack surface
 
 1. **Any page at a matching origin calling `navigator.credentials`.** The
-   shim and the daemon complete the ceremony with no user-presence check and
-   no confirmation UI. The single biggest surface (§7.4).
+   page can still trigger a visible shell prompt for its own origin/RP id, so
+   prompt spam/clickjacking is the main UX/security surface. The daemon only
+   completes the ceremony after shell approval (§7.4).
 2. **The RP-ID/origin binding logic** (`rp_matches_origin`, `valid_rp_id`,
    `origin_host`) — a bug here would be a direct cross-origin credential /
    phishing bypass. Reviewed line-by-line; found correct (§7.3.1).
@@ -456,42 +457,35 @@ Workstation-tier only (idles on headless/Lighthouse nodes). No Bus root, or a
 `Persist::open` failure, leaves the worker idle rather than fabricating a
 credential.
 
-### 7.4 Accepted residual risks — including one that is not yet mitigated
+### 7.4 Accepted residual risks
 
-1. **Honest presence flags + a gesture gate; unforgeable consent UI still
-   deferred (security-2, 2026-07-10).** *Was:* the daemon hardcoded both the
+1. **Honest presence flags + shell consent, but no User Verification yet
+   (security-2, updated 2026-07-15).** *Was:* the daemon hardcoded both the
    User Present (`UP`) and User Verified (`UV`) authenticator-data bits on
-   every ceremony, and the shim dispatched with no user-gesture check — so any
-   page could silently obtain a valid, "user-verified" assertion for its own
-   origin the instant it called the API, with no click, PIN, or biometric.
-   *Now, in three parts:*
-   - **UV** was already dropped to honest-`0` earlier this session (no
-     per-ceremony verification exists, so `UV` is never asserted).
-   - **`UP` is no longer hardcoded.** `authenticator_flags()` in
+   every ceremony, and the shell forwarded page-origin requests straight to the
+   Bus — so a page could silently obtain a valid, "user-verified" assertion for
+   its own origin, with no click, PIN, biometric, or shell confirmation.
+   *Now:*
+   - **UV remains honest-`0`.** No per-ceremony PIN/biometric/user-verification
+     flow exists, so `UV` is never asserted.
+   - **`UP` is not hardcoded.** `authenticator_flags()` in
      `browser_passkeys.rs` sets the `UP` bit **only** when the ceremony carried
-     a real presence signal (`PasskeyRequest::user_present`); a ceremony with
-     no verified presence honestly signs `UP=0`, which a relying party rejects,
-     instead of forging "a human was here." Assertion flags are now `0x01`
-     (present) / `0x00` (absent); registration `0x41` / `0x40` (`AT` always
-     set).
-   - **The shim requires a user gesture.** `cef_browser.rs`'s
-     `passkey_bridge_script` checks `navigator.userActivation.isActive` (WebAuthn
-     transient activation) before dispatching and rejects a gesture-less
-     ceremony with `NotAllowedError`; it threads the gesture as `user_present`
-     through `handle_passkey_event` (`web.rs`) to the daemon.
-   - **DEFERRED / residual:** the presence signal is still *page-asserted* — the
-     shim runs in the page's own JS context, so a hostile **same-origin** page
-     could forge `userActivation` for its **own** `rp_id` (it cannot mint
-     presence for another origin — §7.3.1 + the browser-6 PSL check bind
-     `rp_id` to the origin). A trustworthy, unforgeable presence gate — a
-     shell-rendered consent prompt the page cannot script — is intentionally
-     out of scope for this hardening pass (a sizable new UI) and remains the
-     open item. The `capture_notice` ("Passkey: sent ceremony to daemon") is
-     still a post-hoc transient status line, not that prompt. The net effect
-     is materially improved (auto-dispatch on page load is blocked; a
-     presence-less request signs an honest, RP-rejected `UP=0`), but a
-     click-jacked or scripted same-origin gesture is not yet defeated —
-     disclosed here, not silently claimed done.
+     `PasskeyRequest::user_present`; a ceremony with no presence signal signs
+     `UP=0`, which a relying party rejects. Assertion flags are `0x01`
+     (present) / `0x00` (absent); registration flags are `0x41` / `0x40`
+     (`AT` always set).
+   - **The Browser shell is now the presence gate.** `handle_passkey_event`
+     holds the ceremony as `PendingPasskeyConsent` and renders an Approve/Deny
+     prompt. Denial and duplicate pending requests return a page-side
+     `NotAllowedError`-style completion and never reach the daemon. Approval
+     stamps `user_present=true`, `shell_consent=true`, and
+     `presence_source=browser_shell_prompt` before publishing to
+     `action/browser/passkey`.
+   - **Residual:** this is consent/presence, not verification. It does not
+     defeat a user intentionally approving a malicious same-origin prompt or a
+     clickjacking/social-engineering flow. Direct trusted-Bus writers also
+     remain inside the daemon's trust boundary (§7.4 item 4); the shell gate
+     protects the page-origin browser path, not arbitrary local privileged code.
 2. **Mesh-wide key-sealing root, not a per-device secret.** `seal_private_key`
    keys its passphrase off `age_key_path()` (`/root/.mcnf-age-key` by
    default) — the same identity distributed "to leader-eligible nodes like
