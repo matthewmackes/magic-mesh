@@ -35,6 +35,15 @@ ENOSPC. Treat `.50`/`.90`/`.170` ENOSPC during rsync or `target/` writes as a
 slot-capacity problem: remove only disposable `~/magic-mesh-farm-*` slots you
 created, then rerun the heavy job on BigBoy.
 
+**BigBoy slot hygiene note (learned 2026-07-15):** BigBoy's build VM currently
+has a 79G `/home`; it is the right long-pole target, but several cold heavy
+slots can still fill it. Reuse a warm BigBoy slot for follow-up tests when it
+already contains the needed dependency graph, and remove only your finished or
+failed disposable `~/magic-mesh-farm-*` slots promptly before starting another
+cold heavy crate there. If direct reuse is needed after an `xcp-build.sh` sync,
+SSH to the same slot and run the focused cargo command there with
+`CARGO_INCREMENTAL=0`.
+
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
