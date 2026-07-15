@@ -4598,6 +4598,15 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-browser-workers browser_session_sync` passed 10/10, and `.170`
     `cargo fmt -p mde-shell-egui --check` passed. A `.90` focused shell run hit ENOSPC while
     compiling unrelated shell dependencies; the guidance is now captured in `docs/BUILD-ENVIRONMENT.md`.
+  - **Browser send-tab replay tombstone hardening 2026-07-15:** processed node send-tab records now
+    get a stable content/path tombstone under `browser-send-tab-consumed/<host>/` and an in-memory
+    processed set, so a surviving or unlinkable local/shared JSON record cannot reopen tabs after
+    the next poll or shell restart. The tombstone key includes the record body, so a legitimate new
+    handoff at the same relative path still opens. Farm evidence: `.50`
+    `cargo test -p mde-shell-egui browser_send_tab_outbox_tombstone_prevents_surviving_record_replay`
+    passed 1/1, `.90` `cargo test -p mde-shell-egui --features live-helper browser_send_tab`
+    passed 11/11, BigBoy `.130` `cargo test -p mde-shell-egui browser_send_tab` passed 11/11,
+    and `.170` `cargo fmt -p mde-shell-egui --check` passed.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
