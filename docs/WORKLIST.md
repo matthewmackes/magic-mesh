@@ -4790,6 +4790,20 @@ real enterprise browser rather than Carbon token compliance.
     BigBoy `cargo test -p mde-shell-egui tab_labels_and_hover_cards_name_each_tabs_engine -- --nocapture`
     passed 1/1. Fresh `.90` and `.170` lanes failed before compile with `/home` at 100% during rsync; only
     the disposable failed `tab-polish-*` slots were removed, and verification was rerouted to BigBoy.
+  - **Browser tab bar / engine dock refinement 2026-07-15:** the Browser tab strip no longer presents
+    engine choice as a utility cluster beside the tabs. The selected engine now drives a fused primary
+    action (`New CEF tab` / `New Servo tab`), the engine picker sits in a stroked Material dock keyed to
+    the selected engine accent, tab capsules use subtler active/inactive surface washes with a top active
+    rail, and tab labels dropped the always-on live bullet while preserving meaningful state/profile
+    markers. Servo tabs now spell out `Servo` in the tab badge instead of the older `Sv` abbreviation,
+    while the picker uses compact `C`/`S` glyphs plus readable stack labels. Regression coverage now locks
+    selected-engine primary-action retitling for both CEF and Servo, the marker/glyph split, raw `+CEF` /
+    `+Servo` removal, and badge-owned tab identity. Farm evidence: `.50`
+    `cargo fmt --check -p mde-shell-egui` passed; BigBoy `.130`
+    `cargo test -p mde-shell-egui engine -- --nocapture` passed 8/8; warmed BigBoy `.130`
+    `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130. A duplicate cold `.50` focused
+    lane and a duplicate cold BigBoy browser lane were stopped after the warmed BigBoy lane had the needed
+    coverage.
   - **Browser chrome accelerator ownership slice 2026-07-15:** `chrome_ui` now owns the Browser-reserved
     tab-strip keyboard contract (`F11`/`Esc`, `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`,
     `Ctrl+Shift+Tab`, and `Ctrl+1..9`) alongside the tab strip and engine selector. `web_panel` still
