@@ -57,7 +57,8 @@ The **headline pivot**: MCNF 12.0 "Quasar" becomes an **egui-native mesh thin-cl
 ## MOTION-DRM — NEXT EPIC: cohesive polished transition system for the egui DRM/KMS shell (operator 2026-07-15; questionnaire complete)
 
 **Operator lock / prompt provenance:** this is the next execution epic from the questionnaire-complete
-operator prompt. **All Carbon Design requirements are lifted to meet this goal.** The goal is a native
+operator prompt. **All Carbon Design Requirements are lifted to meet this goal: Questionnaire complete.**
+The goal is a native
 Rust motion system with polished macOS-style continuity, adapted to immediate-mode egui and the production
 direct-seat renderer. Do **not** copy Apple assets or private APIs; reproduce the behavioral principles
 only. The full questionnaire prompt is folded into this epic as binding scope; do not treat this shorter
@@ -102,6 +103,20 @@ move/resize; minimize/maximize or equivalent surface-state transitions; drag-rel
 Do not apply every effect everywhere at once: build primitives, then integrate representative components
 with low regression risk.
 
+**Questionnaire-complete visual contracts:** dialogs/modal overlays fade in, scale from roughly `0.96-0.98`
+to `1.0`, may translate only a few logical pixels, dim the background in parallel, keep text readable, and
+finish exit before state is destroyed or modal blocking is released. Launchers and command palettes animate
+from their logical source or presentation edge when available, otherwise use restrained fade/scale/short
+vertical movement; keyboard focus becomes predictable without waiting on decorative motion, and Escape
+feels immediate while still completing a short dismissal. Popovers stay visually connected to their invoking
+control, use the anchor for transform origin, avoid center-screen zooms, and retarget when the anchor moves.
+Cards animate geometry, clipping, opacity, and nearby layout coherently; text must not bounce independently.
+Pages/workspaces use short directional motion tied to navigation history when known, otherwise cross-fade.
+Routine controls interpolate subtle opacity/fill/border/shadow/geometry state, pressed feedback begins
+immediately, ordinary hover has no overshoot, and toggles/segmented selections may use a damped slide.
+Dragging/resizing tracks input without lag; springs apply only after release, snap, cancel, or constraint
+correction, with velocity preservation where practical and clamped extremes.
+
 **Architecture target:** create a small centralized motion subsystem, conceptually including settings,
 durations, easing, spring presets, animated scalar/position/size/rect/opacity/scale/color values,
 transition phase/lifecycle (`Hidden -> Entering -> Visible -> Exiting`), stable `egui::Id`/motion IDs,
@@ -109,6 +124,12 @@ retargeting, completion detection, reduced-motion substitutions, and explicit re
 IDs or application-owned state; do not key important animation state to reorderable list indices. Keep call
 sites readable: callers should not manually manage timestamps, normalized progress, repaint requests, or
 rest thresholds.
+
+**API ergonomics and presets:** centralize durations, springs, easing curves, reduced-motion substitutions,
+delta-time handling, and repaint logic. Named presets must cover the project equivalents of `control`,
+`panel`, `popover`, `dialog`, `page`, `layout`, and `drag_settle`, with conservative constants and a final
+table of actual durations/easing/spring parameters. Do not introduce a large animation dependency unless an
+existing workspace dependency already fits the architecture clearly.
 
 **Spring requirements:** numerically stable at variable frame rates; clamp large frame deltas after stalls;
 avoid NaN/inf/explosions after suspend/resume; work at 30/60/90/120/144 Hz; clear position/velocity rest
@@ -128,6 +149,14 @@ dismissal is sufficiently complete. Closing controls must not accept duplicate a
 during drag remains correct. Rapid reversals (`open while closing`, `close while opening`, destination
 change during movement, resize during page transition, remove during insertion) retarget from current visual
 state instead of snapping.
+
+**Rendering/performance constraints:** optimize for GLES over EGL/GBM. Prefer opacity, translation, scale,
+clipping, and simple geometry interpolation; avoid baseline blur, large shadows, repeated full-resolution
+offscreen passes, per-frame texture/render-target reallocation, unbounded translucent full-screen blending,
+and arbitrary nonuniform scaling of final text rendering. Favor stable 60 FPS behavior over elaborate
+effects. Before closing this epic, check idle repaint shutdown, no busy-loop while waiting for DRM page
+flips, bounded work with simultaneous overlays/cards, long pause or VT-switch behavior, simulated refresh
+intervals, and low input latency during transitions.
 
 - [ ] **MOTION-DRM-0: survey + design note.** Inspect current render/event loop, view routing, overlays,
   dialogs, panels, cards, input/focus handling, repaint scheduling, and existing motion/interpolation code.
@@ -4472,6 +4501,17 @@ real enterprise browser rather than Carbon token compliance.
   deterministic fake-helper shell input regression, BigBoy `.130` passed the
   focused shell compile/test filter, and `.170` passed rustfmt. This closes the
   gap between helper-wire input proof and the actual shell Browser panel path.
+  **Shell-level Servo fallback UI input smoke 2026-07-15:** env-gated
+  `servo_live_browser_ui` now builds/runs real `mde-web-preview`, loads the same
+  Browser UI input-probe through `WebState`/`web_panel`, proves local HTTP
+  fetch/render, page canvas focus, and pointer/key/text page response via repeated
+  bounded page-text polling (`P:1 K:1 T:m`). The smoke derives the click point
+  from the actual tessellated page texture instead of a fixed panel coordinate, so
+  Servo's stricter hit testing lands inside the probe content; page-text waits now
+  issue fresh request IDs until the queued input has reached the DOM. BigBoy `.130`
+  slot `browser-servo-ui-live` passed the cold Servo helper build plus live Browser
+  UI smoke; `.50` reran and passed CEF live UI; `.90` passed deterministic shell
+  input; `.170` passed rustfmt.
 - [x] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1. **V1 policy closure 2026-07-14:** production CEF launches now keep WebExtensions disabled even when a curated registry exists; `mde-web-cef` reports `CEF_EXTENSIONS_SKIPPED_V1 ... reason=native_adblock_passkeys_reader_ship_for_v1` and only the lab smoke path can opt back in with `MDE_CEF_WEBEXTENSIONS_LAB`. Browser chrome states the supported v1 path: native blocker, passkeys, reader mode, userscripts, and site styles.
 - [>] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface. **C0 slice 2026-07-14:** introduced `web/chrome_ui/`, wrapped the Browser tab/toolbar/bookmarks/find rows in a browser-local light visuals/font scope, removed the default shared MENUBAR-ALL top-strip call from `web_panel`, and moved the existing state-gated Browser command tree under the toolbar's Chrome-style menu button. The menubar coverage backstop now records Browser as a deliberate first-party chrome surface instead of a shared-bar surface. **Material state-layer slice 2026-07-15:** `chrome_ui` now owns Browser-local Material-style surface/container/outline/primary roles plus hover/focus/press state-layer blending; the tab strip, tab search, new-tab buttons, bookmarks row, find row, suggestions, compact tab menus, and Chrome toolbar menu use those Browser-local tokens instead of shared shell fills/text where they are part of first-party browser chrome. **Overlay token slice 2026-07-15:** Browser drawers and page-top permission/before-unload/password/offline/capture notices use Browser-local Material surface/text/status tokens; capture annotation/page pixels intentionally remain unchanged. **Body/interstitial token slice 2026-07-15:** Browser new-tab dashboard text, HTTP insecure prompt, loading/gated empty body, crash body, certificate error, safe-browsing, and managed-policy interstitials now use Browser-local Material text/status tokens instead of shared shell text colors; regression coverage locks the certificate interstitial paint colors and the new-tab dashboard path. **Omnibox Material text-run slice 2026-07-15:** `chrome_ui` now owns the omnibox font/format helpers, the unfocused URL-emphasis readout uses Browser Material dim/primary text runs instead of shared shell `Style::TEXT_DIM/TEXT_STRONG`, and focused inline completion paints with Browser-local dim text; farm coverage ran the full focused `omnibox` test filter plus the chrome helper test. **Page-actions Material slice 2026-07-15:** toolbar star and page-actions menu entries (bookmark, copy URL, send in Chat, share, send-tab) now use Browser-local Material text/star roles; rendered regression locks active page-action text colors and helper coverage locks disabled/plain/bookmarked star states. **Remaining:** extract the rest of tabstrip/toolbar/omnibox/new-tab rendering into `chrome_ui`, embed/use the actual Roboto chrome font asset, continue first-party chrome extraction, and complete the pixel-faithful Chrome pass.
 
