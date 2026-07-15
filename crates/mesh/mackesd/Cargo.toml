@@ -960,6 +960,7 @@ assets = [
     { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
     # BROWSER-CHROME — shell-equivalent verifier for the CEF tab helper wire.
     { source = "target/release/cef-verify",          dest = "/usr/libexec/mackesd/cef-verify", mode = "755" },
+    { source = "install-helpers/browser-verify-engines.sh", dest = "/usr/libexec/mackesd/browser-verify-engines", mode = "755" },
     # BROWSER-DD-1 — pinned Chromium/CEF runtime provisioning. The 311 MB CEF
     # runtime is fetched/verified at first boot, not embedded in this RPM.
     { source = "install-helpers/install-cef-runtime.sh", dest = "/usr/libexec/mackesd/install-cef-runtime", mode = "755" },

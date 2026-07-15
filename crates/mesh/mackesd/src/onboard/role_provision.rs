@@ -609,6 +609,51 @@ mod tests {
     }
 
     #[test]
+    fn browser_rpm_ships_two_engine_operational_verifier_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let source = "install-helpers/browser-verify-engines.sh";
+        let dest = "/usr/libexec/mackesd/browser-verify-engines";
+
+        assert!(
+            asset_exists(browser_assets, source, dest, "755"),
+            "Browser RPM must ship the two-engine Browser operational verifier"
+        );
+        assert!(
+            dest_absent(base_assets, dest),
+            "base RPM must not ship the Browser operational verifier"
+        );
+        assert!(
+            dest_absent(server_assets, dest),
+            "headless server RPM must not ship the Browser operational verifier"
+        );
+
+        let verifier = include_str!("../../../../../install-helpers/browser-verify-engines.sh");
+        for needle in [
+            "/usr/libexec/mackesd/cef-verify",
+            "/usr/bin/mde-web-cef",
+            "/usr/bin/mde-web-preview",
+            "MDE_BROWSER_VERIFY_INPUT=1",
+            "VERIFY RESULT=PASS",
+            "VERIFY on_paint_ready",
+            "mde-browser-verify-p1-k1-tm|P:1 K:1 T:m",
+            "process cleanup passed",
+        ] {
+            assert!(
+                verifier.contains(needle),
+                "Browser operational verifier must contain {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn browser_rpm_ships_browser_read_aloud_tts_wrapper_but_base_and_server_do_not() {
         let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];

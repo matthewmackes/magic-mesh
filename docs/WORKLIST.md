@@ -4900,6 +4900,20 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-web-preview-client --features live-helper --bin cef-verify -- --nocapture`
     passed 5/5, BigBoy `.130` `cargo check -p mde-web-preview-client --features live-helper --bins`
     passed, and `.170` `cargo fmt -p mde-web-preview-client -- --check` passed.
+  - **Browser two-engine operational verifier wrapper 2026-07-15:** the Browser RPM now ships
+    `/usr/libexec/mackesd/browser-verify-engines`, a single installed command that runs the
+    shell-equivalent `cef-verify` input probe against both `/usr/bin/mde-web-cef` and
+    `/usr/bin/mde-web-preview`, requires nav + painted frames + pointer/key/text response, and fails if
+    new helper/verifier processes survive the probe. This turns the current two-engine render/input proof
+    into a repeatable installed-seat gate instead of a pair of copied commands. Static packaging coverage
+    locks the asset into `magic-mesh-browser` only and asserts the wrapper's two-engine/input/cleanup
+    contract. Evidence: local `bash -n install-helpers/browser-verify-engines.sh`,
+    `install-helpers/browser-verify-engines.sh --help`, `install-helpers/verify-rpm-payload.sh payload`,
+    and `git diff --check` passed; `.50` `cargo fmt --check -p mackesd` passed; BigBoy `.130`
+    `cargo test -p mackesd --features async-services
+    browser_rpm_ships_two_engine_operational_verifier_but_base_and_server_do_not -- --nocapture`
+    passed 1/1; BigBoy `.130` `cargo test -p mackesd --features async-services
+    onboard::role_provision -- --nocapture` passed 28/28.
   - **CEF Browser Power Mode launch profile 2026-07-15:** Browser Power Mode now reaches newly
     spawned CEF helpers as process env (`MDE_CEF_BROWSER_POWER_MODE=true` plus the existing
     extension power-mode env), the CEF launcher forwards that state into the native renderer bridge,

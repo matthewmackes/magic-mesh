@@ -93,8 +93,9 @@ enabling the setup units is insufficient because the boot-time units may already
 have skipped; the Browser `%post` must queue
 `systemctl start --no-block $BROWSER_UNITS`. For F44 Enforcing workstation
 proofs, verify `getenforce`, labels, loaded modules, run the installed
-`MDE_BROWSER_VERIFY_INPUT=1 /usr/libexec/mackesd/cef-verify` against both
-`/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview` from a fresh sandbox root,
+`/usr/libexec/mackesd/browser-verify-engines` from a fresh sandbox root (it wraps
+`MDE_BROWSER_VERIFY_INPUT=1 /usr/libexec/mackesd/cef-verify` for both
+`/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview` and checks helper cleanup),
 then confirm `ausearch -m AVC,USER_AVC` has no matches for each final verifier
 window and no helper processes remain.
 
