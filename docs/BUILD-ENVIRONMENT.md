@@ -178,6 +178,14 @@ configured yet", not "provisioning complete"; keeping those units inactive after
 the clean gate lets `systemctl start mde-widevine-cdm-setup.service` and the
 TTS/STT/translation model setup units retry normally after an operator fills the
 licensed URL/SHA or approved model manifest.
+Upgrade caveat from the `.15` split-RPM deploy: a host that previously loaded
+the old `RemainAfterExit=yes` units can keep a legacy `active (exited)` state
+even after new unit files are installed and `daemon-reload` runs. Browser RPM
+post-install must clear that stale retryable state before queueing the setup
+units: if `systemctl show "$unit" -p ExecMainStatus --value` is `78`, stop the
+unit once, then start the setup group. After that one-time state clear, the
+corrected units settle to `inactive/dead` with `ExecMainStatus=78` and remain
+retryable.
 
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those

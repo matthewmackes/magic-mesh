@@ -1007,8 +1007,14 @@ assets = [
 post_install_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
 BROWSER_UNITS="mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service"
+BROWSER_RETRYABLE_UNITS="mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service"
 systemctl unmask $BROWSER_UNITS >/dev/null 2>&1 || :
 systemctl enable $BROWSER_UNITS >/dev/null 2>&1 || :
+for unit in $BROWSER_RETRYABLE_UNITS; do
+  if [ "$(systemctl show "$unit" -p ExecMainStatus --value 2>/dev/null || :)" = "78" ]; then
+    systemctl stop "$unit" >/dev/null 2>&1 || :
+  fi
+done
 systemctl start --no-block $BROWSER_UNITS >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """

@@ -521,6 +521,12 @@ mod tests {
             "Browser RPM post-install must enable and non-blocking queue Browser setup units so live installs do not wait for a reboot"
         );
         assert!(
+            browser_script.contains("BROWSER_RETRYABLE_UNITS=")
+                && browser_script.contains("systemctl show \"$unit\" -p ExecMainStatus --value")
+                && browser_script.contains("systemctl stop \"$unit\""),
+            "Browser RPM post-install must clear legacy exit-78 active/exited state before retrying optional setup units"
+        );
+        assert!(
             !script.contains("systemctl enable --now --no-block magic-mesh-selinux-policy.service"),
             "SELinux policy loaders must not start from dnf %post"
         );
