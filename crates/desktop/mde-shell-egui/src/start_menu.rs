@@ -179,6 +179,13 @@
 //! already uses; the panel's click-away dismissal is suppressed while that menu
 //! is open so choosing "Pin" keeps the menu up (only "Open" closes it, via the
 //! existing tile-activation seam).
+//!
+//! **WIN10-HYBRID B6 update:** the launcher grid now wears the accepted
+//! taskbar-era Start styling rather than the old rounded panel default:
+//! square Start chrome, visible uniform tile bodies, category accent rails,
+//! and explicit hover/focus/pinned state. The topology remains the surviving
+//! Win7 decision: every tileable [`Surface::ALL`] entry appears once in the
+//! grouped grid, with optional pinned copies rendered above it as shortcuts.
 
 use std::time::Duration;
 
@@ -204,6 +211,14 @@ const SLIDE_KEY: &str = "start-menu-slide";
 /// A 1px hairline rule (the dock's/console's `HAIRLINE_W` restated —
 /// module-private in each, the established per-module idiom).
 const HAIRLINE_W: f32 = 1.0;
+
+/// WIN10-HYBRID B6 — Start/taskbar chrome is square. Surfaces still use the
+/// shared 4/6/8 radius tiers; the Start menu and launcher-grid affordances do
+/// not.
+const START_CHROME_RADIUS: f32 = 0.0;
+
+/// The narrow category/state stripe used on headings and tile bodies.
+const START_ACCENT_W: f32 = Style::SP_XS / 2.0;
 
 // ── tile grid geometry (WIN7-3, locks #6/#7/#8) ─────────────────────────────
 
@@ -428,6 +443,10 @@ struct TileGroup {
     /// matching `console.rs`'s own `heading()` row, per this unit's steer to
     /// match Console's precedent since it sits right next to this pane).
     label: &'static str,
+    /// WIN10-HYBRID B6 — a category accent for the heading rail and each
+    /// tile's resting left stripe. Purely presentational; this same table
+    /// remains the one reachability authority for the grouped grid.
+    accent: egui::Color32,
     /// The group's surfaces, kept in [`Surface::ALL`] relative order (the
     /// `dock.rs` `Group::surfaces` L7 convention) — lock #8's own listed
     /// order already satisfies this, checked by a test below.
@@ -443,26 +462,32 @@ struct TileGroup {
 const TILE_GROUPS: [TileGroup; 7] = [
     TileGroup {
         label: "Mesh Control",
+        accent: Style::ACCENT_MESH,
         surfaces: &[Surface::Workbench, Surface::MeshView, Surface::InfraCode],
     },
     TileGroup {
         label: "Desktop & Session",
+        accent: Style::ACCENT,
         surfaces: &[Surface::Desktop],
     },
     TileGroup {
         label: "Media",
+        accent: Style::ACCENT_MEDIA,
         surfaces: &[Surface::Music, Surface::Media],
     },
     TileGroup {
         label: "Files & Data",
+        accent: Style::ACCENT_SYSTEM,
         surfaces: &[Surface::Files, Surface::Bookmarks, Surface::Storage],
     },
     TileGroup {
         label: "Web & Tools",
+        accent: Style::ACCENT_TERMINALS,
         surfaces: &[Surface::Browser, Surface::Terminal, Surface::Editor],
     },
     TileGroup {
         label: "Comms",
+        accent: Style::ACCENT_COMMS,
         // Voice (SIP calling) is a communications surface, not a media player:
         // dock.rs `GROUPS` — the canonical taxonomy — groups it with Chat/Phones,
         // so this tile grouping matches (kept in `Surface::ALL` relative order).
@@ -470,6 +495,7 @@ const TILE_GROUPS: [TileGroup; 7] = [
     },
     TileGroup {
         label: "System",
+        accent: Style::ACCENT_WORKLOADS,
         // Explorer (discover every mesh/LAN/cloud unit) tiles here beside About —
         // whose body IS the Device-Manager hardware inventory — as the pane's
         // inventory/inspection pair. The canonical picker (`dock.rs` GROUPS) files
@@ -801,10 +827,10 @@ pub fn start_menu_panel(
 /// only its OWN inner rail|list divider (no doubled-up border).
 fn paint_frame(ui: &egui::Ui, rect: egui::Rect) {
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
+    painter.rect_filled(rect, START_CHROME_RADIUS, Style::SURFACE);
     painter.rect_stroke(
         rect,
-        Style::RADIUS,
+        START_CHROME_RADIUS,
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
         egui::StrokeKind::Inside,
     );
@@ -833,6 +859,7 @@ struct NavCell {
 /// the layout and the arrow-nav row math ([`nav_rows`]) can never diverge.
 struct NavSection {
     heading: &'static str,
+    accent: egui::Color32,
     pinned: bool,
     rows: Vec<Vec<Surface>>,
 }
@@ -848,6 +875,7 @@ fn nav_sections(pinned: &[Surface]) -> Vec<NavSection> {
     if !pinned.is_empty() {
         sections.push(NavSection {
             heading: "Pinned",
+            accent: Style::ACCENT,
             pinned: true,
             rows: pinned
                 .chunks(TILE_COLUMNS)
@@ -858,6 +886,7 @@ fn nav_sections(pinned: &[Surface]) -> Vec<NavSection> {
     for group in &TILE_GROUPS {
         sections.push(NavSection {
             heading: group.label,
+            accent: group.accent,
             pinned: false,
             rows: group
                 .surfaces
@@ -1097,7 +1126,7 @@ fn left_pane(
             egui::pos2(x0, y),
             egui::vec2((rect.width() - PANE_PAD * 2.0).max(0.0), GROUP_HEADING_H),
         );
-        tile_group_heading(ui, heading_rect, section.heading);
+        tile_group_heading(ui, heading_rect, section.heading, section.accent);
         y += GROUP_HEADING_H;
 
         for (row_idx, row) in section.rows.iter().enumerate() {
@@ -1116,7 +1145,16 @@ fn left_pane(
                 let facts = tile_facts(surface, inputs);
                 let tint = tile_status_tint(surface, inputs);
                 let is_pinned = section.pinned || snapshot.contains(&surface);
-                let out = tile(ui, cell, tile_rect, &facts, tint, time_secs, is_pinned);
+                let out = tile(
+                    ui,
+                    cell,
+                    tile_rect,
+                    &facts,
+                    tint,
+                    time_secs,
+                    is_pinned,
+                    section.accent,
+                );
                 match out.action {
                     TileAction::Activate => activated = Some(surface),
                     TileAction::TogglePin => toggle = Some(surface),
@@ -1150,19 +1188,25 @@ fn toggle_pin(pinned: &mut Vec<Surface>, surface: Surface) {
     }
 }
 
-/// One tile-group heading — visually matches `console.rs`'s own
-/// (module-private) `heading()` row exactly (same uppercased micro-label,
-/// same `SMALL`/`TEXT_DIM` treatment, same `SP_XS` left inset), restated
-/// here since it's private to that module and this pane paints via explicit
-/// rects rather than `console.rs`'s layout-managed `ui.allocate_exact_size`
-/// (this module's own established direct-painter style, e.g. [`paint_frame`]).
-fn tile_group_heading(ui: &egui::Ui, rect: egui::Rect, label: &str) {
-    ui.painter().text(
-        egui::pos2(rect.left() + Style::SP_XS, rect.center().y),
+/// One tile-group heading — B6 keeps the compact uppercase rhythm but adds a
+/// category rail so the grouped launcher reads as organized sections, not a
+/// flat wall of icons.
+fn tile_group_heading(ui: &egui::Ui, rect: egui::Rect, label: &str, accent: egui::Color32) {
+    let painter = ui.painter();
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - Style::SP_XS / 2.0),
+            egui::vec2(START_ACCENT_W, Style::SP_XS),
+        ),
+        START_CHROME_RADIUS,
+        accent,
+    );
+    painter.text(
+        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label.to_uppercase(),
         egui::FontId::proportional(Style::SMALL),
-        Style::TEXT_DIM,
+        accent,
     );
 }
 
@@ -1208,6 +1252,7 @@ fn tile(
     status_tint: Option<egui::Color32>,
     time_secs: f64,
     is_pinned: bool,
+    group_accent: egui::Color32,
 ) -> TileOutcome {
     let surface = cell.surface;
     let resp = ui.interact(rect, nav_cell_id(cell), egui::Sense::click());
@@ -1216,8 +1261,28 @@ fn tile(
     let lit = hovered || focused;
     let painter = ui.painter().clone();
 
-    if lit {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    let fill = if lit { Style::SURFACE_HI } else { Style::BG };
+    painter.rect_filled(rect, START_CHROME_RADIUS, fill);
+    painter.rect_stroke(
+        rect,
+        START_CHROME_RADIUS,
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(START_ACCENT_W, rect.height())),
+        START_CHROME_RADIUS,
+        group_accent,
+    );
+    if is_pinned {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.top()),
+                egui::vec2(rect.width(), START_ACCENT_W),
+            ),
+            START_CHROME_RADIUS,
+            Style::ACCENT,
+        );
     }
     let tint = if lit { Style::TEXT } else { Style::TEXT_DIM };
 
@@ -1356,7 +1421,7 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
     let resp = ui.interact(rect, id, egui::Sense::click());
     if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+            .rect_filled(rect, START_CHROME_RADIUS, Style::SURFACE_HI);
     }
     ui.painter().text(
         egui::pos2(rect.left() + Style::SP_S, rect.center().y),
@@ -1910,6 +1975,26 @@ fn tile_group_label(surface: Surface) -> &'static str {
         .map_or("", |g| g.label)
 }
 
+/// The category accent for a grouped-grid surface (B6). Returns `None` only
+/// for non-grid surfaces such as [`Surface::Timers`].
+fn tile_group_accent(surface: Surface) -> Option<egui::Color32> {
+    TILE_GROUPS
+        .iter()
+        .find(|g| g.surfaces.contains(&surface))
+        .map(|g| g.accent)
+}
+
+/// The one authoritative grouped-grid surface order: every tileable surface
+/// once, with no pinned/search duplicates. The render loop walks the same
+/// [`TILE_GROUPS`] table; tests use this pure helper to pin the B6 launcher
+/// reachability contract.
+fn grouped_grid_surfaces() -> Vec<Surface> {
+    TILE_GROUPS
+        .iter()
+        .flat_map(|group| group.surfaces.iter().copied())
+        .collect()
+}
+
 /// The ranked result list that replaces the grouped grid while a query is live
 /// (SHELL-UX-3): one compact row per match — leading glyph, the surface label,
 /// and its dim group name right-aligned — with the keyboard-highlighted row
@@ -1949,7 +2034,7 @@ fn search_results(
         let is_sel = i == selected;
         let hovered = resp.hovered();
         if is_sel || hovered {
-            painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
+            painter.rect_filled(row, START_CHROME_RADIUS, Style::SURFACE_HI);
         }
         if is_sel {
             painter.rect_filled(
@@ -2703,6 +2788,74 @@ mod tests {
                 "{surface:?} must be placed in exactly one tile group"
             );
         }
+    }
+
+    #[test]
+    fn b6_grouped_grid_reaches_every_tileable_surface_once() {
+        // WIN10-HYBRID B6 completion: the Start launcher grid is THE surface
+        // launcher. Optional Pinned/search copies are convenience affordances,
+        // but the grouped grid itself must contain every tileable surface once
+        // and only once.
+        let grouped = super::grouped_grid_surfaces();
+        assert_eq!(
+            grouped.len(),
+            Surface::ALL.len(),
+            "the grouped grid must expose exactly the tileable surface roster"
+        );
+        for surface in Surface::ALL {
+            assert_eq!(
+                grouped.iter().filter(|&&s| s == surface).count(),
+                1,
+                "{surface:?} must be reachable exactly once from the grouped grid"
+            );
+            assert!(
+                !super::tile_group_label(surface).is_empty(),
+                "{surface:?} must have a visible group label"
+            );
+            assert!(
+                super::tile_group_accent(surface).is_some(),
+                "{surface:?} must inherit a category accent"
+            );
+        }
+        assert!(
+            !grouped.contains(&Surface::Timers),
+            "Timers remains clock/taskbar-owned, not a duplicate Start-grid tile"
+        );
+    }
+
+    #[test]
+    fn b6_start_grid_uses_square_chrome_and_distinct_group_accents() {
+        // WIN10-HYBRID explicitly makes taskbar + Start chrome square while
+        // surfaces keep the shared radius tiers. Pin that locally so this file
+        // does not drift back to `Style::RADIUS` for Start-owned chrome.
+        assert_eq!(super::START_CHROME_RADIUS, 0.0);
+        assert!(
+            super::START_ACCENT_W > 0.0 && super::START_ACCENT_W < Style::SP_XS,
+            "category/state stripes should be visible but compact"
+        );
+
+        let mut accents = Vec::new();
+        for group in &super::TILE_GROUPS {
+            assert_ne!(
+                group.accent,
+                Style::SURFACE,
+                "{} needs a visible category accent, not the panel fill",
+                group.label
+            );
+            assert_ne!(
+                group.accent,
+                Style::BORDER,
+                "{} needs a category accent, not a separator tone",
+                group.label
+            );
+            assert!(
+                !accents.contains(&group.accent),
+                "{} reuses another group's accent; B6 wants scannable sections",
+                group.label
+            );
+            accents.push(group.accent);
+        }
+        assert_eq!(accents.len(), super::TILE_GROUPS.len());
     }
 
     #[test]

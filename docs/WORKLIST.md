@@ -4421,7 +4421,7 @@ Plan: `.claude/plans/snappy-discovering-sphinx.md`; design: `docs/design/win10-t
 - [x] Phase B core — 48px bottom taskbar · bottom strut · left dock retired · two-line clock-with-date
 - [x] Phase C — depth/focus/motion adopted across 17 surfaces (4 farm-fanout waves, integration-green)
 - [x] Phase D — design-lock docs reconciled · F44 RPM `12.0.0-1` cut · **deployed + live-verified on seat 172.20.0.15** (DRM shell up, `"drm":true`)
-- [~] B5-rest — Win10 tray recompose. **DONE (origin `b309518b`, 2026-07-12): action-center→`Surface::Chat` cell + show-desktop nub** (routing + geometry-non-overlap tests, 1110/1110 green, 0 style leaks). **Remaining (visual — need live eyes on .15 after a redeploy):** ▲ overflow flyout · auto-hide bottom-edge reveal · running-icons-only · VDI hover thumbnails · Start-grid restyle (B6).
+- [~] B5-rest — Win10 tray recompose. **DONE (origin `b309518b`, 2026-07-12): action-center→`Surface::Chat` cell + show-desktop nub** (routing + geometry-non-overlap tests, 1110/1110 green, 0 style leaks). **Start-grid restyle B6 DONE 2026-07-15:** square Win10-HYBRID Start chrome, grouped tile bodies, category accent rails, hover/focus/pinned states, and one authoritative grouped grid exposing every tileable `Surface::ALL` entry exactly once; `.50` `cargo test -p mde-shell-egui start_menu -- --nocapture` passed 48/48. **Remaining (visual — need live eyes on .15 after a redeploy):** ▲ overflow flyout · auto-hide bottom-edge reveal · running-icons-only · VDI hover thumbnails.
 - [x] mesh-enroll seat .15 into `magic-mesh` — DONE 2026-07-12: `peer:Basement-Test-Workstation` at overlay `10.42.0.8`, boot-durable, bidirectionally verified vs LH1 (`mackesd add-peer` on the CA → `mackesd join` on .15).
 
 ### BROWSER-CHROME — pixel-faithful stock Chrome chrome over real Chromium (CEF)
@@ -4760,6 +4760,17 @@ real enterprise browser rather than Carbon token compliance.
     `.50` `cargo test -p mde-shell-egui download_drawer_status_uses_browser_material_roles -- --nocapture`
     passed 1/1, `.90` `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 6/6, and BigBoy
     `.130` `cargo fmt --check -p mde-shell-egui` passed.
+  - **Browser tab bar / engine selector polish slice 2026-07-15:** the old raw `+CEF` / `+Servo`
+    affordances are replaced with one familiar new-tab `+` plus a Browser Material segmented engine
+    selector labelled `Chromium` and `Servo`. The future-tab engine choice is now a first-class
+    persisted Browser state, while mixed-engine sessions remain scannable through compact `Cr`/`Sv`
+    tab markers and hover cards that name the engine. Regression coverage locks removal of the raw
+    `+engine` labels, the selector text/state tokens, and per-tab engine labels. Farm evidence:
+    `.50` `cargo test -p mde-shell-egui engine_selector -- --nocapture` passed 1/1, `.90`
+    `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1, BigBoy `.130`
+    `cargo test -p mde-shell-egui tab_labels_and_hover_cards_name_each_tabs_engine -- --nocapture`
+    passed 1/1, BigBoy `.130` `cargo test -p mde-shell-egui tab -- --nocapture` passed 121/121,
+    and BigBoy `.130` `cargo fmt --check -p mde-shell-egui` passed.
   - **Browser send-tab self-loop fix 2026-07-15:** Send Tab to Node no longer defaults to the local
     host or publishes a configured self-target, and the Browser inbox drain now consumes existing
     self-originated node handoff records without opening tabs. Live cleanup on `.15`
