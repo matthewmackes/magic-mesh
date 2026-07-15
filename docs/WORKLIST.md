@@ -4662,6 +4662,14 @@ real enterprise browser rather than Carbon token compliance.
     `1280x800` frames and final title `mde-browser-verify-p1-k1-tm`; Servo observed nav +
     4 painted `1280x800` frames and final page text `P:1 K:1 T:m`. No leftover
     `mde-web-cef`, `mde-web-preview`, or `cef-verify` processes remained after the probes.
+  - **Browser verifier argument hardening 2026-07-15:** `cef-verify` now treats an empty or
+    whitespace URL argument as omitted, so `MDE_BROWSER_VERIFY_INPUT=1 cef-verify <helper> "" 30`
+    uses the built-in input-probe data URL and preserves the requested timeout instead of passing a
+    relative blank URL to the engine. Farm evidence: `.50` `cargo test -p mde-web-preview-client
+    --features live-helper --bin cef-verify args_ -- --nocapture` passed 3/3, `.90`
+    `cargo test -p mde-web-preview-client --features live-helper --bin cef-verify -- --nocapture`
+    passed 5/5, BigBoy `.130` `cargo check -p mde-web-preview-client --features live-helper --bins`
+    passed, and `.170` `cargo fmt -p mde-web-preview-client -- --check` passed.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
