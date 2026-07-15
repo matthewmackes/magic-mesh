@@ -197,6 +197,16 @@ Both public-channel files drop **well under** the limit, and each can grow indep
 either approaches the cliff. zstd could even be reconsidered per-file for faster installs on
 low-end lighthouses, since neither file is near the ceiling anymore.
 
+Fedora 44 deploy cut proof (2026-07-15, `install-helpers/build-rpm-fedora43.sh 44`):
+
+| package | compressed (xz) | bytes | SHA-256 |
+|---|---:|---:|---|
+| `magic-mesh-12.0.0-1.x86_64.rpm` | **70.0 MiB** | 73,349,769 | `b2e26d1aa557a74631d6a5a27da33904990c2da3a7eab5776b3aeff5d1b3ac95` |
+| `magic-mesh-browser-12.0.0-1.x86_64.rpm` | **39.1 MiB** | 41,012,002 | `d4e828adcb3f1b494bf9d664d86b4876b13f44fdf5112a1386d5de6b6816a44f` |
+
+Both F44 artifacts passed payload verification, `rpm -Uvh --test` on the Fedora
+44 `.15` Workstation, and installed together as co-installable split packages.
+
 ### 4.4 Cut-script change (the part that makes it real)
 
 The RPM cut becomes a **three-invocation** sequence (both cut paths —

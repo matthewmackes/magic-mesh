@@ -35,7 +35,23 @@ and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). For an F44
 workstation deploy, use the container lane with an explicit Fedora argument:
 `install-helpers/build-rpm-fedora43.sh 44` from a farm checkout, then copy the
 RPM from `target-f43/generate-rpm/`. The directory name is historical; the first
-positional argument controls the Fedora container tag.
+positional argument controls the Fedora container tag. For the split Browser
+package, copy and install the base and Browser RPMs together and always run the
+transaction test first:
+`rpm -Uvh --test --replacepkgs --force --nosignature magic-mesh-*.rpm magic-mesh-browser-*.rpm`.
+The live `.15` proof on 2026-07-15 used exactly this lane and produced F44 RPMs
+at 70.0 MiB (`magic-mesh`) and 39.1 MiB (`magic-mesh-browser`), both under the
+90 MiB channel guard.
+
+**DRM shell live-restart note (learned 2026-07-15):** `mde-shell-egui.service`
+conflicts with `getty@tty1.service` and has an `ExecStopPost` that starts getty
+again for console recovery. A remote `systemctl restart mde-shell-egui.service`
+can cancel the start because the role-gate `ExecCondition` receives `SIGHUP`
+during the tty1 handoff. For live `.15` deploys over SSH, use the two-step
+sequence instead: `systemctl stop getty@tty1.service; sleep 1; systemctl start
+mde-shell-egui.service`, then confirm `systemctl is-active
+mde-shell-egui.service`, `NRestarts=0`, and the journal version line. This is a
+service orchestration gotcha, not a Browser helper/runtime failure.
 
 **Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
 exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even

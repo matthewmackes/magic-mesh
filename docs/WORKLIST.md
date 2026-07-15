@@ -4575,6 +4575,34 @@ real enterprise browser rather than Carbon token compliance.
   still has automatic ELF soname requirements for shell-linked graphics/font
   libraries, which is expected for the DRM shell and is not the Browser payload
   split boundary.
+  **Browser split F44 deploy proof 2026-07-15:** the Fedora 44 container lane
+  (`install-helpers/build-rpm-fedora43.sh 44`) cut split RPMs under
+  `target-f43/generate-rpm/`: base `magic-mesh-12.0.0-1.x86_64.rpm` at
+  70.0 MiB / 73,349,769 bytes, SHA-256
+  `b2e26d1aa557a74631d6a5a27da33904990c2da3a7eab5776b3aeff5d1b3ac95`, and
+  Browser `magic-mesh-browser-12.0.0-1.x86_64.rpm` at 39.1 MiB /
+  41,012,002 bytes, SHA-256
+  `d4e828adcb3f1b494bf9d664d86b4876b13f44fdf5112a1386d5de6b6816a44f`. Both
+  passed `verify-rpm-payload.sh payload`, the base RPM grep found no Browser
+  helper/runtime payload, and the Browser RPM owned the expected CEF, Servo,
+  verifier, Widevine/model, SELinux, and adblock files. Live `.15`
+  (`Basement-Test-Workstation`, Fedora 44) copied both RPMs to
+  `/tmp/magic-mesh-browser-split/`, hash-verified them, passed
+  `rpm -Uvh --test --replacepkgs --force --nosignature` with both packages in
+  one transaction, then installed both packages together. Post-install state:
+  `rpm -q magic-mesh magic-mesh-browser` returned `12.0.0-1` for both packages;
+  `/usr/bin/mde-web-cef`, `/usr/bin/mde-web-preview`, and
+  `/usr/libexec/mackesd/cef-verify` were installed; `/opt/mde/cef` still points
+  at the pinned CEF 149 runtime; `/mnt/mesh-storage/browser-send-tab` contained
+  zero JSON records; and no leftover `mde-web-cef`, `mde-web-preview`, or
+  `cef-verify` processes remained after probes. Installed verifier proof: the
+  CEF input verifier command reached `VERIFY RESULT=PASS`, CEF final title
+  `mde-browser-verify-p1-k1-tm`, and 4 painted `1280x800` frames; the same
+  verifier against `/usr/bin/mde-web-preview` reached `VERIFY RESULT=PASS` and
+  Servo page text `P:1 K:1 T:m` with 4 painted `1280x800` frames. After the
+  package install, `mde-shell-egui.service` was started on the live DRM seat and
+  reported active/running with `ExecCondition` success, `NRestarts=0`, and shell
+  version `12.0.0 "Quazar" · 7eedfe7d · 2026-07-15 · dev`.
   **CEF private runtime cache hardening 2026-07-15:** live `.15` journal review
   found CEF/fontconfig falling back to `/.cache/fontconfig` inside the
   no-home sandbox (`Fontconfig error: No writable cache directories`). The CEF
