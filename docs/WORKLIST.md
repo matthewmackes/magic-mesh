@@ -4761,16 +4761,35 @@ real enterprise browser rather than Carbon token compliance.
     passed 1/1, `.90` `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 6/6, and BigBoy
     `.130` `cargo fmt --check -p mde-shell-egui` passed.
   - **Browser tab bar / engine selector polish slice 2026-07-15:** the old raw `+CEF` / `+Servo`
-    affordances are replaced with one familiar new-tab `+` plus a Browser Material segmented engine
-    selector labelled `Chromium` and `Servo`. The future-tab engine choice is now a first-class
-    persisted Browser state, while mixed-engine sessions remain scannable through compact `Cr`/`Sv`
-    tab markers and hover cards that name the engine. Regression coverage locks removal of the raw
-    `+engine` labels, the selector text/state tokens, and per-tab engine labels. Farm evidence:
-    `.50` `cargo test -p mde-shell-egui engine_selector -- --nocapture` passed 1/1, `.90`
+    affordances are replaced with a rounded Browser Material engine cluster: one active-engine
+    primary `+ New tab` action, distinct `Chromium` and `Servo` segments, per-engine selected
+    container colors, and accent rails that keep CEF/Servo identity legible without making the
+    tab strip read like debug text. Tab pills now use Browser Material surfaces/strokes plus a
+    top engine accent indicator, while mixed-engine sessions still retain compact `Cr`/`Sv`
+    markers and hover cards that name the engine. Regression coverage locks removal of the raw
+    `+engine` labels, rendered `+ New tab`, selector text/state tokens, tab surface/stroke tokens,
+    and per-tab engine labels. Farm evidence: `.50`
     `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1, BigBoy `.130`
-    `cargo test -p mde-shell-egui tab_labels_and_hover_cards_name_each_tabs_engine -- --nocapture`
-    passed 1/1, BigBoy `.130` `cargo test -p mde-shell-egui tab -- --nocapture` passed 121/121,
-    and BigBoy `.130` `cargo fmt --check -p mde-shell-egui` passed.
+    `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 8/8, BigBoy `.130` warmed-slot
+    `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1, BigBoy `.130`
+    warmed-slot `cargo test -p mde-shell-egui tab_labels_and_hover_cards_name_each_tabs_engine -- --nocapture`
+    passed 1/1, BigBoy `.130` warmed-slot `cargo test -p mde-shell-egui browser -- --nocapture`
+    passed 130/130, and BigBoy `.130` `cargo fmt --check -p mde-shell-egui` passed. A fresh `.90`
+    duplicate hit the documented ENOSPC limit during dependency output and was rerouted to BigBoy.
+  - **Browser Material action-button slice 2026-07-15:** Browser prompt bars and the password/capture
+    controls now use one Browser-local `BrowserActionRole` helper for primary, secondary, warning, and
+    quiet actions instead of hand-rolled/default egui button text. This keeps HTTP upgrade/continue/cancel,
+    passkey approval/denial, device permissions, before-unload, login-save, saved-login fill/delete, and
+    capture dismissal on the Browser Material action palette. The command-menu docs were also updated to
+    reflect the segmented engine selector instead of the retired raw `+Servo`/`+CEF` buttons. Regression
+    coverage locks the action-role fill/text/stroke mapping and rendered prompt-bar text colors. Farm
+    evidence: `.50` `cargo test -p mde-shell-egui browser_action_buttons_use_material_roles -- --nocapture`
+    passed 1/1, BigBoy `.130` warmed-slot
+    `cargo test -p mde-shell-egui browser_prompt_bars_use_material_action_buttons -- --nocapture` passed
+    1/1, BigBoy `.130` `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 8/8, BigBoy
+    `.130` `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130, and BigBoy `.130`
+    `cargo fmt --check -p mde-shell-egui` passed. `.90` and `.170` retries hit documented farm
+    ENOSPC during cold shell builds/rsync and were rerouted.
   - **Browser send-tab self-loop fix 2026-07-15:** Send Tab to Node no longer defaults to the local
     host or publishes a configured self-target, and the Browser inbox drain now consumes existing
     self-originated node handoff records without opening tabs. Live cleanup on `.15`
