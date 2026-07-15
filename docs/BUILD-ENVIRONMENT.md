@@ -106,7 +106,10 @@ proofs, verify `getenforce`, labels, loaded modules, run the installed
 `MDE_BROWSER_VERIFY_INPUT=1 /usr/libexec/mackesd/cef-verify` for both
 `/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview` and checks helper cleanup),
 then confirm `ausearch -m AVC,USER_AVC` has no matches for each final verifier
-window and no helper processes remain.
+window and no helper processes remain. Normal helper exits should not add new
+per-run `/tmp/.mde-web-*-root-<pid>-<run>` directories; only hard-kill/crash
+residue should remain, and per-run naming keeps that residue from poisoning the
+next launch.
 
 **Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
 exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even
@@ -365,6 +368,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 | rsync code 23 while renaming a transient provider file in a farm slot | two `xcp-build.sh` jobs reused the same `MCNF_BUILD_SLOT` concurrently | use distinct slots for parallel jobs, or serialize the `xcp-build.sh` sync/build and direct-SSH into the warmed slot afterward |
 | native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
 | Browser verifier still shows the old failure after an RPM install | an interactive dry-run/install paste may have let `rpm -Uvh --test` consume the queued real install, or only part of the split payload was replaced | run dry-run and install as separate commands; verify helper hashes with `sha256sum` plus `rpm -q --dump magic-mesh-browser`, then run `rpm -V magic-mesh-browser` before debugging runtime behavior |
+| Browser verifier passes but leaves new `/tmp/.mde-web-*-root-<pid>-<run>` directories after ordinary exit | the child cleaned its private `/oldroot` mount but not the host-visible old-root mountpoint before detaching it | normal exits should remove the old-root mountpoint before `umount2(\"/oldroot\", MNT_DETACH)`; compare `find /tmp -name '.mde-web-*-root-[0-9]*-[0-9]*'` before/after a verifier run and expect no new entries |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
 | focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
 | Browser helper labels remain `bin_t` after installing `magic-mesh-browser` | SELinux setup units were enabled but never started on the already-booted seat, or the policy loader failed before relabeling | start the Browser setup units non-blocking from `%post`; verify `semodule -l` and `ls -Z /usr/bin/mde-web-cef /usr/bin/mde-web-preview /usr/libexec/mackesd/mde-web-cef-renderer` |

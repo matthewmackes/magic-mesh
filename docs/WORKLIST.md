@@ -4951,6 +4951,20 @@ real enterprise browser rather than Carbon token compliance.
     no helper/verifier processes remained. The old fixed `/tmp/.mde-web-*-root` directories still
     existed, proving the passing run used the new per-run mountpoints instead of relying on manual
     cleanup.
+  - **Browser sandbox rootfs normal-exit cleanup 2026-07-15:** normal helper exits no longer leak the
+    host-visible per-run `/tmp/.mde-web-*-root-<pid>-<run>` directory. The sandboxed child now removes
+    the old-root view of the mountpoint before detaching `/oldroot`, and the supervisor still keeps a
+    post-exit cleanup fallback for failures before pivot. This preserves collision safety for hard
+    `SIGKILL` residue while keeping routine verifier/tab closes from accumulating empty `/tmp` entries.
+    Farm evidence: `.50` `cargo test --manifest-path crates/desktop/mde-web-sandbox/Cargo.toml --
+    --nocapture` passed 16/16, BigBoy `.130`
+    `cargo test --manifest-path crates/desktop/mde-web-preview/Cargo.toml sandbox::tests --
+    --nocapture` passed 14/14, `.50`
+    `cargo test --manifest-path crates/desktop/mde-web-cef/Cargo.toml --lib -- --nocapture` passed
+    151/151, and BigBoy `.130` manifest fmt passed. Runtime proof on BigBoy used the patched
+    `mde-web-preview` helper plus `cef-verify`: the first probe reproduced the leak with one new
+    `/tmp/.mde-web-preview-root-...` directory, the patched rerun still passed render/input
+    (`P:1 K:1 T:m`, 4 painted `1280x800` frames) and `NEW_ROOTFS_DIRS` was empty.
   - **CEF Browser Power Mode launch profile 2026-07-15:** Browser Power Mode now reaches newly
     spawned CEF helpers as process env (`MDE_CEF_BROWSER_POWER_MODE=true` plus the existing
     extension power-mode env), the CEF launcher forwards that state into the native renderer bridge,

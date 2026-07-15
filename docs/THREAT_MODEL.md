@@ -844,7 +844,10 @@ Servo runs a full browser engine under.
    previous fixed `/tmp/.mde-web-cef-root` and `/tmp/.mde-web-preview-root`
    directories still existed during the pass, while the successful run created
    fresh `/tmp/.mde-web-*-root-<pid>-<run>` mountpoints; the proof therefore did
-   not depend on manually deleting stale roots.
+   not depend on manually deleting stale roots. A follow-up farm runtime proof
+   tightened the lifecycle: ordinary helper exits remove the host-visible
+   per-run mountpoint after successful render/input (`P:1 K:1 T:m`), so only
+   hard-kill/crash residue should persist.
 
 **Rerun triggers:** ad-hoc SSH/user-session launches are not systemd-delegated
 and can honestly log `mde-web-sandbox: cgroup limits not applied ... Permission
