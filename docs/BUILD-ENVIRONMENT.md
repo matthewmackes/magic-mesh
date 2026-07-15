@@ -19,6 +19,22 @@ Avoid containers when a direct farm-host fixture is enough. Farm/test hosts are
 safe for destructive reboot/recovery operations unless the task explicitly says
 otherwise.
 
+**Browser/runtime note (learned 2026-07-14):** the live build-VM addresses are
+the `172.20.0.x` farm lanes above; inherited `10.0.0.x` pins are stale and time
+out. For direct live probes outside `xcp-build.sh`, ssh as the build user with
+the mesh key (`ssh -i ~/.ssh/mackes_mesh_ed25519 mm@172.20.0.x`). CEF runtime
+probes currently have a warm bundle on `.50` at `$HOME/mde-cef-active`; do not
+assume `/opt/mde/cef` exists on generic farm VMs unless a packaging/install step
+has staged it.
+
+**Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
+exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even
+when the source is fine. Put Servo tests/checks on BigBoy (`172.20.0.130`) when
+they are the long pole, and set `CARGO_INCREMENTAL=0` if a previous run hit
+ENOSPC. Treat `.50`/`.90`/`.170` ENOSPC during rsync or `target/` writes as a
+slot-capacity problem: remove only disposable `~/magic-mesh-farm-*` slots you
+created, then rerun the heavy job on BigBoy.
+
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
@@ -105,6 +121,11 @@ user). Secrets are **off-repo** — see "Credentials" below.
 | `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c / — | hypervisor — build VM `mcnf-build-xen-194` (172.20.0.170, 4 vCPU/11 GiB); the **4th dom0** (added after the 3-dom0 table was first written; confirmed live 2026-07-01) |
 
 > ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. The real farm is **4 build VMs: .50 / .90 / .130 / .170** (there are no live `.51`/`.52` IPs — probing them gives "No route to host"). The non-BigBoy build hostnames are descriptive (`mcnf-build-home-services`, `mcnf-build-kvm-xcp1`, `mcnf-build-xen-194`); BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2 = 9** (not 7).
+
+> Stale `10.0.0.x` build-host pins are invalid on this farm and should be
+> treated as doc/agent drift. Run `install-helpers/farm.sh status` or
+> `install-helpers/farm-topology.sh table`, then use the verified `172.20.0.x`
+> address explicitly.
 
 > **Standing rule (operator 2026-06-30): BigBoy takes the longest / most-complex build.** The single heaviest job always routes to **XEN-BIGBOY** (`172.20.0.130`, 12 vCPU / ~20 GiB — the high-capacity node): a full `cargo --workspace` build/test/clippy, the biggest egui crate (`mde-shell-egui`), a cold egui/eframe/wgpu compile, or the RPM release build (`MCNF_BUILD_SHAPE=big` / an explicit `MCNF_BUILD_HOST=172.20.0.130`). The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs. This composes with the per-node concurrency cap: spread the *count* to honor caps, but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI build on a small node while BigBoy runs a trivial one.
 
@@ -204,6 +225,10 @@ Another AI/operator can rebuild the whole thing from this repo:
 | `cloud-localds` missing on EL9 | not packaged | build the seed with `genisoimage` |
 | can't mount a VM's `/etc` from dom0 | btrfs **top-level** ≠ root; real `/etc` is under the `root/` subvol; RO mount can't replay a dirty journal | mount `root/` subvol **RW** (`docs/farm.md` disk-surgery) |
 | new VM halts after a host reboot | XCP gates auto-start on VM **and** pool flags | `other-config:auto_poweron=true` on both |
+| farm ssh with the default key/user fails | direct probes need the mesh key and the build user | `ssh -i ~/.ssh/mackes_mesh_ed25519 mm@172.20.0.x` |
+| farm job hangs on `10.0.0.x` | inherited build-host pin from stale docs/agent memory | verify with `install-helpers/farm.sh status`; use `.50` / `.90` / `.130` / `.170` |
+| CEF live probe says `/opt/mde/cef` is missing on a farm VM | farm build VMs do not all have the packaged runtime staged under `/opt`; `.50` currently has the warm live bundle in `$HOME/mde-cef-active` | set `MDE_CEF_ROOT=$HOME/mde-cef-active` for `.50` probes, or run the packaging installer before using `/opt/mde/cef` |
+| `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
 
 ---
 

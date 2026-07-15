@@ -105,6 +105,13 @@ security (Q23).
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use
   the shared `Style`. *(Deliberate §0-Simple lever: there is **no** raw-literal /
   Carbon-token lint gate — the shared `Style` module is the discipline.)*
+- **Browser workspace exception (operator 2026-07-15).** Browser chrome,
+  Bookmarks, engine controls, tabs, toolbar, menus, and Browser page/action
+  surfaces are **not** constrained by Carbon wording and should apply Material
+  Design 3 principles locally: adaptive layouts, clear top-app-bar/tab hierarchy,
+  tonal surfaces/elevation, explicit interaction states, accessible focus/contrast,
+  and purposeful motion. This is a Browser-only design direction, not permission
+  to migrate unrelated shell/workspace surfaces away from `mde-egui::Style`.
 - **Motion** uses egui's built-in animation (`animate_bool` / `ctx` animation)
   driven by a small shared duration+easing table in `mde-egui`. There is no
   bespoke motion module and no motion lint gate.
@@ -313,6 +320,13 @@ XEN-194 → `mcnf-build-53` → `.170`). Run `./install-helpers/farm-topology.sh
 at the start of every run for a **verified** utilization table — it probes all 4
 nodes and **fails if one is missing** (XEN-194/.170 sat idle a whole session once,
 under a stale 3-node roster). Never hardcode the node list or chart from memory.
+Stale `10.0.0.x` farm pins are invalid; the build VMs live on the `172.20.0.x`
+lanes above. Browser/CEF live probes are not generic farm assumptions: use the
+packaged `/opt/mde/cef` runtime only where installation has staged it, or the
+known warm `.50` bundle at `$HOME/mde-cef-active`. Cold Servo/browser test
+builds can exhaust small-node slot disks through Rust incremental caches; put
+those long-pole jobs on BigBoy and use `CARGO_INCREMENTAL=0` after any ENOSPC
+failure.
 
 ---
 

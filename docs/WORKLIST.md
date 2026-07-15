@@ -54,6 +54,100 @@ The **headline pivot**: MCNF 12.0 "Quasar" becomes an **egui-native mesh thin-cl
 
 **QUASAR-CLOUD supersession (2026-07-03, refreshed 2026-07-10):** the current target hypervisor stack is **Nova/libvirt/QEMU-KVM + OVN**, not cloud-hypervisor. Older E12 cloud-hypervisor text below is retained as historical implementation context until QC-15 deletes the replaced stack; new packaging and live validation work follows `AI_GOVERNANCE.md §5` and QC-1.
 
+## MOTION-DRM — cohesive polished transition system for the egui DRM/KMS shell (operator 2026-07-15; questionnaire complete)
+
+**Operator lock:** all Carbon Design requirements are lifted for this epic. The goal is a native Rust
+motion system with polished macOS-style continuity, adapted to immediate-mode egui and the production
+direct-seat renderer. Do **not** copy Apple assets or private APIs; reproduce the behavioral principles
+only. This epic targets the production path first:
+
+```text
+egui -> egui_glow -> glow/OpenGL ES -> EGL -> GBM scanout surface -> DRM/KMS page flips
+libinput + udev -> egui events
+```
+
+The normal dev path may still use `eframe + winit + wgpu + Wayland`, but this work must not depend on
+Wayland, Xorg, winit, wgpu, compositor-provided animations, or a new compositor. Relevant starting points:
+`crates/shared/mde-egui/src/drm.rs`, `crates/shared/mde-egui/Cargo.toml`, `mde-egui::motion`, existing
+overlays/dialogs/panels/cards/view routing/input/focus/repaint scheduling.
+
+**Motion direction:** smooth and restrained by default; playful only for dialogs, launchers, cards,
+popovers, and overlays. Motion communicates hierarchy, origin, destination, and state. Opening may be
+expressive; closing is faster/quieter with little or no overshoot. Direct manipulation follows the pointer
+immediately; springs settle after release/presentation. Interrupted animations retarget from the current
+visual state, never restart from the original endpoint. Avoid decorative delays, excessive movement,
+staggering that slows work, expensive blur, unbounded render work, and text scaled long enough to look soft.
+
+**Central defaults:** small hover/focus/selection/toggle 80-140 ms; dialog/launcher/card/overlay open
+140-200 ms; dialog/overlay close 100-160 ms; page/workspace 180-260 ms; list insert/remove/expand/collapse
+140-220 ms; drag-release spring settling usually 180-300 ms. Keep durations/easing/springs centralized,
+not scattered literals. Reduced motion is runtime-configurable: normal, reduced, and disabled if clean.
+Reduced mode substitutes short fades for large motion, removes overshoot/bounce, shortens layout movement,
+and preserves immediate feedback.
+
+**Required transition categories:** full-screen page/workspace transitions; dialogs; launchers/command
+palettes; anchored popovers/context overlays; cards entering/leaving/expanding/collapsing; panels opening
+and closing; list insertion/removal; hover/focus/pressed/selected/toggle state changes; window-like surface
+move/resize; minimize/maximize or equivalent surface-state transitions; drag-release settling/snap behavior.
+Do not apply every effect everywhere at once: build primitives, then integrate representative components
+with low regression risk.
+
+**Architecture target:** create a small centralized motion subsystem, conceptually including settings,
+durations, easing, spring presets, animated scalar/position/size/rect/opacity/scale/color values,
+transition phase/lifecycle (`Hidden -> Entering -> Visible -> Exiting`), stable `egui::Id`/motion IDs,
+retargeting, completion detection, reduced-motion substitutions, and explicit repaint requests. Use stable
+IDs or application-owned state; do not key important animation state to reorderable list indices. Keep call
+sites readable: callers should not manually manage timestamps, normalized progress, repaint requests, or
+rest thresholds.
+
+**Spring requirements:** numerically stable at variable frame rates; clamp large frame deltas after stalls;
+avoid NaN/inf/explosions after suspend/resume; work at 30/60/90/120/144 Hz; clear position/velocity rest
+threshold; snap exactly to target at rest; retarget without discontinuity; avoid endless micro-repaints.
+Default presentation spring: gentle restrained overshoot, fast response, minimal oscillation. Closing and
+routine layout transitions should be critically damped or near-critically damped.
+
+**DRM/KMS integration:** use monotonic time. While any animation is active, request another frame; once all
+animations are at rest, stop continuous repainting and do not busy-spin. Preserve the current page-flip and
+GBM buffer lifecycle, avoid queueing unbounded work, avoid giant animation jumps after missed/delayed page
+flips, and keep input responsive during transitions. Review `drm.rs` before modifying its event loop.
+
+**Input/focus lifecycle:** explicitly decide whether hit testing follows animated geometry, whether entry
+is interactive, whether exit remains interactive, when focus transfers, and when modal input blocking
+begins/ends. Modals block background interaction as soon as presentation begins and do not release it until
+dismissal is sufficiently complete. Closing controls must not accept duplicate activation. Pointer capture
+during drag remains correct. Rapid reversals (`open while closing`, `close while opening`, destination
+change during movement, resize during page transition, remove during insertion) retarget from current visual
+state instead of snapping.
+
+- [ ] **MOTION-DRM-0: survey + design note.** Inspect current render/event loop, view routing, overlays,
+  dialogs, panels, cards, input/focus handling, repaint scheduling, and existing motion/interpolation code.
+  Produce the short architectural summary and proposed design before invasive edits.
+- [ ] **MOTION-DRM-1: central motion configuration and primitives.** Add the reusable motion subsystem
+  with presets for control, panel, popover, dialog, page, layout, and drag-settle; scalar/2D/size/rect/
+  opacity/scale/color interpolation; easing and spring values; stable IDs; lifecycle phases; retargeting;
+  completion detection; reduced-motion handling.
+- [ ] **MOTION-DRM-2: deterministic motion tests.** Cover interpolation endpoints, no-overshoot curves,
+  spring convergence, rest detection, large-dt clamping, retargeting continuity, reversal, exit lifecycle
+  completion, reduced-motion substitutions, zero-duration behavior, and no NaN/inf after long-frame stalls.
+- [ ] **MOTION-DRM-3: DRM repaint scheduling integration.** Integrate animation-driven repaint requests
+  into `mde-egui`'s DRM loop without busy-spinning or violating page-flip/buffer lifecycle; idle screens
+  stop requesting frames; delayed page flips clamp dt; input latency stays low.
+- [ ] **MOTION-DRM-4: representative component integrations.** Implement one dialog/modal transition,
+  one anchored popover or launcher/command-palette transition, one panel or card expand/collapse, one
+  page/workspace transition, restrained control-state transitions, and drag-release settling/snap behavior.
+- [ ] **MOTION-DRM-5: reduced-motion runtime setting.** Add a project-level runtime setting that can later
+  connect to config, accessibility, CLI, or system integration; not compile-time-only. Normal/reduced/
+  disabled modes remain behaviorally clear and accessible.
+- [ ] **MOTION-DRM-6: performance and production gates.** Check central paths for per-frame heap allocation,
+  idle repaint shutdown, no unbounded work with simultaneous overlays/cards, long-pause/VT-switch behavior,
+  simulated refresh intervals, input latency during transitions, and production `--features drm` build
+  success. Do not claim exact performance improvements without measurements.
+
+**Deliverables:** modified-file list, tests added/updated, commands used, remaining risks, reduced-motion
+summary, and a final table of presets/durations/easing/spring parameters. Scope discipline: do not replace
+the renderer, migrate DRM to wgpu, add Wayland/Xorg dependencies, rewrite the UI architecture, add a
+compositor, require blur, or scatter hard-coded timing values through unrelated components.
+
 - [✓] **E12-0: Governance rewrite + design lock land.** **As** the platform owner, **I want** `AI_GOVERNANCE.md` re-authored around E12 (Cosmic-era §4/§5/§6 archived as heritage; §1-3/§7-10 carried forward) plus this design doc committed, **so that** every downstream task has one authoritative rulebook for the egui/forked-desktop direction. **Acceptance:** AI_GOVERNANCE.md identity header reads MCNF 12.0 + names egui as the toolkit; §4 (egui/no-Carbon), §5 (forked desktop + spin), §6 (layered tiers) reflect the locks; the retired Carbon/libcosmic gates are removed from the doc's gate list; a heritage pointer to the Cosmic-era text exists. — DONE (2026-06-30, operator go-ahead): `AI_GOVERNANCE.md` rewritten to MCNF 12.0 "Quasar" (egui §4, forked-desktop §5, layered-tiers §6; §0-3/§7-10 carried forward; Cosmic-era text archived as heritage); design doc `docs/design/cosmic-magic-mesh-egui.md` landed. E12-1…E12-12 are the execution backlog.
 - [✓] **E12-1: `mde-egui` harness + shared `Style`/`Visuals` (the foundation, built FIRST).** **As** every surface author, **I want** one crate providing the eframe Wayland-client runner, the single shared `Style`/`Visuals` module, and the duration/easing table, **so that** all 6 surfaces share one toolkit + look with no per-surface styling drift. **Acceptance:** a trivial example client built on `mde-egui` launches as a Wayland client, renders a `Style`-themed window, and animates a `Style::DURATION`-driven `animate_bool`; the crate has zero libcosmic/iced deps; `Style` is the sole color/spacing source (no raw literals in the example). — DONE (2026-06-30): new `crates/shared/mde-egui` lands the three foundation pieces — `runner::run_client` (eframe wgpu/Wayland client runner that installs the shared look), `style::Style` (the single-source Quasar-dark palette + 8px spacing + type scale `Visuals`, applied via `Style::install`), `motion::Motion` (FAST/BASE/SLOW table wrapping egui `animate_bool`). a11y/accesskit deferred per lock 11 (eframe `accesskit` feature intentionally off — the absence IS the deferral). `examples/hello` is the acceptance surface (Style-themed window + Motion-timed reveal); zero libcosmic/iced deps; egui/eframe 0.31 pinned. Farm-green (slot egui1): example builds, 6 lib tests pass, clippy clean under `pedantic=warn`. Live Wayland launch is the hardware-gated `/preview` (optional per §7).
 - [✓] **E12-2: `mde-egui` DRM runner — egui owns the seat (no compositor).** **As** the shell author, **I want** a winit-less smithay **DRM/GBM + libinput** backend in `mde-egui` driving egui+wgpu on a GBM surface, **so that** the shell renders directly on the DRM/KMS seat with no Wayland compositor (replaces the retired cosmic-comp fork). **Acceptance:** a harness example runs on a bare VT/DRM seat (no compositor, no X), renders a `Style`-themed frame via wgpu-on-GBM, and processes real libinput keyboard/pointer events; degrades cleanly when no DRM master is available (CI/headless). — **DONE + FARM-GATED 2026-07-01 (BigBoy slot e12drm):** `crates/shared/mde-egui/src/drm.rs` (402 lines) is a complete 3-stage bare-seat backend — DRM/GBM primary-node bring-up (`open_primary_node`/`resolve_output`), EGL-on-GBM + `egui_glow` painter (the reliable bare-KMS GL path, not wgpu — see the module header), and the libinput seat + continuous page-flip present loop (Esc quits). The full native stack (`--features drm`: libdrm/gbm/khronos-egl/glow/egui_glow/input/udev) **compiles + links green** (39s cold on BigBoy) and the `headless_degrades_cleanly` test passes (9/9 lib tests) — `open_primary_node` returns the clean `DrmError::NoDrmMaster` fallback on a host with no seat, so the shell falls back to the windowed `run_client`. Both examples (`hello`, `hello_drm`) build+link under the feature. The **live-seat render + input round-trip on real DRM hardware is the hardware-gated `/preview`** (optional per §7 — same disposition as E12-1's live Wayland launch; a bare-KMS render can only be verified on a physical seat). E12-3's DRM-seat systemd boot rides this.
@@ -188,12 +282,25 @@ Make `Surface::Files` fully functional (full POSIX op set + archives) and give i
 - [✓] **FILEMGR-12: mesh integration.** **As** a user, **I want** Send-To + Send-in-Chat + shared clipboard, **so that** files flow across the mesh + surfaces. **Acceptance:** right-click Send-To a peer (reuse); Send in Chat hands a file to a NOTIFY-CHAT conversation (reuse the file message-kind); cut/copy/paste share the shell clipboard (cross-surface paths).
 
 ## BOOKMARKS — mesh browser: synced bookmarks + sandboxed Servo + ad-blocker (operator 2026-07-02; design: docs/design/mesh-bookmarks.md)
-A new `Surface::Bookmarks` browser: import bookmarks from all major browsers, manage them as a mesh-synced CRDT collection, browse the web in an out-of-process sandboxed Servo engine, filtered by a mesh-wide ad-blocker service. **NO credential/password handling at all** (the Vault brief's Firefox/NSS half dropped). Carbon §4 GUI; build all-at-once; fleet-wide default-on; Servo always in the workspace build. 100-lock survey in the design doc.
+A new `Surface::Bookmarks` browser: import bookmarks from all major browsers, manage them as a mesh-synced CRDT collection, browse the web in an out-of-process sandboxed Servo engine, filtered by a mesh-wide ad-blocker service. **NO credential/password handling at all** (the Vault brief's Firefox/NSS half dropped). Browser-specific GUI; build all-at-once; fleet-wide default-on; Servo always in the workspace build. 100-lock survey in the design doc.
+
+**Browser UI override (operator 2026-07-15):** all Carbon/Carbon §4 design
+requirements are lifted for the Browser workspace, including Browser chrome,
+Bookmarks, engine controls, tabs, toolbar, menus, and page/action surfaces. Apply
+Material Design 3 principles to Browser only: adaptive layouts, clear top-app-bar
+and tab hierarchy, tonal surfaces/elevation for containment, explicit
+hover/focus/pressed/selected/disabled state layers, accessible contrast/focus,
+and purposeful motion. Real browsing/render/input operability comes first; stale
+Carbon acceptance language in older Browser tasks is superseded by this note.
+Shared shell-owned components may keep their existing `mde-egui::Style`
+discipline where they own the surface. Reference baseline:
+`https://m3.material.io/get-started` and
+`https://m3.material.io/foundations/interaction/states`.
 
 - [✓] **BOOKMARKS-1: model + CRDT.** **As** the platform, **I want** the bookmark tree + CRDT op set, **so that** edits converge mesh-wide with no center. **Acceptance:** `mde-bookmarks` lib — UUID ids, strict one-parent tree, HLC clock, fractional-index order, LWW-delete, ops carrying author user+node, content-addressed favicon store; convergence property-tests (random concurrent op-sets converge identically); no Servo/credentials.
 - [✓] **BOOKMARKS-2: bookmarks worker + mesh sync.** **As** the platform, **I want** a mackesd worker syncing the collection over Syncthing, **so that** every node shares one tree. **Acceptance:** per-node append-only op segments in the encrypted mesh Syncthing share; replay-merge + snapshot/prune; in-memory index + periodic-flush durability; offline-first (edits continue when sync down, auto-resume); `action/bookmarks/*` + `state/bookmarks/*`; two-node convergence proven.
 - [✓] **BOOKMARKS-3: browser importers.** **As** a user, **I want** to import bookmarks from any browser, **so that** my links come with me. **Acceptance:** file/dir picker + format auto-detect for Firefox `places.sqlite` (bookmarks only, RO+immutable), Chromium `Bookmarks` JSON, universal Netscape HTML (Safari via HTML export); FF-tags→tags[], Chromium-roots→named subfolders; normalized-URL dedup; idempotent re-import into `Imported/<Browser>`; **never reads logins/cookies/history**; fixture-tested per format.
-- [✓] **BOOKMARKS-4: Surface::Bookmarks UI (Carbon §4).** **As** a user, **I want** a full bookmark manager surface, **so that** I organize + open bookmarks. **Acceptance:** three-region (folder tree + list + detail/browser pane); folder CRUD (confirm on non-empty); manual order + optional sort-by; title+url live search; Ctrl/Shift multi-select bulk (move/delete/open-all/copy-URLs); drag reorder/move; add via +/paste/shortcut/from-page; double-click→new tab; honest error/empty states matching the platform idiom; §4 Carbon tokens (no raw hex); egui snapshot + headless mount tests.
+- [✓] **BOOKMARKS-4: Surface::Bookmarks UI (Browser Material override applies).** **As** a user, **I want** a full bookmark manager surface, **so that** I organize + open bookmarks. **Acceptance:** three-region (folder tree + list + detail/browser pane); folder CRUD (confirm on non-empty); manual order + optional sort-by; title+url live search; Ctrl/Shift multi-select bulk (move/delete/open-all/copy-URLs); drag reorder/move; add via +/paste/shortcut/from-page; double-click→new tab; honest error/empty states matching the platform idiom; Browser-only Material Design override applies with no Carbon compliance gate; egui snapshot + headless mount tests.
 - [✓] **BOOKMARKS-5: the mde-web-preview Servo browser (bin).** **As** a user, **I want** to browse the web in the surface, **so that** bookmarks open in a real browser. **Acceptance:** out-of-process `mde-web-preview` bin — interactive Servo (JS on, tabs, links, back/forward/address bar, media best-effort); OS sandbox (user namespace + seccomp-bpf + minimal caps + no-new-privs, one process per tab, cgroup memory+CPU caps, read-only rootfs + tmpfs, NO home/keys/data); zero telemetry; system-CA TLS + honest cert warnings; deny-all sensitive web perms; first-party-session/no-third-party cookies cleared on close; no persistent history; generic non-identifying UA; GPU-required; lazy first-launch + one warm helper. Headless test: about:blank → a frame arrives on the shm channel.
 - [✓] **BOOKMARKS-6: IPC + shm texture bridge.** **As** the shell, **I want** to drive + display the sandboxed browser, **so that** it renders in the surface. **Acceptance:** per-session Unix-domain socket (typed length-prefixed control/events) + shm/dmabuf frame transport (upload to an egui texture on paint-ready, not every frame); input forwarding scaled by pixels_per_point; crash → honest "page crashed" state + respawn-on-reload, other tabs unaffected; navigation chrome wired.
 - [✓] **BOOKMARKS-7: ad-filter service + engine.** **As** the platform, **I want** a mesh-wide ad-blocker, **so that** browsing is ad/tracker-free by default. **Acceptance:** mackesd `adfilter` worker — EasyList/EasyPrivacy/uBlock-base bundled + operator-addable custom lists, a leader compiles the serialized `adblock-rust` engine + replicates the blob over Syncthing, per-site allowlist synced mesh-wide (block-on-by-default), anti-adblock best-effort, staleness fallback to last-synced/bundled with an honest indicator, `state/adfilter/*`; the `adblock-rust` engine in `mde-web-preview` blocks network requests before fetch + hides cosmetic elements (injected user-stylesheet, JS-off-safe), exempts mesh/overlay domains, and reports per-page blocked counts. Rule-match folds unit-tested (ad URL blocked, benign allowed). _(2026-07-03: **engine+service crate `mde-adblock` landed `e8882e0`** — hand-rolled parser/matcher/store/bundled-seed + allowlist + staleness, 23t, clippy-clean, airgap-safe (no `adblock-rust` fetch). **STAYS [>] — currently UNREACHABLE (no caller):** remaining for §7 = the mackesd `adfilter` worker (leader-compile blob + Syncthing replicate + upstream refresh + `state/adfilter/*`) + the `mde-web-preview` wiring (block-before-fetch, cosmetic hide, exempt mesh/overlay, per-page counts). DONE 090a461 — worker + browser block-path landed, mde-adblock reachable.)_
@@ -4255,6 +4362,11 @@ Plan: `.claude/plans/snappy-discovering-sphinx.md`; design: `docs/design/win10-t
 
 ### BROWSER-CHROME — pixel-faithful stock Chrome chrome over real Chromium (CEF)
 Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSER-DD**. Started.
+**Operator override 2026-07-15:** Browser GUI work is not constrained by Carbon
+requirements and should apply Material Design 3 principles within the Browser
+workspace only. The chrome should be judged by browsing usability, legible
+render/input state, adaptive layout, Material interaction states, and fit for a
+real enterprise browser rather than Carbon token compliance.
 - [x] E1 (gate) — live CEF ABI validation on a seat (`mde-web-cef render-once`
   → non-garbage BGRA frame); gate runtime activation on it. **Render gate
   command fixed/proven 2026-07-14:** `mde-web-cef render-once` now initializes
@@ -4292,6 +4404,21 @@ Plan: `.claude/plans/browser-chrome-faithful.md`. Sibling/refinement of **BROWSE
   `mde-shell-egui` live Browser UI smoke with `MDE_CEF_LIVE_UI_SMOKE=1` passed
   against the same patched helper/runtime.
 - [x] E2 — provision the 311 MB CEF runtime bundle on seats; flip the default engine to CEF (Servo stays fallback). **Packaged default closure 2026-07-14:** the Fedora 44 full RPM provisions the pinned CEF runtime through `/usr/libexec/mackesd/install-cef-runtime` and now gates activation on both direct render smoke and shell-equivalent wire smoke via `/usr/libexec/mackesd/cef-verify`. On `.15`, the installed runtime setup passed both gates, the installed Gmail verifier run delivered painted frames over the same helper wire the shell consumes, and the installed shell is active/running with `Delegate=yes` and `NRestarts=0`. The shell selector already prefers CEF only when `/usr/bin/mde-web-cef` plus the complete `/opt/mde/cef` runtime are present; Servo remains the fallback when that gate is absent.
+  **Live CEF input closure 2026-07-15:** farm `.50` shell-equivalent `cef-verify`
+  proved the real helper wire now carries painted frames plus pointer, keydown,
+  and text insertion into a focused page input. The root cause for typed text was
+  an incomplete `cef_key_event_t`: the key event header `size` field was never
+  populated, so `KEYEVENT_CHAR` did not insert even though keydown reached the
+  page. The fixed verifier sequence is `KeyDown -> Text(KEYEVENT_CHAR) -> KeyUp`,
+  ending with page title `input-p1-k1-tm-ai` and
+  `VERIFY RESULT=PASS display/load/input handlers fired over the wire`. Farm
+  evidence: `.50` `browser-cef-helper-staged` and `browser-cef-verify-staged`
+  builds passed, `.170` `browser-cef-key-final` passed the CEF key/input tests,
+  and `.50` `browser-cef-page-text-final` passed the page-text tests. The
+  diagnostic-only one-shot `render-once` page-text scrape still returns empty on
+  some runs and is not the operational proof path; the shell wire verifier is.
+  Servo input is no longer dropped at the preview client boundary and has farm
+  check/unit coverage, but live seat proof for Servo mouse/keyboard remains open.
 - [x] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1. **V1 policy closure 2026-07-14:** production CEF launches now keep WebExtensions disabled even when a curated registry exists; `mde-web-cef` reports `CEF_EXTENSIONS_SKIPPED_V1 ... reason=native_adblock_passkeys_reader_ship_for_v1` and only the lab smoke path can opt back in with `MDE_CEF_WEBEXTENSIONS_LAB`. Browser chrome states the supported v1 path: native blocker, passkeys, reader mode, userscripts, and site styles.
 - [>] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface. **C0 slice 2026-07-14:** introduced `web/chrome_ui/`, wrapped the Browser tab/toolbar/bookmarks/find rows in a browser-local light visuals/font scope, removed the default shared MENUBAR-ALL top-strip call from `web_panel`, and moved the existing state-gated Browser command tree under the toolbar's Chrome-style menu button. The menubar coverage backstop now records Browser as a deliberate first-party chrome surface instead of a shared-bar surface. **Remaining:** extract tabstrip/toolbar/omnibox/new-tab rendering into `chrome_ui`, embed/use the actual Roboto chrome font, and complete the pixel-faithful Chrome pass.
 
