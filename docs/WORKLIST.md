@@ -72,6 +72,13 @@ Wayland, Xorg, winit, wgpu, compositor-provided animations, or a new compositor.
 `crates/shared/mde-egui/src/drm.rs`, `crates/shared/mde-egui/Cargo.toml`, `mde-egui::motion`, existing
 overlays/dialogs/panels/cards/view routing/input/focus/repaint scheduling.
 
+**Browser relationship:** the Browser workspace override remains active: Browser chrome, tabs, toolbar,
+menus, Bookmarks, engine controls, and page/action surfaces are governed by local Material Design 3
+principles rather than Carbon wording. MOTION-DRM provides the shared production-safe motion primitives;
+Browser/Chrome should be one of the first representative consumers after page render/input operation is
+stable, without re-imposing Carbon on Browser or migrating unrelated shell surfaces away from `mde-egui`
+discipline.
+
 **Motion direction:** smooth and restrained by default; playful only for dialogs, launchers, cards,
 popovers, and overlays. Motion communicates hierarchy, origin, destination, and state. Opening may be
 expressive; closing is faster/quieter with little or no overshoot. Direct manipulation follows the pointer
@@ -4431,14 +4438,15 @@ real enterprise browser rather than Carbon token compliance.
   **Live CEF input closure 2026-07-15:** farm `.50` shell-equivalent `cef-verify`
   proved the real helper wire now carries painted frames plus pointer, keydown,
   and text insertion into a focused page input. The root cause for typed text was
-  an incomplete `cef_key_event_t`: the key event header `size` field was never
-  populated, so `KEYEVENT_CHAR` did not insert even though keydown reached the
-  page. The fixed verifier sequence is `KeyDown -> Text(KEYEVENT_CHAR) -> KeyUp`,
-  ending with page title `input-p1-k1-tm-ai` and
-  `VERIFY RESULT=PASS display/load/input handlers fired over the wire`. Farm
-  evidence: `.50` `browser-cef-helper-staged` and `browser-cef-verify-staged`
-  builds passed, `.170` `browser-cef-key-final` passed the CEF key/input tests,
-  and `.50` `browser-cef-page-text-final` passed the page-text tests. The
+  a bad `KEYEVENT_CHAR` virtual-key field: the helper used Unicode codepoint
+  `109` as `windows_key_code`, which CEF treats as subtract/minus rather than
+  the `M` key. The fixed verifier sequence is
+  `KeyDown -> Text(KEYEVENT_CHAR) -> KeyUp`, ending with page text
+  `P:1 K:1 T:m`, final title `mde-browser-verify-p1-k1-tm`, and
+  `VERIFY RESULT=PASS display/load/input response observed over the wire`. Farm
+  evidence: `.170` `browser-cef-key-fix` passed the CEF key/input tests, `.90`
+  `browser-verify-client` passed the verifier data-URL tests, and `.50`
+  `browser-verify-cef` passed the live page-text helper-wire test. The
   diagnostic-only one-shot `render-once` page-text scrape still returns empty on
   some runs and is not the operational proof path; the shell wire verifier is.
   **Live Servo fallback input closure 2026-07-15:** the same verifier now has an

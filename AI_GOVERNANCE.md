@@ -112,9 +112,13 @@ security (Q23).
   tonal surfaces/elevation, explicit interaction states, accessible focus/contrast,
   and purposeful motion. This is a Browser-only design direction, not permission
   to migrate unrelated shell/workspace surfaces away from `mde-egui::Style`.
-- **Motion** uses egui's built-in animation (`animate_bool` / `ctx` animation)
-  driven by a small shared duration+easing table in `mde-egui`. There is no
-  bespoke motion module and no motion lint gate.
+- **Motion** is governed by the operator-locked **MOTION-DRM** epic
+  (2026-07-15). The old `animate_bool`-only guidance is superseded: `mde-egui`
+  may own a small centralized, DRM-aware motion subsystem with shared durations,
+  easing, spring presets, animated values, lifecycle phases, reduced-motion
+  handling, and repaint scheduling for the production egui_glow/EGL/GBM/DRM path.
+  Compositor-provided animation, Wayland/Xorg dependencies, a renderer rewrite,
+  and scattered per-widget timing literals remain out of bounds.
 - **Accessibility is deferred** for the 12.0 cutover (egui/eframe carries an
   accesskit path to wire later). A11y is a post-cutover epic, not a Definition-of-
   Done gate for E12 surfaces.
