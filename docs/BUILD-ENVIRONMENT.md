@@ -55,11 +55,12 @@ compare key `sha256sum` output against `rpm -q --dump magic-mesh-browser`, run
 **DRM shell live-restart note (learned 2026-07-15):** `mde-shell-egui.service`
 conflicts with `getty@tty1.service` and has an `ExecStopPost` that starts getty
 again for console recovery. A remote `systemctl restart mde-shell-egui.service`
-can cancel the start because the role-gate `ExecCondition` receives `SIGHUP`
-during the tty1 handoff. For live `.15` deploys over SSH, use the two-step
-sequence instead: `systemctl stop getty@tty1.service; sleep 1; systemctl start
-mde-shell-egui.service`, then confirm `systemctl is-active
-mde-shell-egui.service`, `NRestarts=0`, and the journal version line. This is a
+can cancel the start during the tty1 handoff and leave the shell unit inactive
+but not failed. For live `.15` deploys over SSH, check state after any restart;
+if the unit is inactive, issue a clean `systemctl start mde-shell-egui.service`
+as a separate command and let systemd resolve the getty conflict. Then confirm
+`systemctl is-active mde-shell-egui.service`, `MainPID`, `ExecMainStartTimestamp`,
+`NRestarts=0`, and the installed `/usr/bin/mde-shell-egui` hash. This is a
 service orchestration gotcha, not a Browser helper/runtime failure.
 
 **CEF sandbox live-inspection note (learned 2026-07-15):** when proving CEF OS

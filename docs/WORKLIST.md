@@ -4828,7 +4828,11 @@ real enterprise browser rather than Carbon token compliance.
     passed 1/1, `.50`
     `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1, and `.50`
     `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 8/8; warmed `.50`
-    `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130.
+    `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130. BigBoy `.130` later cut
+    F44 split RPMs from `b028aa90` carrying this Browser chrome, the base/browser payloads passed
+    `verify-rpm-payload.sh payload`, and `.15` was updated with matching RPM hashes. The live
+    `mde-shell-egui.service` was restarted after install and is running the new
+    `/usr/bin/mde-shell-egui` binary (hash `c55016994454222a0ebedd261225faf2d80b34d26284d995f6c49170c8d50c58`).
   - **Browser chrome accelerator ownership slice 2026-07-15:** `chrome_ui` now owns the Browser-reserved
     tab-strip keyboard contract (`F11`/`Esc`, `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`,
     `Ctrl+Shift+Tab`, and `Ctrl+1..9`) alongside the tab strip and engine selector. `web_panel` still
@@ -4964,7 +4968,12 @@ real enterprise browser rather than Carbon token compliance.
     151/151, and BigBoy `.130` manifest fmt passed. Runtime proof on BigBoy used the patched
     `mde-web-preview` helper plus `cef-verify`: the first probe reproduced the leak with one new
     `/tmp/.mde-web-preview-root-...` directory, the patched rerun still passed render/input
-    (`P:1 K:1 T:m`, 4 painted `1280x800` frames) and `NEW_ROOTFS_DIRS` was empty.
+    (`P:1 K:1 T:m`, 4 painted `1280x800` frames) and `NEW_ROOTFS_DIRS` was empty. Installed `.15`
+    proof after deploying the BigBoy F44 RPMs: `browser-verify-engines --engine all --budget 30
+    --timeout 60s` passed CEF display/input, Servo display/input, and process cleanup; before/after
+    rootfs accounting stayed at the same four pre-existing stale directories and emitted no
+    `NEW_ROOTFS_DIR` lines. Installed browser helper hashes matched `rpm -q --dump
+    magic-mesh-browser`, and `rpm -V magic-mesh-browser` was clean.
   - **CEF Browser Power Mode launch profile 2026-07-15:** Browser Power Mode now reaches newly
     spawned CEF helpers as process env (`MDE_CEF_BROWSER_POWER_MODE=true` plus the existing
     extension power-mode env), the CEF launcher forwards that state into the native renderer bridge,

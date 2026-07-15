@@ -847,7 +847,10 @@ Servo runs a full browser engine under.
    not depend on manually deleting stale roots. A follow-up farm runtime proof
    tightened the lifecycle: ordinary helper exits remove the host-visible
    per-run mountpoint after successful render/input (`P:1 K:1 T:m`), so only
-   hard-kill/crash residue should persist.
+   hard-kill/crash residue should persist. The follow-up was deployed to `.15`
+   with fresh BigBoy-built F44 RPMs on 2026-07-15: the installed two-engine
+   verifier passed CEF + Servo display/input, process cleanup passed, and the
+   before/after rootfs directory set did not gain any new per-run entries.
 
 **Rerun triggers:** ad-hoc SSH/user-session launches are not systemd-delegated
 and can honestly log `mde-web-sandbox: cgroup limits not applied ... Permission
