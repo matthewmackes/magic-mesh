@@ -8,6 +8,7 @@
 
 use super::*;
 use super::{PaperSize, PrintOrientation};
+use mde_egui::muted_note;
 
 pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.print_settings_open {
