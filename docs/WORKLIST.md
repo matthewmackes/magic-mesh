@@ -4814,6 +4814,17 @@ real enterprise browser rather than Carbon token compliance.
     passed 1/1; `.50` `cargo test -p mde-shell-egui
     ctrl_t_opens_a_new_tab_intent_and_never_leaks_into_the_page -- --nocapture` passed 1/1; warmed
     BigBoy `.130` `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130.
+  - **Browser panel poll/upload seam slice 2026-07-15:** `web_panel` no longer owns the entire
+    service-poll, per-tab event-drain, side-effect-apply, and active-frame texture upload sequence inline.
+    `WebState` now exposes named private seams for Browser service polling, isolated per-tab polling,
+    post-borrow event application, final address/media/session sync, and paint-ready active-frame upload.
+    The order and helper/session semantics stay unchanged, but future render/input fixes now land against a
+    smaller audited frame-loop surface instead of editing the full panel body. Farm evidence: `.50`
+    `cargo fmt --check -p mde-shell-egui` passed; BigBoy `.130`
+    `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130; warmed BigBoy `.130`
+    `cargo test -p mde-shell-egui a_paint_ready_frame_uploads_to_a_texture_and_paints -- --nocapture`
+    passed 1/1. Duplicate cold `.50` focused paint/input lanes were stopped after BigBoy provided the
+    same render/input coverage plus the full Browser filter.
   - **Browser Material action-button slice 2026-07-15:** Browser prompt bars and the password/capture
     controls now use one Browser-local `BrowserActionRole` helper for primary, secondary, warning, and
     quiet actions instead of hand-rolled/default egui button text. This keeps HTTP upgrade/continue/cancel,
