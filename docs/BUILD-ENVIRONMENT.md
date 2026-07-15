@@ -75,6 +75,12 @@ remote shell to interpret them. Prefer one simple Cargo test filter per farm job
 or a direct SSH command from inside the synced slot when a complex expression is
 really needed.
 
+**Nested CEF workspace note (learned 2026-07-15):** `crates/desktop/mde-web-cef`
+is a standalone nested Cargo workspace, not a package in the repo-root workspace.
+Farm cargo gates for it must use `--manifest-path crates/desktop/mde-web-cef/Cargo.toml`
+instead of `-p mde-web-cef`; `-p mde-web-cef` from the repo root will fail before
+compiling.
+
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
@@ -269,6 +275,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 | `xcp-build.sh bash ...` prints the usage banner | `xcp-build.sh` is not an arbitrary remote-shell wrapper; use `xcp-build.sh cargo ...` or `sync`, then SSH into `~/magic-mesh-farm-<slot>` with the farm key for live/runtime probes | intro "Env-gated live smoke note" |
 | farm job hangs on `10.0.0.x` | inherited build-host pin from stale docs/agent memory | verify with `install-helpers/farm.sh status`; use `.50` / `.90` / `.130` / `.170` |
 | CEF live probe says `/opt/mde/cef` is missing on a farm VM | farm build VMs do not all have the packaged runtime staged under `/opt`; `.50` currently has the warm live bundle in `$HOME/mde-cef-active` | set `MDE_CEF_ROOT=$HOME/mde-cef-active` for `.50` probes, or run the packaging installer before using `/opt/mde/cef` |
+| `cargo test -p mde-web-cef` says the package does not match any packages | `mde-web-cef` is a nested standalone workspace outside the repo-root workspace package set | run through the farm with `cargo test --manifest-path crates/desktop/mde-web-cef/Cargo.toml ...` |
 | native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
 | focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |

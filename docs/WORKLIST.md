@@ -4670,6 +4670,23 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-web-preview-client --features live-helper --bin cef-verify -- --nocapture`
     passed 5/5, BigBoy `.130` `cargo check -p mde-web-preview-client --features live-helper --bins`
     passed, and `.170` `cargo fmt -p mde-web-preview-client -- --check` passed.
+  - **CEF Browser Power Mode launch profile 2026-07-15:** Browser Power Mode now reaches newly
+    spawned CEF helpers as process env (`MDE_CEF_BROWSER_POWER_MODE=true` plus the existing
+    extension power-mode env), the CEF launcher forwards that state into the native renderer bridge,
+    and Chromium switch assembly preserves GPU/GPU compositing plus WebGPU/WebUSB/WebBluetooth for
+    Power Mode tabs while keeping the default enterprise profile conservative. `WebSession::SpawnSpec`
+    now carries explicit helper env so this remains a typed shell-to-helper contract instead of an
+    ambient process mutation. Farm evidence: `.50` `cargo test --manifest-path
+    crates/desktop/mde-web-cef/Cargo.toml --lib -- --nocapture` passed 151/151, `.50` focused
+    `browser_power_mode` passed, `.90` focused `launch_plan_names_the_bridge_and_runtime_environment`
+    passed, BigBoy `.130` `cargo test -p mde-shell-egui --features live-helper
+    cef_power_mode_launch_env_reaches_new_helper_spawns -- --nocapture` passed, BigBoy `.130`
+    `cargo test -p mde-shell-egui --features live-helper
+    cef_live_open_uses_the_browser_ui_spawn_path_and_pumps_a_frame -- --nocapture` passed, `.170`
+    `cargo check -p mde-web-preview-client --features live-helper --bins` passed, `.170`
+    `cargo test -p mde-web-preview-client --features live-helper --bin cef-verify args_ --
+    --nocapture` passed 3/3, and fmt passed for both the main workspace packages and the standalone
+    `mde-web-cef` manifest.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
