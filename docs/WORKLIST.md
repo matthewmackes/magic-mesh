@@ -54,10 +54,11 @@ The **headline pivot**: MCNF 12.0 "Quasar" becomes an **egui-native mesh thin-cl
 
 **QUASAR-CLOUD supersession (2026-07-03, refreshed 2026-07-10):** the current target hypervisor stack is **Nova/libvirt/QEMU-KVM + OVN**, not cloud-hypervisor. Older E12 cloud-hypervisor text below is retained as historical implementation context until QC-15 deletes the replaced stack; new packaging and live validation work follows `AI_GOVERNANCE.md §5` and QC-1.
 
-## MOTION-DRM — cohesive polished transition system for the egui DRM/KMS shell (operator 2026-07-15; questionnaire complete)
+## MOTION-DRM — NEXT EPIC: cohesive polished transition system for the egui DRM/KMS shell (operator 2026-07-15; questionnaire complete)
 
-**Operator lock:** all Carbon Design requirements are lifted for this epic. The goal is a native Rust
-motion system with polished macOS-style continuity, adapted to immediate-mode egui and the production
+**Operator lock / prompt provenance:** this is the next execution epic from the questionnaire-complete
+operator prompt. **All Carbon Design requirements are lifted to meet this goal.** The goal is a native
+Rust motion system with polished macOS-style continuity, adapted to immediate-mode egui and the production
 direct-seat renderer. Do **not** copy Apple assets or private APIs; reproduce the behavioral principles
 only. This epic targets the production path first:
 
