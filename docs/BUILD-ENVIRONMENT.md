@@ -44,6 +44,17 @@ cold heavy crate there. If direct reuse is needed after an `xcp-build.sh` sync,
 SSH to the same slot and run the focused cargo command there with
 `CARGO_INCREMENTAL=0`.
 
+**Env-gated live smoke note (learned 2026-07-15):** `xcp-build.sh cargo ...`
+accepts only Cargo arguments after the `cargo` subcommand and does not forward
+arbitrary local `MDE_*` smoke variables into the remote command. For Browser
+live UI probes such as `MDE_CEF_LIVE_UI_SMOKE=1` or
+`MDE_SERVO_LIVE_UI_SMOKE=1`, first sync/build the slot with `xcp-build.sh cargo
+test ...`, then SSH into the synced `~/magic-mesh-farm-<slot>` directory and run
+the env-prefixed `cargo test` directly on that farm host. Do the same direct-SSH
+step for non-Cargo shell probes/checks; `xcp-build.sh` subcommands are the
+documented `sync`, `cargo`, `gates`, `rpm`, `pull`, `shell`, and route helpers,
+not arbitrary remote command names.
+
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
