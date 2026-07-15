@@ -4560,6 +4560,26 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
     `cargo test -p mde-shell-egui browser_body` passed 2/2, and `.170`
     `cargo fmt -p mde-shell-egui --check` passed.
+  - **Browser Material token closure slice 2026-07-15:** Browser-local chrome now keeps the security
+    chip/site-info panel, downloads-open toolbar affordance, ad-filter hover detail, and region-capture
+    marquee on Browser Material roles instead of shared shell `Style` text/accent/warn tokens. Regression
+    coverage now locks security-level tone mapping and site-info painted text colors. Farm evidence:
+    BigBoy `.130` `cargo test -p mde-shell-egui browser` passed 121/121, `.50`
+    `cargo test -p mde-shell-egui site_info` passed 7/7, `.90`
+    `cargo test -p mde-shell-egui chrome_ui` passed 5/5, and `.170`
+    `cargo fmt -p mde-shell-egui --check` passed.
+  - **Browser send-tab self-loop fix 2026-07-15:** Send Tab to Node no longer defaults to the local
+    host or publishes a configured self-target, and the Browser inbox drain now consumes existing
+    self-originated node handoff records without opening tabs. Live cleanup on `.15`
+    (`Basement-Test-Workstation`) quarantined the two active CEF self-loop records for
+    `https://duckduckgo.com/` from the root-owned local and `/mnt/mesh-storage` send-tab inboxes;
+    a root-owned verification scan found `remaining_self_send_records=0`. Regression coverage locks
+    both the no-publish sender guard and the local+shared poison-record drain. Farm evidence:
+    BigBoy `.130` `cargo test -p mde-shell-egui browser` passed 123/123, BigBoy `.130`
+    `cargo test -p mde-shell-egui send_tab` passed 9/9, `.50`
+    `cargo test -p mde-browser-workers browser_session_sync` passed 10/10, and `.170`
+    `cargo fmt -p mde-shell-egui --check` passed. A `.90` focused shell run hit ENOSPC while
+    compiling unrelated shell dependencies; the guidance is now captured in `docs/BUILD-ENVIRONMENT.md`.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM

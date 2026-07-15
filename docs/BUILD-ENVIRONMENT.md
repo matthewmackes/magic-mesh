@@ -58,6 +58,13 @@ step for non-Cargo shell probes/checks; `xcp-build.sh` subcommands are the
 documented `sync`, `cargo`, `gates`, `rpm`, `pull`, `shell`, and route helpers,
 not arbitrary remote command names.
 
+**Farm command quoting note (learned 2026-07-15):** `xcp-build.sh cargo ...`
+runs the requested cargo command through the remote shell. Avoid unescaped shell
+metacharacters in test filters (`|`, `&&`, `;`, redirects) unless you intend the
+remote shell to interpret them. Prefer one simple Cargo test filter per farm job
+or a direct SSH command from inside the synced slot when a complex expression is
+really needed.
+
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
@@ -252,6 +259,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 | farm job hangs on `10.0.0.x` | inherited build-host pin from stale docs/agent memory | verify with `install-helpers/farm.sh status`; use `.50` / `.90` / `.130` / `.170` |
 | CEF live probe says `/opt/mde/cef` is missing on a farm VM | farm build VMs do not all have the packaged runtime staged under `/opt`; `.50` currently has the warm live bundle in `$HOME/mde-cef-active` | set `MDE_CEF_ROOT=$HOME/mde-cef-active` for `.50` probes, or run the packaging installer before using `/opt/mde/cef` |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
+| focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
 
 ---
 
