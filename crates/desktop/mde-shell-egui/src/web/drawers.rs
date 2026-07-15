@@ -8,7 +8,7 @@
 
 use super::*;
 use super::{PaperSize, PrintOrientation};
-use mde_egui::egui::RichText;
+use mde_egui::egui::{RichText, Sense};
 use mde_egui::muted_note;
 
 pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {

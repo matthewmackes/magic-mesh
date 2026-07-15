@@ -33,7 +33,10 @@ when the source is fine. Put Servo tests/checks on BigBoy (`172.20.0.130`) when
 they are the long pole, and set `CARGO_INCREMENTAL=0` if a previous run hit
 ENOSPC. Treat `.50`/`.90`/`.170` ENOSPC during rsync or `target/` writes as a
 slot-capacity problem: remove only disposable `~/magic-mesh-farm-*` slots you
-created, then rerun the heavy job on BigBoy.
+created, then rerun the heavy job on BigBoy. Do not keep duplicate cold
+small-node filters running after an equivalent warmed BigBoy slot has already
+covered the assertion; cancel or clean the duplicate slot so the farm stays
+usable for the next gate.
 
 **BigBoy slot hygiene note (learned 2026-07-15):** BigBoy's build VM currently
 has a 79G `/home`; it is the right long-pole target, but several cold heavy
