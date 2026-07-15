@@ -4417,8 +4417,17 @@ real enterprise browser rather than Carbon token compliance.
   and `.50` `browser-cef-page-text-final` passed the page-text tests. The
   diagnostic-only one-shot `render-once` page-text scrape still returns empty on
   some runs and is not the operational proof path; the shell wire verifier is.
-  Servo input is no longer dropped at the preview client boundary and has farm
-  check/unit coverage, but live seat proof for Servo mouse/keyboard remains open.
+  **Live Servo fallback input closure 2026-07-15:** the same verifier now has an
+  engine-neutral page-text observation mode for helpers that do not publish title
+  changes. On BigBoy `.130`, `mde-web-preview` built in slot
+  `browser-servo-live-verify` with `CARGO_INCREMENTAL=0`; `cef-verify` then
+  spawned the Servo helper through the exact `WebSession` socket path and proved
+  real nav, six `1280x800` paint frames, pointer delivery, keydown delivery, and
+  text insertion into a focused input. Page text advanced from
+  `MDE_STATUS P:0 K:0 T:` to `MDE_STATUS P:1 K:1 T:m`, and the verifier returned
+  `VERIFY RESULT=PASS display/load/input handlers fired over the wire`. This
+  closes the prior "Servo does not respond" proof gap at the helper-wire level;
+  a physical seat eyes-on pass is still useful but no longer the only evidence.
 - [x] E3 — WebExtensions decision: ship native adblock/passkeys/reader, skip WebExtensions for v1. **V1 policy closure 2026-07-14:** production CEF launches now keep WebExtensions disabled even when a curated registry exists; `mde-web-cef` reports `CEF_EXTENSIONS_SKIPPED_V1 ... reason=native_adblock_passkeys_reader_ship_for_v1` and only the lab smoke path can opt back in with `MDE_CEF_WEBEXTENSIONS_LAB`. Browser chrome states the supported v1 path: native blocker, passkeys, reader mode, userscripts, and site styles.
 - [>] C0–C5 — `web/chrome_ui/` rebuild: browser-local light `Visuals` scope · `tabs/toolbar/omnibox/menu/ntp` · Roboto chrome font · retire MENUBAR-ALL for this surface. **C0 slice 2026-07-14:** introduced `web/chrome_ui/`, wrapped the Browser tab/toolbar/bookmarks/find rows in a browser-local light visuals/font scope, removed the default shared MENUBAR-ALL top-strip call from `web_panel`, and moved the existing state-gated Browser command tree under the toolbar's Chrome-style menu button. The menubar coverage backstop now records Browser as a deliberate first-party chrome surface instead of a shared-bar surface. **Remaining:** extract tabstrip/toolbar/omnibox/new-tab rendering into `chrome_ui`, embed/use the actual Roboto chrome font, and complete the pixel-faithful Chrome pass.
 
