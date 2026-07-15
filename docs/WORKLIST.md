@@ -4541,9 +4541,40 @@ real enterprise browser rather than Carbon token compliance.
   display/load, installed CEF input verify reached final title
   `mde-browser-verify-p1-k1-tm` and `VERIFY RESULT=PASS`, and installed Servo
   input verify reached page text `P:1 K:1 T:m` and `VERIFY RESULT=PASS`.
-  Payload validation passed; the known 109 MiB monolithic RPM size gate still
-  fails for the GitHub Pages channel and remains a packaging split/channel issue,
-  not a seat deploy blocker.
+  Payload validation passed; at that point the known 109 MiB monolithic RPM size
+  gate still failed for the GitHub Pages channel and remained a packaging
+  split/channel issue, not a seat deploy blocker. That packaging issue is now
+  addressed by the Browser RPM split slice below.
+  **Browser RPM split source/tooling slice 2026-07-15:** the base `magic-mesh`
+  RPM no longer owns Browser helper/runtime payload. A co-installable
+  `magic-mesh-browser` RPM now owns Servo (`mde-web-preview`), the CEF helper
+  and renderer, `cef-verify`, CEF runtime setup, Widevine/model provisioning,
+  Browser SELinux policy loaders, WebExtensions lab-smoke assets, and adblock
+  seeds. Base weak-recommends `magic-mesh-browser`; Browser requires the base
+  package plus the Browser runtime/manual graphics dependency set. Base role
+  provisioning no longer enables optional Browser setup units that are absent
+  when the Browser package is not installed. Both RPM cut paths now build the
+  split artifacts and size-gate them. Payload verification understands base,
+  browser, and server shapes. Farm evidence: `.170`
+  `browser-rpm-split-verify` passed 8/8 Browser payload ownership tests; `.90`
+  `browser-rpm-split-builder` passed the Fedora builder regression; BigBoy
+  `.130` `browser-rpm-split-check` passed `cargo check -p mackesd --features
+  async-services --lib`; `.170` `browser-rpm-split-fmt2` passed rustfmt; `.50`
+  `browser-rpm-split-role2` passed 27/27 role-provision tests. BigBoy `.130`
+  `browser-rpm-split-full` cut `/root/mcnf-release-artifacts/magic-mesh-12.0.0-1.x86_64.rpm`
+  at 69.9 MiB, SHA-256
+  `a831d1014db25b1005f7bc4caefa8b8b2998efdf1a1b6598ea50b0dc4f0846d6`, and
+  `/root/mcnf-release-artifacts/magic-mesh-browser-12.0.0-1.x86_64.rpm` at
+  39.0 MiB, SHA-256
+  `96dd4637c3f04457be0dff5ea32020abee2117872c82d8b2d2945475dd519df7`; both
+  passed the 90 MiB cut gate and payload inspection. The base RPM grep found no
+  Browser helper/runtime files, while the Browser RPM owns the expected CEF,
+  Servo, verifier, Widevine/model, SELinux, and adblock files. RPM dependency
+  inspection confirms base recommends `magic-mesh-browser`; Browser requires
+  `magic-mesh`, `bzip2`, and the Browser manual graphics stack. The base RPM
+  still has automatic ELF soname requirements for shell-linked graphics/font
+  libraries, which is expected for the DRM shell and is not the Browser payload
+  split boundary.
   **CEF private runtime cache hardening 2026-07-15:** live `.15` journal review
   found CEF/fontconfig falling back to `/.cache/fontconfig` inside the
   no-home sandbox (`Fontconfig error: No writable cache directories`). The CEF

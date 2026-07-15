@@ -382,22 +382,23 @@ no-default-features = true
 [lints]
 workspace = true
 
-# PKG-1/3/6 (W71/72/75/76/86) — the ONE monolithic MCNF RPM.
+# PKG-1/3/6 (W71/72/75/76/86) — the base MCNF RPM plus split Browser RPM.
 # `cargo generate-rpm -p mackesd` (operator-gated via /release) packages
-# all app/daemon binaries (incl. the ENT-15 meshctl facade) + the
-# packaging/ assets into a single
-# `magic-mesh` RPM; the install-time role chooser (PKG-5) + the
+# all common app/daemon binaries (incl. the ENT-15 meshctl facade) + the
+# packaging/ assets into the base
+# `magic-mesh` RPM; `cargo generate-rpm --variant browser` emits the
+# co-installable `magic-mesh-browser` RPM for the heavy browser engines. The
+# install-time role chooser (PKG-5) + the
 # self-gating mackesd.service (PKG-3) decide what actually runs per node,
 # so there is no per-role package split (§5: Lighthouse ⊂ Server ⊂
-# Workstation, one artifact). RPM GPG signing + the ISO stay operator-gated.
+# Workstation); Browser is split by payload lifecycle, not by role. RPM GPG
+# signing + the ISO stay operator-gated.
 [package.metadata.generate-rpm]
 name = "magic-mesh"
-# PKG — payload codec. The monolithic RPM bundles every workspace binary
-# (~186 MiB raw); default zstd lands ~103 MiB, over GitHub's 100 MiB file limit
-# for the gh-pages dnf channel. xz packs the same payload under 100 MiB so the
-# RPM can be hosted on GitHub. (The `magic-mesh-server` variant below — XPA-6 —
-# drops the GUI bins entirely for headless roles; this xz lever keeps the full
-# desktop RPM under the limit.)
+# PKG — payload codec. The Browser engines now ship as a separate
+# `magic-mesh-browser` RPM so both public-channel artifacts stay below GitHub's
+# 100 MiB file limit. Keep xz until release evidence proves zstd has enough
+# headroom for each split artifact.
 payload_compress = "xz"
 # EFF-40 — the NEVRA release field: bump THIS (not the workspace
 # version) for asset-only/packaging-only changes so `dnf upgrade`
@@ -436,88 +437,10 @@ assets = [
     # headless roles. The org.magicmesh.Shell.desktop launcher still ships via
     # the packaging/applications/*.desktop glob below for session launches.
     { source = "packaging/bootc/units/mde-shell-egui.service", dest = "/usr/lib/systemd/system/mde-shell-egui.service", mode = "644" },
-    # BOOKMARKS-9 — the out-of-process, OS-sandboxed Servo browser helper
-    # (BOOKMARKS-5). The shell spawns it per browser session; it renders offscreen
-    # into a shared-memory frame the Browser surface uploads to an egui texture.
-    # It ships in the BASE (Workstation) RPM so `mde-web-preview` is present in the
-    # base bootc image, then the BOOKMARKS-8 `browser_policy` worker RUNTIME-GATES
-    # whether it may spawn (per-role enable/disable). NOT in the server variant (a
-    # headless Server has no browser). It is its OWN workspace root (Servo drags a
-    # conflicting native sqlite link — see the crate manifest), so it is NOT built
-    # by `cargo build --workspace`; build-rpm-fedora43.sh compiles it into the same
-    # CARGO_TARGET_DIR right after the workspace release build, so this
-    # `target/release/mde-web-preview` path resolves (cargo-generate-rpm rewrites
-    # the `target/` prefix to the active target dir). Its confined SELinux domain +
-    # Servo runtime-lib Requires ship below.
-    { source = "target/release/mde-web-preview",     dest = "/usr/bin/mde-web-preview",     mode = "755" },
-    # BROWSER-DD-1 — the Chromium/CEF compatibility helper scaffold. Like
-    # mde-web-preview, this is a workspace-excluded helper built standalone by
-    # build-rpm-fedora43.sh into the active CARGO_TARGET_DIR before generate-rpm.
-    # It is intentionally honest-gated at runtime until the pinned CEF bundle is
-    # installed under MDE_CEF_ROOT or /opt/mde/cef; shipping the binary now lets the
-    # Browser Engine menu's CEF selection resolve to a real helper path instead of
-    # an absent-binary gate. Not in the server variant (headless roles have no
-    # browser surface).
-    { source = "target/release/mde-web-cef",         dest = "/usr/bin/mde-web-cef",         mode = "755" },
-    { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
-    # BROWSER-CHROME — operator/verifier harness for the shell-equivalent CEF tab
-    # path. It spawns `mde-web-cef tab` through `mde-web-preview-client`'s
-    # live-helper socket path and proves nav/title/paint events arrive over the
-    # same wire the shell consumes.
-    { source = "target/release/cef-verify",          dest = "/usr/libexec/mackesd/cef-verify", mode = "755" },
-    # BROWSER-DD-1 — pinned Chromium/CEF runtime provisioning. The 311 MB CEF
-    # binary payload is fetched/verified by the first-boot service, not embedded
-    # directly in the RPM; the manifest pins the official Linux64 minimal tarball
-    # and the helper activates /opt/mde/cef. Role-gated to Workstation rank so
-    # Lighthouse installs do not spend disk/network on a browser runtime.
-    { source = "install-helpers/install-cef-runtime.sh", dest = "/usr/libexec/mackesd/install-cef-runtime", mode = "755" },
-    { source = "packaging/browser/cef-linux64-minimal.env", dest = "/usr/share/magic-mesh/browser/cef-linux64-minimal.env", mode = "644" },
-    { source = "packaging/systemd/mde-cef-runtime-setup.service", dest = "/usr/lib/systemd/system/mde-cef-runtime-setup.service", mode = "644" },
-    # BROWSER-DD-5 — curated WebExtensions templates plus a live smoke fixture.
-    # The smoke runner stays an explicit operator command; it does not auto-enable
-    # extensions or claim LastPass autofill.
-    { source = "install-helpers/browser-cef-webextension-smoke.sh", dest = "/usr/libexec/mackesd/browser-cef-webextension-smoke", mode = "755" },
-    { source = "packaging/browser/webextensions-allowlist.env", dest = "/usr/share/magic-mesh/browser/webextensions-allowlist.env", mode = "644" },
-    { source = "packaging/browser/webextensions-smoke.env", dest = "/usr/share/magic-mesh/browser/webextensions-smoke.env", mode = "644" },
-    { source = "packaging/browser/smoke-extension/manifest.json", dest = "/usr/share/magic-mesh/browser/smoke-extension/manifest.json", mode = "644" },
-    { source = "packaging/browser/smoke-extension/smoke.js", dest = "/usr/share/magic-mesh/browser/smoke-extension/smoke.js", mode = "644" },
-    # BROWSER-DD-4 — optional Widevine CDM provisioning for the CEF engine. The
-    # CDM is NOT embedded in the RPM; the shipped manifest is an operator-pinned
-    # first-run fetch contract and exits with a clean configuration gate until a
-    # licensed URL + sha256 are supplied. Non-DRM browsing remains available.
-    { source = "install-helpers/install-widevine-cdm.sh", dest = "/usr/libexec/mackesd/install-widevine-cdm", mode = "755" },
-    { source = "packaging/browser/widevine-linux64.env", dest = "/usr/share/magic-mesh/browser/widevine-linux64.env", mode = "644" },
-    { source = "packaging/systemd/mde-widevine-cdm-setup.service", dest = "/usr/lib/systemd/system/mde-widevine-cdm-setup.service", mode = "644" },
-    # BROWSER-DD-11 — default Browser read-aloud command. The daemon still
-    # publishes unavailable when Piper/model/player pieces are absent; this asset
-    # provides the stable Workstation command path and honest exit-code contract.
-    { source = "install-helpers/browser-read-aloud-tts.sh", dest = "/usr/libexec/mackesd/browser-read-aloud-tts", mode = "755" },
-    # BROWSER-DD-11 — default Browser voice-command STT command. It exits
-    # unavailable unless local capture, model, and transcribe pieces are present.
-    { source = "install-helpers/browser-voice-command-stt.sh", dest = "/usr/libexec/mackesd/browser-voice-command-stt", mode = "755" },
-    # BROWSER-DD-12 — default Browser private translation command. It exits
-    # unavailable unless a local/mesh model and translation engine are present.
-    { source = "install-helpers/browser-translate.sh", dest = "/usr/libexec/mackesd/browser-translate", mode = "755" },
     # KDC-MESH-6 — default seat/uinput helper for phone-originated remote input.
     # It opens /dev/uinput directly and exits unavailable when the live seat is
     # not accessible, so kdc remote-input never reports fake injection.
     { source = "install-helpers/seat-remote-input.py", dest = "/usr/libexec/mackesd/seat-remote-input", mode = "755" },
-    # BROWSER-DD-11 — optional Piper voice provisioning. Like Widevine, this is a
-    # first-run sha256-pinned manifest contract: it exits with a clean configuration
-    # gate until an approved offline voice model URL/SHA is supplied.
-    { source = "install-helpers/install-browser-tts-voice.sh", dest = "/usr/libexec/mackesd/install-browser-tts-voice", mode = "755" },
-    { source = "packaging/browser/browser-read-aloud-voice.env", dest = "/usr/share/magic-mesh/browser/browser-read-aloud-voice.env", mode = "644" },
-    { source = "packaging/systemd/mde-browser-tts-voice-setup.service", dest = "/usr/lib/systemd/system/mde-browser-tts-voice-setup.service", mode = "644" },
-    # BROWSER-DD-11 — optional offline STT model provisioning. Runtime command
-    # selection remains operator-configured through the wrapper environment.
-    { source = "install-helpers/install-browser-stt-model.sh", dest = "/usr/libexec/mackesd/install-browser-stt-model", mode = "755" },
-    { source = "packaging/browser/browser-voice-command-stt.env", dest = "/usr/share/magic-mesh/browser/browser-voice-command-stt.env", mode = "644" },
-    { source = "packaging/systemd/mde-browser-stt-model-setup.service", dest = "/usr/lib/systemd/system/mde-browser-stt-model-setup.service", mode = "644" },
-    # BROWSER-DD-12 — optional offline/mesh translation model provisioning. Runtime
-    # command selection remains operator-configured through the wrapper environment.
-    { source = "install-helpers/install-browser-translate-model.sh", dest = "/usr/libexec/mackesd/install-browser-translate-model", mode = "755" },
-    { source = "packaging/browser/browser-translate.env", dest = "/usr/share/magic-mesh/browser/browser-translate.env", mode = "644" },
-    { source = "packaging/systemd/mde-browser-translate-model-setup.service", dest = "/usr/lib/systemd/system/mde-browser-translate-model-setup.service", mode = "644" },
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four Cosmic-era GUIs that
@@ -699,31 +622,9 @@ assets = [
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
     { source = "packaging/systemd/magic-mesh-selinux-policy.service", dest = "/usr/lib/systemd/system/magic-mesh-selinux-policy.service", mode = "644" },
-    # BOOKMARKS-9 — the confined ENFORCING SELinux domain for the Servo browser
-    # helper (mde_web_preview_t). The .te/.fc source ships + the loader compiles it
-    # into a loadable module and installs it (%post below). Defense-in-depth over
-    # the helper's in-process OS sandbox; self-skips where SELinux is disabled (the
-    # SELinux is unavailable/disabled or the policy toolchain is absent — never a
-    # permissive stub.
-    { source = "packaging/selinux/mde-web-preview.te", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.te", mode = "644" },
-    { source = "packaging/selinux/mde-web-preview.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.fc", mode = "644" },
-    { source = "install-helpers/setup-selinux-web-preview.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-preview", mode = "755" },
-    { source = "packaging/systemd/mde-web-preview-selinux.service", dest = "/usr/lib/systemd/system/mde-web-preview-selinux.service", mode = "644" },
-    # security-1 — the confined ENFORCING SELinux domain for the Chromium/CEF
-    # browser helper (mde_web_cef_t): the launcher + the renderer bridge. Same
-    # defense-in-depth shape as the Servo domain above, over the renderer's
-    # in-process OS sandbox (mde-web-sandbox); self-skips where SELinux is
-    # disabled or the policy toolchain is absent — never a permissive stub.
-    { source = "packaging/selinux/mde-web-cef.te", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.te", mode = "644" },
-    { source = "packaging/selinux/mde-web-cef.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.fc", mode = "644" },
-    { source = "install-helpers/setup-selinux-web-cef.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-cef", mode = "755" },
-    { source = "packaging/systemd/mde-web-cef-selinux.service", dest = "/usr/lib/systemd/system/mde-web-cef-selinux.service", mode = "644" },
-    # BOOKMARKS-9 — the bundled ad-filter SEED lists (the offline fallback the
-    # mde-adblock engine compiles before a node's first upstream sync). These are
-    # the SAME bytes `mde-adblock` `include_str!`s into the shipped shell binary
-    # (one source, no drift); shipping them loose makes the "bundles the seed filter
-    # lists" acceptance observable in `rpm -qlp` and operator-inspectable on disk.
-    { source = "crates/services/mde-adblock/seed/*.txt", dest = "/usr/share/magic-mesh/adblock/", mode = "644" },
+    # Browser helper SELinux domains and inspectable adblock seed files ship in
+    # the co-installable magic-mesh-browser package, keeping the base channel
+    # artifact below the public 100 MiB ceiling.
     # DAR-46 — DEVOPS-AUTOMATION-REBUILD: ship the backoffice/control-VM plane so a
     # rebuilt/rebooted control VM re-converges with no manual step (the deploy root
     # is /opt/mcnf — the mcnf-* units WorkingDirectory + cmd_found's MCNF_REPO
@@ -831,11 +732,11 @@ if [ -f /etc/systemd/system/mde-shell.service ] && \
         /etc/systemd/system/multi-user.target.wants/mde-shell.service || :
 fi
 systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
-# SELINUX-1 / BOOKMARKS-9 — policy loading can block in semodule on some fresh
+# SELINUX-1 — policy loading can block in semodule on some fresh
 # VM images. Do NOT run it from dnf's %post, even with --no-block: starting the
 # oneshots can still race the open RPM transaction. Enable only; policy loading
 # is deferred to boot or an explicit post-install retry outside dnf.
-systemctl enable magic-mesh-selinux-policy.service mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service >/dev/null 2>&1 || :
+systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
 # MUSIC-DAEMON-AUTOSTART — enable the mde-musicd USER service for every user so
 # the music library has its action/music/* responder in the desktop session
 # (the GUI talks to it over the bus). It self-gates on Workstation rank
@@ -856,9 +757,8 @@ fi
 post_uninstall_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
 # SELINUX-1 — drop the local policy modules on a full removal (not an upgrade).
-# BOOKMARKS-9 — also drop the confined browser-helper domain (mde-web-preview).
 if [ "$1" = 0 ]; then
-  semodule -r magicmesh-base magicmesh-podman magicmesh-libvirt mde-web-preview >/dev/null 2>&1 || :
+  semodule -r magicmesh-base magicmesh-podman magicmesh-libvirt >/dev/null 2>&1 || :
 fi
 """
 
@@ -899,14 +799,9 @@ wireplumber = "*"
 pipewire-alsa = "*"
 bluez = "*"
 upower = "*"
-# BROWSER-DD-1 — the pinned CEF runtime is distributed as `.tar.bz2`; the
-# Workstation-only first-boot installer extracts it with `tar -xjf`, which needs
-# the external bzip2 helper on Fedora minimal images.
-bzip2 = "*"
-# BROWSER-DD-11 / EDTB-6 — offline spell checking shells `hunspell -a`; the
-# checker also needs an installed dictionary before it can classify words. Keep
-# both as hard Requires so a fresh Workstation has an offline spell engine for
-# editor prose today and Browser spellcheck once its page-text bridge lands.
+# EDTB-6 — offline spell checking shells `hunspell -a`; the checker also needs
+# an installed dictionary before it can classify words. Keep both as hard
+# Requires so a fresh Workstation has an offline spell engine for editor prose.
 hunspell = "*"
 hunspell-en-US = "*"
 # DDC/CI external-monitor brightness (lock 13) shells `ddcutil` over i2c-dev;
@@ -965,35 +860,6 @@ qemu-img = "*"
 fwupd = "*"
 libwacom = "*"
 
-# BOOKMARKS-9 (browser packaging, design mesh-bookmarks.md Q81) — the Servo
-# browser helper (mde-web-preview) dynamically links the system graphics/text
-# stack, so declare those runtime libs as hard Requires (Servo is a SELF-CONTAINED
-# engine — it brings its own JS/layout/net/TLS, so there is DELIBERATELY **no
-# firefox / gecko / nss / nspr** dep here; the helper does system-CA TLS via
-# rustls). One RPM serves every role; a headless Lighthouse installs these but the
-# browser self-gates (it only spawns on a Workstation under the BOOKMARKS-8
-# browser_policy), exactly like the seat runtimes (pipewire/bluez) above. The
-# leaf soname deps (expat/libpng/zlib for fontconfig/freetype) resolve
-# transitively. Reconcile the definitive set against `ldd /usr/bin/mde-web-preview`
-# on a full Servo build (operator-gated build host).
-#   · fontconfig / freetype / harfbuzz — font discovery, rasterization, shaping.
-#   · mesa-libEGL / mesa-libGL / mesa-libGLES / mesa-libgbm / mesa-dri-drivers —
-#     the offscreen GL/EGL + surfaceless GBM path Servo renders through (GPU-required).
-#   · mesa-vulkan-drivers / vulkan-loader — the Vulkan ICD + loader for the wgpu
-#     GPU backend (webrender/webgpu).
-#   · libxkbcommon — keymap handling for forwarded keyboard input.
-fontconfig = "*"
-freetype = "*"
-harfbuzz = "*"
-mesa-libEGL = "*"
-mesa-libGL = "*"
-mesa-libGLES = "*"
-mesa-libgbm = "*"
-mesa-dri-drivers = "*"
-mesa-vulkan-drivers = "*"
-vulkan-loader = "*"
-libxkbcommon = "*"
-
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
 # (spawn failure → recoverable error + back-off) when it's absent. A
@@ -1001,6 +867,10 @@ libxkbcommon = "*"
 # whole ansible stack; `dnf install` still pulls it by default
 # (weak deps on), and `--setopt=install_weak_deps=False` opts out.
 [package.metadata.generate-rpm.recommends]
+# BROWSER-SPLIT — default Workstation installs still pull the production Browser
+# engines, but as a separate public-channel artifact that can be size-gated and
+# removed independently from the base desktop.
+magic-mesh-browser = "*"
 ansible-core = "*"
 # KIRON / NOTIF-7 — `mde-shell-egui`'s single notification-sound seam shells
 # `canberra-gtk-play` for freedesktop event sounds. Fedora provides that binary
@@ -1056,18 +926,6 @@ rsync = "*"
 #                       dGPU) that same worker drives via typed verbs.
 iptsd = "*"
 surface-control = "*"
-# BOOKMARKS-9 — the policy-build toolchain the browser-helper SELinux loader
-# (setup-selinux-web-preview) uses to compile mde-web-preview.te into a loadable
-# module. WEAK: QC-22 targets SELinux Enforcing on shipped nodes, but hosts that
-# are kernel-disabled, pre-reboot, or missing the toolchain still boot; the loader
-# honestly self-skips when policy cannot be built (the helper's OS sandbox stays
-# operative). Present it so enforcing nodes can load the confined browser domain
-# with no manual step. selinux-policy-devel supplies the refpolicy
-# /usr/share/selinux/devel/ Makefile + interfaces; checkpolicy the checkmodule
-# fallback path.
-selinux-policy-devel = "*"
-checkpolicy = "*"
-
 # EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so
 # a box carrying the old package upgrades cleanly into `magic-mesh`.
@@ -1080,6 +938,114 @@ mde-core = "*"
 # between roles explicit. (Harmless when the subpackage isn't present.)
 [package.metadata.generate-rpm.conflicts]
 magic-mesh-server = "*"
+
+# BROWSER-SPLIT — co-installable browser package. This is intentionally NOT a
+# role variant like `magic-mesh-server`: default Workstation installs get it via
+# the base package's weak dependency, but it can be removed independently when a
+# node must keep the desktop without the heavy Browser engines.
+[package.metadata.generate-rpm.variants.browser]
+name = "magic-mesh-browser"
+summary = "MCNF Browser engines — Servo fallback, Chromium/CEF helper, verifier, and browser runtime provisioning"
+payload_compress = "xz"
+release = "1"
+license = "GPL-3.0-or-later AND MPL-2.0"
+assets = [
+    # BOOKMARKS-9 — the out-of-process, OS-sandboxed Servo browser helper
+    # (BOOKMARKS-5). It is its OWN workspace root (Servo drags a conflicting
+    # native sqlite link), so the cut scripts build it standalone before this
+    # variant is generated.
+    { source = "target/release/mde-web-preview",     dest = "/usr/bin/mde-web-preview",     mode = "755" },
+    # BROWSER-DD-1 — Chromium/CEF browser helper plus renderer bridge.
+    { source = "target/release/mde-web-cef",         dest = "/usr/bin/mde-web-cef",         mode = "755" },
+    { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
+    # BROWSER-CHROME — shell-equivalent verifier for the CEF tab helper wire.
+    { source = "target/release/cef-verify",          dest = "/usr/libexec/mackesd/cef-verify", mode = "755" },
+    # BROWSER-DD-1 — pinned Chromium/CEF runtime provisioning. The 311 MB CEF
+    # runtime is fetched/verified at first boot, not embedded in this RPM.
+    { source = "install-helpers/install-cef-runtime.sh", dest = "/usr/libexec/mackesd/install-cef-runtime", mode = "755" },
+    { source = "packaging/browser/cef-linux64-minimal.env", dest = "/usr/share/magic-mesh/browser/cef-linux64-minimal.env", mode = "644" },
+    { source = "packaging/systemd/mde-cef-runtime-setup.service", dest = "/usr/lib/systemd/system/mde-cef-runtime-setup.service", mode = "644" },
+    # BROWSER-DD-5 — curated WebExtensions templates plus explicit lab smoke fixture.
+    { source = "install-helpers/browser-cef-webextension-smoke.sh", dest = "/usr/libexec/mackesd/browser-cef-webextension-smoke", mode = "755" },
+    { source = "packaging/browser/webextensions-allowlist.env", dest = "/usr/share/magic-mesh/browser/webextensions-allowlist.env", mode = "644" },
+    { source = "packaging/browser/webextensions-smoke.env", dest = "/usr/share/magic-mesh/browser/webextensions-smoke.env", mode = "644" },
+    { source = "packaging/browser/smoke-extension/manifest.json", dest = "/usr/share/magic-mesh/browser/smoke-extension/manifest.json", mode = "644" },
+    { source = "packaging/browser/smoke-extension/smoke.js", dest = "/usr/share/magic-mesh/browser/smoke-extension/smoke.js", mode = "644" },
+    # BROWSER-DD-4 — optional Widevine CDM provisioning contract.
+    { source = "install-helpers/install-widevine-cdm.sh", dest = "/usr/libexec/mackesd/install-widevine-cdm", mode = "755" },
+    { source = "packaging/browser/widevine-linux64.env", dest = "/usr/share/magic-mesh/browser/widevine-linux64.env", mode = "644" },
+    { source = "packaging/systemd/mde-widevine-cdm-setup.service", dest = "/usr/lib/systemd/system/mde-widevine-cdm-setup.service", mode = "644" },
+    # BROWSER-DD-11/12 — Browser TTS, STT, and translation command wrappers plus
+    # optional model/voice provisioning contracts.
+    { source = "install-helpers/browser-read-aloud-tts.sh", dest = "/usr/libexec/mackesd/browser-read-aloud-tts", mode = "755" },
+    { source = "install-helpers/browser-voice-command-stt.sh", dest = "/usr/libexec/mackesd/browser-voice-command-stt", mode = "755" },
+    { source = "install-helpers/browser-translate.sh", dest = "/usr/libexec/mackesd/browser-translate", mode = "755" },
+    { source = "install-helpers/install-browser-tts-voice.sh", dest = "/usr/libexec/mackesd/install-browser-tts-voice", mode = "755" },
+    { source = "packaging/browser/browser-read-aloud-voice.env", dest = "/usr/share/magic-mesh/browser/browser-read-aloud-voice.env", mode = "644" },
+    { source = "packaging/systemd/mde-browser-tts-voice-setup.service", dest = "/usr/lib/systemd/system/mde-browser-tts-voice-setup.service", mode = "644" },
+    { source = "install-helpers/install-browser-stt-model.sh", dest = "/usr/libexec/mackesd/install-browser-stt-model", mode = "755" },
+    { source = "packaging/browser/browser-voice-command-stt.env", dest = "/usr/share/magic-mesh/browser/browser-voice-command-stt.env", mode = "644" },
+    { source = "packaging/systemd/mde-browser-stt-model-setup.service", dest = "/usr/lib/systemd/system/mde-browser-stt-model-setup.service", mode = "644" },
+    { source = "install-helpers/install-browser-translate-model.sh", dest = "/usr/libexec/mackesd/install-browser-translate-model", mode = "755" },
+    { source = "packaging/browser/browser-translate.env", dest = "/usr/share/magic-mesh/browser/browser-translate.env", mode = "644" },
+    { source = "packaging/systemd/mde-browser-translate-model-setup.service", dest = "/usr/lib/systemd/system/mde-browser-translate-model-setup.service", mode = "644" },
+    # Browser helper SELinux domains.
+    { source = "packaging/selinux/mde-web-preview.te", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.te", mode = "644" },
+    { source = "packaging/selinux/mde-web-preview.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.fc", mode = "644" },
+    { source = "install-helpers/setup-selinux-web-preview.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-preview", mode = "755" },
+    { source = "packaging/systemd/mde-web-preview-selinux.service", dest = "/usr/lib/systemd/system/mde-web-preview-selinux.service", mode = "644" },
+    { source = "packaging/selinux/mde-web-cef.te", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.te", mode = "644" },
+    { source = "packaging/selinux/mde-web-cef.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.fc", mode = "644" },
+    { source = "install-helpers/setup-selinux-web-cef.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-cef", mode = "755" },
+    { source = "packaging/systemd/mde-web-cef-selinux.service", dest = "/usr/lib/systemd/system/mde-web-cef-selinux.service", mode = "644" },
+    # BOOKMARKS-9 — inspectable ad-filter seed files, same bytes embedded by mde-adblock.
+    { source = "crates/services/mde-adblock/seed/*.txt", dest = "/usr/share/magic-mesh/adblock/", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/magic-mesh-browser/LICENSE", mode = "644" },
+    { source = "NOTICE",  dest = "/usr/share/licenses/magic-mesh-browser/NOTICE",  mode = "644" },
+]
+post_install_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+BROWSER_UNITS="mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service"
+systemctl unmask $BROWSER_UNITS >/dev/null 2>&1 || :
+systemctl enable $BROWSER_UNITS >/dev/null 2>&1 || :
+"""
+pre_uninstall_script = """
+if [ "$1" = 0 ]; then
+  systemctl --no-reload disable --now mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ "$1" = 0 ]; then
+  semodule -r mde-web-preview mde-web-cef >/dev/null 2>&1 || :
+fi
+"""
+
+[package.metadata.generate-rpm.variants.browser.requires]
+magic-mesh = "*"
+# BROWSER-DD-1 — the CEF runtime is distributed as `.tar.bz2`; the installer
+# extracts it with `tar -xjf`, which needs the external bzip2 helper on Fedora
+# minimal images.
+bzip2 = "*"
+# BOOKMARKS-9 — Servo dynamically links the system graphics/text stack. The leaf
+# soname deps (expat/libpng/zlib for fontconfig/freetype) resolve transitively.
+fontconfig = "*"
+freetype = "*"
+harfbuzz = "*"
+mesa-libEGL = "*"
+mesa-libGL = "*"
+mesa-libGLES = "*"
+mesa-libgbm = "*"
+mesa-dri-drivers = "*"
+mesa-vulkan-drivers = "*"
+vulkan-loader = "*"
+libxkbcommon = "*"
+
+[package.metadata.generate-rpm.variants.browser.recommends]
+# Browser SELinux loaders compile .te/.fc policy sources when the policy
+# toolchain is present and self-skip cleanly where it is not.
+selinux-policy-devel = "*"
+checkpolicy = "*"
 
 # XPA-6 — the GUI-less `magic-mesh-server` subpackage (a cargo-generate-rpm
 # *variant*). Built with `cargo generate-rpm -p crates/mesh/mackesd --variant

@@ -11,7 +11,8 @@
 # Reproducible: pulls fedora:43, installs the workspace build deps + the pinned
 # rustup toolchain (rust-toolchain.toml → 1.94.0), builds the full workspace
 # release, and runs cargo-generate-rpm. Reuses the host's ~/.cargo crate caches.
-# Output: target-f43/generate-rpm/magic-mesh-*.x86_64.rpm (host-owned, rootless).
+# Output for the default full mode: target-f43/generate-rpm/magic-mesh-*.rpm plus
+# magic-mesh-browser-*.rpm (host-owned, rootless).
 #
 # XPA-6 — the GUI-less headless package. With `--server` this builds ONLY the
 # daemon + mesh-substrate crates (mackesd/magic-fleet/mde-enroll/mde-bus — none
@@ -19,7 +20,8 @@
 # music/voice-hud/applet GUI compile entirely, then rolls the `server` variant
 # (`cargo generate-rpm --variant server`) → a small `magic-mesh-server-*.rpm`
 # with no GUI bins and no gtk3/libcosmic ELF Requires. The default (no flag)
-# still builds the full workspace + the monolithic `magic-mesh` RPM unchanged.
+# builds the full workspace and emits the base `magic-mesh` RPM plus the
+# co-installable `magic-mesh-browser` RPM.
 #
 # Usage: install-helpers/build-rpm-fedora43.sh [--server] [fedora_version]
 #        install-helpers/build-rpm-fedora43.sh            # full GUI RPM, F43
@@ -133,6 +135,8 @@ sh /tmp/rustup-init.sh -y --default-toolchain "$CHANNEL" --profile minimal >/tmp
 export PATH=/root/.cargo/bin:$PATH
 cd /src
 echo "[f43] toolchain: $(rustc --version)"
+mkdir -p /src/target-f43/generate-rpm
+rm -f /src/target-f43/generate-rpm/magic-mesh*.rpm
 
 echo "[f43] installing cargo-generate-rpm ${CGR_VERSION:-0.21.0}"
 # build-deploy-7 — pin the packager to an EXACT version (CGR_VERSION, exported
@@ -157,6 +161,7 @@ if [ "${MODE:-full}" = "server" ]; then
       -p mackesd -p magic-fleet -p mde-enroll -p mde-bus
   echo "[f43] generating headless RPM (--variant server)"
   cargo generate-rpm -p crates/mesh/mackesd --variant server
+  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-server-*.rpm
 else
   echo "[f43] building workspace (release) — this is the long part"
   cargo build --workspace --release $MDE_RPM_LOCKED
@@ -168,7 +173,7 @@ else
   # `target/release/mde-web-preview` resolves to (cargo-generate-rpm rewrites the
   # `target/` prefix to the active target dir). Servo needs the system graphics/
   # text -devel headers + libclang (mozjs bindgen) at build time; the container has
-  # network here, so its crates fetch. A hard step: the full RPM ships the browser.
+  # network here, so its crates fetch. A hard step: the split Browser RPM ships it.
   echo "[f43] installing the Servo browser-helper build deps"
   dnf install -y --setopt=install_weak_deps=False \
       clang llvm python3 \
@@ -186,8 +191,8 @@ else
     exit 1; }
   # BROWSER-DD-1 - the Chromium/CEF helper is another workspace-excluded browser
   # root. This first slice is a lean scaffold with the shared BOOKMARKS-6 wire
-  # protocol and an honest CEF_MISSING runtime gate; build it now so the full RPM
-  # installs /usr/bin/mde-web-cef and the shell Engine -> CEF selection resolves
+  # protocol and an honest CEF_MISSING runtime gate; build it now so the Browser
+  # RPM installs /usr/bin/mde-web-cef and the shell Engine -> CEF selection resolves
   # to the real helper path once a pinned CEF bundle is present. The same crate
   # also emits mde-web-cef-renderer, the native bridge process shipped under
   # /usr/libexec/mackesd for the Chrome-engine handoff.
@@ -213,11 +218,15 @@ else
   # only re-links one bin.
   echo "[f43] re-linking mde-shell-egui --features $MDE_RPM_SHELL_FEATURES"
   cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features "$MDE_RPM_SHELL_FEATURES"
-  echo "[f43] generating RPM"
+  echo "[f43] generating base RPM"
   cargo generate-rpm -p crates/mesh/mackesd
+  echo "[f43] generating browser RPM (--variant browser)"
+  cargo generate-rpm -p crates/mesh/mackesd --variant browser
+  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm
+  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-browser-*.rpm
 fi
 
-echo "[f43] DONE — artifact:"
+echo "[f43] DONE — artifact(s):"
 ls -la /src/target-f43/generate-rpm/*.rpm
 '
 
@@ -237,20 +246,33 @@ podman run --rm \
     -w /src \
     "$IMAGE" bash -c "$IN_CONTAINER"
 
-# XPA-6 — pick the artifact for THIS mode. `magic-mesh-server-*` sorts after
-# `magic-mesh-*`, and a stale full RPM can sit beside it, so glob on the exact
-# name prefix instead of taking the first *.rpm.
+# XPA-6 / BROWSER-SPLIT — pick the artifacts for THIS mode. `magic-mesh-server-*`
+# and `magic-mesh-browser-*` sort beside `magic-mesh-*`, so glob on exact name
+# prefixes instead of taking the first *.rpm.
 if [ "$MODE" = "server" ]; then
   GLOB="$REPO/target-f43/generate-rpm/magic-mesh-server-*.rpm"
+  # shellcheck disable=SC2086,SC2012  # $GLOB MUST stay unquoted to expand.
+  RPM="$(ls -1t $GLOB 2>/dev/null | head -1 || true)"
+  [ -n "$RPM" ] || { echo "!! no RPM produced (mode=$MODE)" >&2; exit 1; }
+  "$REPO/install-helpers/verify-rpm-payload.sh" size "$RPM"
+  echo
+  echo "✅ Fedora $FEDORA RPM (mode=$MODE): $RPM"
+  echo "   install on F$FEDORA:  sudo dnf install $RPM"
+  echo "   or via Option A:      do-lighthouse-up.sh <mesh> --rpm-url <served-url-of-this-rpm>"
 else
-  # The full package: magic-mesh-<ver>… but NOT magic-mesh-server-…
-  GLOB="$REPO/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm"
+  BASE_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm"
+  BROWSER_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-browser-*.rpm"
+  # shellcheck disable=SC2086,SC2012
+  BASE_RPM="$(ls -1t $BASE_GLOB 2>/dev/null | head -1 || true)"
+  # shellcheck disable=SC2086,SC2012
+  BROWSER_RPM="$(ls -1t $BROWSER_GLOB 2>/dev/null | head -1 || true)"
+  [ -n "$BASE_RPM" ] || { echo "!! no base RPM produced (mode=$MODE)" >&2; exit 1; }
+  [ -n "$BROWSER_RPM" ] || { echo "!! no browser RPM produced (mode=$MODE)" >&2; exit 1; }
+  "$REPO/install-helpers/verify-rpm-payload.sh" size "$BASE_RPM"
+  "$REPO/install-helpers/verify-rpm-payload.sh" size "$BROWSER_RPM"
+  echo
+  echo "✅ Fedora $FEDORA RPMs (mode=$MODE):"
+  echo "   base:    $BASE_RPM"
+  echo "   browser: $BROWSER_RPM"
+  echo "   install on F$FEDORA:  sudo dnf install $BASE_RPM $BROWSER_RPM"
 fi
-# shellcheck disable=SC2086,SC2012  # $GLOB MUST stay unquoted to expand the
-# wildcard; the existing artifact-pick uses the same `ls` glob idiom.
-RPM="$(ls -1t $GLOB 2>/dev/null | head -1 || true)"
-[ -n "$RPM" ] || { echo "!! no RPM produced (mode=$MODE)" >&2; exit 1; }
-echo
-echo "✅ Fedora $FEDORA RPM (mode=$MODE): $RPM"
-echo "   install on F$FEDORA:  sudo dnf install $RPM"
-echo "   or via Option A:      do-lighthouse-up.sh <mesh> --rpm-url <served-url-of-this-rpm>"

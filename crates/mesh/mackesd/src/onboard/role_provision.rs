@@ -46,10 +46,11 @@ pub struct PlannedUnit {
 ///   `mackesd` daemon, the etcd + Syncthing substrate, and the health + status
 ///   timers. This is [`crate::site_yml::CONVERGE_SERVICES`] plus the status
 ///   timer (a unit test pins that superset relationship).
-/// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell, the
-///   voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
-///   worker's tier), and the Chromium/CEF + optional Widevine/Browser-TTS/STT/
-///   translation runtime setup gates.
+/// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell and
+///   the voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
+///   worker's tier). Optional Browser setup units are owned by the
+///   co-installable `magic-mesh-browser` RPM so base-only installs do not try to
+///   enable units whose files are intentionally absent.
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
@@ -58,15 +59,10 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("syncthing.service", 0),
     ("mesh-health.timer", 0),
     ("mesh-status.timer", 0),
-    // ── Rank 1 — Workstation-only: the DRM-seat shell + voice/browser stack.
+    // ── Rank 1 — Workstation-only: the DRM-seat shell + voice stack.
     ("mde-shell-egui.service", 1),
     ("kamailio-mde.service", 1),
     ("rtpengine-mde.service", 1),
-    ("mde-cef-runtime-setup.service", 1),
-    ("mde-widevine-cdm-setup.service", 1),
-    ("mde-browser-tts-voice-setup.service", 1),
-    ("mde-browser-stt-model-setup.service", 1),
-    ("mde-browser-translate-model-setup.service", 1),
 ];
 
 /// The pure role→unit-actions mapping.
@@ -198,6 +194,24 @@ mod tests {
         plan.iter().find(|p| p.unit == unit).expect("unit in plan")
     }
 
+    fn rpm_manifest() -> toml::Value {
+        toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses")
+    }
+
+    fn asset_exists(assets: &[toml::Value], source: &str, dest: &str, mode: &str) -> bool {
+        assets.iter().any(|asset| {
+            asset["source"].as_str() == Some(source)
+                && asset["dest"].as_str() == Some(dest)
+                && asset["mode"].as_str() == Some(mode)
+        })
+    }
+
+    fn dest_absent(assets: &[toml::Value], dest: &str) -> bool {
+        assets
+            .iter()
+            .all(|asset| asset["dest"].as_str() != Some(dest))
+    }
+
     #[test]
     fn lighthouse_enables_control_plane_and_masks_workstation_units() {
         let p = plan(Role::Lighthouse);
@@ -221,11 +235,6 @@ mod tests {
             "mde-shell-egui.service",
             "kamailio-mde.service",
             "rtpengine-mde.service",
-            "mde-cef-runtime-setup.service",
-            "mde-widevine-cdm-setup.service",
-            "mde-browser-tts-voice-setup.service",
-            "mde-browser-stt-model-setup.service",
-            "mde-browser-translate-model-setup.service",
         ] {
             assert_eq!(
                 action_for(&p, u).action,
@@ -271,26 +280,40 @@ mod tests {
 
     #[test]
     fn base_rpm_ships_and_enables_the_drm_seat_unit() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let post_install = rpm["post_install_script"]
             .as_str()
             .expect("base post install script");
         assert_eq!(
-            rpm["requires"]["bzip2"].as_str(),
+            rpm["recommends"]["magic-mesh-browser"].as_str(),
             Some("*"),
-            "the full RPM must require bzip2 so the CEF .tar.bz2 runtime extracts on fresh Workstations"
+            "default Workstation installs should pull the split Browser package as a weak dependency"
+        );
+        let base_requires = rpm["requires"].as_table().expect("base requires table");
+        assert!(
+            !base_requires.contains_key("bzip2"),
+            "the base RPM must not hard-require browser-only bzip2 after the browser split"
+        );
+        assert_eq!(
+            rpm["variants"]["browser"]["requires"]["magic-mesh"].as_str(),
+            Some("*"),
+            "the Browser package must require the base shell package that launches it"
+        );
+        assert_eq!(
+            rpm["variants"]["browser"]["requires"]["bzip2"].as_str(),
+            Some("*"),
+            "the Browser package must require bzip2 so the CEF .tar.bz2 runtime extracts on fresh Workstations"
         );
         assert_eq!(
             rpm["requires"]["hunspell"].as_str(),
             Some("*"),
-            "the full RPM must require hunspell for offline editor/browser spell checking"
+            "the base RPM must require hunspell for offline editor spell checking"
         );
         assert_eq!(
             rpm["requires"]["hunspell-en-US"].as_str(),
             Some("*"),
-            "the full RPM must require a default hunspell dictionary"
+            "the base RPM must require a default hunspell dictionary"
         );
         let base_assets = rpm["assets"].as_array().expect("base assets array");
         assert!(
@@ -445,13 +468,17 @@ mod tests {
 
     #[test]
     fn postinstall_bounds_optional_helper_runtime() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let script = rpm["post_install_script"]
             .as_str()
             .expect("base post install script");
         let assets = rpm["assets"].as_array().expect("base assets array");
+        let browser = &rpm["variants"]["browser"];
+        let browser_script = browser["post_install_script"]
+            .as_str()
+            .expect("browser post install script");
+        let browser_assets = browser["assets"].as_array().expect("browser assets array");
 
         for guarded in [
             "timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf",
@@ -464,10 +491,19 @@ mod tests {
             );
         }
         assert!(
-            script.contains(
-                "systemctl enable magic-mesh-selinux-policy.service mde-web-preview-selinux.service"
-            ),
-            "SELinux policy loaders must be enabled without starting inside dnf %post"
+            script.contains("systemctl enable magic-mesh-selinux-policy.service"),
+            "base SELinux policy loader must be enabled without starting inside dnf %post"
+        );
+        assert!(
+            !script.contains("mde-web-preview-selinux.service")
+                && !script.contains("mde-web-cef-selinux.service"),
+            "base RPM post-install must not enable Browser SELinux units owned by the split Browser package"
+        );
+        assert!(
+            browser_script.contains("systemctl enable $BROWSER_UNITS")
+                && browser_script.contains("mde-web-preview-selinux.service")
+                && browser_script.contains("mde-web-cef-selinux.service"),
+            "Browser RPM post-install must enable Browser SELinux policy loaders outside dnf startup"
         );
         assert!(
             !script.contains("systemctl enable --now --no-block magic-mesh-selinux-policy.service"),
@@ -481,10 +517,7 @@ mod tests {
             !script.contains("/usr/libexec/mackesd/setup-selinux-web-preview >/dev/null"),
             "setup-selinux-web-preview must not run synchronously from dnf %post"
         );
-        for unit in [
-            "/usr/lib/systemd/system/magic-mesh-selinux-policy.service",
-            "/usr/lib/systemd/system/mde-web-preview-selinux.service",
-        ] {
+        for unit in ["/usr/lib/systemd/system/magic-mesh-selinux-policy.service"] {
             assert!(
                 assets
                     .iter()
@@ -492,14 +525,31 @@ mod tests {
                 "base RPM must ship the async SELinux loader unit {unit}"
             );
         }
+        for unit in [
+            "/usr/lib/systemd/system/mde-web-preview-selinux.service",
+            "/usr/lib/systemd/system/mde-web-cef-selinux.service",
+        ] {
+            assert!(
+                dest_absent(assets, unit),
+                "base RPM must not ship Browser SELinux loader unit {unit}"
+            );
+            assert!(
+                browser_assets
+                    .iter()
+                    .any(|asset| asset["dest"].as_str() == Some(unit)),
+                "Browser RPM must ship Browser SELinux loader unit {unit}"
+            );
+        }
     }
 
     #[test]
-    fn full_rpm_ships_browser_helpers_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_browser_helpers_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
@@ -517,28 +567,28 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some("755")
-                }),
-                "full Workstation RPM must ship browser helper {dest}"
+                asset_exists(browser_assets, source, dest, "755"),
+                "Browser RPM must ship browser helper {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship browser helper {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship browser helper {dest}"
             );
         }
     }
 
     #[test]
-    fn full_rpm_ships_browser_read_aloud_tts_wrapper_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_browser_read_aloud_tts_wrapper_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
@@ -546,33 +596,33 @@ mod tests {
         let dest = "/usr/libexec/mackesd/browser-read-aloud-tts";
 
         assert!(
-            base_assets.iter().any(|asset| {
-                asset["source"].as_str() == Some(source)
-                    && asset["dest"].as_str() == Some(dest)
-                    && asset["mode"].as_str() == Some("755")
-            }),
-            "full Workstation RPM must ship the Browser read-aloud TTS wrapper"
+            asset_exists(browser_assets, source, dest, "755"),
+            "Browser RPM must ship the Browser read-aloud TTS wrapper"
         );
         assert!(
-            server_assets
-                .iter()
-                .all(|asset| asset["dest"].as_str() != Some(dest)),
+            dest_absent(base_assets, dest),
+            "base RPM must not ship the Browser read-aloud TTS wrapper"
+        );
+        assert!(
+            dest_absent(server_assets, dest),
             "headless server RPM must not ship the Browser read-aloud TTS wrapper"
         );
     }
 
     #[test]
-    fn full_rpm_ships_browser_tts_voice_provisioning_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_browser_tts_voice_provisioning_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
-        let post_install = rpm["post_install_script"]
+        let post_install = rpm["variants"]["browser"]["post_install_script"]
             .as_str()
-            .expect("base post install script");
+            .expect("browser post install script");
 
         for (source, dest, mode) in [
             (
@@ -592,23 +642,21 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some(mode)
-                }),
-                "full Workstation RPM must ship Browser TTS voice provisioning asset {dest}"
+                asset_exists(browser_assets, source, dest, mode),
+                "Browser RPM must ship Browser TTS voice provisioning asset {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship Browser TTS voice provisioning asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship Browser TTS voice provisioning asset {dest}"
             );
         }
         assert!(
             post_install.contains("mde-browser-tts-voice-setup.service"),
-            "base RPM post-install must enable the Browser TTS voice setup unit"
+            "Browser RPM post-install must enable the Browser TTS voice setup unit"
         );
 
         let unit =
@@ -622,17 +670,19 @@ mod tests {
     }
 
     #[test]
-    fn full_rpm_ships_browser_stt_provisioning_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_browser_stt_provisioning_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
-        let post_install = rpm["post_install_script"]
+        let post_install = rpm["variants"]["browser"]["post_install_script"]
             .as_str()
-            .expect("base post install script");
+            .expect("browser post install script");
 
         for (source, dest, mode) in [
             (
@@ -657,23 +707,21 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some(mode)
-                }),
-                "full Workstation RPM must ship Browser STT asset {dest}"
+                asset_exists(browser_assets, source, dest, mode),
+                "Browser RPM must ship Browser STT asset {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship Browser STT asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship Browser STT asset {dest}"
             );
         }
         assert!(
             post_install.contains("mde-browser-stt-model-setup.service"),
-            "base RPM post-install must enable the Browser STT model setup unit"
+            "Browser RPM post-install must enable the Browser STT model setup unit"
         );
 
         let unit =
@@ -687,17 +735,19 @@ mod tests {
     }
 
     #[test]
-    fn full_rpm_ships_browser_translate_provisioning_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_browser_translate_provisioning_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
-        let post_install = rpm["post_install_script"]
+        let post_install = rpm["variants"]["browser"]["post_install_script"]
             .as_str()
-            .expect("base post install script");
+            .expect("browser post install script");
 
         for (source, dest, mode) in [
             (
@@ -722,23 +772,21 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some(mode)
-                }),
-                "full Workstation RPM must ship Browser translation asset {dest}"
+                asset_exists(browser_assets, source, dest, mode),
+                "Browser RPM must ship Browser translation asset {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship Browser translation asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship Browser translation asset {dest}"
             );
         }
         assert!(
             post_install.contains("mde-browser-translate-model-setup.service"),
-            "base RPM post-install must enable the Browser translation model setup unit"
+            "Browser RPM post-install must enable the Browser translation model setup unit"
         );
 
         let unit = include_str!(
@@ -781,17 +829,19 @@ mod tests {
     }
 
     #[test]
-    fn full_rpm_ships_cef_runtime_provisioning_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_cef_runtime_provisioning_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
-        let post_install = rpm["post_install_script"]
+        let post_install = rpm["variants"]["browser"]["post_install_script"]
             .as_str()
-            .expect("base post install script");
+            .expect("browser post install script");
 
         for (source, dest, mode) in [
             (
@@ -811,24 +861,22 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some(mode)
-                }),
-                "full Workstation RPM must ship CEF runtime provisioning asset {dest}"
+                asset_exists(browser_assets, source, dest, mode),
+                "Browser RPM must ship CEF runtime provisioning asset {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship CEF runtime provisioning asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship CEF runtime provisioning asset {dest}"
             );
         }
 
         assert!(
             post_install.contains("mde-cef-runtime-setup.service"),
-            "base RPM post-install must enable the deferred CEF runtime setup service"
+            "Browser RPM post-install must enable the deferred CEF runtime setup service"
         );
 
         let service =
@@ -864,11 +912,13 @@ mod tests {
     }
 
     #[test]
-    fn full_rpm_ships_cef_webextensions_smoke_assets_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_cef_webextensions_smoke_assets_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
@@ -901,17 +951,15 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some(mode)
-                }),
-                "full Workstation RPM must ship CEF WebExtensions asset {dest}"
+                asset_exists(browser_assets, source, dest, mode),
+                "Browser RPM must ship CEF WebExtensions asset {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship CEF WebExtensions asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship CEF WebExtensions asset {dest}"
             );
         }
@@ -936,17 +984,19 @@ mod tests {
     }
 
     #[test]
-    fn full_rpm_ships_widevine_provisioning_but_server_variant_does_not() {
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+    fn browser_rpm_ships_widevine_provisioning_but_base_and_server_do_not() {
+        let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
         let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let browser_assets = rpm["variants"]["browser"]["assets"]
+            .as_array()
+            .expect("browser assets array");
         let server_assets = rpm["variants"]["server"]["assets"]
             .as_array()
             .expect("server assets array");
-        let post_install = rpm["post_install_script"]
+        let post_install = rpm["variants"]["browser"]["post_install_script"]
             .as_str()
-            .expect("base post install script");
+            .expect("browser post install script");
 
         for (source, dest, mode) in [
             (
@@ -966,24 +1016,22 @@ mod tests {
             ),
         ] {
             assert!(
-                base_assets.iter().any(|asset| {
-                    asset["source"].as_str() == Some(source)
-                        && asset["dest"].as_str() == Some(dest)
-                        && asset["mode"].as_str() == Some(mode)
-                }),
-                "full Workstation RPM must ship Widevine provisioning asset {dest}"
+                asset_exists(browser_assets, source, dest, mode),
+                "Browser RPM must ship Widevine provisioning asset {dest}"
             );
             assert!(
-                server_assets
-                    .iter()
-                    .all(|asset| asset["dest"].as_str() != Some(dest)),
+                dest_absent(base_assets, dest),
+                "base RPM must not ship Widevine provisioning asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
                 "headless server RPM must not ship Widevine provisioning asset {dest}"
             );
         }
 
         assert!(
             post_install.contains("mde-widevine-cdm-setup.service"),
-            "base RPM post-install must enable the deferred Widevine CDM setup service"
+            "Browser RPM post-install must enable the deferred Widevine CDM setup service"
         );
 
         let service =
@@ -1044,12 +1092,36 @@ mod tests {
             "farm RPM builder must build the CEF wire verifier before generate-rpm"
         );
         assert!(
+            script.contains("cargo generate-rpm -p crates/mesh/mackesd --variant browser"),
+            "full Fedora RPM builder must emit the split Browser RPM"
+        );
+        assert!(
+            farm_script.contains("cargo generate-rpm -p crates/mesh/mackesd --variant browser"),
+            "farm RPM builder must emit the split Browser RPM"
+        );
+        assert!(
+            script.contains(
+                "verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm"
+            ) && script.contains(
+                "verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-browser-*.rpm"
+            ),
+            "full Fedora RPM builder must size-gate both base and Browser RPM artifacts"
+        );
+        assert!(
+            farm_script
+                .contains("verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm")
+                && farm_script.contains(
+                    "verify-rpm-payload.sh size target/generate-rpm/magic-mesh-browser-*.rpm"
+                ),
+            "farm RPM builder must size-gate both base and Browser RPM artifacts"
+        );
+        assert!(
             include_str!("../../Cargo.toml").contains("mde-web-cef-renderer"),
-            "the CEF renderer bridge must be built by the helper crate and shipped by the full RPM"
+            "the CEF renderer bridge must be built by the helper crate and shipped by the Browser RPM"
         );
         assert!(
             include_str!("../../Cargo.toml").contains("target/release/cef-verify"),
-            "the CEF wire verifier must be shipped by the full RPM"
+            "the CEF wire verifier must be shipped by the Browser RPM"
         );
     }
 
@@ -1241,11 +1313,12 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the 8 Workstation units.
+        // Lighthouse masks exactly the base Workstation units; optional Browser
+        // runtime setup is owned by the split Browser package.
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            8,
-            "lighthouse masks the rank-1 shell + voice + browser runtime/CDM/TTS/STT/translate units"
+            3,
+            "lighthouse masks the rank-1 shell + voice units"
         );
     }
 
