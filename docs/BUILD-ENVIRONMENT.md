@@ -8,7 +8,7 @@
 
 There are **two surfaces**, but only one does heavy builds:
 
-1. **The build farm** (four Fedora VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
+1. **The build farm** (four **Fedora 42** VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and native farm RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
 2. **The local dev host** (`172.20.145.192`, Rocky 9.8) — **fmt / metadata / probe only.** Heavy local `cargo` is **hard-disabled** here by `cargo-farm-guard.sh` (installed ahead of the real `cargo` via `install-helpers/install-drain-guardrails.sh`): local `target/` dirs fill the disk and wedge the drain, so `build`/`test`/`check`/`clippy`/`run` exit 97 and redirect you to the farm. `fmt` still runs locally (`rustup run 1.94.0 rustfmt`). This host's gcc 11.5 rejects `mold` anyway — see §5 for the fresh-box gold-linker override.
 
 **AI directive:** all AI agents must use the build farm for build/test/gate work
@@ -26,6 +26,16 @@ the mesh key (`ssh -i ~/.ssh/mackes_mesh_ed25519 mm@172.20.0.x`). CEF runtime
 probes currently have a warm bundle on `.50` at `$HOME/mde-cef-active`; do not
 assume `/opt/mde/cef` exists on generic farm VMs unless a packaging/install step
 has staged it.
+
+**RPM target-Fedora note (learned 2026-07-15):** all four farm build VMs
+currently report **Fedora 42**. Therefore `xcp-build.sh rpm` produces a native
+F42-linked RPM, even when the target workstation is Fedora 44. Do not install a
+native farm RPM on an F44 Workstation seat unless `rpm -Uvh --test` passes; media
+and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). For an F44
+workstation deploy, use the container lane with an explicit Fedora argument:
+`install-helpers/build-rpm-fedora43.sh 44` from a farm checkout, then copy the
+RPM from `target-f43/generate-rpm/`. The directory name is historical; the first
+positional argument controls the Fedora container tag.
 
 **Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
 exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even
@@ -259,6 +269,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 | `xcp-build.sh bash ...` prints the usage banner | `xcp-build.sh` is not an arbitrary remote-shell wrapper; use `xcp-build.sh cargo ...` or `sync`, then SSH into `~/magic-mesh-farm-<slot>` with the farm key for live/runtime probes | intro "Env-gated live smoke note" |
 | farm job hangs on `10.0.0.x` | inherited build-host pin from stale docs/agent memory | verify with `install-helpers/farm.sh status`; use `.50` / `.90` / `.130` / `.170` |
 | CEF live probe says `/opt/mde/cef` is missing on a farm VM | farm build VMs do not all have the packaged runtime staged under `/opt`; `.50` currently has the warm live bundle in `$HOME/mde-cef-active` | set `MDE_CEF_ROOT=$HOME/mde-cef-active` for `.50` probes, or run the packaging installer before using `/opt/mde/cef` |
+| native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
 | focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
 
@@ -309,7 +320,7 @@ against the distro before relying on it.
 |---|---|---|---|---|
 | **bootc immutable image base** | **42** | `packaging/bootc/Containerfile:53` (`ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42`) | "matches the fleet's RPM channel … mesh-service container is FROM fedora:42 too" (`Containerfile:50-52`); `--build-arg BOOTC_BASE=…` for an F43+ rebase (`:52`) | The **oldest** live target → the effective glibc **floor**. Anything installed *into* this image (RPM + layered dnf pkgs) must not require a glibc newer than F42's. |
 | **Canonical container RPM cut** | **43** (default) | `install-helpers/build-rpm-fedora43.sh:43` (`FEDORA="${1:-43}"`) | Builds the RPM inside a `fedora:43` container so its glibc `Requires` match F43 and it installs on F43 lighthouses / older cloud images (`:4-9`) | Produces an RPM installable on **F43 and newer** (forward-compat). Positional arg overrides the version. |
-| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**44** per WORKLIST) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora VMs … gcc 15"); farm VMs are F44 per `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)") | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc (F44 → `GLIBC_2.43`)** → the artifact may **not** install on F42/F43 unless its shipped ELFs stay ≤ that target's symbols. ⚠ un-enforced. |
+| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**42** current) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora 42 VMs"); verify live with `install-helpers/farm.sh status` + `/etc/fedora-release` before relying on it | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc and native library sonames**. Today this is an F42 artifact; it is not a safe F44 Workstation artifact when FFmpeg/ICU/Python sonames differ. For F44 seats, use `install-helpers/build-rpm-fedora43.sh 44` and `rpm -Uvh --test`. |
 | **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
 | **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
 | **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/WORKLIST.md:1132`). |
@@ -322,14 +333,19 @@ Per the change discipline (a bootc base bump is load-bearing), **no version
 default was altered** while documenting this. The following divergences are real;
 each is left in place and flagged for the owner rather than "aligned" blindly:
 
-1. **F42 image base vs F43 canonical RPM vs F44 farm/CI — no enforced baseline.**
+1. **F42 image/farm vs F43 canonical RPM vs F44 CI/workstations — no enforced baseline.**
    The glibc-forward rule (7.1) says the canonical RPM should be built on the
    **oldest** live target (today **F42**, the bootc base), yet the canonical
-   script defaults to **F43** and native/CI cuts run on **F44**. Whether this
-   spread is deliberate (F43 chosen as the lighthouse floor, F42 image tolerated
-   via the local lane below) or drift is **not determinable from the code** — it
-   is maintained by operator memory. **Owner call needed:** pick one canonical
-   build baseline and enforce it. This is exactly the P1 finding
+   script defaults to **F43**, native farm cuts currently run on **F42**, and CI
+   plus the live Workstation seat can be **F44**. Glibc compatibility is only
+   one part of this: media/ICU/Python sonames also vary by Fedora release, as
+   the 2026-07-15 `.15` deploy proved when a native F42 farm RPM failed the F44
+   dependency check and the Fedora 44 container-cut RPM passed. Whether this
+   spread is deliberate (F43 chosen as the lighthouse floor, F42 image/farm
+   retained as the oldest baseline, F44 served as a Workstation channel) or drift
+   is **not determinable from the code** — it is maintained by operator memory.
+   **Owner call needed:** pick one canonical build baseline per target channel
+   and enforce it. This is exactly the P1 finding
    `build-deploy-4` in `docs/review/PLATFORM-REVIEW-2026-07-10.md` (§719-725),
    whose recommendation — a committed `FLEET-BASELINE` file driving the RPM
    version + a `verify-rpm.sh` gate asserting `rpm -qpR | grep GLIBC ≤ baseline`
@@ -345,24 +361,24 @@ each is left in place and flagged for the owner rather than "aligned" blindly:
    `packaging/bootc/rpms/`), and the channel lane is gated on the operator
    `/release` publish (`packaging/bootc/README.md:175-181`;
    `install-helpers/do-lighthouse-up.sh:19-20`). **Caveat that keeps this on the
-   list:** the local lane stages a **farm-built (F44)** RPM into an **F42** image —
-   which only installs while that build's ELFs stay ≤ F42's glibc symbols (7.1);
-   nothing enforces it. QC-1 (2026-07-10) installed fine, but that is luck of the
-   symbol set, not a guarantee.
+   list:** the local lane stages whichever RPM the operator/farm produced into
+   an **F42** image. Today the native farm cut is also F42, but container-cut
+   RPMs can target F43/F44 explicitly, and nothing enforces that the staged RPM
+   matches the image/channel before bootc build time.
 
 3. **`build-rpm-fedora43.sh:4` calls the dev host "The F44 dev host".** The
    canonical dev host is **Rocky 9.8 / EL9** (`docs/BUILD-ENVIRONMENT.md:12`), not
-   F44. The script's glibc mechanism is still correct (a newer-glibc *native*
-   build — today the **F44 farm VM**, not the EL9 dev host — is what over-pins the
-   RPM), but the "F44 dev host" wording is stale. Minor; flagged so a reader does
-   not trust it as the current dev-host fact.
+   F44. The script's mechanism is still useful: it lets the farm cut an RPM
+   inside a Fedora container whose tag is chosen explicitly, instead of inheriting
+   the host's Fedora release and dependency sonames. The "F44 dev host" wording is
+   stale. Minor; flagged so a reader does not trust it as the current dev-host
+   fact.
 
-4. **The farm VM Fedora version is not pinned in this doc.** §1/§3 describe the
-   farm VMs only as "four Fedora VMs … gcc 15"; the F44 figure used above comes
-   from `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)"), not from a pinned field
-   here. Since the native RPM cut inherits the farm VM's glibc, the farm VM's
-   Fedora release is load-bearing and should be pinned explicitly (in the golden
-   template / ansible) once the baseline in (1) is chosen.
+4. **The farm VM Fedora version is load-bearing.** This doc now records the
+   live 2026-07-15 farm state as Fedora 42, but the native RPM cut still inherits
+   whatever release the farm image actually runs. Keep this doc, the farm image
+   template, and channel policy synchronized whenever the farm OS changes; do not
+   treat a native RPM as channel-neutral without an explicit dependency test.
 
 > **Reviewer line-number note:** `docs/review/PLATFORM-REVIEW-2026-07-10.md:720`
 > cites `dnf-channel-up.sh:31` for the `FEDORAS='43 44'` default; in the current
