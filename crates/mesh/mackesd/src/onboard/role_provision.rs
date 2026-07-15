@@ -212,6 +212,17 @@ mod tests {
             .all(|asset| asset["dest"].as_str() != Some(dest))
     }
 
+    fn assert_exit_78_gate_is_retryable(unit: &str, label: &str) {
+        assert!(
+            unit.contains("SuccessExitStatus=78"),
+            "{label} must treat an unconfigured manifest as a clean gate"
+        );
+        assert!(
+            !unit.contains("RemainAfterExit=yes"),
+            "{label} must stay retryable after exit 78 so an operator-filled manifest can rerun with systemctl start"
+        );
+    }
+
     #[test]
     fn lighthouse_enables_control_plane_and_masks_workstation_units() {
         let p = plan(Role::Lighthouse);
@@ -733,11 +744,11 @@ mod tests {
 
         let unit =
             include_str!("../../../../../packaging/systemd/mde-browser-tts-voice-setup.service");
+        assert_exit_78_gate_is_retryable(unit, "Browser TTS voice setup unit");
         assert!(
-            unit.contains("SuccessExitStatus=78")
-                && unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+            unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
                 && unit.contains("ExecStart=/usr/libexec/mackesd/install-browser-tts-voice"),
-            "Browser TTS voice setup unit must be Workstation-gated and treat an unconfigured voice manifest as a clean gate"
+            "Browser TTS voice setup unit must be Workstation-gated"
         );
     }
 
@@ -798,11 +809,11 @@ mod tests {
 
         let unit =
             include_str!("../../../../../packaging/systemd/mde-browser-stt-model-setup.service");
+        assert_exit_78_gate_is_retryable(unit, "Browser STT model setup unit");
         assert!(
-            unit.contains("SuccessExitStatus=78")
-                && unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+            unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
                 && unit.contains("ExecStart=/usr/libexec/mackesd/install-browser-stt-model"),
-            "Browser STT model setup unit must be Workstation-gated and treat an unconfigured model manifest as a clean gate"
+            "Browser STT model setup unit must be Workstation-gated"
         );
     }
 
@@ -864,11 +875,11 @@ mod tests {
         let unit = include_str!(
             "../../../../../packaging/systemd/mde-browser-translate-model-setup.service"
         );
+        assert_exit_78_gate_is_retryable(unit, "Browser translation model setup unit");
         assert!(
-            unit.contains("SuccessExitStatus=78")
-                && unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+            unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
                 && unit.contains("ExecStart=/usr/libexec/mackesd/install-browser-translate-model"),
-            "Browser translation model setup unit must be Workstation-gated and treat an unconfigured model manifest as a clean gate"
+            "Browser translation model setup unit must be Workstation-gated"
         );
     }
 
@@ -1108,10 +1119,10 @@ mod tests {
 
         let service =
             include_str!("../../../../../packaging/systemd/mde-widevine-cdm-setup.service");
+        assert_exit_78_gate_is_retryable(service, "Widevine setup unit");
         for needle in [
             "ConditionPathExists=/usr/bin/mde-web-cef",
             "ConditionPathExists=!/opt/mde/widevine/libwidevinecdm.so",
-            "SuccessExitStatus=78",
             "ExecCondition=/usr/bin/mackesd role-gate --min-rank 1",
             "ExecStart=/usr/libexec/mackesd/install-widevine-cdm",
         ] {

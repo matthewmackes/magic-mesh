@@ -171,6 +171,14 @@ Farm cargo gates for it must use `--manifest-path crates/desktop/mde-web-cef/Car
 instead of `-p mde-web-cef`; `-p mde-web-cef` from the repo root will fail before
 compiling.
 
+**Browser optional setup retryability note (learned 2026-07-15):** Browser
+asset setup units that use `SuccessExitStatus=78` for intentionally unconfigured
+operator manifests must not also use `RemainAfterExit=yes`. Exit 78 means "not
+configured yet", not "provisioning complete"; keeping those units inactive after
+the clean gate lets `systemctl start mde-widevine-cdm-setup.service` and the
+TTS/STT/translation model setup units retry normally after an operator fills the
+licensed URL/SHA or approved model manifest.
+
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
