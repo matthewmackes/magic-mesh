@@ -4544,6 +4544,14 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
     `cargo test -p mde-shell-egui browser_default_chrome` passed 1/1, and `.170`
     `cargo fmt -p mde-shell-egui --check` passed.
+  - **Browser AccessKit chrome ownership slice 2026-07-15:** Browser status/page AccessKit nodes and the
+    shared centered body layout helper now live under `web/chrome_ui/accessibility.rs`, so Browser
+    presentation/accessibility descriptions move with the page/chrome renderer while `web/mod.rs` keeps the
+    high-level render route and session-state decisions. Farm evidence: BigBoy `.130`
+    `cargo test -p mde-shell-egui browser` passed 120/120, `.50`
+    `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
+    `cargo test -p mde-shell-egui accesskit` passed 14/14, and `.170`
+    `cargo fmt -p mde-shell-egui --check` passed.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
