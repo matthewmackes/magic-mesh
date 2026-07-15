@@ -782,8 +782,8 @@ here; it means OS-sandboxed.
 A sandbox cannot be mathematically proven by a smoke test, but the CEF OS
 confinement is now runtime-proven on a live seat for the core claims above. The
 headless/unit side remains covered by crate builds and pure planner tests: the
-CEF policy (`web_cef` — host, 2 GiB ceiling, distinct rootfs path), the seccomp
-denylist construction, uid/gid-map and rootfs bind plans, and the CEF-specific
+CEF policy (`web_cef` — host, 2 GiB ceiling, distinct per-run rootfs prefix),
+the seccomp denylist construction, uid/gid-map and rootfs bind plans, and the CEF-specific
 extra-bind planner (`cef_extra_readonly_binds` — exposes only the runtime +
 vetted extensions, never a key/home path). The seccomp denylist is the SAME one
 Servo runs a full browser engine under.
@@ -836,6 +836,15 @@ Servo runs a full browser engine under.
    `/system.slice/mde-browser-cgroup-proof-servo.service/mde-web-preview-...`
    with `memory.max=1073741824`, `cpu.max=80000 100000`, no degraded-cgroup
    warning, `VERIFY RESULT=PASS`, and final page text `P:1 K:1 T:m`.
+7. Per-run sandbox rootfs mountpoints were live-proven after the fixed-root
+   failure class. The installed Browser RPM payload on `.15` matched the new
+   helper hashes for `mde-web-cef-renderer` and `mde-web-preview`, and
+   `/usr/libexec/mackesd/browser-verify-engines --engine all --budget 30 --timeout 60s`
+   passed for both engines with display/input response and process cleanup. The
+   previous fixed `/tmp/.mde-web-cef-root` and `/tmp/.mde-web-preview-root`
+   directories still existed during the pass, while the successful run created
+   fresh `/tmp/.mde-web-*-root-<pid>-<run>` mountpoints; the proof therefore did
+   not depend on manually deleting stale roots.
 
 **Rerun triggers:** ad-hoc SSH/user-session launches are not systemd-delegated
 and can honestly log `mde-web-sandbox: cgroup limits not applied ... Permission

@@ -43,6 +43,15 @@ The live `.15` proof on 2026-07-15 used exactly this lane and produced F44 RPMs
 at 70.0 MiB (`magic-mesh`) and 39.1 MiB (`magic-mesh-browser`), both under the
 90 MiB channel guard.
 
+**RPM deploy verification note (learned 2026-07-15):** run `rpm -Uvh --test`
+and the real `rpm -Uvh` as separate commands in an interactive sudo/TTY session.
+Do not paste a dry-run and real install as one buffered block: the dry-run can
+consume queued stdin and leave the old payload installed. After every Browser
+deploy, prove the exact helper payload before trusting a runtime failure:
+compare key `sha256sum` output against `rpm -q --dump magic-mesh-browser`, run
+`rpm -V magic-mesh-browser`, then run the installed
+`/usr/libexec/mackesd/browser-verify-engines`.
+
 **DRM shell live-restart note (learned 2026-07-15):** `mde-shell-egui.service`
 conflicts with `getty@tty1.service` and has an `ExecStopPost` that starts getty
 again for console recovery. A remote `systemctl restart mde-shell-egui.service`
@@ -93,7 +102,7 @@ enabling the setup units is insufficient because the boot-time units may already
 have skipped; the Browser `%post` must queue
 `systemctl start --no-block $BROWSER_UNITS`. For F44 Enforcing workstation
 proofs, verify `getenforce`, labels, loaded modules, run the installed
-`/usr/libexec/mackesd/browser-verify-engines` from a fresh sandbox root (it wraps
+`/usr/libexec/mackesd/browser-verify-engines` from per-run sandbox roots (it wraps
 `MDE_BROWSER_VERIFY_INPUT=1 /usr/libexec/mackesd/cef-verify` for both
 `/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview` and checks helper cleanup),
 then confirm `ausearch -m AVC,USER_AVC` has no matches for each final verifier
@@ -355,11 +364,12 @@ Another AI/operator can rebuild the whole thing from this repo:
 | `cargo test -p mde-web-cef` says the package does not match any packages | `mde-web-cef` is a nested standalone workspace outside the repo-root workspace package set | run through the farm with `cargo test --manifest-path crates/desktop/mde-web-cef/Cargo.toml ...` |
 | rsync code 23 while renaming a transient provider file in a farm slot | two `xcp-build.sh` jobs reused the same `MCNF_BUILD_SLOT` concurrently | use distinct slots for parallel jobs, or serialize the `xcp-build.sh` sync/build and direct-SSH into the warmed slot afterward |
 | native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
+| Browser verifier still shows the old failure after an RPM install | an interactive dry-run/install paste may have let `rpm -Uvh --test` consume the queued real install, or only part of the split payload was replaced | run dry-run and install as separate commands; verify helper hashes with `sha256sum` plus `rpm -q --dump magic-mesh-browser`, then run `rpm -V magic-mesh-browser` before debugging runtime behavior |
 | `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
 | focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
 | Browser helper labels remain `bin_t` after installing `magic-mesh-browser` | SELinux setup units were enabled but never started on the already-booted seat, or the policy loader failed before relabeling | start the Browser setup units non-blocking from `%post`; verify `semodule -l` and `ls -Z /usr/bin/mde-web-cef /usr/bin/mde-web-preview /usr/libexec/mackesd/mde-web-cef-renderer` |
 | Browser SELinux loader reports no toolchain despite policy packages being installed | the module build can fail when the output stem is hyphenated but `policy_module()` declares an underscore module name | stage `mde-web-cef.te` as `mde_web_cef.te` and `mde-web-preview.te` as `mde_web_preview.te` before the SELinux devel Makefile |
-| Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the stale `/tmp/.mde-web-*-root` path survived a prior failed run | clear only the helper's `/tmp/.mde-web-*-root`, rerun the installed verifier, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh-root pass and no AVCs |
+| Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the helper did not derive a per-run `/tmp/.mde-web-*-root-<pid>-<run>` mountpoint | do not accept manual deletion as the durable fix; confirm the installed helper is new enough to use per-run rootfs mountpoints, rerun `/usr/libexec/mackesd/browser-verify-engines`, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh per-run root pass and no AVCs |
 | Browser sandbox logs `cgroup limits not applied ... Permission denied` under the DRM shell | `Delegate=yes` delegated the service cgroup, but the shell process lived in the service root, so cgroup v2 refused `+memory +cpu` with `EBUSY` | run the shell in `DelegateSubgroup=shell`, export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, and have helpers create capped leaves under the delegated parent service cgroup |
 | BigBoy F44 RPM build hits ENOSPC during cold Servo/helper compilation | stale heavy slots or shared `~/magic-mesh-farm/target` can consume most of the 79G `/home` even on the high-capacity build VM | clean only disposable slots/stale build output you own, verify free space, then rerun the F44 container RPM build on BigBoy |
 

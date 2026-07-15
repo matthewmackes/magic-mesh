@@ -4817,6 +4817,18 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui engine_selector_uses_browser_local_labels_and_state -- --nocapture`
     passed 1/1, warmed BigBoy `.130` `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 8/8,
     and warmed BigBoy `.130` `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130.
+  - **Browser tab bar / engine selector default-chip refinement 2026-07-15:** the engine dock now
+    reads as a first-class Material selector instead of a pair of engine-specific launch buttons: the
+    primary action stays `New tab`, the selected engine carries a `Default` chip, inactive engines carry
+    their live tab count, the selected segment footer shows its tab count, and active tab engine badges
+    are larger pill chips with a small highlight instead of flat text tags. Regression coverage locks the
+    stable action label, default chip, per-engine tab-count labels, CEF/Chromium context, and Browser-local
+    engine token model. Farm evidence: `.50` `cargo fmt --check -p mde-shell-egui` passed, `.50`
+    `cargo test -p mde-shell-egui engine_selector_uses_browser_local_labels_and_state -- --nocapture`
+    passed 1/1, `.50`
+    `cargo test -p mde-shell-egui tab_strip_engine_picker -- --nocapture` passed 1/1, and `.50`
+    `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 8/8; warmed `.50`
+    `cargo test -p mde-shell-egui browser -- --nocapture` passed 130/130.
   - **Browser chrome accelerator ownership slice 2026-07-15:** `chrome_ui` now owns the Browser-reserved
     tab-strip keyboard contract (`F11`/`Esc`, `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`,
     `Ctrl+Shift+Tab`, and `Ctrl+1..9`) alongside the tab strip and engine selector. `web_panel` still
@@ -4914,6 +4926,31 @@ real enterprise browser rather than Carbon token compliance.
     browser_rpm_ships_two_engine_operational_verifier_but_base_and_server_do_not -- --nocapture`
     passed 1/1; BigBoy `.130` `cargo test -p mackesd --features async-services
     onboard::role_provision -- --nocapture` passed 28/28.
+  - **Browser sandbox per-run rootfs hardening 2026-07-15:** the shared CEF sandbox and the
+    current Servo sandbox no longer reuse one fixed `/tmp/.mde-web-*-root` mountpoint across
+    launches. Each helper derives `/tmp/.mde-web-*-root-<host-pid>-<run-id>` before entering
+    user/PID namespaces, validates that the mountpoint stays under the expected engine prefix,
+    and creates a fresh directory instead of silently reusing stale verifier state. This targets
+    the live installed-wrapper failure class `CEF_OS_SANDBOX_FAILED reason=rootfs: File exists`
+    after killed or repeated verifier runs. Farm evidence: `.50`
+    `cargo test --manifest-path crates/desktop/mde-web-sandbox/Cargo.toml -- --nocapture`
+    passed 14/14; BigBoy `.130`
+    `cargo test --manifest-path crates/desktop/mde-web-preview/Cargo.toml sandbox::tests -- --nocapture`
+    passed 12/12; BigBoy `.130`
+    `cargo test --manifest-path crates/desktop/mde-web-cef/Cargo.toml --lib -- --nocapture`
+    passed 151/151; manifest `cargo fmt --check` passed for `mde-web-sandbox`,
+    `mde-web-preview`, and `mde-web-cef`. BigBoy `.130` slot `browser-rootfs-rpm`
+    cut F44 split RPMs, both payloads passed `verify-rpm-payload.sh payload`, and the deployed
+    `.15` payload hashes matched the RPM dump for `/usr/libexec/mackesd/mde-web-cef-renderer`
+    (`8d9ec9759ad02140d69115eb88e7f34fb80ed30a332e4268d6f301716935ccd6`) and
+    `/usr/bin/mde-web-preview`
+    (`61bebdadfddd1a59c8c69fc64db29e69c79f2452085175b0989742d84b8124d7`). Installed-seat proof
+    passed on `.15`: `/usr/libexec/mackesd/browser-verify-engines --engine all --budget 30
+    --timeout 60s` reported CEF display/input verifier passed, Servo display/input verifier
+    passed, process cleanup passed, and overall `PASS`; `rpm -V magic-mesh-browser` was clean and
+    no helper/verifier processes remained. The old fixed `/tmp/.mde-web-*-root` directories still
+    existed, proving the passing run used the new per-run mountpoints instead of relying on manual
+    cleanup.
   - **CEF Browser Power Mode launch profile 2026-07-15:** Browser Power Mode now reaches newly
     spawned CEF helpers as process env (`MDE_CEF_BROWSER_POWER_MODE=true` plus the existing
     extension power-mode env), the CEF launcher forwards that state into the native renderer bridge,
