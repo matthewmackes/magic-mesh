@@ -237,12 +237,13 @@ fn mpris_request_player_list_maps_playerctl_list_to_report() {
         .unwrap()
         .insert(vec!["-l".into()], "mde-music\nvlc\n".into());
 
-    let reports = mpris_response_bodies_for_request(
+    let reports = mpris_response_bodies_for_request_with_browser(
         &control,
         &MprisRequestBody {
             request_player_list: true,
             ..Default::default()
         },
+        None,
     );
 
     assert_eq!(reports.len(), 1);
@@ -279,7 +280,7 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
     );
     drop(outputs);
 
-    let reports = mpris_response_bodies_for_request(
+    let reports = mpris_response_bodies_for_request_with_browser(
         &control,
         &MprisRequestBody {
             player: "mde-music".into(),
@@ -287,6 +288,7 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
             request_volume: true,
             ..Default::default()
         },
+        None,
     );
 
     assert_eq!(reports.len(), 1);
@@ -304,6 +306,128 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
     assert_eq!(report.now_playing, "Test Artist - Test Title");
     assert_eq!(report.can_play, Some(true));
     assert_eq!(report.can_pause, Some(true));
+}
+
+#[test]
+fn mpris_request_player_list_includes_retained_browser_media_status() {
+    let control = RecordingMediaControl::default();
+    control
+        .outputs
+        .lock()
+        .unwrap()
+        .insert(vec!["-l".into()], "mde-music\n".into());
+    let browser = parse_browser_media_status(
+        r#"{
+            "op":"browser_media_status",
+            "state":"playing",
+            "tab_id":7,
+            "metadata":{"title":"Browser Track"}
+        }"#,
+    )
+    .expect("browser status");
+
+    let reports = mpris_response_bodies_for_request_with_browser(
+        &control,
+        &MprisRequestBody {
+            request_player_list: true,
+            ..Default::default()
+        },
+        Some(&browser),
+    );
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].kind(), MprisKind::PlayerList);
+    assert_eq!(reports[0].player_list, vec!["mde-music", "mde-browser"]);
+    assert_eq!(reports[0].support_album_art_payload, Some(false));
+}
+
+#[test]
+fn mpris_request_now_playing_maps_browser_media_status_to_report() {
+    let control = RecordingMediaControl::default();
+    let browser = parse_browser_media_status(
+        r#"{
+            "op":"browser_media_status",
+            "state":"playing",
+            "tab_id":7,
+            "metadata":{
+                "title":"Browser Track",
+                "artist":"Browser Artist",
+                "album":"Browser Album",
+                "artwork_url":"https://media.example/art.png",
+                "duration_ms":120000,
+                "position_ms":42000
+            }
+        }"#,
+    )
+    .expect("browser status");
+
+    let reports = mpris_response_bodies_for_request_with_browser(
+        &control,
+        &MprisRequestBody {
+            player: "mde-browser".into(),
+            request_now_playing: true,
+            request_volume: true,
+            ..Default::default()
+        },
+        Some(&browser),
+    );
+
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(report.kind(), MprisKind::State);
+    assert_eq!(report.player, "mde-browser");
+    assert!(report.is_playing);
+    assert_eq!(report.pos, 42_000);
+    assert_eq!(report.length, 120_000);
+    assert_eq!(report.volume, None);
+    assert_eq!(report.artist, "Browser Artist");
+    assert_eq!(report.title, "Browser Track");
+    assert_eq!(report.album, "Browser Album");
+    assert_eq!(report.album_art_url, "https://media.example/art.png");
+    assert_eq!(report.now_playing, "Browser Artist - Browser Track");
+    assert_eq!(report.can_play, Some(true));
+    assert_eq!(report.can_pause, Some(true));
+}
+
+#[test]
+fn browser_targeted_mpris_request_publishes_browser_media_control() {
+    let bus = tempdir().expect("temp bus");
+    let browser = parse_browser_media_status(
+        r#"{
+            "op":"browser_media_status",
+            "state":"playing",
+            "tab_id":7,
+            "metadata":{"title":"Browser Track"}
+        }"#,
+    )
+    .expect("browser status");
+
+    assert_eq!(
+        apply_browser_mpris_request_command(
+            Some(bus.path()),
+            "node-a",
+            &MprisRequestBody {
+                player: "mde-browser".into(),
+                action: "Pause".into(),
+                ..Default::default()
+            },
+            Some(&browser),
+        ),
+        Some("pause")
+    );
+
+    let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+    let msgs = persist
+        .list_since("action/browser/media-control/node-a", None)
+        .expect("list browser media control");
+    assert_eq!(msgs.len(), 1);
+    let body: Value = serde_json::from_str(msgs[0].body.as_deref().expect("media control body"))
+        .expect("valid media control JSON");
+    assert_eq!(body["op"], "browser_media_control");
+    assert_eq!(body["source"], "kdc_host");
+    assert_eq!(body["player"], "mde-browser");
+    assert_eq!(body["action"], "pause");
+    assert_eq!(body["tab_id"], 7);
 }
 
 #[test]
