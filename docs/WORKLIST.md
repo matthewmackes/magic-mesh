@@ -4753,6 +4753,13 @@ real enterprise browser rather than Carbon token compliance.
     `cargo test -p mde-shell-egui site_info` passed 7/7, `.90`
     `cargo test -p mde-shell-egui chrome_ui` passed 5/5, and `.170`
     `cargo fmt -p mde-shell-egui --check` passed.
+  - **Browser download drawer Material status slice 2026-07-15:** the secondary downloads drawer now
+    maps transfer states through `chrome_ui` Browser-local Material roles instead of the shared shell
+    `Style::OK/DANGER/WARN/TEXT_DIM` palette, keeping drawer status text inside the Browser-only Material
+    exception. Regression coverage locks Done/Failed/Paused/Queued/Running color mapping. Farm evidence:
+    `.50` `cargo test -p mde-shell-egui download_drawer_status_uses_browser_material_roles -- --nocapture`
+    passed 1/1, `.90` `cargo test -p mde-shell-egui chrome_ui -- --nocapture` passed 6/6, and BigBoy
+    `.130` `cargo fmt --check -p mde-shell-egui` passed.
   - **Browser send-tab self-loop fix 2026-07-15:** Send Tab to Node no longer defaults to the local
     host or publishes a configured self-target, and the Browser inbox drain now consumes existing
     self-originated node handoff records without opening tabs. Live cleanup on `.15`
