@@ -4643,6 +4643,18 @@ real enterprise browser rather than Carbon token compliance.
     passed 1/1, `.90` `cargo test -p mde-shell-egui --features live-helper browser_send_tab`
     passed 11/11, BigBoy `.130` `cargo test -p mde-shell-egui browser_send_tab` passed 11/11,
     and `.170` `cargo fmt -p mde-shell-egui --check` passed.
+  - **Browser send-tab durable poison-drain follow-up 2026-07-15:** malformed, wrong-inbox, duplicate,
+    and already-consumed node handoff records are now tombstoned and unlinked instead of retried forever;
+    empty per-source inbox directories are removed after the drain. The session-sync worker now requires
+    a concrete `target_id` for `target=node` handoffs and removes successfully mirrored local outbox
+    records after publishing to the shared root, making send-tab handoffs one-shot on both sides of the
+    mirror. This targets the live `.15` CEF loop class where a persisted self-addressed tab record could
+    replay on each shell restart. Farm evidence: `.90`
+    `cargo test -p mde-browser-workers browser_session_sync -- --nocapture` passed 11/11, `.50`
+    `cargo test -p mde-shell-egui browser_send_tab -- --nocapture` passed 12/12, BigBoy `.130`
+    `cargo test -p mde-shell-egui browser_send_tab -- --nocapture` passed 12/12, `.170`
+    `cargo fmt --check -p mde-shell-egui -p mde-browser-workers` passed, and BigBoy `.130`
+    `cargo check -p mackesd --features async-services --lib` passed.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
