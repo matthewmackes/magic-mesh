@@ -59,8 +59,12 @@ Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 # Browser helpers create per-tab child cgroups for memory/CPU caps. Without
 # delegation, systemd keeps the shell in a non-delegated service cgroup and the
 # helper can only log a degraded sandbox. Delegate the subtree so the OS sandbox's
-# cgroup layer is real on shipped Workstation seats.
+# cgroup layer is real on shipped Workstation seats. The shell itself runs in a
+# stable child subgroup, leaving the service root empty so helpers can enable
+# memory/cpu controllers there and move themselves into capped sibling cgroups.
 Delegate=yes
+DelegateSubgroup=shell
+Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell
 Restart=always
 RestartSec=2
 # If the shell gives up (start-limit hit / GPU dead), hand the VT to a getty so

@@ -1216,6 +1216,14 @@ mod tests {
             unit.contains("Delegate=yes"),
             "the DRM seat unit must delegate its cgroup subtree so browser helpers can create per-tab memory/CPU capped child cgroups"
         );
+        assert!(
+            unit.contains("DelegateSubgroup=shell"),
+            "the DRM seat unit must keep the shell process in a child subgroup so the delegated service root can host capped browser cgroups"
+        );
+        assert!(
+            unit.contains("Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell"),
+            "the Browser sandbox must know which systemd subgroup to escape when creating capped helper cgroups"
+        );
     }
 
     #[test]

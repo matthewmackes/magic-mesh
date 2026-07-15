@@ -723,9 +723,11 @@ factored out of Servo's `sandbox.rs` into the shared **`mde-web-sandbox`** crate
   `perf_event_open`, key management, `kexec`, clock-set, …);
 - **cgroup v2 memory/CPU caps** (2 GiB / ~2 cores — a higher ceiling than the
   single-process Servo tab because the cap binds the WHOLE Chromium tree). The
-  shipped DRM-seat unit sets `Delegate=yes` so browser helpers can create those
-  per-tab child cgroups under the shell service; ad-hoc SSH/farm session scopes
-  that are not systemd-delegated log an honest degraded-cgroup warning while the
+  shipped DRM-seat unit sets `Delegate=yes` plus `DelegateSubgroup=shell` and
+  exports `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, so browser helpers create
+  capped sibling leaves under the delegated service root instead of under the
+  busy shell-process subgroup. Ad-hoc SSH/farm session scopes that are not
+  systemd-delegated log an honest degraded-cgroup warning while the
   namespace/rootfs/seccomp layers still apply.
 
 **Multi-process reconciliation (the crux).** Chromium is multi-process: the
@@ -821,12 +823,23 @@ Servo runs a full browser engine under.
    input observed, and no AVCs for the final window. Servo passed with 4 painted
    `1280x800` frames and final page text `P:1 K:1 T:m`; its final window also
    had no AVCs and no leftover helper processes.
+6. Delegated cgroup caps were closed on `.15` after the
+   `DelegateSubgroup=shell` packaging fix. The running DRM shell moved to
+   `/system.slice/mde-shell-egui.service/shell`, leaving the service root empty.
+   A transient service with the same delegation contract launched the installed
+   CEF verifier and created
+   `/system.slice/mde-browser-cgroup-proof-cef.service/mde-web-cef-...` with
+   `memory.max=2147483648`, `cpu.max=200000 100000`, and no
+   `mde-web-sandbox: cgroup limits not applied` warning. The verifier returned
+   `VERIFY RESULT=PASS`, final title `mde-browser-verify-p1-k1-tm`, and 4
+   painted `1280x800` frames. The same delegated proof against Servo created
+   `/system.slice/mde-browser-cgroup-proof-servo.service/mde-web-preview-...`
+   with `memory.max=1073741824`, `cpu.max=80000 100000`, no degraded-cgroup
+   warning, `VERIFY RESULT=PASS`, and final page text `P:1 K:1 T:m`.
 
-**Remaining validation:** ad-hoc SSH/user-session launches are not
-systemd-delegated and can honestly log `mde-web-sandbox: cgroup limits not
-applied ... Permission denied`; the namespace/rootfs/seccomp/cap layers above
-still apply. The production DRM-seat unit has `Delegate=yes`, so a separate
-shell-spawned proof should confirm the 2 GiB/~2-core cgroup cap from that exact
-service path. If the CEF pin, Servo helper, or Browser sandbox rootfs plan
-changes, rerun the Enforcing AVC audit; do not assume this 2026-07-15 policy
-closure covers a new engine payload.
+**Rerun triggers:** ad-hoc SSH/user-session launches are not systemd-delegated
+and can honestly log `mde-web-sandbox: cgroup limits not applied ... Permission
+denied`; the namespace/rootfs/seccomp/cap layers above still apply. If the CEF
+pin, Servo helper, Browser sandbox rootfs plan, or DRM unit cgroup delegation
+changes, rerun the Enforcing AVC audit and the delegated cgroup-cap proof; do
+not assume this 2026-07-15 closure covers a new engine payload.

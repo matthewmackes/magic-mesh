@@ -62,12 +62,24 @@ or the immediate renderer fork supervisor as the security evidence. Hold a real
 `Seccomp: 2`, zero `CapPrm`/`CapEff`/`CapBnd`, absent `/home`, `/root`,
 `/etc/nebula`, `/etc/mackesd`, `/mnt/mesh-storage`, and host D-Bus sockets under
 `/proc/<pid>/root`, while `/opt/mde/cef` and the private
-`/tmp/mde-web-cef/{home,cache}` tree are visible. An ad-hoc SSH/user-session
-probe can log `mde-web-sandbox: cgroup limits not applied ... Permission
-denied` because that session is not systemd-delegated; the production
-DRM-shell-spawned path still needs its own delegated cgroup-cap proof if that is
-the claim being checked. Kill the held probe by its process group afterward and
-verify no CEF/verifier processes remain.
+`/tmp/mde-web-cef/{home,cache}` tree are visible. Kill the held probe by its
+process group afterward and verify no CEF/verifier processes remain.
+
+**Browser cgroup-cap note (learned 2026-07-15):** cgroup v2 domain controllers
+cannot be enabled under a cgroup that still contains processes. Therefore
+`Delegate=yes` alone is insufficient for `mde-shell-egui.service`: the shell
+process must run in a stable child subgroup (`DelegateSubgroup=shell`), and the
+unit must export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell` so CEF and Servo
+sandbox helpers can place capped `mde-web-*` leaves under the delegated service
+root, not under the busy shell subgroup. The expected proof is a live
+systemd-delegated run with no `cgroup limits not applied` warning and with
+`memory.max`/`cpu.max` populated on the helper leaf. Ad-hoc SSH/user-session
+launches are not systemd-delegated and may still log the degraded-cgroup warning;
+that does not prove or disprove the production DRM-shell path.
+The live `.15` closure used this contract: the shell PID was under
+`/system.slice/mde-shell-egui.service/shell`, the service root `cgroup.procs` was
+empty, CEF proved `memory.max=2147483648` / `cpu.max=200000 100000`, and Servo
+proved `memory.max=1073741824` / `cpu.max=80000 100000`.
 
 **Browser SELinux loader/Enforcing note (learned 2026-07-15):** do not claim a
 Browser SELinux domain until the installed binaries are labelled
@@ -102,9 +114,13 @@ has a 79G `/home`; it is the right long-pole target, but several cold heavy
 slots can still fill it. Reuse a warm BigBoy slot for follow-up tests when it
 already contains the needed dependency graph, and remove only your finished or
 failed disposable `~/magic-mesh-farm-*` slots promptly before starting another
-cold heavy crate there. If direct reuse is needed after an `xcp-build.sh` sync,
-SSH to the same slot and run the focused cargo command there with
-`CARGO_INCREMENTAL=0`.
+cold heavy crate there. A cold F44 container RPM build that includes Servo can
+also exhaust stale shared output under `~/magic-mesh-farm/target`; if BigBoy is
+near full, check `df -h /home` and `du -sh ~/magic-mesh-farm/target
+~/magic-mesh-farm-*`, then remove only disposable slots or stale shared build
+output before retrying the long-pole package build. If direct reuse is needed
+after an `xcp-build.sh` sync, SSH to the same slot and run the focused cargo
+command there with `CARGO_INCREMENTAL=0`.
 
 **Env-gated live smoke note (learned 2026-07-15):** `xcp-build.sh cargo ...`
 accepts only Cargo arguments after the `cargo` subcommand and does not forward
@@ -338,6 +354,8 @@ Another AI/operator can rebuild the whole thing from this repo:
 | Browser helper labels remain `bin_t` after installing `magic-mesh-browser` | SELinux setup units were enabled but never started on the already-booted seat, or the policy loader failed before relabeling | start the Browser setup units non-blocking from `%post`; verify `semodule -l` and `ls -Z /usr/bin/mde-web-cef /usr/bin/mde-web-preview /usr/libexec/mackesd/mde-web-cef-renderer` |
 | Browser SELinux loader reports no toolchain despite policy packages being installed | the module build can fail when the output stem is hyphenated but `policy_module()` declares an underscore module name | stage `mde-web-cef.te` as `mde_web_cef.te` and `mde-web-preview.te` as `mde_web_preview.te` before the SELinux devel Makefile |
 | Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the stale `/tmp/.mde-web-*-root` path survived a prior failed run | clear only the helper's `/tmp/.mde-web-*-root`, rerun the installed verifier, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh-root pass and no AVCs |
+| Browser sandbox logs `cgroup limits not applied ... Permission denied` under the DRM shell | `Delegate=yes` delegated the service cgroup, but the shell process lived in the service root, so cgroup v2 refused `+memory +cpu` with `EBUSY` | run the shell in `DelegateSubgroup=shell`, export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, and have helpers create capped leaves under the delegated parent service cgroup |
+| BigBoy F44 RPM build hits ENOSPC during cold Servo/helper compilation | stale heavy slots or shared `~/magic-mesh-farm/target` can consume most of the 79G `/home` even on the high-capacity build VM | clean only disposable slots/stale build output you own, verify free space, then rerun the F44 container RPM build on BigBoy |
 
 ---
 

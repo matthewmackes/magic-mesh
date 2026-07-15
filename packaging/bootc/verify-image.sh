@@ -69,6 +69,12 @@ grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd
 grep -q '^Delegate=yes$' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "seat unit delegates cgroups for browser sandbox caps" \
     || bad "seat unit missing Delegate=yes for browser sandbox caps"
+grep -q '^DelegateSubgroup=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit keeps shell in delegated subgroup for browser sandbox caps" \
+    || bad "seat unit missing DelegateSubgroup=shell for browser sandbox caps"
+grep -q '^Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit tells browser sandbox which delegated subgroup to escape" \
+    || bad "seat unit missing browser sandbox delegated-subgroup env"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \
