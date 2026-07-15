@@ -4537,6 +4537,13 @@ real enterprise browser rather than Carbon token compliance.
     `.50` `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
     `cargo test -p mde-shell-egui browser_default_chrome` passed 1/1, and `.170`
     `cargo fmt -p mde-shell-egui --check` passed.
+  - **Drawer renderer module relocation slice 2026-07-15:** the secondary Browser drawer renderers now live
+    under `web/chrome_ui/drawers.rs`, so `chrome_ui` owns both drawer stack orchestration and drawer
+    presentation. `web/mod.rs` keeps the high-level panel route plus Browser state/action seams. Farm
+    evidence: BigBoy `.130` `cargo test -p mde-shell-egui browser` passed 120/120, `.50`
+    `cargo test -p mde-shell-egui chrome_ui` passed 5/5, `.90`
+    `cargo test -p mde-shell-egui browser_default_chrome` passed 1/1, and `.170`
+    `cargo fmt -p mde-shell-egui --check` passed.
 
 ### MEDIA-VIDEO — Netflix-style video stage + library (render real frames)
 Plan: `.claude/plans/what-has-been-my-piped-bengio.md`. Under **MEDIA**. NOTE: the `12.0.0-1` RPM
