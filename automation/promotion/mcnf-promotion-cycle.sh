@@ -23,6 +23,7 @@ EAGLE_USER="${MCNF_EAGLE_USER:-mm}"
 EAGLE_PASS_FILE="${MCNF_EAGLE_PASS_FILE:-/root/.mcnf-xapi-cred}"
 SSH_KEY="${MCNF_SSH_KEY:-/root/.ssh/id_ed25519}"
 DECLARATION_FILE="${MCNF_RELEASE_DECLARATION:-$ROOT/docs/ops/production-release-declaration.md}"
+WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -79,7 +80,7 @@ worklist_open_count() {
       }
     }
     END { print count + 0 }
-  ' "$ROOT/docs/WORKLIST.md"
+  ' "$WORKLIST"
 }
 
 worklist_marker_count() {
@@ -92,7 +93,7 @@ worklist_marker_count() {
       }
     }
     END { print count + 0 }
-  ' "$ROOT/docs/WORKLIST.md"
+  ' "$WORKLIST"
 }
 
 worklist_active_breakdown() {
@@ -118,7 +119,7 @@ worklist_next_candidates() {
         exit
       }
     }
-  ' "$ROOT/docs/WORKLIST.md"
+  ' "$WORKLIST"
 }
 
 worklist_farm_job_count() {

@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::style::Elevation;
-use mde_egui::{field, muted_note, Motion, OsdKind, OsdLevel, Severity, Style, Toast};
+use mde_egui::{field, muted_note, Motion, MotionMode, OsdKind, OsdLevel, Severity, Style, Toast};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -312,21 +312,21 @@ impl SystemState {
         if (ctx.zoom_factor() - want_zoom).abs() > f32::EPSILON {
             ctx.set_zoom_factor(want_zoom);
         }
-        // Reduce-motion (a11y-07) — drive BOTH damping seams from the one persisted flag
-        // so the whole shell settles instantly, not just part of it: the shared `Motion`
-        // easings (an explicit-duration path egui's `animation_time` can't reach) via the
-        // process-global, AND egui's own `animation_time` (which the menu bar +
-        // ambient explorer already honour, and egui's built-in `animate_bool` reads).
-        // The baseline cadence is captured once, like the zoom base, so turning the
-        // preference OFF restores the seat's real animation time rather than a guess.
-        Motion::set_reduce_motion(self.appearance.reduce_motion);
+        // Motion mode (MOTION-DRM-5) — drive BOTH runtime seams from the persisted
+        // choice: the shared typed `Motion` subsystem gets the full normal/reduced/
+        // disabled enum, while egui's built-in animation_time remains a conservative
+        // legacy damping signal for old call sites that only understand "reduced".
+        // The baseline cadence is captured once, like the zoom base, so returning to
+        // Normal restores the seat's real animation time rather than a guess.
+        let motion_mode = self.appearance.motion_mode.runtime();
+        Motion::set_mode(motion_mode);
         let anim_base = *self
             .animation_base
             .get_or_insert_with(|| ctx.style().animation_time);
-        let want_anim = if self.appearance.reduce_motion {
-            0.0
-        } else {
+        let want_anim = if motion_mode == MotionMode::Normal {
             anim_base
+        } else {
+            0.0
         };
         if (ctx.style().animation_time - want_anim).abs() > f32::EPSILON {
             ctx.style_mut(|s| s.animation_time = want_anim);
@@ -783,6 +783,7 @@ impl SystemState {
             | HotkeyAction::MonitorFocusSwitch
             | HotkeyAction::ReturnToChrome
             | HotkeyAction::OpenSystem
+            | HotkeyAction::OpenOmnibox
             | HotkeyAction::MediaPlayPause
             | HotkeyAction::MediaPause
             | HotkeyAction::MediaStop
@@ -1295,16 +1296,63 @@ impl TextScale {
     }
 }
 
+/// Runtime motion mode persisted by Personalization → Theme (MOTION-DRM-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AppearanceMotionMode {
+    /// Full shared motion.
+    #[default]
+    Normal,
+    /// Vestibular-comfort mode: typed shared motion uses reduced preset durations,
+    /// while older egui/boolean call sites are damped through `animation_time = 0`.
+    Reduced,
+    /// Endpoint-only mode.
+    Disabled,
+}
+
+impl AppearanceMotionMode {
+    /// The visible picker order.
+    const ALL: [Self; 3] = [Self::Normal, Self::Reduced, Self::Disabled];
+
+    /// Picker label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Reduced => "Reduced",
+            Self::Disabled => "Disabled",
+        }
+    }
+
+    /// Short operator-facing description for the tile body.
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Normal => "Full transitions",
+            Self::Reduced => "Short, calm motion",
+            Self::Disabled => "Endpoint only",
+        }
+    }
+
+    /// Runtime mode consumed by `mde_egui::Motion`.
+    const fn runtime(self) -> MotionMode {
+        match self {
+            Self::Normal => MotionMode::Normal,
+            Self::Reduced => MotionMode::Reduced,
+            Self::Disabled => MotionMode::Disabled,
+        }
+    }
+}
+
 /// The client-data-dir file the Personalization → Theme appearance persists to (the
 /// [`SettingsNav`] / `PowerHonorConfig` one-JSON-per-preference idiom).
 const APPEARANCE_CONFIG_FILE: &str = "settings-appearance.json";
 
 /// The persisted Personalization → Theme appearance (SETTINGS-5): the interactive
-/// accent + the platform text-scale the shell actually applies at runtime. Loaded on
-/// start and restored on open, saved on a pick — the [`SettingsNav`] client-data-dir
-/// JSON idiom, reused. Both fields drive a real live effect through
+/// accent, platform text-scale, and motion mode the shell actually applies at
+/// runtime. Loaded on start and restored on open, saved on a pick — the
+/// [`SettingsNav`] client-data-dir JSON idiom, reused. All fields drive a real live
+/// effect through
 /// [`SystemState::apply_appearance`] (§7 — no dead toggle).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 struct AppearanceConfig {
     /// The interactive accent tint (re-applied over the installed look each frame).
     #[serde(default)]
@@ -1312,14 +1360,42 @@ struct AppearanceConfig {
     /// The whole-UI text-scale step (the EXPLORER-18 accessibility zoom).
     #[serde(default)]
     text_scale: TextScale,
-    /// Reduce motion (a11y-07): a motion / vestibular-comfort toggle. When set, the
-    /// shell's eased animations settle instantly instead of gliding — driven live
+    /// Runtime motion policy (MOTION-DRM-5): normal, reduced, or disabled. Driven live
     /// through [`SystemState::apply_appearance`], which flips the shared
-    /// [`Motion::set_reduce_motion`] global (the explicit-duration easings the shell
-    /// paints with) AND zeroes egui's `animation_time` (the signal the menu bar and
-    /// ambient explorer already honour). Default `false` (motion on, current behaviour).
+    /// [`Motion::set_mode`] global and damps egui's legacy `animation_time` signal
+    /// outside Normal.
     #[serde(default)]
-    reduce_motion: bool,
+    motion_mode: AppearanceMotionMode,
+}
+
+impl<'de> Deserialize<'de> for AppearanceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            accent: AccentChoice,
+            #[serde(default)]
+            text_scale: TextScale,
+            #[serde(default)]
+            motion_mode: Option<AppearanceMotionMode>,
+            #[serde(default)]
+            reduce_motion: bool,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            accent: wire.accent,
+            text_scale: wire.text_scale,
+            motion_mode: wire.motion_mode.unwrap_or(if wire.reduce_motion {
+                AppearanceMotionMode::Reduced
+            } else {
+                AppearanceMotionMode::Normal
+            }),
+        })
+    }
 }
 
 impl AppearanceConfig {
@@ -2469,13 +2545,14 @@ fn hotkeys_section(ui: &mut egui::Ui) {
 
 /// The Theme section (SETTINGS-5) under Personalization — the two appearance controls
 /// the shell **genuinely applies at runtime**: the interactive **accent** (re-tinting
-/// the live `Style` accent across every surface via [`Style::set_accent`]) and the
-/// **text-scale** (the EXPLORER-18 accessibility whole-UI zoom the shell honors). Each
-/// pick mutates the persisted [`AppearanceConfig`] in place; the change is saved after
-/// the render borrow and applied live by [`SystemState::apply_appearance`] on the poll.
-/// The platform is dark-only (the Quasar lock) — there is NO light/dark switch here,
-/// only what the runtime truly drives (§7 — no dead toggle). Laid **across** the wide
-/// pane (SETTINGS-3) — a swatch row + a step row, each a selectable tile.
+/// the live `Style` accent across every surface via [`Style::set_accent`]), the
+/// **text-scale** (the EXPLORER-18 accessibility whole-UI zoom the shell honors),
+/// and the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy).
+/// Each pick mutates the persisted [`AppearanceConfig`] in place; the change is
+/// saved after the render borrow and applied live by [`SystemState::apply_appearance`]
+/// on the poll. The platform is dark-only (the Quasar lock) — there is NO light/dark
+/// switch here, only what the runtime truly drives (§7 — no dead toggle). Laid
+/// **across** the wide pane (SETTINGS-3) as selectable tiles.
 fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     // Accent — a swatch row; the pick re-tints the whole shell's highlights live.
     ui.label(
@@ -2539,8 +2616,7 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
         });
     });
     ui.add_space(Style::SP_M);
-    // Reduce motion — the a11y-07 motion / vestibular-comfort toggle; the pick settles
-    // every eased transition instantly. Reuses the shell's checkbox toggle idiom.
+    // Motion mode — the runtime normal/reduced/disabled policy for shared motion.
     ui.label(
         RichText::new("Motion")
             .color(Style::TEXT_DIM)
@@ -2548,15 +2624,34 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
             .strong(),
     );
     ui.add_space(Style::SP_XS);
-    ui.checkbox(
-        &mut appearance.reduce_motion,
-        RichText::new("Reduce motion").size(Style::BODY),
-    );
+    across_grid(ui, &AppearanceMotionMode::ALL, 3, |ui, &mode| {
+        let selected = appearance.motion_mode == mode;
+        tile(ui, |ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width(), Style::SP_XL],
+                    egui::SelectableLabel::new(
+                        selected,
+                        RichText::new(mode.label()).size(Style::BODY),
+                    ),
+                )
+                .clicked()
+                && !selected
+            {
+                appearance.motion_mode = mode;
+            }
+            ui.label(
+                RichText::new(mode.description())
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+        });
+    });
     ui.add_space(Style::SP_S);
     muted_note(
         ui,
         "Accent re-tints every surface's highlights; text size scales the whole \
-         interface. Reduce motion settles animations instantly for motion sensitivity. \
+         interface. Motion mode applies normal, reduced, or endpoint-only movement. \
          The platform is dark-only — there is no light theme.",
     );
 }

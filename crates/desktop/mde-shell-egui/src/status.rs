@@ -2,9 +2,10 @@
 //!
 //! The daemon owns event severity and segment rollups (`state/notify/segment/*`);
 //! the shell only renders the latest read-model: one local A-F grade pip plus the
-//! four count-free health pips Device · Mesh · Power · Alerts. Missing state is an
-//! honest dim baseline, never fabricated green. NOTIF-6's critical edge cue is
-//! also kept here so status has one shell-side code path.
+//! four count-free health pips Device · Mesh · Power · Alerts plus the shell-fed
+//! File operations segment. Missing state is an honest dim baseline, never
+//! fabricated green. NOTIF-6's critical edge cue is also kept here so status has
+//! one shell-side code path.
 
 use std::time::{Duration, Instant};
 
@@ -12,12 +13,15 @@ use mde_bus::persist::Persist;
 
 use crate::bus_reader::BusReader;
 use mde_egui::egui::{self, FontId};
-use mde_egui::{GradeBand, Style};
+use mde_egui::{
+    operation_progress_value, paint_operation_progress_badge, GradeBand, OperationProgressView,
+    Style,
+};
 use mde_seat::{Battery, BatteryState, Probe, SeatSnapshot};
 use mde_theme::brand::icons::IconId;
 use serde::Deserialize;
 
-use crate::chrome::NodeGrades;
+use crate::chrome::{GradeRow, NodeGrades};
 use crate::dock::{icon_texture, Surface};
 
 const REFRESH: Duration = Duration::from_secs(2);
@@ -30,7 +34,7 @@ const EDGE_PULSE_HALF_CYCLE_SECONDS: f32 = 0.24;
 const EDGE_HELD_W: f32 = 3.0;
 const EDGE_PULSE_W: f32 = 14.0;
 
-/// The four daemon-owned status segments.
+/// The bottom notification/status segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatusSegment {
     /// Local device/platform health.
@@ -39,19 +43,30 @@ pub enum StatusSegment {
     Mesh,
     /// Power and energy posture.
     Power,
+    /// Shell-wide file-operation/download progress.
+    FileOperations,
     /// Aggregate alert health.
     Alerts,
 }
 
 impl StatusSegment {
     /// Render order, top to bottom.
-    pub const ALL: [Self; 4] = [Self::Device, Self::Mesh, Self::Power, Self::Alerts];
+    pub const ALL: [Self; 5] = [
+        Self::Device,
+        Self::Mesh,
+        Self::Power,
+        Self::FileOperations,
+        Self::Alerts,
+    ];
+
+    const DAEMON: [Self; 4] = [Self::Device, Self::Mesh, Self::Power, Self::Alerts];
 
     const fn key(self) -> &'static str {
         match self {
             Self::Device => "device",
             Self::Mesh => "mesh",
             Self::Power => "power",
+            Self::FileOperations => "file-operations",
             Self::Alerts => "alerts",
         }
     }
@@ -60,6 +75,7 @@ impl StatusSegment {
         match self {
             Self::Device | Self::Power => Surface::System,
             Self::Mesh => Surface::MeshView,
+            Self::FileOperations => Surface::Files,
             Self::Alerts => Surface::Chat,
         }
     }
@@ -69,12 +85,45 @@ impl StatusSegment {
             Self::Device => IconId::Settings,
             Self::Mesh => IconId::MeshView,
             Self::Power => IconId::BatteryBolt,
+            Self::FileOperations => IconId::Files,
             Self::Alerts => IconId::Chat,
         }
     }
 
     fn topic(self) -> String {
         format!("{TOPIC_PREFIX}{}", self.key())
+    }
+}
+
+/// Compact shell-wide file-operation status carried by the notification fabric.
+///
+/// Files owns the detailed operation/transfer state. Browser downloads and other
+/// producers feed this bounded projection so the bottom status segment can report
+/// active count, known-progress average, and a primary label without learning any
+/// per-surface job model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileOperationStatus {
+    /// Active file jobs represented by this summary.
+    active: usize,
+    /// Average known progress, `None` while all active jobs are still queued/starting.
+    fraction: Option<f32>,
+    /// Bounded display label for the status strip/panel.
+    label: String,
+}
+
+impl FileOperationStatus {
+    /// Construct a shell-wide file-operation summary.
+    #[must_use]
+    pub fn new(active: usize, fraction: Option<f32>, label: impl Into<String>) -> Self {
+        Self {
+            active,
+            fraction: fraction.map(|f| f.clamp(0.0, 1.0)),
+            label: truncate_file_operation_label(&label.into()),
+        }
+    }
+
+    fn view(&self) -> OperationProgressView<'_> {
+        OperationProgressView::new(self.active, self.fraction, &self.label)
     }
 }
 
@@ -98,7 +147,7 @@ pub struct SegmentRollup {
 }
 
 /// The pips the dock renders.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusSegments {
     /// Latest Device rollup.
     pub device: Option<SegmentRollup>,
@@ -106,6 +155,8 @@ pub struct StatusSegments {
     pub mesh: Option<SegmentRollup>,
     /// Latest Power rollup.
     pub power: Option<SegmentRollup>,
+    /// Shell-fed active file-operation/download progress.
+    pub file_operations: Option<FileOperationStatus>,
     /// Latest Alerts aggregate rollup.
     pub alerts: Option<SegmentRollup>,
     /// `true` once a poll was attempted.
@@ -118,6 +169,7 @@ impl StatusSegments {
             StatusSegment::Device => self.device = rollup,
             StatusSegment::Mesh => self.mesh = rollup,
             StatusSegment::Power => self.power = rollup,
+            StatusSegment::FileOperations => {}
             StatusSegment::Alerts => self.alerts = rollup,
         }
     }
@@ -127,6 +179,7 @@ impl StatusSegments {
             StatusSegment::Device => self.device.as_ref(),
             StatusSegment::Mesh => self.mesh.as_ref(),
             StatusSegment::Power => self.power.as_ref(),
+            StatusSegment::FileOperations => None,
             StatusSegment::Alerts => self.alerts.as_ref(),
         }
     }
@@ -195,9 +248,23 @@ fn read_segments(persist: &Persist) -> StatusSegments {
         seen: true,
         ..StatusSegments::default()
     };
-    for segment in StatusSegment::ALL {
+    for segment in StatusSegment::DAEMON {
         out.set(segment, latest_rollup(persist, segment));
     }
+    out
+}
+
+fn truncate_file_operation_label(label: &str) -> String {
+    const MAX_CHARS: usize = 34;
+    let char_count = label.chars().count();
+    if char_count <= MAX_CHARS {
+        return label.to_owned();
+    }
+    let mut out = label
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
     out
 }
 
@@ -218,6 +285,16 @@ pub(crate) fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
         Some("info" | "notice" | "debug") => Style::SUPPORT_INFO,
         Some("success" | "ok") => Style::SUPPORT_SUCCESS,
         _ => Style::TEXT_DIM,
+    }
+}
+
+/// The color used for a compact status segment, including shell-owned synthetic
+/// segments that do not have daemon rollups.
+pub(crate) fn segment_color(segment: StatusSegment, segments: &StatusSegments) -> egui::Color32 {
+    match segment {
+        StatusSegment::FileOperations if segments.file_operations.is_some() => Style::ACCENT,
+        StatusSegment::FileOperations => Style::TEXT_DIM,
+        _ => severity_color(segments.get(segment)),
     }
 }
 
@@ -256,15 +333,13 @@ struct ActiveCriticalEdge {
 pub struct CriticalEdgeCue {
     active: Option<ActiveCriticalEdge>,
     acknowledged: Option<CriticalEdgeKey>,
-    muted: bool,
     /// WIN7-6 (`docs/design/win7-desktop-survey.md` lock #9) — latched inside
     /// [`Self::update`] on a [`Self::visible`] hidden→visible edge (a fresh
-    /// critical, one re-raised after an older one was acknowledged, or an
-    /// unmute revealing a still-live one — see [`Self::update`]'s own
-    /// comment), drained once by [`Self::take_became_visible`]. `main.rs`
-    /// uses the drain to auto-close an open Start Menu the instant the cue
-    /// starts showing, without re-firing on every steady "still visible"
-    /// frame afterward — the same one-shot `take_*` shape
+    /// critical or one re-raised after an older one was acknowledged), drained
+    /// once by [`Self::take_became_visible`]. `main.rs` uses the drain to
+    /// auto-close an open Start Menu the instant the cue starts showing,
+    /// without re-firing on every steady "still visible" frame afterward — the
+    /// same one-shot `take_*` shape
     /// `start_menu::StartMenuState`'s own `take_tile_activation`/
     /// `HotkeyRouter::take_dock_toggle` already use.
     became_visible: bool,
@@ -272,9 +347,8 @@ pub struct CriticalEdgeCue {
 
 impl CriticalEdgeCue {
     /// Fold the daemon segment rollups into this seat's edge-cue state.
-    pub fn update(&mut self, segments: &StatusSegments, local_host: &str, muted: bool) {
+    pub fn update(&mut self, segments: &StatusSegments, local_host: &str) {
         let was_visible = self.visible();
-        self.muted = muted;
         let next = critical_edge_key(segments, local_host);
         match next {
             Some(key) => {
@@ -291,11 +365,9 @@ impl CriticalEdgeCue {
             }
         }
         // WIN7-6 (lock #9) — an edge, not a level check: `visible()` can go
-        // false→true from a brand-new critical, a genuinely new one after an
-        // old (different) one was acknowledged, OR an unmute revealing a
-        // still-live one (see the `critical_edge_cue_respects_push_mute_
-        // without_clearing_state` test) — all three are real "the cue just
-        // started showing" moments and all three should latch here. A steady
+        // false→true from a brand-new critical or a genuinely new one after an
+        // old (different) one was acknowledged. Both are real "the cue just
+        // started showing" moments and both should latch here. A steady
         // already-visible frame, and the same rollup staying acknowledged,
         // must NOT latch (see `Self::became_visible`'s own doc for why).
         if !was_visible && self.visible() {
@@ -314,7 +386,7 @@ impl CriticalEdgeCue {
     pub fn visible(&self) -> bool {
         self.active
             .as_ref()
-            .is_some_and(|active| !self.muted && self.acknowledged.as_ref() != Some(&active.key))
+            .is_some_and(|active| self.acknowledged.as_ref() != Some(&active.key))
     }
 
     /// WIN7-6 — drain whether the last [`Self::update`] carried the cue
@@ -388,7 +460,7 @@ pub fn critical_edge_live_region_id() -> egui::Id {
 }
 
 fn critical_edge_key(segments: &StatusSegments, local_host: &str) -> Option<CriticalEdgeKey> {
-    for segment in StatusSegment::ALL {
+    for segment in StatusSegment::DAEMON {
         let Some(rollup) = segments.get(segment) else {
             continue;
         };
@@ -470,16 +542,43 @@ fn local_grade_label(grades: &NodeGrades) -> String {
     )
 }
 
-fn segment_label(segment: StatusSegment) -> &'static str {
+fn status_panel_grade_text(row: &GradeRow) -> String {
+    let grade = if row.stale {
+        "?".to_string()
+    } else {
+        GradeBand::from_score(f32::from(row.score))
+            .letter()
+            .to_string()
+    };
+    format!("{}  {} {grade}", row.host, row.trend.arrow())
+}
+
+pub(crate) const fn segment_label(segment: StatusSegment) -> &'static str {
     match segment {
         StatusSegment::Device => "Device",
         StatusSegment::Mesh => "Mesh",
         StatusSegment::Power => "Power",
+        StatusSegment::FileOperations => "File operations",
         StatusSegment::Alerts => "Alerts",
     }
 }
 
-fn segment_accessibility_value(segment: StatusSegment, rollup: Option<&SegmentRollup>) -> String {
+pub(crate) fn segment_accessibility_value(
+    segment: StatusSegment,
+    segments: &StatusSegments,
+) -> String {
+    if segment == StatusSegment::FileOperations {
+        return segments.file_operations.as_ref().map_or_else(
+            || "File operations idle".to_string(),
+            |progress| {
+                format!(
+                    "File operations active: {}",
+                    operation_progress_value(progress.view())
+                )
+            },
+        );
+    }
+    let rollup = segments.get(segment);
     let state = severity_label(rollup);
     rollup.map_or_else(
         || format!("{} status unknown", segment_label(segment)),
@@ -498,7 +597,7 @@ fn segment_accessibility_value(segment: StatusSegment, rollup: Option<&SegmentRo
 fn status_live_summary(grades: &NodeGrades, segments: &StatusSegments) -> String {
     let mut parts = vec![format!("Local grade {}", local_grade_label(grades))];
     for segment in StatusSegment::ALL {
-        parts.push(segment_accessibility_value(segment, segments.get(segment)));
+        parts.push(segment_accessibility_value(segment, segments));
     }
     parts.join(". ")
 }
@@ -531,10 +630,10 @@ fn install_status_accessibility(
 fn install_segment_accessibility(
     ctx: &egui::Context,
     segment: StatusSegment,
-    rollup: Option<&SegmentRollup>,
+    segments: &StatusSegments,
     rect: egui::Rect,
 ) {
-    let value = segment_accessibility_value(segment, rollup);
+    let value = segment_accessibility_value(segment, segments);
     let _ = ctx.accesskit_node_builder(segment_pip_id(segment), |node| {
         node.set_role(egui::accesskit::Role::Button);
         node.set_label(format!("{} status", segment_label(segment)));
@@ -596,11 +695,18 @@ pub fn status_panel_device_id() -> egui::Id {
     egui::Id::new("notif-status-panel-device")
 }
 
+/// Stable id for the expansion panel's file-operation row.
+pub fn status_panel_file_operations_id() -> egui::Id {
+    egui::Id::new("notif-status-panel-file-operations")
+}
+
 /// Output from rendering the compact row.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StatusBarOutcome {
     /// A pip or local grade routed to a surface.
     pub routed: bool,
+    /// The specific segment that routed, when a segment pip was activated.
+    pub routed_segment: Option<StatusSegment>,
     /// The chevron was clicked.
     pub toggle_panel: bool,
 }
@@ -612,6 +718,8 @@ pub struct StatusPanelOutcome {
     pub node_focus: Option<String>,
     /// Device controls requested the full System surface.
     pub route_system: bool,
+    /// A status segment row requested its owning surface.
+    pub routed_segment: Option<StatusSegment>,
 }
 
 /// Render the notification/status micro-icons inside the bottom rail.
@@ -631,9 +739,10 @@ pub fn notification_rail(
         let pip_rect =
             egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(rail_h, rail_h))
                 .shrink(2.0);
-        if segment_pip(ui, segment, segments.get(segment), pip_rect) {
+        if segment_pip(ui, segment, segments, pip_rect) {
             *active = segment.route();
             out.routed = true;
+            out.routed_segment = Some(segment);
         }
         x += rail_h;
     }
@@ -718,9 +827,10 @@ pub fn status_bar(
             egui::vec2(rect.width() / 2.0, pip_h),
         )
         .shrink(1.0);
-        if segment_pip(ui, segment, segments.get(segment), pip_rect) {
+        if segment_pip(ui, segment, segments, pip_rect) {
             *active = segment.route();
             out.routed = true;
+            out.routed_segment = Some(segment);
         }
     }
     out
@@ -729,16 +839,16 @@ pub fn status_bar(
 fn segment_pip(
     ui: &egui::Ui,
     segment: StatusSegment,
-    rollup: Option<&SegmentRollup>,
+    segments: &StatusSegments,
     rect: egui::Rect,
 ) -> bool {
-    install_segment_accessibility(ui.ctx(), segment, rollup, rect);
+    install_segment_accessibility(ui.ctx(), segment, segments, rect);
     let resp = ui.interact(rect, segment_pip_id(segment), egui::Sense::click());
     let painter = ui.painter().clone();
     if resp.hovered() {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
-    let color = severity_color(rollup);
+    let color = segment_color(segment, segments);
     let center = rect.center();
     if let Some(tex) = icon_texture(ui.ctx(), segment.icon(), Style::SP_M, color) {
         let icon = egui::Rect::from_center_size(center, egui::vec2(Style::SP_M, Style::SP_M));
@@ -754,6 +864,7 @@ fn segment_pip(
 pub fn status_panel(
     ui: &egui::Ui,
     grades: &NodeGrades,
+    segments: &StatusSegments,
     seat: Option<&SeatSnapshot>,
     rect: egui::Rect,
 ) -> StatusPanelOutcome {
@@ -799,7 +910,12 @@ pub fn status_panel(
         );
         y += row_h;
     }
-    for row in rows.iter().take(5) {
+    let grade_limit = if segments.file_operations.is_some() {
+        4
+    } else {
+        5
+    };
+    for row in rows.iter().take(grade_limit) {
         let r = egui::Rect::from_min_max(
             egui::pos2(inner_left, y),
             egui::pos2(inner_right, y + row_h),
@@ -808,13 +924,6 @@ pub fn status_panel(
         if resp.hovered() {
             painter.rect_filled(r, Style::RADIUS, Style::SURFACE_HI);
         }
-        let grade = if row.stale {
-            "?".to_string()
-        } else {
-            GradeBand::from_score(f32::from(row.score))
-                .letter()
-                .to_string()
-        };
         let color = if row.stale {
             Style::TEXT_DIM
         } else {
@@ -828,7 +937,7 @@ pub fn status_panel(
         painter.text(
             egui::pos2(r.left() + Style::SP_L, r.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("{}  {grade}", row.host),
+            status_panel_grade_text(row),
             FontId::proportional(Style::SMALL),
             if row.is_local {
                 Style::TEXT
@@ -850,6 +959,23 @@ pub fn status_panel(
     );
     y += Style::SP_S;
 
+    if let Some(progress) = segments.file_operations.as_ref() {
+        let file_rect = egui::Rect::from_min_max(
+            egui::pos2(inner_left, y),
+            egui::pos2(inner_right, y + row_h + Style::SP_S),
+        );
+        if draw_file_operations_row(ui, file_rect, progress) {
+            out.routed_segment = Some(StatusSegment::FileOperations);
+        }
+        y = file_rect.bottom() + Style::SP_XS;
+        painter.hline(
+            inner_left..=inner_right,
+            y,
+            egui::Stroke::new(1.0, Style::BORDER),
+        );
+        y += Style::SP_S;
+    }
+
     let device_rect = egui::Rect::from_min_max(
         egui::pos2(inner_left, y),
         egui::pos2(inner_right, y + row_h * 3.0),
@@ -863,6 +989,30 @@ pub fn status_panel(
     }
     draw_device_controls(ui, seat, device_rect);
     out
+}
+
+fn draw_file_operations_row(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    progress: &FileOperationStatus,
+) -> bool {
+    let resp = ui.interact(
+        rect,
+        status_panel_file_operations_id(),
+        egui::Sense::click(),
+    );
+    let badge_rect = rect.shrink2(egui::vec2(Style::SP_XS, Style::SP_XS));
+    paint_operation_progress_badge(ui, badge_rect, progress.view(), false, resp.hovered());
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(status_panel_file_operations_id(), |node| {
+            node.set_role(egui::accesskit::Role::Button);
+            node.set_label("File operations status");
+            node.set_value(operation_progress_value(progress.view()));
+            node.set_bounds(accesskit_rect(rect));
+            node.add_action(egui::accesskit::Action::Click);
+        });
+    resp.clicked()
 }
 
 fn draw_device_controls(ui: &egui::Ui, seat: Option<&SeatSnapshot>, rect: egui::Rect) {
@@ -905,7 +1055,7 @@ fn draw_device_controls(ui: &egui::Ui, seat: Option<&SeatSnapshot>, rect: egui::
         egui::pos2(left, bt_y),
         egui::Align2::LEFT_CENTER,
         bt.map_or("BT --".to_string(), |(on, connected)| {
-            format!("BT {} · {connected}", if on { "on" } else { "off" })
+            bluetooth_status_text(on, connected)
         }),
         FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
@@ -976,6 +1126,10 @@ fn draw_meter(painter: &egui::Painter, rect: egui::Rect, pct: f32) {
         ),
     );
     painter.rect_filled(fill, Style::RADIUS, Style::ACCENT);
+}
+
+fn bluetooth_status_text(on: bool, connected: usize) -> String {
+    format!("BT {} - {connected}", if on { "on" } else { "off" })
 }
 
 fn battery_status(seat: Option<&SeatSnapshot>) -> Option<&Battery> {
@@ -1122,6 +1276,16 @@ mod tests {
     }
 
     #[test]
+    fn status_panel_grade_rows_include_trend_arrows() {
+        let mut rows = grade(95, false).rows;
+        rows[0].trend = GradeTrend::Up;
+        assert_eq!(status_panel_grade_text(&rows[0]), "eagle  ↑ A");
+        rows[0].trend = GradeTrend::Down;
+        rows[0].stale = true;
+        assert_eq!(status_panel_grade_text(&rows[0]), "eagle  ↓ ?");
+    }
+
+    #[test]
     fn status_bar_exports_accesskit_live_region_and_named_pips() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1137,6 +1301,11 @@ mod tests {
                 11,
             )),
             mesh: Some(rollup("mesh", "warning", "lh-1", "remote-pip-chat", 12)),
+            file_operations: Some(FileOperationStatus::new(
+                2,
+                Some(0.5),
+                "2 browser downloads",
+            )),
             seen: true,
             ..StatusSegments::default()
         };
@@ -1171,6 +1340,7 @@ mod tests {
         assert!(value.contains("Local grade A"));
         assert!(value.contains("Alerts critical"));
         assert!(value.contains("Mesh warning"));
+        assert!(value.contains("File operations active"));
 
         let alert_pip = nodes
             .iter()
@@ -1184,6 +1354,48 @@ mod tests {
                 .is_some_and(|value| value.contains("Alerts critical")),
             "alert pip carries its severity summary"
         );
+        let file_pip = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("file operations pip node");
+        assert_eq!(file_pip.role(), egui::accesskit::Role::Button);
+        assert!(
+            file_pip
+                .value()
+                .is_some_and(|value| value.contains("50% average progress")),
+            "file-operation pip carries progress through the notification status fabric"
+        );
+    }
+
+    #[test]
+    fn file_operation_status_labels_are_bounded_ascii_for_bottom_progress() {
+        let status = FileOperationStatus::new(
+            1,
+            Some(0.5),
+            "Copy very-long-platform-operation-report-final.txt",
+        );
+        let label = status.view().label;
+
+        assert!(label.ends_with("..."), "truncated label = {label}");
+        assert!(label.is_ascii(), "truncated label = {label}");
+        assert!(
+            label.chars().count() <= 34,
+            "bottom-progress label should stay bounded: {label}"
+        );
+        assert!(!label.contains('…'), "label must not use Unicode ellipsis");
+        assert!(
+            !mde_egui::operation_progress_text(status.view()).contains('·'),
+            "shared bottom-progress badge text must not use middle-dot separators"
+        );
+    }
+
+    #[test]
+    fn status_panel_device_copy_uses_ascii_separators() {
+        let text = bluetooth_status_text(true, 2);
+        assert_eq!(text, "BT on - 2");
+        assert!(text.is_ascii());
+        assert!(!text.contains('·'), "Bluetooth status text = {text}");
     }
 
     #[test]
@@ -1342,8 +1554,8 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", false);
-        assert!(cue.visible(), "a live unmuted critical is visible");
+        cue.update(&live, "eagle");
+        assert!(cue.visible(), "a live critical is visible");
 
         cue.acknowledge();
         assert!(
@@ -1351,7 +1563,7 @@ mod tests {
             "ack hides the cue while the same rollup is live"
         );
 
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             !cue.visible(),
             "the same acknowledged rollup does not immediately reappear"
@@ -1367,15 +1579,15 @@ mod tests {
             )),
             ..StatusSegments::default()
         };
-        cue.update(&reraised, "eagle", false);
+        cue.update(&reraised, "eagle");
         assert!(cue.visible(), "a new live critical re-raises the cue");
 
-        cue.update(&StatusSegments::default(), "eagle", false);
+        cue.update(&StatusSegments::default(), "eagle");
         assert!(!cue.visible(), "resolved rollups clear the cue");
     }
 
     #[test]
-    fn critical_edge_cue_respects_push_mute_without_clearing_state() {
+    fn critical_edge_cue_critical_breaks_through_push_suppression_policy() {
         let live = StatusSegments {
             alerts: Some(rollup(
                 "alerts",
@@ -1387,10 +1599,16 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", true);
-        assert!(!cue.visible(), "DND/focus mute suppresses the ambient push");
-        cue.update(&live, "eagle", false);
-        assert!(cue.visible(), "unmuting reveals the still-live critical");
+        cue.update(&live, "eagle");
+        assert!(
+            cue.visible(),
+            "own-seat Critical edge cues break through DND/focus suppression; \
+             non-critical ambient suppression belongs to the toast policy"
+        );
+        assert!(
+            cue.take_became_visible(),
+            "a break-through Critical still latches the one-shot visible edge"
+        );
     }
 
     #[test]
@@ -1412,7 +1630,7 @@ mod tests {
         };
         let mut cue = CriticalEdgeCue::default();
 
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             cue.take_became_visible(),
             "a fresh critical is a hidden->visible edge"
@@ -1422,14 +1640,14 @@ mod tests {
             "draining the edge clears it until the next real transition"
         );
 
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             !cue.take_became_visible(),
             "the SAME still-active critical is not a new edge"
         );
 
         cue.acknowledge();
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             !cue.take_became_visible(),
             "re-affirming an acknowledged rollup is not a new edge"
@@ -1445,42 +1663,16 @@ mod tests {
             )),
             ..StatusSegments::default()
         };
-        cue.update(&reraised, "eagle", false);
+        cue.update(&reraised, "eagle");
         assert!(
             cue.take_became_visible(),
             "a genuinely new critical after an old one was acked is a fresh edge"
         );
 
-        cue.update(&StatusSegments::default(), "eagle", false);
+        cue.update(&StatusSegments::default(), "eagle");
         assert!(
             !cue.take_became_visible(),
             "a resolved rollup clearing the cue is not itself a visible edge"
-        );
-    }
-
-    #[test]
-    fn critical_edge_cue_take_became_visible_latches_on_unmute_too() {
-        let live = StatusSegments {
-            alerts: Some(rollup(
-                "alerts",
-                "critical",
-                "eagle",
-                CRITICAL_POLICY_OWN_SEAT,
-                11,
-            )),
-            ..StatusSegments::default()
-        };
-        let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", true);
-        assert!(
-            !cue.take_became_visible(),
-            "a muted critical never became visible"
-        );
-
-        cue.update(&live, "eagle", false);
-        assert!(
-            cue.take_became_visible(),
-            "unmuting a still-live critical is also a real edge"
         );
     }
 
@@ -1509,7 +1701,7 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -1542,7 +1734,7 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,

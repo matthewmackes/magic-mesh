@@ -115,6 +115,12 @@ fn browser_media_action_for_mpris(action: &str) -> Option<(&'static str, &'stati
         "next" => Some(("next", "next")),
         "previous" | "prev" => Some(("previous", "previous")),
         "stop" => Some(("stop", "stop")),
+        "volumeup" | "volume-up" | "volup" | "raisevolume" | "raise-volume" => {
+            Some(("volume-up", "volume-up"))
+        }
+        "volumedown" | "volume-down" | "voldown" | "lowervolume" | "lower-volume" => {
+            Some(("volume-down", "volume-down"))
+        }
         _ => None,
     }
 }
@@ -144,6 +150,7 @@ pub(super) struct BrowserMediaStatus {
     artwork_url: String,
     duration_ms: i64,
     position_ms: i64,
+    volume_percent: Option<i64>,
 }
 
 impl BrowserMediaStatus {
@@ -174,6 +181,13 @@ fn json_i64(value: &Value, key: &str) -> i64 {
         .unwrap_or_default()
 }
 
+fn json_volume_percent(value: &Value) -> Option<i64> {
+    value
+        .get("volume_percent")
+        .and_then(Value::as_i64)
+        .filter(|n| (0..=100).contains(n))
+}
+
 pub(super) fn parse_browser_media_status(body: &str) -> Option<BrowserMediaStatus> {
     let value: Value = serde_json::from_str(body).ok()?;
     if value.get("op").and_then(Value::as_str) != Some("browser_media_status") {
@@ -189,6 +203,7 @@ pub(super) fn parse_browser_media_status(body: &str) -> Option<BrowserMediaStatu
         artwork_url: json_string(metadata, "artwork_url"),
         duration_ms: json_i64(metadata, "duration_ms"),
         position_ms: json_i64(metadata, "position_ms"),
+        volume_percent: json_volume_percent(metadata),
     })
     .filter(BrowserMediaStatus::is_active)
 }
@@ -231,7 +246,11 @@ fn browser_now_playing(status: &BrowserMediaStatus) -> String {
     }
 }
 
-fn browser_mpris_state_body(status: &BrowserMediaStatus, include_now_playing: bool) -> MprisBody {
+fn browser_mpris_state_body(
+    status: &BrowserMediaStatus,
+    include_now_playing: bool,
+    include_volume: bool,
+) -> MprisBody {
     let mut body = MprisBody {
         player: BROWSER_MPRIS_PLAYER.to_owned(),
         can_pause: Some(true),
@@ -244,6 +263,9 @@ fn browser_mpris_state_body(status: &BrowserMediaStatus, include_now_playing: bo
         length: status.duration_ms,
         ..Default::default()
     };
+    if include_volume {
+        body.volume = status.volume_percent;
+    }
     if include_now_playing {
         body.artist = status.artist.clone();
         body.title = status.title.clone();
@@ -482,7 +504,11 @@ pub(super) fn mpris_response_bodies_for_request_with_browser<C: MediaControl>(
                 || (body.player.trim().is_empty() && selected_mpris_player(control, "").is_none()))
         {
             if let Some(status) = browser {
-                reports.push(browser_mpris_state_body(status, body.request_now_playing));
+                reports.push(browser_mpris_state_body(
+                    status,
+                    body.request_now_playing,
+                    body.request_volume,
+                ));
             }
         } else if let Some(player) = selected_mpris_player(control, &body.player) {
             if let Some(report) = mpris_state_body_for_player(

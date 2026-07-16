@@ -190,6 +190,10 @@ mde-seat = { path = "../mde-seat" }
 # through mde-seat (lock 1). Standard `org.freedesktop.login1` interop (§2 FDO
 # exception), matching mde-seat's build.
 zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+# BROWSER-DD-9 — the Browser MPRIS bridge owns a tiny current-thread tokio runtime
+# for the standard FDO `org.mpris.MediaPlayer2` session-bus service. Browser
+# control remains on mde-bus; tokio is only the zbus runtime surface.
+tokio = { version = "1", features = ["rt", "time"] }
 
 # BOOKMARKS-6 — the Surface::Browser IPC + shm texture bridge. The shell's `web`
 # panel is this crate's first caller: it spawns the sandboxed `mde-web-preview`

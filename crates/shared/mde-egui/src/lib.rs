@@ -40,6 +40,7 @@ pub mod hostkeys;
 pub mod menubar;
 pub mod motion;
 pub mod runner;
+pub mod search_omnibox;
 pub mod style;
 pub mod toast;
 pub mod touch;
@@ -68,7 +69,11 @@ pub use gestures::{
 pub use menubar::{
     resolve_mnemonics, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip,
 };
-pub use motion::{Motion, StatusMotion};
+pub use motion::{
+    Animated, AnimatedColor, AnimatedOpacity, AnimatedRect, AnimatedScalar, AnimatedScale,
+    AnimatedSize, AnimatedVec2, Motion, MotionEasing, MotionMode, MotionOpacity, MotionPreset,
+    MotionScale, MotionSpec, MotionValue, Phase, StatusMotion,
+};
 pub use runner::run_client;
 pub use style::{Density, GradeBand, Style};
 pub use toast::{
@@ -80,7 +85,10 @@ pub use video_plane::{
     PaneRect, Placement, PlaneCatalog, PlaneInfo, PlaneKind, PlaneSet, RecordingScanout, VideoPath,
     VideoPlaneError, VideoPlanePlan, VideoScanout,
 };
-pub use widgets::{field, muted_note, status_dot};
+pub use widgets::{
+    field, muted_note, operation_progress_text, operation_progress_value,
+    paint_operation_progress_badge, status_dot, OperationProgressView,
+};
 
 #[cfg(feature = "drm")]
 pub use drm::{

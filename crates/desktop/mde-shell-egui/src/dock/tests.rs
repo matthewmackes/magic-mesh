@@ -1,16 +1,16 @@
 use super::{
-    action_center_cell_id, clock_cell_id, clock_date_text, desktop_source_row_id,
-    desktop_source_toggle_id, focus_ring_rect, gutter_width, notification_rail,
-    notification_rail_with_sources, rail_more_id, session_entry_id, show_desktop_nub_id,
-    start_cell_id, status_detail_toggle_id, DesktopRailSource, DockState, SessionRailEntry,
-    Surface, CELL_W, DOCK_W, FOCUS_RING_W, ICON_LOGICAL, NOTIFICATION_RAIL_EXPANDED_H,
-    NOTIFICATION_RAIL_H,
+    action_center_cell_id, clock_cell_id, clock_date_text, focus_ring_rect,
+    notification_rail_with_sources, session_entry_id, show_desktop_nub_id, start_cell_id,
+    status_detail_toggle_id, taskbar_reveal, tray_overflow_id, tray_overflow_popup_id,
+    tray_overflow_row_id, DesktopRailSource, DockState, FileOperationProgress, SessionRailEntry,
+    Surface, CELL_W, DOCK_W, FOCUS_RING_W, NOTIFICATION_RAIL_H, TRAY_OVERFLOW_ROW_H,
+    TRAY_OVERFLOW_W,
 };
 use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegments};
 use mde_egui::Style;
 use mde_egui::{egui, Density};
-use mde_seat::PowerVerb;
+use mde_lighthouse_health::LighthouseHealth;
 use mde_theme::brand::icons::{icon_image, IconId};
 
 /// One grade row at a chosen host / score / pin / staleness (steady trend).
@@ -218,21 +218,6 @@ fn every_surface_glyph_rasterizes_nonempty() {
     }
 }
 
-/// Collect every text shape's `(angle, fallback_color)` in a frame's output,
-/// recursing into shape groups. The group labels are rotated (angle ≠ 0),
-/// tinted by their group accent; the clock lines are upright (angle 0).
-fn collect_text_shapes(shape: &egui::Shape, out: &mut Vec<(f32, egui::Color32)>) {
-    match shape {
-        egui::Shape::Text(t) => out.push((t.angle, t.fallback_color)),
-        egui::Shape::Vec(v) => {
-            for s in v {
-                collect_text_shapes(s, out);
-            }
-        }
-        _ => {}
-    }
-}
-
 // --- PICKER-1: the group table + rotated labels + hairline dividers -----------
 
 // ── VDOCK-1: the left vertical dock frame + auto-hide ─────────────────────
@@ -274,14 +259,6 @@ fn drive_vdock_with_sources(
     })
 }
 
-/// Drive `frames` quiet headless frames of the vertical dock on a 1280×800
-/// screen (the VDOCK-1 passthrough/frame tests' size).
-fn run_vdock(ctx: &egui::Context, state: &mut DockState, frames: usize) {
-    for _ in 0..frames {
-        drive_vdock(ctx, state, Vec::new(), egui::vec2(1280.0, 800.0));
-    }
-}
-
 #[test]
 fn the_vertical_dock_is_a_48px_full_height_column() {
     // Locks #2/#23 — the dock is one 48px-wide column, sharing the horizontal
@@ -298,24 +275,6 @@ fn the_vertical_dock_is_a_48px_full_height_column() {
 // ── DOCK-OVERLAP: the shell reserves a gutter so the dock never overlaps ──
 
 // ── VDOCK-2: the vertical app picker (top + middle zones) ─────────────────
-
-fn press_at(pos: egui::Pos2) -> egui::Event {
-    egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed: true,
-        modifiers: egui::Modifiers::default(),
-    }
-}
-
-fn release_at(pos: egui::Pos2) -> egui::Event {
-    egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed: false,
-        modifiers: egui::Modifiers::default(),
-    }
-}
 
 fn key(k: egui::Key) -> egui::Event {
     egui::Event::Key {
@@ -477,7 +436,7 @@ fn click_rail_cell(ctx: &egui::Context, s: &mut DockState, pos: egui::Pos2, sz: 
         modifiers: egui::Modifiers::default(),
     };
     drive_vdock(ctx, s, vec![egui::Event::PointerMoved(pos), press], sz);
-    drive_vdock(ctx, s, vec![release], sz);
+    drive_vdock(ctx, s, vec![egui::Event::PointerMoved(pos), release], sz);
 }
 
 #[test]
@@ -628,6 +587,107 @@ fn win10_hybrid_31_the_new_tray_cells_do_not_overlap_the_sessions_run() {
     }
 }
 
+#[test]
+fn win10_hybrid_31_tray_overflow_flyout_routes_status_segments() {
+    // The ▲ overflow is the Win10 hidden-icons affordance: it opens a compact
+    // status-segment flyout, every segment row is addressable, and row activation
+    // routes to that segment's owning full surface.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        0,
+        false,
+        Vec::new(),
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let overflow = ctx
+        .read_response(tray_overflow_id())
+        .expect("the tray overflow chevron is registered")
+        .rect;
+    click_rail_cell(&ctx, &mut s, overflow.center(), sz);
+    assert!(s.tray_overflow_open, "clicking ▲ opens the tray flyout");
+
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    let _popup = ctx
+        .read_response(tray_overflow_popup_id())
+        .expect("the tray overflow flyout is registered")
+        .rect;
+    for segment in status::StatusSegment::ALL {
+        assert!(
+            ctx.read_response(tray_overflow_row_id(segment)).is_some(),
+            "the tray flyout exposes the {segment:?} segment row"
+        );
+    }
+
+    let popup_h = status::StatusSegment::ALL.len() as f32 * TRAY_OVERFLOW_ROW_H + Style::SP_S;
+    let popup_top = overflow.top() - Style::SP_XS - popup_h;
+    let alerts_index = status::StatusSegment::ALL
+        .iter()
+        .position(|segment| *segment == status::StatusSegment::Alerts)
+        .expect("Alerts segment is part of the tray overflow");
+    let alerts = egui::pos2(
+        overflow.left() + Style::SP_XS + (TRAY_OVERFLOW_W - Style::SP_S) / 2.0,
+        popup_top
+            + Style::SP_XS / 2.0
+            + alerts_index as f32 * TRAY_OVERFLOW_ROW_H
+            + TRAY_OVERFLOW_ROW_H / 2.0,
+    );
+    assert!(
+        alerts.y < overflow.top(),
+        "the computed Alerts row click target sits above the tray chevron"
+    );
+    drive_vdock(&ctx, &mut s, vec![egui::Event::PointerMoved(alerts)], sz);
+    drive_vdock(&ctx, &mut s, vec![egui::Event::PointerMoved(alerts)], sz);
+    assert!(
+        ctx.read_response(tray_overflow_row_id(status::StatusSegment::Alerts))
+            .expect("Alerts row still registered")
+            .hovered(),
+        "the computed screen-space Alerts row target hovers the row"
+    );
+    click_rail_cell(&ctx, &mut s, alerts, sz);
+    assert_eq!(
+        s.active,
+        Surface::Chat,
+        "the Alerts overflow row routes to the Chat notification feed"
+    );
+    assert!(
+        !s.tray_overflow_open,
+        "routing from a tray overflow row closes the flyout"
+    );
+}
+
+#[test]
+fn win10_hybrid_31_autohide_reveal_contract_is_hot_edge_or_latched() {
+    // The auto-hidden taskbar should not pop up merely because the pointer enters
+    // the full 48px band; it reveals from the thin hot edge, then stays up while
+    // latched and the pointer rides the already-shown bar.
+    assert!(
+        taskbar_reveal(false, false, false),
+        "a docked taskbar is always visible"
+    );
+    assert!(
+        !taskbar_reveal(true, false, false),
+        "an auto-hidden taskbar stays hidden away from the hot edge"
+    );
+    assert!(
+        taskbar_reveal(true, true, false),
+        "the bottom hot edge summons an auto-hidden taskbar"
+    );
+    assert!(
+        taskbar_reveal(true, false, true),
+        "a revealed auto-hidden taskbar remains up while latched"
+    );
+}
+
 // ── WIN7-DESKTOP-1 regression fix (post-WIN7-SHOT-1) ────────────────────
 // Every rail test above this point — including WIN7-1's own two — asserts
 // cells RELATIVE to each other (left-to-right order, same-row sharing via
@@ -644,6 +704,20 @@ fn win7_desktop_1_regression_the_taskbar_anchors_to_the_screens_true_bottom_edge
     Style::install(&ctx);
     let mut s = DockState::default();
     s.toggle();
+    s.set_status_inputs(
+        MeshSummary {
+            peers_total: 3,
+            peers_online: 2,
+            health: LighthouseHealth::Degraded,
+            seen: true,
+        },
+        None,
+        0,
+        false,
+        Vec::new(),
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
     let sz = egui::vec2(1280.0, 800.0);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -754,6 +828,20 @@ fn win7_7_the_taskbar_itself_exports_a_toolbar_landmark() {
     Style::install(&ctx);
     let mut s = DockState::default();
     s.toggle();
+    s.set_status_inputs(
+        MeshSummary {
+            peers_total: 3,
+            peers_online: 2,
+            health: LighthouseHealth::Degraded,
+            seen: true,
+        },
+        None,
+        0,
+        false,
+        Vec::new(),
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
     let sz = egui::vec2(1280.0, 800.0);
     drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle (this file's own 2-frame convention)
     let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -802,6 +890,128 @@ fn win7_7_every_primary_taskbar_cell_exports_a_labelled_button_when_sessions_are
             "{label}'s accesskit role"
         );
     }
+}
+
+#[test]
+fn file_operation_progress_opens_inside_the_bottom_rail_and_routes_to_files() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.set_file_operation_progress(Some(FileOperationProgress::new(
+        2,
+        Some(0.5),
+        "2 transfers",
+    )));
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
+    let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let rect = ctx
+        .read_response(status::segment_pip_id(
+            status::StatusSegment::FileOperations,
+        ))
+        .expect("file-operation status segment renders in the bottom rail")
+        .rect;
+    assert!(
+        rect.bottom() > sz.y / 2.0,
+        "file-operation status must live in the bottom navigation bar"
+    );
+    let nodes = accesskit_nodes(&out);
+    let live = nodes
+        .iter()
+        .map(|(_, n)| n)
+        .find(|n| n.label() == Some("Notification status"))
+        .expect("the progress segment is part of notification status");
+    assert!(
+        live.value()
+            .is_some_and(|value| value.contains("File operations active: 2 active")),
+        "the notification live region names active file operations"
+    );
+    let progress = nodes
+        .iter()
+        .map(|(_, n)| n)
+        .find(|n| n.label() == Some("File operations status"))
+        .expect("the progress segment exports accesskit");
+    assert_eq!(progress.role(), egui::accesskit::Role::Button);
+    assert_eq!(
+        progress.value(),
+        Some("File operations active: 2 active file operation(s), 50% average progress")
+    );
+
+    click_rail_cell(&ctx, &mut s, rect.center(), sz);
+    assert_eq!(
+        s.active(),
+        Surface::Files,
+        "clicking global file progress opens Files"
+    );
+    assert!(
+        s.take_file_operation_progress_request(),
+        "clicking global file progress must request the Files Transfers tab"
+    );
+    assert!(
+        !s.take_file_operation_progress_request(),
+        "the file-progress request drains once"
+    );
+}
+
+#[test]
+fn file_operation_progress_renders_in_the_status_panel_and_routes_to_transfers() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    s.open_status_panel_for_test();
+    s.set_file_operation_progress(Some(FileOperationProgress::new(
+        3,
+        Some(0.25),
+        "3 file operations",
+    )));
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let row = ctx
+        .read_response(status::status_panel_file_operations_id())
+        .expect("active file operations render inside the expanded status panel")
+        .rect;
+    let panel = ctx
+        .read_response(status::status_panel_id())
+        .expect("status panel is mounted")
+        .rect;
+    assert!(
+        panel.contains_rect(row),
+        "file-operation status row must stay inside the notification status panel"
+    );
+    let nodes = accesskit_nodes(&out);
+    let row_node = nodes
+        .iter()
+        .map(|(_, n)| n)
+        .find(|n| {
+            n.label() == Some("File operations status")
+                && n.value() == Some("3 active file operation(s), 25% average progress")
+        })
+        .expect("status panel file-operation row exports accesskit");
+    assert_eq!(
+        row_node.value(),
+        Some("3 active file operation(s), 25% average progress")
+    );
+
+    click_rail_cell(&ctx, &mut s, row.center(), sz);
+    assert_eq!(
+        s.active(),
+        Surface::Files,
+        "clicking the status-panel file-operation row opens Files"
+    );
+    assert!(
+        s.take_file_operation_progress_request(),
+        "panel activation requests the Files Transfers tab"
+    );
+    assert!(
+        !s.status_panel_open,
+        "routing from the status-panel file-operation row closes the panel"
+    );
 }
 
 #[test]
@@ -878,6 +1088,20 @@ fn win7_7_the_pin_and_notification_toggle_report_their_state_via_accesskit_value
     Style::install(&ctx);
     let mut s = DockState::default();
     s.toggle();
+    s.set_status_inputs(
+        MeshSummary {
+            peers_total: 3,
+            peers_online: 2,
+            health: LighthouseHealth::Degraded,
+            seen: true,
+        },
+        None,
+        0,
+        false,
+        Vec::new(),
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
     let sz = egui::vec2(1280.0, 800.0);
     drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
     let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -893,7 +1117,10 @@ fn win7_7_the_pin_and_notification_toggle_report_their_state_via_accesskit_value
         .map(|(_, n)| n)
         .find(|n| n.label() == Some("Notification panel"))
         .expect("the notification toggle exports an accesskit node");
-    assert_eq!(toggle.value(), Some("Collapsed"));
+    assert_eq!(
+        toggle.value(),
+        Some("Collapsed; 2/3 peers online; mesh degraded")
+    );
 
     // Pin it, and open the notification panel — the SAME nodes must now
     // report the opposite state, not a value frozen at first paint.
@@ -912,7 +1139,10 @@ fn win7_7_the_pin_and_notification_toggle_report_their_state_via_accesskit_value
         .map(|(_, n)| n)
         .find(|n| n.label() == Some("Notification panel"))
         .expect("the notification toggle still exports an accesskit node");
-    assert_eq!(toggle2.value(), Some("Expanded"));
+    assert_eq!(
+        toggle2.value(),
+        Some("Expanded; 2/3 peers online; mesh degraded")
+    );
 }
 
 #[test]
@@ -1085,9 +1315,9 @@ fn the_clock_cell_shows_the_live_time_and_routes_to_timers() {
 #[test]
 fn the_status_segment_pips_route_to_their_surfaces() {
     // NOTIF-3 wired end-to-end: the bottom taskbar's status pips route
-    // `DockState::active` (lock #15). Each of the four segments carries its own
-    // stable pip id and its own route — Device/Power → System, Mesh → MeshView,
-    // Alerts → Chat (`status::StatusSegment::route`). Mount the live rail, read
+    // `DockState::active` (lock #15). Each segment carries its own stable pip id
+    // and its own route — Device/Power → System, Mesh → MeshView,
+    // FileOperations → Files, Alerts → Chat (`status::StatusSegment::route`). Mount the live rail, read
     // each pip by its id, and prove the click lands on the right surface,
     // resetting to the Workbench between pips so every route is proven
     // independently rather than by luck of the prior click.
@@ -1116,6 +1346,7 @@ fn the_status_segment_pips_route_to_their_surfaces() {
         (StatusSegment::Device, Surface::System),
         (StatusSegment::Mesh, Surface::MeshView),
         (StatusSegment::Power, Surface::System),
+        (StatusSegment::FileOperations, Surface::Files),
         (StatusSegment::Alerts, Surface::Chat),
     ] {
         let center = ctx
@@ -1129,6 +1360,12 @@ fn the_status_segment_pips_route_to_their_surfaces() {
             s.active, expected,
             "clicking the {segment:?} pip routes to {expected:?} (lock #15)"
         );
+        if segment == StatusSegment::FileOperations {
+            assert!(
+                s.take_file_operation_progress_request(),
+                "FileOperations pip also requests the Files Transfers tab"
+            );
+        }
     }
 }
 

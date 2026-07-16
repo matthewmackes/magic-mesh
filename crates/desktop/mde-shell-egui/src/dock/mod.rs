@@ -46,6 +46,8 @@ use mde_theme::brand::icons::{icon_image, IconId};
 use crate::chrome::{MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegment, StatusSegments};
 
+pub type FileOperationProgress = status::FileOperationStatus;
+
 /// Which surface fills the shell body.
 ///
 /// [`Workbench`](Self::Workbench) is the default: the shell opens on the
@@ -341,10 +343,6 @@ pub fn icon_texture(
 /// module, like [`TASKBAR_H`].)
 pub const DOCK_W: f32 = CELL_W;
 
-/// The egui memory key for the dock's slide animation (the Motion latch that
-/// eases the reveal 0↔1). Private to the dock.
-const DOCK_SLIDE_KEY: &str = "vdock-slide";
-
 /// The egui memory key for NOTIF-4's right-side status detail panel.
 const STATUS_PANEL_KEY: &str = "vdock-status-panel";
 
@@ -420,9 +418,14 @@ pub struct DockState {
     /// shell drains it and focuses the Desktop face for that broker-visible
     /// session without inventing a second session store.
     desktop_session_focus: Option<String>,
-    /// TRANSFERS-9 — the Files surface's in-flight transfer count, mirrored from
-    /// the embedded Files ledger each frame. Zero paints no badge.
-    transfer_active_count: usize,
+    /// FILE-STATUS-1 — the Files surface's active local/transfer operation summary,
+    /// mirrored each frame so the bottom taskbar can show one reusable progress
+    /// status area for file work across the platform.
+    file_operation_progress: Option<FileOperationProgress>,
+    /// FILE-STATUS-2 — one-shot activation of the shared file-operation progress
+    /// cell. The dock does not know the Files surface model; the shell drains this
+    /// and opens Files on its Transfers tab.
+    file_operation_progress_request: bool,
     /// NAVBAR-8 — the shell-wide interaction density mirrored from the
     /// formfactor/control-surface path. Mouse keeps the compact icon rail; Touch
     /// expands the rail into the 48px labelled variant.
@@ -572,6 +575,7 @@ impl DockState {
 
     /// Whether the dock should be on screen this frame: revealed **or** pinned
     /// (the pin holds it open, lock #9).
+    #[cfg(test)]
     pub const fn shown(&self) -> bool {
         self.revealed || self.pinned
     }
@@ -616,10 +620,11 @@ impl DockState {
         self.active = surface;
     }
 
-    /// Mirror the Files transfer ledger's active count into the dock. The Files
-    /// surface owns the ledger read; the dock only paints the count.
-    pub const fn set_transfer_active_count(&mut self, count: usize) {
-        self.transfer_active_count = count;
+    /// Mirror active file operation progress into the dock. The Files surface owns
+    /// the ledger/op reads; the dock only paints this bounded status projection.
+    pub fn set_file_operation_progress(&mut self, progress: Option<FileOperationProgress>) {
+        self.file_operation_progress = progress;
+        self.status.segments.file_operations = self.file_operation_progress.clone();
     }
 
     /// Mirror the shell-wide density into the dock. This is deliberately fed by
@@ -633,6 +638,7 @@ impl DockState {
     /// this from its persisted appearance config). When on, the bar reserves no
     /// bottom strut and reveals as a floating overlay on a bottom-edge hover (the B3
     /// reveal). Default off — the bar stays docked and reserves its strut.
+    #[cfg(test)]
     pub const fn set_taskbar_autohide(&mut self, on: bool) {
         self.taskbar_autohide = on;
     }
@@ -674,8 +680,9 @@ impl DockState {
         session_active: bool,
         sessions: Vec<SessionRailEntry>,
         grades: NodeGrades,
-        segments: StatusSegments,
+        mut segments: StatusSegments,
     ) {
+        segments.file_operations = self.file_operation_progress.clone();
         self.status = StatusInputs {
             mesh,
             unread,
@@ -746,13 +753,15 @@ impl DockState {
     pub fn take_desktop_session_focus(&mut self) -> Option<String> {
         self.desktop_session_focus.take()
     }
-}
 
-/// Render the bottom **taskbar** (WIN7-1) — test-only convenience over
-/// [`notification_rail_with_sources`] for callers with no live Desktop sources.
-#[cfg(test)]
-pub fn notification_rail(ctx: &egui::Context, state: &mut DockState) -> bool {
-    notification_rail_with_sources(ctx, state, &[])
+    /// Drain the shared file-operation progress activation (FILE-STATUS-2). Kept
+    /// separate from `active == Files` so ordinary Files navigation does not force
+    /// the Transfers tab.
+    pub const fn take_file_operation_progress_request(&mut self) -> bool {
+        let requested = self.file_operation_progress_request;
+        self.file_operation_progress_request = false;
+        requested
+    }
 }
 
 /// Render the shell's full-width **bottom taskbar** (design
@@ -1050,7 +1059,6 @@ pub fn notification_rail_with_sources(
             if status_detail_toggle(ui, cell(tray_x), state) {
                 clicked = true;
             }
-
             let mut active = state.active;
             let out = status::notification_rail(
                 ui,
@@ -1066,6 +1074,9 @@ pub fn notification_rail_with_sources(
                 clicked = true;
             }
             if out.routed {
+                if out.routed_segment == Some(StatusSegment::FileOperations) {
+                    state.file_operation_progress_request = true;
+                }
                 clicked = true;
             }
 
@@ -1080,6 +1091,7 @@ pub fn notification_rail_with_sources(
                 let panel_out = status::status_panel(
                     &panel_ui,
                     &state.status.grades,
+                    &state.status.segments,
                     state.status.seat.as_ref(),
                     panel_rect,
                 );
@@ -1090,6 +1102,12 @@ pub fn notification_rail_with_sources(
                 }
                 if let Some(host) = panel_out.node_focus {
                     state.request_node_focus(&host);
+                    state.status_panel_open = false;
+                    clicked = true;
+                }
+                if panel_out.routed_segment == Some(StatusSegment::FileOperations) {
+                    state.active = Surface::Files;
+                    state.file_operation_progress_request = true;
                     state.status_panel_open = false;
                     clicked = true;
                 }
@@ -1414,6 +1432,22 @@ fn status_detail_toggle_id() -> egui::Id {
     egui::Id::new(("bottom-rail-icon", IconId::ChevronUp.name()))
 }
 
+fn mesh_status_value(mesh: &MeshSummary, selected: bool) -> String {
+    let panel_state = if selected { "Expanded" } else { "Collapsed" };
+    if !mesh.seen {
+        return format!("{panel_state}; mesh status not seen");
+    }
+    let health = match mesh.health {
+        mde_lighthouse_health::LighthouseHealth::AllHealthy => "mesh healthy",
+        mde_lighthouse_health::LighthouseHealth::Degraded => "mesh degraded",
+        mde_lighthouse_health::LighthouseHealth::None => "no lighthouse status",
+    };
+    format!(
+        "{panel_state}; {}/{} peers online; {health}",
+        mesh.peers_online, mesh.peers_total
+    )
+}
+
 fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(rect, status_detail_toggle_id(), egui::Sense::click());
     let selected = state.status_panel_open;
@@ -1447,7 +1481,7 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
         ui.ctx(),
         status_detail_toggle_id(),
         "Notification panel",
-        if selected { "Expanded" } else { "Collapsed" },
+        mesh_status_value(&state.status.mesh, selected),
         rect,
     );
     if resp.clicked() {
@@ -1478,42 +1512,18 @@ fn tray_overflow_row_id(segment: StatusSegment) -> egui::Id {
     egui::Id::new(("bottom-rail-tray-overflow-row", segment))
 }
 
-/// The tray-overflow flyout row's human label per segment. `status.rs`'s own
-/// `segment_label` + `route` maps are private and out of this lane's edit scope, so
-/// this restates the tiny (four-arm) name + route folds locally rather than widening
-/// `status.rs`'s surface — the same duplicate-a-small-private-map pattern the picker
-/// deletions leave elsewhere.
 const fn tray_segment_label(segment: StatusSegment) -> &'static str {
-    match segment {
-        StatusSegment::Device => "Device",
-        StatusSegment::Mesh => "Mesh",
-        StatusSegment::Power => "Power",
-        StatusSegment::Alerts => "Alerts",
-    }
+    status::segment_label(segment)
 }
 
-/// The surface a tray-overflow row routes to (mirrors `status.rs`'s private
-/// `StatusSegment::route`; see [`tray_segment_label`]).
+/// The surface a tray-overflow row routes to (mirrors `status.rs`'s segment
+/// routing; see [`tray_segment_label`]).
 const fn tray_segment_route(segment: StatusSegment) -> Surface {
     match segment {
         StatusSegment::Device | StatusSegment::Power => Surface::System,
         StatusSegment::Mesh => Surface::MeshView,
+        StatusSegment::FileOperations => Surface::Files,
         StatusSegment::Alerts => Surface::Chat,
-    }
-}
-
-/// This segment's latest rollup out of the public [`StatusSegments`] fields — the
-/// severity source for the row's dot (the `StatusSegments::get` fold is private, so
-/// this restates it over the public fields).
-fn tray_segment_rollup(
-    segments: &StatusSegments,
-    segment: StatusSegment,
-) -> Option<&status::SegmentRollup> {
-    match segment {
-        StatusSegment::Device => segments.device.as_ref(),
-        StatusSegment::Mesh => segments.mesh.as_ref(),
-        StatusSegment::Power => segments.power.as_ref(),
-        StatusSegment::Alerts => segments.alerts.as_ref(),
     }
 }
 
@@ -1574,16 +1584,21 @@ fn tray_overflow_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
 fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState) -> bool {
     let rows = StatusSegment::ALL.len();
     let popup_h = rows as f32 * TRAY_OVERFLOW_ROW_H + Style::SP_S;
+    let popup_pos = egui::pos2(anchor.left(), anchor.top() - Style::SP_XS);
+    let popup_screen_rect = egui::Rect::from_min_size(
+        egui::pos2(popup_pos.x, popup_pos.y - popup_h),
+        egui::vec2(TRAY_OVERFLOW_W, popup_h),
+    );
     let segments = state.status.segments.clone();
     let inner = egui::Area::new(tray_overflow_popup_id())
         .order(egui::Order::Foreground)
         .pivot(egui::Align2::LEFT_BOTTOM)
-        .fixed_pos(egui::pos2(anchor.left(), anchor.top() - Style::SP_XS))
+        .fixed_pos(popup_pos)
         .show(ui.ctx(), |ui| {
             let (area, _) =
                 ui.allocate_exact_size(egui::vec2(TRAY_OVERFLOW_W, popup_h), egui::Sense::hover());
             let bg = ui.painter().add(egui::Shape::Noop);
-            let mut routed: Option<Surface> = None;
+            let mut routed: Option<StatusSegment> = None;
             let mut y = area.top() + Style::SP_XS / 2.0;
             for segment in StatusSegment::ALL {
                 let row = egui::Rect::from_min_size(
@@ -1591,7 +1606,7 @@ fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState
                     egui::vec2(TRAY_OVERFLOW_W - Style::SP_S, TRAY_OVERFLOW_ROW_H),
                 );
                 if tray_overflow_row(ui, row, segment, &segments) {
-                    routed = Some(tray_segment_route(segment));
+                    routed = Some(segment);
                 }
                 y += TRAY_OVERFLOW_ROW_H;
             }
@@ -1607,12 +1622,20 @@ fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState
             );
             routed
         });
-    if let Some(surface) = inner.inner {
-        state.active = surface;
+    if let Some(segment) = inner.inner {
+        state.active = tray_segment_route(segment);
+        if segment == StatusSegment::FileOperations {
+            state.file_operation_progress_request = true;
+        }
         state.tray_overflow_open = false;
         return true;
     }
-    if inner.response.clicked_elsewhere() {
+    let pointer_inside_popup = ui.ctx().input(|i| {
+        i.pointer
+            .latest_pos()
+            .is_some_and(|p| popup_screen_rect.contains(p))
+    });
+    if inner.response.clicked_elsewhere() && !pointer_inside_popup {
         state.tray_overflow_open = false;
         return true;
     }
@@ -1633,9 +1656,12 @@ fn tray_overflow_row(
     if resp.hovered() {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
-    let rollup = tray_segment_rollup(segments, segment);
     let dot_c = egui::pos2(rect.left() + Style::SP_S, rect.center().y);
-    painter.circle_filled(dot_c, Style::SP_XS, status::severity_color(rollup));
+    painter.circle_filled(
+        dot_c,
+        Style::SP_XS,
+        status::segment_color(segment, segments),
+    );
     painter.text(
         egui::pos2(dot_c.x + Style::SP_S, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1652,7 +1678,7 @@ fn tray_overflow_row(
         ui.ctx(),
         tray_overflow_row_id(segment),
         tray_segment_label(segment),
-        status::severity_label(rollup),
+        status::segment_accessibility_value(segment, segments),
         rect,
     );
     response_activated(ui, &resp)

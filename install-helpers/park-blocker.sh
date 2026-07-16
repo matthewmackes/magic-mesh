@@ -14,7 +14,7 @@
 #   e.g. ./install-helpers/park-blocker.sh CONNECT-3 "needs a live lighthouse to verify"
 #
 # Overridable for tests:
-#   MCNF_WORKLIST  (default docs/WORKLIST.md)   MCNF_NEEDS (default docs/NEEDS-OPERATOR.md)
+#   MCNF_WORKLIST  (default docs/platform/WORKLIST.md)   MCNF_NEEDS (default docs/NEEDS-OPERATOR.md)
 set -uo pipefail
 
 ID="${1:-}"
@@ -25,7 +25,7 @@ fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
 NEEDS="${MCNF_NEEDS:-$ROOT/docs/NEEDS-OPERATOR.md}"
 STAMP="$(date -u +%Y-%m-%d)"
 

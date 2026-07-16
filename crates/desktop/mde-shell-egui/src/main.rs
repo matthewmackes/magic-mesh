@@ -33,6 +33,7 @@ mod discovery;
 mod dock;
 mod explorer;
 mod formfactor;
+mod front_door;
 mod host_mirror;
 mod hotkeys;
 mod iac;
@@ -71,6 +72,7 @@ mod workbench;
 
 use std::time::{Duration, Instant};
 
+use mde_egui::search_omnibox::SearchItem;
 use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 use mde_web_preview_client::MediaTransportAction;
 
@@ -82,7 +84,7 @@ use mde_bookmarks_egui::{
 };
 use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
 use mde_files::editor_open::EditorLaunchWatch;
-use mde_files_egui::{files_panel, FileBrowser};
+use mde_files_egui::{files_panel, model::SurfaceTab, FileBrowser};
 use mde_media_egui::{
     media_header, media_panel, media_pump, real_media, MediaSurface, VideoTextureCache,
 };
@@ -210,6 +212,10 @@ struct Shell {
     /// the shell drains it, mirrored open-state into [`Self::console`], and
     /// mounts the panel each frame (`start_menu::start_menu_panel`).
     start_menu: start_menu::StartMenuState,
+    /// SEARCH-omnibox — the shell-owned focused entry that ranks apps, current
+    /// Files rows, discovered mesh units, Browser bookmarks/history, and a real
+    /// Browser web-search action through the shared ranker.
+    front_door: front_door::FrontDoorState,
     /// CONSOLE-1 — the Console front door (`docs/design/console-frontdoor.md`):
     /// the Win10-style taxonomy of operational entries. Pre-WIN7-2 this was
     /// its own standalone panel the dock's Start cell toggled directly; it is
@@ -320,6 +326,10 @@ struct Shell {
     /// until the gated `live-helper` spawn attaches one; the panel shows its honest
     /// gated EmptyState until then, exactly like the VDI Desktop surface.
     web: web::WebState,
+    /// Browser-owned freedesktop MPRIS adapter. It exposes the Browser's retained
+    /// now-playing Bus mirror as `org.mpris.MediaPlayer2.mde-browser` and routes
+    /// methods back through the existing Browser media-control Bus action path.
+    _browser_mpris: web::BrowserMprisHandle,
     /// The Bookmarks manager surface (BOOKMARKS-4), mounted in-shell so Browser
     /// users can reach folders/tags/search/dead-link workflows without leaving the
     /// platform chrome. Persistence and mesh sync remain owned by the bookmarks
@@ -422,6 +432,7 @@ impl Shell {
             local_host: local_hostname(),
             vdock: dock::DockState::default(),
             start_menu: start_menu::StartMenuState::default(),
+            front_door: front_door::FrontDoorState::default(),
             // WIN7-8 (lock #21) — `for_shell` (not bare `default`) so the real
             // shell also gets mesh-wide Custom-entry sync; see `console.rs`'s
             // `custom_sync` field doc for why the two constructors are split.
@@ -445,6 +456,7 @@ impl Shell {
             formfactor: formfactor::FormfactorPublisher::default(),
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
+            _browser_mpris: web::spawn_browser_mpris(),
             bookmarks: real_manager(),
             bookmarks_bus: BookmarksBus::default(),
             terminal: real_terminal(),
@@ -498,25 +510,29 @@ impl Shell {
                 self.nav.expanded = true;
                 self.nav.surface = Surface::System;
             }
+            HotkeyAction::OpenOmnibox => {
+                self.start_menu.close();
+                self.front_door.open();
+            }
             HotkeyAction::MediaPlayPause => {
                 self.web
-                    .active_tab_media_transport(MediaTransportAction::PlayPause);
+                    .selected_media_transport(MediaTransportAction::PlayPause);
             }
             HotkeyAction::MediaPause => {
                 self.web
-                    .active_tab_media_transport(MediaTransportAction::Pause);
+                    .selected_media_transport(MediaTransportAction::Pause);
             }
             HotkeyAction::MediaStop => {
                 self.web
-                    .active_tab_media_transport(MediaTransportAction::Stop);
+                    .selected_media_transport(MediaTransportAction::Stop);
             }
             HotkeyAction::MediaNext => {
                 self.web
-                    .active_tab_media_transport(MediaTransportAction::Next);
+                    .selected_media_transport(MediaTransportAction::Next);
             }
             HotkeyAction::MediaPrevious => {
                 self.web
-                    .active_tab_media_transport(MediaTransportAction::Previous);
+                    .selected_media_transport(MediaTransportAction::Previous);
             }
             HotkeyAction::Lock => {
                 // CURTAIN-1 — Super+L drops the lock curtain (design lock 2).
@@ -1279,12 +1295,17 @@ impl Shell {
             self.start_menu.toggle();
         }
 
+        // SEARCH-omnibox — mounted after hotkey dispatch so Super+Space opens and
+        // focuses it in the same frame, above the active surface and taskbar.
+        self.mount_front_door(ctx);
+
         // The KIRON alert/OSD bridge (KIRON-2) — driven late so its centered OSD
         // pill floats (Foreground order) above the chrome, the surface, and any
         // fullscreen guest. Refresh the suppression posture (lock 10) first: a
         // fullscreen VDI guest in front is a per-session focus mute, and the seat's
         // audio-mute hushes a non-critical's sound. DND is owned by Chat's
-        // notification lane and mutes ambient pushes.
+        // notification lane and mutes non-critical ambient pushes; Critical alerts
+        // still break through.
         let focus_mute =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
         let muted = self.system.snapshot().is_some_and(seat_master_muted);
@@ -1331,17 +1352,14 @@ impl Shell {
         // NOTIF-6 — no-text critical edge cue. Drawn after the curtain so an
         // own-seat critical can still light the edges with the dock hidden/covered;
         // the cue only acknowledges itself and never routes past the lock.
-        self.critical_edge.update(
-            self.notify_status.segments(),
-            &self.local_host,
-            dnd || focus_mute,
-        );
+        self.critical_edge
+            .update(self.notify_status.segments(), &self.local_host);
         self.critical_edge.show(ctx);
 
-        // WIN7-6 (win7-desktop-survey lock #9) — a Critical firing (or an
-        // existing one unmuting into view) auto-closes the Start Menu if it's
-        // open, so the cue gets a clear field: a deliberate STRENGTHENING of
-        // the cue's own "always wins" posture above, not a weakening of
+        // WIN7-6 (win7-desktop-survey lock #9) — a Critical firing auto-closes
+        // the Start Menu if it's open, so the cue gets a clear field: a
+        // deliberate STRENGTHENING of the cue's own "always wins" posture above,
+        // not a weakening of
         // anything WIN7-2 built. Edge-triggered off `take_became_visible` — a
         // one-shot hidden->visible latch, NOT a per-frame "is it visible
         // right now" poll — so this closes an open Start Menu exactly once
@@ -1377,7 +1395,10 @@ impl Shell {
         // straight back OUT so a picker-cell click routes the body.
         self.vdock.set_active(self.nav.surface);
         self.vdock
-            .set_transfer_active_count(self.files.transfers_counts().active);
+            .set_file_operation_progress(shell_file_operation_progress(
+                self.files.operation_progress_summary(),
+                self.web.operation_progress_summary(),
+            ));
         // WIN7-2 — mirror the Start Menu's open state in first, so the Start
         // cell's active tint follows the real panel (the set_active idiom).
         self.vdock.set_start_menu_open(self.start_menu.is_open());
@@ -1409,6 +1430,9 @@ impl Shell {
         let bar_clicked =
             dock::notification_rail_with_sources(ctx, &mut self.vdock, &desktop_sources);
         self.nav.surface = self.vdock.active();
+        if self.vdock.take_file_operation_progress_request() {
+            route_file_operation_progress_request(&mut self.files, &mut self.nav);
+        }
         if let Some(id) = self.vdock.take_desktop_source_pick() {
             if let Some(request) = self.chooser.connect_source_id(&id) {
                 self.vdi
@@ -1579,6 +1603,99 @@ impl Shell {
         }
     }
 
+    fn front_door_items(&self) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
+        let mut items = front_door::app_search_items();
+        let mut rank = items.len();
+
+        items.extend(
+            self.files
+                .active_search_omnibox_items()
+                .into_iter()
+                .map(|item| {
+                    let mapped = SearchItem::new(
+                        item.domain,
+                        item.title,
+                        item.target,
+                        front_door::FrontDoorTarget::File(item.payload),
+                    )
+                    .with_terms(item.terms)
+                    .with_source_rank(rank);
+                    rank += 1;
+                    mapped
+                }),
+        );
+
+        items.extend(
+            self.explorer
+                .search_omnibox_items()
+                .into_iter()
+                .map(|item| {
+                    let mapped = SearchItem::new(
+                        item.domain,
+                        item.title,
+                        item.target,
+                        front_door::FrontDoorTarget::Mesh(item.payload),
+                    )
+                    .with_terms(item.terms)
+                    .with_source_rank(rank);
+                    rank += 1;
+                    mapped
+                }),
+        );
+
+        items.extend(
+            self.web
+                .search_omnibox_items(self.front_door.query())
+                .into_iter()
+                .map(|item| {
+                    let mapped = SearchItem::new(
+                        item.domain,
+                        item.title,
+                        item.target,
+                        front_door::FrontDoorTarget::Browser(item.payload),
+                    )
+                    .with_terms(item.terms)
+                    .with_source_rank(rank);
+                    rank += 1;
+                    mapped
+                }),
+        );
+
+        items
+    }
+
+    fn activate_front_door_target(&mut self, target: front_door::FrontDoorTarget) {
+        self.nav.expanded = true;
+        match target {
+            front_door::FrontDoorTarget::App(surface) => {
+                self.nav.surface = surface;
+            }
+            front_door::FrontDoorTarget::File(target) => {
+                self.nav.surface = Surface::Files;
+                self.files.open_search_omnibox_target(&target);
+            }
+            front_door::FrontDoorTarget::Mesh(id) => {
+                self.nav.surface = Surface::Explorer;
+                self.explorer.open_search_omnibox_target(&id);
+            }
+            front_door::FrontDoorTarget::Browser(target) => {
+                self.nav.surface = Surface::Browser;
+                self.web.open_search_omnibox_target(&target);
+            }
+        }
+    }
+
+    fn mount_front_door(&mut self, ctx: &egui::Context) {
+        if self.curtain.engaged() {
+            self.front_door.close();
+            return;
+        }
+        let items = self.front_door_items();
+        if let Some(target) = front_door::front_door_panel(ctx, &mut self.front_door, items) {
+            self.activate_front_door_target(target);
+        }
+    }
+
     /// The central view: the session↔body cross-fade through the expand
     /// transition. While the settled curtain fully covers the seat (CURTAIN-1,
     /// lock 10) it mounts NOTHING — an opaque sheet hides it anyway, and
@@ -1685,6 +1802,21 @@ fn reserved_taskbar_strut(full_screen_remote_desktop: bool, vdock: &dock::DockSt
     }
 }
 
+fn shell_file_operation_progress(
+    files: Option<mde_files_egui::model::OperationProgressSummary>,
+    browser: Option<mde_files_egui::model::OperationProgressSummary>,
+) -> Option<dock::FileOperationProgress> {
+    files.or(browser).map(|summary| {
+        dock::FileOperationProgress::new(summary.active, summary.fraction, summary.label)
+    })
+}
+
+fn route_file_operation_progress_request(files: &mut FileBrowser, nav: &mut Nav) {
+    files.set_surface_tab(SurfaceTab::Transfers);
+    nav.surface = Surface::Files;
+    nav.expanded = true;
+}
+
 /// The seat's master-output mute, if the mixer probe answered — gates a
 /// non-critical chyron's notification sound (KIRON lock 8). No mixer backend reads
 /// as *not* muted (an absent probe never silences an alert).
@@ -1770,9 +1902,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         chat, console, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
-        media_header, media_panel, real_editor, real_media, real_terminal, reserved_dock_gutter,
-        reserved_taskbar_strut, screenshot, splash, start_menu, status, terminal_panel, Boot, Nav,
-        Plane, Shell, Surface, VideoTextureCache,
+        front_door, media_header, media_panel, real_editor, real_media, real_terminal,
+        reserved_dock_gutter, reserved_taskbar_strut, route_file_operation_progress_request,
+        screenshot, shell_file_operation_progress, splash, start_menu, status, terminal_panel,
+        Boot, Nav, Plane, Shell, Surface, VideoTextureCache,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -1782,7 +1915,63 @@ mod tests {
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
-    use std::path::Path;
+    use mde_files::backend::{
+        AuditEntry, Backend, BackendError, ConflictPolicy, Destination, SendMode,
+    };
+    use mde_files::fileops::{FakeFileOps, FileOps};
+    use mde_files::model::{FileRow, Mime, Peer, SelfNode};
+    use mde_seat::HotkeyAction;
+    use std::path::{Path, PathBuf};
+
+    struct ShellFilesBackend {
+        rows: Vec<FileRow>,
+    }
+
+    impl ShellFilesBackend {
+        fn new(rows: Vec<FileRow>) -> Self {
+            Self { rows }
+        }
+    }
+
+    impl Backend for ShellFilesBackend {
+        fn self_node(&self) -> SelfNode {
+            SelfNode {
+                host: "shell-test".to_owned(),
+                ..SelfNode::default()
+            }
+        }
+
+        fn peers(&self) -> Vec<Peer> {
+            Vec::new()
+        }
+
+        fn list(&self, _path: &str) -> Vec<FileRow> {
+            self.rows.clone()
+        }
+
+        fn audit_log(&self) -> Vec<AuditEntry> {
+            Vec::new()
+        }
+
+        fn send_to(
+            &mut self,
+            _sources: &[PathBuf],
+            _destination: Destination,
+            _mode: SendMode,
+            _conflict: ConflictPolicy,
+        ) -> Result<mde_files::backend::OpId, BackendError> {
+            Err(BackendError::Rejected(
+                "send-to is not used by this shell fixture".to_owned(),
+            ))
+        }
+
+        fn rollback(
+            &mut self,
+            op_id: mde_files::backend::OpId,
+        ) -> Result<mde_files::backend::OpId, BackendError> {
+            Err(BackendError::NotFound(op_id))
+        }
+    }
 
     #[test]
     fn shell_starts_collapsed_on_the_workbench() {
@@ -2432,6 +2621,180 @@ mod tests {
             !prims.is_empty(),
             "the mounted surface produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn shell_mirrors_files_operation_progress_into_the_bottom_rail() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+
+        let fileops = FakeFileOps::new();
+        fileops
+            .create_dir_all(Path::new("/src"))
+            .expect("seed source dir");
+        fileops
+            .create_dir_all(Path::new("/dst"))
+            .expect("seed destination dir");
+        fileops
+            .seed_file("/src/report.txt", b"report")
+            .expect("seed source file");
+
+        let rows = vec![
+            FileRow::local("report.txt", Mime::Doc, "6 B", "now").with_path("/src/report.txt")
+        ];
+        let mut files = mde_files_egui::FileBrowser::with_file_ops(
+            Box::new(ShellFilesBackend::new(rows)),
+            fileops,
+        );
+        files.click(0, 0);
+        assert!(
+            files
+                .drop_transfer(0, PathBuf::from("/dst"), true)
+                .is_some(),
+            "the fixture should submit a real Files copy operation"
+        );
+        assert!(
+            files.operation_progress_summary().is_some(),
+            "the active file operation must produce the shell summary"
+        );
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.files = files;
+        shell.nav.surface = Surface::Workbench;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+
+        let rect = ctx
+            .read_response(status::segment_pip_id(
+                status::StatusSegment::FileOperations,
+            ))
+            .expect("the shell bottom rail must render Files operation status")
+            .rect;
+        assert!(
+            rect.bottom() > 400.0,
+            "file-operation status must render inside the bottom navigation bar"
+        );
+
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let progress = nodes
+            .iter()
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("the shell progress segment exports accesskit");
+        assert_eq!(progress.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            progress.value(),
+            Some("File operations active: 1 active file operation(s), progress pending")
+        );
+        let live = nodes
+            .iter()
+            .find(|node| node.label() == Some("Notification status"))
+            .expect("notification status live region is exported");
+        assert!(
+            live.value()
+                .is_some_and(|value| value.contains("File operations active: 1 active")),
+            "Files operation progress must be folded into Notification status"
+        );
+    }
+
+    #[test]
+    fn shell_file_operation_progress_uses_browser_downloads_when_files_has_no_summary() {
+        let browser = mde_files_egui::model::OperationProgressSummary {
+            active: 2,
+            known_progress: 1,
+            fraction: Some(0.42),
+            label: "2 browser downloads".to_owned(),
+        };
+
+        let progress = shell_file_operation_progress(None, Some(browser.clone()))
+            .expect("Browser active downloads should feed the shared progress cell");
+        assert_eq!(
+            progress,
+            dock::FileOperationProgress::new(2, Some(0.42), "2 browser downloads")
+        );
+        let segments = status::StatusSegments {
+            file_operations: Some(progress.clone()),
+            ..status::StatusSegments::default()
+        };
+        assert!(
+            status::segment_accessibility_value(status::StatusSegment::FileOperations, &segments)
+                .contains("2 active file operation(s), 42% average progress"),
+            "Browser downloads feed the same FileOperations status segment"
+        );
+
+        let files = mde_files_egui::model::OperationProgressSummary {
+            active: 1,
+            known_progress: 0,
+            fraction: None,
+            label: "Copy report.txt".to_owned(),
+        };
+        let progress = shell_file_operation_progress(Some(files), Some(browser))
+            .expect("Files remains the canonical platform transfer summary");
+        assert_eq!(
+            progress,
+            dock::FileOperationProgress::new(1, None, "Copy report.txt")
+        );
+    }
+
+    #[test]
+    fn file_operation_progress_request_routes_files_to_the_transfers_tab() {
+        let mut files = mde_files_egui::real_browser();
+        files.set_surface_tab(mde_files_egui::model::SurfaceTab::Files);
+        let mut nav = Nav {
+            expanded: false,
+            surface: Surface::Workbench,
+            plane: Plane::Fleet,
+        };
+
+        route_file_operation_progress_request(&mut files, &mut nav);
+
+        assert_eq!(nav.surface, Surface::Files);
+        assert!(nav.expanded);
+        assert_eq!(
+            files.surface_tab(),
+            mde_files_egui::model::SurfaceTab::Transfers
+        );
+    }
+
+    #[test]
+    fn open_omnibox_hotkey_opens_the_shell_front_door() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.start_menu.toggle();
+
+        shell.apply_hotkey(HotkeyAction::OpenOmnibox);
+
+        assert!(shell.front_door.is_open());
+        assert!(
+            !shell.start_menu.is_open(),
+            "the full omnibox owns the focused front door while open"
+        );
+    }
+
+    #[test]
+    fn front_door_app_activation_routes_through_shell_nav() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Workbench;
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::App(Surface::Browser));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Browser);
     }
 
     /// The Media surface (MEDIA-18) mounts through the same `body` path — the dock

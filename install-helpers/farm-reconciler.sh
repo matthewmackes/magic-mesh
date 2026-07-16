@@ -66,7 +66,7 @@
 # is NO fake apply and NO pretend-provisioned VM — the live apply is OFF by default.
 #
 # Env: MCNF_REPO (default <repo>), MCNF_TOFU_DIR (default <repo>/infra/tofu),
-#      MCNF_TOFU (default `tofu`), MCNF_WORKLIST (default <repo>/docs/WORKLIST.md),
+#      MCNF_TOFU (default `tofu`), MCNF_WORKLIST (default <repo>/docs/platform/WORKLIST.md),
 #      MCNF_XO_URL (default ws://172.20.145.192:8080 — XO reachability probe),
 #      MCNF_BUILD_USER (default mm), MCNF_FARM_KEY (default ~/.ssh/mackes_mesh_ed25519),
 #      FA_APPLY (default 0 — the apply gate), FA_NOW (epoch; injectable for tests),
@@ -86,7 +86,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${MCNF_REPO:-$(cd "$HERE/.." && pwd)}"
 TOFU_DIR="${MCNF_TOFU_DIR:-$REPO_ROOT/infra/tofu}"
 TOFU="${MCNF_TOFU:-tofu}"
-WORKLIST="${MCNF_WORKLIST:-$REPO_ROOT/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$REPO_ROOT/docs/platform/WORKLIST.md}"
 AUTOSCALE="$HERE/farm-autoscale.sh"
 SNAPSHOT="$HERE/farm-vm-snapshot.sh"
 XCP_BUILD="$HERE/xcp-build.sh"

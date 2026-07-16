@@ -20,8 +20,8 @@ use mde_jellyfin::{
     BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
 };
 use mde_media_core::{
-    EqBand, LoudnessNorm, MediaEngine, MediaKind, PlayerState, ReplayGainMode, ScreenshotMode,
-    SortKey, TrackKind, V4l2Cli, YtDlpCli,
+    EqBand, LibraryItem, LoudnessNorm, MediaEngine, MediaKind, PlayerState, ReplayGainMode,
+    ScreenshotMode, SortKey, TrackKind, V4l2Cli, YtDlpCli,
 };
 
 use crate::model::{
@@ -40,6 +40,14 @@ const OSD_SCRIM: f32 = 0.72;
 
 /// The height of the video stage, on the 8px grid (a token multiple, not a magic px).
 const STAGE_HEIGHT: f32 = Style::SP_XL * 6.0;
+
+/// The minimum width of one Library grid card: wide enough for title + Play/Queue
+/// controls, still allowing a useful multi-column browse on a laptop panel.
+const LIBRARY_CARD_MIN_W: f32 = Style::SP_XL * 6.0;
+
+/// The browse grid gap, held on the 8px grid so card columns line up with the rest of
+/// the Carbon media chrome.
+const LIBRARY_GRID_GAP: f32 = Style::SP_S;
 
 /// The playback-speed presets the Player view offers.
 const SPEED_PRESETS: [f64; 5] = [0.5, 1.0, 1.25, 1.5, 2.0];
@@ -756,7 +764,7 @@ fn download_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, item: 
 // ── Library view ───────────────────────────────────────────────────────────────────
 
 /// The Library browse view: the search field, the kind filter, the sort controls, and
-/// the [`MediaController::visible_items`] fold (MEDIA-7) as clickable rows.
+/// the [`MediaController::visible_items`] fold (MEDIA-7) as a compact card grid.
 #[allow(clippy::too_many_lines)]
 fn library_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
     section_title(ui, "Library");
@@ -845,10 +853,16 @@ fn library_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
     ui.separator();
     ui.add_space(Style::SP_S);
 
-    // The browse fold as rows. Clicking a title plays it; the queue button enqueues.
+    // The browse fold as Carbon grid cards. Clicking a card plays it; the queue
+    // button enqueues. The actions remain the same TransportAction path as the old
+    // rows, so the view owns no playback or queue behavior.
     let mut action: Option<TransportAction> = None;
-    let items = controller.visible_items();
-    if items.is_empty() {
+    let cards: Vec<LibraryCard> = controller
+        .visible_items()
+        .into_iter()
+        .map(LibraryCard::from_item)
+        .collect();
+    if cards.is_empty() {
         muted_note(
             ui,
             "No media matches — clear the search or index a folder in Sources.",
@@ -857,49 +871,24 @@ fn library_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for item in &items {
-                    let (title, subtitle) = library_row_texts(item);
-                    let path = item.path.clone();
-                    ui.group(|ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let kind_dot = match item.metadata.kind {
-                                MediaKind::Audio => Style::ACCENT,
-                                MediaKind::Video => Style::OK,
-                            };
-                            status_dot(ui, kind_dot);
-                            ui.add_space(Style::SP_XS);
-                            let clicked = ui
-                                .label(
-                                    RichText::new(&title)
-                                        .size(Style::BODY)
-                                        .strong()
-                                        .color(Style::TEXT),
-                                )
-                                .interact(Sense::click())
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked();
-                            if clicked {
-                                action = Some(TransportAction::PlayPath(path.clone()));
+                let width = ui.available_width();
+                let columns = library_grid_columns(width);
+                let card_w = library_grid_card_width(width, columns);
+                egui::Grid::new("media-library-grid")
+                    .num_columns(columns)
+                    .spacing(egui::vec2(LIBRARY_GRID_GAP, Style::SP_M))
+                    .show(ui, |ui| {
+                        for (index, card) in cards.iter().enumerate() {
+                            if let Some(next) = library_card(ui, card, card_w) {
+                                action = Some(next);
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Queue").clicked() {
-                                    action = Some(TransportAction::Enqueue(
-                                        path.clone(),
-                                        Some(title.clone()),
-                                    ));
-                                }
-                            });
-                        });
-                        if !subtitle.is_empty() {
-                            muted_note(ui, subtitle);
+                            if (index + 1) % columns == 0 {
+                                ui.end_row();
+                            }
                         }
                     });
-                    ui.add_space(Style::SP_XS);
-                }
             });
     }
-    drop(items);
     if let Some(action) = action {
         // Playing from the library also switches to the Player view.
         let to_player = matches!(action, TransportAction::PlayPath(_));
@@ -908,6 +897,253 @@ fn library_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
             controller.ui_mut().tab = MediaTab::Player;
         }
     }
+}
+
+/// The display data one Library card needs. Built before rendering so egui can draw
+/// the grid without holding borrowed library rows across potential dispatch.
+struct LibraryCard {
+    path: String,
+    title: String,
+    subtitle: String,
+    kind: MediaKind,
+}
+
+impl LibraryCard {
+    fn from_item(item: &LibraryItem) -> Self {
+        let (title, subtitle) = library_row_texts(item);
+        Self {
+            path: item.path.clone(),
+            title,
+            subtitle,
+            kind: item.metadata.kind,
+        }
+    }
+}
+
+/// Number of grid columns that fit a given browse width while preserving the minimum
+/// playable card width. Always returns at least one column, even during first-frame
+/// zero-width layout probes.
+#[must_use]
+fn library_grid_columns(width: f32) -> usize {
+    if width <= LIBRARY_CARD_MIN_W {
+        return 1;
+    }
+    ((width + LIBRARY_GRID_GAP) / (LIBRARY_CARD_MIN_W + LIBRARY_GRID_GAP))
+        .floor()
+        .max(1.0) as usize
+}
+
+/// The exact card width for `columns`, including equal-width expansion when the grid
+/// has extra space.
+#[must_use]
+fn library_grid_card_width(width: f32, columns: usize) -> f32 {
+    let columns = columns.max(1);
+    let gaps = LIBRARY_GRID_GAP * (columns.saturating_sub(1) as f32);
+    ((width - gaps) / columns as f32).max(LIBRARY_CARD_MIN_W)
+}
+
+/// One Netflix-style Library card: a 16:9 media plate, title/subtitle, and the same
+/// Play/Queue actions the old list rows used.
+fn library_card(ui: &mut egui::Ui, card: &LibraryCard, width: f32) -> Option<TransportAction> {
+    let band = ui.painter().add(egui::Shape::Noop);
+    let mut action = None;
+    let content_w = (width - Style::SP_M).max(Style::SP_XL * 4.0);
+    let group = library_card_frame().show(ui, |ui| {
+        ui.set_min_width(content_w);
+        ui.set_max_width(content_w);
+
+        paint_library_art(ui, card.kind, content_w);
+
+        ui.add_space(Style::SP_S);
+        ui.add(
+            egui::Label::new(
+                RichText::new(&card.title)
+                    .size(Style::BODY)
+                    .strong()
+                    .color(Style::TEXT),
+            )
+            .wrap(),
+        );
+        if !card.subtitle.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&card.subtitle)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+
+        ui.add_space(Style::SP_S);
+        ui.horizontal(|ui| {
+            if ui
+                .add_sized(
+                    egui::vec2(content_w * 0.52, Style::SP_L),
+                    egui::Button::new(
+                        RichText::new("▶  Play")
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_STRONG),
+                    )
+                    .fill(Style::ACCENT),
+                )
+                .on_hover_text("Play")
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked()
+            {
+                action = Some(card_play_action(card));
+            }
+            if ui
+                .add_sized(
+                    egui::vec2(content_w * 0.38, Style::SP_L),
+                    egui::Button::new(
+                        RichText::new("+  Queue")
+                            .size(Style::SMALL)
+                            .color(Style::TEXT),
+                    ),
+                )
+                .on_hover_text("Add to queue")
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked()
+            {
+                action = Some(card_queue_action(card));
+            }
+        });
+    });
+    let response = group
+        .response
+        .interact(Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let hover = Motion::animate(
+        ui.ctx(),
+        ("library-card-hover", card.path.as_str()),
+        response.hovered(),
+        Motion::FAST,
+    );
+    if hover > 0.0 {
+        ui.painter().set(
+            band,
+            egui::Shape::rect_filled(
+                response.rect,
+                Style::RADIUS,
+                Style::SURFACE_HI.gamma_multiply(hover),
+            ),
+        );
+    }
+    if response.clicked() && action.is_none() {
+        action = Some(card_play_action(card));
+    }
+    action
+}
+
+fn library_card_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(Style::LAYER_02)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS)
+        .inner_margin(Style::SP_S)
+}
+
+fn paint_library_art(ui: &mut egui::Ui, kind: MediaKind, width: f32) {
+    let height = (width * 9.0 / 16.0).clamp(Style::SP_XL * 2.0, Style::SP_XL * 3.5);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Style::RADIUS, Style::LAYER_01);
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let accent = library_kind_color(kind);
+    let strip = egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(rect.left() + Style::SP_XS, rect.bottom()),
+    );
+    painter.rect_filled(strip, Style::RADIUS_S, accent);
+
+    let icon_rect =
+        egui::Rect::from_center_size(rect.center(), egui::vec2(Style::SP_L, Style::SP_L));
+    match kind {
+        MediaKind::Audio => paint_audio_glyph(painter, icon_rect, accent),
+        MediaKind::Video => paint_video_glyph(painter, icon_rect, accent),
+    }
+
+    let label_rect = egui::Rect::from_min_size(
+        rect.left_top() + egui::vec2(Style::SP_S, Style::SP_S),
+        egui::vec2(Style::SP_XL * 2.0, Style::SP_L),
+    );
+    painter.rect_filled(label_rect, Style::RADIUS_S, Style::BG.gamma_multiply(0.86));
+    painter.text(
+        label_rect.center(),
+        Align2::CENTER_CENTER,
+        library_kind_label(kind),
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_STRONG,
+    );
+}
+
+fn paint_audio_glyph(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(2.0, color);
+    let stem_x = rect.center().x + Style::SP_XS;
+    painter.line_segment(
+        [
+            egui::pos2(stem_x, rect.top()),
+            egui::pos2(stem_x, rect.bottom() - Style::SP_XS),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(stem_x, rect.top()),
+            egui::pos2(rect.right(), rect.top() + Style::SP_XS),
+        ],
+        stroke,
+    );
+    painter.circle_stroke(
+        egui::pos2(rect.left() + Style::SP_S, rect.bottom() - Style::SP_XS),
+        Style::SP_S,
+        stroke,
+    );
+}
+
+fn paint_video_glyph(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(2.0, color);
+    let body = rect.shrink(Style::SP_XS);
+    painter.rect_stroke(body, Style::RADIUS_S, stroke, egui::StrokeKind::Inside);
+    let lens = [
+        body.left_center(),
+        egui::pos2(body.right() - Style::SP_XS, body.top() + Style::SP_S),
+        egui::pos2(body.right() - Style::SP_XS, body.bottom() - Style::SP_S),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        lens.to_vec(),
+        color.gamma_multiply(0.36),
+        stroke,
+    ));
+}
+
+const fn library_kind_color(kind: MediaKind) -> egui::Color32 {
+    match kind {
+        MediaKind::Audio => Style::ACCENT_MEDIA,
+        MediaKind::Video => Style::OK,
+    }
+}
+
+const fn library_kind_label(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Audio => "Audio",
+        MediaKind::Video => "Video",
+    }
+}
+
+fn card_play_action(card: &LibraryCard) -> TransportAction {
+    TransportAction::PlayPath(card.path.clone())
+}
+
+fn card_queue_action(card: &LibraryCard) -> TransportAction {
+    TransportAction::Enqueue(card.path.clone(), Some(card.title.clone()))
 }
 
 // ── Player view ────────────────────────────────────────────────────────────────────
@@ -1877,6 +2113,57 @@ mod tests {
         c.set_kind_filter(None);
         c.set_search("nothing-matches-this");
         render(&mut c, library_view);
+    }
+
+    #[test]
+    fn library_grid_columns_preserve_bounded_card_widths() {
+        assert_eq!(library_grid_columns(0.0), 1);
+        assert_eq!(library_grid_columns(LIBRARY_CARD_MIN_W), 1);
+        assert_eq!(
+            library_grid_columns(LIBRARY_CARD_MIN_W * 2.0 + LIBRARY_GRID_GAP - 1.0),
+            1
+        );
+        assert_eq!(
+            library_grid_columns(LIBRARY_CARD_MIN_W * 2.0 + LIBRARY_GRID_GAP),
+            2
+        );
+        assert_eq!(
+            library_grid_columns(LIBRARY_CARD_MIN_W * 3.0 + LIBRARY_GRID_GAP * 2.0),
+            3
+        );
+
+        let width = LIBRARY_CARD_MIN_W * 3.0 + LIBRARY_GRID_GAP * 2.0 + Style::SP_XL;
+        let columns = library_grid_columns(width);
+        let card_w = library_grid_card_width(width, columns);
+        assert_eq!(columns, 3);
+        assert!(card_w > LIBRARY_CARD_MIN_W);
+        let occupied = card_w * columns as f32 + LIBRARY_GRID_GAP * (columns - 1) as f32;
+        assert!((occupied - width).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn library_cards_dispatch_the_existing_transport_actions() {
+        let item = LibraryItem {
+            path: "/m/song.flac".to_owned(),
+            metadata: MediaMetadata::from_path("/m/song.flac")
+                .expect("audio")
+                .with_artist("Artist")
+                .with_duration(210.0),
+            added_seq: 0,
+        };
+        let card = LibraryCard::from_item(&item);
+
+        assert_eq!(card.title, "song");
+        assert_eq!(card.subtitle, "Audio · 3:30 · Artist");
+        assert_eq!(card.kind, MediaKind::Audio);
+        assert_eq!(
+            card_play_action(&card),
+            TransportAction::PlayPath("/m/song.flac".to_owned())
+        );
+        assert_eq!(
+            card_queue_action(&card),
+            TransportAction::Enqueue("/m/song.flac".to_owned(), Some("song".to_owned()))
+        );
     }
 
     #[test]

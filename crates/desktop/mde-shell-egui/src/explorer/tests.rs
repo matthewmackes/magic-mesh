@@ -1941,18 +1941,41 @@ fn searchable_state() -> Vec<UnitsState> {
 }
 
 #[test]
-fn fuzzy_scoring_is_a_case_insensitive_subsequence_ranked_by_shape() {
-    // Not a subsequence → no match; out-of-order → no match.
-    assert_eq!(fuzzy_score("xz", "abc"), None);
-    assert_eq!(fuzzy_score("cba", "abc"), None);
-    // Case-folds both ways.
-    assert!(fuzzy_score("WEB", "web").is_some());
-    assert!(fuzzy_score("web", "WEB").is_some());
-    // The leading contiguous hit outranks the buried subsequence (the
-    // editor idiom's bread-and-butter ranking).
-    let tight = fuzzy_score("main", "main.rs").expect("tight");
-    let buried = fuzzy_score("main", "domain_view.rs").expect("buried");
-    assert!(tight > buried, "leading contiguous > buried");
+fn explorer_search_items_feed_the_shared_ranker_for_unit_fields() {
+    let s = ExplorerState::with_fake(searchable_state(), "me");
+    let media_idx = s
+        .units
+        .iter()
+        .position(|unit| unit.name == "media-box")
+        .expect("media-box");
+    let web_idx = s
+        .units
+        .iter()
+        .position(|unit| unit.name == "web")
+        .expect("web");
+    let items = s.search_items();
+
+    assert!(items.iter().all(|item| item.domain == SearchDomain::Mesh));
+    assert!(
+        items
+            .iter()
+            .any(|item| item.payload == media_idx && item.title == "5900"),
+        "discovered service/port fields become shared candidates",
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item.payload == web_idx && item.title == "bigboy"),
+        "hosting-node fields become shared candidates",
+    );
+
+    let hits = ranked_hits("mdb", items.clone(), items.len());
+    assert_eq!(
+        hits.first()
+            .map(|hit| s.units[hit.item.payload].name.as_str()),
+        Some("media-box"),
+        "shared fuzzy title ranking still finds the unit name",
+    );
 }
 
 #[test]

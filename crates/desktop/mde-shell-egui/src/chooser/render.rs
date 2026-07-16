@@ -442,7 +442,7 @@ pub(super) fn fit_centered(bounds: egui::Rect, img: egui::Vec2) -> egui::Rect {
 /// The card's content rows, top to bottom inside the plate. Returns the inline
 /// controls surfaced this frame — a CHOOSER-7 power op on a local-VM card, and/or
 /// the CHOOSER-8 offline Retry.
-pub(super) fn card_body(
+fn card_body(
     ui: &mut egui::Ui,
     source: &DesktopSource,
     recent: bool,

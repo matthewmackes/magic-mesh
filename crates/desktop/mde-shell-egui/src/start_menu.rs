@@ -197,6 +197,7 @@ use crate::chrome::MeshSummary;
 use crate::console::{self, ConsoleState};
 use crate::dock::{icon_texture, response_activated, Surface, DOCK_W};
 use crate::status::{self, StatusSegments};
+use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 
 // ── geometry ─────────────────────────────────────────────────────────────────
 
@@ -1916,52 +1917,24 @@ fn search_field(
 /// the render + keyboard both read so the painted list and Enter's target can't
 /// diverge.
 fn search_matches(query: &str) -> Vec<Surface> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Vec::new();
-    }
-    // The fuzzy cost `(span, start)` only discriminates within the fuzzy tier;
-    // the three exact tiers all carry the neutral `(0, 0)` so their tie-break
-    // stays exactly the old `Surface::ALL` index order.
-    let mut scored: Vec<(u8, (usize, usize), usize, Surface)> = Vec::new();
-    for (idx, surface) in Surface::ALL.iter().copied().enumerate() {
-        let label = surface.label().to_lowercase();
-        let (rank, cost) = if label.starts_with(&q) {
-            (0, (0, 0))
-        } else if label.contains(&q) {
-            (1, (0, 0))
-        } else if tile_group_label(surface).to_lowercase().contains(&q) {
-            (2, (0, 0))
-        } else if let Some(cost) = fuzzy_cost(&label, &q) {
-            (3, cost)
-        } else {
-            continue;
-        };
-        scored.push((rank, cost, idx, surface));
-    }
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    scored.into_iter().map(|(.., s)| s).collect()
-}
-
-/// Case-insensitive *fuzzy subsequence* score of `q` against `label` (both
-/// already lowercased). Returns `Some((span, start))` when every char of `q`
-/// occurs in `label` in order (greedy, leftmost) — `span` = the last matched
-/// index minus the first, so a tighter match (fewer intervening gaps) scores
-/// lower, and `start` = the first matched index, breaking a span tie toward the
-/// earlier match. `None` when `q` is not a subsequence of `label`. Surface
-/// labels are ASCII, so byte offsets equal char positions here; empty `q` never
-/// reaches this helper ([`search_matches`] returns early) and would yield
-/// `None` regardless.
-fn fuzzy_cost(label: &str, q: &str) -> Option<(usize, usize)> {
-    let mut haystack = label.char_indices();
-    let mut first: Option<usize> = None;
-    let mut last = 0;
-    for needle in q.chars() {
-        let (at, _) = haystack.by_ref().find(|&(_, c)| c == needle)?;
-        first.get_or_insert(at);
-        last = at;
-    }
-    first.map(|start| (last - start, start))
+    let items = Surface::ALL
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, surface)| {
+            SearchItem::new(
+                SearchDomain::App,
+                surface.label(),
+                format!("surface:{surface:?}"),
+                surface,
+            )
+            .with_terms([tile_group_label(surface)])
+            .with_source_rank(idx)
+        });
+    ranked_hits(query, items, Surface::ALL.len())
+        .into_iter()
+        .map(|hit| hit.item.payload)
+        .collect()
 }
 
 /// Which [`TILE_GROUPS`] group a surface sits in (its label). Every
@@ -1977,6 +1950,7 @@ fn tile_group_label(surface: Surface) -> &'static str {
 
 /// The category accent for a grouped-grid surface (B6). Returns `None` only
 /// for non-grid surfaces such as [`Surface::Timers`].
+#[cfg(test)]
 fn tile_group_accent(surface: Surface) -> Option<egui::Color32> {
     TILE_GROUPS
         .iter()
@@ -1988,6 +1962,7 @@ fn tile_group_accent(surface: Surface) -> Option<egui::Color32> {
 /// once, with no pinned/search duplicates. The render loop walks the same
 /// [`TILE_GROUPS`] table; tests use this pure helper to pin the B6 launcher
 /// reachability contract.
+#[cfg(test)]
 fn grouped_grid_surfaces() -> Vec<Surface> {
     TILE_GROUPS
         .iter()

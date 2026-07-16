@@ -138,6 +138,7 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
         egui::Key::Escape => "Super+Escape",
         egui::Key::L => "Super+l",
         egui::Key::S => "Super+s",
+        egui::Key::Space => "Super+Space",
         _ => return None,
     })
 }
@@ -439,6 +440,10 @@ mod tests {
         assert_eq!(
             r.dispatch(&[], &[press(egui::Key::Escape)]),
             vec![HotkeyAction::ReturnToChrome]
+        );
+        assert_eq!(
+            r.dispatch(&[], &[press(egui::Key::Space)]),
+            vec![HotkeyAction::OpenOmnibox]
         );
     }
 

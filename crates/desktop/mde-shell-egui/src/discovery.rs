@@ -145,6 +145,7 @@ pub(crate) fn publish_open_record(
     OpenPublication { id, body }
 }
 
+#[cfg(any(test, feature = "live-vdi"))]
 fn publish_lifecycle(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,
@@ -156,6 +157,7 @@ fn publish_lifecycle(
 }
 
 /// Publish the `Active` lifecycle transition for a brokered desktop session.
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) fn publish_active(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,
@@ -169,6 +171,7 @@ pub(crate) fn publish_active(
 }
 
 /// Publish the `Disconnect` lifecycle transition for a brokered desktop session.
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) fn publish_disconnect(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,
@@ -182,6 +185,7 @@ pub(crate) fn publish_disconnect(
 }
 
 /// Publish the `Close` lifecycle transition for a brokered desktop session.
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) fn publish_close(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,

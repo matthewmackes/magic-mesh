@@ -47,6 +47,8 @@ pub enum HotkeyAction {
     Lock,
     /// Open the System surface.
     OpenSystem,
+    /// Open the shell-owned unified search/omnibox front door.
+    OpenOmnibox,
 }
 
 impl HotkeyAction {
@@ -71,6 +73,7 @@ impl HotkeyAction {
             Self::ReturnToChrome => "Return to chrome",
             Self::Lock => "Lock seat",
             Self::OpenSystem => "Open System panel",
+            Self::OpenOmnibox => "Open omnibox",
         }
     }
 
@@ -178,6 +181,10 @@ pub static HOTKEYS: &[Hotkey] = &[
     Hotkey {
         chord: "Super+s",
         action: HotkeyAction::OpenSystem,
+    },
+    Hotkey {
+        chord: "Super+Space",
+        action: HotkeyAction::OpenOmnibox,
     },
 ];
 

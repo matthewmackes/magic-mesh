@@ -98,7 +98,11 @@ Browser SELinux domain until the installed binaries are labelled
 (`mde-web-cef.te`, `mde-web-preview.te`), but the module names declared by
 `policy_module()` use underscores; the loader scripts must stage the sources as
 `mde_web_cef.te` / `mde_web_preview.te` before calling
-`/usr/share/selinux/devel/Makefile`. On a live split Browser RPM install,
+`/usr/share/selinux/devel/Makefile`. The Browser RPM can start the CEF and Servo
+SELinux setup units concurrently from `%post`; serialize `semodule -i` with the
+shared `/run/lock/mde-browser-selinux.lock` lock or one loader can lose the
+global SELinux module-store race and falsely report the policy unloaded. On a
+live split Browser RPM install,
 enabling the setup units is insufficient because the boot-time units may already
 have skipped; the Browser `%post` must queue
 `systemctl start --no-block $BROWSER_UNITS`. For F44 Enforcing workstation
@@ -390,6 +394,8 @@ Another AI/operator can rebuild the whole thing from this repo:
 | focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
 | Browser helper labels remain `bin_t` after installing `magic-mesh-browser` | SELinux setup units were enabled but never started on the already-booted seat, or the policy loader failed before relabeling | start the Browser setup units non-blocking from `%post`; verify `semodule -l` and `ls -Z /usr/bin/mde-web-cef /usr/bin/mde-web-preview /usr/libexec/mackesd/mde-web-cef-renderer` |
 | Browser SELinux loader reports no toolchain despite policy packages being installed | the module build can fail when the output stem is hyphenated but `policy_module()` declares an underscore module name | stage `mde-web-cef.te` as `mde_web_cef.te` and `mde-web-preview.te` as `mde_web_preview.te` before the SELinux devel Makefile |
+| One Browser SELinux setup unit reports `semodule -i failed` while the other succeeds during Browser RPM `%post` | CEF and Servo setup units can run concurrently, and `semodule` writes share one global SELinux module store | serialize policy loads with `/run/lock/mde-browser-selinux.lock`; a serial rerun should load both `mde_web_cef` and `mde_web_preview` and relabel the helpers |
+| Browser reopens enough restored tabs to freeze the seat | stale `browser-session-sync` snapshots or queued send-tab replay can enqueue many live helper spawns before the UI is usable | stop `mde-shell-egui.service`, kill Browser helpers, quarantine `/root/.local/share/mde/browser-session-sync`, `/mnt/mesh-storage/browser-session-sync/<host>`, `/mnt/mesh-storage/browser-send-tab/node/<host>`, and `/run/mde-bus/action/browser/session-sync`, then restart the shell; the shell startup path should cap eager opens so a poisoned snapshot or inbox cannot spawn an unbounded helper storm |
 | Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the helper did not derive a per-run `/tmp/.mde-web-*-root-<pid>-<run>` mountpoint | do not accept manual deletion as the durable fix; confirm the installed helper is new enough to use per-run rootfs mountpoints, rerun `/usr/libexec/mackesd/browser-verify-engines`, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh per-run root pass and no AVCs |
 | Browser sandbox logs `cgroup limits not applied ... Permission denied` under the DRM shell | `Delegate=yes` delegated the service cgroup, but the shell process lived in the service root, so cgroup v2 refused `+memory +cpu` with `EBUSY` | run the shell in `DelegateSubgroup=shell`, export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, and have helpers create capped leaves under the delegated parent service cgroup |
 | BigBoy F44 RPM build hits ENOSPC during cold Servo/helper compilation | stale heavy slots or shared `~/magic-mesh-farm/target` can consume most of the 79G `/home` even on the high-capacity build VM | clean only disposable slots/stale build output you own, verify free space, then rerun the F44 container RPM build on BigBoy |
@@ -418,7 +424,7 @@ install on an older release.
 - Proven in-repo: an RPM built on the **Fedora 44** toolchain auto-required
   **`GLIBC_2.43`** and would not `dnf install` on Fedora 43; rebuilding inside a
   `fedora:43` container dropped the requirement to unversioned `libc.so.6`
-  (`install-helpers/build-rpm-fedora43.sh:4-9`; `docs/WORKLIST.md:476`, ONBOARD-7).
+  (`install-helpers/build-rpm-fedora43.sh:4-9`; `docs/platform/WORKLIST.md:476`, ONBOARD-7).
 - Corollary (**the invariant**): **every `fedora-N` channel directory must be
   fed an RPM built on a glibc no newer than Fedora N's.** The channel baseurl is
   `fedora-$releasever-$basearch` (`packaging/repo/magic-mesh.repo`), so each
@@ -444,7 +450,7 @@ against the distro before relying on it.
 | **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**42** current) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora 42 VMs"); verify live with `install-helpers/farm.sh status` + `/etc/fedora-release` before relying on it | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc and native library sonames**. Today this is an F42 artifact; it is not a safe F44 Workstation artifact when FFmpeg/ICU/Python sonames differ. For F44 seats, use `install-helpers/build-rpm-fedora43.sh 44` and `rpm -Uvh --test`. |
 | **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
 | **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
-| **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/WORKLIST.md:1132`). |
+| **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/platform/WORKLIST.md:1132`). |
 | **DO lighthouse droplet** | **43** | `infra/tofu/zone1-do/variables.tf:16` (`default = "fedora-43-x64"`) | Lighthouse cloud image; "must have a live dnf channel for its releasever — fedora-42 has none" (`install-helpers/do-lighthouse-up.sh:19-20`) | Needs the F43-container RPM (`build-rpm-fedora43.sh`) or a channel `fedora-43` dir. |
 | **Local dev host** | **EL9 / Rocky 9.8** (not Fedora) | `docs/BUILD-ENVIRONMENT.md:12,67` | Orchestration + tight local build loops; gcc 11.5 (gold linker) | Builds workspace binaries, **not** release RPMs (its glibc is EL9's, unrelated to the Fedora channel). |
 

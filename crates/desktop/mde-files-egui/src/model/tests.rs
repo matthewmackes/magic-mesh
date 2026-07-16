@@ -1,4 +1,5 @@
 use super::*;
+use mde_egui::search_omnibox::{ranked_hits, SearchDomain};
 use mde_files::backend::{AuditEntry, ConflictPolicy, LocalFsBackend, SendMode};
 use mde_files::fileops::{FakeFileOps, FileOps};
 use mde_files::model::{PeerKind, PeerStatus};
@@ -640,6 +641,47 @@ fn open_local_directory_over_the_real_backend_carries_paths() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn files_search_omnibox_items_project_current_folder_rows_into_shared_ranker() {
+    let rows = vec![
+        FileRow::local("report.txt", Mime::Doc, "1 KB", "now").with_path("/d/report.txt"),
+        FileRow::local("photo.png", Mime::Image, "80 KB", "2 h")
+            .with_path("/d/photo.png")
+            .with_mesh("pine.mesh"),
+        FileRow::local("alpha/", Mime::Folder, "-", "-").with_path("/d/alpha"),
+    ];
+    let mut b = browser_over(FixtureBackend::new(Vec::new(), rows));
+
+    let items = b.search_omnibox_items(0);
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|item| item.domain == SearchDomain::File));
+
+    let report = items
+        .iter()
+        .find(|item| item.title == "report.txt")
+        .expect("report candidate");
+    assert_eq!(report.target, "/d/report.txt");
+    assert_eq!(report.payload.path, Some(PathBuf::from("/d/report.txt")));
+    assert!(report.terms.iter().any(|term| term == "document"));
+
+    let mesh_hit = ranked_hits("pine", items.clone(), 8)
+        .into_iter()
+        .next()
+        .expect("mesh attribution ranks as an auxiliary field");
+    assert_eq!(mesh_hit.item.title, "photo.png");
+
+    let folder_target = items
+        .into_iter()
+        .find(|item| item.title == "alpha/")
+        .expect("folder candidate")
+        .payload;
+    b.open_search_omnibox_target(&folder_target);
+    assert_eq!(
+        b.active_tab().location(),
+        &Location::Local("/d/alpha".to_string())
+    );
+}
+
 // ── recursive search (FILEMGR-4) ─────────────────────────────────────────
 
 #[test]
@@ -688,6 +730,18 @@ fn search_streams_an_operable_results_tab_over_the_real_fs() {
         .collect();
     names.sort();
     assert_eq!(names, vec!["alpha.log", "gamma.log"], "recursive name hits");
+
+    let search_items = b.search_omnibox_items(0);
+    assert_eq!(search_items.len(), 2);
+    assert!(search_items
+        .iter()
+        .all(|item| item.domain == SearchDomain::File));
+    let gamma = ranked_hits("gamma", search_items.clone(), 8)
+        .into_iter()
+        .next()
+        .expect("recursive hit candidate");
+    assert_eq!(gamma.item.title, "gamma.log");
+    assert!(ranked_hits("beta", search_items, 8).is_empty());
 
     // Results are a normal file view: every hit carries a real path, so the op
     // surface (selected_paths → copy/move/delete/Send-To) applies directly.
@@ -812,7 +866,11 @@ fn navigating_an_offline_peer_is_an_honest_no_op() {
         "no mount request is issued for an offline peer"
     );
     assert_eq!(*b.active_tab().location(), before, "location is unchanged");
-    assert!(b.last_note().is_some(), "an honest note explains why");
+    assert_eq!(
+        b.last_note(),
+        Some("cedar is offline - can't mount it."),
+        "an honest ASCII note explains why"
+    );
 }
 
 #[test]
@@ -822,6 +880,10 @@ fn escalate_requests_the_escalate_verb_for_a_reachable_peer() {
     let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
     b.escalate_peer("pine");
     assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Escalate]);
+    assert_eq!(
+        b.last_note(),
+        Some("Escalating pine to full-filesystem access...")
+    );
 }
 
 #[test]
@@ -831,7 +893,7 @@ fn escalate_is_a_no_op_for_an_offline_peer() {
     let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
     b.escalate_peer("cedar"); // Offline
     assert_eq!(probe.request_count(), 0);
-    assert!(b.last_note().is_some());
+    assert_eq!(b.last_note(), Some("cedar is offline - can't escalate it."));
 }
 
 #[test]
@@ -841,6 +903,7 @@ fn unmount_requests_the_unmount_verb() {
     let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
     b.unmount_peer("pine");
     assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Unmount]);
+    assert_eq!(b.last_note(), Some("Unmounting pine..."));
 }
 
 #[test]
@@ -1138,7 +1201,10 @@ fn open_properties_on_a_pathless_peer_row_is_an_honest_note() {
         b.properties().is_none(),
         "no dialog opens for a pathless row"
     );
-    assert!(b.last_note().is_some());
+    assert_eq!(
+        b.last_note(),
+        Some("This entry has no local path - mount the peer to inspect it.")
+    );
 }
 
 // ── TRANSFERS-8: the tab + the three Submit entry points (Q13) ────────────
@@ -1287,4 +1353,38 @@ fn transfers_view_and_counts_read_the_injected_ledger() {
     assert_eq!(c.active, 1, "the running job is active");
     assert_eq!(c.terminal, 1, "the done job is terminal");
     assert!(b.transfers_active());
+}
+
+#[test]
+fn operation_progress_summary_folds_active_transfer_jobs_for_shell_chrome() {
+    let mut running = XJob::new("/a/large.iso", "/b", XMethod::Rsync, XPolicy::default());
+    running.state = XState::Running;
+    running.progress = Some(40);
+    let mut queued = XJob::new("/c/archive.tar", "/d", XMethod::Http, XPolicy::default());
+    queued.state = XState::Queued;
+    let mut done = XJob::new("/e/old.log", "/f", XMethod::Node, XPolicy::default());
+    done.state = XState::Done;
+    let fake = FakeTransfers::new().with_jobs(vec![running, queued, done]);
+    let b = transfers_browser(Vec::new(), fake);
+
+    let summary = b
+        .operation_progress_summary()
+        .expect("two active transfer jobs");
+    assert_eq!(summary.active, 2);
+    assert_eq!(summary.known_progress, 1);
+    assert_eq!(summary.fraction, Some(0.4));
+    assert_eq!(summary.label, "2 transfers");
+}
+
+#[test]
+fn operation_progress_summary_bounds_labels_with_ascii_ellipsis_for_shell_chrome() {
+    let label = truncate_operation_label("Copy very-long-platform-operation-report-final.txt");
+
+    assert!(label.ends_with("..."), "truncated label = {label}");
+    assert!(label.is_ascii(), "truncated label = {label}");
+    assert!(
+        label.chars().count() <= 42,
+        "Files progress summary labels must stay bounded: {label}"
+    );
+    assert!(!label.contains('…'), "label must not use Unicode ellipsis");
 }

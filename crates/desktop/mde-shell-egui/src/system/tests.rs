@@ -627,24 +627,35 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
     );
     assert_eq!(AppearanceConfig::default().accent, AccentChoice::Brand);
     assert_eq!(AppearanceConfig::default().text_scale, TextScale::Default);
-    assert!(
-        !AppearanceConfig::default().reduce_motion,
-        "reduce-motion defaults OFF (motion on, the current behaviour)"
+    assert_eq!(
+        AppearanceConfig::default().motion_mode,
+        AppearanceMotionMode::Normal,
+        "motion defaults to the full normal mode"
     );
 
     let cfg = AppearanceConfig {
         accent: AccentChoice::Green,
         text_scale: TextScale::Larger,
-        reduce_motion: true,
+        motion_mode: AppearanceMotionMode::Disabled,
     };
     cfg.save_to(&path).expect("save");
     let back = AppearanceConfig::load_from(&path);
     assert_eq!(back, cfg, "the appearance round-trips through disk");
     assert_eq!(back.accent, AccentChoice::Green);
     assert_eq!(back.text_scale, TextScale::Larger);
+    assert_eq!(
+        back.motion_mode,
+        AppearanceMotionMode::Disabled,
+        "the motion-mode pick round-trips through disk"
+    );
+    let json = std::fs::read_to_string(&path).expect("appearance json");
     assert!(
-        back.reduce_motion,
-        "the reduce-motion pick round-trips through disk"
+        json.contains("\"motion_mode\": \"disabled\""),
+        "the new runtime mode is persisted explicitly: {json}"
+    );
+    assert!(
+        !json.contains("reduce_motion"),
+        "the legacy boolean should not be written back once migrated: {json}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -670,12 +681,37 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
         TextScale::Default,
         "the absent field folds to its default"
     );
-    assert!(
-        !cfg.reduce_motion,
-        "the absent reduce-motion field folds to its default (OFF)"
+    assert_eq!(
+        cfg.motion_mode,
+        AppearanceMotionMode::Normal,
+        "the absent motion-mode field folds to Normal"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
+    let cfg: AppearanceConfig =
+        serde_json::from_str(r#"{"accent":"green","text_scale":"large","reduce_motion":true}"#)
+            .expect("legacy appearance config");
+
+    assert_eq!(cfg.accent, AccentChoice::Green);
+    assert_eq!(cfg.text_scale, TextScale::Large);
+    assert_eq!(
+        cfg.motion_mode,
+        AppearanceMotionMode::Reduced,
+        "old reduce_motion=true configs migrate to the reduced runtime mode"
+    );
+
+    let cfg: AppearanceConfig =
+        serde_json::from_str(r#"{"motion_mode":"disabled","reduce_motion":false}"#)
+            .expect("explicit appearance config");
+    assert_eq!(
+        cfg.motion_mode,
+        AppearanceMotionMode::Disabled,
+        "an explicit new motion_mode wins over any legacy field"
+    );
 }
 
 #[test]
@@ -690,7 +726,7 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
         appearance: AppearanceConfig {
             accent: AccentChoice::Green,
             text_scale: TextScale::Default,
-            reduce_motion: false,
+            motion_mode: AppearanceMotionMode::Normal,
         },
         ..SystemState::default()
     };
@@ -728,7 +764,7 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
         appearance: AppearanceConfig {
             accent: AccentChoice::default(),
             text_scale: TextScale::Larger,
-            reduce_motion: false,
+            motion_mode: AppearanceMotionMode::Normal,
         },
         ..SystemState::default()
     };
@@ -770,7 +806,7 @@ fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
 
     let mut st = SystemState {
         appearance: AppearanceConfig {
-            reduce_motion: true,
+            motion_mode: AppearanceMotionMode::Reduced,
             ..AppearanceConfig::default()
         },
         ..SystemState::default()
@@ -785,10 +821,23 @@ fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
         Motion::reduce_motion(),
         "…and flips the shared Motion global the eased helpers read"
     );
+    assert_eq!(
+        Motion::mode(),
+        mde_egui::MotionMode::Reduced,
+        "the full runtime enum is reduced, not just a boolean side effect"
+    );
+
+    st.appearance.motion_mode = AppearanceMotionMode::Disabled;
+    st.poll(&ctx);
+    assert_eq!(
+        Motion::mode(),
+        mde_egui::MotionMode::Disabled,
+        "disabled mode is a distinct endpoint-only runtime state"
+    );
 
     // Turning it back OFF restores the captured baseline cadence and clears the
     // global — motion resumes, proving the toggle is bidirectional, not one-way.
-    st.appearance.reduce_motion = false;
+    st.appearance.motion_mode = AppearanceMotionMode::Normal;
     st.poll(&ctx);
     assert!(
         (ctx.style().animation_time - base).abs() < f32::EPSILON,
@@ -799,7 +848,7 @@ fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
         "…and clears the shared Motion global"
     );
 
-    Motion::set_reduce_motion(false); // belt-and-braces restore for sibling tests
+    Motion::set_mode(mde_egui::MotionMode::Normal); // restore for sibling tests
 }
 
 // ── Categorical accent + Carbon layers (SETTINGS-2) ───────────────────────

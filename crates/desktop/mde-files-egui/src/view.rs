@@ -64,6 +64,45 @@ const COL_MOD_W: f32 = 80.0;
 const ROW_H: f32 = 26.0;
 const TILE_W: f32 = 132.0;
 const TILE_H: f32 = 72.0;
+const ACTION_BUTTON_H: f32 = 24.0;
+
+#[derive(Clone, Copy)]
+enum FilesActionTone {
+    Quiet,
+    Primary,
+    Danger,
+}
+
+fn files_action_text(tone: FilesActionTone) -> Color32 {
+    match tone {
+        FilesActionTone::Quiet => Style::TEXT,
+        FilesActionTone::Primary => Style::ACCENT,
+        FilesActionTone::Danger => Style::DANGER,
+    }
+}
+
+fn files_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    tone: FilesActionTone,
+    tip: &str,
+) -> egui::Response {
+    let text_color = files_action_text(tone);
+    let response = ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .size(Style::SMALL)
+                .color(text_color)
+                .strong(),
+        )
+        .fill(Style::LAYER_02)
+        .stroke(Stroke::new(1.0, text_color.gamma_multiply(0.72)))
+        .corner_radius(Style::RADIUS_S)
+        .min_size(egui::vec2(52.0, ACTION_BUTTON_H)),
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    response.on_hover_text(tip)
+}
 
 /// The drag-and-drop payload: which pane the drag started in. The selection to
 /// transfer is read from that pane's model at drop time (it is already the
@@ -753,17 +792,30 @@ fn transfer_row(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>)
 /// The per-row lifecycle buttons (right-aligned): Pause / Resume gated by the
 /// worker's state machine, Cancel always available (a cancel removes the row).
 fn transfer_row_controls(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>) {
-    if ui
-        .small_button("Cancel")
-        .on_hover_text("Remove this transfer from the ledger")
-        .clicked()
+    if files_action_button(
+        ui,
+        "Cancel",
+        FilesActionTone::Danger,
+        "Remove this transfer from the ledger",
+    )
+    .clicked()
     {
         actions.push(Action::TransferCancel(job.id.clone()));
     }
-    if job.state.can_resume() && ui.small_button("Resume").clicked() {
+    if job.state.can_resume()
+        && files_action_button(
+            ui,
+            "Resume",
+            FilesActionTone::Primary,
+            "Resume this transfer",
+        )
+        .clicked()
+    {
         actions.push(Action::TransferResume(job.id.clone()));
     }
-    if job.state.can_pause() && ui.small_button("Pause").clicked() {
+    if job.state.can_pause()
+        && files_action_button(ui, "Pause", FilesActionTone::Quiet, "Pause this transfer").clicked()
+    {
         actions.push(Action::TransferPause(job.id.clone()));
     }
 }
@@ -2894,18 +2946,46 @@ fn op_strip(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if op.is_done() {
-                    if ui.small_button("Dismiss").clicked() {
+                    if files_action_button(
+                        ui,
+                        "Dismiss",
+                        FilesActionTone::Quiet,
+                        "Dismiss this file operation",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::DismissOp(op.op_id));
                     }
                 } else {
-                    if ui.small_button("Cancel").clicked() {
+                    if files_action_button(
+                        ui,
+                        "Cancel",
+                        FilesActionTone::Danger,
+                        "Cancel this file operation",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::CancelOp(op.op_id));
                     }
                     if op.control.is_paused() {
-                        if ui.small_button("Resume").clicked() {
+                        if files_action_button(
+                            ui,
+                            "Resume",
+                            FilesActionTone::Primary,
+                            "Resume this file operation",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::ResumeOp(op.op_id));
                         }
-                    } else if ui.small_button("Pause").clicked() {
+                    } else if files_action_button(
+                        ui,
+                        "Pause",
+                        FilesActionTone::Quiet,
+                        "Pause this file operation",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::PauseOp(op.op_id));
                     }
                 }
@@ -3086,7 +3166,7 @@ mod tests {
     use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode};
     use crate::transfers::test_support::FakeTransfers;
     use crate::transfers::{Method, TransferJob, TransferPolicy, TransferState};
-    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::egui::{self, pos2, vec2, Color32, Rect, Stroke};
     use mde_egui::Style;
     use mde_files::backend::{
         AuditEntry, Backend, BackendError, ConflictPolicy, Destination, MeshOverlayBadge, OpId,
@@ -3194,6 +3274,20 @@ mod tests {
         FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
     }
 
+    fn render_frame(browser: &mut FileBrowser) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                files_panel(ui, browser);
+            });
+        })
+    }
+
     /// Drive one headless egui frame that renders [`files_panel`] into a real
     /// `CentralPanel`, then tessellate the result on the CPU so any paint-path
     /// fault surfaces as a test failure. This is the harness's headless "mount"
@@ -3212,6 +3306,95 @@ mod tests {
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "files_panel produced no draw primitives");
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != Color32::PLACEHOLDER).then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill != Color32::TRANSPARENT => {
+                    out.push(rect.fill);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn rect_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<Stroke> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<Stroke>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
+                    out.push(rect.stroke);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn assert_painted_text_color(texts: &[(String, Color32)], label: &str, color: Color32) {
+        assert!(
+            texts
+                .iter()
+                .any(|(text, painted)| text == label && *painted == color),
+            "expected {label:?} to paint with {color:?}, saw {texts:?}"
+        );
     }
 
     #[test]
@@ -3282,6 +3465,47 @@ mod tests {
         assert_eq!(b.surface_tab(), SurfaceTab::Transfers);
         assert_eq!(b.transfers_view().len(), 2, "both ledger fixtures show");
         mount(&mut b);
+    }
+
+    #[test]
+    fn transfer_lifecycle_controls_use_files_action_button_tokens() {
+        let mut running = TransferJob::new(
+            "/src/a",
+            "peer:oak",
+            Method::Rsync,
+            TransferPolicy::default(),
+        );
+        running.state = TransferState::Running;
+        running.progress = Some(42);
+        let fake = FakeTransfers::new().with_jobs(vec![running]);
+        let mut b =
+            FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
+                .with_transfers(Box::new(fake));
+        b.set_surface_tab(SurfaceTab::Transfers);
+
+        let out = render_frame(&mut b);
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Cancel", Style::DANGER);
+        assert_painted_text_color(&texts, "Pause", Style::TEXT);
+
+        let fills = rect_fills(&out.shapes);
+        assert!(
+            fills.iter().any(|fill| *fill == Style::LAYER_02),
+            "Files transfer lifecycle controls must paint the shared action layer fill: {fills:?}"
+        );
+        let strokes = rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == Style::DANGER.gamma_multiply(0.72)),
+            "Files transfer cancel action must paint a danger outline: {strokes:?}"
+        );
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == Style::TEXT.gamma_multiply(0.72)),
+            "Files transfer pause action must paint a quiet outline: {strokes:?}"
+        );
     }
 
     #[test]

@@ -92,8 +92,10 @@ impl MpvEngine {
             // mpv's frame-queue tracking (`current_frame` in `video/out/vo.c`)
             // is generic across every VO backend, not per-driver.
             let _ = init.set_property("vo", "null");
-            // MEDIA-3: audio leaves on the seat's PipeWire server by default.
-            let _ = init.set_property("ao", "pipewire");
+            // MEDIA-3: audio leaves on the seat's PipeWire server by default,
+            // with mpv's null ao as the explicit fallback for headless or
+            // audio-less seats.
+            let _ = init.set_property("ao", "pipewire,null");
             // A missing/broken audio device must degrade to silent video, never
             // abort the whole file — the same "don't fight the seat for a
             // resource it doesn't have" principle, extended to audio.

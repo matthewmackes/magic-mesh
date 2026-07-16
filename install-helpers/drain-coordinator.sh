@@ -24,7 +24,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
 KEY="${MCNF_FARM_KEY:-/root/.ssh/mackes_mesh_ed25519}"
 SSH_USER="${MCNF_FARM_USER:-mm}"
 

@@ -42,7 +42,7 @@
 )]
 
 use mde_egui::egui::{self, Align2, Color32, FontId, Rect, TextureHandle, TextureOptions};
-use mde_egui::{Motion, Style};
+use mde_egui::{Motion, MotionPreset, Style};
 
 use crate::chooser::decode_png_rgba;
 
@@ -220,8 +220,8 @@ impl Splash {
         // Ease the drawn fill toward the banked fraction through the shared
         // Motion table (a fresh context starts at the target, so the bar never
         // rewinds; each later bank glides).
-        self.eased = ctx
-            .animate_value_with_time(egui::Id::new(EASE_KEY), self.progress(), Motion::SLOW)
+        self.eased = Motion::animate_scalar(ctx, EASE_KEY, self.progress(), MotionPreset::Page)
+            .value()
             .clamp(0.0, 1.0);
         let eased = self.eased;
         let art = self.art(ctx);
@@ -549,10 +549,14 @@ mod tests {
         splash.complete(Milestone::MeshSnapshot);
         assert!(splash.finished());
 
-        // Once the ease has fully settled (well past Motion::SLOW), the splash
-        // dismisses and hands the screen to the first dock frame.
+        // Once the ease has fully settled across normal frames, the splash
+        // dismisses and hands the screen to the first dock frame. A single long
+        // time jump intentionally does not fast-forward the shared motion carrier.
         frame(&mut splash, 0.1);
-        let prims = frame(&mut splash, 5.0);
+        let mut prims = Vec::new();
+        for frame_idx in 7..40 {
+            prims = frame(&mut splash, f64::from(frame_idx) / 60.0);
+        }
         assert!(
             !prims.is_empty(),
             "the settling splash frame painted nothing"

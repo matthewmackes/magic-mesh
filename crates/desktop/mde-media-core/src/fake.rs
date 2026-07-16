@@ -507,7 +507,7 @@ mod tests {
             .contains(&("replaygain".to_owned(), "track".to_owned())));
         assert!(e
             .applied_properties()
-            .contains(&("ao".to_owned(), "pipewire".to_owned())));
+            .contains(&("ao".to_owned(), "pipewire,null".to_owned())));
     }
 
     #[test]

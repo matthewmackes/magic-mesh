@@ -987,6 +987,7 @@ impl ConsoleState {
     /// refreshes the `$PATH` presence table. Kept for this module's own
     /// standalone tests (a one-line "open it" primer); production code drives
     /// [`Self::set_open`] instead, mirroring the Start Menu's own open state in.
+    #[cfg(test)]
     pub(crate) fn toggle(&mut self) {
         self.set_open(!self.open);
     }

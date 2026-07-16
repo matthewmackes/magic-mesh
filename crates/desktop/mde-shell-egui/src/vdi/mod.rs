@@ -120,12 +120,14 @@ impl DesktopEndpoint {
 /// The retained Bus topic the serving peer's `console_broker` (VDI-VM-1) publishes
 /// brokered console endpoints to. MUST equal
 /// `mackesd::workers::console_broker::CONSOLE_TOPIC` (a cross-check test pins it).
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) const CONSOLE_TOPIC: &str = "state/vdi/console";
 
 /// The shell's read mirror of `console_broker`'s brokered-console status — only the
 /// fields the transport needs. serde ignores the rest (e.g. the record's `protocol`
 /// tag: the transport uses the operator's chosen protocol, the record only supplies
 /// the dialable `host:port`).
+#[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum BrokeredConsoleStatus {
@@ -144,6 +146,7 @@ enum BrokeredConsoleStatus {
 }
 
 /// The shell's read mirror of one `console_broker` record on [`CONSOLE_TOPIC`].
+#[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct BrokeredConsoleRecord {
     /// The session this console serves — the globally-unique correlation key the
@@ -154,6 +157,7 @@ struct BrokeredConsoleRecord {
 }
 
 /// The outcome of resolving a brokered console endpoint from the session record.
+#[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConsoleResolution {
     /// No record yet — the serving peer's broker hasn't published one (keep
@@ -170,6 +174,7 @@ pub(crate) enum ConsoleResolution {
 /// [`CONSOLE_TOPIC`] record bodies (the latest matching record wins — the broker
 /// republishes when a session's console state changes). Pure + headless-testable;
 /// the Bus read that feeds it is `read_console_bodies`.
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> ConsoleResolution {
     let mut out = ConsoleResolution::Pending;
     for body in bodies {

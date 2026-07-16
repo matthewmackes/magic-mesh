@@ -29,7 +29,7 @@
 #   farm-jobs.sh jobid <task> <cmd>   print the stable id for a task+command
 set -uo pipefail
 
-WORKLIST="${MCNF_WORKLIST:-$(cd "$(dirname "$0")/../.." && pwd)/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$(cd "$(dirname "$0")/../.." && pwd)/docs/platform/WORKLIST.md}"
 
 jobid() { printf '%s\037%s' "$1" "$2" | sha1sum | cut -c1-12; }
 

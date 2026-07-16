@@ -355,7 +355,8 @@ fn mpris_request_now_playing_maps_browser_media_status_to_report() {
                 "album":"Browser Album",
                 "artwork_url":"https://media.example/art.png",
                 "duration_ms":120000,
-                "position_ms":42000
+                "position_ms":42000,
+                "volume_percent":42
             }
         }"#,
     )
@@ -379,7 +380,7 @@ fn mpris_request_now_playing_maps_browser_media_status_to_report() {
     assert!(report.is_playing);
     assert_eq!(report.pos, 42_000);
     assert_eq!(report.length, 120_000);
-    assert_eq!(report.volume, None);
+    assert_eq!(report.volume, Some(42));
     assert_eq!(report.artist, "Browser Artist");
     assert_eq!(report.title, "Browser Track");
     assert_eq!(report.album, "Browser Album");
@@ -427,6 +428,29 @@ fn browser_targeted_mpris_request_publishes_browser_media_control() {
     assert_eq!(body["source"], "kdc_host");
     assert_eq!(body["player"], "mde-browser");
     assert_eq!(body["action"], "pause");
+    assert_eq!(body["tab_id"], 7);
+
+    assert_eq!(
+        apply_browser_mpris_request_command(
+            Some(bus.path()),
+            "node-a",
+            &MprisRequestBody {
+                player: "mde-browser".into(),
+                action: "VolumeUp".into(),
+                ..Default::default()
+            },
+            Some(&browser),
+        ),
+        Some("volume-up")
+    );
+
+    let msgs = persist
+        .list_since("action/browser/media-control/node-a", None)
+        .expect("list browser media volume control");
+    assert_eq!(msgs.len(), 2);
+    let body: Value = serde_json::from_str(msgs[1].body.as_deref().expect("volume control body"))
+        .expect("valid volume control JSON");
+    assert_eq!(body["action"], "volume-up");
     assert_eq!(body["tab_id"], 7);
 }
 

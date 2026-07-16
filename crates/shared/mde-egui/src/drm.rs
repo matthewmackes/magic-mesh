@@ -621,7 +621,7 @@ fn drm_char(code: u32, shift: bool) -> Option<char> {
 /// spinner), and a finite delay arms a bounded wait. Before this, the loop rendered the
 /// full UI every vblank forever, so every `request_repaint_after` in the shell was dead.
 mod wake {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Upper bound (ms) on a *finite* poll wait. Caps the `c_int` timeout and bounds
     /// the worst-case latency of a finite deadline; 1 s is far longer than any real UI
@@ -640,6 +640,13 @@ mod wake {
         } else {
             Some(repaint_delay)
         }
+    }
+
+    /// egui's requested repaint delay → an absolute monotonic wake deadline for the
+    /// DRM loop. `None` is the idle state; `Some(now)` is an immediate repaint.
+    #[must_use]
+    pub fn repaint_deadline_at(repaint_delay: Duration, now: Instant) -> Option<Instant> {
+        repaint_deadline(repaint_delay).and_then(|delay| now.checked_add(delay))
     }
 
     /// The `poll(2)` timeout (ms) for this iteration, from the time until the next
@@ -714,8 +721,88 @@ mod wake {
 
     #[cfg(test)]
     mod tests {
-        use super::{cached_or_try_insert, poll_timeout_ms, repaint_deadline, should_render};
-        use std::time::Duration;
+        use super::{
+            cached_or_try_insert, poll_timeout_ms, repaint_deadline, repaint_deadline_at,
+            should_render,
+        };
+        use crate::motion::{AnimatedScalar, Motion, MotionMode, MotionPreset};
+        use std::time::{Duration, Instant};
+
+        fn motion_frame(
+            ctx: &egui::Context,
+            target: f32,
+            preset: MotionPreset,
+            mode: MotionMode,
+            time: f64,
+        ) -> (Duration, AnimatedScalar) {
+            let mut animated = None;
+            let out = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    animated = Some(Motion::animate_typed_with_mode(
+                        ctx,
+                        "motion-drm-3",
+                        target,
+                        preset,
+                        mode,
+                    ));
+                },
+            );
+            let repaint_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .expect("root viewport output")
+                .repaint_delay;
+            (
+                repaint_delay,
+                animated.expect("motion driver returned a value"),
+            )
+        }
+
+        fn motion_frame_many(
+            ctx: &egui::Context,
+            target: f32,
+            mode: MotionMode,
+            time: f64,
+        ) -> (Duration, [AnimatedScalar; 7]) {
+            const PRESETS: [MotionPreset; 7] = [
+                MotionPreset::Control,
+                MotionPreset::Panel,
+                MotionPreset::Popover,
+                MotionPreset::Dialog,
+                MotionPreset::Page,
+                MotionPreset::Layout,
+                MotionPreset::DragSettle,
+            ];
+
+            let mut animated = [AnimatedScalar::settled(0.0); 7];
+            let out = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    for (slot, preset) in PRESETS.into_iter().enumerate() {
+                        animated[slot] = Motion::animate_typed_with_mode(
+                            ctx,
+                            ("motion-drm-6-many", slot),
+                            target,
+                            preset,
+                            mode,
+                        );
+                    }
+                },
+            );
+            let repaint_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .expect("root viewport output")
+                .repaint_delay;
+            (repaint_delay, animated)
+        }
 
         #[test]
         fn idle_blocks_indefinitely() {
@@ -734,6 +821,17 @@ mod wake {
             // Continuous repaint (streaming VDI / spinner): due now, don't block.
             assert_eq!(repaint_deadline(Duration::ZERO), Some(Duration::ZERO));
             assert_eq!(poll_timeout_ms(Some(Duration::ZERO), None), 0);
+        }
+
+        #[test]
+        fn absolute_deadline_preserves_idle_now_and_finite_delays() {
+            let now = Instant::now();
+            assert_eq!(repaint_deadline_at(Duration::MAX, now), None);
+            assert_eq!(repaint_deadline_at(Duration::ZERO, now), Some(now));
+            assert_eq!(
+                repaint_deadline_at(Duration::from_millis(16), now),
+                now.checked_add(Duration::from_millis(16))
+            );
         }
 
         #[test]
@@ -790,6 +888,138 @@ mod wake {
             assert!(should_render(false, true, false, false)); // input event
             assert!(should_render(false, false, true, false)); // rotation/formfactor/host-key
             assert!(should_render(false, false, false, true)); // repaint deadline elapsed
+        }
+
+        #[test]
+        fn motion_drm_3_active_animation_requests_immediate_repaint() {
+            let ctx = egui::Context::default();
+            let _ = motion_frame(&ctx, 0.0, MotionPreset::Control, MotionMode::Normal, 0.0);
+
+            let (repaint_delay, animated) = motion_frame(
+                &ctx,
+                1.0,
+                MotionPreset::Control,
+                MotionMode::Normal,
+                1.0 / 60.0,
+            );
+
+            assert!(!animated.is_settled(), "changed target should be active");
+            assert_eq!(
+                repaint_delay,
+                Duration::ZERO,
+                "active shared motion must keep the DRM loop warm"
+            );
+            let now = Instant::now();
+            let repaint_at = repaint_deadline_at(repaint_delay, now);
+            assert_eq!(repaint_at, Some(now));
+            assert_eq!(
+                poll_timeout_ms(repaint_at.map(|t| t.saturating_duration_since(now)), None),
+                0
+            );
+            assert!(should_render(false, false, false, true));
+        }
+
+        #[test]
+        fn motion_drm_3_settled_animation_allows_idle_sleep() {
+            let ctx = egui::Context::default();
+            let _ = motion_frame(&ctx, 0.0, MotionPreset::Control, MotionMode::Normal, 0.0);
+
+            let mut repaint_delay = Duration::ZERO;
+            let mut animated = AnimatedScalar::settled(0.0);
+            for frame in 1..20 {
+                (repaint_delay, animated) = motion_frame(
+                    &ctx,
+                    1.0,
+                    MotionPreset::Control,
+                    MotionMode::Normal,
+                    f64::from(frame) / 60.0,
+                );
+            }
+
+            assert!(animated.is_settled(), "animation should be at rest");
+            assert_eq!(
+                repaint_delay,
+                Duration::MAX,
+                "settled shared motion must stop continuous repainting"
+            );
+            assert_eq!(repaint_deadline_at(repaint_delay, Instant::now()), None);
+            assert_eq!(poll_timeout_ms(None, None), -1);
+            assert!(!should_render(false, false, false, false));
+        }
+
+        #[test]
+        fn motion_drm_3_delayed_page_flip_uses_clamped_motion_dt() {
+            let ctx = egui::Context::default();
+            let _ = motion_frame(&ctx, 0.0, MotionPreset::Page, MotionMode::Normal, 0.0);
+            let (_, first_active) = motion_frame(
+                &ctx,
+                100.0,
+                MotionPreset::Page,
+                MotionMode::Normal,
+                1.0 / 60.0,
+            );
+
+            let (repaint_delay, after_stall) =
+                motion_frame(&ctx, 100.0, MotionPreset::Page, MotionMode::Normal, 5.0);
+
+            let max_expected_elapsed = first_active.elapsed() + (1.0 / 30.0) + f32::EPSILON;
+            assert!(
+                after_stall.elapsed() <= max_expected_elapsed,
+                "delayed flip advanced by {}, expected <= {max_expected_elapsed}",
+                after_stall.elapsed()
+            );
+            assert!(
+                !after_stall.is_settled(),
+                "a delayed page flip must not jump directly to the endpoint"
+            );
+            assert_eq!(
+                repaint_delay,
+                Duration::ZERO,
+                "still-active motion keeps scheduling immediate frames"
+            );
+        }
+
+        #[test]
+        fn motion_drm_6_simultaneous_motion_settles_and_returns_to_idle() {
+            let ctx = egui::Context::default();
+            let _ = motion_frame_many(&ctx, 0.0, MotionMode::Normal, 0.0);
+
+            let (active_delay, active) =
+                motion_frame_many(&ctx, 100.0, MotionMode::Normal, 1.0 / 120.0);
+            assert_eq!(
+                active_delay,
+                Duration::ZERO,
+                "simultaneous active motion keeps the DRM loop warm"
+            );
+            assert!(
+                active.iter().any(|value| !value.is_settled()),
+                "changed targets should put at least one preset in flight"
+            );
+
+            let mut repaint_delay = active_delay;
+            let mut values = active;
+            for frame in 2..80 {
+                (repaint_delay, values) =
+                    motion_frame_many(&ctx, 100.0, MotionMode::Normal, f64::from(frame) / 120.0);
+            }
+
+            assert!(
+                values.iter().all(|value| value.is_settled()),
+                "all simultaneous preset carriers should settle"
+            );
+            assert!(
+                values
+                    .iter()
+                    .all(|value| value.value().is_finite() && value.target().is_finite()),
+                "simultaneous motion must not produce non-finite values"
+            );
+            assert_eq!(
+                repaint_delay,
+                Duration::MAX,
+                "settled simultaneous motion must let the DRM loop return to idle"
+            );
+            assert_eq!(repaint_deadline_at(repaint_delay, Instant::now()), None);
+            assert_eq!(poll_timeout_ms(None, None), -1);
         }
 
         #[test]
@@ -1458,8 +1688,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::ZERO, |vo| vo.repaint_delay);
-        next_repaint_at =
-            wake::repaint_deadline(repaint_delay).and_then(|d| Instant::now().checked_add(d));
+        next_repaint_at = wake::repaint_deadline_at(repaint_delay, Instant::now());
         let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         painter.paint_and_update_textures(
             [wp, hp],
