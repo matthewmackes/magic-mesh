@@ -875,6 +875,11 @@ These decisions refine acceptance and sequencing for the active items below.
   media-list/export language while preserving the internal JSON manifest format;
   farm `.50` fmt, BigBoy `.130` focused `media_export`, and `.90` focused Power
   menu coverage passed.
+  A later 2026-07-17 Browser web-archive copy pass moved capture/offline-copy
+  archive labels and status notices off MHTML wording while preserving the
+  internal `.mhtml` archive format and save path; farm `.50` fmt, BigBoy `.130`
+  focused offline-copy drawer coverage, `.90` focused menubar coverage, and
+  `.170` focused capture-notice coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1087,6 +1092,11 @@ These decisions refine acceptance and sequencing for the active items below.
   CEF, and DOM implementation terms from surfacing in that menu/status path;
   farm `.50` fmt, BigBoy `.130` focused `media_export`, and `.90` focused Power
   menu coverage passed.
+  A later 2026-07-17 Browser web-archive copy pass kept the offline-copy drawer,
+  capture menu row, and capture notice on Browser-facing archive language while
+  preventing MHTML file-format terminology from painting in chrome; farm `.50`
+  fmt, BigBoy `.130` drawer paint coverage, `.90` menubar coverage, and `.170`
+  capture-notice coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
