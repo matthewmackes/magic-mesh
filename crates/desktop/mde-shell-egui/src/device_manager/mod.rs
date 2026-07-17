@@ -1746,7 +1746,7 @@ impl DeviceManagerState {
             "Help",
             vec![Entry::Item(Item::new(
                 MenuAction::About,
-                "About Magic-Mesh",
+                format!("About {}", brand::logo::PRODUCT_NAME),
             ))],
         );
 

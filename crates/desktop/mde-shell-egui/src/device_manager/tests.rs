@@ -483,6 +483,17 @@ fn the_menu_bar_menus_drive_the_real_seams() {
     );
     // Help → the ⓘ dialog (now the 5th menu after MENU-5's Hosts + Device).
     assert_eq!(item_ids(&menus[4]), vec![MenuAction::About]);
+    let Entry::Item(help_item) = &menus[4].entries[0] else {
+        panic!("Help should carry the About item");
+    };
+    assert_eq!(
+        help_item.label,
+        format!("About {}", mde_theme::brand::logo::PRODUCT_NAME)
+    );
+    assert!(
+        !help_item.label.contains("Magic-Mesh"),
+        "Help menu should not show the retired product identity"
+    );
 }
 
 #[test]
