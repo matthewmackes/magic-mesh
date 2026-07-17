@@ -741,6 +741,14 @@ These decisions refine acceptance and sequencing for the active items below.
   `crates/desktop/mde-shell-egui/src/web/chrome_ui/`, capture/printing modules,
   transfer service.
 - Dependencies: CUPS/printing environment and transfer service.
+- Current evidence: The 2026-07-17 menu truthfulness pass tightened the Browser
+  command model so Browser-owned internal pages no longer advertise helper/page
+  tools, stale saved-PDF paths no longer enable `Open Last PDF`, and the no-page
+  menu gate still leaves only genuine chrome/bookmark-manager controls active.
+  Farm evidence: `.50` fmt, BigBoy `.130` internal-page menu test, `.90`
+  stale-PDF menu test, and `.170` no-page menu test passed. Live `.15` still
+  has the installed split Browser RPMs and active shell service, but package
+  replacement/runtime smoke remains blocked by non-interactive sudo.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
