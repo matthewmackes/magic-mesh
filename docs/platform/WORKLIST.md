@@ -755,6 +755,12 @@ These decisions refine acceptance and sequencing for the active items below.
   DevTools, loaded-URL share/download actions, first-party-site permission
   actions, and data-clear actions; farm `.50` fmt and `.130` focused
   `browser_options_disabled_rows_explain_their_command_gate` passed.
+  A later 2026-07-17 Browser downloads drawer pass removed internal
+  `browser_download`/ledger wording from the drawer header, replaced it with a
+  user-facing live status summary derived from active/total Browser transfer
+  counts, and kept the empty worker state honest without exposing implementation
+  terms; farm `.50` fmt and `.130` focused
+  `browser_download_drawer_header_uses_user_facing_status` passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
