@@ -176,9 +176,12 @@ These decisions refine acceptance and sequencing for the active items below.
   and hardened `WebSession` teardown so CEF wrapper/renderer process groups do
   not survive verifier or tab shutdown. Farm `.50` staged-helper proof passed the
   wrapper default (`--idle-media --timeout 90s`: 60-second no-input target,
-  four frame signatures, `playing=true`, and process cleanup passed). Remaining
-  proof is an installed `.15`/live-seat run plus the horizontal-tab and right-edge
-  geometry checks.
+  four frame signatures, `playing=true`, and process cleanup passed). A
+  2026-07-17 focused shell-geometry farm pass proved the horizontal tab page body
+  remains inside a 960x640 workspace and maps a right-edge click to the final
+  frame pixel on `.130`, proved vertical-tab body bounds on `.90`, and proved
+  many horizontal tabs stay in one scrolling row with the active tab reachable on
+  `.50`. Remaining proof is an installed `.15`/live-seat run.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
