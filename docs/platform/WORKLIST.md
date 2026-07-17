@@ -1056,7 +1056,7 @@ These decisions refine acceptance and sequencing for the active items below.
   Quazar identity.
 - Scope: Bottom bar geometry, tray/status area, action center, start grid,
   live-eye pass, and screenshots.
-- Relevant files/components: `crates/desktop/mde-shell-egui/src/dock.rs`,
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/dock/mod.rs`,
   `crates/desktop/mde-shell-egui/src/start_menu.rs`, status/system modules.
 - Dependencies: Live DRM seat for final visual proof.
 - Acceptance criteria: No overlaps at supported resolutions; tray controls are
@@ -1069,7 +1069,10 @@ These decisions refine acceptance and sequencing for the active items below.
   unknown, and non-grid pins normalize on load. Live tray/screenshot proof remains
   the blocking tail for this item. A later 2026-07-17 Start-menu geometry pass
   moved the panel off the retired left-dock `DOCK_W` inset and back to the true
-  screen-left edge, matching the bottom-taskbar-only architecture.
+  screen-left edge, matching the bottom-taskbar-only architecture. A later
+  2026-07-17 taskbar hover-preview pass added the static running-session preview
+  with a real protocol badge above the taskbar; farm `.50` fmt and BigBoy `.130`
+  focused `win10_hybrid_31_session_hover_preview_shows_protocol_badge` passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 

@@ -1289,6 +1289,22 @@ fn session_entry_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
     ))
 }
 
+fn session_hover_preview_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
+    egui::Id::new(("bottom-rail-session-preview", session_entry_id(idx, entry)))
+}
+
+fn session_hover_protocol_badge_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
+    egui::Id::new((
+        "bottom-rail-session-preview-protocol",
+        session_entry_id(idx, entry),
+    ))
+}
+
+const SESSION_PREVIEW_W: f32 = 196.0;
+const SESSION_PREVIEW_H: f32 = 124.0;
+const SESSION_PREVIEW_THUMB_H: f32 = 72.0;
+const SESSION_PROTOCOL_BADGE_H: f32 = 22.0;
+
 /// WIN10-HYBRID #31 — one running-session tile is a fixed **`rail_h` square** (an
 /// icons-only Win10 taskbar button); its full name rides the accesskit node, not a
 /// visible caption. Kept a function taking the same `(ui, entry, rail_h)` so its
@@ -1384,6 +1400,9 @@ fn session_entry(
     } else if resp.hovered() {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
+    if resp.hovered() {
+        session_hover_preview(ui, rect, idx, entry);
+    }
     let tint = if selected || resp.hovered() {
         Style::ACCENT
     } else {
@@ -1425,6 +1444,94 @@ fn session_entry(
         rect,
     );
     resp.clicked()
+}
+
+/// WIN10-HYBRID #31 — static first hover thumbnail for a running Desktop session.
+/// The live frame texture is a later slice; this keeps the user-visible taskbar
+/// affordance in place now with the real session label and protocol badge.
+fn session_hover_preview(ui: &egui::Ui, anchor: egui::Rect, idx: usize, entry: &SessionRailEntry) {
+    let screen = ui.ctx().screen_rect();
+    let margin = Style::SP_S;
+    let x = (anchor.center().x - SESSION_PREVIEW_W / 2.0).clamp(
+        screen.left() + margin,
+        screen.right() - SESSION_PREVIEW_W - margin,
+    );
+    let y = anchor.top() - Style::SP_XS;
+    egui::Area::new(session_hover_preview_id(idx, entry))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(x, y))
+        .show(ui.ctx(), |ui| {
+            let (area, _) = ui.allocate_exact_size(
+                egui::vec2(SESSION_PREVIEW_W, SESSION_PREVIEW_H),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(area, Style::RADIUS, Style::SURFACE);
+            painter.rect_stroke(
+                area,
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            let thumb = egui::Rect::from_min_size(
+                area.min + egui::vec2(Style::SP_S, Style::SP_S),
+                egui::vec2(SESSION_PREVIEW_W - Style::SP_M, SESSION_PREVIEW_THUMB_H),
+            );
+            painter.rect_filled(thumb, Style::RADIUS, Style::SURFACE_HI);
+            painter.rect_stroke(
+                thumb,
+                Style::RADIUS,
+                egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.35)),
+                egui::StrokeKind::Inside,
+            );
+            if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, 32.0, Style::ACCENT) {
+                let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                let icon_rect =
+                    egui::Rect::from_center_size(thumb.center(), egui::vec2(32.0, 32.0));
+                painter.image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+            }
+
+            let title_pos = egui::pos2(
+                area.left() + Style::SP_S,
+                thumb.bottom() + Style::SP_XS + Style::SP_S,
+            );
+            painter.text(
+                title_pos,
+                egui::Align2::LEFT_CENTER,
+                entry.label.as_str(),
+                egui::FontId::proportional(Style::SMALL),
+                Style::TEXT,
+            );
+
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(
+                    thumb.right() - Style::SP_XS - 52.0,
+                    thumb.top() + Style::SP_XS,
+                ),
+                egui::vec2(52.0, SESSION_PROTOCOL_BADGE_H),
+            );
+            ui.interact(
+                badge,
+                session_hover_protocol_badge_id(idx, entry),
+                egui::Sense::hover(),
+            );
+            painter.rect_filled(badge, Style::RADIUS, Style::ACCENT.linear_multiply(0.18));
+            painter.rect_stroke(
+                badge,
+                Style::RADIUS,
+                egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.55)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                entry.protocol,
+                egui::FontId::proportional(Style::SMALL),
+                Style::ACCENT,
+            );
+        });
 }
 
 /// Stable id for the bottom-rail status detail toggle.

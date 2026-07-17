@@ -1,10 +1,10 @@
 use super::{
     action_center_cell_id, clock_cell_id, clock_date_text, focus_ring_rect,
-    notification_rail_with_sources, session_entry_id, show_desktop_nub_id, start_cell_id,
-    status_detail_toggle_id, taskbar_reveal, tray_overflow_id, tray_overflow_popup_id,
-    tray_overflow_row_id, DesktopRailSource, DockState, FileOperationProgress, SessionRailEntry,
-    Surface, CELL_W, DOCK_W, FOCUS_RING_W, NOTIFICATION_RAIL_H, TRAY_OVERFLOW_ROW_H,
-    TRAY_OVERFLOW_W,
+    notification_rail_with_sources, session_entry_id, session_hover_preview_id,
+    session_hover_protocol_badge_id, show_desktop_nub_id, start_cell_id, status_detail_toggle_id,
+    taskbar_reveal, tray_overflow_id, tray_overflow_popup_id, tray_overflow_row_id,
+    DesktopRailSource, DockState, FileOperationProgress, SessionRailEntry, Surface, CELL_W, DOCK_W,
+    FOCUS_RING_W, NOTIFICATION_RAIL_H, TRAY_OVERFLOW_ROW_H, TRAY_OVERFLOW_W,
 };
 use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegments};
@@ -585,6 +585,68 @@ fn win10_hybrid_31_the_new_tray_cells_do_not_overlap_the_sessions_run() {
             "{label} shares the taskbar row"
         );
     }
+}
+
+#[test]
+fn win10_hybrid_31_session_hover_preview_shows_protocol_badge() {
+    // Hovering a running session mounts the first static thumbnail slice: label +
+    // real protocol badge above the taskbar. Live frame texture plumbing is a
+    // later B5-rest item.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        0,
+        true,
+        vec![entry.clone()],
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let session = ctx
+        .read_response(session_entry_id(0, &entry))
+        .expect("session entry registered")
+        .rect;
+    drive_vdock(
+        &ctx,
+        &mut s,
+        vec![egui::Event::PointerMoved(session.center())],
+        sz,
+    );
+    drive_vdock(
+        &ctx,
+        &mut s,
+        vec![egui::Event::PointerMoved(session.center())],
+        sz,
+    );
+
+    let preview = ctx
+        .read_response(session_hover_preview_id(0, &entry))
+        .expect("session hover preview registered")
+        .rect;
+    let badge = ctx
+        .read_response(session_hover_protocol_badge_id(0, &entry))
+        .expect("session protocol badge registered")
+        .rect;
+    assert!(
+        preview.bottom() <= session.top(),
+        "the hover preview opens above the taskbar session tile"
+    );
+    assert!(
+        preview.contains(badge.center()),
+        "the protocol badge is mounted inside the hover preview"
+    );
+    assert!(
+        badge.center().x > preview.center().x,
+        "the protocol badge sits on the compact right side of the preview"
+    );
 }
 
 #[test]
