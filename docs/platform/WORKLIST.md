@@ -140,77 +140,6 @@ These decisions refine acceptance and sequencing for the active items below.
 - Origin or merged source IDs: E12-8, platform review `vdi-vm-4` and
   `shell-ux-1`, old worklist line 366.
 
-### WL-CRIT-003 - Browser geometry and idle media regression
-
-- Status: Blocked
-- Priority: P0
-- Complexity: Medium
-- Problem: User-reported Browser regressions remain: horizontal tabs can render
-  the workspace into the top portion of the screen, the right edge can land off
-  the visible display with no reachable scroll/edge, and YouTube video playback
-  can freeze when the mouse stops moving.
-- Required outcome: Browser chrome and page body occupy the intended viewport in
-  both vertical and horizontal tab modes, no right-edge content is unreachable,
-  and video frames keep advancing while the pointer is idle.
-- Scope: Browser layout, body texture sizing, tab-strip mode switching, CEF/Servo
-  frame wake handling, DRM repaint scheduling, and regression coverage.
-- Relevant files/components: `crates/desktop/mde-shell-egui/src/web/mod.rs`,
-  `crates/desktop/mde-shell-egui/src/web/chrome_ui/`,
-  `crates/desktop/mde-web-cef/src/`, `crates/shared/mde-egui/src/drm.rs`.
-- Dependencies: Root or sudo authority on physical `.15` for installed package
-  replacement and shell restart; live CEF runtime or farm CEF smoke path for
-  media verification.
-- Current evidence: Commit `64508044` fixed the body-geometry regression and CEF
-  idle-media pump path, with farm fmt, shell page-body, and CEF media tests
-  passing on 2026-07-17. Commit `955cacf9` fixed the stale `Cargo.lock`
-  dependency edge that blocked the Fedora 44 RPM lane; BigBoy then produced F44
-  base and Browser RPMs under the size guard. A 2026-07-17 `.15` probe confirmed
-  the currently installed split packages verify cleanly and
-  `/usr/libexec/mackesd/browser-verify-engines` passes, but the installed
-  verifier predates idle-media support. Extracting the newer staged Browser RPM
-  and running its verifier against the staged helpers passes CEF/Servo display
-  and input in user space. A follow-up 2026-07-17 idle-media slice added
-  `cef-verify` idle-media mode plus `browser-verify-engines --idle-media`, kept
-  CEF's default compositor path available instead of launching with
-  `--disable-gpu*`, disabled Chromium background throttling for windowless tabs,
-  and hardened `WebSession` teardown so CEF wrapper/renderer process groups do
-  not survive verifier or tab shutdown. Farm `.50` staged-helper proof passed the
-  wrapper default (`--idle-media --timeout 90s`: 60-second no-input target,
-  four frame signatures, `playing=true`, and process cleanup passed). A
-  2026-07-17 focused shell-geometry farm pass proved the horizontal tab page body
-  remains inside a 960x640 workspace and maps a right-edge click to the final
-  frame pixel on `.130`, proved vertical-tab body bounds on `.90`, and proved
-  many horizontal tabs stay in one scrolling row with the active tab reachable on
-  `.50`. A later 2026-07-17 BigBoy Fedora 44 split-RPM cut from commit
-  `8308453a` passed the size guard and was staged to physical `.15` at
-  `/home/mm/browser-f44-live-proof-8308453a/`; `.15` accepted
-  `rpm -Uvh --test --replacepkgs --force --nosignature` for the staged base and
-  Browser RPMs, and the extracted current Browser payload passed CEF+Servo
-  display/input plus CEF `--idle-media --timeout 90s` with process cleanup on
-  `.15`. A later 2026-07-17 Browser PiP repaint pass moved the shell heartbeat
-  from active-page-only to Browser frame producers, so playing background PiP
-  media keeps polling even when the active tab is an internal Options page; farm
-  `.50` fmt, BigBoy `.130` focused `browser_media_pip`, and `.90` active-page
-  heartbeat tests passed. A later 2026-07-17 horizontal-tab bounds pass wrapped
-  the non-vertical Browser path in the same allocated/clipped panel rect used by
-  vertical tabs and extended the page-body regression to simulate shell left
-  gutter plus bottom taskbar strut. A later 2026-07-17 CEF idle-media pump pass
-  kept OSR invalidation and resize nudges active through the bounded
-  post-navigation media-discovery window so muted or quiet video can be detected
-  before the helper backs off; BigBoy `.130` focused `idle_media_pump` tests and
-  `.50` CEF fmt passed. Remaining proof is the installed replacement and
-  shell-service restart; it is blocked because `.15` is physical hardware, root
-  SSH is unavailable, and `mm` requires an interactive sudo password.
-- Acceptance criteria: Focused screenshots or tessellation checks prove full
-  viewport use in both tab modes; pointer coordinate tests cover the right edge;
-  a media frame counter or visual proof advances for at least 60 seconds without
-  input.
-- Verification method: Farm browser layout tests, BigBoy focused Browser tests,
-  and live CEF/YouTube or local video smoke on a DRM seat.
-- Origin or merged source IDs: User bug report 2026-07-16, BROWSER-DD-2,
-  BROWSER-DD-9, BROWSER-DD-10, C0-C5 residual, old worklist lines 4107, 4184,
-  4207, 4922.
-
 ### WL-CRIT-004 - Control-plane DR backup and guided rebirth
 
 - Status: Blocked
@@ -1134,8 +1063,8 @@ These decisions refine acceptance and sequencing for the active items below.
 - Complexity: Medium
 - Problem: Browser options/internal page, vertical tabs, icons, and first-party
   Chrome-style primitives are implemented in code, but the final visual audit
-  must validate real desktop/mobile-size layouts and catch regressions such as
-  WL-CRIT-003.
+  must validate real desktop/mobile-size layouts and catch new regressions after
+  the archived WL-CRIT-003 geometry/idle-media closure.
 - Required outcome: Browser chrome is compact, light, icon-first, readable, and
   stable across horizontal/vertical tabs and narrow/wide viewports.
 - Scope: Browser chrome visual polish, icon coverage, text color tokens, layout
@@ -1143,7 +1072,8 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `crates/desktop/mde-shell-egui/src/web/chrome_ui/`,
   `crates/desktop/mde-shell-egui/src/web/menubar.rs`,
   `crates/desktop/mde-shell-egui/src/web/mod.rs`.
-- Dependencies: WL-CRIT-003 for known geometry/media regression.
+- Dependencies: Live `.15` screenshot/pixel pass; archived WL-CRIT-003 removed
+  the known geometry/media blocker.
 - Current evidence: The 2026-07-17 Browser chrome pass scoped test-only helpers
   out of production builds, expanded icon coverage to every Browser-local
   `ChromeIcon`, added responsive Browser Options layout coverage for narrow and
@@ -1265,8 +1195,8 @@ These decisions refine acceptance and sequencing for the active items below.
   clear icon button while preserving active-tab selection and Browser token
   coverage; farm `.50` fmt, BigBoy `.130` focused clear-button coverage, and
   `.90` focused text-field token coverage passed.
-  Representative live screenshots still wait on WL-CRIT-003's `.15`
-  install/runtime proof.
+  Representative live screenshots can now use the installed `.15` Browser proof
+  recorded with archived WL-CRIT-003.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
   icons paint non-empty shapes, options page opens/focuses correctly, and visual
   snapshots pass on representative viewports.
@@ -1346,7 +1276,9 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `crates/shared/mde-egui/src/drm.rs`,
   `crates/desktop/mde-shell-egui/src/seat_pump.rs`,
   Browser/media/VDI frame paths.
-- Dependencies: WL-CRIT-003 for Browser-specific idle playback.
+- Dependencies: Browser-specific idle playback was proven by archived
+  WL-CRIT-003; remaining proof should cover non-Browser media/VDI frame sources
+  and slow probe isolation.
 - Current evidence: A 2026-07-17 Browser PiP repaint pass added a background
   Browser media heartbeat for playing PiP tabs, including the active-internal-page
   regression where the previous active-page-only heartbeat would not keep polling
