@@ -1019,6 +1019,49 @@ These decisions refine acceptance and sequencing for the active items below.
   smoke.
 - Origin or merged source IDs: COMPUTE-DISCOVERY, old worklist line 1736.
 
+### WL-FUNC-009 - Sunshine/Moonlight shadowing of the Magic Mesh shell
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Large
+- Problem: Magic Mesh can broker guest/VM desktop consoles, but there is no
+  tracked path for shadowing the actual host egui/DRM shell from another device.
+  The requested design is a Moonlight client connecting over the encrypted mesh
+  to a Sunshine service on a Workstation, where Sunshine captures the Magic Mesh
+  DRM/KMS desktop, hardware-encodes frames, and injects remote keyboard/mouse
+  input back into the shell seat.
+- Required outcome: A paired Moonlight client can view and control the live Magic
+  Mesh shell desktop through Sunshine over the mesh, with explicit local-user
+  authorization, visible on-seat shadowing state, bounded input injection, and
+  honest degraded states when capture or hardware encode is unavailable.
+- Scope: Sunshine packaging/provisioning, Workstation service lifecycle, mesh-only
+  exposure, Moonlight pairing and access policy, DRM/KMS capture permission,
+  hardware encoder selection, remote input handoff, local indicator/kill switch,
+  audit events, and live-seat validation.
+- Relevant files/components: packaging/RPM assets and systemd units,
+  `crates/desktop/mde-shell-egui/src/`, `crates/shared/mde-egui/src/drm.rs`,
+  `crates/mesh/mackesd/src/workers/seat_remote_input.rs`,
+  `install-helpers/seat-remote-input.py`, Device Manager, notification/indicator
+  surfaces, `docs/THREAT_MODEL.md`, `docs/BUILD-ENVIRONMENT.md`.
+- Dependencies: DRM-capable Workstation seat, supported hardware encoder, a
+  Moonlight client, Sunshine availability/licensing review, WL-SEC-004 local
+  remote-input authorization/indicator design, and mesh firewall/exposure policy.
+- Acceptance criteria: Sunshine is installed or honestly gated on Workstation
+  builds only; the service binds to mesh-approved addresses rather than public
+  underlay by default; pairing requires local approval; the shell displays a
+  persistent shadowing indicator with disconnect/kill control; Moonlight receives
+  nonblank advancing frames from the Magic Mesh shell; remote keyboard/mouse
+  events reach the shell only while authorized; disconnect revokes input and
+  stops capture; audit/state publishes show active, denied, disconnected, and
+  degraded modes.
+- Verification method: Unit tests for policy/state/audit decisions, packaging
+  tests proving Sunshine assets are Workstation-only, farm build checks, and live
+  `.15` or spare-seat proof with a Moonlight client showing frame motion,
+  hardware encoder use, input round-trip, indicator visibility, and mesh-only
+  reachability.
+- Origin or merged source IDs: Operator request 2026-07-17, WL-CRIT-001,
+  WL-SEC-004, WL-RUN-005, WL-PERF-002.
+
 ## User Interface And Experience
 
 ### WL-UX-001 - Win10 hybrid bottom taskbar and tray live proof
