@@ -166,6 +166,10 @@ impl Canvas {
             .is_none_or(|first| self.pixels.iter().all(|p| p == first))
     }
 
+    pub(crate) fn count_exact_color(&self, color: Color32) -> usize {
+        self.pixels.iter().filter(|pixel| **pixel == color).count()
+    }
+
     /// Write this canvas as a PNG, creating its parent directory if needed.
     ///
     /// Encoded RGB (no alpha channel): every stored pixel is fully opaque by
