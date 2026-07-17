@@ -1,15 +1,16 @@
 //! `mde-shell-egui` — the single MCNF E12 "Quazar" egui shell (E12-3).
 //!
 //! One eframe app on the `mde-egui` harness. The shell has **ONE chrome** — the
-//! left **vertical dock** (VDOCK, `dock::dock`: the slide-in, auto-hide app picker
-//! + bottom status/system quads; the old horizontal taskbar and the top chrome
-//! strip are both retired). Beside it, the central view is either:
+//! Win10-hybrid bottom taskbar (`dock::notification_rail_with_sources`: Start,
+//! sessions, tray/status, clock, and auto-hide pin). The old horizontal taskbar,
+//! the top chrome strip, and the rendered left vertical dock are retired. Above
+//! that taskbar, the central view is either:
 //!
 //! * the **session `EmptyState`** (collapsed) — a real session is a fullscreen VM
 //!   texture from `mde-vdi`; or
 //! * the active **surface** (expanded) — Workbench / Mesh Map / the app
-//!   surfaces, selected on the dock (the dock IS the nav; any dock click
-//!   surfaces the body).
+//!   surfaces, selected through the Start Menu, front door, hotkeys, or taskbar
+//!   affordances.
 //!
 //! The session↔body transition eases through the shared `Motion` table and the
 //! whole surface renders through the shared `Style` (governance §4/§5/§7). This is
@@ -197,12 +198,11 @@ struct Shell {
     critical_edge: status::CriticalEdgeCue,
     /// Local hostname used to decide whether a critical belongs to this seat.
     local_host: String,
-    /// VDOCK-1/2/3/4 — the left vertical dock's state: the auto-hide half (the
-    /// Super-tap reveal latch + the pin), the app picker's `active` surface, the
-    /// bottom status-strip inputs, and the system-quad power menu + pending request.
-    /// `dock::dock` reads + drives it each frame; the Super-tap reveal toggles it on
-    /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
-    /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
+    /// The retained dock/taskbar state. WIN10-HYBRID retired the rendered left
+    /// vertical dock, but this state still owns the bottom taskbar's active
+    /// surface, Start-cell latch, session rail, status/progress inputs, auto-hide
+    /// pin, and pending lock/power requests. `mount_dock_chrome` mirrors
+    /// `nav.surface` in/out and drains those requests each frame.
     vdock: dock::DockState,
     /// WIN7-2 — the Start Menu's cross-frame state (the fixed-size overlay
     /// panel's own open latch + click-away guard, `docs/design/
@@ -640,8 +640,8 @@ impl Shell {
         });
     }
 
-    /// The expanded shell body: the one active surface. (The dock chrome is NOT
-    /// mounted here — `render` mounts the floating dock before the central view,
+    /// The expanded shell body: the one active surface. (Taskbar chrome is NOT
+    /// mounted here — `render` mounts the bottom taskbar before the central view,
     /// session and body alike.)
     ///
     /// The shell owns the frame loop, so it drives the active surface itself —
@@ -1192,9 +1192,9 @@ impl Shell {
         // product, no second poll.
         self.chrome.poll(ctx);
 
-        // The shell's dock chrome (VDOCK), mounted BEFORE the central view so it
-        // frames the session + shell body: the left vertical dock, the sole chrome.
-        // Extracted to a helper so `render` stays within the line budget.
+        // The shell's bottom taskbar chrome, mounted BEFORE the central view so
+        // its strut can frame the session + shell body. Extracted to a helper so
+        // `render` stays within the line budget.
         self.mount_dock_chrome(ctx);
 
         // WIN7-2 — the Start Menu: the panel + its toggle/request drains, split
@@ -1276,15 +1276,11 @@ impl Shell {
                 self.apply_nav_slot(slot);
             }
         }
-        // VDOCK-1 (lock 13) — a clean Super *tap* (press+release with no leader
-        // chord used in between) toggles the vertical dock. Always DRAINED so the
-        // router's latch never backs up; but, like every chord above, swallowed
-        // while the curtain is engaged (lock 10).
-        //
-        // WIN7-2 (win7-desktop-survey lock #13) reuses this SAME drain for the
-        // Start Menu. WIN10-HYBRID later retired the rendered left dock, so this
-        // path now effectively means a clean Super tap opens/closes the true
-        // bottom-left Start panel while preserving the old hotkey latch shape.
+        // A clean Super *tap* (press+release with no leader chord used in
+        // between) opens/closes the Start Menu. Always DRAINED so the router's
+        // latch never backs up; but, like every chord above, swallowed while the
+        // curtain is engaged (lock 10). `vdock.toggle()` remains only to keep the
+        // retired reveal latch drained for old tests/state.
         if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
             self.vdock.toggle();
             self.start_menu.toggle();
@@ -1373,21 +1369,16 @@ impl Shell {
         }
     }
 
-    /// Mount the shell's **dock chrome** for this frame (VDOCK) — the left
-    /// **vertical dock** (`dock::dock`), the shell's sole chrome: a floating,
-    /// slide-in, auto-hide `Area` that reserves NO gutter of its own (the central
-    /// view fills the full width AND height; `central_view` insets an empty gutter
-    /// in lockstep with the slide so the dock never overlaps the surface). A routed
-    /// click surfaces the shell body (the dock IS the nav — a navigation is never a
-    /// no-op behind the session). Split out of `render` so each stays within the
-    /// line budget.
+    /// Mount the shell's bottom taskbar chrome for this frame. The rendered left
+    /// dock is retired; the surviving `DockState` now drives the Start cell,
+    /// session rail, tray/status area, clock, auto-hide pin, and taskbar-sourced
+    /// navigation. Split out of `render` so each stays within the line budget.
     fn mount_dock_chrome(&mut self, ctx: &egui::Context) {
-        // The dock owns its own picker `active`; the shell keeps `nav.surface` as
-        // the ONE source of truth every other nav path (hotkeys, chyron, self-test,
-        // chooser) writes. So MIRROR the live surface INTO the dock before `dock()`
-        // (the picker then highlights whatever is showing), feed the bottom status
-        // status strip its live inputs, then read the picker's selection
-        // straight back OUT so a picker-cell click routes the body.
+        // The taskbar owns an `active` mirror; the shell keeps `nav.surface` as
+        // the ONE source of truth every other nav path (hotkeys, search, self-test,
+        // chooser) writes. So mirror the live surface into the taskbar state,
+        // feed the bottom status strip its live inputs, then read taskbar-originated
+        // selection straight back out.
         self.vdock.set_active(self.nav.surface);
         self.vdock
             .set_file_operation_progress(shell_file_operation_progress(
@@ -1713,18 +1704,14 @@ impl Shell {
     /// sliding sheet.
     fn central_view(&mut self, ctx: &egui::Context) {
         // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (the
-        // active surface). The floating dock rides outside the fade.
+        // active surface). Bottom taskbar chrome rides outside the fade.
         let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
 
-        // DOCK-OVERLAP — when the dock is shown and we are NOT in a
-        // full-screen remote desktop, reserve a left gutter equal to the dock's
-        // live eased slide width so the central content is NOT covered by the dock
-        // (it insets in lockstep with the slide, no overlap). In a full-screen
-        // remote desktop the dock instead floats as an overlay (it reveals OVER the
-        // edge-to-edge remote), so NO gutter is reserved; hidden → no gutter (full
-        // width). Mounted as an empty left `SidePanel` BEFORE the `CentralPanel`,
-        // which the floating dock `Area` paints over. Reuses the EXACT
-        // full-screen-remote condition the KIRON focus-mute uses (`render`).
+        // The rendered left dock is retired, so this gutter normally stays at
+        // 0.0. Keep the legacy helper in the frame path as a regression guard:
+        // even if old reveal/pin state flips, the central content must not shift
+        // behind a blank left column. Reuses the exact full-screen-remote
+        // condition the KIRON focus-mute uses (`render`).
         let full_screen_remote_desktop =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
         // WIN10-HYBRID bottom strut — reserve the taskbar's height at the bottom
@@ -1777,13 +1764,10 @@ impl Shell {
     }
 }
 
-/// DOCK-OVERLAP — the width of the left gutter the shell reserves for the vertical
-/// dock this frame so the central content is never covered by it. It is the dock's
-/// live eased slide width ([`dock::gutter_width`], `0.0` when hidden + settled) —
-/// but reserved ONLY when we are NOT in a full-screen remote desktop. In a
-/// full-screen remote desktop the dock floats as an overlay (it reveals OVER the
-/// edge-to-edge remote), so nothing is reserved. Split out (and pure but for the
-/// dock's slide read) so the gate is unit-testable.
+/// Width of the retired left-dock gutter. The helper remains so old reveal/pin
+/// state cannot accidentally reintroduce a blank `DOCK_W` column; current
+/// production behavior is always `0.0`, apart from the explicit full-screen
+/// guard also returning `0.0`.
 fn reserved_dock_gutter(
     full_screen_remote_desktop: bool,
     ctx: &egui::Context,
@@ -2027,7 +2011,7 @@ mod tests {
         );
     }
 
-    // ── DOCK-OVERLAP: the vertical dock reserves a gutter so it never overlaps ──
+    // ── Retired left-dock gutter regression guards ─────────────────────────
 
     #[test]
     fn the_retired_left_dock_never_reserves_a_gutter() {
@@ -2093,10 +2077,10 @@ mod tests {
     fn a_reserved_gutter_insets_the_central_content_by_dock_w() {
         // The reservation MECHANISM (mirrors `central_view`): an empty left
         // SidePanel of the reserved width pushes the CentralPanel's content right by
-        // exactly that width, so the floating dock Area over x∈[0,DOCK_W] covers only
-        // the empty gutter — never the surface. The CentralPanel's own inner frame
-        // margin is constant, so the DOCK_W inset shows as the DELTA between the
-        // reserved and the unreserved content left.
+        // exactly that width. If the retired dock path ever came back, it would
+        // have to cover only that empty gutter, never the surface. The
+        // CentralPanel's own inner frame margin is constant, so the DOCK_W inset
+        // shows as the DELTA between the reserved and the unreserved content left.
         let with = central_left_after_gutter(dock::DOCK_W);
         let without = central_left_after_gutter(0.0);
         assert!(
@@ -2593,7 +2577,7 @@ mod tests {
     }
 
     /// Drive one headless frame that reproduces the shell's **body mount** — the
-    /// vertical dock chrome, then a surface scoped under `push_id` in the
+    /// bottom taskbar chrome, then a surface scoped under `push_id` in the
     /// shell's `CentralPanel` — then tessellate it on the CPU so any paint-path
     /// fault surfaces as a failure. This is the same `Context::run` → `tessellate`
     /// path the DRM runner drives, minus the GPU (no window, no wgpu).

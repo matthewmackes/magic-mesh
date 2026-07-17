@@ -1085,6 +1085,10 @@ These decisions refine acceptance and sequencing for the active items below.
   tile grid to the viewport above the fixed search field with a vertical scroll
   region, preventing pinned sections from painting into search; farm `.50` fmt
   and BigBoy `.130` focused pinned-layout coverage passed.
+  A later 2026-07-17 source-comment hygiene pass aligned `main.rs` and
+  `dock/mod.rs` with the bottom-taskbar-only architecture, removing stale live
+  source prose that still described a mounted left vertical dock; farm `.50`
+  fmt and BigBoy `.130` focused retired-gutter coverage passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 

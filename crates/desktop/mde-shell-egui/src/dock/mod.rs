@@ -1,33 +1,19 @@
-//! The shell **dock** — the left **vertical dock** ([`dock`], design
-//! `docs/design/vertical-dock.md`) plus the full-width **bottom taskbar**
-//! ([`notification_rail_with_sources`], design `docs/design/
-//! win7-desktop-survey.md`, WIN7-1): together the shell's ONE chrome (VDOCK, the
-//! sole surface launcher after VDOCK-6b ripped out the old horizontal taskbar;
-//! NAVBAR/NOTIF/CONSOLE-1 then built the *new* bottom rail that WIN7-1 formalizes
-//! as a true Win7-style taskbar).
+//! The shell taskbar/dock state module. The rendered left vertical dock was
+//! retired by WIN10-HYBRID; the live chrome exported from this module is the
+//! full-width **bottom taskbar** ([`notification_rail_with_sources`], design
+//! `docs/design/win10-taskbar.md` plus the Start/taskbar locks from
+//! `docs/design/win7-desktop-survey.md`).
 //!
 //! Under E12 "Quazar" the mesh-control surfaces are **panels in the one shell**,
-//! not separate clients (§5, the EMBED model — there is no compositor). The dock
-//! is that shell nav: a left-edge, full-height, ~48px slide-in auto-hide column
-//! that selects which surface fills the shell body — the mesh-control
-//! [`Workbench`](Surface::Workbench), the live Mesh Map, the Desktop surface, the
-//! embedded app surfaces (Music / Media / Files /
-//! Voice / Browser / Terminal / Editor), the unified [`Chat`](Surface::Chat)
-//! surface, and the System / Storage / About screens. One surface shows at a
-//! time; the Workbench is always one click away.
+//! not separate clients (§5, the EMBED model — there is no compositor). The
+//! bottom taskbar is that shell chrome: Start opens the launcher grid, the
+//! session rail focuses desktops, the tray/status area exposes live system
+//! state, and taskbar cells update the active [`Surface`]. One surface shows at
+//! a time; the Start Menu/front door/hotkeys are the surface launchers.
 //!
-//! The picker leads with the **Workbench** as the top standalone anchor, then the
-//! surfaces gathered into six labelled **groups** (PICKER-1: Comms · Workloads ·
-//! Terminals · Mesh · System · Media) stacked single-column, each with a
-//! horizontal accent label + a left-rail accent stripe over its 24px brand glyph
-//! cells (in [`Surface::ALL`] order). The active cell wears a **left-edge accent
-//! bar** + the subtle selection wash; hover is a fill only — no per-icon captions,
-//! no tooltips anywhere. Beneath the picker sits only VDOCK-4's **system quad**
-//! (Settings · Show-Desktop · Lock · Power) — the Start cell, the session rail,
-//! the clock, the auto-hide pin, and the notification status pips all live in the
-//! separate full-width **bottom taskbar** (WIN7-1 lock #3's Start · sessions ·
-//! tray · clock order, with the pin trailing after the clock), never in this left
-//! rail.
+//! The retired picker grouping and left-rail constants remain only where tests or
+//! shared icon geometry still need them. Production navigation goes through the
+//! bottom taskbar, Start Menu, front door, and hotkeys.
 //!
 //! The dock is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -270,8 +256,8 @@ pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_M + Style::SP_S;
 
 /// The fixed width of one icon-only glyph cell (lock W4 — no caption, so the
 /// cell shrinks to suit the 24px glyph): `SP_XL + SP_M` on the 8px grid. The
-/// vertical dock's [`DOCK_W`] column is this same module. Private: only the
-/// dock's own layout + tests read it.
+/// legacy [`DOCK_W`] column is this same module. Private: only the taskbar/dock
+/// layout + tests read it.
 const CELL_W: f32 = Style::SP_XL + Style::SP_M;
 
 /// The app glyph edge in logical points — the 24px dock icon (lock W3, `SP_L`).
@@ -323,22 +309,17 @@ pub fn icon_texture(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// VDOCK-1 — the left **vertical dock** frame + auto-hide (design
-// `docs/design/vertical-dock.md`, locks #1/#9/#13/#14/#23/#24).
+// Retired VDOCK state and geometry.
 //
-// The shell's left-edge chrome (VDOCK-6b removed the old horizontal taskbar,
-// then NAVBAR/NOTIF/CONSOLE-1 rebuilt a *new* bottom rail this module also owns —
-// see [`notification_rail_with_sources`], WIN7-1's bottom taskbar): a left-edge,
-// full-height, ~48px, solid Carbon-dark column that slides in from the left and
-// auto-hides (hotkey + pin, no hover). VDOCK-1 builds the FRAME + the
-// slide/toggle/pin mechanism; the interior is filled by the app picker (VDOCK-2)
-// and the system quad (VDOCK-4). The Start cell, clock, auto-hide pin, and
-// notification pips all mount in the separate bottom taskbar, not here.
+// The left-edge chrome renderer no longer mounts in production, but some state
+// fields and geometry constants survive because the bottom taskbar reuses the
+// active-surface model, icon sizing, auto-hide pin semantics, and regression
+// tests that prove no left gutter is reserved.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The vertical dock's width in logical points (~48px, design #2/#23) — one
-/// column, the SAME 48px [`CELL_W`] module, so VDOCK-2's app glyphs + VDOCK-3/4's
-/// quads inherit the grid. (`pub`, not `pub(crate)` — the
+/// Legacy left-dock width in logical points (~48px). The rendered dock is
+/// retired; tests still use this constant to prove a stale gutter would shift
+/// content by exactly one legacy column. (`pub`, not `pub(crate)` — the
 /// `clippy::redundant_pub_crate` form for a crate-visible item in a private
 /// module, like [`TASKBAR_H`].)
 pub const DOCK_W: f32 = CELL_W;
@@ -349,16 +330,11 @@ const STATUS_PANEL_KEY: &str = "vdock-status-panel";
 /// The stable id of the bottom notification rail layer.
 const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 
-/// The left vertical dock's **state** — VDOCK-1's auto-hide inputs (locks #9/#13)
-/// plus VDOCK-2's picker state. The auto-hide half (the Super-tap **reveal** latch
-/// and the **pin**) is kept tiny and pure (no egui, no GPU) so the shell's hotkey
-/// path toggles it and the render reads [`Self::shown`] headless-testably; there
-/// is deliberately **no hover-reveal** (lock #9). VDOCK-2 adds the picker's
-/// `active` surface (the shell body follows it, carried over from the horizontal
-/// bar's routing) and the `overflow_open` popup latch (#22). The shell-side getter
-/// [`Self::active`] reads `active` back into the central view (the VDOCK-6 `main.rs`
-/// wire); [`Self::set_active`] mirrors the shell's live surface back in first, so a
-/// hotkey / chyron nav that moved the surface still highlights in the picker.
+/// The shell taskbar state. Legacy reveal/pin fields remain as pure state so old
+/// hotkey/test seams cannot reintroduce a left gutter; live production rendering
+/// uses the bottom taskbar. The active surface, Start latch, session rail,
+/// progress/status inputs, overflow popups, and lock/power requests all flow
+/// through this struct.
 // The dock carries several INDEPENDENT boolean latches (the reveal/pin auto-hide
 // pair + the two overflow-popup latches for the app groups and the grade list) —
 // not a state machine folding into one enum, so opt this one struct past the
@@ -613,15 +589,16 @@ fn truncate_session_label(label: &str) -> String {
 }
 
 impl DockState {
-    /// Toggle the Super-tap **reveal** — the VDOCK-1 hotkey path calls this on a
-    /// clean Super tap (`hotkeys::HotkeyRouter::take_dock_toggle`). A pinned dock
-    /// stays shown regardless — see [`Self::shown`].
+    /// Toggle the legacy Super-tap **reveal** latch. The rendered left dock is
+    /// retired, so production uses this only as harmless retained state while the
+    /// same hotkey drain also toggles the Start Menu.
     pub const fn toggle(&mut self) {
         self.revealed = !self.revealed;
     }
 
-    /// Whether the dock should be on screen this frame: revealed **or** pinned
-    /// (the pin holds it open, lock #9).
+    /// Whether the legacy reveal/pin state says the retired dock would be shown.
+    /// Kept for regression tests that prove even a "shown" legacy dock reserves
+    /// no left gutter.
     #[cfg(test)]
     pub const fn shown(&self) -> bool {
         self.revealed || self.pinned
@@ -649,20 +626,16 @@ impl DockState {
         self.status_panel_open = true;
     }
 
-    /// The **active surface** the app picker currently shows (VDOCK-2). The shell
-    /// reads this back into its central view each frame after [`dock`] (the VDOCK-6
-    /// wire) so a picker-cell click routes the shell body; [`Self::set_active`]
-    /// mirrors the shell's live surface in first, so the picker highlights whatever
-    /// surface is showing (design #25).
+    /// The active surface selected by taskbar/front-door/start-menu navigation.
+    /// The shell mirrors this in before the taskbar renders and reads it back out
+    /// after taskbar interactions.
     pub const fn active(&self) -> Surface {
         self.active
     }
 
-    /// Mirror the shell's live surface into the dock before [`dock`] (VDOCK-6) — a
-    /// hotkey / chyron / self-test nav can move the surface OUTSIDE the picker, so
-    /// the dock must track it (else the [`Self::active`] read-back would stomp that
-    /// nav with a stale selection). A picker click then moves it and the shell reads
-    /// it straight back.
+    /// Mirror the shell's live surface into the taskbar state before rendering.
+    /// Hotkeys, search, and self-tests can move the surface outside the taskbar,
+    /// so the read-back path must not stomp them with a stale selection.
     pub const fn set_active(&mut self, surface: Surface) {
         self.active = surface;
     }
@@ -712,12 +685,12 @@ impl DockState {
         NOTIFICATION_RAIL_H
     }
 
-    /// Refresh the bottom **notification rail's** live inputs (NOTIF-3) — the shell calls
-    /// this each frame before [`dock`] with the SAME folds the horizontal tray
-    /// reads (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
-    /// live-session flag). Owned so the dock's `(ctx, state)` signature stays put;
-    /// the quads render the pre-poll dim state until the first call lands (§7).
-    /// Wired by `main.rs::mount_dock_chrome` (VDOCK-6) — the SOLE dock chrome.
+    /// Refresh the bottom taskbar's live inputs (NOTIF-3) — the shell calls this
+    /// each frame with the same folds the tray/status cells read
+    /// (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
+    /// live-session flag). Owned so the taskbar's `(ctx, state)` signature stays
+    /// put; cells render the pre-poll dim state until the first call lands (§7).
+    /// Wired by `main.rs::mount_dock_chrome`.
     pub fn set_status_inputs(
         &mut self,
         mesh: MeshSummary,
@@ -892,9 +865,8 @@ pub fn notification_rail_with_sources(
             // rect) always works in ABSOLUTE screen-space coordinates — an
             // `egui::Area`'s `fixed_pos` only seeds where the Area's own `Ui`
             // starts; egui establishes no separate (0,0)-based "local" frame for
-            // content painted inside it (contrast `dock()` above, which hands
-            // `paint_dock_frame` the rect it gets straight back from
-            // `ui.allocate_exact_size` — already absolute, never re-derived). The
+            // content painted inside it; the rail's cells receive absolute rects
+            // from `ui.allocate_exact_size`, never a separate local origin. The
             // rail's own strip is always exactly `rail_rect` (already absolute,
             // computed above from `screen.bottom()`), regardless of whether the
             // Area grew upward this frame to also fit the animating status panel —
@@ -1213,16 +1185,9 @@ pub fn notification_rail_with_sources(
     clicked
 }
 
-/// The width of the left **gutter** the shell reserves for the vertical dock this
-/// frame (DOCK-OVERLAP) — [`DOCK_W`] scaled by the dock's live slide progress, so
-/// the central content insets in lockstep with the sliding dock (no content jump
-/// on reveal). Reads the SAME slide latch [`dock`] drives (idempotent within a
-/// frame — egui's `animate_bool` returns the settled endpoint on first sight and
-/// the same value on repeat reads), so the reserved gutter and the dock can never
-/// drift apart. `0.0` when the dock is hidden **and settled** — the central
-/// content then fills the full width. The shell reserves this as an empty left
-/// gutter ONLY when NOT in a full-screen remote desktop; there the dock floats as
-/// an overlay instead (`main.rs::central_view`).
+/// The width of the retired left-dock gutter. Production must reserve no left
+/// gutter even if legacy reveal/pin state is toggled; the bottom taskbar strut is
+/// the only live chrome reservation.
 pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
     // WIN10-HYBRID + DEDUPE-1: the left **vertical dock** is retired — its `dock()`
     // render was deleted, so there is nothing to paint in a left gutter and it must
@@ -1238,7 +1203,7 @@ pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
 /// for the taskbar so surface content is never covered by it (the Windows-10 model:
 /// a maximized surface ends *above* the taskbar, unlike the pre-hybrid floating
 /// overlay). It is the taskbar's live [`rail_height`](DockState::rail_height).
-/// Unlike the auto-hiding left-dock gutter this is reserved whenever the bar is
+/// Unlike the retired left-dock gutter this is reserved whenever the bar is
 /// **docked**; when the bar is auto-hidden it returns `0.0` and the revealed bar
 /// floats as an overlay instead (R5 — the strut is never eased with the reveal, so
 /// content never jumps on a hover). Reserved by `main.rs::central_view` as an empty
