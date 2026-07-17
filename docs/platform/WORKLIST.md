@@ -1232,6 +1232,11 @@ These decisions refine acceptance and sequencing for the active items below.
   CEF/Servo wording and onto Browser Options page, Web page, browsing profile,
   and screen-target language; farm `.50` fmt and BigBoy `.130` focused
   `accesskit` coverage passed.
+  A later 2026-07-17 Browser tab-search polish pass replaced the popup's plain
+  text field with a Browser Material search field, leading search icon, and live
+  clear icon button while preserving active-tab selection and Browser token
+  coverage; farm `.50` fmt, BigBoy `.130` focused clear-button coverage, and
+  `.90` focused text-field token coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
