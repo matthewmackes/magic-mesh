@@ -811,6 +811,10 @@ These decisions refine acceptance and sequencing for the active items below.
   hook wording from generated Markdown artifacts, kept the bounded crawl status
   honest, and covered both no-DOM and DOM-backed scrape exports; farm `.50` fmt
   and BigBoy `.130` focused `scrape_export` coverage passed.
+  A later 2026-07-17 Power-menu polish pass replaced implementation/backlog
+  wording in visible media-manifest and scrape-export captions with user-facing
+  behavior language and extended the Power-menu copy guard; farm `.50` fmt and
+  BigBoy `.130` focused `power_mode_adds_power_menu_and_status_chip` passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
