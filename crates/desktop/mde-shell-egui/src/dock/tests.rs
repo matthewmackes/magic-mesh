@@ -966,7 +966,7 @@ fn file_operation_progress_opens_inside_the_bottom_rail_and_routes_to_files() {
     );
     assert_eq!(
         progress.value(),
-        Some("File operations active: 2 active file operation(s), 50% average progress")
+        Some("File operations active: 2 active file operations, 50% average progress")
     );
 
     click_rail_cell(&ctx, &mut s, rect.center(), sz);
@@ -1020,12 +1020,12 @@ fn file_operation_progress_renders_in_the_status_panel_and_routes_to_transfers()
         .map(|(_, n)| n)
         .find(|n| {
             n.label() == Some("File operations status")
-                && n.value() == Some("3 active file operation(s), 25% average progress")
+                && n.value() == Some("3 active file operations, 25% average progress")
         })
         .expect("status panel file-operation row exports accesskit");
     assert_eq!(
         row_node.value(),
-        Some("3 active file operation(s), 25% average progress")
+        Some("3 active file operations, 25% average progress")
     );
 
     click_rail_cell(&ctx, &mut s, row.center(), sz);

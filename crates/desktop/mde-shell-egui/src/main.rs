@@ -2695,7 +2695,7 @@ mod tests {
         assert_eq!(progress.role(), egui::accesskit::Role::Button);
         assert_eq!(
             progress.value(),
-            Some("File operations active: 1 active file operation(s), progress pending")
+            Some("File operations active: 1 active file operation, progress pending")
         );
         let live = nodes
             .iter()
@@ -2729,7 +2729,7 @@ mod tests {
         };
         assert!(
             status::segment_accessibility_value(status::StatusSegment::FileOperations, &segments)
-                .contains("2 active file operation(s), 42% average progress"),
+                .contains("2 active file operations, 42% average progress"),
             "Browser downloads feed the same FileOperations status segment"
         );
 

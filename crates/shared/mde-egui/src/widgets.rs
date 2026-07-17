@@ -90,19 +90,27 @@ pub fn operation_progress_text(progress: OperationProgressView<'_>) -> String {
     }
 }
 
+fn operation_progress_status_text(progress: OperationProgressView<'_>) -> String {
+    match progress.fraction {
+        Some(fraction) => format!("{:.0}%", fraction * 100.0),
+        None => "starting".to_string(),
+    }
+}
+
+fn active_file_operations_text(active: usize) -> String {
+    match active {
+        1 => "1 active file operation".to_string(),
+        active => format!("{active} active file operations"),
+    }
+}
+
 /// AccessKit value text for a compact operation progress badge.
 #[must_use]
 pub fn operation_progress_value(progress: OperationProgressView<'_>) -> String {
+    let active = active_file_operations_text(progress.active);
     match progress.fraction {
-        Some(fraction) => format!(
-            "{} active file operation(s), {:.0}% average progress",
-            progress.active,
-            fraction * 100.0
-        ),
-        None => format!(
-            "{} active file operation(s), progress pending",
-            progress.active
-        ),
+        Some(fraction) => format!("{}, {:.0}% average progress", active, fraction * 100.0),
+        None => format!("{active}, progress pending"),
     }
 }
 
@@ -144,12 +152,39 @@ pub fn paint_operation_progress_badge(
 
     let clip = rect.shrink(Style::SP_XS);
     let painter = ui.painter().with_clip_rect(clip);
+    let font = egui::FontId::proportional(Style::SMALL);
+    let status = operation_progress_status_text(progress);
+    let status_color = if progress.fraction.is_some() {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    };
+    let status_width = painter
+        .layout_no_wrap(status.clone(), font.clone(), status_color)
+        .size()
+        .x;
+    let text_y = rect.top() + Style::SP_XS;
+    let status_left = rect.right() - Style::SP_S - status_width;
+    let label_max_x = (status_left - Style::SP_XS).max(rect.left() + Style::SP_S);
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + Style::SP_S, rect.top()),
+        egui::pos2(label_max_x, rect.bottom()),
+    );
+    if label_clip.width() >= Style::SP_M {
+        painter.with_clip_rect(label_clip).text(
+            egui::pos2(rect.left() + Style::SP_S, text_y),
+            egui::Align2::LEFT_TOP,
+            progress.label,
+            font.clone(),
+            Style::TEXT,
+        );
+    }
     painter.text(
-        egui::pos2(rect.left() + Style::SP_S, rect.top() + Style::SP_XS),
-        egui::Align2::LEFT_TOP,
-        operation_progress_text(progress),
-        egui::FontId::proportional(Style::SMALL),
-        Style::TEXT,
+        egui::pos2(rect.right() - Style::SP_S, text_y),
+        egui::Align2::RIGHT_TOP,
+        status,
+        font,
+        status_color,
     );
 
     let bar = egui::Rect::from_min_size(
@@ -216,7 +251,7 @@ mod tests {
         assert!(progress_text.is_ascii());
         assert_eq!(
             operation_progress_value(progress),
-            "2 active file operation(s), 42% average progress"
+            "2 active file operations, 42% average progress"
         );
         let pending = OperationProgressView::new(1, None, "Copy report.txt");
         let pending_text = operation_progress_text(pending);
@@ -224,7 +259,7 @@ mod tests {
         assert!(pending_text.is_ascii());
         assert_eq!(
             operation_progress_value(pending),
-            "1 active file operation(s), progress pending"
+            "1 active file operation, progress pending"
         );
 
         let ctx = egui::Context::default();
@@ -237,6 +272,70 @@ mod tests {
         assert!(
             !out.shapes.is_empty(),
             "operation progress badge must paint visible shapes"
+        );
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn operation_progress_badge_keeps_status_visible_with_long_labels() {
+        let progress =
+            OperationProgressView::new(4, Some(0.87), "Synchronizing quarterly archive bundle");
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(128.0, 36.0), Sense::hover());
+                paint_operation_progress_badge(ui, rect, progress, false, false);
+            });
+        });
+        let texts = painted_text(&out.shapes);
+
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "87%" && *color == Style::ACCENT),
+            "progress percent must remain a separate visible text chip: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == progress.label && *color == Style::TEXT),
+            "operation label should still paint through the shared badge: {texts:?}"
         );
     }
 }

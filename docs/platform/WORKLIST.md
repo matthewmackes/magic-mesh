@@ -871,8 +871,13 @@ These decisions refine acceptance and sequencing for the active items below.
   bottom-rail entries. A later 2026-07-17 bottom-rail geometry pass strengthened
   the FileOperations proof so the progress pip and AccessKit node must remain
   inside the taskbar landmark and viewport; farm `.50` fmt and BigBoy `.130`
-  focused bottom-rail progress coverage passed. A live visual smoke is still
-  needed before closing the item.
+  focused bottom-rail progress coverage passed. A later 2026-07-17 shared
+  progress-badge polish pass kept the operation status as a separate right-aligned
+  text chip so percent/starting state remains visible with long labels, and
+  replaced `operation(s)` AccessKit wording with normal singular/plural copy;
+  farm `.50` fmt, BigBoy `.130` `mde-egui operation_progress_badge`, and `.90`
+  `mde-shell-egui file_operation_progress` coverage passed. A live visual smoke
+  is still needed before closing the item.
 - Acceptance criteria: Opening a desktop creates a switchable bar entry; file
   copy/upload/download/compress/extract operations share the same progress UI;
   progress survives surface switches.
