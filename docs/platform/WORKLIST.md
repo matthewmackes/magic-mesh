@@ -1234,7 +1234,16 @@ These decisions refine acceptance and sequencing for the active items below.
   `2026-07-17 13:13:18 EDT`. The installed and running
   `/usr/bin/mde-shell-egui` hash matched the staged payload
   `cccd3f7905d48172abe3e2e412bee6414434c0b63852d0cc8261886e2fda1961`, and
-  the installed CEF display/input verifier passed with process cleanup.
+  the installed CEF display/input verifier passed with process cleanup. A
+  follow-up `.15` operator repro showed Google could still leave the Browser
+  unusable when the helper stayed in loading state before first paint; non-root
+  `.15` inspection confirmed the installed RPMs and root-owned
+  `mde-shell-egui` process were still active, but root journal/proc inspection
+  remained unavailable through `mm` sudo. The Browser loading heartbeat now
+  keeps the low-rate 250ms helper wake alive after the fast-load grace even when
+  no texture has been uploaded yet; farm `.50` fmt and BigBoy `.130` focused
+  `long_loading_page_without_first_frame_keeps_low_rate_heartbeat` coverage
+  passed.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
