@@ -40,7 +40,7 @@
    - **Option 2 (target): features-as-workloads.** As the management layer matures,
      role-specific features (media/Navidrome, back-office services, VMs) become
      **Podman/VM workloads the management layer schedules**, shrinking the base. The
-     **egui-DRM shell is the one host binary** (it owns the seat — the Quasar
+     **egui-DRM shell is the one host binary** (it owns the seat — the Quazar
      premise — so it can't be a workload); it lights up only where a display exists.
      Everything else a role does is a managed workload.
 

@@ -1001,6 +1001,12 @@ These decisions refine acceptance and sequencing for the active items below.
   metadata, sample-visible strings, and front-door docs to `Quazar`, renamed the
   local Console provenance variant, and added `install-helpers/lint-brand-identity.sh`
   to CI as the drift guard.
+  A later 2026-07-17 active-docs pass swept current non-archive docs to the
+  canonical `Quazar` spelling, preserving only the two explicit historical
+  S-spelling decision lines, and expanded `install-helpers/lint-brand-identity.sh`
+  from selected front-door docs to the full current `docs/` tree while excluding
+  `docs/worklist-archive/`; farm verification also hardened the guard with a
+  `grep` fallback for build images that do not have `rg` installed.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

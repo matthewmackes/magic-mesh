@@ -9,7 +9,7 @@ flag that decides which systemd units run.
 
 Two supported paths:
 
-- **Quasar ISO / bootc image** — boot it, and the installer's role chooser pins
+- **Quazar ISO / bootc image** — boot it, and the installer's role chooser pins
   the node's role during install. Best for a fresh machine.
 - **GitHub RPM** on an existing Fedora host — one-shot, the latest release asset:
 
@@ -43,7 +43,7 @@ ansible, firewalld, libvirt). There are **two roles**:
 - **Lighthouse** — the always-on relay + Nebula CA/signer + leader control plane
   (and media server). No local desktop. Start here: the first node in a new mesh
   is a lighthouse.
-- **Workstation** — the full Quasar egui thin client: it brokers and displays VM
+- **Workstation** — the full Quazar egui thin client: it brokers and displays VM
   desktops and runs libvirt/QEMU-KVM + Podman. A **headless** box is a
   Workstation with no local display (daemon stack only, serving VMs/containers to
   the mesh) — "headless" is a capability, not a separate role.

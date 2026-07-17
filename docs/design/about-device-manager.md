@@ -2,7 +2,7 @@
 
 Operator-locked 2026-07-04 (25-Q survey). Turn the **About surface**
 (`mde-shell-egui`, `Surface::About`, QBRAND-6) into a **Windows-Device-Manager-style
-hardware inspector** — a faithful categorized device tree, rendered in Quasar dark,
+hardware inspector** — a faithful categorized device tree, rendered in Quazar dark,
 with the ability to **switch which host you're inspecting** across the whole mesh
 (nodes, cloud instances, paired phones, LAN devices, VyOS/routers). Each node
 self-enumerates its hardware and publishes it to the substrate; the panel reads any
@@ -13,7 +13,7 @@ Phase 2) drives real device actions over the overlay.
 
 | # | Area | Lock |
 |---|------|------|
-| 1 | Fidelity | **Faithful MDM layout, Quasar-skinned** — the exact Device-Manager tree/columns/toolbar/interaction, rendered in `mde_egui::Style` dark tokens (not literal Win chrome, not a loose homage). |
+| 1 | Fidelity | **Faithful MDM layout, Quazar-skinned** — the exact Device-Manager tree/columns/toolbar/interaction, rendered in `mde_egui::Style` dark tokens (not literal Win chrome, not a loose homage). |
 | 2 | Placement | **Device Manager fills the About body** — the brand/version shrinks to a compact title strip; the device tree is the surface body. |
 | 3 | View modes | **By type + By connection + By node** — the two classic MDM modes plus a mesh-native "By node" mode that flattens every host's devices into one cross-fleet tree. |
 | 4 | Categories | **Full Linux taxonomy** — CPU, Memory, Disk drives + storage controllers, Network adapters, Display/GPU, USB controllers, PCI/system devices, Audio, Input, Sensors/thermal, Bluetooth, Battery/power. |
@@ -36,7 +36,7 @@ Phase 2) drives real device actions over the overlay.
 | 21 | Notify | **Yes — fleet-wide fault notify** — a device faulting on ANY node posts to the mesh notify feed (→ Chat + phone), debounced (mirrors node_grade's D/F alert). |
 | 22 | Non-PC hosts | **Same tree, applicable categories only** — a VyOS router shows Network/System/Firmware; a phone shows Power/Sensors/Radios; a Nova instance shows virtio devices; a LAN host shows what's remotely detectable. No empty categories. |
 | 23 | Export | **JSON + Markdown report + clipboard** — export the current host's inventory as machine JSON and a human-readable report. |
-| 24 | About info | **Title strip + ⓘ button** — a compact `◈ Magic-Mesh Quasar v<ver>` strip always visible; an ⓘ button opens license/credits/mesh-identity in a dialog. The tree fills the body. |
+| 24 | About info | **Title strip + ⓘ button** — a compact `◈ Magic-Mesh Quazar v<ver>` strip always visible; an ⓘ button opens license/credits/mesh-identity in a dialog. The tree fills the body. |
 | 25 | Phasing | **Inspector first, actions + reach next** — P1 = a complete READ-ONLY inspector across local + mesh nodes; P2 = actions (armed, any-host), fleet notify, By-node view, non-PC host types, cross-fleet reach. |
 
 ## Architecture
@@ -74,7 +74,7 @@ In `mde-shell-egui`, a new `device_manager.rs` module rendered as the body of
 - **Left host rail** (#5): lists every selectable host (#6) with a status dot + the
   "you are here" local marker; selecting one loads its inventory (hybrid snapshot + a
   live-refresh button, #7; Scan + ~30s auto-refresh, #8; honest dim/stale/offline states).
-- **The tree** (#1/#3/#4/#18): the faithful MDM device tree in Quasar-dark tokens, three
+- **The tree** (#1/#3/#4/#18): the faithful MDM device tree in Quazar-dark tokens, three
   view modes (By type default, By connection = the PCI/USB topology, By node = cross-fleet),
   all-collapsed default, category grouping, per-device **problem badges** (#11 — Linux
   state → MDM problem code).
@@ -97,7 +97,7 @@ In `mde-shell-egui`, a new `device_manager.rs` module rendered as the body of
 
 ## Acceptance (runtime-observable; per task, no stubs — §7)
 - Opening **About** shows the device tree filling the body, brand as a title strip + an
-  ⓘ dialog; the tree is the faithful MDM layout in Quasar-dark, all-collapsed, with the
+  ⓘ dialog; the tree is the faithful MDM layout in Quazar-dark, all-collapsed, with the
   menu bar + toolbar + rich header card.
 - A **device-inventory worker** on each node publishes the full-taxonomy device tree to
   `<root>/device-inventory/<host>.json`; the panel reads the local + any mesh node's tree

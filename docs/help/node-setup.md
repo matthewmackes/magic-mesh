@@ -25,7 +25,7 @@ few peers (losing your only lighthouse is the one painful case — see
 
 ## Add a Workstation
 
-A Workstation is the full Quasar egui thin client. It brokers and displays VM
+A Workstation is the full Quazar egui thin client. It brokers and displays VM
 desktops (libvirt/QEMU-KVM through Nova), runs Podman, and carries fleet
 automation (Ansible-on-each-node, jobs, netstate/firewall convergence) plus a
 Syncthing replicated-storage replica. Enroll it with a single-use token:

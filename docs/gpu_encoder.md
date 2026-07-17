@@ -8,7 +8,7 @@ prove the shipped shell is not using `FakeMpv` or a placeholder video rectangle.
 
 ## Objective
 
-Make `mde-media-egui` a real VLC-class player in the Quasar shell:
+Make `mde-media-egui` a real VLC-class player in the Quazar shell:
 
 - local AV1/Opus/Matroska and common H.264/H.265 media plays with video and audio;
 - hardware decode is used where the seat exposes it, with an honest software

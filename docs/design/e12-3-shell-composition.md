@@ -12,7 +12,7 @@ The surfaces (Music / Files / Voice) run as **embedded egui widgets inside the
 shell process**, not as separate windows/processes the shell composites. Forced by
 three facts, so no survey was needed:
 
-1. **Quasar §5 lock:** "the mesh-control surfaces (Workbench/Files/Music/Voice) are
+1. **Quazar §5 lock:** "the mesh-control surfaces (Workbench/Files/Music/Voice) are
    **panels inside the one shell**, not separate clients."
 2. **No compositor (§5):** the egui shell owns the DRM/KMS seat directly — there is
    no Wayland compositor to composite other processes' windows. So a surface is

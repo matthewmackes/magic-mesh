@@ -14,7 +14,7 @@ The actionable-safe drain is COMPLETE. Landed after this ledger's baseline:
 - Plus the polish/P3 wave (contrast-guard, curtain hit-target, media/mesh-view/panel polish) + nova Fleet-plane Nova-VM teardown guard.
 
 REMAINING (NOT drained — by category, none are safe blind-autonomous work):
-- **OPERATOR-GATED:** .138 live-deploy (needs my pubkey installed); Quazar/Quasar NAMING-1 ruling (repo lock #9 says "Quazar"-Z — findings 764/807 wait on it); BigBoy .130 root-owned qcow2 build-slot cleanup.
+- **OPERATOR-GATED:** .138 live-deploy (needs my pubkey installed); Quazar/Quazar NAMING-1 ruling (repo lock #9 says "Quazar"-Z — findings 764/807 wait on it); BigBoy .130 root-owned qcow2 build-slot cleanup.
 - **LOW-PRI a11y** (operator dropped the TTS output path; AccessKit tree exists, nothing consumes it): a11y-02/04/05/06/07/08, shell-ux-6.
 - **BIG/RISKY — need staging + review:** arch-11 (401, shared BusReader seam across 91 sites), perf-7 (428, VDI dirty sub-rect — needs live visual verify), run_serve extraction (mackesd P3-L).
 - **MARGINAL:** perf-12 (552, clippy lint — mostly already Result-based), docs-consistency-10 (561, WORKLIST.md archive), shell-ux-4/2 (dock — largely closed by the tooltip+group-drift commit).
@@ -44,8 +44,8 @@ the majority of in-scope findings; the OPEN set is dominated by the a11y cluster
 | a11y-07 (682) | mde-shell-egui/src/system.rs | OPEN (a11y low-pri) | AppearanceConfig ~system.rs:1251 | no reduce_motion setting; still accent+text-scale only |
 | a11y-08 (691) | mde-shell-egui/Cargo.toml | OPEN (a11y low-pri) | companion crates' Cargo.toml | accesskit feature still enabled only by mde-shell-egui; term/media/editor/files featureless |
 | shell-ux-2 (746) | mde-shell-egui/src/dock.rs | OPEN | dock.rs:295 GROUPS vs start_menu.rs:420 TILE_GROUPS | two divergent taxonomies persist; no Surface::group() single table |
-| docs-consistency-2 (764) | mde-kdc-host/src/fanout.rs | OPEN (brand-inflight) | fanout.rs:35 "Quasar Mesh"; AI_GOVERNANCE.md:12 | superseded s-spelling still shipped; governance doc still says MCNF 12.0 "Quasar" |
-| shell-ux-9 (807) | mde-theme/src/brand/logo.rs (consumers) | OPEN (brand-inflight) | phones_hub.rs:58, device_manager.rs:1433 | "Quasar Mesh"/"Magic-Mesh Quasar" user strings not routed through brand consts |
+| docs-consistency-2 (764) | mde-kdc-host/src/fanout.rs | OPEN (brand-inflight) | fanout.rs:35 "Quazar Mesh"; AI_GOVERNANCE.md:12 | superseded s-spelling still shipped; governance doc still says MCNF 12.0 "Quazar" |
+| shell-ux-9 (807) | mde-theme/src/brand/logo.rs (consumers) | OPEN (brand-inflight) | phones_hub.rs:58, device_manager.rs:1433 | "Quazar Mesh"/"Magic-Mesh Quazar" user strings not routed through brand consts |
 | shell-ux-8 (940) | mde-shell-egui/src/main.rs | DONE | Surface::Explorer | 8f8ef21e: Explorer promoted to first-class dock surface |
 | perf-8 (949) | mde-shell-egui/src/web/mod.rs | DONE | Arc last_frame | 08ba3ced: browser last_frame shared via Arc, zero per-frame copy |
 | arch-13 (958) | crates/platform/mde-lighthouse-health/ | DONE | renamed | d13bd93f: mde-cosmic-applet → mde-lighthouse-health, last cosmic-era crate name retired (lock regen'd) |

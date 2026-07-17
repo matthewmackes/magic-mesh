@@ -12,7 +12,7 @@
 
 > **Status:** LOCKED (design) · 2026-06-30 · 4-round / 16-question `/plan` survey.
 > **Supersedes:** the Cosmic-era desktop locks (`AI_GOVERNANCE.md` §4/§5/§6, E11).
-> **Series:** opens **MCNF 12.0** (current tip: 11.2.0). Codename **"Quasar"**
+> **Series:** opens **MCNF 12.0** (current tip: 11.2.0). Codename **"Quazar"**
 > (operator-confirmed 2026-06-30).
 > **Authority:** Memory > `AI_GOVERNANCE.md` > this doc > `docs/WORKLIST.md` body
 > (newest wins). Tasks: `docs/WORKLIST.md` → `## E12` section.
@@ -44,7 +44,7 @@ locks (§3), the Definition of Done (§7), the trust envelope (§8), the planes
 | 5 | **Render path** | **All egui as Wayland clients** — the forked `cosmic-comp` stays a *pure* compositor (no embedded UI); shell + panel + apps are **eframe** clients; the shell is independently restartable. |
 | 6 | **Boundary** | **Layered tiers** — `mesh-substrate ⊂ platform-services ⊂ desktop-shell`; dependencies point only inward; lint-gated (new gate replaces `lint-mesh-boundary.sh`). |
 | 7 | **Distribution** | **RPM layer on stock Fedora-Cosmic + integrated spin.** The egui clients install onto stock Cosmic as an RPM layer; the forked compositor ships in the spin. Headless Server/Lighthouse: mesh-only RPM set. |
-| 8 | **Identity** | **Evolve MCNF → 12.0 series** (codename proposed "Quasar"); package/repo id stays `magic-mesh`. The "C" in MCNF now means *our forked Cosmic*, not *runs on Cosmic*. |
+| 8 | **Identity** | **Evolve MCNF → 12.0 series** (codename proposed "Quazar"); package/repo id stays `magic-mesh`. The "C" in MCNF now means *our forked Cosmic*, not *runs on Cosmic*. |
 | 9 | **Design source** | **egui `Style` IS the source** — one shared `Style`/`Visuals` module; **no token crate, no raw-literal lint gate.** |
 | 10 | **Motion** | **egui built-ins** (`animate_bool` / `ctx` animation) + a small shared duration+easing table; no bespoke motion module/gate. |
 | 11 | **Accessibility** | **Deferred** — out of cutover scope (revisit post-stabilization). |
@@ -57,7 +57,7 @@ locks (§3), the Definition of Done (§7), the trust envelope (§8), the planes
 ## Resulting architecture
 
 ```
-                         MCNF 12.0 "Quasar" — one repo, three tiers
+                         MCNF 12.0 "Quazar" — one repo, three tiers
   ┌─────────────────────────────────────────────────────────────────────┐
   │  desktop-shell    (egui eframe Wayland clients — restartable)        │
   │    mde-shell-egui · mde-panel-egui · mde-workbench · mde-files ·     │
@@ -187,7 +187,7 @@ locks (§3), the Definition of Done (§7), the trust envelope (§8), the planes
 
 ## Open item — resolved
 
-- **Codename for the 12.0 series.** **Confirmed "Quasar"** (operator, 2026-06-30).
+- **Codename for the 12.0 series.** **Confirmed "Quazar"** (operator, 2026-06-30).
   The package/repo id stays `magic-mesh`. Per operator go-ahead, the E12
   governance rewrite was applied to `AI_GOVERNANCE.md` and this design doc landed
   at plan-lock time, so **E12-0 is complete**; E12-1…E12-12 remain the execution

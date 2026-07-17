@@ -3,8 +3,8 @@
 #
 # The operator selected "Quazar" as the user-facing 12.x codename. This gate
 # prevents the superseded "Quasar" spelling from returning to current source,
-# generated-user-facing metadata, install helpers, and front-door governance
-# docs. Historical archives and lower-case asset paths such as
+# generated-user-facing metadata, install helpers, and current docs.
+# Historical archives and lower-case asset paths such as
 # assets/brand/quasar are intentionally outside this check.
 #
 # Run with `--self-test` to verify. Exit 0 = clean, 1 = a violation.
@@ -19,9 +19,7 @@ default_paths() {
     "$ROOT/AI_GOVERNANCE.md" \
     "$ROOT/README.md" \
     "$ROOT/CHANGELOG.md" \
-    "$ROOT/docs/NEEDS-OPERATOR.md" \
-    "$ROOT/docs/platform/WORKLIST.md" \
-    "$ROOT/docs/design/quasar-branding.md" \
+    "$ROOT/docs" \
     "$ROOT/crates" \
     "$ROOT/install-helpers" \
     "$ROOT/packaging"
@@ -50,13 +48,36 @@ allowed_hit() {
   esac
 }
 
+search_hits() {
+  local roots=("$@")
+  if command -v rg >/dev/null 2>&1; then
+    rg -n --hidden \
+      --glob '!target/**' \
+      --glob '!target-f43/**' \
+      --glob '!target-f44/**' \
+      --glob '!worklist-archive/**' \
+      --glob '!docs/worklist-archive/**' \
+      --glob '!.git/**' \
+      "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true
+    return 0
+  fi
+  if command -v grep >/dev/null 2>&1; then
+    grep -RIn --binary-files=without-match \
+      --exclude-dir='.git' \
+      --exclude-dir='target' \
+      --exclude-dir='target-f43' \
+      --exclude-dir='target-f44' \
+      --exclude-dir='worklist-archive' \
+      "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true
+    return 0
+  fi
+  echo "lint-brand-identity.sh: neither rg nor grep is available" >&2
+  return 2
+}
+
 scan() {
   local roots=("$@") raw hit path rest line text rc=0
-  raw="$(rg -n --hidden \
-    --glob '!target/**' \
-    --glob '!docs/worklist-archive/**' \
-    --glob '!.git/**' \
-    "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true)"
+  raw="$(search_hits "${roots[@]}")" || return "$?"
 
   while IFS= read -r hit; do
     [ -n "$hit" ] || continue

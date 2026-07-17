@@ -1,7 +1,7 @@
-# Quasar — the egui-native mesh thin-client desktop OS (E12, revised)
+# Quazar — the egui-native mesh thin-client desktop OS (E12, revised)
 
 > **Status:** LOCKED (design) · 2026-06-30 · 50-question `/plan` survey.
-> **Series:** MCNF **12.0 "Quasar"** (package/repo id stays `magic-mesh`).
+> **Series:** MCNF **12.0 "Quazar"** (package/repo id stays `magic-mesh`).
 > **Authority:** Memory > `AI_GOVERNANCE.md` > this doc > `docs/WORKLIST.md` body.
 > **Supersedes (in part):** `docs/design/cosmic-magic-mesh-egui.md` — the
 > **forked-compositor** desktop model (its locks 1/5/6/12: fork `cosmic-comp`,
@@ -97,7 +97,7 @@ adopted capacity, never an install-time role.
 ### Round 5 — Identity, packaging, scope, sequencing
 | # | Decision | Lock |
 |---|---|---|
-| 41 | Identity | **Keep E12 "Quasar"; revise the design** (this doc + governance §4/§5/§6) to the VDI/egui-DRM model. |
+| 41 | Identity | **Keep E12 "Quazar"; revise the design** (this doc + governance §4/§5/§6) to the VDI/egui-DRM model. |
 | 42 | Packaging | **Immutable bootc/ostree image** for the Workstation (image-based, appliance-style updates). |
 | 43 | Crate structure | **Many small crates** (granular: shell, chrome, each panel, RDP, VNC, KVM-broker, session-broker). |
 | 44 | Roles | **Lighthouse · XCP-NG · Workstation** (XCP-NG renamed from Server — the Xen host mirroring the xcp-ng toolstack) **+ a `desktop-host` capability tag** for peers that serve VMs. |
@@ -111,7 +111,7 @@ adopted capacity, never an install-time role.
 ## Resulting architecture
 
 ```
-                MCNF 12.0 "Quasar" — one egui shell, mesh VDI, no compositor
+                MCNF 12.0 "Quazar" — one egui shell, mesh VDI, no compositor
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  desktop-shell (one egui binary on the DRM seat — immutable bootc spin)    │
   │    mde-shell-egui:  thin chrome bar  ⇕expand→  Workbench                   │
@@ -156,7 +156,7 @@ adopted capacity, never an install-time role.
 5. **Sessions roam:** open sessions + layout persist to mesh state and reappear on a second Workstation; a disconnected VM **keeps running** and reconnects.
 6. **Clipboard + the mesh-share folder** move data host⇄guest⇄mesh; **audio** plays (virtio-sound local / protocol remote).
 7. `mackesd` runs the **session-broker + vm-lifecycle** workers; remote VM actions go through **typed verbs** to the hosting peer (no push-SSH); the leader coordinates.
-8. The **layered-tiers lint** passes and fails on a planted outward edge; **no libcosmic/iced/`mde-theme`** remains (`grep` empty); About/greeter reads `MCNF 12.0 "Quasar"`.
+8. The **layered-tiers lint** passes and fails on a planted outward edge; **no libcosmic/iced/`mde-theme`** remains (`grep` empty); About/greeter reads `MCNF 12.0 "Quazar"`.
 9. v1 includes **GPU passthrough, USB redirection, per-monitor-different-VM, and live migration** (lock 48) — each runtime-demonstrated.
 
 ## Risks
@@ -186,7 +186,7 @@ adopted capacity, never an install-time role.
 6. **Advanced (fan out):** GPU passthrough · USB redirection · per-monitor VM · live migration · adaptive codec · clipboard/audio/mesh-share bridges.
 7. **Port the panels** — Files/Music/Voice as in-shell modules over their existing non-GUI logic.
 8. **Packaging** — the immutable **bootc** Workstation image; mesh-only set for headless roles; gh-pages channel.
-9. **Decommission** — remove libcosmic/iced + `mde-theme`/`mde-card`; strike the abandoned iced GUI + the retired cosmic-comp tasks; revise `AI_GOVERNANCE.md` §4/§5/§6/§8 + the About/version to 12.0 "Quasar".
+9. **Decommission** — remove libcosmic/iced + `mde-theme`/`mde-card`; strike the abandoned iced GUI + the retired cosmic-comp tasks; revise `AI_GOVERNANCE.md` §4/§5/§6/§8 + the About/version to 12.0 "Quazar".
 
 ## Open items — resolved
 
