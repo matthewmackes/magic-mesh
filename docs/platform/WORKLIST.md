@@ -906,6 +906,13 @@ These decisions refine acceptance and sequencing for the active items below.
   missing/error, and shows the live custom-filter status in the Privacy menu;
   farm `.170` fmt, BigBoy `.130` focused custom-filter source coverage, `.90`
   focused Privacy menu coverage, and `.50` policy-source audit coverage passed.
+  A later 2026-07-17 Browser synced-filter pass made
+  `adfilter/compiled/engine.json` the real mesh-synced filter-list source for
+  Browser blocking, preserves local operator custom rules while importing the
+  compiled worker store, publishes source-read status, and replaces the static
+  Privacy-menu filter-list promise with the live source count; farm `.170` fmt,
+  BigBoy `.130` focused synced-filter source coverage, `.90` Privacy menu
+  coverage, and `.50` policy-source audit coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1148,6 +1155,11 @@ These decisions refine acceptance and sequencing for the active items below.
   preserving the Browser Material menu model; farm `.170` fmt, BigBoy `.130`
   custom-filter source coverage, `.90` Privacy menu coverage, and `.50`
   policy-source audit coverage passed.
+  A later 2026-07-17 Browser synced-filter pass kept the Privacy menu on Browser
+  Material text tokens while replacing the static bundled/synced/custom caption
+  with live `adfilter/compiled/engine.json` source status; farm `.170` fmt,
+  BigBoy `.130` synced-filter source coverage, `.90` Privacy menu coverage, and
+  `.50` policy-source audit coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
