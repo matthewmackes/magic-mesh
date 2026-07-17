@@ -865,6 +865,11 @@ These decisions refine acceptance and sequencing for the active items below.
   status notice, drawer header summary, and warning row to Browser-facing
   dictionary/service language; farm `.50` fmt and BigBoy `.130` focused
   `spellcheck` coverage passed.
+  A later 2026-07-17 Browser print copy pass moved print drawer labels,
+  unavailable-printer notices, queued/failure print notices, and print-job
+  completion text off CUPS/lp/spool-path wording while keeping the raw CUPS/lp
+  helpers tested internally; farm `.50` fmt and BigBoy `.130` focused `print`
+  coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1068,6 +1073,10 @@ These decisions refine acceptance and sequencing for the active items below.
   Browser warning tokens while preventing Hunspell/runtime/backend/worker terms
   from painting in the visible drawer; farm `.50` fmt and BigBoy `.130` focused
   `spellcheck` coverage passed.
+  A later 2026-07-17 Browser print copy pass kept the print drawer on Browser
+  text/error tokens while preventing CUPS/lp/lpstat backend terms from painting
+  in the visible drawer; farm `.50` fmt and BigBoy `.130` focused `print`
+  coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
