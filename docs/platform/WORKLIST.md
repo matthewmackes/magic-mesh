@@ -772,6 +772,10 @@ These decisions refine acceptance and sequencing for the active items below.
   capture/PDF folders, MHTML/offline-copy subjects, and generated CUPS job
   titles from superseded `Magic Mesh Browser` wording to `Quazar Browser`; farm
   `.50` fmt plus BigBoy focused artifact, dashboard, and CUPS title tests passed.
+  A later 2026-07-17 Browser menu copy pass removed internal follow-up/v1/stub
+  language from visible Power/Privacy captions while keeping the command gates
+  intact; farm `.50` fmt plus `.90` focused Privacy menu coverage passed, and
+  BigBoy `.130` focused Power menu coverage passed after session recovery.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
