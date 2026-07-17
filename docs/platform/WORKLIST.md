@@ -1142,6 +1142,11 @@ These decisions refine acceptance and sequencing for the active items below.
   real progress metadata, verification flag, and error text while leaving command
   behavior on the existing action buttons; farm `.50` fmt and BigBoy `.130`
   focused `browser_download_rows_export_accesskit_status` coverage passed.
+  A later 2026-07-17 Browser history AccessKit pass added named clickable
+  `Button` nodes for visible history rows, exposing the user-facing title and
+  real URL value while preserving the existing click-to-open drawer path; farm
+  `.50` fmt and BigBoy `.130` focused
+  `browser_history_rows_export_accesskit_buttons` coverage passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
