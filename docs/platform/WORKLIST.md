@@ -854,6 +854,12 @@ These decisions refine acceptance and sequencing for the active items below.
   coverage, BigBoy `.130` drawer/prompt paint coverage, `.90` menubar
   chip/read-aloud notice coverage, and `.170` passkey/voice-command coverage
   passed.
+  A later 2026-07-17 Browser empty/gate copy pass replaced the no-page body,
+  AccessKit empty summary, no-seat gate, missing-engine gate, spawn-failure gate,
+  and incomplete Chromium gate with Browser-facing language instead of
+  sandbox/helper/Servo/runtime/path wording; farm `.50` fmt, BigBoy `.130`
+  empty-body and AccessKit coverage, `.90` live-helper no-seat/missing-engine
+  coverage, and `.170` live-helper spawn-failure/Chromium gate coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1049,6 +1055,10 @@ These decisions refine acceptance and sequencing for the active items below.
   voice input, and Chromium terminology while raw TTS/STT/CEF/runtime strings
   remain confined to worker payloads and fixtures; farm `.50`, `.90`, `.130`,
   and `.170` focused coverage passed.
+  A later 2026-07-17 Browser empty/gate copy pass aligned the default no-page
+  body and live-helper gate notices with Browser-facing empty/error states and
+  added paint/AccessKit/live-helper guards against sandbox/helper/Servo/runtime
+  wording; farm `.50`, `.90`, `.130`, and `.170` focused coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
