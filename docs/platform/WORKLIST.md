@@ -829,8 +829,11 @@ These decisions refine acceptance and sequencing for the active items below.
   operations, Browser downloads, Transfers jobs, and archive queue operations
   all fold into one bottom-rail `FileOperations` status projection, clicking it
   routes to Files → Transfers, and named Desktop sessions render as switchable
-  bottom-rail entries. A live visual smoke is still needed before closing the
-  item.
+  bottom-rail entries. A later 2026-07-17 bottom-rail geometry pass strengthened
+  the FileOperations proof so the progress pip and AccessKit node must remain
+  inside the taskbar landmark and viewport; farm `.50` fmt and BigBoy `.130`
+  focused bottom-rail progress coverage passed. A live visual smoke is still
+  needed before closing the item.
 - Acceptance criteria: Opening a desktop creates a switchable bar entry; file
   copy/upload/download/compress/extract operations share the same progress UI;
   progress survives surface switches.

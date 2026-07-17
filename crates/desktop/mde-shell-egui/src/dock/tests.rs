@@ -818,6 +818,14 @@ fn accesskit_nodes(
         .clone()
 }
 
+fn accesskit_bounds_rect(node: &egui::accesskit::Node) -> egui::Rect {
+    let bounds = node.bounds().expect("accesskit node has bounds");
+    egui::Rect::from_min_max(
+        egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+        egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+    )
+}
+
 #[test]
 fn win7_7_the_taskbar_itself_exports_a_toolbar_landmark() {
     // The task's own question: does the taskbar have a sensible landmark
@@ -918,6 +926,22 @@ fn file_operation_progress_opens_inside_the_bottom_rail_and_routes_to_files() {
         "file-operation status must live in the bottom navigation bar"
     );
     let nodes = accesskit_nodes(&out);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, sz);
+    let taskbar = nodes
+        .iter()
+        .map(|(_, n)| n)
+        .find(|n| n.label() == Some("Taskbar"))
+        .expect("the taskbar exports its own landmark node");
+    let taskbar_rect = accesskit_bounds_rect(taskbar);
+    assert!(
+        viewport.contains_rect(taskbar_rect),
+        "taskbar landmark must stay inside the viewport: {taskbar_rect:?}"
+    );
+    assert!(
+        taskbar_rect.contains_rect(rect),
+        "file-operation status must live inside the bottom taskbar landmark: \
+         taskbar={taskbar_rect:?} progress={rect:?}"
+    );
     let live = nodes
         .iter()
         .map(|(_, n)| n)
@@ -934,6 +958,12 @@ fn file_operation_progress_opens_inside_the_bottom_rail_and_routes_to_files() {
         .find(|n| n.label() == Some("File operations status"))
         .expect("the progress segment exports accesskit");
     assert_eq!(progress.role(), egui::accesskit::Role::Button);
+    let progress_bounds = accesskit_bounds_rect(progress);
+    assert!(
+        taskbar_rect.contains_rect(progress_bounds),
+        "file-operation accesskit node must stay inside the taskbar landmark: \
+         taskbar={taskbar_rect:?} progress={progress_bounds:?}"
+    );
     assert_eq!(
         progress.value(),
         Some("File operations active: 2 active file operation(s), 50% average progress")
