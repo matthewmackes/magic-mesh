@@ -936,6 +936,10 @@ These decisions refine acceptance and sequencing for the active items below.
   empty Browser AccessKit status, and cleaned stale drawer docs; farm `.50` fmt,
   `.130` focused `browser_download_toolbar_tip_uses_user_facing_status`, and
   `.90` focused `browser_empty_accesskit_status_uses_user_facing_notice` passed.
+  A later 2026-07-17 Browser Options copy pass replaced the Picture-in-Picture
+  disabled gate's implementation wording with a user-facing playback gate and
+  extended disabled-row coverage; farm `.50` fmt and BigBoy `.130` focused
+  `browser_options_disabled_rows_explain_their_command_gate` passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
