@@ -848,6 +848,12 @@ These decisions refine acceptance and sequencing for the active items below.
   CEF implementation paths; farm `.50` fmt, BigBoy `.130` scrape-export coverage,
   `.90` saved-PDF viewer coverage, and `.170` DevTools/passkey notice coverage
   passed.
+  A later 2026-07-17 Browser speech/passkey copy pass moved read-aloud, voice
+  input, and passkey approval chrome off raw TTS/STT/CEF/runtime wording while
+  preserving worker payloads; farm `.50` fmt plus speech-status parser/display
+  coverage, BigBoy `.130` drawer/prompt paint coverage, `.90` menubar
+  chip/read-aloud notice coverage, and `.170` passkey/voice-command coverage
+  passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1038,6 +1044,11 @@ These decisions refine acceptance and sequencing for the active items below.
   implementation wording; farm `.50` fmt, BigBoy `.130` scrape-export coverage,
   `.90` saved-PDF viewer coverage, and `.170` DevTools/passkey notice coverage
   passed.
+  A later 2026-07-17 Browser speech/passkey copy pass kept speech status chips,
+  speech drawers, capture notices, and passkey prompts on user-facing read-aloud,
+  voice input, and Chromium terminology while raw TTS/STT/CEF/runtime strings
+  remain confined to worker payloads and fixtures; farm `.50`, `.90`, `.130`,
+  and `.170` focused coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
