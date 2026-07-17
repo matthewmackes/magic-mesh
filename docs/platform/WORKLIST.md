@@ -1243,7 +1243,17 @@ These decisions refine acceptance and sequencing for the active items below.
   keeps the low-rate 250ms helper wake alive after the fast-load grace even when
   no texture has been uploaded yet; farm `.50` fmt and BigBoy `.130` focused
   `long_loading_page_without_first_frame_keeps_low_rate_heartbeat` coverage
-  passed.
+  passed. A BigBoy `.130` Fedora 44 split RPM cut from commit `61dcbae5` in
+  slot `browser-google-prepaint-rpm` passed both size guards (base 70.1 MiB,
+  Browser 39.1 MiB). The packages were staged on `.15` at
+  `/home/mm/browser-f44-live-proof-61dcbae5/` with sha256
+  `350f3559bce1b775622e068a8c2242f957a0cd93399f7f8f3b1e3b6a7d486030` for
+  `magic-mesh` and
+  `74709d34f041ef5dd994306d19ca4bdb47d3333bbff5ee60f39409ac7373bb1a` for
+  `magic-mesh-browser`; non-root `rpm -qp` on `.15` confirmed both packages as
+  `12.0.0-1.x86_64`. Installation/restart remains blocked until `.15` grants
+  passwordless sudo or another root path; `sudo -n true` still reports that a
+  password is required.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
