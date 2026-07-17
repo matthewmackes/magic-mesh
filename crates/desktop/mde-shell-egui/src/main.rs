@@ -1282,14 +1282,9 @@ impl Shell {
         // while the curtain is engaged (lock 10).
         //
         // WIN7-2 (win7-desktop-survey lock #13) reuses this SAME drain for the
-        // Start Menu: the survey never anticipated VDOCK-1's pre-existing claim
-        // on Super, and stranding the vertical dock behind an unreachable
-        // hotkey would break the shell's only surface launcher until WIN7-3
-        // lands real tiles in the Start Menu. So one clean Super tap now
-        // reveals BOTH — not a UX collision in practice, since the Start Menu
-        // already mounts immediately beside the dock column (`x = DOCK_W`), so
-        // the two read as one "reveal the nav chrome" gesture. A flagged
-        // judgment call (see `start_menu`'s module doc), not a surveyed answer.
+        // Start Menu. WIN10-HYBRID later retired the rendered left dock, so this
+        // path now effectively means a clean Super tap opens/closes the true
+        // bottom-left Start panel while preserving the old hotkey latch shape.
         if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
             self.vdock.toggle();
             self.start_menu.toggle();
@@ -1471,8 +1466,8 @@ impl Shell {
     /// WIN7-2 — mount the **Start Menu** for this frame: drain the dock Start
     /// cell's toggle latch (ALWAYS drained so it never backs up — the
     /// Super-tap idiom), mount the panel (the fixed-size floating slide-up
-    /// beside the dock, `start_menu::start_menu_panel`, which embeds the
-    /// Console front door as its right pane), and drive Console's typed
+    /// from the true bottom-left edge, `start_menu::start_menu_panel`, which
+    /// embeds the Console front door as its right pane), and drive Console's typed
     /// requests exactly as before (the panel is a presentation change, lock
     /// #10 says the underlying requests/data don't move). Everything but the
     /// drain sits behind the curtain gate (CURTAIN-1 lock 10): the panel reads

@@ -5,11 +5,10 @@
 //! Console behaviour (WIN7-1 relabelled the cell "Start" but left its click
 //! wired to Console directly — this unit is the real two-pane Start Menu lock
 //! #4 describes). It reuses the SAME floating-`egui::Area` + [`Motion`]-tweened
-//! slide-up pattern `console.rs`'s old standalone panel and `dock.rs`'s
-//! vertical dock both already use (not a new mechanism): fixed-size (lock #2 —
-//! never full-screen, never resizable), anchored bottom-left beside the
-//! vertical dock column (`x = DOCK_W`, the Console front door's existing
-//! footprint), opening **upward** from the bottom edge.
+//! slide-up pattern `console.rs`'s old standalone panel already used (not a
+//! new mechanism): fixed-size (lock #2 — never full-screen, never resizable),
+//! anchored at the screen's true bottom-left edge, opening **upward** from the
+//! bottom taskbar.
 //!
 //! **Panes (lock #4):** left = a placeholder for WIN7-3's live-tile grid (this
 //! unit ships the shell only, no tile content); right = [`console::ConsoleState`]
@@ -45,14 +44,10 @@
 //! so this unit must not steal Super away from it (that would strand every
 //! surface behind an unpinned, now-unreachable dock). Lock #13 in the win7
 //! survey just says "Super opens the Start Menu," without addressing that
-//! pre-existing claim. Resolution: `main.rs` applies the SAME clean-Super-tap
-//! drain (`HotkeyRouter::take_dock_toggle`) to BOTH `DockState::toggle` AND
-//! `StartMenuState::toggle`, so one Super tap reveals both — not a conflict in
-//! practice, since the Start Menu already mounts immediately beside the dock
-//! column (`x = DOCK_W`), so revealing both together reads as "the whole nav
-//! chrome" rather than two unrelated popups. This is a deliberate, flagged
-//! choice, not a discovered fact — worth a confirm from the operator, and
-//! likely moot once WIN7-3's tiles let the vertical dock retire.
+//! pre-existing claim. The Win10-hybrid taskbar later retired the rendered
+//! left dock; `main.rs` still drains the same hotkey latch for the Start Menu,
+//! and this panel now anchors to the screen's true left edge rather than
+//! reserving the dead dock column.
 //!
 //! **Accesskit (lock #14):** the panel itself carries a role + label before any
 //! content lands — `Role::Menu` for the whole panel, `Role::Group` landmarks
@@ -200,7 +195,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chrome::MeshSummary;
 use crate::console::{self, ConsoleState};
-use crate::dock::{icon_texture, response_activated, Surface, DOCK_W};
+use crate::dock::{icon_texture, response_activated, Surface};
 use crate::status::{self, StatusSegments};
 use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 
@@ -845,8 +840,8 @@ impl StartMenuState {
 // ── render ───────────────────────────────────────────────────────────────────
 
 /// Mount the Start Menu for this frame: a fixed-size two-pane panel (lock #2)
-/// sliding up from the bottom edge, anchored beside the vertical dock column
-/// (lock #4's bottom-left footprint, the Console front door's former spot).
+/// sliding up from the bottom edge, anchored to the screen's true left edge
+/// (lock #4's bottom-left footprint, updated for the retired left dock).
 /// Fully hidden + settled it mounts **no layer at all** (the dock/console
 /// passthrough guarantee), so a closed Start Menu steals no input from the
 /// surface beneath — and even open, it only claims its own footprint (it
@@ -901,7 +896,7 @@ pub fn start_menu_panel(
         .order(egui::Order::Foreground)
         .fade_in(false)
         .constrain(false)
-        .fixed_pos(egui::pos2(DOCK_W, top))
+        .fixed_pos(egui::pos2(screen.left(), top))
         .show(ctx, |ui| {
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(PANEL_W, panel_h), egui::Sense::hover());
@@ -2553,7 +2548,7 @@ fn install_search_results_announcement(
 
 #[cfg(test)]
 mod tests {
-    use super::{start_menu_panel, StartMenuPrefs, StartMenuState, DOCK_W, PANEL_H, PANEL_W};
+    use super::{start_menu_panel, StartMenuPrefs, StartMenuState, PANEL_H, PANEL_W};
     use crate::console::{self, ConsoleState};
     use crate::dock::Surface;
     use crate::status::{SegmentRollup, StatusSegments};
@@ -2733,7 +2728,7 @@ mod tests {
         let mut s = StartMenuState::default();
         let mut console = ConsoleState::with_store(None);
         run(&ctx, &mut s, &mut console, 2);
-        let inside = egui::pos2(DOCK_W + 10.0, SZ.y - 10.0);
+        let inside = egui::pos2(10.0, SZ.y - 10.0);
         assert_ne!(
             ctx.layer_id_at(inside),
             Some(start_menu_layer()),
@@ -2742,7 +2737,7 @@ mod tests {
 
         // Open on a fresh context (the slide latch settles at the open
         // endpoint on first sight, the console.rs precedent) -> claims exactly
-        // its bottom-left footprint, anchored beside the dock column.
+        // its bottom-left footprint, anchored to the true screen-left edge.
         let ctx2 = egui::Context::default();
         Style::install(&ctx2);
         let mut s2 = StartMenuState::default();
@@ -2760,9 +2755,8 @@ mod tests {
     fn the_open_start_menu_does_not_cover_the_rest_of_the_screen() {
         // Lock #2 (not full-screen) + the design's "it overlays, never hides
         // the active surface behind it": the top-right corner (far from the
-        // bottom-left footprint) and the strip LEFT of the dock column (the
-        // panel sits BESIDE the dock, never under/over it) both stay
-        // unclaimed while the Start Menu is open.
+        // bottom-left footprint) and a point immediately to the right of the
+        // panel both stay unclaimed while the Start Menu is open.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = StartMenuState::default();
@@ -2776,11 +2770,11 @@ mod tests {
             Some(start_menu_layer()),
             "the Start Menu must not blanket the whole screen"
         );
-        let left_of_dock = egui::pos2(DOCK_W - 10.0, SZ.y - 10.0);
+        let right_of_panel = egui::pos2(PANEL_W + 10.0, SZ.y - 10.0);
         assert_ne!(
-            ctx.layer_id_at(left_of_dock),
+            ctx.layer_id_at(right_of_panel),
             Some(start_menu_layer()),
-            "the panel is anchored beside the dock column, not under it"
+            "the panel must not extend past its fixed width"
         );
     }
 
@@ -2822,14 +2816,14 @@ mod tests {
             });
         }
 
-        let inside_the_reserved_band = egui::pos2(DOCK_W + 10.0, SZ.y - rail_h / 2.0);
+        let inside_the_reserved_band = egui::pos2(10.0, SZ.y - rail_h / 2.0);
         assert_ne!(
             ctx.layer_id_at(inside_the_reserved_band),
             Some(start_menu_layer()),
             "the Start Menu must not extend into the reserved taskbar band \
              (the last {rail_h}pt above the screen's true bottom edge)"
         );
-        let just_above_the_band = egui::pos2(DOCK_W + 10.0, SZ.y - rail_h - 10.0);
+        let just_above_the_band = egui::pos2(10.0, SZ.y - rail_h - 10.0);
         assert_eq!(
             ctx.layer_id_at(just_above_the_band),
             Some(start_menu_layer()),
@@ -3121,7 +3115,7 @@ mod tests {
         s.toggle();
         run(&ctx, &mut s, &mut console, 2);
 
-        let left_pane_right_edge = DOCK_W + super::LEFT_PANE_W;
+        let left_pane_right_edge = super::LEFT_PANE_W;
         for surface in Surface::ALL {
             let rect = ctx
                 .read_response(super::tile_id(surface))

@@ -1057,7 +1057,9 @@ These decisions refine acceptance and sequencing for the active items below.
 - Evidence 2026-07-17: Start menu pinned/favorite tiles now persist through
   `start-menu.json` in the shell client-data directory; malformed, duplicate,
   unknown, and non-grid pins normalize on load. Live tray/screenshot proof remains
-  the blocking tail for this item.
+  the blocking tail for this item. A later 2026-07-17 Start-menu geometry pass
+  moved the panel off the retired left-dock `DOCK_W` inset and back to the true
+  screen-left edge, matching the bottom-taskbar-only architecture.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 
