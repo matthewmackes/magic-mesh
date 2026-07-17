@@ -194,7 +194,11 @@ These decisions refine acceptance and sequencing for the active items below.
   heartbeat tests passed. A later 2026-07-17 horizontal-tab bounds pass wrapped
   the non-vertical Browser path in the same allocated/clipped panel rect used by
   vertical tabs and extended the page-body regression to simulate shell left
-  gutter plus bottom taskbar strut. Remaining proof is the installed replacement and
+  gutter plus bottom taskbar strut. A later 2026-07-17 CEF idle-media pump pass
+  kept OSR invalidation and resize nudges active through the bounded
+  post-navigation media-discovery window so muted or quiet video can be detected
+  before the helper backs off; BigBoy `.130` focused `idle_media_pump` tests and
+  `.50` CEF fmt passed. Remaining proof is the installed replacement and
   shell-service restart; it is blocked because `.15` is physical hardware, root
   SSH is unavailable, and `mm` requires an interactive sudo password.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
