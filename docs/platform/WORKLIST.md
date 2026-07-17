@@ -975,6 +975,17 @@ These decisions refine acceptance and sequencing for the active items below.
   `cargo test -p mde-files-egui files_search_omnibox -- --nocapture` passed 1/1;
   and `.90` slot `home-search-shell-frontdoor`
   `cargo test -p mde-shell-egui front_door -- --nocapture` passed 5/5.
+  A later 2026-07-17 Browser omnibox file-suggestion slice reused the Files
+  model search rows as in-memory Browser suggestions, filtered them to path-backed
+  local files, rendered them between bookmark and history rows, and committed
+  them through the normal omnibox load path as `file://` destinations. Farm
+  evidence: `.50` slot `browser-file-omnibox-fmt`
+  `cargo fmt -p mde-shell-egui -- --check` passed; BigBoy `.130` slot
+  `browser-file-omnibox-model2`
+  `cargo test -p mde-shell-egui suggestion -- --nocapture` passed 9/9; and `.90`
+  slot `browser-file-omnibox-chrome`
+  `cargo test -p mde-shell-egui bookmark_suggestions_use_browser_painted_icons -- --nocapture`
+  passed 1/1.
 - Verification method: Index fixture tests and UI search regression.
 - Origin or merged source IDs: SEARCH-omnibox, shell front-door search residual,
   old worklist line 6246.

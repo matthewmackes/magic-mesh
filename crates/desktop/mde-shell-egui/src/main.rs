@@ -804,6 +804,10 @@ impl Shell {
                     self.web.note_seat_px(ui.ctx());
                     self.web.ensure_live_tab(seat_present);
                 }
+                if self.web.wants_file_omnibox_items() {
+                    let file_omnibox_items = self.files.unified_search_omnibox_items();
+                    self.web.set_file_omnibox_items(file_omnibox_items);
+                }
                 let web = &mut self.web;
                 ui.push_id("shell-web", |ui| {
                     web::web_panel(ui, web);
