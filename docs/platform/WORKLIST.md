@@ -912,6 +912,11 @@ These decisions refine acceptance and sequencing for the active items below.
   omnibox minimum width, elides compact metadata before paint, and keeps narrow
   chrome from being consumed by the media cluster; farm `.50` fmt and `.130`
   focused `browser_media_toolbar` plus exact compact-label tests passed.
+  A later 2026-07-17 Browser chrome copy pass made the downloads toolbar tooltip
+  a count-based user-facing status, removed helper-session wording from the
+  empty Browser AccessKit status, and cleaned stale drawer docs; farm `.50` fmt,
+  `.130` focused `browser_download_toolbar_tip_uses_user_facing_status`, and
+  `.90` focused `browser_empty_accesskit_status_uses_user_facing_notice` passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
