@@ -788,9 +788,9 @@ These decisions refine acceptance and sequencing for the active items below.
   replacement/runtime smoke remains blocked by non-interactive sudo.
   A later 2026-07-17 Browser Options pass replaced the generic disabled-row
   tooltip with command-specific gate explanations for typed-address, history,
-  helper-backed page tools, painted-frame captures, saved-PDF viewer, CEF
-  DevTools, loaded-URL share/download actions, first-party-site permission
-  actions, and data-clear actions; farm `.50` fmt and `.130` focused
+  live web-page tools, painted-frame captures, saved-PDF viewer, CEF DevTools,
+  loaded-URL share/download actions, first-party-site permission actions, and
+  data-clear actions; farm `.50` fmt and `.130` focused
   `browser_options_disabled_rows_explain_their_command_gate` passed.
   A later 2026-07-17 Browser downloads drawer pass removed internal
   `browser_download`/ledger wording from the drawer header, replaced it with a
@@ -815,6 +815,10 @@ These decisions refine acceptance and sequencing for the active items below.
   wording in visible media-manifest and scrape-export captions with user-facing
   behavior language and extended the Power-menu copy guard; farm `.50` fmt and
   BigBoy `.130` focused `power_mode_adds_power_menu_and_status_chip` passed.
+  A later 2026-07-17 Browser Options copy pass replaced visible runtime,
+  helper-backed, and internal-tab wording with user-facing Controls, Engines,
+  open-tab, and live-web-page labels; BigBoy `.130` focused `browser_options`
+  coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -978,6 +982,10 @@ These decisions refine acceptance and sequencing for the active items below.
   disabled gate's implementation wording with a user-facing playback gate and
   extended disabled-row coverage; farm `.50` fmt and BigBoy `.130` focused
   `browser_options_disabled_rows_explain_their_command_gate` passed.
+  A later 2026-07-17 Browser Options label pass replaced visible runtime and
+  helper/internal page language with user-facing Controls, Engines, open-tab,
+  and live-web-page wording while preserving compact/wide layout coverage;
+  BigBoy `.130` focused `browser_options` coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
