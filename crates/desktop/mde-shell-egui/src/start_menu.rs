@@ -356,6 +356,13 @@ impl StartSearchHit {
             Self::Console(hit) => hit.group,
         }
     }
+
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Surface(_) => "App",
+            Self::Console(_) => "Console command",
+        }
+    }
 }
 
 // ── live-tile facts (WIN7-4, lock #5) ───────────────────────────────────────
@@ -2392,7 +2399,7 @@ fn search_results(
             egui::FontId::proportional(Style::SMALL),
             Style::TEXT_DIM,
         );
-        install_result_accessibility(ui.ctx(), hit, row, is_sel);
+        install_result_accessibility(ui.ctx(), hit, row, is_sel, i, matches.len());
         if response_activated(ui, &resp) {
             activated = Some(hit);
         }
@@ -2742,11 +2749,18 @@ fn install_result_accessibility(
     hit: StartSearchHit,
     rect: egui::Rect,
     selected: bool,
+    index: usize,
+    total: usize,
 ) {
     let _ = ctx.accesskit_node_builder(search_result_accesskit_id(hit), |node| {
         node.set_role(egui::accesskit::Role::Button);
         node.set_label(hit.label());
-        node.set_value(hit.detail());
+        node.set_value(format!(
+            "Result {} of {total}: {}, {}",
+            index + 1,
+            hit.kind(),
+            hit.detail()
+        ));
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
         if selected {
@@ -4496,6 +4510,55 @@ mod tests {
         click(&ctx, &mut s, &mut console, rect.center(), SZ);
         assert!(s.search_query.is_empty(), "clicking the icon clears search");
         assert!(s.is_open(), "clearing search keeps the Start Menu open");
+    }
+
+    #[test]
+    fn app_search_result_rows_export_positioned_accesskit_buttons() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        s.search_query = "phone".to_string();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        let row = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Phones"))
+            .expect("Phones search result row");
+
+        assert_eq!(row.role(), egui::accesskit::Role::Button);
+        assert_eq!(row.value(), Some("Result 1 of 1: App, Comms"));
+        assert_eq!(row.is_selected(), Some(true));
+        assert!(row.supports_action(egui::accesskit::Action::Click));
+    }
+
+    #[test]
+    fn console_search_result_rows_export_positioned_accesskit_buttons() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        s.search_query = "cloud plane".to_string();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        let row = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Cloud Plane (GUI)"))
+            .expect("Cloud Plane Console search result row");
+
+        assert_eq!(row.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            row.value(),
+            Some("Result 1 of 1: Console command, Containers & VMs")
+        );
+        assert_eq!(row.is_selected(), Some(true));
+        assert!(row.supports_action(egui::accesskit::Action::Click));
     }
 
     #[test]

@@ -1113,6 +1113,10 @@ These decisions refine acceptance and sequencing for the active items below.
   consumers can distinguish the two Browser entries; farm `.50` fmt and BigBoy
   `.130` focused `pinned_tile_accesskit_value_names_the_shortcut_copy` coverage
   passed.
+  A later 2026-07-17 Start-menu search-result AccessKit pass added positioned
+  `Button` values for raw-painted app and embedded Console result rows, including
+  selected keyboard-highlight state; farm `.50` fmt and BigBoy `.130` focused
+  `search_result_rows_export_positioned_accesskit_buttons` coverage passed.
   A later 2026-07-17 Browser tab-search AccessKit pass added named clickable
   `Button` nodes for raw-painted tab-search result rows, including tab position
   values and selected active-tab state; farm `.50` fmt and BigBoy `.130`
