@@ -1118,6 +1118,11 @@ These decisions refine acceptance and sequencing for the active items below.
   values and selected active-tab state; farm `.50` fmt and BigBoy `.130`
   focused `tab_search_results_export_accesskit_buttons_for_switching_tabs`
   coverage passed.
+  A later 2026-07-17 Browser omnibox-suggestion AccessKit pass added named
+  clickable `Button` nodes for raw-painted bookmark, file, history, and search
+  suggestion chips, including suggestion position values and selected keyboard
+  highlight state; farm `.50` fmt and BigBoy `.130` focused
+  `browser_suggestion_chips_export_accesskit_buttons` coverage passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
