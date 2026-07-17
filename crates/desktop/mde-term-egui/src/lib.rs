@@ -29,7 +29,7 @@
 //!   (maximize/restore), Alt-drag rearrange, and focus that follows clicks,
 //!   splits, closes and `Alt+arrow` navigation. The binary now mounts it.
 //! - [`palette`] — the 16/256-colour **content** palette (the documented §4
-//!   carve-out): Quasar-token-derived where a token carries the meaning,
+//!   carve-out): Quazar-token-derived where a token carries the meaning,
 //!   standard ANSI hues elsewhere; the only raw colour values in the crate.
 //!
 //! - [`tabs`] (TERM-5) — a tab layer over the splits: [`tabs::TabbedTerminal`]
@@ -83,7 +83,7 @@
 //! - [`palette`] + [`presets`] + [`appearance`] (TERM-11) — **palette + look**.
 //!   [`palette::Palette`] is the runtime content colour scheme (the 16 ANSI slots
 //!   with the default fg/bg/cursor); [`palette::Palette::from_tokens`] is the
-//!   Quasar default derived from `Style` tokens, and [`presets`] holds the
+//!   Quazar default derived from `Style` tokens, and [`presets`] holds the
 //!   bundled classics (Solarized dark/light, Gruvbox, Nord) — the one sanctioned
 //!   home for their defining hex. [`appearance::Appearance`] bundles the three
 //!   knobs (scheme, font size, cursor style) and [`appearance::AppearancePicker`]
@@ -133,7 +133,7 @@
 //!   tree, never a direct mutation), and the all-sessions picker (attached AND
 //!   detached, from the control-channel `list-sessions` reply). The [`menubar`]
 //!   tmux menu ([`tmux_ui::TmuxMenuChoice`]) is its entry point. **TMUX-FC-4**
-//!   adds the native chrome: the Quasar status bar (session · window list ·
+//!   adds the native chrome: the Quazar status bar (session · window list ·
 //!   clock, ignoring tmux `status-*` config), the op toolbar, the curated
 //!   ~30-command fuzzy palette, and the enriched tab/pane context menus —
 //!   including the `join-pane -h` (beside) trigger — every affordance a tmux

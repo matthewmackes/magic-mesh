@@ -992,6 +992,10 @@ These decisions refine acceptance and sequencing for the active items below.
   decision" language from `AI_GOVERNANCE.md`, `README.md`, `CHANGELOG.md`,
   `docs/design/quasar-branding.md`, and `docs/NEEDS-OPERATOR.md`, and updated
   current examples to `12.0.0 "Quazar"` / `MCNF 12.0 "Quazar"`.
+  A later 2026-07-17 Editor/Terminal pass corrected visible `Quasar Editor`,
+  Terminal colour-scheme, tmux config, Cargo metadata, and in-crate design
+  comments to `Quazar`, with focused label/config tests guarding the user-facing
+  strings.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

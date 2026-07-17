@@ -1,4 +1,4 @@
-# MCNF "Quasar" — `mde-term-egui`: the mesh terminal surface (TERM epic;
+# MCNF "Quazar" — `mde-term-egui`: the mesh terminal surface (TERM epic;
 # design: `docs/design/mesh-terminal.md`).
 #
 # A Terminator-class egui-native terminal. This crate opens with the VT ENGINE
@@ -14,7 +14,7 @@
 # an external crate.
 [package]
 name        = "mde-term-egui"
-description = "MCNF Quasar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring). TERM-2 wires a real local shell to it: the user's $SHELL as a login shell on a fresh PTY (alacritty's own tty layer — typed argv spawn, §9), pump threads both ways, TIOCSWINSZ resize, clean child reap. TERM-3 paints it: an interactive egui widget (batched same-style glyph runs, content palette with true-color pass-through, block cursor, mouse selection + clipboard, scrollback viewport, rect-driven cols/rows) and the runnable surface binary on the mde-egui harness. TERM-4 nests it: Terminator's split model — a pure Leaf|Split binary tree (arbitrary-depth H/V splits, close-collapses, drag-reparent; unit-tested headless) multiplexing one widget per leaf over a session registry, with draggable Style-token dividers, zoom, Alt-drag rearrange, and focus that follows clicks/splits/closes/Alt-arrow navigation."
+description = "MCNF Quazar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring). TERM-2 wires a real local shell to it: the user's $SHELL as a login shell on a fresh PTY (alacritty's own tty layer — typed argv spawn, §9), pump threads both ways, TIOCSWINSZ resize, clean child reap. TERM-3 paints it: an interactive egui widget (batched same-style glyph runs, content palette with true-color pass-through, block cursor, mouse selection + clipboard, scrollback viewport, rect-driven cols/rows) and the runnable surface binary on the mde-egui harness. TERM-4 nests it: Terminator's split model — a pure Leaf|Split binary tree (arbitrary-depth H/V splits, close-collapses, drag-reparent; unit-tested headless) multiplexing one widget per leaf over a session registry, with draggable Style-token dividers, zoom, Alt-drag rearrange, and focus that follows clicks/splits/closes/Alt-arrow navigation."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

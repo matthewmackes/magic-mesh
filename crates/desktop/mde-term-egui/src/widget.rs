@@ -203,7 +203,7 @@ pub struct TerminalWidget {
     cursor_blink: bool,
     /// The focused cursor's shape (TERM-11 knob).
     cursor_shape: CursorShape,
-    /// The active content colour scheme (TERM-11): Quasar default or a preset.
+    /// The active content colour scheme (TERM-11): Quazar default or a preset.
     palette: Palette,
     /// Lines scrolled back into history; `0` = live.
     scroll_offset: usize,
@@ -380,7 +380,7 @@ impl TerminalWidget {
         self
     }
 
-    /// The active content colour scheme — the Quasar default or a preset (TERM-11).
+    /// The active content colour scheme — the Quazar default or a preset (TERM-11).
     #[must_use]
     pub const fn with_palette(mut self, palette: Palette) -> Self {
         self.palette = palette;
@@ -2490,7 +2490,7 @@ mod tests {
         assert!(has(nord.bg), "the preset background filled the grid");
         // … and its cursor colour drew the block cursor.
         assert!(has(nord.cursor), "the preset cursor colour drew the cursor");
-        // The Quasar default's content red is gone — this is genuinely the
+        // The Quazar default's content red is gone — this is genuinely the
         // preset painting the grid, not the default table. (Style::BG can't be
         // used as a negative witness: the egui CentralPanel frame paints it
         // behind the grid regardless of the scheme.)

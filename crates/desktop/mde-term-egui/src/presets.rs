@@ -7,10 +7,10 @@
 //! default foreground/background. Those constants only mean anything *as* their
 //! published values, so reproducing them here is the correct representation —
 //! not a §4 violation but the data a "classic preset" *is*. Each builds a
-//! [`Palette`] of the same shape the Quasar default ([`Palette::from_tokens`])
+//! [`Palette`] of the same shape the Quazar default ([`Palette::from_tokens`])
 //! does, so the renderer treats a preset and the default identically.
 //!
-//! [`Preset`] is the pickable set (the Quasar default plus the four classics)
+//! [`Preset`] is the pickable set (the Quazar default plus the four classics)
 //! the appearance picker lists; [`Preset::palette`] resolves each to its
 //! [`Palette`]. The default's arm delegates to the token derivation (no hex).
 
@@ -153,14 +153,14 @@ pub const fn nord() -> Palette {
     )
 }
 
-/// A user-pickable colour scheme: the Quasar default (token-derived) plus the
+/// A user-pickable colour scheme: the Quazar default (token-derived) plus the
 /// bundled classics. The appearance picker lists [`Self::ALL`]; each resolves to
 /// a [`Palette`] via [`Self::palette`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Preset {
     /// The platform default, derived from `mde-theme`/`Style` tokens.
     #[default]
-    Quasar,
+    Quazar,
     /// Solarized, dark mode.
     SolarizedDark,
     /// Solarized, light mode.
@@ -174,7 +174,7 @@ pub enum Preset {
 impl Preset {
     /// Every pickable preset, in the picker's display order.
     pub const ALL: [Self; 5] = [
-        Self::Quasar,
+        Self::Quazar,
         Self::SolarizedDark,
         Self::SolarizedLight,
         Self::Gruvbox,
@@ -185,7 +185,7 @@ impl Preset {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Quasar => "Quasar",
+            Self::Quazar => "Quazar",
             Self::SolarizedDark => "Solarized Dark",
             Self::SolarizedLight => "Solarized Light",
             Self::Gruvbox => "Gruvbox",
@@ -198,7 +198,7 @@ impl Preset {
     #[must_use]
     pub const fn palette(self) -> Palette {
         match self {
-            Self::Quasar => Palette::from_tokens(),
+            Self::Quazar => Palette::from_tokens(),
             Self::SolarizedDark => solarized_dark(),
             Self::SolarizedLight => solarized_light(),
             Self::Gruvbox => gruvbox_dark(),
@@ -272,14 +272,23 @@ mod tests {
     }
 
     #[test]
+    fn platform_default_label_uses_canonical_quazar_identity() {
+        assert_eq!(Preset::Quazar.label(), "Quazar");
+        assert!(
+            !Preset::Quazar.label().contains(concat!("Qua", "sar")),
+            "terminal preset label must not drift back to the superseded spelling"
+        );
+    }
+
+    #[test]
     fn matching_round_trips_each_preset_and_default() {
         for preset in Preset::ALL {
             assert_eq!(Preset::matching(&preset.palette()), Some(preset));
         }
-        // The token default resolves to the Quasar preset (its palette equals it).
+        // The token default resolves to the Quazar preset (its palette equals it).
         assert_eq!(
             Preset::matching(&Palette::from_tokens()),
-            Some(Preset::Quasar)
+            Some(Preset::Quazar)
         );
         // A scheme outside the bundled set matches nothing.
         let custom = Palette {

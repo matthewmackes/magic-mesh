@@ -1,7 +1,7 @@
 //! The **lib panel seam** (TERM-16): the production terminal surface the one
-//! Quasar shell (`mde-shell-egui`) embeds as `Surface::Terminal`.
+//! Quazar shell (`mde-shell-egui`) embeds as `Surface::Terminal`.
 //!
-//! Under E12 "Quasar" the mesh surfaces are **panels in the one shell**, not
+//! Under E12 "Quazar" the mesh surfaces are **panels in the one shell**, not
 //! separate clients (§5 EMBED — there is no compositor). This module exposes the
 //! full TERM-4/5/8 terminal — the [`TabbedTerminal`](crate::TabbedTerminal) tab
 //! bar over Terminator's split tree, one real login shell per pane — through the

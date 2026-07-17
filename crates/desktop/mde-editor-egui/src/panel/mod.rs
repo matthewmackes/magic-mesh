@@ -1,7 +1,7 @@
 //! The **surface panel seam** (EDITOR-1 → EDITOR-3): the code-editor surface the
-//! one Quasar shell (`mde-shell-egui`) embeds as `Surface::Editor`.
+//! one Quazar shell (`mde-shell-egui`) embeds as `Surface::Editor`.
 //!
-//! Under E12 "Quasar" the mesh surfaces are **panels in the one shell**, not
+//! Under E12 "Quazar" the mesh surfaces are **panels in the one shell**, not
 //! separate clients (§5 EMBED — there is no compositor). This module exposes the
 //! editor surface through the exact seam `mde-files-egui` gives the shell:
 //!
@@ -111,6 +111,8 @@ const TERMINAL_MIN_HEIGHT: f32 = Style::SP_XL * 3.0;
 
 /// The About dialog's title (Help → About the Editor, EDTB-1).
 const ABOUT_TITLE: &str = "About the Editor";
+/// The user-facing product line shown in the About dialog.
+const ABOUT_PRODUCT_LINE: &str = "Quazar Editor";
 
 /// The crate + version line the About dialog shows. `mde-egui` carries no
 /// brand/build module (and the iced-era `mde-theme` brand is deliberately not a
@@ -2076,7 +2078,7 @@ impl EditorSurface {
                 .show(ctx, |ui| {
                     ui.set_min_width(DIALOG_W);
                     ui.label(
-                        RichText::new("Quasar Editor")
+                        RichText::new(ABOUT_PRODUCT_LINE)
                             .size(Style::HEADING)
                             .color(Style::TEXT)
                             .strong(),
@@ -2144,7 +2146,7 @@ impl EditorSurface {
 
     /// Render the EDTB-5 Print Preview overlay: the paginated pages (the same
     /// [`print::paginate`] the print job renders, so the preview is honest) in the
-    /// Quasar style, with a Print button that submits to CUPS and the last
+    /// Quazar style, with a Print button that submits to CUPS and the last
     /// attempt's outcome shown inline. Escape / Close dismisses. Token-styled (§4).
     fn render_print_preview(&mut self, ctx: &egui::Context) {
         if !self.print.preview_open {

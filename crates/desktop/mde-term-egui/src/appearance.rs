@@ -3,7 +3,7 @@
 //!
 //! Design lock Q13 keeps this deliberately small: **no full profile system**,
 //! just the three knobs a user actually reaches for — a colour scheme (the
-//! Quasar default or a bundled classic, [`crate::presets`]), the content font
+//! Quazar default or a bundled classic, [`crate::presets`]), the content font
 //! size, and the cursor style (block / bar / underline, steady or blink). An
 //! [`Appearance`] is that bundle; the surface holds one and pushes it into every
 //! live pane each frame, so a change in the picker reaches all shells at once.

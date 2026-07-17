@@ -1,4 +1,6 @@
-use super::{editor_panel, EditorSurface, NO_FILE_HINT, NO_FILE_TITLE, SCRATCH_SEED};
+use super::{
+    editor_panel, EditorSurface, ABOUT_PRODUCT_LINE, NO_FILE_HINT, NO_FILE_TITLE, SCRATCH_SEED,
+};
 use crate::menu_bar::MenuAction;
 use crate::palette::PaletteCommand;
 use crate::real_editor;
@@ -222,6 +224,15 @@ fn empty_state_copy_is_honest_and_reachable() {
     assert!(
         hint.contains("open") && hint.contains("edit"),
         "the hint should tell the operator to open a file to edit"
+    );
+}
+
+#[test]
+fn about_dialog_uses_canonical_quazar_identity() {
+    assert_eq!(ABOUT_PRODUCT_LINE, "Quazar Editor");
+    assert!(
+        !ABOUT_PRODUCT_LINE.contains(concat!("Qua", "sar")),
+        "Editor About copy must not drift back to the superseded spelling"
     );
 }
 

@@ -1,8 +1,8 @@
-//! `mde-editor-egui` — the MCNF **"Quasar"** native code-editor surface.
+//! `mde-editor-egui` — the MCNF **"Quazar"** native code-editor surface.
 //!
 //! A Zed-style, keyboard-driven Rust code editor adapted to the DRM-native egui
 //! shell (design: `docs/design/editor.md`). It exposes an [`EditorSurface`] state
-//! struct + the [`editor_panel`] seam, mounted in the one Quasar shell
+//! struct + the [`editor_panel`] seam, mounted in the one Quazar shell
 //! (`mde-shell-egui`) as `Surface::Editor` through the exact seam `mde-files-egui`
 //! gives the shell (`files_panel` / `real_browser`): the shell owns the surface
 //! state and drives it per-frame with the `*_panel` fn.
