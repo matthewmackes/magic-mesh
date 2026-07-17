@@ -360,12 +360,20 @@ These decisions refine acceptance and sequencing for the active items below.
   snapshot/revert, and documentation.
 - Relevant files/components: `install-helpers/farm.sh`,
   `install-helpers/xcp-build.sh`, `install-helpers/farm-reconciler.sh`,
-  `automation/farm/`, `docs/BUILD-ENVIRONMENT.md`.
+  `install-helpers/farm-sccache-proof.sh`, `automation/farm/`,
+  `docs/BUILD-ENVIRONMENT.md`.
 - Dependencies: Build farm control VM and live farm nodes.
+- Current evidence: A 2026-07-17 shared-cache proof pass added
+  `install-helpers/farm-sccache-proof.sh` and corrected
+  `docs/BUILD-ENVIRONMENT.md` so it no longer claims shared sccache is live
+  before proof. The live farm check reached `.50`, `.90`, `.130`, and `.170` and
+  all four nodes reported no `sccache` binary and no `~/.sccache.env`, so the
+  item remains open and accurately live-backed.
 - Acceptance criteria: Node A build produces cache hits on node B, fresh-farm
   bootstrap completes, and slots drain without abandoned artifacts.
 - Verification method: Farm lane with explicit `MCNF_BUILD_HOST` and
-  `MCNF_BUILD_SLOT`, plus sccache stats.
+  `MCNF_BUILD_SLOT`, `install-helpers/farm-sccache-proof.sh status`, and
+  sccache stats.
 - Origin or merged source IDs: FARM-AUTO-PROD, DAR-34, DAR-35, DAR-36,
   old worklist lines 2265, 2277, 2278, 3011, 3019, 3027.
 

@@ -342,9 +342,10 @@ idempotently (it skips a job whose result already matches a clean HEAD).
 
 - Jobs are parsed by `automation/lib/farm-jobs.sh` (only open/in-progress tasks are
   active); dispatched by `automation/lib/farm-dispatch.sh` to a free node
-  (per-node flock, big-iron-first), built **with shared sccache** (BUILD-PLATFORM-1),
-  result recorded as JSON + (via the `farm_orchestrator` worker) published to the
-  Bus → the Workbench **Build Farm** panel.
+  (per-node flock, big-iron-first), and the intended BUILD-PLATFORM-1 path is to
+  build with shared sccache once WL-BUILD-002 is complete. Current agents must
+  verify that contract with `install-helpers/farm-sccache-proof.sh status`
+  before claiming cross-node cache behavior.
 - The reconciler is the *canonical* lane; the other FARM-AUTO capabilities (Forgejo
   on push, etcd pull-agents, the mackesd worker) are alternates over the same substrate.
 - Design + rationale: [`docs/design/build-platform.md`](design/build-platform.md).
