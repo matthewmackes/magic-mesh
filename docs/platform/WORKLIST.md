@@ -1210,6 +1210,11 @@ These decisions refine acceptance and sequencing for the active items below.
   tab status chips, hover cards, tab context menus, AccessKit summaries, and the
   Power menu protection summary so visible chrome no longer exposes Userscripts
   wording.
+  A later 2026-07-17 Browser AccessKit tab-summary copy pass moved active-tab
+  screen-reader summaries off Browser internal page/container/display target and
+  CEF/Servo wording and onto Browser Options page, Web page, browsing profile,
+  and screen-target language; farm `.50` fmt and BigBoy `.130` focused
+  `accesskit` coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
