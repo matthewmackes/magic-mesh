@@ -1169,6 +1169,10 @@ These decisions refine acceptance and sequencing for the active items below.
   summaries, and new-tab tooltips to the user-facing `Lightweight` label, while
   leaving raw CEF/Servo implementation markers confined to diagnostics/tests; it
   also removed the visible Privacy caption's `sandboxed engine` wording.
+  A later 2026-07-17 Browser Privacy copy pass renamed visible Userscripts
+  controls/status to Site Fixups/Fixups, moved the protection summary off
+  `native blocker` wording, and removed the `no cookie store` parenthetical from
+  third-party-cookie policy copy while preserving the existing Browser actions.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
