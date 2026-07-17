@@ -1397,6 +1397,10 @@ impl Shell {
         // WIN7-2 — mirror the Start Menu's open state in first, so the Start
         // cell's active tint follows the real panel (the set_active idiom).
         self.vdock.set_start_menu_open(self.start_menu.is_open());
+        // WIN10-HYBRID B3 — Settings owns the persisted preference; DockState owns
+        // the bottom-edge reveal, animation, and strut behavior.
+        self.vdock
+            .set_taskbar_autohide(self.system.taskbar_autohide());
         self.notify_status.poll(ctx);
         let mut rail_sessions = self.session_rail.entries(&self.local_host);
         let has_visible_desktop_session = !rail_sessions.is_empty();

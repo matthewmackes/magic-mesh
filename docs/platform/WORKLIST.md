@@ -1076,7 +1076,11 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-17 taskbar live-thumbnail pass wired the current VDI desktop
   texture into that hover preview, preserving aspect ratio and matching only the
   intended broker/fallback rail entry; farm `.50` fmt, BigBoy `.130` focused
-  `session_preview`, and the exact hover-card regression passed.
+  `session_preview`, and the exact hover-card regression passed. A later
+  2026-07-17 taskbar auto-hide settings pass made the already-tested dock
+  auto-hide behavior reachable from the persisted Personalization appearance
+  config and mirrored it into `DockState`; farm `.50` fmt, BigBoy `.130`
+  focused `appearance`, and the edited legacy migration test passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 

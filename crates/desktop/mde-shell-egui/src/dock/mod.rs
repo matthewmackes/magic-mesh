@@ -685,7 +685,6 @@ impl DockState {
     /// this from its persisted appearance config). When on, the bar reserves no
     /// bottom strut and reveals as a floating overlay on a bottom-edge hover (the B3
     /// reveal). Default off — the bar stays docked and reserves its strut.
-    #[cfg(test)]
     pub const fn set_taskbar_autohide(&mut self, on: bool) {
         self.taskbar_autohide = on;
     }

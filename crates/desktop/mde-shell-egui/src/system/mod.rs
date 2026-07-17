@@ -372,6 +372,13 @@ impl SystemState {
         self.snapshot.as_ref()
     }
 
+    /// Persisted Win10-hybrid taskbar auto-hide preference. The shell mirrors
+    /// this into [`crate::dock::DockState`] each frame, keeping Settings as the
+    /// source of truth while the dock owns the animation and strut behavior.
+    pub(crate) const fn taskbar_autohide(&self) -> bool {
+        self.appearance.taskbar_autohide
+    }
+
     /// The POWER-5 idle/lid policy the honorer reads each tick (the source of truth
     /// the Power section edits).
     pub(crate) const fn power_honor_config(&self) -> &PowerHonorConfig {
@@ -1350,8 +1357,8 @@ const APPEARANCE_CONFIG_FILE: &str = "settings-appearance.json";
 /// accent, platform text-scale, and motion mode the shell actually applies at
 /// runtime. Loaded on start and restored on open, saved on a pick — the
 /// [`SettingsNav`] client-data-dir JSON idiom, reused. All fields drive a real live
-/// effect through
-/// [`SystemState::apply_appearance`] (§7 — no dead toggle).
+/// effect through [`SystemState::apply_appearance`] or the shell's
+/// `DockState` mirror (§7 — no dead toggle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 struct AppearanceConfig {
     /// The interactive accent tint (re-applied over the installed look each frame).
@@ -1366,6 +1373,10 @@ struct AppearanceConfig {
     /// outside Normal.
     #[serde(default)]
     motion_mode: AppearanceMotionMode,
+    /// WIN10-HYBRID taskbar auto-hide: when enabled, the bottom bar reserves no
+    /// strut and reveals from the bottom hot edge.
+    #[serde(default)]
+    taskbar_autohide: bool,
 }
 
 impl<'de> Deserialize<'de> for AppearanceConfig {
@@ -1382,6 +1393,8 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             #[serde(default)]
             motion_mode: Option<AppearanceMotionMode>,
             #[serde(default)]
+            taskbar_autohide: bool,
+            #[serde(default)]
             reduce_motion: bool,
         }
 
@@ -1394,6 +1407,7 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             } else {
                 AppearanceMotionMode::Normal
             }),
+            taskbar_autohide: wire.taskbar_autohide,
         })
     }
 }
@@ -2543,16 +2557,17 @@ fn hotkeys_section(ui: &mut egui::Ui) {
     });
 }
 
-/// The Theme section (SETTINGS-5) under Personalization — the two appearance controls
+/// The Theme section (SETTINGS-5) under Personalization — the appearance controls
 /// the shell **genuinely applies at runtime**: the interactive **accent** (re-tinting
 /// the live `Style` accent across every surface via [`Style::set_accent`]), the
 /// **text-scale** (the EXPLORER-18 accessibility whole-UI zoom the shell honors),
-/// and the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy).
+/// the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy), and
+/// the Win10-hybrid taskbar auto-hide preference mirrored into `DockState`.
 /// Each pick mutates the persisted [`AppearanceConfig`] in place; the change is
 /// saved after the render borrow and applied live by [`SystemState::apply_appearance`]
-/// on the poll. The platform is dark-only (the Quazar lock) — there is NO light/dark
-/// switch here, only what the runtime truly drives (§7 — no dead toggle). Laid
-/// **across** the wide pane (SETTINGS-3) as selectable tiles.
+/// / `main.rs` on the next frame. The platform is dark-only (the Quazar lock) —
+/// there is NO light/dark switch here, only what the runtime truly drives (§7 —
+/// no dead toggle). Laid **across** the wide pane (SETTINGS-3) as selectable tiles.
 fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     // Accent — a swatch row; the pick re-tints the whole shell's highlights live.
     ui.label(
@@ -2647,12 +2662,38 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
             );
         });
     });
+    ui.add_space(Style::SP_M);
+    ui.label(
+        RichText::new("Taskbar")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    tile(ui, |ui| {
+        let mut taskbar_autohide = appearance.taskbar_autohide;
+        if ui
+            .checkbox(
+                &mut taskbar_autohide,
+                RichText::new("Auto-hide taskbar").size(Style::BODY),
+            )
+            .changed()
+        {
+            appearance.taskbar_autohide = taskbar_autohide;
+        }
+        ui.label(
+            RichText::new("Reveal from the bottom edge")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+    });
     ui.add_space(Style::SP_S);
     muted_note(
         ui,
         "Accent re-tints every surface's highlights; text size scales the whole \
          interface. Motion mode applies normal, reduced, or endpoint-only movement. \
-         The platform is dark-only — there is no light theme.",
+         Taskbar auto-hide floats the bottom bar from the edge. The platform is \
+         dark-only — there is no light theme.",
     );
 }
 

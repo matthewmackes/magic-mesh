@@ -632,11 +632,16 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         AppearanceMotionMode::Normal,
         "motion defaults to the full normal mode"
     );
+    assert!(
+        !AppearanceConfig::default().taskbar_autohide,
+        "taskbar auto-hide defaults off so the bottom strut remains reserved"
+    );
 
     let cfg = AppearanceConfig {
         accent: AccentChoice::Green,
         text_scale: TextScale::Larger,
         motion_mode: AppearanceMotionMode::Disabled,
+        taskbar_autohide: true,
     };
     cfg.save_to(&path).expect("save");
     let back = AppearanceConfig::load_from(&path);
@@ -648,10 +653,18 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         AppearanceMotionMode::Disabled,
         "the motion-mode pick round-trips through disk"
     );
+    assert!(
+        back.taskbar_autohide,
+        "the taskbar auto-hide pick round-trips"
+    );
     let json = std::fs::read_to_string(&path).expect("appearance json");
     assert!(
         json.contains("\"motion_mode\": \"disabled\""),
         "the new runtime mode is persisted explicitly: {json}"
+    );
+    assert!(
+        json.contains("\"taskbar_autohide\": true"),
+        "the taskbar auto-hide setting is persisted explicitly: {json}"
     );
     assert!(
         !json.contains("reduce_motion"),
@@ -686,6 +699,10 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
         AppearanceMotionMode::Normal,
         "the absent motion-mode field folds to Normal"
     );
+    assert!(
+        !cfg.taskbar_autohide,
+        "the absent taskbar auto-hide field folds to the docked default"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -703,14 +720,38 @@ fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
         AppearanceMotionMode::Reduced,
         "old reduce_motion=true configs migrate to the reduced runtime mode"
     );
+    assert!(
+        !cfg.taskbar_autohide,
+        "legacy configs keep the taskbar docked unless explicitly opted in"
+    );
 
-    let cfg: AppearanceConfig =
-        serde_json::from_str(r#"{"motion_mode":"disabled","reduce_motion":false}"#)
-            .expect("explicit appearance config");
+    let cfg: AppearanceConfig = serde_json::from_str(
+        r#"{"motion_mode":"disabled","taskbar_autohide":true,"reduce_motion":false}"#,
+    )
+    .expect("explicit appearance config");
     assert_eq!(
         cfg.motion_mode,
         AppearanceMotionMode::Disabled,
         "an explicit new motion_mode wins over any legacy field"
+    );
+    assert!(
+        cfg.taskbar_autohide,
+        "an explicit taskbar auto-hide field is honoured"
+    );
+}
+
+#[test]
+fn appearance_taskbar_autohide_preference_is_exposed_to_shell_chrome() {
+    let st = SystemState {
+        appearance: AppearanceConfig {
+            taskbar_autohide: true,
+            ..AppearanceConfig::default()
+        },
+        ..SystemState::default()
+    };
+    assert!(
+        st.taskbar_autohide(),
+        "main.rs mirrors this persisted preference into DockState each frame"
     );
 }
 
@@ -727,6 +768,7 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
             accent: AccentChoice::Green,
             text_scale: TextScale::Default,
             motion_mode: AppearanceMotionMode::Normal,
+            taskbar_autohide: false,
         },
         ..SystemState::default()
     };
@@ -765,6 +807,7 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
             accent: AccentChoice::default(),
             text_scale: TextScale::Larger,
             motion_mode: AppearanceMotionMode::Normal,
+            taskbar_autohide: false,
         },
         ..SystemState::default()
     };
