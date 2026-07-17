@@ -79,6 +79,7 @@ Rows not copied into the active worklist use these final classifications:
 | Original ID and title | Final classification | Reason for archival | Evidence | Replacement or merged item |
 | --- | --- | --- | --- | --- |
 | WL-TEST-003 Worklist and farm hygiene guardrails | Completed | The active worklist now has an executable lint gate, the farm job parser understands reconciled status-word items, status/drain consumers report the new active counts, and placeholder `@farm` payloads fail planted tests. | `install-helpers/lint-worklist.sh`, `automation/lib/farm-jobs.sh`, `automation/promotion/mcnf-promotion-cycle.sh`, `install-helpers/drain-coordinator.sh`; local `lint-worklist.sh --self-test`, `farm-jobs.sh --self-test`, `lint-worklist.sh`; farm `.50` hygiene lane passed on 2026-07-16. | None. |
+| WL-UX-004 Brand spelling and product identity sweep | Completed | Current source, generated-user-facing metadata, install helpers, packaging, and non-archive docs now use canonical `Quazar` spelling; lower-case package/asset paths remain intentionally unchanged, and only two explicit historical S-spelling decision lines are allowed. | Commits `8a5935d9`, `2df459a1`, `5f610b26`, and `d842bc1f`; `install-helpers/lint-brand-identity.sh` scans the current docs tree plus source/install/package roots and falls back to `grep` on farm images without `rg`; local brand/worklist/diff checks and farm `.50` `brand-docs-lint` passed on 2026-07-17. | None. |
 
 ## Archive Policy Going Forward
 

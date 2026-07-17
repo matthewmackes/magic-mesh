@@ -71,8 +71,6 @@ These decisions refine acceptance and sequencing for the active items below.
 - WL-PERF-001: optimize SPICE dirty rectangles first.
 - WL-PERF-002: verify VDI frame wake behavior first.
 - WL-UX-001: pass/fail is screenshot/pixel proof on `.15`.
-- WL-UX-004: canonical spelling is `Quazar`; sweep user-facing strings plus
-  governance/docs, not internal identifiers.
 - WL-DOC-001: clean current operator docs first:
   `docs/help/install.md`, `docs/help/node-setup.md`,
   `docs/BUILD-ENVIRONMENT.md`, and `docs/ops/promotion-pipeline.md`.
@@ -951,68 +949,6 @@ These decisions refine acceptance and sequencing for the active items below.
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
   review accessibility cluster.
-
-### WL-UX-004 - Brand spelling and product identity sweep
-
-- Status: Remaining
-- Priority: P2
-- Complexity: Medium
-- Problem: The repo still carries the superseded S-spelling beside `Quazar` in
-  user-facing strings, governance, docs, assets, and design locks. The operator
-  has now selected `Quazar` as canonical for user-facing strings plus
-  governance/docs.
-- Required outcome: User-facing strings and governance/docs consistently use
-  `Quazar`, and user-visible strings route through brand constants with a drift
-  guard. Internal identifiers and asset paths are not part of this sweep unless
-  separately justified.
-- Scope: Brand constants, UI strings, governance text, current docs, release
-  notes, and lint.
-- Relevant files/components: `crates/shared/mde-theme/src/brand/`,
-  `AI_GOVERNANCE.md`, `README.md`, `docs/design/quasar-branding.md`, shell UI.
-- Dependencies: None for the selected scope.
-- Current evidence: A 2026-07-17 Browser dashboard pass replaced the visible
-  old-spelling Browser new-tab title with a title derived from the shared brand
-  constants and verified the painted dashboard text uses `Quazar Browser`;
-  farm `.50` fmt and `.130` focused
-  `browser_new_tab_dashboard_uses_canonical_brand_identity` passed.
-  A later 2026-07-17 phone-facing identity pass changed the KDC fanout endpoint,
-  Phones hub mirror, and forwarded phone notification app/ticker from the old
-  Mesh spelling to `Quazar Mesh`, updating the current KDC design note with the shipped
-  spelling; farm `.50` fmt, `.90` focused `mde-kdc-host` fanout test, `.130`
-  focused Phones hub endpoint-name test, and `.170` focused mackesd KDC notify
-  test passed.
-  A later 2026-07-17 Console polish pass routed the visible platform provenance
-  chip through the stamped build codename and verified the chip rejects the old
-  spelling; farm `.50` fmt and `.130` focused
-  `platform_provenance_label_uses_the_canonical_build_codename` passed.
-  A later 2026-07-17 Device Manager pass changed the Markdown report provenance
-  line and Help/About menu label from superseded `Magic-Mesh` mixed identity to
-  the shared `MDE Quazar` product constant; farm `.50`
-  fmt plus `.130` focused report and menu-model tests passed.
-  A later 2026-07-17 governance/docs pass removed stale "pending spelling
-  decision" language from `AI_GOVERNANCE.md`, `README.md`, `CHANGELOG.md`,
-  `docs/design/quasar-branding.md`, and `docs/NEEDS-OPERATOR.md`, and updated
-  current examples to `12.0.0 "Quazar"` / `MCNF 12.0 "Quazar"`.
-  A later 2026-07-17 Editor/Terminal pass corrected the old-spelling Editor title,
-  Terminal colour-scheme, tmux config, Cargo metadata, and in-crate design
-  comments to `Quazar`, with focused label/config tests guarding the user-facing
-  strings.
-  A later 2026-07-17 brand-drift pass corrected remaining current crate
-  metadata, sample-visible strings, and front-door docs to `Quazar`, renamed the
-  local Console provenance variant, and added `install-helpers/lint-brand-identity.sh`
-  to CI as the drift guard.
-  A later 2026-07-17 active-docs pass swept current non-archive docs to the
-  canonical `Quazar` spelling, preserving only the two explicit historical
-  S-spelling decision lines, and expanded `install-helpers/lint-brand-identity.sh`
-  from selected front-door docs to the full current `docs/` tree while excluding
-  `docs/worklist-archive/`; farm verification also hardened the guard with a
-  `grep` fallback for build images that do not have `rg` installed.
-- Acceptance criteria: One canonical spelling appears in user-visible UI, docs
-  explain any package/repo exceptions, and a grep/lint prevents re-drift.
-- Verification method: Brand tests plus repo grep for non-canonical strings after
-  the decision.
-- Origin or merged source IDs: NAMING-1, docs review `docs-consistency-2`,
-  `shell-ux-9`, `docs/NEEDS-OPERATOR.md`.
 
 ## Performance
 

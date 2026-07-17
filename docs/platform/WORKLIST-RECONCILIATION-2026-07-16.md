@@ -229,9 +229,8 @@ archived disposition.
    bounded slices after the current regression is fixed.
 10. WL-FUNC-005, WL-FUNC-006, WL-RUN-005, and WL-RUN-006 - Build user-facing
     completeness work that depends on stable runtime records and bottom-bar UI.
-11. WL-UX-001 through WL-UX-004 - Visual/accessibility/brand polish. WL-UX-004
-    now has an operator decision: `Quazar` is canonical for user-facing strings
-    plus governance/docs.
+11. WL-UX-001 through WL-UX-003 - Visual/accessibility polish. WL-UX-004 closed
+    on 2026-07-17 after the canonical `Quazar` source/docs sweep and drift guard.
 12. WL-PERF-001 and WL-PERF-002 - Performance work after correctness paths have
     stable tests and live probes.
 13. WL-TEST-002 - Harness work; keep the completed hygiene lint in the regular
