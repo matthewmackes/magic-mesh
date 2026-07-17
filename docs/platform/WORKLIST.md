@@ -917,6 +917,9 @@ These decisions refine acceptance and sequencing for the active items below.
   decisions, Privacy menu captions, site-info panel text, and capture notices on
   user-facing blocked-by-default language while preserving the machine-readable
   permission enforcement events.
+  A later 2026-07-17 Browser scrape-export engine-label pass kept JSON/CSV
+  engine wire values stable while moving operator-facing Markdown exports off
+  raw Servo wording and onto the same Lightweight engine label used in chrome.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
