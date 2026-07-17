@@ -1061,7 +1061,13 @@ These decisions refine acceptance and sequencing for the active items below.
   `ui-close` line glyphs, rendered a leading search icon plus live query-clear
   icon button in the Start search field, and exposed the clear button to
   AccessKit; farm `.50` fmt, BigBoy `.130` focused clear-button coverage, and
-  `.90` `mde-theme` icon rasterization coverage passed.
+  `.90` `mde-theme` icon rasterization coverage passed. A later 2026-07-17
+  Start-search scroll pass bounded broad app/Console search results inside the
+  pane above the fixed search field, added pixel proof that offscreen selected
+  rows cannot paint into the field, and wrote
+  `start-menu-search-results-scroll.png`; farm `.50` fmt and BigBoy `.130`
+  focused `search_result` coverage passed, and the PNG was pulled to
+  `/tmp/start-menu-search-scroll/` for visual inspection.
 
 ### WL-UX-003 - Accessibility consumer and application sweep
 

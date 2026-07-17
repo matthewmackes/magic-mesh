@@ -299,10 +299,9 @@ const TILE_GRID_CONTENT_H: f32 = 7.0 * (GROUP_HEADING_H + TILE_H) + 6.0 * GROUP_
 const SEARCH_H: f32 = Style::SP_L;
 
 /// One search-result row's height — a compact list row (leading icon · label ·
-/// dim group name), `SP_L + SP_XS` (28pt). Sized so all 18 tileable surfaces
-/// fit the results area at once even when a one-letter query matches every
-/// one (18 · 28 = 504pt, inside the ~532pt results band with one row of
-/// headroom to spare — pinned by a test below).
+/// dim group name), `SP_L + SP_XS` (28pt). The result list is scroll-bounded
+/// because Start search includes both app tiles and Console commands; broad
+/// queries can exceed the visible band above the fixed search field.
 const RESULT_ROW_H: f32 = Style::SP_L + Style::SP_XS;
 
 /// The search-result row's leading icon size — [`Style::SP_M`] (16px), smaller
@@ -2097,7 +2096,7 @@ fn start_menu_search(
         &matches,
         state.search_highlight,
     );
-    let clicked = search_results(ui, content_rect, &matches, state.search_highlight);
+    let clicked = scrollable_search_results(ui, content_rect, &matches, state.search_highlight);
 
     // Enter launches the highlighted match (the top match by default); a click
     // on any row launches that one. App hits use the tile_activation seam, and
@@ -2400,6 +2399,42 @@ fn search_results(
         y += RESULT_ROW_H;
     }
     activated
+}
+
+fn search_results_content_h(matches: &[StartSearchHit], rect_h: f32) -> f32 {
+    if matches.is_empty() {
+        rect_h
+    } else {
+        (PANE_PAD * 2.0 + matches.len() as f32 * RESULT_ROW_H).max(rect_h)
+    }
+}
+
+fn scrollable_search_results(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    matches: &[StartSearchHit],
+    selected: usize,
+) -> Option<StartSearchHit> {
+    let content_h = search_results_content_h(matches, rect.height());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(rect);
+    egui::ScrollArea::vertical()
+        .id_salt("start-menu-search-results-scroll")
+        .auto_shrink([false, false])
+        .show(&mut child, |ui| {
+            let results_rect = egui::Rect::from_min_size(
+                ui.next_widget_position(),
+                egui::vec2(rect.width(), content_h),
+            );
+            let out = search_results(ui, results_rect, matches, selected);
+            ui.allocate_rect(results_rect, egui::Sense::hover());
+            out
+        })
+        .inner
 }
 
 /// The stable id of one search-result row's interactive rect (the `tile_id`
@@ -2759,10 +2794,12 @@ mod tests {
     use super::{start_menu_panel, StartMenuPrefs, StartMenuState, PANEL_H, PANEL_W};
     use crate::console::{self, ConsoleRequest, ConsoleState};
     use crate::dock::Surface;
+    use crate::screenshot::Capture;
     use crate::status::{SegmentRollup, StatusSegments};
     use crate::workbench::Plane;
     use mde_egui::egui;
     use mde_egui::Style;
+    use std::path::Path;
 
     const SZ: egui::Vec2 = egui::Vec2::new(1280.0, 800.0);
 
@@ -4425,6 +4462,80 @@ mod tests {
         click(&ctx, &mut s, &mut console, rect.center(), SZ);
         assert!(s.search_query.is_empty(), "clicking the icon clears search");
         assert!(s.is_open(), "clearing search keeps the Start Menu open");
+    }
+
+    #[test]
+    fn broad_search_results_scroll_above_the_fixed_search_field() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        s.search_query = "e".to_string();
+
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), SZ);
+        let panel_h = PANEL_H.min(screen.height() - Style::SP_XL);
+        let panel_top = screen.bottom() - panel_h;
+        let left_rect = egui::Rect::from_min_size(
+            egui::pos2(screen.left(), panel_top),
+            egui::vec2(super::LEFT_PANE_W, panel_h),
+        );
+        let search_rect = super::search_rect(left_rect);
+        let content_rect = super::left_pane_content_rect(left_rect, search_rect);
+        let matches = super::search_matches(&s.search_query);
+        let spill_idx = ((search_rect.top() - content_rect.top() - super::PANE_PAD)
+            / super::RESULT_ROW_H)
+            .ceil()
+            .max(0.0) as usize;
+        assert!(
+            matches.len() > spill_idx,
+            "fixture query must produce an offscreen search result row: {} <= {spill_idx}",
+            matches.len()
+        );
+        assert!(
+            super::search_results_content_h(&matches, content_rect.height())
+                > content_rect.height(),
+            "broad Start search should require a scrollable result list"
+        );
+        s.search_highlight = spill_idx;
+
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut cap = Capture::new();
+        let _settle = cap.frame(&ctx, input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("surface");
+            });
+            start_menu_panel(ctx, &mut s, &mut console, 0.0);
+        });
+        let canvas = cap.frame(&ctx, input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("surface");
+            });
+            start_menu_panel(ctx, &mut s, &mut console, 0.0);
+        });
+        assert!(
+            !canvas.is_blank(),
+            "the broad Start search screenshot must not be blank"
+        );
+        assert_eq!(canvas.count_near_color_in_rect(search_rect, Style::ACCENT, 4), 0,
+            "an offscreen selected result row must not paint its accent stripe into the fixed search field"
+        );
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("screenshots")
+            .join("start-menu-search-results-scroll.png");
+        canvas
+            .write_png(&path)
+            .expect("write the bounded Start search screenshot");
+        println!(
+            "Start Menu search-results screenshot written to {}",
+            path.display()
+        );
     }
 
     #[test]
