@@ -984,6 +984,10 @@ These decisions refine acceptance and sequencing for the active items below.
   chip through the stamped build codename and verified the chip rejects the old
   `Quasar` spelling; farm `.50` fmt and `.130` focused
   `platform_provenance_label_uses_the_canonical_build_codename` passed.
+  A later 2026-07-17 Device Manager export pass changed the Markdown report
+  provenance line from the superseded `Magic-Mesh Quasar` mixed identity to the
+  shared `MDE Quazar` product constant; farm `.50` fmt and `.130` focused
+  `the_markdown_report_lists_the_host_every_device_and_the_problem_code` passed.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

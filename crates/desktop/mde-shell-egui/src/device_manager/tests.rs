@@ -935,6 +935,14 @@ fn export_json_round_trips_the_fixture_inventory() {
 fn the_markdown_report_lists_the_host_every_device_and_the_problem_code() {
     let inv = DeviceInventory::fixture();
     let report = render_report(Some(&inv), &inv.host, ViewMode::ByType);
+    assert!(
+        report.contains(mde_theme::brand::logo::PRODUCT_NAME),
+        "the report should carry the canonical product name: {report}"
+    );
+    assert!(
+        !report.contains("Magic-Mesh Quasar"),
+        "the report must not export the superseded mixed product spelling: {report}"
+    );
     // The host header + the mirrored header-card summary fields (#20).
     assert!(report.contains("laptop-mm"), "the host header: {report}");
     assert!(report.contains("Fedora"), "the OS summary line: {report}");

@@ -1430,7 +1430,7 @@ impl DeviceManagerState {
     /// drawer** (DEVMGR-3), then the tree + header card fill the remainder.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         // The brand identity strip (#24) — kept beside the shared MenuBar so the
-        // `◈ Magic-Mesh Quasar v<ver>` mark + the ⓘ button stay always-visible.
+        // product mark + the ⓘ button stay always-visible.
         self.title_strip(ui);
         // MENUBAR-ALL: the shared top bar replaces DEVMGR-2's bespoke Action/View/
         // Help chrome (About is the 14th / last surface onto the shared component).
@@ -2653,10 +2653,8 @@ fn render_report(inv: Option<&DeviceInventory>, host: &str, view: ViewMode) -> S
     } else {
         "By type"
     };
-    let _ = writeln!(
-        out,
-        "_Magic-Mesh Quasar device report \u{00B7} view: {mode}_"
-    );
+    let product = brand::logo::PRODUCT_NAME;
+    let _ = writeln!(out, "_{product} device report \u{00B7} view: {mode}_");
     let _ = writeln!(out);
     // The rich host header (mirrors the on-screen header card, #20).
     for (label, value) in header_lines(inv) {
