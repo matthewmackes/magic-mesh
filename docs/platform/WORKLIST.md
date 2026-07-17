@@ -1164,6 +1164,11 @@ These decisions refine acceptance and sequencing for the active items below.
   with live `adfilter/compiled/engine.json` source status; farm `.170` fmt,
   BigBoy `.130` synced-filter source coverage, `.90` Privacy menu coverage, and
   `.50` policy-source audit coverage passed.
+  A later 2026-07-17 Browser engine-copy polish pass moved the remaining visible
+  Servo engine label in menu rows, status-chip model, hover/accessibility tab
+  summaries, and new-tab tooltips to the user-facing `Lightweight` label, while
+  leaving raw CEF/Servo implementation markers confined to diagnostics/tests; it
+  also removed the visible Privacy caption's `sandboxed engine` wording.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
