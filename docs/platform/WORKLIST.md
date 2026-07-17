@@ -749,6 +749,12 @@ These decisions refine acceptance and sequencing for the active items below.
   stale-PDF menu test, and `.170` no-page menu test passed. Live `.15` still
   has the installed split Browser RPMs and active shell service, but package
   replacement/runtime smoke remains blocked by non-interactive sudo.
+  A later 2026-07-17 Browser Options pass replaced the generic disabled-row
+  tooltip with command-specific gate explanations for typed-address, history,
+  helper-backed page tools, painted-frame captures, saved-PDF viewer, CEF
+  DevTools, loaded-URL share/download actions, first-party-site permission
+  actions, and data-clear actions; farm `.50` fmt and `.130` focused
+  `browser_options_disabled_rows_explain_their_command_gate` passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
