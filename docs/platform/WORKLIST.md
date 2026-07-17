@@ -878,9 +878,11 @@ These decisions refine acceptance and sequencing for the active items below.
 - Dependencies: WL-CRIT-003 for known geometry/media regression.
 - Current evidence: The 2026-07-17 Browser chrome pass scoped test-only helpers
   out of production builds, expanded icon coverage to every Browser-local
-  `ChromeIcon`, and passed farm fmt, the focused icon painter test, and a
-  production-feature `mde-shell-egui` check. Representative live screenshots
-  still wait on WL-CRIT-003's `.15` install/runtime proof.
+  `ChromeIcon`, added responsive Browser Options layout coverage for narrow and
+  wide viewports, and passed farm fmt, focused icon painter coverage, focused
+  Options-page render coverage, and a production-feature `mde-shell-egui` check.
+  Representative live screenshots still wait on WL-CRIT-003's `.15`
+  install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
   icons paint non-empty shapes, options page opens/focuses correctly, and visual
   snapshots pass on representative viewports.
