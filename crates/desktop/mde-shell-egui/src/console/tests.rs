@@ -2,8 +2,8 @@ use super::{
     console_confirm_id, console_content, console_entry_id, console_heading_id, console_power_id,
     console_rail_id, custom_sync, entry_at, identity_line, jump_caption, launch_argv, static_rows,
     tool_present, tool_present_in, total_rows, ConsoleRequest, ConsoleState, CustomEntry,
-    EntryKind, GateReason, PowerAction, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H, PANEL_W, PINNED,
-    POWER_H, RAIL_SECTION_GAP,
+    EntryKind, GateReason, PowerAction, Provenance, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H, PANEL_W,
+    PINNED, POWER_H, RAIL_SECTION_GAP,
 };
 use crate::dock::Surface;
 use crate::workbench::Plane;
@@ -149,6 +149,16 @@ fn the_entry_table_matches_the_locked_taxonomy_and_holds_no_dead_rows() {
     // The flat index space is coherent.
     assert_eq!(static_rows().count(), total_rows());
     assert_eq!(entry_at(0).label, "Terminal");
+}
+
+#[test]
+fn platform_provenance_label_uses_the_canonical_build_codename() {
+    let codename = mde_theme::brand::build::info().codename;
+
+    assert_eq!(codename, "Quazar", "the current brand codename changed");
+    assert_eq!(Provenance::Quasar.label(), codename);
+    assert_ne!(Provenance::Quasar.label(), "Quasar");
+    assert_eq!(Provenance::Quasar.color(), Style::ACCENT);
 }
 
 #[test]

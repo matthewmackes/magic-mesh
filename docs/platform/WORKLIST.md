@@ -980,6 +980,10 @@ These decisions refine acceptance and sequencing for the active items below.
   spelling; farm `.50` fmt, `.90` focused `mde-kdc-host` fanout test, `.130`
   focused Phones hub endpoint-name test, and `.170` focused mackesd KDC notify
   test passed.
+  A later 2026-07-17 Console polish pass routed the visible platform provenance
+  chip through the stamped build codename and verified the chip rejects the old
+  `Quasar` spelling; farm `.50` fmt and `.130` focused
+  `platform_provenance_label_uses_the_canonical_build_codename` passed.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

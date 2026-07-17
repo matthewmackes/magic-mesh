@@ -8,7 +8,7 @@
 //! see the WIN7-5 update below for why identity moved to the top); the
 //! **right pane** is the pinned Terminal + Monitor pair (lock #31) above the
 //! grouped entry list — each row an icon + label + one-line description + a
-//! subtle Fedora/Quasar provenance tag (locks #33/#38). Full arrow-key nav
+//! subtle Fedora/Quazar provenance tag (locks #33/#38). Full arrow-key nav
 //! with the EXPLORER-18 focus-ring posture (locks #40/#48).
 //!
 //! **WIN7-2 update:** this module used to mount its own floating `egui::Area`
@@ -53,7 +53,7 @@
 //! data: `ConsoleGroup` gained no field) in the SAME icon+label shape
 //! [`entry_row`] already uses, just condensed, so the rail reads as a
 //! smaller sibling of the list it jump-scrolls rather than a bare text menu
-//! bolted beside it. The Custom row wears the SAME `Provenance::Quasar`
+//! bolted beside it. The Custom row wears the SAME platform provenance
 //! accent every operator-owned entry already tags itself with, at rest,
 //! flagging "this one's yours" the way its own entries already do. The list
 //! pane's own group headings ([`heading`]) were investigated and found to
@@ -264,7 +264,7 @@ const FIELD_H: f32 = Style::SP_L;
 // ── the entry model (design "Entry model": a const table, no dead entries) ──
 
 /// The subtle per-entry provenance tag (lock #38): whether the op is stock
-/// Fedora tooling or the Quasar mesh platform's own layer.
+/// Fedora tooling or the Quazar mesh platform's own layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provenance {
     /// Stock Fedora / systemd tooling.
@@ -275,10 +275,10 @@ enum Provenance {
 
 impl Provenance {
     /// The tag's label text.
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Fedora => "Fedora",
-            Self::Quasar => "Quasar",
+            Self::Quasar => platform_provenance_label(),
         }
     }
 
@@ -289,6 +289,16 @@ impl Provenance {
             Self::Fedora => Style::TEXT_DIM,
             Self::Quasar => Style::ACCENT,
         }
+    }
+}
+
+/// The visible platform provenance chip follows the stamped build codename.
+fn platform_provenance_label() -> &'static str {
+    let codename = mde_theme::brand::build::info().codename;
+    if codename.is_empty() {
+        "MDE"
+    } else {
+        codename
     }
 }
 
@@ -319,7 +329,7 @@ struct ConsoleEntry {
     /// The `$PATH` binary the entry needs (`""` = always available — surface
     /// links and shell built-ins). Absent → the row greys + reports it (§7).
     tool: &'static str,
-    /// The Fedora/Quasar provenance tag (lock #38).
+    /// The Fedora/Quazar provenance tag (lock #38).
     provenance: Provenance,
     /// The row's **domain glyph** (lock #33's "icon"): a distinct brand glyph
     /// per operational domain (System / Network / Storage / Mesh / …), so the
@@ -1416,7 +1426,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         if hovered {
             painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
         }
-        // The Custom row wears the SAME Quasar accent every operator-owned
+        // The Custom row wears the SAME platform accent every operator-owned
         // entry already tags itself with (`Provenance::Quasar`), at rest —
         // not just on hover — flagging "this category is yours" at a
         // glance; every domain group stays the neutral TEXT/TEXT_DIM pair
@@ -1902,7 +1912,7 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
 }
 
 /// CONSOLE-4 — one **Custom** row (lock #35): the operator's name over its
-/// command line, the Quasar tag (an operator entry is platform-layer config),
+/// command line, the platform tag (an operator entry is platform-layer config),
 /// the remove cross, and the same focus-ring / activation posture as a static
 /// row. Returns `(clicked, remove_clicked)` — the cross is its own hit target,
 /// registered after the row so it wins the pointer.
