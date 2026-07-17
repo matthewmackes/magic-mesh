@@ -969,6 +969,11 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `crates/shared/mde-theme/src/brand/`,
   `AI_GOVERNANCE.md`, `README.md`, `docs/design/quasar-branding.md`, shell UI.
 - Dependencies: None for the selected scope.
+- Current evidence: A 2026-07-17 Browser dashboard pass replaced the visible
+  `Quasar Browser` new-tab title with a title derived from the shared brand
+  constants and verified the painted dashboard text uses `Quazar Browser`;
+  farm `.50` fmt and `.130` focused
+  `browser_new_tab_dashboard_uses_canonical_brand_identity` passed.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after
