@@ -729,6 +729,12 @@ These decisions refine acceptance and sequencing for the active items below.
   `crates/desktop/mde-bookmarks-egui/`,
   `crates/desktop/mde-shell-egui/src/web/`, sync workers.
 - Dependencies: Mesh substrate and bookmark service availability.
+- Current evidence: The 2026-07-17 Browser bookmark truthfulness pass confirmed
+  the Browser mirrors `state/bookmarks/collection` into bar links, bookmarked URL
+  membership, and omnibox bookmark candidates, and tightened the page-action
+  star/menu so pages already present in the system bookmark manager show a
+  disabled `Bookmarked` row instead of offering duplicate `Add bookmark`; farm
+  `.50` fmt and BigBoy `.130` focused page-actions coverage passed.
 - Acceptance criteria: A tab/bookmark/settings change on node A appears on node B,
   conflicts converge, and Browser does not maintain a competing bookmark store.
 - Verification method: Multi-node sync test or deterministic two-store fixture,
