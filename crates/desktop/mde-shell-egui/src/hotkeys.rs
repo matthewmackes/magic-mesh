@@ -1,4 +1,4 @@
-//! The shell's **hotkey dispatch** (E12-19, Quasar host controls; design
+//! The shell's **hotkey dispatch** (E12-19, Quazar host controls; design
 //! `docs/design/quasar-host-controls.md`, locks 8/9).
 //!
 //! `mde_seat::hotkeys::HOTKEYS` is the fixed compiled-in table (chord → typed

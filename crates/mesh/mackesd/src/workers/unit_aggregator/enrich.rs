@@ -122,7 +122,7 @@ pub fn openable_actions(services: &[String]) -> Vec<String> {
 /// A coarse device-type hint from a fingerprint's service set (E5 fingerprint→type).
 ///
 /// A remote-desktop / management listener (RDP/VNC/Spice/WinRM) implies a desktop
-/// `computer` (a Quasar broker target); SSH-only implies a headless `server`. A
+/// `computer` (a Quazar broker target); SSH-only implies a headless `server`. A
 /// weaker set (HTTP-only, empty) is too ambiguous to type ⇒ honest `None` (§7),
 /// never guessed.
 #[must_use]

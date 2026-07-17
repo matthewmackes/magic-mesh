@@ -2936,7 +2936,7 @@ pub(crate) fn spawn_probe_observability_workers(
         .expect("worker_names mutex")
         .push("hardware_probe".into());
 
-    // E12-19 (Quasar host controls) — host_state. Mirrors this node's seat
+    // E12-19 (Quazar host controls) — host_state. Mirrors this node's seat
     // snapshot (published by the shell) to state/host/<node>/seat for the
     // Workbench + remote peers, and authorizes remote typed verbs on
     // action/host/<node>/verb behind the allowlist + safety interlocks

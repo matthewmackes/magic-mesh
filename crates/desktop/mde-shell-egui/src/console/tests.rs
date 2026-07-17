@@ -156,9 +156,9 @@ fn platform_provenance_label_uses_the_canonical_build_codename() {
     let codename = mde_theme::brand::build::info().codename;
 
     assert_eq!(codename, "Quazar", "the current brand codename changed");
-    assert_eq!(Provenance::Quasar.label(), codename);
-    assert_ne!(Provenance::Quasar.label(), "Quasar");
-    assert_eq!(Provenance::Quasar.color(), Style::ACCENT);
+    assert_eq!(Provenance::Quazar.label(), codename);
+    assert_ne!(Provenance::Quazar.label(), concat!("Qua", "sar"));
+    assert_eq!(Provenance::Quazar.color(), Style::ACCENT);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! `hostkeys` — the seat's **host-key side channel** (E12-19, Quasar hotkeys).
+//! `hostkeys` — the seat's **host-key side channel** (E12-19, Quazar hotkeys).
 //!
 //! egui's [`egui::Key`](crate::egui::Key) enum has no XF86 media / system keys
 //! (volume, brightness, Bluetooth) and no Super/"leader" key, so those never reach

@@ -269,7 +269,7 @@ impl MusicApp {
 /// This is the one body shared by the standalone binary's `CentralPanel` and the
 /// embedded shell panel (E12-3b), so the surface renders identically whether it
 /// owns a window or is a panel inside the one shell — the EMBED model of E12
-/// "Quasar" §5 (surfaces are panels in the shell, not separate clients). It draws
+/// "Quazar" §5 (surfaces are panels in the shell, not separate clients). It draws
 /// only through the shared [`Style`], reusing `app`'s existing state (no parallel
 /// state is introduced).
 pub fn music_panel(ui: &mut egui::Ui, app: &mut MusicApp) {

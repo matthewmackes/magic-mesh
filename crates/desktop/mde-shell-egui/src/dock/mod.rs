@@ -6,7 +6,7 @@
 //! NAVBAR/NOTIF/CONSOLE-1 then built the *new* bottom rail that WIN7-1 formalizes
 //! as a true Win7-style taskbar).
 //!
-//! Under E12 "Quasar" the mesh-control surfaces are **panels in the one shell**,
+//! Under E12 "Quazar" the mesh-control surfaces are **panels in the one shell**,
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
 //! is that shell nav: a left-edge, full-height, ~48px slide-in auto-hide column
 //! that selects which surface fills the shell body — the mesh-control
@@ -73,7 +73,7 @@ pub enum Surface {
     /// segmented Explorer lens, which powers the NODE-GRADE-2 node-focus jump.
     Explorer,
     /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
-    /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
+    /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quazar".
     Desktop,
     /// The **Infra as Code (`IaC`)** surface — the `OpenStack` `IaaS` control
     /// plane (`docs/design/iac-workspace.md`, IAC-2): the Keystone service
@@ -180,7 +180,7 @@ impl Surface {
     ];
 
     /// The [`brand::icons`](mde_theme::brand::icons) glyph this surface draws in
-    /// the bar (QBRAND-7). A 1:1 map by name onto the Quasar brand set — every
+    /// the bar (QBRAND-7). A 1:1 map by name onto the Quazar brand set — every
     /// dock surface has a dedicated line-art glyph and `MeshView` folds onto the
     /// topology-map glyph. The dock never re-draws a glyph; it tints this one
     /// through the shared loader (§6).
@@ -2446,7 +2446,7 @@ pub(crate) fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// Keyboard-focus-ring stroke width (a11y-03 / WCAG 2.4.7) — the shared platform
 /// **2px** focus token ([`mde_egui::focus::FOCUS_RING_W`], design lock #5), so every
 /// focus indicator across the shell (taskbar cells, Explorer, Console) reads at one
-/// consistent weight against the Quasar-dark ground. Sourced from the one token
+/// consistent weight against the Quazar-dark ground. Sourced from the one token
 /// rather than the old mirrored `2.5` local literals.
 const FOCUS_RING_W: f32 = mde_egui::focus::FOCUS_RING_W;
 
@@ -2467,7 +2467,7 @@ fn focus_ring_rect(cell: egui::Rect, focused: bool) -> Option<egui::Rect> {
 /// cell shares: when the cell holds keyboard focus, a high-contrast accent stroke
 /// around its edge shows a keyboard user which cell is focused.
 ///
-/// The Quasar palette has no dedicated focus token, so the ring wears the lifted
+/// The Quazar palette has no dedicated focus token, so the ring wears the lifted
 /// brand accent [`Style::ACCENT_HI`] — the same accent egui's own `selection.stroke`
 /// derives its focus/selection ring from (`mde_egui::Style::accent_visuals`), one
 /// rung brighter than the resting [`Style::ACCENT`] so it stays legible over the

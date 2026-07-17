@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Magic Mesh Shell
-Comment=The MCNF Quasar egui shell — mesh control + desktops (Workbench · Files · Music · Voice · Desktop · Instances) in one surface
-# E12-3 "Quasar" — the single egui shell. Built `--features drm` it OWNS the DRM/KMS
+Comment=The MCNF Quazar egui shell — mesh control + desktops (Workbench · Files · Music · Voice · Desktop · Instances) in one surface
+# E12-3 "Quazar" — the single egui shell. Built `--features drm` it OWNS the DRM/KMS
 # seat directly (no compositor); launched from an existing session it runs as a
 # windowed client (the run_drm → NoDrmMaster → run_client fallback in main.rs). This
 # .desktop is the session-launch face; the seat-boot face is a systemd unit (E12-3).

@@ -270,7 +270,7 @@ enum Provenance {
     /// Stock Fedora / systemd tooling.
     Fedora,
     /// The mesh platform's layer (meshctl / mackesd / the Bus / the channel).
-    Quasar,
+    Quazar,
 }
 
 impl Provenance {
@@ -278,7 +278,7 @@ impl Provenance {
     fn label(self) -> &'static str {
         match self {
             Self::Fedora => "Fedora",
-            Self::Quasar => platform_provenance_label(),
+            Self::Quazar => platform_provenance_label(),
         }
     }
 
@@ -287,7 +287,7 @@ impl Provenance {
     const fn color(self) -> egui::Color32 {
         match self {
             Self::Fedora => Style::TEXT_DIM,
-            Self::Quasar => Style::ACCENT,
+            Self::Quazar => Style::ACCENT,
         }
     }
 }
@@ -358,7 +358,7 @@ const PINNED: [ConsoleEntry; 2] = [
         label: "Terminal",
         desc: "Open the Terminal surface — tabs, splits, mesh peers",
         tool: "",
-        provenance: Provenance::Quasar,
+        provenance: Provenance::Quazar,
         icon: IconId::Terminal,
         kind: EntryKind::Link(Surface::Terminal),
     },
@@ -422,7 +422,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Network Status",
                 desc: "Mesh-aware summary: links, routes, overlay + peers",
                 tool: "ip",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::Signal,
                 kind: EntryKind::Tab(
                     "bash -lc 'ip -br addr; echo; ip route; echo; meshctl status'",
@@ -493,7 +493,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Platform Update",
                 desc: "Update the mesh platform from the signed channel",
                 tool: "dnf",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab("sudo dnf upgrade magic-mesh"),
             },
@@ -540,7 +540,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Mesh Storage",
                 desc: "The mesh share mount + Syncthing sync status",
                 tool: "findmnt",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::Storage,
                 kind: EntryKind::Tab(
                     "bash -lc 'findmnt /mnt/mesh-storage; echo; systemctl --no-pager status \"syncthing*\"'",
@@ -555,7 +555,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Mesh Status",
                 desc: "This node + fleet status roll-up (meshctl status)",
                 tool: "meshctl",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab("meshctl status"),
             },
@@ -563,7 +563,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Peers",
                 desc: "Fleet-wide peer directory (meshctl fleet status)",
                 tool: "meshctl",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::Node,
                 kind: EntryKind::Tab("meshctl fleet status"),
             },
@@ -571,7 +571,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Cloud Status",
                 desc: "The state/openstack mirror on the Bus spool",
                 tool: "",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab(
                     "bash -lc 'ls -l \"${MDE_BUS_ROOT:-/run/mde-bus}/state/openstack\" 2>/dev/null || echo \"no cloud mirror published on this node\"'",
@@ -581,7 +581,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Cluster (etcd)",
                 desc: "Endpoint health + members (etcdctl)",
                 tool: "etcdctl",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::Server,
                 kind: EntryKind::Tab("bash -lc 'etcdctl endpoint health; etcdctl member list'"),
             },
@@ -610,7 +610,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "OpenStack Servers",
                 desc: "The cloud's server roster (openstack server list)",
                 tool: "openstack",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::Server,
                 kind: EntryKind::Tab("openstack server list"),
             },
@@ -618,7 +618,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Cloud Plane (GUI)",
                 desc: "Open the Workbench Cloud plane — the VM lifecycle GUI",
                 tool: "",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Quazar,
                 icon: IconId::Server,
                 kind: EntryKind::Plane(Plane::Cloud),
             },
@@ -1427,7 +1427,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
             painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
         }
         // The Custom row wears the SAME platform accent every operator-owned
-        // entry already tags itself with (`Provenance::Quasar`), at rest —
+        // entry already tags itself with (`Provenance::Quazar`), at rest —
         // not just on hover — flagging "this category is yours" at a
         // glance; every domain group stays the neutral TEXT/TEXT_DIM pair
         // the rest of this rail (and the tile grid beside it) already uses.
@@ -1435,7 +1435,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         // own desc-line-is-always-TEXT_DIM convention below.
         let is_custom = group.is_none();
         let label_color = if is_custom {
-            Provenance::Quasar.color()
+            Provenance::Quazar.color()
         } else if hovered {
             Style::TEXT
         } else {
@@ -1983,9 +1983,9 @@ fn custom_row(
     painter.text(
         egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_XS),
         egui::Align2::RIGHT_TOP,
-        Provenance::Quasar.label(),
+        Provenance::Quazar.label(),
         egui::FontId::proportional(Style::SMALL),
-        Provenance::Quasar.color(),
+        Provenance::Quazar.color(),
     );
     // WIN7-5, lock #14 — reuses the SAME flat-index accesskit id space
     // `entry_row` above does (they already share `console_entry_id` for

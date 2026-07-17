@@ -65,7 +65,7 @@ fn focus_ring_only_rings_the_focused_cell() {
         "the focus ring must sit inside its cell"
     );
     // The ring wears the theme's lifted brand accent (no dedicated focus token
-    // exists in the Quasar palette) — one rung brighter than the resting accent.
+    // exists in the Quazar palette) — one rung brighter than the resting accent.
     assert_ne!(Style::ACCENT_HI, Style::ACCENT);
 }
 

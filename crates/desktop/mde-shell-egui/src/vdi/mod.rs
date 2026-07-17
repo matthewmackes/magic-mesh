@@ -1,6 +1,6 @@
 //! The VDI **Desktop** surface — a remote VM desktop rendered egui-native.
 //!
-//! E12 "Quasar" brokers VM desktops *into* the one shell (§5 EMBED, lock 21):
+//! E12 "Quazar" brokers VM desktops *into* the one shell (§5 EMBED, lock 21):
 //! there is no external viewer. The remote framebuffer is decoded by
 //! `mde-vdi-rdp` (RDP-primary), `mde-vdi-vnc` (VNC / XAPI-console fallback), or
 //! `mde-vdi-spice` (native QEMU/KVM console) into an [`egui::ColorImage`]; this

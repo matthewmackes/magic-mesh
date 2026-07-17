@@ -1,4 +1,4 @@
-//! `mde-shell-egui` — the single MCNF E12 "Quasar" egui shell (E12-3).
+//! `mde-shell-egui` — the single MCNF E12 "Quazar" egui shell (E12-3).
 //!
 //! One eframe app on the `mde-egui` harness. The shell has **ONE chrome** — the
 //! left **vertical dock** (VDOCK, `dock::dock`: the slide-in, auto-hide app picker

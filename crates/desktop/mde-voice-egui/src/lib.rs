@@ -1,4 +1,4 @@
-//! `mde-voice-egui` — the MCNF **E12 "Quasar"** egui Voice/SIP surface (E12-11).
+//! `mde-voice-egui` — the MCNF **E12 "Quazar"** egui Voice/SIP surface (E12-11).
 //!
 //! A standalone eframe surface on the shared [`mde_egui`] harness that REUSES the
 //! shipped pure-Rust SIP stack in `mde-voice-hud` (governance §6 — glue, not
@@ -18,7 +18,7 @@
 //! sound device. The retired Cosmic-era HUD is never pulled (`mde-voice-hud` is
 //! consumed with its `gui` feature off).
 //!
-//! Under E12 "Quasar" the mesh-control surfaces are **panels inside the one shell**
+//! Under E12 "Quazar" the mesh-control surfaces are **panels inside the one shell**
 //! (`mde-shell-egui`), not separate clients (§5, the EMBED model — there is no
 //! compositor). So the central view is factored into the public [`voice_panel`]
 //! function: the standalone [`VoiceApp`] renders it into its own `CentralPanel`

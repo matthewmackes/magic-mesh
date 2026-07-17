@@ -478,7 +478,7 @@ pub mod hardware_probe;
 // hardware taxonomy sysfs-first + publishes `device-inventory/<host>.json` for
 // the About → Device-Manager surface (docs/design/about-device-manager.md).
 pub mod device_inventory;
-// E12-19 (Quasar host controls) — mirrors this node's seat snapshot to
+// E12-19 (Quazar host controls) — mirrors this node's seat snapshot to
 // state/host/<node>/seat and executes remote typed verbs (volume/BT/
 // display/power) behind the allowlist + safety interlocks. Runs on every
 // node; spawned in run_serve.

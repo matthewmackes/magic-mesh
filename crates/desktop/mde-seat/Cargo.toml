@@ -1,6 +1,6 @@
 [package]
 name        = "mde-seat"
-description = "E12-15 (Quasar host controls) — the seat hardware-access library. The compositor-less shell owns the DRM seat, so every 'system control' a desktop OS takes for granted (audio, Bluetooth, displays, backlight, power) needs one owner: this crate. Typed clients behind injectable seams for BlueZ / UPower / logind over the system D-Bus, a read-only DRM connector prober, and sysfs backlight read/write — plus the PipeWire and DDC/CI client TRAITS whose real bindings land in E12-16/E12-18 (until then they answer with a typed Unavailable, never a stub that lies). A SeatSnapshot aggregates every probe for the shell's System surface + chrome icons."
+description = "E12-15 (Quazar host controls) — the seat hardware-access library. The compositor-less shell owns the DRM seat, so every 'system control' a desktop OS takes for granted (audio, Bluetooth, displays, backlight, power) needs one owner: this crate. Typed clients behind injectable seams for BlueZ / UPower / logind over the system D-Bus, a read-only DRM connector prober, and sysfs backlight read/write — plus the PipeWire and DDC/CI client TRAITS whose real bindings land in E12-16/E12-18 (until then they answer with a typed Unavailable, never a stub that lies). A SeatSnapshot aggregates every probe for the shell's System surface + chrome icons."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

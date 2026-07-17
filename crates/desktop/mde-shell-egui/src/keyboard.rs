@@ -4,7 +4,7 @@
 //! A convertible with the Type Cover detached has no physical keyboard, so the shell
 //! must draw one and feed the focused text field itself (the bare-DRM seat owns the
 //! input path — there is no external input-method to lean on). This module is that
-//! OSK, built entirely on the Quasar [`Style`]/[`Motion`] tokens (§4 — no raw hex).
+//! OSK, built entirely on the Quazar [`Style`]/[`Motion`] tokens (§4 — no raw hex).
 //!
 //! **Three parts, the first two pure + headless-testable:**
 //!

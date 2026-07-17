@@ -423,7 +423,7 @@ assets = [
     { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
     { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
-    # E12-3 "Quasar" — the single egui shell that OWNS the DRM/KMS seat directly (no
+    # E12-3 "Quazar" — the single egui shell that OWNS the DRM/KMS seat directly (no
     # compositor, no display manager) and hosts Workbench/Files/Music/Voice/Desktop/
     # Instances as in-shell panels. Built `--features drm` (the RPM build re-links this
     # one bin with the feature after the workspace build) so it takes the seat; it
@@ -720,7 +720,7 @@ systemctl enable magic-setup.service >/dev/null 2>&1 || :
 # SEAT-BOOT-1 — the DRM shell seat launcher. It is enabled everywhere in the
 # base RPM but only starts on role="workstation"; `mackesd onboard
 # role-provision` masks it on Lighthouse as a hard-off guard.
-# Early Quasar live seats may carry a hand-written /etc/systemd/system/mde-shell.service
+# Early Quazar live seats may carry a hand-written /etc/systemd/system/mde-shell.service
 # from pre-RPM testing. It also starts mde-shell-egui on tty1 and can race the
 # packaged, role-gated mde-shell-egui.service. Remove only that known legacy
 # launcher; leave any unrelated admin-created mde-shell.service untouched.
@@ -783,7 +783,7 @@ alsa-lib = "*"
 # so hard-Require them.
 btop = "*"
 mc = "*"
-# E12-19 (Quasar host controls) — the seat services the compositor-less shell
+# E12-19 (Quazar host controls) — the seat services the compositor-less shell
 # owns in-process (mde-seat, design quasar-host-controls.md). With no settings
 # daemon these have no other owner, and the shell's Mixer/Bluetooth/Power
 # sections + the hotkeys drive them directly, so hard-Require the runtimes:

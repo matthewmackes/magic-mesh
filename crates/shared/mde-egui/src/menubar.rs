@@ -39,7 +39,7 @@
 //! refactored bars keep byte-identical behaviour. On top of that the strip paints a
 //! shared-[`Motion`] hover/open **underline** and fades a drop-down's body in on
 //! open, and every menu item carries a **2 px accent focus ring** when keyboard-
-//! focused (a11y, Quasar lock 5). All of it is **reduce-motion aware**: a surface
+//! focused (a11y, Quazar lock 5). All of it is **reduce-motion aware**: a surface
 //! that zeroes egui's `animation_time` gets instant transitions here too.
 
 use egui::text::{LayoutJob, TextFormat};
@@ -67,7 +67,7 @@ pub enum ChipTone {
     /// A plain read-out (host, count, codec) — dim body text.
     #[default]
     Neutral,
-    /// An interactive / branded value — the Quasar accent.
+    /// An interactive / branded value — the Quazar accent.
     Info,
     /// A healthy / connected state — success green.
     Ok,
@@ -617,7 +617,7 @@ mod tests {
                     Entry::Submenu {
                         label: "Colour Scheme".to_owned(),
                         mnemonic: None,
-                        entries: vec![Entry::Item(Item::new("quasar", "Quasar").checked(false))],
+                        entries: vec![Entry::Item(Item::new("quasar", "Quazar").checked(false))],
                     },
                 ],
             ),

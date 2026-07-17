@@ -62,7 +62,7 @@ These decisions refine acceptance and sequencing for the active items below.
 - WL-RUN-002: wire worker-restart counters first.
 - WL-RUN-005: verify paired phones as the first non-PC Device Manager source.
 - WL-RUN-006: keep firewall commit-confirm active.
-- WL-ARCH-001/WL-ARCH-002/WL-TEST-001: continue Quasar Cloud in parallel with
+- WL-ARCH-001/WL-ARCH-002/WL-TEST-001: continue Quazar Cloud in parallel with
   substrate work; finish Compute instance verbs/forms first; live smoke creates
   and deletes a nano server instance.
 - WL-ARCH-003: begin shared Bus/Persist seam work soon.
@@ -402,13 +402,13 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Core Architecture
 
-### WL-ARCH-001 - Quasar Cloud hard cutover to Nova/libvirt/QEMU-KVM
+### WL-ARCH-001 - Quazar Cloud hard cutover to Nova/libvirt/QEMU-KVM
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
 - Problem: Governance says cloud-hypervisor is retired, but historical docs and
-  worklist text still carry old-stack assumptions while Quasar Cloud has several
+  worklist text still carry old-stack assumptions while Quazar Cloud has several
   live acceptance gates open.
 - Required outcome: Cutover nodes run the Nova/libvirt/QEMU-KVM plus OVN stack,
   old stack code is absent from runtime paths, and stale cloud-hypervisor
@@ -957,9 +957,10 @@ These decisions refine acceptance and sequencing for the active items below.
 - Status: Remaining
 - Priority: P2
 - Complexity: Medium
-- Problem: The repo still carries both "Quasar" and "Quazar" in user-facing
-  strings, governance, docs, assets, and design locks. The operator has now
-  selected `Quazar` as canonical for user-facing strings plus governance/docs.
+- Problem: The repo still carries the superseded S-spelling beside `Quazar` in
+  user-facing strings, governance, docs, assets, and design locks. The operator
+  has now selected `Quazar` as canonical for user-facing strings plus
+  governance/docs.
 - Required outcome: User-facing strings and governance/docs consistently use
   `Quazar`, and user-visible strings route through brand constants with a drift
   guard. Internal identifiers and asset paths are not part of this sweep unless
@@ -970,32 +971,36 @@ These decisions refine acceptance and sequencing for the active items below.
   `AI_GOVERNANCE.md`, `README.md`, `docs/design/quasar-branding.md`, shell UI.
 - Dependencies: None for the selected scope.
 - Current evidence: A 2026-07-17 Browser dashboard pass replaced the visible
-  `Quasar Browser` new-tab title with a title derived from the shared brand
+  old-spelling Browser new-tab title with a title derived from the shared brand
   constants and verified the painted dashboard text uses `Quazar Browser`;
   farm `.50` fmt and `.130` focused
   `browser_new_tab_dashboard_uses_canonical_brand_identity` passed.
   A later 2026-07-17 phone-facing identity pass changed the KDC fanout endpoint,
-  Phones hub mirror, and forwarded phone notification app/ticker from `Quasar
-  Mesh` to `Quazar Mesh`, updating the current KDC design note with the shipped
+  Phones hub mirror, and forwarded phone notification app/ticker from the old
+  Mesh spelling to `Quazar Mesh`, updating the current KDC design note with the shipped
   spelling; farm `.50` fmt, `.90` focused `mde-kdc-host` fanout test, `.130`
   focused Phones hub endpoint-name test, and `.170` focused mackesd KDC notify
   test passed.
   A later 2026-07-17 Console polish pass routed the visible platform provenance
   chip through the stamped build codename and verified the chip rejects the old
-  `Quasar` spelling; farm `.50` fmt and `.130` focused
+  spelling; farm `.50` fmt and `.130` focused
   `platform_provenance_label_uses_the_canonical_build_codename` passed.
   A later 2026-07-17 Device Manager pass changed the Markdown report provenance
-  line and Help/About menu label from superseded `Magic-Mesh`/`Magic-Mesh
-  Quasar` mixed identity to the shared `MDE Quazar` product constant; farm `.50`
+  line and Help/About menu label from superseded `Magic-Mesh` mixed identity to
+  the shared `MDE Quazar` product constant; farm `.50`
   fmt plus `.130` focused report and menu-model tests passed.
   A later 2026-07-17 governance/docs pass removed stale "pending spelling
   decision" language from `AI_GOVERNANCE.md`, `README.md`, `CHANGELOG.md`,
   `docs/design/quasar-branding.md`, and `docs/NEEDS-OPERATOR.md`, and updated
   current examples to `12.0.0 "Quazar"` / `MCNF 12.0 "Quazar"`.
-  A later 2026-07-17 Editor/Terminal pass corrected visible `Quasar Editor`,
+  A later 2026-07-17 Editor/Terminal pass corrected the old-spelling Editor title,
   Terminal colour-scheme, tmux config, Cargo metadata, and in-crate design
   comments to `Quazar`, with focused label/config tests guarding the user-facing
   strings.
+  A later 2026-07-17 brand-drift pass corrected remaining current crate
+  metadata, sample-visible strings, and front-door docs to `Quazar`, renamed the
+  local Console provenance variant, and added `install-helpers/lint-brand-identity.sh`
+  to CI as the drift guard.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

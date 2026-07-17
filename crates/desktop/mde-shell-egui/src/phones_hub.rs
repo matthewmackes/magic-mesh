@@ -9,7 +9,7 @@
 //! same Bus RPC path the `IaC` + Fleet surfaces use. Nothing here reimplements the
 //! host, the pairing store, or the transport — the surface only presents + drives.
 //!
-//! Four tabs (Carbon-inspired Quasar-dark cards, §4):
+//! Four tabs (Carbon-inspired Quazar-dark cards, §4):
 //! * **Phones** — the paired-phone roster: mesh identity, live signal + battery,
 //!   the per-feature toggles, and the per-phone actions (ring · send clipboard ·
 //!   browse the phone · unpair fast + mesh-wide).

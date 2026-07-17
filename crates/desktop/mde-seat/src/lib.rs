@@ -1,7 +1,7 @@
-//! `mde-seat` — the E12 **seat hardware-access library** (E12-15, Quasar host
+//! `mde-seat` — the E12 **seat hardware-access library** (E12-15, Quazar host
 //! controls; design `docs/design/quasar-host-controls.md`).
 //!
-//! The Quasar shell owns the DRM seat with **no compositor and no settings
+//! The Quazar shell owns the DRM seat with **no compositor and no settings
 //! daemon**, so every "system control" a desktop OS takes for granted — audio,
 //! Bluetooth, displays, backlight, power — has no owner until this crate. It is
 //! the ONE implementation of each protocol client (lock 1): the shell consumes it

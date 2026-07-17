@@ -1,4 +1,4 @@
-# MCNF E12 "Quasar" — `mde-files-egui`: the egui file-manager surface (E12-11).
+# MCNF E12 "Quazar" — `mde-files-egui`: the egui file-manager surface (E12-11).
 #
 # An `eframe` app on the shared `mde-egui` harness that REUSES `mde-files`'
 # render-agnostic core — the `Backend` trait (`RealBackend`/`DemoBackend`/
@@ -11,7 +11,7 @@
 # egui-native, so the retired file-manager GUI is never pulled.
 [package]
 name        = "mde-files-egui"
-description = "MCNF E12 Quasar — an egui file-manager surface on the mde-egui harness that reuses mde-files' render-agnostic backend/model/send_to (file listing + transfer model) over the mesh Bus: browse a local directory and a mesh-peer folder, then initiate a Send-To. Renders through the shared Style; the retired Cosmic-era GUI is not pulled (mde-files is consumed with default-features off)."
+description = "MCNF E12 Quazar — an egui file-manager surface on the mde-egui harness that reuses mde-files' render-agnostic backend/model/send_to (file listing + transfer model) over the mesh Bus: browse a local directory and a mesh-peer folder, then initiate a Send-To. Renders through the shared Style; the retired Cosmic-era GUI is not pulled (mde-files is consumed with default-features off)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

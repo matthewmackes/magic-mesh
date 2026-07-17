@@ -1,4 +1,4 @@
-//! `mde-music-egui` — the MCNF **E12 "Quasar"** egui music surface (E12-5).
+//! `mde-music-egui` — the MCNF **E12 "Quazar"** egui music surface (E12-5).
 //!
 //! A standalone eframe surface on the shared [`mde_egui`] harness that REUSES the
 //! `mde-musicd` service crate end-to-end (governance §6 — glue, not
@@ -14,7 +14,7 @@
 //! never blocks; the render-agnostic view-model in [`model`] is unit-tested
 //! without a GPU or a sound device.
 //!
-//! Under E12 "Quasar" the mesh-control surfaces are **panels inside the one shell**
+//! Under E12 "Quazar" the mesh-control surfaces are **panels inside the one shell**
 //! (`mde-shell-egui`), not separate clients (§5, the EMBED model — there is no
 //! compositor). So the central view is factored into the public [`music_panel`]
 //! function: the standalone [`MusicApp`] renders it into its own `CentralPanel`,

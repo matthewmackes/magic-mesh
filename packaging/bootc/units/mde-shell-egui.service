@@ -1,4 +1,4 @@
-# E12-13 / SEAT-BOOT-1 — the Quasar DRM-seat unit for both bootc and RPM lanes.
+# E12-13 / SEAT-BOOT-1 — the Quazar DRM-seat unit for both bootc and RPM lanes.
 # org.magicmesh.Shell.desktop remains the session-launch face; this is the
 # boot-to-seat face.
 #
@@ -19,7 +19,7 @@
 # never disagree about what "workstation" means.
 
 [Unit]
-Description=MCNF Quasar egui shell (DRM seat, no compositor)
+Description=MCNF Quazar egui shell (DRM seat, no compositor)
 Documentation=https://github.com/matthewmackes/magic-mesh
 # The wizard owns tty1 until a role is pinned; we own it after. Workstation
 # seats in the RPM lane may still boot to multi-user.target, so the install

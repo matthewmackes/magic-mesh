@@ -1,6 +1,6 @@
 [package]
 name        = "mde-vdi-rdp"
-description = "MCNF E12 'Quasar' VDI — render a remote RDP desktop into an egui texture (RDP-primary, lock 21). Pure-Rust ironrdp drives the connection + session; this crate decodes framebuffer/bitmap updates into an egui ColorImage and forwards egui input events as RDP input. NO external viewer — the shell uploads the ColorImage to a TextureHandle."
+description = "MCNF E12 'Quazar' VDI — render a remote RDP desktop into an egui texture (RDP-primary, lock 21). Pure-Rust ironrdp drives the connection + session; this crate decodes framebuffer/bitmap updates into an egui ColorImage and forwards egui input events as RDP input. NO external viewer — the shell uploads the ColorImage to a TextureHandle."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

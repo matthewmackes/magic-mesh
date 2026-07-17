@@ -1806,7 +1806,7 @@ pub fn render_navidrome_heat_stack(
         r#"heat_template_version: 2021-04-16
 description: >
   QC-18 Navidrome media service re-platformed as a Nova instance.
-  Rendered by mackesd from the Quasar cloud doctrine; Heat owns the
+  Rendered by mackesd from the Quazar cloud doctrine; Heat owns the
   workload, Nova runs it, and media is mounted from the object tier.
   Kolla release: {release}.
 parameters:

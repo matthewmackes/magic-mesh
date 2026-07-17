@@ -1,6 +1,6 @@
 [package]
 name        = "mde-shell-egui"
-description = "MCNF E12 \"Quasar\" — the single egui shell (E12-3). One eframe app on the mde-egui harness: a thin persistent chrome bar (peers · sessions · status + an Expand toggle) over a central view that is either the session EmptyState (collapsed — a real session is a VM texture from mde-vdi, a later unit) or the Workbench five-plane nav (expanded). The skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view plug into."
+description = "MCNF E12 \"Quazar\" — the single egui shell (E12-3). One eframe app on the mde-egui harness: a thin persistent chrome bar (peers · sessions · status + an Expand toggle) over a central view that is either the session EmptyState (collapsed — a real session is a VM texture from mde-vdi, a later unit) or the Workbench five-plane nav (expanded). The skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view plug into."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -108,7 +108,7 @@ qrcode = { version = "0.14", default-features = false }
 mde-lighthouse-health = { path = "../../platform/mde-lighthouse-health", default-features = false }
 
 # E12-3b EMBED — the three polished mesh-control surfaces are mounted as in-shell
-# panels (Quasar §5: panels in the one shell, not separate clients). Each is a
+# panels (Quazar §5: panels in the one shell, not separate clients). Each is a
 # desktop-shell-tier lib the shell owns the App of and drives per-frame (pump +
 # header + `*_panel`). The dependency edge points sideways-inward within the
 # desktop-shell tier (§6) — the same toolkit resolution (`mde-egui`) flows through.

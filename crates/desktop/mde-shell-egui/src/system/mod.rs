@@ -1,7 +1,7 @@
 //! `Surface::System` — this seat's host-controls panel (E12-15 status; E12-18 makes
 //! Displays + Power interactive).
 //!
-//! Under E12 "Quasar" the shell owns the DRM seat with no compositor and no
+//! Under E12 "Quazar" the shell owns the DRM seat with no compositor and no
 //! settings daemon, so audio / Bluetooth / displays / power / backlight have no
 //! owner until `mde-seat` (design `docs/design/quasar-host-controls.md`). This
 //! surface is where ALL host-control interaction lives (lock 3); the chrome bar
@@ -2550,7 +2550,7 @@ fn hotkeys_section(ui: &mut egui::Ui) {
 /// and the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy).
 /// Each pick mutates the persisted [`AppearanceConfig`] in place; the change is
 /// saved after the render borrow and applied live by [`SystemState::apply_appearance`]
-/// on the poll. The platform is dark-only (the Quasar lock) — there is NO light/dark
+/// on the poll. The platform is dark-only (the Quazar lock) — there is NO light/dark
 /// switch here, only what the runtime truly drives (§7 — no dead toggle). Laid
 /// **across** the wide pane (SETTINGS-3) as selectable tiles.
 fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {

@@ -9,7 +9,7 @@ authors.workspace      = true
 repository.workspace   = true
 
 # E12-14b — the windowed Cosmic-era `mde-files` binary was stripped; MCNF 12.0
-# "Quasar" renders Files as an egui panel (`mde-files-egui::files_panel`) in
+# "Quazar" renders Files as an egui panel (`mde-files-egui::files_panel`) in
 # `mde-shell-egui`, reusing this crate's render-agnostic backend/model/send_to
 # over the Bus. The crate is now lib-only (no GUI toolkit/wgpu/winit).
 [dependencies]

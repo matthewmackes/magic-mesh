@@ -5,7 +5,7 @@
 //! these constants and call [`Style::install`]; they never hand-roll a colour or a
 //! spacing value.
 //!
-//! The palette is the **Quasar dark** identity (the platform default). Values
+//! The palette is the **Quazar dark** identity (the platform default). Values
 //! are render-agnostic data, so they are unit-tested without a GPU.
 
 use egui::{Color32, Context, Stroke};
@@ -80,7 +80,7 @@ impl Density {
 pub struct Style;
 
 impl Style {
-    // ── Palette (Quasar dark) ───────────────────────────────────────────────
+    // ── Palette (Quazar dark) ───────────────────────────────────────────────
     /// Window / app background — the deepest surface.
     pub const BG: Color32 = Color32::from_rgb(0x16, 0x16, 0x1A);
     /// Raised surface — panels, cards, inputs.
@@ -129,7 +129,7 @@ impl Style {
     /// paints bold spans + heading titles with it.
     pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
 
-    /// Interactive / brand accent (Quasar azure).
+    /// Interactive / brand accent (Quazar azure).
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
     /// Accent, hovered.
     pub const ACCENT_HI: Color32 = Color32::from_rgb(0x7A, 0xA2, 0xFF);

@@ -3,7 +3,7 @@
 //! placement lock #12 — `MDE-QUAZAR-WALLPAPER4.png` is the default, all five ship
 //! selectable).
 //!
-//! Under E12 "Quasar" the shell IS the desktop, so "the empty desktop" is the
+//! Under E12 "Quazar" the shell IS the desktop, so "the empty desktop" is the
 //! Desktop surface with nothing brokered in: the [`crate::vdi`] no-desktop state and
 //! the [`crate::discovery`]/[`crate::chooser`] empty root desktop. Both paint the
 //! wallpaper through this one helper, with any honest status relocated to a small

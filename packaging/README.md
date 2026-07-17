@@ -23,7 +23,7 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   unit + preset + `build-image.sh` (typed-gated) + `verify-image.sh` (static
   image acceptance); doctrine + verification status in `bootc/README.md`.
 - `kickstart/`    → the install ISO kickstarts + boot-menu profile snippets.
-  `magic-on-quasar.ks` (OW-12) is the current **Quasar Workstation** kickstart:
+  `magic-on-quasar.ks` (OW-12) is the current **Quazar Workstation** kickstart:
   a bootc/ostree-native installer that `ostreecontainer`-deploys the immutable
   bootc WS image (`bootc/`, so the magic-mesh RPM + the egui DRM-seat unit +
   QC-1 libvirt/QEMU-KVM/OVN host bits arrive baked in — it references that

@@ -1,6 +1,6 @@
 //! `mde-vdi-spice` — render a remote **SPICE** desktop into an egui texture.
 //!
-//! MCNF 12.0 "Quasar" is a mesh-native thin-client desktop OS whose entire
+//! MCNF 12.0 "Quazar" is a mesh-native thin-client desktop OS whose entire
 //! interface is egui (`docs/design/quasar-vdi-desktop.md`). The Desktop Chooser
 //! (`docs/design/desktop-chooser.md`, lock CHOOSER-5) presents SPICE consoles
 //! alongside RDP/VNC; SPICE is the native console for a QEMU/KVM guest, so this

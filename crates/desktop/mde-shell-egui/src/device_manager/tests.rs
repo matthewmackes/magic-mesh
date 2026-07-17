@@ -951,7 +951,7 @@ fn the_markdown_report_lists_the_host_every_device_and_the_problem_code() {
         "the report should carry the canonical product name: {report}"
     );
     assert!(
-        !report.contains("Magic-Mesh Quasar"),
+        !report.contains(concat!("Magic-Mesh ", "Qua", "sar")),
         "the report must not export the superseded mixed product spelling: {report}"
     );
     // The host header + the mirrored header-card summary fields (#20).

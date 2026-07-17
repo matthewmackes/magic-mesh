@@ -1,4 +1,4 @@
-//! `brand::icons` — the monochrome Quasar line-art icon set (QBRAND-2).
+//! `brand::icons` — the monochrome Quazar line-art icon set (QBRAND-2).
 //!
 //! The 37 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
 //! NAVBAR-W10-1 tray set) embedded as
@@ -44,7 +44,7 @@ use std::fmt;
 
 use resvg::{tiny_skia, usvg};
 
-/// Embed one Quasar brand SVG from `assets/brand/quasar/` at compile time.
+/// Embed one Quazar brand SVG from `assets/brand/quasar/` at compile time.
 macro_rules! quasar_svg {
     ($file:literal) => {
         include_str!(concat!(
@@ -55,7 +55,7 @@ macro_rules! quasar_svg {
     };
 }
 
-/// Identifier for every glyph in the Quasar brand set.
+/// Identifier for every glyph in the Quazar brand set.
 ///
 /// The product marks, the 18 dock/surface glyphs, the 3 node-role badges and
 /// the 14 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible

@@ -1,4 +1,4 @@
-# MCNF E12 "Quasar" — `mde-panel-egui`: the egui panel client (E12-7).
+# MCNF E12 "Quazar" — `mde-panel-egui`: the egui panel client (E12-7).
 #
 # Replaces the Cosmic-era applet shell (its render-agnostic model now lives in
 # crates/platform/mde-lighthouse-health) with an egui panel rendered through the
@@ -14,7 +14,7 @@
 # logic with default-features off.
 [package]
 name        = "mde-panel-egui"
-description = "MCNF E12 Quasar — the egui panel client that replaces the Cosmic-era applet: a live worst-of mesh-health pip (the LIGHTHOUSE-7 snapshot model reused from mde-lighthouse-health + mackes-mesh-types) plus a working Do-Not-Disturb quick action off the mesh-replicated mde-bus DND state, rendered through the shared mde-egui Style/Motion. Render-agnostic model (lib, unit-tested) + the thin eframe panel shell (bin)."
+description = "MCNF E12 Quazar — the egui panel client that replaces the Cosmic-era applet: a live worst-of mesh-health pip (the LIGHTHOUSE-7 snapshot model reused from mde-lighthouse-health + mackes-mesh-types) plus a working Do-Not-Disturb quick action off the mesh-replicated mde-bus DND state, rendered through the shared mde-egui Style/Motion. Render-agnostic model (lib, unit-tested) + the thin eframe panel shell (bin)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

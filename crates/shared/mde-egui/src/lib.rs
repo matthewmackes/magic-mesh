@@ -1,4 +1,4 @@
-//! `mde-egui` — the MCNF **E12 "Quasar"** egui harness.
+//! `mde-egui` — the MCNF **E12 "Quazar"** egui harness.
 //!
 //! E12 retires the Cosmic-era toolkit and rewrites every UI surface from
 //! the iced-based stack to **egui** (governance §4/§5/§6). This crate is the shared

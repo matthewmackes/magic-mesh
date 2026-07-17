@@ -3,7 +3,8 @@
 # Enforces the AI_GOVERNANCE §7 Definition-of-Done gates on every push/PR:
 # build · test (incl. the async-services worker suite) · clippy --all-targets ·
 # fmt --check · the layered-tiers boundary lint (§6) · the no-private-D-Bus-name
-# lint (§2) · and a hard 80% line-coverage floor (Q90/Q93). The crypto +
+# lint (§2) · the Quazar brand-identity lint · and a hard 80% line-coverage floor
+# (Q90/Q93). The crypto +
 # boundary gates are deny-level: a violation fails the build, it doesn't warn.
 name: ci
 
@@ -94,6 +95,9 @@ jobs:
 
       - name: No-private-D-Bus-name lint (§2)
         run: ./install-helpers/lint-bus-names.sh
+
+      - name: Quazar brand identity lint
+        run: ./install-helpers/lint-brand-identity.sh
 
       # NOTE on §1–§4 deeper checks: the Carbon single-source rule (§4) is
       # enforced by the mde-theme token tests above (a palette/metric value

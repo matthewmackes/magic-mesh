@@ -15,7 +15,7 @@ Contents:
   libvirt/QEMU-KVM, Open vSwitch, and OVN host bits. `cloud-hypervisor` is
   deliberately absent per QUASAR-CLOUD/QC-1. Wires the DRM seat, boots to
   `graphical.target`. The writable-partition doctrine is inline.
-- `units/mde-shell-egui.service` — the Quasar **DRM-seat unit** (greetd-style,
+- `units/mde-shell-egui.service` — the Quazar **DRM-seat unit** (greetd-style,
   no display manager, no compositor — `quasar-vdi-desktop.md` lock 34). Image
   lane only; the dnf/RPM lane keeps launching the shell from a session via
   `org.magicmesh.Shell.desktop`.
