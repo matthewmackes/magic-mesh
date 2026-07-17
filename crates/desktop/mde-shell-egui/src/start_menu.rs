@@ -187,11 +187,16 @@
 //! Win7 decision: every tileable [`Surface::ALL`] entry appears once in the
 //! grouped grid, with optional pinned copies rendered above it as shortcuts.
 
-use std::time::Duration;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use mde_egui::egui;
 use mde_egui::{Motion, Style};
 use mde_lighthouse_health::LighthouseHealth;
+use serde::{Deserialize, Serialize};
 
 use crate::chrome::MeshSummary;
 use crate::console::{self, ConsoleState};
@@ -203,6 +208,10 @@ use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 
 /// The stable id of the Start Menu's floating [`egui::Area`] layer.
 const START_MENU_AREA: &str = "start-menu-area";
+
+/// Per-seat Start Menu preferences, stored beside the shell's other
+/// client-data JSON prefs.
+const START_MENU_PREFS_FILE: &str = "start-menu.json";
 
 /// The egui memory key for the panel's slide animation (the `console.rs`
 /// `SLIDE_KEY` / `dock.rs` `DOCK_SLIDE_KEY` idiom, restated here since the
@@ -537,6 +546,117 @@ const _: () = {
     }
 };
 
+/// Stable JSON id for a Start-menu-pinnable surface. Kept local to the Start
+/// menu so the persisted preferences do not depend on display labels.
+fn surface_wire_id(surface: Surface) -> &'static str {
+    match surface {
+        Surface::Workbench => "workbench",
+        Surface::MeshView => "mesh_view",
+        Surface::Explorer => "explorer",
+        Surface::Desktop => "desktop",
+        Surface::InfraCode => "infra_code",
+        Surface::Music => "music",
+        Surface::Media => "media",
+        Surface::Files => "files",
+        Surface::Voice => "voice",
+        Surface::Browser => "browser",
+        Surface::Bookmarks => "bookmarks",
+        Surface::Terminal => "terminal",
+        Surface::Editor => "editor",
+        Surface::Chat => "chat",
+        Surface::Phones => "phones",
+        Surface::System => "system",
+        Surface::Storage => "storage",
+        Surface::About => "about",
+        Surface::Timers => "timers",
+    }
+}
+
+/// Parse the stable Start-menu pin id. Unknown ids are treated as drifted /
+/// hand-edited data and ignored by the loader.
+fn surface_from_wire_id(id: &str) -> Option<Surface> {
+    match id.trim() {
+        "workbench" => Some(Surface::Workbench),
+        "mesh_view" => Some(Surface::MeshView),
+        "explorer" => Some(Surface::Explorer),
+        "desktop" => Some(Surface::Desktop),
+        "infra_code" => Some(Surface::InfraCode),
+        "music" => Some(Surface::Music),
+        "media" => Some(Surface::Media),
+        "files" => Some(Surface::Files),
+        "voice" => Some(Surface::Voice),
+        "browser" => Some(Surface::Browser),
+        "bookmarks" => Some(Surface::Bookmarks),
+        "terminal" => Some(Surface::Terminal),
+        "editor" => Some(Surface::Editor),
+        "chat" => Some(Surface::Chat),
+        "phones" => Some(Surface::Phones),
+        "system" => Some(Surface::System),
+        "storage" => Some(Surface::Storage),
+        "about" => Some(Surface::About),
+        "timers" => Some(Surface::Timers),
+        _ => None,
+    }
+}
+
+fn tileable_surface(surface: Surface) -> bool {
+    Surface::ALL.contains(&surface)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct StartMenuPrefs {
+    #[serde(default)]
+    pinned: Vec<String>,
+}
+
+impl StartMenuPrefs {
+    fn from_pins(pinned: &[Surface]) -> Self {
+        let mut out = Vec::new();
+        for &surface in pinned {
+            if tileable_surface(surface) && !out.iter().any(|id| id == surface_wire_id(surface)) {
+                out.push(surface_wire_id(surface).to_string());
+            }
+        }
+        Self { pinned: out }
+    }
+
+    fn into_pins(self) -> Vec<Surface> {
+        let mut out = Vec::new();
+        for id in self.pinned {
+            let Some(surface) = surface_from_wire_id(&id) else {
+                continue;
+            };
+            if tileable_surface(surface) && !out.contains(&surface) {
+                out.push(surface);
+            }
+        }
+        out
+    }
+
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(START_MENU_PREFS_FILE))
+    }
+
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
 // ── state ────────────────────────────────────────────────────────────────────
 
 /// The Start Menu's cross-frame state: the open latch (driven by the Start
@@ -546,8 +666,11 @@ const _: () = {
 /// tile-click surface activation. Pure (no egui handles), so open/close and
 /// tile activation are unit-tested without a GPU. WIN7-4 (tile rotation) and
 /// WIN7-8 (multi-seat sync) are what grow this further.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StartMenuState {
+    /// Where persisted Start Menu preferences are stored. `None` keeps the
+    /// state purely in-memory, which is what the existing render tests want.
+    prefs_path: Option<PathBuf>,
     /// Whether the panel is up — toggled by a Start-cell click or a clean
     /// Super tap (lock #13); the single source of truth `main.rs` mirrors into
     /// [`ConsoleState`] each frame ([`console::ConsoleState::set_open`]).
@@ -597,14 +720,60 @@ pub struct StartMenuState {
     /// from a tile's right-click context menu ([`tile_context_menu`]). Empty by
     /// default, so an operator who never pins sees exactly the WIN7-3 grid (zero
     /// behaviour change) — the section only appears once something is pinned.
-    /// In-memory this pass: a follow-up should persist it beside the other
-    /// Start-Menu prefs (there is no per-seat Start-Menu store seam yet, and
-    /// this unit deliberately does NOT open a new `main.rs` storage seam for
-    /// it — the pins simply reset on restart until that lands).
+    /// Persisted when the real shell constructs this state with [`Self::load`];
+    /// the plain [`Default`] constructor remains in-memory for unit fixtures.
     pinned: Vec<Surface>,
 }
 
+impl Default for StartMenuState {
+    fn default() -> Self {
+        Self {
+            prefs_path: None,
+            open: false,
+            just_toggled: false,
+            tile_activation: None,
+            tile_inputs: TileFactInputs::default(),
+            search_query: String::new(),
+            search_highlight: 0,
+            search_focus_pending: false,
+            pinned: Vec::new(),
+        }
+    }
+}
+
 impl StartMenuState {
+    /// Load the real shell's persisted Start Menu preferences from client data.
+    /// Missing or malformed files fold to an empty in-memory-compatible state.
+    pub(crate) fn load() -> Self {
+        let prefs_path = StartMenuPrefs::default_path();
+        let pinned = prefs_path
+            .as_deref()
+            .map(StartMenuPrefs::load_from)
+            .unwrap_or_default()
+            .into_pins();
+        Self {
+            prefs_path,
+            pinned,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn load_from(path: PathBuf) -> Self {
+        let pinned = StartMenuPrefs::load_from(&path).into_pins();
+        Self {
+            prefs_path: Some(path),
+            pinned,
+            ..Self::default()
+        }
+    }
+
+    fn persist_pins(&self) {
+        if let Some(path) = &self.prefs_path {
+            let _ = StartMenuPrefs::from_pins(&self.pinned).save_to(path);
+        }
+    }
+
     /// Whether the panel is up.
     pub(crate) const fn is_open(&self) -> bool {
         self.open
@@ -1184,6 +1353,9 @@ fn left_pane(
 /// the no-duplicate invariant lives in a single place. Pinning appends (pin
 /// order = render order); unpinning removes in place, preserving the rest.
 fn toggle_pin(pinned: &mut Vec<Surface>, surface: Surface) {
+    if !tileable_surface(surface) {
+        return;
+    }
     if let Some(idx) = pinned.iter().position(|&s| s == surface) {
         pinned.remove(idx);
     } else {
@@ -1814,7 +1986,11 @@ fn start_menu_search(
         // menu), and Esc dismisses the whole menu exactly as before. The two
         // `&state` borrows below are disjoint fields (`tile_inputs` read-only,
         // `pinned` mutated by a right-click Pin/Unpin), so they coexist.
+        let pinned_before = state.pinned.clone();
         let out = left_pane(ui, left_rect, &state.tile_inputs, &mut state.pinned);
+        if state.pinned != pinned_before {
+            state.persist_pins();
+        }
         if let Some(surface) = out.activated {
             state.tile_activation = Some(surface);
             state.close();
@@ -2377,7 +2553,7 @@ fn install_search_results_announcement(
 
 #[cfg(test)]
 mod tests {
-    use super::{start_menu_panel, StartMenuState, DOCK_W, PANEL_H, PANEL_W};
+    use super::{start_menu_panel, StartMenuPrefs, StartMenuState, DOCK_W, PANEL_H, PANEL_W};
     use crate::console::{self, ConsoleState};
     use crate::dock::Surface;
     use crate::status::{SegmentRollup, StatusSegments};
@@ -2815,6 +2991,38 @@ mod tests {
         assert!(
             !grouped.contains(&Surface::Timers),
             "Timers remains clock/taskbar-owned, not a duplicate Start-grid tile"
+        );
+    }
+
+    #[test]
+    fn start_menu_pin_preferences_keep_valid_tile_surfaces_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("start-menu.json");
+        std::fs::write(
+            &path,
+            r#"{"pinned":["browser","timers","files","browser","unknown","mesh_view"]}"#,
+        )
+        .expect("write hand-edited prefs");
+
+        let loaded = StartMenuState::load_from(path.clone());
+        assert_eq!(
+            loaded.pinned,
+            vec![Surface::Browser, Surface::Files, Surface::MeshView],
+            "load drops non-grid surfaces, unknown ids, and duplicate pins"
+        );
+
+        StartMenuPrefs::from_pins(&[
+            Surface::Browser,
+            Surface::Timers,
+            Surface::Files,
+            Surface::Browser,
+        ])
+        .save_to(&path)
+        .expect("save normalized prefs");
+        assert_eq!(
+            StartMenuPrefs::load_from(&path).into_pins(),
+            vec![Surface::Browser, Surface::Files],
+            "save writes only persisted tile-surface pins once"
         );
     }
 

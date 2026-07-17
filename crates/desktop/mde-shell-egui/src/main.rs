@@ -431,7 +431,7 @@ impl Shell {
             critical_edge: status::CriticalEdgeCue::default(),
             local_host: local_hostname(),
             vdock: dock::DockState::default(),
-            start_menu: start_menu::StartMenuState::default(),
+            start_menu: start_menu::StartMenuState::load(),
             front_door: front_door::FrontDoorState::default(),
             // WIN7-8 (lock #21) — `for_shell` (not bare `default`) so the real
             // shell also gets mesh-wide Custom-entry sync; see `console.rs`'s

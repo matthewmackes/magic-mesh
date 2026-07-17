@@ -1044,6 +1044,10 @@ These decisions refine acceptance and sequencing for the active items below.
 - Verification method: Focused geometry tests and live seat screenshot/pixel
   inspection.
 - Origin or merged source IDs: B5-rest, WIN10-HYBRID, old worklist line 4630.
+- Evidence 2026-07-17: Start menu pinned/favorite tiles now persist through
+  `start-menu.json` in the shell client-data directory; malformed, duplicate,
+  unknown, and non-grid pins normalize on load. Live tray/screenshot proof remains
+  the blocking tail for this item.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 
