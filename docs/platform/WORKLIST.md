@@ -169,8 +169,16 @@ These decisions refine acceptance and sequencing for the active items below.
   cleanly and `/usr/libexec/mackesd/browser-verify-engines` passes, but those
   packages predate the fix commits. Extracting the newer staged Browser RPM and
   running its verifier against the staged helpers passes CEF/Servo display and
-  input in user space; no-input idle media proof still needs a privileged
-  install/restart or a reliable live DRM smoke path.
+  input in user space. A follow-up 2026-07-17 idle-media slice added
+  `cef-verify` idle-media mode plus `browser-verify-engines --idle-media`, kept
+  CEF's default compositor path available instead of launching with
+  `--disable-gpu*`, disabled Chromium background throttling for windowless tabs,
+  and hardened `WebSession` teardown so CEF wrapper/renderer process groups do
+  not survive verifier or tab shutdown. Farm `.50` staged-helper proof passed the
+  wrapper default (`--idle-media --timeout 90s`: 60-second no-input target,
+  four frame signatures, `playing=true`, and process cleanup passed). Remaining
+  proof is an installed `.15`/live-seat run plus the horizontal-tab and right-edge
+  geometry checks.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
