@@ -974,6 +974,12 @@ These decisions refine acceptance and sequencing for the active items below.
   constants and verified the painted dashboard text uses `Quazar Browser`;
   farm `.50` fmt and `.130` focused
   `browser_new_tab_dashboard_uses_canonical_brand_identity` passed.
+  A later 2026-07-17 phone-facing identity pass changed the KDC fanout endpoint,
+  Phones hub mirror, and forwarded phone notification app/ticker from `Quasar
+  Mesh` to `Quazar Mesh`, updating the current KDC design note with the shipped
+  spelling; farm `.50` fmt, `.90` focused `mde-kdc-host` fanout test, `.130`
+  focused Phones hub endpoint-name test, and `.170` focused mackesd KDC notify
+  test passed.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

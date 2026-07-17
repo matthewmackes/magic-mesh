@@ -30,7 +30,7 @@ features online; **C** mesh-aware — the phone reaches every node's services.
 | 5 | Identity | **One mesh-wide identity, paired once** — the phone is a single trusted device to the WHOLE mesh; every node recognizes it without re-pairing (the pairing record is shared mesh-wide). |
 | 6 | Serving node | **All nodes simultaneously** — every node serves the phone at once (a phone notification appears on every desktop; clipboard syncs everywhere). |
 | 7 | Any-node reach | **Mesh service directory, pick the node** — the phone can target ANY node's KDC services (files, run-commands) directly over the overlay via a mesh-wide service directory. |
-| 8 | Presentation | **One 'Mesh' device + a node picker** — the mesh presents as a single "Quasar Mesh" device for the follow-everywhere features, with drill-in to individual nodes for node-specific actions. *(See the Android-constraint note.)* |
+| 8 | Presentation | **One 'Mesh' device + a node picker** — the mesh presents as a single "Quazar Mesh" device for the follow-everywhere features, with drill-in to individual nodes for node-specific actions. *(See the Android-constraint note.)* |
 | 9 | Notifications | **Bidirectional, mesh-wide** — phone notifications appear on every desktop AND the mesh/system notify feed (CHAT-FIX-2) pushes to the phone; reply-from-desktop where supported. |
 | 10 | Remote/media | **Both** — the phone is a touchpad + keyboard for the active desktop (remote input) AND controls media (play/pause/next/vol) + presenter on whichever node plays. |
 | 11 | Files | **Both directions, any node** — send/receive (done) + browse the phone's FS from a desktop (SFTP) + browse any node's shared files from the phone (via the Q7 directory). |
@@ -47,7 +47,7 @@ each host as a separate device. So **lock #8 ("one Mesh device")** is realized h
 - Every node runs `kdc_host` sharing ONE mesh-wide pairing (#5/#15); to stock KDE Connect
   they appear as multiple devices that all trust the phone.
 - A designated **mesh endpoint** (the follow-the-user node, else a stable primary)
-  advertises as **"Quasar Mesh"** — the single device the user interacts with for the
+  advertises as **"Quazar Mesh"** — the single device the user interacts with for the
   follow-everywhere features (#6/#9/#10); a mackesd **mesh-fanout** relays its actions to
   all nodes and aggregates their responses. Node-specific actions (#7) target a node by
   its own overlay identity via the service directory / the desktop Phones hub.

@@ -1076,9 +1076,10 @@ fn mesh_notify_packet_builds_a_kdeconnect_notification() {
     let pkt = mesh_notify_packet(&n, 42);
     assert_eq!(pkt.kind, "kdeconnect.notification");
     let body: NotificationBody = mde_kdc_proto::plugins::from_packet_body(&pkt).expect("decodes");
-    assert_eq!(body.app_name, "Quasar Mesh");
+    assert_eq!(body.app_name, mde_kdc_host::MESH_ENDPOINT_NAME);
     assert_eq!(body.id, "01ULID");
     assert_eq!(body.text, "service sshd.service failed");
+    assert_eq!(body.ticker, "Quazar Mesh: service sshd.service failed");
     assert!(body.title.contains("nyc3") && body.title.contains("service"));
     assert!(!body.is_cancel);
 }

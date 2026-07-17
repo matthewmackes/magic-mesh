@@ -200,7 +200,7 @@ const NOTIFY_FORWARD_TICK: Duration = Duration::from_secs(5);
 
 // ── KDC-MESH-9: the mesh-fanout endpoint (design #8) ─────────────────────────
 //
-// The designated endpoint advertises as "Quasar Mesh" (one device to stock KDE
+// The designated endpoint advertises as "Quazar Mesh" (one device to stock KDE
 // Connect) and relays each follow-everywhere action (a phone clipboard copy / a
 // find-my-device ring) to EVERY node, aggregating their responses. The relay rides
 // the same own-row replicated substrate as the phone roster + notification relay
@@ -884,7 +884,7 @@ fn parse_inbound_notification(
 /// endpoint relays to every node (design #6/#10), or `None` for a packet that isn't
 /// fanned out. Pure (no I/O) so the endpoint's relay decision is unit-tested. Only
 /// the two v1 follow-everywhere actions are fanned out — a clipboard copy and a
-/// find-my-device ring — so a copy / ring on the single "Quasar Mesh" device
+/// find-my-device ring — so a copy / ring on the single "Quazar Mesh" device
 /// reaches EVERY desktop, not just the endpoint one.
 fn fanout_action_for_packet(kind: &str, body: &Value) -> Option<FanoutAction> {
     match kind {
@@ -1060,19 +1060,19 @@ fn collect_local_notifies(
 }
 
 /// Build the outbound `kdeconnect.notification` packet for a forwarded mesh
-/// notification — appears on the phone as a "Quasar Mesh" notification. Pure.
+/// notification — appears on the phone as a "Quazar Mesh" notification. Pure.
 fn mesh_notify_packet(n: &MeshNotify, ts_ms: i64) -> mde_kdc_proto::wire::Packet {
     let title = if n.host.is_empty() {
         format!("Mesh · {}", n.source)
     } else {
         format!("{} · {}", n.host, n.source)
     };
-    let ticker = format!("Quasar Mesh: {}", n.summary);
+    let ticker = format!("{}: {}", mde_kdc_host::MESH_ENDPOINT_NAME, n.summary);
     notification_packet(
         ts_ms,
         NotificationBody {
             id: n.id.clone(),
-            app_name: "Quasar Mesh".to_string(),
+            app_name: mde_kdc_host::MESH_ENDPOINT_NAME.to_string(),
             title,
             text: n.summary.clone(),
             ticker,
@@ -1322,12 +1322,12 @@ async fn run_host(
     // KDC-MESH-9 — elect the mesh-fanout endpoint (design #8): the stable primary
     // (lexicographically-lowest hostname) among the nodes that have published a KDC
     // service-directory row, plus THIS node. The designated endpoint advertises its
-    // KDE Connect identity as "Quasar Mesh" — the single device stock KDE Connect
+    // KDE Connect identity as "Quazar Mesh" — the single device stock KDE Connect
     // shows for the follow-everywhere features — so its inbound clipboard/ring lands
     // here and fans out to the whole mesh. Elected once at start (the advertised KDC
     // name is the TLS-handshake identity, fixed for the link's life); a roster change
     // settles on the next restart. A first-ever boot (empty directory) elects self,
-    // so a lone node is honestly its own "Quasar Mesh".
+    // so a lone node is honestly its own "Quazar Mesh".
     let mut mesh_hosts: Vec<String> = service_directory::collect_all_services(&shunt_root)
         .into_iter()
         .map(|n| n.node_host)
@@ -1630,10 +1630,10 @@ async fn run_host(
                         }
                     }
                     // KDC-MESH-9 — the mesh-fanout endpoint (design #8): when THIS
-                    // node is the designated "Quasar Mesh" endpoint, a follow-
+                    // node is the designated "Quazar Mesh" endpoint, a follow-
                     // everywhere action it just applied locally (a clipboard copy or a
                     // find-my-device ring, classified from the packet) is ALSO relayed
-                    // to every other node, so a copy/ring on the single "Quasar Mesh"
+                    // to every other node, so a copy/ring on the single "Quazar Mesh"
                     // device reaches the whole mesh (#6/#10). The endpoint remembers
                     // the request id to aggregate the responses on the shunt tick.
                     if is_endpoint {

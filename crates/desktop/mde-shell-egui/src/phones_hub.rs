@@ -20,7 +20,7 @@
 //!   bundle + the KDC-MESH-8 `OpenStack` lifecycle set, with the #16 blast-radius
 //!   flag) + a composer that emits a `runcommands.toml` stanza to drop on a node.
 //! * **Pair** — the pair-a-phone flow: the KDE Connect device name the phone sees
-//!   (the "Quasar Mesh" endpoint name when this node is the mesh-fanout endpoint,
+//!   (the "Quazar Mesh" endpoint name when this node is the mesh-fanout endpoint,
 //!   #8), the reachable overlay address, and the scannable KDC-MESH-4 QR payload.
 //!   The payload carries both the daemon-published mesh enroll token and the KDC
 //!   pairing token when available; until a fresh token is published, the QR
@@ -57,7 +57,7 @@ const MESH_NAME_PREFIX: &str = "MDE-MESH";
 
 /// The single device name the designated mesh-fanout endpoint advertises to stock
 /// KDE Connect (mirrors `mde_kdc_host::fanout::MESH_ENDPOINT_NAME`, #8).
-const MESH_ENDPOINT_NAME: &str = "Quasar Mesh";
+const MESH_ENDPOINT_NAME: &str = "Quazar Mesh";
 
 /// KDC-MESH-4 — latest-wins short-TTL mesh enroll token for the Pair QR. Minting
 /// stays in the onboard path; the hub only consumes the worker-published state.
@@ -577,7 +577,7 @@ impl PhonesHubState {
         );
     }
 
-    /// The KDE Connect device name the phone sees: the "Quasar Mesh" endpoint name
+    /// The KDE Connect device name the phone sees: the "Quazar Mesh" endpoint name
     /// when THIS node is the designated mesh-fanout endpoint (#8), else the
     /// `MDE-MESH <host>` name.
     fn endpoint_name(&self) -> String {
@@ -1164,7 +1164,7 @@ fn fold_browse(body: &str) -> LiveBrowse {
 
 /// The deterministic mesh-fanout endpoint election (mirrors
 /// `mde_kdc_host::fanout::is_designated_endpoint` — the lexicographically-lowest
-/// hostname, "a stable primary", #8), so the hub shows the SAME "Quasar Mesh" name
+/// hostname, "a stable primary", #8), so the hub shows the SAME "Quazar Mesh" name
 /// the worker advertises.
 fn is_designated_endpoint(self_host: &str, hosts: &[String]) -> bool {
     if self_host.is_empty() {
@@ -1541,7 +1541,7 @@ mod tests {
 
     #[test]
     fn endpoint_election_mirrors_the_worker() {
-        // Lowest hostname is the endpoint (the "Quasar Mesh" device).
+        // Lowest hostname is the endpoint (the "Quazar Mesh" device).
         assert!(is_designated_endpoint(
             "eagle",
             &to_hosts(&["oak", "eagle", "pine"])
@@ -1555,8 +1555,9 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_name_is_quasar_mesh_only_for_the_endpoint() {
+    fn endpoint_name_is_quazar_mesh_only_for_the_endpoint() {
         let mut s = state_for("eagle", &["oak", "eagle"]);
+        assert_eq!(MESH_ENDPOINT_NAME, "Quazar Mesh");
         assert_eq!(s.endpoint_name(), MESH_ENDPOINT_NAME);
         s.self_host = "oak".to_string();
         assert_eq!(s.endpoint_name(), format!("{MESH_NAME_PREFIX} oak"));
