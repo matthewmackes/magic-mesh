@@ -870,6 +870,11 @@ These decisions refine acceptance and sequencing for the active items below.
   in internal payloads and opener targets while moving visible Browser notices
   to filename/folder labels; farm `.50` fmt and BigBoy `.130` focused
   `browser_output_notices_hide_absolute_paths` coverage passed.
+  A later 2026-07-17 Browser downloads AccessKit pass kept the existing
+  download-manager buttons and transfer dispatch seams intact while exposing each
+  visible download as a read-only accessible row with state, route, real progress
+  metadata, verification, and error details; farm `.50` fmt and BigBoy `.130`
+  focused `browser_download_rows_export_accesskit_status` coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1132,6 +1137,11 @@ These decisions refine acceptance and sequencing for the active items below.
   reasons, shortcuts, selected checked rows, and click actions only for enabled
   commands; farm `.50` fmt and BigBoy `.130` focused
   `browser_options_rows_export_accesskit_buttons` coverage passed.
+  A later 2026-07-17 Browser downloads AccessKit pass added read-only `Row`
+  nodes for visible download-manager entries, including filename, state, route,
+  real progress metadata, verification flag, and error text while leaving command
+  behavior on the existing action buttons; farm `.50` fmt and BigBoy `.130`
+  focused `browser_download_rows_export_accesskit_status` coverage passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
