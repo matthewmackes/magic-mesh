@@ -858,8 +858,13 @@ These decisions refine acceptance and sequencing for the active items below.
   AccessKit empty summary, no-seat gate, missing-engine gate, spawn-failure gate,
   and incomplete Chromium gate with Browser-facing language instead of
   sandbox/helper/Servo/runtime/path wording; farm `.50` fmt, BigBoy `.130`
-  empty-body and AccessKit coverage, `.90` live-helper no-seat/missing-engine
-  coverage, and `.170` live-helper spawn-failure/Chromium gate coverage passed.
+  focused empty-body paint coverage, `.90` live-helper empty-state coverage, and
+  `.170` live-helper spawn/engine-gate coverage passed.
+  A later 2026-07-17 Browser spelling copy pass kept raw Hunspell failure details
+  in the spellcheck result state for diagnostics but moved the visible spelling
+  status notice, drawer header summary, and warning row to Browser-facing
+  dictionary/service language; farm `.50` fmt and BigBoy `.130` focused
+  `spellcheck` coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1059,6 +1064,10 @@ These decisions refine acceptance and sequencing for the active items below.
   body and live-helper gate notices with Browser-facing empty/error states and
   added paint/AccessKit/live-helper guards against sandbox/helper/Servo/runtime
   wording; farm `.50`, `.90`, `.130`, and `.170` focused coverage passed.
+  A later 2026-07-17 Browser spelling copy pass kept the spelling drawer on
+  Browser warning tokens while preventing Hunspell/runtime/backend/worker terms
+  from painting in the visible drawer; farm `.50` fmt and BigBoy `.130` focused
+  `spellcheck` coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
