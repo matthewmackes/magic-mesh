@@ -900,6 +900,12 @@ These decisions refine acceptance and sequencing for the active items below.
   matching and policy-source state; farm `.170` fmt, BigBoy `.130` focused
   security panel coverage, `.90` focused Privacy menu coverage, and `.50`
   focused safe-browsing source coverage passed.
+  A later 2026-07-17 Browser custom-filter policy pass made
+  `browser/custom-filter-rules.txt` a real operator policy source instead of a
+  test-only seam, publishes source-read status, keeps last-good rules active on
+  missing/error, and shows the live custom-filter status in the Privacy menu;
+  farm `.170` fmt, BigBoy `.130` focused custom-filter source coverage, `.90`
+  focused Privacy menu coverage, and `.50` policy-source audit coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1137,6 +1143,11 @@ These decisions refine acceptance and sequencing for the active items below.
   Browser-facing site language instead of host/mesh-hosted wording; farm `.170`
   fmt, BigBoy `.130` security paint coverage, `.90` Privacy menu coverage, and
   `.50` safe-browsing source coverage passed.
+  A later 2026-07-17 Browser custom-filter policy pass kept the Privacy menu's
+  filter-list claim tied to live source status for operator custom rules, while
+  preserving the Browser Material menu model; farm `.170` fmt, BigBoy `.130`
+  custom-filter source coverage, `.90` Privacy menu coverage, and `.50`
+  policy-source audit coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
