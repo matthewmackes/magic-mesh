@@ -1127,6 +1127,11 @@ These decisions refine acceptance and sequencing for the active items below.
   suggestion chips, including suggestion position values and selected keyboard
   highlight state; farm `.50` fmt and BigBoy `.130` focused
   `browser_suggestion_chips_export_accesskit_buttons` coverage passed.
+  A later 2026-07-17 Browser Options AccessKit pass added named `Button` nodes
+  for raw-painted command rows, including enabled on/off state, disabled gate
+  reasons, shortcuts, selected checked rows, and click actions only for enabled
+  commands; farm `.50` fmt and BigBoy `.130` focused
+  `browser_options_rows_export_accesskit_buttons` coverage passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
@@ -1206,9 +1211,15 @@ These decisions refine acceptance and sequencing for the active items below.
   `magic-mesh` and
   `1f6e46546f18b7ee3216e21425efe6608bb544c7a1c629ab2d48a23945054aa4` for
   `magic-mesh-browser`; non-root `rpm -qp` on `.15` confirmed both packages as
-  `12.0.0-1.x86_64`. Live `.15` recovery/deploy proof is still blocked from
-  this shell because `mm@172.20.0.15` still reports `sudo: a password is
-  required`, including for `rpm -Uvh --test`.
+  `12.0.0-1.x86_64`. The same packages were installed on `.15` after a clean
+  `rpm -Uvh --test --replacepkgs --force --nosignature`; `rpm -V
+  magic-mesh magic-mesh-browser` returned clean, the shell restart used the
+  documented restart-then-start tty handoff recovery, and the active service came
+  back as `MainPID=671666`, `NRestarts=0`, start timestamp
+  `2026-07-17 13:13:18 EDT`. The installed and running
+  `/usr/bin/mde-shell-egui` hash matched the staged payload
+  `cccd3f7905d48172abe3e2e412bee6414434c0b63852d0cc8261886e2fda1961`, and
+  the installed CEF display/input verifier passed with process cleanup.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
