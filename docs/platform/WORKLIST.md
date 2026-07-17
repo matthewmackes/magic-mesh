@@ -963,7 +963,18 @@ These decisions refine acceptance and sequencing for the active items below.
   them beside app results and dispatching them through `ConsoleState` so Goto,
   Plane, spawn, and gate behavior stay owned by the Console path; farm `.50`
   fmt, BigBoy `.130` focused Enter-launch coverage, and `.90` focused ranking
-  coverage passed.
+  coverage passed. A 2026-07-17 home-file search slice added a bounded local
+  home snapshot to the Files model through the existing backend `list()` seam,
+  merged it into the shell front door with active-folder de-duplication, and made
+  path-backed results activate through Files even when the row was not already
+  visible. Farm evidence: `.50` slot `home-search-fmt2`
+  `cargo fmt -p mde-files-egui -p mde-shell-egui -- --check` passed after a
+  formatter-only wrap; BigBoy `.130` slot `home-search-files`
+  `cargo test -p mde-files-egui home_search -- --nocapture` passed 2/2; `.170`
+  slot `home-search-files-reg`
+  `cargo test -p mde-files-egui files_search_omnibox -- --nocapture` passed 1/1;
+  and `.90` slot `home-search-shell-frontdoor`
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 5/5.
 - Verification method: Index fixture tests and UI search regression.
 - Origin or merged source IDs: SEARCH-omnibox, shell front-door search residual,
   old worklist line 6246.

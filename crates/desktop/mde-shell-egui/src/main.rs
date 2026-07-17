@@ -1608,7 +1608,7 @@ impl Shell {
 
         items.extend(
             self.files
-                .active_search_omnibox_items()
+                .unified_search_omnibox_items()
                 .into_iter()
                 .map(|item| {
                     let mapped = SearchItem::new(

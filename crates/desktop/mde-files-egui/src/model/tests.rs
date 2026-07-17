@@ -11,6 +11,7 @@ use std::collections::HashMap as Map;
 struct FixtureBackend {
     peers: Vec<Peer>,
     rows: Vec<FileRow>,
+    local_rows: Map<String, Vec<FileRow>>,
     peer_rows: Map<String, Vec<FileRow>>,
     next_op: OpId,
     mesh: Option<MeshOverlayBadge>,
@@ -21,10 +22,15 @@ impl FixtureBackend {
         Self {
             peers,
             rows,
+            local_rows: Map::new(),
             peer_rows: Map::new(),
             next_op: 1,
             mesh: None,
         }
+    }
+    fn with_local(mut self, path: &str, rows: Vec<FileRow>) -> Self {
+        self.local_rows.insert(path.to_string(), rows);
+        self
     }
     fn with_peer(mut self, id: &str, rows: Vec<FileRow>) -> Self {
         self.peer_rows.insert(id.to_string(), rows);
@@ -45,6 +51,9 @@ impl Backend for FixtureBackend {
     fn list(&self, path: &str) -> Vec<FileRow> {
         if let Some(id) = path.strip_prefix("peer:") {
             return self.peer_rows.get(id).cloned().unwrap_or_default();
+        }
+        if let Some(rows) = self.local_rows.get(path) {
+            return rows.clone();
         }
         self.rows.clone()
     }
@@ -680,6 +689,90 @@ fn files_search_omnibox_items_project_current_folder_rows_into_shared_ranker() {
     assert_eq!(
         b.active_tab().location(),
         &Location::Local("/d/alpha".to_string())
+    );
+}
+
+#[test]
+fn home_search_includes_bounded_home_rows_with_metadata() {
+    let current_rows = vec![FileRow::local("work-report.txt", Mime::Doc, "4 KB", "now")
+        .with_path("/work/work-report.txt")];
+    let mut home_rows = vec![
+        FileRow::local("home-notes.md", Mime::Doc, "2 KB", "3 h")
+            .with_path("/home/me/home-notes.md"),
+        FileRow::local("photos/", Mime::Folder, "12 items", "1 d").with_path("/home/me/photos"),
+    ];
+    for ix in 0..40 {
+        home_rows.push(
+            FileRow::local(format!("older-{ix}.txt"), Mime::Doc, "1 KB", "1 w")
+                .with_path(format!("/home/me/older-{ix}.txt")),
+        );
+    }
+    let mut b = browser_over(
+        FixtureBackend::new(Vec::new(), Vec::new())
+            .with_local("local:home", home_rows)
+            .with_local("/work", current_rows),
+    );
+    b.navigate(0, Location::Local("/work".into()));
+
+    let home_items = b.home_search_omnibox_items();
+    assert_eq!(home_items.len(), 32, "home snapshot is bounded");
+
+    let items = b.unified_search_omnibox_items();
+    assert!(items.iter().any(|item| item.title == "work-report.txt"));
+    let home = items
+        .iter()
+        .find(|item| item.title == "home-notes.md")
+        .expect("home file candidate");
+    assert_eq!(home.target, "/home/me/home-notes.md");
+    assert!(home.terms.iter().any(|term| term == "document"));
+    assert!(home.terms.iter().any(|term| term == "2 KB"));
+    assert!(home.terms.iter().any(|term| term == "3 h"));
+
+    let hit = ranked_hits("home-notes", items, 8)
+        .into_iter()
+        .next()
+        .expect("home filename ranks through shared search");
+    assert_eq!(hit.item.title, "home-notes.md");
+}
+
+#[test]
+fn home_search_result_opens_through_the_files_model() {
+    let home_row = FileRow::local("home-notes.md", Mime::Doc, "2 KB", "3 h")
+        .with_path("/home/me/home-notes.md");
+    let mut b = browser_over(
+        FixtureBackend::new(Vec::new(), Vec::new())
+            .with_local(
+                "local:home",
+                vec![
+                    home_row.clone(),
+                    FileRow::local("photos/", Mime::Folder, "12 items", "1 d")
+                        .with_path("/home/me/photos"),
+                ],
+            )
+            .with_local("/home/me", vec![home_row.clone()])
+            .with_local(
+                "/work",
+                vec![FileRow::local("work-report.txt", Mime::Doc, "4 KB", "now")
+                    .with_path("/work/work-report.txt")],
+            ),
+    );
+    b.navigate(0, Location::Local("/work".into()));
+    let target = b
+        .unified_search_omnibox_items()
+        .into_iter()
+        .find(|item| item.title == "home-notes.md")
+        .expect("home candidate")
+        .payload;
+
+    b.open_search_omnibox_target(&target);
+
+    assert_eq!(
+        b.active_tab().location(),
+        &Location::Local("/home/me".to_string())
+    );
+    assert_eq!(
+        b.active_tab().selected_paths(),
+        vec![PathBuf::from("/home/me/home-notes.md")]
     );
 }
 

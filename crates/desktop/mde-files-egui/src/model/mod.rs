@@ -17,7 +17,7 @@
 //! queue runs over `LiveFileOps`; tests drive both with in-memory fakes.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -47,6 +47,7 @@ use mde_files::opqueue::{ConflictChoice, Resolution};
 /// is a cheap local spool scan; a worker transition surfaces within this window.
 /// Matches the other Bus surfaces' cadence.
 const MOUNT_POLL: Duration = Duration::from_secs(2);
+const HOME_SEARCH_LIMIT: usize = 32;
 
 /// The short mount hostname for a peer — the `<host>` verb slot.
 ///
@@ -841,6 +842,35 @@ fn file_search_terms(row: &FileRow, location: &Location) -> Vec<String> {
         terms.push("syncing".to_string());
     }
     terms
+}
+
+fn file_search_item(
+    pane: usize,
+    row_ix: usize,
+    row: &FileRow,
+    location: &Location,
+    source_rank: usize,
+) -> SearchItem<FileSearchTarget> {
+    SearchItem::new(
+        SearchDomain::File,
+        row.name.clone(),
+        file_search_target_label(row, location),
+        FileSearchTarget {
+            pane,
+            row: row_ix,
+            path: row.path.as_deref().map(PathBuf::from),
+        },
+    )
+    .with_terms(file_search_terms(row, location))
+    .with_source_rank(source_rank)
+}
+
+fn file_search_key(item: &SearchItem<FileSearchTarget>) -> String {
+    item.payload
+        .path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| item.target.clone())
 }
 
 const fn mime_search_label(mime: Mime) -> &'static str {
@@ -1767,20 +1797,7 @@ impl FileBrowser {
         tab.rows()
             .iter()
             .enumerate()
-            .map(|(row_ix, row)| {
-                SearchItem::new(
-                    SearchDomain::File,
-                    row.name.clone(),
-                    file_search_target_label(row, tab.location()),
-                    FileSearchTarget {
-                        pane,
-                        row: row_ix,
-                        path: row.path.as_deref().map(PathBuf::from),
-                    },
-                )
-                .with_terms(file_search_terms(row, tab.location()))
-                .with_source_rank(row_ix)
-            })
+            .map(|(row_ix, row)| file_search_item(pane, row_ix, row, tab.location(), row_ix))
             .collect()
     }
 
@@ -1790,11 +1807,90 @@ impl FileBrowser {
         self.search_omnibox_items(self.active_pane)
     }
 
+    /// Shared omnibox candidates for local home entries, even when Files is not
+    /// currently displaying the home folder.
+    ///
+    /// This is a bounded snapshot from the existing backend `list()` seam, not a
+    /// crawler or persistent index. It gives the shell front door the first
+    /// local-file slice required by unified search while keeping activation in
+    /// the Files model and keeping private paths local to this process.
+    #[must_use]
+    pub fn home_search_omnibox_items(&self) -> Vec<SearchItem<FileSearchTarget>> {
+        self.home_search_omnibox_items_with_rank(0)
+    }
+
+    fn home_search_omnibox_items_with_rank(
+        &self,
+        rank_base: usize,
+    ) -> Vec<SearchItem<FileSearchTarget>> {
+        let location = Location::Local(Self::HOME.to_string());
+        self.backend
+            .list(Self::HOME)
+            .into_iter()
+            .take(HOME_SEARCH_LIMIT)
+            .enumerate()
+            .map(|(row_ix, row)| {
+                file_search_item(
+                    self.active_pane,
+                    row_ix,
+                    &row,
+                    &location,
+                    rank_base + row_ix,
+                )
+            })
+            .collect()
+    }
+
+    /// Combined local file candidates for the shell front door.
+    ///
+    /// The focused pane stays first because those entries are closest to the
+    /// user's current workflow. Home entries are appended and de-duplicated by
+    /// path/target so opening Files on Home does not produce doubled results.
+    #[must_use]
+    pub fn unified_search_omnibox_items(&self) -> Vec<SearchItem<FileSearchTarget>> {
+        let mut items = self.active_search_omnibox_items();
+        let mut seen: HashSet<String> = items.iter().map(file_search_key).collect();
+        for item in self.home_search_omnibox_items_with_rank(items.len()) {
+            if seen.insert(file_search_key(&item)) {
+                items.push(item);
+            }
+        }
+        items
+    }
+
     /// Activate a Files omnibox payload through the same path as Enter/double-click.
     pub fn open_search_omnibox_target(&mut self, target: &FileSearchTarget) {
         if target.pane <= 1 {
             self.set_active_pane(target.pane);
-            self.open_row(target.pane, target.row);
+            let current_matches_path = target.path.as_ref().is_some_and(|path| {
+                let ti = self.tab_index(target.pane);
+                self.panes[target.pane].tabs[ti]
+                    .rows
+                    .get(target.row)
+                    .and_then(|row| row.path.as_deref())
+                    .is_some_and(|row_path| Path::new(row_path) == path.as_path())
+            });
+            if target.path.is_none() || current_matches_path {
+                self.open_row(target.pane, target.row);
+            } else if let Some(path) = &target.path {
+                self.open_path_target(target.pane, path);
+            }
+        }
+    }
+
+    fn open_path_target(&mut self, pane: usize, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        self.navigate(pane, Location::Local(parent.to_string_lossy().into_owned()));
+        let target = path.to_string_lossy();
+        let ti = self.tab_index(pane);
+        if let Some(idx) = self.panes[pane].tabs[ti]
+            .rows
+            .iter()
+            .position(|row| row.path.as_deref() == Some(target.as_ref()))
+        {
+            self.open_row(pane, idx);
         }
     }
 
