@@ -776,6 +776,10 @@ These decisions refine acceptance and sequencing for the active items below.
   language from visible Power/Privacy captions while keeping the command gates
   intact; farm `.50` fmt plus `.90` focused Privacy menu coverage passed, and
   BigBoy `.130` focused Power menu coverage passed after session recovery.
+  A later 2026-07-17 Browser scrape-export copy pass removed internal follow-up
+  hook wording from generated Markdown artifacts, kept the bounded crawl status
+  honest, and covered both no-DOM and DOM-backed scrape exports; farm `.50` fmt
+  and BigBoy `.130` focused `scrape_export` coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
