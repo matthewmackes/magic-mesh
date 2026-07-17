@@ -1163,8 +1163,16 @@ These decisions refine acceptance and sequencing for the active items below.
   Browser page repaint path now uses a low-rate 250ms helper heartbeat for
   settled pages while preserving the fast 16ms cadence for loading, audible, or
   media pages; farm `.50` fmt and BigBoy `.130` focused `repaint_heartbeat`
-  coverage passed. Live `.15` recovery/deploy proof is still blocked from this
-  shell because `mm@172.20.0.15` still reports `sudo: a password is required`.
+  coverage passed. A BigBoy `.130` Fedora 44 full RPM cut from cleaned HEAD
+  `b9f84954` passed size guards and was staged on `.15` at
+  `/home/mm/browser-f44-live-proof-b9f84954/` with sha256
+  `db8ddcda749043dec5acd45c2daba953914750347a481dac94ac51f1c655016c` for
+  `magic-mesh` and
+  `18d91866730b0967e6a82b62ebcda82532f068e5c34851a7ae7b5c8fd97572db` for
+  `magic-mesh-browser`; non-root `rpm -qp` on `.15` confirmed both packages as
+  `12.0.0-1.x86_64`. Live `.15` recovery/deploy proof is still blocked from
+  this shell because `mm@172.20.0.15` still reports `sudo: a password is
+  required`.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
