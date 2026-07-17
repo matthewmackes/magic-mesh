@@ -891,6 +891,10 @@ These decisions refine acceptance and sequencing for the active items below.
   share route and translation result state; farm `.50` fmt, BigBoy `.130`
   focused QR drawer coverage, and `.90` focused Translation drawer coverage
   passed.
+  A later 2026-07-17 Browser Site Styles copy pass moved the menu and drawer off
+  injected/host/Userscripts implementation wording while preserving the CSS
+  editor and site-style state; farm `.50` fmt, BigBoy `.130` focused Site
+  Styles drawer coverage, and `.90` focused menubar coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1119,6 +1123,10 @@ These decisions refine acceptance and sequencing for the active items below.
   with Ready, QR code dimensions, language direction, and text counts; farm
   `.50` fmt, BigBoy `.130` QR drawer paint coverage, and `.90` Translation
   drawer paint coverage passed.
+  A later 2026-07-17 Browser Site Styles copy pass kept the Site Styles drawer on
+  Browser text tokens while replacing delivery-mechanism labels with Website and
+  Custom CSS wording; farm `.50` fmt, BigBoy `.130` drawer paint coverage, and
+  `.90` menubar coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
