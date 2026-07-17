@@ -43,6 +43,14 @@ The live `.15` proof on 2026-07-15 used exactly this lane and produced F44 RPMs
 at 70.0 MiB (`magic-mesh`) and 39.1 MiB (`magic-mesh-browser`), both under the
 90 MiB channel guard.
 
+**F44 locked-resolve note (learned 2026-07-17):** if
+`install-helpers/build-rpm-fedora43.sh 44` exits before compile with
+`cannot update the lock file /src/Cargo.lock because --locked was passed`, treat
+that as a release-lane hygiene blocker. Do not edit `MDE_RPM_LOCKED` to bypass
+the failure for a live seat deploy. Reconcile the committed `Cargo.lock` in a
+separate build/release change, then rerun the Fedora 44 container RPM lane and
+the split-package `rpm -Uvh --test` proof.
+
 **RPM deploy verification note (learned 2026-07-15):** run `rpm -Uvh --test`
 and the real `rpm -Uvh` as separate commands in an interactive sudo/TTY session.
 Do not paste a dry-run and real install as one buffered block: the dry-run can
@@ -399,6 +407,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 | Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the helper did not derive a per-run `/tmp/.mde-web-*-root-<pid>-<run>` mountpoint | do not accept manual deletion as the durable fix; confirm the installed helper is new enough to use per-run rootfs mountpoints, rerun `/usr/libexec/mackesd/browser-verify-engines`, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh per-run root pass and no AVCs |
 | Browser sandbox logs `cgroup limits not applied ... Permission denied` under the DRM shell | `Delegate=yes` delegated the service cgroup, but the shell process lived in the service root, so cgroup v2 refused `+memory +cpu` with `EBUSY` | run the shell in `DelegateSubgroup=shell`, export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, and have helpers create capped leaves under the delegated parent service cgroup |
 | BigBoy F44 RPM build hits ENOSPC during cold Servo/helper compilation | stale heavy slots or shared `~/magic-mesh-farm/target` can consume most of the 79G `/home` even on the high-capacity build VM | clean only disposable slots/stale build output you own, verify free space, then rerun the F44 container RPM build on BigBoy |
+| F44 container RPM fails immediately with `cannot update the lock file /src/Cargo.lock because --locked was passed` | the full dependency resolve inside the Fedora container wants to refresh the committed lockfile, so the release `--locked` gate is doing its job | do not disable `MDE_RPM_LOCKED`; reconcile and commit the lockfile under WL-BUILD-003, then prove `build-rpm-fedora43.sh 44` and the split-package transaction test |
 
 ---
 

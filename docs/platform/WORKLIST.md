@@ -160,6 +160,11 @@ These decisions refine acceptance and sequencing for the active items below.
   `crates/desktop/mde-shell-egui/src/web/chrome_ui/`,
   `crates/desktop/mde-web-cef/src/`, `crates/shared/mde-egui/src/drm.rs`.
 - Dependencies: Live CEF runtime or farm CEF smoke path for media verification.
+- Current evidence: Commit `64508044` fixed the body-geometry regression and CEF
+  idle-media pump path, with farm fmt, shell page-body, and CEF media tests
+  passing on 2026-07-17. Live `.15` closure remains open because the required
+  Fedora 44 RPM lane failed before compile under the release `--locked` policy;
+  track that release-lane blocker under WL-BUILD-003 rather than bypassing it.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
@@ -380,6 +385,11 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `automation/promotion/`, `docs/ops/promotion-pipeline.md`,
   `.github/workflows/`, `install-helpers/verify-*`.
 - Dependencies: Valid release candidate and repo secret-scan policy.
+- Current blocker: The 2026-07-17 BigBoy Fedora 44 container RPM cut for
+  WL-CRIT-003 failed with `cannot update the lock file /src/Cargo.lock because
+  --locked was passed`, before any compile step. The fix must preserve the
+  release `--locked` contract by reconciling `Cargo.lock` and proving the F44
+  container lane, not by disabling `MDE_RPM_LOCKED`.
 - Acceptance criteria: A candidate can be promoted and rolled back in test,
   Fedora compatibility is documented, and a planted credential fails the gate.
 - Verification method: Non-production promotion drill, secret-scan fixture, and
