@@ -828,6 +828,11 @@ These decisions refine acceptance and sequencing for the active items below.
   remaining visible Transfers worker wording with Browser-facing downloads
   unavailable copy and extended drawer guards against worker/helper/ledger terms;
   farm `.50` fmt and BigBoy `.130` focused drawer header/muted-note tests passed.
+  A later 2026-07-17 Browser engine copy pass replaced visible `CEF / Chromium`
+  and `Chromium/CEF runtime` wording in engine menu rows, Options, hover cards,
+  DevTools gates, and runtime notices with user-facing Chromium labels while
+  preserving CEF implementation markers; farm `.50` fmt, `.90` menu/hover tests,
+  `.170` chrome-ui label tests, and BigBoy `.130` live-helper gate test passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1003,6 +1008,10 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-17 Browser downloads unavailable-state pass kept empty-drawer
   text on Browser Material dim tokens while replacing worker-facing unavailable
   copy; farm `.50` fmt and BigBoy `.130` focused drawer copy/color tests passed.
+  A later 2026-07-17 Browser engine label pass replaced exposed CEF/Chromium
+  implementation pairing with Chromium-facing menu, Options, hover, and gate copy;
+  farm `.50` fmt, `.90` menu/hover tests, `.170` chrome-ui label tests, and BigBoy
+  `.130` live-helper gate test passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
