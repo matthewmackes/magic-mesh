@@ -816,7 +816,7 @@ pub fn start_menu_panel(
     // while open: a closed-but-not-yet-unmounted panel (t between the slide's
     // endpoints on the way down) is already covered by the tween repaint
     // above, and there is nothing to rotate once fully closed.
-    if state.open && t >= 0.999 {
+    if state.open && t >= 0.999 && ctx.style().animation_time > f32::EPSILON {
         ctx.request_repaint_after(TILE_FACT_REPAINT_TICK);
     }
 }
@@ -1103,7 +1103,8 @@ fn left_pane(
     pinned: &mut Vec<Surface>,
 ) -> LeftPaneOutcome {
     let time_secs = ui.input(|i| i.time);
-    install_tiles_live_summary(ui.ctx(), rect, inputs, time_secs);
+    let rotation_enabled = live_tile_rotation_enabled(ui);
+    install_tiles_live_summary(ui.ctx(), rect, inputs, time_secs, rotation_enabled);
 
     let snapshot = pinned.clone();
     let sections = nav_sections(&snapshot);
@@ -1153,6 +1154,7 @@ fn left_pane(
                     &facts,
                     tint,
                     time_secs,
+                    rotation_enabled,
                     is_pinned,
                     section.accent,
                 );
@@ -1252,6 +1254,7 @@ fn tile(
     facts: &[String],
     status_tint: Option<egui::Color32>,
     time_secs: f64,
+    rotation_enabled: bool,
     is_pinned: bool,
     group_accent: egui::Color32,
 ) -> TileOutcome {
@@ -1316,7 +1319,7 @@ fn tile(
     // among 2+ facts (lock #5). Bottom-centred, clipped to the tile so a long
     // string trims cleanly at the tile edge instead of spilling into its
     // neighbour (unchanged WIN7-3 behaviour).
-    let display_text = tile_display_text(surface, facts, time_secs);
+    let display_text = tile_display_text(surface, facts, time_secs, rotation_enabled);
     painter.with_clip_rect(rect).text(
         egui::pos2(rect.center().x, rect.bottom() - Style::SP_XS),
         egui::Align2::CENTER_BOTTOM,
@@ -1683,6 +1686,14 @@ fn tile_status_tint(surface: Surface, inputs: &TileFactInputs) -> Option<egui::C
     }
 }
 
+/// Whether live tiles may advance their rotating facts this frame. The system
+/// Appearance motion setting already drives egui's per-context `animation_time`;
+/// reading that context-local signal avoids a second Start-menu preference path
+/// and keeps reduced/disabled motion deterministic in tests.
+fn live_tile_rotation_enabled(ui: &egui::Ui) -> bool {
+    ui.style().animation_time > f32::EPSILON
+}
+
 /// Which of `len` facts should show right now, given the current frame clock
 /// (`ui.input(|i| i.time)`, seconds since the egui `Context` was created —
 /// the SAME time source `explorer.rs`'s `hero_card`/`tick_ambient` already
@@ -1691,16 +1702,16 @@ fn tile_status_tint(surface: Surface, inputs: &TileFactInputs) -> Option<egui::C
 /// pure struct its own doc comment promises — every tile derives its
 /// current step fresh from the ONE shared clock each frame, so they all
 /// advance in lockstep and the displayed value never drifts/accumulates
-/// error the way a stored "last rotated at" counter could. `len <= 1` always
-/// answers `0` (nothing to rotate between).
+/// error the way a stored "last rotated at" counter could. `len <= 1` and
+/// reduced/disabled motion always answer `0` (nothing should advance).
 #[allow(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     reason = "time_secs is always >= 0.0 (a monotonic clock since context creation); \
               truncating to whole rotation ticks is the intended behaviour"
 )]
-fn rotating_fact_index(len: usize, time_secs: f64) -> usize {
-    if len <= 1 {
+fn rotating_fact_index(len: usize, time_secs: f64, rotation_enabled: bool) -> usize {
+    if len <= 1 || !rotation_enabled {
         return 0;
     }
     let tick = (time_secs / TILE_FACT_ROTATE_INTERVAL.as_secs_f64()) as u64;
@@ -1718,11 +1729,16 @@ fn rotating_fact_index(len: usize, time_secs: f64) -> usize {
 /// showing instead: its accesskit `Button` node still carries
 /// `surface.label()` as `.label()` unconditionally
 /// ([`install_tile_accessibility`]) — only the VISUAL slot swaps.
-fn tile_display_text<'a>(surface: Surface, facts: &'a [String], time_secs: f64) -> &'a str {
+fn tile_display_text<'a>(
+    surface: Surface,
+    facts: &'a [String],
+    time_secs: f64,
+    rotation_enabled: bool,
+) -> &'a str {
     match facts.len() {
         0 => surface.label(),
         1 => facts[0].as_str(),
-        len => facts[rotating_fact_index(len, time_secs)].as_str(),
+        len => facts[rotating_fact_index(len, time_secs, rotation_enabled)].as_str(),
     }
 }
 
@@ -2222,12 +2238,15 @@ fn tiles_live_region_id() -> egui::Id {
 /// already folds `StatusSegment::ALL` into. A tile with 0-1 facts never
 /// contributes (nothing to announce — it never changes on its own), so a
 /// menu with no live data anywhere yields an empty string.
-fn tiles_live_summary(inputs: &TileFactInputs, time_secs: f64) -> String {
+fn tiles_live_summary(inputs: &TileFactInputs, time_secs: f64, rotation_enabled: bool) -> String {
+    if !rotation_enabled {
+        return String::new();
+    }
     let mut parts = Vec::new();
     for surface in Surface::ALL {
         let facts = tile_facts(surface, inputs);
         if facts.len() >= 2 {
-            let text = &facts[rotating_fact_index(facts.len(), time_secs)];
+            let text = &facts[rotating_fact_index(facts.len(), time_secs, true)];
             parts.push(format!("{}: {text}", surface.label()));
         }
     }
@@ -2246,8 +2265,9 @@ fn install_tiles_live_summary(
     rect: egui::Rect,
     inputs: &TileFactInputs,
     time_secs: f64,
+    rotation_enabled: bool,
 ) {
-    let summary = tiles_live_summary(inputs, time_secs);
+    let summary = tiles_live_summary(inputs, time_secs, rotation_enabled);
     if summary.is_empty() {
         return;
     }
@@ -3041,7 +3061,7 @@ mod tests {
         assert_eq!(facts, vec!["42 bookmarks".to_string()]);
         for t in [0.0, 5.0, 50.0, 500.0] {
             assert_eq!(
-                super::tile_display_text(Surface::Bookmarks, &facts, t),
+                super::tile_display_text(Surface::Bookmarks, &facts, t, true),
                 "42 bookmarks",
                 "a single fact never advances, at any point on the clock"
             );
@@ -3081,7 +3101,7 @@ mod tests {
         assert!(super::tile_facts(Surface::About, &inputs).is_empty());
         assert!(super::tile_facts(Surface::Editor, &inputs).is_empty());
         assert_eq!(
-            super::tile_display_text(Surface::About, &[], 0.0),
+            super::tile_display_text(Surface::About, &[], 0.0, true),
             Surface::About.label(),
             "0 facts paints the plain static label — unchanged WIN7-3 behaviour"
         );
@@ -3166,12 +3186,12 @@ mod tests {
     #[test]
     fn rotating_fact_index_advances_every_locked_interval_and_wraps() {
         let interval = super::TILE_FACT_ROTATE_INTERVAL.as_secs_f64();
-        assert_eq!(super::rotating_fact_index(3, 0.0), 0);
-        assert_eq!(super::rotating_fact_index(3, interval - 0.01), 0);
-        assert_eq!(super::rotating_fact_index(3, interval), 1);
-        assert_eq!(super::rotating_fact_index(3, interval * 2.0), 2);
+        assert_eq!(super::rotating_fact_index(3, 0.0, true), 0);
+        assert_eq!(super::rotating_fact_index(3, interval - 0.01, true), 0);
+        assert_eq!(super::rotating_fact_index(3, interval, true), 1);
+        assert_eq!(super::rotating_fact_index(3, interval * 2.0, true), 2);
         assert_eq!(
-            super::rotating_fact_index(3, interval * 3.0),
+            super::rotating_fact_index(3, interval * 3.0, true),
             0,
             "wraps back to the first fact after a full cycle"
         );
@@ -3180,9 +3200,25 @@ mod tests {
     #[test]
     fn rotating_fact_index_never_advances_a_0_or_1_fact_list() {
         for t in [0.0, 1.0, 100.0, 1000.0] {
-            assert_eq!(super::rotating_fact_index(0, t), 0);
-            assert_eq!(super::rotating_fact_index(1, t), 0);
+            assert_eq!(super::rotating_fact_index(0, t, true), 0);
+            assert_eq!(super::rotating_fact_index(1, t, true), 0);
         }
+    }
+
+    #[test]
+    fn reduced_motion_freezes_multi_fact_tiles_on_the_primary_fact() {
+        let facts = vec!["3 unread".to_string(), "Latest: eagle".to_string()];
+        let interval = super::TILE_FACT_ROTATE_INTERVAL.as_secs_f64();
+        assert_eq!(
+            super::rotating_fact_index(2, interval * 7.0, false),
+            0,
+            "reduced/disabled motion must not advance the rotation clock"
+        );
+        assert_eq!(
+            super::tile_display_text(Surface::Chat, &facts, interval * 7.0, false),
+            "3 unread",
+            "a frozen tile holds its primary live fact instead of cycling"
+        );
     }
 
     #[test]
@@ -3190,15 +3226,15 @@ mod tests {
         let facts = vec!["3 unread".to_string(), "Latest: eagle".to_string()];
         let interval = super::TILE_FACT_ROTATE_INTERVAL.as_secs_f64();
         assert_eq!(
-            super::tile_display_text(Surface::Chat, &facts, 0.0),
+            super::tile_display_text(Surface::Chat, &facts, 0.0, true),
             "3 unread"
         );
         assert_eq!(
-            super::tile_display_text(Surface::Chat, &facts, interval),
+            super::tile_display_text(Surface::Chat, &facts, interval, true),
             "Latest: eagle"
         );
         assert_eq!(
-            super::tile_display_text(Surface::Chat, &facts, interval * 2.0),
+            super::tile_display_text(Surface::Chat, &facts, interval * 2.0, true),
             "3 unread",
             "wraps back to the first fact"
         );
@@ -3307,6 +3343,30 @@ mod tests {
                 .iter()
                 .any(|(_, n)| n.label() == Some("Start Menu live tiles")),
             "no live-data bundle was ever set — no live region should export"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_suppresses_the_rotating_tile_live_region() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        s.set_tile_inputs(super::TileFactInputs {
+            chat_unread: 3,
+            chat_recent_sender: Some("eagle".to_string()),
+            ..super::TileFactInputs::default()
+        });
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Start Menu live tiles")),
+            "a frozen tile should not export a live region because nothing changes"
         );
     }
 

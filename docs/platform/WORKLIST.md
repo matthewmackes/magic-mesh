@@ -1190,6 +1190,12 @@ These decisions refine acceptance and sequencing for the active items below.
 - Acceptance criteria: `MDE_A11Y=1` or a persisted setting produces a consumable
   tree, critical toasts use live regions, raw-painted cells have names/roles, and
   reduce-motion reaches auto-rotating surfaces.
+- Current evidence: A 2026-07-17 Start-menu reduced-motion pass made live-tile
+  rotation read the system Appearance motion signal, freezes multi-fact tiles on
+  their primary fact when motion is reduced/disabled, suppresses the rotating
+  tile live region while frozen, and stops the settled-open rotation heartbeat;
+  farm `.170` fmt, BigBoy `.130` focused Start-menu coverage, `.90` system
+  motion-setting coverage, and `.50` shared motion coverage passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
