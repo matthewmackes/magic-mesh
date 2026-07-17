@@ -1,6 +1,6 @@
 //! `brand::icons` — the monochrome Quazar line-art icon set (QBRAND-2).
 //!
-//! The 37 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
+//! The 39 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
 //! NAVBAR-W10-1 tray set) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
@@ -57,9 +57,10 @@ macro_rules! quasar_svg {
 
 /// Identifier for every glyph in the Quazar brand set.
 ///
-/// The product marks, the 18 dock/surface glyphs, the 3 node-role badges and
-/// the 14 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible
-/// rasterized at 16px) — one variant per SVG in `assets/brand/quasar/`;
+/// The product marks, the 18 dock/surface glyphs, the 3 node-role badges, the
+/// 14 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible rasterized
+/// at 16px), and shared UI action glyphs — one variant per SVG in
+/// `assets/brand/quasar/`;
 /// [`IconId::svg`] resolves the embedded source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconId {
@@ -109,6 +110,10 @@ pub enum IconId {
     /// the spoked [`System`](Self::System) glyph; the dock's right-side Settings
     /// button (PICKER-2) draws this gear.
     Settings,
+    /// Shared UI: search/magnifier glyph for compact search fields.
+    Search,
+    /// Shared UI: close/clear `x` glyph for compact dismiss and clear buttons.
+    Close,
     /// The Workstation role badge.
     Workstation,
     /// The Server role badge.
@@ -154,7 +159,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 39] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -175,6 +180,8 @@ impl IconId {
         Self::Storage,
         Self::MeshView,
         Self::Settings,
+        Self::Search,
+        Self::Close,
         Self::Workstation,
         Self::Server,
         Self::Lighthouse,
@@ -240,6 +247,8 @@ impl IconId {
             Self::Storage => quasar_svg!("surface-storage.svg"),
             Self::MeshView => quasar_svg!("surface-mesh-view.svg"),
             Self::Settings => quasar_svg!("surface-settings.svg"),
+            Self::Search => quasar_svg!("ui-search.svg"),
+            Self::Close => quasar_svg!("ui-close.svg"),
             Self::Workstation => quasar_svg!("role-workstation.svg"),
             Self::Server => quasar_svg!("role-server.svg"),
             Self::Lighthouse => quasar_svg!("role-lighthouse.svg"),
@@ -286,6 +295,8 @@ impl IconId {
             Self::Storage => "surface-storage",
             Self::MeshView => "surface-mesh-view",
             Self::Settings => "surface-settings",
+            Self::Search => "ui-search",
+            Self::Close => "ui-close",
             Self::Workstation => "role-workstation",
             Self::Server => "role-server",
             Self::Lighthouse => "role-lighthouse",

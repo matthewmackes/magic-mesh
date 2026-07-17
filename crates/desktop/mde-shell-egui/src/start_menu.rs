@@ -109,9 +109,10 @@
 //!
 //! **SHELL-UX-3 update:** type-to-launch search. A real [`egui::TextEdit`]
 //! ([`search_field`]) sits at the bottom of the left pane (Win7's own
-//! search-box spot); it auto-focuses when the menu opens so "open, then just
-//! type" filters live. An empty query is the unchanged grouped grid (zero
-//! behaviour change); the moment anything is typed, [`search_matches`] ranks
+//! search-box spot), with a leading search glyph and a query-clear icon button;
+//! it auto-focuses when the menu opens so "open, then just type" filters live.
+//! An empty query is the unchanged grouped grid (zero behaviour change); the
+//! moment anything is typed, [`search_matches`] ranks
 //! the 18 tileable surfaces (case-insensitive: a label prefix beats a label
 //! substring beats a group-name hit) and [`search_results`] paints that flat
 //! list in place of the grid — Up/Down move a highlight, Enter launches (the top
@@ -177,6 +178,7 @@ use crate::console::{self, ConsoleState};
 use crate::dock::{icon_texture, response_activated, Surface};
 use crate::status::{self, StatusSegments};
 use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
+use mde_theme::brand::icons::IconId;
 
 // ── geometry ─────────────────────────────────────────────────────────────────
 
@@ -307,6 +309,9 @@ const RESULT_ROW_H: f32 = Style::SP_L + Style::SP_XS;
 /// than a tile's 24px [`TILE_ICON`] glyph because a result row is a list line,
 /// not a tile face.
 const RESULT_ICON: f32 = Style::SP_M;
+
+/// The search field's leading/clear glyph edge.
+const SEARCH_ICON: f32 = Style::SP_M;
 
 fn search_rect(left_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
@@ -2103,19 +2108,91 @@ fn search_field(
     query: &mut String,
     focus_pending: &mut bool,
 ) -> bool {
-    let resp = ui.put(
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, START_CHROME_RADIUS, Style::BG);
+    painter.rect_stroke(
         rect,
+        START_CHROME_RADIUS,
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let search_icon = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + Style::SP_XS + SEARCH_ICON / 2.0,
+            rect.center().y,
+        ),
+        egui::vec2(SEARCH_ICON, SEARCH_ICON),
+    );
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Search, SEARCH_ICON, Style::TEXT_DIM) {
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), search_icon, uv, egui::Color32::WHITE);
+    }
+
+    let clear_icon = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.right() - Style::SP_XS - SEARCH_ICON / 2.0,
+            rect.center().y,
+        ),
+        egui::vec2(SEARCH_ICON, SEARCH_ICON),
+    );
+    let clear_button = clear_icon.expand(Style::SP_XS);
+    let text_right = if query.is_empty() {
+        rect.right() - Style::SP_XS
+    } else {
+        clear_button.left() - Style::SP_XS
+    };
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(search_icon.right() + Style::SP_XS, rect.top()),
+        egui::pos2(
+            text_right.max(search_icon.right() + Style::SP_L),
+            rect.bottom(),
+        ),
+    );
+    let resp = ui.put(
+        text_rect,
         egui::TextEdit::singleline(query)
             .hint_text("Search apps…")
             .font(egui::FontId::proportional(Style::BODY))
-            .desired_width(rect.width())
-            .return_key(None),
+            .desired_width(text_rect.width())
+            .return_key(None)
+            .frame(false),
     );
     if *focus_pending {
         resp.request_focus();
         *focus_pending = false;
     }
-    resp.changed()
+    let mut changed = resp.changed();
+
+    if !query.is_empty() {
+        let clear_resp = ui.interact(clear_button, search_clear_button_id(), egui::Sense::click());
+        if clear_resp.hovered() || clear_resp.has_focus() {
+            painter.rect_filled(clear_button, START_CHROME_RADIUS, Style::SURFACE_HI);
+        }
+        let tint = if clear_resp.hovered() || clear_resp.has_focus() {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        };
+        if let Some(tex) = icon_texture(ui.ctx(), IconId::Close, SEARCH_ICON, tint) {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(tex.id(), clear_icon, uv, egui::Color32::WHITE);
+        }
+        mde_egui::focus::paint_focus_ring(&painter, clear_button, clear_resp.has_focus());
+        install_search_clear_accessibility(ui.ctx(), clear_button);
+        if response_activated(ui, &clear_resp) {
+            query.clear();
+            resp.request_focus();
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+/// The stable id for the Start Menu search clear icon button.
+fn search_clear_button_id() -> egui::Id {
+    egui::Id::new("start-menu-search-clear")
 }
 
 /// Rank the 18 tileable [`Surface::ALL`] entries against `query`
@@ -2489,6 +2566,11 @@ fn search_field_accesskit_id() -> egui::Id {
     egui::Id::new("start-menu-search-accesskit")
 }
 
+/// The stable accesskit node id for the search clear icon button.
+fn search_clear_accesskit_id() -> egui::Id {
+    egui::Id::new("start-menu-search-clear-accesskit")
+}
+
 /// Install the search box's own accesskit node (lock #14): a `SearchInput`
 /// role with a fixed label and the live query as its value — the SAME
 /// "label = identity, value = current reading" split the tile / segment nodes
@@ -2501,6 +2583,16 @@ fn install_search_accessibility(ctx: &egui::Context, rect: egui::Rect, query: &s
         node.set_label("Start Menu search");
         node.set_value(query);
         node.set_bounds(accesskit_rect(rect));
+    });
+}
+
+/// Install the search field's query-clear button as a named clickable control.
+fn install_search_clear_accessibility(ctx: &egui::Context, rect: egui::Rect) {
+    let _ = ctx.accesskit_node_builder(search_clear_accesskit_id(), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label("Clear Start Menu search");
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
     });
 }
 
@@ -4171,6 +4263,34 @@ mod tests {
             .find(|n| n.label() == Some("Start Menu search"))
             .expect("the search box exports an accesskit node");
         assert_eq!(search.role(), egui::accesskit::Role::SearchInput);
+    }
+
+    #[test]
+    fn live_query_exposes_a_clear_search_icon_button() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        s.search_query = "phone".to_string();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        let clear = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.label() == Some("Clear Start Menu search"))
+            .expect("a live query exports the clear icon button");
+        assert_eq!(clear.role(), egui::accesskit::Role::Button);
+
+        let rect = ctx
+            .read_response(super::search_clear_button_id())
+            .expect("the clear icon button is registered")
+            .rect;
+        click(&ctx, &mut s, &mut console, rect.center(), SZ);
+        assert!(s.search_query.is_empty(), "clicking the icon clears search");
+        assert!(s.is_open(), "clearing search keeps the Start Menu open");
     }
 
     #[test]

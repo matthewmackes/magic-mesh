@@ -1093,6 +1093,11 @@ These decisions refine acceptance and sequencing for the active items below.
   vertical-dock-launcher prose from `start_menu.rs` and the shell `Nav` comment,
   aligning the code comments with the shipped tile/search/pin Start Menu; farm
   `.50` fmt and BigBoy `.130` focused Start-menu grid coverage passed.
+  A later 2026-07-17 Start-menu search-icon pass added reusable `ui-search` and
+  `ui-close` line glyphs, rendered a leading search icon plus live query-clear
+  icon button in the Start search field, and exposed the clear button to
+  AccessKit; farm `.50` fmt, BigBoy `.130` focused clear-button coverage, and
+  `.90` `mde-theme` icon rasterization coverage passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 
