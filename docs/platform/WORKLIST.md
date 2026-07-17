@@ -1183,9 +1183,18 @@ These decisions refine acceptance and sequencing for the active items below.
   `magic-mesh` and
   `18d91866730b0967e6a82b62ebcda82532f068e5c34851a7ae7b5c8fd97572db` for
   `magic-mesh-browser`; non-root `rpm -qp` on `.15` confirmed both packages as
+  `12.0.0-1.x86_64`. The follow-up Google hardening commit `f9713f6f` was
+  pushed, then BigBoy `.130` built Fedora 44 split RPMs in slot
+  `browser-google-repaint-rpm`; both size guards passed (base 70.1 MiB,
+  Browser 39.1 MiB). The packages were staged on `.15` at
+  `/home/mm/browser-f44-live-proof-f9713f6f/` with sha256
+  `e90f06d8234d90605c14146e375b077a7c70c95b62a978880fd85ab9c530449b` for
+  `magic-mesh` and
+  `1f6e46546f18b7ee3216e21425efe6608bb544c7a1c629ab2d48a23945054aa4` for
+  `magic-mesh-browser`; non-root `rpm -qp` on `.15` confirmed both packages as
   `12.0.0-1.x86_64`. Live `.15` recovery/deploy proof is still blocked from
   this shell because `mm@172.20.0.15` still reports `sudo: a password is
-  required`.
+  required`, including for `rpm -Uvh --test`.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
