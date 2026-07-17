@@ -1147,6 +1147,11 @@ These decisions refine acceptance and sequencing for the active items below.
   real URL value while preserving the existing click-to-open drawer path; farm
   `.50` fmt and BigBoy `.130` focused
   `browser_history_rows_export_accesskit_buttons` coverage passed.
+  A later 2026-07-17 Browser bookmarks-bar AccessKit pass added named clickable
+  `Button` nodes for raw-painted bookmark bar buttons and overflow rows,
+  exposing the bookmark title and real URL value while preserving the existing
+  click/open-tab behavior; farm `.50` fmt and BigBoy `.130` focused
+  `browser_bookmark_buttons_export_accesskit_links` coverage passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform
