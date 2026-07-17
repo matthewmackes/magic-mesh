@@ -1602,6 +1602,7 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
         Style::TEXT,
     );
     mde_egui::focus::paint_focus_ring(ui.painter(), rect, resp.has_focus());
+    install_context_menu_row_accessibility(ui.ctx(), id, rect, label);
     response_activated(ui, &resp)
 }
 
@@ -2482,6 +2483,26 @@ fn search_result_accesskit_id(surface: Surface) -> egui::Id {
     egui::Id::new(("start-menu-search-result-accesskit", surface))
 }
 
+/// The stable accesskit node id for one tile context-menu row.
+fn context_menu_row_accesskit_id(id: egui::Id) -> egui::Id {
+    id.with("accesskit")
+}
+
+/// Install one Start Menu context row as a named clickable button.
+fn install_context_menu_row_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    rect: egui::Rect,
+    label: &str,
+) {
+    let _ = ctx.accesskit_node_builder(context_menu_row_accesskit_id(id), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label);
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
 /// Install one result row's accesskit node (lock #14): a `Button` role +
 /// label + bounds + `Click` action (the per-tile shape), plus `set_selected`
 /// on the keyboard-highlighted row so an AT can report which match Enter would
@@ -2625,6 +2646,24 @@ mod tests {
         }
     }
 
+    fn secondary_press_at(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn secondary_release_at(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     /// Click `center` — press one frame, release the next (the dock/console
     /// tests' click model). The caller primes the layout first.
     fn click(
@@ -2642,6 +2681,32 @@ mod tests {
             size,
         );
         drive(ctx, state, console, vec![release_at(center)], size);
+    }
+
+    fn secondary_click(
+        ctx: &egui::Context,
+        state: &mut StartMenuState,
+        console: &mut ConsoleState,
+        center: egui::Pos2,
+        size: egui::Vec2,
+    ) -> egui::FullOutput {
+        drive(
+            ctx,
+            state,
+            console,
+            vec![
+                egui::Event::PointerMoved(center),
+                secondary_press_at(center),
+            ],
+            size,
+        );
+        drive(
+            ctx,
+            state,
+            console,
+            vec![secondary_release_at(center)],
+            size,
+        )
     }
 
     /// The Start Menu's floating-Area `LayerId`.
@@ -3228,6 +3293,37 @@ mod tests {
                 node.role(),
                 egui::accesskit::Role::Button,
                 "{surface:?} tile's accesskit role"
+            );
+        }
+    }
+
+    #[test]
+    fn tile_context_menu_rows_export_labelled_button_roles_for_accesskit() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        let rect = ctx
+            .read_response(super::tile_id(Surface::Browser))
+            .expect("the Browser tile is registered")
+            .rect;
+        let _ = secondary_click(&ctx, &mut s, &mut console, rect.center(), SZ);
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+
+        for label in ["Open", "Pin to top"] {
+            let node = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.label() == Some(label))
+                .unwrap_or_else(|| panic!("context menu row {label:?} exports no accesskit node"));
+            assert_eq!(
+                node.role(),
+                egui::accesskit::Role::Button,
+                "{label:?} context menu row role"
             );
         }
     }
