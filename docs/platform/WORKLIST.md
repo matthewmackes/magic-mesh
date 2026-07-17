@@ -870,6 +870,11 @@ These decisions refine acceptance and sequencing for the active items below.
   completion text off CUPS/lp/spool-path wording while keeping the raw CUPS/lp
   helpers tested internally; farm `.50` fmt and BigBoy `.130` focused `print`
   coverage passed.
+  A later 2026-07-17 Browser media-export copy pass renamed the visible Power
+  menu media export row and status notices from media-manifest/spool wording to
+  media-list/export language while preserving the internal JSON manifest format;
+  farm `.50` fmt, BigBoy `.130` focused `media_export`, and `.90` focused Power
+  menu coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1077,6 +1082,11 @@ These decisions refine acceptance and sequencing for the active items below.
   text/error tokens while preventing CUPS/lp/lpstat backend terms from painting
   in the visible drawer; farm `.50` fmt and BigBoy `.130` focused `print`
   coverage passed.
+  A later 2026-07-17 Browser media-export copy pass kept Power menu captions and
+  media-export notices on behavior language while preventing manifest, helper,
+  CEF, and DOM implementation terms from surfacing in that menu/status path;
+  farm `.50` fmt, BigBoy `.130` focused `media_export`, and `.90` focused Power
+  menu coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
