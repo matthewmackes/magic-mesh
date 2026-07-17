@@ -187,9 +187,13 @@ These decisions refine acceptance and sequencing for the active items below.
   `rpm -Uvh --test --replacepkgs --force --nosignature` for the staged base and
   Browser RPMs, and the extracted current Browser payload passed CEF+Servo
   display/input plus CEF `--idle-media --timeout 90s` with process cleanup on
-  `.15`. Remaining proof is the installed replacement and shell-service restart;
-  it is blocked because `.15` is physical hardware, root SSH is unavailable, and
-  `mm` requires an interactive sudo password.
+  `.15`. A later 2026-07-17 Browser PiP repaint pass moved the shell heartbeat
+  from active-page-only to Browser frame producers, so playing background PiP
+  media keeps polling even when the active tab is an internal Options page; farm
+  `.50` fmt, BigBoy `.130` focused `browser_media_pip`, and `.90` active-page
+  heartbeat tests passed. Remaining proof is the installed replacement and
+  shell-service restart; it is blocked because `.15` is physical hardware, root
+  SSH is unavailable, and `mm` requires an interactive sudo password.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
@@ -1085,6 +1089,11 @@ These decisions refine acceptance and sequencing for the active items below.
   `crates/desktop/mde-shell-egui/src/seat_pump.rs`,
   Browser/media/VDI frame paths.
 - Dependencies: WL-CRIT-003 for Browser-specific idle playback.
+- Current evidence: A 2026-07-17 Browser PiP repaint pass added a background
+  Browser media heartbeat for playing PiP tabs, including the active-internal-page
+  regression where the previous active-page-only heartbeat would not keep polling
+  frames; farm `.50` fmt, BigBoy `.130` focused `browser_media_pip`, and `.90`
+  active-page heartbeat tests passed.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
