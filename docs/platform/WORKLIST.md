@@ -880,6 +880,11 @@ These decisions refine acceptance and sequencing for the active items below.
   internal `.mhtml` archive format and save path; farm `.50` fmt, BigBoy `.130`
   focused offline-copy drawer coverage, `.90` focused menubar coverage, and
   `.170` focused capture-notice coverage passed.
+  A later 2026-07-17 Browser offline-copy metadata pass moved the offline drawer
+  and cached-body fallback off raw cache ids, tab indexes, engine labels, PNG
+  format names, and timestamp-like counters while preserving the underlying
+  cached snapshot state; farm `.50` fmt, BigBoy `.130` focused offline-copy
+  drawer coverage, and `.90` focused cached-body coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1097,6 +1102,11 @@ These decisions refine acceptance and sequencing for the active items below.
   preventing MHTML file-format terminology from painting in chrome; farm `.50`
   fmt, BigBoy `.130` drawer paint coverage, `.90` menubar coverage, and `.170`
   capture-notice coverage passed.
+  A later 2026-07-17 Browser offline-copy metadata pass kept the drawer and
+  cached-body fallback on Browser text tokens while replacing cache ids,
+  tab/engine labels, raw cached counters, and PNG format labels with Ready,
+  Text, Saved now, Preview, and Resources metadata; farm `.50` fmt, BigBoy
+  `.130` drawer paint coverage, and `.90` cached-body paint coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
