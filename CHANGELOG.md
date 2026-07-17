@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to MCNF (magic-mesh) are documented here. The **11.4.x → 12.0** line is the **E12 "Quasar" pivot** to the egui-native, DRM-native thin-client VDI desktop (the libcosmic/iced + strict-IBM-Carbon stack retired); the 12.x codename spelling ("Quazar" vs "Quasar") is a pending operator decision — see [`docs/NEEDS-OPERATOR.md`](docs/NEEDS-OPERATOR.md). The 10.0.x series is codenamed "Magic Mesh"; historical entries below predate the 2026-06-17 rebrand. The format follows
+All notable changes to MCNF (magic-mesh) are documented here. The **11.4.x → 12.0** line is the **E12 "Quazar" pivot** to the egui-native, DRM-native thin-client VDI desktop (the libcosmic/iced + strict-IBM-Carbon stack retired). The 10.0.x series is codenamed "Magic Mesh"; historical entries below predate the 2026-06-17 rebrand. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is the
 single workspace version (`[workspace.package] version`, every crate
 inherits). Release tags are **`magic-mesh-v<version>`**; the RPM NEVRA pairs
@@ -14,7 +14,7 @@ starts at the first packaged release line.
 ## [Unreleased]
 
 _Accumulating since the `magic-mesh-v12.0.0` tag (2026-07-02) toward the next
-operator-gated cut — a broad, still-open 12.0.x wave that fills out the Quasar
+operator-gated cut — a broad, still-open 12.0.x wave that fills out the Quazar
 desktop. It spans a full **native application suite** (terminal, editor, media
 player, files, dual-engine browser), an OpenStack-based **cloud + VDI plane** with
 multi-protocol remote desktops, a Windows-style **desktop shell**, a mesh-wide
@@ -123,8 +123,8 @@ into the version entry at the next cut._
   battery/telephony), two-way any-node file transfer + a service directory, and a
   **Phones hub** surface. A `mackesd` **transfers** worker (queue/ledger/typed verbs) +
   a Transfers tab land the transfer lanes (TRANSFERS-1/8).
-- **QBRAND — the Quasar identity (QBRAND-1..11).** Compile-time build identity, an
-  embedded Quasar SVG icon set + tintable rasterizer, the product logo lockup, a DRM
+- **QBRAND — the Quazar identity (QBRAND-1..11).** Compile-time build identity, an
+  embedded Quazar SVG icon set + tintable rasterizer, the product logo lockup, a DRM
   boot-splash with real init progress, a chrome build tag + per-node role badges, the
   official wallpaper backdrop, and an About surface. **Intel One Mono** becomes the
   platform font (PLAT-FONT-2).
@@ -166,17 +166,16 @@ into the version entry at the next cut._
   JIT on untrusted web content, so a stale pin is a security-relevant defect;
   bump it with the rest of the fleet.
 
-## [12.0.0] "Quasar" — 2026-07-02
+## [12.0.0] "Quazar" — 2026-07-02
 > **Identity cut (`release(E12-14)`, commit `37f28936`; tag `magic-mesh-v12.0.0`).**
-> The **E12 "Quasar" pivot** — the egui-native, DRM-native thin-client VDI desktop —
+> The **E12 "Quazar" pivot** — the egui-native, DRM-native thin-client VDI desktop —
 > is now the platform's identity. Version bumped `11.4.5 → 12.0.0`; the codename is
-> `12.0.0 "Quasar"` (the exact spelling "Quazar"/"Quasar" is a pending operator
-> decision — see `docs/NEEDS-OPERATOR.md`). The large 12.0.x feature wave that
-> followed the tag is under **[Unreleased]** above.
+> `12.0.0 "Quazar"`. The large 12.0.x feature wave that followed the tag is under
+> **[Unreleased]** above.
 ### Changed
 - The egui shell **is** the platform: the retired libcosmic/iced + strict-IBM-Carbon
   stack is gone (completed across 11.4.x); the About/greeter/chrome now carry the
-  12.0 Quasar identity.
+  12.0 Quazar identity.
 
 ## [11.4.5] — 2026-07-01
 > Rolling DRM-shell cutover cut (deployed to fleet machines; **not** git-tagged).
@@ -879,4 +878,3 @@ First packaged release.
 [10.0.0]: https://github.com/matthewmackes/magic-mesh/releases/tag/magic-mesh-v10.0.0
 
 <!-- 11.4.0–11.4.5 were rolling DRM-shell cutover cuts deployed to fleet machines but not git-tagged; they carry no release-tag link. -->
-

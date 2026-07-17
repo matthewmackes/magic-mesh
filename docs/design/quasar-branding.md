@@ -1,10 +1,10 @@
-# QBRAND — Quasar platform branding (professional icons + version placement)
+# QBRAND — Quazar platform branding (professional icons + version placement)
 
 Operator-locked 2026-07-03 (2-round `/plan` survey). Branding for the **DRM-native
 egui platform** (`mde-shell-egui` + surfaces + RPM). Distinct from — and superseding,
 for the egui world — the retired Cosmic/GTK/Qt system-theming design in
 [`branding.md`](branding.md) (BRAND-1..10, which themed a Cosmic desktop: Plymouth,
-LightDM greeter, GTK/Qt icon themes). The E12 Quasar pivot retired libcosmic/iced, so
+LightDM greeter, GTK/Qt icon themes). The E12 Quazar pivot retired libcosmic/iced, so
 the shell now paints its own UI and owns its branding directly.
 
 ## Locked decisions
@@ -16,7 +16,7 @@ the shell now paints its own UI and owns its branding directly.
 | 3 | Icon style | **Monochrome Carbon line-art** — single-weight line glyphs on the Carbon grid, tinted per state (accent / dim / warn) from the tokens; IBM-Carbon-grade consistency with the shell. |
 | 4 | Brand mechanism | **Extend `mde-theme`** — a `brand` submodule inside the theme crate (icons + logo + version/build-info) alongside the color tokens. One source of truth; every surface + the RPM + `--version` read from it. |
 | 5 | Version placement | **All four:** shell chrome/status bar · About/System panel · DRM boot-splash · Mesh Map / fleet (per-node version, so fleet version-skew is visible). |
-| 6 | Version format | **Semver + codename** — `12.0.0 "Quasar"` in chrome + splash; the About panel additionally shows the full build-info. |
+| 6 | Version format | **Semver + codename** — `12.0.0 "Quazar"` in chrome + splash; the About panel additionally shows the full build-info. |
 | 7 | Build identity | **Baked via `build.rs`** — version + short git hash + build date + release channel + codename stamped at compile time into `mde-theme::brand::build`; `--version` and every surface read it. |
 | 8 | Boot-splash | **Logo + wordmark + version** — centered product mark + wordmark + the version line on the Carbon field while the shell initializes. |
 
@@ -43,7 +43,7 @@ sibling to the existing color-token modules):
 
 - **`brand::build`** — a `build.rs` stamps `BuildInfo { version, codename, git_hash,
   build_date, channel }` at compile time (env vars → `include!`/`env!`). Display
-  helpers: `version_line()` → `12.0.0 "Quasar"` (chrome/splash) and `full()` → the
+  helpers: `version_line()` → `12.0.0 "Quazar"` (chrome/splash) and `full()` → the
   complete build-info string (About + `--version`). Handles the no-git case (release
   tarball) with a sentinel hash. Codename is keyed off the workspace version's epoch.
 - **`brand::icons`** — the monochrome Carbon line-art SVG set as inline `&str`
@@ -74,7 +74,7 @@ mark is identical everywhere.
 
 ## Acceptance (runtime-observable, per task)
 - A Workstation boots to a Carbon boot-splash showing the product mark + wordmark +
-  `12.0.0 "Quasar"`, then the dock.
+  `12.0.0 "Quazar"`, then the dock.
 - The shell chrome shows a subtle version tag + the node's role badge; opening About
   shows the logo lockup + full build-info (version · git hash · date · channel) + codename + links.
 - Every dock surface renders its monochrome Carbon glyph from `brand::icons`, crisp at

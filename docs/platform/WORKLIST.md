@@ -872,13 +872,13 @@ These decisions refine acceptance and sequencing for the active items below.
 - Problem: The Win10 hybrid taskbar/start/tray work has many completed slices,
   but the remaining tray composition and live visual proof are still gated.
 - Required outcome: The bottom taskbar, start grid, tray, show-desktop nub, and
-  action center render without overlap on a live seat and match the current
-  Quazar/Quasar identity decision.
+  action center render without overlap on a live seat and match the canonical
+  Quazar identity.
 - Scope: Bottom bar geometry, tray/status area, action center, start grid,
   live-eye pass, and screenshots.
 - Relevant files/components: `crates/desktop/mde-shell-egui/src/dock.rs`,
   `crates/desktop/mde-shell-egui/src/start_menu.rs`, status/system modules.
-- Dependencies: Live DRM seat and brand decision for final naming.
+- Dependencies: Live DRM seat for final visual proof.
 - Acceptance criteria: No overlaps at supported resolutions; tray controls are
   reachable; live screenshots confirm layout.
 - Verification method: Focused geometry tests and live seat screenshot/pixel
@@ -988,6 +988,10 @@ These decisions refine acceptance and sequencing for the active items below.
   line and Help/About menu label from superseded `Magic-Mesh`/`Magic-Mesh
   Quasar` mixed identity to the shared `MDE Quazar` product constant; farm `.50`
   fmt plus `.130` focused report and menu-model tests passed.
+  A later 2026-07-17 governance/docs pass removed stale "pending spelling
+  decision" language from `AI_GOVERNANCE.md`, `README.md`, `CHANGELOG.md`,
+  `docs/design/quasar-branding.md`, and `docs/NEEDS-OPERATOR.md`, and updated
+  current examples to `12.0.0 "Quazar"` / `MCNF 12.0 "Quazar"`.
 - Acceptance criteria: One canonical spelling appears in user-visible UI, docs
   explain any package/repo exceptions, and a grep/lint prevents re-drift.
 - Verification method: Brand tests plus repo grep for non-canonical strings after

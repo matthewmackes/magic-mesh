@@ -9,7 +9,7 @@
 > docs > worklist body**.
 >
 > **Series (E12 pivot, 2026-06-30; design revised same day):** the **12.0 series is
-> codenamed "Quasar"**, surfaced as `MCNF 12.0 "Quasar"` in the About/greeter. The
+> codenamed "Quazar"**, surfaced as `MCNF 12.0 "Quazar"` in the About/greeter. The
 > package + infra id + GitHub repo **stay `magic-mesh`** so the live-node upgrade
 > path is unbroken. Internal identifiers (`mackesd`, `mde-*`, `org.magicmesh.*`,
 > `magic-mesh.repo`, `magic-mesh-v*` tags, the `magic-mesh` icon name) are
@@ -19,7 +19,7 @@
 > `docs/design/quasar-vdi-desktop.md`.
 
 This rewrites the 11.x/Cosmic-era governance for the **E12 pivot** (the 12.0
-series, "Quasar"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
+series, "Quazar"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
 Cosmic; E12 makes the desktop a first-class, mesh-native part of the platform —
 every surface **egui**. The **revised** E12 (50-Q survey, 2026-06-30) is a
 **thin-client VDI** desktop: a single egui shell **owns the DRM seat directly (no
