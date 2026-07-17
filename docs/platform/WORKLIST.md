@@ -913,6 +913,10 @@ These decisions refine acceptance and sequencing for the active items below.
   Privacy-menu filter-list promise with the live source count; farm `.170` fmt,
   BigBoy `.130` focused synced-filter source coverage, `.90` Privacy menu
   coverage, and `.50` policy-source audit coverage passed.
+  A later 2026-07-17 Browser permission copy pass kept permission prompt
+  decisions, Privacy menu captions, site-info panel text, and capture notices on
+  user-facing blocked-by-default language while preserving the machine-readable
+  permission enforcement events.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
