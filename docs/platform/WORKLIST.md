@@ -786,6 +786,12 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `crates/desktop/mde-shell-egui/src/dock.rs`,
   file/transfer services, VDI session state, shared `mde-egui` progress widgets.
 - Dependencies: Current Win10 hybrid taskbar model.
+- Current evidence: The 2026-07-17 progress pass verified that Files local
+  operations, Browser downloads, Transfers jobs, and archive queue operations
+  all fold into one bottom-rail `FileOperations` status projection, clicking it
+  routes to Files → Transfers, and named Desktop sessions render as switchable
+  bottom-rail entries. A live visual smoke is still needed before closing the
+  item.
 - Acceptance criteria: Opening a desktop creates a switchable bar entry; file
   copy/upload/download/compress/extract operations share the same progress UI;
   progress survives surface switches.

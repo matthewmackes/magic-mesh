@@ -3,6 +3,7 @@ use mde_egui::search_omnibox::{ranked_hits, SearchDomain};
 use mde_files::backend::{AuditEntry, ConflictPolicy, LocalFsBackend, SendMode};
 use mde_files::fileops::{FakeFileOps, FileOps};
 use mde_files::model::{PeerKind, PeerStatus};
+use mde_files::{ArchiveFormat, OpKind};
 use std::collections::HashMap as Map;
 
 // ── In-test backend double (from E12-11, unchanged shape) ────────────────
@@ -1374,6 +1375,35 @@ fn operation_progress_summary_folds_active_transfer_jobs_for_shell_chrome() {
     assert_eq!(summary.known_progress, 1);
     assert_eq!(summary.fraction, Some(0.4));
     assert_eq!(summary.label, "2 transfers");
+}
+
+#[test]
+fn operation_progress_summary_folds_archive_queue_ops_for_shell_chrome() {
+    let mut b = transfers_browser(Vec::new(), FakeTransfers::new());
+    b.ops.submit(
+        OpKind::Compress {
+            items: vec![PathBuf::from("project")],
+            base_dir: PathBuf::from("/home/me"),
+            archive: PathBuf::from("/home/me/project.zip"),
+            format: ArchiveFormat::Zip,
+        },
+        "Compress project.zip",
+    );
+    b.ops.submit(
+        OpKind::Extract {
+            archive: PathBuf::from("/home/me/archive.zip"),
+            dest_dir: PathBuf::from("/home/me/archive"),
+        },
+        "Extract archive.zip",
+    );
+
+    let summary = b
+        .operation_progress_summary()
+        .expect("archive queue ops should feed shell chrome");
+    assert_eq!(summary.active, 2);
+    assert_eq!(summary.known_progress, 0);
+    assert_eq!(summary.fraction, None);
+    assert_eq!(summary.label, "2 local file operations");
 }
 
 #[test]
