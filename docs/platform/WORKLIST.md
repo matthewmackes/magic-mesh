@@ -866,6 +866,10 @@ These decisions refine acceptance and sequencing for the active items below.
   handoff JSON, and ceremony terminology inside the wire/test layer while moving
   malformed, duplicate, approved, and denied passkey notices to Browser-facing
   copy; farm `.50` fmt and BigBoy `.130` focused `passkey` coverage passed.
+  A later 2026-07-17 Browser output-notice pass kept capture/PDF/download paths
+  in internal payloads and opener targets while moving visible Browser notices
+  to filename/folder labels; farm `.50` fmt and BigBoy `.130` focused
+  `browser_output_notices_hide_absolute_paths` coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
