@@ -842,6 +842,12 @@ These decisions refine acceptance and sequencing for the active items below.
   launch-block notice with Chromium-facing labels and sanitized verification
   details; farm `.50` fmt, `.90` focused drawer render coverage, `.170`
   status-chip coverage, and BigBoy `.130` live-helper gate coverage passed.
+  A later 2026-07-17 Browser export/notice copy pass removed helper, handoff,
+  and CEF viewer/tab wording from scrape Markdown artifacts, PDF viewer notices,
+  DevTools gates, and malformed passkey notices while preserving the underlying
+  CEF implementation paths; farm `.50` fmt, BigBoy `.130` scrape-export coverage,
+  `.90` saved-PDF viewer coverage, and `.170` DevTools/passkey notice coverage
+  passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1026,6 +1032,12 @@ These decisions refine acceptance and sequencing for the active items below.
   Browser Material colors with Chromium-facing labels plus sanitized verification
   details; farm `.50` fmt, `.90` focused drawer render coverage, `.170`
   status-chip coverage, and BigBoy `.130` live-helper gate coverage passed.
+  A later 2026-07-17 Browser export/notice copy pass kept scrape Markdown
+  artifacts, PDF viewer notices, DevTools gates, and malformed passkey notices
+  on user-facing page/Chromium terminology instead of helper, handoff, or CEF
+  implementation wording; farm `.50` fmt, BigBoy `.130` scrape-export coverage,
+  `.90` saved-PDF viewer coverage, and `.170` DevTools/passkey notice coverage
+  passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
