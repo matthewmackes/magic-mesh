@@ -862,6 +862,10 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-17 Browser download failure notice pass kept the transfer
   request staging paths unchanged while moving intercepted-download and
   observed-media/image download failures off raw spool/request-path terminology.
+  A later 2026-07-17 Browser passkey notice pass kept WebAuthn request ids,
+  handoff JSON, and ceremony terminology inside the wire/test layer while moving
+  malformed, duplicate, approved, and denied passkey notices to Browser-facing
+  copy; farm `.50` fmt and BigBoy `.130` focused `passkey` coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
