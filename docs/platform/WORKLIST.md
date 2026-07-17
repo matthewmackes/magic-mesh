@@ -1157,6 +1157,14 @@ These decisions refine acceptance and sequencing for the active items below.
   regression where the previous active-page-only heartbeat would not keep polling
   frames; farm `.50` fmt, BigBoy `.130` focused `browser_media_pip`, and `.90`
   active-page heartbeat tests passed.
+  A later 2026-07-17 `.15` live-seat incident showed Google could leave the
+  Browser interface unusable while the installed root-owned shell/CEF/mackesd
+  processes continued running and libinput reported input-event lag. The static
+  Browser page repaint path now uses a low-rate 250ms helper heartbeat for
+  settled pages while preserving the fast 16ms cadence for loading, audible, or
+  media pages; farm `.50` fmt and BigBoy `.130` focused `repaint_heartbeat`
+  coverage passed. Live `.15` recovery/deploy proof is still blocked from this
+  shell because `mm@172.20.0.15` still reports `sudo: a password is required`.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.
