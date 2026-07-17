@@ -164,7 +164,13 @@ These decisions refine acceptance and sequencing for the active items below.
   dependency edge that blocked the Fedora 44 RPM lane; BigBoy then produced F44
   base and Browser RPMs under the size guard. Live `.15` install and idle-media
   runtime proof remain open because `.15` accepts the RPM payloads under
-  `/home/mm/` but rejects non-interactive sudo for `rpm -Uvh --test`.
+  `/home/mm/` but rejects non-interactive sudo for `rpm -Uvh --test`. A
+  2026-07-17 `.15` probe confirmed the currently installed split packages verify
+  cleanly and `/usr/libexec/mackesd/browser-verify-engines` passes, but those
+  packages predate the fix commits. Extracting the newer staged Browser RPM and
+  running its verifier against the staged helpers passes CEF/Servo display and
+  input in user space; no-input idle media proof still needs a privileged
+  install/restart or a reliable live DRM smoke path.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
