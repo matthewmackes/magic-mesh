@@ -767,6 +767,11 @@ These decisions refine acceptance and sequencing for the active items below.
   counts, and kept the empty worker state honest without exposing implementation
   terms; farm `.50` fmt and `.130` focused
   `browser_download_drawer_header_uses_user_facing_status` passed.
+  A later 2026-07-17 Browser artifact identity pass centralized the Browser
+  product label, kept the new-tab dashboard on the same label, and changed
+  capture/PDF folders, MHTML/offline-copy subjects, and generated CUPS job
+  titles from superseded `Magic Mesh Browser` wording to `Quazar Browser`; farm
+  `.50` fmt plus BigBoy focused artifact, dashboard, and CUPS title tests passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
