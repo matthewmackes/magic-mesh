@@ -73,9 +73,10 @@ record_gate() {
 
 worklist_open_count() {
   awk '
-    /^[[:space:]]*- \[[^]]+\]/ {
-      marker = substr($0, index($0, "[") + 1, index($0, "]") - index($0, "[") - 1)
-      if (marker == " " || marker == ">" || marker == "!" || marker == "→" || marker == "~" || marker == "◐") {
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == "Remaining") {
         count++
       }
     }
@@ -86,9 +87,10 @@ worklist_open_count() {
 worklist_marker_count() {
   local want="$1"
   awk -v want="$want" '
-    /^[[:space:]]*- \[[^]]+\]/ {
-      marker = substr($0, index($0, "[") + 1, index($0, "]") - index($0, "[") - 1)
-      if (marker == want) {
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == want) {
         count++
       }
     }
@@ -97,26 +99,29 @@ worklist_marker_count() {
 }
 
 worklist_active_breakdown() {
-  printf 'open=%s in_progress=%s blocked=%s delegated=%s partial=%s review=%s\n' \
-    "$(worklist_marker_count ' ')" \
-    "$(worklist_marker_count '>')" \
-    "$(worklist_marker_count '!')" \
-    "$(worklist_marker_count '→')" \
-    "$(worklist_marker_count '~')" \
-    "$(worklist_marker_count '◐')"
+  printf 'remaining=%s blocked=%s needs_clarification=%s\n' \
+    "$(worklist_marker_count 'Remaining')" \
+    "$(worklist_marker_count 'Blocked')" \
+    "$(worklist_marker_count 'Needs clarification')"
 }
 
 worklist_next_candidates() {
   local limit="${1:-8}"
   awk -v limit="$limit" '
-    /^[[:space:]]*- \[[ >]\][[:space:]]+\*\*[A-Za-z0-9._-]+[: ]/ {
-      line = $0
-      sub(/^[[:space:]]*- \[[ >]\][[:space:]]+\*\*/, "", line)
-      sub(/\*\*.*/, "", line)
-      print line
-      count++
-      if (count >= limit) {
-        exit
+    /^### WL-[A-Z0-9-]+ - / {
+      item = $0
+      sub(/^### /, "", item)
+      next
+    }
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == "Remaining" && item != "") {
+        print item
+        count++
+        if (count >= limit) {
+          exit
+        }
       }
     }
   ' "$WORKLIST"
