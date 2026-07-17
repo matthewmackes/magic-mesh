@@ -783,11 +783,12 @@ impl DatacenterState {
                     ui.add_space(Style::SP_S);
                 }
                 if !nodes.is_empty() {
-                    // MV-6b lands the container roster read-only; container run/stop
-                    // lifecycle-drive (action/container/lifecycle) is a follow-up.
+                    // MV-6b lands the container roster without half-wired run/stop
+                    // actions. Keep the visible note operator-facing; the wiring
+                    // detail stays in the module docs.
                     mde_egui::muted_note(
                         ui,
-                        "Container rows are read-only — run/stop lifecycle-drive is a follow-up.",
+                        "Containers are inventory-only here. Start and stop containers from their owning service.",
                     );
                 }
                 // BOOKMARKS-8 — the browser + ad-block fleet section (its own per-node
@@ -1540,6 +1541,47 @@ mod tests {
         )
     }
 
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_datacenter_state(state: &mut DatacenterState) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 520.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        state.show(ui);
+                    });
+            },
+        )
+    }
+
     /// A faithful `state/adfilter/<node>` body (BOOKMARKS-7 `AdfilterStatus`).
     fn adfilter_body(node: &str, enabled: usize, net_rules: usize, at: u64) -> String {
         format!(
@@ -1649,6 +1691,43 @@ mod tests {
             security_update_body("node-b", "missing", "pretend", 1),
         ];
         assert!(project_browser(&adfilter, &policy, &security).is_empty());
+    }
+
+    #[test]
+    fn datacenter_container_inventory_note_is_operator_facing() {
+        let mut state = DatacenterState {
+            bus_root: None,
+            nodes: project(
+                &[health_body("node-a", true, 1)],
+                &[],
+                &[container_body(
+                    "node-a",
+                    &[("cache", "redis:7", "running")],
+                    2,
+                )],
+            ),
+            ..DatacenterState::default()
+        };
+        let out = render_datacenter_state(&mut state);
+        let texts = painted_text(&out.shapes);
+
+        assert!(
+            texts.iter().any(|text| text.contains(
+                "Containers are inventory-only here. Start and stop containers from their owning service."
+            )),
+            "Fleet container note should explain the operator-facing state: {texts:?}"
+        );
+        for forbidden in [
+            "lifecycle-drive",
+            "follow-up",
+            "Start container",
+            "Stop container",
+        ] {
+            assert!(
+                texts.iter().all(|text| !text.contains(forbidden)),
+                "Fleet container UI must not expose {forbidden:?}: {texts:?}"
+            );
+        }
     }
 
     #[test]

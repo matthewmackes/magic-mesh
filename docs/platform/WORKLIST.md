@@ -474,6 +474,11 @@ These decisions refine acceptance and sequencing for the active items below.
   `crates/mesh/mackesd/src/workers/openstack/verbs.rs`,
   `crates/mesh/mackesd/src/workers/openstack/client/`.
 - Dependencies: WL-ARCH-001 and an OpenStack test project.
+- Current evidence: A 2026-07-17 Fleet/Data Center copy pass kept unsupported
+  container lifecycle verbs absent from the container roster while replacing visible
+  implementation/backlog wording with an operator-facing inventory-only note; farm
+  `.50` fmt and BigBoy `.130` focused
+  `datacenter_container_inventory_note_is_operator_facing` passed.
 - Acceptance criteria: Compute, network, volume, image, and orchestration rows can
   list/show and run implemented mutations; unsupported verbs are absent, not dead
   buttons.
