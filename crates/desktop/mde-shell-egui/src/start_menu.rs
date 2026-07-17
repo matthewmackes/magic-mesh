@@ -204,6 +204,9 @@ use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 /// The stable id of the Start Menu's floating [`egui::Area`] layer.
 const START_MENU_AREA: &str = "start-menu-area";
 
+/// The Start Menu tile grid's bounded scroll region above the fixed search box.
+const LEFT_PANE_SCROLL_ID: &str = "start-menu-left-pane-scroll";
+
 /// Per-seat Start Menu preferences, stored beside the shell's other
 /// client-data JSON prefs.
 const START_MENU_PREFS_FILE: &str = "start-menu.json";
@@ -325,6 +328,23 @@ const RESULT_ROW_H: f32 = Style::SP_L + Style::SP_XS;
 /// than a tile's 24px [`TILE_ICON`] glyph because a result row is a list line,
 /// not a tile face.
 const RESULT_ICON: f32 = Style::SP_M;
+
+fn search_rect(left_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            left_rect.left() + PANE_PAD,
+            left_rect.bottom() - PANE_PAD - SEARCH_H,
+        ),
+        egui::vec2((left_rect.width() - PANE_PAD * 2.0).max(0.0), SEARCH_H),
+    )
+}
+
+fn left_pane_content_rect(left_rect: egui::Rect, search_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        left_rect.min,
+        egui::pos2(left_rect.right(), search_rect.top() - Style::SP_XS),
+    )
+}
 
 // ── live-tile facts (WIN7-4, lock #5) ───────────────────────────────────────
 
@@ -1063,6 +1083,17 @@ fn nav_sections(pinned: &[Surface]) -> Vec<NavSection> {
     sections
 }
 
+fn nav_sections_content_h(sections: &[NavSection]) -> f32 {
+    let mut h = PANE_PAD;
+    for section in sections {
+        let rows_n = section.rows.len().max(1);
+        h += GROUP_HEADING_H;
+        h += rows_n as f32 * (TILE_H + TILE_GAP) - TILE_GAP;
+        h += GROUP_GAP;
+    }
+    h
+}
+
 /// Flatten [`nav_sections`] into the top-to-bottom rows of [`NavCell`]s the
 /// arrow-key math walks — sections concatenated in render order, each carrying
 /// its own Pinned-vs-group id namespace. `(row, col)` into this is the ONE
@@ -1342,6 +1373,35 @@ fn left_pane(
         closed,
         menu_open,
     }
+}
+
+fn scrollable_left_pane(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    inputs: &TileFactInputs,
+    pinned: &mut Vec<Surface>,
+) -> LeftPaneOutcome {
+    let sections = nav_sections(pinned);
+    let content_h = nav_sections_content_h(&sections).max(rect.height());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(rect);
+    egui::ScrollArea::vertical()
+        .id_salt(LEFT_PANE_SCROLL_ID)
+        .auto_shrink([false, false])
+        .show(&mut child, |ui| {
+            let pane_rect = egui::Rect::from_min_size(
+                ui.next_widget_position(),
+                egui::vec2(rect.width(), content_h),
+            );
+            let out = left_pane(ui, pane_rect, inputs, pinned);
+            ui.allocate_rect(pane_rect, egui::Sense::hover());
+            out
+        })
+        .inner
 }
 
 /// Add or remove `surface` from the pin set (SM-QOL-1) — the ONE mutator, so
@@ -1950,17 +2010,8 @@ fn start_menu_search(
 ) -> (bool, bool) {
     // The search field sits in the left pane's bottom headroom; the grid /
     // result list get everything above it.
-    let search_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            left_rect.left() + PANE_PAD,
-            left_rect.bottom() - PANE_PAD - SEARCH_H,
-        ),
-        egui::vec2((left_rect.width() - PANE_PAD * 2.0).max(0.0), SEARCH_H),
-    );
-    let content_rect = egui::Rect::from_min_max(
-        left_rect.min,
-        egui::pos2(left_rect.right(), search_rect.top() - Style::SP_XS),
-    );
+    let search_rect = search_rect(left_rect);
+    let content_rect = left_pane_content_rect(left_rect, search_rect);
 
     let query_changed = search_field(
         ui,
@@ -1983,7 +2034,7 @@ fn start_menu_search(
         // `&state` borrows below are disjoint fields (`tile_inputs` read-only,
         // `pinned` mutated by a right-click Pin/Unpin), so they coexist.
         let pinned_before = state.pinned.clone();
-        let out = left_pane(ui, left_rect, &state.tile_inputs, &mut state.pinned);
+        let out = scrollable_left_pane(ui, content_rect, &state.tile_inputs, &mut state.pinned);
         if state.pinned != pinned_before {
             state.persist_pins();
         }
@@ -3917,6 +3968,43 @@ mod tests {
         assert!(
             18.0 * super::RESULT_ROW_H <= results_rows_h,
             "all 18 result rows must fit the results band"
+        );
+    }
+
+    #[test]
+    fn pinned_tiles_scroll_above_the_fixed_search_band() {
+        let left_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, SZ.y - PANEL_H),
+            egui::vec2(super::LEFT_PANE_W, PANEL_H),
+        );
+        let search_rect = super::search_rect(left_rect);
+        let content_rect = super::left_pane_content_rect(left_rect, search_rect);
+        assert!(
+            super::nav_sections_content_h(&super::nav_sections(&[]))
+                <= content_rect.height() + 0.01,
+            "the unpinned 7-group grid should fit above search without scrolling"
+        );
+        assert!(
+            super::nav_sections_content_h(&super::nav_sections(&[Surface::Browser]))
+                > content_rect.height() + 0.01,
+            "one pinned row makes the left pane overflow, so the grid must scroll"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        s.pinned = vec![Surface::Browser];
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+
+        let pinned = ctx
+            .read_response(super::pinned_tile_id(Surface::Browser))
+            .expect("the pinned Browser tile is registered")
+            .rect;
+        assert!(
+            pinned.bottom() <= search_rect.top(),
+            "the pinned section must stay in the scroll viewport above the fixed search field"
         );
     }
 

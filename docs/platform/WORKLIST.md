@@ -1081,6 +1081,10 @@ These decisions refine acceptance and sequencing for the active items below.
   auto-hide behavior reachable from the persisted Personalization appearance
   config and mirrored it into `DockState`; farm `.50` fmt, BigBoy `.130`
   focused `appearance`, and the edited legacy migration test passed.
+  A later 2026-07-17 Start-menu pinned-layout pass bounded the pinned/grouped
+  tile grid to the viewport above the fixed search field with a vertical scroll
+  region, preventing pinned sections from painting into search; farm `.50` fmt
+  and BigBoy `.130` focused pinned-layout coverage passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 
