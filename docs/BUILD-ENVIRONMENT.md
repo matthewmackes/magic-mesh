@@ -49,7 +49,10 @@ at 70.0 MiB (`magic-mesh`) and 39.1 MiB (`magic-mesh-browser`), both under the
 that as a release-lane hygiene blocker. Do not edit `MDE_RPM_LOCKED` to bypass
 the failure for a live seat deploy. Reconcile the committed `Cargo.lock` in a
 separate build/release change, then rerun the Fedora 44 container RPM lane and
-the split-package `rpm -Uvh --test` proof.
+the split-package `rpm -Uvh --test` proof. The 2026-07-17 instance was a missing
+`mde-shell-egui` -> `tokio` lockfile edge, fixed by commit `955cacf9`; the
+follow-up BigBoy F44 lane produced the base and Browser RPMs under the size
+guard.
 
 **RPM deploy verification note (learned 2026-07-15):** run `rpm -Uvh --test`
 and the real `rpm -Uvh` as separate commands in an interactive sudo/TTY session.

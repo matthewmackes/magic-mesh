@@ -162,9 +162,11 @@ These decisions refine acceptance and sequencing for the active items below.
 - Dependencies: Live CEF runtime or farm CEF smoke path for media verification.
 - Current evidence: Commit `64508044` fixed the body-geometry regression and CEF
   idle-media pump path, with farm fmt, shell page-body, and CEF media tests
-  passing on 2026-07-17. Live `.15` closure remains open because the required
-  Fedora 44 RPM lane failed before compile under the release `--locked` policy;
-  track that release-lane blocker under WL-BUILD-003 rather than bypassing it.
+  passing on 2026-07-17. Commit `955cacf9` fixed the stale `Cargo.lock`
+  dependency edge that blocked the Fedora 44 RPM lane; BigBoy then produced F44
+  base and Browser RPMs under the size guard. Live `.15` install and idle-media
+  runtime proof remain open because `.15` accepts the RPM payloads under
+  `/home/mm/` but rejects non-interactive sudo for `rpm -Uvh --test`.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
@@ -385,11 +387,12 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `automation/promotion/`, `docs/ops/promotion-pipeline.md`,
   `.github/workflows/`, `install-helpers/verify-*`.
 - Dependencies: Valid release candidate and repo secret-scan policy.
-- Current blocker: The 2026-07-17 BigBoy Fedora 44 container RPM cut for
-  WL-CRIT-003 failed with `cannot update the lock file /src/Cargo.lock because
-  --locked was passed`, before any compile step. The fix must preserve the
-  release `--locked` contract by reconciling `Cargo.lock` and proving the F44
-  container lane, not by disabling `MDE_RPM_LOCKED`.
+- Current evidence: The 2026-07-17 BigBoy Fedora 44 container RPM cut initially
+  failed with `cannot update the lock file /src/Cargo.lock because --locked was
+  passed`; commit `955cacf9` reconciled the missing `mde-shell-egui` -> `tokio`
+  lockfile edge, and the same F44 lane then produced base and Browser RPMs under
+  the size guard. If this recurs, preserve the release `--locked` contract and
+  reconcile `Cargo.lock` rather than disabling `MDE_RPM_LOCKED`.
 - Acceptance criteria: A candidate can be promoted and rolled back in test,
   Fedora compatibility is documented, and a planted credential fails the gate.
 - Verification method: Non-production promotion drill, secret-scan fixture, and
