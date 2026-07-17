@@ -1173,6 +1173,10 @@ These decisions refine acceptance and sequencing for the active items below.
   controls/status to Site Fixups/Fixups, moved the protection summary off
   `native blocker` wording, and removed the `no cookie store` parenthetical from
   third-party-cookie policy copy while preserving the existing Browser actions.
+  A later 2026-07-17 Browser chrome Site Fixups pass carried that rename into
+  tab status chips, hover cards, tab context menus, AccessKit summaries, and the
+  Power menu protection summary so visible chrome no longer exposes Userscripts
+  wording.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
