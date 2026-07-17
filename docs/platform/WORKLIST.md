@@ -885,6 +885,12 @@ These decisions refine acceptance and sequencing for the active items below.
   format names, and timestamp-like counters while preserving the underlying
   cached snapshot state; farm `.50` fmt, BigBoy `.130` focused offline-copy
   drawer coverage, and `.90` focused cached-body coverage passed.
+  A later 2026-07-17 Browser share/translation drawer metadata pass moved QR
+  share and Translation drawers off raw request ids, peer hosts, matrix module
+  terminology, tab indexes, and engine labels while preserving the underlying
+  share route and translation result state; farm `.50` fmt, BigBoy `.130`
+  focused QR drawer coverage, and `.90` focused Translation drawer coverage
+  passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1107,6 +1113,12 @@ These decisions refine acceptance and sequencing for the active items below.
   tab/engine labels, raw cached counters, and PNG format labels with Ready,
   Text, Saved now, Preview, and Resources metadata; farm `.50` fmt, BigBoy
   `.130` drawer paint coverage, and `.90` cached-body paint coverage passed.
+  A later 2026-07-17 Browser share/translation drawer metadata pass kept QR
+  share and Translation drawers on Browser text tokens while replacing request
+  ids, peer host labels, QR matrix module wording, tab indexes, and engine names
+  with Ready, QR code dimensions, language direction, and text counts; farm
+  `.50` fmt, BigBoy `.130` QR drawer paint coverage, and `.90` Translation
+  drawer paint coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
