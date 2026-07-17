@@ -895,6 +895,11 @@ These decisions refine acceptance and sequencing for the active items below.
   injected/host/Userscripts implementation wording while preserving the CSS
   editor and site-style state; farm `.50` fmt, BigBoy `.130` focused Site
   Styles drawer coverage, and `.90` focused menubar coverage passed.
+  A later 2026-07-17 Browser security/privacy copy pass moved safe-browsing and
+  site-info surfaces off visible host/mesh-hosted wording while preserving host
+  matching and policy-source state; farm `.170` fmt, BigBoy `.130` focused
+  security panel coverage, `.90` focused Privacy menu coverage, and `.50`
+  focused safe-browsing source coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1127,6 +1132,11 @@ These decisions refine acceptance and sequencing for the active items below.
   Browser text tokens while replacing delivery-mechanism labels with Website and
   Custom CSS wording; farm `.50` fmt, BigBoy `.130` drawer paint coverage, and
   `.90` menubar coverage passed.
+  A later 2026-07-17 Browser security/privacy copy pass kept site-info warnings,
+  blocked-resource summaries, and Privacy-menu safe-browsing captions on
+  Browser-facing site language instead of host/mesh-hosted wording; farm `.170`
+  fmt, BigBoy `.130` security paint coverage, `.90` Privacy menu coverage, and
+  `.50` safe-browsing source coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
