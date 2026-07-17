@@ -923,6 +923,9 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-17 Browser offline-archive notice pass kept the saved archive
   format unchanged while moving the visible missing-archive notice off raw MHTML
   terminology.
+  A later 2026-07-17 Browser download failure notice pass kept the transfer
+  request staging paths unchanged while moving intercepted-download and
+  observed-media/image download failures off raw spool/request-path terminology.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
