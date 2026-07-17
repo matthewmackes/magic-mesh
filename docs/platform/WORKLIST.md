@@ -1169,7 +1169,14 @@ These decisions refine acceptance and sequencing for the active items below.
   Browser page repaint path now uses a low-rate 250ms helper heartbeat for
   settled pages while preserving the fast 16ms cadence for loading, audible, or
   media pages; farm `.50` fmt and BigBoy `.130` focused `repaint_heartbeat`
-  coverage passed. A BigBoy `.130` Fedora 44 full RPM cut from cleaned HEAD
+  coverage passed. A follow-up same-day Google hardening pass added a per-tab
+  fast-loading repaint budget: non-media pages that keep Chromium's loading bit
+  set past the short first-paint grace now fall back to the 250ms helper
+  heartbeat while active media remains on the 16ms cadence; farm `.50` fmt,
+  BigBoy `.130` focused
+  `long_loading_static_browser_page_drops_to_low_rate_heartbeat`, and warmed
+  `repaint_heartbeat` coverage passed. A BigBoy `.130` Fedora 44 full RPM cut
+  from cleaned HEAD
   `b9f84954` passed size guards and was staged on `.15` at
   `/home/mm/browser-f44-live-proof-b9f84954/` with sha256
   `db8ddcda749043dec5acd45c2daba953914750347a481dac94ac51f1c655016c` for
