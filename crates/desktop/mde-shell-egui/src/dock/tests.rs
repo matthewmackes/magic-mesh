@@ -1,10 +1,12 @@
 use super::{
     action_center_cell_id, clock_cell_id, clock_date_text, focus_ring_rect,
     notification_rail_with_sources, session_entry_id, session_hover_preview_id,
-    session_hover_protocol_badge_id, show_desktop_nub_id, start_cell_id, status_detail_toggle_id,
+    session_hover_protocol_badge_id, session_preview_texture_for_entry,
+    session_preview_texture_rect, show_desktop_nub_id, start_cell_id, status_detail_toggle_id,
     taskbar_reveal, tray_overflow_id, tray_overflow_popup_id, tray_overflow_row_id,
-    DesktopRailSource, DockState, FileOperationProgress, SessionRailEntry, Surface, CELL_W, DOCK_W,
-    FOCUS_RING_W, NOTIFICATION_RAIL_H, TRAY_OVERFLOW_ROW_H, TRAY_OVERFLOW_W,
+    DesktopRailSource, DockState, FileOperationProgress, SessionPreviewTexture, SessionRailEntry,
+    Surface, CELL_W, DOCK_W, FOCUS_RING_W, NOTIFICATION_RAIL_H, TRAY_OVERFLOW_ROW_H,
+    TRAY_OVERFLOW_W,
 };
 use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegments};
@@ -646,6 +648,55 @@ fn win10_hybrid_31_session_hover_preview_shows_protocol_badge() {
     assert!(
         badge.center().x > preview.center().x,
         "the protocol badge sits on the compact right side of the preview"
+    );
+}
+
+#[test]
+fn win10_hybrid_31_session_preview_texture_preserves_aspect_inside_thumbnail() {
+    let bounds = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(180.0, 72.0));
+    let wide = session_preview_texture_rect([160, 90], bounds);
+    assert!(
+        wide.height() <= bounds.height() && wide.width() <= bounds.width(),
+        "the preview image must fit inside the thumbnail plate"
+    );
+    assert!(
+        (wide.height() - 72.0).abs() < f32::EPSILON,
+        "16:9 frames should letterbox by width only in the taskbar thumbnail"
+    );
+    assert!(
+        (wide.width() - 128.0).abs() < f32::EPSILON,
+        "16:9 frame width should preserve aspect ratio"
+    );
+    assert_eq!(wide.center(), bounds.center());
+}
+
+#[test]
+fn win10_hybrid_31_session_preview_texture_matches_the_current_entry_only() {
+    let ctx = egui::Context::default();
+    let texture = ctx.load_texture(
+        "vdi-preview-test",
+        egui::ColorImage {
+            size: [4, 3],
+            pixels: vec![egui::Color32::WHITE; 12],
+        },
+        egui::TextureOptions::LINEAR,
+    );
+    let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+    let preview = SessionPreviewTexture::new(
+        Some("session-1".to_string()),
+        "Accounting VM",
+        "RDP",
+        texture,
+    );
+    assert!(
+        session_preview_texture_for_entry(Some(&preview), &entry).is_some(),
+        "the broker-matched VDI texture should attach to its rail entry"
+    );
+
+    let other = SessionRailEntry::with_session_id("session-2", "Other VM", "RDP");
+    assert!(
+        session_preview_texture_for_entry(Some(&preview), &other).is_none(),
+        "a live VDI thumbnail must not bleed onto another rail session"
     );
 }
 

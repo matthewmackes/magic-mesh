@@ -386,6 +386,10 @@ pub struct DockState {
     /// it via [`Self::set_status_inputs`] each frame. Defaults to the honest pre-poll
     /// state.
     status: StatusInputs,
+    /// Optional live thumbnail for the currently attached Desktop session. Kept
+    /// separate from [`SessionRailEntry`] so rail entries remain cheap,
+    /// comparable summaries.
+    session_preview: Option<SessionPreviewTexture>,
     /// A pending **node-focus** request the notification panel's grade list records
     /// when a grade row is tapped (design #7): the hostname whose Explorer hero the
     /// shell should open. The dock can't reach the shell's Explorer / nav (§6), so it
@@ -481,6 +485,49 @@ pub struct SessionRailEntry {
     label: String,
     /// Short protocol/status tag such as `RDP` or `VNC`.
     protocol: &'static str,
+}
+
+/// Live taskbar thumbnail snapshot keyed to one visible session entry.
+#[derive(Clone)]
+pub struct SessionPreviewTexture {
+    id: Option<String>,
+    label: String,
+    protocol: &'static str,
+    texture: TextureHandle,
+}
+
+impl std::fmt::Debug for SessionPreviewTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPreviewTexture")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("protocol", &self.protocol)
+            .field("texture_size", &self.texture.size())
+            .finish()
+    }
+}
+
+impl SessionPreviewTexture {
+    pub(crate) fn new(
+        id: Option<String>,
+        label: impl Into<String>,
+        protocol: &'static str,
+        texture: TextureHandle,
+    ) -> Self {
+        Self {
+            id,
+            label: truncate_session_label(&label.into()),
+            protocol,
+            texture,
+        }
+    }
+
+    fn matches(&self, entry: &SessionRailEntry) -> bool {
+        if self.id.is_some() || entry.id.is_some() {
+            return self.id.as_deref() == entry.id.as_deref();
+        }
+        self.label == entry.label && self.protocol == entry.protocol
+    }
 }
 
 /// One compact Desktop source row rendered by the bottom rail flyout. It is a UI
@@ -692,6 +739,10 @@ impl DockState {
             grades,
             segments,
         };
+    }
+
+    pub(crate) fn set_session_preview(&mut self, preview: Option<SessionPreviewTexture>) {
+        self.session_preview = preview;
     }
 
     /// Record a **node-focus** request (NODE-GRADE-2, design #7) — a grade row tap
@@ -964,7 +1015,14 @@ pub fn notification_rail_with_sources(
                         egui::vec2(desired, rail_h),
                     )
                     .shrink(2.0);
-                    if session_entry(ui, rect, idx, entry, state.active == Surface::Desktop) {
+                    if session_entry(
+                        ui,
+                        rect,
+                        idx,
+                        entry,
+                        state.active == Surface::Desktop,
+                        state.session_preview.as_ref(),
+                    ) {
                         state.active = Surface::Desktop;
                         focused_session.clone_from(&entry.id);
                         clicked = true;
@@ -1392,6 +1450,7 @@ fn session_entry(
     idx: usize,
     entry: &SessionRailEntry,
     selected: bool,
+    preview: Option<&SessionPreviewTexture>,
 ) -> bool {
     let resp = ui.interact(rect, session_entry_id(idx, entry), egui::Sense::click());
     let painter = ui.painter().clone();
@@ -1401,7 +1460,13 @@ fn session_entry(
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
     if resp.hovered() {
-        session_hover_preview(ui, rect, idx, entry);
+        session_hover_preview(
+            ui,
+            rect,
+            idx,
+            entry,
+            session_preview_texture_for_entry(preview, entry),
+        );
     }
     let tint = if selected || resp.hovered() {
         Style::ACCENT
@@ -1449,7 +1514,13 @@ fn session_entry(
 /// WIN10-HYBRID #31 — static first hover thumbnail for a running Desktop session.
 /// The live frame texture is a later slice; this keeps the user-visible taskbar
 /// affordance in place now with the real session label and protocol badge.
-fn session_hover_preview(ui: &egui::Ui, anchor: egui::Rect, idx: usize, entry: &SessionRailEntry) {
+fn session_hover_preview(
+    ui: &egui::Ui,
+    anchor: egui::Rect,
+    idx: usize,
+    entry: &SessionRailEntry,
+    preview_texture: Option<&TextureHandle>,
+) {
     let screen = ui.ctx().screen_rect();
     let margin = Style::SP_S;
     let x = (anchor.center().x - SESSION_PREVIEW_W / 2.0).clamp(
@@ -1486,7 +1557,12 @@ fn session_hover_preview(ui: &egui::Ui, anchor: egui::Rect, idx: usize, entry: &
                 egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.35)),
                 egui::StrokeKind::Inside,
             );
-            if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, 32.0, Style::ACCENT) {
+            if let Some(texture) = preview_texture {
+                let image_rect = session_preview_texture_rect(texture.size(), thumb);
+                let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                painter.image(texture.id(), image_rect, uv, egui::Color32::WHITE);
+            } else if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, 32.0, Style::ACCENT)
+            {
                 let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
                 let icon_rect =
                     egui::Rect::from_center_size(thumb.center(), egui::vec2(32.0, 32.0));
@@ -1532,6 +1608,22 @@ fn session_hover_preview(ui: &egui::Ui, anchor: egui::Rect, idx: usize, entry: &
                 Style::ACCENT,
             );
         });
+}
+
+fn session_preview_texture_rect(size: [usize; 2], bounds: egui::Rect) -> egui::Rect {
+    let width = size[0].max(1) as f32;
+    let height = size[1].max(1) as f32;
+    let scale = (bounds.width() / width).min(bounds.height() / height);
+    egui::Rect::from_center_size(bounds.center(), egui::vec2(width * scale, height * scale))
+}
+
+fn session_preview_texture_for_entry<'a>(
+    preview: Option<&'a SessionPreviewTexture>,
+    entry: &SessionRailEntry,
+) -> Option<&'a TextureHandle> {
+    preview
+        .filter(|preview| preview.matches(entry))
+        .map(|preview| &preview.texture)
 }
 
 /// Stable id for the bottom-rail status detail toggle.
@@ -2504,7 +2596,14 @@ fn rail_more_popup(
                     egui::vec2(popup_w - Style::SP_XS, rail_h),
                 )
                 .shrink(2.0);
-                if session_entry(ui, rect, idx, entry, state.active == Surface::Desktop) {
+                if session_entry(
+                    ui,
+                    rect,
+                    idx,
+                    entry,
+                    state.active == Surface::Desktop,
+                    state.session_preview.as_ref(),
+                ) {
                     state.active = Surface::Desktop;
                     focused_session.clone_from(&entry.id);
                     routed = true;

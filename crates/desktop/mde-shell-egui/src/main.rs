@@ -1407,6 +1407,15 @@ impl Shell {
                 .map(|(name, protocol)| vec![dock::SessionRailEntry::new(name, protocol)])
                 .unwrap_or_default();
         }
+        self.vdock
+            .set_session_preview(self.vdi.taskbar_preview_frame().map(|frame| {
+                dock::SessionPreviewTexture::new(
+                    frame.broker_session_id,
+                    frame.label,
+                    frame.protocol,
+                    frame.texture,
+                )
+            }));
         self.vdock.set_status_inputs(
             self.chrome.summary().clone(),
             self.system.snapshot().cloned(),

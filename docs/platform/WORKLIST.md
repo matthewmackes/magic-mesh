@@ -1073,6 +1073,10 @@ These decisions refine acceptance and sequencing for the active items below.
   2026-07-17 taskbar hover-preview pass added the static running-session preview
   with a real protocol badge above the taskbar; farm `.50` fmt and BigBoy `.130`
   focused `win10_hybrid_31_session_hover_preview_shows_protocol_badge` passed.
+  A later 2026-07-17 taskbar live-thumbnail pass wired the current VDI desktop
+  texture into that hover preview, preserving aspect ratio and matching only the
+  intended broker/fallback rail entry; farm `.50` fmt, BigBoy `.130` focused
+  `session_preview`, and the exact hover-card regression passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 
