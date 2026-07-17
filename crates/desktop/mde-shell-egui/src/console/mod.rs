@@ -350,6 +350,20 @@ struct ConsoleGroup {
     entries: &'static [ConsoleEntry],
 }
 
+/// One static Console entry exposed to the Start Menu's type-to-launch search.
+/// The payload is deliberately just enough for search/result rendering and a
+/// flat-index activation through [`ConsoleState::activate_index`]; all launch,
+/// gating, and close behavior still lives in Console's own activation path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsoleSearchHit {
+    pub(crate) flat: usize,
+    pub(crate) label: &'static str,
+    pub(crate) desc: &'static str,
+    pub(crate) group: &'static str,
+    pub(crate) tool: &'static str,
+    pub(crate) icon: IconId,
+}
+
 /// The pinned pair (lock #31): a plain Terminal + the Monitor. The Terminal is
 /// a LIVE surface link (the Terminal surface holds a real PTY shell today); the
 /// Monitor is a command entry, gated like the rest until CONSOLE-2.
@@ -674,6 +688,38 @@ fn entry_at(flat: usize) -> &'static ConsoleEntry {
     static_rows()
         .nth(flat)
         .expect("flat index within total_rows()")
+}
+
+/// Static Console rows that the Start Menu can rank beside app surfaces.
+/// Custom entries remain Console-local for now because they are user data loaded
+/// by [`ConsoleState`] and will join the larger unified index work.
+pub(crate) fn static_search_candidates() -> Vec<ConsoleSearchHit> {
+    let mut out = Vec::with_capacity(total_rows());
+    for (flat, entry) in PINNED.iter().enumerate() {
+        out.push(ConsoleSearchHit {
+            flat,
+            label: entry.label,
+            desc: entry.desc,
+            group: "Pinned",
+            tool: entry.tool,
+            icon: entry.icon,
+        });
+    }
+    let mut flat = PINNED.len();
+    for group in &GROUPS {
+        for entry in group.entries {
+            out.push(ConsoleSearchHit {
+                flat,
+                label: entry.label,
+                desc: entry.desc,
+                group: group.label,
+                tool: entry.tool,
+                icon: entry.icon,
+            });
+            flat += 1;
+        }
+    }
+    out
 }
 
 // ── the honest gate (§7 — typed, never a fake) ──────────────────────────────
@@ -1112,6 +1158,14 @@ impl ConsoleState {
                 }
             }
         }
+    }
+
+    /// Activate a static search result by flat index. This is the Start Menu
+    /// search seam; it intentionally delegates to [`Self::activate`] so search
+    /// results honor the same Goto/Plane/spawn/gate behavior as clicking the
+    /// Console row.
+    pub(crate) fn activate_index(&mut self, flat: usize) {
+        self.activate(flat);
     }
 
     /// Record the spawn-tab request that opens `cmd` in a `name`d Terminal tab,

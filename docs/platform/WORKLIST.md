@@ -958,6 +958,12 @@ These decisions refine acceptance and sequencing for the active items below.
 - Acceptance criteria: File results appear locally, mesh results rank by health
   and relevance, Browser omnibox can query the index, and private data stays local
   unless explicitly shared.
+- Current evidence: A 2026-07-17 Start-menu console-search slice added static
+  Console command candidates to the existing type-to-launch search, rendering
+  them beside app results and dispatching them through `ConsoleState` so Goto,
+  Plane, spawn, and gate behavior stay owned by the Console path; farm `.50`
+  fmt, BigBoy `.130` focused Enter-launch coverage, and `.90` focused ranking
+  coverage passed.
 - Verification method: Index fixture tests and UI search regression.
 - Origin or merged source IDs: SEARCH-omnibox, shell front-door search residual,
   old worklist line 6246.

@@ -112,15 +112,15 @@
 //! search-box spot), with a leading search glyph and a query-clear icon button;
 //! it auto-focuses when the menu opens so "open, then just type" filters live.
 //! An empty query is the unchanged grouped grid (zero behaviour change); the
-//! moment anything is typed, [`search_matches`] ranks
-//! the 18 tileable surfaces (case-insensitive: a label prefix beats a label
+//! moment anything is typed, [`search_matches`] ranks tileable surfaces and
+//! static Console entries (case-insensitive: a label prefix beats a label
 //! substring beats a group-name hit) and [`search_results`] paints that flat
 //! list in place of the grid — Up/Down move a highlight, Enter launches (the top
 //! match by default), a row click launches that row, Esc clears the query
-//! (a second, now-empty Esc dismisses the menu). Every launch routes through
-//! the SAME [`StartMenuState::tile_activation`] seam a tile click already uses,
-//! so `main.rs`'s existing drain carries a searched launch with NO new
-//! plumbing (this whole feature is self-contained to `start_menu.rs`). The
+//! (a second, now-empty Esc dismisses the menu). App launches route through the
+//! SAME [`StartMenuState::tile_activation`] seam a tile click already uses;
+//! Console launches route through `ConsoleState`, so the existing `main.rs`
+//! drains still carry searched launches with no duplicate action behavior. The
 //! box is a focused text field, so the embedded Console's own keyboard nav
 //! politely steps aside (`console::handle_keys` bails while a text field owns
 //! the keyboard) — one Enter never both launches a result and fires a Console
@@ -328,6 +328,35 @@ fn left_pane_content_rect(left_rect: egui::Rect, search_rect: egui::Rect) -> egu
         left_rect.min,
         egui::pos2(left_rect.right(), search_rect.top() - Style::SP_XS),
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartSearchHit {
+    Surface(Surface),
+    Console(console::ConsoleSearchHit),
+}
+
+impl StartSearchHit {
+    fn icon_id(self) -> IconId {
+        match self {
+            Self::Surface(surface) => surface.icon_id(),
+            Self::Console(hit) => hit.icon,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Surface(surface) => surface.label(),
+            Self::Console(hit) => hit.label,
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Surface(surface) => tile_group_label(surface),
+            Self::Console(hit) => hit.group,
+        }
+    }
 }
 
 // ── live-tile facts (WIN7-4, lock #5) ───────────────────────────────────────
@@ -936,7 +965,7 @@ pub fn start_menu_panel(
             // whether the search consumed this frame's Esc (a live query's
             // Esc clears the query, it must NOT be read as a menu dismissal —
             // see the self-closure guard below).
-            let (search_ate_escape, menu_open) = start_menu_search(ui, left_rect, state);
+            let (search_ate_escape, menu_open) = start_menu_search(ui, left_rect, state, console);
             console::console_content(ui, right_rect, console);
             (search_ate_escape, menu_open)
         });
@@ -1991,6 +2020,7 @@ fn start_menu_search(
     ui: &mut egui::Ui,
     left_rect: egui::Rect,
     state: &mut StartMenuState,
+    console: &mut ConsoleState,
 ) -> (bool, bool) {
     // The search field sits in the left pane's bottom headroom; the grid /
     // result list get everything above it.
@@ -2070,14 +2100,22 @@ fn start_menu_search(
     let clicked = search_results(ui, content_rect, &matches, state.search_highlight);
 
     // Enter launches the highlighted match (the top match by default); a click
-    // on any row launches that one — both via the tile_activation seam.
+    // on any row launches that one. App hits use the tile_activation seam, and
+    // Console hits delegate to ConsoleState's existing activation path.
     let launch = clicked.or_else(|| {
         (enter && !matches.is_empty())
             .then(|| matches[state.search_highlight.min(matches.len() - 1)])
     });
-    if let Some(surface) = launch {
-        state.tile_activation = Some(surface);
-        state.close();
+    if let Some(hit) = launch {
+        match hit {
+            StartSearchHit::Surface(surface) => {
+                state.tile_activation = Some(surface);
+                state.close();
+            }
+            StartSearchHit::Console(hit) => {
+                console.activate_index(hit.flat);
+            }
+        }
         return (false, false);
     }
     if esc {
@@ -2152,7 +2190,7 @@ fn search_field(
     let resp = ui.put(
         text_rect,
         egui::TextEdit::singleline(query)
-            .hint_text("Search apps…")
+            .hint_text("Search apps and commands…")
             .font(egui::FontId::proportional(Style::BODY))
             .desired_width(text_rect.width())
             .return_key(None)
@@ -2211,8 +2249,10 @@ fn search_clear_button_id() -> egui::Id {
 /// the static surface tables — unit-tested without a GPU, and the ONE authority
 /// the render + keyboard both read so the painted list and Enter's target can't
 /// diverge.
-fn search_matches(query: &str) -> Vec<Surface> {
-    let items = Surface::ALL
+fn search_matches(query: &str) -> Vec<StartSearchHit> {
+    let console_hits = console::static_search_candidates();
+    let cap = Surface::ALL.len() + console_hits.len();
+    let surface_items = Surface::ALL
         .iter()
         .copied()
         .enumerate()
@@ -2221,12 +2261,22 @@ fn search_matches(query: &str) -> Vec<Surface> {
                 SearchDomain::App,
                 surface.label(),
                 format!("surface:{surface:?}"),
-                surface,
+                StartSearchHit::Surface(surface),
             )
-            .with_terms([tile_group_label(surface)])
+            .with_terms([tile_group_label(surface), "App"])
             .with_source_rank(idx)
         });
-    ranked_hits(query, items, Surface::ALL.len())
+    let console_items = console_hits.into_iter().map(|hit| {
+        SearchItem::new(
+            SearchDomain::App,
+            hit.label,
+            format!("console:{}", hit.flat),
+            StartSearchHit::Console(hit),
+        )
+        .with_terms([hit.desc, hit.group, hit.tool, "Console"])
+        .with_source_rank(Surface::ALL.len() + hit.flat)
+    });
+    ranked_hits(query, surface_items.chain(console_items), cap)
         .into_iter()
         .map(|hit| hit.item.payload)
         .collect()
@@ -2266,12 +2316,12 @@ fn grouped_grid_surfaces() -> Vec<Surface> {
 }
 
 /// The ranked result list that replaces the grouped grid while a query is live
-/// (SHELL-UX-3): one compact row per match — leading glyph, the surface label,
-/// and its dim group name right-aligned — with the keyboard-highlighted row
+/// (SHELL-UX-3): one compact row per match — leading glyph, result label,
+/// and dim source/group name right-aligned — with the keyboard-highlighted row
 /// (and any hover) wearing the SAME `SURFACE_HI` fill the tiles use, plus an
 /// accent left stripe on the highlight so the Enter target reads at a glance.
-/// A click on a row returns its surface for the caller to launch (via the
-/// `tile_activation` seam), matching the tile grid's own click contract. An
+/// A click on a row returns its hit for the caller to launch through the owning
+/// activation seam, matching the tile grid's own click contract. An
 /// empty result set paints an honest "no match" note (§7 — never a silent
 /// blank). Direct-painter + `ui.interact` per row, the SAME addressable-cell
 /// style [`tile`] uses (so a test can read a row's rect back by id and click
@@ -2280,15 +2330,15 @@ fn grouped_grid_surfaces() -> Vec<Surface> {
 fn search_results(
     ui: &egui::Ui,
     rect: egui::Rect,
-    matches: &[Surface],
+    matches: &[StartSearchHit],
     selected: usize,
-) -> Option<Surface> {
+) -> Option<StartSearchHit> {
     let painter = ui.painter().clone();
     if matches.is_empty() {
         painter.text(
             egui::pos2(rect.left() + PANE_PAD, rect.top() + PANE_PAD),
             egui::Align2::LEFT_TOP,
-            "No apps match your search",
+            "No apps or commands match your search",
             egui::FontId::proportional(Style::BODY),
             Style::TEXT_DIM,
         );
@@ -2298,9 +2348,9 @@ fn search_results(
     let x0 = rect.left() + PANE_PAD;
     let w = (rect.width() - PANE_PAD * 2.0).max(0.0);
     let mut y = rect.top() + PANE_PAD;
-    for (i, &surface) in matches.iter().enumerate() {
+    for (i, &hit) in matches.iter().enumerate() {
         let row = egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(w, RESULT_ROW_H));
-        let resp = ui.interact(row, search_result_id(surface), egui::Sense::click());
+        let resp = ui.interact(row, search_result_hit_id(hit), egui::Sense::click());
         let is_sel = i == selected;
         let hovered = resp.hovered();
         if is_sel || hovered {
@@ -2318,7 +2368,7 @@ fn search_results(
         } else {
             Style::TEXT_DIM
         };
-        if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), RESULT_ICON, tint) {
+        if let Some(tex) = icon_texture(ui.ctx(), hit.icon_id(), RESULT_ICON, tint) {
             let icon = egui::Rect::from_center_size(
                 egui::pos2(row.left() + Style::SP_S + RESULT_ICON / 2.0, row.center().y),
                 egui::vec2(RESULT_ICON, RESULT_ICON),
@@ -2332,20 +2382,20 @@ fn search_results(
                 row.center().y,
             ),
             egui::Align2::LEFT_CENTER,
-            surface.label(),
+            hit.label(),
             egui::FontId::proportional(Style::BODY),
             tint,
         );
         painter.text(
             egui::pos2(row.right() - Style::SP_S, row.center().y),
             egui::Align2::RIGHT_CENTER,
-            tile_group_label(surface),
+            hit.detail(),
             egui::FontId::proportional(Style::SMALL),
             Style::TEXT_DIM,
         );
-        install_result_accessibility(ui.ctx(), surface, row, is_sel);
+        install_result_accessibility(ui.ctx(), hit, row, is_sel);
         if response_activated(ui, &resp) {
-            activated = Some(surface);
+            activated = Some(hit);
         }
         y += RESULT_ROW_H;
     }
@@ -2357,6 +2407,17 @@ fn search_results(
 /// row's settled `Rect` back to click its centre).
 fn search_result_id(surface: Surface) -> egui::Id {
     egui::Id::new(("start-menu-search-result", surface))
+}
+
+fn console_search_result_id(flat: usize) -> egui::Id {
+    egui::Id::new(("start-menu-console-search-result", flat))
+}
+
+fn search_result_hit_id(hit: StartSearchHit) -> egui::Id {
+    match hit {
+        StartSearchHit::Surface(surface) => search_result_id(surface),
+        StartSearchHit::Console(hit) => console_search_result_id(hit.flat),
+    }
 }
 
 // ── accesskit (lock #14) ─────────────────────────────────────────────────────
@@ -2597,8 +2658,15 @@ fn install_search_clear_accessibility(ctx: &egui::Context, rect: egui::Rect) {
 }
 
 /// The stable accesskit node id for one search-result row.
-fn search_result_accesskit_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("start-menu-search-result-accesskit", surface))
+fn search_result_accesskit_id(hit: StartSearchHit) -> egui::Id {
+    match hit {
+        StartSearchHit::Surface(surface) => {
+            egui::Id::new(("start-menu-search-result-accesskit", surface))
+        }
+        StartSearchHit::Console(hit) => {
+            egui::Id::new(("start-menu-console-search-result-accesskit", hit.flat))
+        }
+    }
 }
 
 /// The stable accesskit node id for one tile context-menu row.
@@ -2630,13 +2698,14 @@ fn install_context_menu_row_accessibility(
 /// grid already uses.
 fn install_result_accessibility(
     ctx: &egui::Context,
-    surface: Surface,
+    hit: StartSearchHit,
     rect: egui::Rect,
     selected: bool,
 ) {
-    let _ = ctx.accesskit_node_builder(search_result_accesskit_id(surface), |node| {
+    let _ = ctx.accesskit_node_builder(search_result_accesskit_id(hit), |node| {
         node.set_role(egui::accesskit::Role::Button);
-        node.set_label(surface.label());
+        node.set_label(hit.label());
+        node.set_value(hit.detail());
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
         if selected {
@@ -2662,11 +2731,11 @@ fn install_search_results_announcement(
     ctx: &egui::Context,
     rect: egui::Rect,
     query: &str,
-    matches: &[Surface],
+    matches: &[StartSearchHit],
     selected: usize,
 ) {
     let value = if matches.is_empty() {
-        format!("No apps match {query}")
+        format!("No apps or commands match {query}")
     } else {
         let sel = matches[selected.min(matches.len() - 1)];
         format!(
@@ -2688,9 +2757,10 @@ fn install_search_results_announcement(
 #[cfg(test)]
 mod tests {
     use super::{start_menu_panel, StartMenuPrefs, StartMenuState, PANEL_H, PANEL_W};
-    use crate::console::{self, ConsoleState};
+    use crate::console::{self, ConsoleRequest, ConsoleState};
     use crate::dock::Surface;
     use crate::status::{SegmentRollup, StatusSegments};
+    use crate::workbench::Plane;
     use mde_egui::egui;
     use mde_egui::Style;
 
@@ -3903,17 +3973,37 @@ mod tests {
         egui::Event::Text(s.to_string())
     }
 
+    fn search_surfaces(query: &str) -> Vec<Surface> {
+        super::search_matches(query)
+            .into_iter()
+            .filter_map(|hit| match hit {
+                super::StartSearchHit::Surface(surface) => Some(surface),
+                super::StartSearchHit::Console(_) => None,
+            })
+            .collect()
+    }
+
+    fn search_console_labels(query: &str) -> Vec<&'static str> {
+        super::search_matches(query)
+            .into_iter()
+            .filter_map(|hit| match hit {
+                super::StartSearchHit::Surface(_) => None,
+                super::StartSearchHit::Console(hit) => Some(hit.label),
+            })
+            .collect()
+    }
+
     #[test]
     fn a_query_filters_to_the_tiles_whose_label_matches() {
         // The pure ranking authority both the render and Enter read (so the
         // painted list and Enter's target can never diverge). Case-insensitive
         // substring over Surface::label().
         use Surface::{Phones, Terminal, Workbench};
-        assert_eq!(super::search_matches("phone"), vec![Phones]);
-        assert_eq!(super::search_matches("term"), vec![Terminal]);
-        assert_eq!(super::search_matches("workbench"), vec![Workbench]);
+        assert_eq!(search_surfaces("phone"), vec![Phones]);
+        assert_eq!(search_surfaces("term"), vec![Terminal]);
+        assert_eq!(search_surfaces("workbench"), vec![Workbench]);
         assert_eq!(
-            super::search_matches("PHONES"),
+            search_surfaces("PHONES"),
             vec![Phones],
             "matching is case-insensitive"
         );
@@ -3933,18 +4023,31 @@ mod tests {
     }
 
     #[test]
+    fn a_query_also_matches_console_static_entries() {
+        assert_eq!(
+            search_console_labels("cloud plane").first(),
+            Some(&"Cloud Plane (GUI)"),
+            "Console static entries join the Start Menu search result set"
+        );
+        assert!(
+            search_console_labels("journal").contains(&"Live Logs"),
+            "Console descriptions and labels are searchable"
+        );
+    }
+
+    #[test]
     fn search_ranks_prefix_over_substring_over_group_name() {
         use Surface::{InfraCode, MeshView, Music, Workbench};
         // "mesh": a label PREFIX ("Mesh Map") outranks a GROUP-name-only hit
         // ("Mesh Control" → Workbench/InfraCode); ties keep Surface::ALL order.
         assert_eq!(
-            super::search_matches("mesh"),
+            search_surfaces("mesh"),
             vec![MeshView, Workbench, InfraCode],
             "the label-prefix hit leads, then the group-only hits in ALL order"
         );
         // "i": the sole label-PREFIX ("Infra as Code") ranks above every
         // label-SUBSTRING hit (Music/Media/Files/…), never buried among them.
-        let by_i = super::search_matches("i");
+        let by_i = search_surfaces("i");
         assert_eq!(by_i.first(), Some(&InfraCode), "the prefix match leads");
         assert!(
             by_i.len() > 1 && by_i.contains(&Music),
@@ -3958,15 +4061,15 @@ mod tests {
         // the old substring tiers found nothing — the 4th tier does.
         use Surface::{Editor, MeshView};
         assert!(
-            super::search_matches("edtr").contains(&Editor),
+            search_surfaces("edtr").contains(&Editor),
             "'edtr' is a subsequence of 'Editor' (e-d-i-t-o-r), so it fuzzy-matches"
         );
         assert!(
-            super::search_matches("meshmp").contains(&MeshView),
+            search_surfaces("meshmp").contains(&MeshView),
             "'meshmp' is a subsequence of 'Mesh Map' across the space, so it fuzzy-matches"
         );
         assert!(
-            super::search_matches("mm").contains(&MeshView),
+            search_surfaces("mm").contains(&MeshView),
             "'mm' is a subsequence of 'Mesh Map' (the two m's), so it fuzzy-matches"
         );
     }
@@ -3977,14 +4080,14 @@ mod tests {
         // The task's literal example: an exact PREFIX leads its result list, so
         // the fuzzy tier never displaces it.
         assert_eq!(
-            super::search_matches("edi").first(),
+            search_surfaces("edi").first(),
             Some(&Editor),
             "'edi' is a prefix of 'Editor' — the prefix hit still leads"
         );
         // A query carrying BOTH an exact hit and a fuzzy-only hit: the prefix
         // ('Bookmarks') leads and the fuzzy subsequence ('Browser' = b..o, not a
         // substring of "browser") is included but pinned to the bottom.
-        let bo = super::search_matches("bo");
+        let bo = search_surfaces("bo");
         assert_eq!(bo.first(), Some(&Bookmarks), "the label-prefix hit leads");
         assert_eq!(
             bo.last(),
@@ -4000,7 +4103,7 @@ mod tests {
         // Order matters: 'rotide' holds Editor's letters but out of order, so it
         // is NOT a subsequence — an honest no-match, not a fuzzy false positive.
         assert!(
-            super::search_matches("rotide").is_empty(),
+            search_surfaces("rotide").is_empty(),
             "fuzzy matching is order-sensitive, not a bag-of-chars test"
         );
     }
@@ -4013,7 +4116,7 @@ mod tests {
         // tier; the tighter (fewer-gaps) 'Browser' must sort first even though
         // 'Storage' starts earlier.
         assert_eq!(
-            super::search_matches("sr"),
+            search_surfaces("sr"),
             vec![Browser, Storage],
             "among fuzzy hits the tighter match (fewer gaps) leads"
         );
@@ -4102,7 +4205,38 @@ mod tests {
         assert!(
             console.take_request().is_none(),
             "the focused search box kept the embedded Console's own Enter nav inert \
-             (one Enter never both launches a result AND fires a Console row)"
+            (one Enter never both launches a result AND fires a Console row)"
+        );
+    }
+
+    #[test]
+    fn typing_then_enter_launches_a_console_search_hit_through_console() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        drive(&ctx, &mut s, &mut console, vec![text("cloud plane")], SZ);
+        assert_eq!(
+            search_console_labels("cloud plane").first(),
+            Some(&"Cloud Plane (GUI)")
+        );
+
+        drive(&ctx, &mut s, &mut console, vec![key(egui::Key::Enter)], SZ);
+
+        assert_eq!(
+            console.take_request(),
+            Some(ConsoleRequest::Plane(Plane::Cloud)),
+            "Console search hits dispatch through ConsoleState, not a duplicated Start action"
+        );
+        assert!(
+            s.take_tile_activation().is_none(),
+            "Console search hits must not masquerade as app tile activations"
+        );
+        assert!(
+            !s.is_open(),
+            "a successful Console search launch closes the whole Start Menu"
         );
     }
 
