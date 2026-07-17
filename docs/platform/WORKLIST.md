@@ -824,6 +824,10 @@ These decisions refine acceptance and sequencing for the active items below.
   helper-backed, and internal-tab wording with user-facing Controls, Engines,
   open-tab, and live-web-page labels; BigBoy `.130` focused `browser_options`
   coverage passed.
+  A later 2026-07-17 Browser downloads unavailable-state copy pass replaced the
+  remaining visible Transfers worker wording with Browser-facing downloads
+  unavailable copy and extended drawer guards against worker/helper/ledger terms;
+  farm `.50` fmt and BigBoy `.130` focused drawer header/muted-note tests passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -996,6 +1000,9 @@ These decisions refine acceptance and sequencing for the active items below.
   helper/internal page language with user-facing Controls, Engines, open-tab,
   and live-web-page wording while preserving compact/wide layout coverage;
   BigBoy `.130` focused `browser_options` coverage passed.
+  A later 2026-07-17 Browser downloads unavailable-state pass kept empty-drawer
+  text on Browser Material dim tokens while replacing worker-facing unavailable
+  copy; farm `.50` fmt and BigBoy `.130` focused drawer copy/color tests passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
