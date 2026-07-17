@@ -895,6 +895,11 @@ These decisions refine acceptance and sequencing for the active items below.
   `ChromeIcon`, added responsive Browser Options layout coverage for narrow and
   wide viewports, and passed farm fmt, focused icon painter coverage, focused
   Options-page render coverage, and a production-feature `mde-shell-egui` check.
+  A later 2026-07-17 media-toolbar pass added a responsive Browser media-control
+  density policy (`Full`, `Compact`, `IconOnly`, `Hidden`) that reserves the
+  omnibox minimum width, elides compact metadata before paint, and keeps narrow
+  chrome from being consumed by the media cluster; farm `.50` fmt and `.130`
+  focused `browser_media_toolbar` plus exact compact-label tests passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
