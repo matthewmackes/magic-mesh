@@ -1001,6 +1001,19 @@ mod tests {
     }
 
     #[test]
+    fn browser_cef_selinux_policy_allows_proc_pressure_reads() {
+        let policy = include_str!("../../../../../packaging/selinux/mde-web-cef.te");
+        assert!(
+            policy.contains("type proc_psi_t;")
+                && policy.contains("allow mde_web_cef_t proc_psi_t:dir")
+                && policy.contains("search")
+                && policy.contains("allow mde_web_cef_t proc_psi_t:file")
+                && policy.contains("read"),
+            "CEF SELinux policy must allow read-only PSI /proc/pressure probes without AVC flood"
+        );
+    }
+
+    #[test]
     fn browser_rpm_ships_cef_webextensions_smoke_assets_but_base_and_server_do_not() {
         let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];
