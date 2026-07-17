@@ -1107,6 +1107,12 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-17 Start-menu context-row AccessKit pass added named button
   nodes for the tile context menu's Open/Pin rows; farm `.50` fmt and BigBoy
   `.130` focused context-row coverage passed.
+  A later 2026-07-17 Start-menu pinned-shortcut AccessKit pass kept pinned
+  shortcut tiles visually identical to their grouped copies while prefixing the
+  pinned copy's accessibility value with `Pinned shortcut`, so assistive
+  consumers can distinguish the two Browser entries; farm `.50` fmt and BigBoy
+  `.130` focused `pinned_tile_accesskit_value_names_the_shortcut_copy` coverage
+  passed.
 - Verification method: AccessKit tree tests, live consumer smoke, and UI tests for
   named controls.
 - Origin or merged source IDs: a11y-02/04/05/06/07/08, shell-ux-6, platform

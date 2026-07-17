@@ -2575,11 +2575,13 @@ fn tile_accesskit_id(cell: NavCell) -> egui::Id {
 /// the SAME "label stays the identity, value carries the live reading" split
 /// `install_segment_accessibility` already uses (its own `.set_value` carries
 /// the segment's current severity summary while `.set_label` stays the fixed
-/// "{Segment} status"). Deliberately NOT individually `Live::Polite`: a
-/// screen reader hearing every one of up to 18 tiles announce itself on the
-/// same rotation clock would be a spam regression, not an accessibility win
-/// — [`install_tiles_live_summary`] is the ONE live-announcing node for the
-/// whole grid, mirroring NOTIF-11's own shape exactly (one live
+/// "{Segment} status"). Pinned shortcut copies keep the visible surface label,
+/// but prefix the accesskit value so assistive consumers can distinguish them
+/// from the grouped copy. Deliberately NOT individually `Live::Polite`: a screen
+/// reader hearing every one of up to 18 tiles announce itself on the same
+/// rotation clock would be a spam regression, not an accessibility win —
+/// [`install_tiles_live_summary`] is the ONE live-announcing node for the whole
+/// grid, mirroring NOTIF-11's own shape exactly (one live
 /// `status_live_region_id` summary + per-item value-bearing-but-not-live
 /// `segment_pip` nodes in `status.rs`).
 fn install_tile_accessibility(
@@ -2591,7 +2593,11 @@ fn install_tile_accessibility(
     let _ = ctx.accesskit_node_builder(tile_accesskit_id(cell), |node| {
         node.set_role(egui::accesskit::Role::Button);
         node.set_label(cell.surface.label());
-        node.set_value(display_text);
+        if cell.pinned {
+            node.set_value(format!("Pinned shortcut, {display_text}"));
+        } else {
+            node.set_value(display_text);
+        }
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
     });
@@ -3924,6 +3930,34 @@ mod tests {
             .find(|n| n.label() == Some(Surface::About.label()))
             .expect("About tile node");
         assert_eq!(about.value(), Some(Surface::About.label()));
+    }
+
+    #[test]
+    fn pinned_tile_accesskit_value_names_the_shortcut_copy() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        s.pinned = vec![Surface::Browser];
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let nodes = accesskit_nodes(&out);
+        let browser_values: Vec<_> = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .filter(|n| n.label() == Some(Surface::Browser.label()))
+            .filter_map(|n| n.value())
+            .collect();
+
+        assert!(
+            browser_values.contains(&"Pinned shortcut, Browser"),
+            "the pinned copy must be distinguishable from the grouped Browser tile: {browser_values:?}"
+        );
+        assert!(
+            browser_values.contains(&"Browser"),
+            "the grouped Browser tile keeps the normal value: {browser_values:?}"
+        );
     }
 
     // ── WIN7-7: the open/close transition itself is announced (lock #14) ────
