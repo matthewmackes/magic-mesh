@@ -170,6 +170,17 @@ impl Canvas {
         self.pixels.iter().filter(|pixel| **pixel == color).count()
     }
 
+    pub(crate) fn count_near_color(&self, color: Color32, tolerance: u8) -> usize {
+        self.pixels
+            .iter()
+            .filter(|pixel| {
+                pixel.r().abs_diff(color.r()) <= tolerance
+                    && pixel.g().abs_diff(color.g()) <= tolerance
+                    && pixel.b().abs_diff(color.b()) <= tolerance
+            })
+            .count()
+    }
+
     /// Write this canvas as a PNG, creating its parent directory if needed.
     ///
     /// Encoded RGB (no alpha channel): every stored pixel is fully opaque by

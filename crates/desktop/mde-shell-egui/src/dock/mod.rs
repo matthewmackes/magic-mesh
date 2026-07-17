@@ -933,7 +933,7 @@ pub fn notification_rail_with_sources(
             // taskbar concept), so it trails past the clock as an extra rather than
             // interrupting the four-part contract (painted below, right to left).
             let tray_icon_w = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
-            let status_w = tray_icon_w * status::StatusSegment::ALL.len() as f32;
+            let status_w = status::notification_rail_width(&state.status.segments, tray_icon_w);
             let clock_w = rail_h * 2.2;
             // WIN10-HYBRID #31 — the right cluster carries the Win10
             // **action-center** cell (a `rail_h`-wide Chat launcher + its `SP_XS`

@@ -947,8 +947,15 @@ These decisions refine acceptance and sequencing for the active items below.
   text chip so percent/starting state remains visible with long labels, and
   replaced `operation(s)` AccessKit wording with normal singular/plural copy;
   farm `.50` fmt, BigBoy `.130` `mde-egui operation_progress_badge`, and `.90`
-  `mde-shell-egui file_operation_progress` coverage passed. A live visual smoke
-  is still needed before closing the item.
+  `mde-shell-egui file_operation_progress` coverage passed. A later 2026-07-17
+  compact-rail visual pass made active file operations reserve a mini progress
+  badge directly inside the bottom navigation status cluster instead of only a
+  Files pip, kept the expanded status-panel progress row, and added screenshot
+  proof for both states; BigBoy `.130` focused `file_operation_progress`
+  coverage passed, farm `.50` fmt passed, and the generated
+  `taskbar-file-progress-rail.png` / `taskbar-file-progress-panel.png` artifacts
+  were pulled and visually inspected. A live `.15` visual smoke is still needed
+  before closing the item.
 - Acceptance criteria: Opening a desktop creates a switchable bar entry; file
   copy/upload/download/compress/extract operations share the same progress UI;
   progress survives surface switches.

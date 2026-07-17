@@ -33,6 +33,7 @@ const EDGE_PULSE_SECONDS: f32 = 2.4;
 const EDGE_PULSE_HALF_CYCLE_SECONDS: f32 = 0.24;
 const EDGE_HELD_W: f32 = 3.0;
 const EDGE_PULSE_W: f32 = 14.0;
+const FILE_OPERATIONS_RAIL_W: f32 = 148.0;
 
 /// The bottom notification/status segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -296,6 +297,21 @@ pub(crate) fn segment_color(segment: StatusSegment, segments: &StatusSegments) -
         StatusSegment::FileOperations => Style::TEXT_DIM,
         _ => severity_color(segments.get(segment)),
     }
+}
+
+fn segment_rail_width(segment: StatusSegment, segments: &StatusSegments, pip_h: f32) -> f32 {
+    if segment == StatusSegment::FileOperations && segments.file_operations.is_some() {
+        FILE_OPERATIONS_RAIL_W.max(pip_h)
+    } else {
+        pip_h
+    }
+}
+
+pub(crate) fn notification_rail_width(segments: &StatusSegments, pip_h: f32) -> f32 {
+    StatusSegment::ALL
+        .into_iter()
+        .map(|segment| segment_rail_width(segment, segments, pip_h))
+        .sum()
 }
 
 /// `pub(crate)` for the SAME WIN7-4 reuse [`severity_color`] documents.
@@ -736,15 +752,24 @@ pub fn notification_rail(
     let rail_h = rect.height();
     let mut x = rect.left();
     for segment in StatusSegment::ALL {
+        let segment_w = segment_rail_width(segment, segments, rail_h);
         let pip_rect =
-            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(rail_h, rail_h))
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(segment_w, rail_h))
                 .shrink(2.0);
-        if segment_pip(ui, segment, segments, pip_rect) {
+        let routed = if segment == StatusSegment::FileOperations {
+            segments.file_operations.as_ref().map_or_else(
+                || segment_pip(ui, segment, segments, pip_rect),
+                |progress| file_operation_compact_segment(ui, pip_rect, segments, progress),
+            )
+        } else {
+            segment_pip(ui, segment, segments, pip_rect)
+        };
+        if routed {
             *active = segment.route();
             out.routed = true;
             out.routed_segment = Some(segment);
         }
-        x += rail_h;
+        x += segment_w;
     }
     let _ = expanded;
     out
@@ -857,6 +882,90 @@ fn segment_pip(
     } else {
         painter.circle_filled(center, Style::SP_XS, color);
     }
+    resp.clicked()
+}
+
+fn file_operation_compact_segment(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    segments: &StatusSegments,
+    progress: &FileOperationStatus,
+) -> bool {
+    install_segment_accessibility(ui.ctx(), StatusSegment::FileOperations, segments, rect);
+    let resp = ui.interact(
+        rect,
+        segment_pip_id(StatusSegment::FileOperations),
+        egui::Sense::click(),
+    );
+    let view = progress.view();
+    let painter = ui.painter().clone();
+    let fill = if resp.hovered() {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    painter.rect_filled(rect, Style::RADIUS, fill);
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let font = FontId::proportional(Style::SMALL);
+    let status = view.fraction.map_or_else(
+        || "starting".to_string(),
+        |fraction| format!("{:.0}%", fraction * 100.0),
+    );
+    let status_color = if view.fraction.is_some() {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    };
+    let status_width = painter
+        .layout_no_wrap(status.clone(), font.clone(), status_color)
+        .size()
+        .x;
+    let text_y = rect.top() + Style::SP_XS;
+    let label_right =
+        (rect.right() - Style::SP_S - status_width - Style::SP_XS).max(rect.left() + Style::SP_M);
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + Style::SP_XS, rect.top()),
+        egui::pos2(label_right, rect.bottom()),
+    )
+    .intersect(rect);
+    painter.with_clip_rect(label_clip).text(
+        egui::pos2(rect.left() + Style::SP_XS, text_y),
+        egui::Align2::LEFT_TOP,
+        view.label,
+        font.clone(),
+        Style::TEXT,
+    );
+    painter.text(
+        egui::pos2(rect.right() - Style::SP_XS, text_y),
+        egui::Align2::RIGHT_TOP,
+        status,
+        font,
+        status_color,
+    );
+
+    let track = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.left() + Style::SP_XS,
+            rect.bottom() - Style::SP_XS - 3.0,
+        ),
+        egui::vec2((rect.width() - Style::SP_S).max(Style::SP_M), 3.0),
+    );
+    painter.rect_filled(track, Style::RADIUS_S, Style::LAYER_01);
+    let (fraction, color) = view.fraction.map_or((0.14, Style::TEXT_DIM), |fraction| {
+        (fraction, Style::ACCENT)
+    });
+    let fill_w = (track.width() * fraction.clamp(0.0, 1.0)).max(Style::SP_XS);
+    painter.rect_filled(
+        egui::Rect::from_min_size(track.min, egui::vec2(fill_w, track.height())),
+        Style::RADIUS_S,
+        color,
+    );
     resp.clicked()
 }
 

@@ -261,6 +261,53 @@ fn drive_vdock_with_sources(
     })
 }
 
+fn capture_taskbar_screenshot(
+    name: &str,
+    state: &mut DockState,
+    size: egui::Vec2,
+    sources: &[DesktopRailSource],
+) -> crate::screenshot::Canvas {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+        ..Default::default()
+    };
+    let mut cap = crate::screenshot::Capture::new();
+    let _settle = cap.frame(&ctx, input(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label("surface");
+        });
+        let _ = notification_rail_with_sources(ctx, state, sources);
+    });
+    let canvas = cap.frame(&ctx, input(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label("surface");
+        });
+        let _ = notification_rail_with_sources(ctx, state, sources);
+    });
+
+    assert_eq!(
+        (canvas.width(), canvas.height()),
+        (size.x.round() as usize, size.y.round() as usize),
+        "taskbar screenshot canvas must match the driven viewport"
+    );
+    assert!(!canvas.is_blank(), "taskbar screenshot must not be blank");
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("screenshots")
+        .join(name);
+    canvas
+        .write_png(&path)
+        .expect("write the taskbar visual-proof screenshot");
+    println!(
+        "taskbar visual-proof screenshot written to {}",
+        path.display()
+    );
+    canvas
+}
+
 #[test]
 fn the_vertical_dock_is_a_48px_full_height_column() {
     // Locks #2/#23 — the dock is one 48px-wide column, sharing the horizontal
@@ -1154,6 +1201,70 @@ fn file_operation_progress_renders_in_the_status_panel_and_routes_to_transfers()
     assert!(
         !s.status_panel_open,
         "routing from the status-panel file-operation row closes the panel"
+    );
+}
+
+fn file_progress_visual_state(panel_open: bool) -> DockState {
+    let mut s = DockState::default();
+    if panel_open {
+        s.open_status_panel_for_test();
+    }
+    s.set_active(Surface::Desktop);
+    s.set_file_operation_progress(Some(FileOperationProgress::new(
+        3,
+        Some(0.64),
+        "3 file operations",
+    )));
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        1,
+        true,
+        vec![
+            SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP"),
+            SessionRailEntry::with_session_id("session-2", "Build Desktop", "VNC"),
+        ],
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    s
+}
+
+#[test]
+fn file_operation_progress_visual_screenshots_cover_bottom_rail_and_panel() {
+    let size = egui::vec2(1280.0, 760.0);
+    let sources = vec![DesktopRailSource::new(
+        "desktop-accounting",
+        "Accounting VM",
+        "oak",
+        "RDP",
+        true,
+        true,
+        true,
+    )];
+
+    let mut rail = file_progress_visual_state(false);
+    let rail_canvas =
+        capture_taskbar_screenshot("taskbar-file-progress-rail.png", &mut rail, size, &sources);
+    assert!(
+        rail_canvas.count_exact_color(Style::CAPTURE_CLEAR) < rail_canvas.width(),
+        "bottom-rail screenshot should not expose the capture-clear background"
+    );
+    assert!(
+        rail_canvas.count_near_color(Style::ACCENT, 48) > 40,
+        "bottom-rail screenshot must paint a compact file-operation progress bar"
+    );
+
+    let mut panel = file_progress_visual_state(true);
+    let panel_canvas = capture_taskbar_screenshot(
+        "taskbar-file-progress-panel.png",
+        &mut panel,
+        size,
+        &sources,
+    );
+    assert!(
+        panel_canvas.count_near_color(Style::ACCENT, 48) > 80,
+        "expanded file-operation progress screenshot must paint the shared accent progress bar"
     );
 }
 
