@@ -837,6 +837,11 @@ These decisions refine acceptance and sequencing for the active items below.
   DevTools gates, and runtime notices with user-facing Chromium labels while
   preserving CEF implementation markers; farm `.50` fmt, `.90` menu/hover tests,
   `.170` chrome-ui label tests, and BigBoy `.130` live-helper gate test passed.
+  A later 2026-07-17 Browser update-status copy pass replaced raw updater state,
+  runtime paths, CEF wording, and manifest errors in the engine update drawer and
+  launch-block notice with Chromium-facing labels and sanitized verification
+  details; farm `.50` fmt, `.90` focused drawer render coverage, `.170`
+  status-chip coverage, and BigBoy `.130` live-helper gate coverage passed.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1016,6 +1021,11 @@ These decisions refine acceptance and sequencing for the active items below.
   implementation pairing with Chromium-facing menu, Options, hover, and gate copy;
   farm `.50` fmt, `.90` menu/hover tests, `.170` chrome-ui label tests, and BigBoy
   `.130` live-helper gate test passed.
+  A later 2026-07-17 Browser update-status copy pass moved the engine update
+  drawer and launch-block notice off raw daemon state/path/error text and onto
+  Browser Material colors with Chromium-facing labels plus sanitized verification
+  details; farm `.50` fmt, `.90` focused drawer render coverage, `.170`
+  status-chip coverage, and BigBoy `.130` live-helper gate coverage passed.
   Representative live screenshots still wait on WL-CRIT-003's `.15`
   install/runtime proof.
 - Acceptance criteria: No shared shell text leaks into browser chrome, required
