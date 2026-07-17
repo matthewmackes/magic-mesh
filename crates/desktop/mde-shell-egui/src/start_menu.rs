@@ -10,15 +10,13 @@
 //! anchored at the screen's true bottom-left edge, opening **upward** from the
 //! bottom taskbar.
 //!
-//! **Panes (lock #4):** left = a placeholder for WIN7-3's live-tile grid (this
-//! unit ships the shell only, no tile content); right = [`console::ConsoleState`]
-//! embedded via [`console::console_content`] — CONSOLE-1's existing operational
-//! front door (groups, Power section, Custom entries, the CONSOLE-2 spawn-tab
-//! seam), unchanged and fully working, not a bare label. Migrating Console's
-//! *content* here is real work this unit does; *redesigning* its presentation
-//! for the new home (lock #10) is WIN7-5's job — today it renders exactly as
-//! it always has, just embedded at this panel's right-pane rect instead of
-//! mounting its own independent `Area`.
+//! **Panes (lock #4):** left = the Start launcher pane — live tiles, pinned
+//! shortcuts, type-to-launch search, keyboard navigation, and per-tile context
+//! rows; right = [`console::ConsoleState`] embedded via
+//! [`console::console_content`] — CONSOLE-1's operational front door (groups,
+//! Power section, Custom entries, the CONSOLE-2 spawn-tab seam). The Console
+//! content is still owned by `console.rs`; this module owns the surrounding
+//! Start Menu shell, left launcher pane, and open/close propagation.
 //!
 //! **Console's open state is now a mirror, not a source of truth.** Before this
 //! unit, `ConsoleState::open` was the Start cell's own toggle latch. Now this
@@ -37,44 +35,30 @@
 //! menu the way a Win10 Start Menu always did — never a dangling "Console says
 //! closed but the panel is still up" desync.
 //!
-//! **The VDOCK-1 / Super key overlap (a judgment call, not covered by the
-//! survey):** the vertical dock (`dock.rs`) ALREADY binds a clean Super tap to
-//! `DockState::toggle` (VDOCK-1, `docs/design/vertical-dock.md` lock #13) —
-//! it's the shell's only surface launcher until WIN7-3 lands real tiles here,
-//! so this unit must not steal Super away from it (that would strand every
-//! surface behind an unpinned, now-unreachable dock). Lock #13 in the win7
-//! survey just says "Super opens the Start Menu," without addressing that
-//! pre-existing claim. The Win10-hybrid taskbar later retired the rendered
-//! left dock; `main.rs` still drains the same hotkey latch for the Start Menu,
-//! and this panel now anchors to the screen's true left edge rather than
-//! reserving the dead dock column.
+//! **Super key handoff:** the old vertical-dock reveal latch still exists in
+//! retained state, but the rendered left dock is retired. `main.rs` drains the
+//! same clean-Super-tap hotkey and opens/closes this Start Menu, which now
+//! anchors to the screen's true left edge above the bottom taskbar.
 //!
-//! **Accesskit (lock #14):** the panel itself carries a role + label before any
-//! content lands — `Role::Menu` for the whole panel, `Role::Group` landmarks
-//! for each pane — so a screen reader can already navigate the shell. Deep
-//! per-tile / per-row accesskit is WIN7-3's (tiles) and WIN7-7's (the full
-//! sweep) job, not re-litigated here.
+//! **Accesskit (lock #14):** the panel carries a `Role::Menu` label, pane
+//! landmarks, named tile/search/context-row controls, live regions for
+//! opening/closing, rotating tile facts, and search-result updates.
 //!
-//! **WIN7-3 update:** the left pane described above as an empty placeholder is
-//! now the real live-tile grid (locks #6/#7/#8/#23): all 18 [`Surface::ALL`]
-//! entries, grouped into lock #8's 7 function-based groups (Mesh Control ·
-//! Desktop & Session · Media · Files & Data · Web & Tools · Comms · System —
-//! [`TILE_GROUPS`]), each a uniform [`TILE_W`]×[`TILE_H`] tile (lock #6 — one
-//! size, no variants). A tile wears the SAME glyph the app picker already
-//! draws (`Surface::icon_id`) plus a NEW text label (`Surface::label`,
-//! added this unit): the picker itself deliberately carries no per-icon
-//! captions (`dock.rs`'s own PICKER-1 lock), so there was no existing label
-//! table to inherit, only the icon one. A click reuses the picker's own
+//! **WIN7-3 update:** the left pane is the real live-tile grid (locks
+//! #6/#7/#8/#23): all 18 [`Surface::ALL`] entries, grouped into lock #8's 7
+//! function-based groups (Mesh Control · Desktop & Session · Media · Files &
+//! Data · Web & Tools · Comms · System — [`TILE_GROUPS`]), each a uniform
+//! [`TILE_W`]×[`TILE_H`] tile (lock #6 — one size, no variants). A tile wears
+//! the SAME glyph the app picker already draws (`Surface::icon_id`) plus a
+//! text label (`Surface::label`). A click reuses the picker's own
 //! click-vs-Enter/Space activation predicate (`dock::response_activated`,
 //! widened to `pub(crate)` for this reuse, not reimplemented) and records
 //! the surface in a new [`StartMenuState::tile_activation`] slot, drained by
 //! `main.rs` exactly like an embedded Console `Goto` request — both panes
 //! end in the same "go to this surface, close the whole menu" outcome (lock
 //! #23), just raised from different data. [`LEFT_PANE_W`] is no longer
-//! WIN7-2's arbitrary 288pt placeholder; it is now sized to the real grid
-//! this unit renders. Static content only (lock #5's live-fact rotation is
-//! WIN7-4's job) — this unit leaves a [`tile_status_tint`] seam WIN7-4 can
-//! light up rather than hardcoding "never any live data."
+//! WIN7-2's early fixed 288pt shell width; it is now sized to the real grid
+//! this module renders.
 //!
 //! **WIN7-4 update:** the live-tile rotation itself (lock #5) — a new
 //! [`TileFactInputs`] bundle ([`StartMenuState::set_tile_inputs`], mirroring
@@ -105,15 +89,10 @@
 //! value-bearing-but-not-individually-live nodes, not eight independent
 //! announcers all firing on the same clock).
 //!
-//! **WIN7-5 update:** the right pane's content is no longer rendered
-//! "exactly as it always has" — the paragraph above describing that as
-//! WIN7-5's still-open job is now superseded; see `console.rs`'s own module
-//! doc for the redesign itself (its presentation, not this module's). This
-//! module's OWN embedding contract is unchanged by that redesign: the same
+//! **WIN7-5 update:** the right pane's redesigned presentation lives in
+//! `console.rs`; this module's embedding contract is unchanged: the same
 //! [`console::console_content`] call at the same right-pane rect, the same
-//! [`ConsoleState::set_open`] mirror, the same self-closure propagation —
-//! WIN7-5 changed what `console_content` draws inside the rect this module
-//! hands it, not the seam between the two modules.
+//! [`ConsoleState::set_open`] mirror, and the same self-closure propagation.
 //!
 //! **WIN7-6 update:** a Critical firing now closes the menu too (lock #9) —
 //! the same outcome as the other closers listed above (Esc / click-away / an
@@ -278,9 +257,9 @@ const TILE_STATUS_DOT_R: f32 = Style::SP_XS / 2.0;
 
 /// The left (tile-grid) pane's width: [`PANE_PAD`] on both sides plus three
 /// (see [`TILE_COLUMNS`]) [`TILE_W`]-wide columns, [`TILE_GAP`] apart.
-/// WIN7-2 shipped this pane at an arbitrary 288pt placeholder ("WIN7-3 will
-/// very likely resize it" — its own doc comment); this is that resize,
-/// derived from the real grid this unit renders rather than picked by eye.
+/// WIN7-2 shipped this pane at an early fixed 288pt shell width; this is the
+/// later live-grid width, derived from the real grid this module renders rather
+/// than picked by eye.
 /// A test below pins `TILE_COLUMNS == 3` so the `3.0`/`2.0` literals here
 /// can't silently drift from the grid they're meant to fit.
 const LEFT_PANE_W: f32 = PANE_PAD * 2.0 + TILE_W * 3.0 + TILE_GAP * 2.0;
@@ -2332,14 +2311,10 @@ fn console_pane_accesskit_id() -> egui::Id {
     egui::Id::new("start-menu-console-pane-accesskit")
 }
 
-/// Install the panel-level accesskit tree (lock #14 — "the panel itself needs
-/// proper roles/labels even before its content is filled in"): the whole
-/// panel as a `Menu`, and each pane as a landmark `Group`, so a screen reader
-/// can already navigate the shell before WIN7-5/7 land Console's own per-row
-/// accesskit / the full sweep (the `status.rs` `install_status_accessibility`
-/// idiom, restated here since this crate's dock/console panels have none
-/// yet). WIN7-3 lands the tiles' own per-tile accesskit separately —
-/// [`install_tile_accessibility`], called per tile from [`tile`].
+/// Install the panel-level accesskit tree: the whole panel as a `Menu`, and
+/// each pane as a landmark `Group`, so a screen reader can navigate the Start
+/// Menu shell. Per-tile, search, context-row, and live-region nodes are emitted
+/// by the focused helpers that own those controls.
 fn install_accessibility(
     ctx: &egui::Context,
     rect: egui::Rect,

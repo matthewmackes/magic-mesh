@@ -122,8 +122,8 @@ const WORKBENCH_POLL_STAGGER: [Duration; 7] = [
 /// surface) is showing over the session view, and which plane the Workbench has
 /// selected. Kept separate from the surface apps (which need an eframe
 /// `CreationContext` to build) so the nav invariants stay unit-testable without
-/// a GPU. The old chrome Expand/Collapse toggle is retired (the dock is the nav):
-/// any dock click, hotkey, chyron action, or edge swipe surfaces the body.
+/// a GPU. The old chrome Expand/Collapse toggle is retired; Start Menu,
+/// taskbar, hotkey, chyron, and edge-swipe navigation surface the body.
 #[derive(Default)]
 struct Nav {
     /// `true` while the shell body (the active surface) fills the central view.

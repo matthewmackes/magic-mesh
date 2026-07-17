@@ -1089,6 +1089,10 @@ These decisions refine acceptance and sequencing for the active items below.
   `dock/mod.rs` with the bottom-taskbar-only architecture, removing stale live
   source prose that still described a mounted left vertical dock; farm `.50`
   fmt and BigBoy `.130` focused retired-gutter coverage passed.
+  A later 2026-07-17 Start-menu source-doc pass removed stale placeholder and
+  vertical-dock-launcher prose from `start_menu.rs` and the shell `Nav` comment,
+  aligning the code comments with the shipped tile/search/pin Start Menu; farm
+  `.50` fmt and BigBoy `.130` focused Start-menu grid coverage passed.
 
 ### WL-UX-002 - Browser Chrome visual parity live audit
 
