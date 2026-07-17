@@ -142,7 +142,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-CRIT-003 - Browser geometry and idle media regression
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Medium
 - Problem: User-reported Browser regressions remain: horizontal tabs can render
@@ -157,19 +157,19 @@ These decisions refine acceptance and sequencing for the active items below.
 - Relevant files/components: `crates/desktop/mde-shell-egui/src/web/mod.rs`,
   `crates/desktop/mde-shell-egui/src/web/chrome_ui/`,
   `crates/desktop/mde-web-cef/src/`, `crates/shared/mde-egui/src/drm.rs`.
-- Dependencies: Live CEF runtime or farm CEF smoke path for media verification.
+- Dependencies: Root or sudo authority on physical `.15` for installed package
+  replacement and shell restart; live CEF runtime or farm CEF smoke path for
+  media verification.
 - Current evidence: Commit `64508044` fixed the body-geometry regression and CEF
   idle-media pump path, with farm fmt, shell page-body, and CEF media tests
   passing on 2026-07-17. Commit `955cacf9` fixed the stale `Cargo.lock`
   dependency edge that blocked the Fedora 44 RPM lane; BigBoy then produced F44
-  base and Browser RPMs under the size guard. Live `.15` install and idle-media
-  runtime proof remain open because `.15` accepts the RPM payloads under
-  `/home/mm/` but rejects non-interactive sudo for `rpm -Uvh --test`. A
-  2026-07-17 `.15` probe confirmed the currently installed split packages verify
-  cleanly and `/usr/libexec/mackesd/browser-verify-engines` passes, but those
-  packages predate the fix commits. Extracting the newer staged Browser RPM and
-  running its verifier against the staged helpers passes CEF/Servo display and
-  input in user space. A follow-up 2026-07-17 idle-media slice added
+  base and Browser RPMs under the size guard. A 2026-07-17 `.15` probe confirmed
+  the currently installed split packages verify cleanly and
+  `/usr/libexec/mackesd/browser-verify-engines` passes, but the installed
+  verifier predates idle-media support. Extracting the newer staged Browser RPM
+  and running its verifier against the staged helpers passes CEF/Servo display
+  and input in user space. A follow-up 2026-07-17 idle-media slice added
   `cef-verify` idle-media mode plus `browser-verify-engines --idle-media`, kept
   CEF's default compositor path available instead of launching with
   `--disable-gpu*`, disabled Chromium background throttling for windowless tabs,
@@ -181,7 +181,15 @@ These decisions refine acceptance and sequencing for the active items below.
   remains inside a 960x640 workspace and maps a right-edge click to the final
   frame pixel on `.130`, proved vertical-tab body bounds on `.90`, and proved
   many horizontal tabs stay in one scrolling row with the active tab reachable on
-  `.50`. Remaining proof is an installed `.15`/live-seat run.
+  `.50`. A later 2026-07-17 BigBoy Fedora 44 split-RPM cut from commit
+  `8308453a` passed the size guard and was staged to physical `.15` at
+  `/home/mm/browser-f44-live-proof-8308453a/`; `.15` accepted
+  `rpm -Uvh --test --replacepkgs --force --nosignature` for the staged base and
+  Browser RPMs, and the extracted current Browser payload passed CEF+Servo
+  display/input plus CEF `--idle-media --timeout 90s` with process cleanup on
+  `.15`. Remaining proof is the installed replacement and shell-service restart;
+  it is blocked because `.15` is physical hardware, root SSH is unavailable, and
+  `mm` requires an interactive sudo password.
 - Acceptance criteria: Focused screenshots or tessellation checks prove full
   viewport use in both tab modes; pointer coordinate tests cover the right edge;
   a media frame counter or visual proof advances for at least 60 seconds without
