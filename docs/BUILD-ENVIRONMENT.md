@@ -61,7 +61,12 @@ consume queued stdin and leave the old payload installed. After every Browser
 deploy, prove the exact helper payload before trusting a runtime failure:
 compare key `sha256sum` output against `rpm -q --dump magic-mesh-browser`, run
 `rpm -V magic-mesh-browser`, then run the installed
-`/usr/libexec/mackesd/browser-verify-engines`.
+`/usr/libexec/mackesd/browser-verify-engines`. For Browser click-through
+regressions where a page updates the location field but does not commit the
+clicked page, add
+`/usr/libexec/mackesd/browser-verify-engines --engine cef --link-navigation`
+before doing manual Google/News smoke on `.15`; it exercises the same helper
+wire with a deterministic clicked-link navigation target.
 
 **DRM shell live-restart note (learned 2026-07-15):** `mde-shell-egui.service`
 conflicts with `getty@tty1.service` and has an `ExecStopPost` that starts getty

@@ -19,10 +19,9 @@
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
 //! shell owns each surface's app and its per-frame pump.
 //!
-//! The dock slides in from the left over the shared [`Motion`] table and
-//! auto-hides (Super-tap toggle + pin, no hover). When fully hidden + settled it
-//! mounts **no layer at all**, so a hidden dock steals no input from the surface
-//! beneath (the "auto-hide + DRM seat" guarantee).
+//! The bottom taskbar is docked by default and can auto-hide from the persisted
+//! Settings preference; the retired left dock no longer exposes a reveal or pin
+//! control. A clean Super tap opens the Front Door launcher.
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::{Density, Motion, Style};
@@ -446,12 +445,12 @@ pub fn icon_texture(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Retired VDOCK state and geometry.
+// Retired VDOCK geometry and compatibility state.
 //
-// The left-edge chrome renderer no longer mounts in production, but some state
-// fields and geometry constants survive because the bottom taskbar reuses the
-// active-surface model, icon sizing, auto-hide semantics, and regression
-// tests that prove no left gutter is reserved.
+// The left-edge chrome renderer no longer mounts in production, but a small
+// compatibility reveal marker and geometry constants survive because the bottom
+// taskbar reuses the active-surface model, icon sizing, auto-hide semantics, and
+// regression tests that prove no left gutter is reserved.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Legacy left-dock width in logical points (~48px). The rendered dock is
@@ -467,13 +466,13 @@ const STATUS_PANEL_KEY: &str = "vdock-status-panel";
 /// The stable id of the bottom notification rail layer.
 const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 
-/// The shell taskbar state. Legacy reveal/pin fields remain as pure state so old
-/// hotkey/test seams cannot reintroduce a left gutter; live production rendering
-/// uses the bottom taskbar. The active surface, Start latch, session rail,
-/// progress/status inputs, overflow popups, and lock/power requests all flow
-/// through this struct.
-// The dock carries several INDEPENDENT boolean latches (the reveal/pin auto-hide
-// pair + the two overflow-popup latches for the app groups and the grade list) —
+/// The shell taskbar state. The retired left-dock pin is gone; a legacy reveal
+/// marker remains only so old hotkey/test seams can prove they still reserve no
+/// gutter. Live production rendering uses the bottom taskbar. The active surface,
+/// Start latch, session rail, progress/status inputs, and overflow popups all
+/// flow through this struct.
+// The dock carries several INDEPENDENT boolean latches (legacy reveal, taskbar
+// auto-hide, and overflow/detail popups) —
 // not a state machine folding into one enum, so opt this one struct past the
 // `struct_excessive_bools` bar rather than contrive a two-variant enum.
 #[derive(Debug, Default)]
@@ -481,9 +480,6 @@ const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 pub struct DockState {
     /// Toggled by a clean Super tap (lock #13) — the hotkey reveal/hide latch.
     revealed: bool,
-    /// The pin (lock #9): while set, the dock stays on screen regardless of the
-    /// reveal latch — the "hotkey + pin" hold-open.
-    pinned: bool,
     /// The **active surface** the taskbar selects — a taskbar cell click writes it
     /// here; the shell body follows [`Self::active`]. Defaults to
     /// [`Surface::Desktop`] (the shell opens on Remote Sessions).
@@ -730,19 +726,19 @@ fn truncate_session_label(label: &str) -> String {
 }
 
 impl DockState {
-    /// Toggle the legacy **reveal** latch. The rendered left dock is retired; this
-    /// survives only for compatibility regression tests that prove legacy state
-    /// cannot reserve a blank gutter.
+    /// Toggle the legacy **reveal** marker. The rendered left dock is retired; this
+    /// survives only for compatibility regression tests that prove old reveal
+    /// state cannot reserve a blank gutter.
     pub const fn toggle(&mut self) {
         self.revealed = !self.revealed;
     }
 
-    /// Whether the legacy reveal/pin state says the retired dock would be shown.
-    /// Kept for regression tests that prove even a "shown" legacy dock reserves
-    /// no left gutter.
+    /// Whether the legacy reveal marker says the retired dock would be shown. Kept
+    /// for regression tests that prove even a "shown" legacy dock reserves no left
+    /// gutter.
     #[cfg(test)]
     pub const fn shown(&self) -> bool {
-        self.revealed || self.pinned
+        self.revealed
     }
 
     /// Test seam for shell-level integration fixtures: mount the NOTIF-4 detail
@@ -1295,8 +1291,8 @@ pub fn notification_rail_with_sources(
 }
 
 /// The width of the retired left-dock gutter. Production must reserve no left
-/// gutter even if legacy reveal/pin state is toggled; the bottom taskbar strut is
-/// the only live chrome reservation.
+/// gutter even if legacy reveal state is toggled; the bottom taskbar strut is the
+/// only live chrome reservation.
 pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
     // WIN10-HYBRID + DEDUPE-1: the left **vertical dock** is retired — its `dock()`
     // render was deleted, so there is nothing to paint in a left gutter and it must
@@ -1304,7 +1300,7 @@ pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
     // body 48px right behind a blank
     // column — the review `dedupe-gutter-regression`). The single 48px BOTTOM taskbar
     // (`taskbar_strut_height`) is the only chrome the shell reserves now. The
-    // `revealed`/`pinned` state survives (harmlessly) only for a future auto-hide use.
+    // The stale reveal marker survives only as a harmless compatibility seam.
     0.0
 }
 
@@ -2201,8 +2197,9 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
 // the taskbar's own landmark, and every taskbar-owned cell (Start, the
 // Desktop rail cell, the Desktop-source caret + its flyout rows, session
 // entries + the overflow "more" popup — which reuses [`session_entry`], so
-// one fix covers both — the status/notification toggle, the clock, and the
-// pin). Restates the SAME `accesskit_rect` helper + `Role::Button` +
+// one fix covers both — the status/notification toggle, the clock, the
+// action-center cell, and the show-desktop nub). Restates the SAME
+// `accesskit_rect` helper + `Role::Button` +
 // label/value/bounds/`Click` shape `status.rs`/`console.rs`/`start_menu.rs`
 // already use (each panel's accesskit section owns its own copy, the
 // established per-module convention), named `install_cell_accessibility`

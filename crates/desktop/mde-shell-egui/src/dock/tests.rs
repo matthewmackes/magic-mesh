@@ -1194,6 +1194,10 @@ fn taskbar_launch_sources_health_and_overflow_use_distinct_non_chevron_icons() {
         !icons.contains(&IconId::ChevronUp),
         "taskbar actions should not share the old up-arrow glyph"
     );
+    assert!(
+        !icons.contains(&IconId::Pin),
+        "taskbar actions should not include the retired Start-bar pin glyph"
+    );
     let mut names: Vec<&str> = icons.iter().map(|icon| icon.name()).collect();
     names.sort_unstable();
     names.dedup();

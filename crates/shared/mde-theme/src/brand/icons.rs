@@ -248,9 +248,10 @@ pub enum IconId {
     Sessions,
     /// Tray: Start / Advanced menu — the Win10-style left rail menu glyph.
     Start,
-    /// Tray: dock pin — holds the left launcher rail open.
+    /// Shared UI: pin/favorite glyph for launchers and rows that expose pinning.
     Pin,
-    /// Tray: the overflow-flyout `^` chevron (NAVBAR-W10 W10/W13).
+    /// Shared UI: up navigation arrow. The bottom taskbar no longer uses this for
+    /// Desktop Sources, Health, or overflow controls.
     ChevronUp,
     /// Tray: speaker with sound-wave arcs (volume).
     Volume,
@@ -378,14 +379,13 @@ impl IconId {
         Self::BatteryBolt,
     ];
 
-    /// The tray glyph subset (NAVBAR-W10-1) — every glyph the 40px taskbar's
-    /// tray renders at 16px, for targeted iteration in the tray and its tests.
-    pub const TRAY: [Self; 14] = [
+    /// The live tray/status glyph subset (NAVBAR-W10-1) — every glyph the tray
+    /// renders at 16px, for targeted iteration in the tray and its tests. Retired
+    /// Start-bar pin and up-chevron controls stay out of this live subset.
+    pub const TRAY: [Self; 12] = [
         Self::Signal,
         Self::Sessions,
         Self::Start,
-        Self::Pin,
-        Self::ChevronUp,
         Self::Volume,
         Self::VolumeMuted,
         Self::BluetoothSmall,
@@ -873,7 +873,15 @@ mod tests {
         // (24px covers the flyout/hi-DPI step) — every glyph must come back
         // square, correctly sized and with real ink through the same
         // icon_image loader the shell uses.
-        assert_eq!(IconId::TRAY.len(), 14, "tray subset size");
+        assert_eq!(IconId::TRAY.len(), 12, "tray subset size");
+        assert!(
+            !IconId::TRAY.contains(&IconId::Pin),
+            "retired Start-bar pin glyph must stay out of the live tray subset"
+        );
+        assert!(
+            !IconId::TRAY.contains(&IconId::ChevronUp),
+            "old up-chevron glyph must stay out of the live tray subset"
+        );
         for id in IconId::TRAY {
             for size in [16_u32, 24] {
                 let img = icon_image(id, size, TINT)

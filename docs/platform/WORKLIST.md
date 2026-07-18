@@ -980,7 +980,14 @@ These decisions refine acceptance and sequencing for the active items below.
   `browser_drawer_hover_layers_use_chrome_on_color_roles` passed; `.50`
   `cargo fmt -p mde-shell-egui --check` was attempted but is currently blocked by
   unrelated dirty formatting in Chat files and pre-existing Browser toolbar
-  budget code. A later 2026-07-18 Browser capture-artifact
+  budget code. A later 2026-07-18 Browser drawer tooltip sweep routed print
+  stepper and offline viewport-image hovers through Browser Chrome tooltip
+  primitives instead of inline egui hover closures, with rendered coverage for
+  the print stepper tooltip's Browser text/surface paint under dark shell
+  visuals. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui -- --check` passed and BigBoy `.130` focused
+  `browser_print_drawer_stepper_hover_uses_browser_tooltip_surface` passed. A
+  later 2026-07-18 Browser capture-artifact
   palette pass moved annotated, callout, and freehand Browser screenshot outputs
   off shared dark shell colors and onto Browser Chrome tokens: white/pale-blue
   caption surfaces, Google blue overlay accents, and Chrome text. Farm evidence:
@@ -1026,8 +1033,20 @@ These decisions refine acceptance and sequencing for the active items below.
   nearby `child_handler_pointers_resolve_non_null_to_their_registered_block`
   passed, and `.90`
   `cargo fmt --manifest-path crates/desktop/mde-web-cef/Cargo.toml -- --check`
-  passed. Remaining proof is a live `.15` Google/News navigation smoke against
-  the installed split Browser RPM.
+  passed. A later 2026-07-18 Browser verifier-surface pass exposed the existing
+  `cef-verify` clicked-link navigation probe through the installed
+  `browser-verify-engines --link-navigation` wrapper, documents it as the
+  deterministic pre-smoke for the Google/News class of "location changes but
+  page does not commit" failures, and makes Browser RPM packaging coverage
+  assert the shipped wrapper contains the mode and marker. Farm evidence: `.50`
+  focused
+  `cargo test -p mde-web-preview-client --features live-helper --bin cef-verify link_navigation -- --nocapture`
+  passed 3 tests; `.90` focused
+  `cargo test -p mackesd browser_rpm_ships_two_engine_operational_verifier_but_base_and_server_do_not --features async-services -- --nocapture`
+  passed; local `bash -n install-helpers/browser-verify-engines.sh`, help output,
+  conflict-mode parser check, and `git diff --check` passed. Remaining proof is
+  a live `.15` Google/News navigation smoke against the installed split Browser
+  RPM, preceded by the installed `--link-navigation` verifier.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1482,6 +1501,15 @@ These decisions refine acceptance and sequencing for the active items below.
   helper used by session rail entries and hover/accessibility labels; BigBoy
   `.130` focused `taskbar_session_label_truncation_uses_ascii_ellipsis` and
   `.50` fmt passed.
+  A later 2026-07-18 taskbar icon cleanup removed the retired Start-bar pin from
+  `DockState` and the live `IconId::TRAY` subset, preserving the corrected
+  white-on-black taskbar icon path and the distinct Desktop Sources/Health glyphs;
+  farm `.50` file-scoped rustfmt passed, `.90` focused
+  `tray_glyphs_rasterize_nonempty_at_16_and_24` passed, and BigBoy `.130` focused
+  `taskbar_launch_sources_health_and_overflow_use_distinct_non_chevron_icons`
+  passed. Integrated touched-package fmt
+  (`cargo fmt -p mde-shell-egui -p mde-theme -p mackesd -- --check`) passed on
+  `.50` after the concurrent Browser drawer slice landed.
   A later 2026-07-18 Chat/Settings chrome-copy pass replaced visible
   checkmark/arrow/paperclip/Unicode-ellipsis pseudo-icons in Chat delivery
   notes, file-send copy, alert action rows, composers, status/room hints, and
@@ -1885,13 +1913,14 @@ These decisions refine acceptance and sequencing for the active items below.
   keeps the previous active surface in place until the cue finishes, and routes
   through the existing `Nav` model to Remote Sessions. Added
   `menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers`
-  to exercise the public menu-bar request and shell transition path. Farm
-  evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed. BigBoy `.130`
-  focused
+  to exercise the public menu-bar request and shell transition path. Initial
+  shell verification was blocked by an out-of-scope `mde-maps-location-egui`
+  compile edge that is resolved in the current source; BigBoy `.130` then
+  passed the focused
   `cargo test -p mde-shell-egui menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers -- --nocapture`
-  was blocked before the shell test by the out-of-scope
-  `mde-maps-location-egui` compile error
-  `LocationManager::primary_source` missing in `src/model.rs`.
+  gate. Farm evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed before
+  the retest and BigBoy `.130` passed the shell transition test after
+  `LocationManager::primary_source` was present in `src/model.rs`.
 - Origin or merged source IDs: `docs/design/app-launcher-rethink.md` APPLAUNCH,
   `docs/design/search-omnibox.md` Front Door/full omnibox slice,
   `docs/review/PLATFORM-REVIEW-2026-07-10.md` `shell-ux-2`, `shell-ux-3`,

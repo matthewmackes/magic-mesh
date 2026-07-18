@@ -681,8 +681,11 @@ mod tests {
             "/usr/bin/mde-web-cef",
             "/usr/bin/mde-web-preview",
             "MDE_BROWSER_VERIFY_INPUT=1",
+            "MDE_BROWSER_VERIFY_LINK_NAVIGATION=1",
+            "--link-navigation",
             "VERIFY RESULT=PASS",
             "VERIFY on_paint_ready",
+            "mde-browser-link-clicked",
             "mde-browser-verify-p1-k1-tm|P:1 K:1 T:m",
             "process cleanup passed",
         ] {
