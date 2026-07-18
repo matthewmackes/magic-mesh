@@ -1635,7 +1635,11 @@ fn session_hover_preview(
                 area.left() + Style::SP_S,
                 thumb.bottom() + Style::SP_XS + Style::SP_S,
             );
-            painter.text(
+            let title_clip = egui::Rect::from_min_max(
+                egui::pos2(area.left() + Style::SP_S, thumb.bottom() + Style::SP_XS),
+                egui::pos2(area.right() - Style::SP_S, area.bottom() - Style::SP_XS),
+            );
+            painter.with_clip_rect(title_clip).text(
                 title_pos,
                 egui::Align2::LEFT_CENTER,
                 entry.label.as_str(),

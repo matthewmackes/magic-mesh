@@ -1175,8 +1175,11 @@ These decisions refine acceptance and sequencing for the active items below.
   proof for both states; BigBoy `.130` focused `file_operation_progress`
   coverage passed, farm `.50` fmt passed, and the generated
   `taskbar-file-progress-rail.png` / `taskbar-file-progress-panel.png` artifacts
-  were pulled and visually inspected. A live `.15` visual smoke is still needed
-  before closing the item.
+  were pulled and visually inspected. A follow-up 2026-07-18 progress-pump slice
+  made the shell pump Files transfers and Browser downloads before rendering the
+  shared bottom-rail status segment, so progress stays current while other
+  workspaces are active; BigBoy `.130` focused `shell_taskbar_pumps_` coverage
+  passed. A live `.15` visual smoke is still needed before closing the item.
 - Acceptance criteria: Opening a desktop creates a switchable bar entry; file
   copy/upload/download/compress/extract operations share the same progress UI;
   progress survives surface switches.
@@ -1612,6 +1615,12 @@ These decisions refine acceptance and sequencing for the active items below.
 	  pointing cursor, and widget metadata. Farm evidence: BigBoy `.130` focused
 	  `cargo test -p mde-media-egui queue_view_renders_empty_and_with_items -- --nocapture`
 	  passed, and `.50` `cargo fmt -p mde-media-egui -- --check` passed.
+	  A follow-up taskbar hover-title slice clipped long running-session titles to
+	  the fixed hover-preview card body so wide VM names cannot paint into
+	  neighboring chrome, with headless clip-rect coverage. Farm evidence: `.50`
+	  `cargo fmt -p mde-shell-egui -- --check` passed; BigBoy `.130` focused
+	  `win10_hybrid_31_session_hover_preview_clips_long_titles_to_card_body`
+	  passed from an isolated clean worktree carrying only the dock patch.
 	  Remaining icon work is the full per-surface sweep for
 	  hand-painted icons or other code paths that bypass `IconId`, removal or
   repointing of stale Carbon/Material asset uses, and live rendered proof on the

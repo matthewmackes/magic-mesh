@@ -1373,6 +1373,11 @@ impl FileBrowser {
         }
     }
 
+    #[doc(hidden)]
+    pub fn mark_transfers_poll_due_for_test(&mut self) {
+        self.last_transfers_poll = Some(Instant::now() - TRANSFERS_POLL - Duration::from_millis(1));
+    }
+
     /// `true` while the ledger holds an in-flight job — the view keeps a repaint
     /// heartbeat alive so live progress updates without input.
     #[must_use]

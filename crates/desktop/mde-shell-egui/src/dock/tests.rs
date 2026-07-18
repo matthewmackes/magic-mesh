@@ -757,6 +757,73 @@ fn win10_hybrid_31_session_hover_preview_shows_protocol_badge() {
 }
 
 #[test]
+fn win10_hybrid_31_session_hover_preview_clips_long_titles_to_card_body() {
+    // The hover preview is a fixed-width taskbar card. A long VM name must stay
+    // clipped to that card body instead of painting into neighboring chrome.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let entry =
+        SessionRailEntry::with_session_id("session-1", "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW", "RDP");
+    let title = entry.label.clone();
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        0,
+        true,
+        vec![entry.clone()],
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let session = ctx
+        .read_response(session_entry_id(0, &entry))
+        .expect("session entry registered")
+        .rect;
+    drive_vdock(
+        &ctx,
+        &mut s,
+        vec![egui::Event::PointerMoved(session.center())],
+        sz,
+    );
+    let out = drive_vdock(
+        &ctx,
+        &mut s,
+        vec![egui::Event::PointerMoved(session.center())],
+        sz,
+    );
+
+    let preview = ctx
+        .read_response(session_hover_preview_id(0, &entry))
+        .expect("session hover preview registered")
+        .rect;
+    let (_, clip) = painted_text_clips(&out.shapes)
+        .into_iter()
+        .find(|(text, _)| text == &title)
+        .unwrap_or_else(|| panic!("preview title text was not painted: {title}"));
+    assert!(
+        clip.left() >= preview.left() + Style::SP_S - f32::EPSILON
+            && clip.right() <= preview.right() - Style::SP_S + f32::EPSILON,
+        "the title clip must honor the card's horizontal padding: \
+         preview={preview:?} clip={clip:?}"
+    );
+    assert!(
+        clip.width() <= preview.width() - Style::SP_M + f32::EPSILON,
+        "the title clip must be narrower than the fixed hover card body: \
+         preview={preview:?} clip={clip:?}"
+    );
+    assert!(
+        clip.height() < preview.height(),
+        "the title clip should cover only the text band, not the whole hover card: \
+         preview={preview:?} clip={clip:?}"
+    );
+}
+
+#[test]
 fn win10_hybrid_31_session_preview_texture_preserves_aspect_inside_thumbnail() {
     let bounds = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(180.0, 72.0));
     let wide = session_preview_texture_rect([160, 90], bounds);
@@ -1079,6 +1146,25 @@ fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
     let mut out = Vec::new();
     for clipped in shapes {
         walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_text_clips(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+    fn walk(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), clip)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, clip, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, clipped.clip_rect, &mut out);
     }
     out
 }

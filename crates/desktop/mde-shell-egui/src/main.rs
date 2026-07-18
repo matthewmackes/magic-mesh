@@ -1476,6 +1476,8 @@ impl Shell {
         // feed the bottom status strip its live inputs, then read taskbar-originated
         // selection straight back out.
         self.vdock.set_active(self.nav.surface);
+        self.files.pump_transfers();
+        self.web.pump_downloads_for_shell_chrome();
         self.vdock
             .set_file_operation_progress(shell_file_operation_progress(
                 self.files.operation_progress_summary(),
@@ -2342,6 +2344,10 @@ mod tests {
     };
     use mde_files::fileops::{FakeFileOps, FileOps};
     use mde_files::model::{FileRow, Mime, Peer, SelfNode};
+    use mde_files_egui::transfers::{
+        Method as TransferMethod, TransferJob, TransferPolicy, TransferState, TransferVerb,
+        TransfersClient,
+    };
     use mde_seat::HotkeyAction;
     use std::path::{Path, PathBuf};
 
@@ -2393,6 +2399,52 @@ mod tests {
         ) -> Result<mde_files::backend::OpId, BackendError> {
             Err(BackendError::NotFound(op_id))
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct ShellRecordingTransfers {
+        jobs: std::sync::Arc<std::sync::Mutex<Vec<TransferJob>>>,
+        verbs: std::sync::Arc<std::sync::Mutex<Vec<TransferVerb>>>,
+    }
+
+    impl ShellRecordingTransfers {
+        fn set_jobs(&self, jobs: Vec<TransferJob>) {
+            *self.jobs.lock().expect("transfer jobs mutex poisoned") = jobs;
+        }
+    }
+
+    impl TransfersClient for ShellRecordingTransfers {
+        fn jobs(&self) -> Vec<TransferJob> {
+            self.jobs
+                .lock()
+                .expect("transfer jobs mutex poisoned")
+                .clone()
+        }
+
+        fn worker_present(&self) -> bool {
+            true
+        }
+
+        fn dispatch(&self, verb: &TransferVerb) -> Result<(), String> {
+            self.verbs
+                .lock()
+                .expect("transfer verbs mutex poisoned")
+                .push(verb.clone());
+            Ok(())
+        }
+    }
+
+    fn shell_transfer_job(id: &str, method: TransferMethod, progress: Option<u8>) -> TransferJob {
+        let mut job = TransferJob::new(
+            format!("/tmp/{id}.bin"),
+            "/home/mm/Downloads",
+            method,
+            TransferPolicy::default(),
+        );
+        job.id = id.to_owned();
+        job.state = TransferState::Running;
+        job.progress = progress;
+        job
     }
 
     #[test]
@@ -3321,6 +3373,102 @@ mod tests {
         assert_eq!(
             progress,
             dock::FileOperationProgress::new(1, None, "Copy report.txt")
+        );
+    }
+
+    #[test]
+    fn shell_taskbar_pumps_file_transfers_even_when_files_is_not_rendered() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let transfers = ShellRecordingTransfers::default();
+        let files = mde_files_egui::FileBrowser::with_file_ops(
+            Box::new(ShellFilesBackend::new(Vec::new())),
+            FakeFileOps::new(),
+        )
+        .with_transfers(Box::new(transfers.clone()));
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.files = files;
+        shell.nav.surface = Surface::Workbench;
+
+        assert!(
+            shell.files.operation_progress_summary().is_none(),
+            "fixture starts with no cached file-transfer progress"
+        );
+        transfers.set_jobs(vec![shell_transfer_job(
+            "active-file-transfer",
+            TransferMethod::Http,
+            Some(67),
+        )]);
+        shell.files.mark_transfers_poll_due_for_test();
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let progress = nodes
+            .iter()
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("the shell bottom rail exports transfer progress");
+        assert_eq!(
+            progress.value(),
+            Some("File operations active: 1 active file operation, 67% average progress")
+        );
+    }
+
+    #[test]
+    fn shell_taskbar_pumps_browser_downloads_even_when_browser_is_not_rendered() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let transfers = ShellRecordingTransfers::default();
+        let web = super::web::WebState::default().with_transfers(Box::new(transfers.clone()));
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.web = web;
+        shell.nav.surface = Surface::Workbench;
+
+        assert!(
+            shell.web.operation_progress_summary().is_none(),
+            "fixture starts with no cached Browser-download progress"
+        );
+        transfers.set_jobs(vec![shell_transfer_job(
+            "browser-download",
+            TransferMethod::BrowserDownload,
+            Some(42),
+        )]);
+        shell.web.mark_downloads_poll_due_for_test();
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let progress = nodes
+            .iter()
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("the shell bottom rail exports Browser download progress");
+        assert_eq!(
+            progress.value(),
+            Some("File operations active: 1 active file operation, 42% average progress")
         );
     }
 
