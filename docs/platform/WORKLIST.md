@@ -1044,9 +1044,33 @@ These decisions refine acceptance and sequencing for the active items below.
   passed 3 tests; `.90` focused
   `cargo test -p mackesd browser_rpm_ships_two_engine_operational_verifier_but_base_and_server_do_not --features async-services -- --nocapture`
   passed; local `bash -n install-helpers/browser-verify-engines.sh`, help output,
-  conflict-mode parser check, and `git diff --check` passed. Remaining proof is
-  a live `.15` Google/News navigation smoke against the installed split Browser
-  RPM, preceded by the installed `--link-navigation` verifier.
+  conflict-mode parser check, and `git diff --check` passed. During the live
+  `.15` proof, the first `c42953b5` candidate exposed a real release blocker:
+  installed CEF painted frames and accepted pointer/key/text input, but emitted
+  `nav_events=0` and blank `final_url`, so the Browser address/navigation wire
+  path was still unsafe for the Google/News class of failures. Commit
+  `0ba65d2a` fixed the CEF main-frame guard to use the pinned
+  `cef_frame_t::is_main` ABI slot instead of comparing live wrapper pointers,
+  with farm `.50` focused
+  `cef_address_changes_only_update_top_level_url_from_the_main_frame` and `.90`
+  `cargo fmt --manifest-path crates/desktop/mde-web-cef/Cargo.toml -- --check`
+  passing. BigBoy `.130` then cut Fedora 44 split RPMs from the patched worktree
+  with size guards passing (base 66.5 MiB, Browser 39.1 MiB); sha256s were base
+  `174d360850c81ffebbe5f45bc802e4eb1cbe7df5185f95020f90573376063505` and
+  Browser `7d965a4fc7144ffe4f3691e77af8a6ea0c1c79f60bdba3e2cb89b2e41227fa86`.
+  The matched pair was staged on `.15` at
+  `/home/mm/browser-f44-live-proof-0ba65d2a/`, installed after a clean
+  `rpm -Uvh --test --replacepkgs --force --nosignature`, `rpm -V magic-mesh
+  magic-mesh-browser` returned clean, and `mde-shell-egui.service` restarted to
+  `MainPID=2913905`, `NRestarts=0`, start timestamp
+  `2026-07-18 13:05:35 EDT`, with the running shell hash matching
+  `/usr/bin/mde-shell-egui`. Installed `.15` proof passed
+  `browser-verify-engines --engine all --budget 30 --timeout 60s`,
+  `browser-verify-engines --engine cef --link-navigation --budget 30 --timeout
+  60s`, and public CEF display/load smokes for `https://www.google.com/` and
+  `https://news.google.com/`; the Google News smoke committed
+  `https://news.google.com/home?hl=en-US&gl=US&ceid=US:en`, title
+  `Google News`, favicon bytes, and painted frames.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
