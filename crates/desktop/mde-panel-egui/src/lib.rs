@@ -1,4 +1,4 @@
-//! `mde-panel-egui` — the MCNF E12 "Quazar" egui **panel client** (E12-7), the
+//! `mde-panel-egui` — the MCNF E12 "Construct" egui **panel client** (E12-7), the
 //! egui replacement for the retired Cosmic-era applet.
 //!
 //! The panel shows two things, both off live mesh state:

@@ -145,7 +145,7 @@ pub const KEYSTONE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Production [`KeystoneAuth`]: the standard `POST {auth_url}/auth/tokens`.
 ///
 /// Reaches Keystone over the mesh overlay (plaintext HTTP — the overlay is the
-/// transport security, per the QUASAR-CLOUD design). Blocking, so a caller drives
+/// transport security, per the CONSTRUCT-CLOUD design). Blocking, so a caller drives
 /// it on a blocking thread (`reqwest::blocking` offloads to its own runtime, so
 /// it is safe to call from within the async worker's `spawn_blocking` drain).
 #[derive(Debug, Clone, Default)]

@@ -427,6 +427,36 @@ impl NodeView {
     }
 }
 
+/// The Datacenter roster kind Front Door may expose as a service lifecycle row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontDoorLifecycleKind {
+    /// A Podman container reported by `event/podman/containers`.
+    Container,
+    /// A libvirt/KVM guest reported by `event/vm/instances`.
+    Vm,
+}
+
+impl FrontDoorLifecycleKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Vm => "vm",
+        }
+    }
+}
+
+/// One cached Datacenter roster row that can safely become a Front Door service
+/// result. This is intentionally a plain data transfer shape so the launcher can
+/// use cached Fleet facts without polling the Bus or borrowing private node rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontDoorLifecycleCandidate {
+    pub(crate) host: String,
+    pub(crate) kind: FrontDoorLifecycleKind,
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) detail: String,
+}
+
 /// Fold raw topic bodies into a sorted-by-host per-node view. Latest message wins
 /// per host (health, VM roster + container roster each tracked independently by
 /// their own `published_at_ms`), so a growing topic collapses to one row per node.
@@ -676,6 +706,34 @@ impl DatacenterState {
     /// mouse twin of waiting out the poll cadence (§6, no second read path).
     pub(crate) const fn refresh_now(&mut self) {
         self.last_poll = None;
+    }
+
+    /// Cached service lifecycle candidates for Front Door. The launcher uses
+    /// this read-only projection only; it does not trigger Fleet polling while
+    /// opening, so local app/search paths stay responsive when the mesh is slow.
+    pub(crate) fn front_door_lifecycle_candidates(&self) -> Vec<FrontDoorLifecycleCandidate> {
+        let mut out = Vec::new();
+        for node in &self.nodes {
+            for inst in &node.instances {
+                out.push(FrontDoorLifecycleCandidate {
+                    host: node.host.clone(),
+                    kind: FrontDoorLifecycleKind::Vm,
+                    name: inst.name.clone(),
+                    state: inst.state.clone(),
+                    detail: "Virtual machine".to_owned(),
+                });
+            }
+            for container in &node.containers {
+                out.push(FrontDoorLifecycleCandidate {
+                    host: node.host.clone(),
+                    kind: FrontDoorLifecycleKind::Container,
+                    name: container.name.clone(),
+                    state: container.state.clone(),
+                    detail: container.image.clone(),
+                });
+            }
+        }
+        out
     }
 
     /// Read both topics and re-project. Split from the cadence gate so the pure
@@ -1539,6 +1597,43 @@ mod tests {
             r#"{{"host":"{host}","containers":[{}],"published_at_ms":{at}}}"#,
             cs.join(",")
         )
+    }
+
+    #[test]
+    fn front_door_lifecycle_candidates_use_cached_vm_and_container_rosters() {
+        let mut state = DatacenterState {
+            nodes: project(
+                &[],
+                &[roster_body("oak", &[("dispatch-vm", "running")], 10)],
+                &[container_body(
+                    "oak",
+                    &[("mesh-api", "construct/mesh-api:latest", "exited")],
+                    11,
+                )],
+            ),
+            ..DatacenterState::default()
+        };
+
+        let rows = state.front_door_lifecycle_candidates();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.host == "oak"
+                && row.kind == FrontDoorLifecycleKind::Vm
+                && row.name == "dispatch-vm"
+                && row.state == "running"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.host == "oak"
+                && row.kind == FrontDoorLifecycleKind::Container
+                && row.name == "mesh-api"
+                && row.detail == "construct/mesh-api:latest"
+        }));
+
+        state.nodes.clear();
+        assert!(
+            state.front_door_lifecycle_candidates().is_empty(),
+            "Front Door uses cached roster facts only and does not poll during launcher open"
+        );
     }
 
     fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {

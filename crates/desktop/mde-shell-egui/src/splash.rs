@@ -1,13 +1,9 @@
-//! QBRAND-4 — the DRM **boot-splash**: the official Quazar artwork painted while
-//! the shell initializes, with real init progress animated along the artwork's
-//! own loading bar (`docs/design/quasar-branding.md`, locks 8 + 11).
+//! Construct boot-splash: the Construct identity painted while the
+//! shell initializes, with real init progress animated along the loading bar
+//! (`docs/design/construct-branding.md`, locks 8 + 11).
 //!
-//! The image is the operator-locked `MDE-QUAZAR-WALLPAPER1.png` — the centered
-//! mesh-node mark + "MDE Quazar" wordmark with a loading bar composed into the
-//! artwork near the bottom. The splash letterboxes it on the Carbon field
-//! (scale-to-fit, aspect preserved, never stretched) and renders
-//! [`mde_theme::brand::build::version_line()`] beneath the wordmark in the dim
-//! Carbon text token.
+//! The visible composition is native text from [`mde_theme::brand::logo`], so
+//! the Construct product name is not tied to legacy raster wordmark art.
 //!
 //! **The bar animates honest progress, never a timer.** The three milestones are
 //! the real work the shell does before its first dock frame (see the boot driver
@@ -23,14 +19,11 @@
 //!    the chrome bar runs on its cadence; an absent snapshot on a fresh host
 //!    completes the poll honestly rather than hanging boot).
 //!
-//! The artwork bakes its bar at a fixed decorative fraction, so the one-time
-//! decode rebuilds it for animation **from the artwork's own pixels** (no colours
-//! are invented, §4): the baked fill + head-dot band is rewritten to the empty
-//! track (sampled from the artwork's track), the baked gradient is resampled
-//! across the full track width into a fill strip, and the head dot becomes a
-//! luminance-keyed sprite that rides the fill's leading edge. The strip is drawn
-//! UV-clipped to the eased progress fraction. Everything the shell *adds* — the
-//! field behind the letterbox and the version line — is a `Style` token.
+//! When the embedded artwork matches the legacy measured bar geometry, the
+//! one-time decode can rebuild that bar for animation **from the artwork's own
+//! pixels** (no colours are invented, §4). New Construct artwork does not expose
+//! that measured geometry, so it uses the native token progress bar instead:
+//! background, Construct labels, track, and fill all come from `Style`.
 //!
 //! The splash owns the screen until every milestone lands **and** the eased bar
 //! reaches full, then dismisses: the first dock frame replaces it.
@@ -46,16 +39,16 @@ use mde_egui::{Motion, MotionPreset, Style};
 
 use crate::chooser::decode_png_rgba;
 
-/// The official boot-splash artwork (lock 11), embedded like the BRAND-1 lockup
+/// The official Construct boot-splash artwork (lock 11), embedded like the BRAND-1 lockup
 /// so the splash renders with no filesystem / RPM-path dependency.
-const ARTWORK: &[u8] = include_bytes!("../../../../assets/brand/MDE-QUAZAR-WALLPAPER1.png");
+const ARTWORK: &[u8] = include_bytes!("../../../../assets/brand/CONSTRUCT-WALLPAPER1.png");
 
-// ─────────────────── the artwork's measured geometry ───────────────────
+// ─────────────────── legacy measured-bar geometry ───────────────────
 //
-// Coordinates INTO the official artwork, in its native pixels — data about the
-// locked asset (measured from `MDE-QUAZAR-WALLPAPER1.png`), not theme metrics.
-// Guarded by [`ART_W`]×[`ART_H`]: a swapped artwork falls back to the plain
-// letterboxed image (no bar animation) instead of misreading pixels.
+// Coordinates INTO the previous measured splash artwork, in its native pixels.
+// Guarded by [`ART_W`]×[`ART_H`]: the current Construct artwork falls back to
+// the native token fill (no harvested bar animation) instead of misreading
+// pixels.
 
 /// The artwork's native width in pixels.
 const ART_W: usize = 1672;
@@ -85,13 +78,9 @@ const REWRITE_X1: usize = 872;
 /// A column safely inside the artwork's empty track, sampled per-row as the
 /// template the rewritten span copies (the artwork's own "0 %" appearance).
 const TRACK_TPL_X: usize = 950;
-/// The version line's centre row — the open band between the wordmark's subtitle
-/// (ends ≈ row 776) and the bar band (starts row 824).
-const VERSION_CY: usize = 800;
-
 /// The egui-memory animation key easing the drawn fill toward the banked
 /// milestone fraction (through the shared `Motion` table, lock 10 idiom).
-const EASE_KEY: &str = "qbrand4-splash-progress";
+const EASE_KEY: &str = "construct-splash-progress";
 
 /// The eased fill fraction at which the full bar counts as visually settled and
 /// the splash may dismiss.
@@ -136,11 +125,9 @@ impl Milestone {
 
 /// The prepared artwork, uploaded once on the first paint.
 struct SplashArt {
-    /// The full artwork with the bar band rewritten to the empty track.
-    base: TextureHandle,
     /// The animated bar: the full-width gradient fill strip + the head-dot
     /// sprite. `None` when the embedded artwork isn't the measured asset
-    /// (fail-soft to the plain image).
+    /// (fail-soft to a native token fill).
     bar: Option<BarArt>,
 }
 
@@ -162,8 +149,8 @@ enum ArtState {
     Pending,
     /// Decoded + uploaded.
     Ready(SplashArt),
-    /// The embedded asset failed to decode — fail-soft to the bare Carbon
-    /// field + version line, never a panic (§7). Kept so the decode is never
+    /// The embedded asset failed to decode — fail-soft to the native token
+    /// progress fill, never a panic (§7). Kept so the decode is never
     /// re-attempted per frame.
     Missing,
 }
@@ -213,9 +200,8 @@ impl Splash {
         self.finished() && self.eased >= EASE_DONE
     }
 
-    /// Paint one full-screen splash frame: the Carbon field, the letterboxed
-    /// artwork, the progress overlay along the artwork's bar, and the version
-    /// line beneath the wordmark.
+    /// Paint one full-screen splash frame: the shell field, Construct identity,
+    /// and the progress overlay.
     pub(crate) fn show(&mut self, ctx: &egui::Context) {
         // Ease the drawn fill toward the banked fraction through the shared
         // Motion table (a fresh context starts at the target, so the bar never
@@ -224,71 +210,74 @@ impl Splash {
             .value()
             .clamp(0.0, 1.0);
         let eased = self.eased;
-        let art = self.art(ctx);
+        let bar = self.art(ctx).and_then(|art| art.bar.as_ref());
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let free = ui.max_rect();
-            // The Carbon field behind the letterbox — a Style token, never a
-            // raw hex (§4). A painter clone so `Image::paint_at` can borrow `ui`.
             let painter = ui.painter().clone();
             painter.rect_filled(free, 0.0, Style::BG);
 
-            // Fail-soft: an undecodable embedded asset still boots to an honest
-            // Carbon field + version line (§7) while the milestones play out.
-            let Some(art) = art else {
-                painter.text(
-                    free.center(),
-                    Align2::CENTER_CENTER,
-                    mde_theme::brand::build::version_line(),
-                    FontId::proportional(Style::SMALL),
-                    Style::TEXT_DIM,
-                );
-                return;
-            };
+            let center = free.center();
+            let title_y = center.y - Style::SP_XL * 1.55;
+            painter.text(
+                egui::pos2(center.x, title_y),
+                Align2::CENTER_CENTER,
+                mde_theme::brand::logo::PRODUCT_NAME,
+                FontId::proportional(Style::DISPLAY * 2.0),
+                Style::TEXT,
+            );
+            painter.text(
+                egui::pos2(center.x, title_y + Style::SP_XL),
+                Align2::CENTER_CENTER,
+                mde_theme::brand::logo::SOFTWARE_STUDIO,
+                FontId::proportional(Style::TITLE),
+                Style::TEXT_DIM,
+            );
+            painter.text(
+                egui::pos2(center.x, title_y + Style::SP_XL * 2.05),
+                Align2::CENTER_CENTER,
+                mde_theme::brand::logo::PRODUCT_RELEASE,
+                FontId::proportional(Style::SMALL),
+                Style::TEXT_DIM,
+            );
 
-            // Letterbox: scale to fit, preserve aspect, never stretch.
-            let img = letterbox(free, art_size());
-            egui::Image::new(egui::load::SizedTexture::new(art.base.id(), img.size()))
-                .paint_at(ui, img);
+            let track_w = (free.width() - Style::SP_XL * 2.0).max(96.0).min(520.0);
+            let track = Rect::from_center_size(
+                egui::pos2(center.x, center.y + Style::SP_XL * 2.7),
+                egui::vec2(track_w, Style::SP_M),
+            );
+            painter.rect_filled(track, Style::RADIUS, Style::SURFACE);
+            painter.rect_stroke(
+                track,
+                Style::RADIUS,
+                egui::Stroke::new(1.0, Style::BORDER),
+                egui::StrokeKind::Inside,
+            );
 
-            // The progress overlay along the artwork's own bar region: the
-            // resampled gradient strip UV-clipped to the eased fraction, the
-            // head dot at its leading edge.
-            if let Some(bar) = &art.bar {
-                let band = map_rect(img, TRACK_X0, BAND_Y0, TRACK_X1, BAND_Y1);
-                let head_x = band.width().mul_add(eased, band.min.x);
-                if eased > 0.0 {
-                    let fill = Rect::from_min_max(band.min, egui::pos2(head_x, band.max.y));
+            let head_x = track.width().mul_add(eased, track.left());
+            if eased > 0.0 {
+                let fill = Rect::from_min_max(track.min, egui::pos2(head_x, track.max.y));
+                if let Some(bar) = bar {
                     egui::Image::new(egui::load::SizedTexture::new(bar.fill.id(), fill.size()))
                         .uv(Rect::from_min_max(
                             egui::pos2(0.0, 0.0),
                             egui::pos2(eased, 1.0),
                         ))
                         .paint_at(ui, fill);
+                } else {
+                    painter.rect_filled(fill, Style::RADIUS, Style::ACCENT);
                 }
-                let head_w = band.height() * head_aspect();
-                let head = Rect::from_center_size(
-                    egui::pos2(head_x, band.center().y),
-                    egui::vec2(head_w, band.height()),
-                );
-                egui::Image::new(egui::load::SizedTexture::new(bar.head.id(), head.size()))
-                    .paint_at(ui, head);
             }
 
-            // The version line beneath the artwork's wordmark, in the dim Carbon
-            // token, scaled with the artwork so the composition holds at any
-            // resolution.
-            let font = Style::SMALL * (img.height() / art_dim(ART_H));
-            painter.text(
-                egui::pos2(
-                    img.center().x,
-                    img.height().mul_add(band_frac(VERSION_CY), img.top()),
-                ),
-                Align2::CENTER_CENTER,
-                mde_theme::brand::build::version_line(),
-                FontId::proportional(font),
-                Style::TEXT_DIM,
-            );
+            let head_center = egui::pos2(head_x, track.center().y);
+            if let Some(bar) = bar {
+                let head_size = egui::vec2(track.height() * head_aspect(), track.height());
+                let head = Rect::from_center_size(head_center, head_size);
+                egui::Image::new(egui::load::SizedTexture::new(bar.head.id(), head.size()))
+                    .paint_at(ui, head);
+            } else {
+                painter.circle_filled(head_center, track.height() * 0.48, Style::ACCENT);
+            }
         });
     }
 
@@ -308,11 +297,6 @@ impl Splash {
 
 // ──────────────────────────── geometry helpers ────────────────────────────
 
-/// The artwork's native size as a vector.
-const fn art_size() -> egui::Vec2 {
-    egui::vec2(art_dim(ART_W), art_dim(ART_H))
-}
-
 /// A native artwork dimension as `f32` (exact — the artwork is far below 2²⁴).
 #[allow(
     clippy::cast_precision_loss,
@@ -322,37 +306,9 @@ const fn art_dim(px: usize) -> f32 {
     px as f32
 }
 
-/// A native artwork row as a fraction of the artwork height.
-const fn band_frac(y: usize) -> f32 {
-    art_dim(y) / art_dim(ART_H)
-}
-
 /// The head-dot sprite's aspect ratio (width over height).
 const fn head_aspect() -> f32 {
     art_dim(HEAD_X1 - HEAD_X0) / art_dim(BAND_Y1 - BAND_Y0)
-}
-
-/// Centre `size` inside `free` scaled to fit — aspect preserved, letterboxed on
-/// whichever axis has slack, never stretched.
-fn letterbox(free: Rect, size: egui::Vec2) -> Rect {
-    let scale = (free.width() / size.x).min(free.height() / size.y);
-    Rect::from_center_size(free.center(), size * scale)
-}
-
-/// Map a native-artwork pixel rect into the painted (letterboxed) image rect.
-fn map_rect(img: Rect, x0: usize, y0: usize, x1: usize, y1: usize) -> Rect {
-    let sx = img.width() / art_dim(ART_W);
-    let sy = img.height() / art_dim(ART_H);
-    Rect::from_min_max(
-        egui::pos2(
-            art_dim(x0).mul_add(sx, img.left()),
-            art_dim(y0).mul_add(sy, img.top()),
-        ),
-        egui::pos2(
-            art_dim(x1).mul_add(sx, img.left()),
-            art_dim(y1).mul_add(sy, img.top()),
-        ),
-    )
 }
 
 // ──────────────────────────── artwork preparation ────────────────────────────
@@ -362,12 +318,11 @@ fn map_rect(img: Rect, x0: usize, y0: usize, x1: usize, y1: usize) -> Rect {
 /// Carbon field (§7).
 fn upload(ctx: &egui::Context) -> Option<SplashArt> {
     let artwork = decode_png_rgba(ARTWORK)?;
-    let (base, bar) = prepare(&artwork);
+    let (_base, bar) = prepare(&artwork);
     Some(SplashArt {
-        base: ctx.load_texture("qbrand4-splash-base", base, TextureOptions::LINEAR),
         bar: bar.map(|(fill, head)| BarArt {
-            fill: ctx.load_texture("qbrand4-splash-fill", fill, TextureOptions::LINEAR),
-            head: ctx.load_texture("qbrand4-splash-head", head, TextureOptions::LINEAR),
+            fill: ctx.load_texture("construct-splash-fill", fill, TextureOptions::LINEAR),
+            head: ctx.load_texture("construct-splash-head", head, TextureOptions::LINEAR),
         }),
     })
 }
@@ -383,7 +338,7 @@ fn upload(ctx: &egui::Context) -> Option<SplashArt> {
 ///   glow blends over fill and track alike at any progress.
 ///
 /// A non-measured artwork (dimension guard) yields no bar — the caller paints
-/// the plain letterboxed image instead of misreading pixel coordinates.
+/// the native token fill instead of misreading pixel coordinates.
 fn prepare(
     art: &egui::ColorImage,
 ) -> (
@@ -435,45 +390,20 @@ mod tests {
     use super::*;
     use mde_egui::egui::{pos2, vec2};
 
-    /// The embedded official artwork decodes at its measured native size and
-    /// prepares the animated bar — proving the asset is the locked
-    /// `MDE-QUAZAR-WALLPAPER1.png` (lock 11), not a stray or re-exported file
-    /// the measured geometry would misread.
+    /// The embedded Construct artwork decodes at its native size and uses the
+    /// native token progress fill when the source image does not expose a
+    /// measured progress-bar band.
     #[test]
-    fn the_embedded_artwork_decodes_and_prepares_the_bar() {
+    fn the_embedded_construct_artwork_decodes_and_uses_native_progress_fill() {
         let art = decode_png_rgba(ARTWORK).expect("the embedded artwork decodes");
-        assert_eq!(art.size, [ART_W, ART_H], "native artwork size");
+        assert_eq!(art.size, [1408, 768], "native Construct artwork size");
 
         let (base, bar) = prepare(&art);
-        let (fill, head) = bar.expect("the measured artwork yields the animated bar");
-        assert_eq!(fill.size, [TRACK_X1 - TRACK_X0, BAND_Y1 - BAND_Y0]);
-        assert_eq!(head.size, [HEAD_X1 - HEAD_X0, BAND_Y1 - BAND_Y0]);
-
-        // The base's bar starts empty: where the baked gradient sat, the pixel
-        // now matches the dim track (no blue/magenta fill left behind).
-        let mid_fill = base.pixels[833 * ART_W + 700];
+        assert_eq!(base.size, art.size);
         assert!(
-            mid_fill.r() < 60 && mid_fill.b() < 60,
-            "baked fill still visible in the base: {mid_fill:?}"
+            bar.is_none(),
+            "unknown artwork geometry must not be sampled"
         );
-
-        // The fill strip carries the artwork's gradient across the FULL track:
-        // blue-dominant at the far left, magenta at the far right.
-        let row = 833 - BAND_Y0;
-        let left = fill.pixels[row * fill.size[0] + 2];
-        let right = fill.pixels[row * fill.size[0] + fill.size[0] - 2];
-        assert!(
-            left.b() > 150 && left.b() > left.r(),
-            "left of strip: {left:?}"
-        );
-        assert!(right.r() > 150, "right of strip: {right:?}");
-
-        // The head sprite's centre is the bright dot (opaque); its corner glow
-        // is keyed toward transparent.
-        let centre = head.pixels[row * head.size[0] + head.size[0] / 2];
-        assert!(centre.a() > 200, "head dot centre not opaque: {centre:?}");
-        let corner = head.pixels[0];
-        assert!(corner.a() < 80, "head sprite corner not keyed: {corner:?}");
     }
 
     /// A swapped (non-measured) artwork must NOT be misread through the fixed
@@ -514,10 +444,10 @@ mod tests {
     }
 
     /// Drive headless splash frames through the same `Context::run` →
-    /// `tessellate` path the DRM runner uses: the splash paints the artwork +
-    /// version line (real draw primitives), holds the screen while milestones
-    /// are outstanding, and dismisses once init completes and the eased bar
-    /// settles — the first dock frame replaces it.
+    /// `tessellate` path the DRM runner uses: the splash paints Construct
+    /// identity + progress (real draw primitives), holds the screen while
+    /// milestones are outstanding, and dismisses once init completes and the
+    /// eased bar settles — the first dock frame replaces it.
     #[test]
     fn splash_renders_then_dismisses_when_init_completes() {
         let ctx = egui::Context::default();
@@ -534,7 +464,7 @@ mod tests {
             ctx.tessellate(out.shapes, out.pixels_per_point)
         };
 
-        // First boot frame: the splash paints (artwork + version line) and is
+        // First boot frame: the splash paints Construct identity + progress and is
         // nowhere near dismissed.
         let prims = frame(&mut splash, 0.0);
         assert!(!prims.is_empty(), "the splash painted no draw primitives");
@@ -567,14 +497,10 @@ mod tests {
         );
     }
 
-    /// The version line the splash paints is the QBRAND-1 build identity —
-    /// semver + the locked "Quazar" codename (lock 9).
+    /// The visible release line the splash paints stays independent from the
+    /// internal build semver/codename.
     #[test]
-    fn the_splash_version_line_is_the_brand_build_line() {
-        let line = mde_theme::brand::build::version_line();
-        assert!(
-            line.contains("\"Quazar\""),
-            "not the locked codename: {line}"
-        );
+    fn the_splash_version_line_is_the_visible_product_release() {
+        assert_eq!(mde_theme::brand::logo::PRODUCT_RELEASE, "Release 1.0 BETA");
     }
 }

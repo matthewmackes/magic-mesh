@@ -1,7 +1,7 @@
 # packaging/bootc/ — the ONE immutable MCNF image (E12-13)
 
 The §5/QC-1 delivery lock: **one immutable bootc/ostree image for every role** —
-egui-DRM shell + `mackesd` + Podman + Nebula + the QUASAR-CLOUD
+egui-DRM shell + `mackesd` + Podman + Nebula + the CONSTRUCT-CLOUD
 libvirt/QEMU-KVM/OVN host bits baked in; VM disks + mesh state live on the
 writable partition. **Role is a config flag, not a build**: a Lighthouse runs
 the byte-identical image with the desktop seat skipped/masked. The dnf/RPM
@@ -13,9 +13,9 @@ Contents:
 - `Containerfile` — FROM `quay.io/fedora/fedora-bootc:42`, installs the
   `magic-mesh` RPM (two lanes, below), adds the cloud substrate: `podman`,
   libvirt/QEMU-KVM, Open vSwitch, and OVN host bits. `cloud-hypervisor` is
-  deliberately absent per QUASAR-CLOUD/QC-1. Wires the DRM seat, boots to
+  deliberately absent per CONSTRUCT-CLOUD/QC-1. Wires the DRM seat, boots to
   `graphical.target`. The writable-partition doctrine is inline.
-- `units/mde-shell-egui.service` — the Quazar **DRM-seat unit** (greetd-style,
+- `units/mde-shell-egui.service` — the Construct **DRM-seat unit** (greetd-style,
   no display manager, no compositor — `quasar-vdi-desktop.md` lock 34). Image
   lane only; the dnf/RPM lane keeps launching the shell from a session via
   `org.magicmesh.Shell.desktop`.

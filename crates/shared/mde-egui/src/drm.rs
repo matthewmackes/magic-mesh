@@ -45,7 +45,8 @@ use crate::display::{PanelInfo, PanelMode};
 use gbm::AsRaw;
 use input::event::device::DeviceEvent;
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
-use input::event::pointer::{ButtonState, PointerEvent};
+#[allow(deprecated)]
+use input::event::pointer::{Axis, AxisSource, ButtonState, PointerEvent};
 use input::event::switch::{Switch, SwitchEvent, SwitchState as LiSwitchState};
 use input::event::touch::{TouchEvent, TouchEventPosition, TouchEventSlot};
 use input::event::EventTrait;
@@ -1390,8 +1391,10 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             match event {
                 LiEvent::Pointer(PointerEvent::Motion(m)) => {
                     // libinput deltas are physical pixels; egui pointer is in points.
-                    pointer.x = (pointer.x + m.dx() as f32 / ppp).clamp(0.0, pw);
-                    pointer.y = (pointer.y + m.dy() as f32 / ppp).clamp(0.0, ph);
+                    let policy = crate::input_policy();
+                    let scale = policy.pointer_scale();
+                    pointer.x = (pointer.x + m.dx() as f32 * scale / ppp).clamp(0.0, pw);
+                    pointer.y = (pointer.y + m.dy() as f32 * scale / ppp).clamp(0.0, ph);
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::MotionAbsolute(m)) => {
@@ -1402,12 +1405,41 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::Button(b)) => {
-                    events.push(egui::Event::PointerButton {
-                        pos: pointer,
-                        button: egui::PointerButton::Primary,
-                        pressed: b.button_state() == ButtonState::Pressed,
-                        modifiers: egui::Modifiers::default(),
-                    });
+                    if let Some(button) =
+                        crate::pointer_button(b.button(), crate::input_policy().left_handed)
+                    {
+                        events.push(egui::Event::PointerButton {
+                            pos: pointer,
+                            button,
+                            pressed: b.button_state() == ButtonState::Pressed,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+                #[allow(deprecated)]
+                LiEvent::Pointer(PointerEvent::Axis(a)) => {
+                    let policy = crate::input_policy();
+                    if !policy.two_finger_scroll && a.axis_source() == AxisSource::Finger {
+                        continue;
+                    }
+                    let mut delta = egui::Vec2::ZERO;
+                    if a.has_axis(Axis::Horizontal) {
+                        delta.x = a.axis_value(Axis::Horizontal) as f32;
+                    }
+                    if a.has_axis(Axis::Vertical) {
+                        delta.y = a.axis_value(Axis::Vertical) as f32;
+                    }
+                    if policy.natural_scroll {
+                        delta = -delta;
+                    }
+                    delta *= policy.scroll_scale();
+                    if delta != egui::Vec2::ZERO {
+                        events.push(egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
                 }
                 // SURFACE-8 (lock 13): touchscreen contacts. libinput reports a
                 // per-contact slot + a position transformed into the *unrotated* panel
@@ -1416,7 +1448,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                 // single-touch pointer. Down/Motion carry a position; Up/Cancel do not
                 // (the translator reuses the contact's last position). Frame events
                 // (contact-set boundaries) don't map to an egui event.
-                LiEvent::Touch(te) => {
+                LiEvent::Touch(te) if crate::input_policy().touchscreen_enabled => {
                     // A device without slots reports None → fall back to the seat slot
                     // so a single-touch panel still tracks one coherent contact.
                     let slot_of = |s: Option<u32>, seat: u32| s.unwrap_or(seat);
@@ -1478,6 +1510,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         );
                     }
                 }
+                LiEvent::Touch(_) => {}
                 LiEvent::Keyboard(KeyboardEvent::Key(k)) => {
                     let pressed = k.key_state() == KeyState::Pressed;
                     let code = k.key();
@@ -1571,6 +1604,12 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         for gesture in &gesture_out {
             match *gesture {
                 crate::gestures::Gesture::Scroll(delta) => {
+                    let policy = crate::input_policy();
+                    if !policy.two_finger_scroll {
+                        continue;
+                    }
+                    let delta =
+                        if policy.natural_scroll { -delta } else { delta } * policy.scroll_scale();
                     events.push(egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Point,
                         delta,
@@ -1581,6 +1620,9 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     events.push(egui::Event::Zoom(factor));
                 }
                 crate::gestures::Gesture::SecondaryClick(pos) => {
+                    if !crate::input_policy().long_press_secondary {
+                        continue;
+                    }
                     events.push(egui::Event::PointerMoved(pos));
                     for pressed in [true, false] {
                         events.push(egui::Event::PointerButton {
@@ -1592,7 +1634,9 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     }
                 }
                 crate::gestures::Gesture::EdgeSwipe(edge) => {
-                    crate::gestures::push_edge_swipe(edge);
+                    if crate::input_policy().edge_gestures {
+                        crate::gestures::push_edge_swipe(edge);
+                    }
                 }
             }
         }
@@ -1689,6 +1733,10 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::ZERO, |vo| vo.repaint_delay);
         next_repaint_at = wake::repaint_deadline_at(repaint_delay, Instant::now());
+        crate::Style::remap_clipped_shapes_for_color_scheme(
+            &mut full_output.shapes,
+            crate::Style::color_scheme(&egui_ctx),
+        );
         let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         painter.paint_and_update_textures(
             [wp, hp],

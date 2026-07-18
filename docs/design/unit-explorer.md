@@ -124,7 +124,7 @@ now spans three views (Hero / edge-rich card / IPAM table).
 ## The overview layer + ergonomics (operator 2026-07-04, +11-Q round)
 
 "Hero **overview** interface" — the single-hero focus sits inside a whole-fleet
-overview, driven remote-first (Quazar is a DRM thin-client desktop OS).
+overview, driven remote-first (Construct is a DRM thin-client desktop OS).
 
 | # | Area | Lock |
 |---|------|------|

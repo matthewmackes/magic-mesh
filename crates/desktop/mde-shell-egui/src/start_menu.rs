@@ -45,9 +45,9 @@
 //! opening/closing, rotating tile facts, and search-result updates.
 //!
 //! **WIN7-3 update:** the left pane is the real live-tile grid (locks
-//! #6/#7/#8/#23): all 18 [`Surface::ALL`] entries, grouped into lock #8's 7
+//! #6/#7/#8/#23): all 19 [`Surface::ALL`] entries, grouped into lock #8's 7
 //! function-based groups (Mesh Control · Desktop & Session · Media · Files &
-//! Data · Web & Tools · Comms · System — [`TILE_GROUPS`]), each a uniform
+//! Data · Web · Developer Tools · Comms · System — [`TILE_GROUPS`]), each a uniform
 //! [`TILE_W`]×[`TILE_H`] tile (lock #6 — one size, no variants). A tile wears
 //! the SAME glyph the app picker already draws (`Surface::icon_id`) plus a
 //! text label (`Surface::label`). A click reuses the picker's own
@@ -175,7 +175,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::chrome::MeshSummary;
 use crate::console::{self, ConsoleState};
-use crate::dock::{icon_texture, response_activated, Surface};
+#[cfg(test)]
+use crate::dock::launcher_group_accent;
+use crate::dock::{
+    icon_texture, launcher_group_label, response_activated, LauncherGroup, Surface, LAUNCHER_GROUPS,
+};
 use crate::status::{self, StatusSegments};
 use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 use mde_theme::brand::icons::IconId;
@@ -215,7 +219,7 @@ const START_ACCENT_W: f32 = Style::SP_XS / 2.0;
 /// composition `dock.rs`'s own (module-private) `CELL_W` icon-cell token
 /// already uses, restated here per this module's own established
 /// per-file-restatement idiom (see [`HAIRLINE_W`] above). Every one of the
-/// 18 tiles shares this ONE size (lock #6 — no small/wide/large variants).
+/// 19 tiles shares this ONE size (lock #6 — no small/wide/large variants).
 const TILE_H: f32 = Style::SP_XL + Style::SP_M;
 
 /// One tile's width — `SP_XL · 2.5` (80pt): wider than tall, so a full
@@ -227,8 +231,8 @@ const TILE_W: f32 = Style::SP_XL * 2.5;
 /// The gap between adjacent tiles, in both directions of the grid.
 const TILE_GAP: f32 = Style::SP_XS;
 
-/// How many tiles sit in one row before wrapping. The widest of lock #8's 7
-/// groups (Mesh Control / Media / Files & Data / Web & Tools) has exactly 3
+/// How many tiles sit in one row before wrapping. The widest launcher groups
+/// groups (Mesh Control / Media / Web / Developer Tools) has exactly 2-3
 /// members, so every one of today's groups renders as a single tidy row —
 /// pinned by a test below rather than just assumed. [`left_pane`]'s render
 /// loop still wraps generally (N rows, not hardcoded to 1 — `usize::div_ceil`)
@@ -276,17 +280,13 @@ const PANEL_W: f32 = LEFT_PANE_W + console::PANEL_W;
 /// one unified frame, not two mismatched panels glued together.
 const PANEL_H: f32 = console::PANEL_H;
 
-/// The tile grid's total content height: 7 group headings + 7 single tile
-/// rows (see [`TILE_COLUMNS`]'s note — every locked group fits one row
-/// today) + 6 inter-group gaps. Comfortably inside [`PANEL_H`] minus its own
-/// top/bottom [`PANE_PAD`] inset — pinned by a test below rather than
-/// trusted by eye. `#[cfg(test)]`: nothing in the render path reads a
-/// pre-summed total (`left_pane` accumulates `y` incrementally instead), so
-/// this is verification-only data (the `status.rs` `local_grade_pip_id`
-/// `#[cfg(test)]`-on-a-top-level-item idiom), not dead weight in a release
-/// build.
+/// The tile grid's total content height when each launcher group fits one tile
+/// row. This is verification-only data: rendering uses the scrollable section
+/// model below, so the grouped launcher may exceed the visible pane without
+/// colliding with the fixed search band.
 #[cfg(test)]
-const TILE_GRID_CONTENT_H: f32 = 7.0 * (GROUP_HEADING_H + TILE_H) + 6.0 * GROUP_GAP;
+const TILE_GRID_CONTENT_H: f32 = TILE_GROUPS.len() as f32 * (GROUP_HEADING_H + TILE_H)
+    + (TILE_GROUPS.len() - 1) as f32 * GROUP_GAP;
 
 // ── type-to-launch search (SHELL-UX-3) ──────────────────────────────────────
 
@@ -311,6 +311,9 @@ const RESULT_ICON: f32 = Style::SP_M;
 
 /// The search field's leading/clear glyph edge.
 const SEARCH_ICON: f32 = Style::SP_M;
+/// Visible placeholder copy for the Start search field. Keep it ASCII so shell
+/// chrome copy follows the Browser/Start text-glyph cleanup contract.
+const START_SEARCH_HINT: &str = "Search apps and commands...";
 
 fn search_rect(left_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
@@ -478,83 +481,14 @@ pub(crate) struct TileFactInputs {
 
 // ── tile groups (lock #8: function-based grouping) ──────────────────────────
 
-/// One labelled group of the left pane's tile grid (lock #8). Mirrors
-/// `dock.rs`'s `Group` / `console.rs`'s `ConsoleGroup` shape — this module's
-/// own copy since the Start Menu's tile grouping is its own domain concern
-/// (lock #8), distinct from the app picker's PICKER-1 grouping.
-struct TileGroup {
-    /// The group heading, painted by [`tile_group_heading`] (visually
-    /// matching `console.rs`'s own `heading()` row, per this unit's steer to
-    /// match Console's precedent since it sits right next to this pane).
-    label: &'static str,
-    /// WIN10-HYBRID B6 — a category accent for the heading rail and each
-    /// tile's resting left stripe. Purely presentational; this same table
-    /// remains the one reachability authority for the grouped grid.
-    accent: egui::Color32,
-    /// The group's surfaces, kept in [`Surface::ALL`] relative order (the
-    /// `dock.rs` `Group::surfaces` L7 convention) — lock #8's own listed
-    /// order already satisfies this, checked by a test below.
-    surfaces: &'static [Surface],
-}
-
-/// The 7 function-based groups in their locked order (lock #8), each listing
-/// its surfaces in [`Surface::ALL`] relative order. Unlike the app picker's
-/// `GROUPS` (which pulls the Workbench/System/Desktop out to standalone
-/// cells), every one of the 18 [`Surface::ALL`] entries sits inside exactly
-/// one group here — lock #8 places all 18, none outside. Drives the tile
-/// render + the shell tests (the one grouping authority for this pane).
-const TILE_GROUPS: [TileGroup; 7] = [
-    TileGroup {
-        label: "Mesh Control",
-        accent: Style::ACCENT_MESH,
-        surfaces: &[Surface::Workbench, Surface::MeshView, Surface::InfraCode],
-    },
-    TileGroup {
-        label: "Desktop & Session",
-        accent: Style::ACCENT,
-        surfaces: &[Surface::Desktop],
-    },
-    TileGroup {
-        label: "Media",
-        accent: Style::ACCENT_MEDIA,
-        surfaces: &[Surface::Music, Surface::Media],
-    },
-    TileGroup {
-        label: "Files & Data",
-        accent: Style::ACCENT_SYSTEM,
-        surfaces: &[Surface::Files, Surface::Bookmarks, Surface::Storage],
-    },
-    TileGroup {
-        label: "Web & Tools",
-        accent: Style::ACCENT_TERMINALS,
-        surfaces: &[Surface::Browser, Surface::Terminal, Surface::Editor],
-    },
-    TileGroup {
-        label: "Comms",
-        accent: Style::ACCENT_COMMS,
-        // Voice (SIP calling) is a communications surface, not a media player:
-        // dock.rs `GROUPS` — the canonical taxonomy — groups it with Chat/Phones,
-        // so this tile grouping matches (kept in `Surface::ALL` relative order).
-        surfaces: &[Surface::Voice, Surface::Chat, Surface::Phones],
-    },
-    TileGroup {
-        label: "System",
-        accent: Style::ACCENT_WORKLOADS,
-        // Explorer (discover every mesh/LAN/cloud unit) tiles here beside About —
-        // whose body IS the Device-Manager hardware inventory — as the pane's
-        // inventory/inspection pair. The canonical picker (`dock.rs` GROUPS) files
-        // it under Mesh with the Mesh Map; the two taxonomies group per their own
-        // concern (lock #8), so this pane's functional grouping keeps it with the
-        // inventory surfaces rather than adding a fourth mesh tile that would wrap.
-        surfaces: &[Surface::System, Surface::About, Surface::Explorer],
-    },
-];
+/// The 8 function-based groups in their locked order (lock #8), each listing
+/// its surfaces in [`Surface::ALL`] relative order. The data comes from the
+/// shared shell launcher taxonomy so Start and Front Door cannot drift apart.
+const TILE_GROUPS: [LauncherGroup; 8] = LAUNCHER_GROUPS;
 
 // Compile-time guard: every `Surface::ALL` entry appears in `TILE_GROUPS`
-// exactly once (the `dock.rs` `GROUPS` completeness-guard idiom, restated
-// here since this table is its own domain concern — lock #8's grouping, not
-// `dock.rs`'s picker grouping) — so a future `Surface` addition that forgets
-// to place a tile fails the BUILD, not a silent missing/duplicate tile.
+// exactly once, so a future `Surface` addition that forgets to place a tile
+// fails the BUILD, not a silent missing/duplicate tile.
 const _: () = {
     let mut i = 0;
     while i < Surface::ALL.len() {
@@ -595,6 +529,7 @@ fn surface_wire_id(surface: Surface) -> &'static str {
         Surface::Voice => "voice",
         Surface::Browser => "browser",
         Surface::Bookmarks => "bookmarks",
+        Surface::MapsLocation => "maps_location",
         Surface::Terminal => "terminal",
         Surface::Editor => "editor",
         Surface::Chat => "chat",
@@ -621,6 +556,7 @@ fn surface_from_wire_id(id: &str) -> Option<Surface> {
         "voice" => Some(Surface::Voice),
         "browser" => Some(Surface::Browser),
         "bookmarks" => Some(Surface::Bookmarks),
+        "maps_location" => Some(Surface::MapsLocation),
         "terminal" => Some(Surface::Terminal),
         "editor" => Some(Surface::Editor),
         "chat" => Some(Surface::Chat),
@@ -748,7 +684,7 @@ pub struct StartMenuState {
     /// [`search_field`]'s `request_focus`.
     search_focus_pending: bool,
     /// SM-QOL-1 — the operator's pinned/favourite surfaces, rendered as a
-    /// "Pinned" section at the TOP of the left pane (above the 7 function
+    /// "Pinned" section at the TOP of the left pane (above the function
     /// groups). A [`Vec`]-as-ordered-set (pin order is the render order); the
     /// no-duplicate invariant is held by the ONE mutator [`toggle_pin`], driven
     /// from a tile's right-click context menu ([`tile_context_menu`]). Empty by
@@ -811,6 +747,58 @@ impl StartMenuState {
     /// Whether the panel is up.
     pub(crate) const fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Ordered operator favourites for launcher surfaces. The Front Door reads
+    /// this as a display priority only; Start remains the owner of pin mutation
+    /// and persistence.
+    pub(crate) fn pinned_surfaces(&self) -> &[Surface] {
+        &self.pinned
+    }
+
+    /// Toggle a launcher surface in the same persisted favorites set used by
+    /// the Start tile context menu. Front Door uses this seam so the platform
+    /// has one local pin store, not two diverging preference files.
+    pub(crate) fn toggle_surface_pin(&mut self, surface: Surface) -> bool {
+        let before = self.pinned.clone();
+        toggle_pin(&mut self.pinned, surface);
+        let changed = self.pinned != before;
+        if changed {
+            self.persist_pins();
+        }
+        changed
+    }
+
+    pub(crate) fn move_surface_pin_up(&mut self, surface: Surface) -> bool {
+        let Some(idx) = self
+            .pinned
+            .iter()
+            .position(|&candidate| candidate == surface)
+        else {
+            return false;
+        };
+        if idx == 0 {
+            return false;
+        }
+        self.pinned.swap(idx - 1, idx);
+        self.persist_pins();
+        true
+    }
+
+    pub(crate) fn move_surface_pin_down(&mut self, surface: Surface) -> bool {
+        let Some(idx) = self
+            .pinned
+            .iter()
+            .position(|&candidate| candidate == surface)
+        else {
+            return false;
+        };
+        if idx + 1 >= self.pinned.len() {
+            return false;
+        }
+        self.pinned.swap(idx, idx + 1);
+        self.persist_pins();
+        true
     }
 
     /// WIN7-4 — refresh the live-tile fact inputs for this frame (the
@@ -1059,7 +1047,7 @@ struct NavCell {
 
 /// One rendered section of the left pane (SM-QOL-1): a heading plus its tiles
 /// chunked into [`TILE_COLUMNS`]-wide rows. The optional Pinned section leads,
-/// then the 7 [`TILE_GROUPS`]. Built fresh each frame from the live pin set so
+/// then the [`TILE_GROUPS`]. Built fresh each frame from the live pin set so
 /// the layout and the arrow-nav row math ([`nav_rows`]) can never diverge.
 struct NavSection {
     heading: &'static str,
@@ -1070,7 +1058,7 @@ struct NavSection {
 
 /// The pane's ordered sections for this frame: the Pinned section first (only
 /// when something is pinned — an empty pin set renders EXACTLY the WIN7-3 grid,
-/// zero behaviour change), then the 7 locked [`TILE_GROUPS`]. Each section's
+/// zero behaviour change), then the locked [`TILE_GROUPS`]. Each section's
 /// surfaces are chunked into [`TILE_COLUMNS`]-wide rows (today every group is a
 /// single row, but chunking keeps a future >3-member group — or a >3 pin set —
 /// wrapping to a second row instead of overlapping).
@@ -1298,7 +1286,7 @@ struct LeftPaneOutcome {
 }
 
 /// The left pane (WIN7-3, locks #6/#7/#8; WIN7-4, lock #5; SM-QOL-1): the
-/// optional **Pinned** section then [`TILE_GROUPS`]' 7 headed sections, each a
+/// optional **Pinned** section then [`TILE_GROUPS`]' headed sections, each a
 /// row of uniform [`TILE_W`]×[`TILE_H`] tiles. Drives the grid's arrow-key
 /// keyboard focus ([`drive_grid_focus`]) before rendering, and applies a
 /// right-click Pin/Unpin AFTER the render loop (so the frame's read-only pin
@@ -1700,7 +1688,7 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
 /// fabricated rotation. Zero counts/absent data are honest silence (the
 /// `dock.rs` "zero paints no badge" convention, restated per-fact here) —
 /// e.g. Files shows nothing while idle, not "0 transferring".
-#[allow(clippy::too_many_lines)] // one match arm per Surface::ALL variant (18), same shape as badge_for
+#[allow(clippy::too_many_lines)] // one match arm per Surface::ALL variant (19), same shape as badge_for
 fn tile_facts(surface: Surface, inputs: &TileFactInputs) -> Vec<String> {
     match surface {
         Surface::Chat => {
@@ -1838,7 +1826,7 @@ fn tile_facts(surface: Surface, inputs: &TileFactInputs) -> Vec<String> {
         // matching §7 over forcing a rotation with nothing real to show. (The
         // Explorer's discovered-unit count is not plumbed to this pane's
         // `TileFactInputs`; wiring one is a follow-on, not this promotion.)
-        Surface::Editor | Surface::About | Surface::Explorer => Vec::new(),
+        Surface::Editor | Surface::About | Surface::Explorer | Surface::MapsLocation => Vec::new(),
         // Timers deliberately sits OUTSIDE Surface::ALL/TILE_GROUPS (lock
         // #20 — the clock strip is its ONE home, never a picker/tile
         // entry), so this arm is never actually reached by `left_pane`'s
@@ -1907,7 +1895,7 @@ fn severity_rank(rollup: Option<&status::SegmentRollup>) -> u8 {
 /// concept (System's Device/Power segment rollups, MeshView's mesh health,
 /// Chat/Files' accent-on-nonzero-count, the SAME tone language `dock.rs`'s
 /// own badges already use for the identical surfaces/data), `None`
-/// everywhere else — most of the 18 surfaces are plain counts with no
+/// everywhere else — most of the 19 surfaces are plain counts with no
 /// health concept at all, and painting a tint for those would be an
 /// invented severity, not a reused one (§7). `None` is also the honest
 /// "nothing has landed yet" answer (pre-poll / never-visited-this-session),
@@ -2196,7 +2184,7 @@ fn search_field(
     let resp = ui.put(
         text_rect,
         egui::TextEdit::singleline(query)
-            .hint_text("Search apps and commands…")
+            .hint_text(START_SEARCH_HINT)
             .font(egui::FontId::proportional(Style::BODY))
             .desired_width(text_rect.width())
             .return_key(None)
@@ -2239,7 +2227,7 @@ fn search_clear_button_id() -> egui::Id {
     egui::Id::new("start-menu-search-clear")
 }
 
-/// Rank the 18 tileable [`Surface::ALL`] entries against `query`
+/// Rank the 19 tileable [`Surface::ALL`] entries against `query`
 /// (case-insensitive), best match first: a label *prefix* hit (rank 0)
 /// outranks a label *substring* hit (rank 1), which outranks a hit on the
 /// surface's *group name* only (rank 2 — so typing a category like "media"
@@ -2293,20 +2281,14 @@ fn search_matches(query: &str) -> Vec<StartSearchHit> {
 /// above), so the lookup always resolves for a searchable surface; the
 /// never-searched `Timers` (outside `ALL`) would fall to `""`.
 fn tile_group_label(surface: Surface) -> &'static str {
-    TILE_GROUPS
-        .iter()
-        .find(|g| g.surfaces.contains(&surface))
-        .map_or("", |g| g.label)
+    launcher_group_label(surface)
 }
 
 /// The category accent for a grouped-grid surface (B6). Returns `None` only
 /// for non-grid surfaces such as [`Surface::Timers`].
 #[cfg(test)]
 fn tile_group_accent(surface: Surface) -> Option<egui::Color32> {
-    TILE_GROUPS
-        .iter()
-        .find(|g| g.surfaces.contains(&surface))
-        .map(|g| g.accent)
+    launcher_group_accent(surface)
 }
 
 /// The one authoritative grouped-grid surface order: every tileable surface
@@ -2585,7 +2567,7 @@ fn tile_accesskit_id(cell: NavCell) -> egui::Id {
 /// "{Segment} status"). Pinned shortcut copies keep the visible surface label,
 /// but prefix the accesskit value so assistive consumers can distinguish them
 /// from the grouped copy. Deliberately NOT individually `Live::Polite`: a screen
-/// reader hearing every one of up to 18 tiles announce itself on the same
+/// reader hearing every one of up to 19 tiles announce itself on the same
 /// rotation clock would be a spam regression, not an accessibility win —
 /// [`install_tiles_live_summary`] is the ONE live-announcing node for the whole
 /// grid, mirroring NOTIF-11's own shape exactly (one live
@@ -2973,6 +2955,25 @@ mod tests {
             .clone()
     }
 
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     /// A minimal real [`crate::status::SegmentRollup`] at a given severity —
     /// every field but `severity` is a placeholder, mirroring `status.rs`'s
     /// own private `rollup()` test helper (not reusable across modules) for
@@ -3213,17 +3214,17 @@ mod tests {
     // ── WIN7-3: live tiles (locks #6/#7/#8/#23) ──────────────────────────────
 
     #[test]
-    fn the_18_surfaces_are_grouped_into_lock_8s_7_function_based_groups() {
-        // Lock #8's exact taxonomy + order — the `dock.rs`
-        // `the_locked_group_taxonomy_and_order` precedent, restated for this
-        // pane's own (different) grouping table.
+    fn the_19_surfaces_are_grouped_into_lock_8s_7_function_based_groups() {
+        // Lock #8's exact taxonomy + order, consumed from the shared launcher
+        // table and restated here so this pane's layout contract stays visible.
         use Surface::{
-            About, Bookmarks, Browser, Chat, Desktop, Editor, Explorer, Files, InfraCode, Media,
-            MeshView, Music, Phones, Storage, System, Terminal, Voice, Workbench,
+            About, Bookmarks, Browser, Chat, Desktop, Editor, Explorer, Files, InfraCode,
+            MapsLocation, Media, MeshView, Music, Phones, Storage, System, Terminal, Voice,
+            Workbench,
         };
         let expect: [(&str, &[Surface]); 7] = [
             ("Mesh Control", &[Workbench, MeshView, InfraCode]),
-            ("Desktop & Session", &[Desktop]),
+            ("Desktop & Session", &[Desktop, MapsLocation]),
             ("Media", &[Music, Media]),
             ("Files & Data", &[Files, Bookmarks, Storage]),
             ("Web & Tools", &[Browser, Terminal, Editor]),
@@ -3242,11 +3243,9 @@ mod tests {
                 "{label} membership + within-group order"
             );
         }
-        // Unlike the app picker (which pulls Workbench/System/Desktop out to
-        // standalone cells), lock #8 places ALL 18 Surface::ALL entries
-        // inside a group — none sit outside. The compile-time guard above
-        // already enforces "exactly once"; re-prove it here at runtime too
-        // (the dock.rs belt-and-suspenders convention).
+        // The shared taxonomy places ALL 19 Surface::ALL entries inside a
+        // group, none outside. The compile-time guard above already enforces
+        // "exactly once"; re-prove it here at runtime too.
         let mut placed: Vec<Surface> = Vec::new();
         for g in &super::TILE_GROUPS {
             placed.extend_from_slice(g.surfaces);
@@ -3263,6 +3262,31 @@ mod tests {
                 "{surface:?} must be placed in exactly one tile group"
             );
         }
+    }
+
+    #[test]
+    fn start_tiles_use_the_shared_launcher_taxonomy_source() {
+        assert_eq!(
+            super::TILE_GROUPS,
+            crate::dock::LAUNCHER_GROUPS,
+            "Start must consume the shared launcher taxonomy, not a local copy"
+        );
+        for surface in Surface::ALL {
+            assert_eq!(
+                super::tile_group_label(surface),
+                crate::dock::launcher_group_label(surface),
+                "{surface:?} group label drifted between Start and dock"
+            );
+            assert_eq!(
+                super::tile_group_accent(surface),
+                crate::dock::launcher_group_accent(surface),
+                "{surface:?} group accent drifted between Start and dock"
+            );
+        }
+        assert_eq!(super::tile_group_label(Surface::Browser), "Web & Tools");
+        assert_eq!(super::tile_group_label(Surface::Bookmarks), "Files & Data");
+        assert_eq!(super::tile_group_label(Surface::Files), "Files & Data");
+        assert_ne!(super::tile_group_label(Surface::Files), "System");
     }
 
     #[test]
@@ -3413,8 +3437,8 @@ mod tests {
     }
 
     #[test]
-    fn all_18_tiles_render_at_one_uniform_size_and_stay_within_the_left_pane() {
-        // Lock #6 — one uniform tile size for all 18, no variants — proven
+    fn all_19_tiles_render_at_one_uniform_size_and_stay_within_the_left_pane() {
+        // Lock #6 — one uniform tile size for all 19, no variants — proven
         // on REAL rendered rects (the addressable-cell idiom via
         // `tile_id`), not just on the shared constants two tiles happen to
         // both reference.
@@ -4211,7 +4235,7 @@ mod tests {
     fn the_search_field_tucks_below_the_tile_grid_without_overlap() {
         // Constant-geometry assertion (the WIN7-2 `PANEL_H`/`PANEL_W`
         // precedent, no GPU): the 7-group grid must bottom out strictly above
-        // the search band, and all 18 result rows must fit the results area at
+        // the search band, and all surface result rows must fit the results area at
         // once (worst case — a one-letter query matching every surface).
         let grid_bottom = super::PANE_PAD + super::TILE_GRID_CONTENT_H;
         let search_top = PANEL_H - super::PANE_PAD - super::SEARCH_H;
@@ -4221,8 +4245,8 @@ mod tests {
         );
         let results_rows_h = search_top - Style::SP_XS - super::PANE_PAD;
         assert!(
-            18.0 * super::RESULT_ROW_H <= results_rows_h,
-            "all 18 result rows must fit the results band"
+            Surface::ALL.len() as f32 * super::RESULT_ROW_H <= results_rows_h,
+            "all surface result rows must fit the results band"
         );
     }
 
@@ -4482,6 +4506,26 @@ mod tests {
             .find(|n| n.label() == Some("Start Menu search"))
             .expect("the search box exports an accesskit node");
         assert_eq!(search.role(), egui::accesskit::Role::SearchInput);
+    }
+
+    #[test]
+    fn start_menu_search_hint_uses_ascii_chrome_copy() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().any(|text| text == super::START_SEARCH_HINT),
+            "the Start search hint should be visible using ASCII chrome copy: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains('…')),
+            "the Start search field should not paint a Unicode ellipsis: {texts:?}"
+        );
     }
 
     #[test]

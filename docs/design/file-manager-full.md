@@ -76,7 +76,7 @@ Surface::Files (mde-files-egui)                       mackesd (mesh tier)
   Mounted mesh paths are just local paths to it (the worker did the mount).
 - **`mde-files-egui` (Surface::Files)** is render + request: views, navigation, selection,
   DnD, the op-queue panel, the dialogs (conflict/properties/typed-arming), preview/thumbnails,
-  the Mesh sidebar tree. §4 Quazar tokens.
+  the Mesh sidebar tree. §4 Construct tokens.
 - **`mackesd` mesh_mount worker** owns the sshfs lifecycle over the overlay (sealed key,
   roster, mount/unmount/health/reconnect, home-vs-root escalation). §6: the mesh/overlay/key
   concerns stay mesh-side; the desktop surface only requests + browses.

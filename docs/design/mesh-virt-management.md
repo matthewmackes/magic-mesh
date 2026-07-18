@@ -1,6 +1,6 @@
 # Mesh virtualization management + same-stack — design lock
 
-> **PARTIALLY SUPERSEDED 2026-07-03 by `docs/design/quasar-cloud.md` (QUASAR-CLOUD,
+> **PARTIALLY SUPERSEDED 2026-07-03 by `docs/design/quasar-cloud.md` (CONSTRUCT-CLOUD,
 > 90-Q survey).** Pillar 1's **cloud-hypervisor** choice and the §"management
 > layer" **mesh-native #5 scheduler** lock are superseded: the VM plane is now
 > **Nova + Placement on libvirt/QEMU-KVM** (Kolla containers, mackesd-supervised),
@@ -15,7 +15,7 @@
 ## The three pillars locked here
 
 1. **Hypervisor = Fedora + KVM, not XCP-ng (Option B).** The host hypervisor is
-   **libvirt/QEMU-KVM on Fedora** (QUASAR-CLOUD Q32; `cloud-hypervisor` is
+   **libvirt/QEMU-KVM on Fedora** (CONSTRUCT-CLOUD Q32; `cloud-hypervisor` is
    retired), so one OS family runs every role while the VM plane is the same
    stack Nova drives. **XCP-ng is demoted from a role to a day-2 "adopt external
    hypervisor capacity" action** — magic-mesh can still enroll + drive an existing
@@ -40,7 +40,7 @@
    - **Option 2 (target): features-as-workloads.** As the management layer matures,
      role-specific features (media/Navidrome, back-office services, VMs) become
      **Podman/VM workloads the management layer schedules**, shrinking the base. The
-     **egui-DRM shell is the one host binary** (it owns the seat — the Quazar
+     **egui-DRM shell is the one host binary** (it owns the seat — the Construct
      premise — so it can't be a workload); it lights up only where a display exists.
      Everything else a role does is a managed workload.
 

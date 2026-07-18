@@ -63,7 +63,7 @@ use super::sources::{LanHostRecord, LanScanSource};
 /// The port → service-label fingerprint set (design #3).
 ///
 /// The common remote / management ports, each mapped to the service it implies.
-/// Quazar cares about the remote-desktop trio (RDP/VNC/Spice) because a LAN
+/// Construct cares about the remote-desktop trio (RDP/VNC/Spice) because a LAN
 /// desktop is a broker target — the type guess + the E5 openable-action seam ride
 /// these labels.
 pub const FINGERPRINT_PORTS: &[(u16, &str)] = &[
@@ -245,7 +245,7 @@ fn sweep_hosts(locals: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
 /// Reuses the platform surrounding-host [`classify`] cascade for the mDNS /
 /// hostname / well-known-port signals it already knows, then falls back to the
 /// remote-management ports that taxonomy's port map doesn't cover. Best-choice
-/// (no design lock): RDP/VNC/Spice/WinRM ⇒ a desktop `computer` (a Quazar broker
+/// (no design lock): RDP/VNC/Spice/WinRM ⇒ a desktop `computer` (a Construct broker
 /// target); SSH-only ⇒ a headless `server`; HTTP-only is too weak to type ⇒
 /// honest unknown (§7).
 #[must_use]

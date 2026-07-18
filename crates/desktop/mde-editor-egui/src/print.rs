@@ -263,7 +263,7 @@ pub fn submit(program: &str, job: &str, opts: &PrintOptions) -> Result<(), Print
     )
 }
 
-/// Draw one page as a Quazar-styled preview card (EDTB-5): a bordered plate over
+/// Draw one page as a Construct-styled preview card (EDTB-5): a bordered plate over
 /// the page background with a dimmed filename header, the monospace body, and a
 /// right-aligned `Page N of M` footer — the same [`Page`] the print job renders,
 /// so the preview is honest (§7). Carbon `Style` tokens throughout (§4).

@@ -454,7 +454,7 @@ enum Cmd {
         json: bool,
     },
 
-    /// QC-15 — audit a QUASAR-CLOUD cutover node for retired VM-stack leftovers
+    /// QC-15 — audit a CONSTRUCT-CLOUD cutover node for retired VM-stack leftovers
     /// and Q58 fresh-VM rebuild evidence. Exits nonzero when any check fails.
     CutoverAudit {
         /// Repository root to inspect for old-stack artifacts.

@@ -39,13 +39,13 @@
 //! refactored bars keep byte-identical behaviour. On top of that the strip paints a
 //! shared-[`Motion`] hover/open **underline** and fades a drop-down's body in on
 //! open, and every menu item carries a **2 px accent focus ring** when keyboard-
-//! focused (a11y, Quazar lock 5). All of it is **reduce-motion aware**: a surface
+//! focused (a11y, Construct lock 5). All of it is **reduce-motion aware**: a surface
 //! that zeroes egui's `animation_time` gets instant transitions here too.
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align, Button, Color32, FontFamily, FontId, Key, Layout, Rect, RichText, Sense, Stroke,
-    StrokeKind, Ui,
+    StrokeKind, Ui, WidgetInfo, WidgetType,
 };
 
 use crate::{Motion, Style};
@@ -57,6 +57,27 @@ pub const BAR_HEIGHT: f32 = Style::DISPLAY + Style::SP_S;
 /// Minimum drop-down width so short menus don't collapse into slivers — six shared
 /// spacing units (§4), the derivation both refactored bars already used.
 const MENU_MIN_W: f32 = Style::SP_XL * 6.0;
+const REMOTE_SESSIONS_BUTTON_W: f32 = Style::SP_XL;
+const REMOTE_SESSIONS_BUTTON_H: f32 = Style::SP_L;
+
+/// Stable id for the top-right menu-bar minimize button that routes to the
+/// shell's Remote Sessions workspace.
+#[must_use]
+pub fn remote_sessions_button_id() -> egui::Id {
+    egui::Id::new("shared-menubar-remote-sessions-minimize")
+}
+
+fn remote_sessions_request_id() -> egui::Id {
+    egui::Id::new("shared-menubar-remote-sessions-minimize-request")
+}
+
+/// Drain the top-right menu-bar Remote Sessions/minimize request, returning the
+/// clicked button's screen rect so the shell can animate toward the source.
+#[must_use]
+pub fn take_remote_sessions_request(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data_mut(|d| d.remove_temp::<Option<egui::Rect>>(remote_sessions_request_id()))
+        .flatten()
+}
 
 // ─────────────────────────────── status chips ───────────────────────────────
 
@@ -67,7 +88,7 @@ pub enum ChipTone {
     /// A plain read-out (host, count, codec) — dim body text.
     #[default]
     Neutral,
-    /// An interactive / branded value — the Quazar accent.
+    /// An interactive / branded value — the Construct accent.
     Info,
     /// A healthy / connected state — success green.
     Ok,
@@ -353,12 +374,59 @@ impl MenuBar {
             menu_strip(ui, model, &mnemonics, &mut picked);
             // Live status cluster, hugging the right edge (lock 3/6).
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                remote_sessions_button(ui);
+                ui.add_space(Style::SP_XS);
                 for chip in model.status.iter().rev() {
                     status_chip(ui, chip);
                 }
             });
         });
         picked
+    }
+}
+
+fn remote_sessions_button(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(REMOTE_SESSIONS_BUTTON_W, REMOTE_SESSIONS_BUTTON_H),
+        Sense::hover(),
+    );
+    let response = ui.interact(rect, remote_sessions_button_id(), Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            ui.is_enabled(),
+            "Minimize to Remote Sessions",
+        )
+    });
+
+    let visuals = ui.visuals();
+    let fill = if response.is_pointer_button_down_on() {
+        visuals.widgets.active.bg_fill
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
+    }
+    let stroke_color = if response.hovered() {
+        visuals.widgets.hovered.fg_stroke.color
+    } else {
+        Style::TEXT_DIM
+    };
+    let center_y = rect.center().y + 4.0;
+    let x0 = rect.center().x - Style::SP_XS;
+    let x1 = rect.center().x + Style::SP_XS;
+    ui.painter().line_segment(
+        [egui::pos2(x0, center_y), egui::pos2(x1, center_y)],
+        Stroke::new(1.5, stroke_color),
+    );
+
+    if response.clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(remote_sessions_request_id(), Some(rect)));
+        ui.ctx().request_repaint();
     }
 }
 
@@ -588,8 +656,9 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
 #[allow(clippy::float_cmp, clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::{
-        display_title, mnemonic_key, motion_secs, resolve_mnemonics, ChipTone, Entry, Item, Menu,
-        MenuBar, MenuBarModel, StatusChip, BAR_HEIGHT,
+        display_title, mnemonic_key, motion_secs, remote_sessions_button_id, resolve_mnemonics,
+        take_remote_sessions_request, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel,
+        StatusChip, BAR_HEIGHT,
     };
     use crate::{Motion, Style};
 
@@ -617,7 +686,9 @@ mod tests {
                     Entry::Submenu {
                         label: "Colour Scheme".to_owned(),
                         mnemonic: None,
-                        entries: vec![Entry::Item(Item::new("quasar", "Quazar").checked(false))],
+                        entries: vec![Entry::Item(
+                            Item::new("construct", "Construct").checked(false),
+                        )],
                     },
                 ],
             ),
@@ -802,6 +873,83 @@ mod tests {
         assert!(
             BAR_HEIGHT > Style::DISPLAY,
             "the bar clears its display title"
+        );
+    }
+
+    #[test]
+    fn menu_bar_remote_sessions_button_is_top_right_and_requests_minimize() {
+        use egui::{pos2, vec2, Rect};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let menus = sample_menus();
+        let status = [StatusChip::new("nyc3", ChipTone::Neutral)];
+        let render = |ctx: &egui::Context, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::TopBottomPanel::top("shared-menu-bar").show(ctx, |ui| {
+                    let model = MenuBarModel {
+                        title: "Editor",
+                        accent: Style::ACCENT,
+                        menus: &menus,
+                        status: &status,
+                    };
+                    let _ = MenuBar::show(ui, &model);
+                });
+            })
+        };
+
+        render(&ctx, Vec::new());
+        assert!(
+            take_remote_sessions_request(&ctx).is_none(),
+            "idle frames do not request Remote Sessions"
+        );
+        let button = ctx
+            .read_response(remote_sessions_button_id())
+            .expect("top-right Remote Sessions/minimize button registered")
+            .rect;
+        assert!(
+            button.right() > 1240.0 && button.top() < BAR_HEIGHT,
+            "the minimize button should sit in the menu bar's top-right title-bar slot: {button:?}"
+        );
+
+        let pos = button.center();
+        render(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        render(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let source = take_remote_sessions_request(&ctx)
+            .expect("clicking the menu-bar minimize button queues a shell route");
+        assert!(
+            source.contains(pos),
+            "the queued request carries the clicked source rect for the shell animation"
+        );
+        assert!(
+            take_remote_sessions_request(&ctx).is_none(),
+            "the request is drain-once"
         );
     }
 }

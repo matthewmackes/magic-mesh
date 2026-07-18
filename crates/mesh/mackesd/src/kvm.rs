@@ -49,7 +49,7 @@ impl KvmService {
 /// xcp-ng toolstack. Ordered management-brain-first: `libvirtd` (the lifecycle +
 /// network + storage daemon) leads, then the container socket, host networking,
 /// and the libvirt-served default network + storage pool. Cockpit's interim VM
-/// console is retired by the QUASAR-CLOUD/QC-15 cutover and is deliberately not
+/// console is retired by the CONSTRUCT-CLOUD/QC-15 cutover and is deliberately not
 /// part of the live catalog.
 pub static KVM_SERVICES: &[KvmService] = &[
     KvmService::new(

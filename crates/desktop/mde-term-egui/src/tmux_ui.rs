@@ -37,7 +37,7 @@
 //!   OUT to the surface, which owns the controller the menu drives.
 //!
 //! **TMUX-FC-4 — the native chrome** (design locks #4/#8/#15): the **native
-//! Quazar status bar** ([`status_bar`] — session name · the window list · a
+//! Construct status bar** ([`status_bar`] — session name · the window list · a
 //! clock, all `Style` tokens, deliberately ignoring the user's tmux `status-*`
 //! config), the **toolbar** ([`toolbar`] — one-click pane/window ops resolved
 //! through the same [`op_intents`] targets the menu uses), the **curated
@@ -461,7 +461,7 @@ pub struct TmuxChrome {
     roster: Option<Arc<dyn RosterClient>>,
     /// TMUX-FC-6 — the Bus PTY-broker seam a mesh attach dials `tmux -CC` over.
     bus: Option<Arc<dyn PtyBus>>,
-    /// TMUX-FC-8 — the mesh-synced Quazar tmux config + its store.
+    /// TMUX-FC-8 — the mesh-synced Construct tmux config + its store.
     config: crate::TmuxConfig,
     /// The mesh-synced config store (`None` = no store resolved, e.g. tests).
     config_store: Option<crate::TmuxConfigStore>,
@@ -844,7 +844,7 @@ impl TmuxChrome {
                 None => {}
             }
         }
-        // TMUX-FC-8 — the Quazar config settings pane (prefix / mouse / history).
+        // TMUX-FC-8 — the Construct config settings pane (prefix / mouse / history).
         if self.ui.settings_open {
             match render_settings(ui, &mut self.config) {
                 Some(SettingsAction::Save) => self.save_config(),
@@ -868,7 +868,7 @@ impl TmuxChrome {
         }
     }
 
-    /// TMUX-FC-8 — push the mesh-synced Quazar config to the live control client
+    /// TMUX-FC-8 — push the mesh-synced Construct config to the live control client
     /// as `set-option -g` commands (the prefix, mouse, history). Applied the
     /// moment a client is created, so the live server reflects the platform config
     /// regardless of what `.tmux.conf` (if any) it started from. A no-op when no
@@ -1885,10 +1885,10 @@ fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut V
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TMUX-FC-4 — the native Quazar status bar.
+// TMUX-FC-4 — the native Construct status bar.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// FC-4 — the **native Quazar status bar** (design lock #8): the session name,
+/// FC-4 — the **native Construct status bar** (design lock #8): the session name,
 /// the window list (current highlighted, `Z` while zoomed; a click round-trips
 /// `select-window`), and a wall clock — rendered from the live model through
 /// `Style` tokens and deliberately **ignoring the user's tmux `status-*`
@@ -2702,7 +2702,7 @@ fn render_mesh_picker(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TMUX-FC-8 — the Quazar config settings pane.
+// TMUX-FC-8 — the Construct config settings pane.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One action the config settings pane raises.
@@ -2716,10 +2716,10 @@ enum SettingsAction {
 
 /// The common prefix presets the settings pane offers as one-click chips.
 const PREFIX_PRESETS: [&str; 3] = ["C-b", "C-a", "C-Space"];
-const TMUX_CONFIG_TOOLTIP: &str = "Quazar tmux config: prefix, mouse, history (TMUX-FC-8)";
-const TMUX_CONFIG_LABEL: &str = "Quazar tmux config (mesh-synced)";
+const TMUX_CONFIG_TOOLTIP: &str = "Construct tmux config: prefix, mouse, history (TMUX-FC-8)";
+const TMUX_CONFIG_LABEL: &str = "Construct tmux config (mesh-synced)";
 
-/// The Quazar config settings pane (TMUX-FC-8): edit the prefix, the mouse
+/// The Construct config settings pane (TMUX-FC-8): edit the prefix, the mouse
 /// toggle, and the scrollback history limit; Save persists to the mesh-synced
 /// store + applies live over the control channel. Mutates `config` in place.
 fn render_settings(ui: &Ui, config: &mut crate::TmuxConfig) -> Option<SettingsAction> {
@@ -2806,9 +2806,9 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn tmux_config_ui_uses_canonical_quazar_identity() {
-        assert_eq!(TMUX_CONFIG_LABEL, "Quazar tmux config (mesh-synced)");
-        assert!(TMUX_CONFIG_TOOLTIP.starts_with("Quazar tmux config:"));
+    fn tmux_config_ui_uses_canonical_construct_identity() {
+        assert_eq!(TMUX_CONFIG_LABEL, "Construct tmux config (mesh-synced)");
+        assert!(TMUX_CONFIG_TOOLTIP.starts_with("Construct tmux config:"));
         assert!(
             !TMUX_CONFIG_LABEL.contains(concat!("Qua", "sar"))
                 && !TMUX_CONFIG_TOOLTIP.contains(concat!("Qua", "sar")),

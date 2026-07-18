@@ -80,7 +80,7 @@ completed in the follow-up hygiene pass and archived, leaving 42 active items.
 | --- | --- |
 | The old worklist claimed to be the durable tracker while also warning it was too large for humans and agents. | The old file was archived; `docs/platform/WORKLIST.md` is now concise and active-only. |
 | Status legend listed only `[ ]`, `[>]`, and `[✓]`, while the file used `[x]`, `[✗]`, `[!]`, `[~]`, `[→]`, and `[◐]`. | New active file uses explicit words: `Remaining`, `Blocked`, `Needs clarification`. |
-| E12/OW text still mentioned cloud-hypervisor while governance and Quazar Cloud docs say Nova/libvirt/QEMU-KVM. | Active items reference the Nova/libvirt/QEMU-KVM stack; old cloud-hypervisor text is historical. |
+| E12/OW text still mentioned cloud-hypervisor while governance and Construct Cloud docs say Nova/libvirt/QEMU-KVM. | Active items reference the Nova/libvirt/QEMU-KVM stack; old cloud-hypervisor text is historical. |
 | Browser C0-C5 still said "continue extraction" although code now contains `web/chrome_ui/`, internal options page, icons, and vertical-tabs default tests. | Browser chrome work was reclassified as visual/live-audit residual and current regression work: WL-CRIT-003 and WL-UX-002. |
 | Platform review accessibility findings said the production DRM seat had no AccessKit path, but current code has `A11yBridge` and `MDE_A11Y`. | Accessibility was corrected to residual consumer/app-sweep work: WL-UX-003. |
 | CEF resource callbacks were reviewed as unbounded, but current code has caps and fail-closed behavior. | The old review row is archived as completed/residual-only; no active item was created for that exact issue. |
@@ -110,7 +110,7 @@ before they can be closed:
 - Live DR export/restore using off-fleet target and CA holder.
 - Live substrate-v2 cutover on deployed lighthouses.
 - Fresh-node enrollment against current public lighthouse endpoint.
-- Live Quazar Cloud resource create/delete on farm/dev cloud.
+- Live Construct Cloud resource create/delete on farm/dev cloud.
 - Protected media/Widevine and third-party DRM playback.
 - Hardware passkey/CTAP2 and phone-as-authenticator.
 - YouTube or equivalent long-running browser media playback on the DRM seat.
@@ -218,7 +218,7 @@ archived disposition.
    reconnect UX together; reconnect tests need a real transport.
 4. WL-BUILD-001 and WL-BUILD-003 - Make release/rollback/secret-scan gates
    honest before cutting or promoting more live artifacts.
-5. WL-ARCH-001, WL-ARCH-002, and WL-TEST-001 - Finish Quazar Cloud hard cutover,
+5. WL-ARCH-001, WL-ARCH-002, and WL-TEST-001 - Finish Construct Cloud hard cutover,
    resource verbs, and the live/contract test lane as one cloud program.
 6. WL-CRIT-004 and WL-SEC-003 - Complete DR and secret-store distribution after
    substrate and cloud foundations are stable.
@@ -230,7 +230,7 @@ archived disposition.
 10. WL-FUNC-005, WL-FUNC-006, WL-RUN-005, and WL-RUN-006 - Build user-facing
     completeness work that depends on stable runtime records and bottom-bar UI.
 11. WL-UX-001 through WL-UX-003 - Visual/accessibility polish. WL-UX-004 closed
-    on 2026-07-17 after the canonical `Quazar` source/docs sweep and drift guard.
+    on 2026-07-17 after the canonical `Construct` source/docs sweep and drift guard.
 12. WL-PERF-001 and WL-PERF-002 - Performance work after correctness paths have
     stable tests and live probes.
 13. WL-TEST-002 - Harness work; keep the completed hygiene lint in the regular

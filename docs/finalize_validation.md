@@ -72,7 +72,7 @@ Steps:
 
 Pass condition:
 
-- the operator can watch the local video with audio and controls from the Quazar
+- the operator can watch the local video with audio and controls from the Construct
   shell without launching an external player.
 
 ## Stage 4: Promotion Evidence

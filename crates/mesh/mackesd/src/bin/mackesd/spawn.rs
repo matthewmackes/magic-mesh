@@ -1248,7 +1248,7 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             .expect("worker_names mutex")
             .push("storage".into());
     }
-    // QC-2 — the openstack worker: the QUASAR-CLOUD supervision root
+    // QC-2 — the openstack worker: the CONSTRUCT-CLOUD supervision root
     // (docs/design/quasar-cloud.md). Reads the fleet/one-state cloud
     // doctrine for WHICH Kolla service containers this node hosts (the
     // live etcd/Syncthing doctrine read is a typed IntegrationGated until
@@ -2936,7 +2936,7 @@ pub(crate) fn spawn_probe_observability_workers(
         .expect("worker_names mutex")
         .push("hardware_probe".into());
 
-    // E12-19 (Quazar host controls) — host_state. Mirrors this node's seat
+    // E12-19 (Construct host controls) — host_state. Mirrors this node's seat
     // snapshot (published by the shell) to state/host/<node>/seat for the
     // Workbench + remote peers, and authorizes remote typed verbs on
     // action/host/<node>/verb behind the allowlist + safety interlocks

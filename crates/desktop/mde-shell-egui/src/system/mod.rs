@@ -1,7 +1,7 @@
 //! `Surface::System` — this seat's host-controls panel (E12-15 status; E12-18 makes
 //! Displays + Power interactive).
 //!
-//! Under E12 "Quazar" the shell owns the DRM seat with no compositor and no
+//! Under E12 "Construct" the shell owns the DRM seat with no compositor and no
 //! settings daemon, so audio / Bluetooth / displays / power / backlight have no
 //! owner until `mde-seat` (design `docs/design/quasar-host-controls.md`). This
 //! surface is where ALL host-control interaction lives (lock 3); the chrome bar
@@ -22,7 +22,7 @@
 //!   noted typed.
 //! - **Power & Battery** — confirm-gated local lock/suspend/reboot/poweroff
 //!   (logind, lock 12), and multi-battery telemetry (incl. BT-peripheral batteries,
-//!   lock 6). VM lifecycle now lives in the QUASAR-CLOUD plane, not a local
+//!   lock 6). VM lifecycle now lives in the CONSTRUCT-CLOUD plane, not a local
 //!   cloud-hypervisor broker.
 //!
 //! Mixer / Bluetooth stay read-only here (their interaction is E12-16 / E12-17).
@@ -37,7 +37,11 @@ use std::time::Duration;
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::style::Elevation;
-use mde_egui::{field, muted_note, Motion, MotionMode, OsdKind, OsdLevel, Severity, Style, Toast};
+use mde_egui::{
+    field, muted_note, InputPolicy, Motion, MotionMode, OsdKind, OsdLevel, Severity, Style,
+    StyleColorScheme, Toast,
+};
+use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -49,9 +53,17 @@ use mde_seat::{
 };
 
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
+use crate::dock::icon_texture;
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
 use crate::seat_pump::{connector_key, SnapshotPump};
+
+const SYSTEM_READING_SEAT_COPY: &str = "Reading the seat...";
+const SYSTEM_SCANNING_COPY: &str = "Scanning...";
+const SYSTEM_MESH_READING_COPY: &str = "Reading this node's mesh status...";
+const DISPLAY_NUDGE_LEFT_ICON: IconId = IconId::ArrowLeft;
+const DISPLAY_NUDGE_RIGHT_ICON: IconId = IconId::ArrowRight;
+const SETTINGS_TOOLTIP_W: f32 = 260.0;
 
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
 /// this window.
@@ -145,6 +157,16 @@ pub(crate) struct SystemState {
     /// cadence; the Mesh & System sections render it honest-`unknown` where the
     /// snapshot doesn't carry a fact (§6/§7 — no new probe, no root-only cert read).
     mesh: MeshFacts,
+    /// Mesh & System → Remote Proofing policy for Sunshine/Moonlight console
+    /// shadowing. This keeps exposure, pairing, capture, encoder, indicator/input,
+    /// and VNC fallback in the Settings workspace instead of hand-edited service
+    /// config. The service lifecycle layer consumes this persisted policy.
+    remote_proofing: RemoteProofingConfig,
+    /// Devices → Mouse & Touch policy for pointer speed, handedness, scrolling,
+    /// double-click timing, and touch gesture gates. Loaded from disk on start,
+    /// saved on change, and pushed into the native DRM input policy every poll so
+    /// sensitivity fixes affect the real seat rather than only the Settings UI.
+    mouse_touch: MouseTouchConfig,
     /// The Personalization → Theme appearance (SETTINGS-5): the interactive accent +
     /// the platform text-scale. Loaded from disk on start (restored on open), saved on
     /// a pick, and applied live to the context every frame by
@@ -185,6 +207,8 @@ impl Default for SystemState {
             power_honor_config: PowerHonorConfig::load(),
             nav: SettingsNav::load(),
             mesh: MeshFacts::default(),
+            remote_proofing: RemoteProofingConfig::load(),
+            mouse_touch: MouseTouchConfig::load(),
             appearance: AppearanceConfig::load(),
             zoom_base: None,
             animation_base: None,
@@ -286,23 +310,31 @@ impl SystemState {
         // live context every frame (poll runs unconditionally in both runners, so this
         // is honored globally + restored on start — not just while Settings is open).
         self.apply_appearance(ctx);
+        // Devices → Mouse & Touch: publish the persisted input policy to the bare DRM
+        // seat and egui input options every frame, so a restart restores pointer speed
+        // and double-click timing before the operator reopens Settings.
+        self.apply_mouse_touch(ctx);
         ctx.request_repaint_after(REFRESH);
     }
 
     /// Apply the persisted Personalization → Theme appearance (SETTINGS-5) to the live
-    /// context: re-tint the interactive accent, hold the whole-UI text-scale zoom, and
-    /// damp motion under the reduce-motion preference (a11y-07). Cheap-guarded — a no-op
-    /// frame costs one field read and never re-mutates — and self-correcting: if a
-    /// formfactor [`Style::install_with_density`] re-install reset the accent to the
-    /// brand blue, the next poll re-applies the pick. Every effect is real runtime state
-    /// (the egui visuals + zoom + animation time + the shared `Motion` global), never a
-    /// dead toggle (§7).
+    /// context: install the selected colour mode, re-tint the interactive accent, hold
+    /// the whole-UI text-scale zoom, and damp motion under the reduce-motion preference
+    /// (a11y-07). Cheap-guarded — a no-op frame costs field reads and never re-mutates
+    /// — and self-correcting: if a formfactor [`Style::install_with_density`] re-install
+    /// resets the look, the next poll re-applies the pick. Every effect is real runtime
+    /// state (the egui visuals + zoom + animation time + the shared `Motion` global),
+    /// never a dead toggle (§7).
     fn apply_appearance(&mut self, ctx: &egui::Context) {
-        // Accent — re-tint only when the live accent drifts from the pick (a settings
-        // change, a fresh context, OR a formfactor re-install reset it to the brand).
+        // Colour mode + accent — re-tint only when the live look drifts from the pick
+        // (a settings change, a fresh context, OR a formfactor re-install reset it).
+        let want_scheme = self.appearance.color_scheme.runtime();
         let want_accent = self.appearance.accent.color();
-        if ctx.style().visuals.hyperlink_color != want_accent {
-            Style::set_accent(ctx, want_accent);
+        let want_live_accent = Style::accent_for_scheme(want_scheme, want_accent);
+        if Style::color_scheme(ctx) != want_scheme
+            || ctx.style().visuals.hyperlink_color != want_live_accent
+        {
+            Style::set_color_scheme_and_accent(ctx, want_scheme, want_accent);
         }
         // Text-scale — capture the seat's DPI zoom base once (what the DRM runner set
         // from the panel, or 1.0 windowed), then hold the zoom at base × the chosen
@@ -331,6 +363,20 @@ impl SystemState {
         if (ctx.style().animation_time - want_anim).abs() > f32::EPSILON {
             ctx.style_mut(|s| s.animation_time = want_anim);
         }
+    }
+
+    /// Apply the persisted Devices → Mouse & Touch policy to the live input seams.
+    /// Pointer/scroll/button/touch gates publish through `mde_egui::InputPolicy`,
+    /// which the bare DRM libinput loop reads as it translates events. Double-click
+    /// timing is an egui context option, so windowed and DRM paths share it.
+    fn apply_mouse_touch(&self, ctx: &egui::Context) {
+        mde_egui::set_input_policy(self.mouse_touch.input_policy());
+        let want = f64::from(self.mouse_touch.double_click_ms) / 1000.0;
+        ctx.options_mut(|o| {
+            if (o.input_options.max_double_click_delay - want).abs() > f64::EPSILON {
+                o.input_options.max_double_click_delay = want;
+            }
+        });
     }
 
     /// Rebuild the layout on a connector-set change (a replug) and seed any newly
@@ -431,6 +477,8 @@ impl SystemState {
         // it can be detected + persisted afterwards (SETTINGS-5 — the same collect-
         // then-apply idiom `nav` uses; the live re-tint/zoom happens in the poll).
         let appearance_before = self.appearance;
+        let remote_proofing_before = self.remote_proofing;
+        let mouse_touch_before = self.mouse_touch;
         // Whether the BlueZ pairing responder is currently registered — read before
         // the mutable destructure (a Copy bool) so the Pairing section can surface
         // the responder's honest live state (SETTINGS-4).
@@ -449,6 +497,8 @@ impl SystemState {
                 power_honor_config,
                 nav,
                 mesh,
+                remote_proofing,
+                mouse_touch,
                 appearance,
                 ..
             } = self;
@@ -499,6 +549,8 @@ impl SystemState {
                                 charge_threshold,
                                 power_honor_config,
                                 mesh,
+                                remote_proofing,
+                                mouse_touch,
                                 appearance,
                                 agent_active,
                                 prompt_in_flight,
@@ -523,6 +575,19 @@ impl SystemState {
         // real change writes; the live re-tint/zoom lands on the next poll.
         if self.appearance != appearance_before {
             self.appearance.save();
+        }
+        // Persist Remote Proofing policy changes from Mesh & System. The live
+        // Sunshine/service bridge consumes this config; Settings owns the operator
+        // source of truth.
+        if self.remote_proofing != remote_proofing_before {
+            self.remote_proofing.save();
+        }
+        // Persist Devices → Mouse & Touch changes and publish them immediately so
+        // pointer speed / button mapping / scroll direction adjust without waiting
+        // for the next poll tick.
+        if self.mouse_touch != mouse_touch_before {
+            self.mouse_touch.save();
+            self.apply_mouse_touch(ui.ctx());
         }
         self.apply(actions);
     }
@@ -962,8 +1027,8 @@ impl SystemState {
 
 // ──────────────────────────── master-detail nav (SETTINGS-1) ────────────────────────────
 
-/// One rail leaf of the Settings master-detail shell (SETTINGS-1): the six existing
-/// host-control sections plus the four Mesh & System sections SETTINGS-4 wired to
+/// One rail leaf of the Settings master-detail shell (SETTINGS-1): the host-device
+/// control sections plus the Mesh & System sections SETTINGS-4 wired to
 /// this node's real identity / role / pairing / network state. Each belongs to
 /// exactly one [`SettingsGroup`]; the pair the rail rests on is a [`SettingsNav`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -972,6 +1037,8 @@ enum SettingsSection {
     /// Per-output enable / mode / arrangement + brightness (`displays_section`).
     #[default]
     Displays,
+    /// Pointer, scroll, touch, and Surface-class gesture policy.
+    Mouse,
     /// The mixer strips (`mixer_section`) — labelled "Audio" in the rail.
     Audio,
     /// Adapters + devices (`bluetooth_section`).
@@ -992,6 +1059,8 @@ enum SettingsSection {
     Pairing,
     /// Overlay/underlay network facts (`network_section`, SETTINGS-4).
     Network,
+    /// Sunshine/Moonlight console shadowing policy (`remote_proofing_section`).
+    RemoteProofing,
 }
 
 impl SettingsSection {
@@ -999,6 +1068,7 @@ impl SettingsSection {
     const fn label(self) -> &'static str {
         match self {
             Self::Displays => "Displays",
+            Self::Mouse => "Mouse & Touch",
             Self::Audio => "Audio",
             Self::Bluetooth => "Bluetooth",
             Self::Power => "Power & Battery",
@@ -1009,6 +1079,27 @@ impl SettingsSection {
             Self::Role => "Role",
             Self::Pairing => "Pairing",
             Self::Network => "Network",
+            Self::RemoteProofing => "Remote Proofing",
+        }
+    }
+
+    /// The YAMIS-backed glyph used anywhere the Settings shell needs a compact
+    /// visual handle for this section.
+    const fn icon_id(self) -> IconId {
+        match self {
+            Self::Displays => IconId::DisplaySettings,
+            Self::Mouse => IconId::Mouse,
+            Self::Audio => IconId::Audio,
+            Self::Bluetooth => IconId::Bluetooth,
+            Self::Power => IconId::PowerBattery,
+            Self::Wallpaper => IconId::Wallpaper,
+            Self::Hotkeys => IconId::Keyboard,
+            Self::Theme => IconId::Appearance,
+            Self::Identity => IconId::Node,
+            Self::Role => IconId::Workstation,
+            Self::Pairing => IconId::Share,
+            Self::Network => IconId::NetworkSettings,
+            Self::RemoteProofing => IconId::PictureInPicture,
         }
     }
 
@@ -1016,9 +1107,11 @@ impl SettingsSection {
     /// rail + [`SettingsNav`] normalise against).
     const fn group(self) -> SettingsGroup {
         match self {
-            Self::Displays | Self::Audio | Self::Bluetooth | Self::Power => SettingsGroup::Devices,
+            Self::Displays | Self::Mouse | Self::Audio | Self::Bluetooth | Self::Power => {
+                SettingsGroup::Devices
+            }
             Self::Wallpaper | Self::Hotkeys | Self::Theme => SettingsGroup::Personalization,
-            Self::Identity | Self::Role | Self::Pairing | Self::Network => {
+            Self::Identity | Self::Role | Self::Pairing | Self::Network | Self::RemoteProofing => {
                 SettingsGroup::MeshSystem
             }
         }
@@ -1030,12 +1123,12 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SettingsGroup {
-    /// Displays · Audio · Bluetooth · Power & Battery.
+    /// Displays · Mouse & Touch · Audio · Bluetooth · Power & Battery.
     #[default]
     Devices,
     /// Wallpaper · Hotkeys · Theme.
     Personalization,
-    /// Identity · Role · Pairing · Network (SETTINGS-4 — this node's mesh facts).
+    /// Identity · Role · Pairing · Network · Remote Proofing (SETTINGS-4).
     MeshSystem,
 }
 
@@ -1075,6 +1168,7 @@ impl SettingsGroup {
         match self {
             Self::Devices => &[
                 SettingsSection::Displays,
+                SettingsSection::Mouse,
                 SettingsSection::Audio,
                 SettingsSection::Bluetooth,
                 SettingsSection::Power,
@@ -1089,6 +1183,7 @@ impl SettingsGroup {
                 SettingsSection::Role,
                 SettingsSection::Pairing,
                 SettingsSection::Network,
+                SettingsSection::RemoteProofing,
             ],
         }
     }
@@ -1181,7 +1276,611 @@ impl SettingsNav {
     }
 }
 
+// ──────────────────────────── Devices → Mouse & Touch ────────────────────────────
+
+/// The client-data-dir file Devices → Mouse & Touch persists to. This shell-side
+/// policy feeds the native DRM input translator and mirrors the existing `mackesd`
+/// input key names/ranges for the compositor-backed path.
+const MOUSE_TOUCH_CONFIG_FILE: &str = "settings-mouse-touch.json";
+
+/// Which physical button acts as the primary pointer button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PrimaryButton {
+    /// Standard right-handed mapping.
+    #[default]
+    Left,
+    /// Left-handed mapping: physical right button activates primary actions.
+    Right,
+}
+
+impl PrimaryButton {
+    const ALL: [Self; 2] = [Self::Left, Self::Right];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+
+    const fn left_handed(self) -> bool {
+        matches!(self, Self::Right)
+    }
+}
+
+/// Devices → Mouse & Touch persisted policy. Defaults slow the pointer slightly
+/// because the native DRM seat's raw libinput deltas are too sensitive on current
+/// proof hardware; every field is clamped on load so hand-edited drift cannot poison
+/// the input loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct MouseTouchConfig {
+    /// Pointer speed percent delta. `-35` is the platform default until per-device
+    /// calibration lands; `0` means unchanged libinput motion.
+    #[serde(default = "default_pointer_speed_percent")]
+    pointer_speed_percent: i16,
+    /// Primary button mapping.
+    #[serde(default)]
+    primary_button: PrimaryButton,
+    /// Reverse wheel/touchpad/touch gesture scroll deltas.
+    #[serde(default)]
+    natural_scroll: bool,
+    /// Wheel/touchpad/touch scroll delta multiplier, percent.
+    #[serde(default = "default_scroll_speed_percent")]
+    scroll_speed_percent: u16,
+    /// egui double-click recognition window.
+    #[serde(default = "default_double_click_ms")]
+    double_click_ms: u16,
+    /// Touchpad tap-to-click policy for compositor-backed seats.
+    #[serde(default = "default_true")]
+    touchpad_tap_to_click: bool,
+    /// Two-finger scroll gestures from touchpads/touchscreens.
+    #[serde(default = "default_true")]
+    two_finger_scroll: bool,
+    /// Direct touchscreen contacts on Surface-class hardware.
+    #[serde(default = "default_true")]
+    touchscreen_enabled: bool,
+    /// Edge swipes that reveal shell affordances.
+    #[serde(default = "default_true")]
+    edge_gestures: bool,
+    /// Long-press gesture synthesizes a secondary click.
+    #[serde(default = "default_true")]
+    long_press_secondary: bool,
+}
+
+const fn default_pointer_speed_percent() -> i16 {
+    -35
+}
+
+const fn default_scroll_speed_percent() -> u16 {
+    100
+}
+
+const fn default_double_click_ms() -> u16 {
+    300
+}
+
+impl Default for MouseTouchConfig {
+    fn default() -> Self {
+        Self {
+            pointer_speed_percent: default_pointer_speed_percent(),
+            primary_button: PrimaryButton::Left,
+            natural_scroll: false,
+            scroll_speed_percent: default_scroll_speed_percent(),
+            double_click_ms: default_double_click_ms(),
+            touchpad_tap_to_click: true,
+            two_finger_scroll: true,
+            touchscreen_enabled: true,
+            edge_gestures: true,
+            long_press_secondary: true,
+        }
+    }
+}
+
+impl MouseTouchConfig {
+    /// The default Mouse & Touch path (`<client-data-dir>/...json`), or `None` when
+    /// no data dir resolves.
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(MOUSE_TOUCH_CONFIG_FILE))
+    }
+
+    fn normalized(mut self) -> Self {
+        self.pointer_speed_percent = self.pointer_speed_percent.clamp(-100, 100);
+        self.scroll_speed_percent = self.scroll_speed_percent.clamp(25, 300);
+        self.double_click_ms = self.double_click_ms.clamp(150, 900);
+        self
+    }
+
+    /// Runtime policy consumed by `mde_egui`'s bare DRM input loop.
+    fn input_policy(self) -> InputPolicy {
+        let cfg = self.normalized();
+        InputPolicy {
+            pointer_speed_percent: cfg.pointer_speed_percent,
+            scroll_speed_percent: cfg.scroll_speed_percent,
+            left_handed: cfg.primary_button.left_handed(),
+            natural_scroll: cfg.natural_scroll,
+            touchscreen_enabled: cfg.touchscreen_enabled,
+            two_finger_scroll: cfg.two_finger_scroll,
+            edge_gestures: cfg.edge_gestures,
+            long_press_secondary: cfg.long_press_secondary,
+        }
+    }
+
+    /// Value compatible with `mackesd`'s `mouse.pointer_accel` setting.
+    fn mackesd_pointer_accel(self) -> f64 {
+        f64::from(self.normalized().pointer_speed_percent) / 100.0
+    }
+
+    /// Load from `path`, folding missing / malformed data to sensitivity-safe defaults.
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .map_or_else(Self::default, Self::normalized)
+    }
+
+    /// Load from the default path.
+    #[must_use]
+    fn load() -> Self {
+        Self::default_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    /// Write to `path` atomically, mirroring [`SettingsNav`].
+    ///
+    /// # Errors
+    /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
+    /// written / renamed.
+    fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self.normalized())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist to the default path (silent no-op when no data dir resolves).
+    fn save(self) {
+        if let Some(path) = Self::default_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+}
+
+// ──────────────────────────── Mesh & System → Remote Proofing ────────────────────────────
+
+/// The client-data-dir file Mesh & System → Remote Proofing persists to. This is the
+/// single shell-side policy source for Sunshine/Moonlight console shadowing; the
+/// service/provisioning layer consumes it rather than scattering knobs across the
+/// Browser, worklist, or hand-edited Sunshine config.
+const REMOTE_PROOFING_CONFIG_FILE: &str = "settings-remote-proofing.json";
+
+/// The network surface a Sunshine/Moonlight proofing service may expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteProofingExposure {
+    /// Bind only to the encrypted overlay / mesh path.
+    #[default]
+    MeshOnly,
+    /// Bind to the trusted LAN for local Moonlight clients.
+    Lan,
+    /// Bind broadly; requires an explicit warning in the Settings UI.
+    Public,
+}
+
+impl RemoteProofingExposure {
+    const ALL: [Self; 3] = [Self::MeshOnly, Self::Lan, Self::Public];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MeshOnly => "Mesh only",
+            Self::Lan => "LAN",
+            Self::Public => "All interfaces",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::MeshOnly => "Encrypted mesh path; default for workstation proofing.",
+            Self::Lan => "Trusted local network for nearby Moonlight clients.",
+            Self::Public => "Broad bind; keep behind explicit firewall policy.",
+        }
+    }
+}
+
+/// Preferred Sunshine capture path for the native shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteProofingCapture {
+    Auto,
+    #[default]
+    Kms,
+    Wlr,
+    X11,
+}
+
+impl RemoteProofingCapture {
+    const ALL: [Self; 4] = [Self::Kms, Self::Auto, Self::Wlr, Self::X11];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Kms => "DRM/KMS",
+            Self::Wlr => "Wayland DMA-BUF",
+            Self::X11 => "X11 fallback",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Auto => "Let Sunshine pick the first available capture method.",
+            Self::Kms => "Native DRM shell capture; preferred proofing path.",
+            Self::Wlr => "wlroots/Wayland capture path for compositor seats.",
+            Self::X11 => "Compatibility fallback; avoid for performance proofing.",
+        }
+    }
+
+    const fn sunshine_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Kms => "kms",
+            Self::Wlr => "wlr",
+            Self::X11 => "x11",
+        }
+    }
+}
+
+/// Preferred hardware encoder family for the Sunshine stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteProofingEncoder {
+    #[default]
+    Auto,
+    IntelVaapi,
+    NvidiaNvenc,
+    AmdVce,
+    Software,
+}
+
+impl RemoteProofingEncoder {
+    const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::IntelVaapi,
+        Self::NvidiaNvenc,
+        Self::AmdVce,
+        Self::Software,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::IntelVaapi => "Intel VAAPI",
+            Self::NvidiaNvenc => "NVIDIA NVENC",
+            Self::AmdVce => "AMD VCE",
+            Self::Software => "Software",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Auto => "Let Sunshine use the first hardware encoder available.",
+            Self::IntelVaapi => "Intel hardware encode path used by the .15 proof seat.",
+            Self::NvidiaNvenc => "NVIDIA hardware encoder.",
+            Self::AmdVce => "AMD hardware encoder.",
+            Self::Software => "CPU fallback for bring-up only.",
+        }
+    }
+
+    const fn sunshine_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::IntelVaapi => "vaapi",
+            Self::NvidiaNvenc => "nvenc",
+            Self::AmdVce => "amdvce",
+            Self::Software => "software",
+        }
+    }
+}
+
+/// The effective network bind the Sunshine provisioning bridge should apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteProofingBindScope {
+    Disabled,
+    MeshOnly,
+    Lan,
+    Public,
+}
+
+impl RemoteProofingBindScope {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::MeshOnly => "Mesh overlay",
+            Self::Lan => "Trusted LAN",
+            Self::Public => "All interfaces",
+        }
+    }
+}
+
+/// The firewall/exposure policy paired with the bind scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteProofingFirewallPolicy {
+    Closed,
+    MeshOverlayOnly,
+    TrustedLanOnly,
+    PublicExplicit,
+}
+
+impl RemoteProofingFirewallPolicy {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "Closed",
+            Self::MeshOverlayOnly => "Mesh ports only",
+            Self::TrustedLanOnly => "Trusted LAN ports",
+            Self::PublicExplicit => "Public ports with warning",
+        }
+    }
+}
+
+/// The render-free service/provisioning plan derived from the Settings policy.
+///
+/// This is the product-code contract missing from the hand-configured `.15` proof:
+/// Settings owns the durable operator choice, while a later service bridge can consume
+/// this one plan to write Sunshine config, firewall state, prompts, indicators, and
+/// remote-input gates without reinterpreting UI widgets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteProofingServicePlan {
+    enabled: bool,
+    bind_scope: RemoteProofingBindScope,
+    bind_address: Option<String>,
+    firewall: RemoteProofingFirewallPolicy,
+    sunshine_capture: &'static str,
+    sunshine_encoder: &'static str,
+    min_fps_target: u8,
+    native_pairing_prompt: bool,
+    require_local_approval: bool,
+    show_shadowing_indicator: bool,
+    allow_remote_input: bool,
+    vnc_fallback: bool,
+    warnings: Vec<&'static str>,
+}
+
+/// Mesh & System → Remote Proofing policy. These controls are intentionally grouped
+/// together: exposure, pairing, capture, encode, indicator/input, and VNC fallback
+/// form one operator decision surface for console shadowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RemoteProofingConfig {
+    /// Whether the workstation should offer Sunshine/Moonlight shadowing at all.
+    #[serde(default)]
+    enabled: bool,
+    /// Where the Sunshine service may bind.
+    #[serde(default)]
+    exposure: RemoteProofingExposure,
+    /// Capture method requested from Sunshine.
+    #[serde(default)]
+    capture: RemoteProofingCapture,
+    /// Encoder family requested from Sunshine.
+    #[serde(default)]
+    encoder: RemoteProofingEncoder,
+    /// Native shell approval prompt for Moonlight pairing.
+    #[serde(default = "default_true")]
+    native_pairing_prompt: bool,
+    /// Require local approval before a remote viewer can attach.
+    #[serde(default = "default_true")]
+    require_local_approval: bool,
+    /// Show an on-seat indicator while a remote viewer is attached.
+    #[serde(default = "default_true")]
+    show_shadowing_indicator: bool,
+    /// Allow remote keyboard/mouse input once authorized.
+    #[serde(default = "default_true")]
+    allow_remote_input: bool,
+    /// Keep VNC as a fallback/admin channel, not the primary proofing surface.
+    #[serde(default = "default_true")]
+    vnc_fallback: bool,
+    /// Minimum frame cadence expected for proofing, clamped on load.
+    #[serde(default = "default_min_fps")]
+    min_fps_target: u8,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_min_fps() -> u8 {
+    30
+}
+
+impl Default for RemoteProofingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            exposure: RemoteProofingExposure::default(),
+            capture: RemoteProofingCapture::default(),
+            encoder: RemoteProofingEncoder::default(),
+            native_pairing_prompt: true,
+            require_local_approval: true,
+            show_shadowing_indicator: true,
+            allow_remote_input: true,
+            vnc_fallback: true,
+            min_fps_target: default_min_fps(),
+        }
+    }
+}
+
+impl RemoteProofingConfig {
+    /// The default Remote Proofing path (`<client-data-dir>/...json`), or `None`
+    /// when no data dir resolves.
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(REMOTE_PROOFING_CONFIG_FILE))
+    }
+
+    fn normalized(mut self) -> Self {
+        self.min_fps_target = self.min_fps_target.clamp(15, 120);
+        self
+    }
+
+    /// Build the render-free Sunshine/Moonlight service plan for the current mesh
+    /// facts. The UI also renders this plan, so operator-visible exposure state and
+    /// the future service bridge use the same source of truth.
+    fn service_plan(self, mesh: &MeshFacts) -> RemoteProofingServicePlan {
+        let cfg = self.normalized();
+        let mut warnings = Vec::new();
+        let (bind_scope, bind_address, firewall) = if !cfg.enabled {
+            (
+                RemoteProofingBindScope::Disabled,
+                None,
+                RemoteProofingFirewallPolicy::Closed,
+            )
+        } else {
+            match cfg.exposure {
+                RemoteProofingExposure::MeshOnly => {
+                    if mesh.overlay_ip.is_none() {
+                        warnings.push(
+                            "Mesh address is not visible yet; keep the service degraded until the overlay address is known.",
+                        );
+                    }
+                    (
+                        RemoteProofingBindScope::MeshOnly,
+                        mesh.overlay_ip.clone(),
+                        RemoteProofingFirewallPolicy::MeshOverlayOnly,
+                    )
+                }
+                RemoteProofingExposure::Lan => {
+                    if mesh.default_gw.is_none() {
+                        warnings.push(
+                            "LAN exposure needs a trusted local interface before the service starts.",
+                        );
+                    }
+                    (
+                        RemoteProofingBindScope::Lan,
+                        None,
+                        RemoteProofingFirewallPolicy::TrustedLanOnly,
+                    )
+                }
+                RemoteProofingExposure::Public => {
+                    warnings.push(
+                        "All-interfaces exposure must keep the firewall warning, local approval, and on-seat indicator visible.",
+                    );
+                    (
+                        RemoteProofingBindScope::Public,
+                        Some("0.0.0.0".to_owned()),
+                        RemoteProofingFirewallPolicy::PublicExplicit,
+                    )
+                }
+            }
+        };
+
+        if cfg.enabled && !cfg.require_local_approval {
+            warnings.push("Local approval is off; use only for controlled proofing.");
+        }
+        if cfg.enabled && !cfg.show_shadowing_indicator {
+            warnings.push("The on-seat shadowing indicator is off; remote viewers may be hidden.");
+        }
+        if cfg.enabled && !cfg.allow_remote_input {
+            warnings.push("Remote viewers can watch only; keyboard and mouse input are blocked.");
+        }
+
+        RemoteProofingServicePlan {
+            enabled: cfg.enabled,
+            bind_scope,
+            bind_address,
+            firewall,
+            sunshine_capture: cfg.capture.sunshine_value(),
+            sunshine_encoder: cfg.encoder.sunshine_value(),
+            min_fps_target: cfg.min_fps_target,
+            native_pairing_prompt: cfg.native_pairing_prompt,
+            require_local_approval: cfg.require_local_approval,
+            show_shadowing_indicator: cfg.show_shadowing_indicator,
+            allow_remote_input: cfg.allow_remote_input,
+            vnc_fallback: cfg.vnc_fallback,
+            warnings,
+        }
+    }
+
+    /// Load from `path`, folding missing / malformed data to conservative defaults.
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .map_or_else(Self::default, Self::normalized)
+    }
+
+    /// Load from the default path.
+    #[must_use]
+    fn load() -> Self {
+        Self::default_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    /// Write to `path` atomically, mirroring [`SettingsNav`] and
+    /// [`AppearanceConfig`].
+    ///
+    /// # Errors
+    /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
+    /// written / renamed.
+    fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self.normalized())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist to the default path (silent no-op when no data dir resolves).
+    fn save(self) {
+        if let Some(path) = Self::default_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+}
+
 // ──────────────────────────── Personalization → Theme (SETTINGS-5) ────────────────────────────
+
+/// Runtime colour mode persisted by Personalization → Theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AppearanceColorScheme {
+    /// Preserve the current dark platform look.
+    #[default]
+    Dark,
+    /// Windows 2000 basic-inspired light look.
+    Light,
+}
+
+impl AppearanceColorScheme {
+    /// The visible picker order.
+    const ALL: [Self; 2] = [Self::Dark, Self::Light];
+
+    /// Picker label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+
+    /// Short operator-facing description for the tile body.
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Dark => "Current platform colours",
+            Self::Light => "Windows 2000 basic",
+        }
+    }
+
+    /// Runtime mode consumed by `mde_egui::Style`.
+    const fn runtime(self) -> StyleColorScheme {
+        match self {
+            Self::Dark => StyleColorScheme::Dark,
+            Self::Light => StyleColorScheme::Light,
+        }
+    }
+}
 
 /// A curated interactive-**accent** choice (SETTINGS-5). Each variant maps to ONE
 /// existing shared `Style::ACCENT*` token, so the picker offers the shell's own colour
@@ -1353,14 +2052,17 @@ impl AppearanceMotionMode {
 /// [`SettingsNav`] / `PowerHonorConfig` one-JSON-per-preference idiom).
 const APPEARANCE_CONFIG_FILE: &str = "settings-appearance.json";
 
-/// The persisted Personalization → Theme appearance (SETTINGS-5): the interactive
-/// accent, platform text-scale, and motion mode the shell actually applies at
-/// runtime. Loaded on start and restored on open, saved on a pick — the
+/// The persisted Personalization → Theme appearance (SETTINGS-5): the colour mode,
+/// interactive accent, platform text-scale, and motion mode the shell actually
+/// applies at runtime. Loaded on start and restored on open, saved on a pick — the
 /// [`SettingsNav`] client-data-dir JSON idiom, reused. All fields drive a real live
 /// effect through [`SystemState::apply_appearance`] or the shell's
 /// `DockState` mirror (§7 — no dead toggle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 struct AppearanceConfig {
+    /// The platform colour mode.
+    #[serde(default)]
+    color_scheme: AppearanceColorScheme,
     /// The interactive accent tint (re-applied over the installed look each frame).
     #[serde(default)]
     accent: AccentChoice,
@@ -1387,6 +2089,8 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
         #[derive(Deserialize)]
         struct Wire {
             #[serde(default)]
+            color_scheme: AppearanceColorScheme,
+            #[serde(default)]
             accent: AccentChoice,
             #[serde(default)]
             text_scale: TextScale,
@@ -1400,6 +2104,7 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
 
         let wire = Wire::deserialize(deserializer)?;
         Ok(Self {
+            color_scheme: wire.color_scheme,
             accent: wire.accent,
             text_scale: wire.text_scale,
             motion_mode: wire.motion_mode.unwrap_or(if wire.reduce_motion {
@@ -1483,20 +2188,95 @@ fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav) {
                 );
                 ui.add_space(Style::SP_XS);
                 for &section in group.sections() {
-                    let selected = nav.section == section;
-                    let row = ui.add_sized(
-                        [ui.available_width(), Style::SP_L],
-                        egui::SelectableLabel::new(
-                            selected,
-                            RichText::new(section.label()).size(Style::BODY),
-                        ),
-                    );
-                    if row.clicked() {
+                    if settings_section_row(ui, section, nav.section == section) {
                         *nav = SettingsNav::at(section);
                     }
                 }
             }
         });
+}
+
+fn settings_section_row(ui: &mut egui::Ui, section: SettingsSection, selected: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        let accent = section.group().accent();
+        let icon_tint = if selected { accent } else { Style::TEXT_DIM };
+        let (icon_rect, icon_response) =
+            ui.allocate_exact_size(egui::vec2(Style::SP_M, Style::SP_L), egui::Sense::click());
+        let draw_rect =
+            egui::Rect::from_center_size(icon_rect.center(), egui::vec2(Style::SP_M, Style::SP_M));
+        if let Some(tex) = icon_texture(ui.ctx(), section.icon_id(), Style::SP_M, icon_tint) {
+            egui::Image::new(egui::load::SizedTexture::new(tex.id(), draw_rect.size()))
+                .paint_at(ui, draw_rect);
+        }
+        clicked |= icon_response.clicked();
+
+        let text_tint = if selected { accent } else { Style::TEXT };
+        let row = ui.add_sized(
+            [ui.available_width(), Style::SP_L],
+            egui::SelectableLabel::new(
+                selected,
+                RichText::new(section.label())
+                    .size(Style::BODY)
+                    .color(text_tint),
+            ),
+        );
+        clicked |= row.clicked();
+    });
+    clicked
+}
+
+fn settings_detail_header(ui: &mut egui::Ui, section: SettingsSection) {
+    let accent = section.group().accent();
+    ui.horizontal(|ui| {
+        if let Some(tex) = icon_texture(ui.ctx(), section.icon_id(), Style::SP_L, accent) {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                tex.id(),
+                egui::vec2(Style::SP_L, Style::SP_L),
+            )));
+        }
+        ui.label(
+            RichText::new(section.label())
+                .color(accent)
+                .size(Style::HEADING)
+                .strong(),
+        );
+    });
+}
+
+fn settings_icon_button(ui: &mut egui::Ui, icon: IconId, tip: &str) -> egui::Response {
+    let response = ui.add_sized(
+        [Style::SP_L, Style::SP_L],
+        egui::Button::new(RichText::new("")),
+    );
+    if let Some(tex) = icon_texture(ui.ctx(), icon, Style::SP_M, Style::TEXT) {
+        let icon_rect = egui::Rect::from_center_size(
+            response.rect.center(),
+            egui::vec2(Style::SP_M, Style::SP_M),
+        );
+        egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
+            .paint_at(ui, icon_rect);
+    }
+    settings_hover_text(response, tip)
+}
+
+fn settings_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_max_width(SETTINGS_TOOLTIP_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+fn settings_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| settings_tooltip(ui, text.as_str()))
 }
 
 /// The detail pane (SETTINGS-1): an expressive header over the selected section's
@@ -1516,6 +2296,8 @@ fn settings_detail(
     charge_threshold: &mut Option<u8>,
     power_honor_config: &mut PowerHonorConfig,
     mesh: &MeshFacts,
+    remote_proofing: &mut RemoteProofingConfig,
+    mouse_touch: &mut MouseTouchConfig,
     appearance: &mut AppearanceConfig,
     agent_active: bool,
     prompt_in_flight: bool,
@@ -1524,12 +2306,7 @@ fn settings_detail(
     // Expressive header — the active section's title in the large type scale, tinted
     // in its domain group's categorical accent (SETTINGS-2) so the active domain reads
     // at a glance in the same colour as its rail header.
-    ui.label(
-        RichText::new(section.label())
-            .color(section.group().accent())
-            .size(Style::HEADING)
-            .strong(),
-    );
+    settings_detail_header(ui, section);
     ui.add_space(Style::SP_M);
     // The section body sits on a Carbon layer-02 card raised above the layer-01 page,
     // ringed by a hairline border (SETTINGS-2 — [`section_card`]).
@@ -1537,6 +2314,7 @@ fn settings_detail(
         SettingsSection::Displays => {
             displays_section(ui, snap, layout, panel_brightness, ddc_brightness, actions)
         }
+        SettingsSection::Mouse => mouse_touch_section(ui, mouse_touch),
         SettingsSection::Audio => mixer_section(ui, snap),
         SettingsSection::Bluetooth => bluetooth_section(ui, snap, actions),
         SettingsSection::Power => power_section(
@@ -1556,6 +2334,7 @@ fn settings_detail(
             pairing_section(ui, snap, agent_active, prompt_in_flight, actions);
         }
         SettingsSection::Network => network_section(ui, mesh),
+        SettingsSection::RemoteProofing => remote_proofing_section(ui, remote_proofing, mesh),
     });
 }
 
@@ -1705,13 +2484,159 @@ fn probe_section<T>(
 ) {
     match snap.map(pick) {
         None => {
-            muted_note(ui, "Reading the seat…");
+            muted_note(ui, SYSTEM_READING_SEAT_COPY);
         }
         Some(Probe::Present(v)) => present(ui, v),
         Some(Probe::Absent { reason, .. }) => {
             muted_note(ui, reason.clone());
         }
     }
+}
+
+/// Devices → Mouse & Touch: pointer sensitivity, handedness, scroll, double-click,
+/// touchpad tap/two-finger controls, and Surface-class touchscreen gestures. The
+/// native DRM effects are published from [`SystemState::apply_mouse_touch`]; the
+/// touchpad tap policy also mirrors the `mackesd` setting key for compositor seats.
+fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
+    ui.columns(2, |columns| {
+        column_card(&mut columns[0], "Pointer", |ui| {
+            let mut speed = config.pointer_speed_percent;
+            if ui
+                .add(
+                    Slider::new(&mut speed, -100..=100)
+                        .text("Pointer speed")
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                config.pointer_speed_percent = speed;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "mackesd mouse.pointer_accel {:+.2}",
+                    config.mackesd_pointer_accel()
+                ))
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
+            ui.add_space(Style::SP_S);
+
+            ComboBox::from_id_salt(ui.id().with("primary-button"))
+                .selected_text(config.primary_button.label())
+                .show_ui(ui, |ui| {
+                    for choice in PrimaryButton::ALL {
+                        ui.selectable_value(&mut config.primary_button, choice, choice.label());
+                    }
+                });
+        });
+
+        column_card(&mut columns[1], "Scroll & Click", |ui| {
+            let mut natural_scroll = config.natural_scroll;
+            if ui
+                .checkbox(
+                    &mut natural_scroll,
+                    RichText::new("Natural scrolling").size(Style::BODY),
+                )
+                .changed()
+            {
+                config.natural_scroll = natural_scroll;
+            }
+
+            let mut scroll_speed = i32::from(config.scroll_speed_percent);
+            if ui
+                .add(
+                    Slider::new(&mut scroll_speed, 25..=300)
+                        .text("Scroll speed")
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                config.scroll_speed_percent = scroll_speed.clamp(25, 300) as u16;
+            }
+
+            let mut double_click = i32::from(config.double_click_ms);
+            if ui
+                .add(
+                    Slider::new(&mut double_click, 150..=900)
+                        .text("Double-click")
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                config.double_click_ms = double_click.clamp(150, 900) as u16;
+            }
+        });
+    });
+
+    ui.add_space(Style::SP_M);
+    ui.columns(2, |columns| {
+        column_card(&mut columns[0], "Touchpad", |ui| {
+            let mut tap_to_click = config.touchpad_tap_to_click;
+            if ui
+                .checkbox(
+                    &mut tap_to_click,
+                    RichText::new("Tap to click").size(Style::BODY),
+                )
+                .changed()
+            {
+                config.touchpad_tap_to_click = tap_to_click;
+            }
+
+            let mut two_finger_scroll = config.two_finger_scroll;
+            if ui
+                .checkbox(
+                    &mut two_finger_scroll,
+                    RichText::new("Two-finger scroll").size(Style::BODY),
+                )
+                .changed()
+            {
+                config.two_finger_scroll = two_finger_scroll;
+            }
+        });
+
+        column_card(&mut columns[1], "Touch & Surface", |ui| {
+            let mut touchscreen_enabled = config.touchscreen_enabled;
+            if ui
+                .checkbox(
+                    &mut touchscreen_enabled,
+                    RichText::new("Touchscreen input").size(Style::BODY),
+                )
+                .changed()
+            {
+                config.touchscreen_enabled = touchscreen_enabled;
+            }
+
+            let mut edge_gestures = config.edge_gestures;
+            if ui
+                .checkbox(
+                    &mut edge_gestures,
+                    RichText::new("Edge gestures").size(Style::BODY),
+                )
+                .changed()
+            {
+                config.edge_gestures = edge_gestures;
+            }
+
+            let mut long_press_secondary = config.long_press_secondary;
+            if ui
+                .checkbox(
+                    &mut long_press_secondary,
+                    RichText::new("Long-press secondary click").size(Style::BODY),
+                )
+                .changed()
+            {
+                config.long_press_secondary = long_press_secondary;
+            }
+        });
+    });
+
+    ui.add_space(Style::SP_S);
+    muted_note(
+        ui,
+        "Pointer speed, handedness, wheel direction, scroll speed, double-click timing, \
+         touchscreen input, edge gestures, and long-press secondary click are applied \
+         by the native seat. Tap-to-click mirrors the existing compositor input policy.",
+    );
 }
 
 /// The Audio / Mixer section — read-only status (fader/mute/solo interaction is
@@ -1933,7 +2858,7 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
                 ui.spinner();
                 ui.colored_label(
                     Style::TEXT_DIM,
-                    RichText::new("Scanning…").size(Style::SMALL),
+                    RichText::new(SYSTEM_SCANNING_COPY).size(Style::SMALL),
                 );
             } else if ui
                 .button(RichText::new("Scan").size(Style::SMALL))
@@ -2167,10 +3092,14 @@ fn output_row(
                     Style::TEXT_DIM,
                 );
                 if multi {
-                    if ui.button(RichText::new("◀").size(Style::SMALL)).clicked() {
+                    if settings_icon_button(ui, DISPLAY_NUDGE_LEFT_ICON, "Move display left")
+                        .clicked()
+                    {
                         actions.push(SysAction::Nudge(out.id.clone(), true));
                     }
-                    if ui.button(RichText::new("▶").size(Style::SMALL)).clicked() {
+                    if settings_icon_button(ui, DISPLAY_NUDGE_RIGHT_ICON, "Move display right")
+                        .clicked()
+                    {
                         actions.push(SysAction::Nudge(out.id.clone(), false));
                     }
                 }
@@ -2505,7 +3434,7 @@ fn power_verb_row(
 }
 
 /// The Wallpaper section (QBRAND-11) — the desktop-backdrop picker over the five
-/// official Quazar wallpapers (placement lock #12). The choice persists per seat and
+/// official Construct wallpapers (placement lock #12). The choice persists per seat and
 /// follows the mesh identity; the [`crate::backdrop`] desktop layer reflects it live.
 fn wallpaper_section(ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
@@ -2540,7 +3469,7 @@ fn wallpaper_section(ui: &mut egui::Ui) {
     ui.add_space(Style::SP_S);
     muted_note(
         ui,
-        "The five official Quazar wallpapers ship in the RPM; your choice follows your mesh identity when a workgroup volume is present.",
+        "The five official Construct wallpapers ship in the RPM; your choice follows your mesh identity when a workgroup volume is present.",
     );
 }
 
@@ -2558,17 +3487,48 @@ fn hotkeys_section(ui: &mut egui::Ui) {
 }
 
 /// The Theme section (SETTINGS-5) under Personalization — the appearance controls
-/// the shell **genuinely applies at runtime**: the interactive **accent** (re-tinting
-/// the live `Style` accent across every surface via [`Style::set_accent`]), the
-/// **text-scale** (the EXPLORER-18 accessibility whole-UI zoom the shell honors),
+/// the shell **genuinely applies at runtime**: the **colour mode** (dark status quo
+/// or Windows 2000 basic light), the interactive **accent**, the **text-scale**,
 /// the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy), and
 /// the Win10-hybrid taskbar auto-hide preference mirrored into `DockState`.
 /// Each pick mutates the persisted [`AppearanceConfig`] in place; the change is
 /// saved after the render borrow and applied live by [`SystemState::apply_appearance`]
-/// / `main.rs` on the next frame. The platform is dark-only (the Quazar lock) —
-/// there is NO light/dark switch here, only what the runtime truly drives (§7 —
-/// no dead toggle). Laid **across** the wide pane (SETTINGS-3) as selectable tiles.
+/// / `main.rs` on the next frame. Laid **across** the wide pane (SETTINGS-3) as
+/// selectable tiles.
 fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
+    // Colour mode — a real runtime palette selector. Dark preserves the shipped
+    // dark look; Light uses classic Windows 2000 basic system colours.
+    ui.label(
+        RichText::new("Mode")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    across_grid(ui, &AppearanceColorScheme::ALL, 2, |ui, &scheme| {
+        let selected = appearance.color_scheme == scheme;
+        tile(ui, |ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width(), Style::SP_XL],
+                    egui::SelectableLabel::new(
+                        selected,
+                        RichText::new(scheme.label()).size(Style::BODY),
+                    ),
+                )
+                .clicked()
+                && !selected
+            {
+                appearance.color_scheme = scheme;
+            }
+            ui.label(
+                RichText::new(scheme.description())
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+        });
+    });
+    ui.add_space(Style::SP_M);
     // Accent — a swatch row; the pick re-tints the whole shell's highlights live.
     ui.label(
         RichText::new("Accent colour")
@@ -2692,8 +3652,7 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
         ui,
         "Accent re-tints every surface's highlights; text size scales the whole \
          interface. Motion mode applies normal, reduced, or endpoint-only movement. \
-         Taskbar auto-hide floats the bottom bar from the edge. The platform is \
-         dark-only — there is no light theme.",
+         Taskbar auto-hide floats the bottom bar from the edge.",
     );
 }
 

@@ -2908,7 +2908,7 @@ impl FileBrowser {
 
     /// EDITOR-9 — "Send-to-Editor": post the pane's focused **local** file onto
     /// [`ACTION_EDITOR_OPEN`](mde_files::editor_open::ACTION_EDITOR_OPEN) so the one
-    /// Quazar shell's editor mount opens it (`EditorSurface::open_path`) — the same
+    /// Construct shell's editor mount opens it (`EditorSurface::open_path`) — the same
     /// persist-first Bus verb pattern as Send-in-Chat (§6 reuse). A no-op with an
     /// honest note when nothing local is focused (peer/virtual rows carry no path),
     /// and a silent no-op on a node with no Bus.

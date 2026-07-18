@@ -15,7 +15,7 @@
 | 1 | Transport | **Hybrid**: `mde-bus` over Nebula for live delivery, **Syncthing-replicated ring-buffer logs** for durable history + offline backfill. |
 | 2 | Notify model | **Each host is a contact; its alerts are its messages.** A system notification from peer `nyc3` reads as a message from the `nyc3` contact — **hostname = username**. Human chat + machine notifications share one timeline per contact. |
 | 3 | Clipboard | **Fully subsumed.** A clipboard copy on a host is a message from that host's contact (monospace/preview, one-click re-copy); the standalone Clipboard surface is removed. |
-| 4 | ICQ layout | **Authentic ICQ**: the surface *is* the contact roster (narrow list, per-contact status icon, **Online/Offline groups**, unread bold + count); selecting a contact opens its conversation as a focused in-shell pane (the DRM shell has no floating OS windows — "message windows" are shell panes). Classic status idiom in Quazar `Style`. |
+| 4 | ICQ layout | **Authentic ICQ**: the surface *is* the contact roster (narrow list, per-contact status icon, **Online/Offline groups**, unread bold + count); selecting a contact opens its conversation as a focused in-shell pane (the DRM shell has no floating OS windows — "message windows" are shell panes). Classic status idiom in Construct `Style`. |
 | 5 | Presence | **Auto from mesh health + manual override.** Baseline from real reachability (Online / Away = stale heartbeat / Offline = unreachable, from the existing mesh-status snapshot); the operator may set **Away / DND / Invisible / Free-for-Chat** on their own node, gossiped to peers. DND suppresses sound + toast. |
 | 6 | Roster identity | **Every enrolled mesh member + self + VM guests.** One contact per node (by hostname) and per VM-guest mesh peer, plus the local host (self-contact). Role badge (lighthouse / workstation / headless / VM). The roster **is** the peer directory. |
 | 7 | Groups | **Ad-hoc named rooms + auto system rooms.** Operators create named rooms (membership = a signed, Syncthing-replicated room descriptor); PLUS auto-provisioned **All Fleet** + **per-severity alert** rooms so fleet-wide notifications have a home. |
@@ -83,7 +83,7 @@ mde-shell-egui                        mackesd                         substrate
   Runs on every node (headless included).
 - **NOTIFY-CHAT-3 — `Surface::Chat` ICQ UI.** Roster (Online/Offline groups,
   status icons, presence, unread), conversation panes, composer, delivery-status
-  checkmarks — Quazar `Style`, over the real worker (no demo_data).
+  checkmarks — Construct `Style`, over the real worker (no demo_data).
 - **NOTIFY-CHAT-4 — message kinds + per-contact actions.** Text/emoji, clipboard
   re-copy, alert cards + inline action (`action/shell/goto`), file Send-To,
   Call (SIP), Remote Control (VDI) — each reusing its owning crate.

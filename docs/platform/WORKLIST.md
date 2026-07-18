@@ -62,7 +62,7 @@ These decisions refine acceptance and sequencing for the active items below.
 - WL-RUN-002: wire worker-restart counters first.
 - WL-RUN-005: verify paired phones as the first non-PC Device Manager source.
 - WL-RUN-006: keep firewall commit-confirm active.
-- WL-ARCH-001/WL-ARCH-002/WL-TEST-001: continue Quazar Cloud in parallel with
+- WL-ARCH-001/WL-ARCH-002/WL-TEST-001: continue Construct Cloud in parallel with
   substrate work; finish Compute instance verbs/forms first; live smoke creates
   and deletes a nano server instance.
 - WL-ARCH-003: begin shared Bus/Persist seam work soon.
@@ -71,6 +71,9 @@ These decisions refine acceptance and sequencing for the active items below.
 - WL-PERF-001: optimize SPICE dirty rectangles first.
 - WL-PERF-002: verify VDI frame wake behavior first.
 - WL-UX-001: pass/fail is screenshot/pixel proof on `.15`.
+- WL-UX-005: track the Start Menu / Front Door launcher overhaul as one epic;
+  keep WL-UX-001 scoped to bottom-bar/start/tray live proof and WL-FUNC-005
+  scoped to shared search/index plumbing.
 - WL-DOC-001: clean current operator docs first:
   `docs/help/install.md`, `docs/help/node-setup.md`,
   `docs/BUILD-ENVIRONMENT.md`, and `docs/ops/promotion-pipeline.md`.
@@ -373,13 +376,13 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Core Architecture
 
-### WL-ARCH-001 - Quazar Cloud hard cutover to Nova/libvirt/QEMU-KVM
+### WL-ARCH-001 - Construct Cloud hard cutover to Nova/libvirt/QEMU-KVM
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
 - Problem: Governance says cloud-hypervisor is retired, but historical docs and
-  worklist text still carry old-stack assumptions while Quazar Cloud has several
+  worklist text still carry old-stack assumptions while Construct Cloud has several
   live acceptance gates open.
 - Required outcome: Cutover nodes run the Nova/libvirt/QEMU-KVM plus OVN stack,
   old stack code is absent from runtime paths, and stale cloud-hypervisor
@@ -728,9 +731,23 @@ These decisions refine acceptance and sequencing for the active items below.
   tools, stale saved-PDF paths no longer enable `Open Last PDF`, and the no-page
   menu gate still leaves only genuine chrome/bookmark-manager controls active.
   Farm evidence: `.50` fmt, BigBoy `.130` internal-page menu test, `.90`
-  stale-PDF menu test, and `.170` no-page menu test passed. Live `.15` still
-  has the installed split Browser RPMs and active shell service, but package
-  replacement/runtime smoke remains blocked by non-interactive sudo.
+  stale-PDF menu test, and `.170` no-page menu test passed. A 2026-07-18 `.15`
+  recovery pass confirmed passwordless sudo now works for `mm`, quarantined stale
+  Browser session-sync/send-tab replay state from the root and mesh-storage
+  Browser sync paths, restarted the shell service cleanly, and passed the
+  installed split Browser RPM CEF/Servo display/input verifier. BigBoy `.130`
+  then produced Fedora 44 replacement base and Browser RPMs with size guards
+  passing (72.8 MiB and 39.0 MiB). The matched pair was staged on `.15` at
+  `/home/mm/browser-f44-live-proof-20260718-022147/`, installed after a clean
+  `rpm -Uvh --test --replacepkgs --force --nosignature`, and restarted
+  `mde-shell-egui.service` to `MainPID=1890763`, `NRestarts=0`, start timestamp
+  `2026-07-18 02:22:20 EDT`. Installed verifier evidence passed CEF and Servo
+  display/input plus helper cleanup; the running `/proc/1890763/exe` hash
+  matches `/usr/bin/mde-shell-egui`
+  `df63dff6720eea1230997a9167d57b9a1c4810f243f40512b34f2ff7534c40a3`. RPM
+  sha256s: base
+  `fde1f7e072e0e125488d30dbae9743647b25cf1cdffc8146cc454b8f32bee567`, Browser
+  `5445248561e901338306b32f3fe2cc34c93e79528642fc1b402f109f9c514cdb`.
   A later 2026-07-17 Browser Options pass replaced the generic disabled-row
   tooltip with command-specific gate explanations for typed-address, history,
   live web-page tools, painted-frame captures, saved-PDF viewer, CEF DevTools,
@@ -746,7 +763,8 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-17 Browser artifact identity pass centralized the Browser
   product label, kept the new-tab dashboard on the same label, and changed
   capture/PDF folders, MHTML/offline-copy subjects, and generated CUPS job
-  titles from superseded `Magic Mesh Browser` wording to `Quazar Browser`; farm
+  titles from superseded legacy Browser wording to the current Browser
+  product label; farm
   `.50` fmt plus BigBoy focused artifact, dashboard, and CUPS title tests passed.
   A later 2026-07-17 Browser menu copy pass removed internal follow-up/v1/stub
   language from visible Power/Privacy captions while keeping the command gates
@@ -875,6 +893,133 @@ These decisions refine acceptance and sequencing for the active items below.
   visible download as a read-only accessible row with state, route, real progress
   metadata, verification, and error details; farm `.50` fmt and BigBoy `.130`
   focused `browser_download_rows_export_accesskit_status` coverage passed.
+  A later 2026-07-17 Browser toolbar overflow pass replaced the fixed compact
+  cutoff with an explicit toolbar budget model, hides optional controls before
+  the address bar is squeezed, and clamps the omnibox minimum width to the
+  actual remaining row budget so tight horizontal-tab layouts do not push the
+  right-side controls offscreen. Farm evidence: BigBoy `.130`
+  `cargo fmt -p mde-shell-egui --check`, `.90` focused
+  `navigation_toolbar_compacts_before_squeezing_the_address_bar`, and `.50`
+  focused `browser_visual_audit_screenshots_cover_tab_modes_and_viewports`
+  passed; the visual audit wrote `browser-wide-vertical-options.png` and
+  `browser-compact-horizontal-page.png` on the farm.
+  A later 2026-07-17 Browser Chrome palette pass mapped the Browser-local
+  chrome tokens to Chromium/Chrome Refresh light roles for white toolbar/page
+  surfaces, the pale blue surface container, Google blue primary actions,
+  neutral text, subtle text, and outline strokes. It also removed raw black
+  alpha tab depth fills from tab pills and engine badges so the Browser chrome
+  no longer inherits the darker shell look. Farm evidence: BigBoy `.130`
+  focused `browser_chrome_palette_matches_chrome_refresh_light_roles`,
+  `browser_tab_depth_uses_chrome_neutral_depth_not_raw_black`,
+  `paused_active_browser_media_page_uses_low_rate_heartbeat`, and
+  `cargo fmt -p mde-shell-egui --check` passed. A follow-up visual-audit guard
+  made the Browser screenshot test require official light Chrome-palette pixel
+  coverage in the wide toolbar, vertical tab rail, and compact horizontal
+  toolbar; farm `.50` fmt and BigBoy `.130` focused
+  `browser_visual_audit_screenshots_cover_tab_modes_and_viewports` passed and
+  wrote refreshed `browser-wide-vertical-options.png` and
+  `browser-compact-horizontal-page.png` screenshots.
+  A 2026-07-18 Browser surface-scope pass made Browser-owned body/interstitial
+  rendering, prompt bars, capture notices, drawer stack, popovers, context
+  menus, and tooltips install Browser Chrome visuals at their own entry points
+  so shell-invoked surfaces cannot inherit the shared dark shell text/fill
+  palette. The Browser icon paint guards now accept both local vector fallback
+  icons and YAMIS image meshes. Farm evidence: `.50` fmt and tooltip coverage,
+  `.90` insecure-prompt coverage, `.170` page-context and capture-notice
+  coverage, and BigBoy `.130` self-scope and dialog-prompt coverage passed. A
+  later 2026-07-18 Browser Options compact-layout pass replaced the narrow
+  category index's nested unbounded icon/text groups with bounded Chrome-colored
+  chips, clipping labels inside stable chip rects so phone/tablet widths cannot
+  collide or spill while preserving the command page and menu dispatch model.
+  Farm evidence: BigBoy `.130` focused `browser_options` suite passed 9 tests;
+  `.90` focused `browser_options_compact_category_chips_fit_phone_width` passed;
+  `.170` focused
+  `browser_options_page_uses_compact_single_column_layout_when_narrow` passed;
+  `.50` `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18
+  Browser tab-search compact-layout pass removed fixed 300/288px widths from
+  the toolbar tab-search popup, bounds the panel and rows to the available
+  Browser chrome width, clips result labels, and collapses the clear control
+  when the search field is cramped so narrow Browser layouts cannot spill rows
+  or input controls offscreen. Farm evidence: BigBoy `.130` focused
+  `tab_search` suite passed 6 tests; `.90` fresh-slot focused
+  `tab_search_rows_clip_to_narrow_browser_chrome_width` passed; `.170` focused
+  `tab_search_toolbar_anchor_uses_browser_icon_button` passed; `.50`
+  `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18 Browser
+  page-context compact-layout pass removed the fixed page-context menu minimum,
+  made shared Browser menu rows and separators use the bounded available chrome
+  width, clipped labels inside each row rect, and kept command accessibility and
+  shared tab-context row behavior intact. The tab-context icon guard now accepts
+  both local vector fallback icons and resolved YAMIS icon meshes. Farm
+  evidence: BigBoy `.130` focused `page_context` suite passed 4 tests; `.90`
+  focused `page_context_menu_rows_clip_to_narrow_browser_chrome_width` passed;
+  `.170` focused `tab_context_menu_rows_use_browser_material_icons_and_text`
+  passed after the YAMIS-aware test refresh; `.50`
+  `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18 Browser
+  drawer compact-layout pass made drawer text fields, separators, progress
+  bars, QR matrices, and download rows clamp to the bounded Browser drawer
+  width. The downloads drawer now wraps its header and per-download actions at
+  narrow widths instead of expanding the full Browser surface offscreen, while
+  desktop alignment remains unchanged. Drawer icon paint tests now accept both
+  Browser vector fallbacks and resolved YAMIS image meshes. Farm evidence:
+  BigBoy `.130` focused `drawer` suite passed 25 tests; `.90` focused
+  `browser_qr_share_drawer_matrix_clamps_to_narrow_drawer_width` passed; `.170`
+  focused `browser_download_progress_bar_clamps_to_narrow_drawer_width` passed;
+  `.50` `cargo fmt --check` passed. A later 2026-07-18 Browser drawer
+  hover-state pass made selected print-drawer toggles and selector chips use
+  Chrome on-color state layers instead of darkening selected controls toward the
+  text role, keeping hover paint readable on selected Browser drawer controls.
+  Farm evidence: BigBoy `.130` focused
+  `browser_drawer_hover_layers_use_chrome_on_color_roles` passed; `.50`
+  `cargo fmt -p mde-shell-egui --check` was attempted but is currently blocked by
+  unrelated dirty formatting in Chat files and pre-existing Browser toolbar
+  budget code. A later 2026-07-18 Browser capture-artifact
+  palette pass moved annotated, callout, and freehand Browser screenshot outputs
+  off shared dark shell colors and onto Browser Chrome tokens: white/pale-blue
+  caption surfaces, Google blue overlay accents, and Chrome text. Farm evidence:
+  `.50` `cargo fmt -p mde-shell-egui --check` passed; `.90` focused
+  `cargo test -p mde-shell-egui capture -- --nocapture` passed 19 tests,
+  including the generated PNG pixel guards. A later 2026-07-18 Browser neutral
+  icon pass aligned enabled toolbar, menu, option-row, tab-search, history, and
+  page-action glyphs with Chrome's secondary icon color (`#5f6368`) instead of
+  the darker primary text color, while preserving stronger text for labels and
+  selected/active states. Farm evidence: `.130`
+  `cargo fmt -p mde-shell-egui --check` passed; `.90` focused
+  `browser_chrome_palette_matches_chrome_refresh_light_roles`,
+  `page_action_tokens_cover_disabled_plain_and_bookmarked_states`,
+  `tab_search_toolbar_anchor_uses_browser_icon_button`,
+  `tab_context_menu_rows_use_browser_material_icons_and_text`, and
+  `browser_history_drawer_rows_use_browser_material_icon_rows` passed; BigBoy
+  `.130` focused `browser_visual_audit_screenshots_cover_tab_modes_and_viewports`
+  passed and wrote refreshed wide/compact Browser screenshots. A later
+  2026-07-18 Browser new-tab polish pass replaced the sparse default
+  search-line feel with an explicitly centered Chrome-light dashboard heading,
+  rounded search box, and bounded icon quick-link tiles for the installed mesh
+  services while preserving the existing search/load gates. Farm evidence:
+  `.50` `cargo fmt -p mde-shell-egui --check` passed and BigBoy `.130` focused
+  `cargo test -p mde-shell-egui new_tab_dashboard -- --nocapture` passed 5
+  tests. A later 2026-07-18 Browser page-input isolation pass tightened the
+  focused page-canvas event gate so chrome/outside pointer presses cannot be
+  transformed into clamped page-edge clicks, while drag-stop releases still reach
+  the helper to avoid latched page buttons. A later 2026-07-18 Browser toolbar
+  ordering pass made the toolbar slot model explicit: only New Tab/type, Back,
+  Refresh/Stop, and Forward remain left of Location, while page/tool actions sit
+  right of Location before Options, with the full-toolbar loading status included
+  in the Location budget. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
+  `browser_toolbar_order_model_keeps_only_page_navigation_left_of_location` and
+  `browser_toolbar_keeps_only_page_navigation_left_of_location` passed. A later
+  2026-07-18 CEF main-frame navigation hardening pass made Chromium address
+  commits and navigation-generation wakeups ignore iframe/subframe callbacks, so
+  Browser chrome no longer lets a subframe URL masquerade as the top-level page
+  after link clicks on complex sites. Farm evidence: `.50` focused
+  `cef_address_changes_only_update_top_level_url_from_the_main_frame` passed,
+  `.170` focused
+  `cef_navigation_generation_ignores_subframe_navigation_callbacks` passed, `.50`
+  nearby `child_handler_pointers_resolve_non_null_to_their_registered_block`
+  passed, and `.90`
+  `cargo fmt --manifest-path crates/desktop/mde-web-cef/Cargo.toml -- --check`
+  passed. Remaining proof is a live `.15` Google/News navigation smoke against
+  the installed split Browser RPM.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1031,13 +1176,16 @@ These decisions refine acceptance and sequencing for the active items below.
   DRM/KMS desktop, hardware-encodes frames, and injects remote keyboard/mouse
   input back into the shell seat.
 - Required outcome: A paired Moonlight client can view and control the live Magic
-  Mesh shell desktop through Sunshine over the mesh, with explicit local-user
-  authorization, visible on-seat shadowing state, bounded input injection, and
-  honest degraded states when capture or hardware encode is unavailable.
-- Scope: Sunshine packaging/provisioning, Workstation service lifecycle, mesh-only
-  exposure, Moonlight pairing and access policy, DRM/KMS capture permission,
-  hardware encoder selection, remote input handoff, local indicator/kill switch,
-  audit events, and live-seat validation.
+  Mesh shell desktop through Sunshine with an explicit operator exposure mode
+  switch, local-user authorization, visible on-seat shadowing state, bounded
+  input injection, and honest degraded states when capture or hardware encode is
+  unavailable.
+- Scope: Sunshine packaging/provisioning, Workstation service lifecycle,
+  operator-selectable exposure (`mesh-only`, `lan`, and explicit
+  `all-interfaces/public` with warning), Moonlight pairing and access policy,
+  native on-seat pairing prompt, DRM/KMS capture permission, hardware encoder
+  selection, remote input handoff, local indicator/kill switch, audit events,
+  and live-seat validation.
 - Relevant files/components: packaging/RPM assets and systemd units,
   `crates/desktop/mde-shell-egui/src/`, `crates/shared/mde-egui/src/drm.rs`,
   `crates/mesh/mackesd/src/workers/seat_remote_input.rs`,
@@ -1047,20 +1195,179 @@ These decisions refine acceptance and sequencing for the active items below.
   Moonlight client, Sunshine availability/licensing review, WL-SEC-004 local
   remote-input authorization/indicator design, and mesh firewall/exposure policy.
 - Acceptance criteria: Sunshine is installed or honestly gated on Workstation
-  builds only; the service binds to mesh-approved addresses rather than public
-  underlay by default; pairing requires local approval; the shell displays a
-  persistent shadowing indicator with disconnect/kill control; Moonlight receives
-  nonblank advancing frames from the Magic Mesh shell; remote keyboard/mouse
-  events reach the shell only while authorized; disconnect revokes input and
-  stops capture; audit/state publishes show active, denied, disconnected, and
-  degraded modes.
+  builds only; the service has a durable exposure switch and defaults to a
+  conservative non-public bind; `mesh-only`, `lan`, and explicit
+  `all-interfaces/public` modes map to Sunshine bind/origin/firewall policy
+  without changing the rest of the feature; pairing raises a native Magic Mesh
+  shell prompt that names the requesting client and requires local approval; the
+  shell displays a persistent shadowing indicator with disconnect/kill control;
+  Moonlight receives nonblank advancing frames from the Magic Mesh shell; remote
+  keyboard/mouse events reach the shell only while authorized; disconnect revokes
+  input and stops capture; audit/state publishes show active, denied,
+  disconnected, and degraded modes.
 - Verification method: Unit tests for policy/state/audit decisions, packaging
   tests proving Sunshine assets are Workstation-only, farm build checks, and live
   `.15` or spare-seat proof with a Moonlight client showing frame motion,
-  hardware encoder use, input round-trip, indicator visibility, and mesh-only
-  reachability.
+  hardware encoder use, input round-trip, indicator visibility, and exposure
+  switch reachability for at least `mesh-only` and `lan`.
 - Origin or merged source IDs: Operator request 2026-07-17, WL-CRIT-001,
   WL-SEC-004, WL-RUN-005, WL-PERF-002.
+- Current evidence: On 2026-07-17 `.15` had the official Fedora 44 Sunshine RPM
+  installed, Moonlight installed as a user Flatpak, `mm` added to `video`,
+  `input`, and `render`, `/usr/bin/sunshine` granted `cap_sys_admin=p`,
+  Sunshine configured with `capture = kms`, `encoder = vaapi`, `upnp =
+  disabled`, `minimum_fps_target = 30`, and first proved on the mesh address
+  `10.42.0.8`.
+  After restarting the user manager, Sunshine started without the prior
+  PipeWire CPU loop, opened `10.42.0.8:{47984,47989,47990,48010}`, reported KMS
+  DRM capture on `i915`, found the DRM monitor/cursor plane, and found Intel
+  i965 H.264/HEVC VAAPI encoders. After the operator reported Moonlight could
+  not connect to the mesh-only address, `.15` was switched to LAN mode with
+  `bind_address = 172.20.0.15`; firewalld runtime and permanent rules were added
+  to the active `public`, `trusted`, and default zones for TCP
+  `47984,47989,47990,48010` and UDP `47998-48010`; this dev host then proved
+  `https://172.20.0.15:47990` returned `401` and TCP `47984`, `47989`, and
+  `48010` accepted connections. The Moonlight PIN `8602` was accepted by
+  Sunshine via `POST /api/pin` with `{"status":true}`. Credentials are stored
+  on `.15` at
+  `/home/mm/.config/sunshine/mde-proof-creds.txt` with mode `0600`. Remaining
+  proof is a real Moonlight client pairing with advancing frames, input
+  round-trip, shell indicator, disconnect revocation, and the exposure switch
+  implemented in product code rather than a hand-edited Sunshine config.
+  A later 2026-07-17 Settings integration pass added a render-free Remote
+  Proofing service plan derived from the persisted Settings policy and displayed
+  that effective plan in Mesh & System -> Remote Proofing. The plan maps
+  disabled, mesh-only, LAN, and all-interface exposure to explicit Sunshine bind
+  scope, firewall policy, capture backend, encoder backend, FPS floor, approval,
+  indicator, remote-input, VNC fallback, and degraded-warning state. BigBoy
+  `.130` passed `cargo fmt -p mde-shell-egui --check`, focused
+  `remote_proofing` policy coverage, and
+  `selecting_each_section_routes_the_detail_pane_and_paints`. A subsequent
+  2026-07-17 bridge pass added the packaged
+  `/usr/libexec/mackesd/mde-remote-proofing-apply` helper plus the
+  `mde-remote-proofing-plan.{path,service}` Workstation-gated systemd watcher.
+  The helper consumes `/run/mde-bus/settings-remote-proofing.json` and
+  `/run/mde/mesh-status.json`, renders `/run/mde/remote-proofing/plan.json` and
+  `/run/mde/remote-proofing/sunshine.conf`, models mesh/LAN/public firewall
+  intent without opening ports, and defaults missing config to disabled. Local
+  `py_compile`, helper `--self-test`, and fake-root `systemd-analyze verify`
+  passed; BigBoy `.130` passed `cargo fmt -p mackesd --check` and the focused
+  `full_rpm_ships_remote_proofing_bridge_but_server_variant_does_not` packaging
+  test. A 2026-07-18 lifecycle pass extended the helper and unit to render
+  `/run/mde/remote-proofing/lifecycle.json` alongside the plan/config. The
+  lifecycle artifact names the `sunshine.service` user unit, desired
+  stopped/ready/blocked state, bind scope/address, capture/encoder/FPS policy,
+  firewall backend, ports, allowed sources, blockers, local approval,
+  shadowing-indicator, remote-input, and VNC fallback controls, so the eventual
+  supervisor can start/stop Sunshine and apply/remove firewalld rules without
+  inferring state from comments. `.50` passed Python compile, helper
+  `--self-test`, and fake-root `systemd-analyze verify`; BigBoy `.130` passed
+  `cargo fmt -p mackesd --check`; `.90` passed the focused
+  `full_rpm_ships_remote_proofing_bridge_but_server_variant_does_not` packaging
+  test; `.170` passed the four focused `remote_proofing` Settings policy tests.
+  A follow-up 2026-07-18 helper cleanup moved Magic Mesh-only state out of the
+  generated `sunshine.conf` and into `lifecycle.json`, leaving the Sunshine
+  config output to Sunshine-recognized keys (`upnp`, `capture`, `encoder`,
+  `minimum_fps_target`, `address_family`, `origin_web_ui_allowed`, and optional
+  `bind_address`). `.50` passed Python compile, helper `--self-test`, and
+  fake-root `systemd-analyze verify` after that cleanup.
+  A later 2026-07-18 supervisor pass wired the packaged Workstation unit to call
+  `--apply-lifecycle`. The helper now treats a missing Settings policy as
+  unmanaged/no-op, resolves only a regular `/home` desktop user (or a valid
+  override), writes the generated Sunshine config to that user's
+  `~/.config/sunshine/sunshine.conf` with a one-time backup, reconciles only
+  Magic Mesh-owned firewalld rich rules recorded in
+  `/var/lib/mde/remote-proofing/firewalld-state.json`, fail-closes Sunshine
+  startup if firewall reconciliation fails, and restarts/stops the user
+  `sunshine.service` through `runuser ... systemctl --user`. Verification:
+  `.50` passed Python compile, helper `--self-test`, a structured `--apply-dry-run`
+  proving mesh-scoped firewalld commands plus `mm` user-service restart, and
+  fake-root `systemd-analyze verify`; BigBoy `.130` passed
+  `cargo fmt -p mackesd --check`; `.90` passed the focused
+  `full_rpm_ships_remote_proofing_bridge_but_server_variant_does_not` packaging
+  test proving the unit ships with `--apply-lifecycle`. A follow-up LAN-mode fix
+  made apply/dry-run apply resolve trusted-LAN exposure
+  from the mesh snapshot's default gateway via `ip -j route get`, derive the
+  bound local address and source CIDR from `ip -j addr`, remove the unresolved
+  LAN blockers/notes, render the resolved `bind_address`, and apply owned
+  firewalld rich rules scoped to that CIDR before restarting Sunshine. Local and
+  `.50` verification passed Python compile, helper `--self-test`, structured LAN
+  `--apply-dry-run` lifecycle assertions, and fake-root `systemd-analyze verify`.
+  Live `.15` proof on 2026-07-18 then exposed and fixed a real path-unit loop:
+  the watcher no longer uses level-triggered `PathExists=/run/mde-bus`, and the
+  package regression forbids reintroducing a `[Path]` `PathExists=` trigger.
+  The helper also now syncs the summary plan from the resolved lifecycle so
+  `/run/mde/remote-proofing/plan.json` shows the effective LAN bind/source CIDR
+  instead of the pre-resolution placeholder. Corrected Fedora 44 split RPMs were
+  rebuilt on BigBoy `.130` with size guards passing (base 72.8 MiB, Browser
+  39.0 MiB), transaction-tested and installed on `.15`, and `rpm -V
+  magic-mesh magic-mesh-browser` returned clean. The installed helper hash
+  matched source, the installed path unit has only `PathChanged=` triggers, the
+  one-shot settled inactive/success, the path watcher settled active/waiting,
+  `/run/mde/remote-proofing/{plan.json,lifecycle.json}` resolved LAN to
+  `172.20.0.15` and `172.20.0.0/16` with no blockers, firewalld rich rules are
+  scoped to `172.20.0.0/16`, and Sunshine is active/listening on
+  `172.20.0.15:{47984,47989,47990,48010}`. Farm evidence: `.50` passed Python
+  compile, helper `--self-test`, and corrected fake-root `systemd-analyze
+  verify`; `.90` passed the focused
+  `full_rpm_ships_remote_proofing_bridge_but_server_variant_does_not`
+  regression. A later 2026-07-18 shell-status pass wired the existing daemon
+  `state/seat/remote-input/{local-node}` retained indicator into the bottom
+  status rail as a `Remote control` segment. The shell now polls only the local
+  node's armed/active record, paints an obvious status pip, exposes a detail-row
+  and AccessKit value naming the controlling source/client, and routes the pip
+  through System/Settings instead of creating a second control surface. Farm
+  evidence: `.50` passed `cargo fmt -p mde-shell-egui --check`; BigBoy `.130`
+  passed the focused `remote_control_indicator_poll_feeds_local_status_segment`;
+  `.90` passed `the_status_segment_pips_route_to_their_surfaces`; `.170` passed
+  `status_bar_exports_accesskit_live_region_and_named_pips`. Remaining work is
+  native shell pairing/approval, actual Sunshine client-attached shadowing
+  state, Moonlight frame motion, input round-trip, disconnect revocation, and
+  exposure-switch live proof.
+
+### WL-FUNC-010 - Native Maps & Location workspace and offline navigation readiness
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Large
+- Problem: The user-directed Maps & Location surface needs a native egui
+  offline navigation, location-source, and MG90 management experience that is
+  useful without MG90 hardware while staying honest about real adapter gaps.
+- Required outcome: The shell exposes a native Maps & Location workspace with
+  simulator-backed drive/map/routing/location-source/MG90 setup surfaces,
+  render-agnostic readiness models, offline-map state, manual source selection,
+  and no browser wrapper or fake hardware calls.
+- Scope: `mde-maps-location-egui`, simulator scenarios, offline map status,
+  location-source health, MG90 setup/settings/firmware guardrails, route/trip
+  state, and later real adapter seams for MG90, gpsd, Valhalla, Nominatim, CAN,
+  GPIO, serial recovery, firmware upload, and encrypted local vault storage.
+- Relevant files/components: `crates/desktop/mde-maps-location-egui/`,
+  shell surface registration, future MG90/gpsd/routing/geocoder/provider
+  adapters.
+- Dependencies: Real MG90 hardware, gpsd device, routing/geocoder daemons, and
+  vehicle/CAN fixtures for full live acceptance; simulator and offline-map
+  readiness logic remains testable without hardware.
+- Current evidence: A 2026-07-18 Maps & Location readiness slice added a
+  render-agnostic offline-navigation status projection over the selected
+  location source, loaded offline map region, storage cap, local routing and
+  geocoder provider contracts, MG90 setup step, and optional traffic/weather/
+  satellite notes. Drive, Map, and Simulator tabs now render the readiness card;
+  Simulator exposes stale-primary, missing-map-bundle, and restore-ready
+  scenario buttons against the same model. Farm evidence: `.50`
+  `cargo fmt -p mde-maps-location-egui -- --check` passed; `.90`
+  `cargo test -p mde-maps-location-egui -- --nocapture` passed 14 tests.
+- Acceptance criteria: Offline turn-by-turn readiness is never claimed when the
+  primary source is stale/unhealthy, no loaded offline map exists, storage
+  exceeds the cap, local routing/geocoder contracts are unavailable, setup has
+  not verified offline maps, or MG90 management is unauthenticated; healthy peer
+  sources are offered as manual switches rather than auto-failover; every tab
+  tessellates without hardware; real adapters replace simulator seams without
+  changing the shell mount point.
+- Verification method: Focused crate unit/render tests for readiness and
+  simulator scenarios, shell embedding tests, then live MG90/gpsd/map/routing
+  proof when hardware and daemons are available.
+- Origin or merged source IDs: User directive 2026-07-18 Maps & Location hard
+  epic.
 
 ## User Interface And Experience
 
@@ -1073,7 +1380,7 @@ These decisions refine acceptance and sequencing for the active items below.
   but the remaining tray composition and live visual proof are still gated.
 - Required outcome: The bottom taskbar, start grid, tray, show-desktop nub, and
   action center render without overlap on a live seat and match the canonical
-  Quazar identity.
+  Construct identity.
 - Scope: Bottom bar geometry, tray/status area, action center, start grid,
   live-eye pass, and screenshots.
 - Relevant files/components: `crates/desktop/mde-shell-egui/src/dock/mod.rs`,
@@ -1123,7 +1430,448 @@ These decisions refine acceptance and sequencing for the active items below.
   rows cannot paint into the field, and wrote
   `start-menu-search-results-scroll.png`; farm `.50` fmt and BigBoy `.130`
   focused `search_result` coverage passed, and the PNG was pulled to
-  `/tmp/start-menu-search-scroll/` for visual inspection.
+  `/tmp/start-menu-search-scroll/` for visual inspection. A later 2026-07-17
+  YAMIS icon migration pass added the new `assets/icons/YAMIS/YAMIS/` theme and
+  moved the shared `mde-theme::brand::icons::IconId` resolver for the default
+  platform surface/status/tray/action glyphs to YAMIS equivalents while keeping
+  only the product mark/wordmark on brand assets; a later 2026-07-18 Construct
+  brand pass replaced the Construct raster slots with Construct source artwork,
+  Construct wallpaper set, Construct hicolor app icons, and Construct mark/wordmark
+  sources;
+  BigBoy `.130` focused `cargo fmt -p mde-theme --check` and
+  `cargo test -p mde-theme icons -- --nocapture` passed. A later 2026-07-17
+  packaging pass made YAMIS the installed default freedesktop icon theme for the
+  full workstation RPM (`/usr/share/icons/YAMIS` plus GTK 3/4 default
+  `gtk-icon-theme-name=YAMIS`) and added manifest coverage for the payload and
+  post-install cache refresh. A later 2026-07-17 Browser chrome icon pass
+  expanded the shared `IconId` catalog with YAMIS action glyphs and made
+  Browser toolbar, options, drawer, and context-menu icon painting prefer
+  YAMIS-backed textures for direct equivalents while retaining the existing
+  hand-painted fallback for unmatched controls. A follow-up Browser icon pass
+  added direct YAMIS-backed coverage for reload, stop/cancel, engine/internet,
+  edit, and view glyphs, leaving only zoom and compact stepper glyphs on the
+  Browser fallback painter; farm `.130`/`.90` fmt checks, `.50` `mde-theme` icon
+  rasterization coverage, and `.170` focused Browser icon-mapping coverage
+  passed. A later 2026-07-17 YAMIS completion pass added shared
+  `list-remove`, `zoom-in`, and `zoom-out` currentColor action glyphs to the
+  YAMIS tree, exposed them as `IconId::Remove`, `IconId::ZoomIn`, and
+  `IconId::ZoomOut`, and mapped the Browser zoom/compact-minus controls through
+  the YAMIS-backed icon texture path; BigBoy `.130` `mde-theme` icon
+  rasterization coverage, `.90` focused Browser icon-mapping coverage, and
+  `.50` fmt passed. A follow-up bottom-taskbar icon pass added a shared
+  `more-horizontal` currentColor YAMIS glyph, exposed it as
+  `IconId::MoreHorizontal`, and replaced the session-overflow More cell's
+  painted text ellipsis with the shared icon texture path; BigBoy `.130`
+  focused `win7_7_the_session_overflow_more_cell_reports_the_real_hidden_count`,
+  `.90` `mde-theme` icon rasterization coverage, and `.50` fmt passed.
+  A 2026-07-18 Start-menu chrome-copy pass moved the visible Start search
+  placeholder to ASCII copy (`Search apps and commands...`) and added painted
+  text coverage proving the rendered search field no longer emits a Unicode
+  ellipsis; BigBoy `.130` focused
+  `start_menu_search_hint_uses_ascii_chrome_copy` and `.50` fmt passed.
+  A follow-up 2026-07-18 taskbar chrome-copy pass changed long running-session
+  label truncation from a Unicode ellipsis to ASCII `...`, covering the shared
+  helper used by session rail entries and hover/accessibility labels; BigBoy
+  `.130` focused `taskbar_session_label_truncation_uses_ascii_ellipsis` and
+  `.50` fmt passed.
+  A later 2026-07-18 Chat/Settings chrome-copy pass replaced visible
+  checkmark/arrow/paperclip/Unicode-ellipsis pseudo-icons in Chat delivery
+  notes, file-send copy, alert action rows, composers, status/room hints, and
+  menu captions with ASCII labels, and moved Settings loading copy plus display
+  nudge controls to ASCII/YAMIS-backed icon paths; BigBoy `.130` focused
+  `copy_uses_ascii`, `.90` focused
+  `settings_chrome_copy_is_ascii_and_nudges_use_yamis_icons`, and `.50` fmt
+  passed. A later 2026-07-18 Settings hover-polish slice replaced the display
+  nudge controls' raw egui hover text with a Settings themed tooltip surface and
+  rendered text-color coverage so icon hovers cannot regress into unreadable
+  shared-shell popup text.
+  A later 2026-07-18 live `.15` Chat-empty investigation found `chat` and
+  `notify` workers healthy but publishing to root's legacy
+  `/root/.local/share/mde/bus` spool while the GUI read `/run/mde-bus`; the
+  source fix made both workers honor `MDE_BUS_ROOT` before the XDG fallback, and
+  the live `.15` remediation preserved the installed RPM binary while symlinking
+  the root legacy spool to `/run/mde-bus` and restarting `mackesd`. Post-fix
+  `.15` evidence showed `state/chat/roster`, `state/chat/rooms`,
+  `state/chat/notify`, and `event/notify/*` records on `/run/mde-bus`; BigBoy
+  `.130` focused `default_bus_root_resolution_honors_mde_bus_root`,
+  `roster_is_published_for_the_ui`, and
+  `emitted_notification_folds_into_alert_self_exactly_as_chat_does` passed, with
+  `.50` `cargo fmt -p mackesd --check` also passed.
+  A follow-up 2026-07-18 Chat empty-state polish pass replaced the generic
+  no-roster/no-selection pane with a themed waiting panel and a model-backed
+  activity overview that surfaces real peer, room, unread, and folded-alert
+  counts without selecting or acknowledging a lane on the operator's behalf;
+  `.90` focused
+	  `home_overview_renders_activity_without_marking_notifications_read` wrote the
+	  rendered proof `target/screenshots/chat-home-overview.png`, BigBoy `.130`
+	  focused `cargo test -p mde-shell-egui chat -- --nocapture` passed 47 Chat and
+	  Chat-adjacent tests, and `.50` `cargo fmt -p mde-shell-egui --check` passed.
+	  A follow-up Chat default-surface pass made the home unread badge include the
+	  aggregate Notifications watermark without double-counting folded alerts and
+	  added painted-copy coverage for the no-roster waiting pane and loaded-roster
+	  activity overview; BigBoy `.130` focused
+	  `cargo test -p mde-shell-egui chat -- --nocapture` passed 49 Chat and
+	  Chat-adjacent tests, and `.50` `cargo fmt -p mde-shell-egui -- --check`
+	  passed.
+	  A later 2026-07-18 Chat mute-icon slice exposed YAMIS-backed
+	  `IconId::Notifications` and `IconId::NotificationsMuted`, replaced the
+	  contact/room mute button's bell emoji pseudo-icons with the shared icon
+	  texture path plus ASCII labels, and covered both the shared raster mapping
+	  and rendered Chat button copy. Farm evidence: `.90` focused
+	  `notification_glyphs_are_yamis_backed_and_rasterize_at_chat_button_size`,
+	  BigBoy `.130` focused
+	  `chat_mute_button_uses_yamis_icon_instead_of_bell_emoji_text`, and `.50`
+	  touched-file fmt passed.
+	  Remaining icon work is the full per-surface sweep for
+	  hand-painted icons or other code paths that bypass `IconId`, removal or
+  repointing of stale Carbon/Material asset uses, and live rendered proof on the
+  target seat.
+
+### WL-UX-005 - Start Menu and Front Door launcher overhaul epic
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Epic
+- Problem: Start Menu, Front Door, dock launcher taxonomy, and shared search
+  work are documented across multiple evidence sources. The current code already
+  has a Start Menu, shell Front Door panel, and shared search ranker slices, but
+  the full launcher overhaul is not tracked as one active source of truth. This
+  leaves major requirements scattered: one coherent launcher, consistent grouping,
+  fuzzy type-to-launch, real app icons, favorites, mesh/workload/service filters,
+  peer app discovery, Front Door panel mode, and retirement of duplicate launcher
+  surfaces.
+- Required outcome: The Start button and Super key open one polished Front Door
+  launcher experience that serves as the local Start menu and mesh-wide launcher,
+  with compact panel mode, optional full-screen expansion, favorites, unified
+  search, consistent grouping, real icons, keyboard-first operation, and no
+  duplicate application-launcher surface left at parity.
+- Scope: Start Menu to Front Door consolidation; panel/full-screen layout;
+  shared launcher taxonomy; app, Console, file, Browser, mesh, peer-app,
+  workload, and service result rows; favorites/pins; search filters/chips;
+  keyboard navigation; focus-or-launch behavior; peer app on-demand query and
+  remote-desktop launch; real icon-theme/YAMIS integration; accessibility;
+  reduce-motion; live visual proof; migration/removal of retired launcher entry
+  points only after parity.
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/start_menu.rs`,
+  `crates/desktop/mde-shell-egui/src/front_door.rs`,
+  `crates/desktop/mde-shell-egui/src/dock/mod.rs`,
+  `crates/desktop/mde-shell-egui/src/main.rs`,
+  `crates/shared/mde-egui/src/search_omnibox.rs`,
+  Console, Chooser, Browser suggestions, Files search rows, Explorer search,
+  `mackesd` app/workload/service inventory paths, and icon-theme/YAMIS assets.
+- Dependencies: WL-FUNC-005 for shared search/indexing; WL-UX-001 for final live
+  screenshot proof of the surrounding bottom bar/tray geometry; WL-UX-003 for
+  broad accessibility consumer proof; peer-app discovery requires a local app
+  inventory/RPC seam; launcher retirement waits for parity.
+- UX workflow:
+  1. **Summon and orient:** Start button or Super opens the Front Door panel on
+     the primary monitor, focused in the search field but still showing the
+     favorites grid, local status, and available filter chips without requiring
+     the user to type first.
+  2. **Local-first launch:** typing filters local apps and commands immediately;
+     the top match is selected, Enter activates it, and app activation
+     focus-or-launches through the existing shell surface route.
+  3. **Browse without typing:** Apps, Mesh, Workloads, Services, Files, Browser,
+     and Commands filters expose scannable rows/cards with real icons, short
+     labels, one-line context, health/state pills where relevant, and no hidden
+     web-wrapper behavior.
+  4. **Act in place:** workload/service rows expose safe inline actions only
+     where a real seam exists; destructive actions use the platform arming or
+     typed-confirm pattern, and long operations report through the shared
+     bottom-navigation progress/status area.
+  5. **Peer app path:** selecting the Mesh/peer context lazy-loads that peer's
+     app set, shows on-peer badges, and launches through the approved remote
+     desktop path without blocking local launcher responsiveness.
+  6. **Manage favorites:** pin/unpin and reorder are available from the same row
+     context grammar as the Start pinned tiles; favorites remain local/offline
+     usable and are mesh-sync ready once the storage seam exists.
+  7. **Recover gracefully:** no local results, mesh-down, slow peer, missing tool,
+     and disabled action states show honest empty/degraded rows with clear next
+     actions instead of blank space or inert controls.
+  8. **Proof the experience:** each implementation slice captures the affected
+     workflow with focused tests plus rendered proof when layout changes; final
+     acceptance uses `.15` and the Sunshine/Moonlight proof surface when
+     available, checking panel mode, full-screen mode, keyboard-only operation,
+     text/icon legibility, focus visibility, and absence of overlap.
+- Acceptance criteria:
+  1. Start button and Super open Front Door panel mode on the primary monitor in
+     under 150 ms from cached local data.
+  2. Panel mode presents favorites first, supports full-screen expansion, and
+     remains usable at supported portrait/tablet and desktop sizes without
+     overlap.
+  3. Typing immediately fuzzy-matches local apps by name, keywords, and
+     description; Console commands, files, Browser history/bookmarks, mesh units,
+     workloads, and services appear through the shared result model.
+  4. `>` command input routes through an explicit run-command path, not a fake
+     search result.
+  5. Result activation dispatches through each owner surface's existing action
+     seam: app focus-or-launch, Console actions, Files open, Browser load,
+     Explorer jump, workload/service action, or peer remote-desktop launch.
+  6. Dock and launcher use one truthful grouping/taxonomy source; Browser and
+     Bookmarks are not categorized as Terminals, Files is not categorized as
+     System, and a unit test fails on divergence.
+  7. Local entries show real app icons where available and YAMIS/Carbon-style
+     platform glyphs for mesh, workload, service, and command rows.
+  8. Keyboard operation covers open, type, filter-chip traversal, arrow
+     navigation, Enter activation, Escape close, and selected-row visibility.
+  9. Mesh-down state hides or gates mesh results without slowing local launcher
+     open; slow peer app discovery never blocks the panel.
+  10. Favorites/pins persist per user and are ready for mesh sync when that
+      storage seam is available; no usage-history tracking is introduced.
+  11. AccessKit labels/roles/values exist for the search field, filter chips,
+      favorite tiles, result rows, and expansion controls; reduce-motion disables
+      nonessential entrance/rotation motion.
+  12. Any retired launcher/applet entry point is removed only after parity tests
+      prove the Front Door path covers its launch behavior.
+- Verification method: Focused unit tests for taxonomy agreement, ranking,
+  dispatch seams, favorites persistence, keyboard navigation, AccessKit rows, and
+  peer-discovery gating; farm `mde-shell-egui` targeted tests plus relevant
+  `mde-egui`, Files, Browser, Explorer, and `mackesd` tests; live `.15` rendered
+  proof with screenshot/pixel inspection for panel/full-screen modes and
+  Start/Super open behavior.
+- Current evidence: 2026-07-18 Start/Front Door slice moved the active launcher
+  grouping into `dock::LAUNCHER_GROUPS`, made Start consume that shared taxonomy,
+  and changed Front Door app rows to show the shared group label instead of
+  `surface:*` debug targets. Front Door result rows now paint YAMIS-backed icons
+  for app, file, mesh, bookmark, history, web, and assistant domains through the
+  existing `IconId` loader. Farm verification used only targeted lanes:
+  `.130` `cargo test -p mde-shell-egui front_door -- --nocapture` passed 11
+  tests; `.170` passed
+  `start_tiles_use_the_shared_launcher_taxonomy_source`; `.90` passed
+  `the_19_surfaces_are_grouped_into_lock_8s_7_function_based_groups`; `.50`
+  passed `cargo fmt -p mde-shell-egui --check`. A follow-up 2026-07-18 panel
+  mode slice made blank Front Door show initial local shortcut rows instead of
+  an empty `Type to search` body, reusing Start's persisted pin order as
+  read-only display priority and leaving Start as the owner of pin mutation and
+  persistence. Nonblank queries still route through the shared omnibox ranker.
+  BigBoy `.130` passed `cargo test -p mde-shell-egui front_door -- --nocapture`
+  with 15 focused tests; `.50` passed `cargo fmt -p mde-shell-egui --check`.
+  A later 2026-07-18 Start/Super routing slice moved the primary Start button
+  and clean Super tap launcher path onto the unified Front Door panel while the
+  legacy Start Menu remains mounted only for compatibility drains until parity
+  retirement. The taskbar Start cell now mirrors the active Front Door launcher
+  state and exposes "Start launcher" accessibility state text. Farm evidence:
+  BigBoy `.130` focused `front_door` suite passed with 16 tests, including
+  `start_launcher_toggle_opens_front_door_not_legacy_start_menu`; `.170` current
+  source `cargo fmt -p mde-shell-egui --check` passed; `.90` focused
+  `start_launcher_toggle_opens_front_door_not_legacy_start_menu` passed.
+  A later 2026-07-18 Front Door filter-chip slice added compact All, Apps,
+  Files, Mesh, Browser, and Web chips under the launcher search box. The chips
+  filter the existing shared `SearchDomain` buckets instead of adding a second
+  taxonomy, keep blank and typed result paths on the existing owner dispatch
+  seams, and export clickable AccessKit buttons with selected state. Farm
+  evidence: BigBoy `.130` focused `front_door` suite passed with 18 tests; `.90`
+  focused `front_door_filter_chips_keep_domains_separate` passed; `.170`
+  focused `front_door_filter_chips_export_accesskit_buttons` passed; `.50`
+  current-source `cargo fmt -p mde-shell-egui --check` passed. A later
+  2026-07-18 full-screen expansion slice added a compact YAMIS icon layout
+  toggle beside the Front Door search field, kept panel mode as the default
+  Start/Super entry state, and added an expanded bounded launcher canvas for
+  desktop and portrait/tablet sizes without changing the shared result or
+  activation model. The layout toggle exports AccessKit button state with
+  `Panel` / `Full-screen` values and selected state in expanded mode. Farm
+  evidence: BigBoy `.130` focused `front_door` suite passed 20 tests; `.90`
+  focused `front_door_expanded_layout_uses_bounded_screen_geometry` passed;
+  `.170` focused `front_door_expansion_control_exports_accesskit_state` passed;
+  `.50` `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18
+  Front Door narrow-panel polish slice made the search row, filter chips, and
+  result rows size against the actual panel clip width. Filter chips now scale
+  and clip label paint inside their chip rects, cramped search rows stop forcing
+  the expansion button past the row budget, result domain badges shrink within
+  a bounded range, and title/target text is clipped to the remaining row text
+  column. Farm evidence: BigBoy `.130` focused `front_door` suite passed 21
+  tests; `.90` focused `front_door_narrow_panel_chips_and_rows_stay_bounded`
+  passed; `.170` focused `front_door_filter_chips_export_accesskit_buttons`
+  passed; `.50` `cargo fmt -p mde-shell-egui --check` passed. A later
+  2026-07-18 Front Door selected-action slice moved mouse interaction toward
+  the locked click-to-expand launcher design: row clicks now select/expand the
+  result instead of immediately activating it, the selected row renders a
+  compact primary action strip, and the primary button plus Enter continue to
+  dispatch through the existing owner `FrontDoorTarget` seams. The selected
+  action exports an AccessKit button with domain and target metadata, and the
+  result-list height model reserves space for the strip so narrow/short panels
+  remain bounded. Farm evidence: BigBoy `.130` focused `front_door` suite passed
+  22 tests; `.90` focused
+  `front_door_selected_result_exports_primary_action_button` passed; `.170`
+  focused `front_door_narrow_panel_chips_and_rows_stay_bounded` passed; `.50`
+  `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18 Front Door
+  command-mode slice added explicit `>` run-command mode: `>` input bypasses the
+  ranked app/file/browser result list, renders one bounded command row plus a
+  primary Run action, exports command-row and Run-action AccessKit buttons, and
+  returns a distinct `FrontDoorTarget::RunCommand`. Shell activation routes that
+  target through Console's typed `SpawnTab` recipe and the embedded Terminal
+  surface instead of fabricating a launcher result. Farm evidence: BigBoy `.130`
+  focused `front_door` suite passed 26 tests, including the new command-mode,
+  Console recipe, and shell terminal-route coverage; `.50` `cargo fmt --check`
+  passed. A later 2026-07-18 Front Door command-candidate slice added static
+  Console rows to the shared Front Door result model, added a compact Commands
+  filter chip, renders those rows as `Command` domain results with Console-owned
+  icons/AccessKit metadata, and activates them through
+  `ConsoleState::activate_index` plus the shared shell Console request drain.
+  Farm evidence: BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 29 tests,
+  including command-row AccessKit and Console activation coverage; `.50`
+  `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18 Front Door
+  local Workloads/Services filter slice added Workloads and Services chips to
+  the same filter row. These intentionally expose only the current local owner
+  surfaces (`Desktop` / `Infra as Code` for workloads, `Workbench` /
+  `Infra as Code` for service workflows) and add workload/service keywords to
+  local app search; peer app discovery, service cards, and inline
+  start/stop/restart actions remain open parity work. Farm evidence: BigBoy
+  `.130` focused `cargo test -p mde-shell-egui front_door -- --nocapture`
+  passed 29 tests, including the broadened filter scope/search coverage; `.50`
+  `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18 Front Door
+  workflow-card slice added distinct Workload and Service result cards for the
+  current local owner surfaces instead of repurposing app rows: Cloud workloads
+  and Desktop sessions route to Infra as Code/Desktop, while Mesh services and
+  Cloud API services route to Workbench/Infra as Code. These cards use their own
+  result domain labels, YAMIS-backed icons, search terms, AccessKit metadata, and
+  primary Open action through the existing owner-surface switcher. Unit-specific
+  start/stop/restart controls remain open until a safe lifecycle backend seam
+  exists. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 31 tests; a
+  duplicate `.90` workflow filter lane was stopped after BigBoy covered the same
+  assertions, per the no-filler-retest rule. A later 2026-07-18 Front Door
+  favorites-management slice added a typed Front Door request model and a
+  selected-app Pin/Unpin action, plus matching row context menu entries, wired
+  to the existing Start Menu persisted pin store instead of creating a second
+  preference file. Pin/unpin requests keep the launcher open for continued
+  favorites management, while Launch/Open/Run still close through the existing
+  owner activation seams. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 33 tests,
+  including AccessKit Pin/Unpin button metadata and Shell pin-store routing. A
+  follow-up 2026-07-18 ordered-favorites slice added Move up/Move down
+  Front Door requests for already-pinned app rows, renders bounded icon-first
+  reorder controls in the selected action strip, mirrors the same operations in
+  the row context menu, and routes them through the Start-owned persisted pin
+  order. Farm evidence: BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 33 tests,
+  including AccessKit reorder metadata and Shell order mutation; `.50`
+  `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18
+  Front Door mesh-source gating slice added an explicit
+  `FrontDoorSourceStatus` model, makes the Shell pass Explorer's cached mesh
+  source state into the launcher, and gates Mesh-domain rows before selection or
+  Enter activation when peer data is unavailable or still warming. The launcher
+  does not poll or block on Explorer/Bus discovery; it uses cached metadata only
+  and renders an honest non-actionable degraded status row with AccessKit live
+  status while local app, command, file, and Browser results remain available.
+  Peer app lazy-load and remote-desktop launch remain open parity work. Farm
+  evidence: BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 35 tests,
+  including mesh-source gating and degraded-source AccessKit coverage; `.90`
+  focused
+  `cargo test -p mde-shell-egui explorer_search_items_feed_the_shared_ranker_for_unit_fields -- --nocapture`
+  passed; `.170` `cargo fmt -p mde-shell-egui --check` passed. A later
+  2026-07-18 Front Door peer Desktop-connect slice added a selected-row
+  `Connect` action and context-menu row for mesh peer desktop source ids
+  (`peer:` / `peer-vm:`), while keeping the normal primary `Open` action routed
+  to Explorer focus. The new request routes through
+  `ChooserState::connect_source_id` and hands any returned request to the VDI
+  surface with the seat's current preferred device-pixel size, so the launcher
+  path reuses the same Desktop chooser/broker seam as the taskbar source picker.
+  Farm evidence: `.90` focused
+  `front_door_mesh_peer_rows_export_desktop_connect_action` passed; `.170`
+  focused `front_door_peer_connect_request_routes_to_desktop_surface` passed;
+  `.50` `cargo fmt -p mde-shell-egui --check` passed; warm `.90` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 37 tests.
+  A later 2026-07-18 Front Door workflow-deep-link slice added an optional
+  Workbench-plane target to workflow cards and wired the Mesh services card to
+  the existing Workbench Provisioning plane through the same shell `Nav` seam
+  Console already uses. Non-Workbench workload/service cards continue to open
+  their real owner surfaces, so no fake service action was introduced. Farm
+  evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed; `.90` focused
+  `workflow_search_items_expose_real_owner_cards_without_duplicating_apps`
+  passed; `.170` focused
+  `front_door_service_workflow_routes_to_workbench_provisioning_plane` passed.
+  A later 2026-07-18 Front Door workflow-action slice added bounded selected-row
+  quick actions for workflow cards that route to real Workbench Cloud/Fleet
+  planes through a new `OpenWorkbenchPlane` request, keeping primary Open routed
+  to each card's owner surface and avoiding fake start/stop controls without a
+  lifecycle backend. The quick actions are also exposed to AccessKit with owner
+  and target metadata. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 40 tests;
+  current-source `.90` focused
+  `cargo test -p mde-shell-egui front_door_workflow -- --nocapture` passed 3
+  tests. A later 2026-07-18 Front Door filter-keyboard slice made the filter
+  chips keyboard-operable through the shared focused click/Enter/Space
+  activation predicate, paints the shared focus ring on focused chips, and adds
+  Ctrl+Tab / Ctrl+Shift+Tab plus Alt+Right / Alt+Left cycling so keyboard-only
+  users can traverse launcher filters without leaving the search workflow. Farm
+  evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130`
+  focused `cargo test -p mde-shell-egui front_door -- --nocapture` passed 41
+  tests; current-source `.90` focused
+  `front_door_filter_keyboard_traversal_cycles_filter_chips` passed. A later
+  2026-07-18 Front Door rendered-proof slice added a headless egui raster proof
+  for compact panel mode, expanded workflow mode, and degraded Mesh-source mode,
+  writes PNG artifacts for all three states, checks the painted backend color
+  stream is non-empty/varied, verifies the warning state paints a warm status
+  fill, and extends the viewport guard to include rounded path and mesh shapes
+  instead of only raw rect primitives. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui --check` passed; `.170` focused
+  `front_door_rendered_proof_covers_panel_expanded_and_degraded_states` passed
+  and wrote `front-door-compact-panel.png`,
+  `front-door-expanded-workflows.png`, and `front-door-degraded-mesh.png`;
+  BigBoy `.130` focused `cargo test -p mde-shell-egui front_door -- --nocapture`
+  passed 42 tests. A later 2026-07-18 Front Door cloud-instance lifecycle slice
+  added selected-row Start, Stop, and Reboot controls only for Mesh results with
+  provable `cloud:instance:*` unit ids. Start publishes immediately; Stop and
+  Reboot use the launcher arming pattern before dispatch. Shell handling writes
+  the same `action/cloud/instance-*` typed `{"instance": ...}` bus body that the
+  Explorer/OpenStack action lane already owns, and rejects non-instance mesh ids
+  instead of minting fake service controls. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 46 tests,
+  including lifecycle wire, arming, AccessKit, shell bus-write, and rendered
+  Front Door proof coverage. Redundant narrower current-source lanes were
+  stopped after BigBoy covered their assertions, per the no-filler-retest rule.
+  A later 2026-07-18 Front Door Datacenter lifecycle slice added cached Fleet VM
+  and container roster rows to the shared launcher search model, filters them
+  through the Workloads/Services chips, routes primary Open to Workbench Fleet,
+  and exposes selected-row Start/Stop/Restart actions only when the roster
+  carries host, kind, name, and state metadata. Start publishes immediately;
+  Stop and Restart use the launcher arming pattern before publishing the
+  existing `action/services/lifecycle` directory contract with `{peer, kind,
+  name, op}`. The projection reads cached Datacenter state only, so opening the
+  launcher does not poll the Bus. Farm evidence: BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door_service_lifecycle -- --nocapture`
+  passed 4 tests; `.90` focused
+  `front_door_lifecycle_candidates_use_cached_vm_and_container_rosters` passed;
+  `.170` focused
+  `front_door_service_lifecycle_request_writes_directory_bus_action` passed;
+  `.50` `cargo fmt -p mde-shell-egui --check` passed. Peer app lazy-load, parity
+  retirement, and live `.15` Sunshine/Moonlight proof remain open.
+  A later 2026-07-18 Front Door hover-polish slice replaced the expansion
+  control's raw egui tooltip with a Front Door themed tooltip surface and added
+  rendered text-color coverage so the launcher layout hover cannot regress into
+  unreadable shared-shell popup text. A later 2026-07-18 Front Door
+  narrow-expanded geometry slice made panel and expanded widths honor the
+  margin-bounded viewport when a seat is narrower than the historical launcher
+  minimum, and clamped expanded height to the visible screen so the launcher
+  cannot paint sliced off the right or bottom edge on narrow displays. Farm
+  evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130`
+  focused `front_door_expanded_layout_uses_bounded_screen_geometry` passed.
+  A later 2026-07-18 menu-bar Remote Sessions control slice found the shared
+  top-right menu-bar/window-title-bar control already present, then tightened
+  the shell-owned request drain: activating it now closes Front Door and
+  compatibility Start Menu overlays before starting the visible minimize cue,
+  keeps the previous active surface in place until the cue finishes, and routes
+  through the existing `Nav` model to Remote Sessions. Added
+  `menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers`
+  to exercise the public menu-bar request and shell transition path. Farm
+  evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed. BigBoy `.130`
+  focused
+  `cargo test -p mde-shell-egui menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers -- --nocapture`
+  was blocked before the shell test by the out-of-scope
+  `mde-maps-location-egui` compile error
+  `LocationManager::primary_source` missing in `src/model.rs`.
+- Origin or merged source IDs: `docs/design/app-launcher-rethink.md` APPLAUNCH,
+  `docs/design/search-omnibox.md` Front Door/full omnibox slice,
+  `docs/review/PLATFORM-REVIEW-2026-07-10.md` `shell-ux-2`, `shell-ux-3`,
+  `shell-ux-8`, Start-menu portions of WL-UX-001 evidence, and shell
+  Front Door search residuals currently referenced by WL-FUNC-005.
 
 ### WL-UX-003 - Accessibility consumer and application sweep
 
@@ -1299,9 +2047,33 @@ These decisions refine acceptance and sequencing for the active items below.
   `magic-mesh` and
   `74709d34f041ef5dd994306d19ca4bdb47d3333bbff5ee60f39409ac7373bb1a` for
   `magic-mesh-browser`; non-root `rpm -qp` on `.15` confirmed both packages as
-  `12.0.0-1.x86_64`. Installation/restart remains blocked until `.15` grants
-  passwordless sudo or another root path; `sudo -n true` still reports that a
-  password is required.
+  `12.0.0-1.x86_64`. A 2026-07-18 `.15` recovery pass confirmed
+  `sudo -n true` succeeds for `mm`, quarantined stale Browser session restore and
+  send-tab replay state from `/root/.local/share/mde/browser-session-sync`,
+  `/mnt/mesh-storage/browser-session-sync/Basement-Test-Workstation`, and
+  `/run/mde-bus/action/browser/session-sync`, restarted
+  `mde-shell-egui.service` to `ActiveState=active`, `SubState=running`,
+  `NRestarts=0`, and passed the installed CEF/Servo display/input verifier with
+  Browser helper cleanup. BigBoy `.130` then built the follow-up Fedora 44 split
+  RPMs with payload size guards passing (base 72.8 MiB, Browser 39.0 MiB). The
+  packages were staged on `.15` at
+  `/home/mm/browser-f44-live-proof-20260718-022147/` with sha256
+  `fde1f7e072e0e125488d30dbae9743647b25cf1cdffc8146cc454b8f32bee567` for
+  `magic-mesh` and
+  `5445248561e901338306b32f3fe2cc34c93e79528642fc1b402f109f9c514cdb` for
+  `magic-mesh-browser`, installed after a clean same-version RPM transaction
+  test, and restarted the seat to `MainPID=1890763`, `NRestarts=0`, timestamp
+  `2026-07-18 02:22:20 EDT`. The running shell executable hash matched the
+  installed payload, and the installed Browser verifier passed CEF and Servo
+  display/input plus helper cleanup. No live screenshot proof has been claimed
+  yet because the KMS capture attempt failed at ffmpeg format negotiation.
+  A later 2026-07-17 repaint-budget pass narrowed active Browser media wakeups:
+  audible tabs and media with unknown play state still keep the fast repaint
+  cadence, while media explicitly reported as paused now drops to the existing
+  low-rate helper heartbeat. Farm evidence: BigBoy `.130` focused
+  `active_browser_media_with_unknown_play_state_keeps_fast_heartbeat`,
+  `paused_active_browser_media_page_uses_low_rate_heartbeat`, and
+  `cargo fmt -p mde-shell-egui --check` passed.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.

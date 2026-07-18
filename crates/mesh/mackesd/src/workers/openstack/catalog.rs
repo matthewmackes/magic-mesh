@@ -1,7 +1,7 @@
 //! QC-2 — the Kolla service catalog: which `OpenStack` services exist, their
 //! Red-Hat-convention Kolla container/image names, and where each one places.
 //!
-//! The catalog is the pure vocabulary every QUASAR-CLOUD slice shares
+//! The catalog is the pure vocabulary every CONSTRUCT-CLOUD slice shares
 //! (`docs/design/quasar-cloud.md`): the MVP service set (Q24 — Nova+Placement,
 //! Neutron, Glance, Cinder, +Keystone) over the foundation trio (Q15/16/17 —
 //! leader-hosted `MariaDB`, clustered `RabbitMQ`, per-node memcached). QC-3

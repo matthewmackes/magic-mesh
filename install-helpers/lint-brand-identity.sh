@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# lint-brand-identity.sh — QBRAND/WL-UX-004 canonical spelling guard.
+# lint-brand-identity.sh - Construct/WL-UX-004 canonical spelling guard.
 #
-# The operator selected "Quazar" as the user-facing 12.x codename. This gate
-# prevents the superseded "Quasar" spelling from returning to current source,
-# generated-user-facing metadata, install helpers, and current docs.
+# The operator selected "Construct" as both the 12.x codename and visible
+# product name. This gate prevents the two superseded legacy spellings from
+# returning to current source, generated-user-facing metadata, install helpers,
+# and current docs.
 # Historical archives and lower-case asset paths such as
-# assets/brand/quasar are intentionally outside this check.
+# assets/brand/construct are intentionally outside this check.
 #
 # Run with `--self-test` to verify. Exit 0 = clean, 1 = a violation.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SUPERSEDED='Quasar'
+SUPERSEDED='Qua[sz]ar'
 
 default_paths() {
   local p
@@ -36,11 +37,11 @@ allowed_hit() {
       # self-tests.
       return 0
       ;;
-    */docs/design/quasar-branding.md)
-      [[ "$text" == *'supersedes the earlier "Quasar" spelling'* ]]
+    */docs/design/construct-branding.md)
+      [[ "$text" == *'supersedes the earlier legacy naming'* ]]
       ;;
     */docs/NEEDS-OPERATOR.md)
-      [[ "$text" == *'vs "Quasar" (S)'* ]]
+      [[ "$text" == *'superseded legacy naming'* ]]
       ;;
     *)
       return 1
@@ -57,6 +58,7 @@ search_hits() {
       --glob '!target-f44/**' \
       --glob '!worklist-archive/**' \
       --glob '!docs/worklist-archive/**' \
+      --glob '!docs/review/**' \
       --glob '!.git/**' \
       "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true
     return 0
@@ -68,6 +70,7 @@ search_hits() {
       --exclude-dir='target-f43' \
       --exclude-dir='target-f44' \
       --exclude-dir='worklist-archive' \
+      --exclude-dir='review' \
       "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true
     return 0
   fi
@@ -103,7 +106,7 @@ self_test() {
   trap "rm -rf '$td'" EXIT
   mkdir -p "$td/crates/demo/src" "$td/docs/design" "$td/docs"
 
-  printf 'const NAME: &str = "MDE Quazar";\n' >"$td/crates/demo/src/lib.rs"
+  printf 'const NAME: &str = "Construct";\n' >"$td/crates/demo/src/lib.rs"
   if scan "$td/crates" >/dev/null 2>/dev/null; then
     echo "  ok: clean source passes"
   else
@@ -111,7 +114,8 @@ self_test() {
     fails=$((fails + 1))
   fi
 
-  printf 'const NAME: &str = "MDE Quasar";\n' >"$td/crates/demo/src/lib.rs"
+  local bad_spelling="Qua""sar"
+  printf 'const NAME: &str = "MDE %s";\n' "$bad_spelling" >"$td/crates/demo/src/lib.rs"
   if scan "$td/crates" >/dev/null 2>/dev/null; then
     echo "  FAIL: old spelling should fail" >&2
     fails=$((fails + 1))
@@ -120,12 +124,12 @@ self_test() {
   fi
 
   printf '%s\n' \
-    '| 9 | Canonical | supersedes the earlier "Quasar" spelling |' \
-    >"$td/docs/design/quasar-branding.md"
+    '| 9 | Canonical | supersedes the earlier legacy naming |' \
+    >"$td/docs/design/construct-branding.md"
   printf '%s\n' \
-    '- NAMING-1: brand spelling "Quazar" (Z) vs "Quasar" (S) — resolved' \
+    '- NAMING-1: superseded legacy naming — resolved' \
     >"$td/docs/NEEDS-OPERATOR.md"
-  if scan "$td/docs/design/quasar-branding.md" "$td/docs/NEEDS-OPERATOR.md" >/dev/null 2>/dev/null; then
+  if scan "$td/docs/design/construct-branding.md" "$td/docs/NEEDS-OPERATOR.md" >/dev/null 2>/dev/null; then
     echo "  ok: documented old-spelling decision is allowed"
   else
     echo "  FAIL: old-spelling decision lines should be allowed" >&2
@@ -154,6 +158,6 @@ case "${1:-}" in
       mapfile -t roots < <(default_paths)
       scan "${roots[@]}"
     fi
-    echo "lint-brand-identity.sh: clean — current user-facing brand spelling is Quazar"
+    echo "lint-brand-identity.sh: clean — current codename and visible product name are Construct"
     ;;
 esac

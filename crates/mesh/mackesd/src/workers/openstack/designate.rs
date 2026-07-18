@@ -1,4 +1,4 @@
-//! QC-17 (QUASAR-CLOUD) — **Designate replaces naming** (design Q46,
+//! QC-17 (CONSTRUCT-CLOUD) — **Designate replaces naming** (design Q46,
 //! `AI_GOVERNANCE.md` §1: "Designate becomes the mesh name service, fed —
 //! and re-seedable — by the etcd peer directory").
 //!

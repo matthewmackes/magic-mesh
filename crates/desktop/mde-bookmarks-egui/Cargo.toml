@@ -1,4 +1,4 @@
-# MCNF E12 "Quazar" — `mde-bookmarks-egui`: the Surface::Bookmarks manager
+# MCNF E12 "Construct" — `mde-bookmarks-egui`: the Surface::Bookmarks manager
 # (BOOKMARKS-4; design: `docs/design/mesh-bookmarks.md`).
 #
 # An `eframe` app on the shared `mde-egui` harness that REUSES `mde-bookmarks`'
@@ -15,7 +15,7 @@
 # accepts a worker-supplied `Collection` at construction.
 [package]
 name        = "mde-bookmarks-egui"
-description = "MCNF E12 Quazar — the egui Surface::Bookmarks manager on the mde-egui harness that reuses mde-bookmarks' pure Collection/CRDT: a three-region manager (folder tree · list · detail pane) plus a left vertical tab rail, with folder CRUD, manual + sort-by order, live title/URL search, Ctrl/Shift multi-select bulk ops, and drag reorder/move — every edit driving a real mde-bookmarks Op. Renders through the shared Carbon Style (no raw hex); the live Servo browser (BOOKMARKS-5/6) is an honest detail-pane seam, not a stub."
+description = "MCNF E12 Construct — the egui Surface::Bookmarks manager on the mde-egui harness that reuses mde-bookmarks' pure Collection/CRDT: a three-region manager (folder tree · list · detail pane) plus a left vertical tab rail, with folder CRUD, manual + sort-by order, live title/URL search, Ctrl/Shift multi-select bulk ops, and drag reorder/move — every edit driving a real mde-bookmarks Op. Renders through the shared Carbon Style (no raw hex); the live Servo browser (BOOKMARKS-5/6) is an honest detail-pane seam, not a stub."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

@@ -553,6 +553,12 @@ impl Category {
 trait UnitsClient {
     /// Read the latest `state/units/<node>` body from every node's mirror.
     fn read(&self) -> Vec<UnitsState>;
+
+    /// Whether this reader has a configured substrate. A false value means the
+    /// shell can present mesh search as unavailable without performing a Bus scan.
+    fn configured(&self) -> bool {
+        true
+    }
 }
 
 /// The production units reader: enumerate every `state/units/<node>` topic by
@@ -586,6 +592,10 @@ impl UnitsClient for BusUnits {
             }
         }
         states
+    }
+
+    fn configured(&self) -> bool {
+        self.bus_root.is_some()
     }
 }
 
@@ -2072,6 +2082,24 @@ impl ExplorerState {
             }
         }
         items
+    }
+
+    /// Whether the Front Door can safely advertise mesh search as backed by a
+    /// configured local source. This is metadata only; it does not poll the Bus.
+    pub(crate) fn search_omnibox_source_configured(&self) -> bool {
+        self.client.configured()
+    }
+
+    /// Whether Explorer has already polled its source at least once in this shell
+    /// session. Front Door uses this to distinguish "warming" from "read and empty".
+    pub(crate) fn search_omnibox_source_polled(&self) -> bool {
+        self.last_poll.is_some()
+    }
+
+    /// Whether cached discovered units exist for Front Door mesh rows. The launcher
+    /// never waits for peer discovery; it uses only this existing shelf.
+    pub(crate) fn search_omnibox_source_ready(&self) -> bool {
+        !self.units.is_empty()
     }
 
     /// Activate a shell-front-door mesh result through Explorer's normal focus path.

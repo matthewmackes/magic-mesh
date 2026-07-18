@@ -538,6 +538,11 @@ mod menubar_coverage {
                          header; folding it onto the shared bar is a MENUBAR-SWEEP \
                          follow-on",
             },
+            Surface::MapsLocation => Coverage::FirstPartyChrome {
+                reason: "MAPS-LOCATION-1 — Maps & Location owns a native tab rail, \
+                         map canvas, driving dashboard, MG90 setup, and simulator \
+                         chrome instead of the shared MENUBAR-ALL top strip",
+            },
             Surface::Chat => Coverage::Covered {
                 title: "Contacts", // MENU-2 (chat.rs)
             },
@@ -637,7 +642,7 @@ mod menubar_coverage {
                 }
                 Coverage::FirstPartyChrome { reason } => {
                     assert!(
-                        reason.contains("BROWSER-CHROME"),
+                        reason.contains("BROWSER-CHROME") || reason.contains("MAPS-LOCATION"),
                         "{surface:?}: first-party chrome records its owning epic"
                     );
                     first_party += 1;
@@ -657,8 +662,8 @@ mod menubar_coverage {
             "the shared covered set is the seven landed bars"
         );
         assert_eq!(
-            first_party, 1,
-            "Browser is the one routed first-party chrome surface"
+            first_party, 2,
+            "Browser and Maps & Location are the routed first-party chrome surfaces"
         );
         for (view, reason) in ROUTED_NON_SURFACE_VIEWS {
             assert!(

@@ -1,13 +1,14 @@
-//! `brand::icons` — the monochrome Quazar line-art icon set (QBRAND-2).
+//! `brand::icons` — the platform icon resolver (QBRAND-2).
 //!
-//! The 39 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
-//! NAVBAR-W10-1 tray set) embedded as
-//! inline SVG consts behind [`IconId`], plus the SVG→raster loader
-//! ([`icon_image`]) every surface draws them through. The glyphs are authored
-//! in `currentColor` (the text-lockup wordmark excepted — see below), so ONE
-//! embedded set serves every tint: the loader substitutes the caller's color
-//! pre-parse and rasterizes with `resvg` at the exact requested pixel size —
-//! DPI-crisp at any scale, no pre-baked PNG ladder.
+//! The platform glyphs embedded as inline SVG consts behind [`IconId`], plus
+//! the SVG→raster loader ([`icon_image`]) every surface draws them through. The
+//! product mark / wordmark resolve to the Construct brand assets; the default platform
+//! surface, status, and tray glyphs now resolve to the YAMIS monochrome theme
+//! under `assets/icons/YAMIS/YAMIS/`. The SVGs use `currentColor` through the
+//! freedesktop ColorScheme classes, so ONE embedded set serves every tint: the
+//! loader substitutes the caller's color pre-parse and rasterizes with `resvg`
+//! at the exact requested pixel size — DPI-crisp at any scale, no pre-baked PNG
+//! ladder.
 //!
 //! ## Toolkit-free by design
 //!
@@ -28,14 +29,12 @@
 //!
 //! ## The wordmark logotype
 //!
-//! [`IconId::Wordmark`] is the official stacked text lockup ("MDE" / "Quazar"
-//! / "Mackes Display Environment") — pure `<text>` elements carrying their own
-//! brand fills (it is the one glyph NOT authored in `currentColor`, so the
-//! tint does not recolor it). `resvg` is built here without its `text`/fontdb
+//! [`IconId::Wordmark`] is the Construct text lockup ("MDE" / "CONSTRUCT") —
+//! pure `<text>` elements. `resvg` is built here without its `text`/fontdb
 //! features (the minimal, farm-vendorable configuration), so the lockup
 //! parses and keeps its 320×184 aspect but rasterizes fully transparent — it
 //! never panics, and callers wanting the visible lockup should use the
-//! official raster assets (`assets/brand/quasar/app-icon-*.png` /
+//! official raster assets (`assets/brand/construct/app-icon-*.png` /
 //! `brand::logo`, QBRAND-3). The SVG's own `<desc>` flags the designed fix:
 //! outlining the letterforms to paths, with resvg's `text` feature + a
 //! bundled fontdb as the heavier alternative.
@@ -44,31 +43,41 @@ use std::fmt;
 
 use resvg::{tiny_skia, usvg};
 
-/// Embed one Quazar brand SVG from `assets/brand/quasar/` at compile time.
-macro_rules! quasar_svg {
+/// Embed one Construct brand SVG from `assets/brand/construct/` at compile time.
+macro_rules! construct_svg {
     ($file:literal) => {
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../assets/brand/quasar/",
+            "/../../../assets/brand/construct/",
             $file
         ))
     };
 }
 
-/// Identifier for every glyph in the Quazar brand set.
+/// Embed one YAMIS SVG from `assets/icons/YAMIS/YAMIS/` at compile time.
+macro_rules! yamis_svg {
+    ($file:literal) => {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../assets/icons/YAMIS/YAMIS/",
+            $file
+        ))
+    };
+}
+
+/// Identifier for every embedded product and platform glyph.
 ///
-/// The product marks, the 18 dock/surface glyphs, the 3 node-role badges, the
-/// 14 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible rasterized
-/// at 16px), and shared UI action glyphs — one variant per SVG in
-/// `assets/brand/quasar/`;
-/// [`IconId::svg`] resolves the embedded source.
+/// Product marks resolve to the Construct brand assets; surface, role, tray,
+/// and shared UI action glyphs resolve to the bundled YAMIS theme. Call
+/// [`IconId::svg`] for the embedded source and [`IconId::name`] for a stable
+/// cache/debug identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconId {
     /// The round mesh-node constellation product mark (`mark.svg`, the 64×64
     /// trace of the official artwork; the blue plane rides a 0.55-opacity
     /// group so single-color tinting keeps the two-tone hierarchy).
     Mark,
-    /// The stacked "MDE / Quazar / Mackes Display Environment" text lockup
+    /// The stacked "MDE / CONSTRUCT" text lockup
     /// (`wordmark.svg`, 320×184 — rasterizes transparent without a fontdb;
     /// see the module docs).
     Wordmark,
@@ -90,6 +99,8 @@ pub enum IconId {
     Voice,
     /// The Browser surface glyph.
     Browser,
+    /// The Maps & Location vehicle navigation surface glyph.
+    MapsLocation,
     /// The Bookmarks manager surface glyph.
     Bookmarks,
     /// The Terminal surface glyph.
@@ -110,10 +121,120 @@ pub enum IconId {
     /// the spoked [`System`](Self::System) glyph; the dock's right-side Settings
     /// button (PICKER-2) draws this gear.
     Settings,
+    /// Settings category: display/output controls.
+    DisplaySettings,
+    /// Settings category: mouse and pointer controls.
+    Mouse,
+    /// Settings category: touchpad controls.
+    Touchpad,
+    /// Settings category: keyboard/hotkey controls.
+    Keyboard,
+    /// Settings category: desktop wallpaper controls.
+    Wallpaper,
+    /// Settings category: appearance/theme controls.
+    Appearance,
+    /// Settings category: Bluetooth controls.
+    Bluetooth,
+    /// Settings category: power and battery controls.
+    PowerBattery,
+    /// Settings category: network controls.
+    NetworkSettings,
     /// Shared UI: search/magnifier glyph for compact search fields.
     Search,
     /// Shared UI: close/clear `x` glyph for compact dismiss and clear buttons.
     Close,
+    /// Shared UI: reload/refresh glyph.
+    Reload,
+    /// Shared UI: cancel/stop glyph.
+    Cancel,
+    /// Shared UI: left navigation arrow.
+    ArrowLeft,
+    /// Shared UI: right navigation arrow.
+    ArrowRight,
+    /// Shared UI: down navigation arrow.
+    ArrowDown,
+    /// Shared UI: application/options menu glyph.
+    Menu,
+    /// Shared UI: horizontal more/overflow glyph.
+    MoreHorizontal,
+    /// Shared UI: downloads glyph.
+    Downloads,
+    /// Shared UI: camera/screen-capture glyph.
+    Capture,
+    /// Shared UI: print/printer glyph.
+    Print,
+    /// Shared UI: recent/history glyph.
+    History,
+    /// Shared UI: tab-management glyph.
+    Tabs,
+    /// Shared UI: new/add tab glyph.
+    NewTab,
+    /// Shared UI: generic add/plus glyph.
+    Add,
+    /// Shared UI: generic remove/minus glyph.
+    Remove,
+    /// Shared UI: zoom in glyph.
+    ZoomIn,
+    /// Shared UI: zoom out glyph.
+    ZoomOut,
+    /// Shared UI: checkmark/selected glyph.
+    Check,
+    /// Shared UI: document/page glyph.
+    Page,
+    /// Files surface: generic folder entry glyph.
+    FileFolder,
+    /// Files surface: home folder place glyph.
+    FileHome,
+    /// Files surface: documents folder place glyph.
+    FileDocuments,
+    /// Files surface: downloads folder place glyph.
+    FileDownloads,
+    /// Files surface: generic document file glyph.
+    FileDocument,
+    /// Files surface: image file glyph.
+    FileImage,
+    /// Files surface: PDF file glyph.
+    FilePdf,
+    /// Files surface: archive/package file glyph.
+    FileArchive,
+    /// Shared UI: internet/browser-engine glyph.
+    Internet,
+    /// Shared UI: edit/text-entry glyph.
+    TextEdit,
+    /// Shared UI: view/inspect glyph.
+    View,
+    /// Shared UI: security/privacy shield glyph.
+    Security,
+    /// Shared UI: warning/attention glyph.
+    Warning,
+    /// Shared UI: locked/private state glyph.
+    Lock,
+    /// Shared UI: power instrumentation glyph.
+    Power,
+    /// Shared UI: share/send glyph.
+    Share,
+    /// Shared UI: generic audio glyph.
+    Audio,
+    /// Shared UI: lower-volume glyph.
+    VolumeLow,
+    /// Shared UI: media play glyph.
+    Play,
+    /// Shared UI: media pause glyph.
+    Pause,
+    /// Shared UI: media stop glyph.
+    MediaStop,
+    /// Shared UI: previous media item glyph.
+    Previous,
+    /// Shared UI: next media item glyph.
+    Next,
+    /// Shared UI: picture-in-picture / duplicate-window glyph.
+    PictureInPicture,
+    /// Shared UI: dark-mode/night glyph.
+    DarkMode,
+    /// Shared UI: active notification/bell glyph.
+    Notifications,
+    /// Shared UI: muted notifications/bell glyph.
+    NotificationsMuted,
     /// The Workstation role badge.
     Workstation,
     /// The Server role badge.
@@ -159,7 +280,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 95] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -171,6 +292,7 @@ impl IconId {
         Self::Files,
         Self::Voice,
         Self::Browser,
+        Self::MapsLocation,
         Self::Bookmarks,
         Self::Terminal,
         Self::Editor,
@@ -180,8 +302,63 @@ impl IconId {
         Self::Storage,
         Self::MeshView,
         Self::Settings,
+        Self::DisplaySettings,
+        Self::Mouse,
+        Self::Touchpad,
+        Self::Keyboard,
+        Self::Wallpaper,
+        Self::Appearance,
+        Self::Bluetooth,
+        Self::PowerBattery,
+        Self::NetworkSettings,
         Self::Search,
         Self::Close,
+        Self::Reload,
+        Self::Cancel,
+        Self::ArrowLeft,
+        Self::ArrowRight,
+        Self::ArrowDown,
+        Self::Menu,
+        Self::MoreHorizontal,
+        Self::Downloads,
+        Self::Capture,
+        Self::Print,
+        Self::History,
+        Self::Tabs,
+        Self::NewTab,
+        Self::Add,
+        Self::Remove,
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::Check,
+        Self::Page,
+        Self::FileFolder,
+        Self::FileHome,
+        Self::FileDocuments,
+        Self::FileDownloads,
+        Self::FileDocument,
+        Self::FileImage,
+        Self::FilePdf,
+        Self::FileArchive,
+        Self::Internet,
+        Self::TextEdit,
+        Self::View,
+        Self::Security,
+        Self::Warning,
+        Self::Lock,
+        Self::Power,
+        Self::Share,
+        Self::Audio,
+        Self::VolumeLow,
+        Self::Play,
+        Self::Pause,
+        Self::MediaStop,
+        Self::Previous,
+        Self::Next,
+        Self::PictureInPicture,
+        Self::DarkMode,
+        Self::Notifications,
+        Self::NotificationsMuted,
         Self::Workstation,
         Self::Server,
         Self::Lighthouse,
@@ -227,45 +404,107 @@ impl IconId {
     #[must_use]
     pub const fn svg(self) -> &'static str {
         match self {
-            Self::Mark => quasar_svg!("mark.svg"),
-            Self::Wordmark => quasar_svg!("wordmark.svg"),
-            Self::Node => quasar_svg!("node.svg"),
-            Self::Workbench => quasar_svg!("surface-workbench.svg"),
-            Self::Instances => quasar_svg!("surface-instances.svg"),
-            Self::Desktop => quasar_svg!("surface-desktop.svg"),
-            Self::Music => quasar_svg!("surface-music.svg"),
-            Self::Media => quasar_svg!("surface-media.svg"),
-            Self::Files => quasar_svg!("surface-files.svg"),
-            Self::Voice => quasar_svg!("surface-voice.svg"),
-            Self::Browser => quasar_svg!("surface-browser.svg"),
-            Self::Bookmarks => quasar_svg!("surface-bookmarks.svg"),
-            Self::Terminal => quasar_svg!("surface-terminal.svg"),
-            Self::Editor => quasar_svg!("surface-editor.svg"),
-            Self::Chat => quasar_svg!("surface-chat.svg"),
-            Self::Phones => quasar_svg!("surface-phones.svg"),
-            Self::System => quasar_svg!("surface-system.svg"),
-            Self::Storage => quasar_svg!("surface-storage.svg"),
-            Self::MeshView => quasar_svg!("surface-mesh-view.svg"),
-            Self::Settings => quasar_svg!("surface-settings.svg"),
-            Self::Search => quasar_svg!("ui-search.svg"),
-            Self::Close => quasar_svg!("ui-close.svg"),
-            Self::Workstation => quasar_svg!("role-workstation.svg"),
-            Self::Server => quasar_svg!("role-server.svg"),
-            Self::Lighthouse => quasar_svg!("role-lighthouse.svg"),
-            Self::Signal => quasar_svg!("tray-signal.svg"),
-            Self::Sessions => quasar_svg!("tray-sessions.svg"),
-            Self::Start => quasar_svg!("tray-start.svg"),
-            Self::Pin => quasar_svg!("tray-pin.svg"),
-            Self::ChevronUp => quasar_svg!("tray-chevron-up.svg"),
-            Self::Volume => quasar_svg!("tray-volume.svg"),
-            Self::VolumeMuted => quasar_svg!("tray-volume-muted.svg"),
-            Self::BluetoothSmall => quasar_svg!("tray-bluetooth-small.svg"),
-            Self::BatteryEmpty => quasar_svg!("tray-battery-empty.svg"),
-            Self::BatteryQuarter => quasar_svg!("tray-battery-quarter.svg"),
-            Self::BatteryHalf => quasar_svg!("tray-battery-half.svg"),
-            Self::BatteryThreeQuarter => quasar_svg!("tray-battery-three-quarter.svg"),
-            Self::BatteryFull => quasar_svg!("tray-battery-full.svg"),
-            Self::BatteryBolt => quasar_svg!("tray-battery-bolt.svg"),
+            Self::Mark => construct_svg!("mark.svg"),
+            Self::Wordmark => construct_svg!("wordmark.svg"),
+            Self::Node => yamis_svg!("devices/scalable/network-workgroup.svg"),
+            Self::Workbench => yamis_svg!("categories/scalable/applications-system.svg"),
+            Self::Instances => yamis_svg!("devices/scalable/computer.svg"),
+            Self::Desktop => yamis_svg!("devices/scalable/video-display.svg"),
+            Self::Music => yamis_svg!("places/scalable/folder-music.svg"),
+            Self::Media => yamis_svg!("categories/scalable/applications-multimedia.svg"),
+            Self::Files => yamis_svg!("apps/scalable/system-file-manager.svg"),
+            Self::Voice => yamis_svg!("devices/scalable/audio-input-microphone.svg"),
+            Self::Browser => yamis_svg!("apps/scalable/chromium.svg"),
+            Self::MapsLocation => yamis_svg!("apps/scalable/maps.svg"),
+            Self::Bookmarks => yamis_svg!("emblems/scalable/emblem-favorite.svg"),
+            Self::Terminal => yamis_svg!("apps/scalable/utilities-terminal.svg"),
+            Self::Editor => yamis_svg!("apps/scalable/code-oss.svg"),
+            Self::Chat => yamis_svg!("status/scalable/tray-message.svg"),
+            Self::Phones => yamis_svg!("devices/scalable/phone.svg"),
+            Self::System => yamis_svg!("categories/scalable/preferences-system.svg"),
+            Self::Storage => yamis_svg!("devices/scalable/drive-harddisk.svg"),
+            Self::MeshView => yamis_svg!("devices/scalable/network-card.svg"),
+            Self::Settings => yamis_svg!("apps/scalable/systemsettings.svg"),
+            Self::DisplaySettings => yamis_svg!("apps/16/preferences-displays.svg"),
+            Self::Mouse => yamis_svg!("apps/16/preferences-mouse.svg"),
+            Self::Touchpad => yamis_svg!("apps/16/preferences-touchpad.svg"),
+            Self::Keyboard => yamis_svg!("apps/16/preferences-desktop-keyboard.svg"),
+            Self::Wallpaper => yamis_svg!("apps/16/preferences-desktop-wallpaper.svg"),
+            Self::Appearance => yamis_svg!("apps/16/preferences-appearance.svg"),
+            Self::Bluetooth => yamis_svg!("status/scalable/bluetooth-active.svg"),
+            Self::PowerBattery => yamis_svg!("apps/16/preferences-power-and-battery.svg"),
+            Self::NetworkSettings => yamis_svg!("apps/16/preferences-system-network.svg"),
+            Self::Search => yamis_svg!("apps/scalable/system-search.svg"),
+            Self::Close => yamis_svg!("actions/16/remove.svg"),
+            Self::Reload => yamis_svg!("status/scalable/state-sync.svg"),
+            Self::Cancel => yamis_svg!("apps/scalable/dialog-cancel.svg"),
+            Self::ArrowLeft => yamis_svg!("actions/16/arrow-left.svg"),
+            Self::ArrowRight => yamis_svg!("actions/16/arrow-right.svg"),
+            Self::ArrowDown => yamis_svg!("actions/16/arrow-down.svg"),
+            Self::Menu => yamis_svg!("actions/16/application-menu.svg"),
+            Self::MoreHorizontal => yamis_svg!("actions/16/more-horizontal.svg"),
+            Self::Downloads => yamis_svg!("emblems/scalable/emblem-downloads.svg"),
+            Self::Capture => yamis_svg!("devices/scalable/camera-photo.svg"),
+            Self::Print => yamis_svg!("devices/scalable/printer.svg"),
+            Self::History => yamis_svg!("actions/16/document-open-recent.svg"),
+            Self::Tabs => yamis_svg!("preferences/scalable/preferences-tabs.svg"),
+            Self::NewTab => yamis_svg!("actions/16/list-add.svg"),
+            Self::Add => yamis_svg!("actions/16/list-add.svg"),
+            Self::Remove => yamis_svg!("actions/16/list-remove.svg"),
+            Self::ZoomIn => yamis_svg!("actions/16/zoom-in.svg"),
+            Self::ZoomOut => yamis_svg!("actions/16/zoom-out.svg"),
+            Self::Check => yamis_svg!("emblems/scalable/checkmark.svg"),
+            Self::Page => yamis_svg!("preferences/scalable/preferences-document.svg"),
+            Self::FileFolder => yamis_svg!("places/16/folder.svg"),
+            Self::FileHome => yamis_svg!("places/16/user-home.svg"),
+            Self::FileDocuments => yamis_svg!("places/16/folder-documents.svg"),
+            Self::FileDownloads => yamis_svg!("places/16/folder-download.svg"),
+            Self::FileDocument => {
+                yamis_svg!("mimetypes/scalable-outlined/text-x-generic-template.svg")
+            }
+            Self::FileImage => yamis_svg!("mimetypes/scalable-outlined/image-svg+xml.svg"),
+            Self::FilePdf => yamis_svg!("mimetypes/scalable-outlined/application-pdf.svg"),
+            Self::FileArchive => yamis_svg!("emblems/scalable/emblem-package.svg"),
+            Self::Internet => yamis_svg!("categories/scalable/applications-internet.svg"),
+            Self::TextEdit => yamis_svg!("apps/scalable/accessories-text-editor.svg"),
+            Self::View => yamis_svg!("apps/scalable/systemview.svg"),
+            Self::Security => yamis_svg!("preferences/scalable/preferences-security.svg"),
+            Self::Warning => yamis_svg!("status/scalable/state-warning.svg"),
+            Self::Lock => yamis_svg!("emblems/scalable/emblem-encrypted-locked.svg"),
+            Self::Power => yamis_svg!("apps/scalable/system-shutdown.svg"),
+            Self::Share => yamis_svg!("emblems/scalable/emblem-shared.svg"),
+            Self::Audio => yamis_svg!("status/scalable/audio-on.svg"),
+            Self::VolumeLow => yamis_svg!("status/scalable/audio-volume-low.svg"),
+            Self::Play => yamis_svg!("actions/16/media-playback-start.svg"),
+            Self::Pause => yamis_svg!("actions/16/media-playback-pause.svg"),
+            Self::MediaStop => yamis_svg!("actions/16/media-playback-stop.svg"),
+            Self::Previous => yamis_svg!("actions/16/media-skip-backward.svg"),
+            Self::Next => yamis_svg!("actions/16/media-skip-forward.svg"),
+            Self::PictureInPicture => yamis_svg!("preferences/scalable/window-duplicate.svg"),
+            Self::DarkMode => yamis_svg!("status/scalable/weather-clear-night.svg"),
+            Self::Notifications => yamis_svg!("status/scalable/notification-active.svg"),
+            Self::NotificationsMuted => {
+                yamis_svg!("status/scalable/notification-disabled-symbolic.svg")
+            }
+            Self::Workstation => yamis_svg!("apps/scalable/helio-workstation.svg"),
+            Self::Server => yamis_svg!("devices/scalable/network-server.svg"),
+            Self::Lighthouse => {
+                yamis_svg!("preferences/scalable/preferences-system-network-server.svg")
+            }
+            Self::Signal => yamis_svg!("status/scalable/network-wireless-100.svg"),
+            Self::Sessions => yamis_svg!("preferences/scalable/window-duplicate.svg"),
+            Self::Start => yamis_svg!("apps/scalable/start-here.svg"),
+            Self::Pin => yamis_svg!("actions/16/window-pin.svg"),
+            Self::ChevronUp => yamis_svg!("actions/16/arrow-up.svg"),
+            Self::Volume => yamis_svg!("status/scalable/audio-volume-medium.svg"),
+            Self::VolumeMuted => yamis_svg!("status/scalable/audio-volume-muted.svg"),
+            Self::BluetoothSmall => yamis_svg!("status/scalable/bluetooth-active.svg"),
+            Self::BatteryEmpty => yamis_svg!("status/scalable/battery-000.svg"),
+            Self::BatteryQuarter => yamis_svg!("status/scalable/battery-020.svg"),
+            Self::BatteryHalf => yamis_svg!("status/scalable/battery-050.svg"),
+            Self::BatteryThreeQuarter => yamis_svg!("status/scalable/battery-080.svg"),
+            Self::BatteryFull => yamis_svg!("status/scalable/battery-100.svg"),
+            Self::BatteryBolt => yamis_svg!("status/scalable/battery-100-charging.svg"),
         }
     }
 
@@ -277,43 +516,99 @@ impl IconId {
         match self {
             Self::Mark => "mark",
             Self::Wordmark => "wordmark",
-            Self::Node => "node",
-            Self::Workbench => "surface-workbench",
-            Self::Instances => "surface-instances",
-            Self::Desktop => "surface-desktop",
-            Self::Music => "surface-music",
-            Self::Media => "surface-media",
-            Self::Files => "surface-files",
-            Self::Voice => "surface-voice",
-            Self::Browser => "surface-browser",
-            Self::Bookmarks => "surface-bookmarks",
-            Self::Terminal => "surface-terminal",
-            Self::Editor => "surface-editor",
-            Self::Chat => "surface-chat",
-            Self::Phones => "surface-phones",
-            Self::System => "surface-system",
-            Self::Storage => "surface-storage",
-            Self::MeshView => "surface-mesh-view",
-            Self::Settings => "surface-settings",
-            Self::Search => "ui-search",
-            Self::Close => "ui-close",
-            Self::Workstation => "role-workstation",
-            Self::Server => "role-server",
-            Self::Lighthouse => "role-lighthouse",
-            Self::Signal => "tray-signal",
-            Self::Sessions => "tray-sessions",
-            Self::Start => "tray-start",
-            Self::Pin => "tray-pin",
-            Self::ChevronUp => "tray-chevron-up",
-            Self::Volume => "tray-volume",
-            Self::VolumeMuted => "tray-volume-muted",
-            Self::BluetoothSmall => "tray-bluetooth-small",
-            Self::BatteryEmpty => "tray-battery-empty",
-            Self::BatteryQuarter => "tray-battery-quarter",
-            Self::BatteryHalf => "tray-battery-half",
-            Self::BatteryThreeQuarter => "tray-battery-three-quarter",
-            Self::BatteryFull => "tray-battery-full",
-            Self::BatteryBolt => "tray-battery-bolt",
+            Self::Node => "yamis-network-workgroup",
+            Self::Workbench => "yamis-applications-system",
+            Self::Instances => "yamis-computer",
+            Self::Desktop => "yamis-video-display",
+            Self::Music => "yamis-folder-music",
+            Self::Media => "yamis-applications-multimedia",
+            Self::Files => "yamis-system-file-manager",
+            Self::Voice => "yamis-audio-input-microphone",
+            Self::Browser => "yamis-chromium",
+            Self::MapsLocation => "yamis-maps-location",
+            Self::Bookmarks => "yamis-emblem-favorite",
+            Self::Terminal => "yamis-utilities-terminal",
+            Self::Editor => "yamis-code-oss",
+            Self::Chat => "yamis-tray-message",
+            Self::Phones => "yamis-phone",
+            Self::System => "yamis-preferences-system",
+            Self::Storage => "yamis-drive-harddisk",
+            Self::MeshView => "yamis-network-card",
+            Self::Settings => "yamis-systemsettings",
+            Self::DisplaySettings => "yamis-preferences-displays",
+            Self::Mouse => "yamis-preferences-mouse",
+            Self::Touchpad => "yamis-preferences-touchpad",
+            Self::Keyboard => "yamis-preferences-desktop-keyboard",
+            Self::Wallpaper => "yamis-preferences-desktop-wallpaper",
+            Self::Appearance => "yamis-preferences-appearance",
+            Self::Bluetooth => "yamis-bluetooth-active-settings",
+            Self::PowerBattery => "yamis-preferences-power-and-battery",
+            Self::NetworkSettings => "yamis-preferences-system-network",
+            Self::Search => "yamis-system-search",
+            Self::Close => "yamis-remove",
+            Self::Reload => "yamis-state-sync",
+            Self::Cancel => "yamis-dialog-cancel",
+            Self::ArrowLeft => "yamis-arrow-left",
+            Self::ArrowRight => "yamis-arrow-right",
+            Self::ArrowDown => "yamis-arrow-down",
+            Self::Menu => "yamis-application-menu",
+            Self::MoreHorizontal => "yamis-more-horizontal",
+            Self::Downloads => "yamis-emblem-downloads",
+            Self::Capture => "yamis-camera-photo",
+            Self::Print => "yamis-printer",
+            Self::History => "yamis-document-open-recent",
+            Self::Tabs => "yamis-preferences-tabs",
+            Self::NewTab => "yamis-list-add",
+            Self::Add => "yamis-list-add-generic",
+            Self::Remove => "yamis-list-remove",
+            Self::ZoomIn => "yamis-zoom-in",
+            Self::ZoomOut => "yamis-zoom-out",
+            Self::Check => "yamis-checkmark",
+            Self::Page => "yamis-preferences-document",
+            Self::FileFolder => "yamis-folder-file-entry",
+            Self::FileHome => "yamis-user-home-files-place",
+            Self::FileDocuments => "yamis-folder-documents-files-place",
+            Self::FileDownloads => "yamis-folder-download-files-place",
+            Self::FileDocument => "yamis-text-generic-file",
+            Self::FileImage => "yamis-image-file",
+            Self::FilePdf => "yamis-application-pdf-file",
+            Self::FileArchive => "yamis-emblem-package-file",
+            Self::Internet => "yamis-applications-internet",
+            Self::TextEdit => "yamis-accessories-text-editor",
+            Self::View => "yamis-systemview",
+            Self::Security => "yamis-preferences-security",
+            Self::Warning => "yamis-state-warning",
+            Self::Lock => "yamis-emblem-encrypted-locked",
+            Self::Power => "yamis-system-shutdown",
+            Self::Share => "yamis-emblem-shared",
+            Self::Audio => "yamis-audio-on",
+            Self::VolumeLow => "yamis-audio-volume-low",
+            Self::Play => "yamis-media-playback-start",
+            Self::Pause => "yamis-media-playback-pause",
+            Self::MediaStop => "yamis-media-playback-stop",
+            Self::Previous => "yamis-media-skip-backward",
+            Self::Next => "yamis-media-skip-forward",
+            Self::PictureInPicture => "yamis-window-duplicate-pip",
+            Self::DarkMode => "yamis-weather-clear-night",
+            Self::Notifications => "yamis-notification-active",
+            Self::NotificationsMuted => "yamis-notification-disabled",
+            Self::Workstation => "yamis-helio-workstation",
+            Self::Server => "yamis-network-server",
+            Self::Lighthouse => "yamis-preferences-system-network-server",
+            Self::Signal => "yamis-network-wireless-100",
+            Self::Sessions => "yamis-window-duplicate",
+            Self::Start => "yamis-start-here",
+            Self::Pin => "yamis-window-pin",
+            Self::ChevronUp => "yamis-arrow-up",
+            Self::Volume => "yamis-audio-volume-medium",
+            Self::VolumeMuted => "yamis-audio-volume-muted",
+            Self::BluetoothSmall => "yamis-bluetooth-active",
+            Self::BatteryEmpty => "yamis-battery-000",
+            Self::BatteryQuarter => "yamis-battery-020",
+            Self::BatteryHalf => "yamis-battery-050",
+            Self::BatteryThreeQuarter => "yamis-battery-080",
+            Self::BatteryFull => "yamis-battery-100",
+            Self::BatteryBolt => "yamis-battery-100-charging",
         }
     }
 }
@@ -471,6 +766,12 @@ mod tests {
         rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
     }
 
+    /// Count pixels that render as the icon's strong foreground, ignoring the
+    /// low-opacity shell many YAMIS status icons use for the unfilled portion.
+    fn strong_pixels(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4).filter(|px| px[3] >= 192).count()
+    }
+
     /// Byte index of the strongest-coverage pixel — a geometry-independent
     /// anchor for the tint assertions (the official mark trace has no
     /// guaranteed feature at any fixed coordinate).
@@ -551,12 +852,12 @@ mod tests {
     fn wordmark_is_empty_without_a_fontdb_but_never_panics() {
         // The official wordmark is a pure-<text> stacked lockup; resvg is
         // built here without text/fontdb (module docs), so it must parse,
-        // keep its wide 320×184 aspect and return a fully transparent raster
+        // keep its wide 420x160 aspect and return a fully transparent raster
         // — gracefully, no panic. The visible lockup ships via the official
         // raster assets (app-icon-*.png / brand::logo, QBRAND-3).
         let img = icon_image(IconId::Wordmark, 48, TINT).expect("wordmark parses + rasterizes");
         assert_eq!(img.height, 48);
-        assert_eq!(img.width, 83, "320×184 aspect at 48px tall");
+        assert_eq!(img.width, 126, "420x160 aspect at 48px tall");
         let [w, h] = img.size_usize();
         assert_eq!(img.rgba.len(), w * h * 4);
         assert_eq!(
@@ -589,10 +890,10 @@ mod tests {
 
     #[test]
     fn battery_fill_ladder_is_strictly_monotonic_at_16px() {
-        // The W8 fill-level ladder shares one outline and varies only the
-        // fill bar, so at tray size (16px) each step must ink strictly more
-        // pixels than the one below — proving the five levels stay visually
-        // distinct where it matters.
+        // YAMIS battery icons share one low-opacity shell and vary the strong
+        // foreground fill. At tray size (16px), each step must render strictly
+        // more strong pixels than the one below — proving the five levels stay
+        // visually distinct where it matters.
         let ladder = [
             IconId::BatteryEmpty,
             IconId::BatteryQuarter,
@@ -605,7 +906,7 @@ mod tests {
             .map(|&id| {
                 let img =
                     icon_image(id, 16, TINT).unwrap_or_else(|err| panic!("{id:?} failed: {err}"));
-                opaque_pixels(&img.rgba)
+                strong_pixels(&img.rgba)
             })
             .collect();
         for pair in inked.windows(2) {
@@ -617,26 +918,39 @@ mod tests {
     }
 
     #[test]
+    fn notification_glyphs_are_yamis_backed_and_rasterize_at_chat_button_size() {
+        for id in [IconId::Notifications, IconId::NotificationsMuted] {
+            assert!(
+                id.name().starts_with("yamis-notification"),
+                "{id:?} should stay on the shared YAMIS notification path"
+            );
+            assert!(
+                id.svg().contains("currentColor"),
+                "{id:?} must remain tintable through icon_image"
+            );
+            let img = icon_image(id, 16, TINT).unwrap_or_else(|err| panic!("{id:?}: {err}"));
+            assert_eq!(img.height, 16, "{id:?} chat button icon height");
+            assert!(opaque_pixels(&img.rgba) > 0, "{id:?} rasterized empty");
+        }
+    }
+
+    #[test]
     fn zero_size_is_an_error_not_a_panic() {
         assert_eq!(icon_image(IconId::Mark, 0, TINT), Err(IconError::ZeroSize));
     }
 
     #[test]
     fn ids_names_and_sources_are_distinct_and_exhaustive() {
-        // Guards a copy-paste slip in the two match tables: 36 ids, 36 unique
-        // names, 36 unique embedded sources, all valid-looking SVG.
+        // Guards a copy-paste slip in the name table. YAMIS intentionally ships
+        // some alias files with identical SVG bodies, so source-content
+        // uniqueness is not a valid invariant for mixed theme assets.
         let mut names: Vec<&str> = IconId::ALL.iter().map(|id| id.name()).collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), IconId::ALL.len(), "duplicate glyph name");
 
-        let mut sources: Vec<&str> = IconId::ALL.iter().map(|id| id.svg()).collect();
-        sources.sort_unstable();
-        sources.dedup();
-        assert_eq!(sources.len(), IconId::ALL.len(), "duplicate glyph source");
-
         for id in IconId::ALL {
-            assert!(id.svg().starts_with("<svg"), "{id:?} source is not SVG");
+            assert!(id.svg().contains("<svg"), "{id:?} source is not SVG");
         }
     }
 }

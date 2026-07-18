@@ -4,7 +4,7 @@
 //! beside an honest content pane. Live data then wires into each plane: **This
 //! Node** (WB-ThisNode — this host's role / overlay IP / presence + heartbeat /
 //! daemon health, off the mesh-status snapshot), **Cloud** (QC-12 — the
-//! QUASAR-CLOUD Q70 lock: *the Controller plane BECOMES the Cloud plane*; the
+//! CONSTRUCT-CLOUD Q70 lock: *the Controller plane BECOMES the Cloud plane*; the
 //! five cloud resource kinds + the full launch picker + fleet-state launch
 //! presets over the typed QC-11 verbs, with the old Controller view — the
 //! elected leader + control-service rollup — kept live inside it, collapsed),

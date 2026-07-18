@@ -1,4 +1,4 @@
-//! QC-2 (QUASAR-CLOUD) — the mackesd `openstack` worker: the supervision
+//! QC-2 (CONSTRUCT-CLOUD) — the mackesd `openstack` worker: the supervision
 //! root of the mesh-becomes-an-OpenStack-cloud epic
 //! (`docs/design/quasar-cloud.md`, locked 2026-07-03).
 //!

@@ -1,4 +1,4 @@
-# MCNF E12 "Quazar" — `mde-mesh-view`: the live mesh-state canvas widget.
+# MCNF E12 "Construct" — `mde-mesh-view`: the live mesh-state canvas widget.
 #
 # A reusable egui widget that draws the CURRENT mesh state procedurally with
 # `egui::Painter` (the egui-clock-demo idiom — line_segment / circle_filled /
@@ -10,7 +10,7 @@
 # services/mesh-substrate crate, so the substrate stays headless-capable.
 [package]
 name        = "mde-mesh-view"
-description = "MCNF E12 Quazar — a live, procedural egui::Painter canvas of the current mesh state (nodes by role/health, leader pulse, travelling per-link activity). The egui reincarnation of MESHMAP; renders only the MeshState it is handed, through the shared mde-egui Style/Motion."
+description = "MCNF E12 Construct — a live, procedural egui::Painter canvas of the current mesh state (nodes by role/health, leader pulse, travelling per-link activity). The egui reincarnation of MESHMAP; renders only the MeshState it is handed, through the shared mde-egui Style/Motion."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

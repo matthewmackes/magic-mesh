@@ -113,7 +113,7 @@ confinement; there are no blanket `unconfined_*` grants — it is a real confine
 domain, not a permissive stub.
 
 > **Platform note.** The 2026-06-20 disabled-SELinux fleet standard is
-> superseded for Quazar-cloud nodes by QC-22: shipped nodes target SELinux
+> superseded for Construct-cloud nodes by QC-22: shipped nodes target SELinux
 > Enforcing and load the MCNF policy modules through the bounded boot-time
 > policy oneshot. If a node is still kernel-disabled, has not rebooted after the
 > enforcing config change, or lacks the SELinux policy toolchain, the kernel does
@@ -189,7 +189,7 @@ These are conscious tradeoffs; the sandbox (§3) contains everything else.
    security fix and the next MCNF pin (see the CHANGELOG's update cadence). The
    pin makes each build reproducible + tamper-evident.
 4. **Fingerprinting / anti-adblock are best-effort**, not guaranteed.
-5. **SELinux policy rollout state** — Quazar-cloud nodes target Enforcing under
+5. **SELinux policy rollout state** — Construct-cloud nodes target Enforcing under
    QC-22, but a host that is still kernel-disabled, pre-reboot, or missing the
    policy toolchain does not get the browser confined domain (§3.2). The OS
    sandbox (§3.1) is the operative confinement meanwhile. Accepted because the

@@ -1,4 +1,4 @@
-//! `mde-bookmarks-egui` — the MCNF **E12 "Quazar"** egui Bookmarks surface
+//! `mde-bookmarks-egui` — the MCNF **E12 "Construct"** egui Bookmarks surface
 //! (BOOKMARKS-4; design: `docs/design/mesh-bookmarks.md`).
 //!
 //! An `eframe` app on the shared [`mde_egui`] harness that reuses

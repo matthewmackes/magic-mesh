@@ -4,7 +4,7 @@
 pre-locks) + 10 hero-image questions (H1–H10) + standing directive **D-W1** ·
 **Status:** locked, lifted into `docs/WORKLIST.md` (### PLANES) · governance: new §9
 
-> **⚠️ Supersession banner (2026-07-03 — QUASAR-CLOUD, `docs/design/quasar-cloud.md`;
+> **⚠️ Supersession banner (2026-07-03 — CONSTRUCT-CLOUD, `docs/design/quasar-cloud.md`;
 > governance `AI_GOVERNANCE.md` §9): the Controller plane was renamed the Cloud
 > plane.** The shipped IA is exactly **five** planes —
 > **This Node · Cloud · Network · Fleet · Provisioning** (`Plane::ALL`,

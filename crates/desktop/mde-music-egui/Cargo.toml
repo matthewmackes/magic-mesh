@@ -1,4 +1,4 @@
-# MCNF E12 "Quazar" — `mde-music-egui`: the egui music surface (E12-5).
+# MCNF E12 "Construct" — `mde-music-egui`: the egui music surface (E12-5).
 #
 # A standalone eframe surface on the shared `mde-egui` harness that REUSES the
 # `mde-musicd` service crate end-to-end — its Subsonic/Airsonic REST client, the
@@ -12,7 +12,7 @@
 # in no mesh-substrate crate, so the substrate stays headless-capable.
 [package]
 name        = "mde-music-egui"
-description = "MCNF E12 Quazar — the egui-native music surface. Reuses mde-musicd (Airsonic REST client + shared creds + codec classifier + native playback engine) to list a library and play a track, rendered through the shared mde-egui Style. Async airsonic + audio run on a worker thread; the render-agnostic view-model is unit-tested without a GPU or sound device."
+description = "MCNF E12 Construct — the egui-native music surface. Reuses mde-musicd (Airsonic REST client + shared creds + codec classifier + native playback engine) to list a library and play a track, rendered through the shared mde-egui Style. Async airsonic + audio run on a worker thread; the render-agnostic view-model is unit-tested without a GPU or sound device."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

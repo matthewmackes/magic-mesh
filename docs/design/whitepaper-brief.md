@@ -14,7 +14,7 @@ A one-page graphical whitepaper (dense infographic / architectural poster) that 
 
 **Full name:** MCNF — Mackes Cosmic Nebula Fedora
 **Brand:** Magic Mesh
-**Version:** 12.0 "Quazar" series
+**Version:** 12.0 "Construct" series
 **One-line summary:** A secure, no-fixed-center workgroup mesh that turns up to 12 machines into one private, encrypted workgroup — with no central server.
 
 **Core model:** Any node can author fleet policy. Every node enforces it itself. The whole system runs over a [Nebula](https://github.com/slackhq/nebula) encrypted overlay (Ed25519 identity, AES-256-GCM wire encryption) with etcd coordination and Syncthing-backed mesh file storage.
@@ -151,7 +151,7 @@ Runs VM desktops brokered through the mesh: libvirt/QEMU-KVM guests placed by Op
 - **Capability grid:** 5 labeled boxes (2×3 grid with one merged or centered row), each with a prominent icon, title, and 3-5 bullet points. Flank the architecture diagram (2 left, 3 right, or top-and-bottom).
 - **Audience personas:** 3 horizontal cards near the bottom, each with a subtle icon/avatar area, a bold persona title, and 2-3 sentences of description.
 - **Typography:** IBM Plex Sans for headers and body; IBM Plex Mono for code references, CLI commands, and crate names. Title: ~32pt bold. Section headers: ~18pt. Body: ~10-11pt. Code: ~9pt.
-- **Header area:** "MCNF" in large type, "Magic Mesh" as subtitle, "v12.0 Quazar" as a pill/badge. One-line description immediately below.
+- **Header area:** "MCNF" in large type, "Magic Mesh" as subtitle, "v12.0 Construct" as a pill/badge. One-line description immediately below.
 - **Footer:** GPL-3.0-or-later | github.com/matthewmackes/magic-mesh | Built in Rust | 23+ crates | ~215K lines
 - **Layout:** Portrait (US Letter or A4). Single page. Dense but not crowded — use whitespace deliberately between sections. No scroll — everything fits one page.
 

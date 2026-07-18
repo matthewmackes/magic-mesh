@@ -98,7 +98,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // is enabled here; the live UDisks2Executor stays IntegrationGated as-is.
     ("storage", 0),
     // QC-2 — the OpenStack supervision worker: UNIVERSAL (rank 0). The
-    // QUASAR-CLOUD design's universal-node premise (quasar-cloud.md Q1/Q5/Q22:
+    // CONSTRUCT-CLOUD design's universal-node premise (quasar-cloud.md Q1/Q5/Q22:
     // any-role node, APIs on every node, no controller box) means every node —
     // lighthouse included — can carry cloud duties; the fleet/one-state
     // doctrine (not the role) decides WHICH Kolla services a node hosts, and a
@@ -856,7 +856,7 @@ mod tests {
         // +1 storage (BUG-STORAGE-1 — the E12-20 universal per-node topology mirror,
         // pinned at rank 0 so it is a deliberate census entry on every role instead
         // of riding the silent unknown-worker default that hid it from role-workers).
-        // +1 openstack (QC-2 — the QUASAR-CLOUD Kolla-service supervision worker,
+        // +1 openstack (QC-2 — the CONSTRUCT-CLOUD Kolla-service supervision worker,
         // pinned at rank 0: the universal-node premise (quasar-cloud.md Q1/Q5/Q22)
         // puts cloud duties on any role; the fleet doctrine, not the rank, decides
         // which services a node hosts).
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn openstack_worker_runs_on_every_role() {
-        // QC-2 — the QUASAR-CLOUD universal-node premise (Q1/Q5/Q22: any-role
+        // QC-2 — the CONSTRUCT-CLOUD universal-node premise (Q1/Q5/Q22: any-role
         // node, APIs on every node, no controller box). The worker MUST spawn on
         // every role — the fleet doctrine, not the rank, decides which Kolla
         // services a node hosts — and a node assigned none (or a pre-doctrine

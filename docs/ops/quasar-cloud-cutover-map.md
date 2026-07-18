@@ -1,4 +1,4 @@
-# QUASAR-CLOUD cutover map — what dies, what replaces it, what stays
+# CONSTRUCT-CLOUD cutover map — what dies, what replaces it, what stays
 
 > **Status: tracks the LOCKED design** (`docs/design/quasar-cloud.md`,
 > 2026-07-03). This is the operator-facing version of the design's

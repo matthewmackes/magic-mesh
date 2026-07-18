@@ -2,7 +2,7 @@
 # farm-generalize-xcp-template.sh — generalize a booted XCP build-template clone
 # after farm toolchain baking.
 #
-# QUASAR-CLOUD standard images are built by the OpenStack DIB -> Glance pipeline;
+# CONSTRUCT-CLOUD standard images are built by the OpenStack DIB -> Glance pipeline;
 # this helper is only for the XCP build farm's MDE-VM-golden template refresh.
 # Use it on a throwaway clone after installing Rust/sccache/mold, then shut down
 # that clone and mark it as the replacement template.

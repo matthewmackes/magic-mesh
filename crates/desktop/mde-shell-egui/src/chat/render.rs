@@ -19,6 +19,11 @@
 //! parent) because the shell chrome + integration tests reach them by name.
 
 use super::*;
+use crate::dock::icon_texture;
+use mde_theme::brand::icons::IconId;
+
+pub(super) const CHAT_UNMUTE_ICON: IconId = IconId::Notifications;
+pub(super) const CHAT_MUTE_ICON: IconId = IconId::NotificationsMuted;
 
 /// Render a conversation's messages with a muted **day separator** whenever the
 /// civil (UTC) date changes — the authentic chat idiom — each row carrying its own
@@ -161,9 +166,11 @@ pub(super) fn message_row(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if mine && matches!(&msg.kind, MessageKind::Text(_)) {
                         let delivery = Delivery::for_recipient(recipient);
-                        let (glyph, label) = delivery.badge();
-                        ui.colored_label(delivery.color(), RichText::new(glyph).size(Style::SMALL))
-                            .on_hover_text(label);
+                        ui.colored_label(
+                            delivery.color(),
+                            RichText::new(delivery.label()).size(Style::SMALL),
+                        )
+                        .on_hover_text(delivery.hover_text());
                     }
                     // Compact HH:MM (UTC) send time, token-muted, full date on hover —
                     // every message carries its injected timestamp (lock 22), so the
@@ -242,7 +249,7 @@ pub(super) fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&P
                 mde_egui::muted_note(ui, format!("alert · {flag}"));
                 if let Some(verb) = alert_nav_verb(action_verb.as_deref()) {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Go to \u{2192}").clicked() {
+                        if ui.button(CHAT_ALERT_GO_TO_LABEL).clicked() {
                             navigate_via_toast(bus_root, "chat", title, &verb);
                         }
                     });
@@ -359,7 +366,7 @@ pub(super) fn notification_row(
                 ui.horizontal(|ui| {
                     mde_egui::muted_note(ui, "actions");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Go to \u{2192}").clicked() {
+                        if ui.button(CHAT_ALERT_GO_TO_LABEL).clicked() {
                             navigate_via_toast(bus_root, "chat", title, &verb);
                         }
                     });
@@ -463,23 +470,39 @@ pub(super) fn mute_button(
     muted: bool,
     err: &mut Option<String>,
 ) {
-    let (glyph, hint) = if muted {
+    let (icon, label, hint) = if muted {
         (
-            "\u{1F514} Unmute",
+            CHAT_UNMUTE_ICON,
+            "Unmute",
             format!("Unmute {id} — let it ring again"),
         )
     } else {
         (
-            "\u{1F515} Mute",
+            CHAT_MUTE_ICON,
+            "Mute",
             format!("Mute {id} — silence its messages + alerts"),
         )
     };
-    if ui.button(glyph).on_hover_text(hint).clicked() {
+    if yamis_icon_button(ui, icon, label)
+        .on_hover_text(hint)
+        .clicked()
+    {
         // shell-ux-11: surface a failed mute rather than silently dropping it.
         if let Err(e) = publish_mute(bus_root, target, id, !muted) {
             *err = Some(e);
         }
     }
+}
+
+fn yamis_icon_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> egui::Response {
+    let Some(tex) = icon_texture(ui.ctx(), icon, Style::SP_M, Style::TEXT) else {
+        return ui.button(label);
+    };
+    let image = egui::Image::new(egui::load::SizedTexture::new(
+        tex.id(),
+        egui::vec2(Style::SP_M, Style::SP_M),
+    ));
+    ui.add(egui::Button::image_and_text(image, label))
 }
 
 /// Publish `action/chat/mute` `{target, id, muted}` to the local Bus — the worker

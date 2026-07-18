@@ -1,6 +1,6 @@
-//! `mde-vdi-core` — the transport-neutral core the Quazar VDI backends share.
+//! `mde-vdi-core` — the transport-neutral core the Construct VDI backends share.
 //!
-//! MCNF 12.0 "Quazar" renders remote desktops **egui-native**: `mde-vdi-rdp`,
+//! MCNF 12.0 "Construct" renders remote desktops **egui-native**: `mde-vdi-rdp`,
 //! `mde-vdi-vnc` and `mde-vdi-spice` each turn a wire framebuffer into an
 //! [`egui::ColorImage`] and forward [`egui::Event`]s back as protocol input. Three
 //! transports, but the *egui-facing* seam is the same shape — so it was

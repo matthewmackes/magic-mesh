@@ -1,4 +1,4 @@
-# QUASAR-CLOUD — the mesh becomes an OpenStack cloud (universal node)
+# CONSTRUCT-CLOUD — the mesh becomes an OpenStack cloud (universal node)
 
 **Status:** LOCKED 2026-07-03 (90-Q `/plan` survey, operator).
 **Prompt:** *"What would it take to make this platform into a universal OpenStack
@@ -144,7 +144,7 @@ OpenSCAP discipline) are the standard; the deployment machinery is mesh-native
 | 75 | Dev cloud | **Farm VMs as virtual mesh nodes** — disposable, IaC'd |
 | 76 | Packaging | **Host bits + worker in the image**; Kolla images via the Syncthing lane |
 | 77 | Docs | **All four** — operator guide · ENT-12 blast-radius update · architecture (replaced-vs-kept) map · user how-to |
-| 78 | Epic identity | **QUASAR-CLOUD**, tasks `QC-N`, this file |
+| 78 | Epic identity | **CONSTRUCT-CLOUD**, tasks `QC-N`, this file |
 | 79 | MVP bar | **Boot-attach-reach** — from the Workbench Cloud plane, boot from Glance, attach Cinder, reach from any peer, all through verbs |
 | 80 | Governance | **Amend now** — AI_GOVERNANCE.md updated alongside this doc |
 

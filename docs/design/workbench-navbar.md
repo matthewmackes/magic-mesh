@@ -155,7 +155,7 @@ replaced by the Win10 metrics.
 | W9 | State | **Tiny corner status dot** on tray icons (OK/warn/danger), glyph keeps one tint. |
 | W10 | Overflow | **^ chevron flyout**; **Signal + Peers hidden** by default. **Sessions appears only while a VDI session is active.** |
 | W11 | Clock | **Time over date, stacked** (Win10 corner); click → **System**. |
-| W12 | Brand | **Watermark** — Win10-activation-style ghost text, bottom-right above the bar, 3 lines: product ("MDE Quazar") · version line · node (hostname/role), from `brand::build`, painted on the backdrop layer. **W12b (operator 2026-07-04): the watermark is a direct link — clicking it opens the About surface** (hover brightens it slightly as the affordance; still no tooltip per W6). |
+| W12 | Brand | **Watermark** — Win10-activation-style ghost text, bottom-right above the bar, 3 lines: product ("Construct") · version line · node (hostname/role), from `brand::build`, painted on the backdrop layer. **W12b (operator 2026-07-04): the watermark is a direct link — clicking it opens the About surface** (hover brightens it slightly as the affordance; still no tooltip per W6). |
 | W13 | Compact mode | The bar is constant; **compact collapses the tray to ^ + clock** (all icons into the flyout). Expand/Collapse chrome button is dropped. |
 
 **Mechanism:** `dock.rs` relayouts to the 40px flat row (labels/dividers/top-strip out,

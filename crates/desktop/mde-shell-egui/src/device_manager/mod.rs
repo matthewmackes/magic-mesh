@@ -882,7 +882,7 @@ fn blank_summary() -> HostSummary {
 
 /// Synthesize the honest virtio tree for a Nova instance (#22 — "Nova →
 /// virtio devices"): one virtio network interface per reported fixed/floating
-/// IP (a Neutron port IS a virtio-net attachment on the QUASAR-CLOUD
+/// IP (a Neutron port IS a virtio-net attachment on the CONSTRUCT-CLOUD
 /// libvirt/QEMU plane) — falling back to bare port ids when no IP is mapped —
 /// plus the flavor's root disk as a virtio block device. vCPU / RAM flavor
 /// facts land in the header summary, not as fabricated devices. No reported
@@ -1640,7 +1640,7 @@ impl DeviceManagerState {
                     .strong(),
             );
             ui.label(
-                RichText::new(format!("v{}", brand::build::info().version))
+                RichText::new(brand::logo::PRODUCT_RELEASE)
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );

@@ -1,4 +1,4 @@
-# QUASAR-CLOUD operator runbook — standing up and running the mesh cloud
+# CONSTRUCT-CLOUD operator runbook — standing up and running the mesh cloud
 
 > **Status: tracks the LOCKED design** (`docs/design/quasar-cloud.md`,
 > 2026-07-03) and is written as the QC-21 docs deliverable while the build-out

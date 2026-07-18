@@ -57,7 +57,7 @@ didn't create this constraint; it deleted code that (per the now-disproven "CORE
 LANDED" WORKLIST claim) apparently papered over it on cloud-hypervisor.
 
 **A parallel, broader epic already made adjacent calls that pull the other way.**
-`quasar-cloud.md` (QUASAR-CLOUD, locked 2026-07-03, "Nova+Placement own ALL VM
+`quasar-cloud.md` (CONSTRUCT-CLOUD, locked 2026-07-03, "Nova+Placement own ALL VM
 lifecycle") locks Q37 passthrough as **"Nova PCI + vGPU flavors"** (a heavier,
 Placement-inventory-driven mechanism for Nova instances — not a substitute for the
 direct-libvirt `<hostdev>` XML this doc scopes against the VIRT-6/MV-3 layer) and Q38
@@ -370,7 +370,7 @@ improvement, using the same topic shape, same test patterns, same failure-recove
 story already proven in `compute_migrate.rs`, with **none** of the CPU-mode or
 shared-storage landmines above. It's also framed as an incremental improvement to an
 already-shipped, already-scoped feature rather than new "live migration" scope, which
-sidesteps the QUASAR-CLOUD Q38 tension rather than re-litigating it. True `virsh
+sidesteps the CONSTRUCT-CLOUD Q38 tension rather than re-litigating it. True `virsh
 migrate --live` (option b) should stay a separate, explicitly operator-gated
 follow-on — not bundled into a first PR — pending the CPU-mode decision and the
 Q38 scope question above.
@@ -406,7 +406,7 @@ Q38 scope question above.
   ever pursued — its own epic).
 - Nova PCI/vGPU-flavor passthrough for cloud instances (quasar-cloud.md Q37 territory,
   a different mechanism for a different VM population than the one this doc scopes).
-- Resolving the QUASAR-CLOUD Q38 vs E12-10-lock-48 tension — flagged for an operator
+- Resolving the CONSTRUCT-CLOUD Q38 vs E12-10-lock-48 tension — flagged for an operator
   call, not decided here.
 - Reconciling `compute_provision.rs` vs `vm_lifecycle.rs` into one VM-creation path —
   flagged as a recurring factoring cost, not solved here.

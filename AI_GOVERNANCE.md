@@ -8,8 +8,10 @@
 > elsewhere, the **newer lock wins**; authority ranks **Memory > this file > design
 > docs > worklist body**.
 >
-> **Series (E12 pivot, 2026-06-30; design revised same day):** the **12.0 series is
-> codenamed "Quazar"**, surfaced as `MCNF 12.0 "Quazar"` in the About/greeter. The
+> **Series (E12 pivot, 2026-06-30; design revised same day; rebranded 2026-07-18):**
+> the **12.0 series is codenamed "Construct"**, and the visible product name in
+> About, splash, Browser chrome, packaging entries, and other user-facing surfaces
+> is **Construct**. The
 > package + infra id + GitHub repo **stay `magic-mesh`** so the live-node upgrade
 > path is unbroken. Internal identifiers (`mackesd`, `mde-*`, `org.magicmesh.*`,
 > `magic-mesh.repo`, `magic-mesh-v*` tags, the `magic-mesh` icon name) are
@@ -19,7 +21,7 @@
 > `docs/design/quasar-vdi-desktop.md`.
 
 This rewrites the 11.x/Cosmic-era governance for the **E12 pivot** (the 12.0
-series, "Quazar"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
+series, "Construct"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
 Cosmic; E12 makes the desktop a first-class, mesh-native part of the platform —
 every surface **egui**. The **revised** E12 (50-Q survey, 2026-06-30) is a
 **thin-client VDI** desktop: a single egui shell **owns the DRM seat directly (no
@@ -64,7 +66,7 @@ master rule.)*
 - **Public boundary — 3 tiers (CONNECT):** Public (Nebula/4242 + SSH/22 +
   enroll/4243) · Mesh · Ingress-exposed (lighthouse reverse-proxy). Posture is
   **mesh-allow / public-deny**, drift-corrected firewalld on every node.
-- **QUASAR-CLOUD additions (2026-07-03, `docs/design/quasar-cloud.md`):** the
+- **CONSTRUCT-CLOUD additions (2026-07-03, `docs/design/quasar-cloud.md`):** the
   mesh etcd also serves **tooz** coordination for the OpenStack services;
   **Designate becomes the mesh name service**, fed (and re-seedable) by the
   etcd peer directory. Nebula remains the substrate — Neutron/OVN rides on top
@@ -86,7 +88,7 @@ values, asserted by config tests: **Ed25519** node identity · **AES-256-GCM** /
 **ChaCha20-Poly1305** · **XChaCha20-Poly1305** CA backup · **RSA-4096** KDC device
 identity. No OpenSSL — **rustls** throughout. The loopback debug-SSH
 (NET-INTROSPECT) and documented MD5 interop exceptions (thumbnail cache, Subsonic
-auth, SIP digest) stand as recorded. **Clarified 2026-07-03 (QUASAR-CLOUD Q13):
+auth, SIP digest) stand as recorded. **Clarified 2026-07-03 (CONSTRUCT-CLOUD Q13):
 the no-OpenSSL/rustls lock governs MCNF's own code; hosted workloads (e.g. the
 Kolla OpenStack containers) bring their own crypto stacks.** The OpenStack APIs
 bind **plaintext to the Nebula interface only** — the overlay is their transport
@@ -131,7 +133,7 @@ security (Q23).
 > The forked-`cosmic-comp` desktop is **retired** before any code landed; MCNF does
 > **not** fork or ship a Wayland compositor.
 
-> **REVISED 2026-07-03 — QUASAR-CLOUD (90-Q `/plan` survey →
+> **REVISED 2026-07-03 — CONSTRUCT-CLOUD (90-Q `/plan` survey →
 > `docs/design/quasar-cloud.md`). The VM plane is now OpenStack.**
 > **Nova + Placement replace the mesh-native VM scheduler** (the
 > `mesh-virt-management.md` "mesh-native #5" lock is superseded); the hypervisor
@@ -246,7 +248,7 @@ revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
 > operators** (extends ENT-12), guests stay **default-deny inbound**, and
 > per-service ACLs are revisited if the envelope grows materially.
 
-> **QUASAR-CLOUD revision (2026-07-03 — `docs/design/quasar-cloud.md`).**
+> **CONSTRUCT-CLOUD revision (2026-07-03 — `docs/design/quasar-cloud.md`).**
 > **Cloud instances are "inside" without certs:** they live on one flat
 > Neutron/OVN provider network bridged into the mesh, with **default-open
 > security groups** — no per-instance Nebula certs (the VDI dual-homing
@@ -272,7 +274,7 @@ the renderers-not-authorities doctrine are unchanged. **E12 adds** the desktop
 plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 (etcd/Syncthing-backed).
 
-> **QUASAR-CLOUD revision (2026-07-03).** **The Controller plane BECOMES the
+> **CONSTRUCT-CLOUD revision (2026-07-03).** **The Controller plane BECOMES the
 > Cloud plane** — OpenStack is now the control brain this plane described:
 > instances · volumes+snapshots · images · networks+stacks, self-served by
 > **every mesh member** (invisible SSO via the Keystone identity bridge;

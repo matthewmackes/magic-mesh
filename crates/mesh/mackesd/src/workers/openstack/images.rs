@@ -1,4 +1,4 @@
-//! QC-3 (QUASAR-CLOUD) — the Kolla image airgap lane.
+//! QC-3 (CONSTRUCT-CLOUD) — the Kolla image airgap lane.
 //!
 //! Operator-mirrored archives on the mesh share, checksum-verified, then
 //! `podman load`ed locally. **No registry is ever contacted** (design

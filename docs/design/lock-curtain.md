@@ -1,4 +1,4 @@
-# CURTAIN — the secure login/lock curtain (Quazar shell)
+# CURTAIN — the secure login/lock curtain (Construct shell)
 
 Operator-locked 2026-07-04 (10-Q `/plan` survey). The platform boots the DRM shell
 straight to the desktop with **no login prompt** (lightdm removed; no display manager

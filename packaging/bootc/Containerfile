@@ -73,7 +73,7 @@ COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 # podman remains the container substrate (mackesd's kvm/openstack probes check
 # podman.socket) — the fedora-bootc base already ships it, the explicit install
 # is a no-op guard against future base slimming; nebula arrives as the RPM's
-# hard Require. QUASAR-CLOUD/QC-1 replaces the old cloud-hypervisor bake with
+# hard Require. CONSTRUCT-CLOUD/QC-1 replaces the old cloud-hypervisor bake with
 # libvirt/QEMU-KVM + OVN/Open vSwitch host bits in this immutable image lane.
 RUN set -eux; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
@@ -99,7 +99,7 @@ RUN set -eux; \
     dnf clean all; \
     rm -rf /tmp/mcnf-rpms
 
-# E12-19 (Quazar host controls) — the seat services the compositor-less shell
+# E12-19 (Construct host controls) — the seat services the compositor-less shell
 # owns in-process (audio / Bluetooth / power / DDC brightness). The RPM's
 # `requires` pull these on a dnf install, but the bootc image is composed
 # offline, so install them explicitly here too: PipeWire + WirePlumber (the DAW

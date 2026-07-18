@@ -28,7 +28,7 @@ directly below).
   bullets ask for. See §1.
 - A true zero-copy path is **only coherent for the local, same-host Workstation
   case** (QC-23's own "As a Workstation user" framing). SPICE is a wire protocol —
-  no amount of SPICE hardening can ever become "zero-copy" — and QUASAR-CLOUD's
+  no amount of SPICE hardening can ever become "zero-copy" — and CONSTRUCT-CLOUD's
   Q34 already locked SPICE as the answer for the *remote*/Nova-brokered console
   case. QC-23's landed "Progress" notes advanced Q34, not lock 12. See §2.
 - This codebase's **production DRM renderer is `egui_glow` over EGL/GLES2, not

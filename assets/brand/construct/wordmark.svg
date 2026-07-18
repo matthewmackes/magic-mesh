@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 160">
+  <title>Construct wordmark</title>
+  <desc>Construct text lockup. Runtime UI uses text constants for reliable rendering; this SVG is an asset identity source.</desc>
+  <text x="210" y="72" text-anchor="middle" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="56" font-weight="800" fill="currentColor">Construct</text>
+  <text x="210" y="122" text-anchor="middle" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="22" font-weight="700" fill="currentColor">Software Studio: MDE</text>
+</svg>

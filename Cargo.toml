@@ -70,6 +70,7 @@ members = [
     "crates/desktop/mde-media-egui",
     "crates/desktop/mde-jellyfin",
     "crates/desktop/mde-mesh-view",
+    "crates/desktop/mde-maps-location-egui",
     "crates/desktop/mde-music-egui",
     "crates/desktop/mde-files-egui",
     "crates/desktop/mde-bookmarks-egui",

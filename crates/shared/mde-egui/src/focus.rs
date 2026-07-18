@@ -17,7 +17,7 @@ use crate::style::Style;
 /// Keyboard-focus-ring stroke width, in logical px. The design-lock #5 "visible
 /// **2px** focus ring" — the one weight every focus indicator across the shell
 /// shares, so a keyboard user reads focus at a consistent contrast on the
-/// Quazar-dark ground.
+/// dark platform ground.
 pub const FOCUS_RING_W: f32 = 2.0;
 
 /// The rect a focusable `cell`'s ring strokes when `focused`, or `None` when it

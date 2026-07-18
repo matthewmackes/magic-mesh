@@ -228,8 +228,8 @@ fn empty_state_copy_is_honest_and_reachable() {
 }
 
 #[test]
-fn about_dialog_uses_canonical_quazar_identity() {
-    assert_eq!(ABOUT_PRODUCT_LINE, "Quazar Editor");
+fn about_dialog_uses_canonical_construct_identity() {
+    assert_eq!(ABOUT_PRODUCT_LINE, "Construct Editor");
     assert!(
         !ABOUT_PRODUCT_LINE.contains(concat!("Qua", "sar")),
         "Editor About copy must not drift back to the superseded spelling"

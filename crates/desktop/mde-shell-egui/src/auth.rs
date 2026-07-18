@@ -10,7 +10,7 @@
 //!     credential is sealed, it remains SSO/no-prompt: the mesh identity is
 //!     [`crate::discovery::local_peer`] (the node hostname the mesh keys nodes by),
 //!     the SAME value the broker `Open` request already carries as `client_peer`
-//!     ([`crate::discovery::publish_open`]). This matches the Quazar lock:
+//!     ([`crate::discovery::publish_open`]). This matches the Construct lock:
 //!     mesh cert gates the connection, guest login still applies.
 //!   * **External RDP/VNC/Spice endpoint** (an mDNS / manual source, off the mesh
 //!     broker) authenticates with a **credential sealed in the secret store**,

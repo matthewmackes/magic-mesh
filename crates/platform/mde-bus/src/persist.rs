@@ -757,17 +757,176 @@ impl Persist {
             indexed.insert(r.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
         }
 
-        // Walk the file tree.
+        // Walk the file tree. The Bus root can also host client-side state files
+        // (`settings-nav.json`, `tmux/state.json`, etc.) when the shared root is
+        // injected into desktop processes. Those are not Bus messages; a message
+        // file must have a ULID filename and a StoredMessage envelope that points
+        // back at the same relative path.
+        let mut json_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        walk_json_files(&self.bus_root, &self.bus_root, &mut json_files)?;
         let mut on_disk: std::collections::HashSet<String> = std::collections::HashSet::new();
-        walk_json_files(&self.bus_root, &self.bus_root, &mut on_disk)?;
+        let mut invalid_message_files = Vec::new();
+        let mut ignored_non_message_files = Vec::new();
+        for rel in json_files {
+            match read_indexable_message(&self.bus_root, &rel)? {
+                MessageFile::Message(_) => {
+                    on_disk.insert(rel);
+                }
+                MessageFile::Invalid(reason) => {
+                    invalid_message_files.push(DivergenceFileProblem { path: rel, reason });
+                }
+                MessageFile::NonMessage => ignored_non_message_files.push(rel),
+            }
+        }
 
-        let files_without_rows: Vec<String> = on_disk.difference(&indexed).cloned().collect();
-        let rows_without_files: Vec<String> = indexed.difference(&on_disk).cloned().collect();
+        let mut files_without_rows: Vec<String> = on_disk.difference(&indexed).cloned().collect();
+        let mut rows_without_files: Vec<String> = indexed.difference(&on_disk).cloned().collect();
+        files_without_rows.sort();
+        rows_without_files.sort();
+        invalid_message_files.sort_by(|a, b| a.path.cmp(&b.path));
+        ignored_non_message_files.sort();
 
         Ok(DivergenceReport {
             files_without_rows,
             rows_without_files,
+            invalid_message_files,
+            ignored_non_message_files,
         })
+    }
+
+    /// Repair safe divergence between the authoritative JSON file tree and the
+    /// local SQLite index.
+    ///
+    /// Valid message files without rows are re-indexed exactly as-is. Rows whose
+    /// file is missing are reported by default; when `prune_missing_rows` is
+    /// explicit, the stale index rows are exported under `.repair/` before being
+    /// removed from the query index.
+    pub fn repair_divergence(
+        &self,
+        dry_run: bool,
+        prune_missing_rows: bool,
+    ) -> Result<DivergenceRepairReport, PersistError> {
+        let report = self.detect_divergence()?;
+        let mut repair = DivergenceRepairReport {
+            dry_run,
+            rows_without_files: report.rows_without_files.clone(),
+            invalid_message_files: report.invalid_message_files.clone(),
+            ignored_non_message_files: report.ignored_non_message_files.clone(),
+            ..DivergenceRepairReport::default()
+        };
+
+        if dry_run {
+            repair.files_would_reindex = report.files_without_rows;
+            if prune_missing_rows {
+                repair.rows_would_prune = repair.rows_without_files.clone();
+            }
+            return Ok(repair);
+        }
+
+        for rel in &report.files_without_rows {
+            let MessageFile::Message(msg) = read_indexable_message(&self.bus_root, rel)? else {
+                return Err(PersistError::Io(format!(
+                    "message file classification changed during repair: {rel}"
+                )));
+            };
+            if self.insert_existing_message(&msg)? {
+                repair.files_reindexed.push(rel.clone());
+            }
+        }
+        if !repair.files_reindexed.is_empty() {
+            relax_db(&self.bus_root);
+        }
+
+        if prune_missing_rows && !repair.rows_without_files.is_empty() {
+            let missing = self.load_rows_by_file_paths(&repair.rows_without_files)?;
+            if !missing.is_empty() {
+                repair.missing_rows_export = Some(export_missing_rows(&self.bus_root, &missing)?);
+            }
+            self.delete_rows_by_file_paths(&repair.rows_without_files)?;
+            repair.rows_pruned = std::mem::take(&mut repair.rows_without_files);
+            relax_db(&self.bus_root);
+        }
+
+        Ok(repair)
+    }
+
+    fn insert_existing_message(&self, msg: &StoredMessage) -> Result<bool, PersistError> {
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO messages (ulid, topic, priority, title, body, ts_unix_ms, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    &msg.ulid,
+                    &msg.topic,
+                    &msg.priority,
+                    &msg.title,
+                    &msg.body,
+                    msg.ts_unix_ms,
+                    &msg.file_path
+                ],
+            )
+            .map_err(|e| PersistError::Sql(format!("reindex {}: {e}", msg.file_path)))?;
+        if changed > 0 {
+            return Ok(true);
+        }
+
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT file_path FROM messages WHERE ulid = ?1",
+                params![&msg.ulid],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(PersistError::Sql(format!(
+                    "check reindex conflict {}: {other}",
+                    msg.file_path
+                ))),
+            })?;
+        if existing.as_deref() == Some(msg.file_path.as_str()) {
+            return Ok(false);
+        }
+        Err(PersistError::Sql(format!(
+            "reindex {}: ULID {} already indexes {:?}",
+            msg.file_path, msg.ulid, existing
+        )))
+    }
+
+    fn load_rows_by_file_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<StoredMessage>, PersistError> {
+        let mut out = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                 FROM messages WHERE file_path = ?1",
+            )
+            .map_err(|e| PersistError::Sql(format!("prepare missing-row export: {e}")))?;
+        for path in paths {
+            match stmt.query_row(params![path], row_to_message) {
+                Ok(msg) => out.push(msg),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => return Err(PersistError::Sql(format!("load missing row {path}: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_rows_by_file_paths(&self, paths: &[String]) -> Result<(), PersistError> {
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM messages WHERE file_path = ?1")
+            .map_err(|e| PersistError::Sql(format!("prepare missing-row prune: {e}")))?;
+        for path in paths {
+            stmt.execute(params![path])
+                .map_err(|e| PersistError::Sql(format!("prune missing row {path}: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Test-only accessor for the bus root.
@@ -778,7 +937,7 @@ impl Persist {
 }
 
 /// Output of [`Persist::detect_divergence`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct DivergenceReport {
     /// Relative paths (under `bus_root`) of JSON files that
     /// exist on disk but have no SQLite row.
@@ -786,13 +945,61 @@ pub struct DivergenceReport {
     /// Relative paths (under `bus_root`) of SQLite rows whose
     /// JSON file is gone.
     pub rows_without_files: Vec<String>,
+    /// ULID-named JSON files that look like Bus messages but cannot be safely
+    /// re-indexed because their envelope is malformed or inconsistent.
+    pub invalid_message_files: Vec<DivergenceFileProblem>,
+    /// JSON files under the shared root that are not Bus message files. These
+    /// are informational only and do not make the persistence layer divergent.
+    pub ignored_non_message_files: Vec<String>,
 }
 
 impl DivergenceReport {
     /// Convenience — `true` when both sets are empty.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.files_without_rows.is_empty() && self.rows_without_files.is_empty()
+        self.files_without_rows.is_empty()
+            && self.rows_without_files.is_empty()
+            && self.invalid_message_files.is_empty()
+    }
+}
+
+/// A Bus-message-shaped JSON file that cannot be trusted for repair.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DivergenceFileProblem {
+    /// Relative path under the Bus root.
+    pub path: String,
+    /// Operator-facing reason the file was excluded from repair.
+    pub reason: String,
+}
+
+/// Output of [`Persist::repair_divergence`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DivergenceRepairReport {
+    /// True when no writes were attempted.
+    pub dry_run: bool,
+    /// Valid message files actually inserted into the SQLite index.
+    pub files_reindexed: Vec<String>,
+    /// Valid message files that would be inserted during a dry run.
+    pub files_would_reindex: Vec<String>,
+    /// Stale rows still present because `prune_missing_rows` was not requested.
+    pub rows_without_files: Vec<String>,
+    /// Stale rows removed from the SQLite index after being exported.
+    pub rows_pruned: Vec<String>,
+    /// Stale rows that would be pruned during a dry run.
+    pub rows_would_prune: Vec<String>,
+    /// Relative `.repair/...json` export path for pruned rows.
+    pub missing_rows_export: Option<String>,
+    /// Message-shaped files that were not safe to index.
+    pub invalid_message_files: Vec<DivergenceFileProblem>,
+    /// Non-message JSON files ignored by the verifier.
+    pub ignored_non_message_files: Vec<String>,
+}
+
+impl DivergenceRepairReport {
+    /// True when operator follow-up is still required after this repair pass.
+    #[must_use]
+    pub fn has_unresolved(&self) -> bool {
+        !self.rows_without_files.is_empty() || !self.invalid_message_files.is_empty()
     }
 }
 
@@ -921,6 +1128,69 @@ fn validate_topic(topic: &str) -> Result<(), PersistError> {
     Ok(())
 }
 
+enum MessageFile {
+    Message(StoredMessage),
+    Invalid(String),
+    NonMessage,
+}
+
+fn read_indexable_message(root: &Path, rel: &str) -> Result<MessageFile, PersistError> {
+    let path = Path::new(rel);
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(MessageFile::NonMessage);
+    };
+    if stem.parse::<Ulid>().is_err() {
+        return Ok(MessageFile::NonMessage);
+    }
+
+    let abs = root.join(rel);
+    let raw = std::fs::read_to_string(&abs)
+        .map_err(|e| PersistError::Io(format!("read {}: {e}", abs.display())))?;
+    let msg = match serde_json::from_str::<StoredMessage>(&raw) {
+        Ok(msg) => msg,
+        Err(e) => return Ok(MessageFile::Invalid(format!("decode StoredMessage: {e}"))),
+    };
+
+    if msg.ulid != stem {
+        return Ok(MessageFile::Invalid(format!(
+            "filename ULID {stem} does not match envelope ULID {}",
+            msg.ulid
+        )));
+    }
+    if msg.file_path != rel {
+        return Ok(MessageFile::Invalid(format!(
+            "envelope file_path {} does not match path {rel}",
+            msg.file_path
+        )));
+    }
+    if let Err(e) = validate_topic(&msg.topic) {
+        return Ok(MessageFile::Invalid(format!("invalid topic: {e}")));
+    }
+    let expected = format!("{}/{}.json", msg.topic, msg.ulid);
+    if expected != rel {
+        return Ok(MessageFile::Invalid(format!(
+            "topic/ULID imply {expected}, not {rel}"
+        )));
+    }
+
+    Ok(MessageFile::Message(msg))
+}
+
+fn export_missing_rows(root: &Path, rows: &[StoredMessage]) -> Result<String, PersistError> {
+    let repair_dir = root.join(".repair");
+    std::fs::create_dir_all(&repair_dir)
+        .map_err(|e| PersistError::Io(format!("mkdir {}: {e}", repair_dir.display())))?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let rel = format!(".repair/persist-missing-rows-{ts}.json");
+    let path = root.join(&rel);
+    let body = serde_json::to_string_pretty(rows)
+        .map_err(|e| PersistError::Json(format!("encode missing-row export: {e}")))?;
+    std::fs::write(&path, body.as_bytes())
+        .map_err(|e| PersistError::Io(format!("write {}: {e}", path.display())))?;
+    relax_shared(&path, false);
+    Ok(rel)
+}
+
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     Ok(StoredMessage {
         ulid: row.get(0)?,
@@ -985,6 +1255,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Persist::open(tmp.path().to_path_buf()).unwrap();
         (tmp, p)
+    }
+
+    fn stored_message(topic: &str, ulid: &str, body: &str) -> StoredMessage {
+        StoredMessage {
+            ulid: ulid.to_owned(),
+            topic: topic.to_owned(),
+            priority: "default".to_owned(),
+            title: None,
+            body: Some(body.to_owned()),
+            ts_unix_ms: 1_784_349_068_806,
+            file_path: format!("{topic}/{ulid}.json"),
+            actions: Vec::new(),
+            reply_to: None,
+        }
     }
 
     #[test]
@@ -1354,16 +1638,134 @@ mod tests {
             .write("t/x", Priority::Default, None, Some("real"))
             .unwrap();
         // Plant an orphan JSON in the topic dir.
+        let orphan_ulid = "01KXSQW3G6PYVGSXPB2QEQW1XK";
+        let orphan_msg = stored_message("t/x", orphan_ulid, "orphan");
         let topic_dir = p.bus_root().join("t/x");
-        let orphan = topic_dir.join("01ABCDEFGHIJKLMNOPQRSTUVWX.json");
-        std::fs::write(&orphan, "{}").unwrap();
+        let orphan = topic_dir.join(format!("{orphan_ulid}.json"));
+        std::fs::write(&orphan, serde_json::to_string_pretty(&orphan_msg).unwrap()).unwrap();
         let report = p.detect_divergence().unwrap();
         assert!(!report.is_clean());
         assert_eq!(report.rows_without_files, Vec::<String>::new());
         assert_eq!(report.files_without_rows.len(), 1);
-        assert!(report.files_without_rows[0].contains("01ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(report.files_without_rows[0].contains(orphan_ulid));
         // The real message is still indexed.
         let _ = msg;
+    }
+
+    #[test]
+    fn divergence_ignores_non_message_json_files() {
+        let (_tmp, p) = open_tmp();
+        std::fs::write(
+            p.bus_root().join("settings-nav.json"),
+            r#"{"group":"mesh_system","section":"network"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(p.bus_root().join("tmux")).unwrap();
+        std::fs::write(
+            p.bus_root().join("tmux/state.json"),
+            r#"{"last_session":"main"}"#,
+        )
+        .unwrap();
+
+        let report = p.detect_divergence().unwrap();
+        assert!(report.is_clean(), "non-message state is informational");
+        assert_eq!(
+            report.ignored_non_message_files,
+            vec!["settings-nav.json".to_owned(), "tmux/state.json".to_owned()]
+        );
+    }
+
+    #[test]
+    fn divergence_flags_invalid_ulid_named_message_file() {
+        let (_tmp, p) = open_tmp();
+        let bad_ulid = "01KXSQW3G6PYVGSXPB2QEQW1XM";
+        let dir = p.bus_root().join("state/bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{bad_ulid}.json")), "{ not json").unwrap();
+
+        let report = p.detect_divergence().unwrap();
+        assert!(!report.is_clean());
+        assert_eq!(report.files_without_rows, Vec::<String>::new());
+        assert_eq!(report.rows_without_files, Vec::<String>::new());
+        assert_eq!(report.invalid_message_files.len(), 1);
+        assert_eq!(
+            report.invalid_message_files[0].path,
+            format!("state/bad/{bad_ulid}.json")
+        );
+    }
+
+    #[test]
+    fn repair_reindexes_valid_message_file_without_rewriting_body() {
+        let (_tmp, p) = open_tmp();
+        let orphan_ulid = "01KXSQW3G6PYVGSXPB2QEQW1XN";
+        let orphan_msg = stored_message("state/bookmarks/sync", orphan_ulid, "orphan-body");
+        let orphan_path = p.bus_root().join(&orphan_msg.file_path);
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        let before = serde_json::to_string_pretty(&orphan_msg).unwrap();
+        std::fs::write(&orphan_path, &before).unwrap();
+
+        let repair = p.repair_divergence(false, false).unwrap();
+        assert_eq!(repair.files_reindexed, vec![orphan_msg.file_path.clone()]);
+        assert!(!repair.has_unresolved());
+        assert_eq!(std::fs::read_to_string(&orphan_path).unwrap(), before);
+        assert!(p.detect_divergence().unwrap().is_clean());
+        assert_eq!(
+            p.read_latest("state/bookmarks/sync").unwrap().unwrap().ulid,
+            orphan_ulid
+        );
+    }
+
+    #[test]
+    fn repair_reindex_is_idempotent_when_a_row_appears_during_repair() {
+        let (_tmp, p) = open_tmp();
+        let orphan_ulid = "01KXSQW3G6PYVGSXPB2QEQW1XP";
+        let orphan_msg = stored_message("state/bookmarks/sync", orphan_ulid, "orphan-body");
+        assert!(p.insert_existing_message(&orphan_msg).unwrap());
+        assert!(
+            !p.insert_existing_message(&orphan_msg).unwrap(),
+            "a same-path row inserted by another process is already repaired"
+        );
+    }
+
+    #[test]
+    fn repair_reports_missing_rows_without_fabricating_files() {
+        let (_tmp, p) = open_tmp();
+        let msg = p
+            .write(
+                "state/browser-custom-filter-rules-source/test",
+                Priority::Default,
+                None,
+                Some("gone"),
+            )
+            .unwrap();
+        std::fs::remove_file(p.bus_root().join(&msg.file_path)).unwrap();
+
+        let repair = p.repair_divergence(false, false).unwrap();
+        assert_eq!(repair.rows_without_files, vec![msg.file_path.clone()]);
+        assert!(repair.has_unresolved());
+        assert!(!p.bus_root().join(&msg.file_path).exists());
+    }
+
+    #[test]
+    fn repair_prunes_missing_rows_only_when_explicit_and_exports_first() {
+        let (_tmp, p) = open_tmp();
+        let msg = p
+            .write(
+                "state/browser-custom-filter-rules-source/test",
+                Priority::Default,
+                None,
+                Some("gone"),
+            )
+            .unwrap();
+        std::fs::remove_file(p.bus_root().join(&msg.file_path)).unwrap();
+
+        let repair = p.repair_divergence(false, true).unwrap();
+        assert_eq!(repair.rows_pruned, vec![msg.file_path.clone()]);
+        let export = repair.missing_rows_export.expect("export path");
+        assert!(export.starts_with(".repair/persist-missing-rows-"));
+        let exported = std::fs::read_to_string(p.bus_root().join(export)).unwrap();
+        assert!(exported.contains(&msg.file_path));
+        assert!(p.detect_divergence().unwrap().is_clean());
     }
 
     #[test]

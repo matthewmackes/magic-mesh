@@ -1,4 +1,4 @@
-//! QC-12 (QUASAR-CLOUD) — the Workbench **Cloud** plane, the Controller plane's
+//! QC-12 (CONSTRUCT-CLOUD) — the Workbench **Cloud** plane, the Controller plane's
 //! successor (design Q70: "the Controller plane BECOMES the Cloud plane").
 //!
 //! One plane for **every mesh member** (Q82 — admin + self-service, no separate

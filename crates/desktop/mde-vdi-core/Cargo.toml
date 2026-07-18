@@ -1,6 +1,6 @@
 [package]
 name        = "mde-vdi-core"
-description = "MCNF E12 'Quazar' VDI — the transport-neutral core the RDP/VNC/SPICE backends share. Owns the pieces that were byte-for-byte duplicated across mde-vdi-{rdp,vnc,spice} (arch-8): the egui coordinate clamp + wheel-axis pick, the PC/AT set-1 scancode identity + map (shared by RDP + SPICE), the generic Shift/Ctrl/Alt modifier-diff tracker, and the RGBA8 desktop surface (opaque-black init + egui ColorImage hand-off) each Framebuffer wraps. A scancode or clamp fix now lives in ONE place. Transport-free and fully unit-tested; the divergent wire pieces (VNC X11 keysyms/DES, SPICE surface format, each transport's blit) stay in their own crate."
+description = "MCNF E12 'Construct' VDI — the transport-neutral core the RDP/VNC/SPICE backends share. Owns the pieces that were byte-for-byte duplicated across mde-vdi-{rdp,vnc,spice} (arch-8): the egui coordinate clamp + wheel-axis pick, the PC/AT set-1 scancode identity + map (shared by RDP + SPICE), the generic Shift/Ctrl/Alt modifier-diff tracker, and the RGBA8 desktop surface (opaque-black init + egui ColorImage hand-off) each Framebuffer wraps. A scancode or clamp fix now lives in ONE place. Transport-free and fully unit-tested; the divergent wire pieces (VNC X11 keysyms/DES, SPICE surface format, each transport's blit) stay in their own crate."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

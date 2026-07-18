@@ -1,0 +1,1992 @@
+//! Render-agnostic state for the Maps & Location workspace.
+
+use std::collections::BTreeMap;
+
+/// Workspace tabs in the order requested by the product directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WorkspaceTab {
+    /// Default in-motion navigation view.
+    #[default]
+    Drive,
+    /// Full map exploration and layer control.
+    Map,
+    /// Trips, routes, saved places, replay, and export.
+    RoutesTrips,
+    /// Ford 2020 Police Interceptor vehicle telemetry.
+    Vehicle,
+    /// MG90 WAN/cellular/connectivity view.
+    Connectivity,
+    /// Serial recovery, GPIO, USB, Ethernet, CAN/OBD.
+    DevicesIo,
+    /// Primary-source selection and health diagnostics.
+    LocationSources,
+    /// First-time direct-Ethernet setup and reset guardrails.
+    Mg90Setup,
+    /// Native MG90 setting descriptors and pending changes.
+    Mg90Settings,
+    /// Firmware lifecycle and serial recovery workflows.
+    FirmwareRecovery,
+    /// Simulator control surface.
+    Simulator,
+}
+
+impl WorkspaceTab {
+    /// All tabs in stable product order.
+    pub const ALL: [Self; 11] = [
+        Self::Drive,
+        Self::Map,
+        Self::RoutesTrips,
+        Self::Vehicle,
+        Self::Connectivity,
+        Self::DevicesIo,
+        Self::LocationSources,
+        Self::Mg90Setup,
+        Self::Mg90Settings,
+        Self::FirmwareRecovery,
+        Self::Simulator,
+    ];
+
+    /// Human label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Drive => "Drive",
+            Self::Map => "Map",
+            Self::RoutesTrips => "Routes & Trips",
+            Self::Vehicle => "Vehicle",
+            Self::Connectivity => "Connectivity",
+            Self::DevicesIo => "Devices & I/O",
+            Self::LocationSources => "Location Sources",
+            Self::Mg90Setup => "MG90 Setup",
+            Self::Mg90Settings => "MG90 Settings",
+            Self::FirmwareRecovery => "Firmware & Recovery",
+            Self::Simulator => "Simulator",
+        }
+    }
+}
+
+/// Whole workspace state.
+#[derive(Debug, Clone)]
+pub struct MapsLocationSurface {
+    /// Selected workspace tab.
+    pub active: WorkspaceTab,
+    /// Simulators are first-class and on by default.
+    pub simulator_enabled: bool,
+    /// Current map view model.
+    pub map: MapViewState,
+    /// Offline map package manager state.
+    pub offline_maps: OfflineMapManagerState,
+    /// Routing/search abstraction state.
+    pub local_navigation: LocalNavigationState,
+    /// MG90 local-management state.
+    pub mg90: Mg90State,
+    /// Location-source manager.
+    pub locations: LocationManager,
+    /// Trip recorder and export model.
+    pub trips: TripRecorderState,
+    /// Dead-zone recorder/overlay state.
+    pub dead_zones: DeadZoneState,
+    /// Vehicle profile and telemetry.
+    pub vehicle: VehicleState,
+    /// GPIO/CAN/USB/serial device state.
+    pub devices: DeviceIoState,
+    /// Firmware lifecycle model.
+    pub firmware: FirmwareWorkflow,
+    /// Encrypted vault readiness model.
+    pub vault: EncryptedVaultState,
+    /// Known real-hardware gaps for this vertical slice.
+    pub real_hardware_gaps: Vec<String>,
+}
+
+impl MapsLocationSurface {
+    /// Build the first vertical slice in simulator mode.
+    #[must_use]
+    pub fn simulated() -> Self {
+        Self {
+            active: WorkspaceTab::Drive,
+            simulator_enabled: true,
+            map: MapViewState::simulated(),
+            offline_maps: OfflineMapManagerState::simulated_default(),
+            local_navigation: LocalNavigationState::simulated(),
+            mg90: Mg90State::simulated(),
+            locations: LocationManager::simulated(),
+            trips: TripRecorderState::simulated(),
+            dead_zones: DeadZoneState::simulated(),
+            vehicle: VehicleState::ford_interceptor_2020(),
+            devices: DeviceIoState::simulated(),
+            firmware: FirmwareWorkflow::simulated(),
+            vault: EncryptedVaultState::ready_for_local_admin(),
+            real_hardware_gaps: vec![
+                "Real MG90 discovery/auth/status adapters are skeleton seams; simulator is active."
+                    .to_string(),
+                "Valhalla and Nominatim are represented as local-only backend contracts; no live daemon is launched by this slice."
+                    .to_string(),
+                "gpsd, CAN/OBD, GPIO, serial, firmware upload, and factory reset workflows are UI/model complete but not wired to hardware."
+                    .to_string(),
+                "Traffic, weather, and satellite providers expose graceful unavailable states until configured."
+                    .to_string(),
+            ],
+        }
+    }
+
+    /// One-line warning when the selected primary source is unhealthy.
+    #[must_use]
+    pub fn primary_location_warning(&self) -> Option<String> {
+        self.locations.primary_warning()
+    }
+
+    /// Compute whether the current state can provide offline turn-by-turn use.
+    #[must_use]
+    pub fn offline_navigation_status(&self) -> OfflineNavigationStatus {
+        OfflineNavigationStatus::from_surface(self)
+    }
+
+    /// Simulator scenario: the selected source stops updating.
+    pub fn simulate_stale_primary_location(&mut self) {
+        if let Some(source) = self
+            .locations
+            .sources
+            .iter_mut()
+            .find(|source| source.kind == self.locations.primary)
+        {
+            source.status = SourceStatus::Stale;
+            source.sample.update_age_s = 18.0;
+            source
+                .diagnostics
+                .insert("scenario".to_string(), "stale primary source".to_string());
+        }
+    }
+
+    /// Simulator scenario: no usable offline map bundle is loaded.
+    pub fn simulate_no_offline_maps(&mut self) {
+        self.offline_maps.used_gb = 0.0;
+        self.offline_maps.installed_regions.clear();
+        self.offline_maps
+            .available_regions
+            .push("Default state/province region queued for reinstall".to_string());
+    }
+
+    /// Restore simulator data to an offline-navigation-ready state.
+    pub fn simulate_ready_offline_navigation(&mut self) {
+        self.locations = LocationManager::simulated();
+        self.offline_maps = OfflineMapManagerState::simulated_default();
+        self.mg90.setup_step = SetupStep::Ready;
+        self.mg90.authenticated = true;
+    }
+
+    /// True when the motion guard should warn before dangerous changes.
+    #[must_use]
+    pub fn moving(&self) -> bool {
+        self.locations
+            .primary_sample()
+            .is_some_and(LocationSample::moving)
+            || self.vehicle.telemetry.moving
+            || self.mg90.ignition_on
+    }
+
+    /// Build the setting-change execution plan used by MG90 Settings.
+    #[must_use]
+    pub fn setting_change_plan(&self, setting_id: &str) -> Option<SettingChangePlan> {
+        let setting = self
+            .mg90
+            .settings
+            .iter()
+            .find(|descriptor| descriptor.id == setting_id)?;
+        Some(SettingChangePlan::for_setting(setting, self.moving()))
+    }
+}
+
+impl Default for MapsLocationSurface {
+    fn default() -> Self {
+        Self::simulated()
+    }
+}
+
+/// Coarse readiness level for the offline navigation core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineNavigationReadiness {
+    /// Essential offline routing inputs are present.
+    Ready,
+    /// Offline routing can run, but an operator-facing warning is active.
+    Degraded,
+    /// Offline routing should not claim turn-by-turn readiness.
+    Blocked,
+}
+
+impl OfflineNavigationReadiness {
+    /// Human label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::Degraded => "Degraded",
+            Self::Blocked => "Blocked",
+        }
+    }
+}
+
+/// Render-agnostic status for native offline navigation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfflineNavigationStatus {
+    /// Coarse readiness.
+    pub readiness: OfflineNavigationReadiness,
+    /// Selected primary location source.
+    pub primary_source: LocationSourceKind,
+    /// Loaded offline region, if any.
+    pub loaded_region: Option<String>,
+    /// Coverage percentage for the loaded region.
+    pub coverage_percent: Option<u8>,
+    /// Used offline-map storage.
+    pub used_gb: f32,
+    /// Offline-map storage cap.
+    pub cap_gb: u32,
+    /// Hard blockers that prevent an honest offline-navigation-ready claim.
+    pub blockers: Vec<String>,
+    /// Warnings that still allow offline routing.
+    pub warnings: Vec<String>,
+    /// Informational notes for optional providers or simulator fixtures.
+    pub notes: Vec<String>,
+}
+
+impl OfflineNavigationStatus {
+    fn from_surface(surface: &MapsLocationSurface) -> Self {
+        let mut blockers = Vec::new();
+        let mut warnings = Vec::new();
+        let mut notes = Vec::new();
+
+        match surface.locations.primary_source() {
+            Some(source) => {
+                if source.status != SourceStatus::Connected {
+                    blockers.push(format!(
+                        "{} is {}.",
+                        source.kind.label(),
+                        source.status.label()
+                    ));
+                }
+                if source.sample.stale() {
+                    blockers.push(format!(
+                        "{} update is stale at {:.1} s.",
+                        source.kind.label(),
+                        source.sample.update_age_s
+                    ));
+                } else if !source.sample.healthy() {
+                    blockers.push(format!(
+                        "{} accuracy is {:.1} m; route guidance requires <= 5.0 m.",
+                        source.kind.label(),
+                        source.sample.accuracy_m
+                    ));
+                }
+            }
+            None => blockers.push(format!(
+                "Primary location source {} is missing.",
+                surface.locations.primary.label()
+            )),
+        }
+
+        if !blockers.is_empty() {
+            let alternatives = surface.locations.healthy_alternatives();
+            if !alternatives.is_empty() {
+                let labels: Vec<&str> = alternatives.iter().map(|kind| kind.label()).collect();
+                warnings.push(format!(
+                    "Healthy equal peer available: {}; manual switch required because automatic failover is off.",
+                    labels.join(", ")
+                ));
+            }
+        }
+
+        let loaded_region = surface.offline_maps.loaded_region();
+        if let Some(region) = loaded_region {
+            if region.coverage_percent < 100 {
+                warnings.push(format!(
+                    "{} offline coverage is {}%.",
+                    region.name, region.coverage_percent
+                ));
+            }
+        } else {
+            blockers.push("No loaded offline map region is available.".to_string());
+        }
+
+        if surface.offline_maps.used_gb > surface.offline_maps.storage_cap_gb as f32 {
+            blockers.push(format!(
+                "Offline maps use {:.1} GB, above the {} GB cap.",
+                surface.offline_maps.used_gb, surface.offline_maps.storage_cap_gb
+            ));
+        } else if surface.offline_maps.storage_ratio() >= 0.9 {
+            warnings.push(format!(
+                "Offline map storage is {:.0}% of the {} GB cap.",
+                surface.offline_maps.storage_ratio() * 100.0,
+                surface.offline_maps.storage_cap_gb
+            ));
+        }
+
+        for provider in [
+            &surface.offline_maps.map_provider,
+            &surface.local_navigation.routing,
+            &surface.local_navigation.geocoder,
+        ] {
+            if !provider.local_only_core || provider.graceful_unavailable {
+                blockers.push(format!(
+                    "{} is not ready for local-only offline use.",
+                    provider.abstraction
+                ));
+            }
+        }
+
+        if surface.mg90.setup_step < SetupStep::OfflineMapsVerified {
+            blockers.push(format!(
+                "MG90 setup has not verified offline maps; current step is {}.",
+                surface.mg90.setup_step.label()
+            ));
+        } else if surface.mg90.setup_step < SetupStep::Ready {
+            warnings.push(format!(
+                "MG90 setup is not fully complete; current step is {}.",
+                surface.mg90.setup_step.label()
+            ));
+        }
+
+        if !surface.mg90.authenticated {
+            blockers.push("MG90 local management is not authenticated.".to_string());
+        }
+
+        for provider in [
+            &surface.local_navigation.traffic,
+            &surface.local_navigation.weather,
+            &surface.local_navigation.satellite,
+        ] {
+            if provider.graceful_unavailable {
+                notes.push(format!(
+                    "{} is optional and degrades gracefully when no provider is configured.",
+                    provider.abstraction
+                ));
+            }
+        }
+
+        if surface.simulator_enabled {
+            notes.push(
+                "Simulator fixture supplies route, source, and offline-map data without MG90 hardware."
+                    .to_string(),
+            );
+        }
+
+        let readiness = if blockers.is_empty() {
+            if warnings.is_empty() {
+                OfflineNavigationReadiness::Ready
+            } else {
+                OfflineNavigationReadiness::Degraded
+            }
+        } else {
+            OfflineNavigationReadiness::Blocked
+        };
+
+        Self {
+            readiness,
+            primary_source: surface.locations.primary,
+            loaded_region: loaded_region.map(|region| region.name.clone()),
+            coverage_percent: loaded_region.map(|region| region.coverage_percent),
+            used_gb: surface.offline_maps.used_gb,
+            cap_gb: surface.offline_maps.storage_cap_gb,
+            blockers,
+            warnings,
+            notes,
+        }
+    }
+
+    /// Whether turn-by-turn offline routing may be claimed.
+    #[must_use]
+    pub fn can_claim_turn_by_turn(&self) -> bool {
+        self.readiness != OfflineNavigationReadiness::Blocked
+    }
+}
+
+/// Native map viewport state.
+#[derive(Debug, Clone)]
+pub struct MapViewState {
+    /// Dark map styling enabled.
+    pub dark_mode: bool,
+    /// Simulated zoom level.
+    pub zoom: f32,
+    /// Simulated pan offset in egui points.
+    pub pan: [f32; 2],
+    /// Rotation in degrees.
+    pub rotation_deg: f32,
+    /// Pitch in degrees.
+    pub pitch_deg: f32,
+    /// Whether the route line is visible.
+    pub route_visible: bool,
+    /// Whether traffic overlay is visible.
+    pub traffic_overlay: bool,
+    /// Whether weather overlay is visible.
+    pub weather_overlay: bool,
+    /// Whether cellular dead-zone overlay is visible.
+    pub dead_zone_overlay: bool,
+    /// Whether GNSS quality overlay is visible.
+    pub gnss_overlay: bool,
+    /// Attribution string shown on every map view.
+    pub attribution: String,
+}
+
+impl MapViewState {
+    fn simulated() -> Self {
+        Self {
+            dark_mode: true,
+            zoom: 13.0,
+            pan: [0.0, 0.0],
+            rotation_deg: 18.0,
+            pitch_deg: 34.0,
+            route_visible: true,
+            traffic_overlay: true,
+            weather_overlay: true,
+            dead_zone_overlay: true,
+            gnss_overlay: true,
+            attribution: "OpenStreetMap contributors | local offline package | simulated route"
+                .to_string(),
+        }
+    }
+}
+
+/// Offline map manager first-slice state.
+#[derive(Debug, Clone)]
+pub struct OfflineMapManagerState {
+    /// Default state/province-level region label.
+    pub default_region: String,
+    /// Storage cap in GB.
+    pub storage_cap_gb: u32,
+    /// Used storage in GB.
+    pub used_gb: f32,
+    /// Installed regions.
+    pub installed_regions: Vec<OfflineMapRegion>,
+    /// Pending/downloadable regions.
+    pub available_regions: Vec<String>,
+    /// OpenStreetMap-derived provider contract.
+    pub map_provider: ProviderContract,
+}
+
+impl OfflineMapManagerState {
+    fn simulated_default() -> Self {
+        Self {
+            default_region: "Default state/province region".to_string(),
+            storage_cap_gb: 25,
+            used_gb: 3.8,
+            installed_regions: vec![OfflineMapRegion {
+                name: "Default state/province region".to_string(),
+                status: RegionStatus::Loaded,
+                size_gb: 3.8,
+                coverage_percent: 100,
+                updated: "simulated offline bundle".to_string(),
+            }],
+            available_regions: vec![
+                "Neighboring state/province".to_string(),
+                "Cross-border corridor".to_string(),
+            ],
+            map_provider: ProviderContract {
+                abstraction: "Map Provider API".to_string(),
+                first_backend: "OpenStreetMap-derived data".to_string(),
+                local_only_core: true,
+                graceful_unavailable: false,
+            },
+        }
+    }
+
+    fn loaded_region(&self) -> Option<&OfflineMapRegion> {
+        self.installed_regions
+            .iter()
+            .filter(|region| region.status == RegionStatus::Loaded)
+            .max_by_key(|region| region.coverage_percent)
+    }
+
+    fn storage_ratio(&self) -> f32 {
+        if self.storage_cap_gb == 0 {
+            return 1.0;
+        }
+        self.used_gb / self.storage_cap_gb as f32
+    }
+}
+
+/// Installed offline region.
+#[derive(Debug, Clone)]
+pub struct OfflineMapRegion {
+    /// Region display name.
+    pub name: String,
+    /// Load/download status.
+    pub status: RegionStatus,
+    /// Package size.
+    pub size_gb: f32,
+    /// Coverage percentage.
+    pub coverage_percent: u8,
+    /// Last update label.
+    pub updated: String,
+}
+
+/// Offline region state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionStatus {
+    /// Loaded and usable for offline navigation.
+    Loaded,
+    /// Download queued when internet is available.
+    Queued,
+    /// Provider unavailable.
+    Unavailable,
+}
+
+/// Provider/backend abstraction contract.
+#[derive(Debug, Clone)]
+pub struct ProviderContract {
+    /// Abstraction seam name.
+    pub abstraction: String,
+    /// First backend selected by product directive.
+    pub first_backend: String,
+    /// Whether the core v1 path is local-only.
+    pub local_only_core: bool,
+    /// Whether the provider is gracefully unavailable.
+    pub graceful_unavailable: bool,
+}
+
+/// Local routing/search state.
+#[derive(Debug, Clone)]
+pub struct LocalNavigationState {
+    /// Routing abstraction.
+    pub routing: ProviderContract,
+    /// Geocoder abstraction.
+    pub geocoder: ProviderContract,
+    /// Traffic provider abstraction.
+    pub traffic: ProviderContract,
+    /// Weather provider abstraction.
+    pub weather: ProviderContract,
+    /// Satellite provider abstraction.
+    pub satellite: ProviderContract,
+    /// Active simulated route.
+    pub active_route: RoutePlan,
+    /// Recent/favorite destinations.
+    pub destinations: Vec<Destination>,
+}
+
+impl LocalNavigationState {
+    fn simulated() -> Self {
+        Self {
+            routing: ProviderContract {
+                abstraction: "Routing API".to_string(),
+                first_backend: "Valhalla".to_string(),
+                local_only_core: true,
+                graceful_unavailable: false,
+            },
+            geocoder: ProviderContract {
+                abstraction: "Geocoder API".to_string(),
+                first_backend: "Nominatim".to_string(),
+                local_only_core: true,
+                graceful_unavailable: false,
+            },
+            traffic: ProviderContract {
+                abstraction: "Traffic API".to_string(),
+                first_backend: "configured live traffic provider".to_string(),
+                local_only_core: false,
+                graceful_unavailable: true,
+            },
+            weather: ProviderContract {
+                abstraction: "Weather API".to_string(),
+                first_backend: "configured weather provider".to_string(),
+                local_only_core: false,
+                graceful_unavailable: true,
+            },
+            satellite: ProviderContract {
+                abstraction: "Satellite API".to_string(),
+                first_backend: "configured imagery provider".to_string(),
+                local_only_core: false,
+                graceful_unavailable: true,
+            },
+            active_route: RoutePlan {
+                current_road: "US-30 W".to_string(),
+                next_maneuver: "Keep right toward patrol staging".to_string(),
+                distance_to_maneuver_mi: 0.4,
+                eta: "14:32".to_string(),
+                remaining_time_min: 18,
+                remaining_distance_mi: 11.6,
+                alternatives: 2,
+                traffic_alert: "Slowdown +4 min ahead".to_string(),
+                weather_alert: "Heavy rain intersects route in 9 mi".to_string(),
+            },
+            destinations: vec![
+                Destination {
+                    label: "Station".to_string(),
+                    category: "favorite".to_string(),
+                    distance_mi: 3.2,
+                },
+                Destination {
+                    label: "Hospital entrance".to_string(),
+                    category: "recent".to_string(),
+                    distance_mi: 8.7,
+                },
+                Destination {
+                    label: "Command post".to_string(),
+                    category: "favorite".to_string(),
+                    distance_mi: 14.1,
+                },
+            ],
+        }
+    }
+}
+
+/// Active route summary.
+#[derive(Debug, Clone)]
+pub struct RoutePlan {
+    /// Current road name.
+    pub current_road: String,
+    /// Next turn instruction.
+    pub next_maneuver: String,
+    /// Distance to next maneuver.
+    pub distance_to_maneuver_mi: f32,
+    /// ETA clock label.
+    pub eta: String,
+    /// Remaining minutes.
+    pub remaining_time_min: u32,
+    /// Remaining miles.
+    pub remaining_distance_mi: f32,
+    /// Number of alternate routes.
+    pub alternatives: u8,
+    /// Traffic alert strip text.
+    pub traffic_alert: String,
+    /// Weather alert strip text.
+    pub weather_alert: String,
+}
+
+/// Saved/recent destination.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    /// Label.
+    pub label: String,
+    /// Category.
+    pub category: String,
+    /// Distance from current location.
+    pub distance_mi: f32,
+}
+
+/// MG90 model/status.
+#[derive(Debug, Clone)]
+pub struct Mg90State {
+    /// Managed device count. v1 intentionally manages exactly one.
+    pub managed_devices: u8,
+    /// Direct Ethernet is the required management path.
+    pub direct_ethernet_only: bool,
+    /// Current setup wizard step.
+    pub setup_step: SetupStep,
+    /// Discovered hardware model.
+    pub model: Mg90Model,
+    /// Capability profile detected from model/MGOS.
+    pub capabilities: Mg90Capabilities,
+    /// Authentication state.
+    pub authenticated: bool,
+    /// Ignition/input signal state.
+    pub ignition_on: bool,
+    /// Factory reset workflow.
+    pub reset: FactoryResetWorkflow,
+    /// Native setting registry.
+    pub settings: Vec<Mg90SettingDescriptor>,
+    /// Versioned restore points.
+    pub backups: Vec<BackupRecord>,
+    /// Local status dashboard.
+    pub status: Mg90Status,
+}
+
+impl Mg90State {
+    fn simulated() -> Self {
+        let settings = sample_settings();
+        Self {
+            managed_devices: 1,
+            direct_ethernet_only: true,
+            setup_step: SetupStep::Ready,
+            model: Mg90Model::FiveG,
+            capabilities: Mg90Capabilities {
+                lte_a: true,
+                five_g: true,
+                mgos_version: "MGOS simulated capability profile".to_string(),
+                gnss: true,
+                gpio: true,
+                serial_recovery: true,
+                firmware_management: true,
+            },
+            authenticated: true,
+            ignition_on: true,
+            reset: FactoryResetWorkflow::guarded(),
+            settings,
+            backups: vec![BackupRecord {
+                id: "baseline-0001".to_string(),
+                reason: "Baseline backup created before first local status verification"
+                    .to_string(),
+                encrypted: true,
+                restore_point: true,
+                created: "simulated now".to_string(),
+            }],
+            status: Mg90Status::simulated(),
+        }
+    }
+
+    /// Advance the offline setup wizard in simulator mode.
+    pub fn advance_setup_simulated(&mut self) {
+        self.setup_step = self.setup_step.next();
+        if matches!(self.setup_step, SetupStep::Authenticated | SetupStep::Ready) {
+            self.authenticated = true;
+        }
+    }
+}
+
+/// Supported MG90 hardware model families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mg90Model {
+    /// MG90 LTE-A.
+    LteA,
+    /// MG90 5G.
+    FiveG,
+}
+
+impl Mg90Model {
+    /// Label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LteA => "Sierra Wireless AirLink MG90 LTE-A",
+            Self::FiveG => "Sierra Wireless AirLink MG90 5G",
+        }
+    }
+}
+
+/// Detected MG90 feature set.
+#[derive(Debug, Clone)]
+pub struct Mg90Capabilities {
+    /// LTE-A support.
+    pub lte_a: bool,
+    /// 5G support.
+    pub five_g: bool,
+    /// Detected MGOS label.
+    pub mgos_version: String,
+    /// GNSS capability.
+    pub gnss: bool,
+    /// GPIO capability.
+    pub gpio: bool,
+    /// Serial recovery available.
+    pub serial_recovery: bool,
+    /// Firmware lifecycle supported.
+    pub firmware_management: bool,
+}
+
+/// Setup wizard states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SetupStep {
+    /// MG90 not connected.
+    NotConnected,
+    /// Ethernet link detected.
+    EthernetDetected,
+    /// MG90 discovered on direct Ethernet.
+    Mg90Discovered,
+    /// Credentials entered.
+    CredentialsEntered,
+    /// Authenticated.
+    Authenticated,
+    /// Baseline backup created.
+    BaselineBackupCreated,
+    /// Local status verified.
+    LocalStatusVerified,
+    /// GNSS verified.
+    GnssVerified,
+    /// Offline maps verified.
+    OfflineMapsVerified,
+    /// Routing verified.
+    RoutingVerified,
+    /// Ready.
+    Ready,
+}
+
+impl SetupStep {
+    /// All setup steps.
+    pub const ALL: [Self; 11] = [
+        Self::NotConnected,
+        Self::EthernetDetected,
+        Self::Mg90Discovered,
+        Self::CredentialsEntered,
+        Self::Authenticated,
+        Self::BaselineBackupCreated,
+        Self::LocalStatusVerified,
+        Self::GnssVerified,
+        Self::OfflineMapsVerified,
+        Self::RoutingVerified,
+        Self::Ready,
+    ];
+
+    /// Label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotConnected => "Not connected",
+            Self::EthernetDetected => "Ethernet detected",
+            Self::Mg90Discovered => "MG90 discovered",
+            Self::CredentialsEntered => "Credentials entered",
+            Self::Authenticated => "Authenticated",
+            Self::BaselineBackupCreated => "Baseline backup created",
+            Self::LocalStatusVerified => "Local status verified",
+            Self::GnssVerified => "GNSS verified",
+            Self::OfflineMapsVerified => "Offline maps verified",
+            Self::RoutingVerified => "Routing verified",
+            Self::Ready => "Ready",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::NotConnected => Self::EthernetDetected,
+            Self::EthernetDetected => Self::Mg90Discovered,
+            Self::Mg90Discovered => Self::CredentialsEntered,
+            Self::CredentialsEntered => Self::Authenticated,
+            Self::Authenticated => Self::BaselineBackupCreated,
+            Self::BaselineBackupCreated => Self::LocalStatusVerified,
+            Self::LocalStatusVerified => Self::GnssVerified,
+            Self::GnssVerified => Self::OfflineMapsVerified,
+            Self::OfflineMapsVerified => Self::RoutingVerified,
+            Self::RoutingVerified | Self::Ready => Self::Ready,
+        }
+    }
+}
+
+/// Local MG90 status dashboard.
+#[derive(Debug, Clone)]
+pub struct Mg90Status {
+    /// Active WAN label.
+    pub active_wan: String,
+    /// Cellular A.
+    pub cellular_a: CellularLink,
+    /// Cellular B.
+    pub cellular_b: CellularLink,
+    /// Wi-Fi state.
+    pub wifi_state: String,
+    /// Ethernet state.
+    pub ethernet_state: String,
+    /// VPN state.
+    pub vpn_state: String,
+    /// Data transferred.
+    pub data_transferred: String,
+    /// Failover event count.
+    pub failover_events: u32,
+    /// Latency.
+    pub latency_ms: u32,
+    /// Packet loss.
+    pub packet_loss_percent: f32,
+    /// Link quality label.
+    pub link_quality: String,
+}
+
+impl Mg90Status {
+    fn simulated() -> Self {
+        Self {
+            active_wan: "Cellular A".to_string(),
+            cellular_a: CellularLink {
+                sim_state: "ready".to_string(),
+                carrier: "FirstNet".to_string(),
+                signal_dbm: -72,
+                technology: "5G/LTE-A".to_string(),
+                wan_ip: "100.92.14.8".to_string(),
+                healthy: true,
+            },
+            cellular_b: CellularLink {
+                sim_state: "standby".to_string(),
+                carrier: "Carrier B".to_string(),
+                signal_dbm: -94,
+                technology: "LTE".to_string(),
+                wan_ip: "not active".to_string(),
+                healthy: false,
+            },
+            wifi_state: "disabled for management".to_string(),
+            ethernet_state: "direct cable link up".to_string(),
+            vpn_state: "local status unavailable".to_string(),
+            data_transferred: "1.4 GB down / 220 MB up".to_string(),
+            failover_events: 1,
+            latency_ms: 42,
+            packet_loss_percent: 0.3,
+            link_quality: "good".to_string(),
+        }
+    }
+}
+
+/// Cellular link status.
+#[derive(Debug, Clone)]
+pub struct CellularLink {
+    /// SIM state.
+    pub sim_state: String,
+    /// Carrier.
+    pub carrier: String,
+    /// Signal in dBm.
+    pub signal_dbm: i32,
+    /// Network technology.
+    pub technology: String,
+    /// WAN IP.
+    pub wan_ip: String,
+    /// Link health.
+    pub healthy: bool,
+}
+
+/// Factory reset guardrail model.
+#[derive(Debug, Clone)]
+pub struct FactoryResetWorkflow {
+    /// Backup is required before reset.
+    pub backup_required: bool,
+    /// Backup has completed.
+    pub backup_completed: bool,
+    /// Typed confirmation phrase.
+    pub confirmation_phrase: String,
+    /// Phrase entered by the user.
+    pub typed_confirmation: String,
+    /// Reconnect workflow text.
+    pub reconnect_workflow: Vec<String>,
+}
+
+impl FactoryResetWorkflow {
+    fn guarded() -> Self {
+        Self {
+            backup_required: true,
+            backup_completed: true,
+            confirmation_phrase: "RESET MG90".to_string(),
+            typed_confirmation: String::new(),
+            reconnect_workflow: vec![
+                "Wait for MG90 reboot".to_string(),
+                "Keep direct Ethernet connected".to_string(),
+                "Rediscover local address".to_string(),
+                "Re-authenticate".to_string(),
+                "Restore or reconfigure".to_string(),
+                "Create new baseline backup".to_string(),
+            ],
+        }
+    }
+
+    /// Whether reset can be armed.
+    #[must_use]
+    pub fn armed(&self) -> bool {
+        self.backup_completed && self.typed_confirmation == self.confirmation_phrase
+    }
+}
+
+/// Native MG90 setting descriptor.
+#[derive(Debug, Clone)]
+pub struct Mg90SettingDescriptor {
+    /// Stable setting id.
+    pub id: String,
+    /// Display name.
+    pub display_name: String,
+    /// Category.
+    pub category: Mg90SettingCategory,
+    /// Value type.
+    pub value_type: SettingValueType,
+    /// Read method.
+    pub read_method: Mg90ManagementMethod,
+    /// Write method.
+    pub write_method: Mg90ManagementMethod,
+    /// Reboot requirement.
+    pub requires_reboot: bool,
+    /// Management disconnect risk.
+    pub may_disconnect_management: bool,
+    /// Rollback support.
+    pub supports_rollback: bool,
+    /// Validation rules.
+    pub validation: Vec<ValidationRule>,
+}
+
+/// MG90 setting categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Mg90SettingCategory {
+    /// Overview.
+    Overview,
+    /// Cellular and SIM.
+    CellularSim,
+    /// Wi-Fi.
+    Wifi,
+    /// Ethernet.
+    Ethernet,
+    /// WAN policies.
+    WanPolicies,
+    /// LAN/DHCP/VLAN.
+    LanDhcpVlan,
+    /// Firewall.
+    Firewall,
+    /// VPN.
+    Vpn,
+    /// GNSS.
+    Gnss,
+    /// Serial recovery.
+    SerialRecovery,
+    /// GPIO.
+    Gpio,
+    /// Services.
+    Services,
+    /// Security.
+    Security,
+    /// Diagnostics.
+    Diagnostics,
+    /// Logs.
+    Logs,
+    /// Backup and restore.
+    BackupRestore,
+    /// Original Local Configuration Interface fallback.
+    OriginalLciFallback,
+}
+
+impl Mg90SettingCategory {
+    /// All native MG90 setting categories in product order.
+    pub const ALL: [Self; 17] = [
+        Self::Overview,
+        Self::CellularSim,
+        Self::Wifi,
+        Self::Ethernet,
+        Self::WanPolicies,
+        Self::LanDhcpVlan,
+        Self::Firewall,
+        Self::Vpn,
+        Self::Gnss,
+        Self::SerialRecovery,
+        Self::Gpio,
+        Self::Services,
+        Self::Security,
+        Self::Diagnostics,
+        Self::Logs,
+        Self::BackupRestore,
+        Self::OriginalLciFallback,
+    ];
+
+    /// Label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::CellularSim => "Cellular & SIM",
+            Self::Wifi => "Wi-Fi",
+            Self::Ethernet => "Ethernet",
+            Self::WanPolicies => "WAN Policies",
+            Self::LanDhcpVlan => "LAN / DHCP / VLAN",
+            Self::Firewall => "Firewall",
+            Self::Vpn => "VPN",
+            Self::Gnss => "GNSS",
+            Self::SerialRecovery => "Serial Recovery",
+            Self::Gpio => "GPIO",
+            Self::Services => "Services",
+            Self::Security => "Security",
+            Self::Diagnostics => "Diagnostics",
+            Self::Logs => "Logs",
+            Self::BackupRestore => "Backup & Restore",
+            Self::OriginalLciFallback => "Original LCI Fallback",
+        }
+    }
+}
+
+/// Setting value kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingValueType {
+    /// Boolean.
+    Boolean,
+    /// Integer.
+    Integer,
+    /// Text.
+    Text,
+    /// Enum choices.
+    Enum(Vec<String>),
+}
+
+/// Management method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mg90ManagementMethod {
+    /// Local MG90 API over direct Ethernet.
+    LocalApi,
+    /// Local configuration interface fallback.
+    LocalConfigurationInterface,
+    /// Serial recovery console only.
+    SerialRecoveryConsole,
+    /// Simulator method.
+    Simulator,
+    /// Unsupported on this capability profile.
+    Unsupported,
+}
+
+/// Validation rule descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationRule {
+    /// Rule label.
+    pub label: String,
+}
+
+/// Guarded setting-change plan.
+#[derive(Debug, Clone)]
+pub struct SettingChangePlan {
+    /// Setting id.
+    pub setting_id: String,
+    /// Required ordered steps.
+    pub steps: Vec<String>,
+    /// Warn but do not block while moving.
+    pub moving_warning: bool,
+    /// Backup requirement.
+    pub backup_required: bool,
+    /// Rollback possible.
+    pub rollback_supported: bool,
+}
+
+impl SettingChangePlan {
+    fn for_setting(setting: &Mg90SettingDescriptor, moving: bool) -> Self {
+        let mut steps = vec![
+            "Validate pending value".to_string(),
+            "Create versioned backup".to_string(),
+            "Apply change".to_string(),
+            "Read back current value".to_string(),
+            "Verify direct-Ethernet management path".to_string(),
+            "Write audit entry".to_string(),
+        ];
+        if setting.supports_rollback {
+            steps.insert(5, "Rollback if verification fails".to_string());
+        }
+        Self {
+            setting_id: setting.id.clone(),
+            steps,
+            moving_warning: moving,
+            backup_required: true,
+            rollback_supported: setting.supports_rollback,
+        }
+    }
+}
+
+fn sample_settings() -> Vec<Mg90SettingDescriptor> {
+    vec![
+        Mg90SettingDescriptor {
+            id: "gnss.primary".to_string(),
+            display_name: "MG90 GNSS publish rate".to_string(),
+            category: Mg90SettingCategory::Gnss,
+            value_type: SettingValueType::Enum(vec![
+                "1 Hz".to_string(),
+                "5 Hz".to_string(),
+                "10 Hz".to_string(),
+            ]),
+            read_method: Mg90ManagementMethod::Simulator,
+            write_method: Mg90ManagementMethod::Simulator,
+            requires_reboot: false,
+            may_disconnect_management: false,
+            supports_rollback: true,
+            validation: vec![ValidationRule {
+                label: "supported by detected MGOS capability".to_string(),
+            }],
+        },
+        Mg90SettingDescriptor {
+            id: "wan.policy".to_string(),
+            display_name: "WAN failover policy".to_string(),
+            category: Mg90SettingCategory::WanPolicies,
+            value_type: SettingValueType::Enum(vec![
+                "cellular_a_primary".to_string(),
+                "cellular_b_primary".to_string(),
+                "best_quality".to_string(),
+            ]),
+            read_method: Mg90ManagementMethod::Simulator,
+            write_method: Mg90ManagementMethod::Simulator,
+            requires_reboot: false,
+            may_disconnect_management: true,
+            supports_rollback: true,
+            validation: vec![ValidationRule {
+                label: "direct Ethernet remains reachable".to_string(),
+            }],
+        },
+        Mg90SettingDescriptor {
+            id: "security.password".to_string(),
+            display_name: "Local admin password".to_string(),
+            category: Mg90SettingCategory::Security,
+            value_type: SettingValueType::Text,
+            read_method: Mg90ManagementMethod::Simulator,
+            write_method: Mg90ManagementMethod::Simulator,
+            requires_reboot: false,
+            may_disconnect_management: false,
+            supports_rollback: false,
+            validation: vec![ValidationRule {
+                label: "vault write succeeds before device write".to_string(),
+            }],
+        },
+    ]
+}
+
+/// Backup/restore-point record.
+#[derive(Debug, Clone)]
+pub struct BackupRecord {
+    /// Backup id.
+    pub id: String,
+    /// Reason/audit label.
+    pub reason: String,
+    /// Encrypted-at-rest flag.
+    pub encrypted: bool,
+    /// Restore-point flag.
+    pub restore_point: bool,
+    /// Created timestamp label.
+    pub created: String,
+}
+
+/// Location source manager.
+#[derive(Debug, Clone)]
+pub struct LocationManager {
+    /// Primary source selected by the user.
+    pub primary: LocationSourceKind,
+    /// Sources are equal peers; v1 never auto-failovers.
+    pub auto_failover: bool,
+    /// Source records.
+    pub sources: Vec<LocationSource>,
+}
+
+impl LocationManager {
+    fn simulated() -> Self {
+        Self {
+            primary: LocationSourceKind::Mg90Gnss,
+            auto_failover: false,
+            sources: vec![
+                LocationSource::sample(LocationSourceKind::Mg90Gnss, 3.2, 1.0, true),
+                LocationSource::sample(LocationSourceKind::UsbGpsd, 4.6, 1.7, true),
+                LocationSource::sample(LocationSourceKind::ManualTest, 0.0, 0.0, true),
+                LocationSource::sample(LocationSourceKind::Simulator, 2.8, 0.3, true),
+            ],
+        }
+    }
+
+    /// Set primary source manually.
+    pub fn set_primary(&mut self, kind: LocationSourceKind) {
+        if self.sources.iter().any(|source| source.kind == kind) {
+            self.primary = kind;
+        }
+    }
+
+    /// Primary sample.
+    #[must_use]
+    pub fn primary_sample(&self) -> Option<&LocationSample> {
+        self.primary_source().map(|source| &source.sample)
+    }
+
+    /// Primary source record.
+    #[must_use]
+    pub fn primary_source(&self) -> Option<&LocationSource> {
+        self.sources
+            .iter()
+            .find(|source| source.kind == self.primary)
+    }
+
+    /// Warning if primary source is unhealthy.
+    #[must_use]
+    pub fn primary_warning(&self) -> Option<String> {
+        let source = self.primary_source()?;
+        (!source.sample.healthy()).then(|| {
+            format!(
+                "{} unhealthy: accuracy {:.1} m, update age {:.1} s",
+                source.kind.label(),
+                source.sample.accuracy_m,
+                source.sample.update_age_s
+            )
+        })
+    }
+
+    /// Healthy alternatives for one-click manual switch.
+    #[must_use]
+    pub fn healthy_alternatives(&self) -> Vec<LocationSourceKind> {
+        self.sources
+            .iter()
+            .filter(|source| source.kind != self.primary && source.sample.healthy())
+            .map(|source| source.kind)
+            .collect()
+    }
+}
+
+/// Location source kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocationSourceKind {
+    /// MG90 GNSS.
+    Mg90Gnss,
+    /// USB GPS through gpsd.
+    UsbGpsd,
+    /// Manual test location.
+    ManualTest,
+    /// Simulator location.
+    Simulator,
+}
+
+impl LocationSourceKind {
+    /// Label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mg90Gnss => "MG90 GNSS",
+            Self::UsbGpsd => "USB GPS via gpsd",
+            Self::ManualTest => "Manual test location",
+            Self::Simulator => "Simulator location",
+        }
+    }
+}
+
+/// One location source row.
+#[derive(Debug, Clone)]
+pub struct LocationSource {
+    /// Source kind.
+    pub kind: LocationSourceKind,
+    /// Source status.
+    pub status: SourceStatus,
+    /// Connected device label.
+    pub connected_device: String,
+    /// Raw diagnostics.
+    pub diagnostics: BTreeMap<String, String>,
+    /// Latest sample.
+    pub sample: LocationSample,
+}
+
+impl LocationSource {
+    fn sample(
+        kind: LocationSourceKind,
+        accuracy_m: f32,
+        update_age_s: f32,
+        connected: bool,
+    ) -> Self {
+        let mut diagnostics = BTreeMap::new();
+        diagnostics.insert("adapter".to_string(), kind.label().to_string());
+        diagnostics.insert("mode".to_string(), "simulated".to_string());
+        Self {
+            kind,
+            status: if connected {
+                SourceStatus::Connected
+            } else {
+                SourceStatus::Disconnected
+            },
+            connected_device: match kind {
+                LocationSourceKind::Mg90Gnss => "MG90 local GNSS".to_string(),
+                LocationSourceKind::UsbGpsd => "gpsd tcp://127.0.0.1:2947 skeleton".to_string(),
+                LocationSourceKind::ManualTest => "operator-entered point".to_string(),
+                LocationSourceKind::Simulator => "route simulator".to_string(),
+            },
+            diagnostics,
+            sample: LocationSample {
+                fix_type: "3D".to_string(),
+                latitude: 40.4406,
+                longitude: -79.9959,
+                accuracy_m,
+                speed_mph: 27.0,
+                heading_deg: 284.0,
+                altitude_m: 311.0,
+                satellites: Some(14),
+                update_rate_hz: 1.0,
+                update_age_s,
+            },
+        }
+    }
+}
+
+/// Source connection status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStatus {
+    /// Connected.
+    Connected,
+    /// Disconnected.
+    Disconnected,
+    /// Stale.
+    Stale,
+    /// Unhealthy.
+    Unhealthy,
+}
+
+impl SourceStatus {
+    /// Human label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Disconnected => "disconnected",
+            Self::Stale => "stale",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+/// Location sample.
+#[derive(Debug, Clone)]
+pub struct LocationSample {
+    /// Fix type.
+    pub fix_type: String,
+    /// Latitude.
+    pub latitude: f64,
+    /// Longitude.
+    pub longitude: f64,
+    /// Accuracy in meters.
+    pub accuracy_m: f32,
+    /// Speed in mph.
+    pub speed_mph: f32,
+    /// Heading in degrees.
+    pub heading_deg: f32,
+    /// Altitude in meters.
+    pub altitude_m: f32,
+    /// Satellite count.
+    pub satellites: Option<u8>,
+    /// Update rate in Hz.
+    pub update_rate_hz: f32,
+    /// Age of latest update in seconds.
+    pub update_age_s: f32,
+}
+
+impl LocationSample {
+    /// v1 health rule.
+    #[must_use]
+    pub fn healthy(&self) -> bool {
+        self.accuracy_m <= 5.0 && self.update_age_s <= 5.0
+    }
+
+    /// Stale rule.
+    #[must_use]
+    pub fn stale(&self) -> bool {
+        self.update_age_s > 5.0
+    }
+
+    /// Motion rule.
+    #[must_use]
+    pub fn moving(&self) -> bool {
+        self.speed_mph > 1.0
+    }
+}
+
+/// Trip recorder state.
+#[derive(Debug, Clone)]
+pub struct TripRecorderState {
+    /// Retention days.
+    pub retention_days: u32,
+    /// Breadcrumbs.
+    pub breadcrumbs: Vec<Breadcrumb>,
+    /// Export formats.
+    pub export_formats: Vec<TripExportFormat>,
+    /// History encrypted at rest.
+    pub encrypted_at_rest: bool,
+}
+
+impl TripRecorderState {
+    fn simulated() -> Self {
+        Self {
+            retention_days: 30,
+            breadcrumbs: vec![
+                Breadcrumb {
+                    lat: 40.4406,
+                    lon: -79.9959,
+                    speed_mph: 20.0,
+                    source: LocationSourceKind::Mg90Gnss,
+                    event: Some("trip started by ignition".to_string()),
+                },
+                Breadcrumb {
+                    lat: 40.4442,
+                    lon: -80.0031,
+                    speed_mph: 27.0,
+                    source: LocationSourceKind::Mg90Gnss,
+                    event: Some("cellular signal degraded".to_string()),
+                },
+            ],
+            export_formats: TripExportFormat::ALL.to_vec(),
+            encrypted_at_rest: true,
+        }
+    }
+}
+
+/// One breadcrumb point.
+#[derive(Debug, Clone)]
+pub struct Breadcrumb {
+    /// Latitude.
+    pub lat: f64,
+    /// Longitude.
+    pub lon: f64,
+    /// Speed.
+    pub speed_mph: f32,
+    /// Source.
+    pub source: LocationSourceKind,
+    /// Optional event marker.
+    pub event: Option<String>,
+}
+
+/// Trip export formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TripExportFormat {
+    /// GPX.
+    Gpx,
+    /// GeoJSON.
+    GeoJson,
+    /// CSV.
+    Csv,
+    /// Full diagnostic bundle.
+    DiagnosticBundle,
+}
+
+impl TripExportFormat {
+    /// All formats.
+    pub const ALL: [Self; 4] = [Self::Gpx, Self::GeoJson, Self::Csv, Self::DiagnosticBundle];
+
+    /// Label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gpx => "GPX",
+            Self::GeoJson => "GeoJSON",
+            Self::Csv => "CSV",
+            Self::DiagnosticBundle => "Diagnostic bundle",
+        }
+    }
+}
+
+/// Cellular dead-zone state.
+#[derive(Debug, Clone)]
+pub struct DeadZoneState {
+    /// Recorded zones.
+    pub zones: Vec<DeadZoneRecord>,
+    /// Used for route risk awareness.
+    pub route_risk: String,
+}
+
+impl DeadZoneState {
+    fn simulated() -> Self {
+        Self {
+            zones: vec![DeadZoneRecord {
+                position: "40.4442, -80.0031".to_string(),
+                selected_wan: "Cellular A".to_string(),
+                carrier: "FirstNet".to_string(),
+                technology: "5G/LTE-A".to_string(),
+                signal_dbm: -111,
+                packet_loss_percent: 8.0,
+                latency_ms: 220,
+                outage_duration_s: 18,
+            }],
+            route_risk: "One known weak segment in next 11 mi".to_string(),
+        }
+    }
+}
+
+/// Dead-zone record.
+#[derive(Debug, Clone)]
+pub struct DeadZoneRecord {
+    /// Position label.
+    pub position: String,
+    /// Selected WAN.
+    pub selected_wan: String,
+    /// Carrier.
+    pub carrier: String,
+    /// Technology.
+    pub technology: String,
+    /// Signal.
+    pub signal_dbm: i32,
+    /// Packet loss.
+    pub packet_loss_percent: f32,
+    /// Latency.
+    pub latency_ms: u32,
+    /// Outage duration.
+    pub outage_duration_s: u32,
+}
+
+/// Vehicle telemetry state.
+#[derive(Debug, Clone)]
+pub struct VehicleState {
+    /// Profile label.
+    pub profile: String,
+    /// Vehicle telemetry.
+    pub telemetry: VehicleTelemetry,
+    /// Profile notes.
+    pub profile_notes: Vec<String>,
+}
+
+impl VehicleState {
+    fn ford_interceptor_2020() -> Self {
+        Self {
+            profile: "2020 Ford Police Interceptor Utility".to_string(),
+            telemetry: VehicleTelemetry {
+                speed_mph: 27.0,
+                rpm: 1_840,
+                coolant_c: 91.0,
+                battery_v: 13.9,
+                fuel_percent: Some(64.0),
+                dtc_count: 0,
+                ignition_on: true,
+                moving: true,
+                odometer_mi: Some(78_214),
+                runtime_min: 42,
+                confidence: "simulated CAN/OBD profile".to_string(),
+                last_update_age_s: 0.8,
+            },
+            profile_notes: vec![
+                "Generic OBD is not assumed to expose every Ford-specific field.".to_string(),
+                "Profile layer is ready for Ford-specific PIDs as they are validated.".to_string(),
+            ],
+        }
+    }
+}
+
+/// Vehicle telemetry.
+#[derive(Debug, Clone)]
+pub struct VehicleTelemetry {
+    /// Vehicle speed.
+    pub speed_mph: f32,
+    /// Engine RPM.
+    pub rpm: u32,
+    /// Coolant temperature.
+    pub coolant_c: f32,
+    /// Battery/charging voltage.
+    pub battery_v: f32,
+    /// Fuel level.
+    pub fuel_percent: Option<f32>,
+    /// DTC count.
+    pub dtc_count: u32,
+    /// Ignition state.
+    pub ignition_on: bool,
+    /// Park/moving state.
+    pub moving: bool,
+    /// Odometer.
+    pub odometer_mi: Option<u32>,
+    /// Runtime.
+    pub runtime_min: u32,
+    /// Confidence label.
+    pub confidence: String,
+    /// Last update age.
+    pub last_update_age_s: f32,
+}
+
+/// Devices and I/O state.
+#[derive(Debug, Clone)]
+pub struct DeviceIoState {
+    /// Serial recovery console.
+    pub serial: SerialConsoleState,
+    /// GPIO automation rules.
+    pub gpio_rules: Vec<GpioAutomationRule>,
+    /// USB device list.
+    pub usb_devices: Vec<String>,
+    /// Ethernet state.
+    pub ethernet_state: String,
+    /// CAN/OBD state.
+    pub can_obd_state: String,
+}
+
+impl DeviceIoState {
+    fn simulated() -> Self {
+        Self {
+            serial: SerialConsoleState {
+                connected: false,
+                baud_profile: "115200 8N1".to_string(),
+                transcript_lines: vec![
+                    "Serial recovery console is reserved for MG90 recovery only.".to_string(),
+                    "Normal configuration uses direct Ethernet local management.".to_string(),
+                ],
+            },
+            gpio_rules: vec![
+                GpioAutomationRule::new(
+                    "ignition-start-trip",
+                    "WHEN ignition input changes to ON",
+                    "THEN start trip recording",
+                ),
+                GpioAutomationRule::new(
+                    "input-marker",
+                    "WHEN GPIO input 1 is triggered",
+                    "THEN drop event marker on map",
+                ),
+                GpioAutomationRule::new(
+                    "geofence-output",
+                    "WHEN vehicle enters geofence",
+                    "THEN set GPIO output 2 ON",
+                ),
+                GpioAutomationRule::new(
+                    "weather-route-alert",
+                    "WHEN weather alert intersects route",
+                    "THEN create dashboard alert",
+                ),
+            ],
+            usb_devices: vec!["USB GPS dongle simulator".to_string()],
+            ethernet_state: "direct MG90 cable detected".to_string(),
+            can_obd_state: "Ford 2020 Interceptor simulator online".to_string(),
+        }
+    }
+}
+
+/// Serial terminal state.
+#[derive(Debug, Clone)]
+pub struct SerialConsoleState {
+    /// Connected.
+    pub connected: bool,
+    /// Baud/profile selector.
+    pub baud_profile: String,
+    /// Transcript.
+    pub transcript_lines: Vec<String>,
+}
+
+/// GPIO automation rule.
+#[derive(Debug, Clone)]
+pub struct GpioAutomationRule {
+    /// Stable id.
+    pub id: String,
+    /// Enabled flag.
+    pub enabled: bool,
+    /// Trigger text.
+    pub trigger: String,
+    /// Condition text.
+    pub condition: String,
+    /// Action text.
+    pub action: String,
+    /// Last run.
+    pub last_run: String,
+    /// Audit log.
+    pub audit_log: Vec<String>,
+}
+
+impl GpioAutomationRule {
+    fn new(id: &str, trigger: &str, action: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            enabled: true,
+            trigger: trigger.to_string(),
+            condition: "simulator condition passes".to_string(),
+            action: action.to_string(),
+            last_run: "not run".to_string(),
+            audit_log: vec!["created by simulator fixture".to_string()],
+        }
+    }
+}
+
+/// Firmware lifecycle state.
+#[derive(Debug, Clone)]
+pub struct FirmwareWorkflow {
+    /// Current firmware.
+    pub current: String,
+    /// Target package.
+    pub target_package: String,
+    /// Validation checks.
+    pub checks: Vec<FirmwareCheck>,
+    /// Progress.
+    pub progress_percent: u8,
+    /// Restore-point integration.
+    pub restore_point_ready: bool,
+}
+
+impl FirmwareWorkflow {
+    fn simulated() -> Self {
+        Self {
+            current: "MGOS simulated current".to_string(),
+            target_package: "no package selected".to_string(),
+            checks: vec![
+                FirmwareCheck::pass("correct MG90 model"),
+                FirmwareCheck::pass("correct MGOS family"),
+                FirmwareCheck::pass("package integrity placeholder"),
+                FirmwareCheck::warn("verify vehicle/MG90 power before install"),
+                FirmwareCheck::pass("pre-update backup completed"),
+                FirmwareCheck::pass("direct Ethernet present"),
+                FirmwareCheck::pass("credentials valid"),
+                FirmwareCheck::pass("rollback/recovery plan available"),
+            ],
+            progress_percent: 0,
+            restore_point_ready: true,
+        }
+    }
+}
+
+/// Firmware check.
+#[derive(Debug, Clone)]
+pub struct FirmwareCheck {
+    /// Check label.
+    pub label: String,
+    /// Severity/pass state.
+    pub state: CheckState,
+}
+
+impl FirmwareCheck {
+    fn pass(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            state: CheckState::Pass,
+        }
+    }
+
+    fn warn(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            state: CheckState::Warn,
+        }
+    }
+}
+
+/// Check state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    /// Passing.
+    Pass,
+    /// Warning.
+    Warn,
+    /// Failed.
+    Fail,
+}
+
+/// Local encrypted vault readiness model.
+#[derive(Debug, Clone)]
+pub struct EncryptedVaultState {
+    /// Single local admin user.
+    pub local_admin_user: String,
+    /// Credential storage encrypted.
+    pub credentials_encrypted: bool,
+    /// Location/trip data encrypted.
+    pub location_data_encrypted: bool,
+    /// Vault backend label.
+    pub backend: String,
+}
+
+impl EncryptedVaultState {
+    fn ready_for_local_admin() -> Self {
+        Self {
+            local_admin_user: "local admin".to_string(),
+            credentials_encrypted: true,
+            location_data_encrypted: true,
+            backend: "project-managed encrypted local vault skeleton".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gps_health_rule_matches_product_lock() {
+        let healthy = LocationSample {
+            fix_type: "3D".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            accuracy_m: 5.0,
+            speed_mph: 0.0,
+            heading_deg: 0.0,
+            altitude_m: 0.0,
+            satellites: Some(8),
+            update_rate_hz: 1.0,
+            update_age_s: 5.0,
+        };
+        assert!(healthy.healthy());
+        let inaccurate = LocationSample {
+            accuracy_m: 5.1,
+            ..healthy.clone()
+        };
+        let stale = LocationSample {
+            update_age_s: 5.1,
+            ..healthy
+        };
+        assert!(!inaccurate.healthy());
+        assert!(!stale.healthy());
+    }
+
+    #[test]
+    fn motion_rule_warns_above_one_mph() {
+        let mut state = MapsLocationSurface::simulated();
+        state.locations.sources[0].sample.speed_mph = 1.0;
+        state.vehicle.telemetry.moving = false;
+        state.mg90.ignition_on = false;
+        assert!(!state.moving());
+        state.locations.sources[0].sample.speed_mph = 1.01;
+        assert!(state.moving());
+    }
+
+    #[test]
+    fn primary_source_never_auto_failovers() {
+        let mut manager = LocationManager::simulated();
+        manager.sources[0].sample.accuracy_m = 99.0;
+        assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
+        assert!(!manager.auto_failover);
+        assert!(manager.primary_warning().is_some());
+        assert!(manager
+            .healthy_alternatives()
+            .contains(&LocationSourceKind::UsbGpsd));
+        assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
+    }
+
+    #[test]
+    fn offline_navigation_status_is_ready_for_simulated_fixture() {
+        let state = MapsLocationSurface::simulated();
+        let status = state.offline_navigation_status();
+
+        assert_eq!(status.readiness, OfflineNavigationReadiness::Ready);
+        assert!(status.can_claim_turn_by_turn());
+        assert!(status.blockers.is_empty());
+        assert!(status.warnings.is_empty());
+        assert_eq!(
+            status.loaded_region.as_deref(),
+            Some("Default state/province region")
+        );
+        assert_eq!(status.coverage_percent, Some(100));
+        assert!(status
+            .notes
+            .iter()
+            .any(|note| note.contains("Simulator fixture")));
+    }
+
+    #[test]
+    fn stale_primary_blocks_until_operator_selects_healthy_peer() {
+        let mut state = MapsLocationSurface::simulated();
+        state.simulate_stale_primary_location();
+
+        let blocked = state.offline_navigation_status();
+        assert_eq!(blocked.readiness, OfflineNavigationReadiness::Blocked);
+        assert!(!blocked.can_claim_turn_by_turn());
+        assert!(blocked
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("stale")));
+        assert!(blocked
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("manual switch required")));
+
+        state.locations.set_primary(LocationSourceKind::UsbGpsd);
+        let restored = state.offline_navigation_status();
+        assert_eq!(restored.readiness, OfflineNavigationReadiness::Ready);
+        assert!(restored.can_claim_turn_by_turn());
+    }
+
+    #[test]
+    fn missing_offline_map_bundle_blocks_offline_navigation() {
+        let mut state = MapsLocationSurface::simulated();
+        state.simulate_no_offline_maps();
+
+        let status = state.offline_navigation_status();
+        assert_eq!(status.readiness, OfflineNavigationReadiness::Blocked);
+        assert_eq!(status.loaded_region, None);
+        assert!(status
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "No loaded offline map region is available."));
+
+        state.simulate_ready_offline_navigation();
+        assert_eq!(
+            state.offline_navigation_status().readiness,
+            OfflineNavigationReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn setting_changes_always_start_with_backup_and_readback() {
+        let state = MapsLocationSurface::simulated();
+        let plan = state
+            .setting_change_plan("wan.policy")
+            .expect("sample setting exists");
+        assert!(plan.backup_required);
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step == "Create versioned backup"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step == "Read back current value"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step == "Verify direct-Ethernet management path"));
+        assert!(plan.moving_warning);
+    }
+
+    #[test]
+    fn trip_exports_cover_required_formats() {
+        let trips = TripRecorderState::simulated();
+        assert_eq!(trips.retention_days, 30);
+        for format in TripExportFormat::ALL {
+            assert!(trips.export_formats.contains(&format), "{format:?}");
+        }
+        assert!(trips.encrypted_at_rest);
+    }
+
+    #[test]
+    fn setup_wizard_reaches_ready_offline_in_simulator() {
+        let mut mg90 = Mg90State::simulated();
+        mg90.setup_step = SetupStep::NotConnected;
+        for _ in SetupStep::ALL {
+            mg90.advance_setup_simulated();
+        }
+        assert_eq!(mg90.setup_step, SetupStep::Ready);
+        assert!(mg90.authenticated);
+    }
+}

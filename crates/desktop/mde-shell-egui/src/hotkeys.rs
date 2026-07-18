@@ -1,4 +1,4 @@
-//! The shell's **hotkey dispatch** (E12-19, Quazar host controls; design
+//! The shell's **hotkey dispatch** (E12-19, Construct host controls; design
 //! `docs/design/quasar-host-controls.md`, locks 8/9).
 //!
 //! `mde_seat::hotkeys::HOTKEYS` is the fixed compiled-in table (chord → typed
@@ -269,15 +269,14 @@ impl HotkeyRouter {
 }
 
 /// Map a leader-held number key (+ its Shift state) to the surface slot it
-/// selects. Two tiers cover **all 18** `Surface::ALL` entries (REACH-2):
+/// selects. Two tiers cover **all 19** `Surface::ALL` entries (REACH-2):
 ///
 /// * plain **`Super`+`1`…`9`/`0`** → `Surface::ALL[0..=9]` (the Win10 taskbar
 ///   convention, `Super+0` = the tenth slot);
-/// * **`Super`+`Shift`+`1`…`8`** → `Surface::ALL[10..=17]` — the eight surfaces
-///   beyond the first ten (Bookmarks · Terminal · Editor · Chat · Phones ·
-///   System · Storage · About).
+/// * **`Super`+`Shift`+`1`…`9`** → `Surface::ALL[10..=18]` — the nine surfaces
+///   beyond the first ten.
 ///
-/// `Super+Shift+9`/`Super+Shift+0` map past the last surface (slots 18/19); the
+/// `Super+Shift+0` maps past the last surface (slot 19); the
 /// [`NavSlot`] consumer (`apply_nav_slot`) indexes `Surface::ALL` bounds-safely,
 /// so an overshoot is a no-op rather than a panic or a wrap.
 const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
@@ -294,8 +293,8 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
         egui::Key::Num0 => 9,
         _ => return None,
     };
-    // Shift shifts to the second tier: its ten-surface offset lands Num1..Num8 on
-    // ALL[10..=17]. The two overshooting shifted slots resolve to nothing downstream.
+    // Shift shifts to the second tier: its ten-surface offset lands Num1..Num9 on
+    // ALL[10..=18]. The overshooting shifted zero resolves to nothing downstream.
     Some(NavSlot(if shift { digit + 10 } else { digit }))
 }
 
@@ -304,7 +303,7 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
 /// host-first (evdev 125/126, [`decode_scan`]), so a chord is the leader latch
 /// crossed with a `(key, shift)` press. Shift selects the **second** Super-number
 /// nav tier (REACH-2): `Super+1..0` reaches `Surface::ALL[0..=9]`,
-/// `Super+Shift+1..8` reaches `ALL[10..=17]`, so all 18 surfaces are reachable.
+/// `Super+Shift+1..9` reaches `ALL[10..=18]`, so all 19 surfaces are reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyPress {
     /// The pressed egui key.
@@ -567,7 +566,7 @@ mod tests {
 
     #[test]
     fn super_shift_numbers_reach_the_second_surface_tier() {
-        // REACH-2 — Super+Shift+1..8 selects Surface::ALL[10..=17], the eight
+        // REACH-2 — Super+Shift+1..9 selects Surface::ALL[10..=18], the nine
         // surfaces the plain Super+1..0 tier can't reach.
         for (key, want) in [
             (egui::Key::Num1, 10),
@@ -578,6 +577,7 @@ mod tests {
             (egui::Key::Num6, 15),
             (egui::Key::Num7, 16),
             (egui::Key::Num8, 17),
+            (egui::Key::Num9, 18),
         ] {
             let mut r = HotkeyRouter::default();
             let acts = r.dispatch(&[scan(125, true)], &[shift_press(key)]);
@@ -619,6 +619,7 @@ mod tests {
             (egui::Key::Num6, true),
             (egui::Key::Num7, true),
             (egui::Key::Num8, true),
+            (egui::Key::Num9, true),
         ];
         let mut reached = BTreeSet::new();
         for (key, shift) in tier1.into_iter().chain(tier2) {
@@ -630,21 +631,21 @@ mod tests {
                 .expect("a Super-number chord latches a slot");
             reached.insert(slot.index());
         }
-        // REACH-2 — the two tiers together cover all 18 Surface::ALL indices.
+        // REACH-2 — the two tiers together cover all 19 Surface::ALL indices.
         let all: BTreeSet<usize> = (0..crate::dock::Surface::ALL.len()).collect();
-        assert_eq!(all.len(), 18, "Surface::ALL is the 18-surface set");
+        assert_eq!(all.len(), 19, "Surface::ALL is the 19-surface set");
         assert_eq!(
             reached, all,
-            "every Surface::ALL index 0..=17 has a Super-number chord"
+            "every Surface::ALL index 0..=18 has a Super-number chord"
         );
     }
 
     #[test]
     fn an_out_of_range_shift_slot_is_a_safe_no_op() {
-        // Super+Shift+9/0 overshoot past the last surface (slots 18/19). They still
+        // Super+Shift+0 overshoots past the last surface (slot 19). It still
         // latch (so the hold is a chord, not a dock-toggling tap), but indexing
         // Surface::ALL yields nothing — a no-op, never a panic (REACH-2 bounds).
-        for key in [egui::Key::Num9, egui::Key::Num0] {
+        for key in [egui::Key::Num0] {
             let mut r = HotkeyRouter::default();
             let _ = r.dispatch(&[scan(125, true)], &[shift_press(key)]);
             let slot = r

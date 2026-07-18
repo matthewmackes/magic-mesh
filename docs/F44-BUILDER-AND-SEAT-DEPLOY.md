@@ -63,7 +63,7 @@ sshpass -p $LAB_PW ssh $SSHPW <user>@<ip>
 
 | seat | IP | user | notes |
 |---|---|---|---|
-| **.138** | 172.20.146.138 | `root` | physical F44, DRM-capable Quazar seat, `libmpv.so.2` present |
+| **.138** | 172.20.146.138 | `root` | physical F44, DRM-capable Construct seat, `libmpv.so.2` present |
 | **Eagle** | 172.20.146.13 | `mm`   | F44 workstation (`UNIT-EAGLE`); root is rejected → use `mm` |
 | **.2** | 172.20.146.2 | `mm`   | F44; also on the current mesh |
 | ~~.216~~ | 172.20.146.216 | — | **OFFLINE** ("No route to host"); power on before deploying |

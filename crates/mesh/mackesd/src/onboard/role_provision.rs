@@ -497,6 +497,7 @@ mod tests {
         for guarded in [
             "timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf",
             "timeout 60 gtk-update-icon-cache -q -f /usr/share/icons/hicolor",
+            "timeout 60 gtk-update-icon-cache -q -f /usr/share/icons/YAMIS",
             "timeout 60 update-desktop-database -q",
         ] {
             assert!(
@@ -504,6 +505,28 @@ mod tests {
                 "postinstall helper must be timeout-bounded: {guarded}"
             );
         }
+        for (source, dest) in [
+            (
+                "assets/icons/YAMIS/YAMIS/index.theme",
+                "/usr/share/icons/YAMIS/index.theme",
+            ),
+            ("assets/icons/YAMIS/YAMIS/*/**/*", "/usr/share/icons/YAMIS/"),
+            (
+                "assets/icons/YAMIS/YAMIS/LICENSE",
+                "/usr/share/licenses/magic-mesh/YAMIS-LICENSE",
+            ),
+        ] {
+            assert!(
+                asset_exists(assets, source, dest, "644"),
+                "base RPM must ship the YAMIS platform icon payload {source} -> {dest}"
+            );
+        }
+        assert!(
+            script.contains("gtk-icon-theme-name=YAMIS")
+                && script.contains("set_gtk_icon_theme /etc/gtk-3.0/settings.ini")
+                && script.contains("set_gtk_icon_theme /etc/gtk-4.0/settings.ini"),
+            "base RPM post-install must make YAMIS the default toolkit icon theme"
+        );
         assert!(
             script.contains("systemctl enable magic-mesh-selinux-policy.service"),
             "base SELinux policy loader must be enabled without starting inside dnf %post"
@@ -914,6 +937,75 @@ mod tests {
                 .iter()
                 .all(|asset| asset["dest"].as_str() != Some(dest)),
             "headless server RPM must not ship the KDC remote-input seat helper"
+        );
+    }
+
+    #[test]
+    fn full_rpm_ships_remote_proofing_bridge_but_server_variant_does_not() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let post_install = rpm["post_install_script"]
+            .as_str()
+            .expect("base RPM post-install script");
+
+        for (source, dest, mode) in [
+            (
+                "install-helpers/mde-remote-proofing-apply.py",
+                "/usr/libexec/mackesd/mde-remote-proofing-apply",
+                "755",
+            ),
+            (
+                "packaging/systemd/mde-remote-proofing-plan.service",
+                "/usr/lib/systemd/system/mde-remote-proofing-plan.service",
+                "644",
+            ),
+            (
+                "packaging/systemd/mde-remote-proofing-plan.path",
+                "/usr/lib/systemd/system/mde-remote-proofing-plan.path",
+                "644",
+            ),
+        ] {
+            assert!(
+                asset_exists(base_assets, source, dest, mode),
+                "full Workstation RPM must ship Remote Proofing bridge asset {dest}"
+            );
+            assert!(
+                dest_absent(server_assets, dest),
+                "headless server RPM must not ship Remote Proofing bridge asset {dest}"
+            );
+        }
+        assert!(
+            post_install.contains("mde-remote-proofing-plan.path"),
+            "base RPM post-install must enable the Remote Proofing plan watcher"
+        );
+
+        let unit =
+            include_str!("../../../../../packaging/systemd/mde-remote-proofing-plan.service");
+        assert_exit_78_gate_is_retryable(unit, "Remote Proofing plan service");
+        assert!(
+            unit.contains("ExecCondition=/usr/bin/mackesd role-gate --min-rank 1")
+                && unit.contains("/usr/libexec/mackesd/mde-remote-proofing-apply")
+                && unit.contains("--write-plan /run/mde/remote-proofing/plan.json")
+                && unit.contains("--write-config /run/mde/remote-proofing/sunshine.conf")
+                && unit.contains("--write-lifecycle /run/mde/remote-proofing/lifecycle.json")
+                && unit.contains("--apply-lifecycle"),
+            "Remote Proofing plan service must be Workstation-gated and render/apply plan/config/lifecycle artifacts"
+        );
+
+        let path = include_str!("../../../../../packaging/systemd/mde-remote-proofing-plan.path");
+        assert!(
+            path.contains("PathChanged=/run/mde-bus/settings-remote-proofing.json")
+                && path.contains("PathChanged=/run/mde/mesh-status.json")
+                && path.contains("Unit=mde-remote-proofing-plan.service")
+                && !path
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("PathExists=")),
+            "Remote Proofing path unit must watch settings/status changes without a level-triggered PathExists loop"
         );
     }
 

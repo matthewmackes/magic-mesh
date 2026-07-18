@@ -1,0 +1,10 @@
+[Unit]
+Description=MCNF - render the Remote Proofing Sunshine lifecycle plan
+After=mesh-status.service
+ConditionPathExists=/usr/libexec/mackesd/mde-remote-proofing-apply
+
+[Service]
+Type=oneshot
+SuccessExitStatus=78
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
+ExecStart=/usr/libexec/mackesd/mde-remote-proofing-apply --settings /run/mde-bus/settings-remote-proofing.json --mesh-status /run/mde/mesh-status.json --write-plan /run/mde/remote-proofing/plan.json --write-config /run/mde/remote-proofing/sunshine.conf --write-lifecycle /run/mde/remote-proofing/lifecycle.json --apply-lifecycle

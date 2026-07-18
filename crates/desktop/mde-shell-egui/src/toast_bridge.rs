@@ -226,6 +226,7 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "voice" => Some(Surface::Voice),
         "browser" => Some(Surface::Browser),
         "bookmarks" | "bookmark-manager" => Some(Surface::Bookmarks),
+        "maps" | "location" | "maps-location" | "mapslocation" => Some(Surface::MapsLocation),
         // The ONE notification interface (NOTIFY-CHAT-6) — the retired
         // `notifications` / `clipboard` verbs now resolve here so a forward emitter's
         // old `shell/goto/notifications` still reaches a live surface.

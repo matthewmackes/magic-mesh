@@ -3,7 +3,7 @@
 Operator-locked 2026-07-04 (10-Q `/plan` survey). An extensive toolbar chrome for the
 editor surface matching the features/functions of **Microsoft Word 97** — the menu bar
 + Standard toolbar + Formatting toolbar — adapted honestly to a plain-text/markdown
-editor on the Quazar platform. Companions: `editor.md` (the editor architecture;
+editor on the Construct platform. Companions: `editor.md` (the editor architecture;
 EDITOR-1..4/7/9 landed, EDITOR-5 in flight).
 
 ## Locked decisions

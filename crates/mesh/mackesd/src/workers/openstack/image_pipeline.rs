@@ -1,4 +1,4 @@
-//! QC-9 (QUASAR-CLOUD) — the diskimage-builder (DIB) → Glance image pipeline.
+//! QC-9 (CONSTRUCT-CLOUD) — the diskimage-builder (DIB) → Glance image pipeline.
 //!
 //! This module replaces `install-helpers/build-mde-vm-golden.sh` and the
 //! on-disk golden qcow2s (design Q36/53): the platform's standard VM images are

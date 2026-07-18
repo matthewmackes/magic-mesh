@@ -43,7 +43,7 @@ fn role_blurb(role: Role) -> (&'static str, &'static str) {
         ),
         Role::Workstation => (
             "Workstation",
-            "The full Quazar stack — the egui-DRM shell + VDI + \
+            "The full Construct stack — the egui-DRM shell + VDI + \
              libvirt/QEMU-KVM + Podman. A headless machine is just a \
              Workstation without a local display. (Rank 1)",
         ),

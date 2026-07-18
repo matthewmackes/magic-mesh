@@ -413,7 +413,7 @@ const EDIT_ITEMS: [Item; 3] = [
 
 /// The colour-scheme submenu — the TERM-11 [`Preset`] palettes as check items.
 const SCHEME_ITEMS: [Item; 5] = [
-    Item::new("Quazar", A::SetPreset(Preset::Quazar), NoKey, Always),
+    Item::new("Construct", A::SetPreset(Preset::Construct), NoKey, Always),
     Item::new(
         "Solarized Dark",
         A::SetPreset(Preset::SolarizedDark),
@@ -983,12 +983,12 @@ mod tests {
     }
 
     #[test]
-    fn colour_scheme_menu_uses_canonical_quazar_identity() {
+    fn colour_scheme_menu_uses_canonical_construct_identity() {
         let default = SCHEME_ITEMS
             .iter()
-            .find(|item| item.action == MenuAction::SetPreset(Preset::Quazar))
+            .find(|item| item.action == MenuAction::SetPreset(Preset::Construct))
             .expect("platform default colour scheme item");
-        assert_eq!(default.label, "Quazar");
+        assert_eq!(default.label, "Construct");
         assert!(
             !default.label.contains(concat!("Qua", "sar")),
             "colour-scheme menu must not drift back to the superseded spelling"

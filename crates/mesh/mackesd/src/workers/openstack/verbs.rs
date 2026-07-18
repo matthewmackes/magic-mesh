@@ -1,4 +1,4 @@
-//! QC-11 (QUASAR-CLOUD) — the typed Bus verb surface that wraps the cloud.
+//! QC-11 (CONSTRUCT-CLOUD) — the typed Bus verb surface that wraps the cloud.
 //!
 //! Design Q40/Q70: the mackesd Bus verbs stay §9's contract; `OpenStack` is the
 //! backend, and no mesh client (the shell Cloud plane, the phone via

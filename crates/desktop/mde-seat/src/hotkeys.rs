@@ -1,6 +1,6 @@
 //! The fixed compiled-in hotkey table (lock 9).
 //!
-//! Quazar does **not** offer configurable bindings: the table is a compile-time
+//! Construct does **not** offer configurable bindings: the table is a compile-time
 //! constant so the mapping is auditable, cannot drift, and needs no persistence.
 //! Each entry maps a chord (an XF86 media/system key, or a leader-chord combo)
 //! to one **typed** [`HotkeyAction`] — never a shell string (§9, no raw exec).

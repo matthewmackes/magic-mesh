@@ -1,7 +1,7 @@
 # MCNF — Architecture
 
 A secure, **no-fixed-center** workgroup mesh and the **egui-native, DRM-native
-thin-client VDI desktop** that runs on top of it (the E12 "Quazar" epoch). This
+thin-client VDI desktop** that runs on top of it (the E12 "Construct" epoch). This
 is the system map; the binding rules live in
 [`AI_GOVERNANCE.md`](../AI_GOVERNANCE.md), the operator view in
 [`ADMIN.md`](../ADMIN.md) + [`docs/help/`](help/).

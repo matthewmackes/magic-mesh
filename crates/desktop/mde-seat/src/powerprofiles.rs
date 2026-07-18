@@ -4,7 +4,7 @@
 //!
 //! The daemon exposes the host's active power profile (`power-saver` / `balanced`
 //! / `performance`) and the set it supports. This is the **native** seam the
-//! Quazar shell reads/writes directly (design lock 2 — no mackesd Bus relay), the
+//! Construct shell reads/writes directly (design lock 2 — no mackesd Bus relay), the
 //! same mechanism `powerprofilesctl` uses: read the `ActiveProfile` (`s`) and
 //! `Profiles` (`aa{sv}`) properties, and switch by *writing* the `ActiveProfile`
 //! property (`org.freedesktop.DBus.Properties.Set`).

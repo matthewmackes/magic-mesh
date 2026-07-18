@@ -4,7 +4,7 @@
 //! locked 2026-07-04).
 //!
 //! This is the client half of the OpenStack integration. Its server half — the
-//! QUASAR-CLOUD [`super`] worker — *runs* the Kolla service containers; this
+//! CONSTRUCT-CLOUD [`super`] worker — *runs* the Kolla service containers; this
 //! module *talks to* the resulting cloud as a standard-API client, the seam the
 //! later IAC surface units (IAC-2 Overview / IAC-3 Resources / IAC-4 Heat) build
 //! on. It reuses the established worker idioms — pure builders/parsers + injectable

@@ -40,7 +40,7 @@ ovs-vsctl --version >/dev/null 2>&1 \
     && ok "ovs-vsctl executes ($(ovs-vsctl --version | head -n 1))" \
     || bad "ovs-vsctl does not execute"
 [ ! -e /usr/bin/cloud-hypervisor ] \
-    && ok "cloud-hypervisor absent per QUASAR-CLOUD/QC-1" \
+    && ok "cloud-hypervisor absent per CONSTRUCT-CLOUD/QC-1" \
     || bad "cloud-hypervisor still present"
 [ -f /usr/lib/bootc/install/50-magic-mesh.toml ] \
     && ok "bootc install rootfs config present" \

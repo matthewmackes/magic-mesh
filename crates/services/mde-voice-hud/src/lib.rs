@@ -6,7 +6,7 @@
 //! **no GUI-toolkit dependency**.
 //!
 //! E12-14b — the Cosmic-era wlr-layer-shell softphone HUD binary (`src/main.rs`)
-//! was stripped. MCNF 12.0 "Quazar" renders Voice as an egui panel
+//! was stripped. MCNF 12.0 "Construct" renders Voice as an egui panel
 //! (`mde-voice-egui::voice_panel`, pumped by `voice_pump`) inside
 //! `mde-shell-egui`, reusing this core — including the persistent SIP agent
 //! ([`sip::run_agent`]) that the shell spawns once at start — on the shared egui

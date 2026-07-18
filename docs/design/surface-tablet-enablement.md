@@ -31,7 +31,7 @@
 | 11 | Native res | **DRM/EDID native detect + fractional HiDPI scale.** Read the connector's preferred mode + physical size, set the framebuffer to native, compute a fractional egui `pixels_per_point` (~2.0–2.25) so UI is crisp + correctly sized; scale shown + adjustable on the card. |
 | 12 | HD mode | **A real DRM mode picker.** List the connector's real KMS modes (native + 1080p + others from EDID); choosing HD does an actual modeset to 1920×1080 — fewer pixels for wgpu AND for VDI streaming (less to encode/ship). Revertible; active mode shown. |
 | 13 | Touch input | **libinput/evdev multitouch in the shell's DRM seat → egui touch/pointer events.** Extend the seat's input path to read the touchscreen via libinput (kernel evdev the iptsd stack feeds); translate contacts into egui `Event::Touch` + synthesized pointer, coordinate-transformed to the active mode/rotation. Multitouch preserved for gestures. |
-| 14 | On-screen kbd | **A native egui OSK** (Quazar tokens) as a shell overlay, auto-raised when formfactor=Tablet AND a text field has focus, injecting into the same input pipeline; layout + compact/numeric modes; dismissable + manually toggleable. No external IM dependency (bare-DRM shell). |
+| 14 | On-screen kbd | **A native egui OSK** (Construct tokens) as a shell overlay, auto-raised when formfactor=Tablet AND a text field has focus, injecting into the same input pipeline; layout + compact/numeric modes; dismissable + manually toggleable. No external IM dependency (bare-DRM shell). |
 | 15 | Auto-rotate | **Accelerometer → KMS rotation + matching touch-matrix transform**, auto on orientation change (display + touch rotate as one), with a rotation-lock toggle (honoring a hardware lock if present). |
 | 16 | Touch UX | **Full gesture set + touch-mode layout adaptation** — two-finger scroll, pinch-zoom, long-press=right-click, edge-swipes (dock/tablet bar); PLUS in tablet mode the shell bumps hit-target sizes/spacing (a touch density in `Style`). Auto-engages on the Tablet signal, reverts in laptop mode. |
 
@@ -99,7 +99,7 @@ bootc Workstation image ── conditional linux-surface layer + surface-tools g
 - **SURFACE-9 — formfactor signal + auto-rotation.** Watch SW_TABLET_MODE + Type Cover
   attach/detach → `event/hardware/formfactor`; accelerometer → KMS rotation + matching
   touch-matrix transform, auto with a rotation-lock.
-- **SURFACE-10 — the native egui OSK.** A shell-overlay on-screen keyboard (Quazar tokens),
+- **SURFACE-10 — the native egui OSK.** A shell-overlay on-screen keyboard (Construct tokens),
   auto-raised on Tablet + text-focus, injecting into the input pipeline; layout +
   compact/numeric; dismissable/toggleable.
 - **SURFACE-11 — gestures + touch-density layout.** Two-finger scroll, pinch-zoom,

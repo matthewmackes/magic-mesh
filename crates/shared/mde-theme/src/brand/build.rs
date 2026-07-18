@@ -4,9 +4,9 @@
 //! release channel into `cargo:rustc-env` variables; this module reads them back
 //! with `env!` and shapes them into the two lines the platform shows:
 //!
-//! * [`version_line`] → `12.0.0 "Quazar"` — the short brand line in the shell
+//! * [`version_line`] → `12.0.0 "Construct"` — the short brand line in the shell
 //!   chrome and the boot-splash.
-//! * [`full`] → `12.0.0 "Quazar" · <hash> · <date> · <channel>` — the complete
+//! * [`full`] → `12.0.0 "Construct" · <hash> · <date> · <channel>` — the complete
 //!   build stamp for the About panel and `--version`.
 //!
 //! Both are single-sourced from [`info`] so the shell, `mde-shell-egui --version`
@@ -21,15 +21,15 @@ const BUILD_DATE: &str = env!("MDE_BUILD_DATE");
 /// The stamped release channel (`dev` unless the packaging build overrides it).
 const CHANNEL: &str = env!("MDE_BUILD_CHANNEL");
 
-/// The platform codename for a semver major epoch — `12.x` → `"Quazar"`.
+/// The platform codename for a semver major epoch — `12.x` → `"Construct"`.
 ///
 /// Unknown epochs return `""` so [`version_line`] degrades to a bare semver
 /// rather than inventing a name. Keyed off the major so a `12.1`/`12.2` point
-/// release stays "Quazar" without touching this map.
+/// release stays "Construct" without touching this map.
 #[must_use]
 pub const fn codename_for(major: u64) -> &'static str {
     match major {
-        12 => "Quazar",
+        12 => "Construct",
         _ => "",
     }
 }
@@ -43,7 +43,7 @@ pub const fn codename_for(major: u64) -> &'static str {
 pub struct BuildInfo {
     /// Semver version — the workspace `CARGO_PKG_VERSION` (`12.0.0`).
     pub version: &'static str,
-    /// Codename for the version's major epoch (`"Quazar"`; `""` if unknown).
+    /// Codename for the version's major epoch (`"Construct"`; `""` if unknown).
     pub codename: &'static str,
     /// Git short-hash at build time, or the `nogit` sentinel.
     pub git_hash: &'static str,
@@ -75,7 +75,7 @@ pub fn info() -> BuildInfo {
 }
 
 /// The short brand line — semver plus the quoted codename — for the shell chrome
-/// and the boot-splash: `12.0.0 "Quazar"`. The codename is omitted (bare semver)
+/// and the boot-splash: `12.0.0 "Construct"`. The codename is omitted (bare semver)
 /// when the epoch has no name.
 #[must_use]
 pub fn version_line() -> String {
@@ -88,7 +88,7 @@ pub fn version_line() -> String {
 }
 
 /// The complete build-identity line for the About panel and `--version`:
-/// `12.0.0 "Quazar" · <hash> · <date> · <channel>`. Reuses [`version_line`] for
+/// `12.0.0 "Construct" · <hash> · <date> · <channel>`. Reuses [`version_line`] for
 /// the leading brand line so the two never drift.
 #[must_use]
 pub fn full() -> String {
@@ -120,19 +120,19 @@ mod tests {
     use super::{codename_for, full, full_static, info, version_line, VERSION};
 
     #[test]
-    fn codename_maps_the_quazar_epoch_and_blanks_the_unknown() {
-        assert_eq!(codename_for(12), "Quazar");
+    fn codename_maps_the_construct_epoch_and_blanks_the_unknown() {
+        assert_eq!(codename_for(12), "Construct");
         assert!(codename_for(11).is_empty());
         assert!(codename_for(99).is_empty());
     }
 
     #[test]
     fn version_line_is_semver_plus_quoted_codename() {
-        // The workspace is 12.0.0 → the "Quazar" epoch, so the shape is
-        // `<semver> "Quazar"` (the chrome/splash line the design locks).
-        assert_eq!(version_line(), format!("{VERSION} \"Quazar\""));
+        // The workspace is 12.0.0 → the "Construct" epoch, so the shape is
+        // `<semver> "Construct"` (the chrome/splash line the design locks).
+        assert_eq!(version_line(), format!("{VERSION} \"Construct\""));
         assert!(version_line().starts_with(VERSION));
-        assert!(version_line().contains("\"Quazar\""));
+        assert!(version_line().contains("\"Construct\""));
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
         assert!(line.contains(info.build_date), "missing date: {line}");
         assert!(line.contains(info.channel), "missing channel: {line}");
         // full() carries the whole brand line, codename included.
-        assert!(line.contains("\"Quazar\""), "missing codename: {line}");
+        assert!(line.contains("\"Construct\""), "missing codename: {line}");
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         assert!(!info.git_hash.is_empty());
         assert!(!info.build_date.is_empty());
         assert!(!info.channel.is_empty());
-        // Codename is "Quazar" for the current 12.x epoch.
-        assert_eq!(info.codename, "Quazar");
+        // Codename is "Construct" for the current 12.x epoch.
+        assert_eq!(info.codename, "Construct");
     }
 }

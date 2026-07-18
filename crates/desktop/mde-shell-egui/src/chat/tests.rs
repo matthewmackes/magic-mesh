@@ -11,6 +11,33 @@ fn fixed_msg(id: &str, ts: i64, body: &str) -> Message {
     m
 }
 
+fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn assert_painted_text_contains(texts: &[String], expected: &str) {
+    assert!(
+        texts.iter().any(|text| text == expected),
+        "expected painted text {expected:?}; painted text was {texts:?}"
+    );
+}
+
 #[test]
 fn fold_rings_merges_constituent_blobs_in_canonical_order_and_dedups() {
     // perf-5 — the fold is the exact per-conversation build refresh does: a
@@ -117,6 +144,68 @@ fn delivery_state_is_derived_honestly_from_recipient_presence() {
 }
 
 #[test]
+fn chat_chrome_copy_uses_ascii_text_instead_of_pseudo_icons() {
+    for copy in [
+        CHAT_HINT_SET_STATUS,
+        CHAT_HINT_NEW_ROOM,
+        CHAT_HINT_MESSAGE,
+        CHAT_HINT_ATTACH_FILE,
+        CHAT_HINT_ROOM_MESSAGE,
+        CHAT_ATTACH_LABEL,
+        CHAT_ALERT_GO_TO_LABEL,
+        CHAT_SENT_FILE_PREFIX,
+        Delivery::Sent.label(),
+        Delivery::Delivered.label(),
+        Delivery::Queued.label(),
+        Delivery::Queued.hover_text(),
+    ] {
+        assert!(copy.is_ascii(), "{copy:?} should stay ASCII");
+    }
+
+    let preview = delivery_preview_text(Delivery::Queued, "Offline");
+    assert_eq!(preview, "Queued - Offline");
+    assert!(preview.is_ascii());
+    assert_eq!(room_member_note(3), "3 members");
+}
+
+#[test]
+fn chat_mute_button_uses_yamis_icon_instead_of_bell_emoji_text() {
+    use mde_egui::egui::{pos2, vec2, Rect};
+
+    assert_eq!(CHAT_MUTE_ICON.name(), "yamis-notification-disabled");
+    assert_eq!(CHAT_UNMUTE_ICON.name(), "yamis-notification-active");
+    assert!(CHAT_MUTE_ICON.svg().contains("currentColor"));
+    assert!(CHAT_UNMUTE_ICON.svg().contains("currentColor"));
+
+    for (muted, expected_label) in [(false, "Mute"), (true, "Unmute")] {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut err = None;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 80.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                mute_button(ui, None, "contact", "nyc3", muted, &mut err);
+            });
+        });
+
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().any(|text| text == expected_label),
+            "{expected_label} label was not painted: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|text| { !text.contains('\u{1F514}') && !text.contains('\u{1F515}') }),
+            "mute button leaked bell emoji pseudo-icons: {texts:?}"
+        );
+    }
+}
+
+#[test]
 fn presence_and_severity_map_to_style_tokens_not_raw_hex() {
     assert_eq!(presence_color(Presence::Online), Style::OK);
     assert_eq!(presence_color(Presence::Dnd), Style::DANGER);
@@ -195,6 +284,143 @@ fn surface_mounts_and_tessellates_over_real_state() {
     assert!(
         !prims.is_empty(),
         "the chat surface produced no draw primitives"
+    );
+}
+
+#[test]
+fn waiting_pane_renders_meaningful_default_state() {
+    use mde_egui::egui::{pos2, vec2, Rect};
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+
+    let mut state = ChatState {
+        bus_root: None,
+        ..ChatState::default()
+    };
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 540.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.push_id("shell-chat-waiting", |ui| state.show(ui));
+        });
+    });
+
+    let texts = painted_text(&out.shapes);
+    for expected in [
+        "Chat unavailable",
+        "Bus",
+        "missing",
+        "Roster",
+        "waiting",
+        "Alerts",
+    ] {
+        assert_painted_text_contains(&texts, expected);
+    }
+    let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+    assert!(
+        !prims.is_empty(),
+        "the Chat waiting pane must paint a non-empty status surface"
+    );
+}
+
+#[test]
+fn home_overview_renders_activity_without_marking_notifications_read() {
+    use mde_egui::egui::{pos2, vec2, Rect};
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+
+    let mut state = ChatState::default();
+    let mut roster = Roster::new("eagle");
+    roster.upsert(Contact::new("nyc3", NodeRole::Headless).with_presence(Presence::Online));
+    state.roster = Some(roster);
+
+    let mut fields = BTreeMap::new();
+    fields.insert("summary".to_string(), "disk critical".to_string());
+    let mut conv = Conversation::new("nyc3");
+    conv.insert(Message::new(
+        "nyc3",
+        20,
+        MessageKind::Alert {
+            severity: Severity::Critical,
+            flag: "storage".into(),
+            fields,
+            action_verb: None,
+            actions: Vec::new(),
+        },
+    ));
+    state.convos.insert("nyc3".into(), conv);
+    state.seen.insert(NOTIFICATIONS_SEEN_KEY.to_string(), 0);
+    state.selected = None;
+    assert_eq!(state.notifications_unread(), 1);
+    assert_eq!(
+        state.home_unread_count(),
+        1,
+        "the home overview must include unread Notifications lane state"
+    );
+
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 720.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input.clone(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.push_id("shell-chat-home-overview-text", |ui| state.show(ui));
+        });
+    });
+    let texts = painted_text(&out.shapes);
+    for expected in [
+        "Chat activity",
+        "1 unread",
+        "Peers",
+        "Online",
+        "Alerts",
+        "Rooms",
+        "Latest notifications",
+        "disk critical",
+        "Open notifications",
+    ] {
+        assert_painted_text_contains(&texts, expected);
+    }
+    assert_eq!(
+        state.notifications_unread(),
+        1,
+        "painted home copy must not acknowledge the Notifications lane"
+    );
+
+    let canvas = crate::screenshot::Capture::new().frame(&ctx, input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.push_id("shell-chat-home-overview", |ui| state.show(ui));
+        });
+    });
+
+    assert!(
+        !canvas.is_blank(),
+        "the Chat home overview must paint a non-blank activity surface"
+    );
+    assert_eq!(
+        state.selected, None,
+        "the overview is informational; it must not auto-open a lane"
+    );
+    assert_eq!(
+        state.notifications_unread(),
+        1,
+        "summarizing notifications must not acknowledge the Notifications lane"
+    );
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("screenshots")
+        .join("chat-home-overview.png");
+    canvas
+        .write_png(&path)
+        .expect("write the Chat home rendered proof screenshot");
+    println!(
+        "Chat home rendered proof screenshot written to {}",
+        path.display()
     );
 }
 

@@ -38,6 +38,7 @@ use mde_egui::egui::{
 use mde_egui::menubar::{MenuBar as SharedMenuBar, MenuBarModel};
 use mde_egui::style::Elevation;
 use mde_egui::{field, muted_note, status_dot, Motion, Style};
+use mde_theme::brand::icons::{icon_image, IconId};
 
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::{Progress, Resolution};
@@ -65,6 +66,15 @@ const ROW_H: f32 = 26.0;
 const TILE_W: f32 = 132.0;
 const TILE_H: f32 = 72.0;
 const ACTION_BUTTON_H: f32 = 24.0;
+const FILES_NAV_ICON: f32 = 14.0;
+const FILES_PLACE_ICON: f32 = 14.0;
+const FILES_ROW_ICON: f32 = 15.0;
+const FILES_GRID_ICON: f32 = 28.0;
+const FILES_NAV_ICONS: &[(IconId, &str)] = &[
+    (IconId::ArrowLeft, "Back"),
+    (IconId::ArrowRight, "Forward"),
+    (IconId::ChevronUp, "Up"),
+];
 
 #[derive(Clone, Copy)]
 enum FilesActionTone {
@@ -102,6 +112,143 @@ fn files_action_button(
     );
     mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
     response.on_hover_text(tip)
+}
+
+fn files_nav_button(ui: &mut egui::Ui, icon: IconId, enabled: bool, tip: &str) -> egui::Response {
+    let text_color = if enabled {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("")
+            .fill(Style::LAYER_02)
+            .stroke(Stroke::new(1.0, text_color.gamma_multiply(0.72)))
+            .corner_radius(Style::RADIUS_S)
+            .min_size(egui::vec2(ACTION_BUTTON_H, ACTION_BUTTON_H)),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+    let rect = egui::Rect::from_center_size(
+        response.rect.center(),
+        egui::vec2(FILES_NAV_ICON, FILES_NAV_ICON),
+    );
+    if let Some(tex) = files_icon_texture(ui, icon, FILES_NAV_ICON, text_color) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+    }
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    response.on_hover_text(tip)
+}
+
+#[allow(
+    clippy::cast_possible_truncation, // rounded, clamped-positive f32 -> u32
+    clippy::cast_sign_loss            // size_px >= 1.0 by the .max(1.0) clamp
+)]
+fn files_icon_texture(
+    ui: &egui::Ui,
+    id: IconId,
+    logical_px: f32,
+    tint: Color32,
+) -> Option<TextureHandle> {
+    let size_px = (logical_px * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+    let tint = tint.to_array();
+    let key = egui::Id::new(("files-yamis-icon", id.name(), size_px, tint));
+    if let Some(cached) = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<Option<TextureHandle>>(key))
+    {
+        return cached;
+    }
+    let texture = icon_image(id, size_px, tint).ok().map(|img| {
+        let color = egui::ColorImage::from_rgba_unmultiplied(img.size_usize(), &img.rgba);
+        ui.ctx()
+            .load_texture(id.name(), color, TextureOptions::LINEAR)
+    });
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(key, texture.clone()));
+    texture
+}
+
+fn paint_files_icon(ui: &egui::Ui, id: IconId, rect: Rect, logical_px: f32, tint: Color32) -> bool {
+    let Some(tex) = files_icon_texture(ui, id, logical_px, tint) else {
+        return false;
+    };
+    let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+    true
+}
+
+const fn file_type_icon(mime: Mime) -> IconId {
+    match mime {
+        Mime::Folder => IconId::FileFolder,
+        Mime::Doc => IconId::FileDocument,
+        Mime::Image => IconId::FileImage,
+        Mime::Pdf => IconId::FilePdf,
+        Mime::Archive => IconId::FileArchive,
+        Mime::Disk => IconId::Storage,
+    }
+}
+
+fn file_icon_tint(e: &EntryView) -> Color32 {
+    if e.is_dir {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    }
+}
+
+fn local_place_icon(path: &str) -> IconId {
+    match path {
+        "local:home" => IconId::FileHome,
+        "local:docs" => IconId::FileDocuments,
+        "local:downloads" => IconId::FileDownloads,
+        "local:root" => IconId::Storage,
+        _ => IconId::FileFolder,
+    }
+}
+
+fn local_place_row(ui: &mut egui::Ui, icon: IconId, label: &str, selected: bool) -> egui::Response {
+    let height = ROW_H;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let fill = if selected {
+        Style::LAYER_02
+    } else if response.hovered() {
+        Style::LAYER_01
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
+    }
+    let tint = if selected {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    };
+    let icon_rect = Rect::from_center_size(
+        egui::pos2(
+            rect.left() + Style::SP_S + FILES_PLACE_ICON * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(FILES_PLACE_ICON, FILES_PLACE_ICON),
+    );
+    let _ = paint_files_icon(ui, icon, icon_rect, FILES_PLACE_ICON, tint);
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_L, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::monospace(Style::SMALL),
+        if selected {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    response.on_hover_text(label)
 }
 
 /// The drag-and-drop payload: which pane the drag started in. The selection to
@@ -1257,7 +1404,7 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             section_header(ui, "PLACES");
             for spot in LOCAL_SPOTS {
                 let here = matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
-                if ui.selectable_label(here, spot.label).clicked() {
+                if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
                     actions.push(Action::Navigate(active, Location::Local(spot.path.to_string())));
                 }
             }
@@ -1480,26 +1627,17 @@ fn pane_view(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut V
 fn nav_row(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec<Action>) {
     let tab = b.pane(pane_ix).active_tab();
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(tab.can_back(), egui::Button::new("\u{2190}"))
-            .on_hover_text("Back")
-            .clicked()
-        {
+        let (back_icon, back_tip) = FILES_NAV_ICONS[0];
+        if files_nav_button(ui, back_icon, tab.can_back(), back_tip).clicked() {
             actions.push(Action::Back(pane_ix));
         }
-        if ui
-            .add_enabled(tab.can_forward(), egui::Button::new("\u{2192}"))
-            .on_hover_text("Forward")
-            .clicked()
-        {
+        let (forward_icon, forward_tip) = FILES_NAV_ICONS[1];
+        if files_nav_button(ui, forward_icon, tab.can_forward(), forward_tip).clicked() {
             actions.push(Action::Forward(pane_ix));
         }
         let can_up = tab.location().parent().is_some();
-        if ui
-            .add_enabled(can_up, egui::Button::new("\u{2191}"))
-            .on_hover_text("Up")
-            .clicked()
-        {
+        let (up_icon, up_tip) = FILES_NAV_ICONS[2];
+        if files_nav_button(ui, up_icon, can_up, up_tip).clicked() {
             actions.push(Action::Up(pane_ix));
         }
         ui.separator();
@@ -1697,13 +1835,25 @@ fn list_view(
             false
         };
         if !thumbed {
-            ui.painter().text(
-                egui::pos2(tag_x, cy),
-                Align2::LEFT_CENTER,
-                mime_tag(e.mime),
-                FontId::monospace(Style::SMALL),
-                Style::TEXT_DIM,
+            let icon_rect = Rect::from_center_size(
+                egui::pos2(tag_x + FILES_ROW_ICON * 0.5, cy),
+                egui::vec2(FILES_ROW_ICON, FILES_ROW_ICON),
             );
+            if !paint_files_icon(
+                ui,
+                file_type_icon(e.mime),
+                icon_rect,
+                FILES_ROW_ICON,
+                file_icon_tint(e),
+            ) {
+                ui.painter().text(
+                    egui::pos2(tag_x, cy),
+                    Align2::LEFT_CENTER,
+                    mime_tag(e.mime),
+                    FontId::monospace(Style::SMALL),
+                    Style::TEXT_DIM,
+                );
+            }
         }
         let name_clip = Rect::from_min_max(
             egui::pos2(name_x, rect.top()),
@@ -1742,17 +1892,25 @@ fn grid_view(
                 egui::pos2(rect.right() - Style::SP_XS, rect.bottom() - Style::SP_L),
             );
             if !draw_thumb(ui, b, e, art) {
-                ui.painter().text(
+                let icon_rect = Rect::from_center_size(
                     egui::pos2(rect.center().x, rect.top() + Style::SP_L),
-                    Align2::CENTER_CENTER,
-                    mime_tag(e.mime),
-                    FontId::monospace(Style::HEADING),
-                    if e.is_dir {
-                        Style::ACCENT
-                    } else {
-                        Style::TEXT_DIM
-                    },
+                    egui::vec2(FILES_GRID_ICON, FILES_GRID_ICON),
                 );
+                if !paint_files_icon(
+                    ui,
+                    file_type_icon(e.mime),
+                    icon_rect,
+                    FILES_GRID_ICON,
+                    file_icon_tint(e),
+                ) {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.top() + Style::SP_L),
+                        Align2::CENTER_CENTER,
+                        mime_tag(e.mime),
+                        FontId::monospace(Style::HEADING),
+                        file_icon_tint(e),
+                    );
+                }
             }
             let name_clip = Rect::from_min_max(
                 egui::pos2(rect.left() + Style::SP_XS, rect.bottom() - Style::SP_L),
@@ -1786,9 +1944,24 @@ fn details_view(
         paint_entry_bg(ui, resp.id, rect, e.selected, resp.hovered());
         let cols = detail_columns(rect);
         let cy = rect.center().y;
+        let icon_rect = Rect::from_center_size(
+            egui::pos2(cols.name.left() + FILES_ROW_ICON * 0.5, cy),
+            egui::vec2(FILES_ROW_ICON, FILES_ROW_ICON),
+        );
+        let icon_width = if paint_files_icon(
+            ui,
+            file_type_icon(e.mime),
+            icon_rect,
+            FILES_ROW_ICON,
+            file_icon_tint(e),
+        ) {
+            Style::SP_L
+        } else {
+            0.0
+        };
         // Name (clipped to its column).
         ui.painter().with_clip_rect(cols.name).text(
-            egui::pos2(cols.name.left(), cy),
+            egui::pos2(cols.name.left() + icon_width, cy),
             Align2::LEFT_CENTER,
             &e.name,
             FontId::monospace(Style::BODY),
@@ -3162,8 +3335,8 @@ const fn peer_color(status: PeerStatus) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::files_panel;
-    use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode};
+    use super::{file_type_icon, files_panel, local_place_icon, FILES_NAV_ICONS};
+    use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode, LOCAL_SPOTS};
     use crate::transfers::test_support::FakeTransfers;
     use crate::transfers::{Method, TransferJob, TransferPolicy, TransferState};
     use mde_egui::egui::{self, pos2, vec2, Color32, Rect, Stroke};
@@ -3506,6 +3679,68 @@ mod tests {
                 .any(|stroke| stroke.color == Style::TEXT.gamma_multiply(0.72)),
             "Files transfer pause action must paint a quiet outline: {strokes:?}"
         );
+    }
+
+    #[test]
+    fn files_navigation_toolbar_uses_yamis_icons() {
+        assert_eq!(FILES_NAV_ICONS.len(), 3);
+        for (icon, label) in FILES_NAV_ICONS {
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{label} navigation icon should resolve through the YAMIS catalog"
+            );
+            let img = mde_theme::brand::icons::icon_image(*icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| panic!("{label} navigation icon failed to rasterize: {err}"));
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{label} navigation icon rasterized empty"
+            );
+        }
+    }
+
+    #[test]
+    fn files_mime_glyphs_use_yamis_icons() {
+        for (mime, label) in [
+            (Mime::Folder, "folder"),
+            (Mime::Doc, "document"),
+            (Mime::Image, "image"),
+            (Mime::Pdf, "pdf"),
+            (Mime::Archive, "archive"),
+            (Mime::Disk, "disk"),
+        ] {
+            let icon = file_type_icon(mime);
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{label} MIME glyph should resolve through the YAMIS catalog"
+            );
+            let img = mde_theme::brand::icons::icon_image(icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| panic!("{label} MIME glyph failed to rasterize: {err}"));
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{label} MIME glyph rasterized empty"
+            );
+        }
+    }
+
+    #[test]
+    fn files_local_places_use_yamis_icons() {
+        for spot in LOCAL_SPOTS {
+            let icon = local_place_icon(spot.path);
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{} place glyph should resolve through the YAMIS catalog",
+                spot.label
+            );
+            let img = mde_theme::brand::icons::icon_image(icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| {
+                    panic!("{} place glyph failed to rasterize: {err}", spot.label)
+                });
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{} place glyph rasterized empty",
+                spot.label
+            );
+        }
     }
 
     #[test]

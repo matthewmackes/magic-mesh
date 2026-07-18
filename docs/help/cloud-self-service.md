@@ -7,7 +7,7 @@ Workbench's **Cloud plane** (it replaced the old Controller plane), and it is
 **mesh-only**: there is no web portal, and nothing is exposed to the internet.
 For access from outside the mesh, use a VDI desktop.
 
-> **Status:** this guide tracks the locked QUASAR-CLOUD design
+> **Status:** this guide tracks the locked CONSTRUCT-CLOUD design
 > (`docs/design/quasar-cloud.md`). The Cloud plane ships with QC-12/QC-13;
 > exact widget layout is decided at implementation. One plane serves everyone —
 > operators and members alike; there is no separate "My Cloud".

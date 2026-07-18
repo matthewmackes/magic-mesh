@@ -1,4 +1,4 @@
-//! QC-20 (QUASAR-CLOUD) — **cloud events into mesh chat + idle nudges**.
+//! QC-20 (CONSTRUCT-CLOUD) — **cloud events into mesh chat + idle nudges**.
 //!
 //! Design Q65 ("notifications KEPT — mesh chat, + cloud contacts") and Q90
 //! ("idle nudges — no auto-delete; idle instances trigger a chat nudge").

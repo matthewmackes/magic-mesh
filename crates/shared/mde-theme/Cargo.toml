@@ -1,6 +1,6 @@
 [package]
 name        = "mde-theme"
-description = "MCNF Quazar branding + build-identity — the single source of truth for the platform's version line, codename and (QBRAND) build stamp that every egui surface, the RPM and `--version` read from. Toolkit-free so the shell About, the daemon `--version` and packaging share one canonical copy without a GUI dependency."
+description = "Construct branding + MCNF build identity — the single source of truth for the platform's visible product labels, version line, codename, and QBRAND build stamp that every egui surface, the RPM, and `--version` read from. Toolkit-free so the shell About, the daemon `--version`, and packaging share one canonical copy without a GUI dependency."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # QBRAND-2 — SVG→raster for the brand icon set (`brand::icons`). `resvg` (which
 # re-exports its `usvg` parser + `tiny-skia` rasterizer) is pure Rust, so it
 # vendors cleanly on the airgapped farm. default-features OFF drops the
-# text/fontdb stack + raster-image decoding: the 19 Quazar glyphs are pure
+# text/fontdb stack + raster-image decoding: the platform glyphs are pure
 # `currentColor` line-art paths, and the wordmark's <text> logotype is
 # deliberately skipped until it is outlined (see the `brand::icons` docs).
 # Note: this keeps the crate toolkit-free — the loader returns plain RGBA8, no

@@ -4498,6 +4498,7 @@ dependencies = [
  "mde-chat",
  "mde-egui",
  "mde-files",
+ "mde-theme",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4559,6 +4560,14 @@ dependencies = [
  "mde-bus",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mde-maps-location-egui"
+version = "12.0.0"
+dependencies = [
+ "mde-egui",
+ "tempfile",
 ]
 
 [[package]]
@@ -4682,6 +4691,7 @@ dependencies = [
  "mde-files",
  "mde-files-egui",
  "mde-lighthouse-health",
+ "mde-maps-location-egui",
  "mde-media-egui",
  "mde-mesh-view",
  "mde-music-egui",

@@ -4,9 +4,10 @@ use super::{
     session_hover_protocol_badge_id, session_preview_texture_for_entry,
     session_preview_texture_rect, show_desktop_nub_id, start_cell_id, status_detail_toggle_id,
     taskbar_reveal, tray_overflow_id, tray_overflow_popup_id, tray_overflow_row_id,
-    DesktopRailSource, DockState, FileOperationProgress, SessionPreviewTexture, SessionRailEntry,
-    Surface, CELL_W, DOCK_W, FOCUS_RING_W, NOTIFICATION_RAIL_H, TRAY_OVERFLOW_ROW_H,
-    TRAY_OVERFLOW_W,
+    truncate_session_label, DesktopRailSource, DockState, FileOperationProgress,
+    SessionPreviewTexture, SessionRailEntry, Surface, CELL_W, DESKTOP_SOURCE_TOGGLE_ICON, DOCK_W,
+    FOCUS_RING_W, NOTIFICATION_RAIL_H, START_MENU_LAUNCH_ICON, STATUS_DETAIL_ICON,
+    TRAY_OVERFLOW_ICON, TRAY_OVERFLOW_ROW_H, TRAY_OVERFLOW_W,
 };
 use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegments};
@@ -30,6 +31,24 @@ fn grade(host: &str, score: u8, is_local: bool, stale: bool) -> GradeRow {
 /// preserves the order `chrome::NodeGrades::fold` produced.
 fn grades(rows: Vec<GradeRow>) -> NodeGrades {
     NodeGrades { rows, seen: true }
+}
+
+#[test]
+fn taskbar_session_label_truncation_uses_ascii_ellipsis() {
+    let label = truncate_session_label("This is a very long production desktop session name");
+    assert!(
+        label.ends_with("..."),
+        "long labels use ASCII ellipsis: {label}"
+    );
+    assert!(
+        !label.contains('…'),
+        "taskbar chrome must not render a Unicode ellipsis in truncated session labels: {label}"
+    );
+    assert_eq!(
+        truncate_session_label("Short VM"),
+        "Short VM",
+        "short labels are left unchanged"
+    );
 }
 
 /// a11y-03 (WCAG 2.4.7 *Focus Visible*): the shared keyboard-focus-ring seam
@@ -67,23 +86,24 @@ fn focus_ring_only_rings_the_focused_cell() {
         "the focus ring must sit inside its cell"
     );
     // The ring wears the theme's lifted brand accent (no dedicated focus token
-    // exists in the Quazar palette) — one rung brighter than the resting accent.
+    // exists in the Construct palette) — one rung brighter than the resting accent.
     assert_ne!(Style::ACCENT_HI, Style::ACCENT);
 }
 
 #[test]
 fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-    // Seventeen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+    // Nineteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
     // the brokered Desktop surface, the app surfaces (Music / Media — the
     // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
-    // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
-    // PTY, TERM-16 / Editor — the native Zed-style code editor, EDITOR-1), the
+    // browser, BOOKMARKS-6 / Bookmarks / Maps & Location / Terminal — the
+    // Terminator-class terminal over a real PTY, TERM-16 / Editor — the native
+    // Zed-style code editor, EDITOR-1), the
     // unified Chat surface (the ONE notification interface — the standalone
     // Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the Phones
     // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
     // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
     // and the About surface (the platform-identity screen, QBRAND-6).
-    assert_eq!(Surface::ALL.len(), 18);
+    assert_eq!(Surface::ALL.len(), 19);
     assert_eq!(Surface::ALL[0], Surface::Workbench);
     for s in [
         Surface::MeshView,
@@ -96,6 +116,7 @@ fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
         Surface::Voice,
         Surface::Browser,
         Surface::Bookmarks,
+        Surface::MapsLocation,
         Surface::Terminal,
         Surface::Editor,
         Surface::Chat,
@@ -110,8 +131,8 @@ fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
 }
 
 #[test]
-fn the_shell_opens_on_the_workbench_surface() {
-    assert_eq!(Surface::default(), Surface::Workbench);
+fn the_shell_opens_on_remote_sessions() {
+    assert_eq!(Surface::default(), Surface::Desktop);
 }
 
 // --- QBRAND-7: every dock surface renders a brand::icons glyph ----------------
@@ -132,6 +153,7 @@ fn every_surface_maps_to_a_named_brand_glyph() {
         (Surface::Voice, IconId::Voice),
         (Surface::Browser, IconId::Browser),
         (Surface::Bookmarks, IconId::Bookmarks),
+        (Surface::MapsLocation, IconId::MapsLocation),
         (Surface::Terminal, IconId::Terminal),
         (Surface::Editor, IconId::Editor),
         (Surface::Chat, IconId::Chat),
@@ -151,7 +173,7 @@ fn every_surface_maps_to_a_named_brand_glyph() {
             "{surface:?} maps to the blank wordmark"
         );
     }
-    // The map is injective — 18 surfaces, 18 distinct glyph names (IaC wears
+    // The map is injective — 19 surfaces, 19 distinct glyph names (IaC wears
     // the Server badge, Explorer the stacked-cards Instances glyph, each
     // unshared by any other surface).
     let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
@@ -173,13 +195,14 @@ fn every_surface_maps_to_a_nonempty_display_label() {
         (Surface::MeshView, "Mesh Map"),
         (Surface::Explorer, "Explorer"),
         (Surface::InfraCode, "Infra as Code"),
-        (Surface::Desktop, "Desktop"),
+        (Surface::Desktop, "Remote Sessions"),
         (Surface::Music, "Music"),
         (Surface::Media, "Media"),
         (Surface::Files, "Files"),
         (Surface::Voice, "Voice"),
         (Surface::Browser, "Browser"),
         (Surface::Bookmarks, "Bookmarks"),
+        (Surface::MapsLocation, "Maps & Location"),
         (Surface::Terminal, "Terminal"),
         (Surface::Editor, "Editor"),
         (Surface::Chat, "Chat"),
@@ -193,7 +216,7 @@ fn every_surface_maps_to_a_nonempty_display_label() {
         assert_eq!(surface.label(), label, "{surface:?} → wrong label");
         assert!(!label.is_empty(), "{surface:?} has a blank label");
     }
-    // Injective over Surface::ALL — 18 surfaces, 18 distinct labels.
+    // Injective over Surface::ALL — 19 surfaces, 19 distinct labels.
     let mut labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
     labels.sort_unstable();
     labels.dedup();
@@ -396,10 +419,6 @@ fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
         .read_response(clock_cell_id())
         .expect("clock registered")
         .rect;
-    let pin = ctx
-        .read_response(egui::Id::new("vdock-pin"))
-        .expect("pin registered")
-        .rect;
 
     assert!(
         start.right() <= session.left() + 1.0,
@@ -413,22 +432,72 @@ fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
         tray.right() <= clock.left() + 1.0,
         "the tray sits left of the clock"
     );
-    assert!(
-        clock.right() <= pin.left() + 1.0,
-        "the auto-hide pin trails the clock rather than interrupting the \
-         locked Start · sessions · tray · clock order"
-    );
-    for (label, r) in [
-        ("session", session),
-        ("tray", tray),
-        ("clock", clock),
-        ("pin", pin),
-    ] {
+    for (label, r) in [("session", session), ("tray", tray), ("clock", clock)] {
         assert!(
             (r.center().y - start.center().y).abs() < 2.0,
             "{label} shares the Start cell's row"
         );
     }
+}
+
+#[test]
+fn start_cell_keyboard_activation_latches_only_the_start_launcher_toggle() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    ctx.memory_mut(|m| m.request_focus(start_cell_id()));
+    drive_vdock(&ctx, &mut s, vec![key(egui::Key::Enter)], sz);
+
+    assert!(
+        s.take_start_menu_toggle(),
+        "Enter on the focused Start taskbar cell must latch the Start launcher toggle"
+    );
+    assert!(
+        !s.take_start_menu_toggle(),
+        "the Start launcher toggle must remain a one-shot latch"
+    );
+    assert_eq!(
+        s.active(),
+        Surface::Desktop,
+        "activating Start must not route the shell body through another taskbar opener"
+    );
+}
+
+#[test]
+fn start_cell_pointer_activation_latches_only_the_start_launcher_toggle() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    let start = ctx
+        .read_response(start_cell_id())
+        .expect("Start cell registered")
+        .rect
+        .center();
+
+    click_rail_cell(&ctx, &mut s, start, sz);
+
+    assert!(
+        s.take_start_menu_toggle(),
+        "primary click on the Start taskbar cell must latch the Start launcher toggle"
+    );
+    assert!(
+        !s.take_start_menu_toggle(),
+        "the pointer launcher toggle must remain a one-shot latch"
+    );
+    assert_eq!(
+        s.active(),
+        Surface::Desktop,
+        "clicking Start must not route the shell body through another taskbar opener"
+    );
 }
 
 #[test]
@@ -469,8 +538,8 @@ fn win10_the_taskbar_is_a_fixed_48px_height_across_densities() {
 // + the non-overlap contract that keeps them clear of the running-sessions run.
 
 /// Press-then-release a primary click at `pos` over the driven bottom rail,
-/// mirroring `clicking_the_pin_toggle_pins_the_dock_open` — prime, move+press
-/// one frame, release the next.
+/// Prime, move+press one frame, release the next so egui registers a real rail
+/// click.
 fn click_rail_cell(ctx: &egui::Context, s: &mut DockState, pos: egui::Pos2, sz: egui::Vec2) {
     let press = egui::Event::PointerButton {
         pos,
@@ -517,22 +586,19 @@ fn win10_hybrid_31_the_action_center_cell_routes_to_chat() {
 #[test]
 fn win10_hybrid_31_the_show_desktop_nub_routes_to_desktop() {
     // The far-right show-desktop nub minimizes to the Desktop (VDI) surface,
-    // Win10's "show desktop" corner. The shell opens on the Workbench, so a nub
-    // click is an observable route away from it.
+    // Win10's "show desktop" corner. Start from another active surface so a nub
+    // click is an observable route back to Remote Sessions.
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let mut s = DockState::default();
+    s.set_active(Surface::Browser);
     s.toggle(); // reveal the rail so its cells mount
     let sz = egui::vec2(1280.0, 800.0);
     // Prime two frames so egui registers the nub's rect (matching the pin/action
     // tests — one frame is not enough for the click to land).
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
-    assert_ne!(
-        s.active,
-        Surface::Desktop,
-        "the shell opens on the Workbench, not the Desktop"
-    );
+    assert_ne!(s.active, Surface::Desktop, "start off Remote Sessions");
     let center = ctx
         .read_response(show_desktop_nub_id())
         .expect("the show-desktop nub is registered")
@@ -590,10 +656,6 @@ fn win10_hybrid_31_the_new_tray_cells_do_not_overlap_the_sessions_run() {
         .read_response(show_desktop_nub_id())
         .expect("show-desktop nub registered")
         .rect;
-    let pin = ctx
-        .read_response(egui::Id::new("vdock-pin"))
-        .expect("pin registered")
-        .rect;
     let clock = ctx
         .read_response(clock_cell_id())
         .expect("clock registered")
@@ -609,19 +671,15 @@ fn win10_hybrid_31_the_new_tray_cells_do_not_overlap_the_sessions_run() {
         session.right() <= action.left() + 1.0,
         "the sessions run never slides under the action-center cell"
     );
-    // The new cells slot in cleanly: clock · action-center · pin · nub, and the
+    // The right-edge cells slot in cleanly: clock · action-center · nub, and the
     // nub hugs the taskbar's very right edge (Win10's show-desktop corner).
     assert!(
         clock.right() <= action.left() + 1.0,
         "the action-center sits right of the clock"
     );
     assert!(
-        action.right() <= pin.left() + 1.0,
-        "the action-center sits left of the pin"
-    );
-    assert!(
-        pin.right() <= nub.left() + 1.0,
-        "the show-desktop nub trails past the pin"
+        action.right() <= nub.left() + 1.0,
+        "the show-desktop nub trails past the action-center"
     );
     assert!(
         (nub.right() - sz.x).abs() < 1.0,
@@ -771,7 +829,7 @@ fn win10_hybrid_31_tray_overflow_flyout_routes_status_segments() {
 
     let overflow = ctx
         .read_response(tray_overflow_id())
-        .expect("the tray overflow chevron is registered")
+        .expect("the tray overflow control is registered")
         .rect;
     click_rail_cell(&ctx, &mut s, overflow.center(), sz);
     assert!(s.tray_overflow_open, "clicking ▲ opens the tray flyout");
@@ -803,7 +861,7 @@ fn win10_hybrid_31_tray_overflow_flyout_routes_status_segments() {
     );
     assert!(
         alerts.y < overflow.top(),
-        "the computed Alerts row click target sits above the tray chevron"
+        "the computed Alerts row click target sits above the tray overflow control"
     );
     drive_vdock(&ctx, &mut s, vec![egui::Event::PointerMoved(alerts)], sz);
     drive_vdock(&ctx, &mut s, vec![egui::Event::PointerMoved(alerts)], sz);
@@ -890,12 +948,8 @@ fn win7_desktop_1_regression_the_taskbar_anchors_to_the_screens_true_bottom_edge
         .read_response(clock_cell_id())
         .expect("clock registered")
         .rect;
-    let pin = ctx
-        .read_response(egui::Id::new("vdock-pin"))
-        .expect("pin registered")
-        .rect;
 
-    for (label, r) in [("Start", start), ("clock", clock), ("pin", pin)] {
+    for (label, r) in [("Start", start), ("clock", clock)] {
         assert!(
             (r.bottom() - sz.y).abs() < Style::SP_S,
             "{label} cell's bottom edge must sit within one small-spacing \
@@ -955,6 +1009,38 @@ fn win7_desktop_1_regression_the_status_panel_opens_above_the_rail_not_the_scree
     );
 }
 
+#[test]
+fn health_panel_opens_from_the_right_side_health_cell() {
+    // The Health detail panel is triggered from the right taskbar cluster; it should
+    // open above that cluster, not from the rail's left edge.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    s.open_status_panel_for_test();
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let health = ctx
+        .read_response(status_detail_toggle_id())
+        .expect("health panel taskbar cell registered")
+        .rect;
+    let panel = ctx
+        .read_response(status::status_panel_id())
+        .expect("status panel registered while open")
+        .rect;
+
+    assert!(
+        panel.right() <= health.right() + Style::SP_S,
+        "health panel should right-align to the Health taskbar cell: panel={panel:?} health={health:?}"
+    );
+    assert!(
+        panel.left() > sz.x / 2.0,
+        "health panel should open on the right side of the screen, not at the left edge: {panel:?}"
+    );
+}
+
 // ── VDOCK-4: the system 2×2 quad + Power menu (design #7/#17/#18) ──────────
 
 // ── NODE-GRADE-2: the grade mini-list band (design #5/#7/#8/#18/#19) ───────
@@ -978,12 +1064,170 @@ fn accesskit_nodes(
         .clone()
 }
 
+fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                out.push(rect.fill);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text_color(text)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_mesh_vertex_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Mesh(mesh) => out.extend(mesh.vertices.iter().map(|vertex| vertex.color)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn visible_black(color: egui::Color32) -> bool {
+    color.r() == 0 && color.g() == 0 && color.b() == 0 && color.a() >= 0x80
+}
+
+fn visible_white(color: egui::Color32) -> bool {
+    let full_strength_white =
+        color.r() >= 0xF0 && color.g() >= 0xF0 && color.b() >= 0xF0 && color.a() >= 0x80;
+    let opacity_applied_white = color.a() >= 0x80
+        && color.r().abs_diff(color.a()) <= 1
+        && color.g().abs_diff(color.a()) <= 1
+        && color.b().abs_diff(color.a()) <= 1;
+    full_strength_white || opacity_applied_white
+}
+
 fn accesskit_bounds_rect(node: &egui::accesskit::Node) -> egui::Rect {
     let bounds = node.bounds().expect("accesskit node has bounds");
     egui::Rect::from_min_max(
         egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
         egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
     )
+}
+
+#[test]
+fn taskbar_launch_sources_health_and_overflow_use_distinct_non_chevron_icons() {
+    let icons = [
+        START_MENU_LAUNCH_ICON,
+        DESKTOP_SOURCE_TOGGLE_ICON,
+        STATUS_DETAIL_ICON,
+        TRAY_OVERFLOW_ICON,
+    ];
+    assert_eq!(START_MENU_LAUNCH_ICON, IconId::Start);
+    assert_eq!(DESKTOP_SOURCE_TOGGLE_ICON, IconId::Desktop);
+    assert_eq!(STATUS_DETAIL_ICON, IconId::Signal);
+    assert_eq!(TRAY_OVERFLOW_ICON, IconId::MoreHorizontal);
+    assert!(
+        !icons.contains(&IconId::ChevronUp),
+        "taskbar actions should not share the old up-arrow glyph"
+    );
+    let mut names: Vec<&str> = icons.iter().map(|icon| icon.name()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        icons.len(),
+        "taskbar action icons must be distinct"
+    );
+}
+
+#[test]
+fn taskbar_controls_render_white_icons_on_a_black_bar() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    let fills = painted_rect_fills(&out.shapes);
+    assert!(
+        fills.iter().copied().any(visible_black),
+        "taskbar strip should paint the requested black bar: {fills:?}"
+    );
+    let mesh_colors = painted_mesh_vertex_colors(&out.shapes);
+    assert!(
+        mesh_colors.iter().copied().any(visible_white),
+        "taskbar icon meshes should be tinted white: {mesh_colors:?}"
+    );
+    let text_colors = painted_text_colors(&out.shapes);
+    assert!(
+        text_colors.iter().copied().any(visible_white),
+        "clock/taskbar text glyphs should be white on the black bar: {text_colors:?}"
+    );
 }
 
 #[test]
@@ -1027,8 +1271,9 @@ fn win7_7_the_taskbar_itself_exports_a_toolbar_landmark() {
 fn win7_7_every_primary_taskbar_cell_exports_a_labelled_button_when_sessions_are_empty() {
     // The sessions-empty state is DockState's default — this sweep proves
     // the whole four-part contract (Start · sessions(fallback) · tray ·
-    // clock) plus the pin and the Desktop-source caret all export real
-    // `Button` nodes, not just the tray pips `status.rs` already covered.
+    // clock) plus the action center, show-desktop nub, and Desktop-source caret
+    // all export real `Button` nodes, not just the tray pips `status.rs` already
+    // covered.
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     Style::install(&ctx);
@@ -1042,9 +1287,8 @@ fn win7_7_every_primary_taskbar_cell_exports_a_labelled_button_when_sessions_are
     for label in [
         "Start",
         "Sessions",
-        "Notification panel",
+        "Health panel",
         "Clock",
-        "Pin",
         "Desktop sources",
     ] {
         let node = nodes
@@ -1336,7 +1580,7 @@ fn win7_7_the_clocks_accesskit_value_carries_the_live_time_reading() {
 }
 
 #[test]
-fn win7_7_the_pin_and_notification_toggle_report_their_state_via_accesskit_value() {
+fn win7_7_the_notification_toggle_reports_state_and_startbar_pin_is_absent() {
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     Style::install(&ctx);
@@ -1360,38 +1604,39 @@ fn win7_7_the_pin_and_notification_toggle_report_their_state_via_accesskit_value
     drive_vdock(&ctx, &mut s, Vec::new(), sz); // settle
     let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
     let nodes = accesskit_nodes(&out);
-    let pin = nodes
-        .iter()
-        .map(|(_, n)| n)
-        .find(|n| n.label() == Some("Pin"))
-        .expect("the pin exports an accesskit node");
-    assert_eq!(pin.value(), Some("Not pinned"));
+    assert!(
+        nodes
+            .iter()
+            .map(|(_, n)| n)
+            .all(|n| n.label() != Some("Pin")),
+        "the removed Start bar pin must not export an accesskit node"
+    );
     let toggle = nodes
         .iter()
         .map(|(_, n)| n)
-        .find(|n| n.label() == Some("Notification panel"))
+        .find(|n| n.label() == Some("Health panel"))
         .expect("the notification toggle exports an accesskit node");
     assert_eq!(
         toggle.value(),
         Some("Collapsed; 2/3 peers online; mesh degraded")
     );
 
-    // Pin it, and open the notification panel — the SAME nodes must now
-    // report the opposite state, not a value frozen at first paint.
-    s.toggle_pin();
+    // Open the notification panel — the SAME node must now report the opposite
+    // state, not a value frozen at first paint.
     s.status_panel_open = true;
     let out2 = drive_vdock(&ctx, &mut s, Vec::new(), sz);
     let nodes2 = accesskit_nodes(&out2);
-    let pin2 = nodes2
-        .iter()
-        .map(|(_, n)| n)
-        .find(|n| n.label() == Some("Pin"))
-        .expect("the pin still exports an accesskit node");
-    assert_eq!(pin2.value(), Some("Pinned"));
+    assert!(
+        nodes2
+            .iter()
+            .map(|(_, n)| n)
+            .all(|n| n.label() != Some("Pin")),
+        "the removed Start bar pin must stay absent after state changes"
+    );
     let toggle2 = nodes2
         .iter()
         .map(|(_, n)| n)
-        .find(|n| n.label() == Some("Notification panel"))
+        .find(|n| n.label() == Some("Health panel"))
         .expect("the notification toggle still exports an accesskit node");
     assert_eq!(
         toggle2.value(),
@@ -1489,6 +1734,11 @@ fn win7_7_the_session_overflow_more_cell_reports_the_real_hidden_count() {
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
     let nodes = accesskit_nodes(&out);
+    let texts = painted_text(&out.shapes);
+    assert!(
+        !texts.iter().any(|text| text.contains('⋯')),
+        "the session overflow More cell should paint the YAMIS icon, not a text ellipsis: {texts:?}"
+    );
 
     let visible = entries
         .iter()
@@ -1600,6 +1850,7 @@ fn the_status_segment_pips_route_to_their_surfaces() {
         (StatusSegment::Device, Surface::System),
         (StatusSegment::Mesh, Surface::MeshView),
         (StatusSegment::Power, Surface::System),
+        (StatusSegment::RemoteControl, Surface::System),
         (StatusSegment::FileOperations, Surface::Files),
         (StatusSegment::Alerts, Surface::Chat),
     ] {
@@ -1624,8 +1875,8 @@ fn the_status_segment_pips_route_to_their_surfaces() {
 }
 
 #[test]
-fn the_status_chevron_opens_and_dismisses_the_detail_panel() {
-    // NOTIF-4 — the detail panel mounts from the bottom rail's status chevron
+fn the_health_control_opens_and_dismisses_the_detail_panel() {
+    // NOTIF-4 — the detail panel mounts from the bottom rail's Health control
     // (`status_detail_toggle`); Escape and click-away both dismiss it.
     let ctx = egui::Context::default();
     Style::install(&ctx);
@@ -1647,13 +1898,13 @@ fn the_status_chevron_opens_and_dismisses_the_detail_panel() {
     assert!(!s.status_panel_open, "panel starts closed");
     let caret = ctx
         .read_response(status_detail_toggle_id())
-        .expect("bottom-rail status chevron renders")
+        .expect("bottom-rail Health control renders")
         .rect
         .center();
     click_rail_cell(&ctx, &mut s, caret, sz);
     assert!(
         s.status_panel_open,
-        "the status chevron opens the detail panel"
+        "the Health control opens the detail panel"
     );
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);

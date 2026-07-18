@@ -232,7 +232,7 @@ impl eframe::App for Panel {
             self.last_poll = Instant::now();
         }
 
-        // An explicit panel frame (CRAFT §3): the Quazar BG fill plus a single
+        // An explicit panel frame (CRAFT §3): the Construct BG fill plus a single
         // on-rhythm inner margin, so content is inset symmetrically on every edge
         // instead of leaning on scattered per-row `add_space(SP_M)` shims.
         let frame = egui::Frame::default()

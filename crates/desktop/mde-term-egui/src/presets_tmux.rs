@@ -2,7 +2,7 @@
 //!
 //! Design: `docs/design/tmux-first-class.md` (#11/#13). Five curated tmux layouts
 //! for the operator's everyday jobs, each a window of seeded-command panes in the
-//! Quazar style — distinct from the stock tmux five ([`crate::tmux::StockLayout`]).
+//! Construct style — distinct from the stock tmux five ([`crate::tmux::StockLayout`]).
 //!
 //! Each preset is a built-in [`Blueprint`] (the same recipe a TMUX-FC-5 template
 //! opens), so opening one builds a detached session and switches the control

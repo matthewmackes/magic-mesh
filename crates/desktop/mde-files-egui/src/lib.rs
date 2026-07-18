@@ -1,4 +1,4 @@
-//! `mde-files-egui` — the MCNF **"Quazar"** egui file-manager surface (FILEMGR-8).
+//! `mde-files-egui` — the MCNF **"Construct"** egui file-manager surface (FILEMGR-8).
 //!
 //! An `eframe` app on the shared [`mde_egui`] harness that reuses `mde-files`'
 //! render-agnostic core — the `Backend` trait, the `FileRow`/`Peer` model, the

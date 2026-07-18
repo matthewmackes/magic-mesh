@@ -1731,7 +1731,7 @@ pub fn render_fleet_heat_stack(
     let _ = write!(
         body,
         "description: >\n  \
-         MCNF fleet-rendered orchestration stack (QUASAR-CLOUD QC-19, lock Q61).\n  \
+         MCNF fleet-rendered orchestration stack (CONSTRUCT-CLOUD QC-19, lock Q61).\n  \
          Rendered by the mackesd openstack worker from the one-state fleet doctrine\n  \
          (etcd + TOML-on-Syncthing, Q30) — the fleet is authoritative and this\n  \
          template is DERIVED from it, never hand-authored. It provisions nothing\n  \
@@ -1806,13 +1806,13 @@ pub fn render_navidrome_heat_stack(
         r#"heat_template_version: 2021-04-16
 description: >
   QC-18 Navidrome media service re-platformed as a Nova instance.
-  Rendered by mackesd from the Quazar cloud doctrine; Heat owns the
+  Rendered by mackesd from the Construct cloud doctrine; Heat owns the
   workload, Nova runs it, and media is mounted from the object tier.
   Kolla release: {release}.
 parameters:
   image:
     type: string
-    default: mcnf-quasar-media
+    default: mcnf-construct-media
     description: guest image containing /usr/libexec/mackesd/setup-media-navidrome.
   flavor:
     type: string
@@ -3131,7 +3131,7 @@ mod tests {
         assert!(hot.contains("type: OS::Neutron::SecurityGroup"), "{hot}");
         assert!(hot.contains("port_range_min: 4533"), "{hot}");
         assert!(hot.contains("remote_ip_prefix: 10.0.0.0/8"), "{hot}");
-        assert!(hot.contains("default: mcnf-quasar-media"), "{hot}");
+        assert!(hot.contains("default: mcnf-construct-media"), "{hot}");
         assert!(hot.contains("default: m1.small"), "{hot}");
         assert!(hot.contains("default: mesh"), "{hot}");
         for secret in [

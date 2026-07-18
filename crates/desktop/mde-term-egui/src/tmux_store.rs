@@ -11,7 +11,7 @@
 //! This is deliberately **node-local** (not the mesh-synced workgroup root a
 //! saved *layout* uses): "which session this client reattaches to" is a property
 //! of *this* terminal on *this* node, not a shared artefact. The mesh-synced
-//! surface is the Quazar tmux **config** (TMUX-FC-8), a separate store.
+//! surface is the Construct tmux **config** (TMUX-FC-8), a separate store.
 
 use std::fs;
 use std::io;
