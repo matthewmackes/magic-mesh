@@ -533,6 +533,7 @@ impl FrontDoorState {
         let hit = hits.get(self.selected.min(hits.len().saturating_sub(1)))?;
         match &hit.item.payload {
             FrontDoorTarget::Mesh(id) => peer_node_for_unit_id(id).map(str::to_owned),
+            FrontDoorTarget::PeerApp(target) => Some(target.node.clone()),
             _ => None,
         }
     }
@@ -5100,6 +5101,29 @@ mod tests {
         assert!(
             connect.supports_action(egui::accesskit::Action::Click),
             "Front Door peer Connect should be a real clickable action"
+        );
+    }
+
+    #[test]
+    fn front_door_selected_peer_app_reports_owning_node_for_lazy_load_context() {
+        let mut state = FrontDoorState::default();
+        state.open();
+        let items = peer_app_search_items(
+            [FrontDoorPeerApp {
+                id: "org.mozilla.Firefox.desktop".to_owned(),
+                name: "Firefox".to_owned(),
+                node: "oak".to_owned(),
+                source: "flatpak".to_owned(),
+                icon: "firefox".to_owned(),
+                health: "online".to_owned(),
+                state: "installed".to_owned(),
+            }],
+            0,
+        );
+
+        assert_eq!(
+            state.selected_peer_node(items, FrontDoorSourceStatus::default()),
+            Some("oak".to_owned())
         );
     }
 

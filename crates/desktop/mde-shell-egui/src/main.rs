@@ -35,6 +35,7 @@ mod dock;
 mod explorer;
 mod formfactor;
 mod front_door;
+mod front_door_peer_apps;
 mod host_mirror;
 mod hotkeys;
 mod iac;
@@ -267,6 +268,9 @@ struct Shell {
     /// Browser web-search action through the shared ranker. It is also the
     /// Start/Super panel-mode launcher for WL-UX-005.
     front_door: front_door::FrontDoorState,
+    /// WL-UX-005 peer-app lazy-load: non-blocking `action/apps/peer-list` cache
+    /// for the mesh node currently focused in Front Door.
+    front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState,
     /// CONSOLE-1 — the Console front door (`docs/design/console-frontdoor.md`):
     /// the Win10-style taxonomy of operational entries. Pre-WIN7-2 this was
     /// its own standalone panel the dock's Start cell toggled directly; it is
@@ -495,6 +499,7 @@ impl Shell {
             vdock: dock::DockState::default(),
             start_menu: start_menu::StartMenuState::load(),
             front_door: front_door::FrontDoorState::default(),
+            front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState::default(),
             // WIN7-8 (lock #21) — `for_shell` (not bare `default`) so the real
             // shell also gets mesh-wide Custom-entry sync; see `console.rs`'s
             // `custom_sync` field doc for why the two constructors are split.
@@ -1694,9 +1699,23 @@ impl Shell {
         }
     }
 
+    fn front_door_base_items(&self) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
+        self.front_door_items_from_peer_apps(Vec::new())
+    }
+
     fn front_door_items(&self) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
+        self.front_door_items_from_peer_apps(self.front_door_peer_apps.items())
+    }
+
+    fn front_door_items_from_peer_apps(
+        &self,
+        peer_apps: Vec<front_door::FrontDoorPeerApp>,
+    ) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
         let mut items = front_door::app_search_items_with_pins(self.start_menu.pinned_surfaces());
         let mut rank = items.len();
+
+        items.extend(front_door::peer_app_search_items(peer_apps, rank));
+        rank = items.len();
 
         items.extend(front_door::workflow_search_items(rank));
         rank = items.len();
@@ -1914,8 +1933,10 @@ impl Shell {
             return;
         }
         let pinned = self.start_menu.pinned_surfaces().to_vec();
-        let items = self.front_door_items();
         let sources = self.front_door_source_status();
+        let base_items = self.front_door_base_items();
+        self.drive_front_door_peer_apps(&base_items, sources);
+        let items = self.front_door_items();
         if let Some(request) = front_door::front_door_panel_with_sources(
             ctx,
             &mut self.front_door,
@@ -1925,6 +1946,16 @@ impl Shell {
         ) {
             self.handle_front_door_request(ctx, request);
         }
+    }
+
+    fn drive_front_door_peer_apps(
+        &mut self,
+        items: &[SearchItem<front_door::FrontDoorTarget>],
+        sources: front_door::FrontDoorSourceStatus,
+    ) {
+        let focused = self.front_door.selected_peer_node(items.to_vec(), sources);
+        self.front_door_peer_apps
+            .drive_for_focus(focused.as_deref());
     }
 
     fn front_door_source_status(&self) -> front_door::FrontDoorSourceStatus {
@@ -2237,12 +2268,12 @@ mod tests {
     use super::{
         chat, complete_menu_bar_minimize, console, datacenter,
         desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
-        media_header, media_panel, publish_front_door_instance_lifecycle_to_bus,
-        publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
-        reserved_dock_gutter, reserved_taskbar_strut, route_file_operation_progress_request,
-        screenshot, shell_file_operation_progress, splash, start_menu, status, terminal_panel,
-        Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
-        MENU_BAR_MINIMIZE_DURATION,
+        front_door_peer_apps, media_header, media_panel,
+        publish_front_door_instance_lifecycle_to_bus, publish_front_door_service_lifecycle_to_bus,
+        real_editor, real_media, real_terminal, reserved_dock_gutter, reserved_taskbar_strut,
+        route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
+        start_menu, status, terminal_panel, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell,
+        Surface, VideoTextureCache, MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -3724,6 +3755,75 @@ mod tests {
             Surface::Desktop,
             "Front Door peer Connect should enter the Desktop chooser/connect path"
         );
+    }
+
+    #[test]
+    fn front_door_selected_mesh_peer_lazy_loads_peer_apps_from_bus() {
+        let ctx = egui::Context::default();
+        let mut shell = Shell::new_for_ctx(&ctx);
+        let dir = tempfile::tempdir().expect("temp bus");
+        let root = dir.path().to_path_buf();
+        shell.front_door_peer_apps =
+            front_door_peer_apps::FrontDoorPeerAppsState::new(Some(root.clone()));
+        shell.front_door.open();
+
+        let items = vec![mde_egui::search_omnibox::SearchItem::new(
+            mde_egui::search_omnibox::SearchDomain::Mesh,
+            "oak",
+            "peer:oak",
+            front_door::FrontDoorTarget::Mesh("peer:oak".to_owned()),
+        )];
+        shell.drive_front_door_peer_apps(&items, front_door::FrontDoorSourceStatus::default());
+
+        let persist = Persist::open(root.clone()).expect("open bus");
+        let requests = persist
+            .list_since("action/apps/peer-list", None)
+            .expect("peer-list requests");
+        assert_eq!(requests.len(), 1);
+        let request_body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("request body"))
+                .expect("request json");
+        assert_eq!(request_body["node"], "oak");
+
+        let ulid = shell
+            .front_door_peer_apps
+            .pending_ulid()
+            .expect("pending peer-list request")
+            .to_owned();
+        let reply = serde_json::json!({
+            "ok": true,
+            "node": "oak",
+            "entries": [{
+                "id": "org.mozilla.Firefox.desktop",
+                "name": "Firefox",
+                "source": "flatpak",
+                "icon": "firefox",
+                "health": "online",
+                "state": "installed"
+            }]
+        })
+        .to_string();
+        persist
+            .write(
+                &mde_bus::rpc::reply_topic(&ulid),
+                Priority::Default,
+                None,
+                Some(&reply),
+            )
+            .expect("write reply");
+
+        shell.drive_front_door_peer_apps(&items, front_door::FrontDoorSourceStatus::default());
+        let peer_app = shell
+            .front_door_items()
+            .into_iter()
+            .find_map(|item| match item.payload {
+                front_door::FrontDoorTarget::PeerApp(target) => Some(target),
+                _ => None,
+            })
+            .expect("peer app row");
+        assert_eq!(peer_app.node, "oak");
+        assert_eq!(peer_app.app_id, "org.mozilla.Firefox.desktop");
+        assert_eq!(peer_app.name, "Firefox");
     }
 
     #[test]

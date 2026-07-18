@@ -1908,8 +1908,20 @@ These decisions refine acceptance and sequencing for the active items below.
   `front_door_lifecycle_candidates_use_cached_vm_and_container_rosters` passed;
   `.170` focused
   `front_door_service_lifecycle_request_writes_directory_bus_action` passed;
-  `.50` `cargo fmt -p mde-shell-egui --check` passed. Peer app lazy-load, parity
-  retirement, and live `.15` Sunshine/Moonlight proof remain open.
+  `.50` `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18
+  Front Door peer-app lazy-load consumer slice added a shell-side
+  `action/apps/peer-list` Bus request/reply cache, folds the daemon's
+  installed-app reply into `FrontDoorPeerApp` rows, keeps the selected peer node
+  stable once peer-app rows appear, and feeds those rows into the unified
+  Front Door app list without depending on the `mackesd` crate or blocking on
+  network peer discovery. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui -- --check` passed; `.90` focused
+  `cargo test -p mde-shell-egui front_door_peer_apps -- --nocapture` passed 2
+  tests; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 62 tests,
+  including the new shell Bus fold and selected peer-app context coverage.
+  App-specific remote launch through the app-launch verb, parity retirement, and
+  live `.15` Sunshine/Moonlight proof remain open.
   A later 2026-07-18 Front Door hover-polish slice replaced the expansion
   control's raw egui tooltip with a Front Door themed tooltip surface and added
   rendered text-color coverage so the launcher layout hover cannot regress into
