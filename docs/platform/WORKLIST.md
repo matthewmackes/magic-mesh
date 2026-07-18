@@ -1606,6 +1606,12 @@ These decisions refine acceptance and sequencing for the active items below.
 	  buttons while preserving hover text and widget metadata; farm `.90`
 	  focused `files_tab_strip_controls_use_yamis_icon_buttons` and `.50`
 	  `cargo fmt -p mde-files-egui -- --check` passed.
+	  A follow-up Media queue icon slice replaced raw `✕`/`▼`/`▲` queue row
+	  text buttons with labelled icon-only controls using the shared empty-button
+	  plus painted-icon pattern, preserving remove/move behavior, hover text,
+	  pointing cursor, and widget metadata. Farm evidence: BigBoy `.130` focused
+	  `cargo test -p mde-media-egui queue_view_renders_empty_and_with_items -- --nocapture`
+	  passed, and `.50` `cargo fmt -p mde-media-egui -- --check` passed.
 	  Remaining icon work is the full per-surface sweep for
 	  hand-painted icons or other code paths that bypass `IconId`, removal or
   repointing of stale Carbon/Material asset uses, and live rendered proof on the
@@ -1937,8 +1943,15 @@ These decisions refine acceptance and sequencing for the active items below.
   tests; BigBoy `.130` focused
   `cargo test -p mde-shell-egui front_door -- --nocapture` passed 62 tests,
   including the new shell Bus fold and selected peer-app context coverage.
-  App-specific remote launch through the app-launch verb, parity retirement, and
-  live `.15` Sunshine/Moonlight proof remain open.
+  A follow-up 2026-07-18 Front Door peer-app launch slice changed peer-app
+  primary actions from Desktop Connect to Launch, publishes a typed
+  `action/apps/launch` Bus request with node/app_id/name, keeps Desktop Connect
+  as a secondary action, and makes `mackesd` validate `app_id` against the
+  peer's published `apps-installed.json` inventory before returning the existing
+  desktop launch target. Farm evidence: `.50` fmt, `.90` `ipc::apps`, BigBoy
+  `.130` focused `front_door_peer_app`, and BigBoy `.130` full `front_door`
+  lanes passed. Actual remote process execution, parity retirement, and live
+  `.15` Sunshine/Moonlight proof remain open.
   A later 2026-07-18 Front Door hover-polish slice replaced the expansion
   control's raw egui tooltip with a Front Door themed tooltip surface and added
   rendered text-color coverage so the launcher layout hover cannot regress into

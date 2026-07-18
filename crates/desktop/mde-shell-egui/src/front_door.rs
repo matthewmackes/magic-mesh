@@ -217,6 +217,7 @@ pub(crate) enum FrontDoorTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrontDoorRequest {
     Activate(FrontDoorTarget),
+    LaunchPeerApp(FrontDoorPeerAppTarget),
     ConnectDesktopSource(String),
     InstanceLifecycle {
         unit_id: String,
@@ -253,7 +254,7 @@ pub(crate) struct FrontDoorPeerAppTarget {
 }
 
 impl FrontDoorPeerAppTarget {
-    fn desktop_source_id(&self) -> String {
+    pub(crate) fn desktop_source_id(&self) -> String {
         format!("peer:{}", self.node)
     }
 }
@@ -1111,6 +1112,7 @@ pub(crate) fn front_door_panel_with_sources(
         action,
         Some(
             FrontDoorRequest::Activate(_)
+                | FrontDoorRequest::LaunchPeerApp(_)
                 | FrontDoorRequest::ConnectDesktopSource(_)
                 | FrontDoorRequest::OpenWorkbenchPlane(_)
         )
@@ -1689,7 +1691,7 @@ fn action_button_label_visible(button_width: f32) -> bool {
 fn primary_action_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
     match &hit.item.payload {
         FrontDoorTarget::App(_) => "Launch",
-        FrontDoorTarget::PeerApp(_) => "Connect",
+        FrontDoorTarget::PeerApp(_) => "Launch",
         FrontDoorTarget::Workflow(_) | FrontDoorTarget::ServiceLifecycle(_) => "Open",
         FrontDoorTarget::File(_)
         | FrontDoorTarget::Browser(_)
@@ -1701,9 +1703,7 @@ fn primary_action_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
 
 fn activation_request_for_hit(hit: &SearchHit<FrontDoorTarget>) -> FrontDoorRequest {
     match &hit.item.payload {
-        FrontDoorTarget::PeerApp(target) => {
-            FrontDoorRequest::ConnectDesktopSource(target.desktop_source_id())
-        }
+        FrontDoorTarget::PeerApp(target) => FrontDoorRequest::LaunchPeerApp(target.clone()),
         _ => FrontDoorRequest::Activate(hit.item.payload.clone()),
     }
 }
@@ -1727,11 +1727,14 @@ fn peer_node_for_unit_id(id: &str) -> Option<&str> {
     id.strip_prefix("peer:").filter(|node| !node.is_empty())
 }
 
-fn desktop_source_id_for_hit(hit: &SearchHit<FrontDoorTarget>) -> Option<&str> {
-    let FrontDoorTarget::Mesh(id) = &hit.item.payload else {
-        return None;
-    };
-    (id.starts_with("peer:") || id.starts_with("peer-vm:")).then_some(id.as_str())
+fn desktop_source_id_for_hit(hit: &SearchHit<FrontDoorTarget>) -> Option<String> {
+    match &hit.item.payload {
+        FrontDoorTarget::Mesh(id) if id.starts_with("peer:") || id.starts_with("peer-vm:") => {
+            Some(id.clone())
+        }
+        FrontDoorTarget::PeerApp(target) => Some(target.desktop_source_id()),
+        _ => None,
+    }
 }
 
 fn cloud_instance_id(unit_id: &str) -> Option<&str> {
@@ -1796,6 +1799,21 @@ pub(crate) fn service_lifecycle_wire(
     })
     .to_string();
     ("action/services/lifecycle".to_owned(), body)
+}
+
+pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(String, String)> {
+    let node = target.node.trim();
+    let app_id = target.app_id.trim();
+    if node.is_empty() || app_id.is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "node": node,
+        "app_id": app_id,
+        "name": target.name.trim(),
+    })
+    .to_string();
+    Some(("action/apps/launch".to_owned(), body))
 }
 
 fn primary_action_accesskit_id(hit: &SearchHit<FrontDoorTarget>) -> egui::Id {
@@ -2408,7 +2426,7 @@ fn result_action_panel(
                 IconId::Desktop,
                 false,
             );
-            install_connect_desktop_action_accessibility(ui.ctx(), hit, connect_rect, source_id);
+            install_connect_desktop_action_accessibility(ui.ctx(), hit, connect_rect, &source_id);
             connect_response = Some((source_id.to_owned(), response));
             first_button_left = connect_rect.left();
         }
@@ -3602,7 +3620,8 @@ mod tests {
         );
         action.and_then(|request| match request {
             FrontDoorRequest::Activate(target) => Some(target),
-            FrontDoorRequest::ConnectDesktopSource(_)
+            FrontDoorRequest::LaunchPeerApp(_)
+            | FrontDoorRequest::ConnectDesktopSource(_)
             | FrontDoorRequest::InstanceLifecycle { .. }
             | FrontDoorRequest::ServiceLifecycle { .. }
             | FrontDoorRequest::OpenWorkbenchPlane(_)
@@ -5124,6 +5143,72 @@ mod tests {
         assert_eq!(
             state.selected_peer_node(items, FrontDoorSourceStatus::default()),
             Some("oak".to_owned())
+        );
+    }
+
+    #[test]
+    fn front_door_peer_app_primary_action_uses_app_launch_and_keeps_desktop_connect() {
+        let items = peer_app_search_items(
+            [FrontDoorPeerApp {
+                id: "org.mozilla.Firefox.desktop".to_owned(),
+                name: "Firefox".to_owned(),
+                node: "oak".to_owned(),
+                source: "flatpak".to_owned(),
+                icon: "firefox".to_owned(),
+                health: "online".to_owned(),
+                state: "installed".to_owned(),
+            }],
+            0,
+        );
+        let hit = ranked_front_door_hits("firefox", items.clone())
+            .into_iter()
+            .next()
+            .expect("peer app hit");
+        let FrontDoorTarget::PeerApp(target) = &hit.item.payload else {
+            panic!("fixture should produce a peer app target");
+        };
+
+        assert_eq!(primary_action_label(&hit), "Launch");
+        assert_eq!(
+            activation_request_for_hit(&hit),
+            FrontDoorRequest::LaunchPeerApp(target.clone())
+        );
+        assert_eq!(desktop_source_id_for_hit(&hit), Some("peer:oak".to_owned()));
+        let (topic, body) = peer_app_launch_wire(target).expect("peer app launch wire");
+        assert_eq!(topic, "action/apps/launch");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("launch body json");
+        assert_eq!(body["node"], "oak");
+        assert_eq!(body["app_id"], "org.mozilla.Firefox.desktop");
+        assert_eq!(body["name"], "Firefox");
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_front_door_accesskit_frame_with(
+            &ctx,
+            "firefox",
+            0,
+            egui::vec2(900.0, 640.0),
+            items,
+        );
+        let nodes = accesskit_nodes(&out);
+        let launch = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Launch Firefox"))
+            .expect("selected peer app should expose a Launch primary action");
+        assert_eq!(launch.role(), egui::accesskit::Role::Button);
+        assert!(launch.supports_action(egui::accesskit::Action::Click));
+
+        let connect = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Connect desktop for Firefox"))
+            .expect("selected peer app should still expose Desktop Connect");
+        assert_eq!(connect.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            connect.value(),
+            Some("Desktop source: peer:oak; uses Desktop chooser path")
         );
     }
 

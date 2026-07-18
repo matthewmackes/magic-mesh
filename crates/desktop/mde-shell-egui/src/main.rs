@@ -1795,7 +1795,16 @@ impl Shell {
             front_door::FrontDoorTarget::App(surface) => {
                 self.nav.surface = surface;
             }
-            front_door::FrontDoorTarget::PeerApp(_) => {
+            front_door::FrontDoorTarget::PeerApp(target) => {
+                if let Err(err) = self.publish_front_door_peer_app_launch(&target) {
+                    tracing::warn!(
+                        target: "shell::front_door",
+                        node = %target.node,
+                        app_id = %target.app_id,
+                        error = %err,
+                        "Front Door peer app launch request did not publish",
+                    );
+                }
                 self.nav.surface = Surface::Desktop;
             }
             front_door::FrontDoorTarget::Workflow(card) => {
@@ -1872,6 +1881,16 @@ impl Shell {
         publish_front_door_service_lifecycle_to_bus(&root, target, op)
     }
 
+    fn publish_front_door_peer_app_launch(
+        &self,
+        target: &front_door::FrontDoorPeerAppTarget,
+    ) -> Result<String, String> {
+        let root = mde_bus::client_data_dir().ok_or_else(|| {
+            "No mesh Bus directory configured for app launch request.".to_string()
+        })?;
+        publish_front_door_peer_app_launch_to_bus(&root, target)
+    }
+
     fn handle_front_door_request(
         &mut self,
         ctx: &egui::Context,
@@ -1880,6 +1899,18 @@ impl Shell {
         match request {
             front_door::FrontDoorRequest::Activate(target) => {
                 self.activate_front_door_target(target)
+            }
+            front_door::FrontDoorRequest::LaunchPeerApp(target) => {
+                if let Err(err) = self.publish_front_door_peer_app_launch(&target) {
+                    tracing::warn!(
+                        target: "shell::front_door",
+                        node = %target.node,
+                        app_id = %target.app_id,
+                        error = %err,
+                        "Front Door peer app launch request did not publish",
+                    );
+                }
+                self.connect_front_door_desktop_source(ctx, &target.desktop_source_id());
             }
             front_door::FrontDoorRequest::ConnectDesktopSource(id) => {
                 self.connect_front_door_desktop_source(ctx, &id);
@@ -2132,6 +2163,28 @@ fn publish_front_door_service_lifecycle_to_bus(
         .map_err(|err| err.to_string())
 }
 
+fn publish_front_door_peer_app_launch_to_bus(
+    bus_root: &std::path::Path,
+    target: &front_door::FrontDoorPeerAppTarget,
+) -> Result<String, String> {
+    let (topic, body) = front_door::peer_app_launch_wire(target).ok_or_else(|| {
+        format!(
+            "Front Door peer app launch target is incomplete: node='{}' app_id='{}'",
+            target.node, target.app_id
+        )
+    })?;
+    let persist =
+        mde_bus::persist::Persist::open(bus_root.to_path_buf()).map_err(|err| err.to_string())?;
+    mde_bus::rpc::publish_request(
+        &persist,
+        &topic,
+        mde_bus::hooks::config::Priority::Default,
+        None,
+        Some(&body),
+    )
+    .map_err(|err| err.to_string())
+}
+
 /// Width of the retired left-dock gutter. The helper remains so old reveal/pin
 /// state cannot accidentally reintroduce a blank `DOCK_W` column; current
 /// production behavior is always `0.0`, apart from the explicit full-screen
@@ -2269,11 +2322,12 @@ mod tests {
         chat, complete_menu_bar_minimize, console, datacenter,
         desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
         front_door_peer_apps, media_header, media_panel,
-        publish_front_door_instance_lifecycle_to_bus, publish_front_door_service_lifecycle_to_bus,
-        real_editor, real_media, real_terminal, reserved_dock_gutter, reserved_taskbar_strut,
-        route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
-        start_menu, status, terminal_panel, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell,
-        Surface, VideoTextureCache, MENU_BAR_MINIMIZE_DURATION,
+        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
+        publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
+        reserved_dock_gutter, reserved_taskbar_strut, route_file_operation_progress_request,
+        screenshot, shell_file_operation_progress, splash, start_menu, status, terminal_panel,
+        Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
+        MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -3755,6 +3809,31 @@ mod tests {
             Surface::Desktop,
             "Front Door peer Connect should enter the Desktop chooser/connect path"
         );
+    }
+
+    #[test]
+    fn front_door_peer_app_launch_request_publishes_app_launch_body() {
+        let dir = tempfile::tempdir().expect("temp bus");
+        let target = front_door::FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.mozilla.Firefox.desktop".to_owned(),
+            name: "Firefox".to_owned(),
+        };
+
+        let ulid =
+            publish_front_door_peer_app_launch_to_bus(dir.path(), &target).expect("publish launch");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+        let requests = persist
+            .list_since("action/apps/launch", None)
+            .expect("app launch requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].ulid, ulid);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("request body"))
+                .expect("request json");
+        assert_eq!(body["node"], "oak");
+        assert_eq!(body["app_id"], "org.mozilla.Firefox.desktop");
+        assert_eq!(body["name"], "Firefox");
     }
 
     #[test]

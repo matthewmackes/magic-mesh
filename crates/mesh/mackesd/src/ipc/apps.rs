@@ -826,11 +826,37 @@ where
         // PD-2 directory (Q9/Q23/Q24: the thin applet asks; mackesd resolves). The
         // applet then spawns the local RD client to `protocol://target`.
         "launch" => {
-            let node = body
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
-                .and_then(|v| v.get("node").and_then(|n| n.as_str()).map(str::to_string))
-                .unwrap_or_default();
-            match resolve_launch(&dir_doc(), &node) {
+            let request = parse_launch_request(body);
+            let node = request.node.as_str();
+            if !request.app_id.is_empty() {
+                let Some(app) = app_entry_for_launch(svc, node, &request.app_id) else {
+                    return json!({
+                        "ok": false,
+                        "error": format!(
+                            "app '{}' is not published for peer '{}'",
+                            request.app_id, node
+                        )
+                    })
+                    .to_string();
+                };
+                return match resolve_launch(&dir_doc(), node) {
+                    Some((protocol, target)) => json!({
+                        "ok": true,
+                        "node": node,
+                        "app_id": app.id,
+                        "app_name": app.name,
+                        "protocol": protocol,
+                        "target": target,
+                    })
+                    .to_string(),
+                    None => json!({
+                        "ok": false,
+                        "error": format!("no reachable remote-desktop target for peer '{node}'")
+                    })
+                    .to_string(),
+                };
+            }
+            match resolve_launch(&dir_doc(), node) {
                 Some((protocol, target)) => {
                     json!({ "ok": true, "protocol": protocol, "target": target }).to_string()
                 }
@@ -873,6 +899,46 @@ where
         "uninstall" => build_uninstall(body),
         other => json!({ "ok": false, "error": format!("unknown apps verb: {other}") }).to_string(),
     }
+}
+
+#[derive(Debug, Default)]
+struct LaunchRequest {
+    node: String,
+    app_id: String,
+}
+
+fn parse_launch_request(body: Option<&str>) -> LaunchRequest {
+    let Some(v) = body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok()) else {
+        return LaunchRequest::default();
+    };
+    LaunchRequest {
+        node: v
+            .get("node")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        app_id: v
+            .get("app_id")
+            .or_else(|| v.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    }
+}
+
+fn app_entry_for_launch(svc: &AppsService, node: &str, app_id: &str) -> Option<AppEntry> {
+    let app_id = app_id.trim();
+    if app_id.is_empty() {
+        return None;
+    }
+    let entries = if node.is_empty() || node == svc.node_id {
+        scan_local_apps(&default_app_dirs(&svc.home))
+    } else {
+        read_peer_installed(&svc.workgroup_root, node)
+    };
+    entries.into_iter().find(|entry| entry.id == app_id)
 }
 
 /// Resolve a peer's remote-desktop `(protocol, target)` from the PD-2 directory
@@ -1418,6 +1484,69 @@ mod tests {
             serde_json::from_str(&build_peer_list(&svc, "ghost")).unwrap();
         assert_eq!(dead["ok"], true);
         assert_eq!(dead["count"], 0);
+    }
+
+    #[test]
+    fn launch_with_app_id_validates_peer_inventory_and_echoes_app_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let home = tmp.path().join("home");
+        let peer_dir = root.join("anvil");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        std::fs::write(
+            peer_dir.join("apps-installed.json"),
+            r#"{"hostname":"anvil","entries":[{"id":"gimp.desktop","name":"GIMP","kind":"app","source":"flatpak","node":"anvil","exec":"gimp"}]}"#,
+        )
+        .unwrap();
+        let svc = AppsService::new(root, "me", &home);
+        let dir_doc = json!({
+            "peers": [{
+                "hostname": "anvil",
+                "presence": "online",
+                "overlay_ip": "172.20.88.23"
+            }]
+        });
+        let body = json!({
+            "node": "anvil",
+            "app_id": "gimp.desktop",
+            "name": "GIMP"
+        })
+        .to_string();
+
+        let reply: serde_json::Value = serde_json::from_str(&build_reply(
+            &svc,
+            "launch",
+            Some(&body),
+            || dir_doc.clone(),
+            || json!({}),
+        ))
+        .unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["node"], "anvil");
+        assert_eq!(reply["app_id"], "gimp.desktop");
+        assert_eq!(reply["app_name"], "GIMP");
+        assert_eq!(reply["protocol"], "rdp");
+        assert_eq!(reply["target"], "172.20.88.23");
+
+        let missing = json!({
+            "node": "anvil",
+            "app_id": "missing.desktop",
+            "name": "Missing"
+        })
+        .to_string();
+        let missing_reply: serde_json::Value = serde_json::from_str(&build_reply(
+            &svc,
+            "launch",
+            Some(&missing),
+            || dir_doc,
+            || json!({}),
+        ))
+        .unwrap();
+        assert_eq!(missing_reply["ok"], false);
+        assert!(missing_reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing.desktop"));
     }
 
     // ───────────────────── APPLAUNCH-4 — app groups ─────────────────────

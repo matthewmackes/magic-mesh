@@ -60,6 +60,11 @@ const SKIP_SECS: f64 = 10.0;
 /// not every frame — the same human-paced convergence the mesh workers use.
 const ROAM_POLL_INTERVAL_FRAMES: u32 = 60;
 
+/// Compact icon-only queue action button: a 24px click target matching the sibling
+/// YAMIS button rows, with a smaller painted mark centered inside.
+const QUEUE_CONTROL_BUTTON: f32 = Style::SP_L;
+const QUEUE_CONTROL_ICON: f32 = Style::SP_M - Style::SP_XS;
+
 /// The media surface: the controller plus the applied-fullscreen mirror so the app
 /// only issues a viewport command when the immersive state actually flips.
 pub struct MediaApp {
@@ -1822,13 +1827,29 @@ fn queue_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControlle
                                 action = Some(TransportAction::SelectQueueIndex(index));
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("✕").clicked() {
+                                if queue_icon_button(
+                                    ui,
+                                    QueueControlIcon::Remove,
+                                    "Remove from queue",
+                                )
+                                .clicked()
+                                {
                                     action = Some(TransportAction::RemoveQueueIndex(index));
                                 }
-                                if index + 1 < len && ui.button("▼").clicked() {
+                                if index + 1 < len
+                                    && queue_icon_button(
+                                        ui,
+                                        QueueControlIcon::MoveDown,
+                                        "Move down",
+                                    )
+                                    .clicked()
+                                {
                                     action = Some(TransportAction::MoveQueueItem(index, index + 1));
                                 }
-                                if index > 0 && ui.button("▲").clicked() {
+                                if index > 0
+                                    && queue_icon_button(ui, QueueControlIcon::MoveUp, "Move up")
+                                        .clicked()
+                                {
                                     action = Some(TransportAction::MoveQueueItem(index, index - 1));
                                 }
                             });
@@ -1842,6 +1863,89 @@ fn queue_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControlle
     if let Some(action) = action {
         controller.dispatch(action);
     }
+}
+
+#[derive(Clone, Copy)]
+enum QueueControlIcon {
+    Remove,
+    MoveDown,
+    MoveUp,
+}
+
+/// A compact icon-only queue action. It follows the shared YAMIS button idiom used
+/// by sibling egui surfaces: allocate an empty button, install a real labelled
+/// widget for accessibility, then paint the action mark as geometry rather than
+/// text. The queue stays inside this crate's dependency boundary while avoiding
+/// raw glyph text in the render output.
+fn queue_icon_button(ui: &mut egui::Ui, icon: QueueControlIcon, label: &'static str) -> Response {
+    let enabled = ui.is_enabled();
+    let response = ui.add(
+        egui::Button::new("")
+            .fill(Style::LAYER_02)
+            .stroke(egui::Stroke::new(1.0, Style::BORDER))
+            .corner_radius(Style::RADIUS_S)
+            .min_size(egui::vec2(QUEUE_CONTROL_BUTTON, QUEUE_CONTROL_BUTTON)),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+
+    let tint = if enabled {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let icon_rect = egui::Rect::from_center_size(
+        response.rect.center(),
+        egui::vec2(QUEUE_CONTROL_ICON, QUEUE_CONTROL_ICON),
+    );
+    paint_queue_control_icon(ui.painter(), icon_rect, icon, tint);
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+
+    response
+        .on_hover_text(label)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn paint_queue_control_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: QueueControlIcon,
+    tint: egui::Color32,
+) {
+    match icon {
+        QueueControlIcon::Remove => {
+            let mark = egui::Rect::from_center_size(
+                rect.center(),
+                egui::vec2(rect.width() * 0.82, Style::SP_XS * 0.5),
+            );
+            painter.rect_filled(mark, Style::RADIUS_S * 0.25, tint);
+        }
+        QueueControlIcon::MoveDown => paint_queue_arrow(painter, rect, false, tint),
+        QueueControlIcon::MoveUp => paint_queue_arrow(painter, rect, true, tint),
+    }
+}
+
+fn paint_queue_arrow(painter: &egui::Painter, rect: egui::Rect, up: bool, tint: egui::Color32) {
+    let center = rect.center();
+    let half_w = rect.width() * 0.38;
+    let half_h = rect.height() * 0.30;
+    let points = if up {
+        vec![
+            egui::pos2(center.x, center.y - half_h),
+            egui::pos2(center.x + half_w, center.y + half_h),
+            egui::pos2(center.x - half_w, center.y + half_h),
+        ]
+    } else {
+        vec![
+            egui::pos2(center.x, center.y + half_h),
+            egui::pos2(center.x - half_w, center.y - half_h),
+            egui::pos2(center.x + half_w, center.y - half_h),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        tint,
+        egui::Stroke::NONE,
+    ));
 }
 
 // ── PiP mini-player ────────────────────────────────────────────────────────────────
@@ -1991,10 +2095,10 @@ mod tests {
     /// any paint-path fault surfaces as a failure — the same `Context::run` →
     /// `tessellate` path the DRM runner drives, minus the GPU. Proves the views are
     /// runtime-reachable in `cargo test` (§7), with no window / wgpu / seat.
-    fn render(
+    fn render_shapes(
         controller: &mut MediaController<FakeMpv>,
         body: impl Fn(&mut egui::Ui, &mut MediaController<FakeMpv>),
-    ) {
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -2009,8 +2113,16 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| body(ui, controller));
             pip_window(ctx, controller);
         });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
         assert!(!prims.is_empty(), "frame produced no draw primitives");
+        out.shapes
+    }
+
+    fn render(
+        controller: &mut MediaController<FakeMpv>,
+        body: impl Fn(&mut egui::Ui, &mut MediaController<FakeMpv>),
+    ) {
+        let _ = render_shapes(controller, body);
     }
 
     /// Like [`render`], but also threads a [`VideoTextureCache`] — for bodies
@@ -2052,6 +2164,50 @@ mod tests {
             "/m/clip.mkv",
             MediaMetadata::from_path("/m/clip.mkv").expect("video"),
         );
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn queue_icon_shape_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == Style::TEXT
+                        && rect.rect.width() <= QUEUE_CONTROL_ICON
+                        && rect.rect.height() <= Style::SP_XS =>
+                {
+                    1
+                }
+                egui::Shape::Path(path)
+                    if path.fill == Style::TEXT && path.closed && path.points.len() == 3 =>
+                {
+                    1
+                }
+                egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty() => 1,
+                egui::Shape::Vec(shapes) => shapes.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+
+        shapes.iter().map(|clipped| walk(&clipped.shape)).sum()
     }
 
     #[test]
@@ -2267,7 +2423,19 @@ mod tests {
             .push(PlaylistItem::titled("a", "Alpha"));
         c.player_mut().playlist_mut().push(PlaylistItem::new("b"));
         c.player_mut().playlist_mut().push(PlaylistItem::new("c"));
-        render(&mut c, queue_view);
+        let shapes = render_shapes(&mut c, queue_view);
+        let texts = painted_text(&shapes);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains('✕') || text.contains('▼') || text.contains('▲')),
+            "queue controls must not paint raw glyph text: {texts:?}"
+        );
+        let icons = queue_icon_shape_count(&shapes);
+        assert!(
+            icons >= 7,
+            "queue controls must paint icon geometry/textures for remove and move controls; got {icons}"
+        );
     }
 
     #[test]
