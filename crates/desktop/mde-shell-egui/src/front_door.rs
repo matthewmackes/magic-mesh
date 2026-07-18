@@ -37,6 +37,7 @@ const DOMAIN_MIN_W: f32 = 44.0;
 const RESULT_TEXT_MIN_W: f32 = 72.0;
 const SEARCH_MIN_W: f32 = 72.0;
 const TOOLTIP_W: f32 = 260.0;
+const ACTION_BUTTON_TEXT_MIN_W: f32 = 72.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrontDoorMeshSourceStatus {
@@ -1680,6 +1681,10 @@ fn result_action_button_width(available_width: f32) -> f32 {
     preferred.min(available_width).max(min)
 }
 
+fn action_button_label_visible(button_width: f32) -> bool {
+    button_width >= ACTION_BUTTON_TEXT_MIN_W
+}
+
 fn primary_action_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
     match &hit.item.payload {
         FrontDoorTarget::App(_) => "Launch",
@@ -2176,6 +2181,7 @@ fn action_button(
     selected: bool,
 ) -> egui::Response {
     let response = ui.interact(rect, id, egui::Sense::click());
+    let show_label = action_button_label_visible(rect.width());
     let button_fill = if response.hovered() {
         Style::ACCENT.linear_multiply(0.28)
     } else if selected {
@@ -2192,30 +2198,36 @@ fn action_button(
     );
 
     let icon_size = 13.0;
-    let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 10.0 + icon_size / 2.0, rect.center().y),
-        egui::vec2(icon_size, icon_size),
-    );
+    let icon_center = if show_label {
+        egui::pos2(rect.left() + 10.0 + icon_size / 2.0, rect.center().y)
+    } else {
+        rect.center()
+    };
+    let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(icon_size, icon_size));
     if let Some(tex) = icon_texture(ui.ctx(), icon, icon_size, Style::TEXT) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         ui.painter()
             .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
     }
 
-    let text_rect = egui::Rect::from_min_max(
-        egui::pos2(icon_rect.right() + 4.0, rect.top()),
-        rect.right_bottom(),
-    );
-    ui.painter()
-        .with_clip_rect(text_rect.shrink2(egui::vec2(4.0, 0.0)))
-        .text(
-            text_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(12.0),
-            Style::TEXT,
+    if show_label {
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(icon_rect.right() + 4.0, rect.top()),
+            rect.right_bottom(),
         );
-    response
+        ui.painter()
+            .with_clip_rect(text_rect.shrink2(egui::vec2(4.0, 0.0)))
+            .text(
+                text_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                Style::TEXT,
+            );
+        response
+    } else {
+        front_door_hover_text(response, label.to_owned())
+    }
 }
 
 fn icon_action_button(
@@ -3650,9 +3662,10 @@ mod tests {
             .iter()
             .find(|item| item.payload == FrontDoorTarget::App(Surface::Browser))
             .expect("Browser app search row");
-        assert_eq!(browser.target, "Web & Tools");
+        let browser_group = launcher_group_label(Surface::Browser);
+        assert_eq!(browser.target, browser_group);
         assert!(
-            browser.terms.iter().any(|term| term == "Web & Tools"),
+            browser.terms.iter().any(|term| term == browser_group),
             "Front Door app rows should be searchable by the shared launcher group"
         );
     }
@@ -3729,7 +3742,7 @@ mod tests {
         );
         assert_eq!(hits.len(), MAX_HITS);
         assert_eq!(hits[0].item.payload, FrontDoorTarget::App(Surface::Browser));
-        assert_eq!(hits[0].item.target, "Web & Tools");
+        assert_eq!(hits[0].item.target, launcher_group_label(Surface::Browser));
         assert_eq!(hits[1].item.payload, FrontDoorTarget::App(Surface::Files));
         assert_eq!(hits[1].item.target, "Files & Data");
     }
@@ -4500,6 +4513,46 @@ mod tests {
     }
 
     #[test]
+    fn front_door_narrow_action_buttons_use_icon_only_paint_without_losing_accesskit() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_front_door_accesskit_frame_with(
+            &ctx,
+            "browser",
+            0,
+            egui::vec2(220.0, 640.0),
+            fixture_front_door_items(),
+        );
+        let nodes = accesskit_nodes(&out);
+        let launch = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Launch Browser"))
+            .expect("narrow app result should keep the primary action button accessible");
+        let bounds = accesskit_bounds_rect(launch);
+
+        assert!(
+            bounds.width() < ACTION_BUTTON_TEXT_MIN_W,
+            "test setup should exercise the cramped icon-only action width, got {bounds:?}"
+        );
+        assert_eq!(launch.role(), egui::accesskit::Role::Button);
+        let expected_value = format!(
+            "Primary action: App, {}",
+            launcher_group_label(Surface::Browser)
+        );
+        assert_eq!(launch.value(), Some(expected_value.as_str()));
+        assert!(launch.supports_action(egui::accesskit::Action::Click));
+
+        let texts = painted_text(&out.shapes);
+        assert!(
+            !texts.iter().any(|(text, _)| text == "Launch"),
+            "narrow Front Door action buttons should not paint clipped text labels: {texts:?}"
+        );
+    }
+
+    #[test]
     fn front_door_results_accesskit_bounds_follow_the_scroll_cap() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -4586,7 +4639,7 @@ mod tests {
         assert!(
             browser
                 .value()
-                .is_some_and(|value| value.contains("Web & Tools")),
+                .is_some_and(|value| value.contains(launcher_group_label(Surface::Browser))),
             "blank shortcut row should expose the shared launcher category"
         );
 

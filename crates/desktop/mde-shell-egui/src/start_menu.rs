@@ -45,8 +45,8 @@
 //! opening/closing, rotating tile facts, and search-result updates.
 //!
 //! **WIN7-3 update:** the left pane is the real live-tile grid (locks
-//! #6/#7/#8/#23): all 19 [`Surface::ALL`] entries, grouped into lock #8's 7
-//! function-based groups (Mesh Control · Desktop & Session · Media · Files &
+//! #6/#7/#8/#23): all 19 [`Surface::ALL`] entries, grouped into the shared
+//! launcher function groups (Mesh Control · Desktop & Session · Media · Files &
 //! Data · Web · Developer Tools · Comms · System — [`TILE_GROUPS`]), each a uniform
 //! [`TILE_W`]×[`TILE_H`] tile (lock #6 — one size, no variants). A tile wears
 //! the SAME glyph the app picker already draws (`Surface::icon_id`) plus a
@@ -3214,27 +3214,28 @@ mod tests {
     // ── WIN7-3: live tiles (locks #6/#7/#8/#23) ──────────────────────────────
 
     #[test]
-    fn the_19_surfaces_are_grouped_into_lock_8s_7_function_based_groups() {
-        // Lock #8's exact taxonomy + order, consumed from the shared launcher
+    fn the_19_surfaces_are_grouped_into_shared_function_based_groups() {
+        // The shared launcher taxonomy + order, consumed from the shared launcher
         // table and restated here so this pane's layout contract stays visible.
         use Surface::{
             About, Bookmarks, Browser, Chat, Desktop, Editor, Explorer, Files, InfraCode,
             MapsLocation, Media, MeshView, Music, Phones, Storage, System, Terminal, Voice,
             Workbench,
         };
-        let expect: [(&str, &[Surface]); 7] = [
+        let expect: [(&str, &[Surface]); 8] = [
             ("Mesh Control", &[Workbench, MeshView, InfraCode]),
             ("Desktop & Session", &[Desktop, MapsLocation]),
             ("Media", &[Music, Media]),
-            ("Files & Data", &[Files, Bookmarks, Storage]),
-            ("Web & Tools", &[Browser, Terminal, Editor]),
+            ("Files & Data", &[Files, Storage]),
+            ("Web", &[Browser, Bookmarks]),
+            ("Developer Tools", &[Terminal, Editor]),
             ("Comms", &[Voice, Chat, Phones]),
             ("System", &[System, About, Explorer]),
         ];
         assert_eq!(
             super::TILE_GROUPS.len(),
             expect.len(),
-            "seven groups (lock #8)"
+            "shared launcher group count"
         );
         for (g, (label, surfaces)) in super::TILE_GROUPS.iter().zip(expect) {
             assert_eq!(g.label, label, "group order");
@@ -3283,8 +3284,12 @@ mod tests {
                 "{surface:?} group accent drifted between Start and dock"
             );
         }
-        assert_eq!(super::tile_group_label(Surface::Browser), "Web & Tools");
-        assert_eq!(super::tile_group_label(Surface::Bookmarks), "Files & Data");
+        assert_eq!(super::tile_group_label(Surface::Browser), "Web");
+        assert_eq!(super::tile_group_label(Surface::Bookmarks), "Web");
+        assert_eq!(
+            super::tile_group_label(Surface::Terminal),
+            "Developer Tools"
+        );
         assert_eq!(super::tile_group_label(Surface::Files), "Files & Data");
         assert_ne!(super::tile_group_label(Surface::Files), "System");
     }

@@ -262,25 +262,14 @@ pub(super) fn network_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
 
 /// A compact selectable settings tile for Remote Proofing enum choices.
 fn proofing_choice_tile(ui: &mut egui::Ui, selected: bool, label: &str, description: &str) -> bool {
-    let mut clicked = false;
-    tile(ui, |ui| {
-        if ui
-            .add_sized(
-                [ui.available_width(), Style::SP_L],
-                egui::SelectableLabel::new(selected, RichText::new(label).size(Style::BODY)),
-            )
-            .clicked()
-            && !selected
-        {
-            clicked = true;
-        }
-        ui.label(
-            RichText::new(description)
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-    });
-    clicked
+    settings_choice_tile(
+        ui,
+        selected,
+        label,
+        Some(description),
+        SettingsGroup::MeshSystem.accent(),
+        Style::SP_L,
+    )
 }
 
 /// Mesh & System → Remote Proofing — the single Settings workspace for

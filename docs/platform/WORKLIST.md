@@ -702,6 +702,14 @@ These decisions refine acceptance and sequencing for the active items below.
   star/menu so pages already present in the system bookmark manager show a
   disabled `Bookmarked` row instead of offering duplicate `Add bookmark`; farm
   `.50` fmt and BigBoy `.130` focused page-actions coverage passed.
+  A later 2026-07-18 Browser page-actions popup proof pass tightened the
+  rendered regression for the toolbar bookmark/page-actions menu: collapsed
+  context entry points and open toolbar popups must expose bounded AccessKit
+  button rows, paint Browser Chrome text, and settle to the Browser popup
+  surface instead of a thin wedge or inherited shell-dark surface. Farm
+  evidence: `.50` isolated and combined
+  `cargo test -p mde-shell-egui page_actions -- --nocapture` passed 7 tests;
+  `.90` combined `cargo fmt -p mde-shell-egui -- --check` passed.
 - Acceptance criteria: A tab/bookmark/settings change on node A appears on node B,
   conflicts converge, and Browser does not maintain a competing bookmark store.
 - Verification method: Multi-node sync test or deterministic two-store fixture,
@@ -1484,7 +1492,14 @@ These decisions refine acceptance and sequencing for the active items below.
   passed. A later 2026-07-18 Settings hover-polish slice replaced the display
   nudge controls' raw egui hover text with a Settings themed tooltip surface and
   rendered text-color coverage so icon hovers cannot regress into unreadable
-  shared-shell popup text.
+  shared-shell popup text. A later 2026-07-18 Settings choice-tile polish slice
+  replaced Theme, Wallpaper, and Remote Proofing raw selectable labels with a
+  shared Settings choice button whose selected and hover colors resolve through
+  the current dark/light palette and domain accent. Farm evidence: `.90`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
+  `settings_choice_tiles_use_themed_selected_and_hover_colors`,
+  `each_mesh_system_section_renders_live_data_and_honest_unknown`, and
+  `the_reworked_sections_paint_across_a_wide_detail_pane` passed.
   A later 2026-07-18 live `.15` Chat-empty investigation found `chat` and
   `notify` workers healthy but publishing to root's legacy
   `/root/.local/share/mde/bus` spool while the GUI read `/run/mde-bus`; the
@@ -1853,6 +1868,16 @@ These decisions refine acceptance and sequencing for the active items below.
   cannot paint sliced off the right or bottom edge on narrow displays. Farm
   evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130`
   focused `front_door_expanded_layout_uses_bounded_screen_geometry` passed.
+  A later 2026-07-18 Front Door action-button readability/taxonomy slice made
+  cramped selected-row action buttons paint icon-only with the Front Door
+  themed hover label while preserving AccessKit button metadata. It also
+  refreshed Start/Front Door assertions to use the shared
+  `dock::LAUNCHER_GROUPS` labels (`Web`, `Developer Tools`) instead of retired
+  `Web & Tools` test strings. Farm evidence: `.90`
+  `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130`
+  `cargo test -p mde-shell-egui front_door -- --nocapture` passed 58 tests;
+  BigBoy `.130` focused `start_tiles_use_the_shared_launcher_taxonomy_source`
+  and `the_19_surfaces_are_grouped_into_shared_function_based_groups` passed.
   A later 2026-07-18 menu-bar Remote Sessions control slice found the shared
   top-right menu-bar/window-title-bar control already present, then tightened
   the shell-owned request drain: activating it now closes Front Door and

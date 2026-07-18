@@ -2279,6 +2279,105 @@ fn settings_hover_text(response: egui::Response, text: impl Into<String>) -> egu
     response.on_hover_ui(move |ui| settings_tooltip(ui, text.as_str()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsChoiceColors {
+    fill: egui::Color32,
+    stroke: egui::Color32,
+    text: egui::Color32,
+}
+
+fn settings_choice_colors(
+    ctx: &egui::Context,
+    selected: bool,
+    hovered: bool,
+    accent: egui::Color32,
+) -> SettingsChoiceColors {
+    let scheme = Style::color_scheme(ctx);
+    let palette = Style::current_palette(ctx);
+    let accent = Style::accent_for_scheme(scheme, accent);
+    SettingsChoiceColors {
+        fill: if selected {
+            Style::pressed_fill_for_scheme(scheme, accent)
+        } else if hovered {
+            palette.surface_hi
+        } else {
+            palette.surface
+        },
+        stroke: if selected || hovered {
+            accent
+        } else {
+            palette.border
+        },
+        text: if selected {
+            palette.text_strong
+        } else {
+            palette.text
+        },
+    }
+}
+
+fn settings_choice_button(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &str,
+    accent: egui::Color32,
+    height: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let colors = settings_choice_colors(ui.ctx(), selected, response.hovered(), accent);
+        ui.painter().rect(
+            rect,
+            Style::RADIUS,
+            colors.fill,
+            egui::Stroke::new(1.0, colors.stroke),
+            egui::StrokeKind::Inside,
+        );
+        let text_rect = rect.shrink2(egui::vec2(Style::SP_S, 0.0));
+        if text_rect.is_positive() {
+            ui.painter().with_clip_rect(text_rect).text(
+                text_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(Style::BODY),
+                colors.text,
+            );
+        }
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    response
+}
+
+fn settings_choice_tile(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &str,
+    description: Option<&str>,
+    accent: egui::Color32,
+    height: f32,
+) -> bool {
+    let mut clicked = false;
+    tile(ui, |ui| {
+        if settings_choice_button(ui, selected, label, accent, height).clicked() && !selected {
+            clicked = true;
+        }
+        if let Some(description) = description {
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new(description)
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+        }
+    });
+    clicked
+}
+
 /// The detail pane (SETTINGS-1): an expressive header over the selected section's
 /// body, rendered by calling the EXISTING per-section fn verbatim (§6 — no forked
 /// logic; every `apply()`/`SysAction` seam is reused). The Mesh & System sections
@@ -3450,21 +3549,16 @@ fn wallpaper_section(ui: &mut egui::Ui) {
     // presentation pass, the selection logic unchanged (§6/§7).
     across_grid(ui, &crate::backdrop::Wallpaper::ALL, 3, |ui, &wallpaper| {
         let selected = wallpaper == current;
-        tile(ui, |ui| {
-            if ui
-                .add_sized(
-                    [ui.available_width(), Style::SP_XL],
-                    egui::SelectableLabel::new(
-                        selected,
-                        RichText::new(wallpaper.label()).size(Style::BODY),
-                    ),
-                )
-                .clicked()
-                && !selected
-            {
-                crate::backdrop::select_wallpaper(&ctx, wallpaper);
-            }
-        });
+        if settings_choice_tile(
+            ui,
+            selected,
+            wallpaper.label(),
+            None,
+            SettingsGroup::Personalization.accent(),
+            Style::SP_XL,
+        ) {
+            crate::backdrop::select_wallpaper(&ctx, wallpaper);
+        }
     });
     ui.add_space(Style::SP_S);
     muted_note(
@@ -3507,26 +3601,16 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     ui.add_space(Style::SP_XS);
     across_grid(ui, &AppearanceColorScheme::ALL, 2, |ui, &scheme| {
         let selected = appearance.color_scheme == scheme;
-        tile(ui, |ui| {
-            if ui
-                .add_sized(
-                    [ui.available_width(), Style::SP_XL],
-                    egui::SelectableLabel::new(
-                        selected,
-                        RichText::new(scheme.label()).size(Style::BODY),
-                    ),
-                )
-                .clicked()
-                && !selected
-            {
-                appearance.color_scheme = scheme;
-            }
-            ui.label(
-                RichText::new(scheme.description())
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-        });
+        if settings_choice_tile(
+            ui,
+            selected,
+            scheme.label(),
+            Some(scheme.description()),
+            SettingsGroup::Personalization.accent(),
+            Style::SP_XL,
+        ) {
+            appearance.color_scheme = scheme;
+        }
     });
     ui.add_space(Style::SP_M);
     // Accent — a swatch row; the pick re-tints the whole shell's highlights live.
@@ -3550,12 +3634,14 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
                 ui.painter()
                     .rect_filled(rect, Style::RADIUS, choice.color());
                 ui.add_space(Style::SP_XS);
-                if ui
-                    .add(egui::SelectableLabel::new(
-                        selected,
-                        RichText::new(choice.label()).size(Style::BODY),
-                    ))
-                    .clicked()
+                if settings_choice_button(
+                    ui,
+                    selected,
+                    choice.label(),
+                    SettingsGroup::Personalization.accent(),
+                    Style::SP_L,
+                )
+                .clicked()
                     && !selected
                 {
                     appearance.accent = choice;
@@ -3574,21 +3660,16 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     ui.add_space(Style::SP_XS);
     across_grid(ui, &TextScale::ALL, 5, |ui, &scale| {
         let selected = appearance.text_scale == scale;
-        tile(ui, |ui| {
-            if ui
-                .add_sized(
-                    [ui.available_width(), Style::SP_XL],
-                    egui::SelectableLabel::new(
-                        selected,
-                        RichText::new(scale.label()).size(Style::BODY),
-                    ),
-                )
-                .clicked()
-                && !selected
-            {
-                appearance.text_scale = scale;
-            }
-        });
+        if settings_choice_tile(
+            ui,
+            selected,
+            scale.label(),
+            None,
+            SettingsGroup::Personalization.accent(),
+            Style::SP_XL,
+        ) {
+            appearance.text_scale = scale;
+        }
     });
     ui.add_space(Style::SP_M);
     // Motion mode — the runtime normal/reduced/disabled policy for shared motion.
@@ -3601,26 +3682,16 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     ui.add_space(Style::SP_XS);
     across_grid(ui, &AppearanceMotionMode::ALL, 3, |ui, &mode| {
         let selected = appearance.motion_mode == mode;
-        tile(ui, |ui| {
-            if ui
-                .add_sized(
-                    [ui.available_width(), Style::SP_XL],
-                    egui::SelectableLabel::new(
-                        selected,
-                        RichText::new(mode.label()).size(Style::BODY),
-                    ),
-                )
-                .clicked()
-                && !selected
-            {
-                appearance.motion_mode = mode;
-            }
-            ui.label(
-                RichText::new(mode.description())
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-        });
+        if settings_choice_tile(
+            ui,
+            selected,
+            mode.label(),
+            Some(mode.description()),
+            SettingsGroup::Personalization.accent(),
+            Style::SP_XL,
+        ) {
+            appearance.motion_mode = mode;
+        }
     });
     ui.add_space(Style::SP_M);
     ui.label(

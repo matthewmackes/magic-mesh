@@ -102,6 +102,30 @@ fn render_settings_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
     )
 }
 
+fn render_settings_choice_frame(ctx: &egui::Context, selected: bool) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 120.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    ui.set_width(300.0);
+                    settings_choice_tile(
+                        ui,
+                        selected,
+                        "Light",
+                        Some("Windows 2000 basic"),
+                        SettingsGroup::Personalization.accent(),
+                        Style::SP_XL,
+                    );
+                });
+        },
+    )
+}
+
 #[test]
 fn the_pre_poll_state_is_a_full_paint_not_a_blank_panel() {
     let mut st = SystemState::default();
@@ -165,6 +189,62 @@ fn settings_icon_tooltips_use_themed_text_and_surface() {
     assert!(
         fills.contains(&Style::SURFACE),
         "Settings icon tooltip should paint its own themed surface: {fills:?}"
+    );
+}
+
+#[test]
+fn settings_choice_tiles_use_themed_selected_and_hover_colors() {
+    let dark = egui::Context::default();
+    Style::install(&dark);
+    let accent = SettingsGroup::Personalization.accent();
+
+    let dark_selected = settings_choice_colors(&dark, true, false, accent);
+    assert_eq!(
+        dark_selected.fill,
+        Style::pressed_fill_for_scheme(StyleColorScheme::Dark, accent),
+        "dark selected choices should use the shared pressed fill"
+    );
+    assert_eq!(dark_selected.text, Style::TEXT_STRONG);
+
+    let dark_hover = settings_choice_colors(&dark, false, true, accent);
+    assert_eq!(
+        dark_hover.fill,
+        Style::SURFACE_HI,
+        "dark hover choices should use the highlighted surface"
+    );
+    assert_eq!(dark_hover.text, Style::TEXT);
+    assert_eq!(
+        dark_hover.stroke,
+        Style::accent_for_scheme(StyleColorScheme::Dark, accent)
+    );
+
+    let light = egui::Context::default();
+    Style::install_color_scheme_with_density(
+        &light,
+        StyleColorScheme::Light,
+        mde_egui::style::Density::Mouse,
+    );
+    let light_palette = Style::palette_for(StyleColorScheme::Light);
+    let light_selected = settings_choice_colors(&light, true, false, accent);
+    assert_eq!(
+        light_selected.fill,
+        Style::WIN2000_PRESSED_FACE,
+        "light selected choices should keep black text on the classic pressed face"
+    );
+    assert_eq!(light_selected.text, light_palette.text_strong);
+
+    let out = render_settings_choice_frame(&light, true);
+    let texts = painted_text(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "Light" && *color == light_palette.text_strong),
+        "selected Settings choices should paint themed readable text: {texts:?}"
+    );
+    let fills = painted_fill_colors(&out.shapes);
+    assert!(
+        fills.contains(&Style::WIN2000_PRESSED_FACE),
+        "selected Settings choices should paint their own selected fill: {fills:?}"
     );
 }
 
