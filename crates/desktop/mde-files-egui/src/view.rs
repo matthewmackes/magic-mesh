@@ -66,7 +66,7 @@ const ROW_H: f32 = 26.0;
 const TILE_W: f32 = 132.0;
 const TILE_H: f32 = 72.0;
 const ACTION_BUTTON_H: f32 = 24.0;
-const FILES_NAV_ICON: f32 = 14.0;
+const FILES_ICON_BUTTON_ICON: f32 = 14.0;
 const FILES_PLACE_ICON: f32 = 14.0;
 const FILES_ROW_ICON: f32 = 15.0;
 const FILES_GRID_ICON: f32 = 28.0;
@@ -75,6 +75,8 @@ const FILES_NAV_ICONS: &[(IconId, &str)] = &[
     (IconId::ArrowRight, "Forward"),
     (IconId::ChevronUp, "Up"),
 ];
+const FILES_TAB_ICONS: &[(IconId, &str)] =
+    &[(IconId::Close, "Close tab"), (IconId::NewTab, "New tab")];
 
 #[derive(Clone, Copy)]
 enum FilesActionTone {
@@ -115,6 +117,15 @@ fn files_action_button(
 }
 
 fn files_nav_button(ui: &mut egui::Ui, icon: IconId, enabled: bool, tip: &str) -> egui::Response {
+    files_icon_button(ui, icon, enabled, tip)
+}
+
+fn files_icon_button(
+    ui: &mut egui::Ui,
+    icon: IconId,
+    enabled: bool,
+    label: &str,
+) -> egui::Response {
     let text_color = if enabled {
         Style::TEXT
     } else {
@@ -128,17 +139,17 @@ fn files_nav_button(ui: &mut egui::Ui, icon: IconId, enabled: bool, tip: &str) -
             .corner_radius(Style::RADIUS_S)
             .min_size(egui::vec2(ACTION_BUTTON_H, ACTION_BUTTON_H)),
     );
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let rect = egui::Rect::from_center_size(
         response.rect.center(),
-        egui::vec2(FILES_NAV_ICON, FILES_NAV_ICON),
+        egui::vec2(FILES_ICON_BUTTON_ICON, FILES_ICON_BUTTON_ICON),
     );
-    if let Some(tex) = files_icon_texture(ui, icon, FILES_NAV_ICON, text_color) {
+    if let Some(tex) = files_icon_texture(ui, icon, FILES_ICON_BUTTON_ICON, text_color) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
     }
     mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
-    response.on_hover_text(tip)
+    response.on_hover_text(label)
 }
 
 #[allow(
@@ -1678,21 +1689,18 @@ fn tab_strip(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut V
     let pane = b.pane(pane_ix);
     ui.horizontal(|ui| {
         let closeable = pane.tabs().len() > 1;
+        let (close_icon, close_tip) = FILES_TAB_ICONS[0];
         for (i, tab) in pane.tabs().iter().enumerate() {
             let active = i == pane.active_tab_index();
             if ui.selectable_label(active, tab.title()).clicked() {
                 actions.push(Action::SelectTab(pane_ix, i));
             }
-            if closeable
-                && ui
-                    .small_button("\u{00d7}")
-                    .on_hover_text("Close tab")
-                    .clicked()
-            {
+            if closeable && files_icon_button(ui, close_icon, true, close_tip).clicked() {
                 actions.push(Action::CloseTab(pane_ix, i));
             }
         }
-        if ui.small_button("+").on_hover_text("New tab").clicked() {
+        let (new_tab_icon, new_tab_tip) = FILES_TAB_ICONS[1];
+        if files_icon_button(ui, new_tab_icon, true, new_tab_tip).clicked() {
             actions.push(Action::NewTab(pane_ix));
         }
     });
@@ -3335,7 +3343,9 @@ const fn peer_color(status: PeerStatus) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_type_icon, files_panel, local_place_icon, FILES_NAV_ICONS};
+    use super::{
+        file_type_icon, files_panel, local_place_icon, tab_strip, FILES_NAV_ICONS, FILES_TAB_ICONS,
+    };
     use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode, LOCAL_SPOTS};
     use crate::transfers::test_support::FakeTransfers;
     use crate::transfers::{Method, TransferJob, TransferPolicy, TransferState};
@@ -3561,6 +3571,18 @@ mod tests {
         out
     }
 
+    fn image_mesh_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty() => 1,
+                egui::Shape::Vec(shapes) => shapes.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+
+        shapes.iter().map(|clipped| walk(&clipped.shape)).sum()
+    }
+
     fn assert_painted_text_color(texts: &[(String, Color32)], label: &str, color: Color32) {
         assert!(
             texts
@@ -3696,6 +3718,61 @@ mod tests {
                 "{label} navigation icon rasterized empty"
             );
         }
+    }
+
+    #[test]
+    fn files_tab_strip_controls_use_yamis_icon_buttons() {
+        assert_eq!(
+            FILES_TAB_ICONS,
+            &[
+                (mde_theme::brand::icons::IconId::Close, "Close tab"),
+                (mde_theme::brand::icons::IconId::NewTab, "New tab"),
+            ]
+        );
+        for (icon, label) in FILES_TAB_ICONS {
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{label} tab-strip icon should resolve through the YAMIS catalog"
+            );
+            let img = mde_theme::brand::icons::icon_image(*icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| panic!("{label} tab-strip icon failed to rasterize: {err}"));
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{label} tab-strip icon rasterized empty"
+            );
+        }
+
+        let mut b = browser();
+        b.new_tab(0);
+        assert_eq!(b.pane(0).tabs().len(), 2, "test setup needs close buttons");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 80.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut actions = Vec::new();
+                tab_strip(ui, &b, 0, &mut actions);
+                assert!(
+                    actions.is_empty(),
+                    "render-only tab strip should not emit actions"
+                );
+            });
+        });
+
+        assert!(
+            image_mesh_count(&out.shapes) >= 3,
+            "two close controls plus the new-tab control should paint image icons"
+        );
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .all(|(text, _)| text != "\u{00d7}" && text != "+"),
+            "tab-strip icon buttons must not paint raw text controls: {texts:?}"
+        );
     }
 
     #[test]

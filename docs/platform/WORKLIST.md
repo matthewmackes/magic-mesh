@@ -710,6 +710,12 @@ These decisions refine acceptance and sequencing for the active items below.
   evidence: `.50` isolated and combined
   `cargo test -p mde-shell-egui page_actions -- --nocapture` passed 7 tests;
   `.90` combined `cargo fmt -p mde-shell-egui -- --check` passed.
+  A follow-up 2026-07-18 Browser bookmark-overflow popup pass reserved the
+  toolbar popup width before rendering the Browser chrome frame, preventing
+  right-aligned toolbar layout from squeezing overflow bookmark rows into a
+  thin wedge. Farm evidence: `.90` focused
+  `cargo test -p mde-shell-egui bookmark_overflow -- --nocapture` passed, and
+  `.50` `cargo fmt -p mde-shell-egui -p mde-files-egui -- --check` passed.
 - Acceptance criteria: A tab/bookmark/settings change on node A appears on node B,
   conflicts converge, and Browser does not maintain a competing bookmark store.
 - Verification method: Multi-node sync test or deterministic two-store fixture,
@@ -832,6 +838,12 @@ These decisions refine acceptance and sequencing for the active items below.
   completion text off CUPS/lp/spool-path wording while keeping the raw CUPS/lp
   helpers tested internally; farm `.50` fmt and BigBoy `.130` focused `print`
   coverage passed.
+  A follow-up 2026-07-18 Browser password-menu popup pass gave the toolbar
+  password/autofill popup the same reserved Browser chrome width as other
+  toolbar popups, bounded long site and username text, and kept the lock icon
+  on the Browser/YAMIS icon paint path. Farm evidence: BigBoy `.130` focused
+  `cargo test -p mde-shell-egui password -- --nocapture` passed, and `.50`
+  `cargo fmt -p mde-shell-egui -p mde-files-egui -- --check` passed.
   A later 2026-07-17 Browser media-export copy pass renamed the visible Power
   menu media export row and status notices from media-manifest/spool wording to
   media-list/export language while preserving the internal JSON manifest format;
@@ -1589,6 +1601,11 @@ These decisions refine acceptance and sequencing for the active items below.
 	  BigBoy `.130` focused
 	  `chat_mute_button_uses_yamis_icon_instead_of_bell_emoji_text`, and `.50`
 	  touched-file fmt passed.
+	  A follow-up Files icon slice replaced raw tab-strip close/new-tab text
+	  controls with YAMIS-backed `IconId::Close` and `IconId::NewTab` icon
+	  buttons while preserving hover text and widget metadata; farm `.90`
+	  focused `files_tab_strip_controls_use_yamis_icon_buttons` and `.50`
+	  `cargo fmt -p mde-files-egui -- --check` passed.
 	  Remaining icon work is the full per-surface sweep for
 	  hand-painted icons or other code paths that bypass `IconId`, removal or
   repointing of stale Carbon/Material asset uses, and live rendered proof on the
