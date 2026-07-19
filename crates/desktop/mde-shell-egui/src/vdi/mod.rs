@@ -207,10 +207,11 @@ pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> C
 /// published), mirroring the Chooser's `BusDesktopSources::latest` read idiom.
 #[cfg(feature = "live-vdi")]
 fn read_console_bodies(bus_root: Option<&std::path::Path>) -> Vec<String> {
-    let Some(root) = bus_root else {
-        return Vec::new();
-    };
-    let Ok(persist) = mde_bus::persist::Persist::open(root.to_path_buf()) else {
+    // arch-11: open through the shared BusReader seam (full path — this fn is
+    // `live-vdi`-gated, so a top-level import would go unused off that feature).
+    let Some(persist) =
+        crate::bus_reader::BusReader::new(bus_root.map(std::path::Path::to_path_buf)).open()
+    else {
         return Vec::new();
     };
     persist
