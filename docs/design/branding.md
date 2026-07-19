@@ -1,5 +1,7 @@
 # BRAND — Carbon system-wide branding ("Branding Toggle")
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** describes the retired Cosmic/GTK/Qt system-theming branding toggle and the `mde-cosmic-applet`. The E12 Construct pivot retired `libcosmic`; the live brand design is [`construct-branding.md`](construct-branding.md) for the egui shell `mde-shell-egui`. Retained as a historical design record.
+
 Operator-locked 2026-06-16. One-way Carbon branding applied automatically on
 first boot of a **Workstation-role** node. Server/Lighthouse skip it.
 

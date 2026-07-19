@@ -1,5 +1,7 @@
 # PEERS-DT — Peers page as a Carbon data table
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** describes the retired `mde-workbench` Peers panel (`peers.rs`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the `mde-workbench` crate references below as historical.
+
 **Epic prefix:** `PEERS-DT`
 **Status:** locked 2026-06-15 (operator 5-question survey)
 **Reference:** Carbon Design System — Data table usage

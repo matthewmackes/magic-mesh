@@ -1,5 +1,7 @@
 # MCNF — Enterprise-Readiness Verification
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** a point-in-time enterprise-readiness audit (workspace 10.0.0, 2026-06-09) that reasons about the retired **LizardFS** substrate and `mde-workbench` shell. The live substrate is **etcd** + **Syncthing** ([`substrate-v2.md`](substrate-v2.md)) and the live desktop is the egui-native shell `mde-shell-egui` ([`quasar-vdi-desktop.md`](quasar-vdi-desktop.md)). Current architecture is in [`../architecture.md`](../architecture.md); open work is tracked in [`../platform/WORKLIST.md`](../platform/WORKLIST.md).
+
 > **Objective.** Verify, without assumptions, whether this mesh platform deserves to be called
 > enterprise-grade; if it does not, produce the exact worklist required to make that claim true.
 

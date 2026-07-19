@@ -1,5 +1,7 @@
 # Start Menu redesign (APPS-STYLE-2)
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** targets the retired `mde-cosmic-applet` apps-applet (`mde-apps-applet.rs`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` and the launcher is folded into the Front Door — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and [`app-launcher-rethink.md`](app-launcher-rethink.md). Retained as a historical design record.
+
 Goal: **Deploy Redesigned Start menu.** Source design: Claude Design project
 "Start menu improvement design" (`Start Menu.dc.html`), imported 2026-06-18.
 Target: `crates/platform/mde-cosmic-applet/src/bin/mde-apps-applet.rs` (the apps

@@ -1,5 +1,7 @@
 # Notification Hub redesign (operator-locked 2026-06-30)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** describes the retired `mde-workbench` notify-center binary. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the `mde-workbench` crate references below as historical.
+
 Locked via the `/loop /polish /ship /no-flinch` session surveys (Round 1 + Round 2
 + the 10-question viewer survey). Builds on the shipped **NOTIFY-STATUS-STRIP**
 (Carbon-icon header/severity/lighthouse-shield footer). All changes land in

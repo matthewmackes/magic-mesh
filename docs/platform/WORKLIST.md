@@ -3276,3 +3276,84 @@ These decisions refine acceptance and sequencing for the active items below.
 - Verification method: Documentation review and worklist lint fixture.
 - Origin or merged source IDs: docs review `docs-consistency-10`, line-divergence
   postmortem.
+
+## Stewardship
+
+How to add, complete, merge, and archive worklist items without regressing into
+the pre-2026-07-16 giant-file / parallel-tracker failure. This file is the **only**
+active platform worklist; design notes, ops runbooks, review ledgers, and
+`docs/NEEDS-OPERATOR.md` are *evidence sources*, not parallel trackers.
+
+### ID scheme
+
+- Every active item is an epic headed `### WL-<FAMILY>-<NNN> - <title>`.
+- `FAMILY` is one of the reconciled families: `ARCH`, `BUILD`, `CRIT`, `DOC`,
+  `FUNC`, `PERF`, `RUN`, `SEC`, `TEST`, `UX`. Do not invent a new family without an
+  operator decision (a new family is a new plane of work, not a convenience).
+- `NNN` is a zero-padded, per-family sequence number. A new item takes the next
+  free number in its family. **Never reuse or renumber a retired ID** — archived
+  IDs stay reserved so old references keep resolving.
+- Pre-reconciliation IDs (e.g. `MEDIA-3`, `OW-8`, `FED-RUNTIME`) are **not** valid
+  active IDs. Map them to their owning `WL-*` epic via the epic's
+  `Origin or merged source IDs` field and the re-key map in
+  `docs/NEEDS-OPERATOR.md`.
+
+### Required fields per item
+
+Each `### WL-*` epic carries these fields, in this order:
+
+| Field | Rule |
+|---|---|
+| `Status` | Exactly one of `Remaining`, `Blocked`, `Needs clarification` (see Status Vocabulary). Closed work is archived, not left with a `Done`/`Completed` status. |
+| `Priority` | `P0`..`P3`. |
+| `Complexity` | `Small` / `Medium` / `Large` (or `Epic`). |
+| `Problem` | The user-visible or correctness gap, not the solution. |
+| `Required outcome` | The observable end state that closes the item. |
+| `Scope` | The surfaces/systems in and out of scope. |
+| `Relevant files/components` | Concrete crates/paths, so the next agent starts from evidence. |
+| `Acceptance criteria` | Verifiable conditions; live/hardware proofs named explicitly. |
+| `Verification method` | How acceptance is checked (fixture test, live smoke, `@farm:{cargo ...}`). |
+| `Origin or merged source IDs` | The pre-reconcile IDs and review handles this epic absorbed — the audit trail. |
+
+`Dependencies` is optional and names a blocking epic or an unmade decision.
+
+### Archive-on-close procedure
+
+- When an item is completed or retired, **move it out of this file** into
+  `docs/worklist-archive/` with a one-line disposition (done + evidence, or
+  retired + reason). Do not leave closed work in the active file.
+- Archive by appending to a dated archive note under `docs/worklist-archive/`
+  (see that directory's `README.md`); keep the `WL-*` ID in the archived entry so
+  references still resolve.
+- A batch reconciliation may temporarily annotate a still-listed epic as
+  `Done - <date> ...` in place; that is a reconciliation artifact to be swept into
+  the archive at the next stewardship pass, not a new active status value.
+
+### Evidence-citation rule
+
+- Every completion claim cites **file:line**, a live-artifact check, or a wire
+  observation — never intent. GUI/runtime claims need farm/live verification or an
+  explicit "hardware unavailable" note (per `AGENTS.md`).
+- The authoritative evidence ledger for the current epoch is
+  `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md`; per-epic `Status:` lines defer
+  to it where they disagree.
+- Preserve lineage: record absorbed old IDs in `Origin or merged source IDs` rather
+  than deleting the history.
+
+### Duplicate-workstream avoidance rule
+
+- One epic per workstream. Before opening a new item, grep existing `WL-*` headings
+  **and** their `Origin or merged source IDs` for the topic and any old ID — if it
+  is already owned, extend that epic instead of forking a rival.
+- Never resurrect a retired tracker (an old `docs/WORKLIST.md`, a design-note
+  backlog, or the `NEEDS-OPERATOR` queue) as a second source of truth. Re-key into
+  `WL-*` and point the old file at this one.
+
+### Enforcement
+
+- `install-helpers/lint-worklist.sh` guards this file's shape: valid active
+  `Status` vocabulary, no retired `- [ ]` checkbox markers, a max line length, no
+  credential-shaped tokens, and cargo-only `@farm` build payloads. Run
+  `install-helpers/lint-worklist.sh --self-test` to exercise it.
+- `install-helpers/lint-doc-supersession.sh` keeps historical design docs honestly
+  bannered so a superseded note cannot masquerade as live design (WL-DOC-001).

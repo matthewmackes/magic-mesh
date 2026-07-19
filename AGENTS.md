@@ -45,6 +45,26 @@ governance lock and update the stale doc as part of the work.
 
 - Delete dead workflow glue instead of carrying compatibility shims for retired
   agent systems.
-- Keep historical design notes only when they still explain a live behavior.
+- Keep historical design notes only when they still explain a live behavior. A
+  design note that describes retired architecture (the iced/`libcosmic`
+  `mde-workbench` era, the LizardFS substrate, the cloud-hypervisor/`mde-kvm` VM
+  path) must carry a top **HISTORICAL / SUPERSEDED** banner or be allowlisted;
+  `install-helpers/lint-doc-supersession.sh` enforces this.
 - Runtime code must remain reachable, tested, and free of stubs per
   `AI_GOVERNANCE.md §7`.
+
+## Worklist Stewardship
+
+- The **only** active platform worklist is `docs/platform/WORKLIST.md`. Design
+  notes, ops runbooks, review ledgers, and `docs/NEEDS-OPERATOR.md` are *evidence
+  sources*, not parallel trackers — never present a second file as an active
+  worklist.
+- Items are `### WL-<FAMILY>-<NNN>` epics with a fixed field set and a `Status` of
+  `Remaining` / `Blocked` / `Needs clarification`. Full lifecycle — ID scheme,
+  required fields, archive-on-close, evidence-citation, and duplicate-workstream
+  avoidance — is the **Stewardship** section of `docs/platform/WORKLIST.md`.
+- Closed/retired items move to `docs/worklist-archive/` with a disposition (see
+  its `README.md`); they are not left in the active file. Pre-reconciliation IDs
+  re-key to their owning `WL-*` epic (map in `docs/NEEDS-OPERATOR.md`).
+- `install-helpers/lint-worklist.sh` enforces the active file's shape; run its
+  `--self-test` before landing worklist edits.

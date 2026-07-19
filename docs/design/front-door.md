@@ -1,5 +1,7 @@
 # FRONTDOOR — the Magic Mesh Front Door (App Menu redesign)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the Front Door concept lives on, but this doc's implementation is the retired `mde-workbench` launcher. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the `mde-workbench`/iced crate references below as historical.
+
 > Design locks from the 100-question survey, 2026-06-25. Supersedes the old
 > `mde-workbench` launcher. Authority: `AI_GOVERNANCE.md` §0 (Secure, Simple,
 > No-Fixed-Center), §4 (Carbon), §6 (mesh boundary), §7 (Definition of Done).

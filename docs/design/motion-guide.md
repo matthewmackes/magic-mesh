@@ -1,5 +1,7 @@
 # Motion contributor guide — copy-paste patterns
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** copy-paste motion patterns for the retired iced/`mde-workbench` GUIs. The live desktop is the egui-native, DRM-native shell `mde-shell-egui`; motion now lives in the shared `mde-egui` `Motion` module — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and [`motion-system.md`](motion-system.md). The iced/workbench APIs below are stale.
+
 **Audience:** anyone adding motion to an MCNF GUI (`mde-workbench`, `mde-files`,
 `mde-music`, `mde-voice-hud`, the cosmic applets).
 **Companion:** [`motion-system.md`](motion-system.md) is the locked *design* (the

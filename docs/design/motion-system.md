@@ -1,5 +1,7 @@
 # MOTION — unified motion, refresh & visual-feedback system (design)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the motion *principles* here still guide the shell, but they were specced against the retired iced/`libcosmic`/`mde-workbench` GUIs. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` with motion in the shared `mde-egui` `Motion` module — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). The toolkit APIs and crate paths below are stale.
+
 **Status:** design locked (operator prompt, 2026-06-19). No survey forks — the
 operator's brief is fully prescriptive (8 epics, fixed item structure); this doc
 captures it against the real MCNF codebase and lifts it to a worklist.

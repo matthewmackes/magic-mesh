@@ -1,5 +1,7 @@
 # Router Control — per-node Vyatta-CLI router/firewall discovery + control
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the router-control feature lives on, but this doc's GUI is the retired `mde-workbench` Router panel. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the `mde-workbench` GUI references below as historical.
+
 **Status:** Locked (survey 2026-06-27). **Scope:** generalize the single
 hardcoded EdgeRouter integration into a **per-node, auto-discovered Vyatta-CLI
 router/firewall control plane**. **Master rule (§0):** Secure, Simple,

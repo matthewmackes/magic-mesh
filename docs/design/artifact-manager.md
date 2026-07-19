@@ -1,5 +1,7 @@
 # AFM — Artifact Manager interaction-layer completion
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** describes the retired iced/`libcosmic` Artifact Manager surface. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Retained as a historical design record; the crate paths and toolkit references below are stale.
+
 **Epic prefix:** `AFM`
 **Status:** locked 2026-06-15 (operator handed the canonical Claude-Design bundle
 `mde-4-workgroups-desktop` → `Artifact Manager.html` + `files-app.jsx`)

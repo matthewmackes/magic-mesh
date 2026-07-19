@@ -1,5 +1,7 @@
 # MDE-Notification-Hub — design
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** describes the retired `libcosmic` layer-shell notification hub. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and the current [`notification-hub-redesign.md`](notification-hub-redesign.md). Retained as a historical design record.
+
 **Epic prefix:** `NOTIFY`
 **Status:** locked 2026-06-14 (operator survey, 4 forks)
 **Surface crate:** new `crates/services/mde-notify`

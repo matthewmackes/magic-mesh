@@ -1,5 +1,7 @@
 # MUSIC-DOCK + MUSIC-HOME — docked always-open Music + a server-stats Home (design)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** describes the retired iced `mde-music` surface. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the iced toolkit references below as historical.
+
 **Status:** locked via a 10-Q operator survey, 2026-06-18.
 **Trigger:** Operator — "The Music App should always open Maximized; slide in from
 the bottom like a docked window, always open. Change the Home page to show stats

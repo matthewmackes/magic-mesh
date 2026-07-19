@@ -1,5 +1,7 @@
 # Recon: "3 new Lighthouses up, retire the old 2, move Eagle onto the new set"
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** a point-in-time DigitalOcean-lighthouse migration recon. The DO lighthouses it plans against have since been deleted (superseded by the 2-LH `magic-mesh` fleet rebuild), and the substrate has moved off **LizardFS** to **etcd** + **Syncthing** ([`../design/substrate-v2.md`](../design/substrate-v2.md)). Retained as a historical migration record.
+
 > **Status:** RECON ONLY — captured 2026-06-26 from a 5-agent sweep (920s) so a
 > context clear does not force a re-run. No execution has happened. Read this
 > before touching lighthouses/Eagle, then live-reconcile §0 before acting.

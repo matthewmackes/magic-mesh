@@ -1,5 +1,7 @@
 # Substrate-correctness audit (SUBAUDIT) — 2026-06-14
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** a point-in-time audit of the now-**removed** QNM-Shared **LizardFS** mount. The live substrate is **etcd** (coordination) + **Syncthing** (files); see [`substrate-v2.md`](substrate-v2.md). Retained as a historical audit record; the LizardFS findings no longer describe a live plane.
+
 > **Note (post-SUBSTRATE-6):** this audit predates the substrate replacement. The
 > QNM-Shared **LizardFS** mount it reasons about is now **REMOVED** — coordination
 > runs on **etcd** and files sync over **Syncthing** on a plain `/mnt/mesh-storage`

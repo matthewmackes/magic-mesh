@@ -1,5 +1,7 @@
 # PEERS — Directory of Mesh Peers
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** describes the retired `mde-workbench` Peers panel and launcher. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the `mde-workbench` crate references below as historical.
+
 **Date:** 2026-06-09 · **Survey:** 26 questions (3 rounds) + 3 operator directives,
 **+ a 25-question level-2 survey** (same day — implementation depth) ·
 **Status:** locked, lifted into `docs/WORKLIST.md` (### PEERS)
