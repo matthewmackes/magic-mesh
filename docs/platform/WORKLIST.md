@@ -3083,7 +3083,10 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-PERF-003 - Browser native-grade frame rate, occlusion, and audio
 
-- Status: Remaining
+- Status: Core delivered + LIVE-SEAT-VERIFIED 2026-07-19 (operator "Live seat review
+  passes"). P0/P1(tab+surface occlusion)/P2a/P3-engine done, deployed to seat .15,
+  eyes-on pass. Optional refinements remain (P2b dirty-rect, P3 native-mode 🔊 pip,
+  P4 HW decode) — not gaps; retire or spin out on next reconcile.
 - Priority: P1
 - Complexity: Large
 - Problem: The CEF-OSR CPU-readback browser does not match native Chromium under
