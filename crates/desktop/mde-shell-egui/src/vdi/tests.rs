@@ -1466,6 +1466,56 @@ fn live_spice_target_parser_accepts_optional_ticket() {
     );
 }
 
+// WL-PERF-002 — the predicate the shell host loop gates its per-frame VDI
+// repaint on. It must report a LIVE transport (frames actually inbound), never
+// merely a REQUESTED session, so an idle chooser / a session with no live
+// stream never wakes the seat at 60Hz (the whole point of the occlusion work).
+#[cfg(feature = "live-vdi")]
+#[test]
+fn has_live_transport_is_true_only_while_a_transport_handle_is_installed() {
+    // A live RDP transport handle is installed → streaming → wake the loop.
+    let rdp = live_rdp_state();
+    assert!(
+        rdp.has_live_transport(),
+        "an installed RDP transport handle is a live stream that must drive repaints"
+    );
+
+    // A VNC-only session is equally live.
+    let mut vnc = VdiState::default();
+    vnc.live_vnc = Some(dummy_vnc_handle());
+    vnc.requested = Some(rdp_connect_request());
+    assert!(
+        vnc.has_live_transport(),
+        "an installed VNC transport handle is a live stream too"
+    );
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn has_live_transport_stays_false_for_an_idle_or_requested_only_session() {
+    // A fresh idle state (no session at all) must leave the loop idle.
+    let idle = VdiState::default();
+    assert!(
+        !idle.has_live_transport(),
+        "a default idle VdiState has no live transport — the seat must stay idle"
+    );
+
+    // A session that has been REQUESTED but has no live transport handle yet
+    // (or has lost it) must NOT wake the loop — this is the regression the
+    // repaint gate exists to avoid: `requested_target().is_some()` is true here
+    // but there is nothing streaming.
+    let mut requested_only = VdiState::default();
+    requested_only.requested = Some(rdp_connect_request());
+    assert!(
+        requested_only.requested_target().is_some(),
+        "the session IS requested (the naive gate would have repainted)…"
+    );
+    assert!(
+        !requested_only.has_live_transport(),
+        "…but with no live transport handle the loop must stay idle"
+    );
+}
+
 #[cfg(feature = "live-vdi")]
 fn color_image_fnv1a64(image: &egui::ColorImage) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

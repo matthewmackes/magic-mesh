@@ -1253,6 +1253,18 @@ impl Shell {
                         self.vdi.clear_target();
                         self.nav.surface = Surface::Workbench;
                     }
+                    // WL-PERF-002 — keep the frame loop ticking while a live VDI
+                    // transport is actually streaming so its incoming guest frames
+                    // wake an otherwise-idle seat (mirrors the media `is_playing`
+                    // repaint in the Media arm above). Gated on a LIVE transport
+                    // handle (`has_live_transport`) — not merely a requested
+                    // session — so a chooser / connecting-but-dead desktop with no
+                    // live stream leaves the loop idle: the whole point of the
+                    // occlusion work is to NOT repaint at 60Hz when nothing is live.
+                    #[cfg(feature = "live-vdi")]
+                    if self.vdi.has_live_transport() {
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
             Surface::InfraCode => {

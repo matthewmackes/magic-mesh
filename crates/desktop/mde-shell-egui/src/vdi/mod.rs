@@ -1610,9 +1610,13 @@ impl VdiState {
         }
     }
 
-    /// Whether any live transport handle is currently installed.
+    /// Whether any live transport handle is currently installed — i.e. an RDP,
+    /// VNC, or SPICE session is actually streaming (or connecting), not merely
+    /// requested. The shell host loop reads this to keep repainting while guest
+    /// frames are inbound (WL-PERF-002) without waking an idle seat for a
+    /// no-session / chooser-only desktop.
     #[cfg(feature = "live-vdi")]
-    fn has_live_transport(&self) -> bool {
+    pub(crate) fn has_live_transport(&self) -> bool {
         self.live_rdp.is_some() || self.live_vnc.is_some() || self.live_spice.is_some()
     }
 
