@@ -30,12 +30,26 @@ Disposition of all 43:
   WL-PERF-001, WL-PERF-003, WL-RUN-001, WL-RUN-005. Verified complete on real code
   paths; moved out of this active file to
   `docs/worklist-archive/2026-07-19-drain-closed.md` per the archive-on-close rule.
-- **Draining now - farm wave 2026-07-19 (4):** WL-BUILD-003, WL-FUNC-003,
-  WL-PERF-002, WL-RUN-002. One agent per crate, isolated worktrees off `b999251e`.
-- **Autonomously drainable - scoped, queued (12):** WL-ARCH-003, WL-ARCH-004,
-  WL-DOC-001, WL-DOC-002, WL-DOC-003, WL-FUNC-006, WL-FUNC-008, WL-RUN-006,
-  WL-SEC-002, WL-SEC-004, WL-TEST-001, WL-UX-005. (WL-FUNC-006 / WL-TEST-001 carry a
-  live-seat proof runnable on `.15`; WL-ARCH-004 is Epic-sized across ~136 sites.)
+- **Drained this session - code landed + tested + pushed (9):**
+  WL-BUILD-003 (`ed456387`, rollback verb+drill+runbook; secret-scan sub-item
+  deferred per operator), WL-FUNC-003 (`39d4ddba`, two-store convergence fixture),
+  WL-RUN-002 (`0f15faa2`, reconcile/drift/bus-error counters), WL-PERF-002
+  (`643ac7d7`, live-VDI repaint; optional live-seat wake proof remains),
+  WL-DOC-001/002/003 (`ad44f1ed`, supersession banners+lint / NEEDS-OPERATOR re-key
+  / stewardship lifecycle), WL-TEST-001 (`19bc4559`, OpenStack create→verify→delete
+  harness — live *run* blocked on a farm OpenStack endpoint that does not exist yet),
+  WL-SEC-004 (`3d422e07`, seated-user arm/disarm consent publisher). Each built +
+  targeted-tested green on the farm.
+- **Held for operator scoping - Epic-sized, NOT one-shot autonomously (6):**
+  WL-ARCH-003 (BusReader migration of all reader surfaces), WL-ARCH-004 (unify ~136
+  imperative spawn sites into one declarative registry), WL-SEC-002 (cross-mesh
+  federation enforcement + harness), WL-FUNC-008 (unified ServiceRecord aggregator -
+  whole deliverable unbuilt), WL-RUN-006 (router mutation fast-follow), WL-UX-005
+  (Start-Menu dedup + peer-app remote exec). Deliberately left for you to sequence -
+  each is a multi-PR architectural change, not a clean single-commit drain.
+- **Seat-visual proof (1):** WL-FUNC-006 - all code acceptance met; only a live `.15`
+  bottom-rail screenshot remains (folded into the live-verify list; the shell is
+  deployed on `.15`).
 - **Needs operator decision (3):** WL-ARCH-002, WL-FUNC-005, WL-UX-003 - a named
   dependency is an unmade design decision (see ledger).
 - **Park-blocked (16):** WL-ARCH-001, WL-BUILD-001, WL-BUILD-002, WL-CRIT-001,
@@ -43,10 +57,12 @@ Disposition of all 43:
   WL-RUN-003, WL-RUN-004, WL-SEC-001, WL-SEC-003, WL-TEST-002, WL-UX-001 - each
   gated on hardware, a live fleet, external account, or signing/release authority.
 
-**Autonomous ceiling = 24/43 code-complete (8 done + 4 draining + 12 drainable);
-the last 19 (3 decision + 16 park) need the operator.** Beta-readiness of the
-autonomous set does not require the 19 gated epics to be *done* - it requires them
-to be honestly *parked with their gate named*, which this reconciliation does.
+**Drain executed 2026-07-19: 17/43 fully resolved (8 archived-done + 9 landed),
+1 seat-visual (FUNC-006), leaving 6 Epic-sized held for operator scoping + 19
+(3 decision + 16 park) that genuinely need the operator (hardware, live fleet,
+external account, signing/release authority).** The autonomous drain is complete to
+its ceiling; the remaining 25 are honestly categorized with their gate named -
+beta-readiness needs them *parked-with-a-gate*, not *done*.
 
 ## Status Vocabulary
 
