@@ -3118,10 +3118,15 @@ These decisions refine acceptance and sequencing for the active items below.
   `docs/design/browser-perf-native.md`.
 - Dependencies: F44 builder `.131` for seat-deployable shells; live seat `.15`/
   `.138` for eyes-on-glass. Overlaps WL-FUNC-001 (protected media / GPU decode).
-- Current evidence: 2026-07-19 wire seam `ControlMsg::SetHidden` frozen (tag 38,
-  encode/decode/Debug/roundtrip test) and the BGRA converter fused to a single
-  pass (`frame.rs`, drops one full-frame clone + one swap pass per paint; 2x2
-  multi-pixel regression test added). Based on `agent/browser-enterprise-hardening`.
+- Current evidence: 2026-07-19 P1 occlusion signal COMPLETE end-to-end + pushed
+  (branch `agent/browser-enterprise-hardening`): wire seam `SetHidden` tag 38
+  (`233154ba`), engine `was_hidden()` host call at vtable offset 312 (`c735f0ee`),
+  shell `reconcile_tab_visibility` edge-driven per tab (`4b9cdd2c`). P2a: BGRA
+  converter fused to one pass. Farm-green (172.20.0.50): wire 10/0, client 84/0,
+  mde-web-cef 13/0, shell 1635 pass + 0 new failures. NOTE: the WIP base
+  `aab908fb` carries ~19 PRE-EXISTING shell test failures (GUI-polish refactor,
+  non-perf: start_menu/dock/chrome_ui-icons/menubar/paused-media/tab-crash) to
+  drain for beta-ready. Offset 312 needs on-seat header cross-check before ship.
 - Acceptance criteria: `MDE_WEB_PERF` shows the targets above; each phase is
   farm-green + unit-tested + 0 style-leaks; the 5-video case is smooth on a live
   seat with audible in-sync audio and quiescent background tabs.
