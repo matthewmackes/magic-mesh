@@ -16,6 +16,37 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
+## Drain reconciliation - 2026-07-19 (authoritative)
+
+An 8-agent reconciliation (`wf_924f2a46-283`, 929k tokens, file:line evidence per
+epic, run against `agent/browser-enterprise-hardening` @ `b999251e`) re-verified
+all 43 epics against actual code. Full evidence + gates:
+**`docs/platform/DRAIN-RECONCILIATION-2026-07-19.md`** (authoritative; the per-epic
+`Status:` lines below defer to it where they disagree).
+
+Disposition of all 43:
+
+- **Done - marker lagged (8):** WL-ARCH-005, WL-CRIT-002, WL-CRIT-005, WL-FUNC-004,
+  WL-PERF-001, WL-PERF-003, WL-RUN-001, WL-RUN-005. Verified complete on real code
+  paths; marked done in-place below.
+- **Draining now - farm wave 2026-07-19 (4):** WL-BUILD-003, WL-FUNC-003,
+  WL-PERF-002, WL-RUN-002. One agent per crate, isolated worktrees off `b999251e`.
+- **Autonomously drainable - scoped, queued (12):** WL-ARCH-003, WL-ARCH-004,
+  WL-DOC-001, WL-DOC-002, WL-DOC-003, WL-FUNC-006, WL-FUNC-008, WL-RUN-006,
+  WL-SEC-002, WL-SEC-004, WL-TEST-001, WL-UX-005. (WL-FUNC-006 / WL-TEST-001 carry a
+  live-seat proof runnable on `.15`; WL-ARCH-004 is Epic-sized across ~136 sites.)
+- **Needs operator decision (3):** WL-ARCH-002, WL-FUNC-005, WL-UX-003 - a named
+  dependency is an unmade design decision (see ledger).
+- **Park-blocked (16):** WL-ARCH-001, WL-BUILD-001, WL-BUILD-002, WL-CRIT-001,
+  WL-CRIT-004, WL-FUNC-001, WL-FUNC-002, WL-FUNC-007, WL-FUNC-009, WL-FUNC-010,
+  WL-RUN-003, WL-RUN-004, WL-SEC-001, WL-SEC-003, WL-TEST-002, WL-UX-001 - each
+  gated on hardware, a live fleet, external account, or signing/release authority.
+
+**Autonomous ceiling = 24/43 code-complete (8 done + 4 draining + 12 drainable);
+the last 19 (3 decision + 16 park) need the operator.** Beta-readiness of the
+autonomous set does not require the 19 gated epics to be *done* - it requires them
+to be honestly *parked with their gate named*, which this reconciliation does.
+
 ## Status Vocabulary
 
 - `Remaining` - valid unfinished work that can proceed.
@@ -118,7 +149,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-CRIT-002 - VDI reconnect and disconnected-state UX
 
-- Status: Remaining
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P1
 - Complexity: Medium
 - Problem: A transport drop can leave the desktop frozen on the last frame or
@@ -170,7 +201,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-CRIT-005 - Substrate-v2 fleet cutover and LizardFS wedge removal
 
-- Status: Blocked
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P0
 - Complexity: Epic
 - Problem: Incident notes show live FUSE/LizardFS wedge risk remains until the
@@ -524,7 +555,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-ARCH-005 - Browser worker crypto seam and mde-seal emitter completion
 
-- Status: Remaining
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P2
 - Complexity: Medium
 - Problem: Browser worker extraction is mostly done, but passkey/credential
@@ -548,7 +579,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-RUN-001 - Auto-repair must either repair or say observe-only
 
-- Status: Remaining
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P2
 - Complexity: Medium
 - Problem: The reconciler can queue repair intent while the actual take-action
@@ -633,7 +664,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-RUN-005 - Device Manager multi-source inventory and fault notifications
 
-- Status: Remaining
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P2
 - Complexity: Medium
 - Problem: Device Manager needs source coverage and eventing beyond local PC
@@ -783,7 +814,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-FUNC-004 - Browser power tools, downloads, PDF/print, capture, and protocol handling
 
-- Status: Remaining
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P2
 - Complexity: Large
 - Problem: Browser has many first-party tools, but the daily-driver tail still
@@ -2874,7 +2905,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-PERF-001 - VDI dirty-rectangle display uploads
 
-- Status: Remaining
+- Status: Done - 2026-07-19 reconciliation verified complete on real code paths (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
 - Priority: P2
 - Complexity: Large
 - Problem: VDI display paths avoid some idle work, but changed frames can still
@@ -3083,7 +3114,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-PERF-003 - Browser native-grade frame rate, occlusion, and audio
 
-- Status: Core delivered + LIVE-SEAT-VERIFIED 2026-07-19 (operator "Live seat review
+- Status: Done - core delivered + LIVE-SEAT-VERIFIED 2026-07-19 (operator "Live seat review passes"); optional P2b refinements spun to backlog (see docs/platform/DRAIN-RECONCILIATION-2026-07-19.md)
   passes"). P0/P1(tab+surface occlusion)/P2a/P3-engine done, deployed to seat .15,
   eyes-on pass. Optional refinements remain (P2b dirty-rect, P3 native-mode 🔊 pip,
   P4 HW decode) — not gaps; retire or spin out on next reconcile.
