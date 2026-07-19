@@ -29,6 +29,11 @@
 //! A live-gated skeleton ([`live_openstack_catalog_and_resources`]) exercises the
 //! real API when `MDE_OPENSTACK_LIVE_TARGET` points at a `clouds.yaml`, mirroring
 //! the env-gated VDI/console live suites; it is `#[ignore]` so CI stays offline.
+//! Its resource-*mutating* companion ([`live_openstack_create_verify_delete`],
+//! WL-TEST-001) creates a tiny throwaway Heat stack, verifies it reaches
+//! `CREATE_COMPLETE`, then deletes it with a Drop-guard that guarantees cleanup
+//! even if a mid-test assertion panics — also `#[ignore]`, and doubly gated on an
+//! explicit `MDE_OPENSTACK_LIVE_MUTATE=1` opt-in.
 #![allow(
     clippy::unwrap_used,
     clippy::panic,
@@ -873,6 +878,215 @@ fn live_openstack_catalog_and_resources() {
         eprintln!("live-openstack: {} Nova servers", table.rows.len());
         for row in &table.rows {
             assert!(!row.id.trim().is_empty(), "a live server row carries an id");
+        }
+    }
+}
+
+// ───────────── live-gated create → verify → delete (WL-TEST-001) ─────────────
+
+/// The tiniest possible throwaway Heat stack: a single **in-Heat**
+/// `OS::Heat::RandomString` resource. It allocates NO Nova/Neutron/Cinder
+/// infrastructure — the random string is generated entirely inside Heat — so the
+/// create → verify → delete round-trip proves the resource-*mutating* live client
+/// path (auth → `POST /stacks` → poll → `DELETE`) without ever standing up (or
+/// risking a leak of) real cloud infrastructure. Even if teardown somehow failed,
+/// a leaked RandomString stack costs nothing.
+const LIVE_TEST_HOT: &str = "\
+heat_template_version: 2016-10-14
+description: >
+  Ephemeral MDE live-test stack (WL-TEST-001) — a single in-Heat RandomString,
+  no real infrastructure. Safe to create and delete; auto-cleaned by the test.
+resources:
+  probe:
+    type: OS::Heat::RandomString
+    properties:
+      length: 8
+outputs:
+  probe_value:
+    description: proves the stack reached CREATE_COMPLETE
+    value: { get_attr: [probe, value] }
+";
+
+/// A **Drop-guard** that guarantees the throwaway stack is deleted even when a
+/// mid-test assertion panics — the load-bearing cleanup safety of a *mutating*
+/// live test (a leaked cloud resource is the failure mode we refuse to allow).
+///
+/// `cargo test` unwinds on an assertion failure (panic = unwind, not abort), so
+/// this guard's [`Drop`] runs on that unwind path and still fires the delete. The
+/// happy path calls [`Self::teardown`] explicitly (so the delete is *asserted*)
+/// which disarms the net; the guard only auto-deletes when an earlier assertion
+/// already panicked — so cleanup runs exactly once, on every exit path.
+struct StackTeardown {
+    stack_name: String,
+    stack_id: String,
+    /// Set once the explicit happy-path teardown has run, so [`Drop`] doesn't
+    /// double-delete.
+    disarmed: bool,
+}
+
+impl StackTeardown {
+    /// Arm the guard immediately after a successful create, keyed on the new
+    /// stack's name + id, so every later line runs under the cleanup guarantee.
+    fn arm(stack_name: &str, stack_id: &str) -> Self {
+        Self {
+            stack_name: stack_name.to_string(),
+            stack_id: stack_id.to_string(),
+            disarmed: false,
+        }
+    }
+
+    /// The explicit, *asserted* happy-path teardown — issues the real `DELETE` and
+    /// disarms the Drop safety net (so cleanup runs exactly once).
+    fn teardown(&mut self) -> Result<(), super::ClientError> {
+        self.disarmed = true;
+        super::LiveOpenStack::new().heat_delete(&self.stack_name, &self.stack_id)
+    }
+}
+
+impl Drop for StackTeardown {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return; // the explicit happy-path teardown already deleted the stack.
+        }
+        // SAFETY NET: an assertion panicked before the explicit teardown — delete
+        // the throwaway stack anyway so the live cloud is never left with a leak.
+        match super::LiveOpenStack::new().heat_delete(&self.stack_name, &self.stack_id) {
+            Ok(()) => eprintln!(
+                "live-openstack: [cleanup-on-panic] issued DELETE for throwaway stack {} ({})",
+                self.stack_name, self.stack_id
+            ),
+            Err(e) => eprintln!(
+                "live-openstack: [cleanup-on-panic] FAILED to delete stack {} ({}): {e} \
+                 — MANUAL CLEANUP REQUIRED",
+                self.stack_name, self.stack_id
+            ),
+        }
+    }
+}
+
+/// Live-gated **create → verify → delete** proof against a REAL `OpenStack`
+/// cloud — the resource-*mutating* companion to
+/// [`live_openstack_catalog_and_resources`]'s read-only proof. It authenticates,
+/// creates a tiny throwaway Heat stack, polls until it reaches `CREATE_COMPLETE`
+/// (asserting it exists in a ready state), then deletes it — with **guaranteed
+/// cleanup even on assertion failure** via the [`StackTeardown`] Drop-guard.
+///
+/// Doubly gated (it *mutates* a live cloud, so it never runs by accident):
+/// - `MDE_OPENSTACK_LIVE_TARGET` — path to the `clouds.yaml` to authenticate with
+///   (as in the read-only live test); unset ⇒ SKIP.
+/// - `MDE_OPENSTACK_LIVE_MUTATE=1` — an explicit opt-in that this run may create
+///   and delete real cloud resources; unset ⇒ SKIP (never mutate a cloud just
+///   because someone ran `--ignored`).
+///
+/// Run via the farm lane (`install-helpers/openstack-live-test.sh`) or directly:
+///
+/// ```text
+/// MDE_OPENSTACK_LIVE_TARGET=/etc/openstack/clouds.yaml MDE_OPENSTACK_LIVE_MUTATE=1 \
+///   cargo test -p mackesd --lib \
+///   openstack::client::contract::live_openstack_create_verify_delete -- \
+///   --ignored --nocapture --test-threads=1
+/// ```
+///
+/// GATED: live execution needs a farm `OpenStack` endpoint + a throwaway-project
+/// quota that does not yet exist, so this stays `#[ignore]` until that endpoint
+/// lands (see `docs/ops/openstack-live-test.md`).
+#[test]
+#[ignore = "live OpenStack cloud + throwaway quota required — set MDE_OPENSTACK_LIVE_TARGET + MDE_OPENSTACK_LIVE_MUTATE=1"]
+fn live_openstack_create_verify_delete() {
+    use super::{HeatSource, LiveOpenStack};
+
+    let Ok(target) = std::env::var("MDE_OPENSTACK_LIVE_TARGET") else {
+        eprintln!("live-openstack: SKIP — MDE_OPENSTACK_LIVE_TARGET not set (path to clouds.yaml)");
+        return;
+    };
+    if std::env::var("MDE_OPENSTACK_LIVE_MUTATE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "live-openstack: SKIP — MDE_OPENSTACK_LIVE_MUTATE=1 not set; refusing to create real \
+             resources on a live cloud without the explicit mutate opt-in"
+        );
+        return;
+    }
+    // Point the standard clouds.yaml resolver at the operator's target file.
+    std::env::set_var("OS_CLIENT_CONFIG_FILE", &target);
+
+    let live = LiveOpenStack::new();
+
+    // A collision-proof throwaway name (Heat requires a leading letter).
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stack_name = format!("mde-livetest-{suffix}");
+
+    // ── CREATE ──────────────────────────────────────────────────────────────
+    let stack_id = live
+        .heat_create(&stack_name, LIVE_TEST_HOT)
+        .expect("live heat_create of the throwaway stack");
+    // ARM cleanup IMMEDIATELY — before any assertion — so even the id check below
+    // (or any later panic) still deletes the freshly-created stack.
+    let mut teardown = StackTeardown::arm(&stack_name, &stack_id);
+    assert!(
+        !stack_id.trim().is_empty(),
+        "a live create returns the new stack's id"
+    );
+    eprintln!("live-openstack: created throwaway stack {stack_name} ({stack_id})");
+
+    // ── VERIFY: poll until CREATE_COMPLETE (fail fast on CREATE_FAILED) ──────
+    let poll = std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        let detail = live
+            .heat_show(&stack_id)
+            .expect("live heat_show of the throwaway stack");
+        if detail.status == "CREATE_COMPLETE" {
+            eprintln!("live-openstack: stack reached CREATE_COMPLETE");
+            break;
+        }
+        assert_ne!(
+            detail.status, "CREATE_FAILED",
+            "the throwaway stack failed to create: {:?}",
+            detail.status_reason
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for CREATE_COMPLETE (last status {})",
+            detail.status
+        );
+        std::thread::sleep(poll);
+    }
+
+    // ── DELETE (explicit + asserted; disarms the Drop safety net) ───────────
+    teardown
+        .teardown()
+        .expect("live heat_delete of the throwaway stack");
+    eprintln!("live-openstack: issued DELETE for {stack_name} ({stack_id})");
+
+    // Best-effort confirm the delete took effect (a RandomString stack tears down
+    // near-instantly). A slow cloud must not fail the run once DELETE is issued,
+    // so this is logged, not asserted.
+    let del_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match live.heat_show(&stack_id) {
+            // The stack is gone (Heat 404s → a typed transport error) — deleted.
+            Err(_) => {
+                eprintln!("live-openstack: stack is gone — delete confirmed");
+                break;
+            }
+            Ok(detail) if detail.status == "DELETE_COMPLETE" => {
+                eprintln!("live-openstack: stack DELETE_COMPLETE — delete confirmed");
+                break;
+            }
+            Ok(detail) => {
+                if std::time::Instant::now() >= del_deadline {
+                    eprintln!(
+                        "live-openstack: delete still in progress after timeout (status {}) — \
+                         issued, the cloud will finish it async",
+                        detail.status
+                    );
+                    break;
+                }
+                std::thread::sleep(poll);
+            }
         }
     }
 }
