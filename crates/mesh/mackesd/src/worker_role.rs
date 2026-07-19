@@ -11,6 +11,7 @@
 //! fleet + voice/media + desktop worker sits at rank 1 (Workstation — a headless
 //! box is a Workstation too, its desktop workers idle without a local display).
 
+use crate::workers::RestartPolicy;
 use mde_role::{Capability, Role, RoleClass};
 
 /// MEDIA-1 — the deployment **class** that gates worker spawns.
@@ -48,45 +49,77 @@ impl DeployClass {
     }
 }
 
-/// Minimum role rank that runs each worker. The census MUST list every worker
-/// spawned in `run_serve` (a unit test pins the count) — a worker missing from
-/// the table defaults to rank 0 (runs everywhere), a safe default that never
-/// silently drops a worker from a role, but the count test catches the omission
-/// so the tier is a deliberate decision.
-const WORKER_TIERS: &[(&str, u8)] = &[
+/// WL-ARCH-004 — one declarative registration for each supervised, role-tiered
+/// worker: its **name**, its **minimum role rank** (the rank/class gate), and its
+/// **restart policy**. This single table is the source of truth BOTH the role
+/// census AND the `run_serve` spawner derive from, so the two can never drift
+/// (the historical BUG-STORAGE-1 / ARCH-5 failure mode): [`workers_for_class`] /
+/// [`min_rank`] read the gate here, and `spawn_tiered` (bin/mackesd/spawn.rs)
+/// reads the policy + gate here for every spawn — the constructor is bound at the
+/// spawn site (workers carry heterogeneous, order-sensitive construction), so the
+/// entry declares the *what/when*, the site supplies the *how*.
+///
+/// The census MUST list every role-tiered worker `run_serve` spawns (a unit test
+/// pins the count) — a worker missing from the table defaults to rank 0 (runs
+/// everywhere), a safe default that never silently drops a worker from a role,
+/// but the drift test catches the omission so every tier is a deliberate decision.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerSpec {
+    /// The worker's stable name — the `worker_names` roster key, the `runs`
+    /// gate key, and the `spawn_tiered` registration key.
+    pub name: &'static str,
+    /// Minimum role rank that runs this worker (0 lighthouse · 1 workstation).
+    pub min_rank: u8,
+    /// Restart policy the supervisor applies when this worker returns/panics.
+    pub policy: RestartPolicy,
+}
+
+impl WorkerSpec {
+    /// A rank-tiered worker registration.
+    #[must_use]
+    const fn tier(name: &'static str, min_rank: u8, policy: RestartPolicy) -> Self {
+        Self {
+            name,
+            min_rank,
+            policy,
+        }
+    }
+}
+
+const WORKER_REGISTRY: &[WorkerSpec] = &[
     // ── Lighthouse (rank 0) — the relay control plane: Nebula, mde-bus,
     //    mesh routing/discovery, leader, health, security baseline.
-    ("nebula_supervisor", 0),
-    ("heartbeat", 0),
-    ("health_reconciler", 0),
-    ("mesh_router", 0),
-    ("stun_gather", 0),
-    ("mdns_relay", 0),
-    ("mesh_latency", 0),
+    WorkerSpec::tier("nebula_supervisor", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("heartbeat", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("health_reconciler", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("mesh_router", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("stun_gather", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("mdns_relay", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("mesh_latency", 0, RestartPolicy::OnFailure),
     // MESHMAP-6 — per-link byte-counter collector (nftables accounting on
     // the Nebula iface). A control-plane traffic observer that runs on
     // every node, like mesh_latency.
-    ("link-traffic", 0),
-    ("mesh_dns", 0),
-    ("hardware_probe", 0),
-    ("bus_supervisor", 0),
-    ("firewall_preset", 0),
-    ("sshd_overlay_bind", 0),
-    ("ssh_pubkey_gossip", 0),
-    ("fleet_reconcile", 0),
-    ("presence_watch", 0),
-    ("etcd_watch", 0),
-    ("lifecycle_exec", 0),
+    WorkerSpec::tier("link-traffic", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("mesh_dns", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("hardware_probe", 0, RestartPolicy::Always),
+    WorkerSpec::tier("bus_supervisor", 0, RestartPolicy::Always),
+    WorkerSpec::tier("firewall_preset", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("sshd_overlay_bind", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("ssh_pubkey_gossip", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("fleet_reconcile", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("presence_watch", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("etcd_watch", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("lifecycle_exec", 0, RestartPolicy::OnFailure),
     // DEVMGR-8 — the device-control executor: privileged hardware ops
     // (enable/disable, reload module, rescan bus) the Device-Manager surface
     // dispatches to a target node. UNIVERSAL (rank 0) like hardware_probe /
     // lifecycle_exec — every node can be an action target and drains only its
     // own replicated fleet/device-control/<self> request dir.
-    ("device_control", 0),
-    ("reconcile", 0),
-    ("netstate_apply", 0),
-    ("validation_suite", 0),
-    ("metrics_exporter", 0),
+    WorkerSpec::tier("device_control", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("reconcile", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("netstate_apply", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("validation_suite", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("metrics_exporter", 0, RestartPolicy::OnFailure),
     // BUG-STORAGE-1 — the E12-20 storage worker: a UNIVERSAL per-node topology
     // mirror (read-only UDisks2 enumerate → `state/storage/<node>`). Pinned at
     // rank 0 so it provably publishes on EVERY role — a Workstation has local
@@ -96,7 +129,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // it from this census, so `workers_for_rank` / `mackesd role-workers` wrongly
     // reported the Workstation as NOT running storage. Only the READ/publish path
     // is enabled here; the live UDisks2Executor stays IntegrationGated as-is.
-    ("storage", 0),
+    WorkerSpec::tier("storage", 0, RestartPolicy::OnFailure),
     // QC-2 — the OpenStack supervision worker: UNIVERSAL (rank 0). The
     // CONSTRUCT-CLOUD design's universal-node premise (quasar-cloud.md Q1/Q5/Q22:
     // any-role node, APIs on every node, no controller box) means every node —
@@ -106,7 +139,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // IntegrationGated) still publishes its `state/openstack/<node>` mirror.
     // A deliberate census entry like storage's (BUG-STORAGE-1), never the
     // silent unknown-worker default.
-    ("openstack", 0),
+    WorkerSpec::tier("openstack", 0, RestartPolicy::OnFailure),
     // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
     // explorer (unit-explorer.md #18). UNIVERSAL (rank 0) like storage/openstack:
     // every node folds its OWN unit view (self-first #23) — the mesh mirror it
@@ -115,7 +148,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // #20: "no center"); a lighthouse publishes an honest units view too. A
     // deliberate rank-0 entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
-    ("unit_aggregator", 0),
+    WorkerSpec::tier("unit_aggregator", 0, RestartPolicy::OnFailure),
     // CHAT-FIX-2 — the local-notification producer worker: watches this node's
     // OWN event sources (mesh peer join/leave, dnf/platform updates, systemctl
     // --failed, df/SMART, journal WARN+) and publishes typed notifications the
@@ -125,14 +158,14 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // disks / a journal / peers to report on, and its notifications ride the same
     // bus the chat worker folds on every role. A deliberate rank-0 census entry
     // (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
-    ("notify", 0),
+    WorkerSpec::tier("notify", 0, RestartPolicy::OnFailure),
     // NODE-GRADE-1 (node-grade.md #11) — the per-node self-grade worker. UNIVERSAL
     // (rank 0): every node computes + publishes its OWN A–F capability grade
     // (`<workgroup_root>/node-grade/<hostname>.json`) from the telemetry the
     // platform already gathers, so a lighthouse grades itself too. A deliberate
     // rank-0 census entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
-    ("node_grade", 0),
+    WorkerSpec::tier("node_grade", 0, RestartPolicy::OnFailure),
     // KDC-MESH-3 (kdc-mesh.md #15) — the KDE Connect host is UNIVERSAL (rank 0):
     // it runs on EVERY node incl. lighthouses/headless so the mesh-wide "every
     // node recognizes the phone" (#5) + "all nodes serve the phone at once" (#6)
@@ -141,7 +174,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // the public NIC, so `kdc_host` on a lighthouse opens NO public port (the
     // firewall preset opens 1716 on the overlay/trusted zone only; public stays
     // default-deny). Was Workstation-only (rank 1) pre-KDC-MESH-3.
-    ("kdc_host", 0),
+    WorkerSpec::tier("kdc_host", 0, RestartPolicy::OnFailure),
     // CHAT-FIX-1 — the mesh chat worker: folds every node's chat/notification
     // traffic off the bus into the Chat surface's feed. UNIVERSAL (rank 0): it
     // ALREADY ran on every node — a lighthouse included — via the silent
@@ -151,7 +184,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // A deliberate rank-0 census entry now (the BUG-STORAGE-1 lesson) — same rank
     // it always had, now EXPLICIT + counted. Pairs with `notify` (CHAT-FIX-2), the
     // producer whose events it folds.
-    ("chat", 0),
+    WorkerSpec::tier("chat", 0, RestartPolicy::OnFailure),
     // ── ARCH-5 (drift guard) — universal (rank-0) workers that were spawned in
     //    `run_serve` gated on `worker_role::runs(...)` but OMITTED from this census,
     //    so they silently rode the "unknown worker ⇒ rank 0" default: they DID run
@@ -163,40 +196,40 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     //    so runtime behavior is UNCHANGED; they are now EXPLICIT + listed. Each spawn
     //    site documents its own "rank-0 / runs-everywhere / universal" intent
     //    (self-marker-gated where relevant).
-    ("boot_readiness", 0), // BOOT-STATUS-1 — fabric bring-up snapshot, all roles
-    ("xcp_host", 0),       // XCP-6 — hypervisor-capacity advertiser, self-gates on the dom0 marker
-    ("kvm_health", 0),     // MV-2 — per-node KVM service health, universal virt stack
-    ("vm_lifecycle", 0),   // MV — per-node libvirt VM executor, every node hosts VMs
-    ("container", 0),      // MV — per-node Podman container executor, every node hosts containers
-    ("scheduler", 0),      // MV-5 — placement scheduler (single-actor election), runs everywhere
-    ("session_broker", 0), // VDI — session-roster broker, leader-gated internally, runs everywhere
-    ("session_roaming", 0), // VDI — roaming-session reconciler, runs everywhere
-    ("console_broker", 0), // VDI — live-console overlay relay, serving-peer-gated, runs everywhere
-    ("clipboard_bridge", 0), // VDI — per-session clipboard relay, node-local, runs everywhere
-    ("service_onboard", 0), // onboard — action/onboard/service-add engine, leader-gated, runs everywhere
-    ("spawn_lighthouse_onboard", 0), // onboard — action/onboard/spawn-lighthouse engine, leader-gated
-    ("onboard_apply", 0),            // onboard — addressed remote-bundle applier, runs everywhere
-    ("lighthouse_probe", 0), // LIGHTHOUSE-8 — per-lighthouse deep-probe lane (gated in workers/mod.rs), rank-0
+    WorkerSpec::tier("boot_readiness", 0, RestartPolicy::OnFailure), // BOOT-STATUS-1 — fabric bring-up snapshot, all roles
+    WorkerSpec::tier("xcp_host", 0, RestartPolicy::OnFailure), // XCP-6 — hypervisor-capacity advertiser, self-gates on the dom0 marker
+    WorkerSpec::tier("kvm_health", 0, RestartPolicy::OnFailure), // MV-2 — per-node KVM service health, universal virt stack
+    WorkerSpec::tier("vm_lifecycle", 0, RestartPolicy::OnFailure), // MV — per-node libvirt VM executor, every node hosts VMs
+    WorkerSpec::tier("container", 0, RestartPolicy::OnFailure), // MV — per-node Podman container executor, every node hosts containers
+    WorkerSpec::tier("scheduler", 0, RestartPolicy::OnFailure), // MV-5 — placement scheduler (single-actor election), runs everywhere
+    WorkerSpec::tier("session_broker", 0, RestartPolicy::OnFailure), // VDI — session-roster broker, leader-gated internally, runs everywhere
+    WorkerSpec::tier("session_roaming", 0, RestartPolicy::OnFailure), // VDI — roaming-session reconciler, runs everywhere
+    WorkerSpec::tier("console_broker", 0, RestartPolicy::OnFailure), // VDI — live-console overlay relay, serving-peer-gated, runs everywhere
+    WorkerSpec::tier("clipboard_bridge", 0, RestartPolicy::OnFailure), // VDI — per-session clipboard relay, node-local, runs everywhere
+    WorkerSpec::tier("service_onboard", 0, RestartPolicy::OnFailure), // onboard — action/onboard/service-add engine, leader-gated, runs everywhere
+    WorkerSpec::tier("spawn_lighthouse_onboard", 0, RestartPolicy::OnFailure), // onboard — action/onboard/spawn-lighthouse engine, leader-gated
+    WorkerSpec::tier("onboard_apply", 0, RestartPolicy::OnFailure), // onboard — addressed remote-bundle applier, runs everywhere
+    WorkerSpec::tier("lighthouse_probe", 0, RestartPolicy::OnFailure), // LIGHTHOUSE-8 — per-lighthouse deep-probe lane (gated in workers/mod.rs), rank-0
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
     //    gracefully without a local display).
-    ("ansible-pull", 1),
-    ("app-sync", 1),
-    ("job_exec", 1),
-    ("voice_config", 1),
-    ("clipboard_sync", 1),
+    WorkerSpec::tier("ansible-pull", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("app-sync", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("job_exec", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("voice_config", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("clipboard_sync", 1, RestartPolicy::OnFailure),
     // BOOKMARKS-2 — the mesh-synced bookmarks worker. A desktop feature (the
     // seated user edits the Bookmarks surface), so Workstation-tier; it idles
     // gracefully on a headless box (no action/bookmarks/* requests) while still
     // replaying peers' Syncthing segments into the shared collection.
-    ("bookmarks", 1),
+    WorkerSpec::tier("bookmarks", 1, RestartPolicy::Always),
     // BOOKMARKS-7 — the mesh-wide ad-blocker worker. A desktop feature (it feeds
     // the mde-web-preview browser's block engine), so Workstation-tier; it idles
     // gracefully on a headless box (no browser, no action/adfilter/* requests)
     // while still replicating peers' filter-store blobs over Syncthing and, when
     // leader, compiling the shared engine blob.
-    ("adfilter", 1),
+    WorkerSpec::tier("adfilter", 1, RestartPolicy::Always),
     // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker. Reads the
     // Syncthing-synced fleet policy doc, folds it for THIS node's role, and
     // enforces at the browser launch/spawn seam (refuse-to-spawn on a disallowed
@@ -204,94 +237,94 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // out-of-policy navigate / adblock-off actions). A desktop-governance feature,
     // so Workstation-tier; it idles gracefully on a headless box (no browser, no
     // action/browser/* requests) while still replicating the policy doc.
-    ("browser_policy", 1),
+    WorkerSpec::tier("browser_policy", 1, RestartPolicy::Always),
     // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
     // Browser-origin passkey ceremony metadata, persists pending challenges into
     // local + Syncthing-backed roots, and publishes honest pending/error state.
     // A desktop/browser security feature, so Workstation-tier; it idles
     // gracefully on headless boxes with no Browser publishes.
-    ("browser_passkeys", 1),
+    WorkerSpec::tier("browser_passkeys", 1, RestartPolicy::Always),
     // BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
     // action/browser/session-sync snapshots into a local durable latest snapshot
     // and mirrors them to the Syncthing share for follow-me/startup restore. A
     // desktop/browser feature, so Workstation-tier; idles gracefully on a headless
     // box with no Browser publishes.
-    ("browser_session_sync", 1),
+    WorkerSpec::tier("browser_session_sync", 1, RestartPolicy::Always),
     // BROWSER-DD-11 — Browser read-aloud/TTS owner. Drains Browser page-text
     // read-aloud requests and speaks them through the configured offline TTS
     // command when present, publishing honest unavailable/error state otherwise.
     // A desktop/browser accessibility feature, so Workstation-tier.
-    ("browser_read_aloud", 1),
+    WorkerSpec::tier("browser_read_aloud", 1, RestartPolicy::Always),
     // BROWSER-DD-11 — Browser voice-command/dictation STT owner. Drains Browser
     // command/dictation requests and transcribes them through the configured
     // offline STT/capture command when present, publishing honest unavailable or
     // error state otherwise. A desktop/browser accessibility feature.
-    ("browser_voice_command", 1),
+    WorkerSpec::tier("browser_voice_command", 1, RestartPolicy::Always),
     // BROWSER-DD-12 — Browser external-protocol owner. Drains Browser
     // action/browser/protocol handoffs for schemes the shell refuses to navigate,
     // publishing retained route status/events for downstream Email/Transfers
     // owners without faking those surfaces. A desktop/browser integration
     // feature, so Workstation-tier.
-    ("browser_protocol", 1),
+    WorkerSpec::tier("browser_protocol", 1, RestartPolicy::Always),
     // BROWSER-DD-12 — Browser platform-share owner. Drains Browser
     // action/browser/share handoffs for Peer/Email/QR targets, publishing
     // retained route status/events without faking downstream delivery. A
     // desktop/browser integration feature, so Workstation-tier.
-    ("browser_share", 1),
+    WorkerSpec::tier("browser_share", 1, RestartPolicy::Always),
     // BROWSER-DD-12 — Browser private offline/mesh translation owner. Drains
     // Browser page-text translation requests and translates them through a
     // configured local/mesh command when present, publishing honest unavailable
     // or error state otherwise. A desktop/browser integration feature.
-    ("browser_translate", 1),
+    WorkerSpec::tier("browser_translate", 1, RestartPolicy::Always),
     // BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
     // page snapshots, keeps the helper no-store policy intact, and mirrors the
     // bounded private cache records onto the Syncthing-backed file plane.
-    ("browser_offline_cache", 1),
+    WorkerSpec::tier("browser_offline_cache", 1, RestartPolicy::Always),
     // BROWSER-DD-12 — Browser CEF security-update status owner. Watches the
     // packaged fast-update manifest and active CEF runtime, publishing an honest
     // current/missing/mismatch posture for the independent browser engine update
     // path. A desktop/browser integration feature, so Workstation-tier.
-    ("browser_security_update", 1),
+    WorkerSpec::tier("browser_security_update", 1, RestartPolicy::Always),
     // BROWSER-DD-12 — Browser idle-tab suspend owner. Drains shell-published
     // action/browser/tab-suspend handoffs after the shell stops inactive helper
     // load paths, publishing retained suspend status/events for diagnostics and
     // future orchestration. A desktop/browser integration feature, so
     // Workstation-tier.
-    ("browser_tab_suspend", 1),
+    WorkerSpec::tier("browser_tab_suspend", 1, RestartPolicy::Always),
     // KDC-MESH-6 — phone-as-touchpad/keyboard seat consumer. Drains KDC
     // worker's action/seat/remote-input handoffs and invokes the configured
     // local uinput/seat helper when present. Workstation-tier; idles on
     // headless nodes.
-    ("seat_remote_input", 1),
+    WorkerSpec::tier("seat_remote_input", 1, RestartPolicy::Always),
     // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
     // (the seated user browses peers), so Workstation-tier; it idles gracefully
     // with no mount requests on a headless box.
-    ("mesh_mount", 1),
+    WorkerSpec::tier("mesh_mount", 1, RestartPolicy::OnFailure),
     // CHOOSER-1 — the desktop-source discovery aggregator behind the Chooser
     // surface. A desktop feature (the seated user picks a desktop to connect
     // to), so Workstation-tier; it idles gracefully on a headless box (the
     // aggregation is cheap and the verbs simply never arrive).
-    ("desktop_sources", 1),
-    ("remmina-sync", 1),
+    WorkerSpec::tier("desktop_sources", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("remmina-sync", 1, RestartPolicy::OnFailure),
     // MEDIA-8 — Workstation music auto-config: a desktop worker (no seated user
     // on a Lighthouse, so Workstation-tier), reads the published shared
     // account off the registry plane + writes the desktop user's creds.
-    ("music_autoconfig", 1),
+    WorkerSpec::tier("music_autoconfig", 1, RestartPolicy::OnFailure),
     // MEDIA-14 — the mesh media-source discovery aggregator behind the
     // mde-media Sources panel. A desktop feature (the seated user picks a media
     // source to play), so Workstation-tier; it idles gracefully on a headless
     // box (the aggregation is cheap and simply publishes an empty roster).
-    ("media_sources", 1),
+    WorkerSpec::tier("media_sources", 1, RestartPolicy::OnFailure),
     // MEDIA-15 — the mesh media server + DLNA/UPnP + aggregation (the PRODUCER
     // half MEDIA-14 discovers). A desktop feature (the seated user shares their
     // media folders), so Workstation-tier; it idles gracefully on a headless
     // box (empty share manifest, empty aggregated library).
-    ("media_server", 1),
+    WorkerSpec::tier("media_server", 1, RestartPolicy::OnFailure),
     // TERM-7 — the mesh PTY-broker: opens remote shells on peers over the
     // overlay for the mde-term-egui terminal surface. A desktop feature (the
     // seated user opens a terminal on a mesh node), so Workstation-tier; it
     // idles gracefully on a headless box (no action/pty/* requests arrive).
-    ("pty_broker", 1),
+    WorkerSpec::tier("pty_broker", 1, RestartPolicy::OnFailure),
     // TRANSFERS-1 — the transfers worker: the daemon-owned queue/ledger/verb spine
     // of the Transfers surface (docs/design/transfers-surface.md). A desktop feature
     // fronted by the File Browser (Q1), the sibling of pty_broker/mesh_mount, so
@@ -299,7 +332,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // (an empty inbox + empty ledger, no transfer.submit verbs arrive). A deliberate
     // census entry (the BUG-STORAGE-1 lesson — a worker absent from the census
     // silently never runs).
-    ("transfers", 1),
+    WorkerSpec::tier("transfers", 1, RestartPolicy::OnFailure),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -308,7 +341,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
 /// AND carries the tag — so the Navidrome media worker (MEDIA-3) runs on a
 /// `Lighthouse_Media` node but never on a stock lighthouse / server / peer
 /// (acceptance: "container absent on a non-media node"). The worker is still
-/// listed in [`WORKER_TIERS`] for the rank floor; this table adds the tag gate.
+/// listed in [`WORKER_REGISTRY`] for the rank floor; this table adds the tag gate.
 ///
 /// `navidrome` is the foundation entry MEDIA-3 spawns onto: a rank-0 (lighthouse
 /// tier) worker that additionally requires [`Capability::Media`]. It is wired
@@ -331,13 +364,28 @@ pub fn min_rank(worker: &str) -> u8 {
     if let Some(rank) = capability_min_rank(worker) {
         return rank;
     }
-    WORKER_TIERS
+    WORKER_REGISTRY
         .iter()
-        .find(|(n, _)| *n == worker)
-        .map_or(0, |(_, r)| *r)
+        .find(|s| s.name == worker)
+        .map_or(0, |s| s.min_rank)
 }
 
-/// The rank floor for a capability-gated worker that isn't in [`WORKER_TIERS`]
+/// WL-ARCH-004 — the registration for `worker`, if it is a role-tiered worker
+/// (i.e. present in [`WORKER_REGISTRY`]). `None` for a non-tiered worker.
+#[must_use]
+pub fn spec(worker: &str) -> Option<&'static WorkerSpec> {
+    WORKER_REGISTRY.iter().find(|s| s.name == worker)
+}
+
+/// WL-ARCH-004 — the restart policy declared for a role-tiered `worker`. `None`
+/// for a worker absent from [`WORKER_REGISTRY`]; `spawn_tiered` treats that as a
+/// hard error (an unregistered tiered spawn), which the drift test also catches.
+#[must_use]
+pub fn policy_for(worker: &str) -> Option<RestartPolicy> {
+    spec(worker).map(|s| s.policy)
+}
+
+/// The rank floor for a capability-gated worker that isn't in [`WORKER_REGISTRY`]
 /// (the media worker lives in the capability table, not the rank census, so its
 /// rank floor is pinned here). `None` for a plain rank-gated worker.
 fn capability_min_rank(worker: &str) -> Option<u8> {
@@ -480,10 +528,10 @@ pub fn workers_for_rank(role_rank: u8) -> Vec<&'static str> {
 /// census order), then the capability workers the box's tags satisfy.
 #[must_use]
 pub fn workers_for_class(class: DeployClass) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = WORKER_TIERS
+    let mut out: Vec<&'static str> = WORKER_REGISTRY
         .iter()
-        .filter(|(_, tier)| class.rank >= *tier)
-        .map(|(name, _)| *name)
+        .filter(|s| class.rank >= s.min_rank)
+        .map(|s| s.name)
         .collect();
     out.extend(
         WORKER_CAPABILITIES
@@ -499,35 +547,33 @@ mod tests {
     use super::*;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // ARCH-5 — the drift guard between the two worker registries.
+    // WL-ARCH-004 — the (now structural) drift guard.
     //
-    // Worker registration is split across TWO registries that have drifted before
-    // (BUG-STORAGE-1): this static role census (`WORKER_TIERS` + `WORKER_CAPABILITIES`)
-    // vs. the ~136 imperative `sup.spawn(...)` / `worker_names.push(...)` sites in
-    // `run_serve` (`bin/mackesd.rs`) plus the role gates (`worker_role::runs(...)`)
-    // scattered across the crate. Nothing at runtime enforces that the two agree, so a
-    // worker could be:
-    //   • spawned-but-uncensused → its `runs(...)` gate silently resolves to
-    //     `min_rank => 0` (runs on every role, possibly the wrong tier) AND it is
-    //     hidden from `mackesd role-workers` (the exact BUG-STORAGE-1 failure), or
-    //   • censused-but-never-spawned → a phantom row that makes `role-workers` lie.
+    // Worker registration used to be split across TWO registries that drifted
+    // (BUG-STORAGE-1 / ARCH-5): a static role census vs. the ~136 imperative
+    // `sup.spawn(...)` / `worker_names.push(...)` sites in `run_serve`. WL-ARCH-004
+    // unified them: [`WORKER_REGISTRY`] is the ONE declarative table both the census
+    // (`min_rank` / `workers_for_class`) AND the spawner (`spawn_tiered`, which reads
+    // each entry's gate + restart policy) derive from — so a role-tiered worker can
+    // no longer be spawned without a census row, nor censused without a spawn.
     //
-    // `worker_spawns_and_the_census_do_not_drift` READS the crate source at test time
-    // and reconciles the registries so any FUTURE drift fails the build with the
-    // offending worker named. Airgapped-safe: pure source parsing, no live env.
-    // (This does NOT unify the two registries — that is a larger refactor; it only
-    // makes their divergence detectable and forces every spawn to be a deliberate,
-    // classified decision.)
+    // `worker_spawns_and_the_census_do_not_drift` proves that: it asserts the census
+    // is derived from the registry (not a parallel list) AND reads the crate source
+    // at test time to enforce the registry ⇔ `spawn_tiered` site identity, so any
+    // future drift fails the build with the offending worker named. Airgapped-safe:
+    // pure source parsing, no live env. The non-tiered bus responders /
+    // unconditional workers (below) still register with a literal
+    // `worker_names.push(...)` and are reconciled the same way.
 
-    /// Workers spawned in `run_serve` that are deliberately NOT in the role-tier
-    /// census: they spawn UNCONDITIONALLY on every role (mesh/nebula control plane,
-    /// bus responders, datacenter/compute workers that self-gate on a runtime marker),
-    /// or are capability-gated under the `navidrome` key (`media_registry` /
-    /// `navidrome_supervisor`). None of them consult `WORKER_TIERS`, so they cannot
-    /// mis-tier — but listing them here keeps the full-roster reconcile honest: every
-    /// spawned worker must be classified as EITHER a deliberate tier entry OR an
+    /// Workers spawned in `run_serve` that are deliberately NOT role-tiered (absent
+    /// from [`WORKER_REGISTRY`]): they spawn UNCONDITIONALLY on every role (mesh/nebula
+    /// control plane, bus responders, datacenter/compute workers that self-gate on a
+    /// runtime marker), or are capability-gated under the `navidrome` key
+    /// (`media_registry` / `navidrome_supervisor`). None of them consult the registry,
+    /// so they cannot mis-tier — but listing them here keeps the full-roster reconcile
+    /// honest: every spawned worker must be classified as EITHER a registry entry OR an
     /// explicit not-tier-gated entry, so a NEW spawn that is neither fails the guard.
-    /// A future tiering pass may promote an entry from here into `WORKER_TIERS`.
+    /// A future tiering pass may promote an entry from here into [`WORKER_REGISTRY`].
     const NON_TIERED_WORKERS: &[&str] = &[
         "action",
         "alert_relay",
@@ -670,6 +716,36 @@ mod tests {
         out
     }
 
+    /// Extract the FIRST quoted worker-name literal appearing anywhere after each
+    /// `needle` occurrence. Unlike [`scan_names`], the needle need NOT abut the
+    /// opening quote — used for `spawn_tiered(…, "name", || …)` sites, where the
+    /// name is a later argument and rustfmt may line-break the whole call. Only
+    /// lowercase worker tokens (`[a-z0-9_-]`) are kept.
+    fn scan_call_names(src: &str, needle: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while let Some(pos) = src[i..].find(needle) {
+            let after = i + pos + needle.len();
+            if let Some(q1) = src[after..].find('"') {
+                let start = after + q1 + 1;
+                if let Some(q2) = src[start..].find('"') {
+                    let tok = &src[start..start + q2];
+                    if !tok.is_empty()
+                        && tok.bytes().all(|b| {
+                            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                        })
+                    {
+                        out.push(tok.to_string());
+                    }
+                    i = start + q2 + 1;
+                    continue;
+                }
+            }
+            i = after;
+        }
+        out
+    }
+
     /// Every worker name passed to a PRODUCTION `worker_role::runs(...)` /
     /// `runs_in(...)` gate anywhere in the crate. Skips this module (its `runs(...)`
     /// calls are test fixtures like `"some-future-worker"`) and comment lines.
@@ -701,87 +777,120 @@ mod tests {
     fn worker_spawns_and_the_census_do_not_drift() {
         use std::collections::BTreeSet;
 
-        let census: BTreeSet<&str> = WORKER_TIERS.iter().map(|(n, _)| *n).collect();
+        let census: BTreeSet<&str> = WORKER_REGISTRY.iter().map(|s| s.name).collect();
         let caps: BTreeSet<&str> = WORKER_CAPABILITIES.iter().map(|(n, _)| *n).collect();
         let non_tiered: BTreeSet<&str> = NON_TIERED_WORKERS.iter().copied().collect();
         let dynamic: BTreeSet<&str> = DYNAMIC_SPAWNS.iter().copied().collect();
 
-        // The definitive spawn roster: every `worker_names.push("X")` literal in
-        // run_serve (`bin/mackesd.rs`) and in its relocated spawn helpers
-        // (`bin/mackesd/spawn.rs` — the ARCH bin submodule holding the
-        // `spawn_*_workers` / `start_*_bus_responders` fns), plus the
-        // runtime-named dynamic spawns.
+        // WL-ARCH-004 — the registry names are unique.
+        assert_eq!(
+            census.len(),
+            WORKER_REGISTRY.len(),
+            "WL-ARCH-004: duplicate worker name in WORKER_REGISTRY"
+        );
+
+        // WL-ARCH-004 — the census is now DERIVED from WORKER_REGISTRY (both
+        // `min_rank`/`workers_for_class` and the spawner read this one table), so
+        // the two registries that historically drifted (ARCH-5 / BUG-STORAGE-1)
+        // cannot diverge by construction. Prove the derivation is live: the full
+        // rank-1 + media class must resolve to exactly the registry names plus the
+        // capability workers its tag unlocks.
+        let derived: BTreeSet<&str> = workers_for_class(DeployClass {
+            rank: 1,
+            media: true,
+        })
+        .into_iter()
+        .collect();
+        let expected: BTreeSet<&str> = census.union(&caps).copied().collect();
+        assert_eq!(
+            derived, expected,
+            "WL-ARCH-004: workers_for_class no longer derives from WORKER_REGISTRY"
+        );
+
+        // The spawn roster, read from the source at test time:
+        //  • `tiered`  — every `spawn_tiered(…, \"X\", || …)` site (the sole way a
+        //    role-tiered worker is now spawned; policy + gate come from the registry).
+        //  • `pushed`  — every remaining `worker_names.push(\"X\")` literal (the
+        //    non-tiered bus responders / unconditional workers keep this shape).
+        // Both scanned across run_serve (`bin/mackesd.rs`) and its spawn helpers
+        // (`bin/mackesd/spawn.rs`).
         let bin = read_source("bin/mackesd.rs") + &read_source("bin/mackesd/spawn.rs");
+        let tiered: BTreeSet<String> = scan_call_names(&bin, "spawn_tiered(").into_iter().collect();
         let pushed: BTreeSet<String> = scan_names(&bin, ".push(\"").into_iter().collect();
         assert!(
-            pushed.len() >= 120,
-            "ARCH-5 drift guard: only {} `.push(\"…\")` worker sites found — the source scan \
-             is broken (expected ~136)",
+            tiered.len() >= 60,
+            "WL-ARCH-004 drift guard: only {} `spawn_tiered(…, \"X\")` sites found — the source \
+             scan is broken (expected ~70)",
+            tiered.len()
+        );
+        assert!(
+            pushed.len() >= 45,
+            "WL-ARCH-004 drift guard: only {} `.push(\"…\")` non-tiered sites found — the source \
+             scan is broken (expected ~65)",
             pushed.len()
         );
 
-        // Every role gate (`runs`/`runs_in`) across the crate.
-        let gated = collect_gate_names();
-        assert!(
-            gated.len() >= 40,
-            "ARCH-5 drift guard: only {} `runs(…)` gate sites found — the source scan is \
-             broken (expected ~60)",
-            gated.len()
-        );
-
-        // (1) Silent-default guard — the BUG-STORAGE-1 root cause. Every worker GATED
-        //     on the role census must actually BE in the census (or capabilities). A
-        //     gate on an uncensused name silently resolves `min_rank => 0`, so the
-        //     worker runs on every role AND is hidden from `mackesd role-workers`.
-        let mut gated_uncensused: Vec<&str> = gated
-            .iter()
-            .map(String::as_str)
-            .filter(|n| !census.contains(n) && !caps.contains(n))
-            .collect();
-        gated_uncensused.sort_unstable();
-        assert!(
-            gated_uncensused.is_empty(),
-            "ARCH-5 DRIFT: these workers are gated on `worker_role::runs(…)` but are MISSING \
-             from WORKER_TIERS/WORKER_CAPABILITIES, so they silently default to rank 0 and \
-             never appear in `mackesd role-workers` (the BUG-STORAGE-1 bug). Add each to the \
-             census with a deliberate tier: {gated_uncensused:?}"
-        );
-
-        // (2) Phantom guard — every census entry must actually be spawned in run_serve
-        //     (a literal push, or a known runtime-named dynamic spawn). Catches a
-        //     census row whose spawn was renamed/deleted (a lie in `role-workers`).
-        let mut phantom: Vec<&str> = census
+        // (1) Registry ⇔ spawner identity — the structural drift guard. Every
+        //     registry entry is spawned via `spawn_tiered` (or is a known
+        //     runtime-named dynamic spawn), AND every `spawn_tiered` site names a
+        //     registry entry. So the census (derived from the registry) and the live
+        //     spawn set are the SAME set — a tiered worker cannot be spawned without
+        //     a census row, nor censused without a spawn.
+        let mut census_unspawned: Vec<&str> = census
             .iter()
             .copied()
-            .filter(|n| !pushed.contains(*n) && !dynamic.contains(n))
+            .filter(|n| !tiered.contains(*n) && !dynamic.contains(n))
             .collect();
-        phantom.sort_unstable();
+        census_unspawned.sort_unstable();
         assert!(
-            phantom.is_empty(),
-            "ARCH-5 DRIFT: these WORKER_TIERS entries are never spawned in run_serve \
-             (renamed/deleted spawn — remove the census row, or add to DYNAMIC_SPAWNS if it \
-             is spawned under a runtime-computed name): {phantom:?}"
+            census_unspawned.is_empty(),
+            "WL-ARCH-004 DRIFT: these WORKER_REGISTRY entries are never spawned via spawn_tiered \
+             (add the spawn, remove the row, or list a runtime-named spawn in DYNAMIC_SPAWNS): \
+             {census_unspawned:?}"
+        );
+        let mut tiered_unregistered: Vec<&str> = tiered
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !census.contains(n))
+            .collect();
+        tiered_unregistered.sort_unstable();
+        assert!(
+            tiered_unregistered.is_empty(),
+            "WL-ARCH-004 DRIFT: these workers are spawned via spawn_tiered but are MISSING from \
+             WORKER_REGISTRY, so spawn_tiered would panic on the unknown restart policy. Add each \
+             to WORKER_REGISTRY with a deliberate tier: {tiered_unregistered:?}"
         );
 
-        // (3) Full-roster accountability — every spawned worker must be classified:
-        //     a deliberate tier entry (WORKER_TIERS), a capability worker, or an
-        //     explicit not-tier-gated entry (NON_TIERED_WORKERS). A brand-new spawn
-        //     that is none of these fails here, forcing a deliberate decision.
+        // (2) A tiered worker must go through `spawn_tiered`, never a bare literal
+        //     `worker_names.push(\"X\")` — a leftover literal push is a missed
+        //     conversion that would double-register or bypass the registry policy.
+        let mut tiered_pushed_literally: Vec<&str> = pushed
+            .iter()
+            .map(String::as_str)
+            .filter(|n| census.contains(n))
+            .collect();
+        tiered_pushed_literally.sort_unstable();
+        assert!(
+            tiered_pushed_literally.is_empty(),
+            "WL-ARCH-004 DRIFT: these role-tiered workers still `worker_names.push(\"…\")` \
+             directly instead of via spawn_tiered — finish the conversion: {tiered_pushed_literally:?}"
+        );
+
+        // (3) Non-tiered accountability — every remaining literal push must be a
+        //     classified non-tiered worker (bus responder / unconditional spawn),
+        //     and the allowlist has no stale entry + stays disjoint from the census.
         let mut unaccounted: Vec<&str> = pushed
             .iter()
             .map(String::as_str)
-            .filter(|n| !census.contains(n) && !caps.contains(n) && !non_tiered.contains(n))
+            .filter(|n| !non_tiered.contains(n))
             .collect();
         unaccounted.sort_unstable();
         assert!(
             unaccounted.is_empty(),
-            "ARCH-5 DRIFT: these workers are spawned in run_serve but classified NOWHERE. Add \
-             each to WORKER_TIERS (if role-tiered) or NON_TIERED_WORKERS (if it spawns \
-             unconditionally on every role): {unaccounted:?}"
+            "WL-ARCH-004 DRIFT: these workers are pushed in run_serve but classified NOWHERE. \
+             Add each to WORKER_REGISTRY (if role-tiered, spawned via spawn_tiered) or \
+             NON_TIERED_WORKERS (if it spawns unconditionally on every role): {unaccounted:?}"
         );
-
-        // (4) Allowlist hygiene — no stale NON_TIERED_WORKERS entry (each must still be
-        //     spawned), and it stays disjoint from the tier census.
         let mut stale: Vec<&str> = non_tiered
             .iter()
             .copied()
@@ -790,7 +899,7 @@ mod tests {
         stale.sort_unstable();
         assert!(
             stale.is_empty(),
-            "ARCH-5: these NON_TIERED_WORKERS entries are no longer spawned in run_serve — \
+            "WL-ARCH-004: these NON_TIERED_WORKERS entries are no longer pushed in run_serve — \
              remove them: {stale:?}"
         );
         let mut both: Vec<&str> = non_tiered
@@ -801,8 +910,26 @@ mod tests {
         both.sort_unstable();
         assert!(
             both.is_empty(),
-            "ARCH-5: these workers are in BOTH WORKER_TIERS and NON_TIERED_WORKERS — pick one: \
-             {both:?}"
+            "WL-ARCH-004: these workers are in BOTH WORKER_REGISTRY and NON_TIERED_WORKERS — \
+             pick one: {both:?}"
+        );
+
+        // (4) Any REMAINING literal `runs(\"X\")` / `runs_in(\"X\")` gate in the crate
+        //     (the capability gate + a few self-gating workers; the tiered gates now
+        //     live inside spawn_tiered) must still name a censused worker, so a stray
+        //     gate can never silently resolve `min_rank => 0` (the BUG-STORAGE-1 bug).
+        let gated = collect_gate_names();
+        let mut gated_uncensused: Vec<&str> = gated
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !census.contains(n) && !caps.contains(n))
+            .collect();
+        gated_uncensused.sort_unstable();
+        assert!(
+            gated_uncensused.is_empty(),
+            "WL-ARCH-004 DRIFT: these workers are gated on `worker_role::runs(…)` but are MISSING \
+             from WORKER_REGISTRY/WORKER_CAPABILITIES, so they silently default to rank 0 (the \
+             BUG-STORAGE-1 bug). Add each to the census with a deliberate tier: {gated_uncensused:?}"
         );
     }
 
@@ -903,7 +1030,7 @@ mod tests {
         // All rank 0 (behavior-preserving), so the split shifts 30/27 → 44/27,
         // len 57 → 71. The `worker_spawns_and_the_census_do_not_drift` test now keeps
         // the census + the run_serve spawn sites from silently diverging again.
-        assert_eq!(WORKER_TIERS.len(), 71);
+        assert_eq!(WORKER_REGISTRY.len(), 71);
     }
 
     #[test]
@@ -923,7 +1050,12 @@ mod tests {
 
     #[test]
     fn tier_counts_match_the_two_role_split() {
-        let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
+        let count = |rank: u8| {
+            WORKER_REGISTRY
+                .iter()
+                .filter(|s| s.min_rank == rank)
+                .count()
+        };
         assert_eq!(
             count(0),
             44,
@@ -982,8 +1114,8 @@ mod tests {
     #[test]
     fn workstation_runs_every_worker() {
         let r = Role::Workstation.rank();
-        for (name, _) in WORKER_TIERS {
-            assert!(runs(name, r), "Workstation must run {name}");
+        for spec in WORKER_REGISTRY {
+            assert!(runs(spec.name, r), "Workstation must run {}", spec.name);
         }
     }
 
@@ -1152,7 +1284,7 @@ mod tests {
             "a Lighthouse runs the mesh chat worker too (it always did, now explicit)"
         );
         // Present in the census table now, not riding the unknown-worker default.
-        assert!(WORKER_TIERS.iter().any(|(n, _)| *n == "chat"));
+        assert!(WORKER_REGISTRY.iter().any(|s| s.name == "chat"));
         // A DELIBERATE census entry, so `mackesd role-workers` lists it on both roles.
         assert!(workers_for_rank(Role::Workstation.rank()).contains(&"chat"));
         assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"chat"));

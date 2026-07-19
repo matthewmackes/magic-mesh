@@ -12,6 +12,46 @@
 
 use super::*;
 
+/// WL-ARCH-004 — register one role-tiered worker from the single
+/// [`mackesd_core::worker_role::WORKER_REGISTRY`] table.
+///
+/// The worker's **rank gate** and its **restart policy** both come from its
+/// registry entry (keyed by `name`), so the spawn site supplies only the
+/// *constructor* — a closure invoked LAZILY, and ONLY when the gate passes, so a
+/// gated-out worker is never built (the historic behavior of the inline
+/// `if runs(...) { sup.spawn(Spawn::new(ctor, policy)); push }` block this
+/// replaces). Keeping the constructor at the call site (rather than in the table)
+/// preserves each worker's heterogeneous, order-sensitive construction and the
+/// exact spawn order, while the gate + policy + census all flow from the one table.
+///
+/// Panics if `name` is absent from the registry — an unregistered tiered spawn,
+/// a programming error the `worker_spawns_and_the_census_do_not_drift` test catches
+/// first.
+pub(crate) fn spawn_tiered<W, F>(
+    sup: &mut mackesd_core::workers::Supervisor,
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    role_rank: u8,
+    name: &'static str,
+    build: F,
+) where
+    W: mackesd_core::workers::Worker,
+    F: FnOnce() -> W,
+{
+    if !mackesd_core::worker_role::runs(name, role_rank) {
+        return;
+    }
+    let policy = mackesd_core::worker_role::policy_for(name).unwrap_or_else(|| {
+        panic!(
+            "WL-ARCH-004: worker '{name}' spawned via spawn_tiered but absent from WORKER_REGISTRY"
+        )
+    });
+    sup.spawn(mackesd_core::workers::Spawn::new(build(), policy));
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push(name.into());
+}
+
 // run_serve round-2 extract: the Nebula-status + Shell control-surface Bus
 // responders (action/nebula/* + action/shell/*). Verbatim thread-spawns +
 // worker_names registration, original order.
@@ -1105,68 +1145,41 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     daemon_cfg: &mackesd_core::config::daemon::MackesdConfig,
     nebula_signal_slot: &mackesd_core::ipc::nebula::SignalSenderSlot,
 ) {
-    use mackesd_core::workers::{
-        heartbeat::HeartbeatWorker, mdns_relay::MdnsRelayWorker, RestartPolicy, Spawn,
-    };
+    use mackesd_core::workers::{heartbeat::HeartbeatWorker, mdns_relay::MdnsRelayWorker};
     // MESH-MDNS-RELAY — native cross-segment mDNS service relay (browses
     // the local LAN, publishes services to the mesh Bus). Rank 0: a relay
     // control-plane worker, runs on every role.
-    if mackesd_core::worker_role::runs("mdns_relay", role_rank) {
-        sup.spawn(Spawn::new(MdnsRelayWorker::new(), RestartPolicy::OnFailure));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("mdns_relay".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "mdns_relay", || {
+        MdnsRelayWorker::new()
+    });
     // RETIRE-PY.4 (2026-06-07) — the GVFS `fs_sync` worker (supervised
     // `python3 -m mackes.mesh_gvfs.daemon`, a retired Python MDE module
     // absent in the monorepo) is removed. Mesh storage is served by
     // Syncthing (E3); per-peer share access is via the Bus file-ops, so
     // the second FUSE substrate is retired rather than rebuilt.
-    if mackesd_core::worker_role::runs("heartbeat", role_rank) {
-        sup.spawn(Spawn::new(
-            HeartbeatWorker::new(workgroup_root.clone(), node_id.clone())
-                .with_interval(daemon_cfg.heartbeat_interval()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("heartbeat".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "heartbeat", || {
+        HeartbeatWorker::new(workgroup_root.clone(), node_id.clone())
+            .with_interval(daemon_cfg.heartbeat_interval())
+    });
     // BOOT-STATUS-1 — the boot_readiness worker: probes the fabric bring-up
     // chain (Nebula → overlay IP → mackesd → bus → QNM mount → directory) and
     // publishes an ordered snapshot to state/boot-readiness for the HOME
     // boot-status dialog. All roles (headless nodes report the same chain).
-    if mackesd_core::worker_role::runs("boot_readiness", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::boot_readiness::BootReadinessWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-                db_path.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("boot_readiness".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "boot_readiness", || {
+        mackesd_core::workers::boot_readiness::BootReadinessWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+            db_path.clone(),
+        )
+    });
     // XCP-6 (B2) — on an XCP-ng dom0, advertise hypervisor capacity
     // (CPU/RAM/SR-free/running-VMs) to `compute/xcp-host/<node>` so any node
     // can target it for a VM spawn. Self-gates on the dom0 marker, so it's a
     // harmless no-op on every non-hypervisor node; spawned on all roles (a
     // joined XCP host pins Server).
-    if mackesd_core::worker_role::runs("xcp_host", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::xcp_host::XcpHostWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("xcp_host".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "xcp_host", || {
+        mackesd_core::workers::xcp_host::XcpHostWorker::new(node_id.clone())
+    });
     // KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes
     // the per-node KVM virtualization service catalog
     // (`mackesd_core::kvm::KVM_SERVICES`, `systemctl is-active` each) every
@@ -1176,16 +1189,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // Podman set (docs/design/mesh-virt-management.md: "same stack on every
     // machine") — so it gates through the rank-0-default worker resolver,
     // i.e. it runs everywhere.
-    if mackesd_core::worker_role::runs("kvm_health", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::kvm_health::KvmHealthWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("kvm_health".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "kvm_health", || {
+        mackesd_core::workers::kvm_health::KvmHealthWorker::new(node_id.clone())
+    });
     // MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator
     // the Datacenter UI drives. Drains `action/vm/lifecycle` (create-from-
     // image / start / stop / destroy / list, each addressed to a target
@@ -1195,16 +1201,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // every node can host datacenter VMs — so it gates through the
     // rank-0-default worker resolver (runs everywhere). node_id is both the
     // event `host` stamp and the action target this worker matches.
-    if mackesd_core::worker_role::runs("vm_lifecycle", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::vm_lifecycle::VmLifecycleWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("vm_lifecycle".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "vm_lifecycle", || {
+        mackesd_core::workers::vm_lifecycle::VmLifecycleWorker::new(node_id.clone())
+    });
     // MV-4 — the container worker: the Podman container-lifecycle actuator (the
     // container half of the mesh management layer, companion to MV-3
     // vm_lifecycle). Drains `action/container/lifecycle` (run / stop / rm /
@@ -1215,16 +1214,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // so it gates through the rank-0-default worker resolver (runs everywhere).
     // node_id is both the event `host` stamp and the action target this worker
     // matches.
-    if mackesd_core::worker_role::runs("container", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::container::ContainerWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("container".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "container", || {
+        mackesd_core::workers::container::ContainerWorker::new(node_id.clone())
+    });
     // E12-20 — the storage worker: the privileged owner of the Workbench
     // Storage plane (GParted for the mesh). Owns a typed StorageOp pending
     // queue over a live UDisks2 zbus topology, validates each op at stage-time
@@ -1238,16 +1230,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // default, so a Workstation provably publishes its own mirror and the
     // `role-workers` diagnostic lists it). node_id is the per-node topic
     // namespace + the mirror `host` stamp.
-    if mackesd_core::worker_role::runs("storage", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::storage::StorageWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("storage".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "storage", || {
+        mackesd_core::workers::storage::StorageWorker::new(node_id.clone())
+    });
     // QC-2 — the openstack worker: the CONSTRUCT-CLOUD supervision root
     // (docs/design/quasar-cloud.md). Reads the fleet/one-state cloud
     // doctrine for WHICH Kolla service containers this node hosts (the
@@ -1261,19 +1246,12 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // rank-0 census entry like storage's; the doctrine, not the role,
     // decides which services land here. node_id is the mirror `host`
     // stamp; the workgroup root seeds the doctrine seam's Syncthing leg.
-    if mackesd_core::worker_role::runs("openstack", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::openstack::OpenstackWorker::new(
-                node_id.clone(),
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("openstack".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "openstack", || {
+        mackesd_core::workers::openstack::OpenstackWorker::new(
+            node_id.clone(),
+            workgroup_root.clone(),
+        )
+    });
     // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero
     // unit explorer (docs/design/unit-explorer.md). Unions three sources into
     // one typed `Unit` stream and publishes `state/units/<node>`: the mesh
@@ -1286,19 +1264,12 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // (rank 0) like storage/openstack — every node publishes its own unit view,
     // no center. node_id is the mirror `host` stamp + self unit; workgroup_root
     // seeds the peer-directory reader.
-    if mackesd_core::worker_role::runs("unit_aggregator", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::unit_aggregator::UnitAggregatorWorker::new(
-                node_id.clone(),
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("unit_aggregator".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "unit_aggregator", || {
+        mackesd_core::workers::unit_aggregator::UnitAggregatorWorker::new(
+            node_id.clone(),
+            workgroup_root.clone(),
+        )
+    });
     // MV-5a — the scheduler worker: the placement slice of the no-center
     // scheduler. Drains `action/schedule/place`, folds each node's latest
     // `event/kvm/services` capacity, chooses the target node (healthy pin →
@@ -1308,16 +1279,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // vm_lifecycle/container (runs everywhere); an interim lowest-node-id
     // single-actor election keeps N nodes from emitting duplicate placements.
     // Failover re-election + etcd desired-state persistence are MV-5b.
-    if mackesd_core::worker_role::runs("scheduler", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::scheduler::SchedulerWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("scheduler".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "scheduler", || {
+        mackesd_core::workers::scheduler::SchedulerWorker::new(node_id.clone())
+    });
     // E12-5b — the session_broker worker: the mackesd side of the E12-5 VDI
     // remote-desktop milestone. Drains `action/vdi/session`, folds each op
     // into the live VDI-session roster (which peer serves which VM to which
@@ -1327,19 +1291,12 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // Rank-0-default like scheduler (runs everywhere); the shared leader lock
     // keeps an N-node mesh from multi-writing. The live etcd/Syncthing
     // cross-peer publish is integration-gated (typed error, §7).
-    if mackesd_core::worker_role::runs("session_broker", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::session_broker::SessionBrokerWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("session_broker".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "session_broker", || {
+        mackesd_core::workers::session_broker::SessionBrokerWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        )
+    });
     // VDI-VM-1 — the console_broker worker: the serving-side half that actually
     // makes a LOCAL KVM VM's console reachable on the mesh. Every VM binds SPICE
     // to 127.0.0.1 (vm_lifecycle's domain XML), so session_broker can track a
@@ -1353,16 +1310,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // console are physically on the serving host); runs everywhere like
     // session_broker. Honest-gates (never a fake endpoint) when the VM is off /
     // has no graphics / socat|virsh|overlay is absent — §7.
-    if mackesd_core::worker_role::runs("console_broker", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::console_broker::ConsoleBrokerWorker::new(node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("console_broker".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "console_broker", || {
+        mackesd_core::workers::console_broker::ConsoleBrokerWorker::new(node_id.clone())
+    });
     // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
     // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
     // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —
@@ -1374,19 +1324,12 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // through the replicated workgroup-root stores (MeshSessionStore +
     // MeshLayoutStore), with future etcd-backed stores hidden behind the same
     // seams.
-    if mackesd_core::worker_role::runs("session_roaming", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::session_roaming::SessionRoamingWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("session_roaming".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "session_roaming", || {
+        mackesd_core::workers::session_roaming::SessionRoamingWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        )
+    });
     // OW-11 (Bus half) — the service_onboard worker: `onboard service-add`
     // reachable over the Bus. Drains `action/onboard/service-add`, runs the
     // EXISTING onboard::service_add engine (plan + the injectable ServiceApply
@@ -1396,19 +1339,12 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // like session_broker (runs everywhere); real applies run over
     // LiveServiceApply, whose typed IntegrationGated is the honest live answer
     // today (§7).
-    if mackesd_core::worker_role::runs("service_onboard", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::service_onboard::ServiceOnboardWorker::new(
-                workgroup_root.clone(),
-                node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("service_onboard".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "service_onboard", || {
+        mackesd_core::workers::service_onboard::ServiceOnboardWorker::new(
+            workgroup_root.clone(),
+            node_id.clone(),
+        )
+    });
     // OW-7 (Bus half) — the spawn_lighthouse_onboard worker: `onboard
     // spawn-lighthouse` reachable over the Bus. Drains
     // `action/onboard/spawn-lighthouse`, runs the EXISTING
@@ -1419,19 +1355,18 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // Rank-0-default like service_onboard (runs everywhere); real provisions run
     // over LiveProvisioner, whose typed IntegrationGated is the honest live answer
     // today (the live cloud/SSH provision + CA-migrate stays gated, §7).
-    if mackesd_core::worker_role::runs("spawn_lighthouse_onboard", role_rank) {
-        sup.spawn(Spawn::new(
+    spawn_tiered(
+        sup,
+        worker_names,
+        role_rank,
+        "spawn_lighthouse_onboard",
+        || {
             mackesd_core::workers::spawn_lighthouse_onboard::SpawnLighthouseOnboardWorker::new(
                 workgroup_root.clone(),
                 node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("spawn_lighthouse_onboard".into());
-    }
+            )
+        },
+    );
     // OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native
     // receiver for the BusApply remote-push transport. Drains
     // `action/onboard/apply` (a signed JobBundle + the claimed issuer) and
@@ -1443,19 +1378,12 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // only bundles addressed to it). Publishes the typed observed-state /
     // rejection on `event/onboard/apply`; the live cross-node round-trip is
     // operator/live-gated behind BusApply (§7).
-    if mackesd_core::worker_role::runs("onboard_apply", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::onboard_apply::OnboardApplyWorker::new(
-                &workgroup_root,
-                node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("onboard_apply".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "onboard_apply", || {
+        mackesd_core::workers::onboard_apply::OnboardApplyWorker::new(
+            &workgroup_root,
+            node_id.clone(),
+        )
+    });
     // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
     // bridges. Drains `action/vdi/clipboard`, applies a per-session policy
     // (allow/deny + one-way + a size cap) via the pure relay decision
@@ -1466,16 +1394,9 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // rank-0-default the same way (runs everywhere). The live OS/guest clipboard
     // channel (SPICE/RDP vdagent / wl-clipboard) is integration-gated (typed
     // error, §7); the pure model + relay pipeline ship green behind the seam.
-    if mackesd_core::worker_role::runs("clipboard_bridge", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::clipboard_bridge::ClipboardBridgeWorker::new(),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("clipboard_bridge".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "clipboard_bridge", || {
+        mackesd_core::workers::clipboard_bridge::ClipboardBridgeWorker::new()
+    });
     // OV-7.a (v2.6) — health reconciler. Polls each known
     // peer's QNM-Shared heartbeat.json every 5 s, applies the
     // telemetry::health_state_from_age threshold table, writes
@@ -1485,21 +1406,14 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // projects. Spawn order: after HeartbeatWorker so peers
     // have at least one observable heartbeat by the first
     // reconcile tick.
-    if mackesd_core::worker_role::runs("health_reconciler", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::health_reconciler::HealthReconcilerWorker::new(
-                workgroup_root.clone(),
-                db_path.clone(),
-                node_id.clone(),
-                std::sync::Arc::clone(&nebula_signal_slot),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("health_reconciler".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "health_reconciler", || {
+        mackesd_core::workers::health_reconciler::HealthReconcilerWorker::new(
+            workgroup_root.clone(),
+            db_path.clone(),
+            node_id.clone(),
+            std::sync::Arc::clone(&nebula_signal_slot),
+        )
+    });
 }
 
 // run_serve extract: mesh gossip/reconcile plumbing workers (sshd_overlay_bind .. connect_firewall).
@@ -1523,203 +1437,128 @@ pub(crate) fn spawn_mesh_plumbing_workers(
     // address. Quiet no-op on pre-enrollment peers (missing
     // publish file). Replaces mesh_nebula.py::write_sshd_overlay_bind
     // so the Python module can fully retire (DEAD-2.14 plan).
-    sup.spawn(Spawn::new(
-        SshdOverlayBindWorker::new(),
-        RestartPolicy::OnFailure,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("sshd_overlay_bind".into());
+    spawn_tiered(sup, worker_names, role_rank, "sshd_overlay_bind", || {
+        SshdOverlayBindWorker::new()
+    });
     // SVC-2 (Q60) — SSH pubkey gossip: publish this box's user
     // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
     // published key into ~/.ssh/authorized_keys (managed block,
     // write-on-change). Syncthing replication is the transport.
     // PD-11 — the lifecycle executor: descriptor-gated container/VM
     // start/stop requests from peers, via replicated request files.
-    if mackesd_core::worker_role::runs("lifecycle_exec", role_rank) {
-        sup.spawn(Spawn::new(
-            lifecycle_exec::LifecycleExecWorker::new(
-                workgroup_root.clone(),
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("lifecycle_exec".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "lifecycle_exec", || {
+        lifecycle_exec::LifecycleExecWorker::new(
+            workgroup_root.clone(),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // DEVMGR-8 — the device-control executor: drains this box's replicated
     // fleet/device-control/<self>/ for typed privileged-op requests the
     // Device-Manager surface dispatches (enable/disable, reload module,
     // rescan bus), gates each against this node's own published inventory
     // (L9 rail), executes the FIXED sysfs/ip/modprobe seam, hash-chain audits
     // it, and notifies on failure. Universal (rank 0) like lifecycle_exec.
-    if mackesd_core::worker_role::runs("device_control", role_rank) {
-        sup.spawn(Spawn::new(
-            device_control::DeviceControlExecWorker::new(
-                workgroup_root.clone(),
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-                node_id.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("device_control".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "device_control", || {
+        device_control::DeviceControlExecWorker::new(
+            workgroup_root.clone(),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+            node_id.clone(),
+        )
+    });
     // PD-13 — presence-transition alerts: offline/online crossings
     // become desktop notifications via the alert_relay pipeline.
-    if mackesd_core::worker_role::runs("presence_watch", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "presence_watch", || {
         let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
-        sup.spawn(Spawn::new(
-            presence_watch::PresenceWatchWorker::new(
-                workgroup_root.clone(),
-                alerts,
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("presence_watch".into());
-    }
+        presence_watch::PresenceWatchWorker::new(
+            workgroup_root.clone(),
+            alerts,
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // SUBSTRATE-10 — etcd WATCH worker: opens watch streams on /mesh/peers/
     // (a Delete = a keepalive lease expired = a peer dropped) + /mesh/leader
     // (a Put with a new node_id = a leadership handover) and PUSHES instant
     // alerts onto the same alert_relay lane presence_watch uses — no poll,
     // no 5 s reconcile lag. Degrades cleanly off the coordination plane
     // (empty endpoints / etcd unreachable → idle + back off, never panic).
-    if mackesd_core::worker_role::runs("etcd_watch", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "etcd_watch", || {
         let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::etcd_watch::EtcdWatchWorker::new(
-                alerts,
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("etcd_watch".into());
-    }
+        mackesd_core::workers::etcd_watch::EtcdWatchWorker::new(
+            alerts,
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // PD-9 / FPG — the reconcile driver: magic-fleet reconcile on a
     // 15-min cadence + immediately on this host's nudge file.
-    if mackesd_core::worker_role::runs("fleet_reconcile", role_rank) {
-        sup.spawn(Spawn::new(
-            fleet_reconcile::FleetReconcileWorker::new(
-                workgroup_root.clone(),
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("fleet_reconcile".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "fleet_reconcile", || {
+        fleet_reconcile::FleetReconcileWorker::new(
+            workgroup_root.clone(),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // PLANES-18 — mesh DNS: feed <host>.mesh into resolved +
     // /etc/hosts on every node (rank 0 plumbing).
-    if mackesd_core::worker_role::runs("mesh_dns", role_rank) {
-        sup.spawn(Spawn::new(
-            mesh_dns::MeshDnsWorker::new(Some(db_path.clone())),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("mesh_dns".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "mesh_dns", || {
+        mesh_dns::MeshDnsWorker::new(Some(db_path.clone()))
+    });
     // PLANES-15 — netstate engine mount: converge the baseline's
     // network desired-state under a rollback checkpoint + overlay
     // self-test (W77/W78), on every node.
-    if mackesd_core::worker_role::runs("netstate_apply", role_rank) {
-        sup.spawn(Spawn::new(
-            netstate_apply::NetstateApplyWorker::new(
-                workgroup_root.clone(),
-                Some(db_path.clone()),
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("netstate_apply".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "netstate_apply", || {
+        netstate_apply::NetstateApplyWorker::new(
+            workgroup_root.clone(),
+            Some(db_path.clone()),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // PLANES-19 — overlay-reachability validation suite: every node
     // participates; the leader mints nightly/run-now + writes verdicts.
-    if mackesd_core::worker_role::runs("validation_suite", role_rank) {
-        sup.spawn(Spawn::new(
-            validation_suite::ValidationSuiteWorker::new(
-                workgroup_root.clone(),
-                Some(db_path.clone()),
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-                std::path::PathBuf::from(
-                    mackesd_core::workers::netdata_aggregator::DEFAULT_ROLE_HOST_MARKER,
-                ),
+    spawn_tiered(sup, worker_names, role_rank, "validation_suite", || {
+        validation_suite::ValidationSuiteWorker::new(
+            workgroup_root.clone(),
+            Some(db_path.clone()),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+            std::path::PathBuf::from(
+                mackesd_core::workers::netdata_aggregator::DEFAULT_ROLE_HOST_MARKER,
             ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("validation_suite".into());
-    }
+        )
+    });
     // PLANES-9 — the local job executor (execution-tag gated, W84).
-    if mackesd_core::worker_role::runs("job_exec", role_rank) {
-        sup.spawn(Spawn::new(
-            job_exec::JobExecWorker::new(
-                workgroup_root.clone(),
-                node_id
-                    .strip_prefix("peer:")
-                    .unwrap_or(&node_id)
-                    .to_string(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("job_exec".into());
-    }
-    if mackesd_core::worker_role::runs("ssh_pubkey_gossip", role_rank) {
-        sup.spawn(Spawn::new(
-            ssh_pubkey_gossip::SshPubkeyGossipWorker::new(workgroup_root.clone(), node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("ssh_pubkey_gossip".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "job_exec", || {
+        job_exec::JobExecWorker::new(
+            workgroup_root.clone(),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    spawn_tiered(sup, worker_names, role_rank, "ssh_pubkey_gossip", || {
+        ssh_pubkey_gossip::SshPubkeyGossipWorker::new(workgroup_root.clone(), node_id.clone())
+    });
     // NF-21.3 — firewall_preset worker. Applies the Nebula
     // firewalld preset (UDP/4242 inbound on all peers; TCP/443
     // inbound additionally on lighthouses) on first tick + on
@@ -1727,14 +1566,9 @@ pub(crate) fn spawn_mesh_plumbing_workers(
     // marker. Idempotent — firewall-cmd's ALREADY_ENABLED is
     // treated as success. Replaces mesh_nebula.py::apply_nebula_firewall_preset
     // so the Python helper can retire (DEAD-2.14 plan).
-    sup.spawn(Spawn::new(
-        FirewallPresetWorker::new(),
-        RestartPolicy::OnFailure,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("firewall_preset".into());
+    spawn_tiered(sup, worker_names, role_rank, "firewall_preset", || {
+        FirewallPresetWorker::new()
+    });
     // CONNECT-3 — exposure-driven firewall enforcement (additive): opens the
     // policy's ingress ports on the public zone for services bound to this
     // node, so `expose` actually accepts public traffic. Never removes a rule
@@ -2040,7 +1874,6 @@ pub(crate) fn spawn_broker_terminal_workers(
     role_rank: u8,
     workgroup_root: &PathBuf,
 ) {
-    use mackesd_core::workers::{RestartPolicy, Spawn};
     // FILEMGR-5 — the mesh-mount worker owns the sshfs mount lifecycle over
     // the Nebula overlay for the Files surface (design `file-manager-full.md`
     // locks 11/13/15/17): it drains `action/mesh-mount/<host>` (typed verb —
@@ -2051,22 +1884,15 @@ pub(crate) fn spawn_broker_terminal_workers(
     // `MountBackend` seam (§9 — no raw shell in the action layer; §7 — it
     // returns an honest typed error headless, never a faked mount). A desktop
     // feature (Workstation tier); idles gracefully with no mount requests.
-    if mackesd_core::worker_role::runs("mesh_mount", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "mesh_mount", || {
         let runtime_base = mackesd_core::workers::mesh_mount::resolve_runtime_base();
         let repo_dir = mackesd_core::ipc::secret_store::repo_root();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::mesh_mount::MeshMountWorker::new(
-                runtime_base,
-                repo_dir,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("mesh_mount".into());
-    }
+        mackesd_core::workers::mesh_mount::MeshMountWorker::new(
+            runtime_base,
+            repo_dir,
+            workgroup_root.clone(),
+        )
+    });
 
     // TERM-7 — the mesh PTY-broker worker owns the remote-shell lifecycle
     // over the Nebula overlay for the mde-term-egui terminal surface (design
@@ -2081,29 +1907,22 @@ pub(crate) fn spawn_broker_terminal_workers(
     // Unreachable state headless, never a faked session). A desktop feature
     // (Workstation tier); idles gracefully with no pty requests on a headless
     // box.
-    if mackesd_core::worker_role::runs("pty_broker", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "pty_broker", || {
         let runtime_base = mackesd_core::workers::pty_broker::resolve_runtime_base();
         let repo_dir = mackesd_core::ipc::secret_store::repo_root();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::pty_broker::PtyBrokerWorker::new(
-                runtime_base,
-                repo_dir,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("pty_broker".into());
-    }
+        mackesd_core::workers::pty_broker::PtyBrokerWorker::new(
+            runtime_base,
+            repo_dir,
+            workgroup_root.clone(),
+        )
+    });
 }
 
 // run_serve round-3: the browser-worker spawn group (bookmarks + adfilter +
 // browser_policy + the BROWSER-DD-* CEF workers, now that arch-7 moved those
 // workers into mde-browser-workers, re-exported via workers/mod.rs). Extracted
 // VERBATIM — identical spawn order + `worker_names.push(...)` registrations +
-// role gates, so the WORKER_TIERS census + the ARCH-5 drift guard
+// role gates, so the WORKER_REGISTRY census + the ARCH-5 drift guard
 // (`worker_spawns_and_the_census_do_not_drift`) stay byte-identical.
 pub(crate) fn spawn_browser_workers(
     sup: &mut mackesd_core::workers::Supervisor,
@@ -2112,7 +1931,6 @@ pub(crate) fn spawn_browser_workers(
     node_id: &String,
     workgroup_root: &PathBuf,
 ) {
-    use mackesd_core::workers::{RestartPolicy, Spawn};
     // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
     // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
     // `action/bookmarks/*` (add/edit/move/delete/add-folder/rename — minting
@@ -2126,23 +1944,16 @@ pub(crate) fn spawn_browser_workers(
     // `shared_root_writable`, published as an offline SyncStatus, never a faked
     // converge. A desktop feature (Workstation tier); idles gracefully with no
     // requests on a headless box.
-    if mackesd_core::worker_role::runs("bookmarks", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "bookmarks", || {
         let local_root = mackesd_core::workers::bookmarks::resolve_local_root();
         let user = mackesd_core::workers::bookmarks::resolve_user();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::bookmarks::BookmarksWorker::new(
-                node_id.clone(),
-                user,
-                local_root,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("bookmarks".into());
-    }
+        mackesd_core::workers::bookmarks::BookmarksWorker::new(
+            node_id.clone(),
+            user,
+            local_root,
+            workgroup_root.clone(),
+        )
+    });
 
     // BOOKMARKS-7 — the mesh-wide ad-blocker worker (the Syncthing replication +
     // leader compile behind the pure mde-adblock engine). Every node writes its
@@ -2157,21 +1968,14 @@ pub(crate) fn spawn_browser_workers(
     // node-local store survives a down share, and nothing is written into a bare
     // unprovisioned mount (`shared_root_writable`). A desktop feature (Workstation
     // tier); idles gracefully on a headless box with no browser + no requests.
-    if mackesd_core::worker_role::runs("adfilter", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "adfilter", || {
         let local_root = mackesd_core::workers::adfilter::resolve_local_root();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::adfilter::AdfilterWorker::new(
-                node_id.clone(),
-                local_root,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("adfilter".into());
-    }
+        mackesd_core::workers::adfilter::AdfilterWorker::new(
+            node_id.clone(),
+            local_root,
+            workgroup_root.clone(),
+        )
+    });
 
     // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker (fleet
     // governance ENFORCED mesh-side, not just in the UI). Every node writes its
@@ -2189,23 +1993,16 @@ pub(crate) fn spawn_browser_workers(
     // the node-local doc + data survive a down share, and nothing is written
     // into a bare unprovisioned mount (`shared_root_writable`). A desktop-
     // governance feature (Workstation tier); idles gracefully on a headless box.
-    if mackesd_core::worker_role::runs("browser_policy", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "browser_policy", || {
         let local_root = mackesd_core::workers::browser_policy::resolve_local_root();
         let role = mackesd_core::worker_role::role_name(role_rank).to_string();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_policy::BrowserPolicyWorker::new(
-                node_id.clone(),
-                role,
-                local_root,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_policy".into());
-    }
+        mackesd_core::workers::browser_policy::BrowserPolicyWorker::new(
+            node_id.clone(),
+            role,
+            local_root,
+            workgroup_root.clone(),
+        )
+    });
 
     // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Browser
     // publishes strict ceremony metadata to `action/browser/passkey`; this
@@ -2214,21 +2011,14 @@ pub(crate) fn spawn_browser_workers(
     // root, and publishes honest pending/error state without minting fake
     // credentials. A Workstation-tier browser security feature; it idles on
     // headless boxes with no Browser publishes.
-    if mackesd_core::worker_role::runs("browser_passkeys", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "browser_passkeys", || {
         let local_root = mackesd_core::workers::browser_passkeys::resolve_local_root();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_passkeys::BrowserPasskeysWorker::new(
-                node_id.clone(),
-                local_root,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_passkeys".into());
-    }
+        mackesd_core::workers::browser_passkeys::BrowserPasskeysWorker::new(
+            node_id.clone(),
+            local_root,
+            workgroup_root.clone(),
+        )
+    });
 
     // BROWSER-DD-7 — the browser session-sync owner. The shell publishes
     // deduped `action/browser/session-sync` snapshots for tabs/settings/
@@ -2239,21 +2029,14 @@ pub(crate) fn spawn_browser_workers(
     // Browser snapshot shape so startup restore consumes it directly. A
     // Workstation-tier browser feature; it idles on headless boxes with no
     // Browser publishes and never writes into a missing canonical share.
-    if mackesd_core::worker_role::runs("browser_session_sync", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "browser_session_sync", || {
         let local_root = mackesd_core::workers::browser_session_sync::resolve_local_root();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_session_sync::BrowserSessionSyncWorker::new(
-                node_id.clone(),
-                local_root,
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_session_sync".into());
-    }
+        mackesd_core::workers::browser_session_sync::BrowserSessionSyncWorker::new(
+            node_id.clone(),
+            local_root,
+            workgroup_root.clone(),
+        )
+    });
 
     // BROWSER-DD-11 — Browser read-aloud/TTS owner. The shell publishes
     // bounded `action/browser/read-aloud` page-text requests; this worker
@@ -2261,64 +2044,42 @@ pub(crate) fn spawn_browser_workers(
     // (`MDE_BROWSER_TTS_COMMAND` / `MDE_TTS_COMMAND`), and publishes honest
     // spoken/unavailable/error state. A Workstation-tier browser feature; it
     // idles on headless boxes with no Browser publishes.
-    if mackesd_core::worker_role::runs("browser_read_aloud", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_read_aloud::BrowserReadAloudWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_read_aloud".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "browser_read_aloud", || {
+        mackesd_core::workers::browser_read_aloud::BrowserReadAloudWorker::new(node_id.clone())
+    });
 
     // BROWSER-DD-11 — Browser voice-command/dictation STT owner. The shell
     // publishes active-tab context to `action/browser/voice-command`; this
     // worker validates it, invokes the configured offline STT/capture command
     // when present (`MDE_BROWSER_STT_COMMAND` / `MDE_STT_COMMAND`), emits a
     // bounded transcript event, and publishes honest unavailable/error state.
-    if mackesd_core::worker_role::runs("browser_voice_command", role_rank) {
-        sup.spawn(Spawn::new(
+    spawn_tiered(
+        sup,
+        worker_names,
+        role_rank,
+        "browser_voice_command",
+        || {
             mackesd_core::workers::browser_voice_command::BrowserVoiceCommandWorker::new(
                 node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_voice_command".into());
-    }
+            )
+        },
+    );
 
     // BROWSER-DD-12 — Browser external-protocol owner. The shell refuses to
     // navigate `mailto:`/`magnet:` URLs and publishes
     // `action/browser/protocol`; this worker validates those handoffs and
     // emits retained route status/events for Email/Transfers owners.
-    if mackesd_core::worker_role::runs("browser_protocol", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_protocol::BrowserProtocolWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_protocol".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "browser_protocol", || {
+        mackesd_core::workers::browser_protocol::BrowserProtocolWorker::new(node_id.clone())
+    });
 
     // BROWSER-DD-12 — Browser platform-share owner. The shell publishes
     // `action/browser/share` for Peer/Email/QR platform targets; this worker
     // validates those handoffs and emits retained route status/events
     // without faking downstream delivery.
-    if mackesd_core::worker_role::runs("browser_share", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_share::BrowserShareWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_share".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "browser_share", || {
+        mackesd_core::workers::browser_share::BrowserShareWorker::new(node_id.clone())
+    });
 
     // BROWSER-DD-12 — Browser private offline/mesh translation owner. The
     // shell publishes bounded page text to `action/browser/translate`; this
@@ -2326,71 +2087,53 @@ pub(crate) fn spawn_browser_workers(
     // local/mesh translation command when present
     // (`MDE_BROWSER_TRANSLATE_COMMAND` / `MDE_TRANSLATE_COMMAND`), emits a
     // bounded result event, and publishes honest unavailable/error state.
-    if mackesd_core::worker_role::runs("browser_translate", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_translate::BrowserTranslateWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_translate".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "browser_translate", || {
+        mackesd_core::workers::browser_translate::BrowserTranslateWorker::new(node_id.clone())
+    });
 
     // BROWSER-DD-12 — Browser offline/mesh cache owner. The shell publishes
     // explicit private page snapshots to `action/browser/offline-cache`; this
     // worker validates them, writes a local durable cache record, and mirrors
     // it into the Syncthing-backed workgroup root. The browser helper remains
     // no-store; the cache is daemon-owned and private to the mesh.
-    if mackesd_core::worker_role::runs("browser_offline_cache", role_rank) {
-        let local_root = mackesd_core::workers::browser_offline_cache::resolve_local_root();
-        sup.spawn(Spawn::new(
+    spawn_tiered(
+        sup,
+        worker_names,
+        role_rank,
+        "browser_offline_cache",
+        || {
+            let local_root = mackesd_core::workers::browser_offline_cache::resolve_local_root();
             mackesd_core::workers::browser_offline_cache::BrowserOfflineCacheWorker::new(
                 node_id.clone(),
                 local_root,
                 workgroup_root.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_offline_cache".into());
-    }
+            )
+        },
+    );
 
     // BROWSER-DD-12 — Browser CEF security-update status owner. It watches
     // the packaged fast-update manifest plus the active CEF runtime and
     // publishes an honest current/missing/mismatch posture for the
     // independent browser-engine update path.
-    if mackesd_core::worker_role::runs("browser_security_update", role_rank) {
-        sup.spawn(Spawn::new(
+    spawn_tiered(
+        sup,
+        worker_names,
+        role_rank,
+        "browser_security_update",
+        || {
             mackesd_core::workers::browser_security_update::BrowserSecurityUpdateWorker::new(
                 node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_security_update".into());
-    }
+            )
+        },
+    );
 
     // BROWSER-DD-12 — Browser idle-tab suspend owner. The shell already
     // stops inactive helpers and publishes `action/browser/tab-suspend`;
     // this worker validates those handoffs and publishes retained
     // suspend status/events for diagnostics and future orchestration.
-    if mackesd_core::worker_role::runs("browser_tab_suspend", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::browser_tab_suspend::BrowserTabSuspendWorker::new(
-                node_id.clone(),
-            ),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("browser_tab_suspend".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "browser_tab_suspend", || {
+        mackesd_core::workers::browser_tab_suspend::BrowserTabSuspendWorker::new(node_id.clone())
+    });
 }
 
 // run_serve extract: desktop/media discovery + seat input workers (seat_remote_input, desktop_sources, media_sources).
@@ -2401,21 +2144,13 @@ pub(crate) fn spawn_desktop_discovery_workers(
     node_id: &String,
     workgroup_root: &PathBuf,
 ) {
-    use mackesd_core::workers::{RestartPolicy, Spawn};
     // KDC-MESH-6 — seat-side phone remote-input consumer. `kdc_host`
     // publishes sanitized `action/seat/remote-input` rows after the paired
     // phone/protocol checks; this worker owns the local injection seam and
     // honest unavailable/error state when no uinput helper is configured.
-    if mackesd_core::worker_role::runs("seat_remote_input", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::seat_remote_input::SeatRemoteInputWorker::new(node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("seat_remote_input".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "seat_remote_input", || {
+        mackesd_core::workers::seat_remote_input::SeatRemoteInputWorker::new(node_id.clone())
+    });
 
     // CHOOSER-1 — the desktop-source discovery aggregator (design
     // `desktop-chooser.md` §Architecture, locks 5/14): collects every
@@ -2431,21 +2166,14 @@ pub(crate) fn spawn_desktop_discovery_workers(
     // reachability derives from roster presence / VM power state, never
     // a blocking probe. A desktop feature (Workstation tier); idles
     // gracefully on a headless box.
-    if mackesd_core::worker_role::runs("desktop_sources", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "desktop_sources", || {
         let store_root = mackesd_core::workers::desktop_sources::resolve_store_root();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::desktop_sources::DesktopSourcesWorker::new(
-                node_id.clone(),
-                workgroup_root.clone(),
-                store_root,
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("desktop_sources".into());
-    }
+        mackesd_core::workers::desktop_sources::DesktopSourcesWorker::new(
+            node_id.clone(),
+            workgroup_root.clone(),
+            store_root,
+        )
+    });
 
     // MEDIA-14 — the mesh media-source discovery aggregator (design
     // `mesh-media-player.md`, row 26 "Mesh discovery"): folds two lanes into
@@ -2460,19 +2188,12 @@ pub(crate) fn spawn_desktop_discovery_workers(
     // honestly excluded (mde-music's domain), and SSDP-only DLNA is surfaced
     // as a `gated:` mDNS-lane note rather than faked (§7). A desktop feature
     // (Workstation tier); idles gracefully on a headless box.
-    if mackesd_core::worker_role::runs("media_sources", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::media_sources::MediaSourcesWorker::new(
-                node_id.clone(),
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("media_sources".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "media_sources", || {
+        mackesd_core::workers::media_sources::MediaSourcesWorker::new(
+            node_id.clone(),
+            workgroup_root.clone(),
+        )
+    });
 }
 
 // run_serve extract: fleet compute/virt/network-assessment workers (voice_provision .. voip_rtt); owns fw_host.
@@ -2660,20 +2381,13 @@ pub(crate) fn spawn_fleet_compute_workers(
     // hostname (fw_host) like media_registry so its manifest lands on the
     // same replicated <host>/ dir the aggregators read. Idles gracefully on
     // a headless box (empty share, empty library).
-    if mackesd_core::worker_role::runs("media_server", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::media_server::MediaServerWorker::new(
-                node_id.clone(),
-                fw_host.clone(),
-                workgroup_root.clone(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("media_server".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "media_server", || {
+        mackesd_core::workers::media_server::MediaServerWorker::new(
+            node_id.clone(),
+            fw_host.clone(),
+            workgroup_root.clone(),
+        )
+    });
 
     // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
     // running launchable apps to <QNM-Shared>/<host>/running-apps.json
@@ -2924,17 +2638,12 @@ pub(crate) fn spawn_probe_observability_workers(
     // PeerProbe (PCI/USB/kernel/power) + writes it to the replicated
     // directory so every peer's Workbench Hardware panel renders the
     // fleet. Was never built — the panel was permanently empty.
-    sup.spawn(Spawn::new(
+    spawn_tiered(sup, worker_names, role_rank, "hardware_probe", || {
         mackesd_core::workers::hardware_probe::HardwareProbeWorker::new(
             workgroup_root.clone(),
             node_id.clone(),
-        ),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("hardware_probe".into());
+        )
+    });
 
     // E12-19 (Construct host controls) — host_state. Mirrors this node's seat
     // snapshot (published by the shell) to state/host/<node>/seat for the
@@ -3173,19 +2882,14 @@ pub(crate) fn spawn_probe_observability_workers(
         Ok(conn) => {
             let lat_store = Arc::new(tokio::sync::Mutex::new(conn));
             let cache = mackesd_core::workers::mesh_latency::default_cache_path();
-            sup.spawn(Spawn::new(
+            spawn_tiered(sup, worker_names, role_rank, "mesh_latency", || {
                 mackesd_core::workers::mesh_latency::MeshLatencyWorker::new(
                     lat_store,
                     node_id.clone(),
                     cache,
                 )
-                .with_interval(daemon_cfg.mesh_latency_sweep()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("mesh_latency".into());
+                .with_interval(daemon_cfg.mesh_latency_sweep())
+            });
         }
         Err(e) => {
             tracing::warn!(
@@ -3210,18 +2914,13 @@ pub(crate) fn spawn_probe_observability_workers(
             Ok(conn) => {
                 let lt_store = Arc::new(tokio::sync::Mutex::new(conn));
                 let lt_cache = mackesd_core::workers::link_traffic::default_cache_path();
-                sup.spawn(Spawn::new(
+                spawn_tiered(sup, worker_names, role_rank, "link-traffic", || {
                     mackesd_core::workers::link_traffic::LinkTrafficWorker::new(
                         lt_store,
                         node_id.clone(),
                         lt_cache,
-                    ),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names
-                    .lock()
-                    .expect("worker_names mutex")
-                    .push("link-traffic".into());
+                    )
+                });
             }
             Err(e) => {
                 tracing::warn!(
@@ -3288,7 +2987,6 @@ pub(crate) fn spawn_messaging_sync_workers(
     workgroup_root: &PathBuf,
     worker_status: &mackesd_core::workers::WorkerStatusMap,
 ) {
-    use mackesd_core::workers::{RestartPolicy, Spawn};
     use std::sync::Arc;
     // v4.0.1 KDC2-3.3 wire-up (2026-05-23) — spawn the KDC host
     // worker. Owns the pairing store at $XDG_CONFIG_HOME/mde/
@@ -3307,30 +3005,18 @@ pub(crate) fn spawn_messaging_sync_workers(
             .map(|p| p.join("mde").join("connect"))
             .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/mde/connect"))
     };
-    if mackesd_core::worker_role::runs("kdc_host", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::kdc_host::KdcHostWorker::new(kdc_config_dir),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("kdc_host".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "kdc_host", || {
+        mackesd_core::workers::kdc_host::KdcHostWorker::new(kdc_config_dir)
+    });
 
     // BUS-1.1 (v6.x Mackes Bus) — supervise the `mde-bus` daemon
     // subprocess. Gracefully degrades when the binary is absent
     // (dev box, RPM not yet installed) — the worker loops on a
     // 30s tick waiting for the binary to appear. Once the BUS-1
     // sub-epic ships, every mackesd peer carries the bus.
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::bus_supervisor::BusSupervisor::new(),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("bus_supervisor".into());
+    spawn_tiered(sup, worker_names, role_rank, "bus_supervisor", || {
+        mackesd_core::workers::bus_supervisor::BusSupervisor::new()
+    });
 
     // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
     // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
@@ -3342,16 +3028,9 @@ pub(crate) fn spawn_messaging_sync_workers(
     // it's cheap there. (This replaces the never-built `mde-clipd` daemon +
     // `clipd_supervisor`: that binary never existed in the workspace; this
     // worker is the sole, real clipboard capturer.)
-    if mackesd_core::worker_role::runs("clipboard_sync", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::clipboard_sync::build(workgroup_root.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("clipboard_sync".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "clipboard_sync", || {
+        mackesd_core::workers::clipboard_sync::build(workgroup_root.clone())
+    });
 
     // NOTIFY-CHAT-2 — the `chat` worker: live Bus send/recv (signs +
     // relays on event/chat/message, persists to this node's Syncthing
@@ -3374,18 +3053,13 @@ pub(crate) fn spawn_messaging_sync_workers(
                     .strip_prefix("peer:")
                     .unwrap_or(&node_id)
                     .to_string();
-                sup.spawn(Spawn::new(
+                spawn_tiered(sup, worker_names, role_rank, "chat", || {
                     mackesd_core::workers::chat::ChatWorker::new(
                         workgroup_root.clone(),
                         self_host,
                         signing_key,
-                    ),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names
-                    .lock()
-                    .expect("worker_names mutex")
-                    .push("chat".into());
+                    )
+                });
             }
             Err(e) => tracing::warn!(
                 target: "mackesd::chat",
@@ -3405,20 +3079,13 @@ pub(crate) fn spawn_messaging_sync_workers(
     // Surface::Chat UI renders as a timestamped feed + tray badge. Runs on
     // EVERY node (rank 0), same self_host identity as the chat worker; every
     // external source degrades honestly when its binary is absent.
-    if mackesd_core::worker_role::runs("notify", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "notify", || {
         let self_host = node_id
             .strip_prefix("peer:")
             .unwrap_or(&node_id)
             .to_string();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::notify::NotifyWorker::new(workgroup_root.clone(), self_host),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("notify".into());
-    }
+        mackesd_core::workers::notify::NotifyWorker::new(workgroup_root.clone(), self_host)
+    });
 
     // NODE-GRADE-1 — the `node_grade` worker: every node computes + publishes
     // its OWN A–F capability grade (docs/design/node-grade.md). It scores five
@@ -3434,25 +3101,18 @@ pub(crate) fn spawn_messaging_sync_workers(
     // into the Chat feed (CHAT-FIX-2). Universal (rank 0) like notify — every
     // node grades itself; role_rank marks a lighthouse for the mesh factor and
     // worker_status feeds the role factor.
-    if mackesd_core::worker_role::runs("node_grade", role_rank) {
+    spawn_tiered(sup, worker_names, role_rank, "node_grade", || {
         let self_host = node_id
             .strip_prefix("peer:")
             .unwrap_or(&node_id)
             .to_string();
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::node_grade::NodeGradeWorker::new(
-                self_host,
-                workgroup_root.clone(),
-                role_rank,
-                Some(Arc::clone(&worker_status)),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("node_grade".into());
-    }
+        mackesd_core::workers::node_grade::NodeGradeWorker::new(
+            self_host,
+            workgroup_root.clone(),
+            role_rank,
+            Some(Arc::clone(&worker_status)),
+        )
+    });
 
     // TRANSFERS-1 — the `transfers` worker: the daemon-owned queue/ledger/verb/
     // state-machine spine of the Transfers surface (docs/design/transfers-
@@ -3466,18 +3126,11 @@ pub(crate) fn spawn_messaging_sync_workers(
     // sibling of pty_broker/mesh_mount; it idles gracefully on a headless box /
     // Lighthouse (an empty inbox + empty ledger). Store is node-local, so it
     // needs neither the workgroup root nor the node id.
-    if mackesd_core::worker_role::runs("transfers", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::transfers::TransfersWorker::new(
-                mackesd_core::workers::transfers::default_store_root(),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("transfers".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "transfers", || {
+        mackesd_core::workers::transfers::TransfersWorker::new(
+            mackesd_core::workers::transfers::default_store_root(),
+        )
+    });
 
     // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
     // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
@@ -3497,14 +3150,9 @@ pub(crate) fn spawn_messaging_sync_workers(
         .unwrap_or(false);
     if mackesd_core::worker_role::runs("ansible-pull", role_rank) {
         if ansible_configured {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::ansible_pull::build(),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("ansible-pull".into());
+            spawn_tiered(sup, worker_names, role_rank, "ansible-pull", || {
+                mackesd_core::workers::ansible_pull::build()
+            });
         } else {
             tracing::info!(
                 "ansible-pull: MDE_ANSIBLE_PULL_URL unset; fleet config-pull worker skipped"
@@ -3519,29 +3167,15 @@ pub(crate) fn spawn_messaging_sync_workers(
     // `python3 -m mackes.media_sync_daemon` subprocess (advances
     // §11 #6). `OnFailure` keeps the 60 s tick alive across a
     // transient write/probe error.
-    if mackesd_core::worker_role::runs("app-sync", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::app_sync::build(),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("app-sync".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "app-sync", || {
+        mackesd_core::workers::app_sync::build()
+    });
     // remmina-sync is a native Rust tick worker (RETIRE-PY.2): every 60 s
     // it reads the mesh peer registry, TCP-probes SSH/RDP/VNC, and
     // reconciles Remmina's "Mesh Peers" group. No `python3` is spawned.
-    if mackesd_core::worker_role::runs("remmina-sync", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::remmina_sync::build(),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("remmina-sync".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "remmina-sync", || {
+        mackesd_core::workers::remmina_sync::build()
+    });
 
     // MEDIA-8 — Workstation music auto-config (desktop-tier, like
     // remmina-sync). Every 60 s it reads the published shared account off
@@ -3553,15 +3187,8 @@ pub(crate) fn spawn_messaging_sync_workers(
     // shared account flows through the SERVICE REGISTRY, not the secret
     // store. The .with_workgroup_root honors --workgroup-root so it reads
     // where the registry writers write. Never clobbers a user-set creds file.
-    if mackesd_core::worker_role::runs("music_autoconfig", role_rank) {
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
-                .with_workgroup_root(workgroup_root.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("music_autoconfig".into());
-    }
+    spawn_tiered(sup, worker_names, role_rank, "music_autoconfig", || {
+        mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
+            .with_workgroup_root(workgroup_root.clone())
+    });
 }

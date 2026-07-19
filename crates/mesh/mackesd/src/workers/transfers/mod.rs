@@ -28,7 +28,7 @@
 //! `pty_broker` (TERM-7) and `mesh_mount` (FILEMGR-5): a mesh feature fronted by a
 //! desktop surface (the File Browser, Q1). It idles gracefully where unused — a
 //! Lighthouse relay or an untouched headless box simply drains an empty inbox and
-//! keeps an empty ledger. A **deliberate census entry** in `worker_role::WORKER_TIERS`
+//! keeps an empty ledger. A **deliberate census entry** in `worker_role::WORKER_REGISTRY`
 //! (the BUG-STORAGE-1 lesson — a worker absent from the census silently never runs).
 
 #![cfg(feature = "async-services")]
