@@ -1190,6 +1190,12 @@ impl Shell {
     /// surface's in the shell's one `Context`. The Workbench keeps its live Fleet
     /// plane (MV-6).
     fn body(&mut self, ui: &mut egui::Ui) {
+        // Surface-level occlusion: only one surface renders per frame, so a
+        // backgrounded Browser's per-tab reconciler never runs. Tell it whether it
+        // is the foreground surface so a backgrounded Browser hides ALL its tabs
+        // (stopping their engine paint + shm readback) until it is shown again.
+        self.web
+            .note_surface_foreground(self.nav.surface == Surface::Browser);
         match self.nav.surface {
             Surface::Workbench => {
                 workbench::show(
@@ -2984,13 +2990,12 @@ mod tests {
         layout_profile_tooltip, media_header, media_panel, menu_bar_shuffle_cards,
         menu_bar_shuffle_paint_order, publish_front_door_instance_lifecycle_to_bus,
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
-        real_editor, real_media, real_terminal, remote_sessions_fallback_pos,
-        reserved_dock_gutter, reserved_taskbar_strut, route_file_operation_progress_request,
-        screenshot, shell_file_operation_progress, splash, start_menu, status,
+        real_editor, real_media, real_terminal, remote_sessions_fallback_pos, reserved_dock_gutter,
+        reserved_taskbar_strut, route_file_operation_progress_request, screenshot,
+        shell_file_operation_progress, splash, start_menu, status,
         surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
-        LAYOUT_MODE_BUTTON_TOUCH,
-        LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
+        LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -3728,7 +3733,9 @@ mod tests {
         });
         let button = ctx
             .read_response(mde_egui::menubar::remote_sessions_button_id())
-            .expect("bare non-Desktop workspaces should receive a top-right Remote Sessions control")
+            .expect(
+                "bare non-Desktop workspaces should receive a top-right Remote Sessions control",
+            )
             .rect;
 
         assert_eq!(
