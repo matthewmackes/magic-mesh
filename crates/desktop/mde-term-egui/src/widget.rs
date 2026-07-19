@@ -341,6 +341,12 @@ pub struct TerminalWidget {
     /// CONSOLE-2 — the user acknowledged the exit prompt (a key press or a
     /// click); the pane now reaps like any ended shell.
     exit_ack: bool,
+    /// Whether the session's repaint waker has been installed yet. The widget
+    /// only gains its `egui::Context` inside [`Self::show`], so the waker is
+    /// wired on the first frame (once) rather than at construction — after
+    /// which backing output drives an immediate repaint instead of trailing
+    /// the fixed [`LIVE_REPAINT`] self-timer (the render-lag fix).
+    waker_set: bool,
 }
 
 /// The item a TERM-15 context-menu click selected, recorded inside the menu
@@ -428,6 +434,7 @@ impl TerminalWidget {
             new_terminal_here: false,
             hold_on_exit: false,
             exit_ack: false,
+            waker_set: false,
         }
     }
 
@@ -704,6 +711,16 @@ impl TerminalWidget {
     /// Render one frame into `ui`, consuming this frame's input. Fills all
     /// available space.
     pub fn show(&mut self, ui: &mut Ui) -> Response {
+        // Wire the session's repaint waker on the first frame — the widget only
+        // gains its `egui::Context` here. Thereafter PTY output wakes the host
+        // loop directly (both hosts are reactive), so echo + output paint on the
+        // next frame instead of trailing the fixed `LIVE_REPAINT` self-timer.
+        if !self.waker_set {
+            let ctx = ui.ctx().clone();
+            self.session
+                .set_repaint_waker(move || ctx.request_repaint());
+            self.waker_set = true;
+        }
         // Drain any pending backing work first (a remote pane reads its Bus state
         // log; a local pane pumps on its own threads, so this is a no-op there).
         self.session.poll();

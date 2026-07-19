@@ -149,6 +149,14 @@ pub struct LocalPty {
     /// on the [`Self::spawn_argv`] path (`None` until then, and always `None`
     /// on the login-shell path, which never collects one).
     exit: Arc<Mutex<Option<ChildExit>>>,
+    /// A repaint waker the reader pump fires once per read batch, so PTY output
+    /// drives an immediate surface repaint instead of trailing the widget's
+    /// fixed self-timer (the render-lag fix). Shared with the reader thread;
+    /// `None` until a host installs one via [`Self::set_repaint_waker`] — a
+    /// headless [`LocalPty`] (the tests, any egui-free caller) never wakes.
+    /// The boxed `Fn` stays behind `dyn` so this crate keeps `unsafe_code =
+    /// "forbid"` and never names an `egui::Context`.
+    waker: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
 }
 
 /// The resolved program + argv a [`LocalPty`] session runs — the private shape
@@ -269,6 +277,7 @@ impl LocalPty {
         let (tx, input_rx) = mpsc::channel::<Vec<u8>>();
         let input_tx = Arc::new(Mutex::new(Some(tx)));
         let exit = Arc::new(Mutex::new(None));
+        let waker: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
         let collect_exit = plan.collect_exit;
 
         let reader = thread::Builder::new()
@@ -279,8 +288,9 @@ impl LocalPty {
                 let input_tx = Arc::clone(&input_tx);
                 let output_closed = Arc::clone(&output_closed);
                 let exit = Arc::clone(&exit);
+                let waker = Arc::clone(&waker);
                 move || {
-                    pump_output(reader_file, &terminal, &output_closed);
+                    pump_output(reader_file, &terminal, &output_closed, &waker);
                     // The master hit EOF/EIO — the child is gone (its slave fds
                     // closed). Release the PTY now so the child is reaped
                     // promptly, not only at session close (`Drop` finding `None`
@@ -314,6 +324,7 @@ impl LocalPty {
             output_closed,
             child_pid,
             exit,
+            waker,
         })
     }
 
@@ -324,6 +335,16 @@ impl LocalPty {
     #[must_use]
     pub fn exit_status(&self) -> Option<ChildExit> {
         *lock_unpoisoned(&self.exit)
+    }
+
+    /// Install a repaint waker the reader pump fires once per read batch, so
+    /// PTY output drives an immediate repaint instead of trailing the widget's
+    /// fixed self-timer. The host passes an `egui::Context::request_repaint`
+    /// closure here — kept behind a boxed `dyn Fn` so this crate never names an
+    /// `egui::Context` and stays `unsafe_code = "forbid"`. Replaces any prior
+    /// waker (the widget installs it once, on its first frame).
+    pub fn set_repaint_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *lock_unpoisoned(&self.waker) = Some(Box::new(wake));
     }
 
     /// The shared engine state. The reader pump feeds it; the surface (and
@@ -409,12 +430,28 @@ impl Drop for LocalPty {
 /// The PTY→engine pump: blocking-read the master, feed the engine, until the
 /// stream ends. EIO is the normal Linux "child exited, no slave left" ending,
 /// EOF the BSD-style one; both close the stream. Marks `output_closed` last.
-fn pump_output(mut file: std::fs::File, terminal: &Mutex<Terminal>, output_closed: &AtomicBool) {
+///
+/// After each non-empty read is fed, the installed repaint waker fires **once
+/// for the batch** (never per byte) so the surface repaints on real output
+/// instead of trailing the widget's fixed self-timer — the render-lag fix. A
+/// headless session (no waker installed) simply skips it. The waker lock is
+/// taken and released around the call, never while the engine lock is held.
+fn pump_output(
+    mut file: std::fs::File,
+    terminal: &Mutex<Terminal>,
+    output_closed: &AtomicBool,
+    waker: &Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+) {
     let mut buf = [0_u8; READ_CHUNK];
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => lock_unpoisoned(terminal).feed(&buf[..n]),
+            Ok(n) => {
+                lock_unpoisoned(terminal).feed(&buf[..n]);
+                if let Some(wake) = lock_unpoisoned(waker).as_ref() {
+                    wake();
+                }
+            }
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
@@ -712,6 +749,43 @@ mod tests {
             SpawnOptions::default()
         )
         .is_err());
+    }
+
+    // --- the render-lag fix: the reader pump fires the repaint waker ---
+
+    #[test]
+    fn the_reader_pump_fires_the_repaint_waker_on_output() {
+        use std::sync::atomic::AtomicUsize;
+        let session = spawn_sh();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ticks);
+        session.set_repaint_waker(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        // Real output through the engine wakes the surface: the reader pump
+        // fires the installed waker once per read batch after feeding the bytes
+        // (the quoted tail keeps the echoed *input* line from matching first).
+        session
+            .send_input(b"echo waker-'mark'\n")
+            .expect("queue input");
+        wait_for_text(&session, "waker-mark");
+        // The counter advanced — output drove the repaint, not a fixed timer.
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the reader pump must fire the repaint waker when output arrives"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_waker_still_pumps_output() {
+        // The `None` branch of the pump is a no-op: a headless `LocalPty` (no
+        // waker installed — every test here, any egui-free caller) still feeds
+        // the engine exactly as before, so output is never gated on a waker.
+        let session = spawn_sh();
+        session
+            .send_input(b"echo no-'waker'\n")
+            .expect("queue input");
+        wait_for_text(&session, "no-waker");
     }
 
     #[test]

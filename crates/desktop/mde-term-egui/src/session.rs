@@ -74,6 +74,19 @@ impl Session {
         }
     }
 
+    /// Install a repaint waker so backing output drives an immediate repaint
+    /// instead of trailing the widget's fixed self-timer (the render-lag fix).
+    /// A local PTY fires it from its reader pump on each output batch; a tmux
+    /// pane is pumped by the surface-level controller (already on the egui
+    /// thread), so this is a no-op there. The widget installs it once, on its
+    /// first frame, passing an `egui::Context::request_repaint` closure.
+    pub fn set_repaint_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        match self {
+            Self::Local(pty) => pty.set_repaint_waker(wake),
+            Self::Remote(_) | Self::Tmux(_) => {}
+        }
+    }
+
     /// Send input bytes to the shell.
     ///
     /// # Errors
@@ -190,8 +203,11 @@ const fn tone_color(tone: StatusTone) -> Color32 {
 mod tests {
     use super::Session;
     use crate::engine::Terminal;
+    use crate::pty::{LocalPty, SpawnOptions};
     use crate::tmux::{CommandSink, TmuxPaneIo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn tmux_pane_yanks_a_single_line_selection_into_the_buffer_and_skips_multiline() {
@@ -210,6 +226,67 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a multi-line selection must not reach the line-based control channel"
+        );
+    }
+
+    #[test]
+    fn set_repaint_waker_is_a_noop_on_a_tmux_pane() {
+        // A tmux pane is pumped by the surface-level controller (already on the
+        // egui thread), so it stores no waker — the render-lag fix's dispatch is
+        // a no-op there: the call neither panics nor ever fires the closure.
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>();
+        let engine = Arc::new(Mutex::new(Terminal::with_default_scrollback(20, 4)));
+        let session = Session::Tmux(TmuxPaneIo::new(3, engine, CommandSink::for_tests(tx)));
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ticks);
+        session.set_repaint_waker(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(
+            ticks.load(Ordering::Relaxed),
+            0,
+            "a tmux pane must not fire a repaint waker"
+        );
+    }
+
+    #[test]
+    fn set_repaint_waker_reaches_a_local_pty() {
+        // A `Local` session dispatches the waker into its PTY, whose reader pump
+        // fires it on output — the render-lag fix reaching the backing.
+        let session = Session::Local(
+            LocalPty::spawn(SpawnOptions {
+                shell: Some("/bin/sh".to_owned()),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /bin/sh"),
+        );
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ticks);
+        session.set_repaint_waker(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        session
+            .send_input(b"echo reaches-'local'\n")
+            .expect("queue input");
+
+        // Wait on observed engine state (the pumps are async), then the waker
+        // must have advanced — the dispatch reached the pty's reader pump.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen_output = session.with_terminal(|term| {
+                let full = term.full();
+                (0..full.rows()).any(|row| full.line_text(row).contains("reaches-local"))
+            });
+            if seen_output {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for output");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "set_repaint_waker on a Local session must reach the pty's reader pump"
         );
     }
 }
