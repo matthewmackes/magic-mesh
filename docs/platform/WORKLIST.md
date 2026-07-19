@@ -3081,6 +3081,55 @@ These decisions refine acceptance and sequencing for the active items below.
 - Origin or merged source IDs: platform review `perf-1`, `perf-2`, user video
   freeze report.
 
+### WL-PERF-003 - Browser native-grade frame rate, occlusion, and audio
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Large
+- Problem: The CEF-OSR CPU-readback browser does not match native Chromium under
+  load. Verified 2026-07-19: there is NO tab occlusion/visibility signal, so every
+  background helper paints ~30 fps forever (the root cause of "5 video tabs tanks
+  the system"); the frame path did 3 full-frame copies with no dirty-rect and a
+  full-`Context` repaint per media frame; and page audio is silently dropped
+  because `get_audio_parameters` opts into CEF's PCM stream only for the audible
+  pip and then discards every sample, diverting audio away from the OS output.
+- Required outcome: foreground tab sustains 60 fps (p99 <= 16.6 ms); each hidden
+  tab drops to ~0 published fps; 5 simultaneous video tabs (1 visible) stay within
+  a small multiple of one native tab's CPU; page audio plays to the OS in A/V sync.
+- Scope (phased, disjoint-file partition):
+  - P0 Instrumentation: `MDE_WEB_PERF` env-gated per-tab fps/convert/upload/paint
+    metrics + a headless `mde-web-preview-client` fps bench. No ABI.
+  - P1 Occlusion (flagship): `ControlMsg::SetHidden{hidden}` (wire tag 38) ->
+    CEF `CefBrowserHost::WasHidden()` (vtable offset 312, field 34, on-seat
+    header cross-check) -> shell per-tab visibility edges (active/PiP/surface).
+  - P2 Frame path: fused BGRA->Color32 conversion (DONE); honor `on_paint` dirty
+    rects + texture sub-rect upload; scope repaint off the full `Context`.
+  - P3 Native audio: move audible bit to `on_audio_state_changed`, return 0 from
+    `get_audio_parameters` so CEF plays to the OS, verify/enable sandbox audio out.
+  - P4 HW decode (stretch): non-headless GL ozone + `VaapiVideoDecoder` — shared
+    boundary with WL-FUNC-001's GPU-decode line; measure whether P1-P3 already
+    hit the 5-video target before spending here.
+- Relevant files/components: `crates/desktop/mde-web-wire/src/lib.rs`,
+  `crates/desktop/mde-web-cef/src/cef_browser/mod.rs`,
+  `crates/desktop/mde-web-cef/src/cef_init.rs`,
+  `crates/desktop/mde-web-sandbox/src/lib.rs`,
+  `crates/desktop/mde-web-preview-client/src/frame.rs`,
+  `crates/desktop/mde-shell-egui/src/web/mod.rs`; design
+  `docs/design/browser-perf-native.md`.
+- Dependencies: F44 builder `.131` for seat-deployable shells; live seat `.15`/
+  `.138` for eyes-on-glass. Overlaps WL-FUNC-001 (protected media / GPU decode).
+- Current evidence: 2026-07-19 wire seam `ControlMsg::SetHidden` frozen (tag 38,
+  encode/decode/Debug/roundtrip test) and the BGRA converter fused to a single
+  pass (`frame.rs`, drops one full-frame clone + one swap pass per paint; 2x2
+  multi-pixel regression test added). Based on `agent/browser-enterprise-hardening`.
+- Acceptance criteria: `MDE_WEB_PERF` shows the targets above; each phase is
+  farm-green + unit-tested + 0 style-leaks; the 5-video case is smooth on a live
+  seat with audible in-sync audio and quiescent background tabs.
+- Verification method: headless fps bench + farm unit tests, then eyes-on-glass
+  seat smoke per `deploy-shell-needs-drm-features`.
+- Origin or merged source IDs: operator goal 2026-07-19 (native browser perf),
+  memory `browser-perf-architecture-2026-07-19`.
+
 ## Testing And Quality
 
 ### WL-TEST-001 - OpenStack live and contract tests
