@@ -8,7 +8,13 @@
 # UNCHANGED with REPO_BASEURL pointed here):
 #   <root>/fedora-<N>-x86_64/repodata/repomd.xml   ← createrepo_c metadata (SIGNED only)
 #   <root>/fedora-<N>-x86_64/HOLD/                  ← DAR-24: CI stages UNSIGNED here
+#   <root>/fedora-<N>-x86_64/ROLLED-BACK/           ← WL-BUILD-003: rollback quarantine
 #   <root>/RPM-GPG-KEY-magic-mesh                   ← the published public key
+#
+# ROLLED-BACK/ (WL-BUILD-003): a rollback (mcnf-channel-rollback.sh) demotes a
+# too-new NEVRA out of the client-facing set by moving it here. Like HOLD/, this
+# subtree is EXCLUDED from the index, so a rolled-back RPM is never re-advertised
+# on a later `dnf-channel-up.sh` refresh; a re-promote moves it back.
 #
 # Signing stays OPERATOR-GATED (sign-release.sh / the /release step). CI stages
 # UNSIGNED RPMs into HOLD/; an operator signs (rpmsign --addsign, EFF-30) and
@@ -41,11 +47,14 @@ ALLOW_UNSIGNED="${MCNF_DNF_ALLOW_UNSIGNED:-}"
 
 # ── build-deploy-6 supply-chain guards ──────────────────────────────────────
 # The RPMs the client-facing index will cover = everything under the arch dir
-# EXCEPT the HOLD/ staging subtree (mirrors createrepo_c --excludes 'HOLD/*').
+# EXCEPT the excluded staging subtrees HOLD/ (unsigned CI) and ROLLED-BACK/
+# (WL-BUILD-003 rollback quarantine) — mirrors createrepo_c
+# --excludes 'HOLD/*' --excludes 'ROLLED-BACK/*'.
 indexable_rpms() {
   local arch_dir="$1"
   [ -d "$arch_dir" ] || return 0
-  find "$arch_dir" -path "$arch_dir/HOLD" -prune -o -type f -name '*.rpm' -print 2>/dev/null | sort
+  find "$arch_dir" \( -path "$arch_dir/HOLD" -o -path "$arch_dir/ROLLED-BACK" \) -prune \
+       -o -type f -name '*.rpm' -print 2>/dev/null | sort
 }
 
 # Key-independent: does the RPM carry an embedded PGP/RSA/DSA signature?
@@ -112,7 +121,7 @@ verify_indexable_signatures() {
 reindex_arch() {
   local arch_dir="$1"
   verify_indexable_signatures "$arch_dir" || exit 1
-  createrepo_c --update --excludes 'HOLD/*' "$arch_dir" >/dev/null
+  createrepo_c --update --excludes 'HOLD/*' --excludes 'ROLLED-BACK/*' "$arch_dir" >/dev/null
 }
 
 # --self-test: prove (no podman/overlay/network) that HOLD/ is excluded from the
@@ -159,6 +168,17 @@ run_self_test() {
   fi
   ALLOW_UNSIGNED=""
 
+  # T5 — a rolled-back RPM under ROLLED-BACK/ is NOT in the indexable set
+  # (WL-BUILD-003: rollback quarantine is excluded, like HOLD/).
+  mkdir -p "$arch/ROLLED-BACK"
+  : > "$arch/ROLLED-BACK/demoted.rpm"
+  idx="$(indexable_rpms "$arch")"
+  if printf '%s\n' "$idx" | grep -q 'promoted.rpm' && ! printf '%s\n' "$idx" | grep -q 'ROLLED-BACK/'; then
+    echo "  [PASS] T5 index set excludes ROLLED-BACK/ (rollback quarantine)"
+  else
+    echo "  [FAIL] T5 index set did not exclude ROLLED-BACK/: $idx"; fails=1
+  fi
+
   rm -rf "$tmp"
   if [ "$fails" -eq 0 ]; then echo "self-test: ALL PASS"; return 0; fi
   echo "self-test: FAILURES"; return 1
@@ -194,7 +214,7 @@ mkdir -p "$ROOT"
 [ -f "$GPG_KEY" ] && cp -f "$GPG_KEY" "$ROOT/RPM-GPG-KEY-magic-mesh"
 for n in $FEDORAS; do
   arch_dir="$ROOT/fedora-${n}-x86_64"
-  mkdir -p "$arch_dir/HOLD"
+  mkdir -p "$arch_dir/HOLD" "$arch_dir/ROLLED-BACK"
   # build-deploy-6: index ONLY promoted+signed content. reindex_arch runs the
   # fail-closed signature gate over the client-facing set, then createrepo_c with
   # the HOLD/ staging subtree EXCLUDED — so an unsigned CI RPM staged in HOLD/ is

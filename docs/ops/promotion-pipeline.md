@@ -6,6 +6,11 @@ live audit → MEDIA-LIGHTHOUSE verify → fd/EMFILE soak.
 The loop repeats until the worklist is clear, all gates are green, and the
 operator declares the release complete.
 
+Rollback (the inverse: re-point the channel to the previous NEVRA and downgrade
+the fleet) is a separate, typed-confirm path documented in
+[`docs/RELEASE-ROLLBACK.md`](../RELEASE-ROLLBACK.md)
+(`automation/promotion/mcnf-channel-rollback.sh`).
+
 Entrypoint:
 
 ```bash

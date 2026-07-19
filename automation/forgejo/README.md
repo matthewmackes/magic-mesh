@@ -30,7 +30,7 @@ The host overlay IP is auto-detected (nebula/mde-neb) or `--host <overlay-ip>`.
 | admin password            | `/mcnf/secret/forgejo-admin-pass`         | minted+stored if absent; admin = `mcnfadmin` |
 | runner registration token | `/mcnf/secret/forgejo-runner-token`       | re-minted each `forgejo-up.sh`, persisted to the store |
 | runner identity (`.runner`)| `$MCNF_RUNNER_WORKDIR` (`/var/lib/mcnf-forgejo-runner`) | host-native; recreated by re-register |
-| sovereign dnf channel     | `$MCNF_DNF_ROOT` (`/var/lib/mcnf-dnf-channel`) | `fedora-N-x86_64/repodata` + `HOLD/` + the GPG key |
+| sovereign dnf channel     | `$MCNF_DNF_ROOT` (`/var/lib/mcnf-dnf-channel`) | `fedora-N-x86_64/repodata` + `HOLD/` (unsigned CI) + `ROLLED-BACK/` (WL-BUILD-003 rollback quarantine) + the GPG key |
 
 The **only durable Forgejo state** is the sqlite DB + the three `/mcnf/secret/forgejo-*`
 values. Everything else (runner identity, channel metadata) is regenerated from those.
