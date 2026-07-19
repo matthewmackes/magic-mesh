@@ -2,14 +2,17 @@
 name: polish
 description: >-
   Iteratively beautify, enhance, evolve, complete and drive the MCNF egui/wgpu
-  surfaces to a refined Quasar-dark (Carbon-inspired) finish — fanned out across
-  the Xen build farm, one disjoint surface×axis unit per worker. TRIGGER when
-  the operator says "polish the GUI", "beautify the app", "make the UI nicer",
-  "refine the interface", "drive the GUI to done", or "fan out GUI improvements
-  across the farm". Each improvement lands as glue over the shared
-  `mde-egui` Style/Motion/Fonts modules, passes the style-leak grep, builds +
-  tests green, and commits (never pushes). NOT for finding dead code (/audit),
-  a single scoped edit (just do it), or a release cut (/release).
+  surfaces (Quasar-dark, Carbon-inspired) AND their shared egui components
+  (Apple-HIG-adapted, centralized in `mde-egui::widgets`) to a refined finish —
+  fanned out across the Xen build farm, one disjoint surface×axis unit per worker
+  (the shared widget kit lands in one coherent pass first, then surfaces adopt it).
+  TRIGGER when the operator says "polish the GUI", "beautify the app", "make the UI
+  nicer", "refine the interface", "make the components more pleasing", "drive the
+  GUI to done", or "fan out GUI improvements across the farm". Each improvement
+  lands as glue over the shared `mde-egui` Style/Motion/Fonts/widgets modules,
+  passes the style-leak + widget-leak greps, builds + tests green, and commits
+  (never pushes). NOT for finding dead code (/audit), a single scoped edit (just do
+  it), or a release cut (/release).
 ---
 
 # polish — farm-dispatched iterative GUI refinement (MCNF, E12 egui era)
@@ -116,7 +119,10 @@ per-unit review pass. The locks always win over CRAFT.md. The locks:
 9. **Component kit: evaluate before building.** Phase 0 inventories what
    `mde_egui::widgets`/`toast` and the surfaces already have before any new
    shared component (data table, command palette, cards, empty states) is
-   proposed. Consolidation of near-duplicates beats new construction.
+   proposed. Consolidation of near-duplicates beats new construction. The
+   **Component polish** program (below) is where that kit is then driven to a
+   first-class **Apple-HIG-adapted** finish in one coherent pass — inventory-first
+   still applies before minting new APIs.
 
 ## The single hard rule (§4, upgraded with the style-leak grep)
 
@@ -144,6 +150,26 @@ the inline grep IS the gate. The retired Carbon/motion lints stay retired.
 Baseline at adoption, 2026-07-03: **4 hits** — `mde-shell-egui/src/splash.rs`
 ×1, `mde-term-egui/src/widget.rs` ×3 — each is a ready-made first rescue unit.)
 
+### The widget-leak grep (the second mechanical gate — components)
+
+Alongside the style-leak grep, surfaces must **use the shared `mde-egui::widgets`,
+not hand-roll raw egui controls** (so the Apple-HIG component finish is inherited,
+not re-invented per panel). The gate — tune the alternation to the shipped kit:
+
+```sh
+# widget-leak grep — raw interactive egui controls minted in a surface instead of
+# routing through mde-egui::widgets.
+grep -rnE '\begui::(Button|SelectableLabel|Checkbox|RadioButton|Slider|ComboBox|DragValue)::new\b|\bui\.(button|small_button|selectable_label|selectable_value|checkbox|radio|radio_value|toggle_value|slider|drag_value)\(' \
+  crates/desktop --include='*.rs' \
+  | grep -vE 'mde-egui/'   # the kit itself builds on stock egui — exempt
+```
+
+Introduce it **incrementally**: it lights up thousands of existing call sites, so it
+becomes a hard DoD gate for a surface only *after* Phase A ships that widget's
+wrapper, and Phase B drives each surface's count to zero. Track the per-surface
+count as the adoption metric (a fresh high count is a rescue backlog, not a stall).
+Promote to `install-helpers/lint-style-leaks.sh` when stable.
+
 ## Quality axes (the polish dimensions — expanded for Rust/wgpu)
 
 Each is an independent unit of work — one worker owns one axis on one surface so
@@ -164,8 +190,10 @@ units stay file-disjoint and the farm parallelizes cleanly:
 7. **Empty / loading / error states** — skeletons and designed empty states
    instead of blank panels or frozen spinners. No `demo_data`/placeholder
    passing as content (that's a §7 mockup).
-8. **Component reuse & consolidation** — collapse one-off widgets onto the
-   `mde-egui` kit (evaluate-first, lock 9). New code is glue (§6).
+8. **Component reuse & consolidation / adoption** — collapse one-off widgets onto
+   the `mde-egui` kit (evaluate-first, lock 9), then in Phase B *adopt* the
+   HIG-finished shared widgets and drive the **widget-leak grep** to zero for the
+   surface (see *Component polish*). New code is glue (§6).
 9. **Iconography & brand** — the embedded Carbon icon set (lock 6) via
    `mde-egui`; no inline glyphs, no hard-coded paths.
 10. **Layout, responsiveness & DPI** — sane reflow across window sizes and
@@ -177,6 +205,81 @@ units stay file-disjoint and the farm parallelizes cleanly:
 12. **Completeness / "drive to done"** — a panel that renders but whose state
     never updates is half-built (§7). Wire the live data, finish the
     interaction, remove the "coming soon".
+
+## Component polish — the shared widget library (Apple-HIG-adapted, dark Quasar)
+
+**(operator survey 2026-07-19)** Beyond polishing each *surface's* layout, `polish`
+also drives the **individual egui components** — buttons, toggles, chips, text
+inputs, search fields, dropdowns/combos, menus & context menus, sliders, steppers,
+progress, scrollbars, checkboxes, radios, tabs, tooltips/popovers, badges, list
+rows — to a **pleasing, first-class finish**, centralized so every surface inherits
+them.
+
+**Reference: Apple's Human Interface Guidelines, adapted to the dark Quasar skin.**
+HIG governs the component *form and feel* — clarity & deference (content leads,
+chrome recedes), generous spacing and comfortable hit targets, subtle depth &
+material, crisp state feedback, and smooth spring motion. The **Quasar-dark palette,
+the mono-first type, and the embedded icon set stay the container** — HIG guides
+FORM/FEEL, Quasar-dark guides COLOR/TYPE/ICON. This synthesizes cleanly with the
+locks: lock 4's "macOS-level motion" *is* HIG motion; where HIG's "floaty" depth
+would fight lock 2, keep it subtle (HIG's *layering/material* sensibility, not a
+literal blur pass). The surfaces stay Carbon-sensibility; the *widgets inside them*
+gain HIG craft.
+
+**Single source: `crates/shared/mde-egui/src/widgets`** — the component counterpart
+to `Style` being the single source of look. Use **both** approaches:
+- **Restyle egui's stock widgets** through `Style`/`Visuals`/spacing so a plain
+  `egui::Button`/`TextEdit`/`Slider`/`ComboBox` already renders to the HIG-dark
+  baseline everywhere, for free.
+- **Add opinionated wrapper widgets** in `mde-egui::widgets` for the components HIG
+  makes distinctive — filled/tonal/ghost buttons, toggle switches, segmented
+  controls, chips, search fields, menu rows, list rows, badges — that surfaces call.
+
+**Every component earns all four quality axes**, not just color: **shape & spacing
+rhythm** (consistent radii, the 8px padding rhythm, HIG-comfortable hit targets);
+**state feedback** (distinct hover / press / focus / selected / disabled, plus the
+branded 2px focus ring, axis 6); **depth & elevation** (subtle shadow/border so a
+menu or popover reads as its own material — restrained per lock 2); **typography &
+iconography** (mono-first hierarchy inside the control, crisp icon affordances,
+tuned per `Density`). **Motion is part of the component**, not a separate pass —
+hover lift, press scale, focus glow, animated toggle/expand — every tween drawn
+from `mde_egui::motion` (never hand-rolled), reduced-motion aware.
+
+### Two phases (the fan-out shape for components)
+
+**Phase A — build the whole widget library in ONE coherent pass (NOT fanned out).**
+Drive `mde-egui::widgets` to the full HIG-dark baseline as a **single coherent
+unit** — one design hand, so the entire kit is internally consistent (a button, a
+menu row, and a toggle share the exact radii, states, and motion table). This is
+the one place `polish` deliberately does *not* saturate the farm: for the
+foundational kit, coherence beats parallelism. Land it with `cargo test -p mde-egui`
+covering the new widgets + tokens, and register every component in the **component
+gallery** (below). Honor lock 9 first — inventory what `widgets`/`toast`/the
+surfaces already have and consolidate near-duplicates before minting new APIs.
+
+**Phase B — per-surface adoption (fanned out across the farm).** Once the kit is
+HIG-true, saturate the farm the usual way: one worker per surface migrates that
+surface's hand-rolled controls onto the shared kit and drives its **widget-leak
+grep** count to zero. This is the normal surface×axis drain on a new *"component
+adoption"* axis, file-disjoint per surface. A surface is component-done when every
+interactive control routes through `mde-egui::widgets`.
+
+### The component gallery (eyes-on for the kit)
+
+Maintain a **component showcase** — every widget in every state
+(default/hover/press/focus/selected/disabled), at each `Density`, in Quasar dark. A
+dedicated `mde-egui` example or `mde-widget-gallery` bin that headless-screenshots
+to a PNG (via the offscreen capture path below) is the eyes-on tool for judging the
+HIG finish and catching state/spacing regressions. Like all screenshots it is
+**best-effort evidence, never a blocker** — the kit ships on green gates.
+
+### Detailed per-widget HIG specs → `CRAFT.md`
+
+The exact radii/state/motion recipe for each widget (the HIG-adapted "five
+interaction states", menu/popover construction, focus-ring geometry) belongs in
+**`CRAFT.md`** (this folder), which every worker reads. Extend CRAFT.md with the
+per-component HIG specs as Phase A designs them; the locks in this skill always win
+over CRAFT.md.
 
 ## Headless screenshots (the eyes-on tool)
 
@@ -345,8 +448,9 @@ A unit is done only when, from the repo root:
 - `cargo test` green (+ `cargo test -p mde-egui` for any shared-kit edit — the
   design-language ground truth).
 - `cargo clippy --all-targets` + `cargo fmt --all` clean.
-- **Style-leak grep clean** (zero hits in `crates/desktop`) +
-  `lint-layered-tiers.sh` clean (§6).
+- **Style-leak grep clean** (zero hits in `crates/desktop`) + **widget-leak grep
+  clean for the touched surface** (once its `mde-egui::widgets` wrappers exist — see
+  *Component polish*) + `lint-layered-tiers.sh` clean (§6).
 - The surface still **launches and updates** (`timeout 3 cargo run -p <crate>` —
   no panic, real state, not `demo_data`).
 SOFT-ESCAPE if the same gate fails 3× — park it (`park-blocker.sh`) and keep the
