@@ -3170,6 +3170,15 @@ pub(crate) fn spawn_messaging_sync_workers(
     spawn_tiered(sup, worker_names, role_rank, "app-sync", || {
         mackesd_core::workers::app_sync::build()
     });
+    // WL-UX-005 — the peer_app_launch executor: the missing consumer of the
+    // shell Front Door's `action/apps/launch` publishes. It launches a
+    // peer-requested app on THIS node, but only one this node itself advertises
+    // in its own app catalog (`ipc::apps::scan_local_apps`) — never an arbitrary
+    // command off the wire — and logs every launch + refusal. Workstation-tier
+    // (you launch apps onto a seat); node_id is the sole launch target it acts on.
+    spawn_tiered(sup, worker_names, role_rank, "peer_app_launch", || {
+        mackesd_core::workers::peer_app_launch::PeerAppLaunchWorker::new(node_id.clone())
+    });
     // remmina-sync is a native Rust tick worker (RETIRE-PY.2): every 60 s
     // it reads the mesh peer registry, TCP-probes SSH/RDP/VNC, and
     // reconciles Remmina's "Mesh Peers" group. No `python3` is spawned.

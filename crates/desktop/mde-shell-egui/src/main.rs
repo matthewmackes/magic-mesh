@@ -40,6 +40,7 @@ mod host_mirror;
 mod hotkeys;
 mod iac;
 mod keyboard;
+mod launcher_pins;
 mod lock_signal;
 mod logging;
 mod mesh_view;
@@ -61,7 +62,6 @@ mod session;
 mod session_rail;
 mod spawn_lighthouse_flow;
 mod splash;
-mod start_menu;
 mod status;
 mod storage;
 mod surface_card;
@@ -710,11 +710,11 @@ struct Shell {
     /// pin, and pending lock/power requests. `mount_dock_chrome` mirrors
     /// `nav.surface` in/out and drains those requests each frame.
     vdock: dock::DockState,
-    /// WIN7-2 legacy Start Menu state. WL-UX-005 now routes the primary Start
-    /// button and clean Super tap to the unified Front Door panel, but this
-    /// state remains mounted so older tile/Console paths can be drained until
-    /// launcher parity lets us retire the duplicate surface cleanly.
-    start_menu: start_menu::StartMenuState,
+    /// WL-UX-005 — the unified launcher's persisted pin store. The legacy Start
+    /// Menu (the duplicate launcher) was removed; its one surviving local
+    /// capability — the operator's pinned launcher surfaces — lives here now and
+    /// the Front Door reads/mutates it through this single store.
+    launcher_pins: launcher_pins::LauncherPins,
     /// SEARCH-omnibox — the shell-owned focused entry that ranks apps, current
     /// Files rows, discovered mesh units, Browser bookmarks/history, and a real
     /// Browser web-search action through the shared ranker. It is also the
@@ -724,15 +724,14 @@ struct Shell {
     /// for the mesh node currently focused in Front Door.
     front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState,
     /// CONSOLE-1 — the Console front door (`docs/design/console-frontdoor.md`):
-    /// the Win10-style taxonomy of operational entries. Pre-WIN7-2 this was
-    /// its own standalone panel the dock's retired Start cell toggled directly; it is
-    /// now embedded as the Start Menu's right pane ([`Self::start_menu`],
-    /// lock #10) — `console::console_content` renders it there, and this
-    /// field's own `open` bit is a mirror of the Start Menu's, not a second
-    /// independent latch. The shell still drives its typed
-    /// [`console::ConsoleRequest`]s the same way (a live surface-link routes
-    /// the nav; command launches stay honest-gated on the CONSOLE-2 spawn-tab
-    /// seam, §7).
+    /// the Win10-style taxonomy of operational entries. WL-UX-005 removed the
+    /// legacy Start Menu that used to embed the Console panel as its right pane;
+    /// the Console now survives purely as a search/command backend the unified
+    /// Front Door draws on (`console::static_search_candidates`,
+    /// `console::run_command_request`, `activate_index`). The shell still drives
+    /// its typed [`console::ConsoleRequest`]s the same way (a live surface-link
+    /// routes the nav; command launches stay honest-gated on the CONSOLE-2
+    /// spawn-tab seam, §7).
     console: console::ConsoleState,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
@@ -952,7 +951,7 @@ impl Shell {
             critical_edge: status::CriticalEdgeCue::default(),
             local_host: local_hostname(),
             vdock: dock::DockState::default(),
-            start_menu: start_menu::StartMenuState::load(),
+            launcher_pins: launcher_pins::LauncherPins::load(),
             front_door: front_door::FrontDoorState::default(),
             front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState::default(),
             // WIN7-8 (lock #21) — `for_shell` (not bare `default`) so the real
@@ -1012,7 +1011,6 @@ impl Shell {
     }
 
     fn open_front_door_panel(&mut self) {
-        self.start_menu.close();
         self.front_door.open();
     }
 
@@ -1745,11 +1743,11 @@ impl Shell {
         // `render` stays within the line budget.
         self.mount_dock_chrome(ctx);
 
-        // WIN7-2 — the Start Menu: the panel + its toggle/request drains, split
-        // to a helper (the mount_dock_chrome idiom) so `render` stays within
-        // the line budget. Its Super-tap trigger drains later, alongside
-        // VDOCK-1's own dock toggle (see below).
-        self.mount_start_menu(ctx);
+        // WL-UX-005 — the legacy Start Menu (a duplicate launcher) was removed;
+        // the ONE launcher is the unified Front Door, mounted below
+        // (`mount_front_door`). The clean Super-tap and OpenOmnibox hotkey are
+        // its live entry points (drained alongside VDOCK-1's dock toggle below);
+        // the retired taskbar Start cell is a compatibility no-op in `dock`.
 
         let now = Instant::now();
         self.finish_menu_bar_minimize_if_done(now);
@@ -1902,19 +1900,17 @@ impl Shell {
         // not a weakening of
         // anything WIN7-2 built. Edge-triggered off `take_became_visible` — a
         // one-shot hidden->visible latch, NOT a per-frame "is it visible
-        // right now" poll — so this closes an open Start Menu exactly once
+        // right now" poll — so this closes an open launcher exactly once
         // per real firing and never re-fights an operator who reopens the
-        // Start Menu afterward: not while the SAME critical is still up but
+        // launcher afterward: not while the SAME critical is still up but
         // acknowledged (`visible()` stays false, so no further edge fires),
         // and not while it's still up and un-acknowledged either (no NEW
-        // edge without a real change). `StartMenuState::close` already
-        // no-ops while closed, so this is safe to call unconditionally, and
-        // closing it also closes the embedded Console pane for free — its
-        // own `open` bit is a same-frame mirror of the Start Menu's
-        // (`start_menu.rs`'s `console.set_open(state.open)`), not a second
-        // latch this call would need to touch separately.
+        // edge without a real change). WL-UX-005: the ONE launcher is now the
+        // unified Front Door (the legacy Start Menu was removed);
+        // `FrontDoorState::close` already no-ops while closed, so this is safe
+        // to call unconditionally.
         if self.critical_edge.take_became_visible() {
-            self.start_menu.close();
+            self.front_door.close();
         }
     }
 
@@ -1930,7 +1926,7 @@ impl Shell {
         // selection straight back out.
         self.vdock.set_active(self.nav.surface);
         self.vdock
-            .set_pinned_surfaces(self.start_menu.pinned_surfaces());
+            .set_pinned_surfaces(self.launcher_pins.pinned_surfaces());
         self.files.pump_transfers();
         self.web.pump_downloads_for_shell_chrome();
         self.vdock
@@ -1938,10 +1934,10 @@ impl Shell {
                 self.files.operation_progress_summary(),
                 self.web.operation_progress_summary(),
             ));
-        // Compatibility no-op for the retired taskbar Start cell while the legacy
-        // Start Menu paths are being drained.
-        self.vdock
-            .set_start_menu_open(self.front_door.is_open() || self.start_menu.is_open());
+        // Compatibility no-op for the retired taskbar Start cell (WL-UX-005:
+        // the legacy Start Menu launcher was removed; the Front Door is the ONE
+        // launcher whose open state the retired cell would have mirrored).
+        self.vdock.set_start_menu_open(self.front_door.is_open());
         // WIN10-HYBRID B3 — Settings owns the persisted preference; DockState owns
         // the bottom-edge reveal, animation, and strut behavior.
         self.vdock
@@ -2020,84 +2016,6 @@ impl Shell {
         }
     }
 
-    /// WL-UX-005 launcher transition: drain the retired dock Start-cell toggle
-    /// latch (ALWAYS drained so old states never back up), then keep mounting the
-    /// legacy Start Menu if another compatibility/test path has it open so its
-    /// tile and Console request drains remain live until parity retirement.
-    ///
-    /// WIN7-3 — also drains a live-tile click (the left pane) after Console's
-    /// own requests: the SAME "route + expand the body" outcome as a Console
-    /// `Goto`, just raised from `StartMenuState::take_tile_activation`
-    /// instead.
-    fn mount_start_menu(&mut self, ctx: &egui::Context) {
-        let toggled = self.vdock.take_start_menu_toggle();
-        if self.curtain.engaged() {
-            return;
-        }
-        if toggled {
-            self.toggle_front_door_panel();
-        }
-        // WIN7-4 — refresh the live-tile fact inputs before the panel renders
-        // (the `set_status_inputs`/`mount_dock_chrome` idiom): every field
-        // below reads the SAME already-published accessor an existing dock
-        // pip / the surface's own status chip already reads (§7 — see
-        // `TileFactInputs`'s own field docs for each exact source), cloned/
-        // copied out now so `start_menu::start_menu_panel` needs no extra
-        // parameters of its own.
-        let media_loaded = self.media.player().media().is_some();
-        self.start_menu.set_tile_inputs(start_menu::TileFactInputs {
-            chat_unread: self.chat.total_unread(),
-            chat_recent_sender: self.chat.most_recent_sender().map(str::to_owned),
-            mesh: self.chrome.summary().clone(),
-            segments: self.notify_status.segments().clone(),
-            media_title: media_loaded
-                .then(|| mde_media_egui::model::now_playing_title(self.media.player())),
-            media_playing: media_loaded && self.media.is_playing(),
-            music_now_playing: self
-                .music
-                .now_playing()
-                .map(|song| (song.title.clone(), song.artist.clone())),
-            voice_call_label: {
-                let label = self.voice.call_state().label();
-                (!label.is_empty()).then_some(label)
-            },
-            files_active_transfers: self.files.transfers_counts().active,
-            storage_local: self.storage.local_summary(),
-            bookmarks_total: self.bookmarks.total(),
-            phones: self.phones_hub.device_counts(),
-            workbench_seen: self.controller.seen(),
-            workbench_peer_count: self.controller.peer_count(),
-            workbench_leader: self.controller.leader().map(str::to_owned),
-            desktop_sources: self.chooser.source_count(),
-            desktop_session: self
-                .vdi
-                .requested_summary()
-                .map(|(name, protocol)| (name.to_owned(), protocol)),
-            infra_services: self.infra_code.service_summary(),
-            browser_tabs: self.web.tab_count(),
-            terminal_tabs: self.terminal.tab_count(),
-        });
-        // WIN7-DESKTOP-1 regression fix — reserve the SAME live taskbar height
-        // `mount_dock_chrome` just rendered the rail at, so the Start Menu's
-        // Power-anchored bottom sits flush above the taskbar rather than under
-        // it (see `start_menu::start_menu_panel`'s own doc comment).
-        start_menu::start_menu_panel(
-            ctx,
-            &mut self.start_menu,
-            &mut self.console,
-            self.vdock.rail_height(),
-        );
-        self.drain_console_request("start-menu");
-        // WIN7-3 — a live-tile click (the left pane) ends in the SAME
-        // outcome as an embedded Console `Goto` above: route the body and
-        // expand it (a navigation raised from the Start Menu is never a
-        // no-op behind the session, matching every other nav path here).
-        if let Some(surface) = self.start_menu.take_tile_activation() {
-            self.nav.expanded = true;
-            self.nav.surface = surface;
-        }
-    }
-
     fn apply_car_keyboard_routes(&mut self, ctx: &egui::Context) {
         if self.curtain.engaged()
             || self.system.layout_profile() != LayoutProfile::Car
@@ -2120,7 +2038,6 @@ impl Shell {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
                 if let Some(route) = car_key_route(key) {
                     self.front_door.close();
-                    self.start_menu.close();
                     self.nav.expanded = true;
                     self.nav.surface = route.surface();
                 }
@@ -2362,7 +2279,7 @@ impl Shell {
         &self,
         peer_apps: Vec<front_door::FrontDoorPeerApp>,
     ) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
-        let mut items = front_door::app_search_items_with_pins(self.start_menu.pinned_surfaces());
+        let mut items = front_door::app_search_items_with_pins(self.launcher_pins.pinned_surfaces());
         let mut rank = items.len();
 
         items.extend(front_door::peer_app_search_items(peer_apps, rank));
@@ -2596,14 +2513,14 @@ impl Shell {
                 self.nav.plane = plane;
             }
             front_door::FrontDoorRequest::TogglePin(surface) => {
-                self.start_menu.toggle_surface_pin(surface);
+                self.launcher_pins.toggle_surface_pin(surface);
             }
             front_door::FrontDoorRequest::MovePin { surface, direction } => match direction {
                 front_door::FrontDoorPinMoveDirection::Up => {
-                    self.start_menu.move_surface_pin_up(surface);
+                    self.launcher_pins.move_surface_pin_up(surface);
                 }
                 front_door::FrontDoorPinMoveDirection::Down => {
-                    self.start_menu.move_surface_pin_down(surface);
+                    self.launcher_pins.move_surface_pin_down(surface);
                 }
             },
         }
@@ -2614,7 +2531,7 @@ impl Shell {
             self.front_door.close();
             return;
         }
-        let pinned = self.start_menu.pinned_surfaces().to_vec();
+        let pinned = self.launcher_pins.pinned_surfaces().to_vec();
         let sources = self.front_door_source_status();
         let base_items = self.front_door_base_items();
         self.drive_front_door_peer_apps(&base_items, sources);
@@ -2749,7 +2666,6 @@ impl Shell {
             return;
         };
         self.front_door.close();
-        self.start_menu.close();
         self.nav.expanded = true;
         if ctx.style().animation_time <= 0.0 {
             self.nav.surface = Surface::Desktop;
@@ -2997,7 +2913,7 @@ mod tests {
     use super::{
         car_key_route, chat, complete_menu_bar_minimize, console, datacenter,
         desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
-        front_door_peer_apps, install_layout_mode_button_accessibility,
+        front_door_peer_apps, launcher_pins, install_layout_mode_button_accessibility,
         install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
         layout_mode_button_rect, layout_mode_menu_rect, layout_profile_row_accesskit_value,
         layout_profile_tooltip, media_header, media_panel, menu_bar_shuffle_cards,
@@ -3005,7 +2921,7 @@ mod tests {
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_editor, real_media, real_terminal, remote_sessions_fallback_pos, reserved_dock_gutter,
         reserved_taskbar_strut, route_file_operation_progress_request, screenshot,
-        shell_file_operation_progress, splash, start_menu, status,
+        shell_file_operation_progress, splash, status,
         surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
         LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
@@ -3541,7 +3457,6 @@ mod tests {
         shell.nav.expanded = true;
         shell.nav.surface = Surface::Browser;
         shell.front_door.open();
-        shell.start_menu.toggle();
 
         let size = vec2(1280.0, 720.0);
         let workspace = Rect::from_min_size(pos2(40.0, 72.0), vec2(920.0, 520.0));
@@ -3606,8 +3521,8 @@ mod tests {
             "the shell should consume the menu-bar request exactly once"
         );
         assert!(
-            !shell.front_door.is_open() && !shell.start_menu.is_open(),
-            "launcher overlays must clear before the minimize cue routes to Remote Sessions"
+            !shell.front_door.is_open(),
+            "the launcher overlay must clear before the minimize cue routes to Remote Sessions"
         );
         assert_eq!(
             shell.nav.surface,
@@ -4319,23 +4234,24 @@ mod tests {
     }
 
     #[test]
-    fn win7_6_a_critical_firing_closes_an_open_start_menu() {
-        // WIN7-6 (win7-desktop-survey lock #9): the NOTIF-6 edge-cue now also
-        // auto-closes the Start Menu if it's open the instant a Critical
-        // rollup fires, so the cue gets a clear field — a strengthening of
-        // the cue's existing "always wins" posture, not a weakening of
-        // anything WIN7-2 built.
+    fn win7_6_a_critical_firing_closes_an_open_launcher() {
+        // WIN7-6 (win7-desktop-survey lock #9): the NOTIF-6 edge-cue also
+        // auto-closes the open launcher the instant a Critical rollup fires, so
+        // the cue gets a clear field. WL-UX-005: the ONE launcher is now the
+        // unified Front Door (the legacy Start Menu was removed), so the cue
+        // clears the Front Door rather than a duplicate surface.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
         shell.local_host = "eagle".to_string();
-        shell.start_menu.toggle();
+        shell.front_door.open();
 
-        // Frame 1: the menu is open, no critical has fired yet.
+        // Frame 1: the launcher is open, no critical has fired yet.
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
         assert!(
-            shell.start_menu.is_open(),
-            "test setup: the Start Menu opens with no critical firing"
+            shell.front_door.is_open(),
+            "test setup: the Front Door opens with no critical firing"
         );
 
         // Frame 2: an own-seat Critical fires.
@@ -4349,22 +4265,23 @@ mod tests {
             "the own-seat critical keeps the shell edge cue visible"
         );
         assert!(
-            !shell.start_menu.is_open(),
-            "a Critical firing must auto-close an open Start Menu (lock #9)"
+            !shell.front_door.is_open(),
+            "a Critical firing must auto-close the open launcher (lock #9)"
         );
     }
 
     #[test]
-    fn win7_6_a_warning_alert_does_not_close_the_start_menu() {
+    fn win7_6_a_warning_alert_does_not_close_the_launcher() {
         // The strengthening is specifically for Critical severities
         // (`is_critical_severity`) — a Warning rollup must not touch the
-        // Start Menu at all, matching the edge cue's own existing severity
+        // launcher at all, matching the edge cue's own existing severity
         // gate (it never lights up for anything less than Critical either).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
         shell.local_host = "eagle".to_string();
-        shell.start_menu.toggle();
+        shell.front_door.open();
 
         shell
             .notify_status
@@ -4376,8 +4293,8 @@ mod tests {
             "a Warning severity never lights the own-seat edge cue"
         );
         assert!(
-            shell.start_menu.is_open(),
-            "a non-Critical rollup must not touch the Start Menu's open state"
+            shell.front_door.is_open(),
+            "a non-Critical rollup must not touch the launcher's open state"
         );
     }
 
@@ -4386,28 +4303,29 @@ mod tests {
         // WIN7-6's auto-close is edge-triggered off `take_became_visible`,
         // not a per-frame "is it visible" poll — so once the operator has
         // acknowledged the SAME critical (silencing the cue), reopening the
-        // Start Menu afterward must not be immediately fought shut again.
+        // launcher afterward must not be immediately fought shut again.
         // This is the precise "strengthening, not an annoying loop" behavior
         // the design lock calls for.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
         shell.local_host = "eagle".to_string();
-        shell.start_menu.toggle();
+        shell.front_door.open();
 
-        // Frame 1: menu open, no critical yet.
+        // Frame 1: launcher open, no critical yet.
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
-        assert!(shell.start_menu.is_open(), "test setup: opens clean");
+        assert!(shell.front_door.is_open(), "test setup: opens clean");
 
-        // Frame 2: the critical fires and auto-closes the menu (the exact
-        // behavior `win7_6_a_critical_firing_closes_an_open_start_menu`
+        // Frame 2: the critical fires and auto-closes the launcher (the exact
+        // behavior `win7_6_a_critical_firing_closes_an_open_launcher`
         // covers in detail; re-confirmed here as this test's own setup).
         shell
             .notify_status
             .set_segments_for_test(win7_6_own_seat_segments("critical", 42));
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
         assert!(
-            !shell.start_menu.is_open(),
+            !shell.front_door.is_open(),
             "test setup: the firing auto-closed it"
         );
 
@@ -4417,14 +4335,14 @@ mod tests {
         // test drives the same `acknowledge` entry point directly.
         shell.critical_edge.acknowledge();
 
-        // Frame 3: the operator reopens the Start Menu. The SAME critical
+        // Frame 3: the operator reopens the launcher. The SAME critical
         // rollup is still technically active (just acknowledged/silent) —
         // reopening must not be immediately fought shut again.
-        shell.start_menu.toggle();
+        shell.front_door.open();
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
 
         assert!(
-            shell.start_menu.is_open(),
+            shell.front_door.is_open(),
             "reopening after acknowledging the critical must not be re-closed \
              (WIN7-6 must never become an annoying open/slam loop)"
         );
@@ -4749,7 +4667,6 @@ mod tests {
             },
             |ctx| {
                 shell.mount_dock_chrome(ctx);
-                shell.mount_start_menu(ctx);
                 shell.mount_front_door(ctx);
             },
         );
@@ -4760,13 +4677,11 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
-        shell.start_menu.toggle();
 
         shell.apply_hotkey(HotkeyAction::OpenOmnibox);
 
-        assert!(shell.front_door.is_open());
         assert!(
-            !shell.start_menu.is_open(),
+            shell.front_door.is_open(),
             "the full omnibox owns the focused front door while open"
         );
     }
@@ -4776,7 +4691,6 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
-        shell.start_menu.toggle();
 
         let actions = shell.hotkeys.dispatch(
             &[
@@ -4798,10 +4712,9 @@ mod tests {
             shell.toggle_front_door_panel();
         }
 
-        assert!(shell.front_door.is_open());
         assert!(
-            !shell.start_menu.is_open(),
-            "a non-button launcher entry must use the same Front Door owner and close legacy Start"
+            shell.front_door.is_open(),
+            "a non-button launcher entry must use the same Front Door owner"
         );
     }
 
@@ -4811,7 +4724,6 @@ mod tests {
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.curtain = super::curtain::Curtain::default();
-        shell.start_menu.toggle();
         let size = vec2(960.0, 640.0);
 
         shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
@@ -4823,10 +4735,9 @@ mod tests {
 
         shell.toggle_front_door_panel();
 
-        assert!(shell.front_door.is_open());
         assert!(
-            !shell.start_menu.is_open(),
-            "launcher ownership must remain on Front Door, not the legacy Start Menu"
+            shell.front_door.is_open(),
+            "launcher ownership lives on the one Front Door"
         );
 
         shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
@@ -4838,26 +4749,81 @@ mod tests {
     }
 
     #[test]
-    fn start_launcher_toggle_opens_front_door_not_legacy_start_menu() {
+    fn start_launcher_toggle_opens_and_closes_the_one_front_door() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
-        shell.start_menu.toggle();
 
         shell.toggle_front_door_panel();
-
-        assert!(shell.front_door.is_open());
         assert!(
-            !shell.start_menu.is_open(),
-            "Start/Super launcher ownership moved to Front Door panel mode"
+            shell.front_door.is_open(),
+            "Start/Super launcher ownership lives on the Front Door panel mode"
         );
 
         shell.toggle_front_door_panel();
-
-        assert!(!shell.front_door.is_open());
         assert!(
-            !shell.start_menu.is_open(),
-            "closing Front Door should not reopen the legacy Start Menu"
+            !shell.front_door.is_open(),
+            "toggling the Front Door closed leaves no other launcher open"
+        );
+    }
+
+    /// WL-UX-005 AC12 — there is exactly ONE launcher entry point. The legacy
+    /// Start Menu was removed; every launcher trigger the shell exposes (the
+    /// OpenOmnibox hotkey, the clean Super tap via `take_dock_toggle`, the
+    /// taskbar Start-cell toggle) routes into the SAME `open_front_door_panel`/
+    /// `toggle_front_door_panel` pair over the ONE `front_door` state. This test
+    /// exercises each trigger and asserts they all drive that single surface —
+    /// a duplicate launcher would have to expose a second openable state for
+    /// this to still pass, which the type system no longer allows (there is no
+    /// second launcher field to open).
+    #[test]
+    fn every_launcher_entry_point_opens_the_single_front_door() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        // Trigger 1 — the OpenOmnibox hotkey.
+        shell.apply_hotkey(HotkeyAction::OpenOmnibox);
+        assert!(shell.front_door.is_open(), "OpenOmnibox opens the one launcher");
+        shell.toggle_front_door_panel();
+        assert!(!shell.front_door.is_open(), "toggle closes it");
+
+        // Trigger 2 — the clean Super tap (`take_dock_toggle`).
+        let actions = shell.hotkeys.dispatch(
+            &[
+                mde_egui::hostkeys::HostScan {
+                    code: 125,
+                    pressed: true,
+                },
+                mde_egui::hostkeys::HostScan {
+                    code: 125,
+                    pressed: false,
+                },
+            ],
+            &[],
+        );
+        for action in actions {
+            shell.apply_hotkey(action);
+        }
+        if shell.hotkeys.take_dock_toggle() {
+            shell.toggle_front_door_panel();
+        }
+        assert!(
+            shell.front_door.is_open(),
+            "the clean Super tap opens the SAME single launcher"
+        );
+        shell.toggle_front_door_panel();
+
+        // Trigger 3 — the retired taskbar Start-cell toggle drain. It is a
+        // compatibility no-op (`take_start_menu_toggle` always returns false),
+        // so it can never open a second launcher; draining it leaves the one
+        // Front Door closed and untouched.
+        if shell.vdock.take_start_menu_toggle() {
+            shell.toggle_front_door_panel();
+        }
+        assert!(
+            !shell.front_door.is_open(),
+            "the retired Start cell drains to a no-op, opening no second launcher"
         );
     }
 
@@ -5062,18 +5028,18 @@ mod tests {
     }
 
     #[test]
-    fn front_door_pin_request_updates_the_persisted_start_pin_store() {
+    fn front_door_pin_request_updates_the_persisted_launcher_pin_store() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
-        shell.start_menu = start_menu::StartMenuState::default();
+        shell.launcher_pins = launcher_pins::LauncherPins::default();
 
         shell.handle_front_door_request(
             &ctx,
             front_door::FrontDoorRequest::TogglePin(Surface::Files),
         );
 
-        assert_eq!(shell.start_menu.pinned_surfaces(), &[Surface::Files]);
+        assert_eq!(shell.launcher_pins.pinned_surfaces(), &[Surface::Files]);
         let first_app = shell
             .front_door_items()
             .into_iter()
@@ -5085,7 +5051,7 @@ mod tests {
         assert_eq!(
             first_app,
             Surface::Files,
-            "Front Door should read the same ordered favorites that Start persists"
+            "Front Door should read the same ordered favorites the launcher store persists"
         );
 
         shell.handle_front_door_request(
@@ -5093,7 +5059,7 @@ mod tests {
             front_door::FrontDoorRequest::TogglePin(Surface::Browser),
         );
         assert_eq!(
-            shell.start_menu.pinned_surfaces(),
+            shell.launcher_pins.pinned_surfaces(),
             &[Surface::Files, Surface::Browser]
         );
 
@@ -5105,9 +5071,9 @@ mod tests {
             },
         );
         assert_eq!(
-            shell.start_menu.pinned_surfaces(),
+            shell.launcher_pins.pinned_surfaces(),
             &[Surface::Browser, Surface::Files],
-            "Front Door reorder requests should update the Start-owned favorite order"
+            "Front Door reorder requests should update the launcher-owned favorite order"
         );
 
         shell.handle_front_door_request(
@@ -5118,7 +5084,7 @@ mod tests {
             },
         );
         assert_eq!(
-            shell.start_menu.pinned_surfaces(),
+            shell.launcher_pins.pinned_surfaces(),
             &[Surface::Files, Surface::Browser]
         );
 
@@ -5128,22 +5094,22 @@ mod tests {
         );
 
         assert!(
-            !shell.start_menu.pinned_surfaces().contains(&Surface::Files),
-            "a second Front Door pin request should unpin through the same Start store"
+            !shell.launcher_pins.pinned_surfaces().contains(&Surface::Files),
+            "a second Front Door pin request should unpin through the same launcher store"
         );
     }
 
     #[test]
-    fn start_menu_pins_are_mirrored_to_the_taskbar_application_bar() {
+    fn launcher_pins_are_mirrored_to_the_taskbar_application_bar() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
-        shell.start_menu = start_menu::StartMenuState::default();
+        shell.launcher_pins = launcher_pins::LauncherPins::default();
         shell.nav.surface = Surface::Workbench;
 
         assert!(
-            shell.start_menu.toggle_surface_pin(Surface::Browser),
-            "the Start Menu pin action should add Browser to the ordered pin store"
+            shell.launcher_pins.toggle_surface_pin(Surface::Browser),
+            "the launcher pin action should add Browser to the ordered pin store"
         );
 
         let input = egui::RawInput {
@@ -5155,11 +5121,11 @@ mod tests {
 
         let browser = ctx
             .read_response(dock::pinned_app_cell_id(Surface::Browser))
-            .expect("a Start Menu pin should render Browser on the application bar")
+            .expect("a launcher pin should render Browser on the application bar")
             .rect;
         assert!(
             browser.bottom() > 400.0,
-            "application pins should render inside the bottom taskbar, not only in the Start Menu"
+            "application pins should render inside the bottom taskbar"
         );
     }
 
@@ -5490,81 +5456,5 @@ mod tests {
         canvas.write_png(&path).expect("write the proof PNG");
         let written = std::fs::metadata(&path).expect("the PNG must exist on disk");
         assert!(written.len() > 0, "write_png must produce a non-empty file");
-    }
-
-    /// Paint the SAME two free functions `Shell::render` composes in production for
-    /// this exact slice (`dock::notification_rail_with_sources`,
-    /// `start_menu::start_menu_panel`) — bypassing `Shell`/`Curtain` entirely,
-    /// exactly like `dock.rs`'s own standalone tests already drive the taskbar
-    /// without a `Shell`. Going through the full `Shell` would hit the CURTAIN-3 boot
-    /// gate (`Shell::new_for_ctx` starts locked under the shipped
-    /// `require_login_at_boot` default), which would hide the whole nav — including
-    /// the Start Menu — behind the PAM curtain on any host/CI sandbox with no
-    /// persisted power-honor config.
-    fn paint_taskbar_and_start_menu(
-        ctx: &egui::Context,
-        vdock: &mut dock::DockState,
-        menu: &mut start_menu::StartMenuState,
-        console: &mut console::ConsoleState,
-    ) {
-        let _ = dock::notification_rail_with_sources(ctx, vdock, &[]);
-        // Mirrors main.rs's real `mount_start_menu` wiring (WIN7-DESKTOP-1
-        // regression fix) so this fixture's Start Menu reserves the SAME live
-        // taskbar height the rail above just rendered at, exactly like
-        // production — load-bearing for this test's own screenshot to show
-        // the accumulated chrome correctly, not just each piece in isolation.
-        start_menu::start_menu_panel(ctx, menu, console, vdock.rail_height());
-    }
-
-    /// WIN7-SHOT-1's actual payoff: the FIRST real look at the accumulated
-    /// WIN7-1..5 result (the bottom taskbar + the open two-pane Start Menu) —
-    /// every prior WIN7 unit was verified by layout-rect/accesskit assertions
-    /// alone. Writes a REAL file at a stable, reportable path (unlike the
-    /// proof above's tempdir) — this PNG IS the deliverable a human opens.
-    #[test]
-    fn win7_shot_2_start_menu_screenshot_shows_the_accumulated_win7_chrome() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut vdock = dock::DockState::default();
-        let mut menu = start_menu::StartMenuState::default();
-        let mut console = console::ConsoleState::with_store(None);
-        // The start_menu.rs idiom throughout this crate: toggle, then settle a
-        // quiet frame before the shot (e.g.
-        // `the_open_start_menu_does_not_cover_the_rest_of_the_screen`).
-        menu.toggle();
-        vdock.set_start_menu_open(true);
-
-        let size = vec2(1280.0, 800.0);
-        let input = || egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
-            ..Default::default()
-        };
-
-        let mut cap = screenshot::Capture::new();
-        let _settle = cap.frame(&ctx, input(), |ctx| {
-            paint_taskbar_and_start_menu(ctx, &mut vdock, &mut menu, &mut console);
-        });
-        let canvas = cap.frame(&ctx, input(), |ctx| {
-            paint_taskbar_and_start_menu(ctx, &mut vdock, &mut menu, &mut console);
-        });
-
-        assert!(
-            menu.is_open(),
-            "the fixture must really have the Start Menu open"
-        );
-        assert_eq!((canvas.width(), canvas.height()), (1280, 800));
-        assert!(
-            !canvas.is_blank(),
-            "the Start Menu screenshot must not be blank"
-        );
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("screenshots")
-            .join("win7-start-menu.png");
-        canvas
-            .write_png(&path)
-            .expect("write the WIN7 Start Menu screenshot");
-        println!("WIN7 Start Menu screenshot written to {}", path.display());
     }
 }

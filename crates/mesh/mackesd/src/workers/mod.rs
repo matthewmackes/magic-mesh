@@ -647,6 +647,15 @@ pub mod vm_lifecycle;
 // `event/podman/containers`. Universal like vm_lifecycle — every node can host
 // datacenter containers.
 pub mod container;
+// WL-UX-005 — the peer_app_launch worker: the peer-app remote-execution executor.
+// Drains `action/apps/launch` (published by the shell's unified Front Door as
+// `{node, app_id, name}`) and, only for requests addressed to its own node id,
+// actually launches the requested app locally. Security is load-bearing: it execs
+// ONLY an app this node itself advertises in its own app catalog (resolves the
+// opaque `app_id` against `ipc::apps::scan_local_apps`, never an arbitrary command
+// from the wire), and logs every launch + refusal. Workstation-tier — a headless
+// relay has no seat to launch onto — and idles gracefully when no requests arrive.
+pub mod peer_app_launch;
 // QC-2 (CONSTRUCT-CLOUD) — the mackesd `openstack` worker: the supervision root of
 // the mesh-becomes-an-OpenStack-cloud epic (docs/design/quasar-cloud.md). Reads
 // the fleet/one-state cloud doctrine for WHICH Kolla service containers this

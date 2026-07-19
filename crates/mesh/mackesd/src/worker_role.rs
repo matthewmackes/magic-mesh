@@ -219,6 +219,13 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     WorkerSpec::tier("job_exec", 1, RestartPolicy::OnFailure),
     WorkerSpec::tier("voice_config", 1, RestartPolicy::OnFailure),
     WorkerSpec::tier("clipboard_sync", 1, RestartPolicy::OnFailure),
+    // WL-UX-005 — the peer_app_launch executor: drains the shell Front Door's
+    // `action/apps/launch` publishes and actually launches the requested app on
+    // the target node, allowlisted against that node's own advertised app catalog
+    // (never an arbitrary wire command). A desktop feature — you launch apps onto
+    // a seat — so Workstation-tier; it idles gracefully on a headless box (no
+    // launch requests land) and OnFailure-restarts like the other action executors.
+    WorkerSpec::tier("peer_app_launch", 1, RestartPolicy::OnFailure),
     // BOOKMARKS-2 — the mesh-synced bookmarks worker. A desktop feature (the
     // seated user edits the Bookmarks surface), so Workstation-tier; it idles
     // gracefully on a headless box (no action/bookmarks/* requests) while still
