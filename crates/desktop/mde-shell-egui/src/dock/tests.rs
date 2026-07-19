@@ -1,12 +1,13 @@
 use super::{
-    action_center_cell_id, clock_cell_id, clock_date_text, focus_ring_rect,
-    notification_rail_with_sources, session_entry_id, session_hover_preview_id,
-    session_hover_protocol_badge_id, session_preview_texture_for_entry,
+    action_center_cell_id, clock_cell_id, clock_date_text, desktop_source_toggle_id,
+    focus_ring_rect, notification_rail_with_sources, pinned_app_cell_id, session_entry_id,
+    session_hover_preview_id, session_hover_protocol_badge_id, session_preview_texture_for_entry,
     session_preview_texture_rect, show_desktop_nub_id, start_cell_id, status_detail_toggle_id,
     taskbar_reveal, tray_overflow_id, tray_overflow_popup_id, tray_overflow_row_id,
-    truncate_session_label, DesktopRailSource, DockState, FileOperationProgress,
-    SessionPreviewTexture, SessionRailEntry, Surface, CELL_W, DESKTOP_SOURCE_TOGGLE_ICON, DOCK_W,
-    FOCUS_RING_W, NOTIFICATION_RAIL_H, START_MENU_LAUNCH_ICON, STATUS_DETAIL_ICON,
+    truncate_session_label, win11_tray_island_rect, DesktopRailSource, DockState,
+    FileOperationProgress, SessionPreviewTexture, SessionRailEntry, Surface, ACTION_CENTER_ICON,
+    CELL_W, DESKTOP_SOURCE_TOGGLE_ICON, DOCK_W, FOCUS_RING_W, NOTIFICATION_RAIL_H,
+    STATUS_DETAIL_ICON, TASKBAR_TRAY_ISLAND_ACTIVE_FILL, TASKBAR_TRAY_ISLAND_FILL,
     TRAY_OVERFLOW_ICON, TRAY_OVERFLOW_ROW_H, TRAY_OVERFLOW_W,
 };
 use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
@@ -373,18 +374,12 @@ fn the_win10_clock_second_line_is_the_civil_date() {
 
 // ── NOTIF-3: the status strip wired into the dock's bottom zone ────────────
 
-// ── WIN7-1: the bottom rail is now explicitly the Win7-style taskbar ───────
-// (design `docs/design/win7-desktop-survey.md`) — pure relocation + a density
-// pass over content that NAVBAR/NOTIF/CONSOLE-1 already folded into one rail;
-// these tests pin the locked lock #3 order + the lock #12 density trim as
-// their own explicit contract, on top of the pre-existing coverage above.
+// ── Bottom taskbar layout ────────────────────────────────────────────────
+// The left edge starts with Desktop Sources now that the taskbar Start button is
+// retired; the right edge carries the Windows 11-style tray island.
 
 #[test]
-fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
-    // Lock #3: Start · running sessions · tray · clock, left to right. Extends
-    // navbar4_status_tray_is_folded_into_the_bottom_rail with a real session
-    // entry between Start and the tray, and pins the exact four-segment order
-    // end to end (not just "everything shares a row").
+fn taskbar_reads_desktop_sources_sessions_tray_clock_left_to_right() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let mut s = DockState::default();
@@ -403,9 +398,9 @@ fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
 
-    let start = ctx
-        .read_response(start_cell_id())
-        .expect("Start cell registered")
+    let source = ctx
+        .read_response(desktop_source_toggle_id())
+        .expect("Desktop Sources cell registered")
         .rect;
     let session = ctx
         .read_response(session_entry_id(0, &entry))
@@ -421,8 +416,8 @@ fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
         .rect;
 
     assert!(
-        start.right() <= session.left() + 1.0,
-        "Start sits left of the running-sessions run"
+        source.right() <= session.left() + 1.0,
+        "Desktop Sources sits left of the running-sessions run"
     );
     assert!(
         session.right() <= tray.left() + 1.0,
@@ -434,14 +429,14 @@ fn win7_1_the_taskbar_reads_start_sessions_tray_clock_left_to_right() {
     );
     for (label, r) in [("session", session), ("tray", tray), ("clock", clock)] {
         assert!(
-            (r.center().y - start.center().y).abs() < 2.0,
-            "{label} shares the Start cell's row"
+            (r.center().y - source.center().y).abs() < 2.0,
+            "{label} shares the Desktop Sources row"
         );
     }
 }
 
 #[test]
-fn start_cell_keyboard_activation_latches_only_the_start_launcher_toggle() {
+fn taskbar_no_longer_renders_or_latches_a_far_left_start_button() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let mut s = DockState::default();
@@ -450,53 +445,22 @@ fn start_cell_keyboard_activation_latches_only_the_start_launcher_toggle() {
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
 
-    ctx.memory_mut(|m| m.request_focus(start_cell_id()));
-    drive_vdock(&ctx, &mut s, vec![key(egui::Key::Enter)], sz);
-
     assert!(
-        s.take_start_menu_toggle(),
-        "Enter on the focused Start taskbar cell must latch the Start launcher toggle"
+        ctx.read_response(start_cell_id()).is_none(),
+        "the retired far-left Start button must not register a taskbar response"
     );
-    assert!(
-        !s.take_start_menu_toggle(),
-        "the Start launcher toggle must remain a one-shot latch"
-    );
-    assert_eq!(
-        s.active(),
-        Surface::Desktop,
-        "activating Start must not route the shell body through another taskbar opener"
-    );
-}
-
-#[test]
-fn start_cell_pointer_activation_latches_only_the_start_launcher_toggle() {
-    let ctx = egui::Context::default();
-    Style::install(&ctx);
-    let mut s = DockState::default();
-    s.toggle();
-    let sz = egui::vec2(1280.0, 800.0);
-    drive_vdock(&ctx, &mut s, Vec::new(), sz);
-    drive_vdock(&ctx, &mut s, Vec::new(), sz);
-    let start = ctx
-        .read_response(start_cell_id())
-        .expect("Start cell registered")
+    let source = ctx
+        .read_response(desktop_source_toggle_id())
+        .expect("Desktop Sources cell becomes the first taskbar control")
         .rect
-        .center();
-
-    click_rail_cell(&ctx, &mut s, start, sz);
-
+        .left();
     assert!(
-        s.take_start_menu_toggle(),
-        "primary click on the Start taskbar cell must latch the Start launcher toggle"
+        source <= CELL_W,
+        "Desktop Sources should occupy the left-edge taskbar slot after Start removal: {source}"
     );
     assert!(
         !s.take_start_menu_toggle(),
-        "the pointer launcher toggle must remain a one-shot latch"
-    );
-    assert_eq!(
-        s.active(),
-        Surface::Desktop,
-        "clicking Start must not route the shell body through another taskbar opener"
+        "the taskbar must not synthesize a retired Start launcher toggle"
     );
 }
 
@@ -555,6 +519,66 @@ fn click_rail_cell(ctx: &egui::Context, s: &mut DockState, pos: egui::Pos2, sz: 
     };
     drive_vdock(ctx, s, vec![egui::Event::PointerMoved(pos), press], sz);
     drive_vdock(ctx, s, vec![egui::Event::PointerMoved(pos), release], sz);
+}
+
+#[test]
+fn pinned_apps_from_the_start_menu_render_on_the_application_bar() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.set_active(Surface::Workbench);
+    s.set_pinned_surfaces(&[Surface::Browser, Surface::Files]);
+    let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        0,
+        true,
+        vec![entry.clone()],
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let source = ctx
+        .read_response(desktop_source_toggle_id())
+        .expect("Desktop Sources cell registered")
+        .rect;
+    let browser = ctx
+        .read_response(pinned_app_cell_id(Surface::Browser))
+        .expect("pinned Browser app registered on the application bar")
+        .rect;
+    let files = ctx
+        .read_response(pinned_app_cell_id(Surface::Files))
+        .expect("pinned Files app registered on the application bar")
+        .rect;
+    let session = ctx
+        .read_response(session_entry_id(0, &entry))
+        .expect("session entry registered")
+        .rect;
+
+    assert!(
+        source.right() <= browser.left() + 1.0,
+        "pinned apps sit after the Desktop Sources control"
+    );
+    assert!(
+        browser.right() <= files.left() + 1.0,
+        "pinned apps keep Start Menu pin order"
+    );
+    assert!(
+        files.right() <= session.left() + 1.0,
+        "running sessions remain after pinned applications"
+    );
+
+    let center = browser.center();
+    click_rail_cell(&ctx, &mut s, center, sz);
+    assert_eq!(
+        s.active(),
+        Surface::Browser,
+        "clicking a pinned application bar cell routes to that app surface"
+    );
 }
 
 #[test]
@@ -1007,16 +1031,16 @@ fn win7_desktop_1_regression_the_taskbar_anchors_to_the_screens_true_bottom_edge
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
 
-    let start = ctx
-        .read_response(start_cell_id())
-        .expect("Start cell registered")
+    let source = ctx
+        .read_response(desktop_source_toggle_id())
+        .expect("Desktop Sources cell registered")
         .rect;
     let clock = ctx
         .read_response(clock_cell_id())
         .expect("clock registered")
         .rect;
 
-    for (label, r) in [("Start", start), ("clock", clock)] {
+    for (label, r) in [("Desktop Sources", source), ("clock", clock)] {
         assert!(
             (r.bottom() - sz.y).abs() < Style::SP_S,
             "{label} cell's bottom edge must sit within one small-spacing \
@@ -1172,6 +1196,12 @@ fn painted_text_clips(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egu
 fn painted_rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
     fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
         match shape {
+            egui::Shape::Mesh(mesh) => {
+                out.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+            }
+            egui::Shape::Path(path) if path.fill != egui::Color32::TRANSPARENT => {
+                out.push(path.fill);
+            }
             egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
                 out.push(rect.fill);
             }
@@ -1267,15 +1297,15 @@ fn accesskit_bounds_rect(node: &egui::accesskit::Node) -> egui::Rect {
 #[test]
 fn taskbar_launch_sources_health_and_overflow_use_distinct_non_chevron_icons() {
     let icons = [
-        START_MENU_LAUNCH_ICON,
         DESKTOP_SOURCE_TOGGLE_ICON,
         STATUS_DETAIL_ICON,
         TRAY_OVERFLOW_ICON,
+        ACTION_CENTER_ICON,
     ];
-    assert_eq!(START_MENU_LAUNCH_ICON, IconId::Start);
     assert_eq!(DESKTOP_SOURCE_TOGGLE_ICON, IconId::Desktop);
-    assert_eq!(STATUS_DETAIL_ICON, IconId::Signal);
+    assert_eq!(STATUS_DETAIL_ICON, IconId::HealthStatus);
     assert_eq!(TRAY_OVERFLOW_ICON, IconId::MoreHorizontal);
+    assert_eq!(ACTION_CENTER_ICON, IconId::Notifications);
     assert!(
         !icons.contains(&IconId::ChevronUp),
         "taskbar actions should not share the old up-arrow glyph"
@@ -1317,6 +1347,65 @@ fn taskbar_controls_render_white_icons_on_a_black_bar() {
     assert!(
         text_colors.iter().copied().any(visible_white),
         "clock/taskbar text glyphs should be white on the black bar: {text_colors:?}"
+    );
+}
+
+#[test]
+fn win11_tray_clock_and_notification_area_paint_a_grouped_island() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut s = DockState::default();
+    s.toggle();
+    s.set_status_inputs(
+        MeshSummary::default(),
+        None,
+        2,
+        true,
+        Vec::new(),
+        NodeGrades::default(),
+        StatusSegments::default(),
+    );
+    let sz = egui::vec2(1280.0, 800.0);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+    drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+    let status_detail = ctx
+        .read_response(status_detail_toggle_id())
+        .expect("status-detail toggle registered")
+        .rect;
+    let clock = ctx
+        .read_response(clock_cell_id())
+        .expect("clock registered")
+        .rect;
+    let action = ctx
+        .read_response(action_center_cell_id())
+        .expect("action-center registered")
+        .rect;
+
+    let rail = egui::Rect::from_min_size(
+        egui::pos2(0.0, sz.y - s.rail_height()),
+        egui::vec2(sz.x, s.rail_height()),
+    );
+    let tray_icon_w = s
+        .rail_height()
+        .min(super::NOTIFICATION_RAIL_EXPANDED_ICON_H)
+        - 4.0;
+    let status_w = status::notification_rail_width(&s.status.segments, tray_icon_w);
+    let island = win11_tray_island_rect(rail, s.rail_height(), s.rail_height() * 2.5, status_w);
+    assert!(
+        island.contains_rect(status_detail)
+            && island.contains_rect(clock)
+            && island.contains_rect(action),
+        "Windows 11 tray island must contain health, clock, and notification cells: \
+         island={island:?} health={status_detail:?} clock={clock:?} action={action:?}"
+    );
+    let canvas = capture_taskbar_screenshot("taskbar-win11-tray-island.png", &mut s, sz, &[]);
+    let island_pixels = canvas.count_near_color_in_rect(island, TASKBAR_TRAY_ISLAND_FILL, 8)
+        + canvas.count_near_color_in_rect(island, TASKBAR_TRAY_ISLAND_ACTIVE_FILL, 8);
+    assert!(
+        island_pixels > 200,
+        "tray/clock/notification area should visibly paint the Windows 11 grouped island fill; \
+         matched {island_pixels} island pixels"
     );
 }
 
@@ -1374,13 +1463,7 @@ fn win7_7_every_primary_taskbar_cell_exports_a_labelled_button_when_sessions_are
     let out = drive_vdock(&ctx, &mut s, Vec::new(), sz);
     let nodes = accesskit_nodes(&out);
 
-    for label in [
-        "Start",
-        "Sessions",
-        "Health panel",
-        "Clock",
-        "Desktop sources",
-    ] {
+    for label in ["Sessions", "Health panel", "Clock", "Desktop sources"] {
         let node = nodes
             .iter()
             .map(|(_, n)| n)

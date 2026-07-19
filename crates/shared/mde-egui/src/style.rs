@@ -10,10 +10,76 @@
 
 use egui::{
     epaint::{ClippedShape, ColorMode},
-    Color32, Context, Stroke,
+    Color32, Context, FontFamily, FontId, Stroke, TextStyle,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::formfactor::Formfactor;
+
+/// The shell-wide layout profile. Profiles are not just density presets: each one
+/// names a distinct placement model the shell can branch on while still sharing
+/// the same `Style` palette and Inter-first font system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutProfile {
+    /// Windows 2000 Workstation: classic bottom taskbar + Start lower-left.
+    #[default]
+    Workstation,
+    /// Touch tablet: bottom touch bar, larger targets, slide-up controls.
+    Tablet,
+    /// Vehicle HUD: glanceable driving/vehicle/media/comms controls.
+    Car,
+}
+
+impl LayoutProfile {
+    /// Visible picker order.
+    pub const ALL: [Self; 3] = [Self::Workstation, Self::Tablet, Self::Car];
+
+    /// Human label for settings/menu rows.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Workstation => "Windows 2000 Workstation",
+            Self::Tablet => "Tablet",
+            Self::Car => "Car",
+        }
+    }
+
+    /// Compact shell-control label for constrained mode buttons.
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Workstation => "WS",
+            Self::Tablet => "TAB",
+            Self::Car => "CAR",
+        }
+    }
+
+    /// Settings/menu description.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Workstation => "Classic desktop placement",
+            Self::Tablet => "Bottom touch bar and larger targets",
+            Self::Car => "Driving HUD and keyboard actions",
+        }
+    }
+
+    /// Runtime interaction density installed for this profile.
+    #[must_use]
+    pub const fn density(self) -> Density {
+        match self {
+            Self::Workstation => Density::Mouse,
+            Self::Tablet | Self::Car => Density::Touch,
+        }
+    }
+
+    /// Whether this profile is the vehicle HUD model.
+    #[must_use]
+    pub const fn is_car(self) -> bool {
+        matches!(self, Self::Car)
+    }
+}
 
 /// The **interaction density** of a surface — how large hit targets and spacing are
 /// (SURFACE-11, design lock 16).
@@ -186,6 +252,29 @@ impl Style {
     /// paints bold spans + heading titles with it.
     pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
 
+    // ── Bottom taskbar chrome ──────────────────────────────────────────────
+    // The platform taskbar is deliberately a black shell strip with white glyphs
+    // and a Windows-11-style tray island. Keep the exact palette in shared Style
+    // so dock rendering and visual tests do not mint private shell colours.
+    /// Full-width bottom taskbar strip.
+    pub const TASKBAR_BG: Color32 = Color32::BLACK;
+    /// Taskbar hairline/separator.
+    pub const TASKBAR_BORDER: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
+    /// Hover fill for taskbar-owned cells.
+    pub const TASKBAR_HOVER_FILL: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
+    /// Active/selected fill for taskbar-owned cells.
+    pub const TASKBAR_ACTIVE_FILL: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
+    /// Taskbar-owned control glyph tint.
+    pub const TASKBAR_ICON: Color32 = Color32::WHITE;
+    /// Windows 11-style tray island fill.
+    pub const TASKBAR_TRAY_ISLAND_FILL: Color32 = Color32::from_rgb(0x17, 0x17, 0x17);
+    /// Active Windows 11-style tray island fill.
+    pub const TASKBAR_TRAY_ISLAND_ACTIVE_FILL: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
+    /// Windows 11-style tray island border.
+    pub const TASKBAR_TRAY_ISLAND_BORDER: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3A);
+    /// Secondary date text in the taskbar clock stack.
+    pub const TASKBAR_CLOCK_DATE: Color32 = Color32::from_rgb(0xD6, 0xD6, 0xD6);
+
     /// Interactive / brand accent (Construct azure).
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
     /// Accent, hovered.
@@ -297,6 +386,38 @@ impl Style {
     /// Display heading (Carbon productive-heading-06) — the largest type rung,
     /// the markdown-preview H1 title size (EDTB-7).
     pub const DISPLAY: f32 = 26.0;
+    /// Top-left workspace title text: the display rung reduced by two points for
+    /// refined shell chrome.
+    pub const WORKSPACE_TITLE: f32 = Self::DISPLAY - 2.0;
+    /// Shared menu/button chrome text: the body rung reduced by one point so
+    /// menus read as controls, not body copy.
+    pub const MENU_TEXT: f32 = Self::BODY - 1.0;
+    /// Vertical padding for ordinary egui buttons. Kept well below the base 8px
+    /// gutter so toolbar rows read refined without changing the minimum hit target.
+    pub const CONTROL_PAD_Y: f32 = Self::SP_XS;
+    /// Decorative vertical inset for stacked toolbar/header strips. This is
+    /// intentionally near-zero; the hit target still comes from egui's
+    /// interaction size, not from toolbar padding.
+    pub const TOOLBAR_INSET_Y: f32 = 0.0;
+    /// Refined pointer-toolbar visual control height. Derived from the menu text
+    /// rung plus a compact vertical cushion so local toolbar rows can slim down
+    /// without carrying unrelated 24pt literals.
+    pub const TOOLBAR_CONTROL_H: f32 = Self::MENU_TEXT + Self::SP_S + Self::SP_XS * 0.5;
+
+    /// A shared toolbar/header frame margin: normal horizontal inset, refined
+    /// vertical inset. Use this for chrome strips that surround controls, not for
+    /// content cards or body panels.
+    #[must_use]
+    pub const fn toolbar_margin() -> egui::Margin {
+        egui::Margin::symmetric(Self::SP_XS as i8, Self::TOOLBAR_INSET_Y as i8)
+    }
+
+    /// Shared tooltip/hover-card frame margin. This keeps transient chrome lighter
+    /// than content cards while still leaving enough breathing room for small text.
+    #[must_use]
+    pub const fn tooltip_margin() -> egui::Margin {
+        egui::Margin::symmetric(Self::SP_S as i8, Self::SP_XS as i8)
+    }
 
     /// The point size for a markdown/rich-text heading `level` on the shared
     /// type ramp: H1 → [`DISPLAY`](Self::DISPLAY), H2 → [`HEADING`](Self::HEADING),
@@ -348,13 +469,36 @@ impl Style {
         let sp = density.spacing_scale();
         ctx.style_mut(|s| {
             s.visuals = v;
+            s.text_styles.insert(
+                TextStyle::Small,
+                FontId::new(Self::SMALL, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Body,
+                FontId::new(Self::BODY, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Button,
+                FontId::new(Self::MENU_TEXT, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Heading,
+                FontId::new(Self::HEADING, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Monospace,
+                FontId::new(Self::BODY, FontFamily::Monospace),
+            );
             s.spacing.item_spacing = egui::vec2(Self::SP_S * sp, Self::SP_S * sp);
-            s.spacing.button_padding = egui::vec2(Self::SP_M * sp, Self::SP_S * sp);
+            s.spacing.button_padding = egui::vec2(Self::SP_M * sp, Self::CONTROL_PAD_Y * sp);
             s.spacing.indent = Self::SP_M * sp;
             // The minimum interactive size is the finger/pointer hit target.
             s.spacing.interact_size.y = density.min_hit_target();
         });
-        ctx.data_mut(|d| d.insert_temp(Self::color_scheme_id(), scheme));
+        ctx.data_mut(|d| {
+            d.insert_temp(Self::color_scheme_id(), scheme);
+            d.insert_temp(Self::density_id(), density);
+        });
     }
 
     /// The current colour mode installed on `ctx`.
@@ -362,6 +506,15 @@ impl Style {
     pub fn color_scheme(ctx: &Context) -> StyleColorScheme {
         ctx.data(|d| {
             d.get_temp::<StyleColorScheme>(Self::color_scheme_id())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The current density installed on `ctx`.
+    #[must_use]
+    pub fn density(ctx: &Context) -> Density {
+        ctx.data(|d| {
+            d.get_temp::<Density>(Self::density_id())
                 .unwrap_or_default()
         })
     }
@@ -439,6 +592,10 @@ impl Style {
 
     fn color_scheme_id() -> egui::Id {
         egui::Id::new("mde-egui-style-color-scheme")
+    }
+
+    fn density_id() -> egui::Id {
+        egui::Id::new("mde-egui-style-density")
     }
 
     fn visuals_for(scheme: StyleColorScheme, accent: Color32, accent_hi: Color32) -> egui::Visuals {
@@ -920,7 +1077,7 @@ impl Elevation {
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants, clippy::float_cmp)]
 mod tests {
-    use super::{Density, Elevation, GradeBand, Style, StyleColorScheme};
+    use super::{Density, Elevation, GradeBand, LayoutProfile, Style, StyleColorScheme};
     use crate::formfactor::Formfactor;
 
     /// WCAG 2.1 **relative luminance** of an sRGB colour (`0.0..=1.0`; alpha ignored).
@@ -1089,6 +1246,33 @@ mod tests {
         assert_ne!(Style::TEXT, Style::TEXT_DIM);
         assert_ne!(Style::ACCENT, Style::BG);
         assert_ne!(Style::ACCENT, Style::ACCENT_HI);
+    }
+
+    #[test]
+    fn taskbar_palette_keeps_black_bar_white_glyphs_and_grouped_tray() {
+        assert_eq!(Style::TASKBAR_BG, egui::Color32::BLACK);
+        assert_eq!(Style::TASKBAR_ICON, egui::Color32::WHITE);
+        assert_ne!(Style::TASKBAR_BORDER, Style::TASKBAR_BG);
+        assert_ne!(Style::TASKBAR_HOVER_FILL, Style::TASKBAR_BG);
+        assert_ne!(Style::TASKBAR_ACTIVE_FILL, Style::TASKBAR_HOVER_FILL);
+        assert_ne!(
+            Style::TASKBAR_TRAY_ISLAND_ACTIVE_FILL,
+            Style::TASKBAR_TRAY_ISLAND_FILL,
+            "active tray island needs its own tone"
+        );
+        assert_ne!(
+            Style::TASKBAR_TRAY_ISLAND_BORDER,
+            Style::TASKBAR_TRAY_ISLAND_FILL,
+            "tray island border must remain visible on the island fill"
+        );
+        assert!(
+            wcag_contrast_ratio(Style::TASKBAR_ICON, Style::TASKBAR_BG) >= 7.0,
+            "white taskbar icons must remain high contrast on the black bar"
+        );
+        assert!(
+            wcag_contrast_ratio(Style::TASKBAR_CLOCK_DATE, Style::TASKBAR_BG) >= 7.0,
+            "taskbar date text must remain readable on the black bar"
+        );
     }
 
     #[test]
@@ -1290,6 +1474,24 @@ mod tests {
         assert!(Style::BODY < Style::TITLE);
         assert!(Style::TITLE < Style::HEADING);
         assert!(Style::HEADING < Style::DISPLAY);
+        assert_eq!(
+            Style::MENU_TEXT,
+            Style::BODY - 1.0,
+            "menu/control chrome text is one point below body text"
+        );
+        assert!(
+            Style::SMALL < Style::MENU_TEXT && Style::MENU_TEXT < Style::BODY,
+            "menu text should stay between captions and body copy"
+        );
+        assert_eq!(
+            Style::WORKSPACE_TITLE,
+            Style::DISPLAY - 2.0,
+            "top-left workspace title chrome is two points below display text"
+        );
+        assert!(
+            Style::HEADING < Style::WORKSPACE_TITLE && Style::WORKSPACE_TITLE < Style::DISPLAY,
+            "workspace title should stay between section and display headings"
+        );
     }
 
     #[test]
@@ -1339,6 +1541,19 @@ mod tests {
         assert_eq!(ctx.style().visuals.panel_fill, Style::BG);
         assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
         assert_eq!(ctx.style().spacing.indent, Style::SP_M);
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Body].size,
+            Style::BODY
+        );
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Button].size,
+            Style::MENU_TEXT,
+            "raw egui buttons and stray menu rows inherit the refined chrome text size"
+        );
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Heading].size,
+            Style::HEADING
+        );
         // The refactored install routes the accent through the shared derivation, so
         // the whole interactive-accent field group lands on the (darkened) brand accent,
         // with a bright pressed label — the same colour egui reuses for strong text.
@@ -1518,6 +1733,24 @@ mod tests {
     }
 
     #[test]
+    fn layout_profiles_have_locked_order_and_density() {
+        assert_eq!(
+            LayoutProfile::ALL,
+            [
+                LayoutProfile::Workstation,
+                LayoutProfile::Tablet,
+                LayoutProfile::Car
+            ]
+        );
+        assert_eq!(LayoutProfile::default(), LayoutProfile::Workstation);
+        assert_eq!(LayoutProfile::Workstation.density(), Density::Mouse);
+        assert_eq!(LayoutProfile::Tablet.density(), Density::Touch);
+        assert_eq!(LayoutProfile::Car.density(), Density::Touch);
+        assert!(LayoutProfile::Car.is_car());
+        assert_eq!(LayoutProfile::Workstation.short_label(), "WS");
+    }
+
+    #[test]
     fn four_density_presets_scale_spacing_monotonically() {
         // Compact < Mouse < Comfortable < Touch in spacing; hit targets step
         // pointer(24) → finger(44) once. Spacing is the only thing density moves —
@@ -1574,6 +1807,66 @@ mod tests {
         assert_eq!(
             d.style().spacing.interact_size.y,
             mouse.style().spacing.interact_size.y
+        );
+    }
+
+    #[test]
+    fn button_padding_keeps_toolbars_refined_without_shrinking_hit_targets() {
+        assert!(
+            Style::CONTROL_PAD_Y < Style::SP_S,
+            "toolbar buttons should use a slimmer vertical pad than the base gutter"
+        );
+        assert_eq!(
+            Style::CONTROL_PAD_Y,
+            Style::SP_XS,
+            "refined toolbar controls keep to the half-gutter vertical padding"
+        );
+        assert!(
+            Style::TOOLBAR_INSET_Y < Style::SP_XS,
+            "stacked toolbar strips should use a refined vertical inset"
+        );
+        assert_eq!(
+            Style::TOOLBAR_INSET_Y,
+            0.0,
+            "toolbar strip chrome should not add decorative vertical bulk"
+        );
+        assert_eq!(
+            Style::TOOLBAR_CONTROL_H,
+            Style::MENU_TEXT + Style::SP_S + Style::SP_XS * 0.5,
+            "refined toolbar visual controls derive from the menu text rung"
+        );
+        assert!(
+            Style::TOOLBAR_CONTROL_H < Density::Mouse.min_hit_target(),
+            "the refined visual height stays slimmer than the pointer hit-target floor"
+        );
+        assert_eq!(
+            Style::toolbar_margin(),
+            egui::Margin::symmetric(Style::SP_XS as i8, Style::TOOLBAR_INSET_Y as i8)
+        );
+
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, Density::Mouse);
+        assert_eq!(
+            ctx.style().spacing.button_padding.y,
+            Style::CONTROL_PAD_Y,
+            "the shared egui install owns the uniform toolbar/button vertical padding"
+        );
+        assert_eq!(
+            ctx.style().spacing.interact_size.y,
+            Density::Mouse.min_hit_target(),
+            "refined padding must not reduce the minimum pointer hit target"
+        );
+    }
+
+    #[test]
+    fn tooltip_margin_stays_compact_and_uniform() {
+        assert_eq!(
+            Style::tooltip_margin(),
+            egui::Margin::symmetric(Style::SP_S as i8, Style::SP_XS as i8)
+        );
+        assert!(
+            Style::tooltip_margin().top < Style::SP_S as i8,
+            "tooltips should not inherit thick content-card vertical padding"
         );
     }
 

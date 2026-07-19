@@ -6,6 +6,12 @@
 > id; anything the design leaves open says **decided at implementation** rather
 > than guessing. Update this file as each task ships — QC-21's acceptance is
 > that the docs match the shipped behavior.
+>
+> **Provider-neutral runway note, 2026-07-18:** the OpenStack/Kolla deployment
+> below remains the installed backend until replacement-provider proof exists,
+> but it is now an adapter behind Construct Cloud contracts. New operator
+> surfaces, Bus verbs, persisted mirrors, and docs should prefer provider-neutral
+> names and keep OpenStack terms in compatibility diagnostics.
 
 Every MCNF node is a **universal OpenStack node**: the one bootc image carries
 the host virt bits, and a mackesd `openstack` worker runs Red-Hat-convention

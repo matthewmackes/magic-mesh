@@ -29,6 +29,9 @@ use crate::model::{ActionOutcome, LinkCheckRecord, LinkHealth, Manager, SortBy};
 #[derive(Clone, Copy)]
 struct DragItem(uuid::Uuid);
 
+const BOOKMARKS_HEADER_TITLE: f32 = Style::HEADING - 2.0;
+const BOOKMARKS_ACTION_BUTTON_H: f32 = Style::TOOLBAR_CONTROL_H;
+
 /// A user intent captured during a render, applied after the frame.
 enum Action {
     /// Browse a folder's contents (`None` = root).
@@ -180,48 +183,74 @@ fn handle_keys(ui: &egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 
 fn header(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
     egui::TopBottomPanel::top("bm-header").show_inside(ui, |ui| {
-        ui.add_space(Style::SP_XS);
-        ui.horizontal(|ui| {
-            ui.heading(
-                RichText::new("Bookmarks")
-                    .color(Style::TEXT)
-                    .size(Style::HEADING),
-            );
-            ui.add_space(Style::SP_M);
-            ui.colored_label(Style::TEXT_DIM, location_line(m));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                sort_selector(ui, m, actions);
-                ui.add_space(Style::SP_S);
-                search_field(ui, m);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
+        ui.scope(|ui| {
+            scope_bookmarks_toolbar_ui(ui);
+            ui.horizontal(|ui| {
+                ui.heading(
+                    RichText::new("Bookmarks")
+                        .color(Style::TEXT)
+                        .size(BOOKMARKS_HEADER_TITLE),
+                );
+                ui.add_space(Style::SP_M);
+                ui.colored_label(Style::TEXT_DIM, location_line(m));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    sort_selector(ui, m, actions);
+                    ui.add_space(Style::SP_S);
+                    search_field(ui, m);
+                });
             });
         });
-        ui.add_space(Style::SP_XS);
-        toolbar(ui, m, actions);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
+        ui.scope(|ui| {
+            scope_bookmarks_toolbar_ui(ui);
+            toolbar(ui, m, actions);
+        });
         if m.add_open() {
-            ui.add_space(Style::SP_XS);
-            add_form(ui, m, actions);
+            ui.add_space(Style::TOOLBAR_INSET_Y);
+            ui.scope(|ui| {
+                scope_bookmarks_toolbar_ui(ui);
+                add_form(ui, m, actions);
+            });
         }
-        ui.add_space(Style::SP_XS);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
         status_line(ui, m);
-        ui.add_space(Style::SP_XS);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
     });
+}
+
+fn scope_bookmarks_toolbar_ui(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.spacing.button_padding.y = Style::CONTROL_PAD_Y;
+    style.spacing.interact_size.y = BOOKMARKS_ACTION_BUTTON_H;
+}
+
+fn bookmarks_action_button(ui: &mut egui::Ui, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .color(Style::TEXT)
+                .size(Style::MENU_TEXT),
+        )
+        .min_size(egui::vec2(0.0, BOOKMARKS_ACTION_BUTTON_H)),
+    )
 }
 
 fn toolbar(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        if ui.button("+ Add bookmark").clicked() {
+        if bookmarks_action_button(ui, "+ Add bookmark").clicked() {
             actions.push(Action::OpenAdd);
         }
-        if ui.button("New folder").clicked() {
+        if bookmarks_action_button(ui, "New folder").clicked() {
             actions.push(Action::AddFolder(m.current()));
         }
-        if ui.button("Check links").clicked() {
+        if bookmarks_action_button(ui, "Check links").clicked() {
             actions.push(Action::CheckLinks);
         }
         if m.is_searching() {
             ui.add_space(Style::SP_S);
             ui.colored_label(Style::TEXT_DIM, format!("Search: {}", m.query()));
-            if ui.button("Clear").clicked() {
+            if bookmarks_action_button(ui, "Clear").clicked() {
                 actions.push(Action::ClearSearch);
             }
         }
@@ -276,12 +305,13 @@ fn add_form(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
             );
             let submit_on_enter = url.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let add = egui::Button::new(RichText::new("Add").color(Style::BG).strong())
-                .fill(Style::ACCENT);
+                .fill(Style::ACCENT)
+                .min_size(egui::vec2(0.0, BOOKMARKS_ACTION_BUTTON_H));
             let clicked = ui.add_enabled(m.can_submit_add(), add).clicked();
             if clicked || (submit_on_enter && m.can_submit_add()) {
                 actions.push(Action::CommitAdd);
             }
-            if ui.button("Cancel").clicked() {
+            if bookmarks_action_button(ui, "Cancel").clicked() {
                 actions.push(Action::CancelAdd);
             }
         });
@@ -888,7 +918,9 @@ fn confirm_dialog(ui: &egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
         .show(ui.ctx(), |ui| {
             ui.colored_label(
                 Style::TEXT,
-                format!("\u{201c}{name}\u{201d} holds {count} item(s). Delete it and everything inside?"),
+                format!(
+                    "\u{201c}{name}\u{201d} holds {count} item(s). Delete it and everything inside?"
+                ),
             );
             ui.add_space(Style::SP_S);
             ui.horizontal(|ui| {
@@ -979,7 +1011,10 @@ fn author_line(author: &mde_bookmarks::Author) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::bookmarks_panel;
+    use super::{
+        bookmarks_panel, scope_bookmarks_toolbar_ui, BOOKMARKS_ACTION_BUTTON_H,
+        BOOKMARKS_HEADER_TITLE,
+    };
     use crate::model::Manager;
     use mde_bookmarks::Author;
     use mde_egui::egui::{self, pos2, vec2, Rect};
@@ -1010,6 +1045,52 @@ mod tests {
             !prims.is_empty(),
             "bookmarks_panel produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn bookmarks_header_and_toolbar_use_refined_chrome_metrics() {
+        assert_eq!(
+            BOOKMARKS_HEADER_TITLE,
+            Style::HEADING - 2.0,
+            "Bookmarks top-left header title should be two points smaller"
+        );
+        assert!(
+            BOOKMARKS_HEADER_TITLE < Style::HEADING,
+            "Bookmarks header title must not use the old oversized heading rung"
+        );
+        assert_eq!(
+            BOOKMARKS_ACTION_BUTTON_H,
+            Style::TOOLBAR_CONTROL_H,
+            "Bookmarks toolbar buttons should use the shared refined visual control height"
+        );
+        assert!(
+            BOOKMARKS_ACTION_BUTTON_H < Style::SP_L,
+            "Bookmarks toolbar controls should stay slimmer than the old 24pt row height"
+        );
+    }
+
+    #[test]
+    fn bookmarks_toolbar_scope_uses_refined_control_metrics() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut metrics = None;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 80.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                scope_bookmarks_toolbar_ui(ui);
+                metrics = Some((
+                    ui.style().spacing.button_padding.y,
+                    ui.style().spacing.interact_size.y,
+                ));
+            });
+        });
+
+        let (button_pad_y, interact_h) = metrics.expect("toolbar scope captured metrics");
+        assert_eq!(button_pad_y, Style::CONTROL_PAD_Y);
+        assert_eq!(interact_h, Style::TOOLBAR_CONTROL_H);
     }
 
     #[test]

@@ -38,6 +38,8 @@ const RESULT_TEXT_MIN_W: f32 = 72.0;
 const SEARCH_MIN_W: f32 = 72.0;
 const TOOLTIP_W: f32 = 260.0;
 const ACTION_BUTTON_TEXT_MIN_W: f32 = 72.0;
+const SEARCH_TEXT_SIZE: f32 = Style::BODY + 1.0;
+const SEARCH_HINT: &str = "Search apps, workloads, services, commands, files, mesh, Browser";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrontDoorMeshSourceStatus {
@@ -1162,7 +1164,7 @@ fn front_door_tooltip(ui: &mut egui::Ui, text: &str) {
         .fill(Style::SURFACE)
         .stroke(egui::Stroke::new(1.0, Style::BORDER))
         .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(10, 7))
+        .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(TOOLTIP_W);
             ui.add(
@@ -1241,19 +1243,60 @@ fn search_and_expansion_row(
         let available = bounded_available_width(ui);
         let show_expansion = show_expansion_control(available);
         let search_w = search_field_width(available, show_expansion);
-        let response = ui.add_sized(
-            [search_w, INPUT_H],
-            egui::TextEdit::singleline(&mut state.query)
-                .id(input_id)
-                .hint_text("Search apps, workloads, services, commands, files, mesh, Browser")
-                .desired_width(f32::INFINITY),
-        );
+        let response = front_door_search_field(ui, input_id, &mut state.query, search_w);
         if show_expansion && expansion_toggle_button(ui, state.expanded) {
             state.expanded = !state.expanded;
         }
         response
     })
     .inner
+}
+
+fn front_door_search_field(
+    ui: &mut egui::Ui,
+    input_id: egui::Id,
+    query: &mut String,
+    width: f32,
+) -> egui::Response {
+    let width = width.max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, INPUT_H), egui::Sense::hover());
+    let focused = ui.memory(|mem| mem.has_focus(input_id));
+    let fill = if focused {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    let stroke = if focused {
+        egui::Stroke::new(1.0, Style::ACCENT)
+    } else {
+        egui::Stroke::new(1.0, Style::BORDER)
+    };
+    ui.painter().rect_filled(rect, Style::RADIUS_M, fill);
+    ui.painter()
+        .rect_stroke(rect, Style::RADIUS_M, stroke, egui::StrokeKind::Inside);
+
+    let edit_rect = rect.shrink2(egui::vec2(Style::SP_S, Style::SP_XS));
+    let response = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| {
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            ui.add_sized(
+                edit_rect.size(),
+                egui::TextEdit::singleline(query)
+                    .id(input_id)
+                    .frame(false)
+                    .font(egui::FontId::proportional(SEARCH_TEXT_SIZE))
+                    .text_color(Style::TEXT)
+                    .hint_text(
+                        egui::RichText::new(SEARCH_HINT)
+                            .size(SEARCH_TEXT_SIZE)
+                            .color(Style::TEXT_DIM),
+                    )
+                    .desired_width(f32::INFINITY),
+            )
+        })
+        .inner;
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    response
 }
 
 fn show_expansion_control(available_width: f32) -> bool {
@@ -2692,7 +2735,7 @@ fn result_context_menu_request(
 ) -> Option<FrontDoorRequest> {
     let pin_surface = pin_surface_for_hit(hit);
     let mut request = None;
-    let _ = response.context_menu(|ui| {
+    let _ = front_door_context_menu(response, |ui| {
         if context_menu_row(
             ui,
             result_context_item_id(hit, ResultContextItem::Open),
@@ -2767,6 +2810,46 @@ fn result_context_menu_request(
         }
     });
     request
+}
+
+fn front_door_context_menu(
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> Option<egui::InnerResponse<()>> {
+    let previous_style = response.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_front_door_context_style(&mut menu_style);
+    response.ctx.set_style(menu_style);
+    let inner = response.context_menu(|ui| {
+        apply_front_door_context_style(ui.style_mut());
+        add_contents(ui);
+    });
+    response.ctx.set_style(previous_style);
+    inner
+}
+
+fn apply_front_door_context_style(style: &mut egui::Style) {
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::SP_XS);
+    let visuals = &mut style.visuals;
+    visuals.override_text_color = Some(Style::TEXT);
+    visuals.window_fill = Style::SURFACE;
+    visuals.panel_fill = Style::SURFACE;
+    visuals.extreme_bg_color = Style::SURFACE;
+    visuals.faint_bg_color = Style::SURFACE_HI;
+    visuals.widgets.noninteractive.bg_fill = Style::SURFACE;
+    visuals.widgets.noninteractive.fg_stroke.color = Style::TEXT_DIM;
+    visuals.widgets.noninteractive.bg_stroke.color = Style::BORDER;
+    visuals.widgets.inactive.bg_fill = Style::SURFACE;
+    visuals.widgets.inactive.fg_stroke.color = Style::TEXT;
+    visuals.widgets.inactive.bg_stroke.color = Style::BORDER;
+    visuals.widgets.hovered.bg_fill = Style::SURFACE_HI;
+    visuals.widgets.hovered.fg_stroke.color = Style::TEXT;
+    visuals.widgets.active.bg_fill = Style::SURFACE_HI;
+    visuals.widgets.active.fg_stroke.color = Style::TEXT;
+    visuals.widgets.open.bg_fill = Style::SURFACE_HI;
+    visuals.widgets.open.weak_bg_fill = Style::SURFACE_HI;
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
 }
 
 fn run_command_accesskit_id() -> egui::Id {
@@ -3531,6 +3614,36 @@ mod tests {
                     .frame(egui::Frame::NONE)
                     .show(ctx, |ui| {
                         front_door_tooltip(ui, "Expand Front Door");
+                    });
+            },
+        )
+    }
+
+    fn render_front_door_context_row_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 140.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        apply_front_door_context_style(ui.style_mut());
+                        let _ = context_menu_row(
+                            ui,
+                            egui::Id::new("front-door-context-test-open"),
+                            "Launch Browser",
+                        );
+                        let _ = context_menu_row(
+                            ui,
+                            egui::Id::new("front-door-context-test-pin"),
+                            "Pin to top",
+                        );
                     });
             },
         )
@@ -4637,6 +4750,54 @@ mod tests {
     }
 
     #[test]
+    fn front_door_search_field_uses_themed_hint_and_text() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let hint_out = render_front_door_settled_frame(
+            &ctx,
+            "",
+            0,
+            egui::vec2(900.0, 640.0),
+            fixture_front_door_items(),
+            FrontDoorFilter::All,
+            false,
+            FrontDoorSourceStatus::default(),
+        );
+        let hint_text = painted_text(&hint_out.shapes);
+        assert!(
+            hint_text
+                .iter()
+                .any(|(text, color)| text == SEARCH_HINT && *color == Style::TEXT_DIM),
+            "Front Door search hint should paint themed dim text: {hint_text:?}"
+        );
+        assert!(
+            !hint_text
+                .iter()
+                .any(|(text, color)| text == SEARCH_HINT && *color == egui::Color32::BLACK),
+            "Front Door search hint leaked raw black text: {hint_text:?}"
+        );
+
+        let query_out = render_front_door_settled_frame(
+            &ctx,
+            "browser",
+            0,
+            egui::vec2(900.0, 640.0),
+            fixture_front_door_items(),
+            FrontDoorFilter::All,
+            false,
+            FrontDoorSourceStatus::default(),
+        );
+        let query_text = painted_text(&query_out.shapes);
+        assert!(
+            query_text
+                .iter()
+                .any(|(text, color)| text == "browser" && *color == Style::TEXT),
+            "Front Door search query should paint themed primary text: {query_text:?}"
+        );
+    }
+
+    #[test]
     fn blank_front_door_exports_shortcut_rows_and_live_status() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -4902,6 +5063,44 @@ mod tests {
             fills.contains(&Style::SURFACE),
             "Front Door tooltip should paint its own themed surface: {fills:?}"
         );
+    }
+
+    #[test]
+    fn front_door_result_context_menu_rows_use_themed_text() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_front_door_context_row_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        for label in ["Launch Browser", "Pin to top"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == Style::TEXT),
+                "Front Door context row {label:?} should paint themed text: {texts:?}"
+            );
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == egui::Color32::BLACK),
+                "Front Door context row {label:?} leaked raw black popup text: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn front_door_result_context_menu_visual_scope_uses_front_door_tokens() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut style = (*ctx.style()).clone();
+        apply_front_door_context_style(&mut style);
+
+        assert_eq!(style.visuals.window_fill, Style::SURFACE);
+        assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+        assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+        assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+        assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+        assert_eq!(style.visuals.widgets.open.bg_stroke.color, Style::BORDER);
     }
 
     #[test]

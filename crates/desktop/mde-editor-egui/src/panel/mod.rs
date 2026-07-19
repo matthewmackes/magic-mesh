@@ -53,6 +53,7 @@ use crate::search::{self, FindEvent, FindState, ProjectSearch};
 use crate::spell::{self, SpellChecker, SpellMiss, SpellState};
 use crate::terminal::TerminalDock;
 use crate::toolbar;
+use crate::tooltip::editor_hover_text;
 use crate::widget::{editor_widget, EditorView, MatchHighlights};
 
 mod autosave;
@@ -2361,19 +2362,21 @@ impl EditorSurface {
                         ui.horizontal(|ui| {
                             // Replace with the top suggestion (greyed with none).
                             let top = m.suggestions.first().cloned();
-                            if ui
-                                .add_enabled(top.is_some(), egui::Button::new("Replace"))
-                                .on_hover_text("Replace with the top suggestion")
-                                .clicked()
+                            if editor_hover_text(
+                                ui.add_enabled(top.is_some(), egui::Button::new("Replace")),
+                                "Replace with the top suggestion",
+                            )
+                            .clicked()
                             {
                                 replace_with = top;
                             }
                             ignore |= ui.button("Ignore").clicked();
                             ignore_all |= ui.button("Ignore All").clicked();
-                            add |= ui
-                                .button("Add to Dictionary")
-                                .on_hover_text("Add to the session dictionary")
-                                .clicked();
+                            add |= editor_hover_text(
+                                ui.button("Add to Dictionary"),
+                                "Add to the session dictionary",
+                            )
+                            .clicked();
                         });
                         ui.add_space(Style::SP_XS);
                         ui.horizontal(|ui| {
@@ -2633,48 +2636,53 @@ impl EditorSurface {
             ui.add_space(Style::SP_S);
             tree_toggle(ui, &mut self.show_tree);
             // EDITOR-12 — the symbol-outline toggle (mouse twin of Ctrl+Shift+O).
-            if ui
-                .selectable_label(
+            if editor_hover_text(
+                ui.selectable_label(
                     self.show_outline,
                     RichText::new("\u{2263}").size(Style::BODY),
-                )
-                .on_hover_text("Toggle the symbol outline (Ctrl+Shift+O)")
-                .clicked()
+                ),
+                "Toggle the symbol outline (Ctrl+Shift+O)",
+            )
+            .clicked()
             {
                 self.show_outline = !self.show_outline;
             }
             // EDITOR-10 — the integrated-terminal toggle (mouse twin of Ctrl+`).
-            if ui
-                .selectable_label(
+            if editor_hover_text(
+                ui.selectable_label(
                     self.terminal.is_shown(),
                     RichText::new("\u{2328}").size(Style::BODY),
-                )
-                .on_hover_text("Toggle the integrated terminal (Ctrl+`)")
-                .clicked()
+                ),
+                "Toggle the integrated terminal (Ctrl+`)",
+            )
+            .clicked()
             {
                 self.toggle_terminal();
             }
             ui.add_space(Style::SP_M);
-            if ui
-                .selectable_label(false, RichText::new("\u{2503}").size(Style::BODY))
-                .on_hover_text("Split right (Ctrl+\\)")
-                .clicked()
+            if editor_hover_text(
+                ui.selectable_label(false, RichText::new("\u{2503}").size(Style::BODY)),
+                "Split right (Ctrl+\\)",
+            )
+            .clicked()
             {
                 self.split_focused(SplitDir::V);
             }
-            if ui
-                .selectable_label(false, RichText::new("\u{2501}").size(Style::BODY))
-                .on_hover_text("Split down (Ctrl+Shift+\\)")
-                .clicked()
+            if editor_hover_text(
+                ui.selectable_label(false, RichText::new("\u{2501}").size(Style::BODY)),
+                "Split down (Ctrl+Shift+\\)",
+            )
+            .clicked()
             {
                 self.split_focused(SplitDir::H);
             }
             if self.tree.leaf_count() > 1 {
                 ui.add_space(Style::SP_M);
-                if ui
-                    .selectable_label(false, RichText::new("Close pane").size(Style::SMALL))
-                    .on_hover_text("Close the focused pane")
-                    .clicked()
+                if editor_hover_text(
+                    ui.selectable_label(false, RichText::new("Close pane").size(Style::SMALL)),
+                    "Close the focused pane",
+                )
+                .clicked()
                 {
                     let focus = self.focus;
                     self.close_pane(focus);
@@ -2795,10 +2803,11 @@ impl EditorSurface {
                     toggle_wrap = true;
                 }
                 ui.add_space(Style::SP_M);
-                if ui
-                    .selectable_label(autosave_on, RichText::new("Autosave").size(Style::SMALL))
-                    .on_hover_text("Save dirty buffers automatically after a short idle")
-                    .clicked()
+                if editor_hover_text(
+                    ui.selectable_label(autosave_on, RichText::new("Autosave").size(Style::SMALL)),
+                    "Save dirty buffers automatically after a short idle",
+                )
+                .clicked()
                 {
                     toggle_autosave = true;
                 }
@@ -3110,7 +3119,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         .frame(
             egui::Frame::default()
                 .fill(Style::SURFACE)
-                .inner_margin(Style::SP_XS),
+                .inner_margin(Style::toolbar_margin()),
         )
         .show_inside(ui, |ui| {
             action = menu_bar::show(ui, &cx);
@@ -3119,7 +3128,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         .frame(
             egui::Frame::default()
                 .fill(Style::SURFACE)
-                .inner_margin(Style::SP_XS),
+                .inner_margin(Style::toolbar_margin()),
         )
         .show_inside(ui, |ui| {
             if let Some(picked) = toolbar::show(ui, &cx, compact) {
@@ -3133,7 +3142,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         .frame(
             egui::Frame::default()
                 .fill(Style::SURFACE)
-                .inner_margin(Style::SP_XS),
+                .inner_margin(Style::toolbar_margin()),
         )
         .show_inside(ui, |ui| {
             if let Some(picked) = format_bar::show(ui, &cx, compact) {

@@ -70,6 +70,78 @@ const TITLE_STRIP_H: f32 = Style::SMALL + Style::SP_XS * 2.0;
 /// Peak opacity (0–255) of the visual-bell flash overlay at the ring instant.
 const BELL_FLASH_PEAK: f32 = 90.0;
 
+fn terminal_grid_context_menu(response: &Response, add_contents: impl FnOnce(&mut Ui)) {
+    let previous_style = response.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_terminal_grid_menu_style(&response.ctx, &mut menu_style);
+    response.ctx.set_style(menu_style);
+    let _ = response.context_menu(|ui| terminal_grid_menu_scope(ui, add_contents));
+    response.ctx.set_style(previous_style);
+}
+
+fn terminal_grid_menu_scope<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let previous_style = ui.ctx().style();
+    let mut popup_style = (*previous_style).clone();
+    apply_terminal_grid_menu_style(ui.ctx(), &mut popup_style);
+    ui.ctx().set_style(popup_style);
+    let inner = ui
+        .scope(|ui| {
+            let ctx = ui.ctx().clone();
+            apply_terminal_grid_menu_style(&ctx, ui.style_mut());
+            add_contents(ui)
+        })
+        .inner;
+    ui.ctx().set_style(previous_style);
+    inner
+}
+
+fn apply_terminal_grid_menu_style(ctx: &Context, style: &mut egui::Style) {
+    let palette = Style::current_palette(ctx);
+    let accent = Style::resolve_color(ctx, Style::ACCENT_TERMINALS);
+    let border = Stroke::new(1.0, palette.border);
+    let text = Stroke::new(1.0, palette.text);
+    let text_dim = Stroke::new(1.0, palette.text_dim);
+    let visuals = &mut style.visuals;
+
+    visuals.window_fill = palette.surface;
+    visuals.panel_fill = palette.surface;
+    visuals.faint_bg_color = palette.surface;
+    visuals.extreme_bg_color = palette.bg;
+    visuals.window_stroke = border;
+    visuals.override_text_color = Some(palette.text);
+    visuals.menu_corner_radius = egui::CornerRadius::same(Style::RADIUS as u8);
+
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.bg_stroke = border;
+    visuals.widgets.noninteractive.fg_stroke = text_dim;
+
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    visuals.widgets.inactive.bg_stroke = border;
+    visuals.widgets.inactive.fg_stroke = text;
+
+    visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.hovered.fg_stroke = text;
+
+    visuals.widgets.active.bg_fill = palette.surface_hi;
+    visuals.widgets.active.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.fg_stroke = text;
+
+    visuals.widgets.open.bg_fill = palette.surface_hi;
+    visuals.widgets.open.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.open.bg_stroke = border;
+    visuals.widgets.open.fg_stroke = text;
+
+    visuals.selection.bg_fill = accent.gamma_multiply(0.25);
+    visuals.selection.stroke = Stroke::new(1.0, accent);
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+}
+
 /// A cell address in **absolute snapshot space**: `row` counts from the top of
 /// the retained scrollback (row `history` is the first live viewport row).
 /// Selections anchor here so they stay put while output scrolls the window.
@@ -1290,52 +1362,17 @@ impl TerminalWidget {
     ///
     /// The closure only *records* the chosen item (no `self` borrow inside it);
     /// the effect is dispatched afterwards through the injectable seams, so each
-    /// action is unit-tested headless via the recorders. §4 Carbon tokens carry
-    /// the section captions; the menu chrome itself renders through the installed
-    /// [`Style`] visuals.
+    /// action is unit-tested headless via the recorders. Terminal-local popup
+    /// visuals scope the menu before egui builds the native popup, so light-mode
+    /// text and hover states stay readable against the surface.
     fn show_selection_menu(&mut self, response: &Response) {
         let Some(text) = self.selection_text() else {
             return;
         };
         let commands = self.menu.commands.clone();
         let mut chosen: Option<MenuChoice> = None;
-        response.context_menu(|ui| {
-            ui.set_max_width(220.0);
-            if !commands.is_empty() {
-                ui.label(
-                    RichText::new("Custom commands")
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
-                for (i, cmd) in commands.iter().enumerate() {
-                    if ui.button(&cmd.label).clicked() {
-                        chosen = Some(MenuChoice::Custom(i));
-                        ui.close_menu();
-                    }
-                }
-                ui.separator();
-            }
-            ui.label(
-                RichText::new("Mesh actions")
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            );
-            if ui.button("Send selection to Chat").clicked() {
-                chosen = Some(MenuChoice::Chat);
-                ui.close_menu();
-            }
-            if ui.button("Open path in Files").clicked() {
-                chosen = Some(MenuChoice::Files);
-                ui.close_menu();
-            }
-            if ui.button("Open URL in browser").clicked() {
-                chosen = Some(MenuChoice::Browser);
-                ui.close_menu();
-            }
-            if ui.button("New terminal here").clicked() {
-                chosen = Some(MenuChoice::NewHere);
-                ui.close_menu();
-            }
+        terminal_grid_context_menu(response, |ui| {
+            selection_menu_contents(ui, &commands, &mut chosen);
         });
         match chosen {
             Some(MenuChoice::Custom(i)) => {
@@ -1605,6 +1642,50 @@ impl TerminalWidget {
     /// so a fan-out can never re-fan.
     pub fn feed_broadcast(&mut self, bytes: &[u8]) {
         self.write_input(bytes);
+    }
+}
+
+fn selection_menu_contents(
+    ui: &mut Ui,
+    commands: &[crate::menu::CustomCommand],
+    chosen: &mut Option<MenuChoice>,
+) {
+    ui.set_max_width(220.0);
+    let caption_color = Style::resolve_color(ui.ctx(), Style::TEXT_DIM);
+    if !commands.is_empty() {
+        ui.label(
+            RichText::new("Custom commands")
+                .size(Style::SMALL)
+                .color(caption_color),
+        );
+        for (i, cmd) in commands.iter().enumerate() {
+            if ui.button(&cmd.label).clicked() {
+                *chosen = Some(MenuChoice::Custom(i));
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+    }
+    ui.label(
+        RichText::new("Mesh actions")
+            .size(Style::SMALL)
+            .color(caption_color),
+    );
+    if ui.button("Send selection to Chat").clicked() {
+        *chosen = Some(MenuChoice::Chat);
+        ui.close_menu();
+    }
+    if ui.button("Open path in Files").clicked() {
+        *chosen = Some(MenuChoice::Files);
+        ui.close_menu();
+    }
+    if ui.button("Open URL in browser").clicked() {
+        *chosen = Some(MenuChoice::Browser);
+        ui.close_menu();
+    }
+    if ui.button("New terminal here").clicked() {
+        *chosen = Some(MenuChoice::NewHere);
+        ui.close_menu();
     }
 }
 
@@ -2084,11 +2165,169 @@ pub(crate) fn chip(
 #[cfg(test)]
 mod tests {
     use mde_egui::egui::{pos2, vec2, RawInput};
+    use mde_egui::{Density, StyleColorScheme};
 
     use super::*;
     use crate::engine::Terminal;
+    use crate::menu::CustomCommand;
     use crate::pty::SpawnOptions;
     use crate::screen::CursorPos;
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_selection_menu_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 220.0))),
+                ..RawInput::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        terminal_grid_menu_scope(ui, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                let commands =
+                                    [CustomCommand::new("Search selection", "grep -n {}")];
+                                let mut chosen = None;
+                                selection_menu_contents(ui, &commands, &mut chosen);
+                                assert!(chosen.is_none());
+                            });
+                        });
+                    });
+            },
+        )
+    }
+
+    #[test]
+    fn terminal_selection_context_menu_popup_visuals_use_terminal_tokens() {
+        for scheme in [StyleColorScheme::Dark, StyleColorScheme::Light] {
+            let ctx = egui::Context::default();
+            Style::install_color_scheme_with_density(&ctx, scheme, Density::Mouse);
+            let palette = Style::palette_for(scheme);
+            let accent = Style::resolve_color(&ctx, Style::ACCENT_TERMINALS);
+            let mut style = (*ctx.style()).clone();
+
+            apply_terminal_grid_menu_style(&ctx, &mut style);
+
+            assert_eq!(style.visuals.window_fill, palette.surface);
+            assert_eq!(style.visuals.panel_fill, palette.surface);
+            assert_eq!(style.visuals.window_stroke.color, palette.border);
+            assert_eq!(style.visuals.override_text_color, Some(palette.text));
+            assert_eq!(
+                style.visuals.widgets.noninteractive.fg_stroke.color,
+                palette.text_dim
+            );
+            assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.hovered.bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.hovered.bg_stroke.color, accent);
+            assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.active.bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.active.bg_stroke.color, accent);
+            assert_eq!(style.visuals.widgets.active.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.open.bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.open.fg_stroke.color, palette.text);
+            assert_eq!(style.spacing.button_padding.y, Style::CONTROL_PAD_Y);
+            assert_eq!(style.spacing.item_spacing.y, Style::TOOLBAR_INSET_Y);
+        }
+    }
+
+    #[test]
+    fn terminal_selection_menu_contents_use_themed_popup_text_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+
+        let out = render_selection_menu_frame(&ctx);
+        let texts = painted_text_colors(&out.shapes);
+        for label in ["Custom commands", "Mesh actions"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == palette.text_dim),
+                "Terminal selection-menu caption {label:?} should use light-mode dim text: {texts:?}"
+            );
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == Style::TEXT_DIM),
+                "Terminal selection-menu caption {label:?} leaked raw dark-shell dim text: {texts:?}"
+            );
+        }
+        for label in ["Search selection", "Send selection to Chat", "Open path in Files"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == palette.text),
+                "Terminal selection-menu row {label:?} should use light-mode text: {texts:?}"
+            );
+        }
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&palette.surface),
+            "Terminal selection-menu popup should paint the themed surface: {fills:?}"
+        );
+    }
 
     // ── cols/rows-from-rect math ────────────────────────────────────────────
 

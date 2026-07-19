@@ -184,6 +184,52 @@ fn fold_reply_maps_the_reply_tri_state_honestly() {
 }
 
 #[test]
+fn provider_neutral_iac_labels_do_not_leak_the_openstack_backend() {
+    let not_configured = cloud_provider_not_configured("no clouds.yaml on node-a");
+    assert_eq!(
+        not_configured,
+        "Cloud provider not configured \u{2014} no clouds.yaml on node-a"
+    );
+    assert!(
+        not_configured.contains("clouds.yaml"),
+        "operator diagnostics stay intact"
+    );
+
+    let ok: CatalogReply = serde_json::from_str(
+        r#"{"ok":true,"verb":"heat-update","audited":true,"stack":"mesh-net"}"#,
+    )
+    .expect("ok mutation reply parses");
+    let gated: CatalogReply = serde_json::from_str(
+        r#"{"ok":false,"verb":"heat-update","audited":true,"gated":"no clouds.yaml"}"#,
+    )
+    .expect("gated mutation reply parses");
+    let failed: CatalogReply = serde_json::from_str(
+        r#"{"ok":false,"verb":"heat-update","audited":true,"error":"HTTP 503"}"#,
+    )
+    .expect("failed mutation reply parses");
+
+    let labels = [
+        CLOUD_PRODUCT_LABEL.to_string(),
+        CLOUD_API_STATUS_LABEL.to_string(),
+        ORCHESTRATION_TAB_LABEL.to_string(),
+        REVERSE_GENERATED_TEMPLATE_LABEL.to_string(),
+        ORCHESTRATION_TEMPLATE_LABEL.to_string(),
+        not_configured,
+        heat_mutation_note(&ok),
+        heat_mutation_note(&gated),
+        heat_mutation_note(&failed),
+    ];
+    for label in labels {
+        for backend in ["OpenStack", "Keystone", "Nova", "Heat", "Horizon", "HOT"] {
+            assert!(
+                !label.contains(backend),
+                "user-facing IaC label must stay provider-neutral: {label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn services_group_into_buckets_by_type() {
     assert_eq!(service_bucket("compute"), "Compute");
     assert_eq!(service_bucket("network"), "Network");
@@ -626,6 +672,56 @@ fn reverse_services_exclude_orchestration_itself() {
     assert!(
         !services.iter().any(|(ty, _)| ty == "orchestration"),
         "orchestration is excluded from the reverse-generate source set"
+    );
+}
+
+#[test]
+fn heat_toolbar_uses_refined_shared_chrome_metrics() {
+    assert_eq!(
+        HEAT_TOOLBAR_BUTTON_H,
+        Style::TOOLBAR_CONTROL_H,
+        "the Heat toolbar should use the shared refined visual control height"
+    );
+    for label in [
+        "Reverse-generate template",
+        "New stack\u{2026}",
+        "Close new-stack form",
+    ] {
+        let size = heat_toolbar_button_size(label);
+        assert_eq!(
+            size.y, HEAT_TOOLBAR_BUTTON_H,
+            "{label:?} should use the shared compact toolbar control height"
+        );
+        assert!(
+            size.x >= HEAT_TOOLBAR_BUTTON_MIN_W && size.x <= HEAT_TOOLBAR_BUTTON_MAX_W,
+            "{label:?} width should be bounded for a refined toolbar, got {size:?}"
+        );
+    }
+    assert!(
+        HEAT_TOOLBAR_BUTTON_H < Style::SP_L,
+        "the Heat toolbar buttons should stay visually slimmer than the old 24pt toolbar row"
+    );
+    assert_eq!(
+        Style::toolbar_margin().top,
+        Style::TOOLBAR_INSET_Y as i8,
+        "the Heat strip relies on the shared refined toolbar inset"
+    );
+}
+
+#[test]
+fn heat_toolbar_actions_keep_the_existing_state_seams() {
+    let mut state = heat_tab_state(false);
+    assert!(!state.heat.show_create);
+    toggle_heat_create_form(&mut state);
+    assert!(state.heat.show_create);
+    toggle_heat_create_form(&mut state);
+    assert!(!state.heat.show_create);
+
+    state.send_heat_reverse();
+    assert!(
+        state.heat.reverse_pending.is_some()
+            || matches!(state.heat.reverse, Some(HeatOutcome::Failed(_))),
+        "reverse-generate should hit the real request seam: publish when the Bus is reachable or fail honestly"
     );
 }
 

@@ -50,10 +50,12 @@ use crate::pty::SpawnOptions;
 use crate::remote::{BusPtyClient, PtyBus, RemotePty};
 use crate::roster::{BusRoster, RosterClient, RosterSnapshot};
 use crate::splits::SplitTerminal;
+use crate::tooltip::terminal_hover_text;
 use crate::widget::chip;
 
-/// Tab-strip height in points (the `+` button is a square of this side).
-const TAB_BAR_H: f32 = Style::SP_XL;
+/// Tab-strip height in points (the `+` button is a square of this side), aligned
+/// with the shared refined workspace chrome height.
+const TAB_BAR_H: f32 = mde_egui::menubar::BAR_HEIGHT;
 /// Inner horizontal padding at each end of a tab plate.
 const TAB_PAD: f32 = Style::SP_S;
 /// The square reserved on a tab's right for its `×` close affordance.
@@ -927,8 +929,8 @@ impl TabbedTerminal {
     fn paint_remote_button(ui: &Ui, rect: Rect, open: bool) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-remote-btn"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("New terminal on a mesh node (Ctrl+Shift+R)");
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let resp = terminal_hover_text(resp, "New terminal on a mesh node (Ctrl+Shift+R)");
         let painter = ui.painter();
         let hot = open || resp.hovered();
         if hot {
@@ -956,8 +958,8 @@ impl TabbedTerminal {
     fn paint_layouts_button(ui: &Ui, rect: Rect, open: bool) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-layouts-btn"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Saved layouts (Ctrl+Shift+L)");
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let resp = terminal_hover_text(resp, "Saved layouts (Ctrl+Shift+L)");
         let painter = ui.painter();
         let hot = open || resp.hovered();
         if hot {
@@ -985,8 +987,8 @@ impl TabbedTerminal {
     fn paint_appearance_button(ui: &Ui, rect: Rect, open: bool) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-appearance-btn"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Appearance \u{2014} palette + look (Ctrl+Shift+P)");
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let resp = terminal_hover_text(resp, "Appearance \u{2014} palette + look (Ctrl+Shift+P)");
         let painter = ui.painter();
         let hot = open || resp.hovered();
         if hot {
@@ -1141,6 +1143,19 @@ mod tests {
         for _ in 0..frames {
             frame(ctx, term, Vec::new());
         }
+    }
+
+    #[test]
+    fn tab_bar_uses_refined_shared_chrome_height() {
+        assert_eq!(
+            TAB_BAR_H,
+            mde_egui::menubar::BAR_HEIGHT,
+            "Terminal tab strip should inherit the shared refined chrome height"
+        );
+        assert!(
+            TAB_BAR_H < Style::SP_XL,
+            "Terminal tab strip must not return to the old 32pt toolbar band"
+        );
     }
 
     // ── reindex helper (pure) ────────────────────────────────────────────────

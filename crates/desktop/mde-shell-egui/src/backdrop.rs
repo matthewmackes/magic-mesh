@@ -128,6 +128,12 @@ pub(crate) enum Coverage {
     Covered,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusAnchor {
+    Low,
+    Center,
+}
+
 /// One of the five generated Construct wallpapers (placement lock #12). `Four` is the
 /// default; all five ship in the RPM as a selectable set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +217,26 @@ impl Wallpaper {
 /// layout, so the panel's other widgets lay out over it (a covered display's grid
 /// floats above the scrim).
 pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str)>) {
+    show_with_status_anchor(ui, coverage, status, StatusAnchor::Low);
+}
+
+/// Paint the backdrop with its honest status block centered in the workspace.
+/// Used by the Desktop chooser's empty state, where the status itself is the
+/// primary content rather than a secondary note under a session/backdrop.
+pub(crate) fn show_centered_status(
+    ui: &egui::Ui,
+    coverage: Coverage,
+    status: Option<(&str, &str)>,
+) {
+    show_with_status_anchor(ui, coverage, status, StatusAnchor::Center);
+}
+
+fn show_with_status_anchor(
+    ui: &egui::Ui,
+    coverage: Coverage,
+    status: Option<(&str, &str)>,
+    status_anchor: StatusAnchor,
+) {
     let free = ui.max_rect();
 
     // The Carbon §4 field is the background. No wallpaper image is painted here.
@@ -235,7 +261,7 @@ pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str
     // Any honest status (the empty-desktop copy, a gated-transport note) — a small
     // block low on the field, over a subtle backing so it reads over the artwork.
     if let Some((title, detail)) = status {
-        paint_status(&painter, free, title, detail);
+        paint_status(&painter, free, title, detail, status_anchor);
     }
 
     // Keep the frame alive while the cover-scrim crossfade is mid-flight.
@@ -271,9 +297,14 @@ const fn cover_uv(free: Vec2, tex: Vec2) -> Rect {
 /// Paint the status title + detail centred low on the field, over a subtle Carbon
 /// backing so the honest status stays legible over any wallpaper region (§4). The
 /// detail wraps to the free width so a long caption never runs off-panel.
-fn paint_status(painter: &egui::Painter, free: Rect, title: &str, detail: &str) {
+fn paint_status(
+    painter: &egui::Painter,
+    free: Rect,
+    title: &str,
+    detail: &str,
+    anchor: StatusAnchor,
+) {
     let center_x = free.center().x;
-    let top = free.height().mul_add(STATUS_Y_FRAC, free.top());
     let title_galley = painter.layout_no_wrap(
         title.to_owned(),
         FontId::proportional(Style::BODY),
@@ -289,6 +320,10 @@ fn paint_status(painter: &egui::Painter, free: Rect, title: &str, detail: &str) 
 
     let block_w = title_galley.size().x.max(detail_galley.size().x);
     let block_h = title_galley.size().y + Style::SP_XS + detail_galley.size().y;
+    let top = match anchor {
+        StatusAnchor::Low => free.height().mul_add(STATUS_Y_FRAC, free.top()),
+        StatusAnchor::Center => free.center().y - block_h / 2.0,
+    };
     let backing = Rect::from_center_size(
         egui::pos2(center_x, top + block_h / 2.0),
         egui::vec2(
@@ -846,6 +881,46 @@ mod tests {
         assert!(
             !cached,
             "the covered shell-colour backdrop must not cache a wallpaper texture"
+        );
+    }
+
+    #[test]
+    fn centered_status_places_the_empty_desktop_copy_in_the_workspace_center() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let status = Some((
+            "No desktops discovered",
+            "No mesh peer, LAN endpoint, or local VM is advertising a desktop.",
+        ));
+
+        let low = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, Coverage::Empty, status));
+        });
+        let centered = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_centered_status(ui, Coverage::Empty, status);
+            });
+        });
+        let title_y = |out: &egui::FullOutput| {
+            frame_text(&out.shapes)
+                .into_iter()
+                .find_map(|(pos, text)| (text == "No desktops discovered").then_some(pos.y))
+                .expect("status title should paint")
+        };
+
+        let low_y = title_y(&low);
+        let centered_y = title_y(&centered);
+        assert!(
+            centered_y > 250.0 && centered_y < 360.0,
+            "centered empty status should sit near the workspace middle: {centered_y}"
+        );
+        assert!(
+            centered_y + 100.0 < low_y,
+            "centered status should move up from the old low anchor: centered={centered_y}, low={low_y}"
         );
     }
 

@@ -75,7 +75,8 @@ mod workbench;
 use std::time::{Duration, Instant};
 
 use mde_egui::search_omnibox::SearchItem;
-use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
+use mde_egui::{eframe, egui, run_client, LayoutProfile, Motion, Style};
+use mde_theme::brand::icons::IconId;
 use mde_web_preview_client::MediaTransportAction;
 
 use mde_seat::hotkeys::HotkeyAction;
@@ -120,6 +121,15 @@ const WORKBENCH_POLL_STAGGER: [Duration; 7] = [
     Duration::from_millis(4200),
 ];
 const MENU_BAR_MINIMIZE_DURATION: Duration = Duration::from_millis(180);
+const LAYOUT_MODE_HOLD: Duration = Duration::from_secs(5);
+const LAYOUT_MODE_BUTTON_WORKSTATION: f32 = 44.0;
+const LAYOUT_MODE_BUTTON_TOUCH: f32 = 56.0;
+const LAYOUT_MODE_MENU_W: f32 = Style::SP_XL * 8.0;
+const LAYOUT_MODE_ROW_H: f32 = 56.0;
+const LAYOUT_MODE_GAP: f32 = Style::SP_S;
+const CAR_HUD_H: f32 = Style::SP_XL * 3.5;
+const CAR_HUD_TILE_W: f32 = Style::SP_XL * 4.5;
+const CAR_HUD_GAP: f32 = Style::SP_S;
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
@@ -160,9 +170,418 @@ impl MenuBarMinimizeEffect {
     }
 
     fn current_rect(self, now: Instant) -> egui::Rect {
-        let t = ease_out_cubic(self.progress(now));
-        lerp_rect(self.from, self.to, t)
+        self.shuffle_rects(now)[0]
     }
+
+    fn shuffle_rects(self, now: Instant) -> [egui::Rect; 3] {
+        let base = self.progress(now);
+        std::array::from_fn(|idx| {
+            let lag = idx as f32 * 0.12;
+            let phase = ((base - lag) / (1.0 - lag)).clamp(0.0, 1.0);
+            let eased = ease_out_cubic(phase);
+            let stack = idx as f32 * Style::SP_S * (1.0 - eased) * (1.0 - base * 0.25);
+            lerp_rect(self.from, self.to, eased).translate(egui::vec2(-stack, stack))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MenuBarShuffleCard {
+    rect: egui::Rect,
+    depth: f32,
+}
+
+fn menu_bar_shuffle_cards(effect: MenuBarMinimizeEffect, now: Instant) -> [MenuBarShuffleCard; 3] {
+    let rects = effect.shuffle_rects(now);
+    std::array::from_fn(|idx| MenuBarShuffleCard {
+        rect: rects[idx],
+        depth: 1.0 - idx as f32 * 0.18,
+    })
+}
+
+fn menu_bar_shuffle_paint_order(
+    effect: MenuBarMinimizeEffect,
+    now: Instant,
+) -> [MenuBarShuffleCard; 3] {
+    let cards = menu_bar_shuffle_cards(effect, now);
+    [cards[2], cards[1], cards[0]]
+}
+
+#[derive(Debug, Default)]
+struct LayoutModeControl {
+    hold_started: Option<Instant>,
+    menu_open: bool,
+}
+
+impl LayoutModeControl {
+    fn hold_progress(&self, now: Instant) -> f32 {
+        self.hold_started
+            .map_or(0.0, |start| {
+                now.saturating_duration_since(start).as_secs_f32() / LAYOUT_MODE_HOLD.as_secs_f32()
+            })
+            .clamp(0.0, 1.0)
+    }
+
+    fn update_hold(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        now: Instant,
+    ) -> bool {
+        if response.is_pointer_button_down_on() {
+            let start = *self.hold_started.get_or_insert(now);
+            let elapsed = now.saturating_duration_since(start);
+            if elapsed >= LAYOUT_MODE_HOLD {
+                self.hold_started = None;
+                self.menu_open = true;
+                true
+            } else {
+                ctx.request_repaint_after(LAYOUT_MODE_HOLD - elapsed);
+                false
+            }
+        } else {
+            self.hold_started = None;
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarKeyRoute {
+    Map,
+    Engine,
+    Direction,
+    Media,
+    Voip,
+}
+
+impl CarKeyRoute {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Map => "Map",
+            Self::Engine => "Engine",
+            Self::Direction => "Next",
+            Self::Media => "Media",
+            Self::Voip => "VoIP",
+        }
+    }
+
+    const fn surface(self) -> Surface {
+        match self {
+            Self::Map | Self::Engine | Self::Direction => Surface::MapsLocation,
+            Self::Media => Surface::Media,
+            Self::Voip => Surface::Voice,
+        }
+    }
+}
+
+fn layout_mode_button_size(profile: LayoutProfile) -> f32 {
+    match profile {
+        LayoutProfile::Workstation => LAYOUT_MODE_BUTTON_WORKSTATION,
+        LayoutProfile::Tablet | LayoutProfile::Car => LAYOUT_MODE_BUTTON_TOUCH,
+    }
+}
+
+fn layout_mode_button_rect(screen: egui::Rect, rail_h: f32, profile: LayoutProfile) -> egui::Rect {
+    let size = layout_mode_button_size(profile);
+    let margin = Style::SP_M;
+    let left = (screen.right() - margin - size).max(screen.left() + Style::SP_XS);
+    let top = (screen.bottom() - rail_h - margin - size).max(screen.top() + Style::SP_XS);
+    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(size, size))
+}
+
+fn layout_mode_menu_rect(button: egui::Rect, screen: egui::Rect) -> egui::Rect {
+    let w = LAYOUT_MODE_MENU_W.min((screen.width() - Style::SP_M).max(button.width()));
+    let h = Style::SP_S + LayoutProfile::ALL.len() as f32 * LAYOUT_MODE_ROW_H + Style::SP_S;
+    let left = (button.right() - w).clamp(screen.left() + Style::SP_XS, screen.right() - w);
+    let bottom = (button.top() - LAYOUT_MODE_GAP).max(screen.top() + h);
+    egui::Rect::from_min_size(egui::pos2(left, bottom - h), egui::vec2(w, h))
+}
+
+fn car_key_route(key: egui::Key) -> Option<CarKeyRoute> {
+    Some(match key {
+        egui::Key::Num1 | egui::Key::F1 => CarKeyRoute::Map,
+        egui::Key::Num2 | egui::Key::F2 => CarKeyRoute::Engine,
+        egui::Key::Num3 | egui::Key::F3 => CarKeyRoute::Direction,
+        egui::Key::Num4 | egui::Key::F4 => CarKeyRoute::Media,
+        egui::Key::Num5 | egui::Key::F5 => CarKeyRoute::Voip,
+        _ => return None,
+    })
+}
+
+fn layout_profile_icon(profile: LayoutProfile) -> IconId {
+    match profile {
+        LayoutProfile::Workstation => IconId::Workstation,
+        LayoutProfile::Tablet => IconId::Touchpad,
+        LayoutProfile::Car => IconId::MapsLocation,
+    }
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+fn layout_mode_button_accesskit_id() -> egui::Id {
+    egui::Id::new("shell-layout-profile-button-accesskit")
+}
+
+fn layout_profile_row_accesskit_id(profile: LayoutProfile) -> egui::Id {
+    egui::Id::new(("shell-layout-profile-row-accesskit", profile.short_label()))
+}
+
+fn layout_mode_button_accesskit_value(profile: LayoutProfile, menu_open: bool) -> String {
+    format!(
+        "Current layout: {}; menu {}",
+        profile.label(),
+        if menu_open { "open" } else { "closed" }
+    )
+}
+
+fn layout_profile_row_accesskit_value(profile: LayoutProfile, selected: bool) -> String {
+    format!(
+        "{} layout. {}",
+        if selected { "Current" } else { "Available" },
+        profile.description()
+    )
+}
+
+fn install_layout_mode_button_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    profile: LayoutProfile,
+    menu_open: bool,
+) {
+    let _ = ctx.accesskit_node_builder(layout_mode_button_accesskit_id(), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label("Layout mode");
+        node.set_value(layout_mode_button_accesskit_value(profile, menu_open));
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+fn install_layout_profile_row_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    profile: LayoutProfile,
+    selected: bool,
+) {
+    let _ = ctx.accesskit_node_builder(layout_profile_row_accesskit_id(profile), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(profile.label());
+        node.set_value(layout_profile_row_accesskit_value(profile, selected));
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+        if selected {
+            node.set_selected(true);
+        }
+    });
+}
+
+fn layout_profile_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::resolve_color(ui.ctx(), Style::SURFACE))
+        .stroke(egui::Stroke::new(
+            1.0,
+            Style::resolve_color(ui.ctx(), Style::BORDER),
+        ))
+        .corner_radius(Style::RADIUS_M)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(280.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(Style::SMALL)
+                        .color(Style::resolve_color(ui.ctx(), Style::TEXT)),
+                )
+                .wrap(),
+            );
+        });
+}
+
+fn layout_profile_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| layout_profile_tooltip(ui, text.as_str()))
+}
+
+fn paint_layout_mode_button(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    profile: LayoutProfile,
+    hold_progress: f32,
+    open: bool,
+) {
+    let ctx = ui.ctx();
+    let fill = if open {
+        Style::resolve_color(ctx, Style::SURFACE_HI)
+    } else {
+        Style::resolve_color(ctx, Style::SURFACE)
+    };
+    let stroke = if open {
+        egui::Stroke::new(2.0, Style::resolve_color(ctx, Style::ACCENT))
+    } else {
+        egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::BORDER))
+    };
+    ui.painter().rect(
+        rect,
+        Style::RADIUS_L,
+        fill,
+        stroke,
+        egui::StrokeKind::Outside,
+    );
+    let icon_size = rect.height().min(Style::SP_L);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + Style::SP_S + icon_size * 0.5),
+        egui::vec2(icon_size, icon_size),
+    );
+    if let Some(tex) = dock::icon_texture(
+        ctx,
+        layout_profile_icon(profile),
+        icon_size,
+        Style::resolve_color(ctx, Style::TEXT),
+    ) {
+        ui.painter().image(
+            tex.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - Style::SP_XS),
+        egui::Align2::CENTER_BOTTOM,
+        profile.short_label(),
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT),
+    );
+    if hold_progress > 0.0 {
+        let track = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + Style::SP_XS, rect.bottom() - 3.0),
+            egui::pos2(rect.right() - Style::SP_XS, rect.bottom() - 1.0),
+        );
+        ui.painter().rect_filled(
+            track,
+            Style::RADIUS_S,
+            Style::resolve_color(ctx, Style::BORDER),
+        );
+        let fill = egui::Rect::from_min_max(
+            track.min,
+            egui::pos2(track.left() + track.width() * hold_progress, track.bottom()),
+        );
+        ui.painter().rect_filled(
+            fill,
+            Style::RADIUS_S,
+            Style::resolve_color(ctx, Style::ACCENT),
+        );
+    }
+}
+
+fn layout_profile_menu_row(
+    ui: &mut egui::Ui,
+    profile: LayoutProfile,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), LAYOUT_MODE_ROW_H),
+        egui::Sense::click(),
+    );
+    install_layout_profile_row_accessibility(ui.ctx(), rect, profile, selected);
+    let ctx = ui.ctx();
+    let fill = if selected {
+        Style::resolve_color(ctx, Style::SURFACE_HI)
+    } else if response.hovered() {
+        Style::resolve_color(ctx, Style::SURFACE)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Style::RADIUS_M, fill);
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            Style::RADIUS_M,
+            egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::ACCENT)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let icon_size = Style::SP_L;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + Style::SP_M + icon_size * 0.5, rect.center().y),
+        egui::vec2(icon_size, icon_size),
+    );
+    if let Some(tex) = dock::icon_texture(
+        ctx,
+        layout_profile_icon(profile),
+        icon_size,
+        Style::resolve_color(ctx, Style::TEXT),
+    ) {
+        ui.painter().image(
+            tex.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    let text_x = icon_rect.right() + Style::SP_M;
+    ui.painter().text(
+        egui::pos2(text_x, rect.top() + Style::SP_S),
+        egui::Align2::LEFT_TOP,
+        profile.label(),
+        egui::FontId::proportional(Style::BODY),
+        Style::resolve_color(ctx, Style::TEXT),
+    );
+    ui.painter().text(
+        egui::pos2(
+            text_x,
+            rect.top() + Style::SP_S + Style::BODY + Style::SP_XS,
+        ),
+        egui::Align2::LEFT_TOP,
+        profile.description(),
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT_DIM),
+    );
+    response
+}
+
+fn car_hud_tile(ui: &mut egui::Ui, width: f32, label: &str, value: &str, key: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, CAR_HUD_H - Style::SP_M),
+        egui::Sense::hover(),
+    );
+    let ctx = ui.ctx();
+    ui.painter().rect(
+        rect,
+        Style::RADIUS_M,
+        Style::resolve_color(ctx, Style::SURFACE),
+        egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::BORDER)),
+        egui::StrokeKind::Outside,
+    );
+    ui.painter().text(
+        rect.left_top() + egui::vec2(Style::SP_S, Style::SP_S),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT_DIM),
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_S, rect.center().y - Style::SP_XS),
+        egui::Align2::LEFT_CENTER,
+        value,
+        egui::FontId::proportional(if label == "MPH" { 36.0 } else { Style::HEADING }),
+        Style::resolve_color(ctx, Style::TEXT_STRONG),
+    );
+    ui.painter().text(
+        rect.right_bottom() - egui::vec2(Style::SP_S, Style::SP_S),
+        egui::Align2::RIGHT_BOTTOM,
+        key,
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT_DIM),
+    );
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
@@ -186,6 +605,38 @@ fn complete_menu_bar_minimize(
     } else {
         false
     }
+}
+
+fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
+    match surface {
+        Surface::Workbench
+        | Surface::InfraCode
+        | Surface::Chat
+        | Surface::System
+        | Surface::Storage
+        | Surface::About => false,
+        Surface::Desktop => false,
+        Surface::MeshView
+        | Surface::Explorer
+        | Surface::Music
+        | Surface::Media
+        | Surface::Files
+        | Surface::Voice
+        | Surface::Browser
+        | Surface::Bookmarks
+        | Surface::MapsLocation
+        | Surface::Terminal
+        | Surface::Editor
+        | Surface::Phones
+        | Surface::Timers => true,
+    }
+}
+
+fn remote_sessions_fallback_pos(screen: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        screen.right() - Style::SP_XS - mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+        screen.top() + Style::TOOLBAR_INSET_Y,
+    )
 }
 
 /// The whole shell: the nav state, the live chrome/Fleet Bus state, and the three
@@ -273,7 +724,7 @@ struct Shell {
     front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState,
     /// CONSOLE-1 — the Console front door (`docs/design/console-frontdoor.md`):
     /// the Win10-style taxonomy of operational entries. Pre-WIN7-2 this was
-    /// its own standalone panel the dock's Start cell toggled directly; it is
+    /// its own standalone panel the dock's retired Start cell toggled directly; it is
     /// now embedded as the Start Menu's right pane ([`Self::start_menu`],
     /// lock #10) — `console::console_content` renders it there, and this
     /// field's own `open` bit is a mirror of the Start Menu's, not a second
@@ -472,6 +923,9 @@ struct Shell {
     /// Last central workspace rect, captured from the active [`CentralPanel`] so the
     /// minimize cue starts from the actual workspace area.
     last_workspace_rect: Option<egui::Rect>,
+    /// Lower-right layout profile button. A 5-second hold opens the touch-friendly
+    /// Workstation/Tablet/Car menu; Settings persists the same profile.
+    layout_mode: LayoutModeControl,
 }
 
 impl Shell {
@@ -540,6 +994,7 @@ impl Shell {
             workbench_poll_epoch: None,
             menu_bar_minimize: None,
             last_workspace_rect: None,
+            layout_mode: LayoutModeControl::default(),
         };
 
         // CURTAIN-3 boot-gate (design lock 2): when the persisted policy requires a
@@ -754,24 +1209,6 @@ impl Shell {
             Surface::MeshView => self.show_mesh_map(ui),
             Surface::Explorer => self.show_explorer(ui),
             Surface::Desktop => {
-                // MENUBAR-ALL — the shared top bar (DESKTOP), mounted above whichever
-                // face renders below (the Chooser or the brokered desktop). Its two
-                // menus are gated to the face that owns the seam: Session → Return to
-                // Mesh Control (the Esc-chord twin, live while a connect is pending)
-                // and View → Refresh Sources (live on the Chooser). Rendered first so
-                // a picked action applies this frame; the `take_return_to_chrome`
-                // drain below still catches a menu-raised return like an Esc.
-                let pending = self.vdi.requested_summary();
-                let sources = self.chooser.source_count();
-                if let Some(action) = vdi::desktop_menubar(ui, pending, sources) {
-                    match action {
-                        vdi::DesktopMenuAction::ReturnToChrome => {
-                            self.vdi.request_return_to_chrome();
-                        }
-                        vdi::DesktopMenuAction::RefreshSources => self.chooser.refresh_now(),
-                    }
-                }
-                ui.separator();
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
                 // requested it shows the discovered-desktop card grid over the
@@ -1301,6 +1738,7 @@ impl Shell {
         // The central view: the session↔body cross-fade — or nothing at all
         // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
         self.central_view(ctx);
+        self.mount_remote_sessions_fallback(ctx);
         self.drain_menu_bar_minimize_request(ctx, now);
         self.paint_menu_bar_minimize_effect(ctx, now);
 
@@ -1334,14 +1772,9 @@ impl Shell {
         // SURFACE-10 (lock 14): the same flip feeds the OSK so it auto-raises on Tablet.
         if let Some(formfactor) = self.formfactor.pump() {
             self.keyboard.set_formfactor(formfactor);
-            // SURFACE-11 (lock 16): the same flip re-installs the interaction density —
-            // Tablet grows hit targets + spacing (touch), Laptop reverts to the compact
-            // pointer metrics. Keyed off the real SURFACE-9 signal, mesh-wide.
-            let density = Density::for_formfactor(formfactor);
-            Style::install_with_density(ctx, density);
-            // NAVBAR-8: the bottom rail consumes the same shell density instead of
-            // growing its own compact/expanded toggle.
-            self.vdock.set_density(density);
+            // Layout density is now profile-owned (Workstation / Tablet / Car) so a
+            // hardware formfactor flip never silently overrides the user's selected
+            // shell placement model. The formfactor still drives the OSK.
         }
 
         // SURFACE-11 (lock 16): a swipe from the left/bottom edge reveals the shell body
@@ -1380,10 +1813,12 @@ impl Shell {
         if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
             self.toggle_front_door_panel();
         }
+        self.apply_car_keyboard_routes(ctx);
 
         // SEARCH-omnibox — mounted after hotkey dispatch so Super+Space opens and
         // focuses it in the same frame, above the active surface and taskbar.
         self.mount_front_door(ctx);
+        self.mount_layout_profile_control(ctx, now);
 
         // The KIRON alert/OSD bridge (KIRON-2) — driven late so its centered OSD
         // pill floats (Foreground order) above the chrome, the surface, and any
@@ -1465,10 +1900,9 @@ impl Shell {
     }
 
     /// Mount the shell's bottom taskbar chrome for this frame. The rendered left
-    /// dock is retired; the surviving `DockState` now drives the Start cell,
-    /// session rail, tray/status area, clock, action center, show-desktop nub, and
-    /// taskbar-sourced navigation. Split out of `render` so each stays within the
-    /// line budget.
+    /// dock is retired; the surviving `DockState` now drives the session rail,
+    /// tray/status area, clock, action center, show-desktop nub, and taskbar-sourced
+    /// navigation. Split out of `render` so each stays within the line budget.
     fn mount_dock_chrome(&mut self, ctx: &egui::Context) {
         // The taskbar owns an `active` mirror; the shell keeps `nav.surface` as
         // the ONE source of truth every other nav path (hotkeys, search, self-test,
@@ -1476,6 +1910,8 @@ impl Shell {
         // feed the bottom status strip its live inputs, then read taskbar-originated
         // selection straight back out.
         self.vdock.set_active(self.nav.surface);
+        self.vdock
+            .set_pinned_surfaces(self.start_menu.pinned_surfaces());
         self.files.pump_transfers();
         self.web.pump_downloads_for_shell_chrome();
         self.vdock
@@ -1483,15 +1919,15 @@ impl Shell {
                 self.files.operation_progress_summary(),
                 self.web.operation_progress_summary(),
             ));
-        // WL-UX-005 — mirror the current Start/Super launcher state so the
-        // Start cell's active tint follows the unified Front Door panel while
-        // the legacy Start Menu is being retired.
+        // Compatibility no-op for the retired taskbar Start cell while the legacy
+        // Start Menu paths are being drained.
         self.vdock
             .set_start_menu_open(self.front_door.is_open() || self.start_menu.is_open());
         // WIN10-HYBRID B3 — Settings owns the persisted preference; DockState owns
         // the bottom-edge reveal, animation, and strut behavior.
         self.vdock
             .set_taskbar_autohide(self.system.taskbar_autohide());
+        self.vdock.set_density(self.system.layout_density());
         self.notify_status.poll(ctx, &self.local_host);
         let mut rail_sessions = self.session_rail.entries(&self.local_host);
         let has_visible_desktop_session = !rail_sessions.is_empty();
@@ -1521,11 +1957,9 @@ impl Shell {
             self.notify_status.segments().clone(),
         );
         let desktop_sources = self.chooser.rail_sources();
-        // WIN10-HYBRID (B4) — the left vertical dock is retired: launching folds into
-        // the single bottom taskbar, whose Start cell opens the Start-menu grid of all
-        // 19 Surface::ALL. Only the taskbar mounts now; the surface-picker dock
-        // (`dock::dock`) is no longer rendered. `DockState` stays — the taskbar owns
-        // it — and with the dock unshown its left gutter reserves nothing.
+        // WIN10-HYBRID (B4) — the left vertical dock is retired. Launching uses the
+        // Front Door/Super paths; the single bottom taskbar owns sessions, tray,
+        // clock, notifications, and show-desktop routing.
         let bar_clicked =
             dock::notification_rail_with_sources(ctx, &mut self.vdock, &desktop_sources);
         self.nav.surface = self.vdock.active();
@@ -1567,11 +2001,10 @@ impl Shell {
         }
     }
 
-    /// WL-UX-005 launcher transition: drain the dock Start cell's toggle latch
-    /// (ALWAYS drained so it never backs up), route that primary Start action to
-    /// the unified Front Door panel, then keep mounting the legacy Start Menu if
-    /// another compatibility/test path has it open so its tile and Console
-    /// request drains remain live until parity retirement.
+    /// WL-UX-005 launcher transition: drain the retired dock Start-cell toggle
+    /// latch (ALWAYS drained so old states never back up), then keep mounting the
+    /// legacy Start Menu if another compatibility/test path has it open so its
+    /// tile and Console request drains remain live until parity retirement.
     ///
     /// WIN7-3 — also drains a live-tile click (the left pane) after Console's
     /// own requests: the SAME "route + expand the body" outcome as a Console
@@ -1644,6 +2077,203 @@ impl Shell {
             self.nav.expanded = true;
             self.nav.surface = surface;
         }
+    }
+
+    fn apply_car_keyboard_routes(&mut self, ctx: &egui::Context) {
+        if self.curtain.engaged()
+            || self.system.layout_profile() != LayoutProfile::Car
+            || ctx.wants_keyboard_input()
+        {
+            return;
+        }
+        for key in [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::F1,
+            egui::Key::F2,
+            egui::Key::F3,
+            egui::Key::F4,
+            egui::Key::F5,
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+                if let Some(route) = car_key_route(key) {
+                    self.front_door.close();
+                    self.start_menu.close();
+                    self.nav.expanded = true;
+                    self.nav.surface = route.surface();
+                }
+                break;
+            }
+        }
+    }
+
+    fn mount_layout_profile_control(&mut self, ctx: &egui::Context, now: Instant) {
+        if self.curtain.engaged() {
+            return;
+        }
+        let profile = self.system.layout_profile();
+        if profile == LayoutProfile::Car {
+            self.mount_car_hud(ctx);
+        }
+        let screen = ctx.screen_rect();
+        let button = layout_mode_button_rect(screen, self.vdock.rail_height(), profile);
+        let mut open_menu = false;
+        egui::Area::new(egui::Id::new("shell-layout-profile-button"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(button.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(button.size());
+                let (rect, response) =
+                    ui.allocate_exact_size(button.size(), egui::Sense::click_and_drag());
+                let primary_down_on_button = ctx.input(|i| {
+                    i.pointer.primary_down()
+                        && i.pointer
+                            .latest_pos()
+                            .is_some_and(|pos| button.contains(pos))
+                });
+                if response.clicked()
+                    || response.secondary_clicked()
+                    || response.is_pointer_button_down_on()
+                    || primary_down_on_button
+                {
+                    open_menu = true;
+                }
+                if self.layout_mode.update_hold(ctx, &response, now) {
+                    open_menu = true;
+                }
+                install_layout_mode_button_accessibility(
+                    ctx,
+                    rect,
+                    profile,
+                    self.layout_mode.menu_open || open_menu,
+                );
+                paint_layout_mode_button(
+                    ui,
+                    rect,
+                    profile,
+                    self.layout_mode.hold_progress(now),
+                    self.layout_mode.menu_open || open_menu,
+                );
+                let _ = layout_profile_hover_text(
+                    response,
+                    format!(
+                        "Click or hold for 5 seconds to choose {}",
+                        LayoutProfile::ALL
+                            .iter()
+                            .map(|p| p.short_label())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                );
+            });
+        if open_menu {
+            self.layout_mode.menu_open = true;
+        }
+        if self.layout_mode.menu_open {
+            self.mount_layout_profile_menu(ctx, button);
+        }
+    }
+
+    fn mount_layout_profile_menu(&mut self, ctx: &egui::Context, button: egui::Rect) {
+        let screen = ctx.screen_rect();
+        let menu = layout_mode_menu_rect(button, screen);
+        let current = self.system.layout_profile();
+        let mut picked = None;
+        egui::Area::new(egui::Id::new("shell-layout-profile-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(menu.size());
+                let frame = egui::Frame::NONE
+                    .fill(Style::resolve_color(ctx, Style::SURFACE))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        Style::resolve_color(ctx, Style::BORDER),
+                    ))
+                    .inner_margin(egui::Margin::same(Style::SP_S as i8));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(menu.width() - Style::SP_M);
+                    for profile in LayoutProfile::ALL {
+                        if layout_profile_menu_row(ui, profile, profile == current).clicked() {
+                            picked = Some(profile);
+                        }
+                    }
+                });
+            });
+        if let Some(profile) = picked {
+            self.system.set_layout_profile(profile, ctx);
+            self.vdock.set_density(profile.density());
+            self.layout_mode.menu_open = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.layout_mode.menu_open = false;
+        }
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            let pos = ctx.input(|i| i.pointer.latest_pos());
+            if pos.is_some_and(|pos| !menu.contains(pos) && !button.contains(pos)) {
+                self.layout_mode.menu_open = false;
+            }
+        }
+    }
+
+    fn mount_car_hud(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let top = screen.top() + Style::SP_M;
+        let left = screen.left() + Style::SP_M;
+        let max_w = (screen.width() - Style::SP_M * 2.0).max(CAR_HUD_TILE_W);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, top),
+            egui::vec2(
+                max_w.min(CAR_HUD_TILE_W * 5.0 + CAR_HUD_GAP * 4.0),
+                CAR_HUD_H,
+            ),
+        );
+        let media_label = self
+            .media
+            .player()
+            .media()
+            .map_or_else(|| "Idle".to_owned(), |_| "Playing".to_owned());
+        let voice_label = {
+            let label = self.voice.call_state().label();
+            if label.is_empty() {
+                "Ready".to_owned()
+            } else {
+                label.to_owned()
+            }
+        };
+        let tiles = [
+            ("MPH", "--".to_owned(), "1/F1"),
+            ("Engine", "--".to_owned(), "2/F2"),
+            ("Next", "--".to_owned(), "3/F3"),
+            ("Media", media_label, "4/F4"),
+            ("VoIP", voice_label, "5/F5"),
+        ];
+        egui::Area::new(egui::Id::new("shell-car-layout-hud"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(rect.size());
+                let frame = egui::Frame::NONE
+                    .fill(Style::resolve_color(ctx, Style::BG).gamma_multiply(0.88))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        Style::resolve_color(ctx, Style::BORDER),
+                    ))
+                    .inner_margin(egui::Margin::same(Style::SP_S as i8));
+                frame.show(ui, |ui| {
+                    let tile_w =
+                        ((rect.width() - CAR_HUD_GAP * 4.0) / 5.0).clamp(96.0, CAR_HUD_TILE_W);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = CAR_HUD_GAP;
+                        for (label, value, key) in tiles {
+                            car_hud_tile(ui, tile_w, label, &value, key);
+                        }
+                    });
+                });
+            });
     }
 
     fn drain_console_request(&mut self, source: &'static str) {
@@ -2077,6 +2707,24 @@ impl Shell {
         complete_menu_bar_minimize(&mut self.nav, &mut self.menu_bar_minimize, now);
     }
 
+    fn mount_remote_sessions_fallback(&self, ctx: &egui::Context) {
+        if !self.nav.expanded
+            || !surface_needs_remote_sessions_fallback(self.nav.surface)
+            || self.curtain.covers_fully()
+            || self.menu_bar_minimize.is_some()
+        {
+            return;
+        }
+
+        let pos = remote_sessions_fallback_pos(ctx.screen_rect());
+        egui::Area::new(egui::Id::new("shell-remote-sessions-fallback-button"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                mde_egui::menubar::remote_sessions_button(ui);
+            });
+    }
+
     fn drain_menu_bar_minimize_request(&mut self, ctx: &egui::Context, now: Instant) {
         let Some(source) = mde_egui::menubar::take_remote_sessions_request(ctx) else {
             return;
@@ -2109,19 +2757,26 @@ impl Shell {
         };
         let progress = effect.progress(now);
         let opacity = (1.0 - progress).clamp(0.0, 1.0);
-        let rect = effect.current_rect(now);
         let accent = Style::resolve_color(ctx, Style::ACCENT);
+        let surface = Style::resolve_color(ctx, Style::SURFACE);
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("shell-menu-bar-minimize-effect"),
         ));
-        painter.rect_filled(rect, Style::RADIUS_L, accent.gamma_multiply(opacity * 0.10));
-        painter.rect_stroke(
-            rect,
-            Style::RADIUS_L,
-            egui::Stroke::new(1.5, accent.gamma_multiply(opacity.max(0.25))),
-            egui::StrokeKind::Inside,
-        );
+        for card in menu_bar_shuffle_paint_order(effect, now) {
+            let card_opacity = opacity * card.depth;
+            painter.rect_filled(
+                card.rect,
+                Style::RADIUS_L,
+                surface.gamma_multiply(card_opacity * 0.22),
+            );
+            painter.rect_stroke(
+                card.rect,
+                Style::RADIUS_L,
+                egui::Stroke::new(1.5, accent.gamma_multiply(card_opacity.max(0.18))),
+                egui::StrokeKind::Inside,
+            );
+        }
         ctx.request_repaint();
     }
 }
@@ -2321,15 +2976,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat, complete_menu_bar_minimize, console, datacenter,
+        car_key_route, chat, complete_menu_bar_minimize, console, datacenter,
         desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
-        front_door_peer_apps, media_header, media_panel,
-        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
-        publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
+        front_door_peer_apps, install_layout_mode_button_accessibility,
+        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
+        layout_mode_button_rect, layout_mode_menu_rect, layout_profile_row_accesskit_value,
+        layout_profile_tooltip, media_header, media_panel, menu_bar_shuffle_cards,
+        menu_bar_shuffle_paint_order, publish_front_door_instance_lifecycle_to_bus,
+        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
+        real_editor, real_media, real_terminal, remote_sessions_fallback_pos,
         reserved_dock_gutter, reserved_taskbar_strut, route_file_operation_progress_request,
-        screenshot, shell_file_operation_progress, splash, start_menu, status, terminal_panel,
-        Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
-        MENU_BAR_MINIMIZE_DURATION,
+        screenshot, shell_file_operation_progress, splash, start_menu, status,
+        surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
+        MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
+        LAYOUT_MODE_BUTTON_TOUCH,
+        LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -2338,7 +2999,7 @@ mod tests {
         Roster, Severity,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::Style;
+    use mde_egui::{LayoutProfile, Style};
     use mde_files::backend::{
         AuditEntry, Backend, BackendError, ConflictPolicy, Destination, SendMode,
     };
@@ -2458,6 +3119,330 @@ mod tests {
         assert_eq!(n.plane, Plane::ThisNode);
     }
 
+    fn accesskit_nodes(
+        out: &egui::FullOutput,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone()
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Path(path) => {
+                    if path.fill != egui::Color32::TRANSPARENT {
+                        out.push(path.fill);
+                    }
+                }
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_layout_profile_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 96.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        layout_profile_tooltip(ui, "Choose Workstation / Tablet / Car");
+                    });
+            },
+        )
+    }
+
+    #[test]
+    fn layout_profile_tooltip_uses_shell_themed_text_and_surface() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        Style::install(&ctx);
+
+        let out = render_layout_profile_tooltip_frame(&ctx);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+        let tooltip_text = "Choose Workstation / Tablet / Car";
+
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == tooltip_text && *color == text_color),
+            "layout profile tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == tooltip_text && *color == egui::Color32::BLACK),
+            "layout profile tooltip leaked the raw shared popup text color: {texts:?}"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "layout profile tooltip should paint its own themed surface: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn layout_profile_button_sits_lower_right_above_the_taskbar() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let rect = layout_mode_button_rect(
+            screen,
+            dock::DockState::default().rail_height(),
+            LayoutProfile::Workstation,
+        );
+        assert!(
+            rect.right() <= screen.right() - Style::SP_M + f32::EPSILON,
+            "layout button must stay inside the right edge: {rect:?}"
+        );
+        assert!(
+            rect.bottom()
+                <= screen.bottom() - dock::DockState::default().rail_height() - Style::SP_M
+                    + f32::EPSILON,
+            "layout button must sit above the bottom taskbar: {rect:?}"
+        );
+        assert_eq!(
+            rect.size(),
+            vec2(
+                LAYOUT_MODE_BUTTON_WORKSTATION,
+                LAYOUT_MODE_BUTTON_WORKSTATION
+            )
+        );
+
+        let touch = layout_mode_button_rect(screen, 48.0, LayoutProfile::Car);
+        assert_eq!(
+            touch.size(),
+            vec2(LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_TOUCH),
+            "Car/Tablet use a touch-sized lower-right control"
+        );
+    }
+
+    #[test]
+    fn layout_profile_menu_opens_above_the_mode_button_and_stays_onscreen() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 360.0));
+        let button = layout_mode_button_rect(screen, 48.0, LayoutProfile::Car);
+        let menu = layout_mode_menu_rect(button, screen);
+        assert!(
+            screen.contains_rect(menu),
+            "menu should stay on-screen: {menu:?}"
+        );
+        assert!(
+            menu.bottom() <= button.top() + f32::EPSILON,
+            "mode menu opens above the lower-right button: menu={menu:?} button={button:?}"
+        );
+    }
+
+    #[test]
+    fn layout_profile_button_primary_click_opens_the_profile_menu() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(LayoutProfile::Workstation, &ctx);
+        shell
+            .vdock
+            .set_density(LayoutProfile::Workstation.density());
+
+        let size = vec2(1280.0, 800.0);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), size);
+        let button = layout_mode_button_rect(
+            screen,
+            shell.vdock.rail_height(),
+            LayoutProfile::Workstation,
+        );
+        let pos = button.center();
+        let now = std::time::Instant::now();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            shell.mount_layout_profile_control(ctx, now)
+        });
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, true),
+            ]),
+            |ctx| shell.mount_layout_profile_control(ctx, now),
+        );
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, false),
+            ]),
+            |ctx| shell.mount_layout_profile_control(ctx, now),
+        );
+
+        assert!(
+            shell.layout_mode.menu_open,
+            "a normal primary click should open the layout profile menu"
+        );
+    }
+
+    #[test]
+    fn layout_profile_control_exports_accesskit_button_and_rows() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 480.0));
+        let button = Rect::from_min_size(pos2(568.0, 404.0), vec2(44.0, 44.0));
+        let row = Rect::from_min_size(pos2(376.0, 220.0), vec2(240.0, 56.0));
+
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                install_layout_mode_button_accessibility(
+                    ctx,
+                    button,
+                    LayoutProfile::Workstation,
+                    true,
+                );
+                install_layout_profile_row_accessibility(
+                    ctx,
+                    row,
+                    LayoutProfile::Workstation,
+                    true,
+                );
+                install_layout_profile_row_accessibility(
+                    ctx,
+                    row.translate(vec2(0.0, 56.0)),
+                    LayoutProfile::Tablet,
+                    false,
+                );
+            },
+        );
+
+        let nodes = accesskit_nodes(&out);
+        let button = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Layout mode"))
+            .expect("layout mode button accesskit node");
+        let expected_button_value =
+            layout_mode_button_accesskit_value(LayoutProfile::Workstation, true);
+        assert_eq!(button.role(), egui::accesskit::Role::Button);
+        assert_eq!(button.value(), Some(expected_button_value.as_str()));
+        assert!(button.supports_action(egui::accesskit::Action::Click));
+
+        let workstation = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some(LayoutProfile::Workstation.label()))
+            .expect("selected workstation row accesskit node");
+        let expected_workstation_value =
+            layout_profile_row_accesskit_value(LayoutProfile::Workstation, true);
+        assert_eq!(workstation.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            workstation.value(),
+            Some(expected_workstation_value.as_str())
+        );
+        assert_eq!(workstation.is_selected(), Some(true));
+        assert!(workstation.supports_action(egui::accesskit::Action::Click));
+
+        let tablet = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some(LayoutProfile::Tablet.label()))
+            .expect("available tablet row accesskit node");
+        let expected_tablet_value =
+            layout_profile_row_accesskit_value(LayoutProfile::Tablet, false);
+        assert_eq!(tablet.value(), Some(expected_tablet_value.as_str()));
+        assert_ne!(tablet.is_selected(), Some(true));
+        assert!(tablet.supports_action(egui::accesskit::Action::Click));
+    }
+
+    #[test]
+    fn car_layout_external_keyboard_routes_cover_required_hud_categories() {
+        let routes = [
+            (egui::Key::Num1, CarKeyRoute::Map, Surface::MapsLocation),
+            (egui::Key::F1, CarKeyRoute::Map, Surface::MapsLocation),
+            (egui::Key::Num2, CarKeyRoute::Engine, Surface::MapsLocation),
+            (
+                egui::Key::Num3,
+                CarKeyRoute::Direction,
+                Surface::MapsLocation,
+            ),
+            (egui::Key::Num4, CarKeyRoute::Media, Surface::Media),
+            (egui::Key::Num5, CarKeyRoute::Voip, Surface::Voice),
+        ];
+        for (key, route, surface) in routes {
+            let got = car_key_route(key).expect("key should be routed in Car layout");
+            assert_eq!(got, route);
+            assert_eq!(got.surface(), surface);
+            assert!(!got.label().is_empty());
+        }
+        assert_eq!(car_key_route(egui::Key::Num6), None);
+    }
+
     #[test]
     fn menu_bar_minimize_effect_completes_by_routing_to_remote_sessions() {
         let start = std::time::Instant::now();
@@ -2497,6 +3482,35 @@ mod tests {
             "Remote Sessions opens as the active workspace"
         );
         assert!(pending.is_none(), "the cue is one-shot");
+    }
+
+    #[test]
+    fn menu_bar_minimize_effect_uses_staggered_card_shuffle_geometry() {
+        let start = std::time::Instant::now();
+        let workspace = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0));
+        let button = Rect::from_min_size(pos2(960.0, 4.0), vec2(32.0, 24.0));
+        let effect = MenuBarMinimizeEffect::new(start, workspace, button);
+        let mid = start + MENU_BAR_MINIMIZE_DURATION / 2;
+        let cards = menu_bar_shuffle_cards(effect, mid);
+
+        assert_eq!(cards.len(), 3, "the cue should paint a small card stack");
+        assert!(
+            cards[0].rect.width() < cards[1].rect.width()
+                && cards[1].rect.width() < cards[2].rect.width(),
+            "front card should lead while the trailing cards lag: {cards:?}"
+        );
+        assert!(
+            cards[1].rect.left() < cards[0].rect.left()
+                && cards[2].rect.left() < cards[1].rect.left(),
+            "trailing cards should remain visibly staggered behind the lead: {cards:?}"
+        );
+
+        let paint_order = menu_bar_shuffle_paint_order(effect, mid);
+        assert!(
+            paint_order[0].depth < paint_order[1].depth
+                && paint_order[1].depth < paint_order[2].depth,
+            "back cards should paint before the strongest front card: {paint_order:?}"
+        );
     }
 
     #[test]
@@ -2611,6 +3625,206 @@ mod tests {
             shell.nav.expanded,
             "Remote Sessions opens as the shell-managed session surface"
         );
+    }
+
+    #[test]
+    fn desktop_workspace_body_does_not_mount_the_shared_menu_bar_button() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Desktop;
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                shell.body(ui);
+            });
+        });
+
+        assert!(
+            ctx.read_response(mde_egui::menubar::remote_sessions_button_id())
+                .is_none(),
+            "Remote Sessions itself should be a bare workspace with no top-right menu-bar button"
+        );
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the bare Desktop workspace should still paint"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_policy_covers_only_missing_workspace_controls() {
+        for surface in Surface::ALL {
+            let expected = !matches!(
+                surface,
+                Surface::Workbench
+                    | Surface::InfraCode
+                    | Surface::Desktop
+                    | Surface::Chat
+                    | Surface::System
+                    | Surface::Storage
+                    | Surface::About
+            );
+            assert_eq!(
+                surface_needs_remote_sessions_fallback(surface),
+                expected,
+                "{surface:?} fallback policy should match its chrome ownership"
+            );
+        }
+        assert!(
+            surface_needs_remote_sessions_fallback(Surface::Timers),
+            "the clock-routed Timers surface also needs the shell fallback"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_position_tracks_the_top_right_title_slot() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0));
+        let pos = remote_sessions_fallback_pos(screen);
+        assert_eq!(
+            pos,
+            pos2(
+                screen.right() - Style::SP_XS - mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+                Style::TOOLBAR_INSET_Y
+            ),
+            "fallback placement should be derived from the active viewport"
+        );
+
+        let button = Rect::from_min_size(
+            pos,
+            vec2(
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_H,
+            ),
+        );
+        assert!(
+            button.right() <= screen.right() - Style::SP_XS + f32::EPSILON
+                && button.top() <= Style::SP_XS,
+            "fallback control should sit in the top-right window-title slot: {button:?}"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_mounts_for_bare_non_desktop_workspaces() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Files;
+
+        let size = vec2(1024.0, 640.0);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            shell.mount_remote_sessions_fallback(ctx);
+        });
+        let button = ctx
+            .read_response(mde_egui::menubar::remote_sessions_button_id())
+            .expect("bare non-Desktop workspaces should receive a top-right Remote Sessions control")
+            .rect;
+
+        assert_eq!(
+            button.size(),
+            vec2(
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_H,
+            ),
+            "fallback should reuse the shared Remote Sessions chrome primitive"
+        );
+        assert!(
+            button.is_finite() && button.width() > 0.0 && button.height() > 0.0,
+            "fallback control should mount as a bounded foreground response: {button:?}"
+        );
+
+        let desktop = egui::Context::default();
+        Style::install(&desktop);
+        let mut shell = Shell::new_for_ctx(&desktop);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Desktop;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let _ = desktop.run(input, |ctx| {
+            shell.mount_remote_sessions_fallback(ctx);
+        });
+        assert!(
+            desktop
+                .read_response(mde_egui::menubar::remote_sessions_button_id())
+                .is_none(),
+            "Remote Sessions itself remains the bare lowest-level workspace"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_request_uses_shell_transition() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.20);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Files;
+
+        let size = vec2(1024.0, 640.0);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            shell.mount_remote_sessions_fallback(ctx);
+        });
+        let button = ctx
+            .read_response(mde_egui::menubar::remote_sessions_button_id())
+            .expect("fallback Remote Sessions control should be registered")
+            .rect;
+        let pos = button.center();
+        let start = std::time::Instant::now();
+        let workspace = Rect::from_min_size(pos2(40.0, 72.0), vec2(920.0, 520.0));
+        mde_egui::menubar::queue_remote_sessions_request(&ctx, button);
+        let source = mde_egui::menubar::take_remote_sessions_request(&ctx)
+            .expect("fallback should use the shared Remote Sessions request channel");
+        assert!(
+            source.contains(pos),
+            "the fallback request should carry the source rect for the shell animation"
+        );
+        mde_egui::menubar::queue_remote_sessions_request(&ctx, source);
+        shell.last_workspace_rect = Some(workspace);
+        shell.drain_menu_bar_minimize_request(&ctx, start);
+
+        assert!(
+            mde_egui::menubar::take_remote_sessions_request(&ctx).is_none(),
+            "the shell should consume the fallback request exactly once"
+        );
+        assert_eq!(
+            shell.nav.surface,
+            Surface::Files,
+            "the active surface should stay put until the visible cue finishes"
+        );
+        let effect = shell
+            .menu_bar_minimize
+            .expect("fallback click should start the shared minimize cue");
+        assert!(
+            effect.to.contains(pos),
+            "the transition should target the fallback top-right control: {:?}",
+            effect.to
+        );
+
+        assert!(complete_menu_bar_minimize(
+            &mut shell.nav,
+            &mut shell.menu_bar_minimize,
+            start + MENU_BAR_MINIMIZE_DURATION
+        ));
+        assert_eq!(shell.nav.surface, Surface::Desktop);
     }
 
     #[test]
@@ -3572,7 +4786,7 @@ mod tests {
     }
 
     #[test]
-    fn start_taskbar_click_opens_front_door_and_survives_the_opening_click() {
+    fn retired_start_taskbar_button_is_absent_and_front_door_still_opens() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
@@ -3582,41 +4796,24 @@ mod tests {
 
         shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
         shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
-        let start = ctx
-            .read_response(dock::start_cell_id())
-            .expect("Start cell response is registered by the taskbar")
-            .rect
-            .center();
-        shell_launcher_frame(
-            &ctx,
-            &mut shell,
-            vec![
-                egui::Event::PointerMoved(start),
-                pointer_button(start, true),
-            ],
-            size,
+        assert!(
+            ctx.read_response(dock::start_cell_id()).is_none(),
+            "the retired Start taskbar button must not register a response"
         );
-        shell_launcher_frame(
-            &ctx,
-            &mut shell,
-            vec![
-                egui::Event::PointerMoved(start),
-                pointer_button(start, false),
-            ],
-            size,
-        );
+
+        shell.toggle_front_door_panel();
 
         assert!(shell.front_door.is_open());
         assert!(
             !shell.start_menu.is_open(),
-            "the Start taskbar cell must open Front Door, not the legacy Start Menu"
+            "launcher ownership must remain on Front Door, not the legacy Start Menu"
         );
 
         shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
 
         assert!(
             shell.front_door.is_open(),
-            "the click-away guard must not close Front Door on the click that opened it"
+            "Front Door should remain open after the taskbar re-renders without a Start button"
         );
     }
 
@@ -3913,6 +5110,36 @@ mod tests {
         assert!(
             !shell.start_menu.pinned_surfaces().contains(&Surface::Files),
             "a second Front Door pin request should unpin through the same Start store"
+        );
+    }
+
+    #[test]
+    fn start_menu_pins_are_mirrored_to_the_taskbar_application_bar() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.start_menu = start_menu::StartMenuState::default();
+        shell.nav.surface = Surface::Workbench;
+
+        assert!(
+            shell.start_menu.toggle_surface_pin(Surface::Browser),
+            "the Start Menu pin action should add Browser to the ordered pin store"
+        );
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| shell.mount_dock_chrome(ctx));
+        let _ = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+
+        let browser = ctx
+            .read_response(dock::pinned_app_cell_id(Surface::Browser))
+            .expect("a Start Menu pin should render Browser on the application bar")
+            .rect;
+        assert!(
+            browser.bottom() > 400.0,
+            "application pins should render inside the bottom taskbar, not only in the Start Menu"
         );
     }
 

@@ -32,14 +32,16 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::style::Elevation;
 use mde_egui::{
-    field, muted_note, InputPolicy, Motion, MotionMode, OsdKind, OsdLevel, Severity, Style,
-    StyleColorScheme, Toast,
+    field, muted_note, Density, InputPolicy, LayoutProfile, Motion, MotionMode, OsdKind, OsdLevel,
+    Severity, Style, StyleColorScheme, Toast,
 };
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
@@ -167,6 +169,12 @@ pub(crate) struct SystemState {
     /// saved on change, and pushed into the native DRM input policy every poll so
     /// sensitivity fixes affect the real seat rather than only the Settings UI.
     mouse_touch: MouseTouchConfig,
+    /// Personalization → Wallpaper policy for the chromeless desktop page and Bing
+    /// daily-picture fallback. Settings owns the operator policy and can download the
+    /// current image without blocking the egui render thread.
+    wallpaper_service: WallpaperServiceConfig,
+    /// Runtime state for the one in-flight Bing daily-picture download, if any.
+    wallpaper_download: WallpaperDownloadRuntime,
     /// The Personalization → Theme appearance (SETTINGS-5): the interactive accent +
     /// the platform text-scale. Loaded from disk on start (restored on open), saved on
     /// a pick, and applied live to the context every frame by
@@ -209,6 +217,8 @@ impl Default for SystemState {
             mesh: MeshFacts::default(),
             remote_proofing: RemoteProofingConfig::load(),
             mouse_touch: MouseTouchConfig::load(),
+            wallpaper_service: WallpaperServiceConfig::load(),
+            wallpaper_download: WallpaperDownloadRuntime::default(),
             appearance: AppearanceConfig::load(),
             zoom_base: None,
             animation_base: None,
@@ -232,6 +242,8 @@ pub(crate) enum SysAction {
     Backlight { name: String, raw: u32 },
     /// Write an external monitor's DDC/CI brightness (0–100).
     Ddc { bus: String, percent: u8 },
+    /// Download the current Bing daily picture into the local wallpaper cache.
+    DownloadBingDailyPicture,
     /// Arm a power verb for confirmation (first click on a gated verb).
     ArmConfirm(PowerVerb),
     /// Execute a power verb (Lock, or the confirm click on a gated verb).
@@ -318,23 +330,26 @@ impl SystemState {
     }
 
     /// Apply the persisted Personalization → Theme appearance (SETTINGS-5) to the live
-    /// context: install the selected colour mode, re-tint the interactive accent, hold
-    /// the whole-UI text-scale zoom, and damp motion under the reduce-motion preference
-    /// (a11y-07). Cheap-guarded — a no-op frame costs field reads and never re-mutates
-    /// — and self-correcting: if a formfactor [`Style::install_with_density`] re-install
-    /// resets the look, the next poll re-applies the pick. Every effect is real runtime
-    /// state (the egui visuals + zoom + animation time + the shared `Motion` global),
-    /// never a dead toggle (§7).
+    /// context: install the selected colour mode + layout-profile density, re-tint the
+    /// interactive accent, hold the whole-UI text-scale zoom, and damp motion under the
+    /// reduce-motion preference (a11y-07). Cheap-guarded — a no-op frame costs field
+    /// reads and never re-mutates — and self-correcting: if a formfactor or fresh
+    /// context re-install resets the look, the next poll re-applies the pick. Every
+    /// effect is real runtime state (the egui visuals + density + zoom + animation time
+    /// + the shared `Motion` global), never a dead toggle (§7).
     fn apply_appearance(&mut self, ctx: &egui::Context) {
         // Colour mode + accent — re-tint only when the live look drifts from the pick
         // (a settings change, a fresh context, OR a formfactor re-install reset it).
         let want_scheme = self.appearance.color_scheme.runtime();
         let want_accent = self.appearance.accent.color();
         let want_live_accent = Style::accent_for_scheme(want_scheme, want_accent);
+        let want_density = self.appearance.layout_profile.density();
         if Style::color_scheme(ctx) != want_scheme
+            || Style::density(ctx) != want_density
             || ctx.style().visuals.hyperlink_color != want_live_accent
         {
-            Style::set_color_scheme_and_accent(ctx, want_scheme, want_accent);
+            Style::install_color_scheme_with_density(ctx, want_scheme, want_density);
+            Style::set_accent(ctx, want_accent);
         }
         // Text-scale — capture the seat's DPI zoom base once (what the DRM runner set
         // from the panel, or 1.0 windowed), then hold the zoom at base × the chosen
@@ -425,6 +440,27 @@ impl SystemState {
         self.appearance.taskbar_autohide
     }
 
+    /// The persisted shell layout profile. Main owns layout-specific chrome and reads
+    /// this every frame after [`Self::poll`] reapplies the matching shared density.
+    pub(crate) const fn layout_profile(&self) -> LayoutProfile {
+        self.appearance.layout_profile
+    }
+
+    /// The profile-selected density mirrored into the taskbar and other shell chrome.
+    pub(crate) const fn layout_density(&self) -> Density {
+        self.appearance.layout_profile.density()
+    }
+
+    /// Set and persist the shell layout profile from the lower-right profile control.
+    pub(crate) fn set_layout_profile(&mut self, profile: LayoutProfile, ctx: &egui::Context) {
+        if self.appearance.layout_profile == profile {
+            return;
+        }
+        self.appearance.layout_profile = profile;
+        self.appearance.save();
+        self.apply_appearance(ctx);
+    }
+
     /// The POWER-5 idle/lid policy the honorer reads each tick (the source of truth
     /// the Power section edits).
     pub(crate) const fn power_honor_config(&self) -> &PowerHonorConfig {
@@ -457,6 +493,7 @@ impl SystemState {
     /// (a layout/routing pass — the bodies + their `apply()`/`SysAction` seams are
     /// reused verbatim, §6). Drives Displays + Power against the seat.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        self.poll_wallpaper_download();
         let mut actions: Vec<SysAction> = Vec::new();
         // Capture the rail selection before the render borrow so a rail click that
         // moves it can be detected + persisted afterwards (the same collect-then-
@@ -479,6 +516,7 @@ impl SystemState {
         let appearance_before = self.appearance;
         let remote_proofing_before = self.remote_proofing;
         let mouse_touch_before = self.mouse_touch;
+        let wallpaper_service_before = self.wallpaper_service.clone();
         // Whether the BlueZ pairing responder is currently registered — read before
         // the mutable destructure (a Copy bool) so the Pairing section can surface
         // the responder's honest live state (SETTINGS-4).
@@ -499,6 +537,8 @@ impl SystemState {
                 mesh,
                 remote_proofing,
                 mouse_touch,
+                wallpaper_service,
+                wallpaper_download,
                 appearance,
                 ..
             } = self;
@@ -551,6 +591,8 @@ impl SystemState {
                                 mesh,
                                 remote_proofing,
                                 mouse_touch,
+                                wallpaper_service,
+                                wallpaper_download,
                                 appearance,
                                 agent_active,
                                 prompt_in_flight,
@@ -589,7 +631,74 @@ impl SystemState {
             self.mouse_touch.save();
             self.apply_mouse_touch(ui.ctx());
         }
+        if self.wallpaper_service != wallpaper_service_before {
+            self.wallpaper_service.save();
+        }
         self.apply(actions);
+        if self.wallpaper_download.is_running() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    /// Drain a finished Bing wallpaper download without blocking the render thread.
+    fn poll_wallpaper_download(&mut self) {
+        let Some(rx) = self.wallpaper_download.receiver.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.wallpaper_service.apply_download_result(&result);
+                self.wallpaper_service.save();
+                self.wallpaper_download.receiver = None;
+                self.wallpaper_download.status = WallpaperDownloadStatus::Complete {
+                    title: result.title,
+                    path: result.path,
+                };
+            }
+            Ok(Err(err)) => {
+                self.wallpaper_download.receiver = None;
+                self.wallpaper_download.status = WallpaperDownloadStatus::Failed(err);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.wallpaper_download.receiver = None;
+                self.wallpaper_download.status = WallpaperDownloadStatus::Failed(
+                    "Daily picture download stopped before reporting a result.".to_owned(),
+                );
+            }
+        }
+    }
+
+    /// Start a short-lived blocking worker to fetch today's Bing image. The Settings
+    /// surface owns only policy and status; the render thread never performs HTTP.
+    fn start_bing_wallpaper_download(&mut self) {
+        self.poll_wallpaper_download();
+        let policy = self.wallpaper_service.clone().normalized();
+        if self.wallpaper_download.is_running() {
+            return;
+        }
+        if !policy.network_fetch_enabled {
+            self.wallpaper_download.status = WallpaperDownloadStatus::Failed(
+                "Daily picture downloads are disabled for this seat.".to_owned(),
+            );
+            return;
+        }
+        if !policy.bing_daily_enabled {
+            self.wallpaper_download.status =
+                WallpaperDownloadStatus::Failed("Bing daily picture is disabled.".to_owned());
+            return;
+        }
+        let Some(cache_dir) = WallpaperServiceConfig::cache_dir() else {
+            self.wallpaper_download.status = WallpaperDownloadStatus::Failed(
+                "No local data directory is available for the wallpaper cache.".to_owned(),
+            );
+            return;
+        };
+        let (tx, rx) = channel();
+        self.wallpaper_download = WallpaperDownloadRuntime::running(rx);
+        thread::spawn(move || {
+            let _ = tx.send(fetch_bing_daily_picture(cache_dir));
+        });
     }
 
     /// Apply the collected actions after the render borrow ends: drive the seat /
@@ -623,6 +732,7 @@ impl SystemState {
                         self.error = None;
                     }
                 }
+                SysAction::DownloadBingDailyPicture => self.start_bing_wallpaper_download(),
                 SysAction::ArmConfirm(verb) => self.confirm = Some(verb),
                 SysAction::CancelConfirm => self.confirm = None,
                 SysAction::Power(verb) => {
@@ -1450,6 +1560,268 @@ impl MouseTouchConfig {
     }
 }
 
+// ──────────────────────── Personalization → Wallpaper service ────────────────────────
+
+/// The client-data-dir file Personalization → Wallpaper persists to. The old static
+/// wallpaper picker is retired; this policy describes the chromeless desktop page
+/// and Bing image-of-the-day fallback the shell can consume.
+const WALLPAPER_SERVICE_CONFIG_FILE: &str = "settings-wallpaper-service.json";
+
+/// The Bing archive endpoint that returns today's image metadata as JSON. The image
+/// itself is fetched from the returned `url`, usually relative to `www.bing.com`.
+const BING_DAILY_ARCHIVE_URL: &str =
+    "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US";
+
+/// Local subdirectory for the downloaded daily picture.
+const WALLPAPER_CACHE_SUBDIR: &str = "wallpaper-cache";
+
+/// The stable file name for the current daily picture. The metadata record carries
+/// the human title/copyright, while the image path stays predictable for consumers.
+const BING_DAILY_IMAGE_FILE: &str = "bing-image-of-the-day.jpg";
+
+/// Persisted operator policy for the desktop wallpaper/background service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WallpaperServiceConfig {
+    /// Allow this seat to make the external request for the daily picture. Defaults
+    /// ON per the operator's explicit Bing fallback decision, but remains toggleable
+    /// for airgapped deployments.
+    #[serde(default = "default_true")]
+    network_fetch_enabled: bool,
+    /// Use Bing's image of the day as fallback when the configured desktop page is
+    /// absent/unreachable.
+    #[serde(default = "default_true")]
+    bing_daily_enabled: bool,
+    /// Optional local/chromeless desktop page URL served by the separate desktop
+    /// project. Empty means "not configured".
+    #[serde(default)]
+    desktop_page_url: String,
+    /// Last downloaded daily picture path.
+    #[serde(default)]
+    last_image_path: Option<PathBuf>,
+    /// Last downloaded picture title.
+    #[serde(default)]
+    last_image_title: String,
+    /// Last downloaded picture credit/copyright.
+    #[serde(default)]
+    last_image_copyright: String,
+    /// Wall-clock epoch millis for the most recent successful download.
+    #[serde(default)]
+    last_updated_ms: u64,
+}
+
+impl Default for WallpaperServiceConfig {
+    fn default() -> Self {
+        Self {
+            network_fetch_enabled: true,
+            bing_daily_enabled: true,
+            desktop_page_url: String::new(),
+            last_image_path: None,
+            last_image_title: String::new(),
+            last_image_copyright: String::new(),
+            last_updated_ms: 0,
+        }
+    }
+}
+
+impl WallpaperServiceConfig {
+    fn normalized(mut self) -> Self {
+        self.desktop_page_url = sanitize_wallpaper_service_url(&self.desktop_page_url);
+        self.last_image_title = self.last_image_title.trim().chars().take(160).collect();
+        self.last_image_copyright = self.last_image_copyright.trim().chars().take(240).collect();
+        self
+    }
+
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(WALLPAPER_SERVICE_CONFIG_FILE))
+    }
+
+    fn cache_dir() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(WALLPAPER_CACHE_SUBDIR))
+    }
+
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .map_or_else(Self::default, Self::normalized)
+    }
+
+    #[must_use]
+    fn load() -> Self {
+        Self::default_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self.clone().normalized())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn save(&self) {
+        if let Some(path) = Self::default_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+
+    fn apply_download_result(&mut self, result: &WallpaperDownloadResult) {
+        self.last_image_path = Some(result.path.clone());
+        self.last_image_title = result.title.clone();
+        self.last_image_copyright = result.copyright.clone();
+        self.last_updated_ms = result.fetched_at_ms;
+    }
+}
+
+fn sanitize_wallpaper_service_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed.chars().take(2048).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WallpaperDownloadStatus {
+    Idle,
+    Running,
+    Complete { title: String, path: PathBuf },
+    Failed(String),
+}
+
+impl Default for WallpaperDownloadStatus {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Default)]
+struct WallpaperDownloadRuntime {
+    receiver: Option<Receiver<Result<WallpaperDownloadResult, String>>>,
+    status: WallpaperDownloadStatus,
+}
+
+impl WallpaperDownloadRuntime {
+    fn running(receiver: Receiver<Result<WallpaperDownloadResult, String>>) -> Self {
+        Self {
+            receiver: Some(receiver),
+            status: WallpaperDownloadStatus::Running,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self.status, WallpaperDownloadStatus::Running)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WallpaperDownloadResult {
+    title: String,
+    copyright: String,
+    image_url: String,
+    path: PathBuf,
+    fetched_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BingDailyImage {
+    title: String,
+    copyright: String,
+    image_url: String,
+}
+
+fn fetch_bing_daily_picture(cache_dir: PathBuf) -> Result<WallpaperDownloadResult, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| format!("Create daily picture client: {err}"))?;
+    let archive = client
+        .get(BING_DAILY_ARCHIVE_URL)
+        .send()
+        .map_err(|err| format!("Read Bing daily picture metadata: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("Bing daily picture metadata was not accepted: {err}"))?
+        .json::<Value>()
+        .map_err(|err| format!("Parse Bing daily picture metadata: {err}"))?;
+    let image = bing_daily_image_from_archive(&archive)?;
+    let bytes = client
+        .get(&image.image_url)
+        .send()
+        .map_err(|err| format!("Download Bing daily picture: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("Bing daily picture download was not accepted: {err}"))?
+        .bytes()
+        .map_err(|err| format!("Read Bing daily picture bytes: {err}"))?;
+    fs::create_dir_all(&cache_dir)
+        .map_err(|err| format!("Create wallpaper cache directory: {err}"))?;
+    let path = cache_dir.join(BING_DAILY_IMAGE_FILE);
+    fs::write(&path, &bytes).map_err(|err| format!("Write Bing daily picture: {err}"))?;
+    Ok(WallpaperDownloadResult {
+        title: image.title,
+        copyright: image.copyright,
+        image_url: image.image_url,
+        path,
+        fetched_at_ms: unix_millis(),
+    })
+}
+
+fn bing_daily_image_from_archive(value: &Value) -> Result<BingDailyImage, String> {
+    let image = value
+        .get("images")
+        .and_then(Value::as_array)
+        .and_then(|images| images.first())
+        .ok_or_else(|| "Bing daily picture metadata did not include an image.".to_owned())?;
+    let raw_url = image
+        .get("url")
+        .and_then(Value::as_str)
+        .or_else(|| image.get("urlbase").and_then(Value::as_str))
+        .ok_or_else(|| "Bing daily picture metadata did not include an image URL.".to_owned())?;
+    let image_url = bing_absolute_image_url(raw_url)?;
+    let title = image
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Bing image of the day")
+        .chars()
+        .take(160)
+        .collect();
+    let copyright = image
+        .get("copyright")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .chars()
+        .take(240)
+        .collect();
+    Ok(BingDailyImage {
+        title,
+        copyright,
+        image_url,
+    })
+}
+
+fn bing_absolute_image_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().replace("&amp;", "&");
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Ok(trimmed);
+    }
+    if trimmed.starts_with('/') {
+        return Ok(format!("https://www.bing.com{trimmed}"));
+    }
+    Err("Bing daily picture metadata used an unsupported image URL.".to_owned())
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
 // ──────────────────────────── Mesh & System → Remote Proofing ────────────────────────────
 
 /// The client-data-dir file Mesh & System → Remote Proofing persists to. This is the
@@ -2053,10 +2425,10 @@ impl AppearanceMotionMode {
 const APPEARANCE_CONFIG_FILE: &str = "settings-appearance.json";
 
 /// The persisted Personalization → Theme appearance (SETTINGS-5): the colour mode,
-/// interactive accent, platform text-scale, and motion mode the shell actually
-/// applies at runtime. Loaded on start and restored on open, saved on a pick — the
-/// [`SettingsNav`] client-data-dir JSON idiom, reused. All fields drive a real live
-/// effect through [`SystemState::apply_appearance`] or the shell's
+/// interactive accent, layout profile, platform text-scale, and motion mode the shell
+/// actually applies at runtime. Loaded on start and restored on open, saved on a pick
+/// — the [`SettingsNav`] client-data-dir JSON idiom, reused. All fields drive a real
+/// live effect through [`SystemState::apply_appearance`] or the shell's
 /// `DockState` mirror (§7 — no dead toggle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 struct AppearanceConfig {
@@ -2066,6 +2438,9 @@ struct AppearanceConfig {
     /// The interactive accent tint (re-applied over the installed look each frame).
     #[serde(default)]
     accent: AccentChoice,
+    /// The shell-wide placement/profile model.
+    #[serde(default)]
+    layout_profile: LayoutProfile,
     /// The whole-UI text-scale step (the EXPLORER-18 accessibility zoom).
     #[serde(default)]
     text_scale: TextScale,
@@ -2093,6 +2468,8 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             #[serde(default)]
             accent: AccentChoice,
             #[serde(default)]
+            layout_profile: LayoutProfile,
+            #[serde(default)]
             text_scale: TextScale,
             #[serde(default)]
             motion_mode: Option<AppearanceMotionMode>,
@@ -2106,6 +2483,7 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
         Ok(Self {
             color_scheme: wire.color_scheme,
             accent: wire.accent,
+            layout_profile: wire.layout_profile,
             text_scale: wire.text_scale,
             motion_mode: wire.motion_mode.unwrap_or(if wire.reduce_motion {
                 AppearanceMotionMode::Reduced
@@ -2265,7 +2643,7 @@ fn settings_tooltip(ui: &mut egui::Ui, text: &str) {
         .fill(Style::SURFACE)
         .stroke(egui::Stroke::new(1.0, Style::BORDER))
         .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(10, 7))
+        .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(SETTINGS_TOOLTIP_W);
             ui.add(
@@ -2277,6 +2655,54 @@ fn settings_tooltip(ui: &mut egui::Ui, text: &str) {
 fn settings_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
     let text = text.into();
     response.on_hover_ui(move |ui| settings_tooltip(ui, text.as_str()))
+}
+
+fn settings_popup_visual_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let previous_style = ui.ctx().style();
+    let mut popup_style = (*previous_style).clone();
+    apply_settings_popup_style(&mut popup_style);
+    ui.ctx().set_style(popup_style);
+    let inner = ui
+        .scope(|ui| {
+            apply_settings_popup_style(ui.style_mut());
+            add(ui)
+        })
+        .inner;
+    ui.ctx().set_style(previous_style);
+    inner
+}
+
+fn apply_settings_popup_style(style: &mut egui::Style) {
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::SP_XS);
+    let visuals = &mut style.visuals;
+    visuals.override_text_color = Some(Style::TEXT);
+    visuals.window_fill = Style::SURFACE;
+    visuals.panel_fill = Style::SURFACE;
+    visuals.extreme_bg_color = Style::SURFACE;
+    visuals.faint_bg_color = Style::SURFACE_HI;
+    visuals.window_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.selection.bg_fill = Style::SURFACE_HI;
+    visuals.selection.stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.widgets.noninteractive.bg_fill = Style::SURFACE;
+    visuals.widgets.noninteractive.weak_bg_fill = Style::SURFACE;
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, Style::TEXT_DIM);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.widgets.inactive.bg_fill = Style::SURFACE;
+    visuals.widgets.inactive.weak_bg_fill = Style::SURFACE;
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.widgets.hovered.bg_fill = Style::SURFACE_HI;
+    visuals.widgets.hovered.weak_bg_fill = Style::SURFACE_HI;
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.widgets.active.bg_fill = Style::SURFACE_HI;
+    visuals.widgets.active.weak_bg_fill = Style::SURFACE_HI;
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.widgets.open.bg_fill = Style::SURFACE_HI;
+    visuals.widgets.open.weak_bg_fill = Style::SURFACE_HI;
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2397,6 +2823,8 @@ fn settings_detail(
     mesh: &MeshFacts,
     remote_proofing: &mut RemoteProofingConfig,
     mouse_touch: &mut MouseTouchConfig,
+    wallpaper_service: &mut WallpaperServiceConfig,
+    wallpaper_download: &mut WallpaperDownloadRuntime,
     appearance: &mut AppearanceConfig,
     agent_active: bool,
     prompt_in_flight: bool,
@@ -2424,7 +2852,9 @@ fn settings_detail(
             power_honor_config,
             actions,
         ),
-        SettingsSection::Wallpaper => wallpaper_section(ui),
+        SettingsSection::Wallpaper => {
+            wallpaper_section(ui, wallpaper_service, wallpaper_download, actions);
+        }
         SettingsSection::Hotkeys => hotkeys_section(ui),
         SettingsSection::Theme => theme_section(ui, appearance),
         SettingsSection::Identity => identity_section(ui, mesh),
@@ -2620,13 +3050,16 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
             );
             ui.add_space(Style::SP_S);
 
-            ComboBox::from_id_salt(ui.id().with("primary-button"))
-                .selected_text(config.primary_button.label())
-                .show_ui(ui, |ui| {
-                    for choice in PrimaryButton::ALL {
-                        ui.selectable_value(&mut config.primary_button, choice, choice.label());
-                    }
-                });
+            settings_popup_visual_scope(ui, |ui| {
+                ComboBox::from_id_salt(ui.id().with("primary-button"))
+                    .selected_text(config.primary_button.label())
+                    .show_ui(ui, |ui| {
+                        apply_settings_popup_style(ui.style_mut());
+                        for choice in PrimaryButton::ALL {
+                            ui.selectable_value(&mut config.primary_button, choice, choice.label());
+                        }
+                    });
+            });
         });
 
         column_card(&mut columns[1], "Scroll & Click", |ui| {
@@ -3241,20 +3674,26 @@ fn mode_picker(
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        ComboBox::from_id_salt((out.connector.as_str(), "mode"))
-            .selected_text(RichText::new(label).size(Style::SMALL))
-            .show_ui(ui, |ui| {
-                for mode in &conn.modes {
-                    let selected = current == Some(*mode);
-                    if ui
-                        .selectable_label(selected, RichText::new(mode.label()).size(Style::SMALL))
-                        .clicked()
-                        && !selected
-                    {
-                        actions.push(SysAction::SetMode(out.id.clone(), *mode));
+        settings_popup_visual_scope(ui, |ui| {
+            ComboBox::from_id_salt((out.connector.as_str(), "mode"))
+                .selected_text(RichText::new(label).size(Style::SMALL))
+                .show_ui(ui, |ui| {
+                    apply_settings_popup_style(ui.style_mut());
+                    for mode in &conn.modes {
+                        let selected = current == Some(*mode);
+                        if ui
+                            .selectable_label(
+                                selected,
+                                RichText::new(mode.label()).size(Style::SMALL),
+                            )
+                            .clicked()
+                            && !selected
+                        {
+                            actions.push(SysAction::SetMode(out.id.clone(), *mode));
+                        }
                     }
-                }
-            });
+                });
+        });
     });
 }
 
@@ -3532,39 +3971,120 @@ fn power_verb_row(
     });
 }
 
-/// The Wallpaper section (QBRAND-11) — the desktop-backdrop picker over the five
-/// official Construct wallpapers (placement lock #12). The choice persists per seat and
-/// follows the mesh identity; the [`crate::backdrop`] desktop layer reflects it live.
-fn wallpaper_section(ui: &mut egui::Ui) {
-    let ctx = ui.ctx().clone();
-    let current = crate::backdrop::selected_wallpaper(&ctx);
+/// The Wallpaper section: policy for the chromeless desktop page and Bing
+/// image-of-the-day fallback. The static Construct wallpaper gallery is retired
+/// because the current shell backdrop is a solid shell-colour field; this panel now
+/// controls the service that supplies the future desktop/background image.
+fn wallpaper_section(
+    ui: &mut egui::Ui,
+    config: &mut WallpaperServiceConfig,
+    download: &mut WallpaperDownloadRuntime,
+    actions: &mut Vec<SysAction>,
+) {
+    *config = config.clone().normalized();
     ui.label(
-        RichText::new("Desktop wallpaper")
+        RichText::new("Desktop background service")
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
     );
     ui.add_space(Style::SP_S);
-    // The official wallpapers as a gallery laid across the wide pane (SETTINGS-3):
-    // each is a selectable tile driving the SAME backdrop seam the combo did — a
-    // presentation pass, the selection logic unchanged (§6/§7).
-    across_grid(ui, &crate::backdrop::Wallpaper::ALL, 3, |ui, &wallpaper| {
-        let selected = wallpaper == current;
-        if settings_choice_tile(
-            ui,
-            selected,
-            wallpaper.label(),
-            None,
-            SettingsGroup::Personalization.accent(),
-            Style::SP_XL,
-        ) {
-            crate::backdrop::select_wallpaper(&ctx, wallpaper);
+
+    field(
+        ui,
+        "Desktop page",
+        if config.desktop_page_url.is_empty() {
+            "Not configured"
+        } else {
+            "Configured"
+        },
+        Style::TEXT,
+    );
+    ui.add_space(Style::SP_XS);
+    let edit = ui.add(
+        egui::TextEdit::singleline(&mut config.desktop_page_url)
+            .hint_text("http://127.0.0.1:8787/")
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Body),
+    );
+    if edit.changed() {
+        config.desktop_page_url = sanitize_wallpaper_service_url(&config.desktop_page_url);
+    }
+    ui.add_space(Style::SP_S);
+
+    ui.checkbox(
+        &mut config.network_fetch_enabled,
+        RichText::new("Allow daily picture downloads").size(Style::BODY),
+    );
+    ui.checkbox(
+        &mut config.bing_daily_enabled,
+        RichText::new("Use Bing image of the day as fallback").size(Style::BODY),
+    );
+    ui.add_space(Style::SP_S);
+
+    let download_enabled =
+        config.network_fetch_enabled && config.bing_daily_enabled && !download.is_running();
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                download_enabled,
+                egui::Button::new(RichText::new("Download today's picture").size(Style::SMALL)),
+            )
+            .clicked()
+        {
+            actions.push(SysAction::DownloadBingDailyPicture);
         }
+        let (status, color) = wallpaper_download_status(download, config);
+        ui.label(RichText::new(status).color(color).size(Style::SMALL));
     });
     ui.add_space(Style::SP_S);
+
+    if let Some(path) = &config.last_image_path {
+        field(
+            ui,
+            "Cached picture",
+            &path.display().to_string(),
+            Style::TEXT_DIM,
+        );
+    }
+    if !config.last_image_copyright.is_empty() {
+        field(
+            ui,
+            "Attribution",
+            &config.last_image_copyright,
+            Style::TEXT_DIM,
+        );
+    }
     muted_note(
         ui,
-        "The five official Construct wallpapers ship in the RPM; your choice follows your mesh identity when a workgroup volume is present.",
+        "The shell uses the configured desktop page first. When it is unavailable, this service can cache Bing's current daily picture for the background. Disable downloads for airgapped seats.",
     );
+}
+
+fn wallpaper_download_status(
+    download: &WallpaperDownloadRuntime,
+    config: &WallpaperServiceConfig,
+) -> (String, egui::Color32) {
+    match &download.status {
+        WallpaperDownloadStatus::Idle => {
+            if !config.network_fetch_enabled {
+                ("Downloads disabled".to_owned(), Style::TEXT_DIM)
+            } else if !config.bing_daily_enabled {
+                ("Bing fallback disabled".to_owned(), Style::TEXT_DIM)
+            } else if config.last_image_title.is_empty() {
+                ("No daily picture cached".to_owned(), Style::TEXT_DIM)
+            } else {
+                (
+                    format!("Cached: {}", config.last_image_title),
+                    Style::TEXT_DIM,
+                )
+            }
+        }
+        WallpaperDownloadStatus::Running => ("Downloading...".to_owned(), Style::ACCENT_MEDIA),
+        WallpaperDownloadStatus::Complete { title, .. } => {
+            (format!("Downloaded: {title}"), Style::SUPPORT_SUCCESS)
+        }
+        WallpaperDownloadStatus::Failed(err) => (err.clone(), Style::DANGER),
+    }
 }
 
 /// The Hotkeys section — the fixed compiled-in table (lock 9) read-only, laid
@@ -3650,6 +4170,29 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
         });
     });
     ui.add_space(Style::SP_M);
+    // Layout profile — a real shell placement model, not just text size. Workstation
+    // is the Windows 2000 desktop baseline; Tablet and Car branch the shell chrome.
+    ui.label(
+        RichText::new("Layout")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    across_grid(ui, &LayoutProfile::ALL, 3, |ui, &profile| {
+        let selected = appearance.layout_profile == profile;
+        if settings_choice_tile(
+            ui,
+            selected,
+            profile.label(),
+            Some(profile.description()),
+            SettingsGroup::Personalization.accent(),
+            Style::SP_XL,
+        ) {
+            appearance.layout_profile = profile;
+        }
+    });
+    ui.add_space(Style::SP_M);
     // Text-scale — the EXPLORER-18 accessibility whole-UI zoom, as legible steps.
     ui.label(
         RichText::new("Text size")
@@ -3721,9 +4264,10 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     ui.add_space(Style::SP_S);
     muted_note(
         ui,
-        "Accent re-tints every surface's highlights; text size scales the whole \
-         interface. Motion mode applies normal, reduced, or endpoint-only movement. \
-         Taskbar auto-hide floats the bottom bar from the edge.",
+        "Accent re-tints every surface's highlights; layout changes placement and \
+         control density; text size scales the whole interface. Motion mode applies \
+         normal, reduced, or endpoint-only movement. Taskbar auto-hide floats the \
+         bottom bar from the edge.",
     );
 }
 

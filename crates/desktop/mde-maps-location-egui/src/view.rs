@@ -6,25 +6,25 @@ use mde_egui::egui::{
 use mde_egui::Style;
 
 use crate::model::{
-    BackupRecord, CheckState, DeadZoneState, DeviceIoState, EncryptedVaultState, FirmwareWorkflow,
-    LocationManager, LocationSample, Mg90ManagementMethod, Mg90SettingCategory,
-    Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
-    OfflineNavigationStatus, ProviderContract, RoutePlan, SettingValueType, SetupStep,
-    SourceStatus, TripRecorderState, VehicleState, WorkspaceTab,
+    BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, DeviceIoState, EncryptedVaultState,
+    FirmwareWorkflow, LocationManager, LocationSample, LocationSource, Mg90ManagementMethod,
+    Mg90SettingCategory, Mg90SettingDescriptor, Mg90State, OfflineMapManagerState,
+    OfflineNavigationReadiness, OfflineNavigationStatus, ProviderContract, RoutePlan,
+    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
 const RAIL_W: f32 = 176.0;
-const HEADER_H: f32 = 50.0;
+const HEADER_H: f32 = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
 const CARD_MIN_H: f32 = 84.0;
-const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18);
-const MAP_LIGHT_BG: Color32 = Color32::from_rgb(0xE8, 0xEF, 0xE8);
-const ROAD_DARK: Color32 = Color32::from_rgb(0x42, 0x50, 0x57);
-const ROAD_LIGHT: Color32 = Color32::from_rgb(0xB8, 0xC3, 0xB6);
-const ROUTE_BLUE: Color32 = Color32::from_rgb(0x4C, 0xA3, 0xFF);
-const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3);
-const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8);
-const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54);
+const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18); // style-leak-ok: map-content-color
+const MAP_LIGHT_BG: Color32 = Color32::from_rgb(0xE8, 0xEF, 0xE8); // style-leak-ok: map-content-color
+const ROAD_DARK: Color32 = Color32::from_rgb(0x42, 0x50, 0x57); // style-leak-ok: map-content-color
+const ROAD_LIGHT: Color32 = Color32::from_rgb(0xB8, 0xC3, 0xB6); // style-leak-ok: map-content-color
+const ROUTE_BLUE: Color32 = Color32::from_rgb(0x4C, 0xA3, 0xFF); // style-leak-ok: map-content-color
+const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3); // style-leak-ok: map-content-color
+const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8); // style-leak-ok: map-content-color
+const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54); // style-leak-ok: map-content-color
 
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
@@ -90,7 +90,7 @@ fn header(ui: &mut egui::Ui, state: &MapsLocationSurface) {
         Style::TEXT_STRONG,
     );
     painter.text(
-        title_pos + egui::vec2(0.0, Style::SP_M),
+        title_pos + egui::vec2(0.0, Style::SP_S + Style::SP_XS),
         Align2::LEFT_CENTER,
         "Native offline navigation, local MG90 management, simulator active",
         FontId::proportional(Style::SMALL),
@@ -455,6 +455,8 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
             Style::OK,
         );
     });
+    ui.add_space(Style::SP_S);
+    dead_zone_card(ui, &state.dead_zones);
 }
 
 fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
@@ -540,7 +542,10 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
     });
     ui.add_space(Style::SP_S);
     card(ui, "Profile integration", |ui| {
-        bullet(ui, "Map events, trip history, route alerts, diagnostic bundles, and motion detection read this profile layer.");
+        bullet(
+            ui,
+            "Map events, trip history, route alerts, diagnostic bundles, and motion detection read this profile layer.",
+        );
         for note in &vehicle.profile_notes {
             bullet(ui, note);
         }
@@ -674,9 +679,11 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
     }
     let mut picked = None;
     for source in &manager.sources {
+        let switch_ready = source.manual_switch_ready();
+        let source_tone = source_readiness_tone(source);
         card(ui, source.kind.label(), |ui| {
             ui.horizontal(|ui| {
-                status_dot(ui, health_color(&source.sample));
+                status_dot(ui, source_tone);
                 ui.label(if manager.primary == source.kind {
                     "Primary source"
                 } else {
@@ -685,7 +692,7 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add_enabled(
-                            manager.primary != source.kind,
+                            manager.primary != source.kind && switch_ready,
                             egui::Button::new("Make primary"),
                         )
                         .clicked()
@@ -699,6 +706,12 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
                 "Status",
                 source_status_label(source.status),
                 Style::TEXT,
+            );
+            metric(
+                ui,
+                "Switch readiness",
+                &source.manual_switch_reason(),
+                source_tone,
             );
             metric(ui, "Fix", &source.sample.fix_type, Style::TEXT);
             metric(
@@ -973,9 +986,18 @@ fn show_simulator(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             if ui.button("Restore offline ready").clicked() {
                 state.simulate_ready_offline_navigation();
             }
+            if ui.button("Record cellular dead zone").clicked() {
+                state.simulate_cellular_dead_zone();
+            }
         });
-        bullet(ui, "Scenario buttons mutate the same readiness model used by Drive, Map, and Location Sources.");
-        bullet(ui, "The simulator never auto-failovers; a healthy peer source still requires manual primary selection.");
+        bullet(
+            ui,
+            "Scenario buttons mutate the same readiness model used by Drive, Map, and Location Sources.",
+        );
+        bullet(
+            ui,
+            "The simulator never auto-failovers; a healthy peer source still requires manual primary selection.",
+        );
     });
     ui.add_space(Style::SP_S);
     show_vault(ui, &state.vault);
@@ -1308,6 +1330,43 @@ fn trip_card(ui: &mut egui::Ui, trips: &TripRecorderState) {
     });
 }
 
+fn dead_zone_card(ui: &mut egui::Ui, dead_zones: &DeadZoneState) {
+    card(ui, "Cellular dead-zone recorder", |ui| {
+        metric(ui, "Route risk", &dead_zones.route_risk, Style::WARN);
+        metric(
+            ui,
+            "Recorded zones",
+            &dead_zones.zones.len().to_string(),
+            Style::ACCENT,
+        );
+        for zone in &dead_zones.zones {
+            ui.separator();
+            metric(ui, "Position", &zone.position, severity_tone(zone.severity));
+            metric(
+                ui,
+                "Severity",
+                zone.severity.label(),
+                severity_tone(zone.severity),
+            );
+            metric(ui, "WAN", &zone.selected_wan, Style::TEXT);
+            metric(ui, "Carrier", &zone.carrier, Style::TEXT);
+            metric(ui, "Technology", &zone.technology, Style::ACCENT);
+            metric(
+                ui,
+                "Signal / loss",
+                &format!("{} dBm / {:.1}%", zone.signal_dbm, zone.packet_loss_percent),
+                severity_tone(zone.severity),
+            );
+            metric(
+                ui,
+                "Latency / duration",
+                &format!("{} ms / {} s", zone.latency_ms, zone.outage_duration_s),
+                Style::TEXT,
+            );
+        }
+    });
+}
+
 fn show_vault(ui: &mut egui::Ui, vault: &EncryptedVaultState) {
     card(ui, "Encrypted local vault", |ui| {
         metric(ui, "Admin model", &vault.local_admin_user, Style::TEXT);
@@ -1511,6 +1570,16 @@ fn health_color_opt(sample: Option<&LocationSample>) -> Color32 {
     sample.map_or(Style::WARN, health_color)
 }
 
+fn source_readiness_tone(source: &LocationSource) -> Color32 {
+    if source.manual_switch_ready() {
+        Style::OK
+    } else if source.sample.stale() || source.status == SourceStatus::Stale {
+        Style::WARN
+    } else {
+        Style::DANGER
+    }
+}
+
 fn bool_label(value: bool) -> &'static str {
     if value {
         "yes"
@@ -1566,6 +1635,14 @@ fn readiness_tone(readiness: OfflineNavigationReadiness) -> Color32 {
     }
 }
 
+fn severity_tone(severity: DeadZoneSeverity) -> Color32 {
+    match severity {
+        DeadZoneSeverity::Good => Style::OK,
+        DeadZoneSeverity::Weak => Style::WARN,
+        DeadZoneSeverity::Degraded | DeadZoneSeverity::Outage => Style::DANGER,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1691,19 @@ mod tests {
     }
 
     #[test]
+    fn maps_header_uses_refined_shared_chrome_height() {
+        assert_eq!(
+            HEADER_H,
+            mde_egui::menubar::BAR_HEIGHT + Style::SP_S,
+            "Maps header should inherit the shared refined chrome height"
+        );
+        assert!(
+            HEADER_H < 40.0,
+            "Maps header must not return to a thick fixed strip"
+        );
+    }
+
+    #[test]
     fn every_tab_tessellates_without_hardware() {
         for tab in WorkspaceTab::ALL {
             let mut surface = MapsLocationSurface::simulated();
@@ -1633,6 +1723,22 @@ mod tests {
         missing_maps.active = WorkspaceTab::Simulator;
         missing_maps.simulate_no_offline_maps();
         assert!(tessellate(&mut missing_maps) > 0);
+
+        let mut dead_zone = MapsLocationSurface::simulated();
+        dead_zone.active = WorkspaceTab::Simulator;
+        dead_zone.simulate_cellular_dead_zone();
+        assert!(tessellate(&mut dead_zone) > 0);
+    }
+
+    #[test]
+    fn location_sources_tessellate_with_blocked_manual_switches() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::LocationSources;
+        surface.locations.sources[1].status = SourceStatus::Disconnected;
+        surface.locations.sources[2].sample.update_age_s = 6.0;
+        surface.locations.sources[3].sample.accuracy_m = 6.0;
+
+        assert!(tessellate(&mut surface) > 0);
     }
 
     #[test]

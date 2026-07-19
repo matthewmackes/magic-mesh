@@ -188,6 +188,7 @@ pub mod tmux;
 pub mod tmux_config;
 pub mod tmux_store;
 pub mod tmux_ui;
+mod tooltip;
 pub mod watch;
 pub mod widget;
 

@@ -3,8 +3,8 @@
 #
 # This helper is intentionally render-free: it consumes the shell-owned
 # Remote Proofing settings file and the mesh-status snapshot, then writes a
-# deterministic Sunshine/firewall lifecycle intent for the service layer. It
-# never starts Sunshine and never opens firewall ports by itself.
+# deterministic Sunshine/firewall lifecycle intent for the service layer. When
+# requested by the systemd bridge it also applies that lifecycle idempotently.
 
 from __future__ import annotations
 
@@ -404,6 +404,7 @@ def render_sunshine_config_from_lifecycle(lifecycle: dict[str, Any]) -> str:
             f"encoder = {sunshine['encoder']}",
             f"minimum_fps_target = {sunshine['minimum_fps_target']}",
             "address_family = ipv4",
+            "system_tray = disabled",
             f"origin_web_ui_allowed = {sunshine_origin_web_ui_for_policy(lifecycle['firewall']['policy'])}",
         ]
     )
@@ -440,6 +441,7 @@ def render_sunshine_config(plan: dict[str, Any]) -> str:
             f"encoder = {sunshine['encoder']}",
             f"minimum_fps_target = {sunshine['minimum_fps_target']}",
             "address_family = ipv4",
+            "system_tray = disabled",
             f"origin_web_ui_allowed = {sunshine_origin_web_ui(plan)}",
         ]
     )
@@ -647,7 +649,7 @@ def user_systemctl_env(user: pwd.struct_passwd) -> dict[str, str]:
     return env
 
 
-def user_systemctl_command(user: pwd.struct_passwd, action: str) -> list[str]:
+def user_systemctl_command(user: pwd.struct_passwd, action: str, *extra: str) -> list[str]:
     runtime = f"/run/user/{user.pw_uid}"
     return [
         "runuser",
@@ -660,6 +662,7 @@ def user_systemctl_command(user: pwd.struct_passwd, action: str) -> list[str]:
         "systemctl",
         "--user",
         action,
+        *extra,
         SUNSHINE_SERVICE_UNIT,
     ]
 
@@ -668,11 +671,27 @@ def write_user_sunshine_config(
     user: pwd.struct_passwd,
     config_text: str,
     dry_run: bool,
-) -> Path:
+) -> tuple[Path, bool]:
     target = Path(user.pw_dir) / ".config" / "sunshine" / "sunshine.conf"
     if dry_run:
-        return target
+        try:
+            return target, target.read_text(encoding="utf-8") != config_text
+        except UnicodeDecodeError:
+            return target, True
+        except OSError:
+            return target, True
     target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if target.read_text(encoding="utf-8") == config_text:
+            os.chown(target, user.pw_uid, user.pw_gid)
+            os.chmod(target, 0o600)
+            return target, False
+    except FileNotFoundError:
+        pass
+    except UnicodeDecodeError:
+        pass
+    except OSError:
+        pass
     backup = target.with_suffix(target.suffix + ".mde-backup")
     if target.exists() and not backup.exists():
         try:
@@ -684,7 +703,26 @@ def write_user_sunshine_config(
     _atomic_write(target, config_text)
     os.chown(target, user.pw_uid, user.pw_gid)
     os.chmod(target, 0o600)
-    return target
+    return target, True
+
+
+def desktop_user_bus_available(user: pwd.struct_passwd, dry_run: bool) -> bool:
+    return dry_run or Path(f"/run/user/{user.pw_uid}/bus").exists()
+
+
+def sunshine_service_active(
+    user: pwd.struct_passwd,
+    result: dict[str, Any],
+    dry_run: bool,
+) -> bool:
+    if dry_run:
+        return False
+    return _run(
+        user_systemctl_command(user, "is-active", "--quiet"),
+        result,
+        dry_run,
+        env=user_systemctl_env(user),
+    )
 
 
 def reconcile_firewall(
@@ -776,23 +814,36 @@ def apply_lifecycle(
     firewall_ok = reconcile_firewall(lifecycle, state_path, result, dry_run)
     sunshine = lifecycle["sunshine"]
     if sunshine["start_allowed"] and firewall_ok:
-        target = write_user_sunshine_config(user, config_text, dry_run)
+        target, config_changed = write_user_sunshine_config(user, config_text, dry_run)
         result["sunshine"]["config_path"] = str(target)
-        result["sunshine"]["changed"] = True
-        if not Path(f"/run/user/{user.pw_uid}/bus").exists() and not dry_run:
-            result["warnings"].append("Desktop user bus is unavailable; Sunshine restart skipped.")
+        result["sunshine"]["config_changed"] = config_changed
+        if not desktop_user_bus_available(user, dry_run):
+            result["warnings"].append("Desktop user bus is unavailable; Sunshine start skipped.")
             return result
-        if not _run(user_systemctl_command(user, "restart"), result, dry_run, env=user_systemctl_env(user)):
-            result["warnings"].append("Sunshine restart failed.")
+        active = sunshine_service_active(user, result, dry_run)
+        result["sunshine"]["service_active"] = active
+        if active and not config_changed:
+            result["sunshine"]["service_action"] = "unchanged"
+        elif active:
+            result["sunshine"]["changed"] = True
+            result["sunshine"]["service_action"] = "restart"
+            if not _run(user_systemctl_command(user, "restart"), result, dry_run, env=user_systemctl_env(user)):
+                result["warnings"].append("Sunshine restart failed.")
+        else:
+            result["sunshine"]["changed"] = True
+            result["sunshine"]["service_action"] = "start"
+            _run(user_systemctl_command(user, "reset-failed"), result, dry_run, env=user_systemctl_env(user))
+            if not _run(user_systemctl_command(user, "start"), result, dry_run, env=user_systemctl_env(user)):
+                result["warnings"].append("Sunshine start failed.")
     elif sunshine["start_allowed"] and not firewall_ok:
         result["sunshine"]["changed"] = True
         result["warnings"].append("Sunshine start skipped because firewall reconciliation failed.")
-        if Path(f"/run/user/{user.pw_uid}/bus").exists() or dry_run:
+        if desktop_user_bus_available(user, dry_run):
             if not _run(user_systemctl_command(user, "stop"), result, dry_run, env=user_systemctl_env(user)):
                 result["warnings"].append("Sunshine stop failed.")
     elif sunshine["stop_required"] or sunshine["desired_state"] == "blocked":
         result["sunshine"]["changed"] = True
-        if not Path(f"/run/user/{user.pw_uid}/bus").exists() and not dry_run:
+        if not desktop_user_bus_available(user, dry_run):
             result["warnings"].append("Desktop user bus is unavailable; Sunshine stop skipped.")
             return result
         if not _run(user_systemctl_command(user, "stop"), result, dry_run, env=user_systemctl_env(user)):
@@ -860,6 +911,7 @@ def run_self_test() -> None:
         assert "encoder = vaapi" in rendered
         assert "minimum_fps_target = 45" in rendered
         assert "address_family = ipv4" in rendered
+        assert "system_tray = disabled" in rendered
         assert "origin_web_ui_allowed = lan" in rendered
         assert "mde_remote_proofing_enabled" not in rendered
         lifecycle = build_lifecycle(plan, root / "sunshine.conf")
@@ -919,6 +971,23 @@ def run_self_test() -> None:
         assert disabled_lifecycle["sunshine"]["stop_required"]
         assert disabled_lifecycle["firewall"]["desired_state"] == "closed"
         assert desired_firewall_rules(disabled_lifecycle) == []
+
+        fake_user = type(
+            "FakeUser",
+            (),
+            {
+                "pw_dir": str(root / "home"),
+                "pw_uid": os.getuid(),
+                "pw_gid": os.getgid(),
+            },
+        )()
+        target, changed = write_user_sunshine_config(fake_user, "upnp = disabled\n", False)
+        assert changed
+        assert target.read_text(encoding="utf-8") == "upnp = disabled\n"
+        _, changed = write_user_sunshine_config(fake_user, "upnp = disabled\n", False)
+        assert not changed
+        _, changed = write_user_sunshine_config(fake_user, "upnp = enabled\n", True)
+        assert changed
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

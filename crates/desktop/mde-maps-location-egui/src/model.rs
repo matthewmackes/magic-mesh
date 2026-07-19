@@ -174,6 +174,52 @@ impl MapsLocationSurface {
         self.mg90.authenticated = true;
     }
 
+    /// Simulator scenario: the active cellular path degrades enough to record a route dead zone.
+    pub fn simulate_cellular_dead_zone(&mut self) -> bool {
+        self.mg90.status.cellular_a.signal_dbm = -116;
+        self.mg90.status.cellular_a.healthy = false;
+        self.mg90.status.packet_loss_percent = 14.0;
+        self.mg90.status.latency_ms = 260;
+        self.mg90.status.link_quality = "dead-zone candidate".to_string();
+        self.record_dead_zone_from_current_status()
+    }
+
+    /// Append a dead-zone record from the current primary location and active MG90 link.
+    ///
+    /// Returns `false` when the current cellular state is good or no location/link is available.
+    pub fn record_dead_zone_from_current_status(&mut self) -> bool {
+        let severity = self.mg90.status.dead_zone_severity();
+        if severity == DeadZoneSeverity::Good {
+            return false;
+        }
+        let Some(sample) = self.locations.primary_sample().cloned() else {
+            return false;
+        };
+        let Some(link) = self.mg90.status.active_cellular_link() else {
+            return false;
+        };
+
+        let outage_duration_s = match severity {
+            DeadZoneSeverity::Good => 0,
+            DeadZoneSeverity::Weak => 5,
+            DeadZoneSeverity::Degraded => 18,
+            DeadZoneSeverity::Outage => 30,
+        };
+        self.dead_zones.zones.push(DeadZoneRecord {
+            position: format!("{:.4}, {:.4}", sample.latitude, sample.longitude),
+            selected_wan: self.mg90.status.active_wan.clone(),
+            carrier: link.carrier.clone(),
+            technology: link.technology.clone(),
+            signal_dbm: link.signal_dbm,
+            packet_loss_percent: self.mg90.status.packet_loss_percent,
+            latency_ms: self.mg90.status.latency_ms,
+            outage_duration_s,
+            severity,
+        });
+        self.dead_zones.refresh_route_risk();
+        true
+    }
+
     /// True when the motion guard should warn before dangerous changes.
     #[must_use]
     pub fn moving(&self) -> bool {
@@ -901,6 +947,39 @@ impl Mg90Status {
             link_quality: "good".to_string(),
         }
     }
+
+    /// Active cellular link, when the selected WAN is cellular.
+    #[must_use]
+    pub fn active_cellular_link(&self) -> Option<&CellularLink> {
+        match self.active_wan.as_str() {
+            "Cellular A" => Some(&self.cellular_a),
+            "Cellular B" => Some(&self.cellular_b),
+            _ => None,
+        }
+    }
+
+    /// Classify the current active link for route dead-zone recording.
+    #[must_use]
+    pub fn dead_zone_severity(&self) -> DeadZoneSeverity {
+        let Some(link) = self.active_cellular_link() else {
+            return DeadZoneSeverity::Good;
+        };
+        if !link.healthy || self.packet_loss_percent >= 20.0 || link.signal_dbm <= -118 {
+            DeadZoneSeverity::Outage
+        } else if self.packet_loss_percent >= 5.0
+            || self.latency_ms >= 200
+            || link.signal_dbm <= -110
+        {
+            DeadZoneSeverity::Degraded
+        } else if self.packet_loss_percent >= 1.0
+            || self.latency_ms >= 120
+            || link.signal_dbm <= -100
+        {
+            DeadZoneSeverity::Weak
+        } else {
+            DeadZoneSeverity::Good
+        }
+    }
 }
 
 /// Cellular link status.
@@ -1241,7 +1320,11 @@ impl LocationManager {
 
     /// Set primary source manually.
     pub fn set_primary(&mut self, kind: LocationSourceKind) {
-        if self.sources.iter().any(|source| source.kind == kind) {
+        if self
+            .sources
+            .iter()
+            .any(|source| source.kind == kind && source.manual_switch_ready())
+        {
             self.primary = kind;
         }
     }
@@ -1264,9 +1347,9 @@ impl LocationManager {
     #[must_use]
     pub fn primary_warning(&self) -> Option<String> {
         let source = self.primary_source()?;
-        (!source.sample.healthy()).then(|| {
+        source.health_issue().map(|issue| {
             format!(
-                "{} unhealthy: accuracy {:.1} m, update age {:.1} s",
+                "{} unhealthy: {issue}; accuracy {:.1} m, update age {:.1} s",
                 source.kind.label(),
                 source.sample.accuracy_m,
                 source.sample.update_age_s
@@ -1279,7 +1362,7 @@ impl LocationManager {
     pub fn healthy_alternatives(&self) -> Vec<LocationSourceKind> {
         self.sources
             .iter()
-            .filter(|source| source.kind != self.primary && source.sample.healthy())
+            .filter(|source| source.kind != self.primary && source.manual_switch_ready())
             .map(|source| source.kind)
             .collect()
     }
@@ -1363,6 +1446,42 @@ impl LocationSource {
                 update_age_s,
             },
         }
+    }
+
+    /// True when this source is safe to select manually as the primary source.
+    #[must_use]
+    pub fn manual_switch_ready(&self) -> bool {
+        self.health_issue().is_none()
+    }
+
+    /// Operator-facing readiness reason for the manual primary switch button.
+    #[must_use]
+    pub fn manual_switch_reason(&self) -> String {
+        self.health_issue().unwrap_or_else(|| {
+            format!(
+                "ready: connected with {:.1} m accuracy and {:.1} s update age",
+                self.sample.accuracy_m, self.sample.update_age_s
+            )
+        })
+    }
+
+    fn health_issue(&self) -> Option<String> {
+        if self.status != SourceStatus::Connected {
+            return Some(format!("source is {}", self.status.label()));
+        }
+        if self.sample.stale() {
+            return Some(format!(
+                "update is stale at {:.1} s",
+                self.sample.update_age_s
+            ));
+        }
+        if !self.sample.healthy() {
+            return Some(format!(
+                "accuracy {:.1} m exceeds 5.0 m",
+                self.sample.accuracy_m
+            ));
+        }
+        None
     }
 }
 
@@ -1541,9 +1660,35 @@ impl DeadZoneState {
                 packet_loss_percent: 8.0,
                 latency_ms: 220,
                 outage_duration_s: 18,
+                severity: DeadZoneSeverity::Degraded,
             }],
             route_risk: "One known weak segment in next 11 mi".to_string(),
         }
+    }
+
+    fn refresh_route_risk(&mut self) {
+        let outage_count = self
+            .zones
+            .iter()
+            .filter(|zone| zone.severity == DeadZoneSeverity::Outage)
+            .count();
+        let degraded_count = self
+            .zones
+            .iter()
+            .filter(|zone| zone.severity == DeadZoneSeverity::Degraded)
+            .count();
+        self.route_risk = if outage_count > 0 {
+            format!("{outage_count} cellular outage segment(s) recorded on this route")
+        } else if degraded_count > 0 {
+            format!("{degraded_count} degraded cellular segment(s) recorded on this route")
+        } else if self.zones.is_empty() {
+            "No cellular dead zones recorded on this route".to_string()
+        } else {
+            format!(
+                "{} weak cellular segment(s) recorded on this route",
+                self.zones.len()
+            )
+        };
     }
 }
 
@@ -1566,6 +1711,34 @@ pub struct DeadZoneRecord {
     pub latency_ms: u32,
     /// Outage duration.
     pub outage_duration_s: u32,
+    /// Classified route risk severity.
+    pub severity: DeadZoneSeverity,
+}
+
+/// Cellular route-risk severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadZoneSeverity {
+    /// Current active cellular path is suitable.
+    Good,
+    /// Cellular path is usable but weak.
+    Weak,
+    /// Cellular path is degraded enough to warn during route planning.
+    Degraded,
+    /// Cellular path is effectively out or the active link reports unhealthy.
+    Outage,
+}
+
+impl DeadZoneSeverity {
+    /// Human label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Good => "good",
+            Self::Weak => "weak",
+            Self::Degraded => "degraded",
+            Self::Outage => "outage",
+        }
+    }
 }
 
 /// Vehicle telemetry state.
@@ -1885,6 +2058,43 @@ mod tests {
     }
 
     #[test]
+    fn manual_switch_readiness_requires_connected_fresh_accurate_peer() {
+        let mut manager = LocationManager::simulated();
+        manager.sources[1].status = SourceStatus::Disconnected;
+        manager.sources[2].sample.update_age_s = 6.0;
+        manager.sources[3].sample.accuracy_m = 6.0;
+
+        assert!(manager.healthy_alternatives().is_empty());
+        assert!(manager.primary_warning().is_none());
+        assert!(!manager.sources[1].manual_switch_ready());
+        assert!(!manager.sources[2].manual_switch_ready());
+        assert!(!manager.sources[3].manual_switch_ready());
+
+        manager.set_primary(LocationSourceKind::UsbGpsd);
+        assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
+
+        manager.sources[1].status = SourceStatus::Connected;
+        assert_eq!(
+            manager.healthy_alternatives(),
+            vec![LocationSourceKind::UsbGpsd]
+        );
+        manager.set_primary(LocationSourceKind::UsbGpsd);
+        assert_eq!(manager.primary, LocationSourceKind::UsbGpsd);
+    }
+
+    #[test]
+    fn primary_warning_reports_source_status_even_with_healthy_sample() {
+        let mut manager = LocationManager::simulated();
+        manager.sources[0].status = SourceStatus::Unhealthy;
+
+        let warning = manager.primary_warning().expect("status warning");
+        assert!(warning.contains("source is unhealthy"));
+        assert!(manager
+            .healthy_alternatives()
+            .contains(&LocationSourceKind::UsbGpsd));
+    }
+
+    #[test]
     fn offline_navigation_status_is_ready_for_simulated_fixture() {
         let state = MapsLocationSurface::simulated();
         let status = state.offline_navigation_status();
@@ -1988,5 +2198,37 @@ mod tests {
         }
         assert_eq!(mg90.setup_step, SetupStep::Ready);
         assert!(mg90.authenticated);
+    }
+
+    #[test]
+    fn active_mg90_link_classifies_dead_zone_severity() {
+        let mut status = Mg90Status::simulated();
+        assert_eq!(status.dead_zone_severity(), DeadZoneSeverity::Good);
+
+        status.cellular_a.signal_dbm = -104;
+        assert_eq!(status.dead_zone_severity(), DeadZoneSeverity::Weak);
+
+        status.packet_loss_percent = 6.0;
+        assert_eq!(status.dead_zone_severity(), DeadZoneSeverity::Degraded);
+
+        status.cellular_a.healthy = false;
+        assert_eq!(status.dead_zone_severity(), DeadZoneSeverity::Outage);
+    }
+
+    #[test]
+    fn cellular_dead_zone_record_uses_current_location_and_updates_route_risk() {
+        let mut state = MapsLocationSurface::simulated();
+        let initial_zones = state.dead_zones.zones.len();
+
+        assert!(!state.record_dead_zone_from_current_status());
+        assert_eq!(state.dead_zones.zones.len(), initial_zones);
+
+        assert!(state.simulate_cellular_dead_zone());
+        assert_eq!(state.dead_zones.zones.len(), initial_zones + 1);
+        let recorded = state.dead_zones.zones.last().expect("record appended");
+        assert_eq!(recorded.position, "40.4406, -79.9959");
+        assert_eq!(recorded.selected_wan, "Cellular A");
+        assert_eq!(recorded.severity, DeadZoneSeverity::Outage);
+        assert!(state.dead_zones.route_risk.contains("outage"));
     }
 }

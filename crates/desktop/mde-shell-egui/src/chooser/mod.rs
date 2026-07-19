@@ -1398,15 +1398,6 @@ impl ChooserState {
         self.take_connect()
     }
 
-    /// Force an immediate roster re-read now (MENUBAR-ALL — the Desktop bar's
-    /// **View → Refresh Sources**), bypassing the poll cadence. Reuses the SAME
-    /// [`Self::refresh`] the cadence drives (§6, no second read path) and re-arms the
-    /// cadence clock so the next `poll` doesn't immediately re-read.
-    pub(crate) fn refresh_now(&mut self) {
-        self.last_poll = Some(Instant::now());
-        self.refresh();
-    }
-
     /// Re-read the newest published roster and fold it (split from the
     /// cadence gate). A missing record keeps the last-known state — the read
     /// path never blanks a live grid on a transient read miss. Either way the
@@ -2267,11 +2258,12 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     } else {
         crate::backdrop::Coverage::Covered
     };
-    crate::backdrop::show(
-        ui,
-        coverage,
-        status.as_ref().map(|(t, d)| (t.as_str(), d.as_str())),
-    );
+    let status = status.as_ref().map(|(t, d)| (t.as_str(), d.as_str()));
+    if empty {
+        crate::backdrop::show_centered_status(ui, coverage, status);
+    } else {
+        crate::backdrop::show(ui, coverage, status);
+    }
 
     if let Some(err) = state.last_error.as_deref() {
         ui.colored_label(Style::DANGER, err);

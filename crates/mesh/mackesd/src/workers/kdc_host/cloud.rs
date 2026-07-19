@@ -1,17 +1,22 @@
-//! KDC-MESH-8 — fleet OpenStack lifecycle run-commands for the KDC host.
+//! KDC-MESH-8 — fleet cloud lifecycle run-commands for the KDC host.
 //!
 //! Split out of the parent `kdc_host` god-file (behavior-preserving
 //! relocation): the phone-triggered [`CloudCommand`] set that drives the
-//! QC `action/cloud/*` typed Bus verbs by consuming the openstack worker's
-//! PUBLIC interface, never touching the worker. Every action audits #16.
+//! QC `action/cloud/*` typed Bus verbs by consuming the installed provider
+//! adapter's PUBLIC interface, never touching the adapter. Every action audits
+//! #16.
 
 use super::*;
 
-/// How long a phone-triggered cloud Bus round-trip waits for the openstack
-/// worker's reply before honest-gating "cloud unavailable" (no fabricated result).
+/// How long a phone-triggered cloud Bus round-trip waits for the provider
+/// adapter's reply before honest-gating "cloud unavailable" (no fabricated
+/// result).
 const CLOUD_BUS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The fleet OpenStack lifecycle commands the phone can trigger (design #12).
+/// Audit action name for phone-triggered cloud lifecycle work.
+const KDC_CLOUD_AUDIT_ACTION: &str = "kdc_cloud";
+
+/// The fleet cloud lifecycle commands the phone can trigger (design #12).
 ///
 /// Bulk-scoped because stock KDE Connect's run-command sends only a curated
 /// `key` (no instance argument): `List`/`Status` read the roster; `StartAll`/
@@ -21,7 +26,7 @@ const CLOUD_BUS_TIMEOUT: Duration = Duration::from_secs(30);
 /// needs an instance the stock run-command can't carry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CloudCommand {
-    /// List every Nova instance (name + status).
+    /// List every cloud provider instance (name + status).
     List,
     /// Summarize the roster (counts by status).
     Status,
@@ -95,18 +100,19 @@ pub(super) fn cloud_command_entries() -> Vec<RunCmd> {
     .map(|c| RunCmd {
         key: c.key().to_string(),
         name: c.name().to_string(),
-        command: "(mesh OpenStack lifecycle over the Bus)".to_string(),
+        command: "(Cloud provider lifecycle over the Bus)".to_string(),
     })
     .collect()
 }
 
-/// The `openstack server <verb>` Bus verb for a lifecycle action
+/// The provider lifecycle Bus verb for a lifecycle action
 /// (`instance-start` / `instance-stop` / `instance-reboot`).
 pub(super) fn lifecycle_bus_verb(action: LifecycleAction) -> String {
     format!("instance-{}", action.cli_verb())
 }
 
-/// Pick the instances a bulk lifecycle command acts on, filtered by Nova status:
+/// Pick the instances a bulk lifecycle command acts on, filtered by provider
+/// status:
 /// `Start` targets `SHUTOFF` instances, `Stop`/`Reboot` target `ACTIVE` ones,
 /// `Delete` (never phone-exposed) targets none. Pure + testable — the decision
 /// that keeps a start-all from redundantly starting already-running instances.
@@ -157,7 +163,7 @@ pub(super) fn summarize_status(instances: &[CloudInstance]) -> String {
 }
 
 /// One synchronous cloud Bus round-trip: publish `action/cloud/<verb>` with
-/// `body` and poll `reply/<ulid>` until the openstack worker answers or
+/// `body` and poll `reply/<ulid>` until the provider adapter answers or
 /// [`CLOUD_BUS_TIMEOUT`] elapses. Sync (the `Persist` never crosses an await —
 /// it runs inside `spawn_blocking`), consuming the PUBLIC rpc + verb interface.
 /// `None` is an honest gate (no responder / timeout), never a fabricated reply.
@@ -203,12 +209,11 @@ fn run_cloud_command_blocking(cmd: CloudCommand) -> String {
             );
         }
         None => {
-            return "Cloud unavailable (no response — is the openstack worker running?)"
-                .to_string();
+            return "Cloud unavailable (no response from a cloud provider adapter)".to_string();
         }
     };
     audit_kdc_action(json!({
-        "action": "kdc_openstack",
+        "action": KDC_CLOUD_AUDIT_ACTION,
         "verb": "list-instances",
         "count": instances.len(),
     }));
@@ -231,7 +236,7 @@ fn run_cloud_command_blocking(cmd: CloudCommand) -> String {
             Some(r) if r.ok => {
                 done += 1;
                 audit_kdc_action(json!({
-                    "action": "kdc_openstack",
+                    "action": KDC_CLOUD_AUDIT_ACTION,
                     "verb": verb,
                     "instance": name,
                     "audited": r.audited,
@@ -240,7 +245,7 @@ fn run_cloud_command_blocking(cmd: CloudCommand) -> String {
             Some(r) => {
                 failed += 1;
                 audit_kdc_action(json!({
-                    "action": "kdc_openstack",
+                    "action": KDC_CLOUD_AUDIT_ACTION,
                     "verb": verb,
                     "instance": name,
                     "result": "failed",
@@ -250,7 +255,7 @@ fn run_cloud_command_blocking(cmd: CloudCommand) -> String {
             None => {
                 failed += 1;
                 audit_kdc_action(json!({
-                    "action": "kdc_openstack",
+                    "action": KDC_CLOUD_AUDIT_ACTION,
                     "verb": verb,
                     "instance": name,
                     "result": "timeout",

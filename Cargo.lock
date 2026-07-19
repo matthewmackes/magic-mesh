@@ -4454,6 +4454,7 @@ dependencies = [
  "input",
  "khronos-egl",
  "libc",
+ "serde",
  "udev",
 ]
 

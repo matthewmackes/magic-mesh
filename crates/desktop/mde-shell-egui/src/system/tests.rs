@@ -126,6 +126,62 @@ fn render_settings_choice_frame(ctx: &egui::Context, selected: bool) -> egui::Fu
     )
 }
 
+fn render_wallpaper_section_frame(ctx: &egui::Context) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(520.0, 280.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let mut config = WallpaperServiceConfig::default();
+                    let mut download = WallpaperDownloadRuntime::default();
+                    let mut actions = Vec::new();
+                    wallpaper_section(ui, &mut config, &mut download, &mut actions);
+                });
+        },
+    )
+}
+
+fn render_settings_combo_popup_frame(ctx: &egui::Context) -> egui::FullOutput {
+    fn input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 180.0))),
+            ..Default::default()
+        }
+    }
+
+    fn show_popup(ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                ui.set_width(240.0);
+                settings_popup_visual_scope(ui, |ui| {
+                    let popup_id = ui.make_persistent_id("settings-popup-choice-test");
+                    let response = ui.button("Right");
+                    ui.memory_mut(|mem| mem.open_popup(popup_id));
+                    let _ = egui::popup::popup_above_or_below_widget(
+                        ui,
+                        popup_id,
+                        &response,
+                        egui::AboveOrBelow::Below,
+                        egui::popup::PopupCloseBehavior::IgnoreClicks,
+                        |ui| {
+                            apply_settings_popup_style(ui.style_mut());
+                            let _ = ui.selectable_label(false, "Left");
+                            let _ = ui.selectable_label(true, "Right");
+                        },
+                    );
+                });
+            });
+    }
+
+    let _ = ctx.run(input(), show_popup);
+    ctx.run(input(), show_popup)
+}
+
 #[test]
 fn the_pre_poll_state_is_a_full_paint_not_a_blank_panel() {
     let mut st = SystemState::default();
@@ -245,6 +301,129 @@ fn settings_choice_tiles_use_themed_selected_and_hover_colors() {
     assert!(
         fills.contains(&Style::WIN2000_PRESSED_FACE),
         "selected Settings choices should paint their own selected fill: {fills:?}"
+    );
+}
+
+#[test]
+fn wallpaper_service_defaults_enable_bing_fallback_and_round_trip() {
+    let cfg = WallpaperServiceConfig::default();
+    assert!(cfg.network_fetch_enabled);
+    assert!(cfg.bing_daily_enabled);
+    assert!(cfg.desktop_page_url.is_empty());
+
+    let dir = nav_temp_dir("wallpaper-service");
+    let path = dir.join("settings-wallpaper-service.json");
+    let changed = WallpaperServiceConfig {
+        network_fetch_enabled: false,
+        bing_daily_enabled: true,
+        desktop_page_url: "  http://127.0.0.1:8787/  ".to_owned(),
+        last_image_path: Some(dir.join("wallpaper-cache").join("bing.jpg")),
+        last_image_title: "  Today  ".to_owned(),
+        last_image_copyright: "  Credit  ".to_owned(),
+        last_updated_ms: 42,
+    };
+    changed.save_to(&path).expect("save wallpaper service");
+    let loaded = WallpaperServiceConfig::load_from(&path);
+    assert!(!loaded.network_fetch_enabled);
+    assert!(loaded.bing_daily_enabled);
+    assert_eq!(loaded.desktop_page_url, "http://127.0.0.1:8787/");
+    assert_eq!(loaded.last_image_title, "Today");
+    assert_eq!(loaded.last_image_copyright, "Credit");
+    assert_eq!(loaded.last_updated_ms, 42);
+}
+
+#[test]
+fn bing_daily_archive_parser_resolves_relative_image_url() {
+    let value: serde_json::Value = serde_json::json!({
+        "images": [{
+            "url": "/th?id=OHR.TestImage_EN-US1234567890_1920x1080.jpg&rf=LaDigue_1920x1080.jpg",
+            "title": "Lake",
+            "copyright": "Lake credit"
+        }]
+    });
+    let image = bing_daily_image_from_archive(&value).expect("parse bing metadata");
+    assert_eq!(
+        image.image_url,
+        "https://www.bing.com/th?id=OHR.TestImage_EN-US1234567890_1920x1080.jpg&rf=LaDigue_1920x1080.jpg"
+    );
+    assert_eq!(image.title, "Lake");
+    assert_eq!(image.copyright, "Lake credit");
+}
+
+#[test]
+fn wallpaper_section_renders_bing_service_instead_of_static_gallery() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    mde_egui::fonts::install(&ctx);
+    let out = render_wallpaper_section_frame(&ctx);
+    let texts = painted_text(&out.shapes);
+
+    for label in [
+        "Desktop background service",
+        "Allow daily picture downloads",
+        "Use Bing image of the day as fallback",
+        "Download today's picture",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == label),
+            "Wallpaper service label {label:?} was not painted: {texts:?}"
+        );
+    }
+    assert!(
+        !texts.iter().any(|(text, _)| text.starts_with("Wallpaper 1")
+            || text.starts_with("Wallpaper 2")
+            || text.starts_with("Wallpaper 3")
+            || text.starts_with("Wallpaper 4")
+            || text.starts_with("Wallpaper 5")),
+        "retired static wallpaper gallery labels should not render: {texts:?}"
+    );
+}
+
+#[test]
+fn settings_combobox_popups_use_themed_readable_choice_colors() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    mde_egui::fonts::install(&ctx);
+
+    let mut style = (*ctx.style()).clone();
+    apply_settings_popup_style(&mut style);
+    assert_eq!(style.visuals.window_fill, Style::SURFACE);
+    assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+    assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+    assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.active.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.active.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.open.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.bg_stroke.color, Style::BORDER);
+    assert_eq!(
+        style.visuals.widgets.noninteractive.fg_stroke.color,
+        Style::TEXT_DIM
+    );
+
+    let out = render_settings_combo_popup_frame(&ctx);
+    let texts = painted_text(&out.shapes);
+    for label in ["Left", "Right"] {
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == label && *color == Style::TEXT),
+            "Settings ComboBox choice {label:?} should paint themed text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == label && *color == egui::Color32::BLACK),
+            "Settings ComboBox choice {label:?} leaked raw black popup text: {texts:?}"
+        );
+    }
+
+    let fills = painted_fill_colors(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Settings ComboBox popup should paint the Settings surface: {fills:?}"
     );
 }
 
@@ -1151,6 +1330,11 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         "dark mode preserves the current status-quo interface by default"
     );
     assert_eq!(AppearanceConfig::default().accent, AccentChoice::Brand);
+    assert_eq!(
+        AppearanceConfig::default().layout_profile,
+        LayoutProfile::Workstation,
+        "Windows 2000 Workstation is the fresh-install layout"
+    );
     assert_eq!(AppearanceConfig::default().text_scale, TextScale::Default);
     assert_eq!(
         AppearanceConfig::default().motion_mode,
@@ -1165,6 +1349,7 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
     let cfg = AppearanceConfig {
         color_scheme: AppearanceColorScheme::Light,
         accent: AccentChoice::Green,
+        layout_profile: LayoutProfile::Car,
         text_scale: TextScale::Larger,
         motion_mode: AppearanceMotionMode::Disabled,
         taskbar_autohide: true,
@@ -1174,6 +1359,11 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
     assert_eq!(back, cfg, "the appearance round-trips through disk");
     assert_eq!(back.accent, AccentChoice::Green);
     assert_eq!(back.text_scale, TextScale::Larger);
+    assert_eq!(
+        back.layout_profile,
+        LayoutProfile::Car,
+        "the layout profile pick round-trips through disk"
+    );
     assert_eq!(
         back.motion_mode,
         AppearanceMotionMode::Disabled,
@@ -1196,6 +1386,10 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
     assert!(
         json.contains("\"motion_mode\": \"disabled\""),
         "the new runtime mode is persisted explicitly: {json}"
+    );
+    assert!(
+        json.contains("\"layout_profile\": \"car\""),
+        "the layout profile is persisted explicitly: {json}"
     );
     assert!(
         json.contains("\"taskbar_autohide\": true"),
@@ -1235,6 +1429,11 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
         "the absent color-mode field folds to dark"
     );
     assert_eq!(
+        cfg.layout_profile,
+        LayoutProfile::Workstation,
+        "the absent layout-profile field folds to Windows 2000 Workstation"
+    );
+    assert_eq!(
         cfg.motion_mode,
         AppearanceMotionMode::Normal,
         "the absent motion-mode field folds to Normal"
@@ -1264,6 +1463,11 @@ fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
         cfg.color_scheme,
         AppearanceColorScheme::Dark,
         "legacy appearance configs keep the dark status-quo palette"
+    );
+    assert_eq!(
+        cfg.layout_profile,
+        LayoutProfile::Workstation,
+        "legacy appearance configs keep the Windows 2000 Workstation layout"
     );
     assert!(
         !cfg.taskbar_autohide,
@@ -1306,6 +1510,46 @@ fn appearance_taskbar_autohide_preference_is_exposed_to_shell_chrome() {
 }
 
 #[test]
+fn appearance_layout_profile_drives_live_density() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    assert_eq!(
+        Style::density(&ctx),
+        LayoutProfile::Workstation.density(),
+        "the installed default is the Windows 2000 Workstation density"
+    );
+
+    let mut st = SystemState {
+        appearance: AppearanceConfig {
+            layout_profile: LayoutProfile::Car,
+            ..AppearanceConfig::default()
+        },
+        ..SystemState::default()
+    };
+    st.poll(&ctx);
+    assert_eq!(
+        st.layout_profile(),
+        LayoutProfile::Car,
+        "SystemState exposes the persisted profile to shell chrome"
+    );
+    assert_eq!(
+        st.layout_density(),
+        LayoutProfile::Car.density(),
+        "the shell mirrors the profile-selected density"
+    );
+    assert_eq!(
+        Style::density(&ctx),
+        LayoutProfile::Car.density(),
+        "poll applies the profile density to the live context"
+    );
+    assert_eq!(
+        ctx.style().spacing.interact_size.y,
+        LayoutProfile::Car.density().min_hit_target(),
+        "Car mode installs the larger touch hit target"
+    );
+}
+
+#[test]
 fn the_theme_accent_choice_retints_the_live_context_on_poll() {
     // The apply seam is real: with a persisted accent pick, one poll re-tints the
     // live egui interactive accent (observable in the context's visuals) — not a
@@ -1317,6 +1561,7 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
         appearance: AppearanceConfig {
             color_scheme: AppearanceColorScheme::Dark,
             accent: AccentChoice::Green,
+            layout_profile: LayoutProfile::Workstation,
             text_scale: TextScale::Default,
             motion_mode: AppearanceMotionMode::Normal,
             taskbar_autohide: false,
@@ -1403,6 +1648,7 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
         appearance: AppearanceConfig {
             color_scheme: AppearanceColorScheme::Dark,
             accent: AccentChoice::default(),
+            layout_profile: LayoutProfile::Workstation,
             text_scale: TextScale::Larger,
             motion_mode: AppearanceMotionMode::Normal,
             taskbar_autohide: false,

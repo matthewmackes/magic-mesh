@@ -29,6 +29,7 @@ accesskit = ["eframe/accesskit", "egui/accesskit"]
 # live-region consumer without forcing it onto headless/default builds.
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayland", "default_fonts"] }
 egui   = "0.31"
+serde  = { workspace = true }
 
 # --- E12-2 bare-seat (DRM/KMS) backend — optional, enabled by `--features drm`.
 # Native deps: libdrm, libgbm, libEGL/libGLESv2, libinput, libudev. Versions are

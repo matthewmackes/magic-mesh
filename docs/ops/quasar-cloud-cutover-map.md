@@ -5,6 +5,13 @@
 > replaced-vs-kept map: what to expect at cutover, in migration terms. The
 > design doc's table is the maintained source; this note explains the
 > consequences.
+>
+> **Provider-neutral runway note, 2026-07-18:** this document describes the
+> installed OpenStack/Kolla backend and the earlier cutover from the retired VM
+> stack. It is no longer the product architecture target by itself. Current
+> Construct Cloud work must move shell surfaces, Bus contracts, persisted
+> mirrors, and operator copy toward provider-neutral cloud contracts where this
+> OpenStack path is one compatibility adapter.
 
 ## Cutover semantics (read first)
 

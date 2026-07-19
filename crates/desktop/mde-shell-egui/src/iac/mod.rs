@@ -87,6 +87,18 @@ const HEAT_DELETE_VERB: &str = "heat-delete";
 /// tab is live only when the catalog advertises it (else an honest "no Heat").
 const HEAT_SERVICE: &str = "orchestration";
 
+/// User-facing cloud product name. Backend-specific names stay behind the Bus
+/// and shared payload contracts so later providers can satisfy the same UI seam.
+pub(super) const CLOUD_PRODUCT_LABEL: &str = "Construct Cloud";
+const CLOUD_PROVIDER_TITLE: &str = "Cloud provider";
+const CLOUD_API_STATUS_LABEL: &str = "Cloud API status";
+const ORCHESTRATION_TAB_LABEL: &str = "Orchestration";
+const REVERSE_GENERATED_TEMPLATE_LABEL: &str = "Reverse-generated template";
+const ORCHESTRATION_TEMPLATE_LABEL: &str = "Template";
+const HEAT_TOOLBAR_BUTTON_H: f32 = Style::TOOLBAR_CONTROL_H;
+const HEAT_TOOLBAR_BUTTON_MIN_W: f32 = Style::SP_XL * 3.0;
+const HEAT_TOOLBAR_BUTTON_MAX_W: f32 = Style::SP_XL * 6.0;
+
 /// The live-health auto-poll cadence (design Q12, ~15 s): how long a settled
 /// catalog is kept before a fresh request goes out (when auto-refresh is on).
 const CATALOG_REFRESH: Duration = Duration::from_secs(15);
@@ -506,8 +518,8 @@ impl InfraCodeState {
                 // clobbered by a transient miss).
                 if matches!(self.outcome, CatalogOutcome::Querying) {
                     self.outcome = CatalogOutcome::Failed(
-                        "the cloud catalog service did not respond — OpenStack may not be running \
-                         on this node"
+                        "the cloud catalog service did not respond — the cloud provider may not \
+                         be running on this node"
                             .to_string(),
                     );
                 }
@@ -737,7 +749,7 @@ impl InfraCodeState {
                 }
                 self.heat.show_for = None;
             } else if sent.elapsed() >= REQUEST_TIMEOUT {
-                self.note = Some("the cloud did not answer the Heat request".to_string());
+                self.note = Some("the cloud did not answer the orchestration request".to_string());
                 self.heat.mutation_pending = None;
             }
         }
@@ -1119,7 +1131,7 @@ fn fold_heat<T>(
 ) -> HeatOutcome<T> {
     if reply.ok {
         payload(&reply).map_or_else(
-            || HeatOutcome::Failed("the Heat reply carried no payload".to_string()),
+            || HeatOutcome::Failed("the orchestration reply carried no payload".to_string()),
             HeatOutcome::Ready,
         )
     } else if let Some(gated) = reply.gated {
@@ -1127,7 +1139,7 @@ fn fold_heat<T>(
     } else if let Some(error) = reply.error {
         HeatOutcome::Failed(error)
     } else {
-        HeatOutcome::Failed("the Heat request was rejected".to_string())
+        HeatOutcome::Failed("the orchestration request was rejected".to_string())
     }
 }
 
@@ -1136,17 +1148,23 @@ fn fold_heat<T>(
 fn heat_mutation_note(reply: &CatalogReply) -> String {
     if reply.ok {
         reply.stack.as_ref().map_or_else(
-            || "Heat request completed.".to_string(),
-            |s| format!("Heat request completed on {s}."),
+            || "Orchestration request completed.".to_string(),
+            |s| format!("Orchestration request completed on {s}."),
         )
     } else if let Some(gated) = &reply.gated {
-        format!("Heat request gated: {gated}")
+        format!("Orchestration request gated: {gated}")
     } else {
         format!(
-            "Heat request failed: {}",
+            "Orchestration request failed: {}",
             reply.error.as_deref().unwrap_or("unknown error")
         )
     }
+}
+
+/// Provider-neutral user-facing copy for a backend gate. The reason remains
+/// verbatim so operator diagnostics such as `clouds.yaml` still surface.
+fn cloud_provider_not_configured(reason: &str) -> String {
+    format!("{CLOUD_PROVIDER_TITLE} not configured \u{2014} {reason}")
 }
 
 /// The typed-arming gate (#22): the operator's echo, trimmed, must equal the
@@ -1215,7 +1233,7 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut InfraCodeState) {
         for (tab, label) in [
             (IacTab::Overview, "Overview"),
             (IacTab::Resources, "Resources"),
-            (IacTab::Heat, "Heat"),
+            (IacTab::Heat, ORCHESTRATION_TAB_LABEL),
         ] {
             let selected = state.tab == tab;
             let color = if selected {
@@ -1258,10 +1276,10 @@ fn render_catalog_absent(ui: &mut egui::Ui, outcome: &CatalogOutcome) {
         CatalogOutcome::Querying => crate::session::empty_state(
             ui,
             "Querying the cloud catalog",
-            "Reading the Keystone service directory from the mesh cloud control plane\u{2026}",
+            "Reading the identity provider service directory from Construct Cloud\u{2026}",
         ),
         CatalogOutcome::NotConfigured(reason) => {
-            crate::session::empty_state(ui, "OpenStack not configured", reason);
+            crate::session::empty_state(ui, "Cloud provider not configured", reason);
         }
         CatalogOutcome::Failed(reason) => {
             ui.colored_label(Style::DANGER, RichText::new(reason).size(Style::SMALL));
@@ -1269,7 +1287,7 @@ fn render_catalog_absent(ui: &mut egui::Ui, outcome: &CatalogOutcome) {
             crate::session::empty_state(
                 ui,
                 "Cloud catalog unavailable",
-                "The OpenStack control plane appears here once the mesh cloud answers.",
+                "Construct Cloud appears here once the cloud provider answers.",
             );
         }
         CatalogOutcome::Ready(_) => {}
@@ -1297,9 +1315,9 @@ fn render_heat_tab(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     if catalog.service(HEAT_SERVICE).is_none() {
         crate::session::empty_state(
             ui,
-            "No Heat orchestration service",
-            "The Keystone catalog advertises no orchestration (Heat) endpoint on this cloud, so \
-             there is no native IaC engine to drive here.",
+            "No orchestration service",
+            "The cloud provider catalog advertises no orchestration endpoint, so there is no \
+             native IaC engine to drive here.",
         );
         return;
     }
@@ -1318,20 +1336,52 @@ fn render_heat_tab(ui: &mut egui::Ui, state: &mut InfraCodeState) {
 /// The Heat toolbar: reverse-generate (capture reality as code, #5) + the
 /// new-stack form toggle.
 fn render_heat_toolbar(ui: &mut egui::Ui, state: &mut InfraCodeState) {
-    ui.horizontal(|ui| {
-        if ui.button("Reverse-generate template").clicked() {
-            state.send_heat_reverse();
-        }
-        let label = if state.heat.show_create {
-            "Close new-stack form"
-        } else {
-            "New stack\u{2026}"
-        };
-        if ui.button(label).clicked() {
-            state.heat.show_create = !state.heat.show_create;
-        }
-    });
-    ui.add_space(Style::SP_XS);
+    egui::Frame::NONE
+        .fill(Style::LAYER_01)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
+        .inner_margin(Style::toolbar_margin())
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = Style::SP_XS;
+                if heat_toolbar_button(ui, "Reverse-generate template").clicked() {
+                    state.send_heat_reverse();
+                }
+                let label = if state.heat.show_create {
+                    "Close new-stack form"
+                } else {
+                    "New stack\u{2026}"
+                };
+                if heat_toolbar_button(ui, label).clicked() {
+                    toggle_heat_create_form(state);
+                }
+            });
+        });
+    ui.add_space(Style::TOOLBAR_INSET_Y);
+}
+
+fn heat_toolbar_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let response = ui.add_sized(
+        heat_toolbar_button_size(label),
+        egui::Button::new(RichText::new(label).size(Style::SMALL).color(Style::TEXT))
+            .fill(Style::SURFACE_HI)
+            .stroke(egui::Stroke::new(1.0, Style::BORDER))
+            .corner_radius(Style::RADIUS_S),
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    response
+}
+
+fn heat_toolbar_button_size(label: &str) -> egui::Vec2 {
+    let text_w = label.chars().count() as f32 * Style::SMALL * 0.58;
+    egui::vec2(
+        (text_w + Style::SP_M * 2.0).clamp(HEAT_TOOLBAR_BUTTON_MIN_W, HEAT_TOOLBAR_BUTTON_MAX_W),
+        HEAT_TOOLBAR_BUTTON_H,
+    )
+}
+
+fn toggle_heat_create_form(state: &mut InfraCodeState) {
+    state.heat.show_create = !state.heat.show_create;
 }
 
 /// The reverse-generated HOT template output (#5) — a copyable monospace view, or
@@ -1340,11 +1390,11 @@ fn render_heat_reverse_output(ui: &mut egui::Ui, state: &InfraCodeState) {
     let Some(outcome) = state.heat.reverse.clone() else {
         return;
     };
-    egui::CollapsingHeader::new("Reverse-generated HOT template")
+    egui::CollapsingHeader::new(REVERSE_GENERATED_TEMPLATE_LABEL)
         .default_open(true)
         .show(ui, |ui| match &outcome {
             HeatOutcome::NotConfigured(reason) => {
-                mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+                mde_egui::muted_note(ui, cloud_provider_not_configured(reason));
             }
             HeatOutcome::Failed(reason) => {
                 ui.colored_label(
@@ -1414,7 +1464,7 @@ fn render_heat_create_form(ui: &mut egui::Ui, state: &mut InfraCodeState) {
                 );
             });
             ui.label(
-                RichText::new("Template (HOT)")
+                RichText::new(ORCHESTRATION_TEMPLATE_LABEL)
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
             );
@@ -1457,7 +1507,7 @@ fn render_heat_stack_list(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     {
         Some(ResourceOutcome::Ready(t)) => t.clone(),
         Some(ResourceOutcome::NotConfigured(reason)) => {
-            mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+            mde_egui::muted_note(ui, cloud_provider_not_configured(reason));
             return;
         }
         Some(ResourceOutcome::Failed(reason)) => {
@@ -1545,7 +1595,7 @@ fn render_heat_detail(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     let detail = match &state.heat.detail {
         Some(HeatOutcome::Ready(d)) => d.clone(),
         Some(HeatOutcome::NotConfigured(reason)) => {
-            mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+            mde_egui::muted_note(ui, cloud_provider_not_configured(reason));
             return;
         }
         Some(HeatOutcome::Failed(reason)) => {
@@ -1579,7 +1629,7 @@ fn render_heat_detail(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     render_heat_sections(ui, &detail);
 
     // The editable template buffer — Preview / Update act on it.
-    egui::CollapsingHeader::new("Template (HOT)")
+    egui::CollapsingHeader::new(ORCHESTRATION_TEMPLATE_LABEL)
         .default_open(true)
         .show(ui, |ui| {
             mde_egui::muted_note(
@@ -1647,7 +1697,7 @@ fn render_heat_preview(ui: &mut egui::Ui, state: &InfraCodeState) {
             );
             match &outcome {
                 HeatOutcome::NotConfigured(reason) => {
-                    mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+                    mde_egui::muted_note(ui, cloud_provider_not_configured(reason));
                 }
                 HeatOutcome::Failed(reason) => {
                     ui.colored_label(
@@ -2057,7 +2107,7 @@ fn render_service_section(
             mde_egui::muted_note(ui, "querying resources\u{2026}");
         }
         Some(ResourceOutcome::NotConfigured(reason)) => {
-            mde_egui::muted_note(ui, format!("OpenStack not configured \u{2014} {reason}"));
+            mde_egui::muted_note(ui, cloud_provider_not_configured(reason));
         }
         Some(ResourceOutcome::Failed(reason)) => {
             ui.colored_label(
@@ -2163,10 +2213,10 @@ fn render_overview(ui: &mut egui::Ui, view: &CatalogView, show_urls: bool) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // ── the OpenStack API status band ──
-            section_header(ui, "OpenStack API status");
+            // ── the provider-neutral API status band ──
+            section_header(ui, CLOUD_API_STATUS_LABEL);
             if view.catalog.services.is_empty() {
-                mde_egui::muted_note(ui, "the Keystone catalog advertises no services");
+                mde_egui::muted_note(ui, "the cloud provider catalog advertises no services");
             } else {
                 ui.horizontal_wrapped(|ui| {
                     for svc in &view.catalog.services {

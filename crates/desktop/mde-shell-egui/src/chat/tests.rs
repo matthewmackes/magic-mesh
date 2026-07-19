@@ -1,6 +1,7 @@
 use super::render::*;
 use super::*;
 use mde_chat::{Message, MessageId, NodeRole};
+use mde_theme::brand::icons::IconId;
 
 /// A message with a FIXED id so dedup + canonical order are deterministic
 /// across the perf-5 fold/rebuild tests (the real `Message::text` mints a
@@ -15,6 +16,72 @@ fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
     fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
         match shape {
             egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text_color(text))),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Mesh(mesh) => {
+                out.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+            }
+            egui::Shape::Path(path) => {
+                if path.fill != egui::Color32::TRANSPARENT {
+                    out.push(path.fill);
+                }
+            }
+            egui::Shape::Rect(rect) => {
+                if rect.fill != egui::Color32::TRANSPARENT {
+                    out.push(rect.fill);
+                }
+            }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, out);
@@ -206,6 +273,87 @@ fn chat_mute_button_uses_yamis_icon_instead_of_bell_emoji_text() {
 }
 
 #[test]
+fn chat_hover_tooltip_uses_themed_text_and_surface() {
+    use mde_egui::egui::{pos2, vec2, Rect};
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                chat_tooltip(ui, "Re-copy to clipboard");
+            });
+    });
+
+    let texts = painted_text_colors(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "Re-copy to clipboard" && *color == Style::TEXT),
+        "Chat tooltip should paint themed text: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, color)| text == "Re-copy to clipboard" && *color == egui::Color32::BLACK),
+        "Chat tooltip leaked raw black popup text: {texts:?}"
+    );
+
+    let fills = painted_fill_colors(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Chat tooltip should paint its own themed surface: {fills:?}"
+    );
+}
+
+#[test]
+fn chat_action_buttons_use_yamis_icons_instead_of_emoji_pseudo_icons() {
+    use mde_egui::egui::{pos2, vec2, Rect};
+
+    assert_eq!(CHAT_CALL_ICON, IconId::Phones);
+    assert_eq!(CHAT_REMOTE_ICON, IconId::Sessions);
+    assert_eq!(CHAT_STATUS_EDIT_ICON, IconId::TextEdit);
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(560.0, 180.0))),
+        ..Default::default()
+    };
+    let mut err = None;
+    let mut state = ChatState::default();
+    let roster = Roster::new("eagle");
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                contact_actions(ui, None, "nyc3", false, &mut err);
+                ui.separator();
+                state.self_line(ui, &roster);
+            });
+    });
+
+    let texts = painted_text(&out.shapes);
+    for expected in ["Call", "Remote Control", "Mute", "Edit"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "{expected} action label was not painted: {texts:?}"
+        );
+    }
+    assert!(
+        texts.iter().all(|text| {
+            !text.contains('\u{1F4DE}') && !text.contains('\u{1F5A5}') && !text.contains('\u{270E}')
+        }),
+        "Chat actions leaked emoji/text pseudo-icons: {texts:?}"
+    );
+}
+
+#[test]
 fn presence_and_severity_map_to_style_tokens_not_raw_hex() {
     assert_eq!(presence_color(Presence::Online), Style::OK);
     assert_eq!(presence_color(Presence::Dnd), Style::DANGER);
@@ -240,6 +388,74 @@ fn empty_copy_distinguishes_a_missing_bus_from_an_empty_roster() {
     let (title, subtitle) = empty_copy(false);
     assert_eq!(title, "Chat unavailable");
     assert!(subtitle.contains("Bus") && subtitle.contains("unblocks"));
+}
+
+#[test]
+fn contacts_pane_titles_use_refined_header_size() {
+    assert_eq!(
+        CHAT_PANE_TITLE,
+        Style::HEADING - 2.0,
+        "Contacts pane headers should be two points smaller than the old heading rung"
+    );
+    assert!(
+        Style::TITLE < CHAT_PANE_TITLE && CHAT_PANE_TITLE < Style::HEADING,
+        "Contacts pane headers should sit between section title and old oversized heading text"
+    );
+}
+
+#[test]
+fn contacts_layout_reserves_quarter_width_for_roster_and_keeps_messages_onscreen() {
+    use mde_egui::egui::{pos2, vec2, Rect};
+
+    assert_eq!(chat_split_widths(1000.0), (250.0, 750.0));
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+
+    let mut state = ChatState::default();
+    let mut roster = Roster::new("eagle");
+    roster.upsert(Contact::new("nyc3", NodeRole::Headless).with_presence(Presence::Online));
+    roster.upsert(Contact::new("fra1", NodeRole::Headless).with_presence(Presence::Offline));
+    state.roster = Some(roster);
+    let mut conv = Conversation::new("nyc3");
+    conv.insert(Message::text("nyc3", 20, "layout check"));
+    state.convos.insert("nyc3".into(), conv);
+
+    let viewport = vec2(1000.0, 640.0);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), viewport)),
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                ui.push_id("shell-chat-layout", |ui| state.show(ui));
+            });
+    });
+
+    let roster_rect = ctx
+        .read_response(chat_roster_pane_id())
+        .expect("Contacts roster pane registers its bounded layout rect")
+        .rect;
+    let message_rect = ctx
+        .read_response(chat_message_pane_id())
+        .expect("Messages pane registers its bounded layout rect")
+        .rect;
+    let combined_width = message_rect.right() - roster_rect.left();
+    let roster_ratio = roster_rect.width() / combined_width;
+    assert!(
+        (roster_ratio - 0.25).abs() < 0.01,
+        "Contacts roster should be 25% of the two-pane body: roster={roster_rect:?} messages={message_rect:?}"
+    );
+    assert!(
+        roster_rect.right() <= message_rect.left() + 1.0,
+        "Messages pane should start after the Contacts roster without overlap: roster={roster_rect:?} messages={message_rect:?}"
+    );
+    assert!(
+        message_rect.right() <= viewport.x + 1.0,
+        "Messages pane must stay inside the viewport instead of rendering off the right edge: {message_rect:?}"
+    );
 }
 
 /// Headless mount + tessellate: build a populated roster + conversation and
@@ -373,13 +589,14 @@ fn home_overview_renders_activity_without_marking_notifications_read() {
     });
     let texts = painted_text(&out.shapes);
     for expected in [
-        "Chat activity",
+        "Contacts",
+        "Messages",
         "1 unread",
         "Peers",
         "Online",
         "Alerts",
         "Rooms",
-        "Latest notifications",
+        "Recent messages",
         "disk critical",
         "Open notifications",
     ] {

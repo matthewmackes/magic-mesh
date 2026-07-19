@@ -71,6 +71,7 @@ use crate::highlight::{HighlightSpan, Highlighter};
 use crate::lsp_ui::{severity_color, DiagnosticsOverlay};
 use crate::md_actions::MdOutcome;
 use crate::spell::SpellMarks;
+use crate::tooltip::editor_hover_text;
 
 /// Soft-tab width: a Tab keypress inserts this many spaces (the editor is
 /// spaces-by-default, the common Rust convention). Not a metric — a text unit.
@@ -2231,8 +2232,7 @@ fn paint_diagnostic_underlines(
         // mark so egui never sees a duplicate interaction this frame).
         let rect = Rect::from_min_max(pos2(left, y), pos2(right, y + m.row_h));
         let id = ui.id().with(("mde-editor-diag", vr, i));
-        ui.interact(rect, id, Sense::hover())
-            .on_hover_text(mark.message.as_str());
+        editor_hover_text(ui.interact(rect, id, Sense::hover()), mark.message.as_str());
     }
 }
 
@@ -2283,7 +2283,7 @@ fn paint_spell_underlines(
                 miss.suggestions.join(", ")
             )
         };
-        ui.interact(rect, id, Sense::hover()).on_hover_text(hover);
+        editor_hover_text(ui.interact(rect, id, Sense::hover()), hover);
     }
 }
 

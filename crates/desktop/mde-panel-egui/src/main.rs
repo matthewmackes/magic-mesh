@@ -39,6 +39,7 @@ const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
 /// One full pip-pulse period (seconds), derived from the shared [`Motion`] table
 /// so the cadence stays on the harness timing scale, not a bespoke literal.
 const PIP_PULSE_SECS: f64 = Motion::SLOW as f64 * 4.0;
+const PANEL_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 /// The eframe panel: the live model plus the small IO context needed to refresh
 /// and persist it.
@@ -170,7 +171,7 @@ impl Panel {
             .inner;
 
         if let Some(tip) = tooltip {
-            let _ = resp.on_hover_text(tip);
+            let _ = panel_hover_text(resp, tip);
         }
     }
 
@@ -223,6 +224,29 @@ impl Panel {
             self.toggle_dnd();
         }
     }
+}
+
+fn panel_tooltip(ui: &mut egui::Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(PANEL_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn panel_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| panel_tooltip(ui, text.as_str()))
 }
 
 impl eframe::App for Panel {
@@ -296,7 +320,95 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_dnd, now_unix_ms};
+    use super::{load_dnd, now_unix_ms, panel_tooltip};
+    use mde_egui::Style;
+
+    fn painted_text_colors(
+        shapes: &[mde_egui::egui::epaint::ClippedShape],
+    ) -> Vec<(String, mde_egui::egui::Color32)> {
+        fn text_color(text: &mde_egui::egui::epaint::TextShape) -> mde_egui::egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != mde_egui::egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &mde_egui::egui::Shape, out: &mut Vec<(String, mde_egui::egui::Color32)>) {
+            match shape {
+                mde_egui::egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)))
+                }
+                mde_egui::egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(
+        shapes: &[mde_egui::egui::epaint::ClippedShape],
+    ) -> Vec<mde_egui::egui::Color32> {
+        fn walk(shape: &mde_egui::egui::Shape, out: &mut Vec<mde_egui::egui::Color32>) {
+            match shape {
+                mde_egui::egui::Shape::Rect(rect) => {
+                    if rect.fill != mde_egui::egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                mde_egui::egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_panel_tooltip_frame(
+        ctx: &mde_egui::egui::Context,
+        text: &str,
+    ) -> mde_egui::egui::FullOutput {
+        ctx.run(
+            mde_egui::egui::RawInput {
+                screen_rect: Some(mde_egui::egui::Rect::from_min_size(
+                    mde_egui::egui::Pos2::ZERO,
+                    mde_egui::egui::vec2(360.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                mde_egui::egui::CentralPanel::default()
+                    .frame(mde_egui::egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        panel_tooltip(ui, text);
+                    });
+            },
+        )
+    }
 
     #[test]
     fn now_unix_ms_is_positive() {
@@ -308,5 +420,37 @@ mod tests {
     fn load_dnd_without_a_bus_root_is_off() {
         // No bus dir → the safe default (DND off), never a panic.
         assert!(!load_dnd(None).active);
+    }
+
+    #[test]
+    fn panel_pip_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        let ctx = mde_egui::egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            mde_egui::StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        let tooltip = "Waiting for mesh status";
+        let out = render_panel_tooltip_frame(&ctx, tooltip);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == tooltip && *color == text_color),
+            "panel tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            text_color != surface,
+            "panel tooltip text and surface must stay distinct in light mode"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "panel tooltip should paint its themed surface: {fills:?}"
+        );
     }
 }

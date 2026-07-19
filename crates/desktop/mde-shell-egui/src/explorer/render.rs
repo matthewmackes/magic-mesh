@@ -16,6 +16,39 @@
 use super::*;
 use mde_egui::style::Elevation;
 
+const EXPLORER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+
+pub(super) fn explorer_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(Stroke::new(1.0, Style::BORDER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(EXPLORER_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+pub(super) trait ExplorerHoverExt {
+    fn explorer_hover_text(self, text: impl Into<String>) -> Self;
+    fn explorer_disabled_hover_text(self, text: impl Into<String>) -> Self;
+}
+
+impl ExplorerHoverExt for egui::Response {
+    fn explorer_hover_text(self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        self.on_hover_ui(move |ui| explorer_tooltip(ui, text.as_str()))
+    }
+
+    fn explorer_disabled_hover_text(self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        self.on_disabled_hover_ui(move |ui| explorer_tooltip(ui, text.as_str()))
+    }
+}
+
 /// Synthesise this node's own hero unit for the honest empty state (#23) — a real
 /// self-reference (hostname, in-mesh), never a faked peer; health stays unknown
 /// (the ring spins "discovering") until a real mirror lands.
@@ -221,7 +254,7 @@ pub(super) fn edge_chip(ui: &mut egui::Ui, chip: &ChipItem) -> bool {
         galley,
         Style::TEXT,
     );
-    let resp = resp.on_hover_text(&chip.name);
+    let resp = resp.explorer_hover_text(&chip.name);
     // a11y-05 — the edge jump-chip's accesskit node: the neighbour's name +
     // its kind (the two facts the pill paints).
     install_cell_accessibility(
@@ -332,7 +365,7 @@ pub(super) fn thumbnail(
             );
         })
         .response;
-    let resp = resp.on_hover_text(&unit.name);
+    let resp = resp.explorer_hover_text(&unit.name);
     // a11y-05 — the thumbnail's accesskit node (a filmstrip thumb has no mark
     // set, so `marked` is false; the pin marker rides the value).
     install_unit_accessibility(ui.ctx(), resp.id, unit, pinned, false, resp.rect);
@@ -565,7 +598,7 @@ pub(super) fn mosaic_tile(
             Style::ACCENT_HI,
         );
     }
-    let resp = resp.on_hover_text(if pinned {
+    let resp = resp.explorer_hover_text(if pinned {
         "Right-click to unpin · Ctrl-click / Space marks"
     } else {
         "Right-click to pin · Ctrl-click / Space marks"
@@ -755,7 +788,7 @@ pub(super) fn ipam_address_row(
         band,
         egui::Shape::rect_filled(resp.rect, Style::RADIUS * 0.5, fill),
     );
-    let resp = resp.on_hover_text(format!("Jump to {}", occ.name));
+    let resp = resp.explorer_hover_text(format!("Jump to {}", occ.name));
     // a11y-05 — the IPAM occupant row's accesskit node: the occupant name +
     // its kind/address (+ gateway marker for the conventional .1).
     install_cell_accessibility(

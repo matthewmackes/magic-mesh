@@ -149,6 +149,15 @@ security (Q23).
 > build farm are unchanged. Old-stack code is **deleted on per-node hard
 > cutover** (§7).
 
+> **NEWER LOCK 2026-07-18 — CONSTRUCT-CLOUD provider-neutral runway.** The
+> OpenStack/Kolla/Nova/Heat implementation above remains a valid installed
+> backend while replacement work is underway, but it is no longer the product
+> architecture target. New Construct Cloud work must move shell surfaces, Bus
+> verbs, persisted mirrors, docs, and operator copy toward provider-neutral
+> contracts where OpenStack is only one adapter. Do not delete or disable the
+> current backend before a provider-neutral seam, compatibility tests, and a
+> replacement-provider proof can carry list/launch/lifecycle behavior.
+
 - **The host is an egui thin client, not a general desktop.** The whole UI is a
   single **egui shell that owns the DRM/KMS seat directly** (the §4 `mde-egui` smithay
   DRM/GBM + libinput runner) — **no Wayland compositor**. There are **no native host
@@ -285,6 +294,13 @@ plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 > RabbitMQ is OpenStack-internal RPC only (§2 untouched). One amendment:
 > **hard per-user quotas** are enforced in the cloud plane (see §8) — the
 > documented exception to "no RBAC".
+
+> **CONSTRUCT-CLOUD provider-neutral amendment (2026-07-18).** The Cloud plane
+> remains the Controller plane, but product-facing architecture must be Construct
+> Cloud contracts first and provider adapters second. OpenStack-specific API,
+> identity, orchestration, notification, and mirror names are backend details;
+> user-facing surfaces and new contracts should not require those names except
+> in explicit diagnostics for the installed OpenStack adapter.
 
 ## §10 — Build & development environment (canonical — do not rediscover)
 

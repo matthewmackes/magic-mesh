@@ -23,6 +23,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mde_bus::persist::Persist;
@@ -172,11 +173,20 @@ impl Chime for SystemChime {
             Severity::Critical | Severity::Warning => "dialog-warning",
             Severity::Info => "message-new-instant",
         };
-        let _ = Command::new("canberra-gtk-play")
-            .args(["-i", event])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let event = event.to_owned();
+        let _ = thread::Builder::new()
+            .name("mde-toast-chime".to_owned())
+            .spawn(move || {
+                let Ok(mut child) = Command::new("canberra-gtk-play")
+                    .args(["-i", event.as_str()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    return;
+                };
+                let _ = child.wait();
+            });
     }
 }
 

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use super::{
     service_bucket, service_display_name, Arming, CatalogOutcome, HeatOp, IacTab, InfraCodeState,
-    BUCKETS, DOT, HEAT_SERVICE,
+    BUCKETS, CLOUD_PRODUCT_LABEL, DOT, HEAT_SERVICE,
 };
 use mackes_mesh_types::openstack::default_collection;
 use mde_egui::egui::Ui;
@@ -303,7 +303,9 @@ fn build_help_menu() -> Menu<MenuAction> {
     Menu::new(
         "Help",
         vec![
-            Entry::Caption("Infra as Code \u{2014} the OpenStack IaaS control plane.".to_string()),
+            Entry::Caption(format!(
+                "Infra as Code \u{2014} the {CLOUD_PRODUCT_LABEL} control plane."
+            )),
             Entry::Item(Item::new(
                 MenuAction::HelpAbout,
                 "Audit + notify posture\u{2026}",
@@ -464,7 +466,7 @@ pub(super) fn apply(state: &mut InfraCodeState, action: MenuAction) {
 #[allow(clippy::panic)]
 mod tests {
     use super::super::tests::{fixture_view, heat_view};
-    use super::super::{CatalogOutcome, HeatOp, InfraCodeState, HEAT_SERVICE};
+    use super::super::{CatalogOutcome, HeatOp, InfraCodeState, CLOUD_PRODUCT_LABEL, HEAT_SERVICE};
     use super::{
         apply, build_help_menu, build_menus, build_service_menus, build_status, MenuAction,
     };
@@ -703,6 +705,19 @@ mod tests {
         let help = build_help_menu();
         assert_eq!(help.title, "Help");
         assert_eq!(menu_action_ids(&help), vec![MenuAction::HelpAbout]);
+        let caption = help
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Caption(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("help caption");
+        assert!(caption.contains(CLOUD_PRODUCT_LABEL), "{caption}");
+        assert!(
+            !caption.contains("OpenStack"),
+            "the Help caption is user-facing and must stay provider-neutral"
+        );
         // The action drives a real seam — the audit/notify posture note.
         let mut state = InfraCodeState::default();
         assert!(state.note.is_none());

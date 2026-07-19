@@ -139,6 +139,8 @@ pub enum IconId {
     PowerBattery,
     /// Settings category: network controls.
     NetworkSettings,
+    /// Shared UI: system/mesh health status glyph.
+    HealthStatus,
     /// Shared UI: search/magnifier glyph for compact search fields.
     Search,
     /// Shared UI: close/clear `x` glyph for compact dismiss and clear buttons.
@@ -246,7 +248,8 @@ pub enum IconId {
     /// Tray: active VDI session — a monitor carrying a two-node link mark
     /// (the Desktop monitor + a connection, per NAVBAR-W10 W2/W10).
     Sessions,
-    /// Tray: Start / Advanced menu — the Win10-style left rail menu glyph.
+    /// Tray/launcher: Start / advanced menu — the Construct mark, replacing the
+    /// old generic `start-here` launcher glyph.
     Start,
     /// Shared UI: pin/favorite glyph for launchers and rows that expose pinning.
     Pin,
@@ -281,7 +284,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 95] = [
+    pub const ALL: [Self; 96] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -312,6 +315,7 @@ impl IconId {
         Self::Bluetooth,
         Self::PowerBattery,
         Self::NetworkSettings,
+        Self::HealthStatus,
         Self::Search,
         Self::Close,
         Self::Reload,
@@ -434,6 +438,7 @@ impl IconId {
             Self::Bluetooth => yamis_svg!("status/scalable/bluetooth-active.svg"),
             Self::PowerBattery => yamis_svg!("apps/16/preferences-power-and-battery.svg"),
             Self::NetworkSettings => yamis_svg!("apps/16/preferences-system-network.svg"),
+            Self::HealthStatus => yamis_svg!("preferences/scalable/preferences-smart-status.svg"),
             Self::Search => yamis_svg!("apps/scalable/system-search.svg"),
             Self::Close => yamis_svg!("actions/16/remove.svg"),
             Self::Reload => yamis_svg!("status/scalable/state-sync.svg"),
@@ -493,7 +498,7 @@ impl IconId {
             }
             Self::Signal => yamis_svg!("status/scalable/network-wireless-100.svg"),
             Self::Sessions => yamis_svg!("preferences/scalable/window-duplicate.svg"),
-            Self::Start => yamis_svg!("apps/scalable/start-here.svg"),
+            Self::Start => construct_svg!("mark.svg"),
             Self::Pin => yamis_svg!("actions/16/window-pin.svg"),
             Self::ChevronUp => yamis_svg!("actions/16/arrow-up.svg"),
             Self::Volume => yamis_svg!("status/scalable/audio-volume-medium.svg"),
@@ -544,6 +549,7 @@ impl IconId {
             Self::Bluetooth => "yamis-bluetooth-active-settings",
             Self::PowerBattery => "yamis-preferences-power-and-battery",
             Self::NetworkSettings => "yamis-preferences-system-network",
+            Self::HealthStatus => "yamis-preferences-smart-status",
             Self::Search => "yamis-system-search",
             Self::Close => "yamis-remove",
             Self::Reload => "yamis-state-sync",
@@ -597,7 +603,7 @@ impl IconId {
             Self::Lighthouse => "yamis-preferences-system-network-server",
             Self::Signal => "yamis-network-wireless-100",
             Self::Sessions => "yamis-window-duplicate",
-            Self::Start => "yamis-start-here",
+            Self::Start => "construct-start-menu-mark",
             Self::Pin => "yamis-window-pin",
             Self::ChevronUp => "yamis-arrow-up",
             Self::Volume => "yamis-audio-volume-medium",
@@ -868,6 +874,25 @@ mod tests {
     }
 
     #[test]
+    fn start_menu_glyph_uses_the_construct_mark() {
+        assert_eq!(
+            IconId::Start.svg(),
+            IconId::Mark.svg(),
+            "Start menu launcher glyph should use the Construct mark, not the old generic start icon"
+        );
+        assert_eq!(
+            IconId::Start.name(),
+            "construct-start-menu-mark",
+            "Start menu glyph needs a unique texture/cache name even when it shares mark.svg"
+        );
+        assert_ne!(
+            IconId::Start.name(),
+            IconId::Mark.name(),
+            "Start and Mark cache names must not collide"
+        );
+    }
+
+    #[test]
     fn tray_glyphs_rasterize_nonempty_at_16_and_24() {
         // NAVBAR-W10-1 §7 gate: the Win10 tray draws these at exactly 16px
         // (24px covers the flyout/hi-DPI step) — every glyph must come back
@@ -940,6 +965,27 @@ mod tests {
             assert_eq!(img.height, 16, "{id:?} chat button icon height");
             assert!(opaque_pixels(&img.rgba) > 0, "{id:?} rasterized empty");
         }
+    }
+
+    #[test]
+    fn health_status_glyph_is_dedicated_and_rasterizes() {
+        assert_ne!(
+            IconId::HealthStatus,
+            IconId::Security,
+            "Health panel should not reuse the privacy/security shield glyph"
+        );
+        assert_eq!(
+            IconId::HealthStatus.name(),
+            "yamis-preferences-smart-status"
+        );
+        let img = icon_image(IconId::HealthStatus, 24, TINT)
+            .unwrap_or_else(|err| panic!("HealthStatus failed: {err}"));
+        assert_eq!(img.height, 24);
+        assert_eq!(img.width, 24);
+        assert!(
+            opaque_pixels(&img.rgba) > 0,
+            "HealthStatus rasterized empty"
+        );
     }
 
     #[test]

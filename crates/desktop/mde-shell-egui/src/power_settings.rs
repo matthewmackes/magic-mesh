@@ -242,6 +242,76 @@ pub(crate) fn idle_option_label(mins: Option<u64>) -> String {
     mins.map_or_else(|| "Never".to_owned(), |m| format!("{m} min"))
 }
 
+#[must_use]
+fn power_combo_menu_style(ui: &egui::Ui) -> egui::Style {
+    let mut style = ui.style().as_ref().clone();
+    let palette = Style::current_palette(ui.ctx());
+    let border = egui::Stroke::new(1.0, palette.border);
+    let text = egui::Stroke::new(1.0, palette.text);
+    let text_dim = egui::Stroke::new(1.0, palette.text_dim);
+    let control_radius = egui::CornerRadius::same(Style::RADIUS_S as u8);
+    let accent = style.visuals.selection.stroke.color;
+    let active_bg_stroke = style.visuals.widgets.active.bg_stroke;
+    let open_fill = Style::pressed_fill_for_scheme(Style::color_scheme(ui.ctx()), accent);
+
+    style.visuals.window_fill = palette.surface;
+    style.visuals.faint_bg_color = palette.surface;
+    style.visuals.extreme_bg_color = palette.bg;
+    style.visuals.override_text_color = Some(palette.text);
+    style.visuals.window_stroke = border;
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
+
+    style.visuals.widgets.noninteractive.bg_fill = palette.surface;
+    style.visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    style.visuals.widgets.noninteractive.bg_stroke = border;
+    style.visuals.widgets.noninteractive.fg_stroke = text_dim;
+
+    style.visuals.widgets.inactive.bg_fill = palette.surface;
+    style.visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    style.visuals.widgets.inactive.bg_stroke = border;
+    style.visuals.widgets.inactive.fg_stroke = text;
+    style.visuals.widgets.inactive.corner_radius = control_radius;
+
+    style.visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    style.visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    style.visuals.widgets.hovered.fg_stroke = text;
+    style.visuals.widgets.hovered.corner_radius = control_radius;
+
+    style.visuals.selection.bg_fill = accent.gamma_multiply(0.35);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+    style.visuals.widgets.active.bg_fill = open_fill;
+    style.visuals.widgets.active.weak_bg_fill = open_fill;
+    style.visuals.widgets.active.bg_stroke = active_bg_stroke;
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, palette.text_strong);
+    style.visuals.widgets.active.corner_radius = control_radius;
+    style.visuals.widgets.open = style.visuals.widgets.active;
+
+    style.spacing.menu_margin = Style::tooltip_margin();
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::SP_XS * 0.5);
+    style.spacing.item_spacing.y = Style::SP_XS * 0.5;
+    style
+}
+
+fn apply_power_combo_menu_style(ui: &mut egui::Ui) {
+    ui.set_style(power_combo_menu_style(ui));
+}
+
+fn show_power_combo_menu<R>(
+    ui: &mut egui::Ui,
+    combo: ComboBox,
+    menu_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ui.scope(|ui| {
+        apply_power_combo_menu_style(ui);
+        combo.show_ui(ui, |ui| {
+            apply_power_combo_menu_style(ui);
+            menu_contents(ui)
+        })
+    })
+    .inner
+}
+
 /// The idle picker (POWER-5 + CURTAIN-3) — the idle **timeout** (Never / 1 / 5 / 10 /
 /// 30 min) plus what firing it **does** (Suspend / **Lock** / Do nothing), both editing
 /// the honorer's persisted [`PowerHonorConfig`]. A real change writes the new value into
@@ -261,11 +331,12 @@ pub(crate) fn idle_timeout_body(
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        ComboBox::from_id_salt("power5-idle-timeout")
-            .selected_text(
+        show_power_combo_menu(
+            ui,
+            ComboBox::from_id_salt("power5-idle-timeout").selected_text(
                 RichText::new(idle_option_label(config.idle_timeout_min)).size(Style::SMALL),
-            )
-            .show_ui(ui, |ui| {
+            ),
+            |ui| {
                 for opt in IDLE_OPTIONS {
                     let selected = config.idle_timeout_min == opt;
                     if ui
@@ -280,7 +351,8 @@ pub(crate) fn idle_timeout_body(
                         actions.push(SysAction::SavePowerHonorConfig);
                     }
                 }
-            });
+            },
+        );
     });
     // CURTAIN-3 — what firing the idle timeout does: Suspend (default) / Lock (drop
     // the curtain in-process) / Do nothing. Mirrors the lid-action picker; the honorer
@@ -292,9 +364,11 @@ pub(crate) fn idle_timeout_body(
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        ComboBox::from_id_salt("curtain3-idle-action")
-            .selected_text(RichText::new(config.idle_action.label()).size(Style::SMALL))
-            .show_ui(ui, |ui| {
+        show_power_combo_menu(
+            ui,
+            ComboBox::from_id_salt("curtain3-idle-action")
+                .selected_text(RichText::new(config.idle_action.label()).size(Style::SMALL)),
+            |ui| {
                 for action in IdleAction::ALL {
                     let selected = config.idle_action == action;
                     if ui
@@ -309,7 +383,8 @@ pub(crate) fn idle_timeout_body(
                         actions.push(SysAction::SavePowerHonorConfig);
                     }
                 }
-            });
+            },
+        );
     });
     muted_note(
         ui,
@@ -333,9 +408,11 @@ pub(crate) fn lid_action_body(
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        ComboBox::from_id_salt("power5-lid-action")
-            .selected_text(RichText::new(config.lid_action.label()).size(Style::SMALL))
-            .show_ui(ui, |ui| {
+        show_power_combo_menu(
+            ui,
+            ComboBox::from_id_salt("power5-lid-action")
+                .selected_text(RichText::new(config.lid_action.label()).size(Style::SMALL)),
+            |ui| {
                 for action in LidAction::ALL {
                     let selected = config.lid_action == action;
                     if ui
@@ -350,7 +427,8 @@ pub(crate) fn lid_action_body(
                         actions.push(SysAction::SavePowerHonorConfig);
                     }
                 }
-            });
+            },
+        );
     });
     muted_note(
         ui,
@@ -362,6 +440,7 @@ pub(crate) fn lid_action_body(
 mod tests {
     use super::*;
     use mde_egui::egui::{pos2, vec2, Rect};
+    use mde_egui::{Density, StyleColorScheme};
     use mde_seat::{Backend, BatteryKind, BatteryState};
 
     fn profiles(active: &str, available: &[&str]) -> ProfileState {
@@ -502,6 +581,20 @@ mod tests {
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
     }
 
+    fn captured_power_combo_menu_style(ctx: &egui::Context) -> egui::Style {
+        let mut captured = None;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 480.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                captured = Some(power_combo_menu_style(ui));
+            });
+        });
+        captured.expect("power combo menu style was captured")
+    }
+
     #[test]
     fn the_power4_body_builders_lay_out_real_geometry_and_dispatch_nothing_idle() {
         let mut actions: Vec<SysAction> = Vec::new();
@@ -534,6 +627,39 @@ mod tests {
         assert_eq!(idle_option_label(None), "Never");
         assert_eq!(idle_option_label(Some(1)), "1 min");
         assert_eq!(idle_option_label(Some(30)), "30 min");
+    }
+
+    #[test]
+    fn power_combo_menu_style_uses_themed_compact_popup_chrome() {
+        for scheme in [StyleColorScheme::Dark, StyleColorScheme::Light] {
+            let ctx = egui::Context::default();
+            Style::install_color_scheme_with_density(&ctx, scheme, Density::Mouse);
+            let base_padding = ctx.style().spacing.button_padding;
+            let style = captured_power_combo_menu_style(&ctx);
+            let palette = Style::palette_for(scheme);
+
+            assert_eq!(style.visuals.window_fill, palette.surface);
+            assert_eq!(style.visuals.override_text_color, Some(palette.text));
+            assert_eq!(style.visuals.window_stroke.color, palette.border);
+            assert_eq!(style.visuals.widgets.inactive.weak_bg_fill, palette.surface);
+            assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.hovered.weak_bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.open.fg_stroke.color, palette.text_strong);
+            assert_eq!(
+                style.visuals.widgets.open.weak_bg_fill,
+                Style::pressed_fill_for_scheme(
+                    scheme,
+                    Style::accent_for_scheme(scheme, Style::ACCENT),
+                )
+            );
+            assert_eq!(
+                style.spacing.button_padding,
+                egui::vec2(Style::SP_S, Style::SP_XS * 0.5)
+            );
+            assert!(style.spacing.button_padding.x < base_padding.x);
+            assert!(style.spacing.button_padding.y < base_padding.y);
+        }
     }
 
     #[test]

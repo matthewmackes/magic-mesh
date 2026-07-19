@@ -5,7 +5,7 @@
 //! the shared [`Style`]/[`Motion`]/`fonts` alone (§4 — no raw hex, no literal
 //! durations):
 //!
-//! 1. a **large UPPERCASE mono DISPLAY-tier title**, accent-tinted (the EDTB-7
+//! 1. a **refined UPPERCASE mono title**, accent-tinted (the EDTB-7
 //!    heading ramp), on the left — decorative identity only (lock 10);
 //! 2. an **inline menu strip** — a caller-supplied tree of drop-downs, each item a
 //!    real seam (§7): the caller **omits** an absent feature and passes
@@ -50,15 +50,25 @@ use egui::{
 
 use crate::{Motion, Style};
 
-/// The bar's fixed height — the DISPLAY-tier title (lock 2) plus one base gutter,
-/// so every surface's bar reads at the same slim consistent height (lock 11).
-pub const BAR_HEIGHT: f32 = Style::DISPLAY + Style::SP_S;
+/// The shared workspace-title size: the display rung pulled down by two points so
+/// the top-left identity reads refined instead of oversized.
+pub const TITLE_FONT_SIZE: f32 = Style::WORKSPACE_TITLE;
+
+/// The shared menu label size: body text pulled down by one point so menu strips and
+/// popups sit visually below the workspace title.
+pub const MENU_FONT_SIZE: f32 = Style::MENU_TEXT;
+
+/// The bar's fixed height — the refined title plus one half-gutter, so every
+/// surface's top chrome reads at the same slim consistent height (lock 11).
+pub const BAR_HEIGHT: f32 = TITLE_FONT_SIZE + Style::SP_XS;
 
 /// Minimum drop-down width so short menus don't collapse into slivers — six shared
 /// spacing units (§4), the derivation both refactored bars already used.
 const MENU_MIN_W: f32 = Style::SP_XL * 6.0;
-const REMOTE_SESSIONS_BUTTON_W: f32 = Style::SP_XL;
-const REMOTE_SESSIONS_BUTTON_H: f32 = Style::SP_L;
+/// Logical width of the shared top-right Remote Sessions/minimize button.
+pub const REMOTE_SESSIONS_BUTTON_W: f32 = Style::SP_XL;
+/// Logical height of the shared top-right Remote Sessions/minimize button.
+pub const REMOTE_SESSIONS_BUTTON_H: f32 = Style::SP_L;
 
 /// Stable id for the top-right menu-bar minimize button that routes to the
 /// shell's Remote Sessions workspace.
@@ -77,6 +87,14 @@ fn remote_sessions_request_id() -> egui::Id {
 pub fn take_remote_sessions_request(ctx: &egui::Context) -> Option<egui::Rect> {
     ctx.data_mut(|d| d.remove_temp::<Option<egui::Rect>>(remote_sessions_request_id()))
         .flatten()
+}
+
+/// Queue a shell-owned Remote Sessions/minimize request from a top-right chrome
+/// control. This keeps shared menubars and shell fallback buttons on one request
+/// path while leaving the shell as the only owner of the navigation transition.
+pub fn queue_remote_sessions_request(ctx: &egui::Context, source: egui::Rect) {
+    ctx.data_mut(|d| d.insert_temp(remote_sessions_request_id(), Some(source)));
+    ctx.request_repaint();
 }
 
 // ─────────────────────────────── status chips ───────────────────────────────
@@ -108,6 +126,27 @@ impl ChipTone {
             Self::Ok => Style::OK,
             Self::Warn => Style::WARN,
             Self::Danger => Style::DANGER,
+        }
+    }
+}
+
+/// Colours resolved against the active [`StyleColorScheme`](crate::StyleColorScheme)
+/// before they reach menu text/popup paint. Shared menu surfaces often paint
+/// explicit `Style::*` tokens inside popup layers; resolving them here prevents
+/// dark-mode text tokens from leaking into the Windows-2000 light palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MenuColors {
+    accent: Color32,
+    text: Color32,
+    text_dim: Color32,
+}
+
+impl MenuColors {
+    fn resolve(ctx: &egui::Context, accent: Color32) -> Self {
+        Self {
+            accent: Style::resolve_color(ctx, accent),
+            text: Style::resolve_color(ctx, Style::TEXT),
+            text_dim: Style::resolve_color(ctx, Style::TEXT_DIM),
         }
     }
 }
@@ -279,7 +318,7 @@ impl<Id> Menu<Id> {
 /// live status cluster. Borrowed so the surface can build the pieces from its own
 /// static tables + live state without giving up ownership.
 pub struct MenuBarModel<'a, Id> {
-    /// The workspace title — rendered UPPERCASE, mono, DISPLAY-tier, accent-tinted.
+    /// The workspace title — rendered UPPERCASE, mono, refined title-sized, accent-tinted.
     pub title: &'a str,
     /// The surface's category accent (the dock group's [`Style`] token).
     pub accent: Color32,
@@ -363,15 +402,16 @@ impl MenuBar {
     /// if any. The surface maps that id to its real seam (§6). Generic over the
     /// caller's id type so every surface keeps its own action vocabulary.
     pub fn show<Id: Clone>(ui: &mut Ui, model: &MenuBarModel<'_, Id>) -> Option<Id> {
+        let colors = MenuColors::resolve(ui.ctx(), model.accent);
         let mnemonics = resolve_mnemonics(model.menus);
         let mut picked: Option<Id> = None;
         ui.horizontal(|ui| {
             ui.set_min_height(BAR_HEIGHT);
             // Title — decorative identity only (lock 10), left-anchored.
-            title_header(ui, model.title, model.accent);
+            title_header(ui, model.title, colors.accent);
             ui.add_space(Style::SP_M);
             // Inline menu strip.
-            menu_strip(ui, model, &mnemonics, &mut picked);
+            menu_strip(ui, model, &mnemonics, colors, &mut picked);
             // Live status cluster, hugging the right edge (lock 3/6).
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 remote_sessions_button(ui);
@@ -385,7 +425,9 @@ impl MenuBar {
     }
 }
 
-fn remote_sessions_button(ui: &mut Ui) {
+/// Paint the shared top-right Remote Sessions/minimize button and queue the
+/// same shell-owned request path used by [`MenuBar::show`].
+pub fn remote_sessions_button(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(REMOTE_SESSIONS_BUTTON_W, REMOTE_SESSIONS_BUTTON_H),
         Sense::hover(),
@@ -413,7 +455,7 @@ fn remote_sessions_button(ui: &mut Ui) {
     let stroke_color = if response.hovered() {
         visuals.widgets.hovered.fg_stroke.color
     } else {
-        Style::TEXT_DIM
+        Style::resolve_color(ui.ctx(), Style::TEXT_DIM)
     };
     let center_y = rect.center().y + 4.0;
     let x0 = rect.center().x - Style::SP_XS;
@@ -424,18 +466,16 @@ fn remote_sessions_button(ui: &mut Ui) {
     );
 
     if response.clicked() {
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(remote_sessions_request_id(), Some(rect)));
-        ui.ctx().request_repaint();
+        queue_remote_sessions_request(ui.ctx(), rect);
     }
 }
 
-/// Paint the large UPPERCASE mono DISPLAY-tier accent title (lock 2/14).
+/// Paint the UPPERCASE mono accent title (lock 2/14).
 fn title_header(ui: &mut Ui, title: &str, accent: Color32) {
     ui.label(
         RichText::new(display_title(title))
             .family(FontFamily::Monospace)
-            .size(Style::DISPLAY)
+            .size(TITLE_FONT_SIZE)
             .color(accent),
     );
 }
@@ -447,6 +487,7 @@ fn menu_strip<Id: Clone>(
     ui: &mut Ui,
     model: &MenuBarModel<'_, Id>,
     mnemonics: &[Option<char>],
+    colors: MenuColors,
     picked: &mut Option<Id>,
 ) {
     // Flat, chrome-free top-level buttons — the menu-bar look (egui's own menu-bar
@@ -467,14 +508,14 @@ fn menu_strip<Id: Clone>(
         let secs = motion_secs(ui, Motion::FAST);
         let fade = Motion::animate(ui.ctx(), menu_id.with("open-fade"), is_open, secs);
 
-        let job = menu_label_job(&menu.title, *mnemonic);
+        let job = menu_label_job(&menu.title, *mnemonic, colors.text);
         let response = egui::menu::menu_button(ui, job, |ui| {
             ui.set_min_width(MENU_MIN_W);
             // Open-spring: fade the body in (clamped so it never fully vanishes).
             if fade < 1.0 {
                 ui.multiply_opacity(fade.max(0.2));
             }
-            render_entries(ui, &menu.entries, picked);
+            render_entries(ui, &menu.entries, colors, picked);
         })
         .response;
         rects.push((menu_id, response.rect));
@@ -482,7 +523,7 @@ fn menu_strip<Id: Clone>(
         // The shared-motion hover/open underline indicator (reduce-motion aware).
         let hot = response.hovered() || is_open;
         let grow = Motion::animate(ui.ctx(), menu_id.with("underline"), hot, secs);
-        paint_underline(ui, response.rect, model.accent, grow);
+        paint_underline(ui, response.rect, colors.accent, grow);
     }
 
     handle_alt_mnemonics(ui, bar_id, &rects, mnemonics);
@@ -502,9 +543,8 @@ fn flatten_menu_buttons(ui: &mut Ui) {
 /// Build a top-level (or submenu) label as a [`LayoutJob`] with its mnemonic char
 /// underlined. Its `.text()` equals `label`, so egui derives the same menu id the
 /// Alt handler computes from `label`.
-fn menu_label_job(label: &str, mnemonic: Option<char>) -> LayoutJob {
-    let color = Style::TEXT;
-    let font = FontId::new(Style::BODY, FontFamily::Proportional);
+fn menu_label_job(label: &str, mnemonic: Option<char>, color: Color32) -> LayoutJob {
+    let font = FontId::new(MENU_FONT_SIZE, FontFamily::Proportional);
     let underline = Stroke::new(1.0, color);
     let mut job = LayoutJob::default();
     let mut buf = [0u8; 4];
@@ -539,25 +579,34 @@ fn paint_underline(ui: &Ui, rect: Rect, accent: Color32, t: f32) {
 }
 
 /// Render a menu body's entries into an open drop-down.
-fn render_entries<Id: Clone>(ui: &mut Ui, entries: &[Entry<Id>], picked: &mut Option<Id>) {
+fn render_entries<Id: Clone>(
+    ui: &mut Ui,
+    entries: &[Entry<Id>],
+    colors: MenuColors,
+    picked: &mut Option<Id>,
+) {
     for entry in entries {
         match entry {
             Entry::Separator => {
                 ui.separator();
             }
             Entry::Caption(text) => {
-                crate::widgets::muted_note(ui, text.as_str());
+                ui.label(
+                    RichText::new(text.as_str())
+                        .size(Style::SMALL)
+                        .color(colors.text_dim),
+                );
             }
-            Entry::Item(item) => render_item(ui, item, picked),
+            Entry::Item(item) => render_item(ui, item, colors, picked),
             Entry::Submenu {
                 label,
                 mnemonic,
                 entries,
             } => {
-                let job = menu_label_job(label, *mnemonic);
+                let job = menu_label_job(label, *mnemonic, colors.text);
                 ui.menu_button(job, |ui| {
                     ui.set_min_width(MENU_MIN_W);
-                    render_entries(ui, entries, picked);
+                    render_entries(ui, entries, colors, picked);
                 });
             }
         }
@@ -567,18 +616,23 @@ fn render_entries<Id: Clone>(ui: &mut Ui, entries: &[Entry<Id>], picked: &mut Op
 /// Render one item as a button — a leading check-mark for a toggle/radio item, its
 /// right-aligned shortcut hint, disabled-grey when gated (§7), and a 2 px accent
 /// focus ring when keyboard-focused (a11y, lock 5). Records the activated id.
-fn render_item<Id: Clone>(ui: &mut Ui, item: &Item<Id>, picked: &mut Option<Id>) {
+fn render_item<Id: Clone>(
+    ui: &mut Ui,
+    item: &Item<Id>,
+    colors: MenuColors,
+    picked: &mut Option<Id>,
+) {
     let label = match item.checked {
         Some(true) => format!("\u{2713} {}", item.label),
         Some(false) => format!("\u{2003}{}", item.label),
         None => item.label.clone(),
     };
     let color = if item.enabled {
-        Style::TEXT
+        colors.text
     } else {
-        Style::TEXT_DIM
+        colors.text_dim
     };
-    let mut button = Button::new(RichText::new(label).color(color));
+    let mut button = Button::new(RichText::new(label).size(MENU_FONT_SIZE).color(color));
     if let Some(hint) = &item.shortcut {
         button = button.shortcut_text(hint);
     }
@@ -587,7 +641,7 @@ fn render_item<Id: Clone>(ui: &mut Ui, item: &Item<Id>, picked: &mut Option<Id>)
         ui.painter().rect_stroke(
             response.rect,
             Style::RADIUS,
-            Stroke::new(2.0, Style::ACCENT),
+            Stroke::new(2.0, colors.accent),
             StrokeKind::Outside,
         );
     }
@@ -634,7 +688,7 @@ fn handle_alt_mnemonics(
 /// Paint one right-aligned status chip: a rounded [`Style::SURFACE_HI`] plate with
 /// the tone-coloured `icon + text` at the caption size.
 fn status_chip(ui: &mut Ui, chip: &StatusChip) {
-    let color = chip.tone.color();
+    let color = Style::resolve_color(ui.ctx(), chip.tone.color());
     let text = chip
         .icon
         .as_ref()
@@ -646,8 +700,11 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
     );
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
     let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
-    ui.painter()
-        .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    ui.painter().rect_filled(
+        rect,
+        Style::RADIUS,
+        Style::resolve_color(ui.ctx(), Style::SURFACE_HI),
+    );
     ui.painter().galley(rect.min + pad, galley, color);
     ui.add_space(Style::SP_XS);
 }
@@ -656,11 +713,11 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
 #[allow(clippy::float_cmp, clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::{
-        display_title, mnemonic_key, motion_secs, remote_sessions_button_id, resolve_mnemonics,
-        take_remote_sessions_request, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel,
-        StatusChip, BAR_HEIGHT,
+        display_title, menu_label_job, mnemonic_key, motion_secs, remote_sessions_button_id,
+        resolve_mnemonics, take_remote_sessions_request, ChipTone, Entry, Item, Menu, MenuBar,
+        MenuBarModel, MenuColors, StatusChip, BAR_HEIGHT, MENU_FONT_SIZE, TITLE_FONT_SIZE,
     };
-    use crate::{Motion, Style};
+    use crate::{Density, Motion, Style, StyleColorScheme};
 
     /// A small four-menu editor-shaped model over `&str` ids for the model tests.
     fn sample_menus() -> Vec<Menu<&'static str>> {
@@ -754,6 +811,63 @@ mod tests {
         assert_eq!(ChipTone::Ok.color(), Style::OK);
         assert_eq!(ChipTone::Danger.color(), Style::DANGER);
         assert_eq!(ChipTone::default(), ChipTone::Neutral);
+    }
+
+    #[test]
+    fn light_mode_menu_colors_resolve_before_popup_paint() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+
+        let colors = MenuColors::resolve(&ctx, Style::ACCENT);
+        assert_eq!(colors.text, Style::WIN2000_WINDOW_TEXT);
+        assert_eq!(colors.text_dim, Style::WIN2000_DIM_TEXT);
+        assert_eq!(colors.accent, Style::WIN2000_ACTIVE_TITLE);
+        assert_ne!(
+            colors.text,
+            Style::TEXT,
+            "shared menus must not paint dark-mode text tokens in light-mode popups"
+        );
+        assert_ne!(
+            colors.text_dim,
+            Style::TEXT_DIM,
+            "disabled/caption rows must resolve to the light palette"
+        );
+
+        let label = menu_label_job("File", Some('F'), colors.text);
+        for section in &label.sections {
+            assert_eq!(section.format.color, Style::WIN2000_WINDOW_TEXT);
+            if section.byte_range == (0..1) {
+                assert_eq!(section.format.underline.color, Style::WIN2000_WINDOW_TEXT);
+            }
+        }
+    }
+
+    #[test]
+    fn menu_bar_uses_refined_chrome_typography() {
+        assert_eq!(
+            TITLE_FONT_SIZE,
+            Style::WORKSPACE_TITLE,
+            "workspace titles in the top-left menubar should be two points smaller"
+        );
+        assert_eq!(
+            MENU_FONT_SIZE,
+            Style::MENU_TEXT,
+            "menu text should be one point smaller than the body-text rung"
+        );
+        assert!(
+            BAR_HEIGHT < Style::DISPLAY + Style::SP_S,
+            "the shared menubar should be slimmer than the old display-plus-gutter strip"
+        );
+        assert!(
+            BAR_HEIGHT > TITLE_FONT_SIZE,
+            "the bar still clears the refined workspace title"
+        );
+
+        let label = menu_label_job("File", Some('F'), Style::TEXT);
+        assert!(label
+            .sections
+            .iter()
+            .all(|section| section.format.font_id.size == MENU_FONT_SIZE));
     }
 
     // ── mnemonic resolution ──────────────────────────────────────────────────
@@ -871,8 +985,8 @@ mod tests {
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "the bar produced no draw primitives");
         assert!(
-            BAR_HEIGHT > Style::DISPLAY,
-            "the bar clears its display title"
+            BAR_HEIGHT > TITLE_FONT_SIZE,
+            "the bar clears its refined title"
         );
     }
 

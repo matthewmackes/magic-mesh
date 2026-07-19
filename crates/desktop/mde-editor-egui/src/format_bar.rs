@@ -49,6 +49,9 @@ use mde_egui::egui::{self, pos2, vec2, Rect, RichText, Sense, Stroke, Ui};
 use mde_egui::Style;
 
 use crate::menu_bar::{ListStyle, MenuAction, MenuContext, WrapMarker, OVERFLOW_GLYPH};
+use crate::tooltip::editor_menu_button;
+
+const FORMAT_BAR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 /// The Style dropdown's labels, indexed by heading level (0 = Normal body text).
 pub const STYLE_LABELS: [&str; 7] = [
@@ -70,10 +73,7 @@ pub const PICKER_COLS: usize = 10;
 /// Render one Formatting-strip command button (styled text face + Word tooltip),
 /// greyed when `enabled` is false. Returns whether it was clicked this frame.
 fn tool(ui: &mut Ui, face: RichText, tip: &'static str, enabled: bool) -> bool {
-    ui.add_enabled(enabled, egui::Button::new(face))
-        .on_hover_text(tip)
-        .on_disabled_hover_text(tip)
-        .clicked()
+    format_bar_hover_text(ui.add_enabled(enabled, egui::Button::new(face)), tip).clicked()
 }
 
 /// Render the Formatting toolbar and return the action the operator picked this
@@ -207,7 +207,7 @@ fn style_dropdown(ui: &mut Ui, cx: &MenuContext, enabled: bool) -> Option<MenuAc
                 }
             })
             .response
-            .on_hover_text("Paragraph style");
+            .on_hover_ui(|ui| format_bar_tooltip(ui, "Paragraph style"));
     });
     action
 }
@@ -221,23 +221,55 @@ fn overflow(ui: &mut Ui, cx: &MenuContext, enabled: bool) -> Option<MenuAction> 
     let level = usize::from(cx.heading_level.unwrap_or(0)).min(STYLE_LABELS.len() - 1);
     let mut action = None;
     ui.add_enabled_ui(enabled, |ui| {
-        ui.menu_button(OVERFLOW_GLYPH, |ui| {
-            ui.label(
-                RichText::new("Paragraph style")
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            );
-            for (i, label) in STYLE_LABELS.iter().enumerate() {
-                if ui.selectable_label(i == level, *label).clicked() {
-                    action = Some(MenuAction::Heading(u8::try_from(i).unwrap_or(0)));
-                    ui.close_menu();
-                }
-            }
+        editor_menu_button(ui, OVERFLOW_GLYPH, |ui| {
+            overflow_contents(ui, level, &mut action);
         })
         .response
-        .on_hover_text("More formatting");
+        .on_hover_ui(|ui| format_bar_tooltip(ui, "More formatting"));
     });
     action
+}
+
+fn overflow_contents(ui: &mut Ui, level: usize, action: &mut Option<MenuAction>) {
+    ui.label(
+        RichText::new("Paragraph style")
+            .size(Style::SMALL)
+            .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
+    );
+    for (i, label) in STYLE_LABELS.iter().enumerate() {
+        if ui.selectable_label(i == level, *label).clicked() {
+            *action = Some(MenuAction::Heading(u8::try_from(i).unwrap_or(0)));
+            ui.close_menu();
+        }
+    }
+}
+
+fn format_bar_tooltip(ui: &mut Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(FORMAT_BAR_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn format_bar_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response
+        .on_hover_ui({
+            let text = text.clone();
+            move |ui| format_bar_tooltip(ui, text.as_str())
+        })
+        .on_disabled_hover_ui(move |ui| format_bar_tooltip(ui, text.as_str()))
 }
 
 /// Render Word's hover **grid-picker** inside `ui` (already inside the Insert
@@ -316,6 +348,112 @@ pub fn table_grid(ui: &mut Ui) -> Option<(u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::{ListStyle, MenuAction, WrapMarker, PICKER_COLS, PICKER_ROWS, STYLE_LABELS};
+    use mde_egui::{egui, Density, Style, StyleColorScheme};
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_format_bar_tooltip_frame(ctx: &egui::Context, text: &str) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        super::format_bar_tooltip(ui, text);
+                    });
+            },
+        )
+    }
+
+    fn render_format_bar_overflow_menu_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(260.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        crate::tooltip::editor_popup_visual_scope(ui, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                let mut action = None;
+                                super::overflow_contents(ui, 1, &mut action);
+                                assert!(action.is_none());
+                            });
+                        });
+                    });
+            },
+        )
+    }
 
     #[test]
     fn style_labels_cover_normal_plus_six_headings() {
@@ -349,5 +487,67 @@ mod tests {
         let (rows, cols) = (PICKER_ROWS, PICKER_COLS);
         assert!((1..=10).contains(&rows), "rows {rows} out of range");
         assert!((1..=10).contains(&cols), "cols {cols} out of range");
+    }
+
+    #[test]
+    fn format_bar_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let tooltip = "Paragraph style";
+        let out = render_format_bar_tooltip_frame(&ctx, tooltip);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == tooltip && *color == text_color),
+            "Editor format bar tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            text_color != surface,
+            "Editor format bar tooltip text and surface must stay distinct in light mode"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "Editor format bar tooltip should paint its themed surface: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn format_bar_overflow_menu_uses_themed_text_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+        let out = render_format_bar_overflow_menu_frame(&ctx);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts.iter().any(
+                |(text, color)| text == "Paragraph style" && *color == palette.text_dim
+            ),
+            "Editor format overflow caption should use light-mode dim text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "Paragraph style" && *color == Style::TEXT_DIM),
+            "Editor format overflow caption leaked raw dark-shell dim text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Heading 1" && *color == palette.text),
+            "Editor format overflow rows should use light-mode text: {texts:?}"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&palette.surface),
+            "Editor format overflow menu should paint the themed popup surface: {fills:?}"
+        );
     }
 }

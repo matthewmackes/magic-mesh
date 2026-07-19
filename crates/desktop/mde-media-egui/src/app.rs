@@ -60,10 +60,22 @@ const SKIP_SECS: f64 = 10.0;
 /// not every frame — the same human-paced convergence the mesh workers use.
 const ROAM_POLL_INTERVAL_FRAMES: u32 = 60;
 
-/// Compact icon-only queue action button: a 24px click target matching the sibling
-/// YAMIS button rows, with a smaller painted mark centered inside.
-const QUEUE_CONTROL_BUTTON: f32 = Style::SP_L;
+/// Compact icon-only queue action button. Queue rows are not the primary transport
+/// surface, so their visual controls follow the shared refined chrome height
+/// rather than carrying the older 24px button band.
+const QUEUE_CONTROL_BUTTON: f32 = Style::TOOLBAR_CONTROL_H;
 const QUEUE_CONTROL_ICON: f32 = Style::SP_M - Style::SP_XS;
+
+/// Media-local tooltip width for icon/transport affordances. Kept near the chrome
+/// helpers so hover surfaces stay on this crate's `Style` tokens.
+const MEDIA_TOOLTIP_W: f32 = Style::SP_XL * 8.0;
+
+/// Stable transport hit target and icon metrics. The button rect is fixed; only the
+/// optional ASCII label changes, so narrow rows do not shift when play/pause flips.
+const TRANSPORT_BUTTON_H: f32 = mde_egui::menubar::BAR_HEIGHT;
+const TRANSPORT_ICON: f32 = Style::SP_M;
+const TRANSPORT_ICON_BUTTON_W: f32 = TRANSPORT_BUTTON_H + Style::SP_XS;
+const TRANSPORT_LABEL_GAP: f32 = Style::SP_XS;
 
 /// The media surface: the controller plus the applied-fullscreen mirror so the app
 /// only issues a viewport command when the immersive state actually flips.
@@ -982,34 +994,26 @@ fn library_card(ui: &mut egui::Ui, card: &LibraryCard, width: f32) -> Option<Tra
 
         ui.add_space(Style::SP_S);
         ui.horizontal(|ui| {
-            if ui
-                .add_sized(
-                    egui::vec2(content_w * 0.52, Style::SP_L),
-                    egui::Button::new(
-                        RichText::new("▶  Play")
-                            .size(Style::SMALL)
-                            .color(Style::TEXT_STRONG),
-                    )
-                    .fill(Style::ACCENT),
-                )
-                .on_hover_text("Play")
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .clicked()
+            if media_icon_button(
+                ui,
+                content_w * 0.52,
+                TransportIcon::Play,
+                Some("Play"),
+                "Play",
+                MediaButtonTone::Primary,
+            )
+            .clicked()
             {
                 action = Some(card_play_action(card));
             }
-            if ui
-                .add_sized(
-                    egui::vec2(content_w * 0.38, Style::SP_L),
-                    egui::Button::new(
-                        RichText::new("+  Queue")
-                            .size(Style::SMALL)
-                            .color(Style::TEXT),
-                    ),
-                )
-                .on_hover_text("Add to queue")
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .clicked()
+            if media_text_button_sized(
+                ui,
+                egui::vec2(content_w * 0.38, Style::SP_L),
+                "+ Queue",
+                "Add to queue",
+                MediaButtonTone::Quiet,
+            )
+            .clicked()
             {
                 action = Some(card_queue_action(card));
             }
@@ -1204,34 +1208,36 @@ fn player_view<E: MediaEngine>(
     // The transport row — the primary play/pause is the one accent-filled action; the
     // rest are icon buttons that name themselves on hover (CRAFT §6).
     ui.horizontal(|ui| {
-        if transport_button(ui, "⏮", "Previous track").clicked() {
+        if transport_icon_button(ui, TransportIcon::Back, None, "Previous track").clicked() {
             action = Some(TransportAction::Prev);
         }
-        if transport_button(ui, "⏪ 10s", "Back 10 seconds").clicked() {
+        if transport_icon_button(ui, TransportIcon::Back, Some("10s"), "Back 10 seconds").clicked()
+        {
             action = Some(TransportAction::SeekBy(-SKIP_SECS));
         }
         let state = controller.player().state();
-        let glyph = if state == PlayerState::Playing {
-            "⏸"
+        let icon = if state == PlayerState::Playing {
+            TransportIcon::Pause
         } else {
-            "▶"
+            TransportIcon::Play
         };
-        if primary_transport_button(
+        if primary_transport_button(ui, icon, play_pause_label(state), "Play / pause").clicked() {
+            action = Some(TransportAction::TogglePlay);
+        }
+        if transport_icon_button(
             ui,
-            &format!("{glyph}  {}", play_pause_label(state)),
-            "Play / pause",
+            TransportIcon::Forward,
+            Some("10s"),
+            "Forward 10 seconds",
         )
         .clicked()
         {
-            action = Some(TransportAction::TogglePlay);
-        }
-        if transport_button(ui, "10s ⏩", "Forward 10 seconds").clicked() {
             action = Some(TransportAction::SeekBy(SKIP_SECS));
         }
-        if transport_button(ui, "⏭", "Next track").clicked() {
+        if transport_icon_button(ui, TransportIcon::Forward, None, "Next track").clicked() {
             action = Some(TransportAction::Next);
         }
-        if transport_button(ui, "Stop", "Stop playback").clicked() {
+        if transport_text_button(ui, "Stop", "Stop playback").clicked() {
             action = Some(TransportAction::Stop);
         }
     });
@@ -1240,22 +1246,40 @@ fn player_view<E: MediaEngine>(
 
     // Frame-step + snapshot (design Q12/Q15).
     ui.horizontal(|ui| {
-        if transport_button(ui, "◁ Frame", "Step back one frame").clicked() {
+        if transport_icon_button(
+            ui,
+            TransportIcon::Back,
+            Some("Frame"),
+            "Step back one frame",
+        )
+        .clicked()
+        {
             action = Some(TransportAction::FrameBack);
         }
-        if transport_button(ui, "Frame ▷", "Step forward one frame").clicked() {
+        if transport_icon_button(
+            ui,
+            TransportIcon::Forward,
+            Some("Frame"),
+            "Step forward one frame",
+        )
+        .clicked()
+        {
             action = Some(TransportAction::FrameForward);
         }
-        if transport_button(ui, "Snapshot", "Save a frame snapshot").clicked() {
+        if transport_text_button(ui, "Snapshot", "Save a frame snapshot").clicked() {
             action = Some(TransportAction::Snapshot(ScreenshotMode::Subtitles));
         }
         // Chapter nav, only when the media is chaptered.
         if controller.player().chapter_count().is_some() {
             ui.add_space(Style::SP_M);
-            if transport_button(ui, "Chapter ◀", "Previous chapter").clicked() {
+            if transport_icon_button(ui, TransportIcon::Back, Some("Chapter"), "Previous chapter")
+                .clicked()
+            {
                 action = Some(TransportAction::ChapterPrev);
             }
-            if transport_button(ui, "Chapter ▶", "Next chapter").clicked() {
+            if transport_icon_button(ui, TransportIcon::Forward, Some("Chapter"), "Next chapter")
+                .clicked()
+            {
                 action = Some(TransportAction::ChapterNext);
             }
         }
@@ -1878,31 +1902,41 @@ enum QueueControlIcon {
 /// text. The queue stays inside this crate's dependency boundary while avoiding
 /// raw glyph text in the render output.
 fn queue_icon_button(ui: &mut egui::Ui, icon: QueueControlIcon, label: &'static str) -> Response {
-    let enabled = ui.is_enabled();
-    let response = ui.add(
-        egui::Button::new("")
-            .fill(Style::LAYER_02)
-            .stroke(egui::Stroke::new(1.0, Style::BORDER))
-            .corner_radius(Style::RADIUS_S)
-            .min_size(egui::vec2(QUEUE_CONTROL_BUTTON, QUEUE_CONTROL_BUTTON)),
-    );
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let response = ui
+        .scope(|ui| {
+            ui.style_mut().spacing.button_padding =
+                egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+            ui.style_mut().spacing.interact_size.y = QUEUE_CONTROL_BUTTON;
 
-    let tint = if enabled {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    let icon_rect = egui::Rect::from_center_size(
-        response.rect.center(),
-        egui::vec2(QUEUE_CONTROL_ICON, QUEUE_CONTROL_ICON),
-    );
-    paint_queue_control_icon(ui.painter(), icon_rect, icon, tint);
-    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+            let enabled = ui.is_enabled();
+            let response = ui.add(
+                egui::Button::new("")
+                    .fill(Style::LAYER_02)
+                    .stroke(egui::Stroke::new(1.0, Style::BORDER))
+                    .corner_radius(Style::RADIUS_S)
+                    .min_size(egui::vec2(QUEUE_CONTROL_BUTTON, QUEUE_CONTROL_BUTTON)),
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)
+            });
 
-    response
-        .on_hover_text(label)
-        .on_hover_cursor(CursorIcon::PointingHand)
+            let tint = if enabled {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            };
+            let icon_rect = egui::Rect::from_center_size(
+                response.rect.center(),
+                egui::vec2(QUEUE_CONTROL_ICON, QUEUE_CONTROL_ICON),
+            );
+            paint_queue_control_icon(ui.painter(), icon_rect, icon, tint);
+            mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+
+            response
+        })
+        .inner;
+
+    media_hover_text(response, label).on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn paint_queue_control_icon(
@@ -2001,7 +2035,16 @@ pub fn pip_window<E: MediaEngine>(ctx: &Context, controller: &mut MediaControlle
                 {
                     action = Some(TransportAction::TogglePlay);
                 }
-                if ui.button("Next ⏭").clicked() {
+                if media_icon_button(
+                    ui,
+                    Style::SP_XL * 2.5,
+                    TransportIcon::Forward,
+                    Some("Next"),
+                    "Next track",
+                    MediaButtonTone::Quiet,
+                )
+                .clicked()
+                {
                     action = Some(TransportAction::Next);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2035,26 +2078,260 @@ fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.add_space(Style::SP_S);
 }
 
-/// A **transport-control button** — an icon/label button that names itself in a
-/// tooltip and shows the pointing-hand cursor (CRAFT §6: every icon-only control is
-/// keyboard/hover discoverable, and buttons show a hand). Consolidates the transport
-/// rows' repeated `button + on_hover_text + on_hover_cursor` idiom so every transport
-/// affordance reads identically. Draws through the shared `Style` (§4).
-fn transport_button(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
-    ui.button(label)
-        .on_hover_text(tip)
-        .on_hover_cursor(CursorIcon::PointingHand)
+fn media_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_M)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(MEDIA_TOOLTIP_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
 }
 
-/// The **primary** transport action — the play/pause — rendered as the one
-/// accent-filled control (design lock: a single accent, reserved for the primary
-/// action, so the eye lands on it first in the transport row). Built from `Style`
-/// tokens only (§4): a [`Style::ACCENT`] fill under [`Style::TEXT_STRONG`] text, plus
-/// the shared transport tooltip + pointing-hand cursor.
-fn primary_transport_button(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
-    ui.add(egui::Button::new(RichText::new(label).color(Style::TEXT_STRONG)).fill(Style::ACCENT))
-        .on_hover_text(tip)
-        .on_hover_cursor(CursorIcon::PointingHand)
+fn media_hover_text(response: Response, text: impl Into<String>) -> Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| media_tooltip(ui, text.as_str()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaButtonTone {
+    Quiet,
+    Primary,
+}
+
+impl MediaButtonTone {
+    const fn text_color(self) -> egui::Color32 {
+        match self {
+            Self::Quiet => Style::TEXT,
+            Self::Primary => Style::TEXT_STRONG,
+        }
+    }
+
+    const fn fill(self) -> Option<egui::Color32> {
+        match self {
+            Self::Quiet => None,
+            Self::Primary => Some(Style::ACCENT),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TransportIcon {
+    Back,
+    Play,
+    Pause,
+    Forward,
+}
+
+/// A **transport-control button** — geometry icon plus optional ASCII label, named by
+/// a themed hover surface and accessibility metadata. It keeps the visible control
+/// off Unicode pseudo-icon text while staying dependency-light inside this crate.
+fn transport_icon_button(
+    ui: &mut egui::Ui,
+    icon: TransportIcon,
+    label: Option<&str>,
+    tip: &str,
+) -> Response {
+    media_icon_button(
+        ui,
+        transport_icon_button_width(label),
+        icon,
+        label,
+        tip,
+        MediaButtonTone::Quiet,
+    )
+}
+
+/// The **primary** transport action — play/pause — rendered as the one accent-filled
+/// control. The play/pause mark is painted geometry and the text remains ASCII.
+fn primary_transport_button(
+    ui: &mut egui::Ui,
+    icon: TransportIcon,
+    label: &str,
+    tip: &str,
+) -> Response {
+    media_icon_button(
+        ui,
+        transport_icon_button_width(Some(label)).max(Style::SP_XL * 3.25),
+        icon,
+        Some(label),
+        tip,
+        MediaButtonTone::Primary,
+    )
+}
+
+fn transport_text_button(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
+    media_text_button_sized(
+        ui,
+        egui::vec2(transport_text_button_width(label), TRANSPORT_BUTTON_H),
+        label,
+        tip,
+        MediaButtonTone::Quiet,
+    )
+}
+
+fn media_text_button_sized(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    label: &str,
+    tip: &str,
+    tone: MediaButtonTone,
+) -> Response {
+    let enabled = ui.is_enabled();
+    let tint = if enabled {
+        tone.text_color()
+    } else {
+        Style::TEXT_DIM
+    };
+    let mut button =
+        egui::Button::new(RichText::new(label).size(Style::SMALL).color(tint)).min_size(size);
+    if let Some(fill) = tone.fill() {
+        button = button.fill(fill);
+    }
+    let response = ui.add_sized(size, button);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+    media_hover_text(response, tip).on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn media_icon_button(
+    ui: &mut egui::Ui,
+    width: f32,
+    icon: TransportIcon,
+    label: Option<&str>,
+    tip: &str,
+    tone: MediaButtonTone,
+) -> Response {
+    let size = egui::vec2(width.max(TRANSPORT_ICON_BUTTON_W), TRANSPORT_BUTTON_H);
+    let enabled = ui.is_enabled();
+    let mut button = egui::Button::new(RichText::new("")).min_size(size);
+    if let Some(fill) = tone.fill() {
+        button = button.fill(fill);
+    }
+    let response = ui.add_sized(size, button);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+
+    let tint = if enabled {
+        tone.text_color()
+    } else {
+        Style::TEXT_DIM
+    };
+    paint_media_icon_button(ui, response.rect, icon, label, tint);
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+
+    media_hover_text(response, tip).on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn paint_media_icon_button(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    icon: TransportIcon,
+    label: Option<&str>,
+    tint: egui::Color32,
+) {
+    let label_w = label.map_or(0.0, transport_label_width);
+    let content_w = TRANSPORT_ICON
+        + if label_w > 0.0 {
+            TRANSPORT_LABEL_GAP + label_w
+        } else {
+            0.0
+        };
+    let icon_min = egui::pos2(
+        rect.center().x - content_w * 0.5,
+        rect.center().y - TRANSPORT_ICON * 0.5,
+    );
+    let icon_rect = egui::Rect::from_min_size(icon_min, egui::vec2(TRANSPORT_ICON, TRANSPORT_ICON));
+    paint_transport_icon(ui.painter(), icon_rect, icon, tint);
+
+    if let Some(label) = label {
+        ui.painter().text(
+            egui::pos2(icon_rect.right() + TRANSPORT_LABEL_GAP, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(Style::SMALL),
+            tint,
+        );
+    }
+}
+
+fn transport_icon_button_width(label: Option<&str>) -> f32 {
+    let label_w = label.map_or(0.0, transport_label_width);
+    (TRANSPORT_ICON
+        + if label_w > 0.0 {
+            TRANSPORT_LABEL_GAP + label_w
+        } else {
+            0.0
+        }
+        + Style::SP_M)
+        .max(TRANSPORT_ICON_BUTTON_W)
+}
+
+fn transport_text_button_width(label: &str) -> f32 {
+    (transport_label_width(label) + Style::SP_L).max(Style::SP_XL * 2.0)
+}
+
+fn transport_label_width(label: &str) -> f32 {
+    label.chars().count() as f32 * Style::SMALL * 0.58
+}
+
+fn paint_transport_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: TransportIcon,
+    tint: egui::Color32,
+) {
+    match icon {
+        TransportIcon::Back => paint_transport_triangle(painter, rect.shrink(1.0), false, tint),
+        TransportIcon::Play => paint_transport_triangle(painter, rect.shrink(1.0), true, tint),
+        TransportIcon::Pause => paint_transport_pause_icon(painter, rect, tint),
+        TransportIcon::Forward => paint_transport_triangle(painter, rect.shrink(1.0), true, tint),
+    }
+}
+
+fn paint_transport_pause_icon(painter: &egui::Painter, rect: egui::Rect, tint: egui::Color32) {
+    let bar_w = (rect.width() * 0.24).max(2.0);
+    let gap = rect.width() * 0.18;
+    let height = rect.height() * 0.74;
+    let y0 = rect.center().y - height * 0.5;
+    let left = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - gap * 0.5 - bar_w, y0),
+        egui::vec2(bar_w, height),
+    );
+    let right = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x + gap * 0.5, y0),
+        egui::vec2(bar_w, height),
+    );
+    painter.rect_filled(left, Style::RADIUS_S * 0.25, tint);
+    painter.rect_filled(right, Style::RADIUS_S * 0.25, tint);
+}
+
+fn paint_transport_triangle(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    forward: bool,
+    tint: egui::Color32,
+) {
+    let points = if forward {
+        vec![
+            egui::pos2(rect.left(), rect.top()),
+            egui::pos2(rect.left(), rect.bottom()),
+            egui::pos2(rect.right(), rect.center().y),
+        ]
+    } else {
+        vec![
+            egui::pos2(rect.right(), rect.top()),
+            egui::pos2(rect.right(), rect.bottom()),
+            egui::pos2(rect.left(), rect.center().y),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        tint,
+        egui::Stroke::NONE,
+    ));
 }
 
 #[cfg(test)]
@@ -2088,6 +2365,15 @@ mod tests {
     fn controller() -> MediaController<FakeMpv> {
         MediaController::new(Player::new(
             FakeMpv::new().with_duration(120.0).with_tracks(tracks()),
+        ))
+    }
+
+    fn chapter_controller() -> MediaController<FakeMpv> {
+        MediaController::new(Player::new(
+            FakeMpv::new()
+                .with_duration(120.0)
+                .with_tracks(tracks())
+                .with_chapters(4),
         ))
     }
 
@@ -2125,14 +2411,14 @@ mod tests {
         let _ = render_shapes(controller, body);
     }
 
-    /// Like [`render`], but also threads a [`VideoTextureCache`] — for bodies
+    /// Like [`render_shapes`], but also threads a [`VideoTextureCache`] — for bodies
     /// that reach `player_stage` (`player_view`/`media_panel`), which now owns
     /// the MEDIA-2 phase-1 video frame-sink texture (`docs/gpu_encoder.md`).
-    fn render_with_video(
+    fn render_video_shapes(
         controller: &mut MediaController<FakeMpv>,
         video: &mut VideoTextureCache,
         body: impl Fn(&mut egui::Ui, &mut MediaController<FakeMpv>, &mut VideoTextureCache),
-    ) {
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -2147,8 +2433,17 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| body(ui, controller, video));
             pip_window(ctx, controller);
         });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
         assert!(!prims.is_empty(), "frame produced no draw primitives");
+        out.shapes
+    }
+
+    fn render_with_video(
+        controller: &mut MediaController<FakeMpv>,
+        video: &mut VideoTextureCache,
+        body: impl Fn(&mut egui::Ui, &mut MediaController<FakeMpv>, &mut VideoTextureCache),
+    ) {
+        let _ = render_video_shapes(controller, video, body);
     }
 
     fn populate(controller: &mut MediaController<FakeMpv>) {
@@ -2166,10 +2461,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transport_buttons_use_refined_shared_chrome_height() {
+        assert_eq!(
+            TRANSPORT_BUTTON_H,
+            mde_egui::menubar::BAR_HEIGHT,
+            "Media transport controls should inherit the shared refined chrome height"
+        );
+        assert!(
+            TRANSPORT_BUTTON_H < Style::SP_XL,
+            "Media transport controls must not return to an oversized toolbar band"
+        );
+        assert_eq!(
+            TRANSPORT_ICON_BUTTON_W,
+            TRANSPORT_BUTTON_H + Style::SP_XS,
+            "icon transport controls keep a compact fixed width derived from the height"
+        );
+    }
+
+    #[test]
+    fn queue_action_buttons_use_refined_shared_chrome_height() {
+        assert_eq!(
+            QUEUE_CONTROL_BUTTON,
+            Style::TOOLBAR_CONTROL_H,
+            "Media queue row actions should inherit the shared refined chrome height"
+        );
+        assert!(
+            QUEUE_CONTROL_BUTTON < Style::SP_L,
+            "Media queue row actions must not return to the older 24pt button band"
+        );
+        assert!(
+            QUEUE_CONTROL_ICON < QUEUE_CONTROL_BUTTON,
+            "the painted queue action icon must fit inside the refined button rect"
+        );
+    }
+
     fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
         fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
                 egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_text_with_color(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Path(path) if path.fill != egui::Color32::TRANSPARENT => {
+                    out.push(path.fill);
+                }
+                egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                    out.push(rect.fill);
+                }
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
                         walk(shape, out);
@@ -2208,6 +2602,52 @@ mod tests {
         }
 
         shapes.iter().map(|clipped| walk(&clipped.shape)).sum()
+    }
+
+    fn transport_icon_shape_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn is_transport_tint(fill: egui::Color32) -> bool {
+            matches!(fill, Style::TEXT | Style::TEXT_STRONG)
+        }
+
+        fn walk(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Rect(rect)
+                    if is_transport_tint(rect.fill)
+                        && rect.rect.width() <= TRANSPORT_ICON
+                        && rect.rect.height() <= TRANSPORT_ICON =>
+                {
+                    1
+                }
+                egui::Shape::Path(path)
+                    if is_transport_tint(path.fill) && path.closed && path.points.len() == 3 =>
+                {
+                    1
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+
+        shapes.iter().map(|clipped| walk(&clipped.shape)).sum()
+    }
+
+    fn render_media_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(320.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        media_tooltip(ui, "Back 10 seconds");
+                    });
+            },
+        )
     }
 
     #[test]
@@ -2340,6 +2780,64 @@ mod tests {
         // Idle-hidden OSD branch.
         c.ui_mut().osd_idle_secs = crate::model::OSD_HIDE_SECS + 1.0;
         render_with_video(&mut c, &mut video, player_view);
+    }
+
+    #[test]
+    fn player_transport_controls_paint_icons_without_unicode_text() {
+        let mut c = chapter_controller();
+        let mut video = VideoTextureCache::default();
+        c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
+        c.pump();
+
+        let shapes = render_video_shapes(&mut c, &mut video, player_view);
+        let texts = painted_text(&shapes);
+        for glyph in ["⏮", "⏪", "⏩", "⏭", "◁", "▷", "◀", "▶", "⏸"] {
+            assert!(
+                !texts.iter().any(|text| text.contains(glyph)),
+                "transport controls must not paint raw glyph {glyph:?}: {texts:?}"
+            );
+        }
+        for label in ["10s", "Pause", "Frame", "Chapter", "Stop", "Snapshot"] {
+            assert!(
+                texts.iter().any(|text| text == label),
+                "transport row should keep the ASCII label {label:?}: {texts:?}"
+            );
+        }
+
+        let icons = transport_icon_shape_count(&shapes);
+        assert!(
+            icons >= 10,
+            "transport controls must paint geometry icons instead of text glyphs; got {icons}"
+        );
+    }
+
+    #[test]
+    fn media_transport_tooltip_uses_themed_text_and_surface() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        Style::install(&ctx);
+
+        let out = render_media_tooltip_frame(&ctx);
+        let texts = painted_text_with_color(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Back 10 seconds" && *color == Style::TEXT),
+            "media transport tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(text, color)| {
+                text == "Back 10 seconds"
+                    && matches!(*color, egui::Color32::BLACK | Style::BG | Style::TEXT_DIM)
+            }),
+            "media transport tooltip leaked unreadable/shared popup text color: {texts:?}"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&Style::SURFACE),
+            "media transport tooltip should paint its own themed surface: {fills:?}"
+        );
     }
 
     /// A canned discovery so the cast list renders with no real network probe.

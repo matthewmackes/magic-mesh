@@ -153,6 +153,7 @@ mod search;
 pub mod spell;
 mod terminal;
 mod toolbar;
+mod tooltip;
 pub mod widget;
 
 use mde_egui::{eframe, egui};

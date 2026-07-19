@@ -1737,7 +1737,7 @@ fn connect_verb_sftp_requires_paired_and_enqueues_a_browse_request() {
     assert_eq!(queued[0].packet.kind, "kdeconnect.sftp.request");
 }
 
-// ── KDC-MESH-8: run-commands (OpenStack lifecycle) + telephony + connectivity ─
+// ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ─
 
 fn instance(name: &str, status: &str) -> CloudInstance {
     CloudInstance {
@@ -1774,10 +1774,17 @@ fn cloud_command_keys_map_and_the_list_includes_them() {
     }
     // Delete is deliberately NOT phone-exposed (safety).
     assert!(!list.contains("cloud-delete"));
+    let lower = list.to_ascii_lowercase();
+    for term in ["openstack", "nova", "keystone", "heat", "horizon"] {
+        assert!(
+            !lower.contains(term),
+            "phone-visible cloud command list must not expose {term}"
+        );
+    }
 }
 
 #[test]
-fn plan_cloud_lifecycle_filters_by_nova_status() {
+fn plan_cloud_lifecycle_filters_by_provider_status() {
     let fleet = [
         instance("web", "ACTIVE"),
         instance("db", "SHUTOFF"),
@@ -1803,7 +1810,7 @@ fn plan_cloud_lifecycle_filters_by_nova_status() {
 }
 
 #[test]
-fn lifecycle_bus_verb_maps_to_the_openstack_action_verb() {
+fn lifecycle_bus_verb_maps_to_the_cloud_action_verb() {
     assert_eq!(lifecycle_bus_verb(LifecycleAction::Start), "instance-start");
     assert_eq!(
         lifecycle_bus_verb(LifecycleAction::Reboot),
@@ -1869,7 +1876,7 @@ fn kdc_mesh8_a_phone_action_appends_a_hash_chained_audit_row() {
     std::env::set_var("MDE_HOME", tmp.path());
     let before = audit_row_count(&crate::default_db_path());
     audit_kdc_action(
-        json!({ "action": "kdc_openstack", "verb": "instance-reboot", "instance": "web" }),
+        json!({ "action": "kdc_cloud", "verb": "instance-reboot", "instance": "web" }),
     );
     let after = audit_row_count(&crate::default_db_path());
     assert_eq!(

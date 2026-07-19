@@ -156,6 +156,85 @@ use crate::toast_bridge::TOAST_TOPIC;
 /// auto-refresh; the producer republishes on its own cadence). A Scan forces an
 /// immediate re-read regardless of this gate.
 const REFRESH: Duration = Duration::from_secs(30);
+const DEVMGR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+
+fn devmgr_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(DEVMGR_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+fn devmgr_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let previous_style = response.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_devmgr_popup_style(&response.ctx, &mut menu_style);
+    response.ctx.set_style(menu_style);
+    let _ = response.context_menu(|ui| {
+        let ctx = ui.ctx().clone();
+        apply_devmgr_popup_style(&ctx, ui.style_mut());
+        add_contents(ui);
+    });
+    response.ctx.set_style(previous_style);
+}
+
+fn apply_devmgr_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
+    let palette = Style::current_palette(ctx);
+    let border = egui::Stroke::new(1.0, palette.border);
+    let text = egui::Stroke::new(1.0, palette.text);
+    let text_dim = egui::Stroke::new(1.0, palette.text_dim);
+    let danger = Style::resolve_color(ctx, Style::DANGER);
+    let visuals = &mut style.visuals;
+
+    visuals.window_fill = palette.surface;
+    visuals.panel_fill = palette.surface;
+    visuals.faint_bg_color = palette.surface;
+    visuals.extreme_bg_color = palette.bg;
+    visuals.window_stroke = border;
+    visuals.override_text_color = Some(palette.text);
+
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.bg_stroke = border;
+    visuals.widgets.noninteractive.fg_stroke = text_dim;
+
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    visuals.widgets.inactive.bg_stroke = border;
+    visuals.widgets.inactive.fg_stroke = text;
+
+    visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.bg_stroke = border;
+    visuals.widgets.hovered.fg_stroke = text;
+
+    visuals.widgets.active.bg_fill = palette.surface_hi;
+    visuals.widgets.active.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, danger);
+    visuals.widgets.active.fg_stroke = text;
+
+    visuals.widgets.open.bg_fill = palette.surface_hi;
+    visuals.widgets.open.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.open.bg_stroke = border;
+    visuals.widgets.open.fg_stroke = text;
+
+    visuals.selection.bg_fill = danger.gamma_multiply(0.22);
+    visuals.selection.stroke = egui::Stroke::new(1.0, danger);
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+}
+
+fn devmgr_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| devmgr_tooltip(ui, text.as_str()))
+}
 
 /// How long a published snapshot may age before the rail marks a host **stale**
 /// (design §7 — honest dim/stale/offline). The producer republishes on its own
@@ -1366,13 +1445,12 @@ impl DeviceManagerState {
                             .strong(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(
-                                RichText::new("\u{21BB}") // ↻ — live-refresh this host
-                                    .size(Style::SMALL)
-                                    .color(Style::TEXT),
-                            )
-                            .on_hover_text("Refresh this host's inventory from the mesh")
+                        let refresh = ui.button(
+                            RichText::new("\u{21BB}") // ↻ — live-refresh this host
+                                .size(Style::SMALL)
+                                .color(Style::TEXT),
+                        );
+                        if devmgr_hover_text(refresh, "Refresh this host's inventory from the mesh")
                             .clicked()
                         {
                             refresh_clicked = true;
@@ -1645,13 +1723,12 @@ impl DeviceManagerState {
                     .size(Style::SMALL),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(
-                        RichText::new("\u{24D8}") // ⓘ
-                            .size(Style::BODY)
-                            .color(Style::TEXT),
-                    )
-                    .on_hover_text("About \u{2014} license, credits, mesh identity")
+                let about = ui.button(
+                    RichText::new("\u{24D8}") // ⓘ
+                        .size(Style::BODY)
+                        .color(Style::TEXT),
+                );
+                if devmgr_hover_text(about, "About \u{2014} license, credits, mesh identity")
                     .clicked()
                 {
                     self.show_about = true;
@@ -2407,10 +2484,8 @@ impl DeviceManagerState {
                         .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = ui
-                        .button(RichText::new("\u{00D7}").size(Style::BODY)) // ×
-                        .on_hover_text("Close")
-                        .clicked();
+                    let close_button = ui.button(RichText::new("\u{00D7}").size(Style::BODY)); // ×
+                    close = devmgr_hover_text(close_button, "Close").clicked();
                 });
             });
             ui.separator();
@@ -3594,7 +3669,9 @@ fn device_row(
         .interact(egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let mut action: Option<RowActionRequest> = None;
-    resp.context_menu(|ui| action = device_context_menu(ui, category, dev, allow_control));
+    devmgr_context_menu(&resp, |ui| {
+        action = device_context_menu(ui, category, dev, allow_control);
+    });
     // a11y-05 — the row's accesskit node (name + the MDM status reading), keyed
     // by the strip response id. Pure metadata over the raw-painted row.
     install_row_accessibility(
@@ -3748,8 +3825,8 @@ fn host_row(
     // selection target (click a host to inspect it), with a hover summary.
     let resp = resp
         .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(host_hover(entry, now_ms));
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = devmgr_hover_text(resp, host_hover(entry, now_ms));
     // a11y-05 — the rail row's accesskit node (host name + freshness/counts),
     // keyed by the strip response id.
     install_row_accessibility(

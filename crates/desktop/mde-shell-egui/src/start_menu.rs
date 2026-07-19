@@ -288,6 +288,27 @@ const PANEL_H: f32 = console::PANEL_H;
 const TILE_GRID_CONTENT_H: f32 = TILE_GROUPS.len() as f32 * (GROUP_HEADING_H + TILE_H)
     + (TILE_GROUPS.len() - 1) as f32 * GROUP_GAP;
 
+fn start_menu_reserved_rail_h(screen: egui::Rect, rail_h: f32) -> f32 {
+    rail_h
+        .max(0.0)
+        .min((screen.height() - Style::SP_XL).max(0.0))
+}
+
+fn start_menu_panel_size(screen: egui::Rect, rail_h: f32) -> egui::Vec2 {
+    let reserved_rail_h = start_menu_reserved_rail_h(screen, rail_h);
+    let available_w = screen.width().max(1.0);
+    let available_h = (screen.height() - reserved_rail_h - Style::SP_XL).max(1.0);
+    egui::vec2(PANEL_W.min(available_w), PANEL_H.min(available_h))
+}
+
+fn start_menu_panel_pos(screen: egui::Rect, rail_h: f32, panel_h: f32, t: f32) -> egui::Pos2 {
+    let reserved_rail_h = start_menu_reserved_rail_h(screen, rail_h);
+    egui::pos2(
+        screen.left(),
+        screen.bottom() - reserved_rail_h - t * panel_h,
+    )
+}
+
 // ── type-to-launch search (SHELL-UX-3) ──────────────────────────────────────
 
 /// The search field's row height — a single [`Style::SP_L`] (24pt) line that
@@ -311,6 +332,9 @@ const RESULT_ICON: f32 = Style::SP_M;
 
 /// The search field's leading/clear glyph edge.
 const SEARCH_ICON: f32 = Style::SP_M;
+/// Start search text sits slightly above dense menu copy without becoming a
+/// launcher title.
+const START_SEARCH_TEXT_SIZE: f32 = Style::BODY + 1.0;
 /// Visible placeholder copy for the Start search field. Keep it ASCII so shell
 /// chrome copy follows the Browser/Start text-glyph cleanup contract.
 const START_SEARCH_HINT: &str = "Search apps and commands...";
@@ -913,25 +937,26 @@ pub fn start_menu_panel(
     // only because the taskbar itself was mispositioned at the time; once it
     // renders where it belongs this panel's Power-anchored bottom (lock #11)
     // would sit right underneath it without this reservation.
-    let panel_h = PANEL_H.min(screen.height() - rail_h - Style::SP_XL);
+    let panel_size = start_menu_panel_size(screen, rail_h);
     // The slide-up: the panel's top rides from the taskbar's top edge (t=0)
     // to its settled height above it (t=1) — the console.rs precedent,
     // restated here since the Area now lives in this module.
-    let top = screen.bottom() - rail_h - t * panel_h;
+    let pos = start_menu_panel_pos(screen, rail_h, panel_size.y, t);
 
     let area = egui::Area::new(egui::Id::new(START_MENU_AREA))
         .order(egui::Order::Foreground)
         .fade_in(false)
         .constrain(false)
-        .fixed_pos(egui::pos2(screen.left(), top))
+        .fixed_pos(pos)
         .show(ctx, |ui| {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(PANEL_W, panel_h), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(panel_size, egui::Sense::hover());
+            ui.set_clip_rect(rect);
             paint_frame(ui, rect);
+            let left_pane_w = LEFT_PANE_W.min(rect.width());
             let left_rect =
-                egui::Rect::from_min_size(rect.min, egui::vec2(LEFT_PANE_W, rect.height()));
+                egui::Rect::from_min_size(rect.min, egui::vec2(left_pane_w, rect.height()));
             let right_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + LEFT_PANE_W, rect.top()),
+                egui::pos2(rect.left() + left_pane_w, rect.top()),
                 rect.max,
             );
             install_accessibility(ui.ctx(), rect, left_rect, right_rect);
@@ -1026,11 +1051,13 @@ fn paint_frame(ui: &egui::Ui, rect: egui::Rect) {
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
         egui::StrokeKind::Inside,
     );
-    painter.vline(
-        rect.left() + LEFT_PANE_W,
-        (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
+    if rect.width() > LEFT_PANE_W {
+        painter.vline(
+            rect.left() + LEFT_PANE_W,
+            (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
+            egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+        );
+    }
 }
 
 /// One addressable cell in the keyboard-nav grid (SM-QOL-1): a surface plus
@@ -1622,7 +1649,7 @@ fn tile_context_menu(
     is_pinned: bool,
     action: &mut TileAction,
 ) -> bool {
-    let inner = resp.context_menu(|ui| {
+    let inner = start_menu_context_menu(resp, |ui| {
         if context_menu_row(
             ui,
             tile_context_item_id(surface, TileContextItem::Open),
@@ -1648,6 +1675,56 @@ fn tile_context_menu(
     inner.is_some()
 }
 
+fn start_menu_context_menu(
+    resp: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> Option<egui::InnerResponse<()>> {
+    let previous_style = resp.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_start_menu_context_style(&resp.ctx, &mut menu_style);
+    resp.ctx.set_style(menu_style);
+    let inner = resp.context_menu(|ui| {
+        let ctx = ui.ctx().clone();
+        apply_start_menu_context_style(&ctx, ui.style_mut());
+        add_contents(ui);
+    });
+    resp.ctx.set_style(previous_style);
+    inner
+}
+
+fn start_menu_color(ctx: &egui::Context, color: egui::Color32) -> egui::Color32 {
+    Style::resolve_color(ctx, color)
+}
+
+fn apply_start_menu_context_style(ctx: &egui::Context, style: &mut egui::Style) {
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::SP_XS);
+    let surface = start_menu_color(ctx, Style::SURFACE);
+    let surface_hi = start_menu_color(ctx, Style::SURFACE_HI);
+    let text = start_menu_color(ctx, Style::TEXT);
+    let text_dim = start_menu_color(ctx, Style::TEXT_DIM);
+    let border = start_menu_color(ctx, Style::BORDER);
+    let visuals = &mut style.visuals;
+    visuals.override_text_color = Some(text);
+    visuals.window_fill = surface;
+    visuals.panel_fill = surface;
+    visuals.extreme_bg_color = surface;
+    visuals.faint_bg_color = surface_hi;
+    visuals.widgets.noninteractive.bg_fill = surface;
+    visuals.widgets.noninteractive.fg_stroke.color = text_dim;
+    visuals.widgets.noninteractive.bg_stroke.color = border;
+    visuals.widgets.inactive.bg_fill = surface;
+    visuals.widgets.inactive.fg_stroke.color = text;
+    visuals.widgets.inactive.bg_stroke.color = border;
+    visuals.widgets.hovered.bg_fill = surface_hi;
+    visuals.widgets.hovered.fg_stroke.color = text;
+    visuals.widgets.active.bg_fill = surface_hi;
+    visuals.widgets.active.fg_stroke.color = text;
+    visuals.widgets.open.bg_fill = surface_hi;
+    visuals.widgets.open.weak_bg_fill = surface_hi;
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, text);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, border);
+}
+
 /// One context-menu row — restates `dock::context_menu_row` exactly (a
 /// hand-painted `Sense::click()` row with the shared hover wash + focus ring),
 /// since that helper is private to `dock`. All colours are `Style` tokens (§4);
@@ -1658,15 +1735,18 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, Style::SP_L), egui::Sense::hover());
     let resp = ui.interact(rect, id, egui::Sense::click());
     if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, START_CHROME_RADIUS, Style::SURFACE_HI);
+        ui.painter().rect_filled(
+            rect,
+            START_CHROME_RADIUS,
+            start_menu_color(ui.ctx(), Style::SURFACE_HI),
+        );
     }
     ui.painter().text(
         egui::pos2(rect.left() + Style::SP_S, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(Style::SMALL),
-        Style::TEXT,
+        start_menu_color(ui.ctx(), Style::TEXT),
     );
     mde_egui::focus::paint_focus_ring(ui.painter(), rect, resp.has_focus());
     install_context_menu_row_accessibility(ui.ctx(), id, rect, label);
@@ -2141,11 +2221,16 @@ fn search_field(
     focus_pending: &mut bool,
 ) -> bool {
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, START_CHROME_RADIUS, Style::BG);
+    let bg = start_menu_color(ui.ctx(), Style::SURFACE);
+    let border = start_menu_color(ui.ctx(), Style::BORDER);
+    let text = start_menu_color(ui.ctx(), Style::TEXT);
+    let text_dim = start_menu_color(ui.ctx(), Style::TEXT_DIM);
+    let surface_hi = start_menu_color(ui.ctx(), Style::SURFACE_HI);
+    painter.rect_filled(rect, START_CHROME_RADIUS, bg);
     painter.rect_stroke(
         rect,
         START_CHROME_RADIUS,
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+        egui::Stroke::new(HAIRLINE_W, border),
         egui::StrokeKind::Inside,
     );
 
@@ -2156,7 +2241,7 @@ fn search_field(
         ),
         egui::vec2(SEARCH_ICON, SEARCH_ICON),
     );
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::Search, SEARCH_ICON, Style::TEXT_DIM) {
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Search, SEARCH_ICON, text_dim) {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(tex.id(), search_icon, uv, egui::Color32::WHITE);
     }
@@ -2184,8 +2269,13 @@ fn search_field(
     let resp = ui.put(
         text_rect,
         egui::TextEdit::singleline(query)
-            .hint_text(START_SEARCH_HINT)
-            .font(egui::FontId::proportional(Style::BODY))
+            .hint_text(
+                egui::RichText::new(START_SEARCH_HINT)
+                    .size(START_SEARCH_TEXT_SIZE)
+                    .color(text_dim),
+            )
+            .font(egui::FontId::proportional(START_SEARCH_TEXT_SIZE))
+            .text_color(text)
             .desired_width(text_rect.width())
             .return_key(None)
             .frame(false),
@@ -2195,16 +2285,17 @@ fn search_field(
         *focus_pending = false;
     }
     let mut changed = resp.changed();
+    mde_egui::focus::paint_focus_ring(&painter, rect, resp.has_focus());
 
     if !query.is_empty() {
         let clear_resp = ui.interact(clear_button, search_clear_button_id(), egui::Sense::click());
         if clear_resp.hovered() || clear_resp.has_focus() {
-            painter.rect_filled(clear_button, START_CHROME_RADIUS, Style::SURFACE_HI);
+            painter.rect_filled(clear_button, START_CHROME_RADIUS, surface_hi);
         }
         let tint = if clear_resp.hovered() || clear_resp.has_focus() {
-            Style::TEXT
+            text
         } else {
-            Style::TEXT_DIM
+            text_dim
         };
         if let Some(tex) = icon_texture(ui.ctx(), IconId::Close, SEARCH_ICON, tint) {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -2793,14 +2884,17 @@ fn install_search_results_announcement(
 
 #[cfg(test)]
 mod tests {
-    use super::{start_menu_panel, StartMenuPrefs, StartMenuState, PANEL_H, PANEL_W};
+    use super::{
+        start_menu_panel, start_menu_panel_pos, start_menu_panel_size, StartMenuPrefs,
+        StartMenuState, PANEL_H, PANEL_W,
+    };
     use crate::console::{self, ConsoleRequest, ConsoleState};
     use crate::dock::Surface;
     use crate::screenshot::Capture;
     use crate::status::{SegmentRollup, StatusSegments};
     use crate::workbench::Plane;
     use mde_egui::egui;
-    use mde_egui::Style;
+    use mde_egui::{Style, StyleColorScheme};
     use std::path::Path;
 
     const SZ: egui::Vec2 = egui::Vec2::new(1280.0, 800.0);
@@ -2967,6 +3061,43 @@ mod tests {
                 _ => {}
             }
         }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut out = Vec::new();
         for clipped in shapes {
             walk(&clipped.shape, &mut out);
@@ -3141,6 +3272,46 @@ mod tests {
             "the Start Menu's footprint must still reach flush up to the top \
              of the reserved taskbar band, not shrink further than necessary"
         );
+    }
+
+    #[test]
+    fn start_menu_panel_geometry_is_bounded_to_narrow_screens() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+        let rail_h = 48.0;
+        let size = start_menu_panel_size(screen, rail_h);
+        let pos = start_menu_panel_pos(screen, rail_h, size.y, 1.0);
+        let rect = egui::Rect::from_min_size(pos, size);
+
+        assert!(
+            rect.left() >= screen.left() && rect.right() <= screen.right(),
+            "the Start Menu panel must not hang off a narrow viewport: {rect:?} vs {screen:?}"
+        );
+        assert!(
+            rect.bottom() <= screen.bottom() - rail_h,
+            "the Start Menu must still reserve the taskbar band on narrow screens"
+        );
+        assert!(
+            rect.height() > 0.0,
+            "bounded geometry must never produce a zero/negative panel height"
+        );
+    }
+
+    #[test]
+    fn start_menu_panel_geometry_clamps_excessive_rail_height() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 120.0));
+        let size = start_menu_panel_size(screen, 400.0);
+        let pos = start_menu_panel_pos(screen, 400.0, size.y, 1.0);
+        let rect = egui::Rect::from_min_size(pos, size);
+
+        assert!(
+            rect.top() >= screen.top(),
+            "an oversized rail reservation must not push the Start Menu above the screen"
+        );
+        assert!(
+            rect.right() <= screen.right() && rect.bottom() <= screen.bottom(),
+            "the Start Menu stays inside the visible screen even with a bad rail input"
+        );
+        assert!(rect.width() > 0.0 && rect.height() > 0.0);
     }
 
     // ── dismiss (Esc / click-away / an embedded action closing for real) ────
@@ -3600,6 +3771,57 @@ mod tests {
                 "{label:?} context menu row role"
             );
         }
+
+        let texts = painted_text_colors(&out.shapes);
+        for label in ["Open", "Pin to top"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == Style::TEXT),
+                "Start tile context row {label:?} should paint with Start text: {texts:?}"
+            );
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == egui::Color32::BLACK),
+                "Start tile context row {label:?} leaked raw black popup text: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tile_context_menu_visual_scope_uses_start_menu_tokens() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut style = (*ctx.style()).clone();
+        super::apply_start_menu_context_style(&ctx, &mut style);
+
+        assert_eq!(style.visuals.window_fill, Style::SURFACE);
+        assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+        assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+        assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+        assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+        assert_eq!(style.visuals.widgets.open.bg_stroke.color, Style::BORDER);
+    }
+
+    #[test]
+    fn tile_context_menu_visual_scope_resolves_light_mode_tokens() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        let mut style = (*ctx.style()).clone();
+        super::apply_start_menu_context_style(&ctx, &mut style);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+
+        assert_eq!(style.visuals.window_fill, palette.surface);
+        assert_eq!(style.visuals.panel_fill, palette.surface);
+        assert_eq!(style.visuals.override_text_color, Some(palette.text));
+        assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, palette.text);
+        assert_eq!(style.visuals.widgets.hovered.bg_fill, palette.surface_hi);
+        assert_eq!(style.visuals.widgets.open.bg_stroke.color, palette.border);
     }
 
     // ── WIN7-4: live-tile rotation (lock #5) ─────────────────────────────────
@@ -4534,6 +4756,72 @@ mod tests {
     }
 
     #[test]
+    fn start_menu_search_field_uses_themed_hint_and_query_text() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = StartMenuState::default();
+        let mut console = ConsoleState::with_store(None);
+        s.toggle();
+        run(&ctx, &mut s, &mut console, 2);
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == super::START_SEARCH_HINT && *color == Style::TEXT_DIM),
+            "dark Start search hint should use themed dim text: {texts:?}"
+        );
+
+        s.search_query = "phone".to_string();
+        let out = drive(&ctx, &mut s, &mut console, Vec::new(), SZ);
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "phone" && *color == Style::TEXT),
+            "dark Start search query should use themed primary text: {texts:?}"
+        );
+
+        let light_ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &light_ctx,
+            StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        let mut light = StartMenuState::default();
+        let mut light_console = ConsoleState::with_store(None);
+        light.toggle();
+        run(&light_ctx, &mut light, &mut light_console, 2);
+        let out = drive(&light_ctx, &mut light, &mut light_console, Vec::new(), SZ);
+        let texts = painted_text_colors(&out.shapes);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == super::START_SEARCH_HINT && *color == palette.text_dim),
+            "light Start search hint should use Windows-2000 dim text: {texts:?}"
+        );
+
+        light.search_query = "phone".to_string();
+        let out = drive(&light_ctx, &mut light, &mut light_console, Vec::new(), SZ);
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "phone" && *color == palette.text),
+            "light Start search query should use Windows-2000 primary text: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(text, color)| {
+                (text == super::START_SEARCH_HINT || text == "phone")
+                    && *color == egui::Color32::BLACK
+                    && *color != palette.text
+            }),
+            "Start search should not leak raw black except the light palette text token: {texts:?}"
+        );
+    }
+
+    #[test]
     fn live_query_exposes_a_clear_search_icon_button() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -4667,7 +4955,9 @@ mod tests {
             !canvas.is_blank(),
             "the broad Start search screenshot must not be blank"
         );
-        assert_eq!(canvas.count_near_color_in_rect(search_rect, Style::ACCENT, 4), 0,
+        assert_eq!(
+            canvas.count_near_color_in_rect(search_rect, Style::ACCENT, 4),
+            0,
             "an offscreen selected result row must not paint its accent stripe into the fixed search field"
         );
 

@@ -2726,6 +2726,20 @@ fn generous_display_type_leads_the_type_ramp() {
 }
 
 #[test]
+fn explorer_chrome_strips_use_refined_toolbar_margin() {
+    assert_eq!(
+        explorer_toolbar_margin(),
+        Style::toolbar_margin(),
+        "Explorer filter/search/action strips should follow the shared toolbar density"
+    );
+    assert_ne!(
+        explorer_toolbar_margin(),
+        egui::Margin::same(Style::SP_S as i8),
+        "Explorer chrome strips must not keep the old full-gutter thickness"
+    );
+}
+
+#[test]
 fn the_focus_ring_paints_the_selection_in_mosaic_and_hero() {
     // Presence, not just definition: with NO pins and NO marks on the
     // shelf, the ONLY author of ACCENT_HI vertices is the shared

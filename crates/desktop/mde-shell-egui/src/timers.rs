@@ -52,6 +52,8 @@ const NOTIFY_SOURCE: &str = "timer";
 /// The persisted store file under the client data dir (the
 /// `settings-appearance.json` / `power-honor.json` sibling).
 const STORE_FILE: &str = "timers-alarms.json";
+const START_TIMER_DISABLED_TIP: &str = "Set a duration first";
+const TIMERS_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 /// Seconds per day — the alarm schedule's civil-day modulus.
 const DAY_SECS: i64 = 86_400;
@@ -619,11 +621,8 @@ fn timers_section(
         ui.add(egui::DragValue::new(m).range(0..=59).suffix("m"));
         ui.add(egui::DragValue::new(s).range(0..=59).suffix("s"));
         let zero = *h == 0 && *m == 0 && *s == 0;
-        if ui
-            .add_enabled(!zero, egui::Button::new("Start"))
-            .on_disabled_hover_text("Set a duration first")
-            .clicked()
-        {
+        let start_response = ui.add_enabled(!zero, egui::Button::new("Start"));
+        if timers_disabled_hover_text(start_response, START_TIMER_DISABLED_TIP).clicked() {
             state.start_draft_timer(now);
         }
     });
@@ -648,6 +647,29 @@ fn timers_section(
         });
     }
     any_running
+}
+
+fn timers_tooltip(ui: &mut egui::Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(TIMERS_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn timers_disabled_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_disabled_hover_ui(move |ui| timers_tooltip(ui, text.as_str()))
 }
 
 /// One timer row's state line + buttons — each run state shows its honest
@@ -794,7 +816,7 @@ mod tests {
     };
     use mde_bus::persist::Persist;
     use mde_egui::egui;
-    use mde_egui::Style;
+    use mde_egui::{Density, Style, StyleColorScheme};
     use std::path::PathBuf;
 
     /// A fresh per-test scratch dir (no tempdir dev-dep in this crate) —
@@ -831,6 +853,84 @@ mod tests {
             .into_iter()
             .filter_map(|m| m.body)
             .collect()
+    }
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_timers_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::timers_tooltip(ui, super::START_TIMER_DISABLED_TIP);
+                });
+            },
+        )
     }
 
     #[test]
@@ -954,6 +1054,33 @@ mod tests {
         let bad = scratch.0.join("garbage.json");
         std::fs::write(&bad, "{not json").expect("write garbage");
         assert_eq!(TimersFile::load_from(&bad), TimersFile::default());
+    }
+
+    #[test]
+    fn disabled_start_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let out = render_timers_tooltip_frame(&ctx);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text == super::START_TIMER_DISABLED_TIP && *color == text_color
+            }),
+            "Timers disabled tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            text_color != surface,
+            "Timers disabled tooltip text and surface must stay distinct in light mode"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "Timers disabled tooltip should paint its themed surface: {fills:?}"
+        );
     }
 
     #[test]

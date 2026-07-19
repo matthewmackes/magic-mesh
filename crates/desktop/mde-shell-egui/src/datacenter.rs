@@ -66,6 +66,9 @@ const BROWSER_POLICY_STATE_PREFIX: &str = "state/browser-policy/";
 /// BROWSER-DD-12 — per-node CEF runtime security-update posture, published by the
 /// `browser_security_update` worker.
 const BROWSER_SECURITY_UPDATE_STATE_PREFIX: &str = "state/browser-security-update/";
+const DATACENTER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+const CLOUD_MANAGED_TOOLTIP: &str =
+    "Managed by the Cloud plane - start/stop this instance there, not from the Fleet roster.";
 
 /// Poll cadence for the two live topics — a node's health flip or a new VM
 /// surfaces within this window. Matches the panel shell's 5 s refresh; the read
@@ -917,6 +920,29 @@ fn card_shadow() -> egui::Shadow {
     }
 }
 
+fn datacenter_tooltip(ui: &mut egui::Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(DATACENTER_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn datacenter_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| datacenter_tooltip(ui, text.as_str()))
+}
+
 /// Render one node's section: header + health summary, KVM service rows, VM
 /// roster with per-VM start/stop, and the inline create control. Any button
 /// click sets `pending` (the host is always this node — the fan-out guard).
@@ -962,8 +988,12 @@ fn show_node(
                     };
                     ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
                     ui.add_space(Style::SP_XS);
-                    ui.label(RichText::new(&svc.id).color(Style::TEXT).size(Style::SMALL))
-                        .on_hover_text(format!("systemd unit: {}", svc.unit));
+                    let service_response =
+                        ui.label(RichText::new(&svc.id).color(Style::TEXT).size(Style::SMALL));
+                    let _ = datacenter_hover_text(
+                        service_response,
+                        format!("systemd unit: {}", svc.unit),
+                    );
                     ui.add_space(Style::SP_XS);
                     let tone = if svc.active {
                         Style::TEXT_DIM
@@ -1361,7 +1391,7 @@ fn is_nova_managed(name: &str) -> bool {
 ///
 /// docs-consistency-8 / review-608: a Nova-managed guest ([`is_nova_managed`])
 /// also appears here (unfiltered `virsh list --all`), where its lifecycle
-/// belongs to the Cloud plane. Such rows are badged "Nova-managed" and their
+/// belongs to the Cloud plane. Such rows are badged "Cloud-managed" and their
 /// Stop confirm carries a "prefer the Cloud plane" warning, so the Fleet plane
 /// cannot silently tear down a Nova instance out from under the Cloud plane's
 /// lifecycle — without hiding the row or removing the honest raw control.
@@ -1392,15 +1422,12 @@ fn show_instance_row(
     if nova {
         // Info-tone badge + a Cloud-plane cross-hint. This plane can't switch
         // planes without reaching outside its scope, so the pointer is a hover.
-        ui.label(
-            RichText::new("Nova-managed")
+        let nova_response = ui.label(
+            RichText::new("Cloud-managed")
                 .color(Style::ACCENT)
                 .size(Style::SMALL),
-        )
-        .on_hover_text(
-            "Managed by OpenStack Nova — start/stop this instance from the Cloud plane, \
-             not the Fleet roster.",
         );
+        let _ = datacenter_hover_text(nova_response, CLOUD_MANAGED_TOOLTIP);
         ui.add_space(Style::SP_S);
     }
     if running {
@@ -1418,7 +1445,7 @@ fn show_instance_row(
                 // the second (dispatching) click. The existing two-step arm is the
                 // gate; this only adds the warning line.
                 ui.label(
-                    RichText::new("Nova-managed — prefer the Cloud plane")
+                    RichText::new("Cloud-managed - prefer the Cloud plane")
                         .color(Style::WARN)
                         .size(Style::SMALL),
                 );
@@ -1656,6 +1683,86 @@ mod tests {
         out
     }
 
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_datacenter_tooltip_frame(ctx: &egui::Context, text: &str) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 104.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        datacenter_tooltip(ui, text);
+                    });
+            },
+        )
+    }
+
     fn render_datacenter_state(state: &mut DatacenterState) -> egui::FullOutput {
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -1675,6 +1782,37 @@ mod tests {
                     });
             },
         )
+    }
+
+    #[test]
+    fn datacenter_hover_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            mde_egui::StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        let out = render_datacenter_tooltip_frame(&ctx, CLOUD_MANAGED_TOOLTIP);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == CLOUD_MANAGED_TOOLTIP && *color == text_color),
+            "Datacenter tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            text_color != surface,
+            "Datacenter tooltip text and surface must stay distinct in light mode"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "Datacenter tooltip should paint its themed surface: {fills:?}"
+        );
     }
 
     /// A faithful `state/adfilter/<node>` body (BOOKMARKS-7 `AdfilterStatus`).
@@ -1823,6 +1961,34 @@ mod tests {
                 "Fleet container UI must not expose {forbidden:?}: {texts:?}"
             );
         }
+    }
+
+    #[test]
+    fn cloud_managed_vm_badge_uses_provider_neutral_copy() {
+        let mut state = DatacenterState {
+            bus_root: None,
+            nodes: project(
+                &[],
+                &[roster_body(
+                    "node-a",
+                    &[("instance-deadbeef", "running")],
+                    1,
+                )],
+                &[],
+            ),
+            ..DatacenterState::default()
+        };
+
+        let out = render_datacenter_state(&mut state);
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().any(|text| text == "Cloud-managed"),
+            "Cloud-managed badge should render for cloud-owned VM rows: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "Nova-managed"),
+            "Fleet row should not expose provider-specific Nova branding: {texts:?}"
+        );
     }
 
     #[test]

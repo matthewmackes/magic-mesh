@@ -7,6 +7,7 @@
 //! parent's private types + egui/`Style` imports via `use super::*`.
 
 use super::*;
+use crate::tooltip::editor_hover_text;
 
 /// The tab's title: its file name, or "scratch" for a pathless buffer — the same
 /// naming the old single-doc chrome used.
@@ -56,10 +57,11 @@ pub(super) fn tab_bar(ui: &mut Ui, pane: &PaneTabs, pane_focused: bool) -> Optio
             }
         }
         ui.add_space(Style::SP_XS);
-        if ui
-            .selectable_label(false, RichText::new("+").size(Style::BODY))
-            .on_hover_text("New tab (Ctrl+T)")
-            .clicked()
+        if editor_hover_text(
+            ui.selectable_label(false, RichText::new("+").size(Style::BODY)),
+            "New tab (Ctrl+T)",
+        )
+        .clicked()
         {
             action = Some(LeafAction::NewTab);
         }
@@ -191,10 +193,11 @@ pub(super) fn preview_empty(ui: &mut Ui) {
 /// open-document and empty-state chromes. A token-styled (§4) `selectable_label`
 /// bound to `show_tree`.
 pub(super) fn tree_toggle(ui: &mut Ui, show_tree: &mut bool) {
-    if ui
-        .selectable_label(*show_tree, RichText::new("\u{2630}").size(Style::BODY))
-        .on_hover_text("Toggle the project tree")
-        .clicked()
+    if editor_hover_text(
+        ui.selectable_label(*show_tree, RichText::new("\u{2630}").size(Style::BODY)),
+        "Toggle the project tree",
+    )
+    .clicked()
     {
         *show_tree = !*show_tree;
     }

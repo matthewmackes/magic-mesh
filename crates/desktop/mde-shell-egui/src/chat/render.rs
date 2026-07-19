@@ -24,6 +24,9 @@ use mde_theme::brand::icons::IconId;
 
 pub(super) const CHAT_UNMUTE_ICON: IconId = IconId::Notifications;
 pub(super) const CHAT_MUTE_ICON: IconId = IconId::NotificationsMuted;
+pub(super) const CHAT_CALL_ICON: IconId = IconId::Phones;
+pub(super) const CHAT_REMOTE_ICON: IconId = IconId::Sessions;
+pub(super) const CHAT_STATUS_EDIT_ICON: IconId = IconId::TextEdit;
 
 /// Render a conversation's messages with a muted **day separator** whenever the
 /// civil (UTC) date changes — the authentic chat idiom — each row carrying its own
@@ -138,6 +141,25 @@ pub(super) fn card_shadow() -> egui::Shadow {
     }
 }
 
+pub(super) fn chat_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+pub(super) fn chat_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| chat_tooltip(ui, text.as_str()))
+}
+
 /// Render one message row (human text, a clipboard copy, a folded alert card, or
 /// a file/call/remote hand-off). Each kind renders **and acts** (NOTIFY-CHAT-4 —
 /// re-copy, run an alert verb, download a file, re-launch Call / Remote); my own
@@ -166,23 +188,23 @@ pub(super) fn message_row(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if mine && matches!(&msg.kind, MessageKind::Text(_)) {
                         let delivery = Delivery::for_recipient(recipient);
-                        ui.colored_label(
+                        let delivery_resp = ui.colored_label(
                             delivery.color(),
                             RichText::new(delivery.label()).size(Style::SMALL),
-                        )
-                        .on_hover_text(delivery.hover_text());
+                        );
+                        let _ = chat_hover_text(delivery_resp, delivery.hover_text());
                     }
                     // Compact HH:MM (UTC) send time, token-muted, full date on hover —
                     // every message carries its injected timestamp (lock 22), so the
                     // row is no longer time-blind (the biggest "looks incomplete" tell).
                     let hhmm = fmt_hh_mm(msg.ts_unix_ms);
                     if !hhmm.is_empty() {
-                        ui.label(
+                        let time_resp = ui.label(
                             RichText::new(hhmm)
                                 .color(Style::TEXT_DIM)
                                 .size(Style::SMALL),
-                        )
-                        .on_hover_text(fmt_full_datetime(msg.ts_unix_ms));
+                        );
+                        let _ = chat_hover_text(time_resp, fmt_full_datetime(msg.ts_unix_ms));
                     }
                 });
             });
@@ -211,11 +233,7 @@ pub(super) fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&P
                         .monospace(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .button("Copy")
-                        .on_hover_text("Re-copy to clipboard")
-                        .clicked()
-                    {
+                    if chat_hover_text(ui.button("Copy"), "Re-copy to clipboard").clicked() {
                         ui.ctx().copy_text(full.clone());
                     }
                 });
@@ -268,10 +286,7 @@ pub(super) fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&P
                 ui.label(RichText::new(name).color(Style::TEXT).size(Style::BODY));
                 mde_egui::muted_note(ui, format!("{size_bytes} bytes"));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .button("Save")
-                        .on_hover_text("Open the mesh inbox in Files")
-                        .clicked()
+                    if chat_hover_text(ui.button("Save"), "Open the mesh inbox in Files").clicked()
                     {
                         navigate_via_toast(bus_root, "chat", name, "shell/goto/files");
                     }
@@ -343,12 +358,12 @@ pub(super) fn notification_row(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let hhmm = fmt_hh_mm(item.msg.ts_unix_ms);
                     if !hhmm.is_empty() {
-                        ui.label(
+                        let time_resp = ui.label(
                             RichText::new(hhmm)
                                 .color(Style::TEXT_DIM)
                                 .size(Style::SMALL),
-                        )
-                        .on_hover_text(fmt_full_datetime(item.msg.ts_unix_ms));
+                        );
+                        let _ = chat_hover_text(time_resp, fmt_full_datetime(item.msg.ts_unix_ms));
                     }
                 });
             });
@@ -440,17 +455,19 @@ pub(super) fn contact_actions(
     err: &mut Option<String>,
 ) {
     ui.horizontal(|ui| {
-        if ui
-            .button("\u{1F4DE} Call")
-            .on_hover_text(format!("Place a SIP call to {host}"))
-            .clicked()
+        if chat_hover_text(
+            yamis_icon_button(ui, CHAT_CALL_ICON, "Call"),
+            format!("Place a SIP call to {host}"),
+        )
+        .clicked()
         {
             dial_peer(bus_root, host);
         }
-        if ui
-            .button("\u{1F5A5} Remote Control")
-            .on_hover_text(format!("Open {host}'s remote desktop"))
-            .clicked()
+        if chat_hover_text(
+            yamis_icon_button(ui, CHAT_REMOTE_ICON, "Remote Control"),
+            format!("Open {host}'s remote desktop"),
+        )
+        .clicked()
         {
             request_host_desktop(bus_root, host);
         }
@@ -483,10 +500,7 @@ pub(super) fn mute_button(
             format!("Mute {id} — silence its messages + alerts"),
         )
     };
-    if yamis_icon_button(ui, icon, label)
-        .on_hover_text(hint)
-        .clicked()
-    {
+    if chat_hover_text(yamis_icon_button(ui, icon, label), hint).clicked() {
         // shell-ux-11: surface a failed mute rather than silently dropping it.
         if let Err(e) = publish_mute(bus_root, target, id, !muted) {
             *err = Some(e);
@@ -494,7 +508,7 @@ pub(super) fn mute_button(
     }
 }
 
-fn yamis_icon_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> egui::Response {
+pub(super) fn yamis_icon_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> egui::Response {
     let Some(tex) = icon_texture(ui.ctx(), icon, Style::SP_M, Style::TEXT) else {
         return ui.button(label);
     };
@@ -502,7 +516,11 @@ fn yamis_icon_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> egui::Resp
         tex.id(),
         egui::vec2(Style::SP_M, Style::SP_M),
     ));
-    ui.add(egui::Button::image_and_text(image, label))
+    let response = ui.add(egui::Button::image_and_text(image, label));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    response
 }
 
 /// Publish `action/chat/mute` `{target, id, muted}` to the local Bus — the worker

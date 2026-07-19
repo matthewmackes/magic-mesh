@@ -230,6 +230,14 @@ const ZOOM_SECS: f32 = Motion::SLOW;
 /// tile, and the mosaic settles back in from here on Back (O3).
 const ZOOM_FADE_FLOOR: f32 = 0.4;
 
+fn explorer_toolbar_margin() -> egui::Margin {
+    Style::toolbar_margin()
+}
+
+fn explorer_toolbar_frame() -> egui::Frame {
+    egui::Frame::NONE.inner_margin(explorer_toolbar_margin())
+}
+
 // ─────────────────────────── wire mirrors (§6) ───────────────────────────
 
 /// The kind of a discovered unit — a **local** mirror of the aggregator's
@@ -2722,7 +2730,7 @@ impl ExplorerState {
                 ));
             if ui
                 .add(pin_button)
-                .on_hover_text("Pinned units sort to the front (P)")
+                .explorer_hover_text("Pinned units sort to the front (P)")
                 .clicked()
             {
                 self.toggle_pin(&unit.id);
@@ -2811,7 +2819,7 @@ impl ExplorerState {
         let resp = ui.add_enabled(seam.is_ok(), button);
         match &seam {
             Err(reason) => {
-                resp.on_disabled_hover_text(reason.clone());
+                resp.explorer_disabled_hover_text(reason.clone());
             }
             Ok(_) => {
                 if resp.clicked() {
@@ -3142,13 +3150,13 @@ impl ExplorerState {
         self.tick_ambient(ui.ctx());
 
         egui::TopBottomPanel::top(ui.id().with("explorer-chips"))
-            .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+            .frame(explorer_toolbar_frame())
             .show_inside(ui, |ui| self.header(ui));
         // The `/` universal-search overlay rides between the summary strip and
         // the active mode, so the hit list never covers the filter chips.
         if self.search.is_some() {
             egui::TopBottomPanel::top(ui.id().with("explorer-search"))
-                .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                .frame(explorer_toolbar_frame())
                 .show_inside(ui, |ui| self.search_overlay(ui));
         }
         match self.mode {
@@ -3158,7 +3166,7 @@ impl ExplorerState {
                 // the typed bulk arming, and the per-unit rollup.
                 if !self.marked.is_empty() {
                     egui::TopBottomPanel::bottom(ui.id().with("explorer-bulk"))
-                        .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                        .frame(explorer_toolbar_frame())
                         .show_inside(ui, |ui| self.bulk_bar(ui));
                 }
                 egui::CentralPanel::default()
@@ -3167,7 +3175,7 @@ impl ExplorerState {
             }
             SurfaceMode::Hero => {
                 egui::TopBottomPanel::bottom(ui.id().with("explorer-strip"))
-                    .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                    .frame(explorer_toolbar_frame())
                     .show_inside(ui, |ui| self.filmstrip(ui));
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)

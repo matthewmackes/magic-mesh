@@ -376,30 +376,75 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Core Architecture
 
-### WL-ARCH-001 - Construct Cloud hard cutover to Nova/libvirt/QEMU-KVM
+### WL-ARCH-001 - Construct Cloud provider-neutral runway and OpenStack exit
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Governance says cloud-hypervisor is retired, but historical docs and
-  worklist text still carry old-stack assumptions while Construct Cloud has several
-  live acceptance gates open.
-- Required outcome: Cutover nodes run the Nova/libvirt/QEMU-KVM plus OVN stack,
-  old stack code is absent from runtime paths, and stale cloud-hypervisor
-  directions are either archived or bannered as historical.
-- Scope: Kolla/OpenStack services, image pipeline, networking, old-stack deletion,
-  docs cleanup, and live cloud status.
+- Problem: Construct Cloud is still coupled to OpenStack service names, Kolla
+  topology, Nova/Heat resource verbs, and `state/openstack/*` mirrors while the
+  user has directed a new track to move away from OpenStack. The existing
+  backend must remain honest and usable until a replacement provider path carries
+  the same typed behavior.
+- Required outcome: Cloud UI, Bus verbs, persisted mirrors, orchestration forms,
+  image/network lifecycle, and docs use provider-neutral Construct Cloud
+  contracts; OpenStack becomes a replaceable backend adapter instead of the
+  product architecture, and replacement provider work can be introduced without
+  rewiring shell surfaces.
+- Scope: Cloud provider contracts, OpenStack adapter boundaries, provider
+  registry/configuration, IaC UI labels and verbs, image pipeline, networking,
+  old-stack deletion after replacement proof, docs cleanup, and live cloud
+  status.
 - Relevant files/components: `crates/mesh/mackesd/src/workers/openstack/`,
   `docs/design/quasar-cloud.md`, `docs/ops/quasar-cloud-runbook.md`,
-  `packaging/bootc/`, cloud UI.
-- Dependencies: Farm dev cloud/test bed and live cloud credentials.
-- Acceptance criteria: API catalog is healthy, instances launch over mesh
-  networking, old-stack binaries/modules are not used, and docs point to the
-  current architecture.
-- Verification method: Farm dev cloud lane, `/audit` old-stack grep, live cloud
-  smoke.
+  `packaging/bootc/`, cloud UI, `crates/desktop/mde-shell-egui/src/iac/`, and
+  unit-aggregator cloud mirror consumers.
+- Dependencies: Replacement provider decision/prototype, farm dev cloud/test bed,
+  and live cloud credentials.
+- Current evidence: A 2026-07-18 provider-neutral runway pass updated
+  `AI_GOVERNANCE.md` with the newer Construct Cloud provider-neutral lock, then
+  moved the native IaC surface's user-facing copy from OpenStack/Keystone/Heat/
+  HOT wording to Construct Cloud, Cloud provider, Cloud API status,
+  Orchestration, and Template language while preserving backend diagnostics and
+  existing wire contracts. Farm evidence: BigBoy `.130` slot
+  `openstack-exit-iac`
+  `cargo test -p mde-shell-egui iac -- --nocapture` passed 31 tests; focused
+  rustfmt over the three edited IaC files passed. Whole-crate `cargo fmt
+  --package mde-shell-egui -- --check` is still blocked by unrelated existing
+  formatting drift in other dirty shell files. A follow-up 2026-07-18
+  unit-aggregator slice made the Bus cloud mirror reader prefer provider-neutral
+  `state/cloud/<node>` mirrors while accepting legacy `state/openstack/<node>`
+  adapter mirrors for backward-compatible reads and diagnostics. Farm evidence:
+  the post-cleanup `.50` slot `openstack-exit-units3`
+  `cargo test -p mackesd unit_aggregator::sources -- --nocapture` passed 8
+  focused source tests, including persisted cloud+legacy topic folding into
+  units and invalid/empty topic rejection after disambiguating the provider-
+  neutral `CloudMirrorSource::read` call from the legacy compatibility trait;
+  `.90` slot `openstack-exit-fmt3` `cargo fmt -p mackesd -- --check` passed.
+  A third 2026-07-18 OpenStack-exit track added the provider-neutral
+  `mackes_mesh_types::cloud` facade so new consumers can import Construct Cloud
+  catalog, health, resource table, and orchestration aliases without binding to
+  the legacy `openstack` module path. The facade accepts direct provider-neutral
+  catalog/resource JSON from a non-OpenStack fake while preserving Keystone and
+  OpenStack collection fallback parsing for the installed adapter. Farm
+  evidence: `.90` slot `cloud-facade-test`
+  `cargo test -p mackes-mesh-types cloud -- --nocapture` passed 6 focused tests;
+  `.50` slot `cloud-facade-fmt`
+  `cargo fmt -p mackes-mesh-types -- --check` passed.
+- Acceptance criteria: User-facing shell surfaces no longer require OpenStack,
+  Keystone, Nova, Heat, or Horizon terminology; typed Bus and persisted cloud
+  contracts can be satisfied by at least one non-OpenStack fake/provider in
+  tests; the existing OpenStack backend can be disabled without breaking the UI;
+  a replacement backend can list and launch a test workload over mesh networking;
+  stale OpenStack-only docs are archived or bannered once the replacement path is
+  live.
+- Verification method: Provider-neutral UI and contract fixture tests, OpenStack
+  adapter compatibility tests while it remains installed, provider-disabled UI
+  smoke, replacement-provider smoke, and `/audit` grep for product-facing
+  OpenStack terminology.
 - Origin or merged source IDs: QC-1 through QC-15, OW-8, E12 supersession notes,
-  old worklist lines 3457-3567.
+  old worklist lines 3457-3567, user directive 2026-07-18 to start moving away
+  from OpenStack.
 
 ### WL-ARCH-002 - Cloud resource verbs, forms, and typed arming
 
@@ -647,6 +692,19 @@ These decisions refine acceptance and sequencing for the active items below.
   `crates/desktop/mde-shell-egui/src/web/`, browser runtime installer.
 - Dependencies: Widevine-capable CEF runtime and live test account/content where
   legally usable.
+- Current evidence: A 2026-07-19 Browser PiP/background-media polling slice
+  fixed the inactive-tab poll gate so the currently selected background
+  Picture-in-Picture media tab drains helper events every Browser frame while
+  the PiP overlay is visible, instead of waiting up to the one-second quiet
+  background cadence. Quiet inactive tabs still use the bounded background poll
+  cadence and cap, and known/unknown playing background media still bypasses
+  the quiet-tab cap. Farm evidence: BigBoy `.130` slot `browser-pip-poll`
+  `cargo test -p mde-shell-egui media_pip -- --nocapture` passed 5 tests; `.90`
+  slot `browser-background-poll`
+  `cargo test -p mde-shell-egui background -- --nocapture` passed 8 tests; `.50`
+  slot `browser-pip-poll-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-shell-egui/src/web/mod.rs`.
 - Acceptance criteria: A protected-media smoke passes or is blocked with a named
   external requirement; normal browser works without CDM; media keys and PiP
   route through browser chrome.
@@ -965,6 +1023,15 @@ These decisions refine acceptance and sequencing for the active items below.
   `tab_search_rows_clip_to_narrow_browser_chrome_width` passed; `.170` focused
   `tab_search_toolbar_anchor_uses_browser_icon_button` passed; `.50`
   `cargo fmt -p mde-shell-egui --check` passed. A later 2026-07-18 Browser
+  Search Tabs popup-surface pass wrapped the popup contents in the shared
+  Browser `chrome_popup_frame`, subtracting frame margin from the narrow content
+  budget so the popup paints the official Chrome-light surface/outline without
+  pushing beyond tight Browser chrome. Farm evidence: `.50` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check
+  crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs` passed, and BigBoy
+  `.130` focused
+  `cargo test -p mde-shell-egui tab_search_rows_clip_to_narrow_browser_chrome_width -- --nocapture`
+  passed. A later 2026-07-18 Browser
   page-context compact-layout pass removed the fixed page-context menu minimum,
   made shared Browser menu rows and separators use the bounded available chrome
   width, clipped labels inside each row rect, and kept command accessibility and
@@ -999,7 +1066,27 @@ These decisions refine acceptance and sequencing for the active items below.
   visuals. Farm evidence: `.50`
   `cargo fmt -p mde-shell-egui -- --check` passed and BigBoy `.130` focused
   `browser_print_drawer_stepper_hover_uses_browser_tooltip_surface` passed. A
-  later 2026-07-18 Browser capture-artifact
+  later 2026-07-18 Browser context-menu chrome pass routed page, address-bar,
+  and tab right-click menus through the Browser Chrome visual scope before egui
+  builds the native menu frame, and mapped egui's open widget state to Browser
+  Chrome roles so menu/open controls cannot inherit dark shell fills. Farm
+  evidence: `.50` `cargo fmt -p mde-shell-egui -- --check` passed and `.90`
+  focused `cargo test -p mde-shell-egui browser_chrome -- --nocapture` passed
+  12 tests. A later 2026-07-18 Browser site-info popup pass routed both
+  security-chip entry points through the same reserved Chrome popup frame so the
+  Location-bar trust menu cannot collapse into a narrow wedge or inherit shell
+  popup paint. Farm evidence: BigBoy `.130` slot `browser-site-info-popup`
+  focused `security_chip_toolbar_popup_keeps_full_browser_site_info_width`
+  passed; file-level `rustfmt --check` for `web/chrome_ui/mod.rs` passed on the
+  same farm slot. A later 2026-07-19 Browser toolbar-popup right-edge slice
+  replaced raw fixed outer popup sizing for the page-actions, bookmark-overflow,
+  and password toolbar anchors with a clip-aware reservation helper, preserving
+  full Browser menu width while proving page-actions, bookmark overflow, security
+  chip, and password popups stay inside the right edge of narrow Browser frames.
+  Farm evidence: `.90` slot `start-menu-light-style-test`
+  `cargo test -p mde-shell-egui popup -- --nocapture` passed 10 tests; `.50`
+  file-scoped `rustfmt --edition 2024 --config skip_children=true --check` for
+  `web/chrome_ui/mod.rs` passed. A later 2026-07-18 Browser capture-artifact
   palette pass moved annotated, callout, and freehand Browser screenshot outputs
   off shared dark shell colors and onto Browser Chrome tokens: white/pale-blue
   caption surfaces, Google blue overlay accents, and Chrome text. Farm evidence:
@@ -1082,7 +1169,29 @@ These decisions refine acceptance and sequencing for the active items below.
   60s`, and public CEF display/load smokes for `https://www.google.com/` and
   `https://news.google.com/`; the Google News smoke committed
   `https://news.google.com/home?hl=en-US&gl=US&ceid=US:en`, title
-  `Google News`, favicon bytes, and painted frames.
+  `Google News`, favicon bytes, and painted frames. A follow-up 2026-07-18
+  Fedora 44 split-RPM proof from commit `13844e25` produced base and Browser
+  RPMs on BigBoy `.130` with size guards passing (base 66.5 MiB, Browser
+  39.1 MiB; sha256s base
+  `fb6b9484a27d7d94818dffb62c5f0f98e03ed5e0ae181d7a2924a024fce03d07`, Browser
+  `0c0a4f9733ffb679d6a96da2b5f6397264c5385e417b376963f11b1252ff0b5e`). The
+  matched pair was staged on `.15` at
+  `/home/mm/browser-f44-live-proof-13844e25/`, transaction-tested, installed, and
+  verified with clean `rpm -V magic-mesh magic-mesh-browser`. The live shell
+  recovered to `MainPID=3087677`, `NRestarts=0`, start timestamp
+  `2026-07-18 14:52:02 EDT`, and the running `/proc/3087677/exe` hash matched
+  `/usr/bin/mde-shell-egui`
+  `6ef89cdb22a012002586b00adb3dde86108f2af4e437c343e0fff000a1c816b6`.
+  Installed `.15` proof passed
+  `browser-verify-engines --engine all --budget 30 --timeout 60s`,
+  `browser-verify-engines --engine cef --link-navigation --budget 30 --timeout
+  60s`, `browser-verify-engines --engine cef --idle-media --budget 70 --timeout
+  90s`, and public CEF display/load smokes for `https://www.google.com/` and
+  `https://news.google.com/`; the Google smoke ended at
+  `https://www.google.com/`, title `Google`, favicon bytes, and 215 painted
+  frames, while the News smoke ended at
+  `https://news.google.com/home?hl=en-US&gl=US&ceid=US:en`, title
+  `Google News`, favicon bytes, and 211 painted frames.
 - Acceptance criteria: Command rows dispatch to real behavior; disabled items
   explain the gate; no text-only stub menu remains.
 - Verification method: Focused command dispatch tests, print/capture tests, and
@@ -1136,6 +1245,38 @@ These decisions refine acceptance and sequencing for the active items below.
   slot `browser-file-omnibox-chrome`
   `cargo test -p mde-shell-egui bookmark_suggestions_use_browser_painted_icons -- --nocapture`
   passed 1/1.
+  A later 2026-07-18 Browser location-bar usability slice raised the Location
+  edit field height/text metrics and clears only the committed page URL when a
+  user begins a fresh omnibox edit, while preserving partially typed drafts.
+  Farm evidence: BigBoy `.130` slot `browser-omnibox-clear`
+  `cargo test -p mde-shell-egui omnibox -- --nocapture` passed 25 tests.
+  A later 2026-07-18 Browser omnibox polish slice raised the active Location
+  text to a larger Browser-local scale, gave the field a taller row/inner text
+  budget, and tightened the readability guard so it cannot regress to dense
+  toolbar typography. Farm evidence: BigBoy `.130` slot
+  `browser-omnibox-polish` focused
+  `cargo test -p mde-shell-egui browser_omnibox -- --nocapture` passed 3 tests;
+  `.50` slot `browser-omnibox-polish-fmt` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` for
+  `web/mod.rs` and `web/chrome_ui/mod.rs` passed. Package-level fmt is still
+  blocked by unrelated dirty formatting drift in other shell files, so it was
+  not used as a claim for this slice.
+  A later 2026-07-19 Browser omnibox clipping slice made the unfocused pretty
+  URL overlay and focused inline-completion tail paint through the Location
+  field clip rect, so long URLs cannot overpaint right-side Browser controls.
+  Farm evidence: `.90` slot `start-menu-light-style-test`
+  `cargo test -p mde-shell-egui omnibox -- --nocapture` passed 27 tests; `.50`
+  file-scoped `rustfmt --edition 2024 --config skip_children=true --check` for
+  `web/chrome_ui/mod.rs` passed.
+  A later 2026-07-19 Browser suggestion-hover polish slice routed bookmark,
+  file, history, and web-search suggestion chip hovers through the shared Browser
+  `chrome_hover_text` primitive and made the rendered hover tooltip prove Browser
+  Chrome text/surface colors. The bookmark-suggestion icon regression now accepts
+  both YAMIS image meshes and vector fallback strokes. Farm evidence: `.90` slot
+  `start-menu-light-style-test`
+  `cargo test -p mde-shell-egui suggestion -- --nocapture` passed 11 tests; `.50`
+  file-scoped `rustfmt --edition 2024 --config skip_children=true --check` for
+  `web/chrome_ui/mod.rs` passed.
 - Verification method: Index fixture tests and UI search regression.
 - Origin or merged source IDs: SEARCH-omnibox, shell front-door search residual,
   old worklist line 6246.
@@ -1179,7 +1320,13 @@ These decisions refine acceptance and sequencing for the active items below.
   made the shell pump Files transfers and Browser downloads before rendering the
   shared bottom-rail status segment, so progress stays current while other
   workspaces are active; BigBoy `.130` focused `shell_taskbar_pumps_` coverage
-  passed. A live `.15` visual smoke is still needed before closing the item.
+  passed. A follow-up 2026-07-18 Fedora 44 split-RPM proof from commit
+  `13844e25` installed the bounded taskbar-progress/browser-download pump slice
+  on `.15` with clean `rpm -V magic-mesh magic-mesh-browser`, matched running
+  shell hash, and passed installed Browser all-engine, link-navigation,
+  idle-media, Google, and Google News smokes. This is package/runtime proof; a
+  live `.15` screenshot-level visual smoke of the bottom rail remains needed
+  before closing the item.
 - Acceptance criteria: Opening a desktop creates a switchable bar entry; file
   copy/upload/download/compress/extract operations share the same progress UI;
   progress survives surface switches.
@@ -1386,7 +1533,17 @@ These decisions refine acceptance and sequencing for the active items below.
   evidence: `.50` passed `cargo fmt -p mde-shell-egui --check`; BigBoy `.130`
   passed the focused `remote_control_indicator_poll_feeds_local_status_segment`;
   `.90` passed `the_status_segment_pips_route_to_their_surfaces`; `.170` passed
-  `status_bar_exports_accesskit_live_region_and_named_pips`. Remaining work is
+  `status_bar_exports_accesskit_live_region_and_named_pips`. A same-day `.15`
+  bounce fix made the lifecycle
+  apply path idempotent: unchanged generated user configs no longer restart an
+  active Sunshine service, while failed/stopped services recover with
+  `reset-failed` plus `start`. The installed helper passed `--self-test`;
+  Sunshine recovered from `start-limit-hit` to active/running, stayed on the
+  same PID/invocation across planner runs at `18:38:56`, `18:39:26`,
+  `18:39:57`, and `18:40:27`, `--print-apply-result` reported
+  `config_changed=false`, `service_action=unchanged`, and `firewall.changed=false`,
+  and `https://172.20.0.15:47990` returned `401`.
+  Remaining work is
   native shell pairing/approval, actual Sunshine client-attached shadowing
   state, Moonlight frame motion, input round-trip, disconnect revocation, and
   exposure-switch live proof.
@@ -1422,6 +1579,25 @@ These decisions refine acceptance and sequencing for the active items below.
   scenario buttons against the same model. Farm evidence: `.50`
   `cargo fmt -p mde-maps-location-egui -- --check` passed; `.90`
   `cargo test -p mde-maps-location-egui -- --nocapture` passed 14 tests.
+  A later 2026-07-18 Maps & Location dead-zone slice classified the active MG90
+  cellular link into weak/degraded/outage route-risk states, records dead zones
+  from the selected primary location sample and current MG90 telemetry, exposes
+  the recorder in Routes & Trips plus a Simulator scenario button, and refreshes
+  the route-risk summary from recorded severities. Farm evidence: `.90` slot
+  `mapsloc-dz` `cargo fmt -p mde-maps-location-egui -- --check` passed; `.50`
+  slot `maps-dead-zone`
+  `cargo test -p mde-maps-location-egui dead_zone -- --nocapture` passed 2
+  tests; BigBoy `.130` slot `mapsloc-dz-render` and `.90` slot `maps-sim-ui`
+  both passed the focused simulator tessellation proof. A later 2026-07-18
+  manual-switch readiness slice made primary location switching require a
+  connected, fresh, 5-meter-or-better source, removed invalid peers from healthy
+  alternatives, reports primary source status failures even when the last sample
+  itself looks healthy, and disables invalid `Make primary` actions in the
+  Location Sources tab while showing switch-readiness text. Farm evidence: `.50`
+  `cargo fmt -p mde-maps-location-egui -- --check` passed; `.90`
+  `cargo test -p mde-maps-location-egui switch -- --nocapture` passed 2 tests;
+  `.170` `cargo test -p mde-maps-location-egui primary_warning -- --nocapture`
+  passed 1 test.
 - Acceptance criteria: Offline turn-by-turn readiness is never claimed when the
   primary source is stale/unhealthy, no loaded offline map exists, storage
   exceeds the cap, local routing/geocoder contracts are unavailable, setup has
@@ -1559,14 +1735,427 @@ These decisions refine acceptance and sequencing for the active items below.
   passed. A later 2026-07-18 Settings hover-polish slice replaced the display
   nudge controls' raw egui hover text with a Settings themed tooltip surface and
   rendered text-color coverage so icon hovers cannot regress into unreadable
-  shared-shell popup text. A later 2026-07-18 Settings choice-tile polish slice
+  shared-shell popup text. A later 2026-07-19 OSK tooltip polish slice replaced
+  the on-screen keyboard toggle's raw egui hover text with a keyboard-themed
+  tooltip frame using active `Style` text/surface/border tokens and rendered
+  coverage against raw black popup text. Farm evidence: `.90` slot
+  `start-menu-light-style-test`
+  `cargo test -p mde-shell-egui osk_toggle_tooltip -- --nocapture` passed; `.50`
+  file-scoped `rustfmt --edition 2024 --config skip_children=true --check` for
+  `crates/desktop/mde-shell-egui/src/keyboard.rs` passed. A follow-up
+  2026-07-19 shell tooltip readability slice replaced the Timers disabled Start
+  hover and Phones Hub destructive Unpair hover with local themed tooltip frames
+  that resolve active `Style` text/surface/border colors, with light-mode
+  rendered coverage proving text and surface stay distinct. Farm evidence: `.90`
+  slot `timers-tooltip-test2`
+  `cargo test -p mde-shell-egui disabled_start_tooltip -- --nocapture` passed;
+  `.170` slot `phones-tooltip-test2`
+  `cargo test -p mde-shell-egui unpair_hover_tooltip -- --nocapture` passed; `.50`
+  slot `tooltip-fmt2` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` for
+  `crates/desktop/mde-shell-egui/src/timers.rs` and
+  `crates/desktop/mde-shell-egui/src/phones_hub.rs` passed. A follow-up
+  2026-07-19 Datacenter tooltip/provider-copy slice routed Fleet KVM service
+  and cloud-owned VM row hovers through a Datacenter-themed tooltip frame,
+  replaced visible `Nova-managed` VM badges and warnings with provider-neutral
+  `Cloud-managed` copy, and left the Nova/libvirt detector internal. Farm
+  evidence: `.90` slot `datacenter-tooltip-test`
+  `cargo test -p mde-shell-egui datacenter_hover_tooltip -- --nocapture` passed;
+  `.170` slot `datacenter-cloud-copy-test`
+  `cargo test -p mde-shell-egui cloud_managed_vm_badge -- --nocapture` passed;
+  `.50` slot `datacenter-tooltip-fmt2` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` for
+  `crates/desktop/mde-shell-egui/src/datacenter.rs` passed. A follow-up
+  2026-07-19 panel tooltip readability slice routed the standalone
+  `mde-panel-egui` mesh-health pip hover through a panel-themed tooltip frame
+  using active `Style` text/surface/border colors, with light-mode rendered
+  coverage. Farm evidence: `.90` slot `panel-tooltip-test`
+  `cargo test -p mde-panel-egui panel_pip_tooltip -- --nocapture` passed; `.50`
+  slot `panel-tooltip-fmt2` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` for
+  `crates/desktop/mde-panel-egui/src/main.rs` passed. A follow-up 2026-07-19
+  Editor toolbar tooltip readability slice routed the Standard toolbar and
+  Formatting toolbar hovers through local Editor-themed tooltip frames using
+  active `Style` text/surface/border colors, with light-mode rendered coverage
+  for both toolbar rows and existing compact-bar behavior preserved. Farm
+  evidence: `.90` slot `editor-tooltip-tests`
+  `cargo test -p mde-editor-egui tooltip -- --nocapture` passed; `.170` slot
+  `editor-bars-tests` `cargo test -p mde-editor-egui bars -- --nocapture`
+  passed; `.50` slot `editor-tooltip-fmt2` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` for
+  `crates/desktop/mde-editor-egui/src/toolbar.rs` and
+  `crates/desktop/mde-editor-egui/src/format_bar.rs` passed. A follow-up
+  2026-07-19 Terminal tooltip readability slice added a shared
+  `mde-term-egui` Terminal tooltip helper and routed tmux toolbar/tab-template
+  hovers, Terminal tab-bar utility hovers, and saved-layout launch hovers through
+  themed `Style` text/surface/border colors. A residual raw-hover sweep across
+  `crates/desktop/mde-term-egui/src` now finds no direct
+  `on_hover_text` / `on_disabled_hover_text` call sites. Farm evidence: `.90`
+  slot `term-tooltip-test`
+  `cargo test -p mde-term-egui tooltip -- --nocapture` passed; `.170` slot
+  `term-tabs-toggle-test` `cargo test -p mde-term-egui toggle -- --nocapture`
+  passed 14 tests; `.90` slot `term-tmux-chrome-final`
+  `cargo test -p mde-term-egui toolbar_and_status_bar_render_headless -- --nocapture`
+  passed; `.50` slot `term-tooltip-fmt2`
+  `cargo fmt -p mde-term-egui -- --check` passed. A follow-up 2026-07-19
+  Terminal refined-height slice aligned the first-party Terminal tab strip and
+  tmux status bar to the shared `mde_egui::menubar::BAR_HEIGHT`, removing the
+  old 32pt local bands while preserving the existing toolbar/status render path.
+  Farm evidence: `.90` slot `term-refined-height`
+  `cargo test -p mde-term-egui refined_shared_chrome_height -- --nocapture`
+  passed 2 focused height tests; `.170` slot `term-refined-render`
+  `cargo test -p mde-term-egui toolbar_and_status_bar_render_headless -- --nocapture`
+  passed; `.50` slot `term-refined-height-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for `tabs.rs` and `tmux_ui.rs`.
+  A follow-up 2026-07-19
+  Terminal tmux context-menu popup slice added Terminal-local popup visuals,
+  routed tmux window/sidebar/pane/tab context menus through them, wrapped the
+  nested `Join Into Window` menu, and covered dark/light menu text tokens so the
+  popup path follows the same refined chrome/readability contract as the
+  toolbars. Farm evidence: `.130`
+  `cargo test -p mde-term-egui tmux_context_menu_popup -- --nocapture` passed;
+  `.50` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check crates/desktop/mde-term-egui/src/tmux_ui.rs`
+  passed. A follow-up 2026-07-19 Terminal grid selection-menu popup slice routed
+  the actual terminal widget right-click selection menu through Terminal-local
+  popup visuals, resolved caption text through the active light/dark palette,
+  and covered the rendered menu body so mesh-action rows cannot regress to raw
+  egui popup text. Farm evidence: `.90` slot `term-grid-menu-test`
+  `cargo test -p mde-term-egui terminal_selection -- --nocapture` passed 2
+  focused tests; `.50` slot `term-grid-menu-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check crates/desktop/mde-term-egui/src/widget.rs`
+  passed. A follow-up 2026-07-19 Editor overflow-popup readability slice added
+  an Editor-local popup visual scope and routed the Standard toolbar `Zoom`
+  overflow plus Formatting toolbar `Paragraph style` overflow through it,
+  resolving caption text and row states from the active light/dark palette
+  instead of raw egui menu defaults. Farm evidence: `.90` slot
+  `editor-overflow-toolbar`
+  `cargo test -p mde-editor-egui toolbar_overflow -- --nocapture` passed;
+  BigBoy `.130` slot `editor-overflow-format`
+  `cargo test -p mde-editor-egui format_bar_overflow -- --nocapture` passed;
+  `.170` slot `editor-popup-style`
+  `cargo test -p mde-editor-egui editor_popup_visuals -- --nocapture` passed;
+  `.50` slot `editor-overflow-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `mde-editor-egui/src/tooltip.rs`, `toolbar.rs`, and `format_bar.rs`.
+  A follow-up 2026-07-19 shared
+  chrome density slice made ordinary toolbar button padding slimmer without
+  shrinking the pointer hit target, reduced shared menu text by one point,
+  reduced the top-left shared workspace title by two points, added a shared
+  near-zero toolbar/header vertical inset, removed the extra vertical padding
+  around the Files shared menu bar, and applied the refined inset to Files,
+  Bookmarks, and Editor top toolbar/header strips. Farm evidence: BigBoy `.130`
+  slot
+  `shared-refined-chrome`
+  `cargo test -p mde-egui refined -- --nocapture` passed 2 typography/density
+  tests; `.90` slot `editor-refined-toolbar`
+  `cargo test -p mde-editor-egui toolbar -- --nocapture` passed 8 toolbar tests;
+  `.50` slot `files-refined-toolbar`
+  `cargo test -p mde-files-egui files_navigation_toolbar_uses_yamis_icons -- --nocapture`
+  passed; `.170` slot `bookmarks-refined-header`
+  `cargo test -p mde-bookmarks-egui renders_the_empty_first_run_state -- --nocapture`
+  passed; file-scoped farm `rustfmt --edition 2021 --check` passed for
+  `mde-egui/src/style.rs`, `mde-files-egui/src/view.rs`,
+  `mde-bookmarks-egui/src/view.rs`, and `mde-editor-egui/src/panel/mod.rs`.
+  A follow-up 2026-07-19 Editor residual-hover readability slice added a shared
+  `mde-editor-egui` tooltip helper and routed search, outline, follow banner,
+  diagnostic/spelling hit regions, pane/tab chrome, and spell-control hovers
+  through themed Editor tooltip surfaces. A residual raw-hover sweep across
+  `crates/desktop/mde-editor-egui/src` now finds no direct `on_hover_text` /
+  `on_disabled_hover_text` call sites. Farm evidence: `.90` slot
+  `editor-shared-tooltip-test2`
+  `cargo test -p mde-editor-egui tooltip -- --nocapture` passed; `.170` slot
+  `editor-search-hover-test2`
+  `cargo test -p mde-editor-egui search -- --nocapture` passed 14 tests; `.50`
+  slot `editor-tooltip-fmt5` `cargo fmt -p mde-editor-egui -- --check` passed.
+  A follow-up 2026-07-19 shared tooltip-margin refinement slice added
+  `Style::tooltip_margin()` as the single compact 8x4 hover-card frame margin,
+  removed the remaining thicker 10x7 tooltip frames, and routed themed tooltip
+  helpers in Shell, Browser chrome, Files, Editor, Terminal, Media, Panel,
+  Remote Sessions, Device Manager, Explorer, Phones, Storage, Timers,
+  Datacenter, Keyboard, and Settings through the shared token. Residual scan
+  evidence finds no `Margin::symmetric(10, 7)` under desktop/shared Rust
+  surfaces. Farm evidence: `.90` slot `shared-tooltip-style`
+  `cargo test -p mde-egui tooltip_margin -- --nocapture` passed; BigBoy `.130`
+  slot `shared-tooltip-shell`
+  `cargo test -p mde-shell-egui tooltip -- --nocapture` passed 14 shell/browser
+  rendered tooltip tests; `.170` slot `shared-tooltip-media`
+  `cargo test -p mde-media-egui tooltip -- --nocapture` passed; `.90` slot
+  `shared-tooltip-editor` `cargo test -p mde-editor-egui tooltip -- --nocapture`
+  passed 3 tests; `.170` slot `shared-tooltip-term`
+  `cargo test -p mde-term-egui tooltip -- --nocapture` passed; `.50` slot
+  `shared-tooltip-files`
+  `cargo test -p mde-files-egui files_hover_tooltip -- --nocapture` passed;
+  BigBoy `.130` slot `shared-tooltip-panel`
+  `cargo test -p mde-panel-egui panel_pip_tooltip -- --nocapture` passed; `.50`
+  file-scoped `rustfmt --edition 2021 --config skip_children=true --check`
+  passed for the touched tooltip/style files after an intentionally broader
+  package fmt check exposed unrelated package-level drift.
+  A follow-up 2026-07-19 IaC Heat toolbar density slice replaced the raw egui
+  Heat toolbar buttons with a compact shared `Style::toolbar_margin()` strip and
+  `heat_toolbar_button` primitive using `Style::SMALL` text, bounded widths,
+  shared surface/border tokens, and focus-ring painting while preserving the
+  reverse-generate and new-stack state seams. Farm evidence: BigBoy `.130` slot
+  `iac-heat-toolbar-test`
+  `cargo test -p mde-shell-egui heat_toolbar -- --nocapture` passed 2 focused
+  tests; `.50` slot `iac-heat-toolbar-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-shell-egui/src/iac/mod.rs` and
+  `crates/desktop/mde-shell-egui/src/iac/tests.rs`; local `git diff --check`
+  passed for the touched IaC files. A later 2026-07-19 IaC refined-height
+  correction made `HEAT_TOOLBAR_BUTTON_H` resolve directly to
+  `Style::TOOLBAR_CONTROL_H` instead of the old 24pt `Style::SP_L`, tightened
+  `heat_toolbar_uses_refined_shared_chrome_metrics` to assert that exact shared
+  token and the below-24pt bound, and left the provider-neutral IaC copy/seams
+  intact. Farm evidence: `.90` slot `iac-density-test`
+  `cargo test -p mde-shell-egui heat_toolbar_uses_refined_shared_chrome_metrics -- --nocapture`
+  passed; `.50` slot `iac-density-filefmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `iac/mod.rs` and `iac/tests.rs`; local `git diff --check` passed for the
+  touched IaC files. A package-wide fmt check was intentionally not used as the
+  status gate after it exposed unrelated dirty formatting drift in `main.rs` and
+  `power_settings.rs`. A follow-up 2026-07-19 uniform chrome
+  density slice applied the same refined `Style::toolbar_margin()` path to the
+  Explorer summary/filter/search/bulk-action/filmstrip chrome strips, while
+  preserving body panel spacing; the shared `mde-egui` title/menu/button
+  density tests remain the governing typography contract for all shared
+  workspace menubars. Farm evidence: BigBoy `.130` slot `egui-density`
+  `cargo test -p mde-egui refined -- --nocapture` passed 2 tests; `.90` slot
+  `explorer-density`
+  `cargo test -p mde-shell-egui explorer_chrome_strips_use_refined_toolbar_margin -- --nocapture`
+  passed; `.50` file-scoped farm `rustfmt --edition 2021 --config
+  skip_children=true --check` passed for the shared style/menubar, Explorer,
+  Editor, Files, and IaC density files after a broader package fmt check exposed
+  unrelated pre-existing formatting drift in `start_menu.rs`,
+  `mde-egui/src/lib.rs`, and `iac/tests.rs`.
+  A follow-up 2026-07-19 Browser refined-margin slice removed remaining thick
+  hard-coded Browser chrome insets from Options category/command cards, the
+  new-tab dashboard search pill, and Browser permission/passkey prompt bars,
+  replacing them with named compact Browser margin helpers and a unit guard.
+  Farm evidence: BigBoy `.130` slot `browser-refined-margins`
+  `cargo test -p mde-shell-egui
+  browser_chrome_transient_surfaces_use_refined_margins -- --nocapture` passed;
+  `.90` slot `browser-dashboard-margin`
+  `cargo test -p mde-shell-egui
+  browser_new_tab_dashboard_uses_bing_style_search_language_and_centering --
+  --nocapture` passed; `.170` slot `browser-prompt-margin`
+  `cargo test -p mde-shell-egui
+  browser_prompt_bars_use_material_action_buttons -- --nocapture` passed; `.50`
+  slot `browser-refined-margin-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs`. A follow-up
+  2026-07-19 Browser bookmark-bar clipping slice clipped bookmark title paint
+  to each bookmark button's text rect, so long bookmark names cannot overpaint
+  adjacent bookmark buttons or overflow the Browser chrome, and updated adjacent
+  icon regressions to accept either Browser vector fallback icons or YAMIS image
+  icons. Farm evidence: BigBoy `.130` slot `browser-bookmark-clip`
+  `cargo test -p mde-shell-egui browser_bookmark_bar_long_titles_clip_to_bookmark_button -- --nocapture`
+  passed; `.90` slot `browser-bookmark-adjacent-2`
+  `cargo test -p mde-shell-egui browser_bookmark -- --nocapture` passed 9
+  focused bookmark tests; `.50` slot `browser-bookmark-clip-fmt-2`
+  file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs`
+  passed.
+  A follow-up 2026-07-19 refined chrome verification slice rechecked the current
+  shared density contract after the operator asked for uniformly slimmer
+  toolbars, one-point-smaller menu text, and two-point-smaller top-left
+  workspace titles. The active contract is `Style::CONTROL_PAD_Y`,
+  `Style::TOOLBAR_INSET_Y`, `Style::MENU_TEXT`, and `Style::WORKSPACE_TITLE`,
+  consumed by the shared menubar and the toolbar surfaces that have already been
+  migrated to `Style::toolbar_margin()`. Farm evidence: `.50` slot
+  `refined-chrome-fmt` file-scoped `rustfmt --edition 2021 --check` passed for
+  the shared style/menubar and representative shell, Files, chooser, Device
+  Manager, Explorer, and Editor toolbar files; `.90` slot
+  `refined-chrome-shared`
+  `cargo test -p mde-egui refined -- --nocapture` passed 2 typography/density
+  tests; BigBoy `.130` slot `shell-remote-fallback-refined`
+  `cargo test -p mde-shell-egui shell_remote_sessions_fallback -- --nocapture`
+  passed 4 tests; BigBoy `.130` slot `shell-refined-toolbar`
+  `cargo test -p mde-shell-egui refined_toolbar -- --nocapture` passed the
+  Explorer refined chrome-strip test and
+  `cargo test -p mde-shell-egui refined_shared_chrome_metrics -- --nocapture`
+  passed the IaC Heat shared chrome metrics test; `.90` slot
+  `files-refined-popup`
+  `cargo test -p mde-files-egui context_menu_visuals_use_themed_text_and_surface -- --nocapture`
+  passed the Files popup/text/padding test. A follow-up 2026-07-19 Browser
+  control-height slice trimmed Browser-owned toolbar buttons, horizontal tabs,
+  and the location-bar frame while preserving the enlarged omnibox text from the
+  earlier location-bar usability fix; the governing regression is
+  `browser_omnibox_uses_readable_location_bar_metrics`. Farm evidence: BigBoy
+  `.130` slot `browser-refined-height`
+  `cargo test -p mde-shell-egui browser_omnibox_uses_readable_location_bar_metrics -- --nocapture`
+  passed; `.90` slot `shared-refined-contract`
+  `cargo test -p mde-egui refined -- --nocapture` passed 2 typography/density
+  tests; `.50` slot `browser-refined-height-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for the touched Browser files; local
+  `install-helpers/lint-style-leaks.sh` and scoped `git diff --check` passed.
+  A follow-up 2026-07-19 Browser drawer control-height slice tied the Browser
+  drawer text buttons, icon buttons, status icons, toggles, selector chips, and
+  inline separators to the Browser-local `CHROME_BUTTON` 21pt chrome metric,
+  removing the remaining 24pt drawer-control height literals while keeping the
+  rendered print-drawer token path intact. Farm evidence: `.90` slot
+  `browser-drawer-height`
+  `cargo test -p mde-shell-egui browser_drawer_controls_use_refined_chrome_height -- --nocapture`
+  passed; BigBoy `.130` slot `browser-drawer-render`
+  `cargo test -p mde-shell-egui browser_print_drawer -- --nocapture` passed 5
+  focused rendered print-drawer tests; `.50` slot `browser-drawer-refined-fmt`
+  file-scoped `rustfmt --edition 2021 --check` passed for the touched Browser
+  drawer files.
+  A follow-up 2026-07-19 Maps refined-header slice reduced the Maps & Location
+  first-party header to the shared menubar height plus a half-gutter and tightened
+  the title/subtitle offset so it no longer carries the remaining thick 44pt
+  header band. Farm evidence: `.90` slot `maps-refined-header`
+  `cargo test -p mde-maps-location-egui maps_header_uses_refined_shared_chrome_height -- --nocapture`
+  passed; `.170` slot `maps-refined-render`
+  `cargo test -p mde-maps-location-egui maps_location_panel_renders_simulated_vertical_slice -- --nocapture`
+  passed; `.50` slot `maps-refined-header-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for `view.rs`. A follow-up
+  2026-07-19 Media refined-transport slice tied the Media transport button height
+  to `mde_egui::menubar::BAR_HEIGHT`, preserving the compact transport icon/text
+  render path while preventing local toolbar-height drift. Farm evidence: `.90`
+  slot `media-refined-transport`
+  `cargo test -p mde-media-egui transport_buttons_use_refined_shared_chrome_height -- --nocapture`
+  passed; `.170` slot `media-transport-render`
+  `cargo test -p mde-media-egui player_transport_controls_paint_icons_without_unicode_text -- --nocapture`
+  passed; `.50` slot `media-refined-transport-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for `app.rs`.
+  A follow-up 2026-07-19 Media queue-density slice moved the icon-only queue row
+  actions off the remaining 24pt `Style::SP_L` visual button band and onto
+  `Style::TOOLBAR_CONTROL_H`, with a Media-local queue-button scope so egui's
+  default interaction floor cannot thicken those row controls while the painted
+  remove/move icons and accessibility labels remain intact. Farm evidence: `.90`
+  slot `media-queue-density-test`
+  `cargo test -p mde-media-egui queue_action_buttons_use_refined_shared_chrome_height -- --nocapture`
+  passed; BigBoy `.130` slot `media-queue-render-test`
+  `cargo test -p mde-media-egui queue_view_renders_empty_and_with_items -- --nocapture`
+  passed; `.50` slot `media-queue-density-fmt`
+  `cargo fmt -p mde-media-egui -- --check` passed; local `git diff --check`
+  passed for `crates/desktop/mde-media-egui/src/app.rs`.
+  A follow-up 2026-07-19 Files refined-toolbar-control slice added shared
+  `Style::TOOLBAR_CONTROL_H` as a 21pt visual control-height token, routed Files
+  action/icon buttons plus the Files surface tab strip, top toolbar, pane
+  navigation row, and pane tab strip through a Files toolbar scope using that
+  metric, and kept the shared pointer hit-target floor covered by the existing
+  density contract. Farm evidence: `.90` slot `shared-toolbar-control`
+  `cargo test -p mde-egui refined -- --nocapture` passed 2 shared
+  typography/density tests; `.170` slot `files-refined-action-height`
+  `cargo test -p mde-files-egui refined -- --nocapture` passed the Files refined
+  action-height and toolbar-scope tests; BigBoy `.130` slot `files-action-render`
+  `cargo test -p mde-files-egui transfer_lifecycle_controls_use_files_action_button_tokens -- --nocapture`
+  passed; `.50` slot `files-refined-action-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for `style.rs` and `view.rs`.
+  A follow-up 2026-07-19 Browser suggestions-density slice removed the remaining
+  128pt page-scale gutter from the omnibox suggestions row, replaced it with a
+  `CHROME_BUTTON + CHROME_GAP` leading inset, and added a painted-geometry
+  regression so the first suggestion category stays close to the location bar on
+  narrow Browser surfaces. Farm evidence: BigBoy `.130` slot
+  `browser-suggestion-regression`
+  `cargo test -p mde-shell-egui browser_suggestion -- --nocapture` passed 4
+  focused suggestion tests; `.90` slot `browser-suggestion-inset`
+  `cargo test -p mde-shell-egui browser_suggestions_panel_uses_refined_leading_inset -- --nocapture`
+  passed; `.50` slot `browser-suggestion-fmt` package-level `cargo fmt --check`
+  exposed unrelated pre-existing formatting drift in other dirty `mde-shell-egui`
+  files, then direct remote file-scoped `rustfmt --edition 2021 --config
+  skip_children=true --check crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs`
+  passed.
+  A follow-up 2026-07-19 Bookmarks refined-header slice reduced the Bookmarks
+  top-left header title by the requested 2pt, introduced a Bookmarks-local
+  toolbar scope that uses shared `Style::CONTROL_PAD_Y` and
+  `Style::TOOLBAR_CONTROL_H`, and routed header/search/sort/add-form toolbar
+  controls through the refined 21pt visual height while preserving 24pt bookmark
+  data rows for list readability. Farm evidence: `.90` slot
+  `bookmarks-density-tests2`
+  `cargo test -p mde-bookmarks-egui bookmarks_ -- --nocapture` passed the 2
+  focused density tests; `.170` slot `bookmarks-density-render2`
+  `cargo test -p mde-bookmarks-egui renders_the_populated_manager -- --nocapture`
+  passed the populated render path; `.50` slot `bookmarks-density-fmt2`
+  `cargo fmt -p mde-bookmarks-egui -- --check` passed.
+  A follow-up 2026-07-19 Storage refined-action-control slice replaced the
+  remaining 24pt Storage icon button row with `Style::TOOLBAR_CONTROL_H`, added
+  a Storage-local action-button padding scope so 16pt YAMIS icons still fit the
+  refined 21pt visual height, and applied it to Refresh topology, Stage, and
+  pending-queue move/remove controls while leaving disk segment bars and form
+  fields untouched. Farm evidence: BigBoy `.130` slot `storage-density-test`
+  `cargo test -p mde-shell-egui storage_action_buttons_use_refined_chrome_height -- --nocapture`
+  passed; `.90` slot `storage-icon-render`
+  `cargo test -p mde-shell-egui storage_queue_controls_do_not_paint_unicode_pseudo_icons -- --nocapture`
+  passed; `.50` slot `storage-density-fmt` direct remote file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `storage/mod.rs` and `storage/tests.rs`.
+  Shared-token evidence: `.90` slot `style-density`
+  `cargo test -p mde-egui button_padding_keeps_toolbars_refined_without_shrinking_hit_targets -- --nocapture`
+  passed; `.170` slot `menubar-density`
+  `cargo test -p mde-egui menu_bar_uses_refined_chrome_typography -- --nocapture`
+  passed.
+  A local raw-hover sweep
+  across shell, Files, Media, Panel, and shared egui surfaces now finds no direct
+  `on_hover_text` / `on_disabled_hover_text` call sites outside themed helper
+  names and Browser Chrome custom hover cards. A later 2026-07-19 follow-up
+  extended `install-helpers/lint-style-leaks.sh` so direct raw egui hover text
+  calls in `crates/desktop` or `crates/shared` are now a mechanical regression
+  failure; the focused `rg` verification remains at 0 hits. A later 2026-07-19
+  style-gate cleanup made the full `lint-style-leaks.sh` run green by separating
+  true shared-shell chrome leaks from documented non-shell colour data: Browser
+  chrome keeps its AI_GOVERNANCE §4 local Chrome/Material palette, CEF verifier
+  pixel samples stay classified as test data, and the Maps vertical-slice canvas
+  palette is allowed only on explicit `style-leak-ok: map-content-color` lines.
+  Verification: local `bash -n install-helpers/lint-style-leaks.sh`,
+  `install-helpers/lint-style-leaks.sh`, the raw colour search with the same
+  exclusions, and `git diff --check` all passed; `.50` slot
+  `style-lint-map-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-maps-location-egui/src/view.rs`. A later 2026-07-18 Settings
+  choice-tile polish slice
   replaced Theme, Wallpaper, and Remote Proofing raw selectable labels with a
   shared Settings choice button whose selected and hover colors resolve through
   the current dark/light palette and domain accent. Farm evidence: `.90`
   `cargo fmt -p mde-shell-egui --check` passed; BigBoy `.130` focused
   `settings_choice_tiles_use_themed_selected_and_hover_colors`,
   `each_mesh_system_section_renders_live_data_and_honest_unknown`, and
-  `the_reworked_sections_paint_across_a_wide_detail_pane` passed.
+  `the_reworked_sections_paint_across_a_wide_detail_pane` passed. A later
+  2026-07-18 Settings popup/ComboBox readability slice routed the Mouse primary
+  button and Displays mode pickers through a Settings visual scope so raw egui
+  popup/window/open/hover/active choice states resolve to `Style` surface, text,
+  dim text, and border tokens instead of inherited shell defaults. Rendered
+  popup choice coverage proves row text paints with Settings text and not raw
+  black. Farm evidence: `.50` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check
+  crates/desktop/mde-shell-egui/src/system/mod.rs
+  crates/desktop/mde-shell-egui/src/system/tests.rs` passed; `.90` focused
+  `cargo test -p mde-shell-egui
+  settings_combobox_popups_use_themed_readable_choice_colors -- --nocapture`
+  passed. A follow-up 2026-07-19 Power Settings dropdown polish slice routed the
+  idle timeout, idle action, and lid-close action ComboBoxes through a local
+  compact popup style helper so those power pickers inherit light/dark Settings
+  surface/text/hover/open/selection roles instead of raw egui dropdown defaults,
+  while preserving `PowerHonorConfig` save dispatch only on real selection
+  changes. Farm evidence: BigBoy `.130` slot `power-popup-style`
+  `cargo test -p mde-shell-egui power_combo_menu_style_uses_themed_compact_popup_chrome -- --nocapture`
+  passed; `.90` slot `power-picker-render`
+  `cargo test -p mde-shell-egui the_power5_pickers_draw_and_dispatch_nothing_on_an_untouched_frame -- --nocapture`
+  passed; `.50` slot `power-popup-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for
+  `crates/desktop/mde-shell-egui/src/power_settings.rs`. A later
+  2026-07-18 Start tile context-menu polish slice wrapped the tile right-click
+  menu in a Start-menu visual scope so the popup surface, widget states, and row
+  text use shell `Style` tokens instead of inherited egui popup colors, while
+  preserving Open/Pin behavior and AccessKit rows. Farm evidence: `.50`
+  file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check
+  crates/desktop/mde-shell-egui/src/start_menu.rs` passed; BigBoy `.130`
+  focused `cargo test -p mde-shell-egui tile_context_menu -- --nocapture`
+  passed 2 tests. A later 2026-07-18 shared menu-bar light-mode readability
+  slice resolved menu titles, dropdown row text, disabled/caption labels, accent
+  focus/underline paint, the top-right Remote Sessions stroke, and status-chip
+  fills/tone colors through the active `Style` color scheme before popup paint,
+  so Windows-2000 light mode no longer paints shared drop-downs with dark-shell
+  text tokens. Farm evidence: `.90` file-scoped
+  `rustfmt --edition 2021 --check crates/shared/mde-egui/src/menubar.rs`
+  passed; `.90` focused `cargo test -p mde-egui menubar -- --nocapture` passed
+  12 tests; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui the_browser_bar_renders_headless -- --nocapture`
+  passed. Broad `.50` `cargo fmt -p mde-egui -- --check` remains blocked by
+  pre-existing rustfmt drift in `mde-egui` exports/imports outside this slice.
   A later 2026-07-18 live `.15` Chat-empty investigation found `chat` and
   `notify` workers healthy but publishing to root's legacy
   `/root/.local/share/mde/bus` spool while the GUI read `/run/mde-bus`; the
@@ -1584,45 +2173,164 @@ These decisions refine acceptance and sequencing for the active items below.
   activity overview that surfaces real peer, room, unread, and folded-alert
   counts without selecting or acknowledging a lane on the operator's behalf;
   `.90` focused
-	  `home_overview_renders_activity_without_marking_notifications_read` wrote the
-	  rendered proof `target/screenshots/chat-home-overview.png`, BigBoy `.130`
-	  focused `cargo test -p mde-shell-egui chat -- --nocapture` passed 47 Chat and
-	  Chat-adjacent tests, and `.50` `cargo fmt -p mde-shell-egui --check` passed.
-	  A follow-up Chat default-surface pass made the home unread badge include the
-	  aggregate Notifications watermark without double-counting folded alerts and
-	  added painted-copy coverage for the no-roster waiting pane and loaded-roster
-	  activity overview; BigBoy `.130` focused
-	  `cargo test -p mde-shell-egui chat -- --nocapture` passed 49 Chat and
-	  Chat-adjacent tests, and `.50` `cargo fmt -p mde-shell-egui -- --check`
-	  passed.
-	  A later 2026-07-18 Chat mute-icon slice exposed YAMIS-backed
-	  `IconId::Notifications` and `IconId::NotificationsMuted`, replaced the
-	  contact/room mute button's bell emoji pseudo-icons with the shared icon
-	  texture path plus ASCII labels, and covered both the shared raster mapping
-	  and rendered Chat button copy. Farm evidence: `.90` focused
-	  `notification_glyphs_are_yamis_backed_and_rasterize_at_chat_button_size`,
-	  BigBoy `.130` focused
-	  `chat_mute_button_uses_yamis_icon_instead_of_bell_emoji_text`, and `.50`
-	  touched-file fmt passed.
-	  A follow-up Files icon slice replaced raw tab-strip close/new-tab text
-	  controls with YAMIS-backed `IconId::Close` and `IconId::NewTab` icon
-	  buttons while preserving hover text and widget metadata; farm `.90`
-	  focused `files_tab_strip_controls_use_yamis_icon_buttons` and `.50`
-	  `cargo fmt -p mde-files-egui -- --check` passed.
-	  A follow-up Media queue icon slice replaced raw `✕`/`▼`/`▲` queue row
-	  text buttons with labelled icon-only controls using the shared empty-button
-	  plus painted-icon pattern, preserving remove/move behavior, hover text,
-	  pointing cursor, and widget metadata. Farm evidence: BigBoy `.130` focused
-	  `cargo test -p mde-media-egui queue_view_renders_empty_and_with_items -- --nocapture`
-	  passed, and `.50` `cargo fmt -p mde-media-egui -- --check` passed.
-	  A follow-up taskbar hover-title slice clipped long running-session titles to
-	  the fixed hover-preview card body so wide VM names cannot paint into
-	  neighboring chrome, with headless clip-rect coverage. Farm evidence: `.50`
-	  `cargo fmt -p mde-shell-egui -- --check` passed; BigBoy `.130` focused
-	  `win10_hybrid_31_session_hover_preview_clips_long_titles_to_card_body`
-	  passed from an isolated clean worktree carrying only the dock patch.
-	  Remaining icon work is the full per-surface sweep for
-	  hand-painted icons or other code paths that bypass `IconId`, removal or
+  `home_overview_renders_activity_without_marking_notifications_read` wrote the
+  rendered proof `target/screenshots/chat-home-overview.png`, BigBoy `.130`
+  focused `cargo test -p mde-shell-egui chat -- --nocapture` passed 47 Chat and
+  Chat-adjacent tests, and `.50` `cargo fmt -p mde-shell-egui --check` passed.
+  A follow-up Chat default-surface pass made the home unread badge include the
+  aggregate Notifications watermark without double-counting folded alerts and
+  added painted-copy coverage for the no-roster waiting pane and loaded-roster
+  activity overview; BigBoy `.130` focused
+  `cargo test -p mde-shell-egui chat -- --nocapture` passed 49 Chat and
+  Chat-adjacent tests, and `.50` `cargo fmt -p mde-shell-egui -- --check`
+  passed.
+  A later 2026-07-18 Chat mute-icon slice exposed YAMIS-backed
+  `IconId::Notifications` and `IconId::NotificationsMuted`, replaced the
+  contact/room mute button's bell emoji pseudo-icons with the shared icon
+  texture path plus ASCII labels, and covered both the shared raster mapping
+  and rendered Chat button copy. Farm evidence: `.90` focused
+  `notification_glyphs_are_yamis_backed_and_rasterize_at_chat_button_size`,
+  BigBoy `.130` focused
+  `chat_mute_button_uses_yamis_icon_instead_of_bell_emoji_text`, and `.50`
+  touched-file fmt passed.
+  A follow-up 2026-07-18 Contacts action-icon pass routed Call, Remote Control,
+  and self-status Edit through YAMIS-backed `IconId::Phones`,
+  `IconId::Sessions`, and `IconId::TextEdit`, eliminating the remaining
+  phone/desktop/pencil pseudo-icons in those Chat controls. Farm evidence: `.90`
+  focused `chat_action_buttons_use_yamis_icons_instead_of_emoji_pseudo_icons`
+  passed.
+  A later 2026-07-18 Contacts Center ICQ layout slice made the Chat surface read
+  as a persistent two-pane client: the Rooms/Contacts roster stays on the left,
+  the right side is always a themed Messages browser, and the no-selection state
+  previews recent real contact/room message rows without selecting a lane or
+  clearing unread watermarks. Farm evidence: BigBoy `.130` focused
+  `home_overview_renders_activity_without_marking_notifications_read` passed
+  from the current tree and wrote the rendered Chat proof screenshot; `.90`
+  independently passed the same focused Chat test; `.170` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` passed across
+  the touched shell GUI files.
+  A follow-up 2026-07-18 Contacts layout fix replaced the stateful resizable
+  roster side panel with a deterministic 25%/75% bounded split so the Messages
+  browser cannot render off the right edge of the workspace. Farm evidence:
+  BigBoy `.130` focused
+  `contacts_layout_reserves_quarter_width_for_roster_and_keeps_messages_onscreen`
+  and adjacent `surface_mounts_and_tessellates_over_real_state` passed; `.50`
+  file-scoped chat `rustfmt --edition 2024 --config skip_children=true --check`
+  passed.
+  A later 2026-07-19 Contacts title-density slice added `CHAT_PANE_TITLE =
+  Style::HEADING - 2.0` and routed the right-side Messages, contact,
+  Notifications, and room headers through that refined pane-title rung while
+  leaving metric values on `Style::HEADING` for emphasis. Farm evidence: `.90`
+  reused warmed shell slot `iac-density-test`
+  `cargo test -p mde-shell-egui contacts_pane_titles_use_refined_header_size -- --nocapture`
+  passed; `.50` reused scoped file-format slot `iac-density-filefmt`
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `chat/mod.rs` and `chat/tests.rs`; local `git diff --check` passed for the
+  touched Chat files.
+  A follow-up Files icon slice replaced raw tab-strip close/new-tab text
+  controls with YAMIS-backed `IconId::Close` and `IconId::NewTab` icon
+  buttons while preserving hover text and widget metadata; farm `.90`
+  focused `files_tab_strip_controls_use_yamis_icon_buttons` and `.50`
+  `cargo fmt -p mde-files-egui -- --check` passed.
+  A follow-up 2026-07-18 Files tooltip polish slice routed all Files view hover
+  and disabled-hover copy through a Files-local themed tooltip frame so file
+  manager tooltips no longer inherit raw egui popup colors. Farm evidence:
+  BigBoy `.130` focused
+  `files_hover_tooltip_uses_themed_text_and_surface` passed, `.90` focused
+  `mounts_and_renders_the_transfers_tab_with_ledger_fixtures` passed, and `.50`
+  file-scoped `rustfmt --edition 2024 --config skip_children=true --check`
+  passed for `mde-files-egui/src/view.rs`.
+  A follow-up 2026-07-19 Files context-menu polish slice routed file-row
+  right-click menus through a Files-local popup visual scope that resolves the
+  active light/dark `Style` palette for menu surface, row states, disabled text,
+  and selection while preserving existing Send to / Send in Chat / Transfer to /
+  Editor / clipboard / Properties / Delete action paths. Farm evidence: `.90`
+  slot `files-context-menu2`
+  `cargo test -p mde-files-egui files_context_menu_visuals_use_themed_text_and_surface -- --nocapture`
+  passed; `.170` slot `files-tooltip-guard2`
+  `cargo test -p mde-files-egui files_hover_tooltip_uses_themed_text_and_surface -- --nocapture`
+  passed; `.50` slot `files-context-fmt2`
+  `cargo fmt -p mde-files-egui -- --check` passed. A follow-up 2026-07-19 Files
+  nested-submenu polish slice routed the row context menu's `Send to`,
+  `Send in Chat`, and `Transfer to` submenus through a Files-scoped popup
+  helper so nested egui menu windows reapply the same light/dark text, hover,
+  active, and compact spacing roles as the outer row context menu. Farm
+  evidence: BigBoy `.130` slot `files-submenu-polish`
+  `cargo test -p mde-files-egui files_nested_popup_scope_repairs_raw_menu_visuals -- --nocapture`
+  passed; BigBoy `.130` slot `files-submenu-polish`
+  `cargo fmt --package mde-files-egui -- --check` passed.
+  A follow-up 2026-07-18 Device Manager tooltip polish slice routed host-rail,
+  live-refresh, About, modal-close, and detail-drawer close/copy hovers through a
+  Device Manager themed tooltip frame so the hardware inspector no longer
+  inherits raw egui popup colors. Farm evidence: BigBoy `.130` focused
+  `device_manager_tooltip_uses_themed_text_and_surface` passed, `.90` focused
+  `the_tree_renders_headless_from_a_fixture_inventory` passed, and `.50`
+  file-scoped `rustfmt --edition 2024 --config skip_children=true --check`
+  passed for the touched `device_manager` files.
+  A follow-up 2026-07-19 Device Manager context-menu polish slice routed device
+  row right-click menus through a Device Manager popup visual scope that resolves
+  active light/dark `Style` palette roles for menu surface, row states, disabled
+  text, destructive selection tint, and compact row spacing while preserving
+  Properties / Scan / Copy details / typed privileged-operation arming behavior.
+  Farm evidence: BigBoy `.130` slot `devmgr-context-popup`
+  `cargo test -p mde-shell-egui device_manager_context_menu_uses_themed_text_and_surface -- --nocapture`
+  passed; `.90` slot `devmgr-context-render`
+  `cargo test -p mde-shell-egui a_device_row_context_menu_renders_and_the_drawer_copy_path_is_live -- --nocapture`
+  passed; `.50` slot `devmgr-context-fmt` file-scoped
+  `rustfmt --edition 2021 --check` passed for the Device Manager source and test
+  files.
+  A follow-up 2026-07-18 Storage icon/tooltip polish slice routed Refresh
+  topology, Stage, queue move up/down, and queue remove controls through
+  shared `IconId` actions, replaced the remaining Storage lock/staging/arrow
+  pseudo-icon text with plain labels, and routed Storage hover help through a
+  themed tooltip frame. Farm evidence: `.90` focused
+  `storage_queue_controls_do_not_paint_unicode_pseudo_icons` passed.
+  A follow-up Media queue icon slice replaced raw `✕`/`▼`/`▲` queue row
+  text buttons with labelled icon-only controls using the shared empty-button
+  plus painted-icon pattern, preserving remove/move behavior, hover text,
+  pointing cursor, and widget metadata. Farm evidence: BigBoy `.130` focused
+  `cargo test -p mde-media-egui queue_view_renders_empty_and_with_items -- --nocapture`
+  passed, and `.50` `cargo fmt -p mde-media-egui -- --check` passed.
+  A follow-up taskbar hover-title slice clipped long running-session titles to
+  the fixed hover-preview card body so wide VM names cannot paint into
+  neighboring chrome, with headless clip-rect coverage. Farm evidence: `.50`
+  `cargo fmt -p mde-shell-egui -- --check` passed; BigBoy `.130` focused
+  `win10_hybrid_31_session_hover_preview_clips_long_titles_to_card_body`
+  passed from an isolated clean worktree carrying only the dock patch. The
+  follow-up 2026-07-18 `13844e25` Fedora 44 split-RPM proof installed the
+  bounded progress/preview build on live `.15`, verified the active shell
+  binary hash against `/usr/bin/mde-shell-egui`, and passed installed Browser
+  all-engine, link-navigation, idle-media, Google, and Google News smokes.
+  A later same-day taskbar health/tray polish pass replaced the Health status
+  control's wireless-signal glyph with a dedicated YAMIS-backed smart-status
+  icon, preserving distinct Desktop Sources, Health, overflow, and notification
+  icons, and moved the Windows 11 tray-island proof to the headless screenshot
+  raster path. Farm evidence: `.50` file-scoped rustfmt over `dock/mod.rs` and
+  `dock/tests.rs` passed; `.170` focused
+  `health_status_glyph_is_dedicated_and_rasterizes` passed; BigBoy `.130`
+  focused
+  `taskbar_launch_sources_health_and_overflow_use_distinct_non_chevron_icons`
+  and `win11_tray_clock_and_notification_area_paint_a_grouped_island` passed,
+  with `taskbar-win11-tray-island.png` generated. A follow-up 2026-07-19 taskbar
+  token cleanup moved the black taskbar strip, white icon tint, cell hover/active
+  fills, clock date tone, and Windows 11 tray-island fills/border from
+  `dock/mod.rs` into shared `mde_egui::Style`, removing Dock from the
+  `lint-style-leaks.sh` hardcoded-color hit list while preserving the rendered
+  black-bar and grouped-tray proof paths. Farm evidence: `.50` slot
+  `taskbar-style-test`
+  `cargo test -p mde-egui taskbar_palette -- --nocapture` passed; BigBoy `.130`
+  slot `taskbar-black-bar`
+  `cargo test -p mde-shell-egui taskbar_controls_render_white_icons_on_a_black_bar -- --nocapture`
+  passed; `.90` slot `taskbar-tray-island`
+  `cargo test -p mde-shell-egui win11_tray_clock_and_notification_area_paint_a_grouped_island -- --nocapture`
+  passed and wrote `taskbar-win11-tray-island.png`; `.170` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/shared/mde-egui/src/style.rs` and
+  `crates/desktop/mde-shell-egui/src/dock/mod.rs`.
+  Remaining live proof is the screenshot/pixel pass for the full taskbar,
+  Start grid, tray, and action-center composition on the target seat.
+  Remaining icon work is the full per-surface sweep for
+  hand-painted icons or other code paths that bypass `IconId`, removal or
   repointing of stale Carbon/Material asset uses, and live rendered proof on the
   target seat.
 
@@ -1964,7 +2672,24 @@ These decisions refine acceptance and sequencing for the active items below.
   A later 2026-07-18 Front Door hover-polish slice replaced the expansion
   control's raw egui tooltip with a Front Door themed tooltip surface and added
   rendered text-color coverage so the launcher layout hover cannot regress into
-  unreadable shared-shell popup text. A later 2026-07-18 Front Door
+  unreadable shared-shell popup text. A follow-up 2026-07-18 Front Door
+  context-menu polish slice routed result row right-click menus through a
+  Front Door visual scope, making popup/window/widget states use
+  `Style::SURFACE`, `Style::SURFACE_HI`, `Style::TEXT`, and `Style::BORDER`
+  before egui builds the native menu. Rendered row coverage proves Launch/Pin
+  menu text paints with Front Door tokens and not raw black. Farm evidence:
+  BigBoy `.130` focused
+  `cargo test -p mde-shell-egui front_door_result_context_menu -- --nocapture`
+  passed 2 tests; `.50` file-scoped `rustfmt --edition 2024 --config
+  skip_children=true --check crates/desktop/mde-shell-egui/src/front_door.rs`
+  passed. A later 2026-07-18 shell layout-profile
+  tooltip slice replaced the lower-right Workstation/Tablet/Car layout control's
+  raw egui hover text with a shell-themed tooltip surface using the current
+  Style color roles, and added rendered paint coverage for tooltip text and
+  surface colors so this platform control cannot regress into black-on-black
+  popup text. Farm evidence: BigBoy `.130`
+  `cargo test -p mde-shell-egui layout_profile_tooltip -- --nocapture` passed.
+  A later 2026-07-18 Front Door
   narrow-expanded geometry slice made panel and expanded widths honor the
   margin-bounded viewport when a seat is narrower than the historical launcher
   minimum, and clamped expanded height to the visible screen so the launcher
@@ -1991,11 +2716,79 @@ These decisions refine acceptance and sequencing for the active items below.
   to exercise the public menu-bar request and shell transition path. Initial
   shell verification was blocked by an out-of-scope `mde-maps-location-egui`
   compile edge that is resolved in the current source; BigBoy `.130` then
-  passed the focused
-  `cargo test -p mde-shell-egui menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers -- --nocapture`
-  gate. Farm evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed before
-  the retest and BigBoy `.130` passed the shell transition test after
-  `LocationManager::primary_source` was present in `src/model.rs`.
+	  passed the focused
+	  `cargo test -p mde-shell-egui menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers -- --nocapture`
+	  gate. Farm evidence: `.50` `cargo fmt -p mde-shell-egui --check` passed before
+	  the retest and BigBoy `.130` passed the shell transition test after
+	  `LocationManager::primary_source` was present in `src/model.rs`. A later
+	  2026-07-18 Desktop workspace chrome slice removed the Desktop/Remote
+	  Sessions menu-bar mount and deleted the stale VDI Desktop menubar helper,
+	  leaving the workspace as a bare session picker/remote desktop surface. The
+	  empty chooser title now uses a centered backdrop status path, and the
+	  top-right minimize-to-Remote-Sessions cue now paints a staggered card-shuffle
+	  stack instead of a single shrinking rectangle. Farm evidence: BigBoy `.130`
+	  focused
+	  `desktop_workspace_body_does_not_mount_the_shared_menu_bar_button`,
+	  `empty_roster_title_renders_near_the_workspace_center`,
+	  `centered_status_places_the_empty_desktop_copy_in_the_workspace_center`,
+	  and `menu_bar_minimize_effect_uses_staggered_card_shuffle_geometry` passed;
+		  `.170` file-scoped
+		  `rustfmt --edition 2024 --config skip_children=true --check` passed across
+		  the touched shell GUI files. A follow-up 2026-07-18 Remote Sessions
+		  tooltip polish slice routed chooser card-detail, Retry, and protocol-port
+		  hovers through a chooser-local themed tooltip frame so Remote Sessions
+		  hover copy cannot inherit raw egui popup colors. Farm evidence: BigBoy
+		  `.130` focused
+		  `chooser_hover_tooltip_uses_themed_text_and_surface` passed; `.90`
+		  focused `the_filter_bar_and_grid_render_together` passed; `.50`
+		  file-scoped
+		  `rustfmt --edition 2024 --config skip_children=true --check` passed for
+		  `chooser/render.rs` and `chooser/tests.rs`. A follow-up 2026-07-19
+		  Remote Sessions popup polish slice routed the chooser filter/sort
+		  ComboBox dropdowns and per-card right-click menu through a chooser-local
+		  popup visual scope that resolves active light/dark `Style` palette roles
+		  for surface, row states, disabled text, selection, and compact spacing
+		  while preserving Connect / Pin / Retry / power / manual edit/remove
+		  behavior. Farm evidence: BigBoy `.130` slot `chooser-popup-style`
+		  `cargo test -p mde-shell-egui chooser_popup_surfaces_use_themed_text_and_compact_spacing -- --nocapture`
+		  passed; `.90` slot `chooser-filter-render`
+		  `cargo test -p mde-shell-egui the_filter_bar_and_grid_render_together -- --nocapture`
+		  passed; `.50` slot `chooser-popup-fmt` file-scoped
+		  `rustfmt --edition 2021 --check` passed for `chooser/render.rs` and
+		  `chooser/tests.rs`. A later
+		  2026-07-18 compatibility Start Menu panel slice bounded the legacy panel
+	  width to the current screen, clamps excessive taskbar/rail reservations so
+	  bad restored state cannot push the panel off-screen or produce negative
+	  geometry, clips child panes to the bounded rect, and only paints the divider
+	  when a right pane fits. Farm evidence: `.50`
+	  `cargo fmt -p mde-shell-egui -- --check` passed; BigBoy `.130` focused
+	  `cargo test -p mde-shell-egui start_menu_panel_geometry -- --nocapture`
+	  passed 2 tests; `.90` focused
+	  `start_taskbar_click_opens_front_door_and_survives_the_opening_click`
+	  passed; BigBoy `.130` focused
+	  `clean_super_tap_opens_front_door_without_the_start_button` passed. A
+	  follow-up 2026-07-19 Front Door search-field polish slice replaced the
+	  stock launcher `TextEdit` presentation with a Front Door-owned framed
+	  search primitive: themed surface and border paint, compact inset, larger
+	  search text, dim themed hint text, and the shared focus ring, while keeping
+	  the same search query state and input AccessKit node. Farm evidence:
+	  BigBoy `.130` slot `front-door-search-polish`
+	  `cargo test -p mde-shell-egui front_door_search_field_uses_themed_hint_and_text -- --nocapture`
+	  passed; `.50` slot `front-door-search-fmt` file-scoped
+	  `rustfmt --edition 2021 --check crates/desktop/mde-shell-egui/src/front_door.rs`
+	  passed; local `install-helpers/lint-style-leaks.sh` passed with 0 leaks.
+	  A follow-up 2026-07-19 compatibility Start Menu search-field polish slice
+	  moved the still-mounted legacy Start search field onto resolved Start/Menu
+	  theme colors: framed surface and border, larger query/hint typography,
+	  themed search and clear icons, and shared focus-ring paint for dark mode
+	  and Windows-2000 light mode. Farm evidence: BigBoy `.130` slot
+	  `start-search-polish-test`
+	  `cargo test -p mde-shell-egui start_menu_search_field_uses_themed_hint_and_query_text -- --nocapture`
+	  passed; `.90` slot `start-search-polish-fmt2` file-scoped
+	  `rustfmt --edition 2021 --check crates/desktop/mde-shell-egui/src/start_menu.rs`
+	  passed; local `install-helpers/lint-style-leaks.sh` and scoped
+	  `git diff --check` passed. Live `.15` Sunshine/Moonlight visual proof
+	  remains open.
 - Origin or merged source IDs: `docs/design/app-launcher-rethink.md` APPLAUNCH,
   `docs/design/search-omnibox.md` Front Door/full omnibox slice,
   `docs/review/PLATFORM-REVIEW-2026-07-10.md` `shell-ux-2`, `shell-ux-3`,
@@ -2203,6 +2996,85 @@ These decisions refine acceptance and sequencing for the active items below.
   `active_browser_media_with_unknown_play_state_keeps_fast_heartbeat`,
   `paused_active_browser_media_page_uses_low_rate_heartbeat`, and
   `cargo fmt -p mde-shell-egui --check` passed.
+  A follow-up 2026-07-19 Browser hot-path slice removed the intermediate
+  open-tab host `Vec` from `update_site_data_from_tabs`, preserving the
+  site-data behavior while streaming owned host iterators directly into
+  `SiteDataManager`; it also strengthened coverage for the existing Browser
+  frame-retention and session-sync hot-path fixes by proving the retained
+  `ColorImage` is shared with the texture upload via `Arc`, and that the
+  per-frame session snapshot catch-all is throttled off the vblank path while
+  unchanged snapshot bodies remain de-duped. Farm evidence: BigBoy `.130` slot
+  `browser-hot-path`
+  `cargo test -p mde-shell-egui browser_hot_path -- --nocapture` passed 3
+  focused tests; `.50` slot `browser-hot-path-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-shell-egui/src/web/mod.rs` and
+  `crates/desktop/mde-shell-egui/src/web/site_data.rs`. A follow-up
+  2026-07-19 Browser resource-audit hot-path slice added a sequence-filtered
+  `WebSession::recent_resource_requests_after` snapshot for poll paths that only
+  need newly observed resource rows, then routed the shell mixed-content audit
+  loop through that watermark so unchanged active tabs do not clone the full
+  bounded resource history every Browser frame. Farm evidence: `.90` slot
+  `browser-resource-client-test`
+  `cargo test -p mde-web-preview-client
+  recent_resource_requests_after_returns_only_newer_rows -- --nocapture` passed;
+  BigBoy `.130` slot `browser-resource-hotpath-test`
+  `cargo test -p mde-shell-egui
+  resource_audit_hot_path_uses_sequence_watermark_for_new_rows -- --nocapture`
+  passed; `.50` slot `browser-resource-session-fmt` file-scoped
+  `rustfmt --edition 2024 --config skip_children=true --check` passed for
+  `crates/desktop/mde-web-preview-client/src/session.rs`; local `git diff
+  --check` passed for the Browser files touched by this slice.
+  A follow-up 2026-07-19 Browser multi-tab scheduler slice capped quiet inactive
+  helper polling to two due background tabs per Browser panel frame, staggering
+  large tab sets so they cannot all drain helper IPC in the same render pass
+  while known playing background media still bypasses the quiet cap. Farm
+  evidence: BigBoy `.130` slot `browser-bg-poll-cap` focused
+  `cargo test -p mde-shell-egui background -- --nocapture` passed 6
+  background/media tests, and the same warmed slot passed
+  `cargo test -p mde-shell-egui
+  many_due_inactive_browser_tabs_are_staggered_across_panel_frames -- --nocapture`.
+  A follow-up 2026-07-19 Browser omnibox hot-path slice made the security/site-info
+  resource snapshot lazy, so closed toolbar frames no longer clone the active
+  tab's bounded resource history just to draw the security icon; the snapshot is
+  now taken only when the site-info popup renders. Farm evidence: BigBoy `.130`
+  slot `browser-omnibox-lazy`
+  `cargo test -p mde-shell-egui
+  omnibox_security_button_defers_resource_snapshot_until_popup_is_open --
+  --nocapture` passed, the same warmed slot passed
+  `cargo test -p mde-shell-egui
+  site_info_panel_opens_from_the_security_chip_and_renders_without_panicking --
+  --nocapture`, and `.50` slot `browser-omnibox-lazy-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs`.
+  A follow-up 2026-07-19 Browser tab-strip favicon hot-path slice removed the
+  frame-wide `Vec<Option<TextureHandle>>` allocation from both horizontal and
+  vertical tab strips. Favicons now resolve on demand per rendered tab through
+  `tab_favicon_texture_at`, while preserving the existing per-tab decode/cache
+  behavior. Farm evidence: BigBoy `.130` slot `browser-favicon-demand`
+  `cargo test -p mde-shell-egui
+  tab_strip_favicon_resolution_is_on_demand_per_tab -- --nocapture` passed; `.50`
+  slot `browser-favicon-demand-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs` and
+  `crates/desktop/mde-shell-egui/src/web/mod.rs`; local `git diff --check`
+  passed for the touched Browser files.
+  A follow-up 2026-07-19 Browser resource-audit fast-check slice added
+  `WebSession::has_recent_resource_requests_after`, letting the shell read the
+  newest monotonic resource sequence before scanning/cloning the bounded
+  resource-history window. Unchanged pages with already-audited resource rows
+  now skip the mixed-content audit scan on panel frames. Farm evidence: `.90`
+  slot `browser-resource-fastcheck-client`
+  `cargo test -p mde-web-preview-client
+  recent_resource_requests_after_returns_only_newer_rows -- --nocapture` passed;
+  BigBoy `.130` slot `browser-resource-fastcheck-shell`
+  `cargo test -p mde-shell-egui
+  resource_audit_hot_path_uses_sequence_watermark_for_new_rows -- --nocapture`
+  passed; `.50` slot `browser-resource-fastcheck-fmt` file-scoped
+  `rustfmt --edition 2021 --config skip_children=true --check` passed for
+  `crates/desktop/mde-web-preview-client/src/session.rs` and
+  `crates/desktop/mde-shell-egui/src/web/mod.rs`; local `git diff --check`
+  passed for the touched Browser files.
 - Acceptance criteria: No frame source requires pointer movement to advance; slow
   probes cannot freeze UI; regression tests cover wake scheduling.
 - Verification method: Headless wake tests plus live seat smoke.

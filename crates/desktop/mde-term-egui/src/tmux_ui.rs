@@ -67,7 +67,90 @@ use crate::tmux::{
     StockLayout, TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxPaneIo, TmuxSession,
     TmuxWindow,
 };
+use crate::tooltip::terminal_hover_text;
 use crate::widget::TerminalWidget;
+
+fn tmux_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut Ui)) {
+    let previous_style = response.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_tmux_popup_style(&response.ctx, &mut menu_style);
+    response.ctx.set_style(menu_style);
+    let _ = response.context_menu(|ui| tmux_popup_visual_scope(ui, add_contents));
+    response.ctx.set_style(previous_style);
+}
+
+fn tmux_menu_button<R>(
+    ui: &mut Ui,
+    label: impl Into<egui::WidgetText>,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    tmux_popup_visual_scope(ui, |ui| {
+        ui.menu_button(label, |ui| tmux_popup_visual_scope(ui, add_contents))
+    })
+}
+
+fn tmux_popup_visual_scope<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let previous_style = ui.ctx().style();
+    let mut popup_style = (*previous_style).clone();
+    apply_tmux_popup_style(ui.ctx(), &mut popup_style);
+    ui.ctx().set_style(popup_style);
+    let inner = ui
+        .scope(|ui| {
+            let ctx = ui.ctx().clone();
+            apply_tmux_popup_style(&ctx, ui.style_mut());
+            add_contents(ui)
+        })
+        .inner;
+    ui.ctx().set_style(previous_style);
+    inner
+}
+
+fn apply_tmux_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
+    let palette = Style::current_palette(ctx);
+    let border = Stroke::new(1.0, palette.border);
+    let text = Stroke::new(1.0, palette.text);
+    let text_dim = Stroke::new(1.0, palette.text_dim);
+    let accent = Style::resolve_color(ctx, Style::ACCENT);
+    let visuals = &mut style.visuals;
+
+    visuals.window_fill = palette.surface;
+    visuals.panel_fill = palette.surface;
+    visuals.faint_bg_color = palette.surface;
+    visuals.extreme_bg_color = palette.bg;
+    visuals.window_stroke = border;
+    visuals.override_text_color = Some(palette.text);
+    visuals.menu_corner_radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
+
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.bg_stroke = border;
+    visuals.widgets.noninteractive.fg_stroke = text_dim;
+
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    visuals.widgets.inactive.bg_stroke = border;
+    visuals.widgets.inactive.fg_stroke = text;
+
+    visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.hovered.fg_stroke = text;
+
+    visuals.widgets.active.bg_fill = palette.surface_hi;
+    visuals.widgets.active.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.fg_stroke = text;
+
+    visuals.widgets.open.bg_fill = palette.surface_hi;
+    visuals.widgets.open.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.open.bg_stroke = border;
+    visuals.widgets.open.fg_stroke = text;
+
+    visuals.selection.bg_fill = accent.gamma_multiply(0.25);
+    visuals.selection.stroke = Stroke::new(1.0, accent);
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+}
 
 /// The default grid a mesh control channel dials at, before the mounted view's
 /// `refresh-client -C` sizes it to the real on-screen rect (TMUX-FC-6).
@@ -78,8 +161,9 @@ const MESH_DIAL_ROWS: u16 = 24;
 /// The pointer slop either side of a divider strip that still grabs it.
 const DIVIDER_HIT_SLOP: f32 = 3.0;
 
-/// The status bar's height (design lock #8) — one `SP_XL` band, like the strip.
-const STATUS_BAR_H: f32 = Style::SP_XL;
+/// The status bar's height (design lock #8), aligned with the shared refined
+/// workspace chrome height instead of carrying an oversized local band.
+const STATUS_BAR_H: f32 = mde_egui::menubar::BAR_HEIGHT;
 
 /// How many cells a toolbar/palette resize nudge moves a pane.
 const RESIZE_STEP: u16 = 5;
@@ -1206,7 +1290,7 @@ fn window_node(
             if resp.clicked() {
                 intents.push(TmuxIntent::SelectWindow(window));
             }
-            resp.context_menu(|ui| {
+            tmux_context_menu(&resp, |ui| {
                 if ui.button("Rename\u{2026}").clicked() {
                     state.win_rename = Some((window, win.name().to_owned()));
                     ui.close_menu();
@@ -1281,7 +1365,9 @@ fn pane_node(
                 StrokeKind::Inside,
             );
         }
-        resp.context_menu(|ui| pane_context_menu(ui, model, pane, title, state, intents));
+        tmux_context_menu(&resp, |ui| {
+            pane_context_menu(ui, model, pane, title, state, intents);
+        });
         rows.push((RowTarget::Pane(pane), resp.rect));
     });
 }
@@ -1324,7 +1410,7 @@ fn pane_context_menu(
         intents.push(TmuxIntent::SwapPanePrev(pane));
         ui.close_menu();
     }
-    ui.menu_button("Join Into Window", |ui| {
+    tmux_menu_button(ui, "Join Into Window", |ui| {
         let src_window = model.pane(pane).and_then(TmuxPane::window);
         let mut any = false;
         for w in model.windows_in_order() {
@@ -1478,7 +1564,7 @@ fn tab_strip(
             }
             // FC-4: the full window context menu — select · rename · reorder ·
             // new/kill, every item a tmux command through the round-trip.
-            resp.context_menu(|ui| {
+            tmux_context_menu(&resp, |ui| {
                 if ui.button("Select").clicked() {
                     intents.push(TmuxIntent::SelectWindow(window));
                     ui.close_menu();
@@ -1508,11 +1594,7 @@ fn tab_strip(
             });
             tabs.push((window, resp.rect));
         }
-        if ui
-            .button("+")
-            .on_hover_text("New window (new-window)")
-            .clicked()
-        {
+        if terminal_hover_text(ui.button("+"), "New window (new-window)").clicked() {
             intents.push(TmuxIntent::NewWindow);
         }
     });
@@ -1799,62 +1881,65 @@ fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut V
     ui.horizontal_wrapped(|ui| {
         ui.add_space(Style::SP_XS);
         for (label, hint, op) in TOOLBAR_OPS {
-            let resp = ui
-                .add(Button::new(
-                    RichText::new(label).size(Style::SMALL).color(Style::TEXT),
-                ))
-                .on_hover_text(hint);
+            let resp = ui.add(Button::new(
+                RichText::new(label).size(Style::SMALL).color(Style::TEXT),
+            ));
+            let resp = terminal_hover_text(resp, hint);
             if resp.clicked() {
                 intents.extend(op_intents(model, op));
             }
         }
         ui.add_space(Style::SP_S);
-        if ui
-            .add(Button::new(
+        if terminal_hover_text(
+            ui.add(Button::new(
                 RichText::new("Commands\u{2026}")
                     .size(Style::SMALL)
                     .color(Style::ACCENT_TERMINALS),
-            ))
-            .on_hover_text("The tmux command palette (fuzzy, ~30 curated ops)")
-            .clicked()
+            )),
+            "The tmux command palette (fuzzy, ~30 curated ops)",
+        )
+        .clicked()
         {
             state.open_palette();
         }
-        if ui
-            .add(Button::new(
+        if terminal_hover_text(
+            ui.add(Button::new(
                 RichText::new("Projects\u{2026}")
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
-            ))
-            .on_hover_text("Saved session templates (TMUX-FC-5)")
-            .clicked()
+            )),
+            "Saved session templates (TMUX-FC-5)",
+        )
+        .clicked()
         {
             state.templates_open = true;
         }
-        if ui
-            .add(Button::new(
+        if terminal_hover_text(
+            ui.add(Button::new(
                 RichText::new("Mesh\u{2026}")
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
-            ))
-            .on_hover_text("Attach tmux on a mesh node (TMUX-FC-6)")
-            .clicked()
+            )),
+            "Attach tmux on a mesh node (TMUX-FC-6)",
+        )
+        .clicked()
         {
             state.mesh_open = true;
         }
-        if ui
-            .add(Button::new(
+        if terminal_hover_text(
+            ui.add(Button::new(
                 RichText::new("Config\u{2026}")
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
-            ))
-            .on_hover_text(TMUX_CONFIG_TOOLTIP)
-            .clicked()
+            )),
+            TMUX_CONFIG_TOOLTIP,
+        )
+        .clicked()
         {
             state.settings_open = true;
         }
-        if ui
-            .add(Button::new(
+        if terminal_hover_text(
+            ui.add(Button::new(
                 RichText::new(if state.tree_open {
                     "Tree \u{25C0}"
                 } else {
@@ -1862,22 +1947,22 @@ fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut V
                 })
                 .size(Style::SMALL)
                 .color(Style::TEXT_DIM),
-            ))
-            .on_hover_text("Show/hide the session tree sidebar")
-            .clicked()
+            )),
+            "Show/hide the session tree sidebar",
+        )
+        .clicked()
         {
             state.tree_open = !state.tree_open;
         }
-        if ui
-            .add(Button::new(
+        if terminal_hover_text(
+            ui.add(Button::new(
                 RichText::new("Detach")
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
-            ))
-            .on_hover_text(
-                "Detach this control client (detach-client) \u{2014} the session keeps running",
-            )
-            .clicked()
+            )),
+            "Detach this control client (detach-client) \u{2014} the session keeps running",
+        )
+        .clicked()
         {
             intents.push(TmuxIntent::Detach);
         }
@@ -2442,10 +2527,11 @@ fn render_templates(ui: &Ui, templates: &[crate::SessionTemplate]) -> Option<Tem
                 if ui.button("New\u{2026}").clicked() {
                     action = Some(TemplateAction::NewEditor);
                 }
-                if ui
-                    .button("Save current\u{2026}")
-                    .on_hover_text("Capture the live session's layout as a new template")
-                    .clicked()
+                if terminal_hover_text(
+                    ui.button("Save current\u{2026}"),
+                    "Capture the live session's layout as a new template",
+                )
+                .clicked()
                 {
                     action = Some(TemplateAction::CaptureEditor);
                 }
@@ -2803,6 +2889,7 @@ mod tests {
     use super::*;
     use crate::tmux::{Parser, TmuxModel};
     use mde_egui::egui::{pos2, vec2, Context, Rect};
+    use mde_egui::{Density, StyleColorScheme};
     use std::sync::mpsc;
 
     #[test]
@@ -2814,6 +2901,39 @@ mod tests {
                 && !TMUX_CONFIG_TOOLTIP.contains(concat!("Qua", "sar")),
             "tmux config UI copy must not drift back to the superseded spelling"
         );
+    }
+
+    #[test]
+    fn tmux_context_menu_popup_visuals_use_terminal_tokens() {
+        for scheme in [StyleColorScheme::Dark, StyleColorScheme::Light] {
+            let ctx = Context::default();
+            Style::install_color_scheme_with_density(&ctx, scheme, Density::Mouse);
+            let palette = Style::palette_for(scheme);
+            let accent = Style::resolve_color(&ctx, Style::ACCENT);
+            let mut style = (*ctx.style()).clone();
+
+            apply_tmux_popup_style(&ctx, &mut style);
+
+            assert_eq!(style.visuals.window_fill, palette.surface);
+            assert_eq!(style.visuals.panel_fill, palette.surface);
+            assert_eq!(style.visuals.window_stroke.color, palette.border);
+            assert_eq!(style.visuals.override_text_color, Some(palette.text));
+            assert_eq!(
+                style.visuals.widgets.noninteractive.fg_stroke.color,
+                palette.text_dim
+            );
+            assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.hovered.bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.hovered.bg_stroke.color, accent);
+            assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.active.bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.active.bg_stroke.color, accent);
+            assert_eq!(style.visuals.widgets.active.fg_stroke.color, palette.text);
+            assert_eq!(style.visuals.widgets.open.bg_fill, palette.surface_hi);
+            assert_eq!(style.visuals.widgets.open.fg_stroke.color, palette.text);
+            assert_eq!(style.spacing.button_padding.y, Style::CONTROL_PAD_Y);
+            assert_eq!(style.spacing.item_spacing.y, Style::TOOLBAR_INSET_Y);
+        }
     }
 
     // ── the intent → command map (the round-trip's first half) ───────────────
@@ -3402,6 +3522,19 @@ mod tests {
     }
 
     // ── TMUX-FC-4: the toolbar + native status bar render headless ───────────
+
+    #[test]
+    fn tmux_status_bar_uses_refined_shared_chrome_height() {
+        assert_eq!(
+            STATUS_BAR_H,
+            mde_egui::menubar::BAR_HEIGHT,
+            "tmux status bar should inherit the shared refined chrome height"
+        );
+        assert!(
+            STATUS_BAR_H < Style::SP_XL,
+            "tmux status bar must not return to the old 32pt toolbar band"
+        );
+    }
 
     #[test]
     fn toolbar_and_status_bar_render_headless() {
