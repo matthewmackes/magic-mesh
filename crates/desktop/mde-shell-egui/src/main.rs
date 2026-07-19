@@ -55,6 +55,7 @@ mod provisioning;
 #[cfg(test)]
 mod screenshot;
 mod seat_pump;
+mod seat_remote_input_consent;
 mod services_flow;
 mod session;
 mod session_rail;

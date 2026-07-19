@@ -286,6 +286,9 @@ pub struct PhonesHubState {
     published_pair_enroll: Option<PairEnrollToken>,
     /// The in-flight daemon mint request for [`PAIR_ENROLL_TOKEN_ACTION`].
     pair_enroll_pending: Option<PendingVerb>,
+    /// WL-SEC-004 — the seated-user arm/disarm consent control for phone remote
+    /// input. Publishes to the seat worker's `ARM_TOPIC`; reflects its indicator.
+    remote_input: crate::seat_remote_input_consent::RemoteInputConsent,
 }
 
 impl Default for PhonesHubState {
@@ -309,6 +312,7 @@ impl Default for PhonesHubState {
             pair_enroll_token: String::new(),
             published_pair_enroll: None,
             pair_enroll_pending: None,
+            remote_input: crate::seat_remote_input_consent::RemoteInputConsent::default(),
         }
     }
 }
@@ -379,6 +383,8 @@ impl PhonesHubState {
             self.last_refresh = Some(Instant::now());
             self.refresh_directory();
             self.refresh_pair_enroll_token();
+            // WL-SEC-004 — reflect the seat worker's live arm indicator (read-only).
+            self.remote_input.refresh(self.bus_root.as_deref());
             if self.roster_pending.is_none() {
                 self.request_roster();
             }
@@ -595,6 +601,14 @@ impl PhonesHubState {
 
     fn phones_tab(&mut self, ui: &mut egui::Ui) {
         self.feature_card(ui);
+        ui.add_space(Style::SP_S);
+        // WL-SEC-004 — the seated-user arm/disarm consent card for phone remote
+        // input. Shown regardless of the roster: consent is meaningful before any
+        // phone is confirmed driving.
+        let bus_root = self.bus_root.clone();
+        card_frame(ui).show(ui, |ui| {
+            self.remote_input.body(ui, bus_root.as_deref());
+        });
         ui.add_space(Style::SP_S);
         if self.devices.is_empty() {
             empty_state(
