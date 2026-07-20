@@ -123,36 +123,6 @@ pub fn bookmarks_panel(ui: &mut egui::Ui, m: &mut Manager) {
     }
 }
 
-// ── Depth (shared elevation ladder) ──────────────────────────────────────────
-
-/// Build an [`egui::Shadow`] from the shared [`Elevation`](mde_egui::style::Elevation)
-/// depth token — the surface-side conversion the token module defers (it stays
-/// free of egui's shadow type, per its own doc). Reads the token's
-/// offset/blur/spread/umbra, casting the logical-px floats onto epaint's small
-/// integer fields; mints **no** colour of its own (the umbra comes straight from
-/// the token), so the depth reads only from `mde_egui` (§4) — the same conversion
-/// the sibling shell surfaces (music, chat, voice) use.
-fn elevation_shadow(elevation: mde_egui::style::Elevation) -> egui::Shadow {
-    let token = elevation.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
-/// The transient-contextual-card frame: the exact `Frame::group` egui's `ui.group`
-/// builds (same fill/stroke/margins), lifted onto the shared
-/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) rung so a card that
-/// appears on demand — the add-bookmark form, the multi-select bulk bar — reads as
-/// genuinely raised off the flat list (a translucent soft shadow, lock #2) rather
-/// than a flat bordered box. Adds only the shadow — no layout or behaviour change —
-/// and mints nothing of its own.
-fn card_frame(ui: &egui::Ui) -> egui::Frame {
-    egui::Frame::group(ui.style()).shadow(elevation_shadow(mde_egui::style::Elevation::Raised))
-}
-
 /// Global keyboard + paste handling: Ctrl+N opens the add form (lock Q26 —
 /// shortcut path); a paste of a URL-shaped string opens the add form pre-filled
 /// (lock Q26 — paste path).
@@ -281,7 +251,11 @@ fn sort_selector(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 }
 
 fn add_form(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
-    card_frame(ui).show(ui, |ui| {
+    // A transient contextual card: the shared `card()` primitive lifts the
+    // add-bookmark form off the flat header on the foundation's Raised rung — a
+    // translucent soft shadow, hairline border, and the mid corner radius, all
+    // read straight from `mde_egui` (§4), no per-surface shadow fork.
+    mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("URL")
@@ -470,7 +444,7 @@ fn tree_folder(
             ui.painter().rect_stroke(
                 resp.rect,
                 Style::RADIUS,
-                egui::Stroke::new(1.0, Style::ACCENT),
+                egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -658,7 +632,11 @@ fn rename_row(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
 /// browser is BOOKMARKS-5/6; until it lands this pane is detail-only, and any
 /// "open in a tab" intent is listed here — a clearly-labelled seam, not a stub (§7).
 fn browser_seam(ui: &mut egui::Ui, m: &Manager) {
-    ui.group(|ui| {
+    // A nested read-only region — the shared `inset()` primitive recesses it into
+    // the detail pane (deep app-background fill, hairline border, no shadow) so
+    // the browser placeholder reads as a well set *into* the pane, not a card
+    // floating above it.
+    mde_egui::inset().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new("Browser").color(Style::TEXT_DIM).size(Style::SMALL).strong());
         mde_egui::muted_note(
@@ -716,7 +694,9 @@ fn list(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 }
 
 fn bulk_bar(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
-    card_frame(ui).show(ui, |ui| {
+    // The multi-select action bar is the list's other on-demand card — the same
+    // shared `card()` primitive, so it reads as genuinely raised off the rows.
+    mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.colored_label(Style::ACCENT, format!("{} selected", m.selection_len()));
             ui.add_space(Style::SP_S);
@@ -816,7 +796,9 @@ fn list_row(ui: &mut egui::Ui, m: &Manager, item: &Item, actions: &mut Vec<Actio
         Motion::FAST,
     );
     let wash = if m.is_selected(id) {
-        Some(Style::ACCENT.gamma_multiply(0.30))
+        // The steady selection tint from the shared token, so a selected row never
+        // re-mixes the accent alpha — one source of the selection look (§4).
+        Some(Style::selection_fill())
     } else if hover_t > 0.0 {
         Some(Style::SURFACE_HI.gamma_multiply(hover_t))
     } else {
@@ -915,6 +897,11 @@ fn confirm_dialog(ui: &egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        // The shared modal-sheet frame: base surface fill, hairline border, the
+        // large window radius, and the deepest (Modal) elevation shadow — so the
+        // destructive confirm sits on the foundation's modal tier, not a
+        // hand-rolled box.
+        .frame(mde_egui::dialog())
         .show(ui.ctx(), |ui| {
             ui.colored_label(
                 Style::TEXT,
@@ -1184,30 +1171,20 @@ mod tests {
     }
 
     #[test]
-    fn card_frame_shadow_reuses_the_shared_raised_token() {
-        // The transient contextual cards (add form · bulk bar) adopt the shared
-        // elevation ladder verbatim: the conversion copies the Raised token's
-        // offset/blur/spread/umbra onto egui's Shadow and mints no colour of its
-        // own (§4), so the depth reads only from `mde_egui`. A translucent umbra
-        // keeps it a soft shadow, never an opaque fill (design lock #2).
-        use mde_egui::style::Elevation;
-        let token = Elevation::Raised.shadow();
-        let shadow = super::elevation_shadow(Elevation::Raised);
+    fn transient_cards_adopt_the_shared_raised_card_primitive() {
+        // The transient contextual cards (add form · bulk bar) render through the
+        // shared `mde_egui::card()` primitive, so their depth reads straight from
+        // the foundation's Raised elevation rung (§4) — no per-surface shadow
+        // fork. A translucent umbra keeps it a soft shadow, never an opaque fill
+        // (design lock #2).
+        use mde_egui::Elevation;
+        let card = mde_egui::card();
         assert_eq!(
-            shadow.color, token.umbra,
-            "the umbra comes straight from the shared token"
+            card.shadow,
+            Elevation::Raised.egui_shadow(),
+            "the transient card adopts the shared Raised elevation shadow"
         );
-        assert_eq!(
-            shadow.offset,
-            [token.offset[0] as i8, token.offset[1] as i8],
-            "the cast preserves the token offset"
-        );
-        assert_eq!(shadow.blur, token.blur as u8, "the cast preserves the blur");
-        assert_eq!(
-            shadow.spread, token.spread as u8,
-            "the cast preserves the spread"
-        );
-        let alpha = shadow.color.a();
+        let alpha = card.shadow.color.a();
         assert!(
             alpha > 0 && alpha < 255,
             "a Raised card casts a translucent soft shadow (lock #2), got alpha {alpha}"
