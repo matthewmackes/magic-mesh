@@ -10,13 +10,14 @@ use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
-    ActivityFeed, ActorId, CollabCommand, ConversationTimeline, DeliveryState, EventId, SpaceId,
-    SpaceKind, SpaceRole,
+    ActivityFeed, ActorId, CollabCommand, ConversationTimeline, DeliveryState, EventId, FileRef,
+    FileRefId, FileReferenceView, FileReferences, SpaceId, SpaceKind, SpaceRole, TransferControl,
+    TransferDirection, TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
 };
 
 use crate::fixture::{activity, message, space_summary, FixtureData};
 use crate::{
-    amend_affordance, ActivityFilter, AmendAffordance, CollabData, CommandSink,
+    amend_affordance, file_ref_of_path, ActivityFilter, AmendAffordance, CollabData, CommandSink,
     CommunicationsSurface, Mode, ALL_COLLAB_ICONS, EDIT_WINDOW_MS,
 };
 
@@ -367,16 +368,23 @@ fn activity_body_renders_the_feed() {
 
 #[test]
 fn labeled_for_later_modes_are_honest() {
-    // Files/Documents/Alerts/Clipboard are placeholders, not faked data — they
-    // carry a Phase-3b note and are not marked implemented.
-    for mode in [Mode::Files, Mode::Documents, Mode::Alerts, Mode::Clipboard] {
+    // Documents/Alerts/Clipboard are placeholders, not faked data — they carry a
+    // Phase-3b note and are not marked implemented. (Files graduated to a full
+    // mode with WL-FUNC-011 and is asserted implemented below.)
+    for mode in [Mode::Documents, Mode::Alerts, Mode::Clipboard] {
         assert!(!mode.is_implemented(), "{mode:?} is a Phase-3b placeholder");
         assert!(
             mode.phase_3b_note().contains("Phase 3b"),
             "{mode:?} must carry an honest labeled-for-later note"
         );
     }
-    assert!(Mode::Activity.is_implemented() && Mode::Messages.is_implemented());
+    assert!(
+        Mode::Activity.is_implemented()
+            && Mode::Messages.is_implemented()
+            && Mode::Files.is_implemented()
+    );
+    // An implemented mode never renders a placeholder note.
+    assert_eq!(Mode::Files.phase_3b_note(), "");
 }
 
 #[test]
@@ -391,5 +399,237 @@ fn drafts_persist_across_space_switches() {
         surface.draft(a),
         "half-written",
         "a switched-away draft must survive locally"
+    );
+}
+
+// ── Files mode (WL-FUNC-011) ─────────────────────────────────────────────────
+
+/// A fixture space with one linked file whose transfer is active — the Files
+/// mode's happy-path read model.
+fn files_fixture(space: SpaceId, file: FileRefId, transfer: TransferId) -> FixtureData {
+    let owner = ActorId::new("eagle");
+    FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_file_references(FileReferences {
+            space,
+            files: vec![FileReferenceView {
+                file,
+                reference: FileRef {
+                    name: "deploy.log".to_owned(),
+                    size: 2048,
+                    sha256_hex: "a".repeat(64),
+                    mime: Some("text/plain".to_owned()),
+                },
+                linked_by: owner,
+                linked_unix_ms: 900_000,
+            }],
+        })
+        .with_transfer_jobs(TransferJobs {
+            jobs: vec![TransferJobView {
+                transfer,
+                file,
+                method: TransferMethod::Node,
+                direction: TransferDirection::Outbound,
+                state: TransferState::Active,
+                moved: 1024,
+                total: 2048,
+            }],
+        })
+}
+
+#[test]
+fn files_mode_renders_a_fixture_reference_set() {
+    let space = SpaceId::new();
+    let data = files_fixture(space, FileRefId::new(), TransferId::new());
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Files);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(
+        !shapes.is_empty(),
+        "the Files reference list painted nothing"
+    );
+    // Carbon glyphs (file-row + transfer controls) paint as image meshes.
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the Files mode must paint Carbon icons as image meshes"
+    );
+}
+
+#[test]
+fn files_mode_empty_state_is_honest() {
+    // No file references projected → an honest empty state, never faked, never a
+    // panic. (`Mode::Files` is implemented, so it carries no Phase-3b note.)
+    assert!(Mode::Files.is_implemented());
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        2,
+        1_000,
+    ));
+    assert!(data.file_references(space).is_none());
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Files);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the empty Files state painted nothing");
+}
+
+#[test]
+fn linking_a_picked_file_emits_link_file_with_the_true_content_address() {
+    // Picking a canonical file reads + SHA-256-hashes it into a FileRef and emits
+    // LinkFile — the honest content address, never a placeholder.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("report.txt");
+    std::fs::write(&path, b"hello mesh").expect("write temp file");
+
+    let space = SpaceId::new();
+    let mut surface = CommunicationsSurface::new();
+    surface.open_file_picker_at(dir.path().to_path_buf());
+    assert!(surface.file_picker_open());
+
+    let mut sink = CommandSink::new();
+    surface
+        .link_file_from_path(&mut sink, space, &path)
+        .expect("link the temp file");
+
+    let linked = sink.queued().iter().find_map(|c| match c {
+        CollabCommand::LinkFile {
+            space: s,
+            reference,
+            ..
+        } => Some((*s, reference.clone())),
+        _ => None,
+    });
+    let (s, reference) = linked.expect("LinkFile emitted");
+    assert_eq!(s, space);
+    assert_eq!(reference.name, "report.txt");
+    assert_eq!(reference.size, 10);
+    assert_eq!(
+        reference.sha256_hex,
+        mde_collab_types::value::sha256_hex(b"hello mesh"),
+        "the FileRef carries the real content hash, not a fake"
+    );
+    assert_eq!(reference.mime.as_deref(), Some("text/plain"));
+    // A successful link closes the picker.
+    assert!(!surface.file_picker_open());
+}
+
+#[test]
+fn file_ref_of_path_is_the_real_sha256() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("abc");
+    std::fs::write(&path, b"abc").expect("write");
+    let (_id, reference) = file_ref_of_path(&path).expect("build ref");
+    assert_eq!(
+        reference.sha256_hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "known SHA-256('abc')"
+    );
+    assert_eq!(reference.size, 3);
+}
+
+#[test]
+fn remove_from_space_emits_unlink_file() {
+    // "Remove from space" is a single-click reference removal — UnlinkFile, which
+    // removes only the space's reference (the worker leaves the canonical file).
+    let space = SpaceId::new();
+    let file = FileRefId::new();
+    let surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+    surface.remove_reference(&mut sink, space, file);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::UnlinkFile { space: s, file: f }) if *s == space && *f == file
+        ),
+        "remove-from-space must emit UnlinkFile for the reference"
+    );
+}
+
+#[test]
+fn starting_and_controlling_a_transfer_emits_the_right_commands() {
+    let space = SpaceId::new();
+    let file = FileRefId::new();
+    let surface = CommunicationsSurface::new();
+
+    // Share to members → StartTransfer (outbound, mesh transport).
+    let mut sink = CommandSink::new();
+    surface.start_transfer_to_members(&mut sink, space, file);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::StartTransfer {
+                space: s,
+                file: f,
+                direction: TransferDirection::Outbound,
+                method: TransferMethod::Node,
+                ..
+            }) if *s == space && *f == file
+        ),
+        "share-to-members must emit StartTransfer"
+    );
+
+    // A transfer-control action → ControlTransfer (read state from the shared
+    // ledger mirror; the control is the collab command).
+    let transfer = TransferId::new();
+    let mut sink = CommandSink::new();
+    surface.control_transfer(&mut sink, transfer, TransferControl::Pause);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::ControlTransfer {
+                transfer: t,
+                control: TransferControl::Pause,
+            }) if *t == transfer
+        ),
+        "a transfer-control action must emit ControlTransfer"
+    );
+}
+
+#[test]
+fn permanent_delete_is_typed_confirm_gated() {
+    // Permanent delete is distinct from remove-from-space: it fires only after the
+    // file's exact name is typed (spec: a separate typed-confirm, not undoable).
+    let space = SpaceId::new();
+    let file = FileRefId::new();
+    let mut surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+
+    surface.request_permanent_delete(file, "secret.txt");
+    // Un-typed: must NOT fire.
+    assert!(!surface.confirm_permanent_delete(&mut sink, space));
+    assert!(
+        sink.is_empty(),
+        "permanent delete must not fire without the typed confirmation"
+    );
+    // Wrong text: still must NOT fire.
+    surface.set_permanent_delete_typed("wrong.txt");
+    assert!(!surface.confirm_permanent_delete(&mut sink, space));
+    assert!(
+        sink.is_empty(),
+        "a mismatched confirmation must not arm the delete"
+    );
+    // Exact name: fires, as UnlinkFile (the collab primitive; the canonical bytes
+    // are then purge-gated once no reference remains).
+    surface.set_permanent_delete_typed("secret.txt");
+    assert!(surface.confirm_permanent_delete(&mut sink, space));
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::UnlinkFile { space: s, file: f }) if *s == space && *f == file
+        ),
+        "a confirmed permanent delete must emit UnlinkFile"
     );
 }

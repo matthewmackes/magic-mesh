@@ -725,9 +725,11 @@ impl Worker for CollabWorker {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use mde_collab_types::value::MessageBody;
+    use mde_collab_types::value::{sha256_hex, MessageBody};
     use mde_collab_types::{
-        ConversationTimeline, PresenceState, SpaceDirectory, SpaceKind, SpaceRole,
+        CollabEventKind, ConversationTimeline, FileRef, FileRefId, FileReferences, PresenceState,
+        SpaceDirectory, SpaceKind, SpaceRole, TransferControl, TransferDirection, TransferId,
+        TransferJobs, TransferMethod, TransferState,
     };
     use rand::rngs::OsRng;
 
@@ -957,6 +959,181 @@ mod tests {
         let timeline: ConversationTimeline =
             serde_json::from_str(convo_msg.body.as_deref().expect("convo body")).expect("decode");
         assert_eq!(timeline.messages.len(), 1, "the message is projected");
+    }
+
+    /// Create a space (this node becomes Owner) and link `reference` into it as
+    /// `file`. Assumes the command cursors are already seeded. Returns the space.
+    fn create_space_and_link(
+        w: &CollabWorker,
+        persist: &Persist,
+        state: &mut CollabState,
+        file: FileRefId,
+        reference: FileRef,
+        t0: i64,
+    ) -> SpaceId {
+        write_command(
+            persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(persist, state, t0);
+        let space = only_space(state);
+        write_command(
+            persist,
+            &CollabCommand::LinkFile {
+                space,
+                file,
+                reference,
+            },
+        );
+        w.tick_once(persist, state, t0 + 100);
+        space
+    }
+
+    #[test]
+    fn linking_a_file_projects_a_reference_then_unlinking_removes_only_the_space_ref() {
+        // WL-FUNC-011 — linking a file records the FileRef (owner + name + content
+        // hash) into the space's file_references projection; unlinking removes the
+        // SPACE REFERENCE, not the canonical file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        let file = FileRefId::new();
+        let reference = FileRef {
+            name: "deploy.log".into(),
+            size: 2048,
+            sha256_hex: sha256_hex(b"deploy log bytes"),
+            mime: Some("text/plain".into()),
+        };
+        let space = create_space_and_link(&w, &persist, &mut state, file, reference.clone(), 200);
+
+        // The per-space file-references projection is published + carries the ref.
+        let files_topic = topics::space_state_topic(proj::FILE_REFERENCES, space);
+        assert_eq!(files_topic, format!("state/collab/file-references/{space}"));
+        let read_refs = |persist: &Persist| -> FileReferences {
+            let msg = persist
+                .read_latest(&files_topic)
+                .expect("read file_refs")
+                .expect("file_refs published");
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode file_refs")
+        };
+        let refs = read_refs(&persist);
+        assert_eq!(refs.files.len(), 1, "the linked file is projected");
+        assert_eq!(refs.files[0].file, file);
+        assert_eq!(refs.files[0].reference.name, "deploy.log");
+        assert_eq!(
+            refs.files[0].reference.sha256_hex, reference.sha256_hex,
+            "the projected FileRef carries the real content hash"
+        );
+        assert_eq!(
+            refs.files[0].linked_by, w.self_actor,
+            "the projection records who linked it (the owner)"
+        );
+
+        // Unlink: removes the space's reference.
+        write_command(&persist, &CollabCommand::UnlinkFile { space, file });
+        w.tick_once(&persist, &mut state, 400);
+        let refs = read_refs(&persist);
+        assert!(
+            refs.files.is_empty(),
+            "unlinking removes the space's reference from the projection"
+        );
+
+        // ...but NOT the canonical file: unlink is a reference tombstone, so the
+        // FileLinked event (which carries the file's content address/identity) is
+        // still in the durable log alongside a separate FileUnlinked event — no
+        // content purge happened.
+        let events = state.engine.all_events();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                CollabEventKind::FileLinked { file: f, reference: r }
+                    if *f == file && r.sha256_hex == reference.sha256_hex
+            )),
+            "the FileLinked event (the file's identity + hash) is retained after unlink"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, CollabEventKind::FileUnlinked { file: f } if *f == file)
+            ),
+            "the unlink is a distinct reference tombstone, not a content delete"
+        );
+    }
+
+    #[test]
+    fn transfer_start_then_control_projects_the_shared_ledger_state() {
+        // WL-FUNC-011 — a linked file's transfer flows through the shared ledger:
+        // StartTransfer projects the control handle (Queued); ControlTransfer moves
+        // its state. Byte progress (moved/total) is mirrored from WL-FUNC-006, not
+        // recomputed here — 0/0 until the ledger reports (no second authority).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        let file = FileRefId::new();
+        let reference = FileRef {
+            name: "artifact.iso".into(),
+            size: 4096,
+            sha256_hex: sha256_hex(b"iso bytes"),
+            mime: None,
+        };
+        let space = create_space_and_link(&w, &persist, &mut state, file, reference, 200);
+
+        let jobs_topic = topics::state_topic(proj::TRANSFER_JOBS);
+        let read_jobs = |persist: &Persist| -> TransferJobs {
+            let msg = persist
+                .read_latest(&jobs_topic)
+                .expect("read transfers")
+                .expect("transfers published");
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode transfers")
+        };
+
+        // Share to members → StartTransfer → the mirror carries a Queued job.
+        let transfer = TransferId::new();
+        write_command(
+            &persist,
+            &CollabCommand::StartTransfer {
+                space,
+                transfer,
+                file,
+                method: TransferMethod::Node,
+                direction: TransferDirection::Outbound,
+            },
+        );
+        w.tick_once(&persist, &mut state, 400);
+        let jobs = read_jobs(&persist);
+        assert_eq!(jobs.jobs.len(), 1, "the transfer is projected");
+        assert_eq!(jobs.jobs[0].transfer, transfer);
+        assert_eq!(jobs.jobs[0].file, file);
+        assert_eq!(jobs.jobs[0].state, TransferState::Queued);
+        assert_eq!(
+            (jobs.jobs[0].moved, jobs.jobs[0].total),
+            (0, 0),
+            "byte progress is mirrored from WL-FUNC-006, not owned here"
+        );
+
+        // Pause → the state machine moves; still no second progress authority.
+        write_command(
+            &persist,
+            &CollabCommand::ControlTransfer {
+                transfer,
+                control: TransferControl::Pause,
+            },
+        );
+        w.tick_once(&persist, &mut state, 500);
+        let jobs = read_jobs(&persist);
+        assert_eq!(
+            jobs.jobs[0].state,
+            TransferState::Paused,
+            "ControlTransfer::Pause moved the shared transfer to Paused"
+        );
     }
 
     #[test]

@@ -38,5 +38,21 @@ mde-egui = { path = "../../shared/mde-egui" }
 # dependency edge points inward (§6).
 mde-collab-types = { path = "../../shared/mde-collab-types" }
 
+# WL-FUNC-011 Files mode — REUSE the file-manager's render-agnostic core (the
+# `LocalFsBackend` directory listing + the `FileRow`/`Mime` model, the exact core
+# `mde-files-egui` itself is built on) to drive the "link a file" picker, rather
+# than rewriting a filesystem lister. Only the static `LocalFsBackend::list_dir`
+# read + the `FileRow` shape are used (no `RealBackend`, so no Bus connect and no
+# `FileBrowser` worker threads on the paint path). A same-tier desktop edge, the
+# same reuse `mde-editor-egui`/`mde-term-egui` take on this crate.
+mde-files = { path = "../../services/mde-files" }
+
+[dev-dependencies]
+# The Files-mode tests write a real temp file, then link it (read + SHA-256 hash)
+# to assert the emitted `FileRef` carries the true content address. `tempfile` is
+# already in the workspace lock (the services tier + other desktop crates use it),
+# so this is fetch-free on the airgapped farm.
+tempfile = "3"
+
 [lints]
 workspace = true

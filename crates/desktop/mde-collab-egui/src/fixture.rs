@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use mde_collab_types::{
     ActivityEntry, ActivityFeed, ActorClock, ActorId, CallKind, CallParticipantState,
     CallParticipantView, CallState, CallView, ConversationTimeline, DeliveryState, EventId,
-    MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary, ThreadId,
-    ThreadTimeline,
+    FileReferences, MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
+    ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -28,6 +28,8 @@ pub struct FixtureData {
     threads: HashMap<ThreadId, ThreadTimeline>,
     thread_roots: HashMap<EventId, ThreadId>,
     call_state: CallState,
+    file_references: HashMap<SpaceId, FileReferences>,
+    transfer_jobs: TransferJobs,
 }
 
 impl FixtureData {
@@ -44,6 +46,8 @@ impl FixtureData {
             threads: HashMap::new(),
             thread_roots: HashMap::new(),
             call_state: CallState::default(),
+            file_references: HashMap::new(),
+            transfer_jobs: TransferJobs::default(),
         }
     }
 
@@ -82,6 +86,21 @@ impl FixtureData {
     #[must_use]
     pub fn with_call(mut self, call: CallView) -> Self {
         self.call_state.active.push(call);
+        self
+    }
+
+    /// Set a space's linked-file references (the Files mode's read model).
+    #[must_use]
+    pub fn with_file_references(mut self, refs: FileReferences) -> Self {
+        self.file_references.insert(refs.space, refs);
+        self
+    }
+
+    /// Set the transfer-jobs mirror (the read-side of the WL-FUNC-006 ledger the
+    /// Files mode's transfer controls read state from).
+    #[must_use]
+    pub fn with_transfer_jobs(mut self, jobs: TransferJobs) -> Self {
+        self.transfer_jobs = jobs;
         self
     }
 
@@ -287,6 +306,14 @@ impl CollabData for FixtureData {
 
     fn call_state(&self) -> &CallState {
         &self.call_state
+    }
+
+    fn file_references(&self, space: SpaceId) -> Option<&FileReferences> {
+        self.file_references.get(&space)
+    }
+
+    fn transfer_jobs(&self) -> Option<&TransferJobs> {
+        Some(&self.transfer_jobs)
     }
 }
 

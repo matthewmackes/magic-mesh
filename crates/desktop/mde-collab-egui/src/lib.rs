@@ -16,8 +16,8 @@
 //!   [`SpaceDirectory`](mde_collab_types::SpaceDirectory) with per-space unread
 //!   badges (the selection key for every other pane);
 //! * per-space **mode tabs** across the top —
-//!   [`Mode::Activity`] and [`Mode::Messages`] are implemented in full; the rest
-//!   are honestly labeled "coming in Phase 3b", never faked;
+//!   [`Mode::Activity`], [`Mode::Messages`], and [`Mode::Files`] are implemented
+//!   in full; the rest are honestly labeled "coming in Phase 3b", never faked;
 //! * a persistent **call bar** across the bottom that renders the
 //!   [`CallState`](mde_collab_types::CallState) read model and survives every
 //!   mode/space switch, with controls wired to the call commands even though the
@@ -35,6 +35,15 @@
 //!   [`SendMessage`](mde_collab_types::CollabCommand::SendMessage), locally
 //!   persisted drafts, honest delivery state, and an edit/delete affordance that
 //!   reflects the core's five-minute author window (spec §3).
+//! * [`Mode::Files`] — the files a space owns **references** to
+//!   ([`FileReferences`](mde_collab_types::FileReferences)) with their owner +
+//!   content address, a picker that reuses the file-manager's listing to
+//!   [`LinkFile`](mde_collab_types::CollabCommand::LinkFile), a reference-remove
+//!   ([`UnlinkFile`](mde_collab_types::CollabCommand::UnlinkFile)) kept distinct
+//!   from a typed-confirm permanent delete, and shared-transfer controls
+//!   ([`StartTransfer`](mde_collab_types::CollabCommand::StartTransfer) /
+//!   [`ControlTransfer`](mde_collab_types::CollabCommand::ControlTransfer)) whose
+//!   state is read from the WL-FUNC-006 ledger mirror (no second authority).
 //!
 //! # Data + commands
 //!
@@ -48,6 +57,7 @@
 
 mod activity;
 mod data;
+mod files;
 mod fixture;
 mod frame;
 mod icons;
@@ -63,8 +73,11 @@ pub use fixture::FixtureData;
 pub use icons::ALL_COLLAB_ICONS;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use mde_collab_types::{EventId, SpaceId, ThreadId};
+
+pub use files::file_ref_of_path;
 
 // Re-export the harness `egui` so a mount site and the tests resolve to the one
 // pinned toolkit version through this crate alone.
@@ -81,7 +94,7 @@ pub enum Mode {
     Activity,
     /// The Markdown conversation timeline + anchored threads.
     Messages,
-    /// The files linked into a space (Phase 3b).
+    /// The files linked into a space (their references + shared transfers).
     Files,
     /// The live co-edited documents (Phase 3b).
     Documents,
@@ -115,11 +128,11 @@ impl Mode {
         }
     }
 
-    /// Whether this mode is implemented in this phase (Activity + Messages) or is
-    /// a labeled-for-later placeholder.
+    /// Whether this mode is implemented in this phase (Activity + Messages +
+    /// Files) or is a labeled-for-later placeholder.
     #[must_use]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Activity | Self::Messages)
+        matches!(self, Self::Activity | Self::Messages | Self::Files)
     }
 
     /// The honest placeholder line a not-yet-implemented mode shows instead of
@@ -127,12 +140,11 @@ impl Mode {
     #[must_use]
     pub const fn phase_3b_note(self) -> &'static str {
         match self {
-            Self::Files => "Files mode arrives in Phase 3b.",
             Self::Documents => "Documents mode arrives in Phase 3b.",
             Self::Alerts => "Alerts mode arrives in Phase 3b.",
             Self::Clipboard => "Clipboard mode arrives in Phase 3b.",
             // The implemented modes never render this note.
-            Self::Activity | Self::Messages => "",
+            Self::Activity | Self::Messages | Self::Files => "",
         }
     }
 }
@@ -226,6 +238,19 @@ pub struct CommunicationsSurface {
     thread_drafts: HashMap<ThreadId, String>,
     /// The message being inline-edited (its id + the working buffer), if any.
     editing: Option<(EventId, String)>,
+    /// Files mode — the open "link a file" picker's current browse directory, or
+    /// `None` when the picker is closed. The picker reuses the file-manager's
+    /// [`mde_files`] `LocalFsBackend` listing (§reuse).
+    file_picker: Option<PathBuf>,
+    /// Files mode — the pending **permanent-delete** typed-confirm, or `None`.
+    /// Distinct from a plain "remove from space" (which is a single-click
+    /// [`UnlinkFile`](mde_collab_types::CollabCommand::UnlinkFile)); a permanent
+    /// delete is gated behind typing the file's exact name (spec: not undoable).
+    files_confirm_delete: Option<files::PendingDelete>,
+    /// Files mode — a transient, honest notice line (e.g. a file the picker could
+    /// not read to hash). Shown once, cleared on the next successful action; never
+    /// a silent swallow (§7).
+    files_notice: Option<String>,
 }
 
 impl CommunicationsSurface {
@@ -246,10 +271,15 @@ impl CommunicationsSurface {
     pub fn select_space(&mut self, space: SpaceId) {
         if self.selected_space != Some(space) {
             self.selected_space = Some(space);
-            // A space switch closes any anchored thread + cancels an inline edit;
-            // the drafts (keyed by space/thread) deliberately survive.
+            // A space switch closes any anchored thread + cancels an inline edit,
+            // and closes the file picker + any pending permanent-delete confirm
+            // (both are per-space intents); the drafts (keyed by space/thread)
+            // deliberately survive.
             self.open_thread = None;
             self.editing = None;
+            self.file_picker = None;
+            self.files_confirm_delete = None;
+            self.files_notice = None;
         }
     }
 
@@ -325,6 +355,7 @@ impl CommunicationsSurface {
         match self.mode {
             Mode::Activity => self.activity_body(ui, data),
             Mode::Messages => self.messages_body(ui, data, sink),
+            Mode::Files => self.files_body(ui, data, sink),
             other => frame::phase_3b_body(ui, other),
         }
     }

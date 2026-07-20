@@ -11,8 +11,8 @@
 //! [`FixtureData`](crate::FixtureData).
 
 use mde_collab_types::{
-    ActivityFeed, ActorId, CallState, CollabCommand, ConversationTimeline, EventId, MessageView,
-    SpaceDirectory, SpaceId, ThreadId, ThreadTimeline,
+    ActivityFeed, ActorId, CallState, CollabCommand, ConversationTimeline, EventId, FileReferences,
+    MessageView, SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 /// The message **edit/delete window** in milliseconds: an author may amend
@@ -71,6 +71,29 @@ pub trait CollabData {
     /// an empty (no active call) state, so a source that has not wired calls yet
     /// still renders the honest "no active call" bar.
     fn call_state(&self) -> &CallState;
+
+    /// A space's linked-file references (the
+    /// [`FileReferences`](mde_collab_types::FileReferences) projection the Files
+    /// mode renders). `None` until the worker has projected any for the space —
+    /// the honest "no files linked yet" empty state, never faked. Defaults to
+    /// `None` so a data source that has not folded the `file_references` mirror
+    /// yet still compiles + renders the empty state.
+    #[must_use]
+    fn file_references(&self, space: SpaceId) -> Option<&FileReferences> {
+        let _ = space;
+        None
+    }
+
+    /// The read-side mirror of the shared transfer ledger (WL-FUNC-006), scoped to
+    /// the whole seat — the Files mode looks a linked file's transfer up in here by
+    /// its `FileRefId`. This crate never owns a second progress authority: byte
+    /// progress (`moved`/`total`) is *mirrored* from the ledger, never recomputed.
+    /// Defaults to `None` so a source that has not folded `transfer_jobs` yet still
+    /// renders the honest "not shared yet" state.
+    #[must_use]
+    fn transfer_jobs(&self) -> Option<&TransferJobs> {
+        None
+    }
 }
 
 /// The sink the surface pushes emitted [`CollabCommand`]s into for the caller to

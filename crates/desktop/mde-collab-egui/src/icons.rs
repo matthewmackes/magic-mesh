@@ -85,6 +85,29 @@ pub const CALL_MUTE: &str = "audio-volume-muted";
 /// Unmute the local microphone in a call.
 pub const CALL_UNMUTE: &str = "audio-volume-high";
 
+// ---- Files mode ----------------------------------------------------------
+/// Link a canonical file into the space (open the picker / add a reference).
+pub const FILE_LINK: &str = "list-add";
+/// Remove a file **reference** from the space (unlink — the canonical file is
+/// untouched; distinct from a permanent delete).
+pub const FILE_UNLINK: &str = "list-remove";
+/// Permanently delete the canonical file (danger, typed-confirm gated).
+pub const FILE_DELETE_PERMANENT: &str = "dialog-warning";
+/// A linked-file row's leading glyph.
+pub const FILE_ROW: &str = "text-x-generic";
+/// Start sharing a linked file to members (start a transfer through the ledger).
+pub const TRANSFER_SEND: &str = "download";
+/// Pause a running transfer.
+pub const TRANSFER_PAUSE: &str = "media-playback-pause";
+/// Resume a paused transfer.
+pub const TRANSFER_RESUME: &str = "media-playback-start";
+/// Cancel a transfer.
+pub const TRANSFER_CANCEL: &str = "media-playback-stop";
+/// A folder row in the link picker.
+pub const PICKER_FOLDER: &str = "view-grid";
+/// Ascend to the parent directory in the link picker.
+pub const PICKER_UP: &str = "go-up";
+
 /// Every Carbon glyph name this surface can paint — the icon-standard set a test
 /// asserts is registered in the shared loader and rasterizes to a non-blank
 /// tinted mask. Keep this in sync with the mappings above.
@@ -111,6 +134,11 @@ pub const ALL_COLLAB_ICONS: &[&str] = &[
     "window-close",
     "audio-volume-muted",
     "audio-volume-high",
+    // Files mode (link / unlink / permanent-delete + transfer controls + picker)
+    "list-add",
+    "media-playback-pause",
+    "media-playback-stop",
+    "go-up",
 ];
 
 /// Paint a Carbon glyph `name` at `size` logical points tinted `color`, sensing
