@@ -30,6 +30,7 @@
 //! harness-pinned egui version (no cross-surface version skew).
 
 pub mod a11y;
+pub mod carbon;
 pub mod code;
 pub mod display;
 pub mod focus;
@@ -52,6 +53,10 @@ pub mod widgets;
 #[cfg(feature = "drm")]
 pub mod drm;
 
+pub use carbon::{
+    CarbonRaster, carbon_icon, carbon_names, carbon_raster, carbon_svg_bytes, carbon_texture,
+    paint_carbon,
+};
 pub use code::CodeToken;
 pub use display::{
     DisplayController, EdidError, EdidPanel, HeadlessModeset, ModeClass, ModesetError, ModesetSeam,

@@ -549,6 +549,14 @@ assets = [
     { source = "assets/icons/YAMIS/YAMIS/LICENSE",     dest = "/usr/share/icons/YAMIS/LICENSE",     mode = "644" },
     { source = "assets/icons/YAMIS/YAMIS/changelog",   dest = "/usr/share/icons/YAMIS/changelog",   mode = "644" },
     { source = "assets/icons/YAMIS/YAMIS/*/**/*",      dest = "/usr/share/icons/YAMIS/",            mode = "644" },
+    # Mackes-Carbon — the canonical platform freedesktop icon theme (IBM Carbon
+    # as a currentColor SVG theme). The egui shell embeds the curated subset it
+    # renders through mde_egui::carbon for native surfaces; toolkit/XDG consumers
+    # inherit the full theme installed here at /usr/share/icons/Mackes-Carbon.
+    { source = "assets/icons/Mackes-Carbon/index.theme", dest = "/usr/share/icons/Mackes-Carbon/index.theme", mode = "644" },
+    { source = "assets/icons/Mackes-Carbon/LICENSE",     dest = "/usr/share/icons/Mackes-Carbon/LICENSE",     mode = "644" },
+    { source = "assets/icons/Mackes-Carbon/NOTICE",      dest = "/usr/share/icons/Mackes-Carbon/NOTICE",      mode = "644" },
+    { source = "assets/icons/Mackes-Carbon/scalable/*/**/*", dest = "/usr/share/icons/Mackes-Carbon/scalable/", mode = "644" },
     # AUD2-4 — the swappable brand-imagery pack at /usr/share/mde/brand/
     # (the system layer; the Carbon-era Brand loader retired with mde-theme
     # under E12-14c, but the imagery stays operator-swappable on disk).

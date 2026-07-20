@@ -31,6 +31,13 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayl
 egui   = "0.31"
 serde  = { workspace = true }
 
+# Mackes-Carbon SVG icon loader (`carbon`): SVG → raster for the canonical
+# platform icon set. `resvg` re-exports its `usvg` parser + `tiny-skia`
+# rasterizer and is pure Rust (no system libraries); default features are off so
+# the unused `text`/fontdb stack is dropped — the Carbon glyphs are flat
+# `currentColor` `<path>` artwork with no `<text>`.
+resvg = { version = "0.45", default-features = false }
+
 # --- E12-2 bare-seat (DRM/KMS) backend — optional, enabled by `--features drm`.
 # Native deps: libdrm, libgbm, libEGL/libGLESv2, libinput, libudev. Versions are
 # pinned loosely; the farm build is the source of truth for resolution.

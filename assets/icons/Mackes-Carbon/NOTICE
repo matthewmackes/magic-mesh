@@ -1,0 +1,9 @@
+Mackes-Carbon is derived from the IBM Carbon Design System icon set.
+
+Upstream: https://github.com/carbon-design-system/carbon/tree/main/packages/icons
+License:  Apache License 2.0 (see LICENSE)
+
+The original SVGs are unmodified geometry; the only transformation is
+the injection of fill="currentColor" on the root <svg> element so the
+icons recolor with the application's GTK style context. Files are
+renamed and reorganized into a freedesktop icon-theme directory layout.
