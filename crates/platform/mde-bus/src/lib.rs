@@ -35,6 +35,9 @@ pub mod cli;
 pub mod correlate;
 pub mod discovery;
 pub mod dnd;
+/// WL-SEC-002 — cross-mesh federation runtime enforcement (grant-gated routing,
+/// accept/revoke core, trust-cert install-on-accept, cross-mesh ingress spool).
+pub mod federation;
 pub mod hooks;
 pub mod persist;
 pub mod retention;

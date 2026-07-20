@@ -173,6 +173,13 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // bus the chat worker folds on every role. A deliberate rank-0 census entry
     // (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
     WorkerSpec::tier("notify", 0, RestartPolicy::OnFailure),
+    // WL-SEC-002 — the federation runtime-enforcement worker. UNIVERSAL (rank 0):
+    // a Lighthouse RELAYS cross-mesh traffic so it especially must enforce the
+    // cross-mesh boundary (default-deny grant-gated routing + trust-cert lifecycle),
+    // and a Workstation enforces its own foreign-mesh ingress too. A deliberate
+    // rank-0 census entry (the BUG-STORAGE-1 lesson), never the silent
+    // unknown-worker default.
+    WorkerSpec::tier("federation_enforcer", 0, RestartPolicy::OnFailure),
     // NODE-GRADE-1 (node-grade.md #11) — the per-node self-grade worker. UNIVERSAL
     // (rank 0): every node computes + publishes its OWN A–F capability grade
     // (`<workgroup_root>/node-grade/<hostname>.json`) from the telemetry the
@@ -1058,7 +1065,9 @@ mod tests {
         // len 73 (this assertion + the tier-split counts below stale-asserted 71/27).
         // +1 router_action (WL-RUN-006 — the universal rank-0 router firewall-edit
         // executor; rank-0 45 → 46, len 73 → 74).
-        assert_eq!(WORKER_REGISTRY.len(), 74);
+        // +1 federation_enforcer (WL-SEC-002 — the universal rank-0 cross-mesh
+        // federation runtime-enforcement worker; rank-0 46 → 47, len 74 → 75).
+        assert_eq!(WORKER_REGISTRY.len(), 75);
     }
 
     #[test]
@@ -1086,8 +1095,8 @@ mod tests {
         };
         assert_eq!(
             count(0),
-            46,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
+            47,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
         );
         assert_eq!(
             count(1),
@@ -1359,8 +1368,9 @@ mod tests {
         // WL-FUNC-008 +1 rank-0 service_aggregator → lh 45; reconcile +1 rank-1
         // peer_app_launch (WL-UX-005, previously uncounted) → ws = 45 + 28 = 73.
         // WL-RUN-006 +1 rank-0 router_action (universal) → lh 46, ws = 46 + 28 = 74.
-        assert_eq!(lh.len(), 46);
-        assert_eq!(ws.len(), 74);
+        // WL-SEC-002 +1 rank-0 federation_enforcer (universal) → lh 47, ws = 47 + 28 = 75.
+        assert_eq!(lh.len(), 47);
+        assert_eq!(ws.len(), 75);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -1427,16 +1437,17 @@ mod tests {
         // universal notify producer, the NODE-GRADE-1 universal node_grade
         // self-grade, the KDC-MESH-3 universal kdc_host, the CHAT-FIX-1 universal
         // chat worker + the DEVMGR-8 universal device_control executor + the
-        // WL-RUN-006 universal router_action executor + the ARCH-5 14 universal
+        // WL-RUN-006 universal router_action executor + the WL-SEC-002 universal
+        // federation_enforcer + the ARCH-5 14 universal
         // rank-0 workers + the WL-FUNC-008 service_aggregator) + navidrome.
-        assert_eq!(set.len(), 47);
+        assert_eq!(set.len(), 48);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 46);
+        assert_eq!(workers_for_class(plain_lh).len(), 47);
     }
 
     #[test]

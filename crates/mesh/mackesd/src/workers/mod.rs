@@ -858,6 +858,16 @@ pub mod chat;
 // an injectable probe (absent binary ⇒ skipped honestly), so the whole worker is
 // headless-testable with fixtures; runs on EVERY node (rank 0).
 pub mod notify;
+// WL-SEC-002 — the federation runtime-enforcement worker. Reads the accepted
+// cross-mesh grants (`federation.yaml`) and ENFORCES them at runtime: drains the
+// cross-mesh ingress spool through the DEFAULT-DENY decision gate (only granted,
+// non-excluded topics from accepted/non-revoked foreign meshes cross onto the local
+// bus; everything else is dropped + audited), drains the shell Federation panel's
+// accept/revoke/refuse-mint actions (accept installs the cross-mesh Nebula trust
+// cert; revoke deletes it), and publishes the `state/federation/<node>` mirror the
+// shell renders. Universal (rank 0): a lighthouse relays cross-mesh traffic so it
+// especially must enforce the boundary; a workstation enforces its own ingress too.
+pub mod federation_enforcer;
 // NODE-GRADE-1 — the per-node self-grade worker (design docs/design/node-grade.md).
 // Every node computes + publishes its OWN A–F capability grade from telemetry the
 // platform already gathers (§6, no new probes): CPU headroom, RAM + disk free,

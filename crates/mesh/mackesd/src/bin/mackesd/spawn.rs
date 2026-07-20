@@ -3117,6 +3117,18 @@ pub(crate) fn spawn_messaging_sync_workers(
         mackesd_core::workers::notify::NotifyWorker::new(workgroup_root.clone(), self_host)
     });
 
+    // WL-SEC-002 — the federation runtime-enforcement worker. UNIVERSAL (rank 0): it
+    // reads the accepted cross-mesh grants (`federation.yaml`) and ENFORCES them —
+    // draining the cross-mesh ingress spool through the DEFAULT-DENY decision gate
+    // (only granted, non-excluded topics from accepted/non-revoked foreign meshes
+    // cross onto the local bus), draining the shell Federation panel's accept/revoke
+    // actions (accept installs the cross-mesh Nebula trust cert; revoke deletes it),
+    // and publishing the `state/federation/<node>` mirror the shell renders. Keyed by
+    // the full node id (the retained-status mirror key `state/federation/<node>`).
+    spawn_tiered(sup, worker_names, role_rank, "federation_enforcer", || {
+        mackesd_core::workers::federation_enforcer::FederationEnforcerWorker::new(node_id.clone())
+    });
+
     // NODE-GRADE-1 — the `node_grade` worker: every node computes + publishes
     // its OWN A–F capability grade (docs/design/node-grade.md). It scores five
     // factors from telemetry the platform already gathers (§6, no new probes):

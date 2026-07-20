@@ -191,6 +191,11 @@ pub(crate) struct SystemState {
     /// capture-once idiom as [`zoom_base`](Self::zoom_base). `None` until the first poll
     /// observes the base.
     animation_base: Option<f32>,
+    /// WL-SEC-002 — the cross-mesh Federation panel shown under Mesh & System →
+    /// Pairing: reflects the `federation_enforcer` worker's `state/federation/<node>`
+    /// mirror (accepted meshes + pending offers) and publishes explicit accept /
+    /// refuse actions. A foreign mesh cannot route until the operator accepts it here.
+    federation: crate::federation::FederationPanel,
 }
 
 impl Default for SystemState {
@@ -222,6 +227,7 @@ impl Default for SystemState {
             appearance: AppearanceConfig::load(),
             zoom_base: None,
             animation_base: None,
+            federation: crate::federation::FederationPanel::default(),
         }
     }
 }
@@ -318,6 +324,10 @@ impl SystemState {
             let mesh_snapshot = fs::read_to_string(MESH_STATUS_PATH).unwrap_or_default();
             self.mesh = MeshFacts::project(&mesh_snapshot);
         }
+        // WL-SEC-002 — reflect the federation_enforcer worker's retained cross-mesh
+        // status mirror (accepted meshes + pending offers) for the Pairing section.
+        // A cheap read-only Bus probe; never publishes.
+        self.federation.refresh();
         // SETTINGS-5: apply the persisted Personalization → Theme appearance to the
         // live context every frame (poll runs unconditionally in both runners, so this
         // is honored globally + restored on start — not just while Settings is open).
@@ -540,6 +550,7 @@ impl SystemState {
                 wallpaper_service,
                 wallpaper_download,
                 appearance,
+                federation,
                 ..
             } = self;
             let snap = snapshot.as_ref();
@@ -598,6 +609,17 @@ impl SystemState {
                                 prompt_in_flight,
                                 &mut actions,
                             );
+                            // WL-SEC-002 — cross-mesh Federation lives under the same
+                            // Mesh & System → Pairing section (federating with another
+                            // mesh is the cross-mesh sibling of device pairing). Render
+                            // it below the pairing responder so accept/refuse of a
+                            // foreign mesh is one explicit local act.
+                            if selected == SettingsSection::Pairing {
+                                ui.add_space(Style::SP_L);
+                                ui.separator();
+                                ui.add_space(Style::SP_M);
+                                federation.body(ui);
+                            }
                         });
                 });
 

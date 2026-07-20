@@ -35,6 +35,7 @@ mod dock;
 mod explorer;
 mod formfactor;
 mod front_door;
+mod federation;
 mod front_door_peer_apps;
 mod host_mirror;
 mod hotkeys;
