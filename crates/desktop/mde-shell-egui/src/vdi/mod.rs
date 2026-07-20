@@ -2026,24 +2026,6 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     }
 }
 
-/// The reconnect / failure overlay's depth — the surface-side conversion of the
-/// shared [`Elevation::Modal`](mde_egui::style::Elevation::Modal) depth token into
-/// an [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
-/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's small
-/// integer fields; mints **no** colour of its own (the umbra comes straight from the
-/// token), so the honest status sheet reads as a genuine modal lifted off the dimmed
-/// desktop while the look still comes only from `mde_egui` (§4, lock #2).
-#[cfg(feature = "live-vdi")]
-fn overlay_shadow() -> egui::Shadow {
-    let token = mde_egui::style::Elevation::Modal.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
 /// shell-ux-1 — paint the honest reconnect / failure overlay OVER the (frozen) last
 /// desktop frame that fills `body`, and return the affordance the operator pressed
 /// this frame, if any. The content is the pure [`SessionOverlay`] model (asserted by
@@ -2063,63 +2045,64 @@ fn paint_session_overlay(
     ui.painter()
         .rect_filled(body, egui::CornerRadius::ZERO, Style::SCRIM);
 
+    // The session-state accent carries the honest connection state: a transient
+    // reconnect reads as a WARNING, a terminal failure as an ERROR (the shared
+    // support-tone tokens, never a minted colour).
     let accent = if overlay.failed {
-        Style::DANGER
+        Style::SUPPORT_ERROR
     } else {
-        Style::ACCENT
+        Style::SUPPORT_WARNING
     };
     let mut chosen = None;
     egui::Area::new(egui::Id::new("vdi-session-overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(body.center() - egui::vec2(220.0, 80.0))
         .show(ui.ctx(), |ui| {
-            egui::Frame::NONE
-                .fill(Style::SURFACE)
-                .stroke(egui::Stroke::new(1.0, Style::BORDER))
-                .corner_radius(Style::RADIUS)
-                .shadow(overlay_shadow())
-                .inner_margin(Style::SP_L)
-                .show(ui, |ui| {
-                    ui.set_max_width(440.0);
-                    ui.label(
-                        RichText::new(&overlay.title)
-                            .size(Style::TITLE)
-                            .strong()
-                            .color(accent),
-                    );
-                    ui.add_space(Style::SP_XS);
-                    ui.label(
-                        RichText::new(&overlay.detail)
-                            .size(Style::BODY)
-                            .color(Style::TEXT_DIM),
-                    );
-                    ui.add_space(Style::SP_M);
-                    ui.horizontal(|ui| {
-                        for action in &overlay.actions {
-                            let (label, fill) = match action {
-                                OverlayAction::Retry => (
-                                    if overlay.failed {
-                                        "Reconnect"
-                                    } else {
-                                        "Retry now"
-                                    },
-                                    Style::ACCENT,
-                                ),
-                                OverlayAction::PickDifferent => {
-                                    ("Pick a different desktop", Style::SURFACE_HI)
-                                }
-                            };
-                            let button = egui::Button::new(
-                                RichText::new(label).size(Style::SMALL).color(Style::TEXT),
-                            )
-                            .fill(fill);
-                            if ui.add(button).clicked() {
-                                chosen = Some(*action);
+            // The honest status sheet is a modal: the shared `dialog()` primitive
+            // carries the surface fill, hairline border, large radius, generous
+            // padding, and the translucent Modal depth — lifted off the dimmed
+            // desktop with the look sourced only from `mde_egui` (§4, lock #2).
+            mde_egui::dialog().show(ui, |ui| {
+                ui.set_max_width(440.0);
+                ui.label(
+                    RichText::new(&overlay.title)
+                        .size(Style::TITLE)
+                        .strong()
+                        .color(accent),
+                );
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(&overlay.detail)
+                        .size(Style::BODY)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_M);
+                ui.horizontal(|ui| {
+                    for action in &overlay.actions {
+                        let (label, fill) = match action {
+                            OverlayAction::Retry => (
+                                if overlay.failed {
+                                    "Reconnect"
+                                } else {
+                                    "Retry now"
+                                },
+                                Style::ACCENT,
+                            ),
+                            OverlayAction::PickDifferent => {
+                                ("Pick a different desktop", Style::SURFACE_HI)
                             }
-                            ui.add_space(Style::SP_S);
+                        };
+                        let button = egui::Button::new(
+                            RichText::new(label).size(Style::SMALL).color(Style::TEXT),
+                        )
+                        .fill(fill);
+                        if ui.add(button).clicked() {
+                            chosen = Some(*action);
                         }
-                    });
+                        ui.add_space(Style::SP_S);
+                    }
                 });
+            });
         });
     chosen
 }

@@ -358,35 +358,23 @@ fn session_overlay_offers_a_retry_when_failed_and_nothing_when_live() {
     );
 }
 
-/// The reconnect / failure sheet casts the shared `Elevation::Modal` soft shadow
-/// (Phase-C depth adoption): every field of [`overlay_shadow`] comes straight from
-/// the token — offset/blur/spread and, critically, the umbra colour (no minted
-/// `Color32`, §4) — and the umbra stays translucent (design lock #2), so the sheet
-/// reads as a genuine modal lifted off the dimmed desktop, never an opaque fill.
+/// The reconnect / failure sheet renders through the shared `dialog()` primitive,
+/// so its depth is the `Elevation::Modal` soft shadow by construction (Phase-C
+/// depth adoption): the sheet's shadow is exactly the shared `Modal` token — no
+/// surface-side re-derivation — and its umbra stays translucent (design lock #2),
+/// so the sheet reads as a genuine modal lifted off the dimmed desktop, never an
+/// opaque fill and never a minted `Color32` (§4).
 #[cfg(feature = "live-vdi")]
 #[test]
-fn overlay_shadow_is_the_modal_depth_token() {
-    let modal = mde_egui::style::Elevation::Modal.shadow();
-    let shadow = overlay_shadow();
+fn session_sheet_uses_the_shared_modal_dialog_depth() {
+    let sheet = mde_egui::dialog();
+    let modal = mde_egui::style::Elevation::Modal.egui_shadow();
     assert_eq!(
-        shadow.offset,
-        [modal.offset[0] as i8, modal.offset[1] as i8],
-        "the overlay shadow offset comes from the Modal token"
-    );
-    assert_eq!(
-        shadow.blur, modal.blur as u8,
-        "the overlay shadow blur comes from the Modal token"
-    );
-    assert_eq!(
-        shadow.spread, modal.spread as u8,
-        "the overlay shadow spread comes from the Modal token"
-    );
-    assert_eq!(
-        shadow.color, modal.umbra,
-        "the overlay shadow umbra is the Modal token's, not a minted colour"
+        sheet.shadow, modal,
+        "the honest status sheet lifts on the shared dialog()'s Modal depth"
     );
     assert!(
-        shadow.color.a() > 0 && shadow.color.a() < 255,
+        sheet.shadow.color.a() > 0 && sheet.shadow.color.a() < 255,
         "the depth is a translucent umbra (lock #2), never an opaque fill"
     );
 }

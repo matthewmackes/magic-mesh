@@ -216,11 +216,13 @@ impl Reachability {
     /// variant, so an `Unknown`/unverified endpoint is filterable too.
     const ALL: [Self; 3] = [Self::Reachable, Self::Unreachable, Self::Unknown];
 
-    /// The status-pip tone: live = OK, offline = danger, unverified = dim.
+    /// The status-pip tone, sourced from the shared support-state tokens: a
+    /// reachable desktop reads as SUCCESS, an offline one as ERROR, and an
+    /// unverified endpoint stays neutral/dim (it is honestly not a state, §7).
     const fn pip(self) -> egui::Color32 {
         match self {
-            Self::Reachable => Style::OK,
-            Self::Unreachable => Style::DANGER,
+            Self::Reachable => Style::SUPPORT_SUCCESS,
+            Self::Unreachable => Style::SUPPORT_ERROR,
             Self::Unknown => Style::TEXT_DIM,
         }
     }

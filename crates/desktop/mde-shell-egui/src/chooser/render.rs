@@ -18,10 +18,11 @@ use super::*;
 const CHOOSER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 pub(super) fn chooser_tooltip(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::NONE
-        .fill(Style::SURFACE)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
-        .corner_radius(Style::RADIUS_S)
+    // A floating hover surface: the shared `overlay()` primitive supplies the
+    // themed fill, hairline border, and the Overlay depth so the tip lifts like
+    // every other popover; specialize only its tooltip-tight radius + margin.
+    mde_egui::overlay()
+        .corner_radius(mde_egui::corner(Style::RADIUS_S))
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(CHOOSER_TOOLTIP_MAX_W);
@@ -68,9 +69,9 @@ fn chooser_combo_menu<R>(
 
 pub(super) fn apply_chooser_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
     let palette = Style::current_palette(ctx);
-    let border = egui::Stroke::new(1.0, palette.border);
-    let text = egui::Stroke::new(1.0, palette.text);
-    let text_dim = egui::Stroke::new(1.0, palette.text_dim);
+    let border = egui::Stroke::new(Style::STROKE_HAIRLINE, palette.border);
+    let text = egui::Stroke::new(Style::STROKE_HAIRLINE, palette.text);
+    let text_dim = egui::Stroke::new(Style::STROKE_HAIRLINE, palette.text_dim);
     let accent = Style::resolve_color(ctx, Style::ACCENT);
     let visuals = &mut style.visuals;
 
@@ -93,12 +94,12 @@ pub(super) fn apply_chooser_popup_style(ctx: &egui::Context, style: &mut egui::S
 
     visuals.widgets.hovered.bg_fill = palette.surface_hi;
     visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(Style::STROKE_HAIRLINE, accent);
     visuals.widgets.hovered.fg_stroke = text;
 
     visuals.widgets.active.bg_fill = palette.surface_hi;
     visuals.widgets.active.weak_bg_fill = palette.surface_hi;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(Style::STROKE_HAIRLINE, accent);
     visuals.widgets.active.fg_stroke = text;
 
     visuals.widgets.open.bg_fill = palette.surface_hi;
@@ -107,7 +108,7 @@ pub(super) fn apply_chooser_popup_style(ctx: &egui::Context, style: &mut egui::S
     visuals.widgets.open.fg_stroke = text;
 
     visuals.selection.bg_fill = accent.gamma_multiply(0.25);
-    visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+    visuals.selection.stroke = egui::Stroke::new(Style::STROKE_HAIRLINE, accent);
     style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
     style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
 }
@@ -386,7 +387,7 @@ pub(super) fn source_card(
         ui.painter().rect_stroke(
             rect,
             Style::RADIUS,
-            Stroke::new(1.0, border),
+            Stroke::new(Style::STROKE_HAIRLINE, border),
             StrokeKind::Inside,
         );
         // CHOOSER-8 — the pin marker: a small accent dot in the top-right corner
