@@ -14,7 +14,7 @@ use mde_egui::egui::{
     self, Align, Align2, Context, CursorIcon, FontId, Layout, Response, RichText, ScrollArea,
     Sense, Slider,
 };
-use mde_egui::{muted_note, status_dot, Motion, Style};
+use mde_egui::{muted_note, overlay, status_dot, Motion, Style};
 
 use mde_jellyfin::{
     BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
@@ -1048,7 +1048,7 @@ fn library_card(ui: &mut egui::Ui, card: &LibraryCard, width: f32) -> Option<Tra
 fn library_card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(Style::LAYER_02)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .stroke(Style::hairline())
         .corner_radius(Style::RADIUS)
         .inner_margin(Style::SP_S)
 }
@@ -1061,7 +1061,7 @@ fn paint_library_art(ui: &mut egui::Ui, kind: MediaKind, width: f32) {
     painter.rect_stroke(
         rect,
         Style::RADIUS,
-        egui::Stroke::new(1.0, Style::BORDER),
+        Style::hairline(),
         egui::StrokeKind::Inside,
     );
 
@@ -1912,7 +1912,7 @@ fn queue_icon_button(ui: &mut egui::Ui, icon: QueueControlIcon, label: &'static 
             let response = ui.add(
                 egui::Button::new("")
                     .fill(Style::LAYER_02)
-                    .stroke(egui::Stroke::new(1.0, Style::BORDER))
+                    .stroke(Style::hairline())
                     .corner_radius(Style::RADIUS_S)
                     .min_size(egui::vec2(QUEUE_CONTROL_BUTTON, QUEUE_CONTROL_BUTTON)),
             );
@@ -1984,24 +1984,6 @@ fn paint_queue_arrow(painter: &egui::Painter, rect: egui::Rect, up: bool, tint: 
 
 // ── PiP mini-player ────────────────────────────────────────────────────────────────
 
-/// The floating `PiP` mini-player's window shadow — the surface-side conversion of the
-/// shared [`Elevation::Overlay`](mde_egui::style::Elevation::Overlay) depth token into
-/// an [`egui::Shadow`] (the token module stays free of egui's shadow type). Every field
-/// comes straight from the token: offset/blur/spread cast onto epaint's small integer
-/// fields, and the umbra colour verbatim — no minted `Color32` (§4) — so the mini-player
-/// reads as a genuine floating overlay lifted off the surface behind it, and the depth
-/// is a translucent umbra (design lock #2), not egui's stock window shadow.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // token px values are small +ve.
-fn pip_overlay_shadow() -> egui::Shadow {
-    let token = mde_egui::style::Elevation::Overlay.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
 /// The floating `PiP` mini-player (design Q31/Q32): a compact now-playing + play/pause
 /// window shown when [`crate::model::UiState::pip`] is on. A real, reachable window —
 /// not a stub.
@@ -2014,7 +1996,8 @@ pub fn pip_window<E: MediaEngine>(ctx: &Context, controller: &mut MediaControlle
     // The stock window frame, its depth re-sourced from the shared Overlay token so the
     // floating mini-player casts the same soft overlay shadow as every other popover
     // (same fill/stroke/margin — only the shadow changes, no layout change).
-    let window_frame = egui::Frame::window(&ctx.style()).shadow(pip_overlay_shadow());
+    let window_frame =
+        egui::Frame::window(&ctx.style()).shadow(mde_egui::style::Elevation::Overlay.egui_shadow());
     egui::Window::new("Mini-player")
         .resizable(false)
         .collapsible(false)
@@ -2079,10 +2062,10 @@ fn section_title(ui: &mut egui::Ui, title: &str) {
 }
 
 fn media_tooltip(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::NONE
-        .fill(Style::SURFACE)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
-        .corner_radius(Style::RADIUS_M)
+    // The shared floating-popover primitive (base fill, hairline border, mid radius,
+    // soft Overlay shadow) with only the deliberately tighter tooltip margin overridden
+    // — so the hover card lifts with the same depth as every other overlay (UI-VIS-111).
+    overlay()
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(MEDIA_TOOLTIP_W);
@@ -2948,14 +2931,15 @@ mod tests {
     }
 
     /// The floating PiP mini-player casts the shared `Elevation::Overlay` soft shadow
-    /// (Phase-C depth adoption): every field of [`pip_overlay_shadow`] comes straight
-    /// from the token — offset/blur/spread and, critically, the umbra colour (no minted
-    /// `Color32`, §4) — and the umbra stays translucent (design lock #2), so the window
-    /// reads as a genuine overlay, not egui's stock window shadow.
+    /// (Phase-C depth adoption): the window frame reads its shadow straight from the
+    /// shared `Elevation::Overlay.egui_shadow()` converter, so every field —
+    /// offset/blur/spread and, critically, the umbra colour (no minted `Color32`, §4) —
+    /// comes from the token, and the umbra stays translucent (design lock #2), so the
+    /// window reads as a genuine overlay, not egui's stock window shadow.
     #[test]
     fn pip_window_casts_the_overlay_depth_token() {
         let overlay = mde_egui::style::Elevation::Overlay.shadow();
-        let shadow = pip_overlay_shadow();
+        let shadow = mde_egui::style::Elevation::Overlay.egui_shadow();
         assert_eq!(
             shadow.offset,
             [overlay.offset[0] as i8, overlay.offset[1] as i8],
