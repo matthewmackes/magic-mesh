@@ -1,0 +1,34 @@
+{{ ansible_managed | comment }}
+# magic-mesh Ansible role `service` (WL-ARCH-006 U13) — headless mesh service on a
+# Service-VM, rendered from the WorkloadSpec. Do not edit by hand.
+[Unit]
+Description={{ item.description | default(item.name + ' (magic-mesh Service-VM workload)') }}
+After=network-online.target mackesd.service
+Wants=network-online.target
+{% for dep in item.after | default([]) %}
+After={{ dep }}
+{% endfor %}
+
+[Service]
+Type={{ item.type | default('simple') }}
+{% if item.user is defined %}
+User={{ item.user }}
+{% endif %}
+{% if item.working_directory is defined %}
+WorkingDirectory={{ item.working_directory }}
+{% endif %}
+{% for key, value in (item.environment | default({})).items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
+{% if item.secret is defined %}
+EnvironmentFile={{ service_dropin_dir }}/{{ item.name }}.env
+{% endif %}
+ExecStart={{ item.exec_start }}
+{% if item.exec_reload is defined %}
+ExecReload={{ item.exec_reload }}
+{% endif %}
+Restart={{ item.restart | default('on-failure') }}
+RestartSec={{ item.restart_sec | default(3) }}
+
+[Install]
+WantedBy=multi-user.target

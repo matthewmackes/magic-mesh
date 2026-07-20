@@ -1,0 +1,14 @@
+---
+# WL-ARCH-006 (U13) — app_forward role defaults.
+
+# The apps this App-VM forwards into the MDE desktop via the session_broker.
+# Each item: { name: "<label>", exec: "<command>" (default = name) }.
+# Empty by default — the WorkloadSpec/reconcile supplies the catalog at run time.
+app_forward_apps: []
+
+# Packages to install so the forwarded apps exist on the VM (idempotent).
+app_forward_packages: []
+
+# The mackesd site convergence playbook re-applied when the app catalog changes
+# (SETUP-7; same default the cloud_vm role uses).
+app_forward_site_yml: /etc/mackesd/site.yml

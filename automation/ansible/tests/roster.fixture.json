@@ -3,6 +3,11 @@
     { "id": "lh1", "role": "lighthouse", "scopes": [], "alive": true, "ip": "10.42.0.1" },
     { "id": "eagle", "role": "workstation", "scopes": ["media"], "alive": true, "ip": "10.42.0.13" },
     { "id": "worker-a", "role": "workstation", "scopes": ["cloud"], "alive": true, "ip": "10.44.0.10" },
-    { "id": "worker-b", "role": "workstation", "scopes": ["cloud"], "alive": false, "ip": "10.44.0.11" }
+    { "id": "worker-b", "role": "workstation", "scopes": ["cloud"], "alive": false, "ip": "10.44.0.11" },
+    { "id": "seat-1", "role": "workstation", "scopes": ["cloud", "desktop_vm"], "alive": true, "ip": "10.44.0.20" },
+    { "id": "svc-1", "role": "workstation", "scopes": ["cloud", "service_vm"], "alive": true, "ip": "10.44.0.21" },
+    { "id": "app-1", "role": "workstation", "scopes": ["cloud", "app_vm"], "alive": true, "ip": "10.44.0.22" },
+    { "id": "ctr-1", "role": "workstation", "scopes": ["cloud", "service_container"], "alive": true, "ip": "10.44.0.23" },
+    { "id": "droid-1", "role": "workstation", "delivery": ["android_vm"], "alive": true, "ip": "10.44.0.24" }
   ]
 }

@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: service
+  namespace: magic_mesh
+  author: magic-mesh
+  description: >-
+    Run a headless systemd service on a Service-VM (WL-ARCH-006 U13). Templates
+    each WorkloadSpec-supplied unit into /etc/systemd/system, reloads systemd, and
+    enables + starts it. Unit secrets ride the mde-seal/age store via the mde_seal
+    lookup (no Ansible Vault). Empty `service_units` = a no-op.
+  license: proprietary
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+dependencies: []

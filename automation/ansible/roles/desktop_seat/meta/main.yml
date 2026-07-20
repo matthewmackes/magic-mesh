@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  role_name: desktop_seat
+  namespace: magic_mesh
+  author: magic-mesh
+  description: >-
+    Install/enable the Quasar VDI seat on a Desktop-VM (WL-ARCH-006 U13). Pins the
+    Workstation role and converges its systemd unit set via `mackesd role-pin` +
+    `mackesd onboard role-provision`, so the DRM-native egui shell
+    (mde-shell-egui.service) runs on the KMS seat. Reuses the same path a
+    hand-provisioned Workstation uses.
+  license: proprietary
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+dependencies: []
