@@ -97,7 +97,7 @@ fn files_action_text(tone: FilesActionTone) -> Color32 {
 fn files_tooltip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
         .fill(Style::SURFACE)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .stroke(Style::hairline())
         .corner_radius(Style::RADIUS_S)
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
@@ -138,9 +138,9 @@ fn scope_files_popup_ui(ui: &mut egui::Ui) {
 
 fn apply_files_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
     let palette = Style::current_palette(ctx);
-    let border = Stroke::new(1.0, palette.border);
-    let text = Stroke::new(1.0, palette.text);
-    let text_dim = Stroke::new(1.0, palette.text_dim);
+    let border = Stroke::new(Style::STROKE_HAIRLINE, palette.border);
+    let text = Stroke::new(Style::STROKE_HAIRLINE, palette.text);
+    let text_dim = Stroke::new(Style::STROKE_HAIRLINE, palette.text_dim);
     let accent = Style::resolve_color(ctx, Style::ACCENT);
     let visuals = &mut style.visuals;
 
@@ -168,7 +168,7 @@ fn apply_files_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
 
     visuals.widgets.active.bg_fill = palette.surface_hi;
     visuals.widgets.active.weak_bg_fill = palette.surface_hi;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.bg_stroke = Stroke::new(Style::STROKE_HAIRLINE, accent);
     visuals.widgets.active.fg_stroke = text;
 
     visuals.widgets.open.bg_fill = palette.surface_hi;
@@ -177,7 +177,7 @@ fn apply_files_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
     visuals.widgets.open.fg_stroke = text;
 
     visuals.selection.bg_fill = accent.gamma_multiply(0.25);
-    visuals.selection.stroke = Stroke::new(1.0, accent);
+    visuals.selection.stroke = Stroke::new(Style::STROKE_HAIRLINE, accent);
     style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
     style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
 }
@@ -221,7 +221,10 @@ fn files_action_button(
                 .strong(),
         )
         .fill(Style::LAYER_02)
-        .stroke(Stroke::new(1.0, text_color.gamma_multiply(0.72)))
+        .stroke(Stroke::new(
+            Style::STROKE_HAIRLINE,
+            text_color.gamma_multiply(0.72),
+        ))
         .corner_radius(Style::RADIUS_S)
         .min_size(egui::vec2(52.0, ACTION_BUTTON_H)),
     );
@@ -248,7 +251,10 @@ fn files_icon_button(
         enabled,
         egui::Button::new("")
             .fill(Style::LAYER_02)
-            .stroke(Stroke::new(1.0, text_color.gamma_multiply(0.72)))
+            .stroke(Stroke::new(
+                Style::STROKE_HAIRLINE,
+                text_color.gamma_multiply(0.72),
+            ))
             .corner_radius(Style::RADIUS_S)
             .min_size(egui::vec2(ACTION_BUTTON_H, ACTION_BUTTON_H)),
     );
@@ -1582,7 +1588,7 @@ fn destinations_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Ac
             ui.painter().rect_stroke(
                 resp.rect,
                 Style::RADIUS,
-                Stroke::new(1.0, target_tone(target.kind)),
+                Stroke::new(Style::STROKE_HAIRLINE, target_tone(target.kind)),
                 StrokeKind::Inside,
             );
         }
@@ -1737,7 +1743,7 @@ fn pane_view(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut V
             ui.painter().hline(
                 top.x_range(),
                 top.top(),
-                Stroke::new(2.0, Style::ACCENT.gamma_multiply(t)),
+                Stroke::new(Style::FOCUS_RING_W, Style::ACCENT.gamma_multiply(t)),
             );
         }
         ui.add_space(Style::SP_XS);
@@ -2148,11 +2154,8 @@ fn detail_columns(rect: Rect) -> DetailCols {
 fn details_header(ui: &mut egui::Ui, pane_ix: usize, sort: SortSpec, actions: &mut Vec<Action>) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::hover());
-    ui.painter().hline(
-        rect.x_range(),
-        rect.bottom(),
-        Stroke::new(1.0, Style::BORDER),
-    );
+    ui.painter()
+        .hline(rect.x_range(), rect.bottom(), Style::hairline());
     let cols = detail_columns(rect);
     let cy = rect.center().y;
     let header =
@@ -2293,7 +2296,7 @@ fn entry_interactions(
                 ui.painter().rect_stroke(
                     resp.rect,
                     Style::RADIUS,
-                    Stroke::new(1.0, Style::ACCENT),
+                    Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT),
                     StrokeKind::Inside,
                 );
             }
@@ -2394,7 +2397,7 @@ fn rubber_band(
             ui.painter().rect_stroke(
                 band,
                 0.0,
-                Stroke::new(1.0, Style::ACCENT),
+                Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT),
                 StrokeKind::Inside,
             );
             let covered: BTreeSet<usize> = rects
@@ -2423,7 +2426,7 @@ fn pane_drop(
         ui.painter().rect_stroke(
             bg.rect,
             Style::RADIUS,
-            Stroke::new(1.0, Style::ACCENT),
+            Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT),
             StrokeKind::Inside,
         );
         if let Some(pos) = bg.hover_pos() {
@@ -2793,20 +2796,6 @@ fn fmt_duration(secs: f64) -> String {
     }
 }
 
-/// Convert the shared [`Elevation`] ladder's shadow token into egui's
-/// `epaint::Shadow`, reusing the token's translucent umbra verbatim — depth
-/// stays single-sourced in `mde_egui::style`, no local colour is minted (§4).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // token px values are small +ve.
-fn elevation_shadow(elevation: Elevation) -> egui::Shadow {
-    let token = elevation.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
 /// FILEMGR-10 — the Space quick-look: a modal overlay dimming the shell and
 /// centering the built-in viewer at full size. Space / Escape / a backdrop
 /// click closes it. Same `preview_body` the pane draws — one viewer, two
@@ -2842,15 +2831,11 @@ fn quick_look_overlay(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>)
             // soft Modal shadow painted behind the fill lifts it off the dim
             // backdrop (translucent umbra, lock #2; no layout change).
             ui.painter()
-                .add(elevation_shadow(Elevation::Modal).as_shape(card, Style::RADIUS));
+                .add(Elevation::Modal.egui_shadow().as_shape(card, Style::RADIUS));
             ui.painter()
                 .rect_filled(card, Style::RADIUS, Style::SURFACE);
-            ui.painter().rect_stroke(
-                card,
-                Style::RADIUS,
-                Stroke::new(1.0, Style::BORDER),
-                StrokeKind::Inside,
-            );
+            ui.painter()
+                .rect_stroke(card, Style::RADIUS, Style::hairline(), StrokeKind::Inside);
             let inner = card.shrink(Style::SP_M);
             let mut body = ui.new_child(
                 egui::UiBuilder::new()
@@ -4273,10 +4258,11 @@ mod tests {
     fn quick_look_card_casts_the_shared_modal_shadow() {
         use mde_egui::style::Elevation;
 
-        // The conversion reuses the Modal token verbatim — the depth ladder
-        // stays single-sourced in mde_egui::style, no local colour is minted.
+        // The shared `Elevation::egui_shadow()` reuses the Modal token verbatim —
+        // the depth ladder stays single-sourced in mde_egui::style, no local
+        // colour is minted and no per-surface `card_shadow()` helper is forked.
         let token = Elevation::Modal.shadow();
-        let shadow = super::elevation_shadow(Elevation::Modal);
+        let shadow = Elevation::Modal.egui_shadow();
         assert_eq!(
             shadow.offset,
             [token.offset[0] as i8, token.offset[1] as i8],
