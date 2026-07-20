@@ -24,7 +24,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use mde_egui::egui::{self, Align, Layout, RichText, Stroke, Ui};
+use mde_egui::egui::{Align, Layout, RichText, Ui};
 use mde_egui::Style;
 
 /// The CUPS submission program — the standard System-V print command.
@@ -268,37 +268,35 @@ pub fn submit(program: &str, job: &str, opts: &PrintOptions) -> Result<(), Print
 /// right-aligned `Page N of M` footer — the same [`Page`] the print job renders,
 /// so the preview is honest (§7). Carbon `Style` tokens throughout (§4).
 pub fn draw_page(ui: &mut Ui, page: &Page, filename: &str, total: usize) {
-    egui::Frame::default()
-        .fill(Style::BG)
-        .stroke(Stroke::new(1.0, Style::BORDER))
-        .corner_radius(Style::RADIUS)
-        .inner_margin(Style::SP_S)
-        .show(ui, |ui| {
+    // A recessed bordered plate over the page background — the shared `inset()`
+    // primitive (BG fill · hairline edge · tight corner · snug padding), so the
+    // preview page's look reads only from `mde_egui` (§4).
+    mde_egui::inset().show(ui, |ui| {
+        ui.label(
+            RichText::new(page_header(filename))
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM)
+                .monospace(),
+        );
+        ui.add_space(Style::SP_XS);
+        // One multiline monospace label keeps the body cheap (one galley per
+        // page) while preserving blank rows via the join.
+        ui.label(
+            RichText::new(page.rows.join("\n"))
+                .size(Style::SMALL)
+                .color(Style::TEXT)
+                .monospace(),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new(page_header(filename))
+                RichText::new(page_footer(page.number, total))
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM)
                     .monospace(),
             );
-            ui.add_space(Style::SP_XS);
-            // One multiline monospace label keeps the body cheap (one galley per
-            // page) while preserving blank rows via the join.
-            ui.label(
-                RichText::new(page.rows.join("\n"))
-                    .size(Style::SMALL)
-                    .color(Style::TEXT)
-                    .monospace(),
-            );
-            ui.add_space(Style::SP_XS);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(page_footer(page.number, total))
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM)
-                        .monospace(),
-                );
-            });
         });
+    });
 }
 
 #[cfg(test)]

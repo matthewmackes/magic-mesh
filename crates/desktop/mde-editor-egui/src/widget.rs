@@ -2294,7 +2294,7 @@ fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
     if x1 <= x0 {
         return;
     }
-    let stroke = Stroke::new(1.0, color);
+    let stroke = Stroke::new(Style::STROKE_HAIRLINE, color);
     let amp = Style::SP_XS / 2.0;
     let step = Style::SP_XS;
     // Integer segment count across the span (≥ 1) — no float loop condition.
@@ -2467,7 +2467,7 @@ fn paint_match_highlights(
             painter.rect_stroke(
                 rect,
                 0.0,
-                Stroke::new(1.0, Style::WARN),
+                Stroke::new(Style::STROKE_HAIRLINE, Style::WARN),
                 egui::StrokeKind::Inside,
             );
         }
@@ -2499,7 +2499,7 @@ fn paint_gutter(
     painter.vline(
         gx + m.gutter_w,
         clip.y_range(),
-        Stroke::new(1.0, Style::BORDER),
+        Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER),
     );
     let num_x = gx + m.gutter_w - Style::SP_S;
     for vr in first..last {
@@ -2587,7 +2587,7 @@ fn paint_carets(
             painter.rect_stroke(
                 caret,
                 0.0,
-                Stroke::new(1.0, Style::TEXT_DIM),
+                Stroke::new(Style::STROKE_HAIRLINE, Style::TEXT_DIM),
                 egui::StrokeKind::Middle,
             );
         }

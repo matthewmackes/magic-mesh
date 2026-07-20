@@ -10,8 +10,8 @@ pub(crate) fn editor_tooltip(ui: &mut Ui, text: &str) {
     let text_color = Style::resolve_color(&ctx, Style::TEXT);
     egui::Frame::NONE
         .fill(surface)
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(Style::RADIUS_S as u8))
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, border))
+        .corner_radius(mde_egui::corner(Style::RADIUS_S))
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(EDITOR_TOOLTIP_MAX_W);
@@ -59,9 +59,9 @@ pub(crate) fn editor_popup_visual_scope<R>(
 fn apply_editor_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
     let palette = Style::current_palette(ctx);
     let accent = Style::resolve_color(ctx, Style::ACCENT);
-    let border = Stroke::new(1.0, palette.border);
-    let text = Stroke::new(1.0, palette.text);
-    let text_dim = Stroke::new(1.0, palette.text_dim);
+    let border = Stroke::new(Style::STROKE_HAIRLINE, palette.border);
+    let text = Stroke::new(Style::STROKE_HAIRLINE, palette.text);
+    let text_dim = Stroke::new(Style::STROKE_HAIRLINE, palette.text_dim);
     let visuals = &mut style.visuals;
 
     visuals.window_fill = palette.surface;
@@ -70,7 +70,7 @@ fn apply_editor_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
     visuals.extreme_bg_color = palette.bg;
     visuals.window_stroke = border;
     visuals.override_text_color = Some(palette.text);
-    visuals.menu_corner_radius = egui::CornerRadius::same(Style::RADIUS_S as u8);
+    visuals.menu_corner_radius = mde_egui::corner(Style::RADIUS_S);
 
     visuals.widgets.noninteractive.bg_fill = palette.surface;
     visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
@@ -84,12 +84,12 @@ fn apply_editor_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
 
     visuals.widgets.hovered.bg_fill = palette.surface_hi;
     visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(Style::STROKE_HAIRLINE, accent);
     visuals.widgets.hovered.fg_stroke = text;
 
     visuals.widgets.active.bg_fill = palette.surface_hi;
     visuals.widgets.active.weak_bg_fill = palette.surface_hi;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.bg_stroke = Stroke::new(Style::STROKE_HAIRLINE, accent);
     visuals.widgets.active.fg_stroke = text;
 
     visuals.widgets.open.bg_fill = palette.surface_hi;
@@ -98,7 +98,7 @@ fn apply_editor_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
     visuals.widgets.open.fg_stroke = text;
 
     visuals.selection.bg_fill = accent.gamma_multiply(0.25);
-    visuals.selection.stroke = Stroke::new(1.0, accent);
+    visuals.selection.stroke = Stroke::new(Style::STROKE_HAIRLINE, accent);
     style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
     style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
 }

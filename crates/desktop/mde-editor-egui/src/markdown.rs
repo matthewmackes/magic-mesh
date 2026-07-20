@@ -554,7 +554,7 @@ fn append_spans(job: &mut LayoutJob, spans: &[Span], size: f32, strong_base: boo
             ..Default::default()
         };
         if span.emphasis.strike {
-            fmt.strikethrough = Stroke::new(1.0, color);
+            fmt.strikethrough = Stroke::new(Style::STROKE_HAIRLINE, color);
         }
         if span.emphasis.code {
             fmt.background = Style::SURFACE;

@@ -328,8 +328,8 @@ fn editor_toolbar_tooltip(ui: &mut Ui, text: &str) {
     let text_color = Style::resolve_color(&ctx, Style::TEXT);
     egui::Frame::NONE
         .fill(surface)
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(6))
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, border))
+        .corner_radius(mde_egui::corner(Style::RADIUS_M))
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(EDITOR_TOOLBAR_TOOLTIP_MAX_W);

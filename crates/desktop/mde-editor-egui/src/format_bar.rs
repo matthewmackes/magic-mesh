@@ -251,8 +251,8 @@ fn format_bar_tooltip(ui: &mut Ui, text: &str) {
     let text_color = Style::resolve_color(&ctx, Style::TEXT);
     egui::Frame::NONE
         .fill(surface)
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(6))
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, border))
+        .corner_radius(mde_egui::corner(Style::RADIUS_M))
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(FORMAT_BAR_TOOLTIP_MAX_W);
@@ -313,7 +313,7 @@ pub fn table_grid(ui: &mut Ui) -> Option<(u8, u8)> {
             painter.rect_stroke(
                 cell_rect,
                 0.0,
-                Stroke::new(1.0, Style::BORDER),
+                Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER),
                 egui::StrokeKind::Inside,
             );
         }
@@ -526,9 +526,9 @@ mod tests {
 
         let texts = painted_text_colors(&out.shapes);
         assert!(
-            texts.iter().any(
-                |(text, color)| text == "Paragraph style" && *color == palette.text_dim
-            ),
+            texts
+                .iter()
+                .any(|(text, color)| text == "Paragraph style" && *color == palette.text_dim),
             "Editor format overflow caption should use light-mode dim text: {texts:?}"
         );
         assert!(

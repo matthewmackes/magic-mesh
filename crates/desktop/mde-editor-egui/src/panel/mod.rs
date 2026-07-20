@@ -3059,7 +3059,7 @@ impl EditorSurface {
             ui.painter().rect_stroke(
                 *rect,
                 Style::RADIUS,
-                Stroke::new(1.0, Style::ACCENT),
+                Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT),
                 StrokeKind::Inside,
             );
         }

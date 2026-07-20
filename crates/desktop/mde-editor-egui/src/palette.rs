@@ -26,22 +26,6 @@ use mde_egui::Style;
 
 use crate::fuzzy;
 
-/// Build the shared [`Elevation::Overlay`] soft shadow as an [`egui::Shadow`] — the
-/// surface-side conversion the token module defers (it stays free of egui's shadow
-/// type). Casts the token's logical-px floats onto epaint's small integer fields and
-/// mints **no** colour of its own (the umbra comes straight from the token), so the
-/// palette's depth still reads only from `mde_egui` (§4). A translucent umbra keeps it
-/// a soft layered shadow, never an opaque plate (lock #2).
-fn overlay_shadow() -> egui::Shadow {
-    let token = Elevation::Overlay.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
 /// Fixed width of the palette overlay plate (§4 spacing units).
 const PALETTE_WIDTH: f32 = Style::SP_XL * 14.0;
 /// Vertical drop of the overlay from the top edge (§4 spacing units).
@@ -236,7 +220,7 @@ pub fn show(ctx: &egui::Context, palette: &mut CommandPalette) -> Option<Palette
         // [`Elevation::Overlay`] soft shadow so it reads as lifted off the editor, in
         // place of egui's ad-hoc default window shadow. Keeps the standard window
         // frame's token fill/stroke/radius (SURFACE / BORDER); only the depth changes.
-        .frame(egui::Frame::window(&ctx.style()).shadow(overlay_shadow()))
+        .frame(egui::Frame::window(&ctx.style()).shadow(Elevation::Overlay.egui_shadow()))
         .anchor(Align2::CENTER_TOP, Vec2::new(0.0, TOP_DROP))
         .show(ctx, |ui| {
             ui.set_min_width(PALETTE_WIDTH);
@@ -311,16 +295,17 @@ fn command_row(ui: &mut egui::Ui, cmd: PaletteCommand, selected: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{overlay_shadow, CommandPalette, PaletteCommand};
+    use super::{CommandPalette, PaletteCommand};
     use mde_egui::style::Elevation;
 
     #[test]
     fn overlay_shadow_is_the_shared_overlay_depth_token() {
-        // The palette's floating plate borrows the shared `Elevation::Overlay` depth —
-        // the conversion casts the token's floats onto epaint's ints but invents no
-        // shape or colour of its own, so the look reads only from `mde_egui` (§4).
+        // The palette's floating plate borrows the shared `Elevation::Overlay` depth via
+        // the foundation `egui_shadow()` conversion — it casts the token's floats onto
+        // epaint's ints but invents no shape or colour of its own, so the look reads only
+        // from `mde_egui` (§4).
         let token = Elevation::Overlay.shadow();
-        let shadow = overlay_shadow();
+        let shadow = Elevation::Overlay.egui_shadow();
         assert_eq!(
             shadow.offset,
             [token.offset[0] as i8, token.offset[1] as i8]
