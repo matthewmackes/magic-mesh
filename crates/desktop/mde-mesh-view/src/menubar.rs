@@ -432,11 +432,12 @@ impl MeshMenuBar {
             .open(&mut self.legend_open)
             .collapsible(false)
             .resizable(false)
-            // The legend is a floating reference popover — give its plate the shared
-            // [`Elevation::Overlay`] soft shadow so it reads as lifted off the map, in
-            // place of egui's ad-hoc default window shadow. Keeps the standard window
+            // The legend is a floating reference popover, not a modal sheet — lift its
+            // plate onto the shared [`Elevation::Overlay`] depth (lighter than the
+            // installed Modal window shadow) via the foundation `egui_shadow()`
+            // conversion, so it reads as hovering over the map. Keeps the standard window
             // frame's token fill/stroke/radius (SURFACE / BORDER); only the depth changes.
-            .frame(egui::Frame::window(&ctx.style()).shadow(overlay_shadow()))
+            .frame(egui::Frame::window(&ctx.style()).shadow(Elevation::Overlay.egui_shadow()))
             .show(ctx, |ui| {
                 legend_heading(ui, "Health");
                 legend_swatch(ui, Style::OK, "Healthy — reachable and well");
@@ -461,22 +462,6 @@ impl MeshMenuBar {
     }
 }
 
-/// Build the shared [`Elevation::Overlay`] soft shadow as an [`egui::Shadow`] — the
-/// surface-side conversion the token module defers (it stays free of egui's shadow
-/// type). Casts the token's logical-px floats onto epaint's small integer fields and
-/// mints **no** colour of its own (the umbra comes straight from the token), so the
-/// legend's depth still reads only from `mde_egui` (§4). A translucent umbra keeps it
-/// a soft layered shadow, never an opaque plate (lock #2).
-fn overlay_shadow() -> egui::Shadow {
-    let token = Elevation::Overlay.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
 /// A dim section heading inside the legend window (the caption tier).
 fn legend_heading(ui: &mut egui::Ui, text: &str) {
     ui.label(
@@ -498,8 +483,7 @@ fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        apply, build_menus, build_status, overlay_shadow, MeshAction, MeshMenuBar, MeshOutcome,
-        MeshViewOptions,
+        apply, build_menus, build_status, MeshAction, MeshMenuBar, MeshOutcome, MeshViewOptions,
     };
     use crate::state::{Health, MeshLink, MeshNode, MeshState, Role};
     use mde_egui::menubar::{Entry, Item};
@@ -763,12 +747,12 @@ mod tests {
     #[test]
     fn legend_popover_wears_the_shared_overlay_depth_token() {
         // The Help ▸ Legend window is a floating reference popover, so its plate
-        // borrows the shared `Elevation::Overlay` soft shadow in place of egui's
-        // ad-hoc default window shadow. The conversion casts the token's floats onto
-        // epaint's ints but invents no shape or colour of its own, so the depth reads
-        // only from `mde_egui` (§4).
+        // borrows the shared `Elevation::Overlay` soft shadow (lighter than the
+        // installed Modal window depth) via the foundation `egui_shadow()` conversion.
+        // That conversion casts the token's floats onto epaint's ints but invents no
+        // shape or colour of its own, so the depth reads only from `mde_egui` (§4).
         let token = Elevation::Overlay.shadow();
-        let shadow = overlay_shadow();
+        let shadow = Elevation::Overlay.egui_shadow();
         assert_eq!(
             shadow.offset,
             [token.offset[0] as i8, token.offset[1] as i8]
