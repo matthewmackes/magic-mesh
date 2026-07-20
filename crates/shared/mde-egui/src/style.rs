@@ -307,6 +307,25 @@ impl Style {
     /// squiggle), never the same red for two different meanings.
     pub const SPELL: Color32 = Color32::from_rgb(0xDA, 0x1E, 0x28);
 
+    // ── Semantic interaction-state roles (UI-VIS-110) ───────────────────────
+    // success/warning/error/info already have Carbon SUPPORT_* aliases above; a
+    // control still cycles through focus / selected / disabled, so name those
+    // remaining state roles once here — a surface must never re-decide "what
+    // colour is focus / selection / disabled" at a call site, and state is never
+    // communicated by colour alone (the focus *ring width* and the disabled
+    // *dimming* carry the meaning too).
+    /// **Focus** — the accent hue of the visible focus ring. The ring reads as
+    /// focus (not hover/selection) by its 2 px [`FOCUS_RING_W`](Self::FOCUS_RING_W)
+    /// width, per UI-VIS-132; build it with [`focus_stroke`](Self::focus_stroke).
+    pub const FOCUS: Color32 = Self::ACCENT;
+    /// **Selection** — the accent a selected row / tab / text run is keyed to; the
+    /// translucent body fill comes from [`selection_fill`](Self::selection_fill).
+    pub const SELECTION: Color32 = Self::ACCENT;
+    /// **Disabled** — the quiet foreground for an unavailable/disabled control:
+    /// one rung below [`TEXT_DIM`](Self::TEXT_DIM) so a disabled label reads as
+    /// "unavailable", never as ordinary secondary text.
+    pub const DISABLED: Color32 = Color32::from_rgb(0x5C, 0x5C, 0x66);
+
     // ── Categorical accents (picker groups · explorer categories) ───────────
     // Distinct categorical hues that key a group's / category's
     // identity — the ONE colour language shared across the bottom picker's group
@@ -373,6 +392,16 @@ impl Style {
     /// Back-compat alias for the mid tier — the ~130 pre-tier call sites read this.
     pub const RADIUS: f32 = Self::RADIUS_M;
 
+    // ── Stroke widths ───────────────────────────────────────────────────────
+    /// **Hairline** — the 1 px weight of a border / separator ([`BORDER`](Self::BORDER)).
+    /// The single source for `Stroke::new(1.0, …)` chrome; [`hairline`](Self::hairline)
+    /// bakes it against the border tone.
+    pub const STROKE_HAIRLINE: f32 = 1.0;
+    /// **Focus-ring width** — the 2 px accent ring (the platform's 2 px focus-ring
+    /// design lock); [`focus_stroke`](Self::focus_stroke) bakes it against
+    /// [`FOCUS`](Self::FOCUS).
+    pub const FOCUS_RING_W: f32 = 2.0;
+
     // ── Type scale (point sizes) ────────────────────────────────────────────
     /// Small / caption text.
     pub const SMALL: f32 = 10.0;
@@ -392,6 +421,19 @@ impl Style {
     /// Shared menu/button chrome text: the body rung reduced by one point so
     /// menus read as controls, not body copy.
     pub const MENU_TEXT: f32 = Self::BODY - 1.0;
+
+    // ── Icon sizes (logical points) ─────────────────────────────────────────
+    // The optical-size ladder for glyphs (Carbon icons render crisp at any of
+    // these; see [`crate::carbon`]). One scale so a toolbar glyph, a menu glyph,
+    // and a status dot never each pick a private pixel size (UI-VIS-119/120).
+    /// Small icon — inline status affordances, dense rows.
+    pub const ICON_S: f32 = 14.0;
+    /// Medium icon — the default toolbar / menu glyph optical size.
+    pub const ICON_M: f32 = 16.0;
+    /// Large icon — prominent chrome actions, section headers.
+    pub const ICON_L: f32 = 20.0;
+    /// Extra-large icon — launcher tiles, hero / empty-state glyphs, touch targets.
+    pub const ICON_XL: f32 = 24.0;
     /// Vertical padding for ordinary egui buttons. Kept well below the base 8px
     /// gutter so toolbar rows read refined without changing the minimum hit target.
     pub const CONTROL_PAD_Y: f32 = Self::SP_XS;
@@ -403,6 +445,19 @@ impl Style {
     /// rung plus a compact vertical cushion so local toolbar rows can slim down
     /// without carrying unrelated 24pt literals.
     pub const TOOLBAR_CONTROL_H: f32 = Self::MENU_TEXT + Self::SP_S + Self::SP_XS * 0.5;
+
+    // ── Control-height scale (UI-VIS-107) ───────────────────────────────────
+    // Ordinary controls key a consistent, usable height off this small ladder
+    // instead of stray per-widget literals. Density still owns the interaction
+    // *hit-target floor* ([`Density::min_hit_target`]) and *spacing*; these are the
+    // drawn control heights a surface sizes buttons / inputs / rows to.
+    /// Compact control height — the dense/expert rung; equals the pointer
+    /// hit-target floor ([`Density::Mouse`] `min_hit_target`).
+    pub const CONTROL_H_S: f32 = 24.0;
+    /// Standard control height — the roomier default for ordinary controls.
+    pub const CONTROL_H_M: f32 = 28.0;
+    /// Large control height — primary buttons and full list rows.
+    pub const CONTROL_H_L: f32 = 36.0;
 
     /// A shared toolbar/header frame margin: normal horizontal inset, refined
     /// vertical inset. Use this for chrome strips that surround controls, not for
@@ -642,7 +697,32 @@ impl Style {
         // hyperlink, the text-selection wash + ring, the hover ring, and the
         // pressed fill + ring.
         Self::accent_visuals_for_scheme(&mut v, scheme, accent, accent_hi);
+
+        // Corner geometry + elevation from the shared tokens (UI-VIS-105/108) so
+        // no surface hand-rolls widget rounding or a popup/window shadow.
+        Self::apply_geometry(&mut v);
         v
+    }
+
+    /// Configure the shared corner geometry + elevation on `v` from the radius and
+    /// shadow tokens (UI-VIS-105/106/108): controls take the small radius, menus
+    /// the mid radius, windows/dialogs the large radius; anchored popups and
+    /// windows cast the shared soft overlay / modal shadow. The single place the
+    /// installed [`egui::Visuals`] gets its rounding + depth, so a surface never
+    /// re-decides widget rounding at a call site (it was hand-set as
+    /// `visuals.menu_corner_radius = …` in at least one surface before this).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn apply_geometry(v: &mut egui::Visuals) {
+        let control = egui::CornerRadius::same(Self::RADIUS_S as u8);
+        v.widgets.noninteractive.corner_radius = control;
+        v.widgets.inactive.corner_radius = control;
+        v.widgets.hovered.corner_radius = control;
+        v.widgets.active.corner_radius = control;
+        v.widgets.open.corner_radius = control;
+        v.window_corner_radius = egui::CornerRadius::same(Self::RADIUS_L as u8);
+        v.menu_corner_radius = egui::CornerRadius::same(Self::RADIUS_M as u8);
+        v.popup_shadow = Elevation::Overlay.egui_shadow();
+        v.window_shadow = Elevation::Modal.egui_shadow();
     }
 
     /// Apply the interactive-accent derivation to `v` for one colour scheme.
@@ -869,6 +949,33 @@ impl Style {
         Self::ACCENT.gamma_multiply(0.16)
     }
 
+    /// The **row / text selection** fill — the accent at a body alpha, matching
+    /// the `selection.bg_fill` the shared install lands on egui. Heavier than the
+    /// light [`selection_wash`](Self::selection_wash) marquee tint: use this for a
+    /// selected list row / tab / text run, the wash for a drag-select rectangle.
+    /// One source, so a selected surface never re-mixes the accent alpha (§4).
+    #[must_use]
+    pub fn selection_fill() -> Color32 {
+        Self::ACCENT.gamma_multiply(0.35)
+    }
+
+    /// The **2 px accent focus ring** stroke ([`FOCUS`](Self::FOCUS) at
+    /// [`FOCUS_RING_W`](Self::FOCUS_RING_W)) — the platform focus-ring design lock.
+    /// One source so every surface draws the same visible-focus treatment,
+    /// distinct from hover/selection by its width (UI-VIS-132).
+    #[must_use]
+    pub fn focus_stroke() -> Stroke {
+        Stroke::new(Self::FOCUS_RING_W, Self::FOCUS)
+    }
+
+    /// The **hairline border** stroke — [`BORDER`](Self::BORDER) at
+    /// [`STROKE_HAIRLINE`](Self::STROKE_HAIRLINE) — so a surface never re-types
+    /// `Stroke::new(1.0, Style::BORDER)` for a separator / card edge.
+    #[must_use]
+    pub fn hairline() -> Stroke {
+        Stroke::new(Self::STROKE_HAIRLINE, Self::BORDER)
+    }
+
     /// The translucent **visual-bell flash** tint — the brief attention wash a
     /// terminal paints over its pane when the shell rings the bell with audio
     /// muted (TERM-12). A premultiplied **white** at the supplied `alpha`: the
@@ -1006,8 +1113,9 @@ impl GradeBand {
     }
 }
 
-/// A soft-shadow token (raw data; a surface builds `epaint::Shadow` from it at
-/// draw time, keeping this module free of egui's shadow type). The umbra is
+/// A soft-shadow token (raw data). A surface (or the shared
+/// [`to_shadow`](ShadowToken::to_shadow) converter) turns it into an
+/// `egui::epaint::Shadow` at draw time. The umbra is
 /// **always** a translucent black (`a() < 255`): depth is alpha + a soft blur,
 /// never an opaque fill and never a true gaussian-blur *pass* over the content
 /// behind (design lock #2 — "layered soft shadows … no blur pass").
@@ -1072,12 +1180,90 @@ impl Elevation {
             },
         }
     }
+
+    /// This tier's soft shadow as a concrete [`egui::epaint::Shadow`], ready for
+    /// [`egui::Frame::shadow`] — the ergonomic one-call form of
+    /// `self.shadow().to_shadow()`. [`Flat`](Self::Flat) yields a fully-transparent
+    /// (no-op) shadow. This is the single shared `Elevation → Shadow` conversion,
+    /// superseding the per-surface `card_shadow()` helper that was copy-pasted
+    /// across several shell surfaces.
+    #[must_use]
+    pub fn egui_shadow(self) -> egui::epaint::Shadow {
+        self.shadow().to_shadow()
+    }
+}
+
+impl ShadowToken {
+    /// Build the concrete [`egui::epaint::Shadow`] this token describes, mapping
+    /// the token's logical-px `f32` fields onto egui's `i8`/`u8` shadow fields.
+    /// The one shared converter, so a surface reads a soft-shadow token straight
+    /// into a `Frame` instead of re-typing the field mapping by hand.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn to_shadow(self) -> egui::epaint::Shadow {
+        egui::epaint::Shadow {
+            offset: [self.offset[0] as i8, self.offset[1] as i8],
+            blur: self.blur as u8,
+            spread: self.spread as u8,
+            color: self.umbra,
+        }
+    }
+}
+
+/// The restrained **three-level surface hierarchy** (UI-VIS-106): the app
+/// background, a persistent base surface, and an elevated/floating surface — the
+/// only three tonal planes a shell should stack, so regions separate by
+/// elevation instead of boxing every panel. Each level resolves onto an existing
+/// palette tone (§4 — no new hue) and the [`Elevation`] that casts its shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceLevel {
+    /// The deepest plane — the desktop / window background ([`Style::BG`]).
+    App,
+    /// A persistent panel / page surface resting on the app background
+    /// ([`Style::SURFACE`], Carbon layer-01).
+    Base,
+    /// A raised card / floating surface one step above the base
+    /// ([`Style::SURFACE_HI`], Carbon layer-02).
+    Elevated,
+}
+
+impl SurfaceLevel {
+    /// Ordered deepest → highest.
+    pub const ALL: [Self; 3] = [Self::App, Self::Base, Self::Elevated];
+
+    /// The palette fill for this plane.
+    #[must_use]
+    pub const fn fill(self) -> Color32 {
+        match self {
+            Self::App => Style::BG,
+            Self::Base => Style::SURFACE,
+            Self::Elevated => Style::SURFACE_HI,
+        }
+    }
+
+    /// The elevation (shadow depth) this plane casts. The two grounded planes are
+    /// [`Flat`](Elevation::Flat); only the elevated surface lifts off the page.
+    #[must_use]
+    pub const fn elevation(self) -> Elevation {
+        match self {
+            Self::App | Self::Base => Elevation::Flat,
+            Self::Elevated => Elevation::Raised,
+        }
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::assertions_on_constants, clippy::float_cmp)]
+#[allow(
+    clippy::assertions_on_constants,
+    clippy::float_cmp,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 mod tests {
-    use super::{Density, Elevation, GradeBand, LayoutProfile, Style, StyleColorScheme};
+    use super::{
+        Density, Elevation, GradeBand, LayoutProfile, ShadowToken, Style, StyleColorScheme,
+        SurfaceLevel,
+    };
     use crate::formfactor::Formfactor;
 
     /// WCAG 2.1 **relative luminance** of an sRGB colour (`0.0..=1.0`; alpha ignored).
@@ -1982,5 +2168,164 @@ mod tests {
         assert_eq!(Style::grade_fill(-10.0), Style::GRADE_F);
         // A lower score yields a redder fill, along the same axis as the ramp.
         assert!(redness(Style::grade_fill(20.0)) > redness(Style::grade_fill(95.0)));
+    }
+
+    // --- UI-VIS-104..110: the polish foundation additions --------------------
+
+    #[test]
+    fn semantic_state_roles_are_named_and_distinct() {
+        // Focus + selection key off the interactive accent (one interaction hue),
+        // but each is its own named role so a surface reads intent, not a colour.
+        assert_eq!(Style::FOCUS, Style::ACCENT);
+        assert_eq!(Style::SELECTION, Style::ACCENT);
+        // Disabled is a genuinely distinct quiet tone — dimmer than secondary
+        // text, and not any of the surface/border/text tokens.
+        let sum = |c: egui::Color32| u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b());
+        assert!(
+            sum(Style::DISABLED) < sum(Style::TEXT_DIM),
+            "disabled fg must be quieter than secondary text"
+        );
+        for other in [
+            Style::TEXT,
+            Style::TEXT_DIM,
+            Style::TEXT_STRONG,
+            Style::BORDER,
+            Style::SURFACE,
+            Style::SURFACE_HI,
+        ] {
+            assert_ne!(Style::DISABLED, other, "disabled must be its own tone");
+        }
+    }
+
+    #[test]
+    fn stroke_widths_name_the_hairline_and_2px_focus_ring() {
+        assert_eq!(Style::STROKE_HAIRLINE, 1.0);
+        assert_eq!(Style::FOCUS_RING_W, 2.0, "the focus ring is the 2px lock");
+        let focus = Style::focus_stroke();
+        assert_eq!(focus.width, Style::FOCUS_RING_W);
+        assert_eq!(focus.color, Style::FOCUS);
+        let hair = Style::hairline();
+        assert_eq!(hair.width, Style::STROKE_HAIRLINE);
+        assert_eq!(hair.color, Style::BORDER);
+    }
+
+    #[test]
+    fn selection_fill_is_a_heavier_translucent_accent_than_the_wash() {
+        // The row/text selection fill matches the installed selection.bg_fill and
+        // is heavier than the light drag-select marquee wash — both accent-derived
+        // so a theme re-tint carries them.
+        let fill = Style::selection_fill();
+        let wash = Style::selection_wash();
+        assert!(
+            fill.a() > 0 && fill.a() < 255,
+            "selection fill is translucent"
+        );
+        assert!(
+            fill.a() > wash.a(),
+            "the selection fill ({}) must be heavier than the marquee wash ({})",
+            fill.a(),
+            wash.a()
+        );
+        assert!(
+            fill.b() > fill.r(),
+            "the selection fill keeps the accent hue"
+        );
+    }
+
+    #[test]
+    fn icon_sizes_ascend_on_a_single_ladder() {
+        let ladder = [Style::ICON_S, Style::ICON_M, Style::ICON_L, Style::ICON_XL];
+        for w in ladder.windows(2) {
+            assert!(w[1] > w[0], "icon sizes must strictly ascend: {ladder:?}");
+        }
+        assert!(Style::ICON_S > 0.0, "the smallest icon size is positive");
+    }
+
+    #[test]
+    fn control_height_scale_ascends_and_anchors_the_pointer_target() {
+        assert!(
+            Style::CONTROL_H_S < Style::CONTROL_H_M && Style::CONTROL_H_M < Style::CONTROL_H_L,
+            "control heights must strictly ascend"
+        );
+        assert_eq!(
+            Style::CONTROL_H_S,
+            Density::Mouse.min_hit_target(),
+            "the compact control height equals the pointer hit-target floor"
+        );
+    }
+
+    #[test]
+    fn surface_hierarchy_has_three_ascending_planes() {
+        // Deepest → highest, each a distinct existing palette tone, only the
+        // elevated plane lifts off the page.
+        assert_eq!(
+            SurfaceLevel::ALL,
+            [
+                SurfaceLevel::App,
+                SurfaceLevel::Base,
+                SurfaceLevel::Elevated
+            ]
+        );
+        assert_eq!(SurfaceLevel::App.fill(), Style::BG);
+        assert_eq!(SurfaceLevel::Base.fill(), Style::SURFACE);
+        assert_eq!(SurfaceLevel::Elevated.fill(), Style::SURFACE_HI);
+        assert_ne!(SurfaceLevel::App.fill(), SurfaceLevel::Base.fill());
+        assert_ne!(SurfaceLevel::Base.fill(), SurfaceLevel::Elevated.fill());
+        assert_eq!(SurfaceLevel::App.elevation(), Elevation::Flat);
+        assert_eq!(SurfaceLevel::Base.elevation(), Elevation::Flat);
+        assert_eq!(SurfaceLevel::Elevated.elevation(), Elevation::Raised);
+    }
+
+    #[test]
+    fn shadow_token_converts_to_a_soft_egui_shadow() {
+        // The shared Elevation → egui::Shadow converter matches the raw token
+        // fields, stays soft (translucent) for real tiers, and is a no-op for Flat.
+        for tier in [Elevation::Raised, Elevation::Overlay, Elevation::Modal] {
+            let token = tier.shadow();
+            let shadow = tier.egui_shadow();
+            assert_eq!(shadow.blur, token.blur as u8);
+            assert_eq!(shadow.color, token.umbra);
+            assert!(shadow.blur > 0, "a real tier casts a blurred shadow");
+            assert!(
+                shadow.color.a() > 0 && shadow.color.a() < 255,
+                "the umbra stays translucent"
+            );
+        }
+        let flat = Elevation::Flat.egui_shadow();
+        assert_eq!(flat.blur, 0, "flat casts no blur");
+        assert_eq!(flat.color.a(), 0, "flat casts a transparent (no-op) shadow");
+        // Depth grows monotonically Raised < Overlay < Modal.
+        assert!(Elevation::Raised.egui_shadow().blur < Elevation::Overlay.egui_shadow().blur);
+        assert!(Elevation::Overlay.egui_shadow().blur < Elevation::Modal.egui_shadow().blur);
+        // The free token also converts (raw-data entry point).
+        let raw: ShadowToken = Elevation::Modal.shadow();
+        assert_eq!(raw.to_shadow(), Elevation::Modal.egui_shadow());
+    }
+
+    #[test]
+    fn install_lands_the_shared_corner_geometry_and_shadows() {
+        // UI-VIS-105/108: the authoritative install configures widget rounding,
+        // menu/window rounding, and the popup/window shadow from the tokens — so a
+        // surface inherits coherent geometry without hand-setting it.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let v = &ctx.style().visuals;
+        assert_eq!(
+            v.widgets.inactive.corner_radius,
+            egui::CornerRadius::same(Style::RADIUS_S as u8),
+            "controls take the small radius"
+        );
+        assert_eq!(
+            v.menu_corner_radius,
+            egui::CornerRadius::same(Style::RADIUS_M as u8),
+            "menus take the mid radius"
+        );
+        assert_eq!(
+            v.window_corner_radius,
+            egui::CornerRadius::same(Style::RADIUS_L as u8),
+            "windows/dialogs take the large radius"
+        );
+        assert_eq!(v.popup_shadow, Elevation::Overlay.egui_shadow());
+        assert_eq!(v.window_shadow, Elevation::Modal.egui_shadow());
     }
 }

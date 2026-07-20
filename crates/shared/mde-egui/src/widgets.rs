@@ -4,9 +4,105 @@
 //! these instead of re-typing the same idiom, so a look lives in ONE place
 //! (§6 glue; `/polish` axis 7 — component reuse & consolidation).
 
-use egui::{Color32, Response, RichText, Sense, Ui};
+use egui::{Color32, CornerRadius, Frame, Margin, Response, RichText, Sense, Ui};
 
-use crate::Style;
+use crate::{style::Elevation, Style};
+
+// ── Surface primitives (UI-VIS-111) ─────────────────────────────────────────
+// The shared replacements for a hand-rolled `egui::Frame::group` / bordered
+// rectangle: one card / inset / toolbar / section / dialog / overlay each, with
+// controlled fill, stroke, margin, rounding, and (where it lifts) a soft shadow
+// from the shared `Style` tokens and the `Elevation` ladder. Every one returns a
+// configured `egui::Frame`, so a surface shows content the idiomatic way —
+// `card().show(ui, |ui| { … })` — and can still override a field when it must.
+// Hierarchy comes from these plus typography/spacing, NOT from boxing every
+// region (a `section` is deliberately frameless).
+
+/// Convert a corner-radius token (logical px — [`Style::RADIUS_S`] …) into an
+/// [`egui::CornerRadius`]. The one place the `f32` radius tiers become egui's
+/// integer corner type, so a surface never re-casts a rounding value.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn corner(radius: f32) -> CornerRadius {
+    CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8)
+}
+
+/// A **card** — a persistent raised surface for grouped content: the base surface
+/// fill, a hairline border, the mid corner radius, comfortable inner padding, and
+/// a soft raised shadow. The shared replacement for `egui::Frame::group` plus a
+/// per-surface `card_shadow()`. Show content with `card().show(ui, |ui| { … })`.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn card() -> Frame {
+    Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(Style::hairline())
+        .corner_radius(corner(Style::RADIUS_M))
+        .inner_margin(Margin::same(Style::SP_M as i8))
+        .shadow(Elevation::Raised.egui_shadow())
+}
+
+/// An **inset** — a recessed well for an input or a nested read-only region: the
+/// deep app-background fill, a hairline border, the tight corner radius, snug
+/// padding, and no shadow (it sits *into* its parent, not above it).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn inset() -> Frame {
+    Frame::NONE
+        .fill(Style::BG)
+        .stroke(Style::hairline())
+        .corner_radius(corner(Style::RADIUS_S))
+        .inner_margin(Margin::same(Style::SP_S as i8))
+}
+
+/// A **toolbar** — a quiet chrome strip around controls: the base surface fill,
+/// no border, the tight corner radius, and the shared refined toolbar margin.
+/// Deliberately flat (no shadow) so inactive chrome stays visually quiet
+/// (UI-VIS-109).
+#[must_use]
+pub fn toolbar() -> Frame {
+    Frame::NONE
+        .fill(Style::SURFACE)
+        .corner_radius(corner(Style::RADIUS_S))
+        .inner_margin(Style::toolbar_margin())
+}
+
+/// A **section** — a typographic grouping with breathing room but *no* box: no
+/// fill, no stroke, only vertical rhythm. Prefer this over a bordered frame when
+/// sectioning (UI-VIS-114 — hierarchy from spacing and typography, not
+/// containers).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn section() -> Frame {
+    Frame::NONE.inner_margin(Margin::symmetric(0, Style::SP_S as i8))
+}
+
+/// A **dialog** — a modal sheet: the base surface fill, a hairline border, the
+/// large corner radius, generous padding, and the deep modal shadow (UI-VIS-111).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn dialog() -> Frame {
+    Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(Style::hairline())
+        .corner_radius(corner(Style::RADIUS_L))
+        .inner_margin(Margin::same(Style::SP_L as i8))
+        .shadow(Elevation::Modal.egui_shadow())
+}
+
+/// An **overlay** — a floating menu / popover / tooltip surface: the base fill, a
+/// hairline border, the mid corner radius, compact padding, and the overlay
+/// shadow (UI-VIS-111/125).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn overlay() -> Frame {
+    Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(Style::hairline())
+        .corner_radius(corner(Style::RADIUS_M))
+        .inner_margin(Margin::same(Style::SP_S as i8))
+        .shadow(Elevation::Overlay.egui_shadow())
+}
 
 /// A **muted note** — a dim, small-caption label — returning its [`Response`].
 ///
@@ -336,6 +432,95 @@ mod tests {
                 .iter()
                 .any(|(text, color)| text == progress.label && *color == Style::TEXT),
             "operation label should still paint through the shared badge: {texts:?}"
+        );
+    }
+
+    // --- UI-VIS-111: shared surface primitives -------------------------------
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn corner_maps_radius_tokens_to_egui_corner_radius() {
+        assert_eq!(
+            corner(Style::RADIUS_S),
+            CornerRadius::same(Style::RADIUS_S as u8)
+        );
+        assert_eq!(
+            corner(Style::RADIUS_M),
+            CornerRadius::same(Style::RADIUS_M as u8)
+        );
+        assert_eq!(
+            corner(Style::RADIUS_L),
+            CornerRadius::same(Style::RADIUS_L as u8)
+        );
+        // Rounds and clamps rather than wrapping on an out-of-range radius.
+        assert_eq!(corner(999.0), CornerRadius::same(255));
+        assert_eq!(corner(-4.0), CornerRadius::same(0));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn surface_primitives_carry_the_shared_tokens() {
+        // Card: a raised, bordered, mid-rounded surface that lifts off the page.
+        let card = card();
+        assert_eq!(card.fill, Style::SURFACE);
+        assert_eq!(card.stroke, Style::hairline());
+        assert_eq!(card.corner_radius, corner(Style::RADIUS_M));
+        assert!(card.shadow.blur > 0, "a card casts a soft raised shadow");
+
+        // Inset: recessed into the app background, tight radius, no shadow.
+        let inset = inset();
+        assert_eq!(inset.fill, Style::BG);
+        assert_eq!(inset.corner_radius, corner(Style::RADIUS_S));
+        assert_eq!(inset.shadow.color.a(), 0, "an inset casts no shadow");
+
+        // Toolbar: quiet — filled but borderless and flat (UI-VIS-109).
+        let toolbar = toolbar();
+        assert_eq!(toolbar.fill, Style::SURFACE);
+        assert_eq!(
+            toolbar.stroke.width, 0.0,
+            "an inactive toolbar has no border"
+        );
+        assert_eq!(toolbar.shadow.color.a(), 0, "a toolbar is flat");
+
+        // Section: typographic, not a box — no fill, no stroke, no shadow.
+        let section = section();
+        assert_eq!(section.fill.a(), 0, "a section is unfilled (no box)");
+        assert_eq!(section.stroke.width, 0.0, "a section has no border");
+        assert_eq!(section.shadow.color.a(), 0, "a section casts no shadow");
+
+        // Dialog: the large radius and the deepest (modal) shadow.
+        let dialog = dialog();
+        assert_eq!(dialog.corner_radius, corner(Style::RADIUS_L));
+        assert_eq!(dialog.shadow, Elevation::Modal.egui_shadow());
+
+        // Overlay: mid radius, the floating overlay shadow.
+        let overlay = overlay();
+        assert_eq!(overlay.corner_radius, corner(Style::RADIUS_M));
+        assert_eq!(overlay.shadow, Elevation::Overlay.egui_shadow());
+
+        // The elevation ladder is honoured across the primitives: card < overlay <
+        // dialog in shadow depth.
+        assert!(card.shadow.blur < overlay.shadow.blur);
+        assert!(overlay.shadow.blur < dialog.shadow.blur);
+    }
+
+    #[test]
+    fn surface_primitives_lay_out_headless() {
+        // Every primitive must actually render a real frame (shapes, no panic) on a
+        // CPU-only context — proof they are live, reusable chrome, not dead code.
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for frame in [card(), inset(), toolbar(), section(), dialog(), overlay()] {
+                    frame.show(ui, |ui| {
+                        ui.label("content");
+                    });
+                }
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "surface primitives must paint visible shapes"
         );
     }
 }

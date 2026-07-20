@@ -54,27 +54,27 @@ pub mod widgets;
 pub mod drm;
 
 pub use carbon::{
-    CarbonRaster, carbon_icon, carbon_names, carbon_raster, carbon_svg_bytes, carbon_texture,
-    paint_carbon,
+    carbon_icon, carbon_names, carbon_raster, carbon_svg_bytes, carbon_texture, paint_carbon,
+    CarbonRaster,
 };
 pub use code::CodeToken;
 pub use display::{
+    build_mode_list, fractional_scale, panel_dpi, parse_edid, scale_for_panel, select_mode,
     DisplayController, EdidError, EdidPanel, HeadlessModeset, ModeClass, ModesetError, ModesetSeam,
-    PanelInfo, PanelMode, build_mode_list, fractional_scale, panel_dpi, parse_edid,
-    scale_for_panel, select_mode,
+    PanelInfo, PanelMode,
 };
 pub use formfactor::{
-    AccelSensor, AutoRotate, Formfactor, FormfactorDebounce, HeadlessRotate, Orientation,
-    RotateCommand, RotateError, RotationApply, SensorError, SwitchState, SysfsAccel,
     apply_rotation, drain_formfactor, orientation_from_accel, push_formfactor, request_rotation,
-    take_rotation_commands,
+    take_rotation_commands, AccelSensor, AutoRotate, Formfactor, FormfactorDebounce,
+    HeadlessRotate, Orientation, RotateCommand, RotateError, RotationApply, SensorError,
+    SwitchState, SysfsAccel,
 };
 pub use gestures::{
-    Edge, Gesture, GestureConfig, GestureRecognizer, drain_edge_swipes, push_edge_swipe,
+    drain_edge_swipes, push_edge_swipe, Edge, Gesture, GestureConfig, GestureRecognizer,
 };
-pub use input_policy::{InputPolicy, input_policy, pointer_button, set_input_policy};
+pub use input_policy::{input_policy, pointer_button, set_input_policy, InputPolicy};
 pub use menubar::{
-    ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip, resolve_mnemonics,
+    resolve_mnemonics, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip,
 };
 pub use motion::{
     Animated, AnimatedColor, AnimatedOpacity, AnimatedRect, AnimatedScalar, AnimatedScale,
@@ -82,25 +82,29 @@ pub use motion::{
     MotionScale, MotionSpec, MotionValue, Phase, StatusMotion,
 };
 pub use runner::run_client;
-pub use style::{Density, GradeBand, LayoutProfile, Style, StyleColorScheme, StylePalette};
+pub use style::{
+    Density, Elevation, GradeBand, LayoutProfile, ShadowToken, Style, StyleColorScheme,
+    StylePalette, SurfaceLevel,
+};
 pub use toast::{
     ChyronInteraction, Dwell, OsdKind, OsdLevel, Severity, Tier, Toast, ToastAction, ToastHost,
 };
 pub use touch::{RawContact, Rotation, TouchTransform, TouchTranslator};
 pub use video_plane::{
-    FakeCatalog, FallbackReason, FbToken, PaneRect, Placement, PlaneCatalog, PlaneInfo, PlaneKind,
-    PlaneSet, RecordingScanout, VideoPath, VideoPlaneError, VideoPlanePlan, VideoScanout,
-    clamp_and_crop, fit_rect, plane_placement, present_frame,
+    clamp_and_crop, fit_rect, plane_placement, present_frame, FakeCatalog, FallbackReason, FbToken,
+    PaneRect, Placement, PlaneCatalog, PlaneInfo, PlaneKind, PlaneSet, RecordingScanout, VideoPath,
+    VideoPlaneError, VideoPlanePlan, VideoScanout,
 };
 pub use widgets::{
-    OperationProgressView, field, muted_note, operation_progress_text, operation_progress_value,
-    paint_operation_progress_badge, status_dot,
+    card, corner, dialog, field, inset, muted_note, operation_progress_text,
+    operation_progress_value, overlay, paint_operation_progress_badge, section, status_dot,
+    toolbar, OperationProgressView,
 };
 
 #[cfg(feature = "drm")]
 pub use drm::{
-    DrmVideoScanout, PrimeImportLiveness, probe_primary_video_plane, probe_prime_import_liveness,
-    probe_video_plane, run_drm,
+    probe_primary_video_plane, probe_prime_import_liveness, probe_video_plane, run_drm,
+    DrmVideoScanout, PrimeImportLiveness,
 };
 
 // Re-export the toolkit so surfaces depend on `mde-egui` alone and share one
