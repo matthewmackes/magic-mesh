@@ -703,15 +703,15 @@ mod tests {
     }
 
     #[test]
-    fn the_workloads_skeleton_verbs_are_honestly_not_yet_wired() {
+    fn the_remaining_workloads_skeleton_verbs_are_honestly_not_yet_wired() {
+        // image-build (U6) + container-deploy (U7) are now wired (their own tests
+        // cover them); the rest still surface an honest not-yet-wired skeleton.
         let w = staged_worker(Arc::new(FakeRunner::default()));
         // `set-desired` + `plan` are wired by U4 (see the verbs::desired tests); the
         // remainder stay honest not-yet-wired skeletons for U6–U10 to fill.
         for verb in [
             "inventory",
             "output",
-            "image-build",
-            "container-deploy",
             "console-attach",
             "android-provision",
         ] {

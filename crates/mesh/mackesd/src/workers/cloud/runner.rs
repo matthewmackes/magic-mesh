@@ -85,6 +85,23 @@ impl CloudRunOutcome {
     }
 }
 
+/// The captured result of one generic backend-tool invocation through the
+/// [`CloudRunner::run_tool`] seam (`bootc-image-builder` / `osbuild` /
+/// `ansible-playbook` / `podman` …). `ok` is the process exit success; the streams
+/// are captured so the image-build (U6) + container-deploy (U7) verbs parse them
+/// (an artifact path, a `PLAY RECAP`) and surface an honest failure detail. A spawn
+/// failure (the binary is absent) is an `Err` from `run_tool`, never a fabricated
+/// `ToolRun` (§7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRun {
+    /// Whether the process exited successfully.
+    pub ok: bool,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+}
+
 /// The backend-execution seam the worker drives: shell OpenTofu / Ansible / virsh.
 ///
 /// Production is [`ShellCloudRunner`]; tests inject a fake so the drain, gate,
@@ -122,6 +139,25 @@ pub trait CloudRunner: Send + Sync {
     /// An honest `Err` when the tfvars can't be written or `tofu` can't run (tool
     /// absent / plan failed) — never a fabricated empty plan.
     fn plan_json(&self, tfvars_json: &str) -> Result<String, String>;
+    /// Run an arbitrary backend tool `bin` with `args`, capturing its output — the
+    /// generic seam the image-build (U6) + container-deploy (U7) verbs drive their
+    /// per-tool pipelines through (`bootc-image-builder`/`osbuild` for a golden disk;
+    /// `ansible-playbook` for the Quadlet install), so those verbs stay fully
+    /// fake-testable without the real tools installed. `Err` ONLY on a spawn failure
+    /// (the binary is absent / unexecutable), so the caller reports an honest "tool
+    /// unavailable" gate rather than a fabricated failure (§7). The default shells the
+    /// process; the injected test fake scripts it.
+    fn run_tool(&self, bin: &str, args: &[&str]) -> Result<ToolRun, String> {
+        let out = Command::new(bin)
+            .args(args)
+            .output()
+            .map_err(|e| format!("{bin}: {e}"))?;
+        Ok(ToolRun {
+            ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
 }
 
 /// Normalize a libvirt domain state to the OpenStack-style status token the
@@ -485,12 +521,31 @@ pub(crate) mod fake {
         pub plan_err: Option<String>,
         /// The tfvars documents `plan_json` was handed — proves the renderer ran.
         pub tfvars_written: Mutex<Vec<String>>,
+        /// `run_tool` invocations recorded as `(bin, args)` — proves the image-build
+        /// / container-deploy pipelines drove the right tools.
+        pub tool_calls: Mutex<Vec<(String, Vec<String>)>>,
+        /// Make `run_tool` report a spawn failure (binary absent) — the honest
+        /// "tool unavailable" gate path.
+        pub tool_absent: bool,
+        /// Make `run_tool` report a non-zero exit (the tool ran + failed).
+        pub tool_fail: bool,
+        /// Suppress the simulated artifact write even on success (exercises the honest
+        /// "build reported success but produced no artifact" branch).
+        pub tool_no_artifact: bool,
     }
 
     impl FakeRunner {
         fn record(&self, verb: &str, apply: bool) {
             self.calls.lock().unwrap().push((verb.to_string(), apply));
         }
+    }
+
+    /// The argument immediately following `flag` in `args`, if present.
+    fn arg_after<'a>(args: &'a [&str], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| *a == flag)
+            .and_then(|i| args.get(i + 1))
+            .copied()
     }
 
     impl CloudRunner for FakeRunner {
@@ -550,6 +605,39 @@ pub(crate) mod fake {
             Ok(self.plan_ndjson.clone().unwrap_or_else(|| {
                 r#"{"type":"change_summary","changes":{"add":0,"change":0,"remove":0}}"#.to_string()
             }))
+        }
+
+        fn run_tool(&self, bin: &str, args: &[&str]) -> Result<ToolRun, String> {
+            self.tool_calls.lock().unwrap().push((
+                bin.to_string(),
+                args.iter().map(|a| (*a).to_string()).collect(),
+            ));
+            if self.tool_absent {
+                return Err(format!("{bin}: No such file or directory (os error 2)"));
+            }
+            // Simulate a disk builder writing its artifact under the `--output` dir,
+            // so the caller's find-artifact + sha256 + record path runs end to end.
+            if !self.tool_fail && !self.tool_no_artifact {
+                if let Some(out) = arg_after(args, "--output") {
+                    let dir = std::path::Path::new(out);
+                    let _ = std::fs::create_dir_all(dir);
+                    let _ = std::fs::write(dir.join("disk.qcow2"), b"fake-golden-image-bytes");
+                }
+            }
+            Ok(ToolRun {
+                ok: !self.tool_fail,
+                // An `ansible-playbook` run reports a PLAY RECAP the caller parses.
+                stdout: if bin.contains("ansible") {
+                    "meshnode : ok=3 changed=1 unreachable=0 failed=0 skipped=0".to_string()
+                } else {
+                    String::new()
+                },
+                stderr: if self.tool_fail {
+                    format!("{bin}: simulated tool failure")
+                } else {
+                    String::new()
+                },
+            })
         }
     }
 

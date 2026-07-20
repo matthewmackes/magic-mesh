@@ -28,6 +28,10 @@ use super::gate::{self, CloudDecision, TokenVerdict};
 use super::runner::CloudRunOutcome;
 use super::CloudWorker;
 
+// Disjoint per-verb handler modules (one unit each, `cloud/verbs/<unit>.rs`).
+mod container;
+mod image;
+
 /// A drained `action/cloud/<verb>` classified for dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloudVerb {
@@ -172,6 +176,9 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
             ..Default::default()
         };
     };
+    // `raw` = the untouched wire body the image-build/container-deploy handlers
+    // parse their verb-specific fields from; `body` = the shared gate fields.
+    let raw = body_str;
     let body = CloudActionBody::parse(body_str);
 
     match verb {
@@ -186,9 +193,11 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
         CloudVerb::Plan => desired::handle_plan(w, verb_name, body_str),
         CloudVerb::SetDesired => desired::handle_set_desired(w, verb_name, body_str),
 
-        // ── skeleton MUTATIONS (U4–U10 fill the bodies) ──
-        CloudVerb::ImageBuild => not_yet(verb_name, "U7"),
-        CloudVerb::ContainerDeploy => not_yet(verb_name, "U8"),
+        // ── wired MUTATIONS — image-build (U6) + container-deploy (U7) ──
+        CloudVerb::ImageBuild => image::handle(w, verb_name, raw),
+        CloudVerb::ContainerDeploy => container::handle(w, verb_name, raw),
+
+        // ── skeleton MUTATIONS (U8–U10 fill the bodies) ──
         CloudVerb::ConsoleAttach => not_yet(verb_name, "U9"),
         CloudVerb::AndroidProvision => not_yet(verb_name, "U10"),
 
