@@ -26,6 +26,15 @@ path = "src/main.rs"
 [dependencies]
 mde-egui = { path = "../../shared/mde-egui" }
 
+# Rolling Node Phase 2 — the live `state/vehicle/<node>` mirror this cockpit
+# folds onto its simulator-seeded models. mde-bus is the platform-services
+# tier; mackes-mesh-types is the mesh-tier wire-type registry. Both are pure
+# data/read seams (no daemon dependency), matching the dependency edge
+# mde-shell-egui already draws on the same two crates (§6).
+mde-bus       = { path = "../../platform/mde-bus" }
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+serde_json.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 

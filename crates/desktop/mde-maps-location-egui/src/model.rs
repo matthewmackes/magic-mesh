@@ -2,6 +2,12 @@
 
 use std::collections::BTreeMap;
 
+/// The `real_hardware_gaps` placeholder note for the un-wired MG90 adapter —
+/// factored out so [`MapsLocationSurface::refresh_from_vehicle`] can retract
+/// it by exact match once a live `state/vehicle/<node>` mirror lands.
+const SIMULATED_MG90_GAP_NOTE: &str =
+    "Real MG90 discovery/auth/status adapters are skeleton seams; simulator is active.";
+
 /// Workspace tabs in the order requested by the product directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkspaceTab {
@@ -117,8 +123,7 @@ impl MapsLocationSurface {
             firmware: FirmwareWorkflow::simulated(),
             vault: EncryptedVaultState::ready_for_local_admin(),
             real_hardware_gaps: vec![
-                "Real MG90 discovery/auth/status adapters are skeleton seams; simulator is active."
-                    .to_string(),
+                SIMULATED_MG90_GAP_NOTE.to_string(),
                 "Valhalla and Nominatim are represented as local-only backend contracts; no live daemon is launched by this slice."
                     .to_string(),
                 "gpsd, CAN/OBD, GPIO, serial, firmware upload, and factory reset workflows are UI/model complete but not wired to hardware."
@@ -240,6 +245,151 @@ impl MapsLocationSurface {
             .find(|descriptor| descriptor.id == setting_id)?;
         Some(SettingChangePlan::for_setting(setting, self.moving()))
     }
+
+    /// Rolling Node Phase 2 — fold a live `state/vehicle/<node>` mirror onto
+    /// this surface's LIVE models: `WanStatus` -> `Mg90Status` (+ both
+    /// `CellularLink`s), `GpsFix` -> the primary `LocationSource`'s
+    /// `LocationSample`, and `VehicleTelem` -> `VehicleTelemetry`. Fields the
+    /// wire type doesn't carry (`Mg90Status::data_transferred`, the MG90
+    /// setup/settings/backup seams, …) are left untouched — this is an
+    /// additive fold over the simulator seed, never a full replacement, so a
+    /// live gateway with a partial mirror still shows the surface's other
+    /// seams honestly.
+    pub fn refresh_from_vehicle(&mut self, v: &mackes_mesh_types::vehicle::VehicleState) {
+        // WanStatus -> Mg90Status.
+        let status = &mut self.mg90.status;
+        status.active_wan = v.wan.active_wan.clone();
+        status.cellular_a = cellular_link_from_wire(&v.wan.cellular_a);
+        status.cellular_b = cellular_link_from_wire(&v.wan.cellular_b);
+        status.wifi_state = v.wan.wifi_state.clone();
+        status.ethernet_state = v.wan.ethernet_state.clone();
+        status.vpn_state = v.wan.vpn_state.clone();
+        status.failover_events = v.wan.failover_events;
+        status.latency_ms = v.wan.latency_ms;
+        status.packet_loss_percent = v.wan.packet_loss_percent;
+        status.link_quality = v.wan.link_quality.clone();
+
+        // GpsFix -> the primary LocationSource's LocationSample. HDOP has no
+        // exact meters conversion; ~5 m per HDOP unit is the commonly-cited
+        // civilian-GNSS UERE estimate — an honest approximation, not a
+        // precision figure.
+        if let Some(source) = self.locations.primary_source_mut() {
+            let gps = &v.gps;
+            source.sample = LocationSample {
+                fix_type: gps.fix_type.clone(),
+                latitude: gps.latitude,
+                longitude: gps.longitude,
+                accuracy_m: gps.hdop * 5.0,
+                speed_mph: gps.speed_mph,
+                heading_deg: gps.heading_deg,
+                altitude_m: gps.altitude_m,
+                satellites: Some(gps.satellites),
+                update_rate_hz: gps.update_rate_hz,
+                update_age_s: gps.age_s,
+            };
+        }
+
+        // VehicleTelem -> VehicleTelemetry. Optional OBD fields (coolant/
+        // fuel/odometer) preserve the prior value when the mirror reports
+        // `None` — an unsupported PID is not the same as a zero reading.
+        let telem = &v.telem;
+        let telemetry = &mut self.vehicle.telemetry;
+        telemetry.speed_mph = telem.speed_mph;
+        telemetry.rpm = telem.rpm;
+        if let Some(coolant_c) = telem.coolant_c {
+            telemetry.coolant_c = coolant_c;
+        }
+        telemetry.battery_v = telem.battery_v;
+        if telem.fuel_percent.is_some() {
+            telemetry.fuel_percent = telem.fuel_percent;
+        }
+        telemetry.dtc_count = telem.dtc_count;
+        telemetry.ignition_on = telem.ignition_on;
+        telemetry.moving = telem.moving;
+        if telem.odometer_mi.is_some() {
+            telemetry.odometer_mi = telem.odometer_mi;
+        }
+        telemetry.runtime_min = telem.runtime_min;
+        telemetry.internal_temp_c = Some(telem.internal_temp_c);
+        telemetry.confidence = if v.online {
+            format!("live vehicle-gateway mirror ({} {})", v.model, v.mgos_version)
+        } else {
+            "vehicle-gateway mirror reports the adapter offline".to_string()
+        };
+        telemetry.last_update_age_s = mirror_age_s(v.published_at_ms);
+
+        // Fold the adapter's own honest gap report in place of the generic
+        // "simulator is active" placeholder now that a live mirror exists.
+        self.real_hardware_gaps.retain(|g| g != SIMULATED_MG90_GAP_NOTE);
+        if v.gaps.is_empty() {
+            let note = format!(
+                "Live vehicle-gateway mirror active for node `{}` ({} {}).",
+                v.host, v.model, v.mgos_version
+            );
+            if !self.real_hardware_gaps.contains(&note) {
+                self.real_hardware_gaps.insert(0, note);
+            }
+        } else {
+            for gap in &v.gaps {
+                let note = format!("Vehicle-gateway adapter gap: {gap}");
+                if !self.real_hardware_gaps.contains(&note) {
+                    self.real_hardware_gaps.push(note);
+                }
+            }
+        }
+    }
+
+    /// Read the `state/vehicle/<node>` mirror off the Bus (fail-soft, honest
+    /// off-mesh no-op) and fold it in via [`Self::refresh_from_vehicle`].
+    /// When no mirror is retained yet — no spool, no adapter worker running,
+    /// or the topic is simply empty — this leaves the simulated seed exactly
+    /// as it was, `real_hardware_gaps` note included: the honest offline
+    /// fallback. Opens the store per call (no cached `Connection`) rather
+    /// than reaching into the shell's crate-private `BusReader` seam,
+    /// matching that seam's own fail-soft idiom for a cross-crate caller.
+    pub fn refresh_from_bus(&mut self, node: &str) {
+        if let Some(mirror) = read_vehicle_mirror(node) {
+            self.refresh_from_vehicle(&mirror);
+        }
+    }
+}
+
+/// `mackes_mesh_types::vehicle::CellLink` -> the cockpit's `CellularLink` —
+/// same six fields, different crate.
+fn cellular_link_from_wire(link: &mackes_mesh_types::vehicle::CellLink) -> CellularLink {
+    CellularLink {
+        sim_state: link.sim_state.clone(),
+        carrier: link.carrier.clone(),
+        signal_dbm: link.signal_dbm,
+        technology: link.technology.clone(),
+        wan_ip: link.wan_ip.clone(),
+        healthy: link.healthy,
+    }
+}
+
+/// Wall-clock age of a `published_at_ms` mirror stamp, seconds. Falls back to
+/// `0.0` if the system clock is somehow before the Unix epoch — never panics.
+fn mirror_age_s(published_at_ms: i64) -> f32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(published_at_ms, |d| {
+            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+        });
+    ((now_ms - published_at_ms).max(0) as f32) / 1000.0
+}
+
+/// Open the Bus fail-soft and decode the newest `state/vehicle/<node>`
+/// mirror body — the same "resolve `client_data_dir`, `Persist::open`
+/// fail-soft, newest row, `serde_json` decode" prelude as the shell's
+/// `BusReader::latest_json`, embedded locally since that seam is
+/// crate-private to `mde-shell-egui`.
+fn read_vehicle_mirror(node: &str) -> Option<mackes_mesh_types::vehicle::VehicleState> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
 }
 
 impl Default for MapsLocationSurface {
@@ -1343,6 +1493,13 @@ impl LocationManager {
             .find(|source| source.kind == self.primary)
     }
 
+    /// Mutable primary source record — the live-mirror fold's write point
+    /// for [`MapsLocationSurface::refresh_from_vehicle`].
+    pub fn primary_source_mut(&mut self) -> Option<&mut LocationSource> {
+        let primary = self.primary;
+        self.sources.iter_mut().find(|source| source.kind == primary)
+    }
+
     /// Warning if primary source is unhealthy.
     #[must_use]
     pub fn primary_warning(&self) -> Option<String> {
@@ -1767,6 +1924,7 @@ impl VehicleState {
                 moving: true,
                 odometer_mi: Some(78_214),
                 runtime_min: 42,
+                internal_temp_c: None,
                 confidence: "simulated CAN/OBD profile".to_string(),
                 last_update_age_s: 0.8,
             },
@@ -1801,6 +1959,10 @@ pub struct VehicleTelemetry {
     pub odometer_mi: Option<u32>,
     /// Runtime.
     pub runtime_min: u32,
+    /// Gateway MCU board temperature, `Celsius` (Rolling Node — from the
+    /// `state/vehicle/<node>` mirror's `VehicleTelem::internal_temp_c`;
+    /// `None` in simulator mode, which has no MCU to sample).
+    pub internal_temp_c: Option<f32>,
     /// Confidence label.
     pub confidence: String,
     /// Last update age.
