@@ -1,7 +1,9 @@
 use super::*;
+use mde_egui::search_omnibox::{ranked_hits, SearchDomain};
 use mde_files::backend::{AuditEntry, ConflictPolicy, LocalFsBackend, SendMode};
 use mde_files::fileops::{FakeFileOps, FileOps};
 use mde_files::model::{PeerKind, PeerStatus};
+use mde_files::{ArchiveFormat, OpKind};
 use std::collections::HashMap as Map;
 
 // ── In-test backend double (from E12-11, unchanged shape) ────────────────
@@ -9,6 +11,7 @@ use std::collections::HashMap as Map;
 struct FixtureBackend {
     peers: Vec<Peer>,
     rows: Vec<FileRow>,
+    local_rows: Map<String, Vec<FileRow>>,
     peer_rows: Map<String, Vec<FileRow>>,
     next_op: OpId,
     mesh: Option<MeshOverlayBadge>,
@@ -19,10 +22,15 @@ impl FixtureBackend {
         Self {
             peers,
             rows,
+            local_rows: Map::new(),
             peer_rows: Map::new(),
             next_op: 1,
             mesh: None,
         }
+    }
+    fn with_local(mut self, path: &str, rows: Vec<FileRow>) -> Self {
+        self.local_rows.insert(path.to_string(), rows);
+        self
     }
     fn with_peer(mut self, id: &str, rows: Vec<FileRow>) -> Self {
         self.peer_rows.insert(id.to_string(), rows);
@@ -43,6 +51,9 @@ impl Backend for FixtureBackend {
     fn list(&self, path: &str) -> Vec<FileRow> {
         if let Some(id) = path.strip_prefix("peer:") {
             return self.peer_rows.get(id).cloned().unwrap_or_default();
+        }
+        if let Some(rows) = self.local_rows.get(path) {
+            return rows.clone();
         }
         self.rows.clone()
     }
@@ -640,6 +651,131 @@ fn open_local_directory_over_the_real_backend_carries_paths() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn files_search_omnibox_items_project_current_folder_rows_into_shared_ranker() {
+    let rows = vec![
+        FileRow::local("report.txt", Mime::Doc, "1 KB", "now").with_path("/d/report.txt"),
+        FileRow::local("photo.png", Mime::Image, "80 KB", "2 h")
+            .with_path("/d/photo.png")
+            .with_mesh("pine.mesh"),
+        FileRow::local("alpha/", Mime::Folder, "-", "-").with_path("/d/alpha"),
+    ];
+    let mut b = browser_over(FixtureBackend::new(Vec::new(), rows));
+
+    let items = b.search_omnibox_items(0);
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|item| item.domain == SearchDomain::File));
+
+    let report = items
+        .iter()
+        .find(|item| item.title == "report.txt")
+        .expect("report candidate");
+    assert_eq!(report.target, "/d/report.txt");
+    assert_eq!(report.payload.path, Some(PathBuf::from("/d/report.txt")));
+    assert!(report.terms.iter().any(|term| term == "document"));
+
+    let mesh_hit = ranked_hits("pine", items.clone(), 8)
+        .into_iter()
+        .next()
+        .expect("mesh attribution ranks as an auxiliary field");
+    assert_eq!(mesh_hit.item.title, "photo.png");
+
+    let folder_target = items
+        .into_iter()
+        .find(|item| item.title == "alpha/")
+        .expect("folder candidate")
+        .payload;
+    b.open_search_omnibox_target(&folder_target);
+    assert_eq!(
+        b.active_tab().location(),
+        &Location::Local("/d/alpha".to_string())
+    );
+}
+
+#[test]
+fn home_search_includes_bounded_home_rows_with_metadata() {
+    let current_rows = vec![FileRow::local("work-report.txt", Mime::Doc, "4 KB", "now")
+        .with_path("/work/work-report.txt")];
+    let mut home_rows = vec![
+        FileRow::local("home-notes.md", Mime::Doc, "2 KB", "3 h")
+            .with_path("/home/me/home-notes.md"),
+        FileRow::local("photos/", Mime::Folder, "12 items", "1 d").with_path("/home/me/photos"),
+    ];
+    for ix in 0..40 {
+        home_rows.push(
+            FileRow::local(format!("older-{ix}.txt"), Mime::Doc, "1 KB", "1 w")
+                .with_path(format!("/home/me/older-{ix}.txt")),
+        );
+    }
+    let mut b = browser_over(
+        FixtureBackend::new(Vec::new(), Vec::new())
+            .with_local("local:home", home_rows)
+            .with_local("/work", current_rows),
+    );
+    b.navigate(0, Location::Local("/work".into()));
+
+    let home_items = b.home_search_omnibox_items();
+    assert_eq!(home_items.len(), 32, "home snapshot is bounded");
+
+    let items = b.unified_search_omnibox_items();
+    assert!(items.iter().any(|item| item.title == "work-report.txt"));
+    let home = items
+        .iter()
+        .find(|item| item.title == "home-notes.md")
+        .expect("home file candidate");
+    assert_eq!(home.target, "/home/me/home-notes.md");
+    assert!(home.terms.iter().any(|term| term == "document"));
+    assert!(home.terms.iter().any(|term| term == "2 KB"));
+    assert!(home.terms.iter().any(|term| term == "3 h"));
+
+    let hit = ranked_hits("home-notes", items, 8)
+        .into_iter()
+        .next()
+        .expect("home filename ranks through shared search");
+    assert_eq!(hit.item.title, "home-notes.md");
+}
+
+#[test]
+fn home_search_result_opens_through_the_files_model() {
+    let home_row = FileRow::local("home-notes.md", Mime::Doc, "2 KB", "3 h")
+        .with_path("/home/me/home-notes.md");
+    let mut b = browser_over(
+        FixtureBackend::new(Vec::new(), Vec::new())
+            .with_local(
+                "local:home",
+                vec![
+                    home_row.clone(),
+                    FileRow::local("photos/", Mime::Folder, "12 items", "1 d")
+                        .with_path("/home/me/photos"),
+                ],
+            )
+            .with_local("/home/me", vec![home_row.clone()])
+            .with_local(
+                "/work",
+                vec![FileRow::local("work-report.txt", Mime::Doc, "4 KB", "now")
+                    .with_path("/work/work-report.txt")],
+            ),
+    );
+    b.navigate(0, Location::Local("/work".into()));
+    let target = b
+        .unified_search_omnibox_items()
+        .into_iter()
+        .find(|item| item.title == "home-notes.md")
+        .expect("home candidate")
+        .payload;
+
+    b.open_search_omnibox_target(&target);
+
+    assert_eq!(
+        b.active_tab().location(),
+        &Location::Local("/home/me".to_string())
+    );
+    assert_eq!(
+        b.active_tab().selected_paths(),
+        vec![PathBuf::from("/home/me/home-notes.md")]
+    );
+}
+
 // ── recursive search (FILEMGR-4) ─────────────────────────────────────────
 
 #[test]
@@ -688,6 +824,18 @@ fn search_streams_an_operable_results_tab_over_the_real_fs() {
         .collect();
     names.sort();
     assert_eq!(names, vec!["alpha.log", "gamma.log"], "recursive name hits");
+
+    let search_items = b.search_omnibox_items(0);
+    assert_eq!(search_items.len(), 2);
+    assert!(search_items
+        .iter()
+        .all(|item| item.domain == SearchDomain::File));
+    let gamma = ranked_hits("gamma", search_items.clone(), 8)
+        .into_iter()
+        .next()
+        .expect("recursive hit candidate");
+    assert_eq!(gamma.item.title, "gamma.log");
+    assert!(ranked_hits("beta", search_items, 8).is_empty());
 
     // Results are a normal file view: every hit carries a real path, so the op
     // surface (selected_paths → copy/move/delete/Send-To) applies directly.
@@ -812,7 +960,11 @@ fn navigating_an_offline_peer_is_an_honest_no_op() {
         "no mount request is issued for an offline peer"
     );
     assert_eq!(*b.active_tab().location(), before, "location is unchanged");
-    assert!(b.last_note().is_some(), "an honest note explains why");
+    assert_eq!(
+        b.last_note(),
+        Some("cedar is offline - can't mount it."),
+        "an honest ASCII note explains why"
+    );
 }
 
 #[test]
@@ -822,6 +974,10 @@ fn escalate_requests_the_escalate_verb_for_a_reachable_peer() {
     let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
     b.escalate_peer("pine");
     assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Escalate]);
+    assert_eq!(
+        b.last_note(),
+        Some("Escalating pine to full-filesystem access...")
+    );
 }
 
 #[test]
@@ -831,7 +987,7 @@ fn escalate_is_a_no_op_for_an_offline_peer() {
     let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
     b.escalate_peer("cedar"); // Offline
     assert_eq!(probe.request_count(), 0);
-    assert!(b.last_note().is_some());
+    assert_eq!(b.last_note(), Some("cedar is offline - can't escalate it."));
 }
 
 #[test]
@@ -841,6 +997,7 @@ fn unmount_requests_the_unmount_verb() {
     let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
     b.unmount_peer("pine");
     assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Unmount]);
+    assert_eq!(b.last_note(), Some("Unmounting pine..."));
 }
 
 #[test]
@@ -1138,7 +1295,10 @@ fn open_properties_on_a_pathless_peer_row_is_an_honest_note() {
         b.properties().is_none(),
         "no dialog opens for a pathless row"
     );
-    assert!(b.last_note().is_some());
+    assert_eq!(
+        b.last_note(),
+        Some("This entry has no local path - mount the peer to inspect it.")
+    );
 }
 
 // ── TRANSFERS-8: the tab + the three Submit entry points (Q13) ────────────
@@ -1287,4 +1447,67 @@ fn transfers_view_and_counts_read_the_injected_ledger() {
     assert_eq!(c.active, 1, "the running job is active");
     assert_eq!(c.terminal, 1, "the done job is terminal");
     assert!(b.transfers_active());
+}
+
+#[test]
+fn operation_progress_summary_folds_active_transfer_jobs_for_shell_chrome() {
+    let mut running = XJob::new("/a/large.iso", "/b", XMethod::Rsync, XPolicy::default());
+    running.state = XState::Running;
+    running.progress = Some(40);
+    let mut queued = XJob::new("/c/archive.tar", "/d", XMethod::Http, XPolicy::default());
+    queued.state = XState::Queued;
+    let mut done = XJob::new("/e/old.log", "/f", XMethod::Node, XPolicy::default());
+    done.state = XState::Done;
+    let fake = FakeTransfers::new().with_jobs(vec![running, queued, done]);
+    let b = transfers_browser(Vec::new(), fake);
+
+    let summary = b
+        .operation_progress_summary()
+        .expect("two active transfer jobs");
+    assert_eq!(summary.active, 2);
+    assert_eq!(summary.known_progress, 1);
+    assert_eq!(summary.fraction, Some(0.4));
+    assert_eq!(summary.label, "2 transfers");
+}
+
+#[test]
+fn operation_progress_summary_folds_archive_queue_ops_for_shell_chrome() {
+    let mut b = transfers_browser(Vec::new(), FakeTransfers::new());
+    b.ops.submit(
+        OpKind::Compress {
+            items: vec![PathBuf::from("project")],
+            base_dir: PathBuf::from("/home/me"),
+            archive: PathBuf::from("/home/me/project.zip"),
+            format: ArchiveFormat::Zip,
+        },
+        "Compress project.zip",
+    );
+    b.ops.submit(
+        OpKind::Extract {
+            archive: PathBuf::from("/home/me/archive.zip"),
+            dest_dir: PathBuf::from("/home/me/archive"),
+        },
+        "Extract archive.zip",
+    );
+
+    let summary = b
+        .operation_progress_summary()
+        .expect("archive queue ops should feed shell chrome");
+    assert_eq!(summary.active, 2);
+    assert_eq!(summary.known_progress, 0);
+    assert_eq!(summary.fraction, None);
+    assert_eq!(summary.label, "2 local file operations");
+}
+
+#[test]
+fn operation_progress_summary_bounds_labels_with_ascii_ellipsis_for_shell_chrome() {
+    let label = truncate_operation_label("Copy very-long-platform-operation-report-final.txt");
+
+    assert!(label.ends_with("..."), "truncated label = {label}");
+    assert!(label.is_ascii(), "truncated label = {label}");
+    assert!(
+        label.chars().count() <= 42,
+        "Files progress summary labels must stay bounded: {label}"
+    );
+    assert!(!label.contains('…'), "label must not use Unicode ellipsis");
 }

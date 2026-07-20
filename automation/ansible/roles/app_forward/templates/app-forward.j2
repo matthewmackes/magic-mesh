@@ -1,0 +1,7 @@
+{{ ansible_managed | comment }}
+# magic-mesh Ansible role `app_forward` (WL-ARCH-006 U13). VDI app-mode: the
+# mackesd session_broker forwards these apps into the MDE desktop's app rail.
+mode=app_forward
+{% for app in app_forward_apps %}
+app={{ app.name }}={{ app.exec | default(app.name) }}
+{% endfor %}

@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: container_host
+  namespace: magic_mesh
+  author: magic-mesh
+  description: >-
+    Podman + Quadlet host prep for a Service-Container (WL-ARCH-006 U13). Installs
+    Podman, provisions the Quadlet drop-in dir, enables the Podman API socket, and
+    reloads the systemd generator — rootless by default. Optional registry auth
+    rides the mde-seal/age store (no Ansible Vault).
+  license: proprietary
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+dependencies: []

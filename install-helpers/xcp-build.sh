@@ -14,7 +14,7 @@
 #   xcp-build.sh sync                 rsync the working tree to the VM
 #   xcp-build.sh cargo <args...>      sync + run `cargo <args>` on the VM
 #   xcp-build.sh gates                sync + fmt-check + clippy + test (the ship/release gates)
-#   xcp-build.sh rpm                  sync + release build + cargo generate-rpm; pull the RPM local
+#   xcp-build.sh rpm                  sync + release build + base/browser RPMs; pull them local
 #   xcp-build.sh pull <remote-glob>   rsync artifacts back (relative to the remote repo)
 #   xcp-build.sh shell                interactive ssh into the build VM
 #   xcp-build.sh route <cargo args>   print the shape-routed host + reason (dry; no sync/build)
@@ -468,9 +468,11 @@ case "${1:-}" in
     # BOOKMARKS-9 — mde-web-preview is intentionally excluded from the parent
     # workspace because Servo's sqlite dependency conflicts with the mesh lock.
     # BROWSER-DD-1 — mde-web-cef is also workspace-excluded and emits both the
-    # helper and renderer bridge. The full RPM ships all browser helpers, so
-    # build those separate workspaces into the same target/release directory
-    # before generate-rpm.
+    # helper and renderer bridge. BROWSER-CHROME additionally ships `cef-verify`,
+    # a shell-equivalent wire verifier built from mde-web-preview-client with
+    # live-helper enabled. The split Browser RPM ships all browser helpers and
+    # diagnostics, so build those separate targets into the same target/release
+    # directory before generate-rpm.
     # + BUG-VIDEO-1 / MEDIA-2 phase 1 `mpv-libs-devel` (docs/gpu_encoder.md):
     # links the real libmpv2 engine for the `media-mpv` re-link below —
     # without it the shell would silently fall back to FakeMpv.
@@ -497,10 +499,15 @@ case "${1:-}" in
     # build-deploy-3 — feature list + --locked come from rpm-features.sh (sourced
     # above); $MDE_RPM_* expand HERE on the local host, so the literal flags land
     # in the remote command string identical to build-rpm-fedora43.sh's.
-    remote "cargo build --workspace --release $MDE_RPM_LOCKED && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd"
+    remote "mkdir -p target/generate-rpm && rm -f target/generate-rpm/magic-mesh*.rpm && cargo build --workspace --release $MDE_RPM_LOCKED && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release $MDE_RPM_LOCKED -p mde-web-preview-client --features live-helper --bin cef-verify && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd && cargo generate-rpm -p crates/mesh/mackesd --variant browser && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-browser-*.rpm"
     mkdir -p "$ARTIFACTS"
+    rm -f "$ARTIFACTS"/magic-mesh*.rpm
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"
+    for rpm in "$ARTIFACTS"/magic-mesh*.rpm; do
+      [ -e "$rpm" ] || continue
+      "$REPO/install-helpers/verify-rpm-payload.sh" size "$rpm"
+    done
     ls -la "$ARTIFACTS"/*.rpm
     ;;
 

@@ -6,7 +6,7 @@
 //! not a brand-new one"): it is the enumeration + publish support the rank-0
 //! [`super::hardware_probe`] worker calls on its tick, in the mold of the
 //! crate-root `legacy_inventory` module. The `hardware_probe` census entry
-//! (`worker_role::WORKER_TIERS`) is unchanged — the same worker now publishes a
+//! (`worker_role::WORKER_REGISTRY`) is unchanged — the same worker now publishes a
 //! second artifact.
 //!
 //! ## What it does (the producer side of §6)

@@ -1,5 +1,7 @@
 # MCNF Workbench — Control Surface redesign (CTRLSURF)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the Control-Surface *concepts* (Command Watchfloor, compact↔expand, unified search/ladder/catalog/pin store) carry forward, but this doc targets the retired `mde-workbench` crate. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). The `mde-workbench` crate paths and `cargo test -p mde-workbench` DoD below are stale.
+
 **Status:** locked 2026-06-29 via the operator design tour + two synthesis
 workflows (the 10-paradigm control-surface design `wf_13ac8b02`, and the nav
 taxonomy rethink `wf_f45a892b`) + a convergence survey. Supersedes the ad-hoc

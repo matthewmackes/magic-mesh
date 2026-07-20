@@ -62,7 +62,6 @@ log "etcd: setup-etcd ${ETCD_ARGS[*]}"
 if [ "$NO_FILES" -eq 0 ]; then
   SYNC_ARGS=(--folder "$FOLDER")
   [ -n "$LISTEN" ]  && SYNC_ARGS+=(--listen "$LISTEN")
-  [ -n "$ANCHORS" ] && SYNC_ARGS+=(--anchors "$ANCHORS")
   log "syncthing: setup-syncthing ${SYNC_ARGS[*]}"
   "$(helper setup-syncthing)" "${SYNC_ARGS[@]}"
 else

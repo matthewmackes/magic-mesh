@@ -1,5 +1,5 @@
 # E12-13 — image-lane systemd preset (bootc only; the dnf/RPM lane enables via
-# the post-install scriptlet instead). Declares the Quasar seat policy so a
+# the post-install scriptlet instead). Declares the Construct seat policy so a
 # factory reset / `systemctl preset-all` / a unit re-added after /etc surgery
 # re-enables the same set the image build materialized with `systemctl enable`.
 # The seat unit still self-gates on the role flag at runtime (§5) — preset

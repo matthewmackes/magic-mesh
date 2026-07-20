@@ -1,7 +1,7 @@
-//! TMUX-FC-8 — the **platform-managed Quasar tmux config** (mesh-synced) + its
+//! TMUX-FC-8 — the **platform-managed Construct tmux config** (mesh-synced) + its
 //! application over the control channel.
 //!
-//! Design: `docs/design/tmux-first-class.md` (#14 config: a Quasar default,
+//! Design: `docs/design/tmux-first-class.md` (#14 config: a Construct default,
 //! mesh-synced, no per-user file hand-editing). A small model — the prefix, the
 //! mouse toggle, the scrollback history limit — that the operator edits in a GUI
 //! pane rather than by hand-editing a `.tmux.conf`.
@@ -17,7 +17,7 @@
 //! **Applied over control mode** ([`TmuxConfig::option_commands`]): rather than a
 //! per-user file a fresh server may or may not have read, the config is pushed as
 //! `set-option -g` commands the moment the control client attaches — so the live
-//! server always reflects the Quasar config regardless of what `.tmux.conf` (if
+//! server always reflects the Construct config regardless of what `.tmux.conf` (if
 //! any) it started from. [`TmuxConfig::to_conf`] still renders the equivalent
 //! `.tmux.conf` text (the canonical artefact + a test anchor).
 
@@ -37,11 +37,11 @@ const CONFIG_FILE: &str = "config.json";
 /// share is provisioned fails honestly rather than landing on a bare local dir.
 const CANONICAL_MOUNT: &str = "/mnt/mesh-storage";
 
-/// The default scrollback history limit (lines) — the Quasar default, matching a
+/// The default scrollback history limit (lines) — the Construct default, matching a
 /// generous-but-bounded terminal.
 const DEFAULT_HISTORY: u32 = 50_000;
 
-/// The platform-managed Quasar tmux config: the operator-tunable knobs.
+/// The platform-managed Construct tmux config: the operator-tunable knobs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmuxConfig {
     /// The tmux prefix key token (tmux's own syntax, e.g. `C-b`, `C-a`,
@@ -100,14 +100,14 @@ impl TmuxConfig {
         ]
     }
 
-    /// The equivalent `.tmux.conf` text — the canonical Quasar config artefact
+    /// The equivalent `.tmux.conf` text — the canonical Construct config artefact
     /// (what the operator would see as a file), kept in step with
     /// [`Self::option_commands`].
     #[must_use]
     pub fn to_conf(&self) -> String {
         let prefix = self.safe_prefix();
         format!(
-            "# Quasar tmux config (platform-managed, mesh-synced) — TMUX-FC-8\n\
+            "# Construct tmux config (platform-managed, mesh-synced) — TMUX-FC-8\n\
              set-option -g prefix {prefix}\n\
              bind-key {prefix} send-prefix\n\
              set-option -g mouse {}\n\
@@ -154,7 +154,7 @@ impl TmuxConfigStore {
         self.root.join(TMUX_SUBDIR).join(CONFIG_FILE)
     }
 
-    /// Load the mesh config — the Quasar [`TmuxConfig::default`] when absent,
+    /// Load the mesh config — the Construct [`TmuxConfig::default`] when absent,
     /// unreadable, or malformed (a half-write / a fresh mesh never wedges boot).
     #[must_use]
     pub fn load(&self) -> TmuxConfig {
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_the_quasar_config() {
+    fn the_default_is_the_construct_config() {
         let cfg = TmuxConfig::default();
         assert_eq!(cfg.prefix, "C-b");
         assert!(cfg.mouse);
@@ -257,8 +257,13 @@ mod tests {
     }
 
     #[test]
-    fn to_conf_renders_the_equivalent_file() {
+    fn to_conf_renders_the_equivalent_construct_file() {
         let conf = TmuxConfig::default().to_conf();
+        assert!(conf.starts_with("# Construct tmux config"));
+        assert!(
+            !conf.contains(concat!("Qua", "sar")),
+            "generated tmux config must not drift back to the superseded spelling"
+        );
         assert!(conf.contains("set-option -g prefix C-b"));
         assert!(conf.contains("set-option -g mouse on"));
         assert!(conf.contains("set-option -g history-limit 50000"));
@@ -295,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_config_loads_the_quasar_default() {
+    fn a_missing_config_loads_the_construct_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = TmuxConfigStore::new(dir.path().join("never-synced"));
         assert_eq!(store.load(), TmuxConfig::default());

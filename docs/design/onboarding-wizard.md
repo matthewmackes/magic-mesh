@@ -1,7 +1,7 @@
 # Onboarding / First-Time Wizard — design lock
 
 **Status:** LOCKED 2026-06-30 via a 50-question operator survey (`/plan`).
-**Epic prefix:** `ONBOARD-WIZARD` (worklist) · **Identity:** E12 "Quasar" (12.0).
+**Epic prefix:** `ONBOARD-WIZARD` (worklist) · **Identity:** E12 "Construct" (12.0).
 **One sentence:** one installer takes a bare box from first boot to a working mesh —
 pick a role (Lighthouse / Workstation), create a new mesh **or** join an
 existing one, and drive the whole path (CA bootstrap → optional lighthouse spawn →
@@ -124,7 +124,7 @@ boot → role-chooser (DISCLAIMER ack, §43) ─┬─ Lighthouse ─┐
 ### Roles (redefined by this survey)
 - **Lighthouse** — relay + control plane **+ media server (Navidrome→DO Spaces) + the CA/signer** once migrated. RPM on Fedora 43, cloud or local. Holds a media volume (§27). *(This is the big change vs the old "relay-only".)*
 - **XCP-NG** — the 16-service toolstack + a static Nebula member; serves VM desktops + hosts the back-office Files/service VMs behind its own cert (§34). Headless TUI onboarding.
-- **Workstation** — the Quasar egui shell + VDI; the **only role that can found a mesh**; the bootstrap CA until a lighthouse takes over; per-peer session roaming. ISO/bootc.
+- **Workstation** — the Construct egui shell + VDI; the **only role that can found a mesh**; the bootstrap CA until a lighthouse takes over; per-peer session roaming. ISO/bootc.
 
 ### `mackesd` engine surface (new workers/verbs the wizard drives)
 `onboard` · `mesh-create` (CA + id) · `invite-issue` (QR + short code, short-TTL) ·

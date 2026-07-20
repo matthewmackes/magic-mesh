@@ -34,6 +34,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use axum::extract::{Path, State};

@@ -51,7 +51,7 @@ A new module in `crates/shared/mde-egui`:
   keymap so a rebind reflects).
 - **The status cluster** — a caller-supplied `Vec<StatusChip>` (icon/text/tone) rendered
   right-aligned; the surface fills it from its live state each frame.
-- **Reduce-motion aware**, DPI-crisp, focus-ring on every menu item (a11y, lock 5 of Quasar).
+- **Reduce-motion aware**, DPI-crisp, focus-ring on every menu item (a11y, lock 5 of Construct).
 
 ### Per-surface embedding (MENUBAR-ALL-2..16, one big wave)
 Each surface crate embeds `MenuBar` at the top of its panel, passing:

@@ -1,5 +1,7 @@
 # LIGHTHOUSE — Hero focus on lighthouses (design)
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** frames the lighthouse around the `lizardfs-master`/shadow SPOF and the retired iced/`mde-workbench` shell. **LizardFS is removed** — the live substrate is **etcd** (coordination) + **Syncthing** (files); see [`substrate-v2.md`](substrate-v2.md). The live desktop is the egui-native shell `mde-shell-egui` ([`quasar-vdi-desktop.md`](quasar-vdi-desktop.md)). Retained as a historical design record.
+
 **Status:** locked via 25-Q operator survey, 2026-06-18.
 **Trigger:** Operator — "Hero Focus on Lighthouses throughout the system. ALWAYS use Carbon. New Feature: add, at the bottom of the Notifications Hub, an area focused on lighthouse health. Each lighthouse a square icon, animated like a lighthouse (circling beam), Carbon Green = healthy, Red = unhealthy. Clicking takes the operator to a dedicated 'Lighthouses' tab under Mesh in the Workbench."
 

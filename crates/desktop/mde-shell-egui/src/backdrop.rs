@@ -1,24 +1,11 @@
-//! QBRAND-11 — the shell's **desktop wallpaper backdrop**: the official Quazar
-//! artwork painted as the bottom-most desktop layer (`docs/design/quasar-branding.md`,
-//! placement lock #12 — `MDE-QUAZAR-WALLPAPER4.png` is the default, all five ship
-//! selectable).
+//! The shell's desktop backdrop: the bottom-most layer is the shell background
+//! colour, with the watermark and any honest status text above it.
 //!
-//! Under E12 "Quasar" the shell IS the desktop, so "the empty desktop" is the
+//! Under E12 "Construct" the shell IS the desktop, so "the empty desktop" is the
 //! Desktop surface with nothing brokered in: the [`crate::vdi`] no-desktop state and
 //! the [`crate::discovery`]/[`crate::chooser`] empty root desktop. Both paint the
-//! wallpaper through this one helper, with any honest status relocated to a small
-//! block low on the field (§7 honesty preserved).
-//!
-//! The wallpaper resolves at runtime from the installed set QBRAND-9 drops under
-//! [`WALLPAPER_DIR`], decoded ONCE to a cached texture (the decode + upload is shared
-//! by every empty path, never re-run per frame) and cover-filled to the display —
-//! aspect preserved, the overflow axis cropped via UV, never stretched. The selected
-//! wallpaper persists per seat and follows the mesh identity through the same
-//! `chooser/chooser_prefs.rs` (CHOOSER-9) idiom. Only the default `WALLPAPER4` is
-//! embedded (`include_bytes!`) as a bundled fallback — embedding all five would add
-//! ~6 MB to the binary, so the rest load from disk (disk-honest, §4). All colour the
-//! shell *adds* — the Carbon field beneath, the cover scrim, the status backing — is
-//! a `mde-theme`/`Style` token, never a raw hex (§4).
+//! this one helper, with any honest status relocated to a small block low on the
+//! field (§7 honesty preserved).
 //!
 //! NAVBAR-W10-3 (`docs/design/workbench-navbar.md` lock W12) rides this same layer:
 //! a Windows-10-activation-style **ghost watermark** — the product mark, the brand
@@ -60,7 +47,7 @@ use mackes_mesh_types::peers::default_workgroup_root;
 use crate::chooser::decode_png_rgba;
 use crate::dock::Surface;
 
-/// The installed wallpaper directory — QBRAND-9 drops all five official wallpapers
+/// The installed wallpaper directory — QBRAND drops the Construct wallpapers
 /// here in the RPM. The selected one is loaded from disk at runtime.
 const WALLPAPER_DIR: &str = "/usr/share/backgrounds/magic-mesh";
 
@@ -69,7 +56,7 @@ const WALLPAPER_DIR: &str = "/usr/share/backgrounds/magic-mesh";
 /// Only `WALLPAPER4` is carried — embedding all five would add ~6 MB to the binary,
 /// so the rest load from [`WALLPAPER_DIR`] (disk-honest, §4).
 const DEFAULT_WALLPAPER: &[u8] =
-    include_bytes!("../../../../assets/brand/MDE-QUAZAR-WALLPAPER4.png");
+    include_bytes!("../../../../assets/brand/CONSTRUCT-WALLPAPER4.png");
 
 /// The share subdirectory the per-seat wallpaper prefs record lives under
 /// (`<root>/wallpaper-prefs/<identity>/<seat>.json`) — the same layout
@@ -94,9 +81,8 @@ const STATUS_Y_FRAC: f32 = 0.74;
 /// wallpaper region (§4 token, never a raw hex).
 const STATUS_BACKING_ALPHA: f32 = 0.5;
 
-/// The watermark's product mark — the first, slightly larger ghost line
-/// (NAVBAR-W10 lock W12 names the product "MDE Quazar").
-const WATERMARK_PRODUCT: &str = "MDE Quazar";
+/// The watermark's product mark — the first, slightly larger ghost line.
+const WATERMARK_PRODUCT: &str = mde_theme::brand::logo::PRODUCT_NAME;
 
 /// The ghost emphasis of the watermark ink: [`Style::TEXT_DIM`] faded further to
 /// the Win10 "Activate Windows" register — visible over the artwork, never
@@ -142,19 +128,25 @@ pub(crate) enum Coverage {
     Covered,
 }
 
-/// One of the five official Quazar wallpapers (placement lock #12). `Four` is the
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusAnchor {
+    Low,
+    Center,
+}
+
+/// One of the five generated Construct wallpapers (placement lock #12). `Four` is the
 /// default; all five ship in the RPM as a selectable set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wallpaper {
-    /// `MDE-QUAZAR-WALLPAPER1.png`.
+    /// `CONSTRUCT-WALLPAPER1.png`.
     One,
-    /// `MDE-QUAZAR-WALLPAPER2.png`.
+    /// `CONSTRUCT-WALLPAPER2.png`.
     Two,
-    /// `MDE-QUAZAR-WALLPAPER3.png`.
+    /// `CONSTRUCT-WALLPAPER3.png`.
     Three,
-    /// `MDE-QUAZAR-WALLPAPER4.png` — the default desktop wallpaper (lock #12).
+    /// `CONSTRUCT-WALLPAPER4.png` — the default desktop wallpaper (lock #12).
     Four,
-    /// `MDE-QUAZAR-WALLPAPER5.png`.
+    /// `CONSTRUCT-WALLPAPER5.png`.
     Five,
 }
 
@@ -203,11 +195,11 @@ impl Wallpaper {
     /// The asset filename under [`WALLPAPER_DIR`].
     const fn filename(self) -> &'static str {
         match self {
-            Self::One => "MDE-QUAZAR-WALLPAPER1.png",
-            Self::Two => "MDE-QUAZAR-WALLPAPER2.png",
-            Self::Three => "MDE-QUAZAR-WALLPAPER3.png",
-            Self::Four => "MDE-QUAZAR-WALLPAPER4.png",
-            Self::Five => "MDE-QUAZAR-WALLPAPER5.png",
+            Self::One => "CONSTRUCT-WALLPAPER1.png",
+            Self::Two => "CONSTRUCT-WALLPAPER2.png",
+            Self::Three => "CONSTRUCT-WALLPAPER3.png",
+            Self::Four => "CONSTRUCT-WALLPAPER4.png",
+            Self::Five => "CONSTRUCT-WALLPAPER5.png",
         }
     }
 
@@ -217,20 +209,37 @@ impl Wallpaper {
     }
 }
 
-/// Paint the desktop wallpaper as the bottom-most layer of the current panel: the
-/// solid Carbon §4 field (the ultimate fallback), the selected wallpaper cover-filled
-/// over it, an eased cover scrim when a surface/window is open, and — when `status` is
-/// given — an honest status block placed low on the field.
+/// Paint the shell-colour backdrop as the bottom-most layer of the current panel:
+/// the solid Carbon §4 field, an eased cover scrim when a surface/window is open,
+/// and — when `status` is given — an honest status block placed low on the field.
 ///
 /// Call this FIRST in the panel body: it draws through the painter and consumes no
 /// layout, so the panel's other widgets lay out over it (a covered display's grid
 /// floats above the scrim).
 pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str)>) {
+    show_with_status_anchor(ui, coverage, status, StatusAnchor::Low);
+}
+
+/// Paint the backdrop with its honest status block centered in the workspace.
+/// Used by the Desktop chooser's empty state, where the status itself is the
+/// primary content rather than a secondary note under a session/backdrop.
+pub(crate) fn show_centered_status(
+    ui: &egui::Ui,
+    coverage: Coverage,
+    status: Option<(&str, &str)>,
+) {
+    show_with_status_anchor(ui, coverage, status, StatusAnchor::Center);
+}
+
+fn show_with_status_anchor(
+    ui: &egui::Ui,
+    coverage: Coverage,
+    status: Option<(&str, &str)>,
+    status_anchor: StatusAnchor,
+) {
     let free = ui.max_rect();
 
-    // The Carbon §4 field is painted first as the ultimate fallback: if neither the
-    // selected wallpaper nor the embedded default decodes, this honest solid field
-    // still stands (§7). A painter clone so `Image::paint_at` can still borrow `ui`.
+    // The Carbon §4 field is the background. No wallpaper image is painted here.
     let painter = ui.painter().clone();
     painter.rect_filled(free, 0.0, Style::BG);
 
@@ -238,19 +247,9 @@ pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str
     // every empty↔covered transition).
     let empty = coverage == Coverage::Empty;
     let reveal = Motion::animate(ui.ctx(), CROSSFADE_KEY, empty, Motion::SLOW);
-
-    // The desktop wallpaper, cover-filled to the display — aspect preserved, the
-    // overflow axis cropped via UV, never stretched. A missing/undecodable set falls
-    // through to the embedded default, then to the bare Carbon field above (§7).
-    if let Some(texture) = wallpaper_texture(ui.ctx()) {
-        let uv = cover_uv(free.size(), texture.size_vec2());
-        egui::Image::new(egui::load::SizedTexture::new(texture.id(), free.size()))
-            .uv(uv)
-            .paint_at(ui, free);
-        let scrim = (1.0 - reveal) * COVERED_SCRIM;
-        if scrim > f32::EPSILON {
-            painter.rect_filled(free, 0.0, Style::BG.gamma_multiply(scrim));
-        }
+    let scrim = (1.0 - reveal) * COVERED_SCRIM;
+    if scrim > f32::EPSILON {
+        painter.rect_filled(free, 0.0, Style::BG.gamma_multiply(scrim));
     }
 
     // NAVBAR-W10-3 (lock W12) — the brand watermark: three ghost lines in the
@@ -262,7 +261,7 @@ pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str
     // Any honest status (the empty-desktop copy, a gated-transport note) — a small
     // block low on the field, over a subtle backing so it reads over the artwork.
     if let Some((title, detail)) = status {
-        paint_status(&painter, free, title, detail);
+        paint_status(&painter, free, title, detail, status_anchor);
     }
 
     // Keep the frame alive while the cover-scrim crossfade is mid-flight.
@@ -298,9 +297,14 @@ const fn cover_uv(free: Vec2, tex: Vec2) -> Rect {
 /// Paint the status title + detail centred low on the field, over a subtle Carbon
 /// backing so the honest status stays legible over any wallpaper region (§4). The
 /// detail wraps to the free width so a long caption never runs off-panel.
-fn paint_status(painter: &egui::Painter, free: Rect, title: &str, detail: &str) {
+fn paint_status(
+    painter: &egui::Painter,
+    free: Rect,
+    title: &str,
+    detail: &str,
+    anchor: StatusAnchor,
+) {
     let center_x = free.center().x;
-    let top = free.height().mul_add(STATUS_Y_FRAC, free.top());
     let title_galley = painter.layout_no_wrap(
         title.to_owned(),
         FontId::proportional(Style::BODY),
@@ -316,6 +320,10 @@ fn paint_status(painter: &egui::Painter, free: Rect, title: &str, detail: &str) 
 
     let block_w = title_galley.size().x.max(detail_galley.size().x);
     let block_h = title_galley.size().y + Style::SP_XS + detail_galley.size().y;
+    let top = match anchor {
+        StatusAnchor::Low => free.height().mul_add(STATUS_Y_FRAC, free.top()),
+        StatusAnchor::Center => free.center().y - block_h / 2.0,
+    };
     let backing = Rect::from_center_size(
         egui::pos2(center_x, top + block_h / 2.0),
         egui::vec2(
@@ -746,15 +754,15 @@ fn watermark() -> &'static [String; 3] {
         .get_or_init(|| watermark_lines(&crate::discovery::local_peer(), resolve_role().as_deref()))
 }
 
-/// Fold the watermark's three ghost lines (lock W12): the product mark, the brand
-/// version line ([`brand::build::version_line`]), and the node identity —
+/// Fold the watermark's three ghost lines (lock W12): the product mark, the visible
+/// release line ([`brand::logo::PRODUCT_RELEASE`]), and the node identity —
 /// `<host> · <role>`, or the bare hostname when no role is pinned (honest
 /// omission, §7).
 fn watermark_lines(host: &str, role: Option<&str>) -> [String; 3] {
     let node = role.map_or_else(|| host.to_owned(), |role| format!("{host} · {role}"));
     [
         WATERMARK_PRODUCT.to_owned(),
-        brand::build::version_line(),
+        brand::logo::PRODUCT_RELEASE.to_owned(),
         node,
     ]
 }
@@ -802,9 +810,9 @@ mod tests {
     use mde_egui::egui::{pos2, vec2};
 
     /// Render one headless 960×640 frame of the backdrop and tessellate it on the
-    /// CPU — the same `Context::run` → `tessellate` path the DRM runner drives, minus
-    /// the GPU. Returns whether it drew primitives and whether the wallpaper texture
-    /// was cached (proving the one decode+upload happened).
+    /// CPU — the same `Context::run` → `tessellate` path the DRM runner drives,
+    /// minus the GPU. Returns whether it drew primitives and whether a wallpaper
+    /// texture was cached.
     fn run(coverage: Coverage, status: Option<(&str, &str)>) -> (bool, bool) {
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -837,13 +845,13 @@ mod tests {
         // Proves the embedded default (the bundled fallback) is a real, correctly
         // shaped image — not a stray/missing/mis-encoded file.
         let img = decode_png_rgba(DEFAULT_WALLPAPER).expect("the embedded default decodes");
-        assert_eq!(img.size, [1672, 941], "native WALLPAPER4 size");
+        assert_eq!(img.size, [1408, 768], "native Construct wallpaper size");
     }
 
     #[test]
-    fn an_empty_desktop_paints_the_wallpaper_and_caches_it() {
-        // The empty path: the wallpaper fills + a status block below, and the one
-        // texture upload is cached for reuse.
+    fn an_empty_desktop_paints_the_shell_color_without_wallpaper_cache() {
+        // The empty path: the shell field fills + a status block below. No
+        // wallpaper image is decoded or cached for the background.
         let (drew, cached) = run(
             Coverage::Empty,
             Some((
@@ -853,26 +861,66 @@ mod tests {
         );
         assert!(
             drew,
-            "the empty wallpaper backdrop produced no draw primitives"
+            "the empty shell-colour backdrop produced no draw primitives"
         );
         assert!(
-            cached,
-            "the wallpaper texture was not cached after the first paint"
+            !cached,
+            "the shell-colour background must not cache a wallpaper texture"
         );
     }
 
     #[test]
-    fn a_covered_desktop_still_paints_the_wallpaper_under_the_scrim() {
-        // The covered path: the wallpaper still fills (dimmed under the scrim) behind
-        // whatever content covers the display, with no status block.
+    fn a_covered_desktop_still_paints_shell_color_under_the_scrim() {
+        // The covered path: the shell field still fills behind whatever content
+        // covers the display, with no status block or wallpaper cache.
         let (drew, cached) = run(Coverage::Covered, None);
         assert!(
             drew,
-            "the covered wallpaper backdrop produced no draw primitives"
+            "the covered shell-colour backdrop produced no draw primitives"
         );
         assert!(
-            cached,
-            "the wallpaper texture was not cached on the covered path"
+            !cached,
+            "the covered shell-colour backdrop must not cache a wallpaper texture"
+        );
+    }
+
+    #[test]
+    fn centered_status_places_the_empty_desktop_copy_in_the_workspace_center() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let status = Some((
+            "No desktops discovered",
+            "No mesh peer, LAN endpoint, or local VM is advertising a desktop.",
+        ));
+
+        let low = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, Coverage::Empty, status));
+        });
+        let centered = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_centered_status(ui, Coverage::Empty, status);
+            });
+        });
+        let title_y = |out: &egui::FullOutput| {
+            frame_text(&out.shapes)
+                .into_iter()
+                .find_map(|(pos, text)| (text == "No desktops discovered").then_some(pos.y))
+                .expect("status title should paint")
+        };
+
+        let low_y = title_y(&low);
+        let centered_y = title_y(&centered);
+        assert!(
+            centered_y > 250.0 && centered_y < 360.0,
+            "centered empty status should sit near the workspace middle: {centered_y}"
+        );
+        assert!(
+            centered_y + 100.0 < low_y,
+            "centered status should move up from the old low anchor: centered={centered_y}, low={low_y}"
         );
     }
 
@@ -1036,8 +1084,8 @@ mod tests {
         assert_eq!(product, WATERMARK_PRODUCT);
         assert_eq!(
             version,
-            brand::build::version_line(),
-            "the version line is brand::build's, never a re-derived string"
+            brand::logo::PRODUCT_RELEASE.to_owned(),
+            "the visible release line is the brand constant, never a re-derived string"
         );
         assert_eq!(node, "eagle · workstation");
     }

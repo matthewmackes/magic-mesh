@@ -1,0 +1,64 @@
+---
+# WL-ARCH-006 (U13) — install Cuttlefish + cvd on an Android-VM and start it with
+# a VNC server.
+#
+# Per the plan's two-layer Android path (U9): the AndroidVm is a nested-KVM Debian
+# VM (host-passthrough CPU, ≥8G/≥4vcpu/≥80G). This role runs INSIDE that Debian VM
+# — it installs the android-cuttlefish host packages, puts the run user in the KVM
+# + cuttlefish-network groups, and launches `cvd start --start_vnc_server`. The
+# console is then VNC/WebRTC (the console-attach verb, U8). Because the Android VM
+# is a Debian base and not a mackesd mesh node, it is NOT in the cloud_vm group —
+# the base cloud_vm convergence does not run here.
+
+- name: Assert nested KVM is available (Cuttlefish needs /dev/kvm)
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: cuttlefish_kvm
+  failed_when: not cuttlefish_kvm.stat.exists
+
+- name: Install the android-cuttlefish host .deb packages
+  ansible.builtin.apt:
+    deb: "{{ item }}"
+  loop: "{{ cuttlefish_debs }}"
+  when: cuttlefish_debs | length > 0
+
+- name: Assert cvd is installed (from the debs above or a pre-baked golden image)
+  ansible.builtin.command: cvd version
+  register: cuttlefish_cvd_version
+  changed_when: false
+  failed_when: cuttlefish_cvd_version.rc != 0
+
+- name: Ensure the run user is in the kvm + cuttlefish-network groups
+  ansible.builtin.user:
+    name: "{{ cuttlefish_user }}"
+    groups: "{{ cuttlefish_groups }}"
+    append: true
+
+- name: Enable the cuttlefish host bridge/network services (if the debs shipped them)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: "{{ cuttlefish_host_services }}"
+  when: cuttlefish_host_services | length > 0
+
+- name: Check whether a cvd instance is already running (idempotency guard)
+  ansible.builtin.command: cvd status
+  register: cuttlefish_status
+  become: true
+  become_user: "{{ cuttlefish_user }}"
+  changed_when: false
+  failed_when: false
+
+- name: Start the Cuttlefish device with a VNC server
+  ansible.builtin.command: >-
+    cvd start --start_vnc_server
+    {% if cuttlefish_cpus is defined %} --cpus {{ cuttlefish_cpus }}{% endif %}
+    {% if cuttlefish_memory_mb is defined %} --memory_mb {{ cuttlefish_memory_mb }}{% endif %}
+  become: true
+  become_user: "{{ cuttlefish_user }}"
+  register: cuttlefish_start
+  changed_when: cuttlefish_start.rc == 0
+  # `cvd status` exits non-zero when no device is running — the honest idempotency
+  # guard: only start when nothing is already up.
+  when: cuttlefish_status.rc != 0

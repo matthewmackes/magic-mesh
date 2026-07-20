@@ -6,12 +6,12 @@
 #   park-worklist-item.sh --self-test
 #
 # The script edits exactly two durable tracker files:
-#   * docs/WORKLIST.md: [ ]/[>] TASK-ID -> [!]
+#   * docs/platform/WORKLIST.md: [ ]/[>] TASK-ID -> [!]
 #   * docs/NEEDS-OPERATOR.md: appends an idempotent blocker entry
 set -euo pipefail
 
 REPO="${MCNF_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
-WORKLIST="${MCNF_WORKLIST:-$REPO/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$REPO/docs/platform/WORKLIST.md}"
 NEEDS="${MCNF_NEEDS_OPERATOR:-$REPO/docs/NEEDS-OPERATOR.md}"
 DATE_="${MCNF_PARK_DATE:-$(date -u +%Y-%m-%d)}"
 

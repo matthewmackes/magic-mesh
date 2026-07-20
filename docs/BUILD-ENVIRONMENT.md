@@ -8,7 +8,7 @@
 
 There are **two surfaces**, but only one does heavy builds:
 
-1. **The build farm** (four Fedora VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
+1. **The build farm** (four **Fedora 42** VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and native farm RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
 2. **The local dev host** (`172.20.145.192`, Rocky 9.8) — **fmt / metadata / probe only.** Heavy local `cargo` is **hard-disabled** here by `cargo-farm-guard.sh` (installed ahead of the real `cargo` via `install-helpers/install-drain-guardrails.sh`): local `target/` dirs fill the disk and wedge the drain, so `build`/`test`/`check`/`clippy`/`run` exit 97 and redirect you to the farm. `fmt` still runs locally (`rustup run 1.94.0 rustfmt`). This host's gcc 11.5 rejects `mold` anyway — see §5 for the fresh-box gold-linker override.
 
 **AI directive:** all AI agents must use the build farm for build/test/gate work
@@ -18,6 +18,194 @@ independent verification across `.50` / `.90` / `.130` / `.170` using explicit
 Avoid containers when a direct farm-host fixture is enough. Farm/test hosts are
 safe for destructive reboot/recovery operations unless the task explicitly says
 otherwise.
+
+**Browser/runtime note (learned 2026-07-14):** the live build-VM addresses are
+the `172.20.0.x` farm lanes above; inherited `10.0.0.x` pins are stale and time
+out. For direct live probes outside `xcp-build.sh`, ssh as the build user with
+the mesh key (`ssh -i ~/.ssh/mackes_mesh_ed25519 mm@172.20.0.x`). CEF runtime
+probes currently have a warm bundle on `.50` at `$HOME/mde-cef-active`; do not
+assume `/opt/mde/cef` exists on generic farm VMs unless a packaging/install step
+has staged it.
+
+**RPM target-Fedora note (learned 2026-07-15):** all four farm build VMs
+currently report **Fedora 42**. Therefore `xcp-build.sh rpm` produces a native
+F42-linked RPM, even when the target workstation is Fedora 44. Do not install a
+native farm RPM on an F44 Workstation seat unless `rpm -Uvh --test` passes; media
+and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). For an F44
+workstation deploy, use the container lane with an explicit Fedora argument:
+`install-helpers/build-rpm-fedora43.sh 44` from a farm checkout, then copy the
+RPM from `target-f43/generate-rpm/`. The directory name is historical; the first
+positional argument controls the Fedora container tag. For the split Browser
+package, copy and install the base and Browser RPMs together and always run the
+transaction test first:
+`rpm -Uvh --test --replacepkgs --force --nosignature magic-mesh-*.rpm magic-mesh-browser-*.rpm`.
+The live `.15` proof on 2026-07-15 used exactly this lane and produced F44 RPMs
+at 70.0 MiB (`magic-mesh`) and 39.1 MiB (`magic-mesh-browser`), both under the
+90 MiB channel guard.
+
+**F44 locked-resolve note (learned 2026-07-17):** if
+`install-helpers/build-rpm-fedora43.sh 44` exits before compile with
+`cannot update the lock file /src/Cargo.lock because --locked was passed`, treat
+that as a release-lane hygiene blocker. Do not edit `MDE_RPM_LOCKED` to bypass
+the failure for a live seat deploy. Reconcile the committed `Cargo.lock` in a
+separate build/release change, then rerun the Fedora 44 container RPM lane and
+the split-package `rpm -Uvh --test` proof. The 2026-07-17 instance was a missing
+`mde-shell-egui` -> `tokio` lockfile edge, fixed by commit `955cacf9`; the
+follow-up BigBoy F44 lane produced the base and Browser RPMs under the size
+guard.
+
+**RPM deploy verification note (learned 2026-07-15):** run `rpm -Uvh --test`
+and the real `rpm -Uvh` as separate commands in an interactive sudo/TTY session.
+Do not paste a dry-run and real install as one buffered block: the dry-run can
+consume queued stdin and leave the old payload installed. After every Browser
+deploy, prove the exact helper payload before trusting a runtime failure:
+compare key `sha256sum` output against `rpm -q --dump magic-mesh-browser`, run
+`rpm -V magic-mesh-browser`, then run the installed
+`/usr/libexec/mackesd/browser-verify-engines`. For Browser click-through
+regressions where a page updates the location field but does not commit the
+clicked page, add
+`/usr/libexec/mackesd/browser-verify-engines --engine cef --link-navigation`
+before doing manual Google/News smoke on `.15`; it exercises the same helper
+wire with a deterministic clicked-link navigation target.
+
+**DRM shell live-restart note (learned 2026-07-15):** `mde-shell-egui.service`
+conflicts with `getty@tty1.service` and has an `ExecStopPost` that starts getty
+again for console recovery. A remote `systemctl restart mde-shell-egui.service`
+can cancel the start during the tty1 handoff and leave the shell unit inactive
+but not failed. For live `.15` deploys over SSH, check state after any restart;
+if the unit is inactive, issue a clean `systemctl start mde-shell-egui.service`
+as a separate command and let systemd resolve the getty conflict. Then confirm
+`systemctl is-active mde-shell-egui.service`, `MainPID`, `ExecMainStartTimestamp`,
+`NRestarts=0`, and the installed `/usr/bin/mde-shell-egui` hash. This is a
+service orchestration gotcha, not a Browser helper/runtime failure.
+
+**CEF sandbox live-inspection note (learned 2026-07-15):** when proving CEF OS
+confinement on a live seat, do not use the `/usr/bin/mde-web-cef` launcher PID
+or the immediate renderer fork supervisor as the security evidence. Hold a real
+`/usr/bin/mde-web-cef tab` open, then inspect the sandboxed
+`mde-web-cef-renderer` browser child and its Chromium `--type=zygote` /
+`--type=utility` descendants. The expected proof is `NoNewPrivs: 1`,
+`Seccomp: 2`, zero `CapPrm`/`CapEff`/`CapBnd`, absent `/home`, `/root`,
+`/etc/nebula`, `/etc/mackesd`, `/mnt/mesh-storage`, and host D-Bus sockets under
+`/proc/<pid>/root`, while `/opt/mde/cef` and the private
+`/tmp/mde-web-cef/{home,cache}` tree are visible. Kill the held probe by its
+process group afterward and verify no CEF/verifier processes remain.
+
+**Browser cgroup-cap note (learned 2026-07-15):** cgroup v2 domain controllers
+cannot be enabled under a cgroup that still contains processes. Therefore
+`Delegate=yes` alone is insufficient for `mde-shell-egui.service`: the shell
+process must run in a stable child subgroup (`DelegateSubgroup=shell`), and the
+unit must export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell` so CEF and Servo
+sandbox helpers can place capped `mde-web-*` leaves under the delegated service
+root, not under the busy shell subgroup. The expected proof is a live
+systemd-delegated run with no `cgroup limits not applied` warning and with
+`memory.max`/`cpu.max` populated on the helper leaf. Ad-hoc SSH/user-session
+launches are not systemd-delegated and may still log the degraded-cgroup warning;
+that does not prove or disprove the production DRM-shell path.
+The live `.15` closure used this contract: the shell PID was under
+`/system.slice/mde-shell-egui.service/shell`, the service root `cgroup.procs` was
+empty, CEF proved `memory.max=2147483648` / `cpu.max=200000 100000`, and Servo
+proved `memory.max=1073741824` / `cpu.max=80000 100000`.
+
+**Browser SELinux loader/Enforcing note (learned 2026-07-15):** do not claim a
+Browser SELinux domain until the installed binaries are labelled
+`mde_web_cef_exec_t` / `mde_web_preview_exec_t` and `semodule -l` shows
+`mde_web_cef` / `mde_web_preview`. The policy source filenames are hyphenated
+(`mde-web-cef.te`, `mde-web-preview.te`), but the module names declared by
+`policy_module()` use underscores; the loader scripts must stage the sources as
+`mde_web_cef.te` / `mde_web_preview.te` before calling
+`/usr/share/selinux/devel/Makefile`. The Browser RPM can start the CEF and Servo
+SELinux setup units concurrently from `%post`; serialize `semodule -i` with the
+shared `/run/lock/mde-browser-selinux.lock` lock or one loader can lose the
+global SELinux module-store race and falsely report the policy unloaded. On a
+live split Browser RPM install,
+enabling the setup units is insufficient because the boot-time units may already
+have skipped; the Browser `%post` must queue
+`systemctl start --no-block $BROWSER_UNITS`. For F44 Enforcing workstation
+proofs, verify `getenforce`, labels, loaded modules, run the installed
+`/usr/libexec/mackesd/browser-verify-engines` from per-run sandbox roots (it wraps
+`MDE_BROWSER_VERIFY_INPUT=1 /usr/libexec/mackesd/cef-verify` for both
+`/usr/bin/mde-web-cef` and `/usr/bin/mde-web-preview` and checks helper cleanup),
+then confirm `ausearch -m AVC,USER_AVC` has no matches for each final verifier
+window and no helper processes remain. Normal helper exits should not add new
+per-run `/tmp/.mde-web-*-root-<pid>-<run>` directories; only hard-kill/crash
+residue should remain, and per-run naming keeps that residue from poisoning the
+next launch.
+
+**Servo/browser test note (learned 2026-07-15):** cold Servo test builds can
+exhaust a 4-vCPU farm VM's disk through Rust incremental/query-cache output even
+when the source is fine. Put Servo tests/checks on BigBoy (`172.20.0.130`) when
+they are the long pole, and set `CARGO_INCREMENTAL=0` if a previous run hit
+ENOSPC. Treat `.50`/`.90`/`.170` ENOSPC during rsync or `target/` writes as a
+slot-capacity problem: remove only disposable `~/magic-mesh-farm-*` slots you
+created, then rerun the heavy job on BigBoy. Do not keep duplicate cold
+small-node filters running after an equivalent warmed BigBoy slot has already
+covered the assertion; cancel or clean the duplicate slot so the farm stays
+usable for the next gate.
+As of the 2026-07-15 Browser tab-polish pass, `.90` and `.170` both reported
+`/home` at 100% before compilation during fresh-slot rsync, largely due to the
+shared `~/magic-mesh-farm` plus stale heavy slots. Check `df -h /home` before
+using those lanes for new Browser/shell fanout; if they are full, clean only
+your disposable failed slot and route the shell test to a warmed BigBoy slot.
+
+**BigBoy slot hygiene note (learned 2026-07-15):** BigBoy's build VM currently
+has a 79G `/home`; it is the right long-pole target, but several cold heavy
+slots can still fill it. Reuse a warm BigBoy slot for follow-up tests when it
+already contains the needed dependency graph, and remove only your finished or
+failed disposable `~/magic-mesh-farm-*` slots promptly before starting another
+cold heavy crate there. A cold F44 container RPM build that includes Servo can
+also exhaust stale shared output under `~/magic-mesh-farm/target`; if BigBoy is
+near full, check `df -h /home` and `du -sh ~/magic-mesh-farm/target
+~/magic-mesh-farm-*`, then remove only disposable slots or stale shared build
+output before retrying the long-pole package build. If direct reuse is needed
+after an `xcp-build.sh` sync, SSH to the same slot and run the focused cargo
+command there with `CARGO_INCREMENTAL=0`.
+
+**Env-gated live smoke note (learned 2026-07-15):** `xcp-build.sh cargo ...`
+accepts only Cargo arguments after the `cargo` subcommand and does not forward
+arbitrary local `MDE_*` smoke variables into the remote command. For Browser
+live UI probes such as `MDE_CEF_LIVE_UI_SMOKE=1` or
+`MDE_SERVO_LIVE_UI_SMOKE=1`, first sync/build the slot with `xcp-build.sh cargo
+test ...`, then SSH into the synced `~/magic-mesh-farm-<slot>` directory and run
+the env-prefixed `cargo test` directly on that farm host. Do the same direct-SSH
+step for non-Cargo shell probes/checks; `xcp-build.sh` subcommands are the
+documented `sync`, `cargo`, `gates`, `rpm`, `pull`, `shell`, and route helpers,
+not arbitrary remote command names.
+
+**Farm command quoting note (learned 2026-07-15):** `xcp-build.sh cargo ...`
+runs the requested cargo command through the remote shell. Avoid unescaped shell
+metacharacters in test filters (`|`, `&&`, `;`, redirects) unless you intend the
+remote shell to interpret them. Prefer one simple Cargo test filter per farm job
+or a direct SSH command from inside the synced slot when a complex expression is
+really needed.
+
+**Parallel slot reuse note (learned 2026-07-15):** do not start two
+`xcp-build.sh` sync/cargo jobs against the same `MCNF_BUILD_SLOT` concurrently;
+their rsync phases can collide on transient files and fail with code 23. Use
+distinct slots for parallel fanout, or wait for the first sync/build to finish
+and then SSH into that warmed slot for follow-up env-gated probes.
+
+**Nested CEF workspace note (learned 2026-07-15):** `crates/desktop/mde-web-cef`
+is a standalone nested Cargo workspace, not a package in the repo-root workspace.
+Farm cargo gates for it must use `--manifest-path crates/desktop/mde-web-cef/Cargo.toml`
+instead of `-p mde-web-cef`; `-p mde-web-cef` from the repo root will fail before
+compiling.
+
+**Browser optional setup retryability note (learned 2026-07-15):** Browser
+asset setup units that use `SuccessExitStatus=78` for intentionally unconfigured
+operator manifests must not also use `RemainAfterExit=yes`. Exit 78 means "not
+configured yet", not "provisioning complete"; keeping those units inactive after
+the clean gate lets `systemctl start mde-widevine-cdm-setup.service` and the
+TTS/STT/translation model setup units retry normally after an operator fills the
+licensed URL/SHA or approved model manifest.
+Upgrade caveat from the `.15` split-RPM deploy: a host that previously loaded
+the old `RemainAfterExit=yes` units can keep a legacy `active (exited)` state
+even after new unit files are installed and `daemon-reload` runs. Browser RPM
+post-install must clear that stale retryable state before queueing the setup
+units: if `systemctl show "$unit" -p ExecMainStatus --value` is `78`, stop the
+unit once, then start the setup group. After that one-time state clear, the
+corrected units settle to `inactive/dead` with `ExecMainStatus=78` and remain
+retryable.
 
 **Bench-test directive (operator 2026-07-07):** exclude **Eagle** from bench
 testing. Use the other two available bench seats for bench verification. Those
@@ -106,6 +294,11 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 > ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. The real farm is **4 build VMs: .50 / .90 / .130 / .170** (there are no live `.51`/`.52` IPs — probing them gives "No route to host"). The non-BigBoy build hostnames are descriptive (`mcnf-build-home-services`, `mcnf-build-kvm-xcp1`, `mcnf-build-xen-194`); BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2 = 9** (not 7).
 
+> Stale `10.0.0.x` build-host pins are invalid on this farm and should be
+> treated as doc/agent drift. Run `install-helpers/farm.sh status` or
+> `install-helpers/farm-topology.sh table`, then use the verified `172.20.0.x`
+> address explicitly.
+
 > **Standing rule (operator 2026-06-30): BigBoy takes the longest / most-complex build.** The single heaviest job always routes to **XEN-BIGBOY** (`172.20.0.130`, 12 vCPU / ~20 GiB — the high-capacity node): a full `cargo --workspace` build/test/clippy, the biggest egui crate (`mde-shell-egui`), a cold egui/eframe/wgpu compile, or the RPM release build (`MCNF_BUILD_SHAPE=big` / an explicit `MCNF_BUILD_HOST=172.20.0.130`). The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs. This composes with the per-node concurrency cap: spread the *count* to honor caps, but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI build on a small node while BigBoy runs a trivial one.
 
 ### Credentials (locations only — never in-repo)
@@ -154,9 +347,10 @@ idempotently (it skips a job whose result already matches a clean HEAD).
 
 - Jobs are parsed by `automation/lib/farm-jobs.sh` (only open/in-progress tasks are
   active); dispatched by `automation/lib/farm-dispatch.sh` to a free node
-  (per-node flock, big-iron-first), built **with shared sccache** (BUILD-PLATFORM-1),
-  result recorded as JSON + (via the `farm_orchestrator` worker) published to the
-  Bus → the Workbench **Build Farm** panel.
+  (per-node flock, big-iron-first), and the intended BUILD-PLATFORM-1 path is to
+  build with shared sccache once WL-BUILD-002 is complete. Current agents must
+  verify that contract with `install-helpers/farm-sccache-proof.sh status`
+  before claiming cross-node cache behavior.
 - The reconciler is the *canonical* lane; the other FARM-AUTO capabilities (Forgejo
   on push, etcd pull-agents, the mackesd worker) are alternates over the same substrate.
 - Design + rationale: [`docs/design/build-platform.md`](design/build-platform.md).
@@ -204,6 +398,25 @@ Another AI/operator can rebuild the whole thing from this repo:
 | `cloud-localds` missing on EL9 | not packaged | build the seed with `genisoimage` |
 | can't mount a VM's `/etc` from dom0 | btrfs **top-level** ≠ root; real `/etc` is under the `root/` subvol; RO mount can't replay a dirty journal | mount `root/` subvol **RW** (`docs/farm.md` disk-surgery) |
 | new VM halts after a host reboot | XCP gates auto-start on VM **and** pool flags | `other-config:auto_poweron=true` on both |
+| farm ssh with the default key/user fails | direct probes need the mesh key and the build user | `ssh -i ~/.ssh/mackes_mesh_ed25519 mm@172.20.0.x` |
+| `xcp-build.sh bash ...` prints the usage banner | `xcp-build.sh` is not an arbitrary remote-shell wrapper; use `xcp-build.sh cargo ...` or `sync`, then SSH into `~/magic-mesh-farm-<slot>` with the farm key for live/runtime probes | intro "Env-gated live smoke note" |
+| farm job hangs on `10.0.0.x` | inherited build-host pin from stale docs/agent memory | verify with `install-helpers/farm.sh status`; use `.50` / `.90` / `.130` / `.170` |
+| CEF live probe says `/opt/mde/cef` is missing on a farm VM | farm build VMs do not all have the packaged runtime staged under `/opt`; `.50` currently has the warm live bundle in `$HOME/mde-cef-active` | set `MDE_CEF_ROOT=$HOME/mde-cef-active` for `.50` probes, or run the packaging installer before using `/opt/mde/cef` |
+| `cargo test -p mde-web-cef` says the package does not match any packages | `mde-web-cef` is a nested standalone workspace outside the repo-root workspace package set | run through the farm with `cargo test --manifest-path crates/desktop/mde-web-cef/Cargo.toml ...` |
+| rsync code 23 while renaming a transient provider file in a farm slot | two `xcp-build.sh` jobs reused the same `MCNF_BUILD_SLOT` concurrently | use distinct slots for parallel jobs, or serialize the `xcp-build.sh` sync/build and direct-SSH into the warmed slot afterward |
+| native farm RPM dependency check fails on an F44 Workstation | the farm VMs are Fedora 42, so `xcp-build.sh rpm` emits an F42-linked/native-dependency RPM; F44 Workstations can have newer FFmpeg/ICU/Python sonames instead | cut the workstation RPM in the Fedora container lane, e.g. `install-helpers/build-rpm-fedora43.sh 44`, then prove it with `rpm -Uvh --test` before install |
+| Browser verifier still shows the old failure after an RPM install | an interactive dry-run/install paste may have let `rpm -Uvh --test` consume the queued real install, or only part of the split payload was replaced | run dry-run and install as separate commands; verify helper hashes with `sha256sum` plus `rpm -q --dump magic-mesh-browser`, then run `rpm -V magic-mesh-browser` before debugging runtime behavior |
+| Browser verifier passes but leaves new `/tmp/.mde-web-*-root-<pid>-<run>` directories after ordinary exit | the child cleaned its private `/oldroot` mount but not the host-visible old-root mountpoint before detaching it | normal exits should remove the old-root mountpoint before `umount2(\"/oldroot\", MNT_DETACH)`; compare `find /tmp -name '.mde-web-*-root-[0-9]*-[0-9]*'` before/after a verifier run and expect no new entries |
+| `.170` returns ENOSPC despite a warm default checkout | stale per-slot `~/magic-mesh-farm-*` / `cef-*` directories can consume the VM disk | remove only stale disposable slot dirs; keep the shared warm `~/magic-mesh-farm` unless intentionally resetting cache |
+| focused `mde-shell-egui` tests ENOSPC on a fresh `.90` slot | the shell crate can still compile a broad desktop dependency fanout before reaching a narrow test filter | put the long shell/browser compile on BigBoy `.130` or reuse a warmed slot; clean the failed disposable slot before retrying |
+| Browser helper labels remain `bin_t` after installing `magic-mesh-browser` | SELinux setup units were enabled but never started on the already-booted seat, or the policy loader failed before relabeling | start the Browser setup units non-blocking from `%post`; verify `semodule -l` and `ls -Z /usr/bin/mde-web-cef /usr/bin/mde-web-preview /usr/libexec/mackesd/mde-web-cef-renderer` |
+| Browser SELinux loader reports no toolchain despite policy packages being installed | the module build can fail when the output stem is hyphenated but `policy_module()` declares an underscore module name | stage `mde-web-cef.te` as `mde_web_cef.te` and `mde-web-preview.te` as `mde_web_preview.te` before the SELinux devel Makefile |
+| One Browser SELinux setup unit reports `semodule -i failed` while the other succeeds during Browser RPM `%post` | CEF and Servo setup units can run concurrently, and `semodule` writes share one global SELinux module store | serialize policy loads with `/run/lock/mde-browser-selinux.lock`; a serial rerun should load both `mde_web_cef` and `mde_web_preview` and relabel the helpers |
+| Browser reopens enough restored tabs to freeze the seat | stale `browser-session-sync` snapshots or queued send-tab replay can enqueue many live helper spawns before the UI is usable | stop `mde-shell-egui.service`, kill Browser helpers, quarantine `/root/.local/share/mde/browser-session-sync`, `/mnt/mesh-storage/browser-session-sync/<host>`, `/mnt/mesh-storage/browser-send-tab/node/<host>`, and `/run/mde-bus/action/browser/session-sync`, then restart the shell; the shell startup path should cap eager opens so a poisoned snapshot or inbox cannot spawn an unbounded helper storm |
+| Enforcing Browser verifier fails in sandbox rootfs setup | the policy is missing a specific mount/remount/tmpfs permission, or the helper did not derive a per-run `/tmp/.mde-web-*-root-<pid>-<run>` mountpoint | do not accept manual deletion as the durable fix; confirm the installed helper is new enough to use per-run rootfs mountpoints, rerun `/usr/libexec/mackesd/browser-verify-engines`, and tune from `ausearch -m AVC,USER_AVC` for that exact window; final proof requires a fresh per-run root pass and no AVCs |
+| Browser sandbox logs `cgroup limits not applied ... Permission denied` under the DRM shell | `Delegate=yes` delegated the service cgroup, but the shell process lived in the service root, so cgroup v2 refused `+memory +cpu` with `EBUSY` | run the shell in `DelegateSubgroup=shell`, export `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, and have helpers create capped leaves under the delegated parent service cgroup |
+| BigBoy F44 RPM build hits ENOSPC during cold Servo/helper compilation | stale heavy slots or shared `~/magic-mesh-farm/target` can consume most of the 79G `/home` even on the high-capacity build VM | clean only disposable slots/stale build output you own, verify free space, then rerun the F44 container RPM build on BigBoy |
+| F44 container RPM fails immediately with `cannot update the lock file /src/Cargo.lock because --locked was passed` | the full dependency resolve inside the Fedora container wants to refresh the committed lockfile, so the release `--locked` gate is doing its job | do not disable `MDE_RPM_LOCKED`; reconcile and commit the lockfile under WL-BUILD-003, then prove `build-rpm-fedora43.sh 44` and the split-package transaction test |
 
 ---
 
@@ -229,7 +442,7 @@ install on an older release.
 - Proven in-repo: an RPM built on the **Fedora 44** toolchain auto-required
   **`GLIBC_2.43`** and would not `dnf install` on Fedora 43; rebuilding inside a
   `fedora:43` container dropped the requirement to unversioned `libc.so.6`
-  (`install-helpers/build-rpm-fedora43.sh:4-9`; `docs/WORKLIST.md:476`, ONBOARD-7).
+  (`install-helpers/build-rpm-fedora43.sh:4-9`; `docs/platform/WORKLIST.md:476`, ONBOARD-7).
 - Corollary (**the invariant**): **every `fedora-N` channel directory must be
   fed an RPM built on a glibc no newer than Fedora N's.** The channel baseurl is
   `fedora-$releasever-$basearch` (`packaging/repo/magic-mesh.repo`), so each
@@ -252,10 +465,10 @@ against the distro before relying on it.
 |---|---|---|---|---|
 | **bootc immutable image base** | **42** | `packaging/bootc/Containerfile:53` (`ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42`) | "matches the fleet's RPM channel … mesh-service container is FROM fedora:42 too" (`Containerfile:50-52`); `--build-arg BOOTC_BASE=…` for an F43+ rebase (`:52`) | The **oldest** live target → the effective glibc **floor**. Anything installed *into* this image (RPM + layered dnf pkgs) must not require a glibc newer than F42's. |
 | **Canonical container RPM cut** | **43** (default) | `install-helpers/build-rpm-fedora43.sh:43` (`FEDORA="${1:-43}"`) | Builds the RPM inside a `fedora:43` container so its glibc `Requires` match F43 and it installs on F43 lighthouses / older cloud images (`:4-9`) | Produces an RPM installable on **F43 and newer** (forward-compat). Positional arg overrides the version. |
-| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**44** per WORKLIST) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora VMs … gcc 15"); farm VMs are F44 per `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)") | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc (F44 → `GLIBC_2.43`)** → the artifact may **not** install on F42/F43 unless its shipped ELFs stay ≤ that target's symbols. ⚠ un-enforced. |
+| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**42** current) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora 42 VMs"); verify live with `install-helpers/farm.sh status` + `/etc/fedora-release` before relying on it | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc and native library sonames**. Today this is an F42 artifact; it is not a safe F44 Workstation artifact when FFmpeg/ICU/Python sonames differ. For F44 seats, use `install-helpers/build-rpm-fedora43.sh 44` and `rpm -Uvh --test`. |
 | **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
 | **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
-| **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/WORKLIST.md:1132`). |
+| **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/platform/WORKLIST.md:1132`). |
 | **DO lighthouse droplet** | **43** | `infra/tofu/zone1-do/variables.tf:16` (`default = "fedora-43-x64"`) | Lighthouse cloud image; "must have a live dnf channel for its releasever — fedora-42 has none" (`install-helpers/do-lighthouse-up.sh:19-20`) | Needs the F43-container RPM (`build-rpm-fedora43.sh`) or a channel `fedora-43` dir. |
 | **Local dev host** | **EL9 / Rocky 9.8** (not Fedora) | `docs/BUILD-ENVIRONMENT.md:12,67` | Orchestration + tight local build loops; gcc 11.5 (gold linker) | Builds workspace binaries, **not** release RPMs (its glibc is EL9's, unrelated to the Fedora channel). |
 
@@ -265,14 +478,19 @@ Per the change discipline (a bootc base bump is load-bearing), **no version
 default was altered** while documenting this. The following divergences are real;
 each is left in place and flagged for the owner rather than "aligned" blindly:
 
-1. **F42 image base vs F43 canonical RPM vs F44 farm/CI — no enforced baseline.**
+1. **F42 image/farm vs F43 canonical RPM vs F44 CI/workstations — no enforced baseline.**
    The glibc-forward rule (7.1) says the canonical RPM should be built on the
    **oldest** live target (today **F42**, the bootc base), yet the canonical
-   script defaults to **F43** and native/CI cuts run on **F44**. Whether this
-   spread is deliberate (F43 chosen as the lighthouse floor, F42 image tolerated
-   via the local lane below) or drift is **not determinable from the code** — it
-   is maintained by operator memory. **Owner call needed:** pick one canonical
-   build baseline and enforce it. This is exactly the P1 finding
+   script defaults to **F43**, native farm cuts currently run on **F42**, and CI
+   plus the live Workstation seat can be **F44**. Glibc compatibility is only
+   one part of this: media/ICU/Python sonames also vary by Fedora release, as
+   the 2026-07-15 `.15` deploy proved when a native F42 farm RPM failed the F44
+   dependency check and the Fedora 44 container-cut RPM passed. Whether this
+   spread is deliberate (F43 chosen as the lighthouse floor, F42 image/farm
+   retained as the oldest baseline, F44 served as a Workstation channel) or drift
+   is **not determinable from the code** — it is maintained by operator memory.
+   **Owner call needed:** pick one canonical build baseline per target channel
+   and enforce it. This is exactly the P1 finding
    `build-deploy-4` in `docs/review/PLATFORM-REVIEW-2026-07-10.md` (§719-725),
    whose recommendation — a committed `FLEET-BASELINE` file driving the RPM
    version + a `verify-rpm.sh` gate asserting `rpm -qpR | grep GLIBC ≤ baseline`
@@ -288,24 +506,24 @@ each is left in place and flagged for the owner rather than "aligned" blindly:
    `packaging/bootc/rpms/`), and the channel lane is gated on the operator
    `/release` publish (`packaging/bootc/README.md:175-181`;
    `install-helpers/do-lighthouse-up.sh:19-20`). **Caveat that keeps this on the
-   list:** the local lane stages a **farm-built (F44)** RPM into an **F42** image —
-   which only installs while that build's ELFs stay ≤ F42's glibc symbols (7.1);
-   nothing enforces it. QC-1 (2026-07-10) installed fine, but that is luck of the
-   symbol set, not a guarantee.
+   list:** the local lane stages whichever RPM the operator/farm produced into
+   an **F42** image. Today the native farm cut is also F42, but container-cut
+   RPMs can target F43/F44 explicitly, and nothing enforces that the staged RPM
+   matches the image/channel before bootc build time.
 
 3. **`build-rpm-fedora43.sh:4` calls the dev host "The F44 dev host".** The
    canonical dev host is **Rocky 9.8 / EL9** (`docs/BUILD-ENVIRONMENT.md:12`), not
-   F44. The script's glibc mechanism is still correct (a newer-glibc *native*
-   build — today the **F44 farm VM**, not the EL9 dev host — is what over-pins the
-   RPM), but the "F44 dev host" wording is stale. Minor; flagged so a reader does
-   not trust it as the current dev-host fact.
+   F44. The script's mechanism is still useful: it lets the farm cut an RPM
+   inside a Fedora container whose tag is chosen explicitly, instead of inheriting
+   the host's Fedora release and dependency sonames. The "F44 dev host" wording is
+   stale. Minor; flagged so a reader does not trust it as the current dev-host
+   fact.
 
-4. **The farm VM Fedora version is not pinned in this doc.** §1/§3 describe the
-   farm VMs only as "four Fedora VMs … gcc 15"; the F44 figure used above comes
-   from `docs/WORKLIST.md:1132` ("MDE-VM-1/2/3/4 (F44)"), not from a pinned field
-   here. Since the native RPM cut inherits the farm VM's glibc, the farm VM's
-   Fedora release is load-bearing and should be pinned explicitly (in the golden
-   template / ansible) once the baseline in (1) is chosen.
+4. **The farm VM Fedora version is load-bearing.** This doc now records the
+   live 2026-07-15 farm state as Fedora 42, but the native RPM cut still inherits
+   whatever release the farm image actually runs. Keep this doc, the farm image
+   template, and channel policy synchronized whenever the farm OS changes; do not
+   treat a native RPM as channel-neutral without an explicit dependency test.
 
 > **Reviewer line-number note:** `docs/review/PLATFORM-REVIEW-2026-07-10.md:720`
 > cites `dnf-channel-up.sh:31` for the `FEDORAS='43 44'` default; in the current

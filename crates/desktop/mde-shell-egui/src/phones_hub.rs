@@ -9,7 +9,7 @@
 //! same Bus RPC path the `IaC` + Fleet surfaces use. Nothing here reimplements the
 //! host, the pairing store, or the transport — the surface only presents + drives.
 //!
-//! Four tabs (Carbon-inspired Quasar-dark cards, §4):
+//! Four tabs (Carbon-inspired dark platform cards, §4):
 //! * **Phones** — the paired-phone roster: mesh identity, live signal + battery,
 //!   the per-feature toggles, and the per-phone actions (ring · send clipboard ·
 //!   browse the phone · unpair fast + mesh-wide).
@@ -20,12 +20,13 @@
 //!   bundle + the KDC-MESH-8 `OpenStack` lifecycle set, with the #16 blast-radius
 //!   flag) + a composer that emits a `runcommands.toml` stanza to drop on a node.
 //! * **Pair** — the pair-a-phone flow: the KDE Connect device name the phone sees
-//!   (the "Quasar Mesh" endpoint name when this node is the mesh-fanout endpoint,
+//!   (the "Construct Mesh" endpoint name when this node is the mesh-fanout endpoint,
 //!   #8), the reachable overlay address, and the scannable KDC-MESH-4 QR payload.
 //!   The payload carries both the daemon-published mesh enroll token and the KDC
 //!   pairing token when available; until a fresh token is published, the QR
 //!   honestly carries `enroll:null` and labels that leg pending (§7).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +36,11 @@ use mde_egui::Style;
 use qrcode::{types::Color, EcLevel, QrCode};
 
 use mackes_mesh_types::peers::default_workgroup_root;
+// WL-FUNC-008 — the unified service provenance/health record, shared with the
+// mackesd `service_aggregator` worker that publishes `state/services/<node>`.
+use mackes_mesh_types::service_record::{
+    ServiceHealth, ServiceProvenance, ServiceRecord, ServicesState,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
@@ -44,8 +50,15 @@ use crate::bus_reader::BusReader;
 /// How often the hub refreshes the roster + the service directory while in view.
 const REFRESH: Duration = Duration::from_secs(2);
 
+/// WL-FUNC-008 — the per-node unified-service mirror topic prefix
+/// (`state/services/<node>`) the `service_aggregator` worker publishes. Every
+/// node's mirror carries the mesh-wide merge, so the view folds every one it sees.
+const SERVICES_STATE_PREFIX: &str = "state/services/";
+
 /// How long a verb request waits for its reply before the note goes honest-timeout.
 const VERB_TIMEOUT: Duration = Duration::from_secs(6);
+const UNPAIR_HOVER_TIP: &str = "Removes this phone from the whole mesh";
+const PHONES_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 /// The KDC overlay port every host binds (mirrors `kdc_host::KDC_PORT`) — shown in
 /// the pairing address.
@@ -57,7 +70,7 @@ const MESH_NAME_PREFIX: &str = "MDE-MESH";
 
 /// The single device name the designated mesh-fanout endpoint advertises to stock
 /// KDE Connect (mirrors `mde_kdc_host::fanout::MESH_ENDPOINT_NAME`, #8).
-const MESH_ENDPOINT_NAME: &str = "Quasar Mesh";
+const MESH_ENDPOINT_NAME: &str = "Construct Mesh";
 
 /// KDC-MESH-4 — latest-wins short-TTL mesh enroll token for the Pair QR. Minting
 /// stays in the onboard path; the hub only consumes the worker-published state.
@@ -152,17 +165,25 @@ enum HubTab {
     #[default]
     Phones,
     Files,
+    Services,
     Commands,
     Pair,
 }
 
 impl HubTab {
-    const ALL: [Self; 4] = [Self::Phones, Self::Files, Self::Commands, Self::Pair];
+    const ALL: [Self; 5] = [
+        Self::Phones,
+        Self::Files,
+        Self::Services,
+        Self::Commands,
+        Self::Pair,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Phones => "Phones",
             Self::Files => "Files",
+            Self::Services => "Services",
             Self::Commands => "Commands",
             Self::Pair => "Pair",
         }
@@ -259,6 +280,10 @@ pub struct PhonesHubState {
     roster_pending: Option<PendingVerb>,
     /// The mesh service directory, folded from `<workgroup>/kdc-services/*.json`.
     nodes: Vec<NodeMirror>,
+    /// WL-FUNC-008 — the unified service set, folded from every `state/services/*`
+    /// mirror the `service_aggregator` worker publishes (provenance + health + the
+    /// upgrade of the bare directory `Vec<String>`).
+    service_records: Vec<ServiceRecord>,
     /// Which tab is showing.
     tab: HubTab,
     /// The desktop-side feature toggles (design #13).
@@ -284,6 +309,9 @@ pub struct PhonesHubState {
     published_pair_enroll: Option<PairEnrollToken>,
     /// The in-flight daemon mint request for [`PAIR_ENROLL_TOKEN_ACTION`].
     pair_enroll_pending: Option<PendingVerb>,
+    /// WL-SEC-004 — the seated-user arm/disarm consent control for phone remote
+    /// input. Publishes to the seat worker's `ARM_TOPIC`; reflects its indicator.
+    remote_input: crate::seat_remote_input_consent::RemoteInputConsent,
 }
 
 impl Default for PhonesHubState {
@@ -296,6 +324,7 @@ impl Default for PhonesHubState {
             devices: Vec::new(),
             roster_pending: None,
             nodes: Vec::new(),
+            service_records: Vec::new(),
             tab: HubTab::default(),
             features: FeatureToggles::default(),
             clip_draft: std::collections::HashMap::new(),
@@ -307,6 +336,7 @@ impl Default for PhonesHubState {
             pair_enroll_token: String::new(),
             published_pair_enroll: None,
             pair_enroll_pending: None,
+            remote_input: crate::seat_remote_input_consent::RemoteInputConsent::default(),
         }
     }
 }
@@ -376,7 +406,10 @@ impl PhonesHubState {
         if due {
             self.last_refresh = Some(Instant::now());
             self.refresh_directory();
+            self.refresh_services();
             self.refresh_pair_enroll_token();
+            // WL-SEC-004 — reflect the seat worker's live arm indicator (read-only).
+            self.remote_input.refresh(self.bus_root.as_deref());
             if self.roster_pending.is_none() {
                 self.request_roster();
             }
@@ -388,6 +421,33 @@ impl PhonesHubState {
     /// scan, KDC-MESH-7) — every node's published KDC services + shared-roots snapshot.
     fn refresh_directory(&mut self) {
         self.nodes = collect_nodes(&self.workgroup_root);
+    }
+
+    /// WL-FUNC-008 — re-fold the unified service set off every `state/services/*`
+    /// mirror the `service_aggregator` worker publishes, through the shared BusReader
+    /// seam. A missing/unopenable spool clears the set (the honest off-mesh state, §7).
+    fn refresh_services(&mut self) {
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
+            self.service_records = Vec::new();
+            return;
+        };
+        let topics = persist.list_topics().unwrap_or_default();
+        let mut states = Vec::new();
+        for topic in topics
+            .iter()
+            .filter(|t| t.starts_with(SERVICES_STATE_PREFIX))
+        {
+            if let Ok(Some(msg)) = persist.read_latest(topic) {
+                if let Some(state) = msg
+                    .body
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<ServicesState>(b).ok())
+                {
+                    states.push(state);
+                }
+            }
+        }
+        self.service_records = fold_service_records(&states);
     }
 
     /// Re-read the daemon-minted short-TTL mesh enroll token for the Pair QR.
@@ -545,6 +605,7 @@ impl PhonesHubState {
             .show(ui, |ui| match self.tab {
                 HubTab::Phones => self.phones_tab(ui),
                 HubTab::Files => self.files_tab(ui),
+                HubTab::Services => self.services_tab(ui),
                 HubTab::Commands => self.commands_tab(ui),
                 HubTab::Pair => self.pair_tab(ui),
             });
@@ -577,7 +638,7 @@ impl PhonesHubState {
         );
     }
 
-    /// The KDE Connect device name the phone sees: the "Quasar Mesh" endpoint name
+    /// The KDE Connect device name the phone sees: the "Construct Mesh" endpoint name
     /// when THIS node is the designated mesh-fanout endpoint (#8), else the
     /// `MDE-MESH <host>` name.
     fn endpoint_name(&self) -> String {
@@ -593,6 +654,14 @@ impl PhonesHubState {
 
     fn phones_tab(&mut self, ui: &mut egui::Ui) {
         self.feature_card(ui);
+        ui.add_space(Style::SP_S);
+        // WL-SEC-004 — the seated-user arm/disarm consent card for phone remote
+        // input. Shown regardless of the roster: consent is meaningful before any
+        // phone is confirmed driving.
+        let bus_root = self.bus_root.clone();
+        card_frame(ui).show(ui, |ui| {
+            self.remote_input.body(ui, bus_root.as_deref());
+        });
         ui.add_space(Style::SP_S);
         if self.devices.is_empty() {
             empty_state(
@@ -690,11 +759,8 @@ impl PhonesHubState {
                 // Unpair — fast + mesh-wide (design risk: a lost phone = fleet control
                 // until unpaired). The store replicates, so one unpair drops the phone
                 // everywhere.
-                if ui
-                    .button(RichText::new("Unpair").color(Style::DANGER))
-                    .on_hover_text("Removes this phone from the whole mesh")
-                    .clicked()
-                {
+                let unpair_response = ui.button(RichText::new("Unpair").color(Style::DANGER));
+                if phones_hover_text(unpair_response, UNPAIR_HOVER_TIP).clicked() {
                     self.drive(
                         "unpair",
                         &serde_json::json!({ "device_id": d.id }),
@@ -878,6 +944,56 @@ impl PhonesHubState {
                 });
             }
         });
+    }
+
+    // ── Services tab (WL-FUNC-008 unified provenance/health view) ────────────
+
+    /// The unified service view: every mesh service the `service_aggregator` merged
+    /// from the three sources, grouped by host, each row showing its endpoint,
+    /// health, the provenance source(s) that attest it, and its openable action —
+    /// the upgrade of the bare directory `Vec<String>` to provenance + health.
+    fn services_tab(&mut self, ui: &mut egui::Ui) {
+        card_frame(ui).show(ui, |ui| {
+            ui.label(
+                RichText::new("Mesh services")
+                    .size(Style::TITLE)
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.colored_label(
+                Style::TEXT_DIM,
+                RichText::new(
+                    "Every service the mesh knows about, unified from three sources — the \
+                     nodes' published directory, the network probe, and host enrichment — with \
+                     its health and which source(s) attest it.",
+                )
+                .size(Style::SMALL),
+            );
+        });
+        ui.add_space(Style::SP_S);
+        if self.service_records.is_empty() {
+            empty_state(
+                ui,
+                "No services discovered yet",
+                "The service aggregator publishes the merged set as nodes advertise, get \
+                 probed, and are enriched.",
+            );
+            return;
+        }
+        // Group by host; the records are already sorted by (host, kind).
+        let mut current_host: Option<String> = None;
+        let records = self.service_records.clone();
+        for rec in &records {
+            if current_host.as_deref() != Some(rec.host.as_str()) {
+                current_host = Some(rec.host.clone());
+                ui.add_space(Style::SP_S);
+                ui.label(
+                    RichText::new(&rec.host)
+                        .size(Style::BODY)
+                        .color(Style::ACCENT),
+                );
+            }
+            service_row(ui, rec);
+        }
     }
 
     // ── Commands tab (KDC-MESH-8 catalog + composer) ─────────────────────────
@@ -1135,6 +1251,94 @@ fn collect_nodes(workgroup_root: &std::path::Path) -> Vec<NodeMirror> {
     out
 }
 
+/// WL-FUNC-008 — union every node's `state/services/*` mirror into one deduped
+/// [`ServiceRecord`] set keyed by `(host, kind)`. Each node publishes the mesh-wide
+/// merge, so the mirrors overlap; provenance is unioned across them and the freshest
+/// row (`last_seen_ms`) supplies the endpoint / health / action. Sorted by
+/// `(host, kind)`. Pure — no Bus, no GPU.
+fn fold_service_records(states: &[ServicesState]) -> Vec<ServiceRecord> {
+    let mut by_key: BTreeMap<(String, String), ServiceRecord> = BTreeMap::new();
+    for st in states {
+        for rec in &st.records {
+            match by_key.entry(rec.key()) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(rec.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    let cur = o.get_mut();
+                    for p in &rec.provenance {
+                        cur.attest(*p);
+                    }
+                    if rec.last_seen_ms >= cur.last_seen_ms {
+                        cur.endpoint = rec.endpoint.clone();
+                        cur.health = rec.health;
+                        cur.action = rec.action.clone();
+                        cur.last_seen_ms = rec.last_seen_ms;
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<ServiceRecord> = by_key.into_values().collect();
+    out.sort_by(|a, b| a.key().cmp(&b.key()));
+    out
+}
+
+/// The color ramp for a [`ServiceHealth`] badge.
+const fn health_color(health: ServiceHealth) -> egui::Color32 {
+    match health {
+        ServiceHealth::Up => Style::OK,
+        ServiceHealth::Unknown => Style::TEXT_DIM,
+        ServiceHealth::Stale => Style::WARN,
+        ServiceHealth::Down => Style::DANGER,
+    }
+}
+
+/// One unified-service row: kind · health · endpoint · provenance badges · action.
+fn service_row(ui: &mut egui::Ui, rec: &ServiceRecord) {
+    card_frame(ui).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(&rec.kind)
+                    .size(Style::BODY)
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.colored_label(
+                health_color(rec.health),
+                RichText::new(rec.health.as_str()).size(Style::SMALL),
+            );
+            if let Some(endpoint) = &rec.endpoint {
+                ui.colored_label(Style::TEXT_DIM, RichText::new(endpoint).size(Style::SMALL));
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(Style::TEXT_DIM, RichText::new("via").size(Style::SMALL));
+            for p in &rec.provenance {
+                ui.colored_label(
+                    provenance_color(*p),
+                    RichText::new(p.as_str()).size(Style::SMALL),
+                );
+            }
+            if let Some(action) = &rec.action {
+                ui.colored_label(
+                    Style::ACCENT,
+                    RichText::new(format!("\u{00B7} {action}")).size(Style::SMALL),
+                );
+            }
+        });
+    });
+}
+
+/// The accent for a [`ServiceProvenance`] badge — probe (live) reads brighter than a
+/// published advertisement or a derived enrichment label.
+const fn provenance_color(source: ServiceProvenance) -> egui::Color32 {
+    match source {
+        ServiceProvenance::Probe => Style::ACCENT_COMMS,
+        ServiceProvenance::Published => Style::TEXT,
+        ServiceProvenance::Enrichment => Style::TEXT_DIM,
+    }
+}
+
 /// Fold an `action/connect/devices` reply body into the roster (mirrors the worker's
 /// sorted `WireDevice` array). A malformed reply yields an empty roster (§7).
 fn fold_devices(body: &str) -> Vec<WireDevice> {
@@ -1164,7 +1368,7 @@ fn fold_browse(body: &str) -> LiveBrowse {
 
 /// The deterministic mesh-fanout endpoint election (mirrors
 /// `mde_kdc_host::fanout::is_designated_endpoint` — the lexicographically-lowest
-/// hostname, "a stable primary", #8), so the hub shows the SAME "Quasar Mesh" name
+/// hostname, "a stable primary", #8), so the hub shows the SAME "Construct Mesh" name
 /// the worker advertises.
 fn is_designated_endpoint(self_host: &str, hosts: &[String]) -> bool {
     if self_host.is_empty() {
@@ -1495,6 +1699,29 @@ fn card_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style()).shadow(card_shadow())
 }
 
+fn phones_tooltip(ui: &mut egui::Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(PHONES_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn phones_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| phones_tooltip(ui, text.as_str()))
+}
+
 /// A labeled read-only value row.
 fn labeled(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
@@ -1525,6 +1752,136 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fold_service_records_unions_provenance_across_overlapping_mirrors() {
+        // WL-FUNC-008 — two nodes both publish the mesh-wide merge; one attests
+        // (alpha, ssh) via Published, the other (freshest) via Probe + the ssh
+        // endpoint. The fold collapses them into ONE record attested by both, with
+        // the freshest row's endpoint/health, and keeps a distinct second service.
+        let mut pub_only = ServiceRecord::new("alpha", "ssh");
+        pub_only.attest(ServiceProvenance::Published);
+        pub_only.health = ServiceHealth::Unknown;
+        pub_only.last_seen_ms = 100;
+
+        let mut probed = ServiceRecord::new("alpha", "ssh");
+        probed.attest(ServiceProvenance::Probe);
+        probed.endpoint = Some("10.42.0.5:22".into());
+        probed.health = ServiceHealth::Up;
+        probed.last_seen_ms = 200; // fresher
+
+        let mut other = ServiceRecord::new("beta", "http");
+        other.attest(ServiceProvenance::Probe);
+        other.last_seen_ms = 50;
+
+        let states = vec![
+            ServicesState {
+                host: "node-a".into(),
+                records: vec![pub_only, other.clone()],
+                published_at_ms: 1,
+            },
+            ServicesState {
+                host: "node-b".into(),
+                records: vec![probed, other],
+                published_at_ms: 2,
+            },
+        ];
+        let out = fold_service_records(&states);
+        // (alpha, http)? no — (alpha, ssh) + (beta, http): 2 records, sorted.
+        assert_eq!(out.len(), 2);
+        let ssh = &out[0];
+        assert_eq!(ssh.key(), ("alpha".into(), "ssh".into()));
+        // Provenance unioned across the two mirrors.
+        assert!(ssh.attested_by(ServiceProvenance::Published));
+        assert!(ssh.attested_by(ServiceProvenance::Probe));
+        // The fresher (probe) row supplied the endpoint + Up health.
+        assert_eq!(ssh.endpoint.as_deref(), Some("10.42.0.5:22"));
+        assert_eq!(ssh.health, ServiceHealth::Up);
+        assert_eq!(out[1].key(), ("beta".into(), "http".into()));
+    }
+
+    #[test]
+    fn fold_service_records_is_empty_for_no_mirrors() {
+        assert!(fold_service_records(&[]).is_empty());
+    }
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_phones_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    phones_tooltip(ui, UNPAIR_HOVER_TIP);
+                });
+            },
+        )
+    }
+
+    #[test]
     fn fold_devices_parses_the_roster_and_tolerates_junk() {
         let body = r#"[
             {"id":"aaaa1111bbbb","name":"Pixel","online":true,"battery":82},
@@ -1540,8 +1897,39 @@ mod tests {
     }
 
     #[test]
+    fn unpair_hover_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            mde_egui::StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        let out = render_phones_tooltip_frame(&ctx);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == UNPAIR_HOVER_TIP && *color == text_color),
+            "Phones unpair tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            text_color != surface,
+            "Phones unpair tooltip text and surface must stay distinct in light mode"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "Phones unpair tooltip should paint its themed surface: {fills:?}"
+        );
+    }
+
+    #[test]
     fn endpoint_election_mirrors_the_worker() {
-        // Lowest hostname is the endpoint (the "Quasar Mesh" device).
+        // Lowest hostname is the endpoint (the "Construct Mesh" device).
         assert!(is_designated_endpoint(
             "eagle",
             &to_hosts(&["oak", "eagle", "pine"])
@@ -1555,8 +1943,9 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_name_is_quasar_mesh_only_for_the_endpoint() {
+    fn endpoint_name_is_construct_mesh_only_for_the_endpoint() {
         let mut s = state_for("eagle", &["oak", "eagle"]);
+        assert_eq!(MESH_ENDPOINT_NAME, "Construct Mesh");
         assert_eq!(s.endpoint_name(), MESH_ENDPOINT_NAME);
         s.self_host = "oak".to_string();
         assert_eq!(s.endpoint_name(), format!("{MESH_NAME_PREFIX} oak"));

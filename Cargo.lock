@@ -4194,6 +4194,8 @@ dependencies = [
  "mde-browser-workers",
  "mde-bus",
  "mde-chat",
+ "mde-collab-core",
+ "mde-collab-types",
  "mde-kdc-host",
  "mde-kdc-proto",
  "mde-role",
@@ -4411,6 +4413,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-collab-core"
+version = "12.0.0"
+dependencies = [
+ "dirs",
+ "ed25519-dalek 2.2.0",
+ "mde-collab-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid 1.23.4",
+]
+
+[[package]]
+name = "mde-collab-egui"
+version = "12.0.0"
+dependencies = [
+ "mde-collab-types",
+ "mde-egui",
+]
+
+[[package]]
+name = "mde-collab-types"
+version = "12.0.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "uuid 1.23.4",
+]
+
+[[package]]
 name = "mde-disclaimer"
 version = "12.0.0"
 
@@ -4454,6 +4492,8 @@ dependencies = [
  "input",
  "khronos-egl",
  "libc",
+ "resvg",
+ "serde",
  "udev",
 ]
 
@@ -4498,6 +4538,7 @@ dependencies = [
  "mde-chat",
  "mde-egui",
  "mde-files",
+ "mde-theme",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4559,6 +4600,14 @@ dependencies = [
  "mde-bus",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mde-maps-location-egui"
+version = "12.0.0"
+dependencies = [
+ "mde-egui",
+ "tempfile",
 ]
 
 [[package]]
@@ -4673,6 +4722,7 @@ version = "12.0.0"
 dependencies = [
  "base64",
  "mackes-mesh-types",
+ "mde-bookmarks",
  "mde-bookmarks-egui",
  "mde-bus",
  "mde-chat",
@@ -4681,6 +4731,7 @@ dependencies = [
  "mde-files",
  "mde-files-egui",
  "mde-lighthouse-health",
+ "mde-maps-location-egui",
  "mde-media-egui",
  "mde-mesh-view",
  "mde-music-egui",
@@ -4699,8 +4750,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid 1.23.4",
  "zbus 5.16.0",
 ]
 

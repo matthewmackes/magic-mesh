@@ -166,6 +166,50 @@ impl Canvas {
             .is_none_or(|first| self.pixels.iter().all(|p| p == first))
     }
 
+    pub(crate) fn count_exact_color(&self, color: Color32) -> usize {
+        self.pixels.iter().filter(|pixel| **pixel == color).count()
+    }
+
+    pub(crate) fn count_near_color(&self, color: Color32, tolerance: u8) -> usize {
+        self.pixels
+            .iter()
+            .filter(|pixel| {
+                pixel.r().abs_diff(color.r()) <= tolerance
+                    && pixel.g().abs_diff(color.g()) <= tolerance
+                    && pixel.b().abs_diff(color.b()) <= tolerance
+            })
+            .count()
+    }
+
+    pub(crate) fn count_near_color_in_rect(
+        &self,
+        rect: egui::Rect,
+        color: Color32,
+        tolerance: u8,
+    ) -> usize {
+        let x0 = rect.left().floor().max(0.0) as usize;
+        let y0 = rect.top().floor().max(0.0) as usize;
+        let x1 = rect.right().ceil().min(self.width as f32) as usize;
+        let y1 = rect.bottom().ceil().min(self.height as f32) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return 0;
+        }
+        let mut count = 0;
+        for y in y0..y1 {
+            let row = y * self.width;
+            for x in x0..x1 {
+                let pixel = self.pixels[row + x];
+                if pixel.r().abs_diff(color.r()) <= tolerance
+                    && pixel.g().abs_diff(color.g()) <= tolerance
+                    && pixel.b().abs_diff(color.b()) <= tolerance
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Write this canvas as a PNG, creating its parent directory if needed.
     ///
     /// Encoded RGB (no alpha channel): every stored pixel is fully opaque by

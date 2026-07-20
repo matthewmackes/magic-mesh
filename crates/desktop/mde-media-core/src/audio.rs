@@ -51,7 +51,8 @@ const fn yes_no(on: bool) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioDriver {
-    /// mpv's native `PipeWire` ao (`ao=pipewire`) — the seat default.
+    /// mpv's native `PipeWire` ao with an explicit `null` fallback
+    /// (`ao=pipewire,null`) — the seat default.
     #[default]
     PipeWire,
     /// Let mpv auto-probe the ao (no explicit `ao` property is set).
@@ -64,7 +65,7 @@ impl AudioDriver {
     /// The `ao` property value to set, or [`None`] to leave mpv auto-probing.
     fn ao_property(&self) -> Option<String> {
         match self {
-            Self::PipeWire => Some("pipewire".to_owned()),
+            Self::PipeWire => Some("pipewire,null".to_owned()),
             Self::Auto => None,
             Self::Custom(name) => Some(name.clone()),
         }
@@ -341,11 +342,11 @@ mod tests {
         let cfg = AudioConfig::new();
         // No filters at all → empty af graph (clears mpv's chain).
         assert_eq!(cfg.af_graph(), "");
-        // PipeWire ao pinned, ReplayGain off, gapless on.
+        // PipeWire ao pinned first, null fallback available, ReplayGain off, gapless on.
         assert_eq!(
             cfg.properties(),
             vec![
-                ("ao".to_owned(), "pipewire".to_owned()),
+                ("ao".to_owned(), "pipewire,null".to_owned()),
                 ("replaygain".to_owned(), "no".to_owned()),
                 ("gapless-audio".to_owned(), "yes".to_owned()),
             ]

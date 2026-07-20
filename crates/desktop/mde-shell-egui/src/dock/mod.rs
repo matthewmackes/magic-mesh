@@ -1,42 +1,27 @@
-//! The shell **dock** — the left **vertical dock** ([`dock`], design
-//! `docs/design/vertical-dock.md`) plus the full-width **bottom taskbar**
-//! ([`notification_rail_with_sources`], design `docs/design/
-//! win7-desktop-survey.md`, WIN7-1): together the shell's ONE chrome (VDOCK, the
-//! sole surface launcher after VDOCK-6b ripped out the old horizontal taskbar;
-//! NAVBAR/NOTIF/CONSOLE-1 then built the *new* bottom rail that WIN7-1 formalizes
-//! as a true Win7-style taskbar).
+//! The shell taskbar/dock state module. The rendered left vertical dock was
+//! retired by WIN10-HYBRID; the live chrome exported from this module is the
+//! full-width **bottom taskbar** ([`notification_rail_with_sources`], design
+//! `docs/design/win10-taskbar.md` plus the taskbar locks from
+//! `docs/design/win7-desktop-survey.md`).
 //!
-//! Under E12 "Quasar" the mesh-control surfaces are **panels in the one shell**,
-//! not separate clients (§5, the EMBED model — there is no compositor). The dock
-//! is that shell nav: a left-edge, full-height, ~48px slide-in auto-hide column
-//! that selects which surface fills the shell body — the mesh-control
-//! [`Workbench`](Surface::Workbench), the live Mesh Map, the Desktop surface, the
-//! embedded app surfaces (Music / Media / Files /
-//! Voice / Browser / Terminal / Editor), the unified [`Chat`](Surface::Chat)
-//! surface, and the System / Storage / About screens. One surface shows at a
-//! time; the Workbench is always one click away.
+//! Under E12 "Construct" the mesh-control surfaces are **panels in the one shell**,
+//! not separate clients (§5, the EMBED model — there is no compositor). The
+//! bottom taskbar is that shell chrome: the session rail focuses desktops, the
+//! tray/status area exposes live system
+//! state, and taskbar cells update the active [`Surface`]. One surface shows at
+//! a time; the Start Menu/front door/hotkeys are the surface launchers.
 //!
-//! The picker leads with the **Workbench** as the top standalone anchor, then the
-//! surfaces gathered into six labelled **groups** (PICKER-1: Comms · Workloads ·
-//! Terminals · Mesh · System · Media) stacked single-column, each with a
-//! horizontal accent label + a left-rail accent stripe over its 24px brand glyph
-//! cells (in [`Surface::ALL`] order). The active cell wears a **left-edge accent
-//! bar** + the subtle selection wash; hover is a fill only — no per-icon captions,
-//! no tooltips anywhere. Beneath the picker sits only VDOCK-4's **system quad**
-//! (Settings · Show-Desktop · Lock · Power) — the Start cell, the session rail,
-//! the clock, the auto-hide pin, and the notification status pips all live in the
-//! separate full-width **bottom taskbar** (WIN7-1 lock #3's Start · sessions ·
-//! tray · clock order, with the pin trailing after the clock), never in this left
-//! rail.
+//! The retired picker grouping and left-rail constants remain only where tests or
+//! shared icon geometry still need them. Production navigation goes through the
+//! bottom taskbar, front door, and hotkeys.
 //!
 //! The dock is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
 //! shell owns each surface's app and its per-frame pump.
 //!
-//! The dock slides in from the left over the shared [`Motion`] table and
-//! auto-hides (Super-tap toggle + pin, no hover). When fully hidden + settled it
-//! mounts **no layer at all**, so a hidden dock steals no input from the surface
-//! beneath (the "auto-hide + DRM seat" guarantee).
+//! The bottom taskbar is docked by default and can auto-hide from the persisted
+//! Settings preference; the retired left dock no longer exposes a reveal or pin
+//! control. A clean Super tap opens the Front Door launcher.
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::{Density, Motion, Style};
@@ -46,16 +31,18 @@ use mde_theme::brand::icons::{icon_image, IconId};
 use crate::chrome::{MeshSummary, NodeGrades};
 use crate::status::{self, StatusSegment, StatusSegments};
 
+pub type FileOperationProgress = status::FileOperationStatus;
+
 /// Which surface fills the shell body.
 ///
-/// [`Workbench`](Self::Workbench) is the default: the shell opens on the
-/// mesh-control Workbench — the other surfaces are the panels beside it.
+/// [`Desktop`](Self::Desktop) is the default: the shell opens on the neutral
+/// Remote Sessions view, while mesh-control work starts only after an explicit
+/// route to the Workbench.
 /// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form for
 /// crate-visible items in a private module — like `TASKBAR_H` below.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Surface {
     /// The five-plane mesh-control Workbench (This Node → Fleet).
-    #[default]
     Workbench,
     /// The live **Mesh Map** — the egui reincarnation of MESHMAP (`mde-mesh-view`):
     /// a procedural canvas of the current mesh (nodes by role + health, the elected
@@ -65,19 +52,20 @@ pub enum Surface {
     MeshView,
     /// The **Explorer** — the EXPLORER-epic discovery surface (`crate::explorer`):
     /// a cinematic one-unit-at-a-time hero view over every discovered unit (mesh
-    /// peers · off-mesh LAN hosts · `OpenStack` objects), folded from the
+    /// peers · off-mesh LAN hosts · cloud objects), folded from the
     /// aggregator's `state/units/*` mirrors. A first-class dock surface (its Mesh
     /// sibling beside the Mesh Map); it is ALSO reachable as the Mesh Map's
     /// segmented Explorer lens, which powers the NODE-GRADE-2 node-focus jump.
     Explorer,
     /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
-    /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
+    /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Construct".
+    #[default]
     Desktop,
-    /// The **Infra as Code (`IaC`)** surface — the `OpenStack` `IaaS` control
-    /// plane (`docs/design/iac-workspace.md`, IAC-2): the Keystone service
-    /// catalog + per-service API health + the merged service directory, consumed
-    /// off the Bus (`action/cloud/get-catalog`). The comprehensive `OpenStack`
-    /// admin beside the member-facing Cloud plane (#24).
+    /// The **Infra as Code (`IaC`)** surface — the cloud `IaaS` control plane
+    /// (`docs/design/iac-workspace.md`, IAC-2): the service catalog + per-service
+    /// API health + the merged service directory, consumed off the Bus
+    /// (`action/cloud/get-catalog`). The comprehensive infrastructure admin beside
+    /// the member-facing Cloud plane (#24).
     InfraCode,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
@@ -95,6 +83,11 @@ pub enum Surface {
     /// The embedded Bookmarks manager (`mde-bookmarks-egui`) — folders, tags,
     /// search, import, and bookmark detail management over the mesh CRDT model.
     Bookmarks,
+    /// The embedded Maps & Location surface (`mde-maps-location-egui`) — native
+    /// offline navigation, location-source control, MG90 direct-Ethernet
+    /// management, vehicle telemetry, recovery, and simulator workflows for one
+    /// vehicle.
+    MapsLocation,
     /// The embedded Terminal surface (`mde-term-egui`) — the full Terminator-class
     /// terminal (tabs / splits / broadcast / a shell on any mesh peer, TERM-4/5/8)
     /// over a real local PTY, mounted as an in-shell panel (TERM-16).
@@ -113,11 +106,19 @@ pub enum Surface {
     /// The **Phones** hub surface (KDC-MESH-9) — the desktop-side management surface
     /// for the mesh's paired phone(s): mesh identity + battery/signal, per-feature
     /// toggles, the node-targeted file browser, the run-command catalog (incl. the
-    /// OpenStack lifecycle set), fast mesh-wide unpair, and the pair-a-phone flow. A
+    /// cloud lifecycle set), fast mesh-wide unpair, and the pair-a-phone flow. A
     /// thin client of the `kdc_host` worker (the `action/connect/*` verbs + the mesh
     /// service directory) — it renders published state + drives Bus verbs, never
     /// reimplementing the host (§6).
     Phones,
+    /// The **Communications** surface (WL-FUNC-011) — the unified collaboration
+    /// hub (`mde-collab-egui`): a spaces rail + per-space Activity feed and Markdown
+    /// Messages timeline, folded from the collab worker's `state/collab/*` mirrors
+    /// and driven back via typed `action/collab/*` commands. Lands ALONGSIDE the
+    /// standalone Chat/Voice surfaces (the cutover that retires them is a later
+    /// phase); the labeled-for-later modes (Files/Documents/Alerts/Clipboard) stay
+    /// labeled — no faked data.
+    Communications,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
     /// (E12-15). Owns ALL host-control interaction (lock 3); dock status keeps
@@ -129,7 +130,7 @@ pub enum Surface {
     /// node and any mesh peer; the `mackesd` storage worker owns the walls + executor.
     Storage,
     /// The About surface — the canonical "about this platform" screen (QBRAND-6,
-    /// placement lock #13): the official `MDE-QUAZAR-MAIN.png` lockup, the product
+    /// placement lock #13): the official `CONSTRUCT-MAIN.png` lockup, the product
     /// name + tagline, the full build identity (version · git hash · date · channel),
     /// and the shipped legal docs + source URL. A pure renderer of the
     /// [`mde_theme::brand`] constants (`crate::about`).
@@ -152,11 +153,10 @@ impl Surface {
     /// built + checked against: the Workbench (mesh-control home) first, then the
     /// live Mesh Map, the Cloud/IaC control surface + the brokered Desktop, the
     /// app surfaces, the unified Chat surface (the ONE notification interface),
-    /// and the System / Storage / About screens. PICKER-1 gathers these into the
-    /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
-    /// relative order within each group (L7); a compile-time guard keeps the two
-    /// tables in sync.
-    pub(crate) const ALL: [Surface; 18] = [
+    /// and the System / Storage / About screens. [`LAUNCHER_GROUPS`] gathers these
+    /// into the shared launcher taxonomy, preserving this relative order within
+    /// each group; a compile-time guard keeps the two tables in sync.
+    pub(crate) const ALL: [Surface; 20] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Explorer,
@@ -168,6 +168,7 @@ impl Surface {
         Surface::Voice,
         Surface::Browser,
         Surface::Bookmarks,
+        Surface::MapsLocation,
         Surface::Terminal,
         Surface::Editor,
         Surface::Chat,
@@ -175,10 +176,14 @@ impl Surface {
         Surface::System,
         Surface::Storage,
         Surface::About,
+        // WL-FUNC-011 — the unified Communications hub lands as the twentieth
+        // surface (Super+Shift+0 in the REACH-2 nav tiers, the slot the prior
+        // 19-surface set left open). It joins the Comms launcher group below.
+        Surface::Communications,
     ];
 
     /// The [`brand::icons`](mde_theme::brand::icons) glyph this surface draws in
-    /// the bar (QBRAND-7). A 1:1 map by name onto the Quasar brand set — every
+    /// the bar (QBRAND-7). A 1:1 map by name onto the Construct/YAMIS icon set — every
     /// dock surface has a dedicated line-art glyph and `MeshView` folds onto the
     /// topology-map glyph. The dock never re-draws a glyph; it tints this one
     /// through the shared loader (§6).
@@ -192,7 +197,7 @@ impl Surface {
             // topology glyph beside it in the Mesh group.
             Surface::Explorer => IconId::Instances,
             // The IaC surface wears the **Server** (infrastructure/rack) badge —
-            // the OpenStack IaaS control plane reads as "infrastructure".
+            // the cloud IaaS control plane reads as "infrastructure".
             Surface::InfraCode => IconId::Server,
             Surface::Desktop => IconId::Desktop,
             Surface::Music => IconId::Music,
@@ -201,11 +206,16 @@ impl Surface {
             Surface::Voice => IconId::Voice,
             Surface::Browser => IconId::Browser,
             Surface::Bookmarks => IconId::Bookmarks,
+            Surface::MapsLocation => IconId::MapsLocation,
             Surface::Terminal => IconId::Terminal,
             Surface::Editor => IconId::Editor,
             Surface::Chat => IconId::Chat,
             // The Phones hub wears the dedicated smartphone glyph (KDC-MESH-9).
             Surface::Phones => IconId::Phones,
+            // The Communications hub wears the shared-emblem (`network-workgroup`
+            // collaboration) glyph — distinct from Chat's speech bubble and Voice's
+            // handset, reading as "the shared collaboration space" (WL-FUNC-011).
+            Surface::Communications => IconId::Share,
             // The System (host-controls) surface is the dock's right-side Settings
             // button (PICKER-2) — it wears the toothed **cog** glyph, the Win10
             // settings-gear idiom, distinct from the spoked legacy System glyph.
@@ -238,23 +248,126 @@ impl Surface {
             Surface::MeshView => "Mesh Map",
             Surface::Explorer => "Explorer",
             Surface::InfraCode => "Infra as Code",
-            Surface::Desktop => "Desktop",
+            Surface::Desktop => "Remote Sessions",
             Surface::Music => "Music",
             Surface::Media => "Media",
             Surface::Files => "Files",
             Surface::Voice => "Voice",
             Surface::Browser => "Browser",
             Surface::Bookmarks => "Bookmarks",
+            Surface::MapsLocation => "Maps & Location",
             Surface::Terminal => "Terminal",
             Surface::Editor => "Editor",
             Surface::Chat => "Chat",
             Surface::Phones => "Phones",
+            Surface::Communications => "Communications",
             Surface::System => "System",
             Surface::Storage => "Storage",
             Surface::About => "About",
             Surface::Timers => "Timers & Alarms",
         }
     }
+}
+
+/// One shared launcher category used by Start, Front Door, and tests. Keeping
+/// the taxonomy next to [`Surface`] prevents a surface from being "Files" in
+/// one launcher and "System" in another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LauncherGroup {
+    pub(crate) label: &'static str,
+    pub(crate) accent: egui::Color32,
+    pub(crate) surfaces: &'static [Surface],
+}
+
+/// The one truthful surface grouping for shell launchers. Every
+/// [`Surface::ALL`] entry appears exactly once; [`Surface::Timers`] remains
+/// clock-owned and outside the launcher grid.
+pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
+    LauncherGroup {
+        label: "Mesh Control",
+        accent: Style::ACCENT_MESH,
+        surfaces: &[Surface::Workbench, Surface::MeshView, Surface::InfraCode],
+    },
+    LauncherGroup {
+        label: "Desktop & Session",
+        accent: Style::ACCENT,
+        surfaces: &[Surface::Desktop, Surface::MapsLocation],
+    },
+    LauncherGroup {
+        label: "Media",
+        accent: Style::ACCENT_MEDIA,
+        surfaces: &[Surface::Music, Surface::Media],
+    },
+    LauncherGroup {
+        label: "Files & Data",
+        accent: Style::ACCENT_SYSTEM,
+        surfaces: &[Surface::Files, Surface::Storage],
+    },
+    LauncherGroup {
+        label: "Web",
+        accent: Style::ACCENT_WEB,
+        surfaces: &[Surface::Browser, Surface::Bookmarks],
+    },
+    LauncherGroup {
+        label: "Developer Tools",
+        accent: Style::ACCENT_TERMINALS,
+        surfaces: &[Surface::Terminal, Surface::Editor],
+    },
+    LauncherGroup {
+        label: "Comms",
+        accent: Style::ACCENT_COMMS,
+        surfaces: &[
+            Surface::Voice,
+            Surface::Chat,
+            Surface::Phones,
+            Surface::Communications,
+        ],
+    },
+    LauncherGroup {
+        label: "System",
+        accent: Style::ACCENT_WORKLOADS,
+        surfaces: &[Surface::System, Surface::About, Surface::Explorer],
+    },
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < Surface::ALL.len() {
+        let target = Surface::ALL[i] as usize;
+        let mut count = 0;
+        let mut g = 0;
+        while g < LAUNCHER_GROUPS.len() {
+            let surfaces = LAUNCHER_GROUPS[g].surfaces;
+            let mut s = 0;
+            while s < surfaces.len() {
+                if surfaces[s] as usize == target {
+                    count += 1;
+                }
+                s += 1;
+            }
+            g += 1;
+        }
+        assert!(
+            count == 1,
+            "every Surface::ALL entry must appear in LAUNCHER_GROUPS exactly once",
+        );
+        i += 1;
+    }
+};
+
+pub(crate) fn launcher_group_label(surface: Surface) -> &'static str {
+    LAUNCHER_GROUPS
+        .iter()
+        .find(|group| group.surfaces.contains(&surface))
+        .map_or("", |group| group.label)
+}
+
+#[cfg(test)]
+pub(crate) fn launcher_group_accent(surface: Surface) -> Option<egui::Color32> {
+    LAUNCHER_GROUPS
+        .iter()
+        .find(|group| group.surfaces.contains(&surface))
+        .map(|group| group.accent)
 }
 
 /// A shared bar-height token in logical points (`SP_XL + SP_M + SP_S` on the 8px
@@ -268,13 +381,84 @@ pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_M + Style::SP_S;
 
 /// The fixed width of one icon-only glyph cell (lock W4 — no caption, so the
 /// cell shrinks to suit the 24px glyph): `SP_XL + SP_M` on the 8px grid. The
-/// vertical dock's [`DOCK_W`] column is this same module. Private: only the
-/// dock's own layout + tests read it.
+/// legacy [`DOCK_W`] column is this same module. Private: only the taskbar/dock
+/// layout + tests read it.
 const CELL_W: f32 = Style::SP_XL + Style::SP_M;
 
 /// The app glyph edge in logical points — the 24px dock icon (lock W3, `SP_L`).
 /// Rasterized crisp at the physical pixel size by `icon_texture`.
 const ICON_LOGICAL: f32 = Style::SP_L;
+
+/// The live bottom taskbar is intentionally a black shell strip with white control
+/// glyphs. Status pips may still use semantic health colors, but taskbar-owned
+/// controls do not inherit the old dim/accent icon tint ramp.
+const TASKBAR_BG: egui::Color32 = Style::TASKBAR_BG;
+const TASKBAR_BORDER: egui::Color32 = Style::TASKBAR_BORDER;
+const TASKBAR_HOVER_FILL: egui::Color32 = Style::TASKBAR_HOVER_FILL;
+const TASKBAR_ACTIVE_FILL: egui::Color32 = Style::TASKBAR_ACTIVE_FILL;
+const TASKBAR_ICON: egui::Color32 = Style::TASKBAR_ICON;
+pub(crate) const TASKBAR_TRAY_ISLAND_FILL: egui::Color32 = Style::TASKBAR_TRAY_ISLAND_FILL;
+pub(crate) const TASKBAR_TRAY_ISLAND_ACTIVE_FILL: egui::Color32 =
+    Style::TASKBAR_TRAY_ISLAND_ACTIVE_FILL;
+const TASKBAR_TRAY_ISLAND_BORDER: egui::Color32 = Style::TASKBAR_TRAY_ISLAND_BORDER;
+const TASKBAR_CLOCK_DATE: egui::Color32 = Style::TASKBAR_CLOCK_DATE;
+const DESKTOP_SOURCE_TOGGLE_ICON: IconId = IconId::Desktop;
+const STATUS_DETAIL_ICON: IconId = IconId::HealthStatus;
+const TRAY_OVERFLOW_ICON: IconId = IconId::MoreHorizontal;
+const ACTION_CENTER_ICON: IconId = IconId::Notifications;
+
+#[must_use]
+const fn taskbar_control_icon_tint(
+    _selected: bool,
+    _hovered: bool,
+    _disabled: bool,
+) -> egui::Color32 {
+    TASKBAR_ICON
+}
+
+#[must_use]
+const fn taskbar_cell_fill(selected: bool, hovered: bool) -> Option<egui::Color32> {
+    if selected {
+        Some(TASKBAR_ACTIVE_FILL)
+    } else if hovered {
+        Some(TASKBAR_HOVER_FILL)
+    } else {
+        None
+    }
+}
+
+fn win11_tray_island_width(rail_h: f32, clock_w: f32, status_w: f32) -> f32 {
+    rail_h * 3.0 + clock_w + status_w + Style::SP_XS
+}
+
+fn win11_tray_island_rect(
+    rail: egui::Rect,
+    rail_h: f32,
+    clock_w: f32,
+    status_w: f32,
+) -> egui::Rect {
+    let right = rail.right() - Style::SP_S;
+    let width = win11_tray_island_width(rail_h, clock_w, status_w);
+    egui::Rect::from_min_max(
+        egui::pos2(right - width, rail.top() + 2.0),
+        egui::pos2(right, rail.bottom() - 2.0),
+    )
+}
+
+fn paint_win11_tray_island(ui: &egui::Ui, rect: egui::Rect, active: bool) {
+    let fill = if active {
+        TASKBAR_TRAY_ISLAND_ACTIVE_FILL
+    } else {
+        TASKBAR_TRAY_ISLAND_FILL
+    };
+    ui.painter().rect_filled(rect, Style::RADIUS, fill);
+    ui.painter().rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(HAIRLINE_W, TASKBAR_TRAY_ISLAND_BORDER),
+        egui::StrokeKind::Inside,
+    );
+}
 
 /// The Carbon-blue group hairline width in logical points — a 1px rule (L3).
 const HAIRLINE_W: f32 = 1.0;
@@ -300,7 +484,7 @@ pub fn icon_texture(
     tint: egui::Color32,
 ) -> Option<TextureHandle> {
     let size_px = (logical_px * ctx.pixels_per_point()).round().max(1.0) as u32;
-    let tint = tint.to_array();
+    let tint = Style::resolve_color(ctx, tint).to_array();
     let key = egui::Id::new(("qbrand7-dock-icon", id.name(), size_px, tint));
 
     // Fast path: the resolved texture (or a cached `None` from an earlier failed
@@ -321,29 +505,20 @@ pub fn icon_texture(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// VDOCK-1 — the left **vertical dock** frame + auto-hide (design
-// `docs/design/vertical-dock.md`, locks #1/#9/#13/#14/#23/#24).
+// Retired VDOCK geometry and compatibility state.
 //
-// The shell's left-edge chrome (VDOCK-6b removed the old horizontal taskbar,
-// then NAVBAR/NOTIF/CONSOLE-1 rebuilt a *new* bottom rail this module also owns —
-// see [`notification_rail_with_sources`], WIN7-1's bottom taskbar): a left-edge,
-// full-height, ~48px, solid Carbon-dark column that slides in from the left and
-// auto-hides (hotkey + pin, no hover). VDOCK-1 builds the FRAME + the
-// slide/toggle/pin mechanism; the interior is filled by the app picker (VDOCK-2)
-// and the system quad (VDOCK-4). The Start cell, clock, auto-hide pin, and
-// notification pips all mount in the separate bottom taskbar, not here.
+// The left-edge chrome renderer no longer mounts in production, but a small
+// compatibility reveal marker and geometry constants survive because the bottom
+// taskbar reuses the active-surface model, icon sizing, auto-hide semantics, and
+// regression tests that prove no left gutter is reserved.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The vertical dock's width in logical points (~48px, design #2/#23) — one
-/// column, the SAME 48px [`CELL_W`] module, so VDOCK-2's app glyphs + VDOCK-3/4's
-/// quads inherit the grid. (`pub`, not `pub(crate)` — the
+/// Legacy left-dock width in logical points (~48px). The rendered dock is
+/// retired; tests still use this constant to prove a stale gutter would shift
+/// content by exactly one legacy column. (`pub`, not `pub(crate)` — the
 /// `clippy::redundant_pub_crate` form for a crate-visible item in a private
 /// module, like [`TASKBAR_H`].)
 pub const DOCK_W: f32 = CELL_W;
-
-/// The egui memory key for the dock's slide animation (the Motion latch that
-/// eases the reveal 0↔1). Private to the dock.
-const DOCK_SLIDE_KEY: &str = "vdock-slide";
 
 /// The egui memory key for NOTIF-4's right-side status detail panel.
 const STATUS_PANEL_KEY: &str = "vdock-status-panel";
@@ -351,18 +526,14 @@ const STATUS_PANEL_KEY: &str = "vdock-status-panel";
 /// The stable id of the bottom notification rail layer.
 const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 
-/// The left vertical dock's **state** — VDOCK-1's auto-hide inputs (locks #9/#13)
-/// plus VDOCK-2's picker state. The auto-hide half (the Super-tap **reveal** latch
-/// and the **pin**) is kept tiny and pure (no egui, no GPU) so the shell's hotkey
-/// path toggles it and the render reads [`Self::shown`] headless-testably; there
-/// is deliberately **no hover-reveal** (lock #9). VDOCK-2 adds the picker's
-/// `active` surface (the shell body follows it, carried over from the horizontal
-/// bar's routing) and the `overflow_open` popup latch (#22). The shell-side getter
-/// [`Self::active`] reads `active` back into the central view (the VDOCK-6 `main.rs`
-/// wire); [`Self::set_active`] mirrors the shell's live surface back in first, so a
-/// hotkey / chyron nav that moved the surface still highlights in the picker.
-// The dock carries several INDEPENDENT boolean latches (the reveal/pin auto-hide
-// pair + the two overflow-popup latches for the app groups and the grade list) —
+/// The shell taskbar state. The retired left-dock pin is gone; a legacy reveal
+/// marker remains only so old hotkey/test seams can prove they still reserve no
+/// gutter. Live production rendering uses the bottom taskbar. The active surface,
+/// session rail, progress/status inputs, and overflow popups all flow through this
+/// struct. Start Menu remains the owner of app pins; this state carries only the
+/// frame-local projection needed to paint those pins on the application bar.
+// The dock carries several INDEPENDENT boolean latches (legacy reveal, taskbar
+// auto-hide, and overflow/detail popups) —
 // not a state machine folding into one enum, so opt this one struct past the
 // `struct_excessive_bools` bar rather than contrive a two-variant enum.
 #[derive(Debug, Default)]
@@ -370,24 +541,28 @@ const NOTIFICATION_RAIL_AREA: &str = "notif-bottom-rail-area";
 pub struct DockState {
     /// Toggled by a clean Super tap (lock #13) — the hotkey reveal/hide latch.
     revealed: bool,
-    /// The pin (lock #9): while set, the dock stays on screen regardless of the
-    /// reveal latch — the "hotkey + pin" hold-open.
-    pinned: bool,
     /// The **active surface** the taskbar selects — a taskbar cell click writes it
     /// here; the shell body follows [`Self::active`]. Defaults to
-    /// [`Surface::Workbench`] (the shell opens on the Workbench).
+    /// [`Surface::Desktop`] (the shell opens on Remote Sessions).
     active: Surface,
+    /// Application-bar pins mirrored from the Start Menu's ordered pin store.
+    /// The dock never persists or mutates this list; it only paints/routes it.
+    pinned_surfaces: Vec<Surface>,
     /// WIN10-HYBRID #31 — whether the ▲ **tray-overflow** flyout is open (the Win10
     /// hidden-icons popup): set by the ▲ cell, cleared on a route or a click-away.
     tray_overflow_open: bool,
     /// NOTIF-4 — whether the bottom notification rail's detail panel is open.
-    /// Toggled by the rail chevron and dismissed by Esc or click-away.
+    /// Toggled by the rail Health control and dismissed by Esc or click-away.
     status_panel_open: bool,
     /// The live inputs NOTIF-3's bottom **notification rail** folds each frame —
     /// owned so the taskbar keeps its `(ctx, state)` signature; the shell refreshes
     /// it via [`Self::set_status_inputs`] each frame. Defaults to the honest pre-poll
     /// state.
     status: StatusInputs,
+    /// Optional live thumbnail for the currently attached Desktop session. Kept
+    /// separate from [`SessionRailEntry`] so rail entries remain cheap,
+    /// comparable summaries.
+    session_preview: Option<SessionPreviewTexture>,
     /// A pending **node-focus** request the notification panel's grade list records
     /// when a grade row is tapped (design #7): the hostname whose Explorer hero the
     /// shell should open. The dock can't reach the shell's Explorer / nav (§6), so it
@@ -395,16 +570,6 @@ pub struct DockState {
     /// [`Self::take_node_focus`] (the deferred-wire idiom).
     /// A `String` (not `Copy`), so it rides its own field.
     pending_node_focus: Option<String>,
-    /// WIN7-2 — whether the Start Menu panel is up, mirrored in by the shell
-    /// each frame ([`Self::set_start_menu_open`]) so the Start cell wears its
-    /// active tint (the `set_active` mirror idiom). Was `console_open`
-    /// pre-WIN7-2, when the Start cell opened Console directly.
-    start_menu_open: bool,
-    /// WIN7-2 — latched `true` by a Start-cell click ([`start_cell`]); the
-    /// shell drains it ([`Self::take_start_menu_toggle`]) and toggles the
-    /// Start Menu panel (`crate::start_menu`). The dock can't reach the panel
-    /// itself (§6, the deferred wire). Was `console_toggle` pre-WIN7-2.
-    start_menu_toggle: bool,
     /// NAVBAR-U1 — latched by the bottom-rail Desktop cell. The shell drains it
     /// and asks the chooser to reconnect the newest recent desktop, falling back
     /// to the chooser if no recent can connect.
@@ -420,9 +585,14 @@ pub struct DockState {
     /// shell drains it and focuses the Desktop face for that broker-visible
     /// session without inventing a second session store.
     desktop_session_focus: Option<String>,
-    /// TRANSFERS-9 — the Files surface's in-flight transfer count, mirrored from
-    /// the embedded Files ledger each frame. Zero paints no badge.
-    transfer_active_count: usize,
+    /// FILE-STATUS-1 — the Files surface's active local/transfer operation summary,
+    /// mirrored each frame so the bottom taskbar can show one reusable progress
+    /// status area for file work across the platform.
+    file_operation_progress: Option<FileOperationProgress>,
+    /// FILE-STATUS-2 — one-shot activation of the shared file-operation progress
+    /// cell. The dock does not know the Files surface model; the shell drains this
+    /// and opens Files on its Transfers tab.
+    file_operation_progress_request: bool,
     /// NAVBAR-8 — the shell-wide interaction density mirrored from the
     /// formfactor/control-surface path. Mouse keeps the compact icon rail; Touch
     /// expands the rail into the 48px labelled variant.
@@ -478,6 +648,49 @@ pub struct SessionRailEntry {
     label: String,
     /// Short protocol/status tag such as `RDP` or `VNC`.
     protocol: &'static str,
+}
+
+/// Live taskbar thumbnail snapshot keyed to one visible session entry.
+#[derive(Clone)]
+pub struct SessionPreviewTexture {
+    id: Option<String>,
+    label: String,
+    protocol: &'static str,
+    texture: TextureHandle,
+}
+
+impl std::fmt::Debug for SessionPreviewTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPreviewTexture")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("protocol", &self.protocol)
+            .field("texture_size", &self.texture.size())
+            .finish()
+    }
+}
+
+impl SessionPreviewTexture {
+    pub(crate) fn new(
+        id: Option<String>,
+        label: impl Into<String>,
+        protocol: &'static str,
+        texture: TextureHandle,
+    ) -> Self {
+        Self {
+            id,
+            label: truncate_session_label(&label.into()),
+            protocol,
+            texture,
+        }
+    }
+
+    fn matches(&self, entry: &SessionRailEntry) -> bool {
+        if self.id.is_some() || entry.id.is_some() {
+            return self.id.as_deref() == entry.id.as_deref();
+        }
+        self.label == entry.label && self.protocol == entry.protocol
+    }
 }
 
 /// One compact Desktop source row rendered by the bottom rail flyout. It is a UI
@@ -557,38 +770,25 @@ fn truncate_session_label(label: &str) -> String {
         out.push(ch);
     }
     if label.chars().count() > MAX_CHARS {
-        out.push('…');
+        out.push_str("...");
     }
     out
 }
 
 impl DockState {
-    /// Toggle the Super-tap **reveal** — the VDOCK-1 hotkey path calls this on a
-    /// clean Super tap (`hotkeys::HotkeyRouter::take_dock_toggle`). A pinned dock
-    /// stays shown regardless — see [`Self::shown`].
+    /// Toggle the legacy **reveal** marker. The rendered left dock is retired; this
+    /// survives only for compatibility regression tests that prove old reveal
+    /// state cannot reserve a blank gutter.
     pub const fn toggle(&mut self) {
         self.revealed = !self.revealed;
     }
 
-    /// Whether the dock should be on screen this frame: revealed **or** pinned
-    /// (the pin holds it open, lock #9).
+    /// Whether the legacy reveal marker says the retired dock would be shown. Kept
+    /// for regression tests that prove even a "shown" legacy dock reserves no left
+    /// gutter.
+    #[cfg(test)]
     pub const fn shown(&self) -> bool {
-        self.revealed || self.pinned
-    }
-
-    /// Whether the dock is pinned open.
-    pub const fn pinned(&self) -> bool {
-        self.pinned
-    }
-
-    /// Flip the **pin** (the in-dock pin toggle). Pinning also reveals, so the
-    /// dock never animates out from under a just-set pin; unpinning leaves the
-    /// reveal latch as it was (a Super tap then hides it).
-    pub const fn toggle_pin(&mut self) {
-        self.pinned = !self.pinned;
-        if self.pinned {
-            self.revealed = true;
-        }
+        self.revealed
     }
 
     /// Test seam for shell-level integration fixtures: mount the NOTIF-4 detail
@@ -598,28 +798,33 @@ impl DockState {
         self.status_panel_open = true;
     }
 
-    /// The **active surface** the app picker currently shows (VDOCK-2). The shell
-    /// reads this back into its central view each frame after [`dock`] (the VDOCK-6
-    /// wire) so a picker-cell click routes the shell body; [`Self::set_active`]
-    /// mirrors the shell's live surface in first, so the picker highlights whatever
-    /// surface is showing (design #25).
+    /// The active surface selected by taskbar/front-door/start-menu navigation.
+    /// The shell mirrors this in before the taskbar renders and reads it back out
+    /// after taskbar interactions.
     pub const fn active(&self) -> Surface {
         self.active
     }
 
-    /// Mirror the shell's live surface into the dock before [`dock`] (VDOCK-6) — a
-    /// hotkey / chyron / self-test nav can move the surface OUTSIDE the picker, so
-    /// the dock must track it (else the [`Self::active`] read-back would stomp that
-    /// nav with a stale selection). A picker click then moves it and the shell reads
-    /// it straight back.
+    /// Mirror the shell's live surface into the taskbar state before rendering.
+    /// Hotkeys, search, and self-tests can move the surface outside the taskbar,
+    /// so the read-back path must not stomp them with a stale selection.
     pub const fn set_active(&mut self, surface: Surface) {
         self.active = surface;
     }
 
-    /// Mirror the Files transfer ledger's active count into the dock. The Files
-    /// surface owns the ledger read; the dock only paints the count.
-    pub const fn set_transfer_active_count(&mut self, count: usize) {
-        self.transfer_active_count = count;
+    /// Mirror the Start Menu's ordered app pins into the application bar. This is
+    /// intentionally an owned per-frame copy so taskbar clicks cannot diverge from
+    /// the Start/Front Door preference store.
+    pub fn set_pinned_surfaces(&mut self, pinned: &[Surface]) {
+        self.pinned_surfaces.clear();
+        self.pinned_surfaces.extend_from_slice(pinned);
+    }
+
+    /// Mirror active file operation progress into the dock. The Files surface owns
+    /// the ledger/op reads; the dock only paints this bounded status projection.
+    pub fn set_file_operation_progress(&mut self, progress: Option<FileOperationProgress>) {
+        self.file_operation_progress = progress;
+        self.status.segments.file_operations = self.file_operation_progress.clone();
     }
 
     /// Mirror the shell-wide density into the dock. This is deliberately fed by
@@ -660,12 +865,12 @@ impl DockState {
         NOTIFICATION_RAIL_H
     }
 
-    /// Refresh the bottom **notification rail's** live inputs (NOTIF-3) — the shell calls
-    /// this each frame before [`dock`] with the SAME folds the horizontal tray
-    /// reads (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
-    /// live-session flag). Owned so the dock's `(ctx, state)` signature stays put;
-    /// the quads render the pre-poll dim state until the first call lands (§7).
-    /// Wired by `main.rs::mount_dock_chrome` (VDOCK-6) — the SOLE dock chrome.
+    /// Refresh the bottom taskbar's live inputs (NOTIF-3) — the shell calls this
+    /// each frame with the same folds the tray/status cells read
+    /// (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
+    /// live-session flag). Owned so the taskbar's `(ctx, state)` signature stays
+    /// put; cells render the pre-poll dim state until the first call lands (§7).
+    /// Wired by `main.rs::mount_dock_chrome`.
     pub fn set_status_inputs(
         &mut self,
         mesh: MeshSummary,
@@ -674,8 +879,9 @@ impl DockState {
         session_active: bool,
         sessions: Vec<SessionRailEntry>,
         grades: NodeGrades,
-        segments: StatusSegments,
+        mut segments: StatusSegments,
     ) {
+        segments.file_operations = self.file_operation_progress.clone();
         self.status = StatusInputs {
             mesh,
             unread,
@@ -685,6 +891,10 @@ impl DockState {
             grades,
             segments,
         };
+    }
+
+    pub(crate) fn set_session_preview(&mut self, preview: Option<SessionPreviewTexture>) {
+        self.session_preview = preview;
     }
 
     /// Record a **node-focus** request (NODE-GRADE-2, design #7) — a grade row tap
@@ -704,28 +914,16 @@ impl DockState {
         self.pending_node_focus.take()
     }
 
-    /// Mirror the Start Menu panel's open state into the dock before [`dock`]
-    /// (WIN7-2) — the Start cell's active tint then follows the real panel
-    /// (the [`Self::set_active`] mirror idiom). Wired by
-    /// `main.rs::mount_dock_chrome`.
-    pub const fn set_start_menu_open(&mut self, open: bool) {
-        self.start_menu_open = open;
-    }
+    /// Compatibility no-op for the retired taskbar Start button. Launcher state is
+    /// owned by the shell Front Door and clean Super tap now; the bottom taskbar
+    /// no longer mirrors it into a painted cell.
+    pub const fn set_start_menu_open(&mut self, _open: bool) {}
 
-    /// Drain the Start cell's **Start Menu toggle** (WIN7-2) — `true` exactly
-    /// once per Start-cell click; the shell flips the Start Menu panel on it
-    /// (the [`Self::take_request`] deferred-wire idiom). Pressing Start with
-    /// the panel already up drains through the same latch and closes it (lock
-    /// #4, restated as WIN7-2's lock #13). A clean Super tap fires the SAME
-    /// toggle through a different path — `main.rs` applies
-    /// `crate::hotkeys::HotkeyRouter::take_dock_toggle`'s drain (the vertical
-    /// dock's OWN pre-existing Super-tap latch) to this panel too; see
-    /// `crate::start_menu`'s module doc for why one Super tap now reveals
-    /// both.
+    /// Compatibility drain for the retired taskbar Start button. The taskbar no
+    /// longer creates this toggle, so the drain is always empty; clean Super taps
+    /// continue through `crate::hotkeys::HotkeyRouter::take_dock_toggle`.
     pub const fn take_start_menu_toggle(&mut self) -> bool {
-        let toggled = self.start_menu_toggle;
-        self.start_menu_toggle = false;
-        toggled
+        false
     }
 
     /// Drain the bottom-rail Desktop reconnect request (NAVBAR-U1). This is
@@ -746,29 +944,28 @@ impl DockState {
     pub fn take_desktop_session_focus(&mut self) -> Option<String> {
         self.desktop_session_focus.take()
     }
-}
 
-/// Render the bottom **taskbar** (WIN7-1) — test-only convenience over
-/// [`notification_rail_with_sources`] for callers with no live Desktop sources.
-#[cfg(test)]
-pub fn notification_rail(ctx: &egui::Context, state: &mut DockState) -> bool {
-    notification_rail_with_sources(ctx, state, &[])
+    /// Drain the shared file-operation progress activation (FILE-STATUS-2). Kept
+    /// separate from `active == Files` so ordinary Files navigation does not force
+    /// the Transfers tab.
+    pub const fn take_file_operation_progress_request(&mut self) -> bool {
+        let requested = self.file_operation_progress_request;
+        self.file_operation_progress_request = false;
+        requested
+    }
 }
 
 /// Render the shell's full-width **bottom taskbar** (design
 /// `docs/design/win7-desktop-survey.md`, WIN7-1 lock #3), fed the compact Desktop
-/// source flyout from `ChooserState` by the shell. Left → right: the **Start**
-/// cell ([`start_cell`]) · the **running sessions** run (the Desktop rail cell +
-/// source caret, then [`SessionRailEntry`]/[`DesktopRailSource`] entries or the
-/// dim fallback glyph, NAVBAR-U1/U2/U3) · the **tray** (the status-detail
+/// source flyout from `ChooserState` by the shell. Left → right: the
+/// **Desktop-source selector** · Start/Menu **application pins** · the
+/// **running sessions** run
+/// ([`SessionRailEntry`]/[`DesktopRailSource`] entries or the dim fallback glyph,
+/// NAVBAR-U1/U2/U3) · the **tray** (the status-detail
 /// chevron + [`status::notification_rail`]'s segment pips, unchanged
 /// click-through-to-Chat behavior) · the **clock** ([`clock_cell_rect`]) · the
-/// auto-hide **pin** trailing last (this shell's own dock-hold-open control, not
-/// a Win7 taskbar concept, so it rides past the four-part contract rather than
-/// interrupting it). Compact (`Density::Mouse`, [`NOTIFICATION_RAIL_H`]) is this
-/// taskbar's default, deliberately denser than the shell's other Carbon-baseline
-/// chrome (lock #12); `Density::Touch` grows it to the labelled
-/// [`NOTIFICATION_RAIL_EXPANDED_H`] variant.
+/// notification button and far-right show-desktop nub. Compact (`Density::Mouse`,
+/// [`NOTIFICATION_RAIL_H`]) is this taskbar's default.
 pub fn notification_rail_with_sources(
     ctx: &egui::Context,
     state: &mut DockState,
@@ -833,9 +1030,8 @@ pub fn notification_rail_with_sources(
             // rect) always works in ABSOLUTE screen-space coordinates — an
             // `egui::Area`'s `fixed_pos` only seeds where the Area's own `Ui`
             // starts; egui establishes no separate (0,0)-based "local" frame for
-            // content painted inside it (contrast `dock()` above, which hands
-            // `paint_dock_frame` the rect it gets straight back from
-            // `ui.allocate_exact_size` — already absolute, never re-derived). The
+            // content painted inside it; the rail's cells receive absolute rects
+            // from `ui.allocate_exact_size`, never a separate local origin. The
             // rail's own strip is always exactly `rail_rect` (already absolute,
             // computed above from `screen.bottom()`), regardless of whether the
             // Area grew upward this frame to also fit the animating status panel —
@@ -851,15 +1047,12 @@ pub fn notification_rail_with_sources(
             // true_bottom_edge`) and by the analogous status-panel test, since
             // `notification_panel_rect` derives from this same rect.
             let local = rail_rect;
-            ui.painter().rect_filled(
-                local,
-                egui::CornerRadius::ZERO,
-                Style::BG.linear_multiply(0.92),
-            );
+            ui.painter()
+                .rect_filled(local, egui::CornerRadius::ZERO, TASKBAR_BG);
             ui.painter().hline(
                 local.left()..=local.right(),
                 local.top(),
-                egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+                egui::Stroke::new(HAIRLINE_W, TASKBAR_BORDER),
             );
             // WIN7-7, lock #14 — the taskbar itself needs a landmark role, not
             // just its contents: a screen reader jumping between landmarks
@@ -875,16 +1068,8 @@ pub fn notification_rail_with_sources(
                     .shrink(2.0)
             };
 
-            if start_cell(ui, cell(x), state) {
-                clicked = true;
-            }
-            x += rail_h;
-
-            // DEDUPE-2 — the dedicated always-on Desktop cell is retired: it was
-            // redundant with the running-sessions run (below), the far-right
-            // show-desktop nub, and the Start tile's Desktop launcher. The source
-            // caret + its flyout stay as the Win10 "pick a desktop" affordance; the
-            // running-sessions run reclaims the retired cell's `rail_h` of x-space.
+            // The far-left Start button is retired. The source caret is now the
+            // first taskbar control; launching stays on the Front Door/Super paths.
             let source_caret = egui::Rect::from_min_size(
                 egui::pos2(x, local.top()),
                 egui::vec2(DESKTOP_CARET_W, rail_h),
@@ -897,32 +1082,32 @@ pub fn notification_rail_with_sources(
             }
             x += DESKTOP_CARET_W;
 
-            // Lock #3 (WIN7-1): Start · sessions · tray · clock, left to right — the
-            // auto-hide pin is this shell's own dock-hold-open control (not a Win7
-            // taskbar concept), so it trails past the clock as an extra rather than
-            // interrupting the four-part contract (painted below, right to left).
+            // The action-center button and show-desktop nub trail past the
+            // sessions/tray/clock run as taskbar affordances painted below, right
+            // to left.
             let tray_icon_w = rail_h.min(NOTIFICATION_RAIL_EXPANDED_ICON_H) - 4.0;
-            let status_w = tray_icon_w * status::StatusSegment::ALL.len() as f32;
-            let clock_w = rail_h * 2.2;
-            // WIN10-HYBRID #31 — the right cluster carries the Win10
-            // **action-center** cell (a `rail_h`-wide Chat launcher + its `SP_XS`
-            // gap), the ▲ **tray-overflow** cell (another `rail_h`), and the
-            // far-right **show-desktop nub** (`SP_S` wide). Every width is folded in
-            // here so `session_right` keeps reserving the WHOLE cluster and the
-            // running-sessions run can never grow under the new cells (the same
-            // overlap contract the clock/pips/detail already rely on — see the
-            // geometry test in `tests.rs`).
-            let right_cluster_w = rail_h
-                + clock_w
-                + status_w
-                + Style::SP_XS
-                + rail_h
-                + Style::SP_XS
-                + rail_h
-                + Style::SP_XS
-                + rail_h
-                + Style::SP_S;
-            let session_right = (local.right() - Style::SP_XS - right_cluster_w).max(x);
+            let status_w = status::notification_rail_width(&state.status.segments, tray_icon_w);
+            let clock_w = rail_h * 2.5;
+            let tray_island = win11_tray_island_rect(local, rail_h, clock_w, status_w);
+            let session_right = (tray_island.left() - Style::SP_XS).max(x);
+            let pinned = state.pinned_surfaces.clone();
+            let min_session_w = rail_h;
+            let pin_right = (session_right - min_session_w - Style::SP_XS).max(x);
+            for surface in pinned {
+                if x + rail_h > pin_right {
+                    break;
+                }
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, local.top()),
+                    egui::vec2(rail_h, rail_h),
+                )
+                .shrink(2.0);
+                if pinned_app_cell(ui, rect, surface, state.active == surface) {
+                    state.active = surface;
+                    clicked = true;
+                }
+                x += rail_h + Style::SP_XS;
+            }
             if state.status.sessions.is_empty() {
                 if rail_icon(
                     ui,
@@ -955,7 +1140,14 @@ pub fn notification_rail_with_sources(
                         egui::vec2(desired, rail_h),
                     )
                     .shrink(2.0);
-                    if session_entry(ui, rect, idx, entry, state.active == Surface::Desktop) {
+                    if session_entry(
+                        ui,
+                        rect,
+                        idx,
+                        entry,
+                        state.active == Surface::Desktop,
+                        state.session_preview.as_ref(),
+                    ) {
                         state.active = Surface::Desktop;
                         focused_session.clone_from(&entry.id);
                         clicked = true;
@@ -989,9 +1181,17 @@ pub fn notification_rail_with_sources(
                     state.rail_more_open = false;
                 }
             }
+            paint_win11_tray_island(
+                ui,
+                tray_island,
+                state.status_panel_open
+                    || state.tray_overflow_open
+                    || state.active == Surface::Timers
+                    || state.active == Surface::Chat,
+            );
             // WIN10-HYBRID #31 — the far-right **show-desktop nub**: Win10's
             // corner "minimize to desktop" sliver, a thin hairline-separated strip
-            // pinned to the taskbar's very right edge (right of the pin).
+            // pinned to the taskbar's very right edge.
             let nub_rect = egui::Rect::from_min_size(
                 egui::pos2(local.right() - Style::SP_S, local.top()),
                 egui::vec2(Style::SP_S, rail_h),
@@ -999,18 +1199,11 @@ pub fn notification_rail_with_sources(
             if show_desktop_nub(ui, nub_rect, state) {
                 clicked = true;
             }
-            // The pin is the taskbar's rightmost CELL (trailing the clock, see the
-            // lock #3 note above) — this shell's own auto-hide affordance, not one
-            // of the four locked taskbar segments. It now sits just left of the nub.
             let mut tray_x = local.right() - Style::SP_S - rail_h;
-            if pin_toggle(ui, cell(tray_x), state) {
-                clicked = true;
-            }
             // WIN10-HYBRID #31 — the **action-center** cell (Win10's tray
             // notification button): routes the body to the unified Chat feed
             // (Chat IS the notification interface here, NOTIFY-CHAT). Sits
-            // immediately left of the pin.
-            tray_x -= rail_h + Style::SP_XS;
+            // immediately left of the show-desktop nub.
             if action_center_cell(ui, cell(tray_x), state) {
                 clicked = true;
             }
@@ -1038,8 +1231,8 @@ pub fn notification_rail_with_sources(
                 egui::pos2(tray_x, local.top() + (rail_h - pip_h) / 2.0),
                 egui::vec2(status_w, pip_h),
             );
-            // WIN10-HYBRID #31 — the ▲ **tray-overflow** cell sits immediately LEFT
-            // of the status pips (Win10's hidden-icons chevron).
+            // WIN10-HYBRID #31 — the tray-overflow cell sits immediately LEFT
+            // of the status pips with its own horizontal overflow glyph.
             tray_x -= rail_h;
             let tray_overflow = cell(tray_x);
             let opened_tray_overflow = tray_overflow_toggle(ui, tray_overflow, state);
@@ -1047,10 +1240,10 @@ pub fn notification_rail_with_sources(
                 clicked = true;
             }
             tray_x -= rail_h;
-            if status_detail_toggle(ui, cell(tray_x), state) {
+            let status_detail = cell(tray_x);
+            if status_detail_toggle(ui, status_detail, state) {
                 clicked = true;
             }
-
             let mut active = state.active;
             let out = status::notification_rail(
                 ui,
@@ -1066,11 +1259,14 @@ pub fn notification_rail_with_sources(
                 clicked = true;
             }
             if out.routed {
+                if out.routed_segment == Some(StatusSegment::FileOperations) {
+                    state.file_operation_progress_request = true;
+                }
                 clicked = true;
             }
 
             if panel_t > 0.001 {
-                let panel_rect = notification_panel_rect(local, panel_t);
+                let panel_rect = notification_panel_rect(local, status_detail, panel_t);
                 let mut panel_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(panel_rect)
@@ -1080,6 +1276,7 @@ pub fn notification_rail_with_sources(
                 let panel_out = status::status_panel(
                     &panel_ui,
                     &state.status.grades,
+                    &state.status.segments,
                     state.status.seat.as_ref(),
                     panel_rect,
                 );
@@ -1090,6 +1287,12 @@ pub fn notification_rail_with_sources(
                 }
                 if let Some(host) = panel_out.node_focus {
                     state.request_node_focus(&host);
+                    state.status_panel_open = false;
+                    clicked = true;
+                }
+                if panel_out.routed_segment == Some(StatusSegment::FileOperations) {
+                    state.active = Surface::Files;
+                    state.file_operation_progress_request = true;
                     state.status_panel_open = false;
                     clicked = true;
                 }
@@ -1138,24 +1341,17 @@ pub fn notification_rail_with_sources(
     clicked
 }
 
-/// The width of the left **gutter** the shell reserves for the vertical dock this
-/// frame (DOCK-OVERLAP) — [`DOCK_W`] scaled by the dock's live slide progress, so
-/// the central content insets in lockstep with the sliding dock (no content jump
-/// on reveal). Reads the SAME slide latch [`dock`] drives (idempotent within a
-/// frame — egui's `animate_bool` returns the settled endpoint on first sight and
-/// the same value on repeat reads), so the reserved gutter and the dock can never
-/// drift apart. `0.0` when the dock is hidden **and settled** — the central
-/// content then fills the full width. The shell reserves this as an empty left
-/// gutter ONLY when NOT in a full-screen remote desktop; there the dock floats as
-/// an overlay instead (`main.rs::central_view`).
+/// The width of the retired left-dock gutter. Production must reserve no left
+/// gutter even if legacy reveal state is toggled; the bottom taskbar strut is the
+/// only live chrome reservation.
 pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
     // WIN10-HYBRID + DEDUPE-1: the left **vertical dock** is retired — its `dock()`
     // render was deleted, so there is nothing to paint in a left gutter and it must
-    // NEVER be reserved (else a Super-tap or the taskbar Pin, which still flip
-    // `revealed`/`pinned`, would shift the whole surface body 48px right behind a blank
+    // NEVER be reserved (else stale reveal/pin state would shift the whole surface
+    // body 48px right behind a blank
     // column — the review `dedupe-gutter-regression`). The single 48px BOTTOM taskbar
     // (`taskbar_strut_height`) is the only chrome the shell reserves now. The
-    // `revealed`/`pinned` state survives (harmlessly) only for a future auto-hide use.
+    // The stale reveal marker survives only as a harmless compatibility seam.
     0.0
 }
 
@@ -1163,7 +1359,7 @@ pub fn gutter_width(_ctx: &egui::Context, _state: &DockState) -> f32 {
 /// for the taskbar so surface content is never covered by it (the Windows-10 model:
 /// a maximized surface ends *above* the taskbar, unlike the pre-hybrid floating
 /// overlay). It is the taskbar's live [`rail_height`](DockState::rail_height).
-/// Unlike the auto-hiding left-dock gutter this is reserved whenever the bar is
+/// Unlike the retired left-dock gutter this is reserved whenever the bar is
 /// **docked**; when the bar is auto-hidden it returns `0.0` and the revealed bar
 /// floats as an overlay instead (R5 — the strut is never eased with the reveal, so
 /// content never jumps on a hover). Reserved by `main.rs::central_view` as an empty
@@ -1198,7 +1394,7 @@ const fn taskbar_reveal(autohidden: bool, pointer_near_bottom: bool, latched: bo
 
 /// The stable id of the Start Menu's trigger cell (WIN7-2; CONSOLE-1
 /// originally), so tests read its settled `Rect`.
-fn start_cell_id() -> egui::Id {
+pub(crate) fn start_cell_id() -> egui::Id {
     egui::Id::new("vdock-start-cell")
 }
 
@@ -1206,6 +1402,51 @@ fn start_cell_id() -> egui::Id {
 /// glyph itself since (today) each [`IconId`] only ever backs one such cell.
 fn rail_icon_id(icon: IconId) -> egui::Id {
     egui::Id::new(("bottom-rail-icon", icon.name()))
+}
+
+pub(crate) fn pinned_app_cell_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("bottom-rail-pinned-app", surface))
+}
+
+fn pinned_app_cell(ui: &egui::Ui, rect: egui::Rect, surface: Surface, selected: bool) -> bool {
+    let id = pinned_app_cell_id(surface);
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    let painter = ui.painter();
+    if let Some(fill) = taskbar_cell_fill(selected, resp.hovered()) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
+    }
+    let tint = taskbar_control_icon_tint(selected, resp.hovered(), false);
+    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), edge, tint) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(
+            tex.id(),
+            rail_icon_rect(rect, edge),
+            uv,
+            egui::Color32::WHITE,
+        );
+    }
+    if selected {
+        let underline = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.bottom() - ACTIVE_BAR_W),
+            egui::vec2(rect.width(), ACTIVE_BAR_W),
+        );
+        painter.rect_filled(underline, egui::CornerRadius::ZERO, Style::ACCENT);
+    }
+    paint_rail_label(ui, rect, surface.label(), tint);
+    paint_focus_ring(painter, rect, resp.has_focus());
+    install_cell_accessibility(
+        ui.ctx(),
+        id,
+        surface.label(),
+        if selected {
+            "Active pinned application"
+        } else {
+            "Pinned application"
+        },
+        rect,
+    );
+    resp.clicked()
 }
 
 /// A bare icon-only taskbar cell (WIN7-1's sessions-empty fallback glyph is
@@ -1217,15 +1458,14 @@ fn rail_icon(
     ui: &egui::Ui,
     rect: egui::Rect,
     icon: IconId,
-    tint: egui::Color32,
+    _tint: egui::Color32,
     label: &str,
     value: &str,
 ) -> bool {
     let resp = ui.interact(rect, rail_icon_id(icon), egui::Sense::click());
-    let color = if resp.hovered() { Style::TEXT } else { tint };
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    let color = taskbar_control_icon_tint(false, resp.hovered(), false);
+    if let Some(fill) = taskbar_cell_fill(false, resp.hovered()) {
+        ui.painter().rect_filled(rect, Style::RADIUS, fill);
     }
     let edge = (rect.height() - 2.0).max(Style::SP_S);
     if let Some(tex) = icon_texture(ui.ctx(), icon, edge, color) {
@@ -1270,6 +1510,22 @@ fn session_entry_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
         entry.protocol,
     ))
 }
+
+fn session_hover_preview_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
+    egui::Id::new(("bottom-rail-session-preview", session_entry_id(idx, entry)))
+}
+
+fn session_hover_protocol_badge_id(idx: usize, entry: &SessionRailEntry) -> egui::Id {
+    egui::Id::new((
+        "bottom-rail-session-preview-protocol",
+        session_entry_id(idx, entry),
+    ))
+}
+
+const SESSION_PREVIEW_W: f32 = 196.0;
+const SESSION_PREVIEW_H: f32 = 124.0;
+const SESSION_PREVIEW_THUMB_H: f32 = 72.0;
+const SESSION_PROTOCOL_BADGE_H: f32 = 22.0;
 
 /// WIN10-HYBRID #31 — one running-session tile is a fixed **`rail_h` square** (an
 /// icons-only Win10 taskbar button); its full name rides the accesskit node, not a
@@ -1358,19 +1614,23 @@ fn session_entry(
     idx: usize,
     entry: &SessionRailEntry,
     selected: bool,
+    preview: Option<&SessionPreviewTexture>,
 ) -> bool {
     let resp = ui.interact(rect, session_entry_id(idx, entry), egui::Sense::click());
     let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if resp.hovered() {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    if let Some(fill) = taskbar_cell_fill(selected, resp.hovered()) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
     }
-    let tint = if selected || resp.hovered() {
-        Style::ACCENT
-    } else {
-        Style::TEXT_DIM
-    };
+    if resp.hovered() {
+        session_hover_preview(
+            ui,
+            rect,
+            idx,
+            entry,
+            session_preview_texture_for_entry(preview, entry),
+        );
+    }
+    let tint = taskbar_control_icon_tint(selected, resp.hovered(), false);
     let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
     if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, edge, tint) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
@@ -1409,9 +1669,144 @@ fn session_entry(
     resp.clicked()
 }
 
+/// WIN10-HYBRID #31 — static first hover thumbnail for a running Desktop session.
+/// The live frame texture is a later slice; this keeps the user-visible taskbar
+/// affordance in place now with the real session label and protocol badge.
+fn session_hover_preview(
+    ui: &egui::Ui,
+    anchor: egui::Rect,
+    idx: usize,
+    entry: &SessionRailEntry,
+    preview_texture: Option<&TextureHandle>,
+) {
+    let screen = ui.ctx().screen_rect();
+    let margin = Style::SP_S;
+    let x = (anchor.center().x - SESSION_PREVIEW_W / 2.0).clamp(
+        screen.left() + margin,
+        screen.right() - SESSION_PREVIEW_W - margin,
+    );
+    let y = anchor.top() - Style::SP_XS;
+    egui::Area::new(session_hover_preview_id(idx, entry))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(x, y))
+        .show(ui.ctx(), |ui| {
+            let (area, _) = ui.allocate_exact_size(
+                egui::vec2(SESSION_PREVIEW_W, SESSION_PREVIEW_H),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(area, Style::RADIUS, Style::SURFACE);
+            painter.rect_stroke(
+                area,
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            let thumb = egui::Rect::from_min_size(
+                area.min + egui::vec2(Style::SP_S, Style::SP_S),
+                egui::vec2(SESSION_PREVIEW_W - Style::SP_M, SESSION_PREVIEW_THUMB_H),
+            );
+            painter.rect_filled(thumb, Style::RADIUS, Style::SURFACE_HI);
+            painter.rect_stroke(
+                thumb,
+                Style::RADIUS,
+                egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.35)),
+                egui::StrokeKind::Inside,
+            );
+            if let Some(texture) = preview_texture {
+                let image_rect = session_preview_texture_rect(texture.size(), thumb);
+                let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                painter.image(texture.id(), image_rect, uv, egui::Color32::WHITE);
+            } else if let Some(tex) = icon_texture(ui.ctx(), IconId::Sessions, 32.0, Style::ACCENT)
+            {
+                let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                let icon_rect =
+                    egui::Rect::from_center_size(thumb.center(), egui::vec2(32.0, 32.0));
+                painter.image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+            }
+
+            let title_pos = egui::pos2(
+                area.left() + Style::SP_S,
+                thumb.bottom() + Style::SP_XS + Style::SP_S,
+            );
+            let title_clip = egui::Rect::from_min_max(
+                egui::pos2(area.left() + Style::SP_S, thumb.bottom() + Style::SP_XS),
+                egui::pos2(area.right() - Style::SP_S, area.bottom() - Style::SP_XS),
+            );
+            painter.with_clip_rect(title_clip).text(
+                title_pos,
+                egui::Align2::LEFT_CENTER,
+                entry.label.as_str(),
+                egui::FontId::proportional(Style::SMALL),
+                Style::TEXT,
+            );
+
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(
+                    thumb.right() - Style::SP_XS - 52.0,
+                    thumb.top() + Style::SP_XS,
+                ),
+                egui::vec2(52.0, SESSION_PROTOCOL_BADGE_H),
+            );
+            ui.interact(
+                badge,
+                session_hover_protocol_badge_id(idx, entry),
+                egui::Sense::hover(),
+            );
+            painter.rect_filled(badge, Style::RADIUS, Style::ACCENT.linear_multiply(0.18));
+            painter.rect_stroke(
+                badge,
+                Style::RADIUS,
+                egui::Stroke::new(1.0, Style::ACCENT.linear_multiply(0.55)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                entry.protocol,
+                egui::FontId::proportional(Style::SMALL),
+                Style::ACCENT,
+            );
+        });
+}
+
+fn session_preview_texture_rect(size: [usize; 2], bounds: egui::Rect) -> egui::Rect {
+    let width = size[0].max(1) as f32;
+    let height = size[1].max(1) as f32;
+    let scale = (bounds.width() / width).min(bounds.height() / height);
+    egui::Rect::from_center_size(bounds.center(), egui::vec2(width * scale, height * scale))
+}
+
+fn session_preview_texture_for_entry<'a>(
+    preview: Option<&'a SessionPreviewTexture>,
+    entry: &SessionRailEntry,
+) -> Option<&'a TextureHandle> {
+    preview
+        .filter(|preview| preview.matches(entry))
+        .map(|preview| &preview.texture)
+}
+
 /// Stable id for the bottom-rail status detail toggle.
 fn status_detail_toggle_id() -> egui::Id {
-    egui::Id::new(("bottom-rail-icon", IconId::ChevronUp.name()))
+    egui::Id::new("bottom-rail-health-panel")
+}
+
+fn mesh_status_value(mesh: &MeshSummary, selected: bool) -> String {
+    let panel_state = if selected { "Expanded" } else { "Collapsed" };
+    if !mesh.seen {
+        return format!("{panel_state}; mesh status not seen");
+    }
+    let health = match mesh.health {
+        mde_lighthouse_health::LighthouseHealth::AllHealthy => "mesh healthy",
+        mde_lighthouse_health::LighthouseHealth::Degraded => "mesh degraded",
+        mde_lighthouse_health::LighthouseHealth::None => "no lighthouse status",
+    };
+    format!(
+        "{panel_state}; {}/{} peers online; {health}",
+        mesh.peers_online, mesh.peers_total
+    )
 }
 
 fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
@@ -1419,20 +1814,12 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
     let selected = state.status_panel_open;
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    if let Some(fill) = taskbar_cell_fill(selected, hovered) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
     }
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    let edge = (rect.height() - 2.0).max(Style::SP_S);
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::ChevronUp, edge, tint) {
+    let tint = taskbar_control_icon_tint(selected, hovered, false);
+    let edge = ICON_LOGICAL.min((rect.height() - Style::SP_S).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), STATUS_DETAIL_ICON, edge, tint) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         painter.image(
             tex.id(),
@@ -1441,13 +1828,13 @@ fn status_detail_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
             egui::Color32::WHITE,
         );
     }
-    paint_rail_label(ui, rect, "Status", tint);
+    paint_rail_label(ui, rect, "Health", tint);
     paint_focus_ring(&painter, rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
         status_detail_toggle_id(),
-        "Notification panel",
-        if selected { "Expanded" } else { "Collapsed" },
+        "Health panel",
+        mesh_status_value(&state.status.mesh, selected),
         rect,
     );
     if resp.clicked() {
@@ -1462,8 +1849,8 @@ const TRAY_OVERFLOW_ROW_H: f32 = Style::SP_L;
 /// The tray-overflow flyout's fixed width — wide enough for a segment name + dot.
 const TRAY_OVERFLOW_W: f32 = Style::SP_XL * 4.0;
 
-/// Stable id for the ▲ tray-overflow toggle cell (WIN10-HYBRID #31) — its own tag,
-/// so it never collides with [`status_detail_toggle_id`]'s chevron cell.
+/// Stable id for the tray-overflow toggle cell (WIN10-HYBRID #31) — its own tag,
+/// so it never collides with [`status_detail_toggle_id`]'s health cell.
 fn tray_overflow_id() -> egui::Id {
     egui::Id::new("bottom-rail-tray-overflow")
 }
@@ -1478,69 +1865,37 @@ fn tray_overflow_row_id(segment: StatusSegment) -> egui::Id {
     egui::Id::new(("bottom-rail-tray-overflow-row", segment))
 }
 
-/// The tray-overflow flyout row's human label per segment. `status.rs`'s own
-/// `segment_label` + `route` maps are private and out of this lane's edit scope, so
-/// this restates the tiny (four-arm) name + route folds locally rather than widening
-/// `status.rs`'s surface — the same duplicate-a-small-private-map pattern the picker
-/// deletions leave elsewhere.
 const fn tray_segment_label(segment: StatusSegment) -> &'static str {
-    match segment {
-        StatusSegment::Device => "Device",
-        StatusSegment::Mesh => "Mesh",
-        StatusSegment::Power => "Power",
-        StatusSegment::Alerts => "Alerts",
-    }
+    status::segment_label(segment)
 }
 
-/// The surface a tray-overflow row routes to (mirrors `status.rs`'s private
-/// `StatusSegment::route`; see [`tray_segment_label`]).
+/// The surface a tray-overflow row routes to (mirrors `status.rs`'s segment
+/// routing; see [`tray_segment_label`]).
 const fn tray_segment_route(segment: StatusSegment) -> Surface {
     match segment {
-        StatusSegment::Device | StatusSegment::Power => Surface::System,
+        StatusSegment::Device | StatusSegment::Power | StatusSegment::RemoteControl => {
+            Surface::System
+        }
         StatusSegment::Mesh => Surface::MeshView,
+        StatusSegment::FileOperations => Surface::Files,
         StatusSegment::Alerts => Surface::Chat,
     }
 }
 
-/// This segment's latest rollup out of the public [`StatusSegments`] fields — the
-/// severity source for the row's dot (the `StatusSegments::get` fold is private, so
-/// this restates it over the public fields).
-fn tray_segment_rollup(
-    segments: &StatusSegments,
-    segment: StatusSegment,
-) -> Option<&status::SegmentRollup> {
-    match segment {
-        StatusSegment::Device => segments.device.as_ref(),
-        StatusSegment::Mesh => segments.mesh.as_ref(),
-        StatusSegment::Power => segments.power.as_ref(),
-        StatusSegment::Alerts => segments.alerts.as_ref(),
-    }
-}
-
-/// The ▲ **tray-overflow** cell (WIN10-HYBRID #31) — Win10's hidden-icons chevron,
-/// immediately left of the status pips. A click toggles the bottom-anchored flyout
-/// of every status segment ([`tray_overflow_flyout`]). Wears the selection wash +
-/// ACCENT tint while open, else the shared tray hover/rest idiom. Every colour is a
-/// [`Style`] token (§4). Returns `true` on a toggle.
+/// The **tray-overflow** cell (WIN10-HYBRID #31) — a distinct horizontal overflow
+/// glyph immediately left of the status pips. A click toggles the bottom-anchored
+/// flyout of every status segment ([`tray_overflow_flyout`]).
 fn tray_overflow_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(rect, tray_overflow_id(), egui::Sense::click());
     let selected = state.tray_overflow_open;
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    if let Some(fill) = taskbar_cell_fill(selected, hovered) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
     }
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
+    let tint = taskbar_control_icon_tint(selected, hovered, false);
     let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::ChevronUp, edge, tint) {
+    if let Some(tex) = icon_texture(ui.ctx(), TRAY_OVERFLOW_ICON, edge, tint) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         painter.image(
             tex.id(),
@@ -1574,16 +1929,21 @@ fn tray_overflow_toggle(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) 
 fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState) -> bool {
     let rows = StatusSegment::ALL.len();
     let popup_h = rows as f32 * TRAY_OVERFLOW_ROW_H + Style::SP_S;
+    let popup_pos = egui::pos2(anchor.left(), anchor.top() - Style::SP_XS);
+    let popup_screen_rect = egui::Rect::from_min_size(
+        egui::pos2(popup_pos.x, popup_pos.y - popup_h),
+        egui::vec2(TRAY_OVERFLOW_W, popup_h),
+    );
     let segments = state.status.segments.clone();
     let inner = egui::Area::new(tray_overflow_popup_id())
         .order(egui::Order::Foreground)
         .pivot(egui::Align2::LEFT_BOTTOM)
-        .fixed_pos(egui::pos2(anchor.left(), anchor.top() - Style::SP_XS))
+        .fixed_pos(popup_pos)
         .show(ui.ctx(), |ui| {
             let (area, _) =
                 ui.allocate_exact_size(egui::vec2(TRAY_OVERFLOW_W, popup_h), egui::Sense::hover());
             let bg = ui.painter().add(egui::Shape::Noop);
-            let mut routed: Option<Surface> = None;
+            let mut routed: Option<StatusSegment> = None;
             let mut y = area.top() + Style::SP_XS / 2.0;
             for segment in StatusSegment::ALL {
                 let row = egui::Rect::from_min_size(
@@ -1591,7 +1951,7 @@ fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState
                     egui::vec2(TRAY_OVERFLOW_W - Style::SP_S, TRAY_OVERFLOW_ROW_H),
                 );
                 if tray_overflow_row(ui, row, segment, &segments) {
-                    routed = Some(tray_segment_route(segment));
+                    routed = Some(segment);
                 }
                 y += TRAY_OVERFLOW_ROW_H;
             }
@@ -1607,12 +1967,20 @@ fn tray_overflow_flyout(ui: &egui::Ui, anchor: egui::Rect, state: &mut DockState
             );
             routed
         });
-    if let Some(surface) = inner.inner {
-        state.active = surface;
+    if let Some(segment) = inner.inner {
+        state.active = tray_segment_route(segment);
+        if segment == StatusSegment::FileOperations {
+            state.file_operation_progress_request = true;
+        }
         state.tray_overflow_open = false;
         return true;
     }
-    if inner.response.clicked_elsewhere() {
+    let pointer_inside_popup = ui.ctx().input(|i| {
+        i.pointer
+            .latest_pos()
+            .is_some_and(|p| popup_screen_rect.contains(p))
+    });
+    if inner.response.clicked_elsewhere() && !pointer_inside_popup {
         state.tray_overflow_open = false;
         return true;
     }
@@ -1633,9 +2001,12 @@ fn tray_overflow_row(
     if resp.hovered() {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
-    let rollup = tray_segment_rollup(segments, segment);
     let dot_c = egui::pos2(rect.left() + Style::SP_S, rect.center().y);
-    painter.circle_filled(dot_c, Style::SP_XS, status::severity_color(rollup));
+    painter.circle_filled(
+        dot_c,
+        Style::SP_XS,
+        status::segment_color(segment, segments),
+    );
     painter.text(
         egui::pos2(dot_c.x + Style::SP_S, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1652,7 +2023,7 @@ fn tray_overflow_row(
         ui.ctx(),
         tray_overflow_row_id(segment),
         tray_segment_label(segment),
-        status::severity_label(rollup),
+        status::segment_accessibility_value(segment, segments),
         rect,
     );
     response_activated(ui, &resp)
@@ -1662,7 +2033,7 @@ fn tray_overflow_row(
 /// Win10 tray "action center" affordance. Keyed by its own tag so it never
 /// collides with the bare [`rail_icon`] Chat glyph.
 fn action_center_cell_id() -> egui::Id {
-    egui::Id::new(("bottom-rail-action-center", IconId::Chat.name()))
+    egui::Id::new(("bottom-rail-action-center", ACTION_CENTER_ICON.name()))
 }
 
 /// The taskbar **action-center** cell (WIN10-HYBRID #31) — Win10's tray
@@ -1678,26 +2049,25 @@ fn action_center_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) ->
     let unread = state.status.unread > 0;
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    if let Some(fill) = taskbar_cell_fill(selected, hovered) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
     }
-    let tint = if selected || unread {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
+    let tint = taskbar_control_icon_tint(selected || unread, hovered, false);
     let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::Chat, edge, tint) {
+    if let Some(tex) = icon_texture(ui.ctx(), ACTION_CENTER_ICON, edge, tint) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         painter.image(
             tex.id(),
             rail_icon_rect(rect, edge),
             uv,
             egui::Color32::WHITE,
+        );
+    }
+    if unread {
+        painter.circle_filled(
+            egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_S),
+            3.0,
+            Style::ACCENT,
         );
     }
     paint_rail_label(ui, rect, "Notifications", tint);
@@ -1736,13 +2106,13 @@ fn show_desktop_nub(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     let resp = ui.interact(rect, show_desktop_nub_id(), egui::Sense::click());
     let painter = ui.painter().clone();
     if resp.hovered() {
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, Style::SURFACE_HI);
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, TASKBAR_HOVER_FILL);
     }
     // The Win10 hairline that fences the show-desktop corner off from the tray.
     painter.vline(
         rect.left(),
         rect.top()..=rect.bottom(),
-        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+        egui::Stroke::new(HAIRLINE_W, TASKBAR_BORDER),
     );
     paint_focus_ring(&painter, rect, resp.has_focus());
     install_cell_accessibility(
@@ -1758,106 +2128,6 @@ fn show_desktop_nub(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     );
     if resp.clicked() {
         state.active = Surface::Desktop;
-        return true;
-    }
-    false
-}
-
-/// The **Start cell** — the Start Menu's trigger (WIN7-2, design locks
-/// #4/#13; CONSOLE-1's original Start front door, relabelled "Start" per
-/// WIN7-1): the bottom taskbar's far-left affordance, wearing the repo's
-/// Win10-style Start/Menu tray glyph. A click latches the Start Menu toggle
-/// for the shell to drain ([`DockState::take_start_menu_toggle`] — the
-/// deferred wire; pressing it again closes, lock #4/#13). While the panel is
-/// up (mirrored in via [`DockState::set_start_menu_open`]) the cell wears the
-/// selection wash + ACCENT tint, the sys-cell "menu open" idiom. Every colour
-/// is a Style token (§4). Returns `true` on a click.
-fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
-    let resp = ui.interact(rect, start_cell_id(), egui::Sense::click());
-    let hovered = resp.hovered();
-    let painter = ui.painter().clone();
-    if state.start_menu_open {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
-    }
-    let tint = if state.start_menu_open {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    let icon_edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::Start, icon_edge, tint) {
-        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        painter.image(
-            tex.id(),
-            rail_icon_rect(rect, icon_edge),
-            uv,
-            egui::Color32::WHITE,
-        );
-    }
-    paint_rail_label(ui, rect, "Start", tint);
-    paint_focus_ring(&painter, rect, resp.has_focus());
-    install_cell_accessibility(
-        ui.ctx(),
-        start_cell_id(),
-        "Start",
-        if state.start_menu_open {
-            "Start Menu open"
-        } else {
-            "Start Menu closed"
-        },
-        rect,
-    );
-    if resp.clicked() {
-        state.start_menu_toggle = true;
-        return true;
-    }
-    false
-}
-
-/// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
-/// holds the dock open when set (the "pin" half of "hotkey + pin, no hover").
-/// It uses the repo's shared tray pin glyph so the bottom rail remains all-icons.
-/// Every colour is a Style token (§4). Returns `true` on a click (which flips the
-/// pin via [`DockState::toggle_pin`]).
-fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
-    let resp = ui.interact(cell, egui::Id::new("vdock-pin"), egui::Sense::click());
-    let pinned = state.pinned();
-    let color = if pinned {
-        Style::ACCENT
-    } else if resp.hovered() {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(cell, Style::RADIUS, Style::SURFACE_HI);
-    }
-    let edge = ICON_LOGICAL.min((cell.height() - 4.0).max(Style::SP_S));
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::Pin, edge, color) {
-        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-        ui.painter().image(
-            tex.id(),
-            rail_icon_rect(cell, edge),
-            uv,
-            egui::Color32::WHITE,
-        );
-    }
-    paint_rail_label(ui, cell, "Pin", color);
-    paint_focus_ring(ui.painter(), cell, resp.has_focus());
-    install_cell_accessibility(
-        ui.ctx(),
-        egui::Id::new("vdock-pin"),
-        "Pin",
-        if pinned { "Pinned" } else { "Not pinned" },
-        cell,
-    );
-    if resp.clicked() {
-        state.toggle_pin();
         return true;
     }
     false
@@ -1890,49 +2160,32 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
     let selected = state.active == Surface::Timers;
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    if let Some(fill) = taskbar_cell_fill(selected, hovered) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
     }
-    if selected {
-        let bar =
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(ACTIVE_BAR_W, rect.height()));
-        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
-    }
-    // The pick_app_cell two-tone: active reads ACCENT, hover brightens to TEXT,
-    // rest sits dim — the time digits ARE the glyph (lock #20).
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
+    let tint = taskbar_control_icon_tint(selected, hovered, false);
     let now = crate::timers::now_unix();
     let time_text = crate::timers::hhmm(now);
-    let time_font = egui::FontId::proportional(Style::SMALL.min((rect.height() - 6.0).max(8.0)));
+    let time_font =
+        egui::FontId::proportional((Style::SMALL + 1.0).min((rect.height() - 6.0).max(10.0)));
     if rect.height() >= NOTIFICATION_RAIL_EXPANDED_H - 1.0 {
-        // WIN10-HYBRID — the Win10 tray clock is two lines: HH:MM over the date. On
-        // the 48px bar the date replaces the old single "Clock" label; the crate's ONE
-        // calendar (`chat::civil_from_days`) formats it so no second date fold leaks in.
+        // Windows 11-style tray clock: compact, right-aligned HH:MM over the date.
+        // The crate's ONE calendar (`chat::civil_from_days`) formats it so no
+        // second date fold leaks in.
+        let text_x = rect.right() - Style::SP_S;
         painter.text(
-            egui::pos2(rect.center().x, rect.center().y - Style::SP_XS - 1.0),
-            egui::Align2::CENTER_CENTER,
+            egui::pos2(text_x, rect.center().y - Style::SP_XS - 1.0),
+            egui::Align2::RIGHT_CENTER,
             &time_text,
             time_font,
             tint,
         );
         painter.text(
-            egui::pos2(rect.center().x, rect.center().y + Style::SP_S),
-            egui::Align2::CENTER_CENTER,
+            egui::pos2(text_x, rect.center().y + Style::SP_S),
+            egui::Align2::RIGHT_CENTER,
             &clock_date_text(now),
             egui::FontId::proportional(Style::SMALL - 1.0),
-            if selected {
-                Style::ACCENT
-            } else {
-                Style::TEXT_DIM
-            },
+            TASKBAR_CLOCK_DATE,
         );
     } else {
         painter.text(
@@ -1982,8 +2235,9 @@ fn clock_cell_rect(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bo
 // the taskbar's own landmark, and every taskbar-owned cell (Start, the
 // Desktop rail cell, the Desktop-source caret + its flyout rows, session
 // entries + the overflow "more" popup — which reuses [`session_entry`], so
-// one fix covers both — the status/notification toggle, the clock, and the
-// pin). Restates the SAME `accesskit_rect` helper + `Role::Button` +
+// one fix covers both — the status/notification toggle, the clock, the
+// action-center cell, and the show-desktop nub). Restates the SAME
+// `accesskit_rect` helper + `Role::Button` +
 // label/value/bounds/`Click` shape `status.rs`/`console.rs`/`start_menu.rs`
 // already use (each panel's accesskit section owns its own copy, the
 // established per-module convention), named `install_cell_accessibility`
@@ -2064,7 +2318,7 @@ const NOTIFICATION_RAIL_H: f32 = Style::SP_XL + Style::SP_M;
 /// larger touch targets, so WIN7-1's density pass does not shrink it.
 const NOTIFICATION_RAIL_EXPANDED_H: f32 = 48.0;
 const NOTIFICATION_RAIL_EXPANDED_ICON_H: f32 = 24.0;
-const DESKTOP_CARET_W: f32 = 14.0;
+const DESKTOP_CARET_W: f32 = NOTIFICATION_RAIL_H;
 const DESKTOP_SOURCE_ROW_H: f32 = 28.0;
 const DESKTOP_SOURCE_FLYOUT_W: f32 = Style::SP_XL * 7.5;
 const DESKTOP_SOURCE_MAX_ROWS: usize = 8;
@@ -2075,8 +2329,10 @@ const STATUS_PANEL_W: f32 = Style::SP_XL * 7.0;
 const STATUS_PANEL_GAP: f32 = Style::SP_XS;
 const STATUS_PANEL_H: f32 = Style::SP_XL * 8.0;
 
-fn notification_panel_rect(rail: egui::Rect, t: f32) -> egui::Rect {
-    let left = rail.left() + Style::SP_S;
+fn notification_panel_rect(rail: egui::Rect, anchor: egui::Rect, t: f32) -> egui::Rect {
+    let min_left = rail.left() + Style::SP_S;
+    let max_left = (rail.right() - Style::SP_S - STATUS_PANEL_W).max(min_left);
+    let left = (anchor.right() - STATUS_PANEL_W).clamp(min_left, max_left);
     let top =
         rail.top() - STATUS_PANEL_GAP - STATUS_PANEL_H + (1.0 - t.clamp(0.0, 1.0)) * Style::SP_XL;
     egui::Rect::from_min_size(
@@ -2119,23 +2375,13 @@ fn desktop_source_toggle(
     let hovered = resp.hovered();
     let selected = state.desktop_sources_open;
     let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    if let Some(fill) = taskbar_cell_fill(selected, hovered) {
+        painter.rect_filled(rect, Style::RADIUS, fill);
     }
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else if empty {
-        Style::TEXT_DIM.linear_multiply(0.7)
-    } else {
-        Style::TEXT_DIM
-    };
+    let tint = taskbar_control_icon_tint(selected, hovered, empty);
     let edge = (rect.height() - 2.0).max(Style::SP_S);
-    if let Some(tex) = icon_texture(ui.ctx(), IconId::ChevronUp, edge, tint) {
-        let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(edge, edge));
+    if let Some(tex) = icon_texture(ui.ctx(), DESKTOP_SOURCE_TOGGLE_ICON, edge, tint) {
+        let icon = rail_icon_rect(rect, edge);
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
     }
@@ -2308,16 +2554,20 @@ fn rail_more_cell(
     let resp = ui.interact(rect, rail_more_id(), egui::Sense::click());
     let active = state.rail_more_open || resp.hovered();
     if active {
-        ui.painter()
-            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+        ui.painter().rect_filled(
+            rect,
+            Style::RADIUS,
+            taskbar_cell_fill(state.rail_more_open, resp.hovered()).unwrap_or(TASKBAR_HOVER_FILL),
+        );
     }
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "⋯",
-        egui::FontId::proportional(Style::BODY),
-        if active { Style::TEXT } else { Style::TEXT_DIM },
-    );
+    let tint = taskbar_control_icon_tint(state.rail_more_open, resp.hovered(), false);
+    let edge = ICON_LOGICAL.min((rect.height() - 4.0).max(Style::SP_S));
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::MoreHorizontal, edge, tint) {
+        let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(edge, edge));
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        ui.painter()
+            .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+    }
     paint_focus_ring(ui.painter(), rect, resp.has_focus());
     install_cell_accessibility(
         ui.ctx(),
@@ -2371,7 +2621,14 @@ fn rail_more_popup(
                     egui::vec2(popup_w - Style::SP_XS, rail_h),
                 )
                 .shrink(2.0);
-                if session_entry(ui, rect, idx, entry, state.active == Surface::Desktop) {
+                if session_entry(
+                    ui,
+                    rect,
+                    idx,
+                    entry,
+                    state.active == Surface::Desktop,
+                    state.session_preview.as_ref(),
+                ) {
                     state.active = Surface::Desktop;
                     focused_session.clone_from(&entry.id);
                     routed = true;
@@ -2420,7 +2677,7 @@ pub(crate) fn response_activated(ui: &egui::Ui, resp: &egui::Response) -> bool {
 /// Keyboard-focus-ring stroke width (a11y-03 / WCAG 2.4.7) — the shared platform
 /// **2px** focus token ([`mde_egui::focus::FOCUS_RING_W`], design lock #5), so every
 /// focus indicator across the shell (taskbar cells, Explorer, Console) reads at one
-/// consistent weight against the Quasar-dark ground. Sourced from the one token
+/// consistent weight against the dark platform ground. Sourced from the one token
 /// rather than the old mirrored `2.5` local literals.
 const FOCUS_RING_W: f32 = mde_egui::focus::FOCUS_RING_W;
 
@@ -2441,7 +2698,7 @@ fn focus_ring_rect(cell: egui::Rect, focused: bool) -> Option<egui::Rect> {
 /// cell shares: when the cell holds keyboard focus, a high-contrast accent stroke
 /// around its edge shows a keyboard user which cell is focused.
 ///
-/// The Quasar palette has no dedicated focus token, so the ring wears the lifted
+/// The platform palette has no dedicated focus token, so the ring wears the lifted
 /// brand accent [`Style::ACCENT_HI`] — the same accent egui's own `selection.stroke`
 /// derives its focus/selection ring from (`mde_egui::Style::accent_visuals`), one
 /// rung brighter than the resting [`Style::ACCENT`] so it stays legible over the

@@ -1,0 +1,13 @@
+---
+# WL-ARCH-006 (U13) — app_forward role handlers.
+# Re-apply the SETUP-7 site convergence when the app catalog changes, mirroring
+# the cloud_vm role: `mackesd converge --site` re-runs /etc/mackesd/site.yml
+# locally. A very fresh join may not have generated site.yml yet — tolerate that
+# honestly rather than fail the whole play.
+- name: converge mackesd site
+  ansible.builtin.command: "mackesd converge --site {{ app_forward_site_yml }}"
+  register: app_forward_converge_out
+  changed_when: "'converge complete' in app_forward_converge_out.stdout"
+  failed_when:
+    - app_forward_converge_out.rc != 0
+    - "'no convergence playbook' not in app_forward_converge_out.stderr"

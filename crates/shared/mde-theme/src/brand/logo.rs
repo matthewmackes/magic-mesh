@@ -2,7 +2,7 @@
 //!
 //! The shell's one-stop for the platform identity lockup: the horizontal
 //! mark-left/wordmark-right artwork the About panel headers with (design lock
-//! #13, [`MDE-QUAZAR-MAIN.png`]), the tintable vector mark for chrome, and the
+//! #13, [`CONSTRUCT-MAIN.png`]), the tintable vector mark for chrome, and the
 //! user-facing product name/tagline (lock #10) that the About panel (QBRAND-6)
 //! and chrome (QBRAND-5) print.
 //!
@@ -17,7 +17,7 @@
 //!
 //! ## Embed vs. reference — the centered splash lockup lives elsewhere
 //!
-//! Design lock #11 paints the boot-splash from [`MDE-QUAZAR-WALLPAPER1.png`]
+//! Design lock #11 paints the boot-splash from [`CONSTRUCT-WALLPAPER1.png`]
 //! (the centered mark + wordmark + loading bar). That ≈470 KB raster is
 //! **deliberately not embedded here**: the boot-splash (QBRAND-4,
 //! `mde-shell-egui/src/splash.rs`) already `include_bytes!`es it directly, and
@@ -33,8 +33,8 @@
 //! dependency: raster accessors hand back the raw PNG bytes and [`mark_rgba`]
 //! returns a plain [`IconImage`], leaving the egui texture upload to the shell.
 //!
-//! [`MDE-QUAZAR-MAIN.png`]: lockup_horizontal
-//! [`MDE-QUAZAR-WALLPAPER1.png`]: SPLASH_LOCKUP_ASSET
+//! [`CONSTRUCT-MAIN.png`]: lockup_horizontal
+//! [`CONSTRUCT-WALLPAPER1.png`]: SPLASH_LOCKUP_ASSET
 
 use super::icons::{self, IconError, IconId, IconImage};
 
@@ -43,27 +43,34 @@ use super::icons::{self, IconError, IconId, IconImage};
 /// Shown in the About panel, the boot-splash and the window chrome;
 /// `magic-mesh` stays the infra/mesh and package name underneath (the GNOME
 /// vs. `gnome-shell` split).
-pub const PRODUCT_NAME: &str = "MDE Quazar";
+pub const PRODUCT_NAME: &str = "Construct";
 
-/// The product tagline / expansion of the name (design lock #10) — the
-/// "Mackes Display Environment" line the About panel sets beneath the lockup.
-pub const PRODUCT_TAGLINE: &str = "Mackes Display Environment";
+/// The visible studio/platform label requested for the Construct brand.
+pub const SOFTWARE_STUDIO: &str = "Software Studio: MDE";
+
+/// Compatibility alias for older callers that still ask for a tagline. New
+/// visible surfaces should prefer [`SOFTWARE_STUDIO`] and [`PRODUCT_RELEASE`].
+pub const PRODUCT_TAGLINE: &str = SOFTWARE_STUDIO;
+
+/// The visible release label. Internal Cargo/package versioning intentionally
+/// remains independent and continues to come from [`crate::brand::build`].
+pub const PRODUCT_RELEASE: &str = "Release 1.0 BETA";
 
 /// The workspace-relative path to the centered boot-splash lockup
-/// (`MDE-QUAZAR-WALLPAPER1.png`, design lock #11).
+/// (`CONSTRUCT-WALLPAPER1.png`, design lock #11).
 ///
 /// This is a **reference, not an embedded blob**: the boot-splash (QBRAND-4)
 /// owns the `include_bytes!` of this asset, so re-embedding it here would
 /// duplicate ≈470 KB in the binary (see the module docs). Packaging scripts and
 /// callers that need the on-disk path resolve it through this const.
-pub const SPLASH_LOCKUP_ASSET: &str = "assets/brand/MDE-QUAZAR-WALLPAPER1.png";
+pub const SPLASH_LOCKUP_ASSET: &str = "assets/brand/CONSTRUCT-WALLPAPER1.png";
 
 /// The 8-byte PNG signature (`\x89PNG\r\n\x1a\n`) every embedded raster begins
 /// with — used by the tests to prove the accessors return real PNG data.
 pub const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// The horizontal product lockup — the official mark-left / wordmark-right
-/// artwork (`MDE-QUAZAR-MAIN.png`), embedded at compile time.
+/// artwork (`CONSTRUCT-MAIN.png`), embedded at compile time.
 ///
 /// This is the About-panel header image (design lock #13). Returned as raw PNG
 /// bytes; the shell decodes and uploads it as a texture.
@@ -71,7 +78,7 @@ pub const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 pub const fn lockup_horizontal() -> &'static [u8] {
     include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../assets/brand/MDE-QUAZAR-MAIN.png"
+        "/../../../assets/brand/CONSTRUCT-MAIN.png"
     ))
 }
 
@@ -119,7 +126,7 @@ pub fn mark_rgba(size_px: u32, tint: [u8; 4]) -> Result<IconImage, IconError> {
 mod tests {
     use super::{
         lockup_horizontal, mark_rgba, mark_svg, wordmark_svg, IconId, PNG_MAGIC, PRODUCT_NAME,
-        PRODUCT_TAGLINE, SPLASH_LOCKUP_ASSET,
+        PRODUCT_RELEASE, PRODUCT_TAGLINE, SOFTWARE_STUDIO, SPLASH_LOCKUP_ASSET,
     };
 
     #[test]
@@ -161,9 +168,11 @@ mod tests {
 
     #[test]
     fn product_name_and_tagline_are_the_locked_strings() {
-        // Design lock #10 — the user-facing name/tagline every surface prints.
-        assert_eq!(PRODUCT_NAME, "MDE Quazar");
-        assert_eq!(PRODUCT_TAGLINE, "Mackes Display Environment");
+        // Design lock #10 - the user-facing Construct identity.
+        assert_eq!(PRODUCT_NAME, "Construct");
+        assert_eq!(SOFTWARE_STUDIO, "Software Studio: MDE");
+        assert_eq!(PRODUCT_TAGLINE, SOFTWARE_STUDIO);
+        assert_eq!(PRODUCT_RELEASE, "Release 1.0 BETA");
     }
 
     #[test]
@@ -172,7 +181,7 @@ mod tests {
         // blob). Prove the reference is honest: it names WALLPAPER1 and resolves
         // to a file on disk relative to the crate manifest.
         assert!(
-            SPLASH_LOCKUP_ASSET.ends_with("MDE-QUAZAR-WALLPAPER1.png"),
+            SPLASH_LOCKUP_ASSET.ends_with("CONSTRUCT-WALLPAPER1.png"),
             "splash reference names the wrong asset"
         );
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

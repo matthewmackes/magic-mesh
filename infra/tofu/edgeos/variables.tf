@@ -1,3 +1,28 @@
+variable "appliance_id" {
+  description = <<-EOT
+    WL-RUN-006 — the stable id of the router appliance THIS instance manages: the
+    gateway MAC (lowercase colon or dash form — the same `router/<mac>` key the
+    mackesd router_registry seals a credential under). This is the PER-APPLIANCE
+    key: one tofu state + one `appliances/<id>.tfvars` per router, so more than one
+    appliance can be managed from this single root (state layout `state/router/<mac>`,
+    supplied at init via `-backend-config=appliances/<id>.backend.hcl`).
+
+    `gateway` is the reserved alias for the pre-existing farm gateway (172.20.0.1),
+    whose values live in the auto-loaded `terraform.tfvars` and whose LIVE state is
+    grandfathered at `state/edgeos` (the re-key to `state/router/<mac>` is an
+    operator-gated migration — see backend.tf / README, never automatic).
+  EOT
+  type        = string
+  default     = "gateway"
+
+  validation {
+    condition = var.appliance_id == "gateway" || can(regex(
+      "^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$", var.appliance_id
+    ))
+    error_message = "appliance_id must be `gateway` or a MAC address (aa:bb:cc:dd:ee:ff)."
+  }
+}
+
 variable "edgeos_host" {
   description = "EdgeRouter management IP."
   type        = string

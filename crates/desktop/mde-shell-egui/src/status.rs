@@ -2,9 +2,10 @@
 //!
 //! The daemon owns event severity and segment rollups (`state/notify/segment/*`);
 //! the shell only renders the latest read-model: one local A-F grade pip plus the
-//! four count-free health pips Device · Mesh · Power · Alerts. Missing state is an
-//! honest dim baseline, never fabricated green. NOTIF-6's critical edge cue is
-//! also kept here so status has one shell-side code path.
+//! four count-free health pips Device · Mesh · Power · Alerts plus the shell-fed
+//! File operations segment. Missing state is an honest dim baseline, never
+//! fabricated green. NOTIF-6's critical edge cue is also kept here so status has
+//! one shell-side code path.
 
 use std::time::{Duration, Instant};
 
@@ -12,16 +13,20 @@ use mde_bus::persist::Persist;
 
 use crate::bus_reader::BusReader;
 use mde_egui::egui::{self, FontId};
-use mde_egui::{GradeBand, Style};
+use mde_egui::{
+    operation_progress_value, paint_operation_progress_badge, GradeBand, OperationProgressView,
+    Style,
+};
 use mde_seat::{Battery, BatteryState, Probe, SeatSnapshot};
 use mde_theme::brand::icons::IconId;
 use serde::Deserialize;
 
-use crate::chrome::NodeGrades;
+use crate::chrome::{GradeRow, NodeGrades};
 use crate::dock::{icon_texture, Surface};
 
 const REFRESH: Duration = Duration::from_secs(2);
 const TOPIC_PREFIX: &str = "state/notify/segment/";
+const REMOTE_INPUT_TOPIC_PREFIX: &str = "state/seat/remote-input/";
 const BATTERY_LOW: f64 = 20.0;
 const BATTERY_CRITICAL: f64 = 5.0;
 const CRITICAL_POLICY_OWN_SEAT: &str = "own-seat-light-show";
@@ -29,8 +34,9 @@ const EDGE_PULSE_SECONDS: f32 = 2.4;
 const EDGE_PULSE_HALF_CYCLE_SECONDS: f32 = 0.24;
 const EDGE_HELD_W: f32 = 3.0;
 const EDGE_PULSE_W: f32 = 14.0;
+const FILE_OPERATIONS_RAIL_W: f32 = 148.0;
 
-/// The four daemon-owned status segments.
+/// The bottom notification/status segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatusSegment {
     /// Local device/platform health.
@@ -39,19 +45,34 @@ pub enum StatusSegment {
     Mesh,
     /// Power and energy posture.
     Power,
+    /// Local seat remote-control arm/active state.
+    RemoteControl,
+    /// Shell-wide file-operation/download progress.
+    FileOperations,
     /// Aggregate alert health.
     Alerts,
 }
 
 impl StatusSegment {
     /// Render order, top to bottom.
-    pub const ALL: [Self; 4] = [Self::Device, Self::Mesh, Self::Power, Self::Alerts];
+    pub const ALL: [Self; 6] = [
+        Self::Device,
+        Self::Mesh,
+        Self::Power,
+        Self::RemoteControl,
+        Self::FileOperations,
+        Self::Alerts,
+    ];
+
+    const DAEMON: [Self; 4] = [Self::Device, Self::Mesh, Self::Power, Self::Alerts];
 
     const fn key(self) -> &'static str {
         match self {
             Self::Device => "device",
             Self::Mesh => "mesh",
             Self::Power => "power",
+            Self::RemoteControl => "remote-control",
+            Self::FileOperations => "file-operations",
             Self::Alerts => "alerts",
         }
     }
@@ -60,6 +81,8 @@ impl StatusSegment {
         match self {
             Self::Device | Self::Power => Surface::System,
             Self::Mesh => Surface::MeshView,
+            Self::RemoteControl => Surface::System,
+            Self::FileOperations => Surface::Files,
             Self::Alerts => Surface::Chat,
         }
     }
@@ -69,12 +92,85 @@ impl StatusSegment {
             Self::Device => IconId::Settings,
             Self::Mesh => IconId::MeshView,
             Self::Power => IconId::BatteryBolt,
+            Self::RemoteControl => IconId::PictureInPicture,
+            Self::FileOperations => IconId::Files,
             Self::Alerts => IconId::Chat,
         }
     }
 
     fn topic(self) -> String {
         format!("{TOPIC_PREFIX}{}", self.key())
+    }
+}
+
+/// Compact shell-wide file-operation status carried by the notification fabric.
+///
+/// Files owns the detailed operation/transfer state. Browser downloads and other
+/// producers feed this bounded projection so the bottom status segment can report
+/// active count, known-progress average, and a primary label without learning any
+/// per-surface job model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileOperationStatus {
+    /// Active file jobs represented by this summary.
+    active: usize,
+    /// Average known progress, `None` while all active jobs are still queued/starting.
+    fraction: Option<f32>,
+    /// Bounded display label for the status strip/panel.
+    label: String,
+}
+
+impl FileOperationStatus {
+    /// Construct a shell-wide file-operation summary.
+    #[must_use]
+    pub fn new(active: usize, fraction: Option<f32>, label: impl Into<String>) -> Self {
+        Self {
+            active,
+            fraction: fraction.map(|f| f.clamp(0.0, 1.0)),
+            label: truncate_file_operation_label(&label.into()),
+        }
+    }
+
+    fn view(&self) -> OperationProgressView<'_> {
+        OperationProgressView::new(self.active, self.fraction, &self.label)
+    }
+}
+
+/// Local retained indicator for whether this seat is armed for remote control
+/// or actively receiving remote keyboard/mouse input.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RemoteControlStatus {
+    /// Node whose seat this indicator describes.
+    node: String,
+    /// True while a live local consent grant permits injection.
+    armed: bool,
+    /// True while remote input has recently reached the seat.
+    active: bool,
+    /// Controlling source label from the arm grant, when available.
+    source: Option<String>,
+    /// Phone/client id the grant is bound to, when available.
+    phone: Option<String>,
+    /// Wall-clock ms at which the current grant auto-disarms, when armed.
+    armed_until_ms: Option<u64>,
+    /// Timestamp of the retained indicator publication.
+    updated_ms: u64,
+}
+
+impl RemoteControlStatus {
+    fn active_or_armed(&self) -> bool {
+        self.active || self.armed
+    }
+
+    fn summary(&self) -> String {
+        if self.active {
+            format!(
+                "Remote control active{}",
+                remote_control_source_suffix(self)
+            )
+        } else if self.armed {
+            format!("Remote control armed{}", remote_control_source_suffix(self))
+        } else {
+            "Remote control disarmed".to_string()
+        }
     }
 }
 
@@ -98,7 +194,7 @@ pub struct SegmentRollup {
 }
 
 /// The pips the dock renders.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusSegments {
     /// Latest Device rollup.
     pub device: Option<SegmentRollup>,
@@ -106,6 +202,10 @@ pub struct StatusSegments {
     pub mesh: Option<SegmentRollup>,
     /// Latest Power rollup.
     pub power: Option<SegmentRollup>,
+    /// Latest local remote-control indicator.
+    pub remote_control: Option<RemoteControlStatus>,
+    /// Shell-fed active file-operation/download progress.
+    pub file_operations: Option<FileOperationStatus>,
     /// Latest Alerts aggregate rollup.
     pub alerts: Option<SegmentRollup>,
     /// `true` once a poll was attempted.
@@ -118,6 +218,8 @@ impl StatusSegments {
             StatusSegment::Device => self.device = rollup,
             StatusSegment::Mesh => self.mesh = rollup,
             StatusSegment::Power => self.power = rollup,
+            StatusSegment::RemoteControl => {}
+            StatusSegment::FileOperations => {}
             StatusSegment::Alerts => self.alerts = rollup,
         }
     }
@@ -127,6 +229,8 @@ impl StatusSegments {
             StatusSegment::Device => self.device.as_ref(),
             StatusSegment::Mesh => self.mesh.as_ref(),
             StatusSegment::Power => self.power.as_ref(),
+            StatusSegment::RemoteControl => None,
+            StatusSegment::FileOperations => None,
             StatusSegment::Alerts => self.alerts.as_ref(),
         }
     }
@@ -162,7 +266,7 @@ impl StatusState {
     }
 
     /// Poll the local Bus mirror, self-gated to a cheap cadence.
-    pub fn poll(&mut self, ctx: &egui::Context) {
+    pub fn poll(&mut self, ctx: &egui::Context, local_host: &str) {
         if self.last_poll.is_some_and(|t| t.elapsed() < REFRESH) {
             return;
         }
@@ -170,7 +274,7 @@ impl StatusState {
         // arch-11: open through the shared BusReader seam. A missing spool and an
         // unopenable one both fold to the same honest "seen but dim" state.
         if let Some(persist) = BusReader::new(self.bus_root.clone()).open() {
-            self.segments = read_segments(&persist);
+            self.segments = read_segments(&persist, local_host);
         } else {
             self.segments.seen = true;
         }
@@ -190,14 +294,29 @@ impl StatusState {
     }
 }
 
-fn read_segments(persist: &Persist) -> StatusSegments {
+fn read_segments(persist: &Persist, local_host: &str) -> StatusSegments {
     let mut out = StatusSegments {
         seen: true,
         ..StatusSegments::default()
     };
-    for segment in StatusSegment::ALL {
+    for segment in StatusSegment::DAEMON {
         out.set(segment, latest_rollup(persist, segment));
     }
+    out.remote_control = latest_remote_control(persist, local_host);
+    out
+}
+
+fn truncate_file_operation_label(label: &str) -> String {
+    const MAX_CHARS: usize = 34;
+    let char_count = label.chars().count();
+    if char_count <= MAX_CHARS {
+        return label.to_owned();
+    }
+    let mut out = label
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
     out
 }
 
@@ -205,6 +324,17 @@ fn latest_rollup(persist: &Persist, segment: StatusSegment) -> Option<SegmentRol
     let topic = segment.topic();
     let msg = persist.list_since(&topic, None).ok()?.pop()?;
     serde_json::from_str(msg.body.as_deref()?).ok()
+}
+
+fn latest_remote_control(persist: &Persist, local_host: &str) -> Option<RemoteControlStatus> {
+    let local_host = local_host.trim();
+    if local_host.is_empty() {
+        return None;
+    }
+    let topic = format!("{REMOTE_INPUT_TOPIC_PREFIX}{local_host}");
+    let msg = persist.read_latest(&topic).ok()??;
+    let status: RemoteControlStatus = serde_json::from_str(msg.body.as_deref()?).ok()?;
+    (status.node == local_host).then_some(status)
 }
 
 /// `pub(crate)` (not private) because WIN7-4's Start Menu System tile
@@ -219,6 +349,45 @@ pub(crate) fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
         Some("success" | "ok") => Style::SUPPORT_SUCCESS,
         _ => Style::TEXT_DIM,
     }
+}
+
+/// The color used for a compact status segment, including shell-owned synthetic
+/// segments that do not have daemon rollups.
+pub(crate) fn segment_color(segment: StatusSegment, segments: &StatusSegments) -> egui::Color32 {
+    match segment {
+        StatusSegment::RemoteControl => {
+            segments
+                .remote_control
+                .as_ref()
+                .map_or(Style::TEXT_DIM, |status| {
+                    if status.active {
+                        Style::SUPPORT_WARNING
+                    } else if status.armed {
+                        Style::SUPPORT_INFO
+                    } else {
+                        Style::TEXT_DIM
+                    }
+                })
+        }
+        StatusSegment::FileOperations if segments.file_operations.is_some() => Style::ACCENT,
+        StatusSegment::FileOperations => Style::TEXT_DIM,
+        _ => severity_color(segments.get(segment)),
+    }
+}
+
+fn segment_rail_width(segment: StatusSegment, segments: &StatusSegments, pip_h: f32) -> f32 {
+    if segment == StatusSegment::FileOperations && segments.file_operations.is_some() {
+        FILE_OPERATIONS_RAIL_W.max(pip_h)
+    } else {
+        pip_h
+    }
+}
+
+pub(crate) fn notification_rail_width(segments: &StatusSegments, pip_h: f32) -> f32 {
+    StatusSegment::ALL
+        .into_iter()
+        .map(|segment| segment_rail_width(segment, segments, pip_h))
+        .sum()
 }
 
 /// `pub(crate)` for the SAME WIN7-4 reuse [`severity_color`] documents.
@@ -256,15 +425,13 @@ struct ActiveCriticalEdge {
 pub struct CriticalEdgeCue {
     active: Option<ActiveCriticalEdge>,
     acknowledged: Option<CriticalEdgeKey>,
-    muted: bool,
     /// WIN7-6 (`docs/design/win7-desktop-survey.md` lock #9) — latched inside
     /// [`Self::update`] on a [`Self::visible`] hidden→visible edge (a fresh
-    /// critical, one re-raised after an older one was acknowledged, or an
-    /// unmute revealing a still-live one — see [`Self::update`]'s own
-    /// comment), drained once by [`Self::take_became_visible`]. `main.rs`
-    /// uses the drain to auto-close an open Start Menu the instant the cue
-    /// starts showing, without re-firing on every steady "still visible"
-    /// frame afterward — the same one-shot `take_*` shape
+    /// critical or one re-raised after an older one was acknowledged), drained
+    /// once by [`Self::take_became_visible`]. `main.rs` uses the drain to
+    /// auto-close an open Start Menu the instant the cue starts showing,
+    /// without re-firing on every steady "still visible" frame afterward — the
+    /// same one-shot `take_*` shape
     /// `start_menu::StartMenuState`'s own `take_tile_activation`/
     /// `HotkeyRouter::take_dock_toggle` already use.
     became_visible: bool,
@@ -272,9 +439,8 @@ pub struct CriticalEdgeCue {
 
 impl CriticalEdgeCue {
     /// Fold the daemon segment rollups into this seat's edge-cue state.
-    pub fn update(&mut self, segments: &StatusSegments, local_host: &str, muted: bool) {
+    pub fn update(&mut self, segments: &StatusSegments, local_host: &str) {
         let was_visible = self.visible();
-        self.muted = muted;
         let next = critical_edge_key(segments, local_host);
         match next {
             Some(key) => {
@@ -291,11 +457,9 @@ impl CriticalEdgeCue {
             }
         }
         // WIN7-6 (lock #9) — an edge, not a level check: `visible()` can go
-        // false→true from a brand-new critical, a genuinely new one after an
-        // old (different) one was acknowledged, OR an unmute revealing a
-        // still-live one (see the `critical_edge_cue_respects_push_mute_
-        // without_clearing_state` test) — all three are real "the cue just
-        // started showing" moments and all three should latch here. A steady
+        // false→true from a brand-new critical or a genuinely new one after an
+        // old (different) one was acknowledged. Both are real "the cue just
+        // started showing" moments and both should latch here. A steady
         // already-visible frame, and the same rollup staying acknowledged,
         // must NOT latch (see `Self::became_visible`'s own doc for why).
         if !was_visible && self.visible() {
@@ -314,7 +478,7 @@ impl CriticalEdgeCue {
     pub fn visible(&self) -> bool {
         self.active
             .as_ref()
-            .is_some_and(|active| !self.muted && self.acknowledged.as_ref() != Some(&active.key))
+            .is_some_and(|active| self.acknowledged.as_ref() != Some(&active.key))
     }
 
     /// WIN7-6 — drain whether the last [`Self::update`] carried the cue
@@ -388,7 +552,7 @@ pub fn critical_edge_live_region_id() -> egui::Id {
 }
 
 fn critical_edge_key(segments: &StatusSegments, local_host: &str) -> Option<CriticalEdgeKey> {
-    for segment in StatusSegment::ALL {
+    for segment in StatusSegment::DAEMON {
         let Some(rollup) = segments.get(segment) else {
             continue;
         };
@@ -470,16 +634,50 @@ fn local_grade_label(grades: &NodeGrades) -> String {
     )
 }
 
-fn segment_label(segment: StatusSegment) -> &'static str {
+fn status_panel_grade_text(row: &GradeRow) -> String {
+    let grade = if row.stale {
+        "?".to_string()
+    } else {
+        GradeBand::from_score(f32::from(row.score))
+            .letter()
+            .to_string()
+    };
+    format!("{}  {} {grade}", row.host, row.trend.arrow())
+}
+
+pub(crate) const fn segment_label(segment: StatusSegment) -> &'static str {
     match segment {
         StatusSegment::Device => "Device",
         StatusSegment::Mesh => "Mesh",
         StatusSegment::Power => "Power",
+        StatusSegment::RemoteControl => "Remote control",
+        StatusSegment::FileOperations => "File operations",
         StatusSegment::Alerts => "Alerts",
     }
 }
 
-fn segment_accessibility_value(segment: StatusSegment, rollup: Option<&SegmentRollup>) -> String {
+pub(crate) fn segment_accessibility_value(
+    segment: StatusSegment,
+    segments: &StatusSegments,
+) -> String {
+    if segment == StatusSegment::FileOperations {
+        return segments.file_operations.as_ref().map_or_else(
+            || "File operations idle".to_string(),
+            |progress| {
+                format!(
+                    "File operations active: {}",
+                    operation_progress_value(progress.view())
+                )
+            },
+        );
+    }
+    if segment == StatusSegment::RemoteControl {
+        return segments.remote_control.as_ref().map_or_else(
+            || "Remote control status unknown".to_string(),
+            RemoteControlStatus::summary,
+        );
+    }
+    let rollup = segments.get(segment);
     let state = severity_label(rollup);
     rollup.map_or_else(
         || format!("{} status unknown", segment_label(segment)),
@@ -498,7 +696,7 @@ fn segment_accessibility_value(segment: StatusSegment, rollup: Option<&SegmentRo
 fn status_live_summary(grades: &NodeGrades, segments: &StatusSegments) -> String {
     let mut parts = vec![format!("Local grade {}", local_grade_label(grades))];
     for segment in StatusSegment::ALL {
-        parts.push(segment_accessibility_value(segment, segments.get(segment)));
+        parts.push(segment_accessibility_value(segment, segments));
     }
     parts.join(". ")
 }
@@ -531,10 +729,10 @@ fn install_status_accessibility(
 fn install_segment_accessibility(
     ctx: &egui::Context,
     segment: StatusSegment,
-    rollup: Option<&SegmentRollup>,
+    segments: &StatusSegments,
     rect: egui::Rect,
 ) {
-    let value = segment_accessibility_value(segment, rollup);
+    let value = segment_accessibility_value(segment, segments);
     let _ = ctx.accesskit_node_builder(segment_pip_id(segment), |node| {
         node.set_role(egui::accesskit::Role::Button);
         node.set_label(format!("{} status", segment_label(segment)));
@@ -596,11 +794,23 @@ pub fn status_panel_device_id() -> egui::Id {
     egui::Id::new("notif-status-panel-device")
 }
 
+/// Stable id for the expansion panel's file-operation row.
+pub fn status_panel_file_operations_id() -> egui::Id {
+    egui::Id::new("notif-status-panel-file-operations")
+}
+
+/// Stable id for the expansion panel's remote-control row.
+pub fn status_panel_remote_control_id() -> egui::Id {
+    egui::Id::new("notif-status-panel-remote-control")
+}
+
 /// Output from rendering the compact row.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StatusBarOutcome {
     /// A pip or local grade routed to a surface.
     pub routed: bool,
+    /// The specific segment that routed, when a segment pip was activated.
+    pub routed_segment: Option<StatusSegment>,
     /// The chevron was clicked.
     pub toggle_panel: bool,
 }
@@ -612,6 +822,8 @@ pub struct StatusPanelOutcome {
     pub node_focus: Option<String>,
     /// Device controls requested the full System surface.
     pub route_system: bool,
+    /// A status segment row requested its owning surface.
+    pub routed_segment: Option<StatusSegment>,
 }
 
 /// Render the notification/status micro-icons inside the bottom rail.
@@ -628,14 +840,24 @@ pub fn notification_rail(
     let rail_h = rect.height();
     let mut x = rect.left();
     for segment in StatusSegment::ALL {
+        let segment_w = segment_rail_width(segment, segments, rail_h);
         let pip_rect =
-            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(rail_h, rail_h))
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(segment_w, rail_h))
                 .shrink(2.0);
-        if segment_pip(ui, segment, segments.get(segment), pip_rect) {
+        let routed = if segment == StatusSegment::FileOperations {
+            segments.file_operations.as_ref().map_or_else(
+                || segment_pip(ui, segment, segments, pip_rect),
+                |progress| file_operation_compact_segment(ui, pip_rect, segments, progress),
+            )
+        } else {
+            segment_pip(ui, segment, segments, pip_rect)
+        };
+        if routed {
             *active = segment.route();
             out.routed = true;
+            out.routed_segment = Some(segment);
         }
-        x += rail_h;
+        x += segment_w;
     }
     let _ = expanded;
     out
@@ -718,9 +940,10 @@ pub fn status_bar(
             egui::vec2(rect.width() / 2.0, pip_h),
         )
         .shrink(1.0);
-        if segment_pip(ui, segment, segments.get(segment), pip_rect) {
+        if segment_pip(ui, segment, segments, pip_rect) {
             *active = segment.route();
             out.routed = true;
+            out.routed_segment = Some(segment);
         }
     }
     out
@@ -729,16 +952,16 @@ pub fn status_bar(
 fn segment_pip(
     ui: &egui::Ui,
     segment: StatusSegment,
-    rollup: Option<&SegmentRollup>,
+    segments: &StatusSegments,
     rect: egui::Rect,
 ) -> bool {
-    install_segment_accessibility(ui.ctx(), segment, rollup, rect);
+    install_segment_accessibility(ui.ctx(), segment, segments, rect);
     let resp = ui.interact(rect, segment_pip_id(segment), egui::Sense::click());
     let painter = ui.painter().clone();
     if resp.hovered() {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
-    let color = severity_color(rollup);
+    let color = segment_color(segment, segments);
     let center = rect.center();
     if let Some(tex) = icon_texture(ui.ctx(), segment.icon(), Style::SP_M, color) {
         let icon = egui::Rect::from_center_size(center, egui::vec2(Style::SP_M, Style::SP_M));
@@ -750,10 +973,95 @@ fn segment_pip(
     resp.clicked()
 }
 
+fn file_operation_compact_segment(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    segments: &StatusSegments,
+    progress: &FileOperationStatus,
+) -> bool {
+    install_segment_accessibility(ui.ctx(), StatusSegment::FileOperations, segments, rect);
+    let resp = ui.interact(
+        rect,
+        segment_pip_id(StatusSegment::FileOperations),
+        egui::Sense::click(),
+    );
+    let view = progress.view();
+    let painter = ui.painter().clone();
+    let fill = if resp.hovered() {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    painter.rect_filled(rect, Style::RADIUS, fill);
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let font = FontId::proportional(Style::SMALL);
+    let status = view.fraction.map_or_else(
+        || "starting".to_string(),
+        |fraction| format!("{:.0}%", fraction * 100.0),
+    );
+    let status_color = if view.fraction.is_some() {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    };
+    let status_width = painter
+        .layout_no_wrap(status.clone(), font.clone(), status_color)
+        .size()
+        .x;
+    let text_y = rect.top() + Style::SP_XS;
+    let label_right =
+        (rect.right() - Style::SP_S - status_width - Style::SP_XS).max(rect.left() + Style::SP_M);
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + Style::SP_XS, rect.top()),
+        egui::pos2(label_right, rect.bottom()),
+    )
+    .intersect(rect);
+    painter.with_clip_rect(label_clip).text(
+        egui::pos2(rect.left() + Style::SP_XS, text_y),
+        egui::Align2::LEFT_TOP,
+        view.label,
+        font.clone(),
+        Style::TEXT,
+    );
+    painter.text(
+        egui::pos2(rect.right() - Style::SP_XS, text_y),
+        egui::Align2::RIGHT_TOP,
+        status,
+        font,
+        status_color,
+    );
+
+    let track = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.left() + Style::SP_XS,
+            rect.bottom() - Style::SP_XS - 3.0,
+        ),
+        egui::vec2((rect.width() - Style::SP_S).max(Style::SP_M), 3.0),
+    );
+    painter.rect_filled(track, Style::RADIUS_S, Style::LAYER_01);
+    let (fraction, color) = view.fraction.map_or((0.14, Style::TEXT_DIM), |fraction| {
+        (fraction, Style::ACCENT)
+    });
+    let fill_w = (track.width() * fraction.clamp(0.0, 1.0)).max(Style::SP_XS);
+    painter.rect_filled(
+        egui::Rect::from_min_size(track.min, egui::vec2(fill_w, track.height())),
+        Style::RADIUS_S,
+        color,
+    );
+    resp.clicked()
+}
+
 /// Render NOTIF-4's slide-out detail panel to the right of the dock.
 pub fn status_panel(
     ui: &egui::Ui,
     grades: &NodeGrades,
+    segments: &StatusSegments,
     seat: Option<&SeatSnapshot>,
     rect: egui::Rect,
 ) -> StatusPanelOutcome {
@@ -799,7 +1107,12 @@ pub fn status_panel(
         );
         y += row_h;
     }
-    for row in rows.iter().take(5) {
+    let extra_rows = usize::from(segments.file_operations.is_some())
+        + usize::from(remote_control_panel_visible(
+            segments.remote_control.as_ref(),
+        ));
+    let grade_limit = 5usize.saturating_sub(extra_rows).max(3);
+    for row in rows.iter().take(grade_limit) {
         let r = egui::Rect::from_min_max(
             egui::pos2(inner_left, y),
             egui::pos2(inner_right, y + row_h),
@@ -808,13 +1121,6 @@ pub fn status_panel(
         if resp.hovered() {
             painter.rect_filled(r, Style::RADIUS, Style::SURFACE_HI);
         }
-        let grade = if row.stale {
-            "?".to_string()
-        } else {
-            GradeBand::from_score(f32::from(row.score))
-                .letter()
-                .to_string()
-        };
         let color = if row.stale {
             Style::TEXT_DIM
         } else {
@@ -828,7 +1134,7 @@ pub fn status_panel(
         painter.text(
             egui::pos2(r.left() + Style::SP_L, r.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("{}  {grade}", row.host),
+            status_panel_grade_text(row),
             FontId::proportional(Style::SMALL),
             if row.is_local {
                 Style::TEXT
@@ -850,6 +1156,44 @@ pub fn status_panel(
     );
     y += Style::SP_S;
 
+    if let Some(progress) = segments.file_operations.as_ref() {
+        let file_rect = egui::Rect::from_min_max(
+            egui::pos2(inner_left, y),
+            egui::pos2(inner_right, y + row_h + Style::SP_S),
+        );
+        if draw_file_operations_row(ui, file_rect, progress) {
+            out.routed_segment = Some(StatusSegment::FileOperations);
+        }
+        y = file_rect.bottom() + Style::SP_XS;
+        painter.hline(
+            inner_left..=inner_right,
+            y,
+            egui::Stroke::new(1.0, Style::BORDER),
+        );
+        y += Style::SP_S;
+    }
+
+    if let Some(remote) = segments
+        .remote_control
+        .as_ref()
+        .filter(|status| status.active_or_armed())
+    {
+        let remote_rect = egui::Rect::from_min_max(
+            egui::pos2(inner_left, y),
+            egui::pos2(inner_right, y + row_h + Style::SP_XS),
+        );
+        if draw_remote_control_row(ui, remote_rect, remote) {
+            out.routed_segment = Some(StatusSegment::RemoteControl);
+        }
+        y = remote_rect.bottom() + Style::SP_XS;
+        painter.hline(
+            inner_left..=inner_right,
+            y,
+            egui::Stroke::new(1.0, Style::BORDER),
+        );
+        y += Style::SP_S;
+    }
+
     let device_rect = egui::Rect::from_min_max(
         egui::pos2(inner_left, y),
         egui::pos2(inner_right, y + row_h * 3.0),
@@ -863,6 +1207,124 @@ pub fn status_panel(
     }
     draw_device_controls(ui, seat, device_rect);
     out
+}
+
+fn draw_file_operations_row(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    progress: &FileOperationStatus,
+) -> bool {
+    let resp = ui.interact(
+        rect,
+        status_panel_file_operations_id(),
+        egui::Sense::click(),
+    );
+    let badge_rect = rect.shrink2(egui::vec2(Style::SP_XS, Style::SP_XS));
+    paint_operation_progress_badge(ui, badge_rect, progress.view(), false, resp.hovered());
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(status_panel_file_operations_id(), |node| {
+            node.set_role(egui::accesskit::Role::Button);
+            node.set_label("File operations status");
+            node.set_value(operation_progress_value(progress.view()));
+            node.set_bounds(accesskit_rect(rect));
+            node.add_action(egui::accesskit::Action::Click);
+        });
+    resp.clicked()
+}
+
+fn remote_control_panel_visible(status: Option<&RemoteControlStatus>) -> bool {
+    status.is_some_and(RemoteControlStatus::active_or_armed)
+}
+
+fn remote_control_source_suffix(status: &RemoteControlStatus) -> String {
+    status
+        .source
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(String::new, |source| {
+            status
+                .phone
+                .as_deref()
+                .filter(|phone| !phone.trim().is_empty())
+                .map_or_else(
+                    || format!(" from {source}"),
+                    |phone| format!(" from {source} ({phone})"),
+                )
+        })
+}
+
+fn draw_remote_control_row(ui: &egui::Ui, rect: egui::Rect, status: &RemoteControlStatus) -> bool {
+    let resp = ui.interact(rect, status_panel_remote_control_id(), egui::Sense::click());
+    let painter = ui.painter().clone();
+    let fill = if resp.hovered() {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    painter.rect_filled(rect, Style::RADIUS, fill);
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let tone = segment_color(
+        StatusSegment::RemoteControl,
+        &StatusSegments {
+            remote_control: Some(status.clone()),
+            ..StatusSegments::default()
+        },
+    );
+    let icon_center = egui::pos2(rect.left() + Style::SP_M, rect.center().y);
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::PictureInPicture, Style::SP_M, tone) {
+        let icon = egui::Rect::from_center_size(icon_center, egui::vec2(Style::SP_M, Style::SP_M));
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    } else {
+        painter.circle_filled(icon_center, Style::SP_XS, tone);
+    }
+    painter.text(
+        egui::pos2(rect.left() + Style::SP_L, rect.top() + Style::SP_XS),
+        egui::Align2::LEFT_TOP,
+        if status.active {
+            "Remote control active"
+        } else {
+            "Remote control armed"
+        },
+        FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    painter.text(
+        egui::pos2(rect.left() + Style::SP_L, rect.top() + Style::SP_M),
+        egui::Align2::LEFT_TOP,
+        remote_control_accessory_text(status),
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(status_panel_remote_control_id(), |node| {
+            node.set_role(egui::accesskit::Role::Button);
+            node.set_label("Remote control status");
+            node.set_value(status.summary());
+            node.set_bounds(accesskit_rect(rect));
+            node.add_action(egui::accesskit::Action::Click);
+        });
+    resp.clicked()
+}
+
+fn remote_control_accessory_text(status: &RemoteControlStatus) -> String {
+    let source = status
+        .source
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("unknown source");
+    status
+        .phone
+        .as_deref()
+        .filter(|phone| !phone.trim().is_empty())
+        .map_or_else(|| source.to_string(), |phone| format!("{source} - {phone}"))
 }
 
 fn draw_device_controls(ui: &egui::Ui, seat: Option<&SeatSnapshot>, rect: egui::Rect) {
@@ -905,7 +1367,7 @@ fn draw_device_controls(ui: &egui::Ui, seat: Option<&SeatSnapshot>, rect: egui::
         egui::pos2(left, bt_y),
         egui::Align2::LEFT_CENTER,
         bt.map_or("BT --".to_string(), |(on, connected)| {
-            format!("BT {} · {connected}", if on { "on" } else { "off" })
+            bluetooth_status_text(on, connected)
         }),
         FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
@@ -978,6 +1440,10 @@ fn draw_meter(painter: &egui::Painter, rect: egui::Rect, pct: f32) {
     painter.rect_filled(fill, Style::RADIUS, Style::ACCENT);
 }
 
+fn bluetooth_status_text(on: bool, connected: usize) -> String {
+    format!("BT {} - {connected}", if on { "on" } else { "off" })
+}
+
 fn battery_status(seat: Option<&SeatSnapshot>) -> Option<&Battery> {
     match seat.map(|s| &s.batteries) {
         Some(Probe::Present(cells)) => system_pack(cells),
@@ -1034,7 +1500,7 @@ fn system_pack(cells: &[Battery]) -> Option<&Battery> {
 mod tests {
     use super::*;
     use crate::chrome::{GradeRow, GradeTrend};
-    use mde_bus::hooks::config::Priority;
+    use mde_bus::{hooks::config::Priority, persist::Persist};
     use mde_seat::BatteryKind;
 
     fn grade(score: u8, stale: bool) -> NodeGrades {
@@ -1110,6 +1576,69 @@ mod tests {
     }
 
     #[test]
+    fn remote_control_indicator_poll_feeds_local_status_segment() {
+        let tmp = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let local_body = serde_json::json!({
+            "node": "eagle",
+            "armed": true,
+            "active": true,
+            "source": "Moonlight",
+            "phone": "tablet-1",
+            "armed_until_ms": 123456,
+            "updated_ms": 123000,
+        })
+        .to_string();
+        let peer_body = serde_json::json!({
+            "node": "hawk",
+            "armed": false,
+            "active": false,
+            "source": null,
+            "phone": null,
+            "armed_until_ms": null,
+            "updated_ms": 123000,
+        })
+        .to_string();
+        persist
+            .write(
+                "state/seat/remote-input/eagle",
+                Priority::Min,
+                None,
+                Some(&local_body),
+            )
+            .expect("local indicator");
+        persist
+            .write(
+                "state/seat/remote-input/hawk",
+                Priority::Min,
+                None,
+                Some(&peer_body),
+            )
+            .expect("peer indicator");
+
+        let ctx = egui::Context::default();
+        let mut state = StatusState::with_bus_root(tmp.path().to_path_buf());
+        state.poll(&ctx, "eagle");
+
+        let remote = state
+            .segments()
+            .remote_control
+            .as_ref()
+            .expect("local remote-control status");
+        assert!(remote.active);
+        assert!(remote.armed);
+        assert_eq!(remote.source.as_deref(), Some("Moonlight"));
+        assert_eq!(
+            segment_color(StatusSegment::RemoteControl, state.segments()),
+            Style::SUPPORT_WARNING
+        );
+        assert_eq!(
+            segment_accessibility_value(StatusSegment::RemoteControl, state.segments()),
+            "Remote control active from Moonlight (tablet-1)"
+        );
+    }
+
+    #[test]
     fn local_grade_pip_uses_grade_band_or_dim_unknown() {
         assert_eq!(local_grade_label(&grade(95, false)), "A");
         assert_eq!(
@@ -1119,6 +1648,16 @@ mod tests {
         assert_eq!(local_grade_label(&grade(20, true)), "?");
         assert_eq!(local_grade_color(&grade(20, true)), Style::TEXT_DIM);
         assert_eq!(local_grade_label(&NodeGrades::default()), "?");
+    }
+
+    #[test]
+    fn status_panel_grade_rows_include_trend_arrows() {
+        let mut rows = grade(95, false).rows;
+        rows[0].trend = GradeTrend::Up;
+        assert_eq!(status_panel_grade_text(&rows[0]), "eagle  ↑ A");
+        rows[0].trend = GradeTrend::Down;
+        rows[0].stale = true;
+        assert_eq!(status_panel_grade_text(&rows[0]), "eagle  ↓ ?");
     }
 
     #[test]
@@ -1137,6 +1676,20 @@ mod tests {
                 11,
             )),
             mesh: Some(rollup("mesh", "warning", "lh-1", "remote-pip-chat", 12)),
+            remote_control: Some(RemoteControlStatus {
+                node: "eagle".to_string(),
+                armed: true,
+                active: true,
+                source: Some("Moonlight".to_string()),
+                phone: Some("tablet-1".to_string()),
+                armed_until_ms: Some(1000),
+                updated_ms: 900,
+            }),
+            file_operations: Some(FileOperationStatus::new(
+                2,
+                Some(0.5),
+                "2 browser downloads",
+            )),
             seen: true,
             ..StatusSegments::default()
         };
@@ -1171,6 +1724,8 @@ mod tests {
         assert!(value.contains("Local grade A"));
         assert!(value.contains("Alerts critical"));
         assert!(value.contains("Mesh warning"));
+        assert!(value.contains("Remote control active"));
+        assert!(value.contains("File operations active"));
 
         let alert_pip = nodes
             .iter()
@@ -1184,6 +1739,60 @@ mod tests {
                 .is_some_and(|value| value.contains("Alerts critical")),
             "alert pip carries its severity summary"
         );
+        let file_pip = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("file operations pip node");
+        assert_eq!(file_pip.role(), egui::accesskit::Role::Button);
+        assert!(
+            file_pip
+                .value()
+                .is_some_and(|value| value.contains("50% average progress")),
+            "file-operation pip carries progress through the notification status fabric"
+        );
+        let remote_pip = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Remote control status"))
+            .expect("remote control pip node");
+        assert_eq!(remote_pip.role(), egui::accesskit::Role::Button);
+        assert!(
+            remote_pip
+                .value()
+                .is_some_and(|value| value.contains("Remote control active from Moonlight")),
+            "remote-control pip carries the local seat indicator"
+        );
+    }
+
+    #[test]
+    fn file_operation_status_labels_are_bounded_ascii_for_bottom_progress() {
+        let status = FileOperationStatus::new(
+            1,
+            Some(0.5),
+            "Copy very-long-platform-operation-report-final.txt",
+        );
+        let label = status.view().label;
+
+        assert!(label.ends_with("..."), "truncated label = {label}");
+        assert!(label.is_ascii(), "truncated label = {label}");
+        assert!(
+            label.chars().count() <= 34,
+            "bottom-progress label should stay bounded: {label}"
+        );
+        assert!(!label.contains('…'), "label must not use Unicode ellipsis");
+        assert!(
+            !mde_egui::operation_progress_text(status.view()).contains('·'),
+            "shared bottom-progress badge text must not use middle-dot separators"
+        );
+    }
+
+    #[test]
+    fn status_panel_device_copy_uses_ascii_separators() {
+        let text = bluetooth_status_text(true, 2);
+        assert_eq!(text, "BT on - 2");
+        assert!(text.is_ascii());
+        assert!(!text.contains('·'), "Bluetooth status text = {text}");
     }
 
     #[test]
@@ -1209,7 +1818,7 @@ mod tests {
             )
             .unwrap();
 
-        let segments = read_segments(&persist);
+        let segments = read_segments(&persist, "eagle");
         assert!(segments.seen);
         assert_eq!(
             segments.mesh.as_ref().map(|r| r.severity.as_str()),
@@ -1234,7 +1843,7 @@ mod tests {
             .unwrap();
         let ctx = egui::Context::default();
         let mut state = StatusState::with_bus_root(tmp.path().to_path_buf());
-        state.poll(&ctx);
+        state.poll(&ctx, "eagle");
         assert_eq!(
             state.segments().alerts.as_ref().map(|r| r.source.as_str()),
             Some("journal")
@@ -1342,8 +1951,8 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", false);
-        assert!(cue.visible(), "a live unmuted critical is visible");
+        cue.update(&live, "eagle");
+        assert!(cue.visible(), "a live critical is visible");
 
         cue.acknowledge();
         assert!(
@@ -1351,7 +1960,7 @@ mod tests {
             "ack hides the cue while the same rollup is live"
         );
 
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             !cue.visible(),
             "the same acknowledged rollup does not immediately reappear"
@@ -1367,15 +1976,15 @@ mod tests {
             )),
             ..StatusSegments::default()
         };
-        cue.update(&reraised, "eagle", false);
+        cue.update(&reraised, "eagle");
         assert!(cue.visible(), "a new live critical re-raises the cue");
 
-        cue.update(&StatusSegments::default(), "eagle", false);
+        cue.update(&StatusSegments::default(), "eagle");
         assert!(!cue.visible(), "resolved rollups clear the cue");
     }
 
     #[test]
-    fn critical_edge_cue_respects_push_mute_without_clearing_state() {
+    fn critical_edge_cue_critical_breaks_through_push_suppression_policy() {
         let live = StatusSegments {
             alerts: Some(rollup(
                 "alerts",
@@ -1387,10 +1996,16 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", true);
-        assert!(!cue.visible(), "DND/focus mute suppresses the ambient push");
-        cue.update(&live, "eagle", false);
-        assert!(cue.visible(), "unmuting reveals the still-live critical");
+        cue.update(&live, "eagle");
+        assert!(
+            cue.visible(),
+            "own-seat Critical edge cues break through DND/focus suppression; \
+             non-critical ambient suppression belongs to the toast policy"
+        );
+        assert!(
+            cue.take_became_visible(),
+            "a break-through Critical still latches the one-shot visible edge"
+        );
     }
 
     #[test]
@@ -1412,7 +2027,7 @@ mod tests {
         };
         let mut cue = CriticalEdgeCue::default();
 
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             cue.take_became_visible(),
             "a fresh critical is a hidden->visible edge"
@@ -1422,14 +2037,14 @@ mod tests {
             "draining the edge clears it until the next real transition"
         );
 
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             !cue.take_became_visible(),
             "the SAME still-active critical is not a new edge"
         );
 
         cue.acknowledge();
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         assert!(
             !cue.take_became_visible(),
             "re-affirming an acknowledged rollup is not a new edge"
@@ -1445,42 +2060,16 @@ mod tests {
             )),
             ..StatusSegments::default()
         };
-        cue.update(&reraised, "eagle", false);
+        cue.update(&reraised, "eagle");
         assert!(
             cue.take_became_visible(),
             "a genuinely new critical after an old one was acked is a fresh edge"
         );
 
-        cue.update(&StatusSegments::default(), "eagle", false);
+        cue.update(&StatusSegments::default(), "eagle");
         assert!(
             !cue.take_became_visible(),
             "a resolved rollup clearing the cue is not itself a visible edge"
-        );
-    }
-
-    #[test]
-    fn critical_edge_cue_take_became_visible_latches_on_unmute_too() {
-        let live = StatusSegments {
-            alerts: Some(rollup(
-                "alerts",
-                "critical",
-                "eagle",
-                CRITICAL_POLICY_OWN_SEAT,
-                11,
-            )),
-            ..StatusSegments::default()
-        };
-        let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", true);
-        assert!(
-            !cue.take_became_visible(),
-            "a muted critical never became visible"
-        );
-
-        cue.update(&live, "eagle", false);
-        assert!(
-            cue.take_became_visible(),
-            "unmuting a still-live critical is also a real edge"
         );
     }
 
@@ -1509,7 +2098,7 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -1542,7 +2131,7 @@ mod tests {
             ..StatusSegments::default()
         };
         let mut cue = CriticalEdgeCue::default();
-        cue.update(&live, "eagle", false);
+        cue.update(&live, "eagle");
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,

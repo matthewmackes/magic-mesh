@@ -1,5 +1,7 @@
 # MDE Workbench — navigation grouping redesign (NAV-1)
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** describes the retired `mde-workbench` navigation model (`model.rs`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and the current [`workbench-nav-grouping`](workbench-nav-grouping.md) successor concepts in the egui shell. Retained as a historical design record.
+
 **Status:** locked 2026-06-14 via a 15-question operator survey. Supersedes the
 ad-hoc 15-group nav in `crates/workbench/mde-workbench/src/model.rs`.
 

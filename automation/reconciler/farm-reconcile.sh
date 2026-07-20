@@ -13,7 +13,7 @@
 #           worklist task to `needs-review` by recording it in $STATE/needs-review.txt
 #           (the AI supervisor/coordinator reads that to pick up review work). The human
 #           worklist checkbox is left untouched — collision-free, and this script's
-#           pathspec is never docs/WORKLIST.md (AI_GOVERNANCE).
+#           pathspec is never the canonical platform worklist (AI_GOVERNANCE).
 #   RED   — raises a triage task: one line per failed job in $STATE/triage.txt (and a
 #           GitHub issue when `gh` is configured), so a red build surfaces work for the
 #           AI supervisor instead of silently rotting.
@@ -89,8 +89,9 @@ open_pr() {
 
 # flip_needs_review <rev> <pr_url> <task...> — record each contributing task as
 # needs-review for the AI supervisor. We do NOT edit the human worklist checkbox
-# (collision-free + AI_GOVERNANCE: this file's pathspec must never be docs/WORKLIST.md);
-# the marker lives in $REVIEW (the coordinator/AI reads it to pick up review work).
+# (collision-free + AI_GOVERNANCE: this file's pathspec must never be the
+# canonical platform worklist); the marker lives in $REVIEW (the coordinator/AI
+# reads it to pick up review work).
 flip_needs_review() {
   local rev="$1" url="$2"; shift 2
   local t
@@ -178,7 +179,7 @@ case "${1:-}" in
   -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-log "rev=$CUR  jobs from $(basename "$(cd "$LIB/../.." && pwd)")/docs/WORKLIST.md"
+log "rev=$CUR  jobs from docs/platform/WORKLIST.md"
 declare -a NEED=()
 declare -A CMD=()
 declare -A TASK=()

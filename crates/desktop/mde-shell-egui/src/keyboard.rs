@@ -4,7 +4,7 @@
 //! A convertible with the Type Cover detached has no physical keyboard, so the shell
 //! must draw one and feed the focused text field itself (the bare-DRM seat owns the
 //! input path — there is no external input-method to lean on). This module is that
-//! OSK, built entirely on the Quasar [`Style`]/[`Motion`] tokens (§4 — no raw hex).
+//! OSK, built entirely on the Construct [`Style`]/[`Motion`] tokens (§4 — no raw hex).
 //!
 //! **Three parts, the first two pure + headless-testable:**
 //!
@@ -28,6 +28,9 @@
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::{Formfactor, Motion, Style};
+use mde_theme::brand::icons::IconId;
+
+use crate::dock::icon_texture;
 
 /// Which layer the OSK is currently showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -212,6 +215,9 @@ const OSK_AREA: &str = "mcnf-osk";
 const OSK_TOGGLE: &str = "mcnf-osk-toggle";
 /// The `Motion::animate` key for the slide/fade.
 const OSK_ANIM: &str = "mcnf-osk-anim";
+/// Shared YAMIS icon used by the tablet-bar affordance.
+const OSK_TOGGLE_ICON: IconId = IconId::Keyboard;
+const OSK_TOGGLE_LABEL: &str = "On-screen keyboard";
 
 /// The shell's on-screen keyboard overlay (SURFACE-10).
 ///
@@ -326,10 +332,7 @@ impl Keyboard {
                     egui::vec2(-Style::SP_M, -Style::SP_M),
                 )
                 .show(ctx, |ui| {
-                    let r = ui.add_sized(
-                        egui::vec2(KEY_H, KEY_H),
-                        egui::Button::new(RichText::new("\u{2328}").size(Style::HEADING)), // ⌨
-                    );
+                    let r = osk_toggle_button(ui);
                     if r.clicked() {
                         self.toggle();
                         interacted = true;
@@ -402,9 +405,157 @@ impl Keyboard {
     }
 }
 
+fn osk_toggle_button(ui: &mut egui::Ui) -> egui::Response {
+    let response = ui.add_sized(egui::vec2(KEY_H, KEY_H), egui::Button::new(""));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), OSK_TOGGLE_LABEL)
+    });
+    let icon_size = Style::SP_L;
+    let icon_rect =
+        egui::Rect::from_center_size(response.rect.center(), egui::vec2(icon_size, icon_size));
+    if let Some(tex) = icon_texture(ui.ctx(), OSK_TOGGLE_ICON, icon_size, Style::TEXT) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        ui.painter()
+            .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
+    } else {
+        paint_keyboard_fallback(ui.painter(), icon_rect, Style::TEXT);
+    }
+    keyboard_hover_text(response, OSK_TOGGLE_LABEL)
+}
+
+fn keyboard_tooltip(ui: &mut egui::Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn keyboard_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| keyboard_tooltip(ui, text.as_str()))
+}
+
+fn paint_keyboard_fallback(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3, color);
+    painter.rect_stroke(rect.shrink(1.0), 3.0, stroke, egui::StrokeKind::Inside);
+    let row_h = rect.height() / 4.5;
+    for row in 1..=3 {
+        let y = rect.top() + row as f32 * row_h;
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 3.0, y),
+                egui::pos2(rect.right() - 3.0, y),
+            ],
+            stroke,
+        );
+    }
+    painter.line_segment(
+        [
+            egui::pos2(
+                rect.left() + rect.width() * 0.25,
+                rect.bottom() - row_h * 0.75,
+            ),
+            egui::pos2(
+                rect.right() - rect.width() * 0.25,
+                rect.bottom() - row_h * 0.75,
+            ),
+        ],
+        egui::Stroke::new(1.8, color),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_keyboard_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    keyboard_tooltip(ui, OSK_TOGGLE_LABEL);
+                });
+            },
+        )
+    }
 
     // --- the raise/dismiss fold (formfactor × focus × manual → visible) -------------
 
@@ -479,6 +630,15 @@ mod tests {
         kb.toggle();
         kb.tick(false);
         assert!(!kb.visible, "a second toggle hides it");
+    }
+
+    #[test]
+    fn tablet_toggle_uses_yamis_keyboard_icon() {
+        assert_eq!(OSK_TOGGLE_ICON, IconId::Keyboard);
+        assert!(
+            OSK_TOGGLE_ICON.name().starts_with("yamis-"),
+            "the OSK toggle should route through the YAMIS icon catalog"
+        );
     }
 
     // --- keypress → egui-event mapping ----------------------------------------------
@@ -623,6 +783,33 @@ mod tests {
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "the OSK key grid drew nothing");
+    }
+
+    #[test]
+    fn osk_toggle_tooltip_uses_themed_text_and_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let out = render_keyboard_tooltip_frame(&ctx);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == OSK_TOGGLE_LABEL && *color == Style::TEXT),
+            "OSK toggle tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == OSK_TOGGLE_LABEL && *color == egui::Color32::BLACK),
+            "OSK toggle tooltip leaked raw black popup text: {texts:?}"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&Style::SURFACE),
+            "OSK toggle tooltip should paint its themed surface: {fills:?}"
+        );
     }
 
     #[test]

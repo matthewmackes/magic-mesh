@@ -113,7 +113,7 @@ confinement; there are no blanket `unconfined_*` grants — it is a real confine
 domain, not a permissive stub.
 
 > **Platform note.** The 2026-06-20 disabled-SELinux fleet standard is
-> superseded for Quasar-cloud nodes by QC-22: shipped nodes target SELinux
+> superseded for Construct-cloud nodes by QC-22: shipped nodes target SELinux
 > Enforcing and load the MCNF policy modules through the bounded boot-time
 > policy oneshot. If a node is still kernel-disabled, has not rebooted after the
 > enforcing config change, or lacks the SELinux policy toolchain, the kernel does
@@ -189,7 +189,7 @@ These are conscious tradeoffs; the sandbox (§3) contains everything else.
    security fix and the next MCNF pin (see the CHANGELOG's update cadence). The
    pin makes each build reproducible + tamper-evident.
 4. **Fingerprinting / anti-adblock are best-effort**, not guaranteed.
-5. **SELinux policy rollout state** — Quasar-cloud nodes target Enforcing under
+5. **SELinux policy rollout state** — Construct-cloud nodes target Enforcing under
    QC-22, but a host that is still kernel-disabled, pre-reboot, or missing the
    policy toolchain does not get the browser confined domain (§3.2). The OS
    sandbox (§3.1) is the operative confinement meanwhile. Accepted because the
@@ -355,17 +355,17 @@ despite the similar name, is a different, unrelated worker (BROWSER-DD-12's
 | Component | Tier | Trust |
 |-----------|------|-------|
 | Page JavaScript (`navigator.credentials`) | inside the browser engine | **UNTRUSTED** page content — confined the same as any other script (§3) when the engine is Servo. |
-| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Intercepts `navigator.credentials.create`/`.get` **only when `options.publicKey` is present** (browser-4), calling through to the original for `{password}`/`{federated}`/`{otp}` requests; requires a user gesture (`navigator.userActivation`, security-2) before dispatch and ships the ceremony + presence signal to the shell over the existing IPC/beacon channel. See the CEF note in §7.4. |
-| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Forwards the ceremony to the local Bus, threading the shim's `user_present` gesture signal through — but there is still no unforgeable confirmation prompt at this layer (§7.4, item 1: deferred). |
+| The injected WebAuthn shim (`passkey_bridge_script`/`passkey_bridge_drain_script`) | engine process (Servo `mde-web-preview` or CEF `mde-web-cef`) | Intercepts `navigator.credentials.create`/`.get` **only when `options.publicKey` is present** (browser-4), calling through to the original for `{password}`/`{federated}`/`{otp}` requests; ships bounded public ceremony metadata plus a bridge-minted `client_request_id` to the shell over the existing IPC/beacon channel. CEF also checks `navigator.userActivation` before dispatch; the shell prompt below is the production presence gate. |
+| `mde-shell-egui::web.rs` (`handle_passkey_event`) | shell process | Trusted. Holds each ceremony as `PendingPasskeyConsent`, renders an Approve/Deny prompt the page cannot script, rejects denial/duplicates back to the page with `CompletePasskey { error }`, and only after approval publishes `action/browser/passkey` with `user_present=true`, `shell_consent=true`, and `presence_source=browser_shell_prompt`. |
 | `browser_passkeys` worker (Workstation, rank 1) | mackesd | Trusted. Validates the request shape + RP-ID/origin binding, mints or uses a P-256 keypair, signs, mirrors to the Syncthing share. |
 | Sealed credential store (`credentials/sealed/*.age`, local + Syncthing-shared workgroup root) | at rest | Confidentiality rests on the **mesh-wide age identity** (`/root/.mcnf-age-key`) — the same trust root already used for VPN tunnel secrets and XCP dom0 passwords, not a per-device or per-user secret (§7.4). |
 | Hardware FIDO2 keys / phone-as-authenticator | — | **Not wired to a live ceremony.** Only a HID readiness probe + CTAPHID_INIT diagnostic exist; the worker's own doc comment says CTAP2 credential commands and phone-as-authenticator "remain separate owners." |
 
 ```
 page JS  navigator.credentials.create()/get()
-   -> injected shim (engine process, Servo or CEF)   [no user-gesture check found]
-   -> beacon/IPC -> mde-shell-egui::web.rs            [forwarded verbatim, no consent UI]
-   -> Bus action/browser/passkey
+   -> injected shim (engine process, Servo or CEF)   [metadata only; no key material]
+   -> beacon/IPC -> mde-shell-egui::web.rs            [shell Approve/Deny gate]
+   -> Bus action/browser/passkey                      [only after approval]
    -> browser_passkeys worker
         create: mint P-256 keypair, seal private key, mirror public+sealed record over Syncthing
         get:    locate stored credential by rp_id (+ allow_credentials), unseal, sign
@@ -380,8 +380,9 @@ drive this entire pipeline; see §7.4 for what does, and does not, gate it.
 ### 7.2 Attack surface
 
 1. **Any page at a matching origin calling `navigator.credentials`.** The
-   shim and the daemon complete the ceremony with no user-presence check and
-   no confirmation UI. The single biggest surface (§7.4).
+   page can still trigger a visible shell prompt for its own origin/RP id, so
+   prompt spam/clickjacking is the main UX/security surface. The daemon only
+   completes the ceremony after shell approval (§7.4).
 2. **The RP-ID/origin binding logic** (`rp_matches_origin`, `valid_rp_id`,
    `origin_host`) — a bug here would be a direct cross-origin credential /
    phishing bypass. Reviewed line-by-line; found correct (§7.3.1).
@@ -456,42 +457,35 @@ Workstation-tier only (idles on headless/Lighthouse nodes). No Bus root, or a
 `Persist::open` failure, leaves the worker idle rather than fabricating a
 credential.
 
-### 7.4 Accepted residual risks — including one that is not yet mitigated
+### 7.4 Accepted residual risks
 
-1. **Honest presence flags + a gesture gate; unforgeable consent UI still
-   deferred (security-2, 2026-07-10).** *Was:* the daemon hardcoded both the
+1. **Honest presence flags + shell consent, but no User Verification yet
+   (security-2, updated 2026-07-15).** *Was:* the daemon hardcoded both the
    User Present (`UP`) and User Verified (`UV`) authenticator-data bits on
-   every ceremony, and the shim dispatched with no user-gesture check — so any
-   page could silently obtain a valid, "user-verified" assertion for its own
-   origin the instant it called the API, with no click, PIN, or biometric.
-   *Now, in three parts:*
-   - **UV** was already dropped to honest-`0` earlier this session (no
-     per-ceremony verification exists, so `UV` is never asserted).
-   - **`UP` is no longer hardcoded.** `authenticator_flags()` in
+   every ceremony, and the shell forwarded page-origin requests straight to the
+   Bus — so a page could silently obtain a valid, "user-verified" assertion for
+   its own origin, with no click, PIN, biometric, or shell confirmation.
+   *Now:*
+   - **UV remains honest-`0`.** No per-ceremony PIN/biometric/user-verification
+     flow exists, so `UV` is never asserted.
+   - **`UP` is not hardcoded.** `authenticator_flags()` in
      `browser_passkeys.rs` sets the `UP` bit **only** when the ceremony carried
-     a real presence signal (`PasskeyRequest::user_present`); a ceremony with
-     no verified presence honestly signs `UP=0`, which a relying party rejects,
-     instead of forging "a human was here." Assertion flags are now `0x01`
-     (present) / `0x00` (absent); registration `0x41` / `0x40` (`AT` always
-     set).
-   - **The shim requires a user gesture.** `cef_browser.rs`'s
-     `passkey_bridge_script` checks `navigator.userActivation.isActive` (WebAuthn
-     transient activation) before dispatching and rejects a gesture-less
-     ceremony with `NotAllowedError`; it threads the gesture as `user_present`
-     through `handle_passkey_event` (`web.rs`) to the daemon.
-   - **DEFERRED / residual:** the presence signal is still *page-asserted* — the
-     shim runs in the page's own JS context, so a hostile **same-origin** page
-     could forge `userActivation` for its **own** `rp_id` (it cannot mint
-     presence for another origin — §7.3.1 + the browser-6 PSL check bind
-     `rp_id` to the origin). A trustworthy, unforgeable presence gate — a
-     shell-rendered consent prompt the page cannot script — is intentionally
-     out of scope for this hardening pass (a sizable new UI) and remains the
-     open item. The `capture_notice` ("Passkey: sent ceremony to daemon") is
-     still a post-hoc transient status line, not that prompt. The net effect
-     is materially improved (auto-dispatch on page load is blocked; a
-     presence-less request signs an honest, RP-rejected `UP=0`), but a
-     click-jacked or scripted same-origin gesture is not yet defeated —
-     disclosed here, not silently claimed done.
+     `PasskeyRequest::user_present`; a ceremony with no presence signal signs
+     `UP=0`, which a relying party rejects. Assertion flags are `0x01`
+     (present) / `0x00` (absent); registration flags are `0x41` / `0x40`
+     (`AT` always set).
+   - **The Browser shell is now the presence gate.** `handle_passkey_event`
+     holds the ceremony as `PendingPasskeyConsent` and renders an Approve/Deny
+     prompt. Denial and duplicate pending requests return a page-side
+     `NotAllowedError`-style completion and never reach the daemon. Approval
+     stamps `user_present=true`, `shell_consent=true`, and
+     `presence_source=browser_shell_prompt` before publishing to
+     `action/browser/passkey`.
+   - **Residual:** this is consent/presence, not verification. It does not
+     defeat a user intentionally approving a malicious same-origin prompt or a
+     clickjacking/social-engineering flow. Direct trusted-Bus writers also
+     remain inside the daemon's trust boundary (§7.4 item 4); the shell gate
+     protects the page-origin browser path, not arbitrary local privileged code.
 2. **Mesh-wide key-sealing root, not a per-device secret.** `seal_private_key`
    keys its passphrase off `age_key_path()` (`/root/.mcnf-age-key` by
    default) — the same identity distributed "to leader-eligible nodes like
@@ -514,9 +508,9 @@ credential.
    shared `mde-web-sandbox` OS sandbox before `cef_initialize` (§10), so the CEF
    lane is now in §1's trust table and confined by the same class as Servo. The
    residual gap is that **Chromium's OWN internal sandbox stays off**
-   (`--no-sandbox`) — see §10.3. The OS sandbox contains the whole Chromium
-   process tree regardless, but live-seat verification of that confinement is
-   still required (§10.4).
+   (`--no-sandbox`) — see §10.3. Live `.15` runtime proof now shows the CEF
+   browser child and Chromium zygote/utility children inherit MCNF's OS sandbox
+   (§10.4).
 5. **Local Bus trust, same caveat as §6.4's.** Anything running as the
    desktop user that can write `action/browser/passkey` can trigger a real
    signed ceremony for any `rp_id` it can also satisfy the origin check for
@@ -595,63 +589,54 @@ to CEF tabs, with no working mitigation beyond the (real, but narrower)
   enterprise policy `WebRtcIPHandling`); it constrains ICE candidate
   gathering to proxied/relayed transport, the correct mechanism for the
   local-IP-leak concern.
-- **Added** renderer-level removal of the JS-reachable WebRTC surface
-  (`cef_browser::webrtc_block_script`): deletes `window.RTCPeerConnection`,
-  `webkitRTCPeerConnection`, `RTCDataChannel`, `RTCSessionDescription`,
-  `RTCIceCandidate`, and `navigator.mediaDevices`/`MediaDevices.prototype`'s
+- **Added native CEF camera/microphone permission handling (2026-07-14).**
+  `CefPermissionHandler::OnRequestMediaAccessPermission` is now pinned in the
+  local ABI and bridged into the Browser's session-only permission prompt. CEF
+  receives exactly the requested device audio/video capture bitmask on allow,
+  or `0` on deny; desktop capture remains default-deny.
+- **Made browser-page WebRTC reachable in CEF by default (2026-07-14).**
+  Once the native media permission path existed, the old renderer-level WebRTC
+  remover became an operational blocker for DD-9/browser compatibility. CEF now
+  leaves `RTCPeerConnection`/`getUserMedia` reachable by default; the privacy
+  posture is the real Chromium IP-handling policy plus the explicit
+  camera/microphone permission prompt.
+- **Retained the renderer-level remover as an opt-in emergency block.**
+  Setting `MDE_CEF_WEBRTC_BLOCKED=1` restores the old best-effort JS API
+  removal (`cef_browser::webrtc_block_script`). That script still deletes
+  `window.RTCPeerConnection`, `webkitRTCPeerConnection`, `RTCDataChannel`,
+  `RTCSessionDescription`, `RTCIceCandidate`, and
+  `navigator.mediaDevices`/`MediaDevices.prototype`'s
   `getUserMedia`/`getDisplayMedia` (plus legacy vendor-prefixed
-  `getUserMedia`). Applied unconditionally — not a per-tab toggle — on every
-  `run_windowless_tab` session, on the same 250ms poll cadence and via the
-  same `cef_frame_t::execute_java_script` mechanism this codebase already
-  uses for the passkey-ceremony shim (`passkey_bridge_script`) and every
-  other renderer-side privacy/feature injection in that file.
-- **Extended the removal to every reachable frame (browser-3, 2026-07-10).**
-  The removal originally ran only in `get_main_frame`, so a page could bypass
-  it with a child iframe (its own unpatched JS context). `webrtc_block_script`
-  now parameterises the strip over a target window and `sweep`s recursively
-  through `w.frames`, and installs a `MutationObserver` to re-sweep on DOM
-  mutation so a **newly inserted same-origin iframe** is patched between poll
-  ticks. This closes the trivial same-origin child-iframe bypass.
+  `getUserMedia`), sweeping same-origin frames and late iframe insertions.
 
 ### 8.3 Accepted residual risk — defense-in-depth, not airtight
 
-Unlike a real command-line kill switch, `webrtc_block_script` is JS run
-*after* the renderer's JS context already exists, on a poll timer. This
-crate's hand-rolled CEF ABI has no `OnContextCreated`-equivalent hook (the
-mechanism that would let a script win the race against a page's own inline
-`<script>` deterministically), so:
+CEF WebRTC is now an enabled browser-compat feature, so the accepted residual
+risk has changed:
 
-- A page's own synchronous top-of-document inline script can still execute
-  and construct an `RTCPeerConnection` before the first poll tick lands (the
-  first tick fires immediately on browser creation, then every 250ms
-  thereafter — the identical structural gap this codebase already accepts
-  for the passkey bridge).
-- A fresh document commit (e.g. same-tab in-page navigation to a new origin)
-  gets an unpatched JS context until the next poll tick re-applies the shim.
-- **Cross-origin subframes remain unreachable from JS** by same-origin policy
-  (property access on them throws and is swallowed). The definitive airtight
-  fix is a native `CefPermissionHandler::OnRequestMediaAccessPermission` deny
-  and/or an ICE-layer block, but the hand-rolled pinned CEF 149 ABI exposes no
-  permission-handler or frame-enumeration vtable offset verified from the farm
-  headers, so it is not attempted here; the JS `sweep` covers the *reachable*
-  (same-origin) frames and the switch below is the backstop for the rest.
-- `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` is the backstop
-  for exactly this gap: even a same-tick `RTCPeerConnection` that wins the
-  race, or one in a cross-origin subframe, still cannot leak a raw local IP
-  over non-proxied UDP without a configured proxy.
-- Camera/mic OS-device permission for the CEF helper process is a separate,
-  still-unaudited question (§7.4 point 4) — this section covers WebRTC
-  transport/API-surface hardening only, not device-permission plumbing.
+- The local-IP-leak class is mitigated by
+  `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, not by deleting
+  the API. That switch remains load-bearing and must not be removed.
+- Camera/microphone access is user-mediated through the Browser permission
+  prompt and held session-only. A prompt denial returns `0` allowed media bits
+  to CEF.
+- The OS sandbox now exposes only the explicit local capture device nodes
+  needed for operational media (`/dev/snd`, `/dev/videoN`) when present, in
+  addition to `/dev/dri`; it still does not expose `$HOME`, `/root`, `/var`,
+  SSH/Nebula/Syncthing state, or broad `/dev`.
+- If `MDE_CEF_WEBRTC_BLOCKED=1` is used, the old JS remover is still not an
+  airtight kill switch: it runs after the JS context exists and has no
+  `OnContextCreated`-equivalent early hook. It is an emergency compatibility
+  lever, not the primary privacy guarantee.
 
 ### 8.4 Out of scope
 
 A full CEF confinement audit equivalent to §3 (Servo's `sandbox.rs`); the CEF
 OS confinement now lives in **§10** (security-1). This section documents the
-WebRTC-specific finding above, not that confinement layer. Enabling real WebRTC
-as a feature
-(BROWSER-DD-9, `docs/design/browser-dd9-webrtc-rescope.md`) is a separate,
-much larger, not-yet-started item — this fix is a hardening correctness fix
-for the *current* (WebRTC-off) posture, not a step toward shipping it.
+WebRTC-specific finding above, not that confinement layer. Full DD-9 is still
+broader than browser-page WebRTC: PiP, GPU/HW decode tuning, screen share,
+multi-party mesh conferencing, and product decisions around SIP/RTP reuse remain
+separate work.
 
 ---
 
@@ -737,7 +722,13 @@ factored out of Servo's `sandbox.rs` into the shared **`mde-web-sandbox`** crate
   (ptrace, the mount family, `unshare`/`setns`, module loading, `bpf`,
   `perf_event_open`, key management, `kexec`, clock-set, …);
 - **cgroup v2 memory/CPU caps** (2 GiB / ~2 cores — a higher ceiling than the
-  single-process Servo tab because the cap binds the WHOLE Chromium tree).
+  single-process Servo tab because the cap binds the WHOLE Chromium tree). The
+  shipped DRM-seat unit sets `Delegate=yes` plus `DelegateSubgroup=shell` and
+  exports `MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell`, so browser helpers create
+  capped sibling leaves under the delegated service root instead of under the
+  busy shell-process subgroup. Ad-hoc SSH/farm session scopes that are not
+  systemd-delegated log an honest degraded-cgroup warning while the
+  namespace/rootfs/seccomp layers still apply.
 
 **Multi-process reconciliation (the crux).** Chromium is multi-process: the
 browser process forks + re-`exec`s the renderer bridge with `--type=renderer`
@@ -786,36 +777,84 @@ inside Chromium — it just covers the whole tree from outside rather than
 per-process from inside. Do **not** read "sandboxed" as "Chromium-sandboxed"
 here; it means OS-sandboxed.
 
-### 10.4 Verification status — live-seat check REQUIRED (deferred)
+### 10.4 Verification status — live `.15` OS-sandbox proof
 
-A sandbox cannot be fully proven headlessly. What IS verified: the crate builds
-and its pure planners are unit-tested — the CEF policy (`web_cef` — host, 2 GiB
-ceiling, distinct rootfs path), the seccomp denylist construction, the
-uid/gid-map and rootfs bind plans, and the CEF-specific extra-bind planner
-(`cef_extra_readonly_binds` — exposes only the runtime + vetted extensions,
-never a key/home path). The seccomp denylist is the SAME one Servo runs a full
-browser engine under.
+A sandbox cannot be mathematically proven by a smoke test, but the CEF OS
+confinement is now runtime-proven on a live seat for the core claims above. The
+headless/unit side remains covered by crate builds and pure planner tests: the
+CEF policy (`web_cef` — host, 2 GiB ceiling, distinct per-run rootfs prefix),
+the seccomp denylist construction, uid/gid-map and rootfs bind plans, and the CEF-specific
+extra-bind planner (`cef_extra_readonly_binds` — exposes only the runtime +
+vetted extensions, never a key/home path). The seccomp denylist is the SAME one
+Servo runs a full browser engine under.
 
-**Still required, and deferred to the operator (live seat .13 / .138):**
+**Live proof, 2026-07-15, `.15` (`Basement-Test-Workstation`, Fedora 44):**
 
-1. Launch a real CEF tab on a seat with the pinned `/opt/mde/cef` bundle present
-   and confirm it renders (the `CEF_OS_SANDBOX applied=1 …` line prints, then a
-   frame arrives). CEF may need a `root_cache_path`/cache dir the sandbox's
-   writable `/tmp` must satisfy — a cache-path failure would surface here.
-2. Confirm from **inside** the browser process (e.g. a `file://` probe / a
-   crafted page, or `nsenter` into the renderer's mount ns) that `~/.ssh`, the
-   Nebula CA (`/etc/nebula`), and `/etc/mackesd` are **NOT readable** — the core
-   confinement claim.
-3. Confirm Chromium's multi-process children actually start under the OS sandbox
-   (no `EPERM`-induced crash from the seccomp denylist tripping a syscall
-   Chromium — unlike Servo — needs; if one does, the fix is to remove that
-   single syscall from the shared denylist, not to weaken the whole layer).
-4. On a SELinux-Enforcing node, `audit2allow` any residual AVC for
-   `mde_web_cef_t` (a prebuilt Chromium is mmap-/syscall-heavy; the shipped
-   `.te` is the known-necessary least-privilege set, not a headlessly-proven
-   byte-perfect policy).
+1. A held real `/usr/bin/mde-web-cef tab` launched against the installed pinned
+   `/opt/mde/cef` bundle and initialized CEF successfully. The log showed
+   `CEF_OS_SANDBOX applied=1 ... home_visible=0 seccomp=1 caps_dropped=1`,
+   `CEF_PRIVATE_RUNTIME_ENV ... tmpfs=1`, `CEF_INITIALIZE_OK`, and Chromium
+   subprocess bridge starts for zygote and network utility processes. The
+   installed verifier on the same deploy had already proven CEF render/input:
+   final title `mde-browser-verify-p1-k1-tm`, 4 painted `1280x800` frames, and
+   `VERIFY RESULT=PASS`.
+2. The sandbox fork layout was inspected from the host. The launcher and fork
+   supervisor are not the security evidence. The actual CEF browser child
+   (`mde-web-cef-renderer` child PID 566774 in that run) and all observed
+   Chromium zygote/utility descendants (PIDs 566787, 566788, 566808, 566817,
+   566818, 566827, 566829) had `NoNewPrivs: 1`, `Seccomp: 2`, and zero
+   `CapPrm`/`CapEff`/`CapBnd` masks.
+3. Those CEF/Chromium children inherited the same sandbox namespaces in that
+   run (`mnt:[4026532544]`, `user:[4026532535]`, `pid:[4026532552]`,
+   `ipc:[4026532551]`, `uts:[4026532549]`, `cgroup:[4026532558]`). The
+   `/proc/<pid>/root` view exposed `/opt/mde/cef/Release/libcef.so`, the
+   renderer bridge, and the private `/tmp/mde-web-cef/{home,cache}` tree, while
+   `/home`, `/root`, `/etc/nebula`, `/etc/mackesd`, `/mnt/mesh-storage`,
+   `/run/user/1000/bus`, and `/run/dbus/system_bus_socket` were absent.
+4. Chromium multi-process startup therefore works under the outer MCNF OS
+   sandbox: zygote and utility children started and stayed alive without an
+   `EPERM` crash from the shared seccomp denylist.
+5. SELinux Enforcing was separately closed on the same F44 seat after the split
+   Browser RPM loader fixes. Final fresh-root verifier passes ran with
+   `getenforce = Enforcing`, no permissive domain marker, loaded modules
+   `mde_web_cef` and `mde_web_preview`, and binary labels
+   `mde_web_cef_exec_t` / `mde_web_preview_exec_t`. CEF passed with final title
+   `mde-browser-verify-p1-k1-tm`, 4 painted `1280x800` frames, pointer/key/text
+   input observed, and no AVCs for the final window. Servo passed with 4 painted
+   `1280x800` frames and final page text `P:1 K:1 T:m`; its final window also
+   had no AVCs and no leftover helper processes.
+6. Delegated cgroup caps were closed on `.15` after the
+   `DelegateSubgroup=shell` packaging fix. The running DRM shell moved to
+   `/system.slice/mde-shell-egui.service/shell`, leaving the service root empty.
+   A transient service with the same delegation contract launched the installed
+   CEF verifier and created
+   `/system.slice/mde-browser-cgroup-proof-cef.service/mde-web-cef-...` with
+   `memory.max=2147483648`, `cpu.max=200000 100000`, and no
+   `mde-web-sandbox: cgroup limits not applied` warning. The verifier returned
+   `VERIFY RESULT=PASS`, final title `mde-browser-verify-p1-k1-tm`, and 4
+   painted `1280x800` frames. The same delegated proof against Servo created
+   `/system.slice/mde-browser-cgroup-proof-servo.service/mde-web-preview-...`
+   with `memory.max=1073741824`, `cpu.max=80000 100000`, no degraded-cgroup
+   warning, `VERIFY RESULT=PASS`, and final page text `P:1 K:1 T:m`.
+7. Per-run sandbox rootfs mountpoints were live-proven after the fixed-root
+   failure class. The installed Browser RPM payload on `.15` matched the new
+   helper hashes for `mde-web-cef-renderer` and `mde-web-preview`, and
+   `/usr/libexec/mackesd/browser-verify-engines --engine all --budget 30 --timeout 60s`
+   passed for both engines with display/input response and process cleanup. The
+   previous fixed `/tmp/.mde-web-cef-root` and `/tmp/.mde-web-preview-root`
+   directories still existed during the pass, while the successful run created
+   fresh `/tmp/.mde-web-*-root-<pid>-<run>` mountpoints; the proof therefore did
+   not depend on manually deleting stale roots. A follow-up farm runtime proof
+   tightened the lifecycle: ordinary helper exits remove the host-visible
+   per-run mountpoint after successful render/input (`P:1 K:1 T:m`), so only
+   hard-kill/crash residue should persist. The follow-up was deployed to `.15`
+   with fresh BigBoy-built F44 RPMs on 2026-07-15: the installed two-engine
+   verifier passed CEF + Servo display/input, process cleanup passed, and the
+   before/after rootfs directory set did not gain any new per-run entries.
 
-Until (1)-(3) are done on a live seat, the OS confinement is **implemented and
-unit-exercised but not runtime-proven**; the honest claim is "the same
-confinement class as Servo, applied — pending live verification", not "proven
-confined".
+**Rerun triggers:** ad-hoc SSH/user-session launches are not systemd-delegated
+and can honestly log `mde-web-sandbox: cgroup limits not applied ... Permission
+denied`; the namespace/rootfs/seccomp/cap layers above still apply. If the CEF
+pin, Servo helper, Browser sandbox rootfs plan, or DRM unit cgroup delegation
+changes, rerun the Enforcing AVC audit and the delegated cgroup-cap proof; do
+not assume this 2026-07-15 closure covers a new engine payload.

@@ -38,6 +38,7 @@ use mde_egui::egui::{
 use mde_egui::menubar::{MenuBar as SharedMenuBar, MenuBarModel};
 use mde_egui::style::Elevation;
 use mde_egui::{field, muted_note, status_dot, Motion, Style};
+use mde_theme::brand::icons::{icon_image, IconId};
 
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::{Progress, Resolution};
@@ -64,6 +65,315 @@ const COL_MOD_W: f32 = 80.0;
 const ROW_H: f32 = 26.0;
 const TILE_W: f32 = 132.0;
 const TILE_H: f32 = 72.0;
+const ACTION_BUTTON_H: f32 = Style::TOOLBAR_CONTROL_H;
+const FILES_ICON_BUTTON_ICON: f32 = 14.0;
+const FILES_PLACE_ICON: f32 = 14.0;
+const FILES_ROW_ICON: f32 = 15.0;
+const FILES_GRID_ICON: f32 = 28.0;
+const FILES_NAV_ICONS: &[(IconId, &str)] = &[
+    (IconId::ArrowLeft, "Back"),
+    (IconId::ArrowRight, "Forward"),
+    (IconId::ChevronUp, "Up"),
+];
+const FILES_TAB_ICONS: &[(IconId, &str)] =
+    &[(IconId::Close, "Close tab"), (IconId::NewTab, "New tab")];
+const FILES_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+
+#[derive(Clone, Copy)]
+enum FilesActionTone {
+    Quiet,
+    Primary,
+    Danger,
+}
+
+fn files_action_text(tone: FilesActionTone) -> Color32 {
+    match tone {
+        FilesActionTone::Quiet => Style::TEXT,
+        FilesActionTone::Primary => Style::ACCENT,
+        FilesActionTone::Danger => Style::DANGER,
+    }
+}
+
+fn files_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(FILES_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+fn files_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let previous_style = response.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_files_popup_style(&response.ctx, &mut menu_style);
+    response.ctx.set_style(menu_style);
+    let _ = response.context_menu(|ui| {
+        scope_files_popup_ui(ui);
+        add_contents(ui);
+    });
+    response.ctx.set_style(previous_style);
+}
+
+fn files_submenu_button<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ui.menu_button(title, |ui| {
+        scope_files_popup_ui(ui);
+        add_contents(ui)
+    })
+}
+
+fn scope_files_popup_ui(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    apply_files_popup_style(&ctx, ui.style_mut());
+}
+
+fn apply_files_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
+    let palette = Style::current_palette(ctx);
+    let border = Stroke::new(1.0, palette.border);
+    let text = Stroke::new(1.0, palette.text);
+    let text_dim = Stroke::new(1.0, palette.text_dim);
+    let accent = Style::resolve_color(ctx, Style::ACCENT);
+    let visuals = &mut style.visuals;
+
+    visuals.window_fill = palette.surface;
+    visuals.panel_fill = palette.surface;
+    visuals.faint_bg_color = palette.surface;
+    visuals.extreme_bg_color = palette.bg;
+    visuals.window_stroke = border;
+    visuals.override_text_color = Some(palette.text);
+
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.bg_stroke = border;
+    visuals.widgets.noninteractive.fg_stroke = text_dim;
+
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    visuals.widgets.inactive.bg_stroke = border;
+    visuals.widgets.inactive.fg_stroke = text;
+
+    visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.bg_stroke = border;
+    visuals.widgets.hovered.fg_stroke = text;
+
+    visuals.widgets.active.bg_fill = palette.surface_hi;
+    visuals.widgets.active.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.fg_stroke = text;
+
+    visuals.widgets.open.bg_fill = palette.surface_hi;
+    visuals.widgets.open.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.open.bg_stroke = border;
+    visuals.widgets.open.fg_stroke = text;
+
+    visuals.selection.bg_fill = accent.gamma_multiply(0.25);
+    visuals.selection.stroke = Stroke::new(1.0, accent);
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+}
+
+fn scope_files_toolbar_ui(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.spacing.interact_size.y = Style::TOOLBAR_CONTROL_H;
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+}
+
+trait FilesHoverExt {
+    fn files_hover_text(self, text: impl Into<String>) -> Self;
+    fn files_disabled_hover_text(self, text: impl Into<String>) -> Self;
+}
+
+impl FilesHoverExt for egui::Response {
+    fn files_hover_text(self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        self.on_hover_ui(move |ui| files_tooltip(ui, text.as_str()))
+    }
+
+    fn files_disabled_hover_text(self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        self.on_disabled_hover_ui(move |ui| files_tooltip(ui, text.as_str()))
+    }
+}
+
+fn files_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    tone: FilesActionTone,
+    tip: &str,
+) -> egui::Response {
+    let text_color = files_action_text(tone);
+    let response = ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .size(Style::SMALL)
+                .color(text_color)
+                .strong(),
+        )
+        .fill(Style::LAYER_02)
+        .stroke(Stroke::new(1.0, text_color.gamma_multiply(0.72)))
+        .corner_radius(Style::RADIUS_S)
+        .min_size(egui::vec2(52.0, ACTION_BUTTON_H)),
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    response.files_hover_text(tip)
+}
+
+fn files_nav_button(ui: &mut egui::Ui, icon: IconId, enabled: bool, tip: &str) -> egui::Response {
+    files_icon_button(ui, icon, enabled, tip)
+}
+
+fn files_icon_button(
+    ui: &mut egui::Ui,
+    icon: IconId,
+    enabled: bool,
+    label: &str,
+) -> egui::Response {
+    let text_color = if enabled {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("")
+            .fill(Style::LAYER_02)
+            .stroke(Stroke::new(1.0, text_color.gamma_multiply(0.72)))
+            .corner_radius(Style::RADIUS_S)
+            .min_size(egui::vec2(ACTION_BUTTON_H, ACTION_BUTTON_H)),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let rect = egui::Rect::from_center_size(
+        response.rect.center(),
+        egui::vec2(FILES_ICON_BUTTON_ICON, FILES_ICON_BUTTON_ICON),
+    );
+    if let Some(tex) = files_icon_texture(ui, icon, FILES_ICON_BUTTON_ICON, text_color) {
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+    }
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    response.files_hover_text(label)
+}
+
+#[allow(
+    clippy::cast_possible_truncation, // rounded, clamped-positive f32 -> u32
+    clippy::cast_sign_loss            // size_px >= 1.0 by the .max(1.0) clamp
+)]
+fn files_icon_texture(
+    ui: &egui::Ui,
+    id: IconId,
+    logical_px: f32,
+    tint: Color32,
+) -> Option<TextureHandle> {
+    let size_px = (logical_px * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+    let tint = tint.to_array();
+    let key = egui::Id::new(("files-yamis-icon", id.name(), size_px, tint));
+    if let Some(cached) = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<Option<TextureHandle>>(key))
+    {
+        return cached;
+    }
+    let texture = icon_image(id, size_px, tint).ok().map(|img| {
+        let color = egui::ColorImage::from_rgba_unmultiplied(img.size_usize(), &img.rgba);
+        ui.ctx()
+            .load_texture(id.name(), color, TextureOptions::LINEAR)
+    });
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(key, texture.clone()));
+    texture
+}
+
+fn paint_files_icon(ui: &egui::Ui, id: IconId, rect: Rect, logical_px: f32, tint: Color32) -> bool {
+    let Some(tex) = files_icon_texture(ui, id, logical_px, tint) else {
+        return false;
+    };
+    let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+    true
+}
+
+const fn file_type_icon(mime: Mime) -> IconId {
+    match mime {
+        Mime::Folder => IconId::FileFolder,
+        Mime::Doc => IconId::FileDocument,
+        Mime::Image => IconId::FileImage,
+        Mime::Pdf => IconId::FilePdf,
+        Mime::Archive => IconId::FileArchive,
+        Mime::Disk => IconId::Storage,
+    }
+}
+
+fn file_icon_tint(e: &EntryView) -> Color32 {
+    if e.is_dir {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    }
+}
+
+fn local_place_icon(path: &str) -> IconId {
+    match path {
+        "local:home" => IconId::FileHome,
+        "local:docs" => IconId::FileDocuments,
+        "local:downloads" => IconId::FileDownloads,
+        "local:root" => IconId::Storage,
+        _ => IconId::FileFolder,
+    }
+}
+
+fn local_place_row(ui: &mut egui::Ui, icon: IconId, label: &str, selected: bool) -> egui::Response {
+    let height = ROW_H;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let fill = if selected {
+        Style::LAYER_02
+    } else if response.hovered() {
+        Style::LAYER_01
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
+    }
+    let tint = if selected {
+        Style::ACCENT
+    } else {
+        Style::TEXT_DIM
+    };
+    let icon_rect = Rect::from_center_size(
+        egui::pos2(
+            rect.left() + Style::SP_S + FILES_PLACE_ICON * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(FILES_PLACE_ICON, FILES_PLACE_ICON),
+    );
+    let _ = paint_files_icon(ui, icon, icon_rect, FILES_PLACE_ICON, tint);
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_L, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::monospace(Style::SMALL),
+        if selected {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    response.files_hover_text(label)
+}
 
 /// The drag-and-drop payload: which pane the drag started in. The selection to
 /// transfer is read from that pane's model at drop time (it is already the
@@ -547,7 +857,6 @@ fn menu_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     let status = crate::menubar::build_status(&cx);
     let mut picked = None;
     egui::TopBottomPanel::top("files-menubar").show_inside(ui, |ui| {
-        ui.add_space(Style::SP_XS);
         let model = MenuBarModel {
             title: "Files",
             accent: Style::ACCENT_SYSTEM,
@@ -555,7 +864,6 @@ fn menu_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             status: &status,
         };
         picked = SharedMenuBar::show(ui, &model);
-        ui.add_space(Style::SP_XS);
     });
     if let Some(p) = picked {
         match crate::menubar::to_action(p.clone(), &cx) {
@@ -584,7 +892,8 @@ fn surface_tabs(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     let current = b.surface_tab();
     let active = b.transfers_counts().active;
     egui::TopBottomPanel::top("files-surface-tabs").show_inside(ui, |ui| {
-        ui.add_space(Style::SP_XS);
+        scope_files_toolbar_ui(ui);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
         ui.horizontal(|ui| {
             for tab in SurfaceTab::ALL {
                 let label = if tab == SurfaceTab::Transfers && active > 0 {
@@ -597,7 +906,7 @@ fn surface_tabs(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                 }
             }
         });
-        ui.add_space(Style::SP_XS);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
     });
 }
 
@@ -632,7 +941,7 @@ fn transfers_panel(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>
                 .fill(Style::ACCENT);
             if ui
                 .add(btn)
-                .on_hover_text("Queue a transfer (source \u{2192} destination)")
+                .files_hover_text("Queue a transfer (source \u{2192} destination)")
                 .clicked()
             {
                 actions.push(Action::OpenNewTransfer);
@@ -719,7 +1028,7 @@ fn transfer_row(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>)
                 ui.add_space(Style::SP_S);
                 // Route (truncated by the row width; the full route is on hover).
                 ui.label(RichText::new(job.route()).color(Style::TEXT))
-                    .on_hover_text(job.route());
+                    .files_hover_text(job.route());
                 // State chip + controls on the right.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     transfer_row_controls(ui, job, actions);
@@ -753,17 +1062,30 @@ fn transfer_row(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>)
 /// The per-row lifecycle buttons (right-aligned): Pause / Resume gated by the
 /// worker's state machine, Cancel always available (a cancel removes the row).
 fn transfer_row_controls(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>) {
-    if ui
-        .small_button("Cancel")
-        .on_hover_text("Remove this transfer from the ledger")
-        .clicked()
+    if files_action_button(
+        ui,
+        "Cancel",
+        FilesActionTone::Danger,
+        "Remove this transfer from the ledger",
+    )
+    .clicked()
     {
         actions.push(Action::TransferCancel(job.id.clone()));
     }
-    if job.state.can_resume() && ui.small_button("Resume").clicked() {
+    if job.state.can_resume()
+        && files_action_button(
+            ui,
+            "Resume",
+            FilesActionTone::Primary,
+            "Resume this transfer",
+        )
+        .clicked()
+    {
         actions.push(Action::TransferResume(job.id.clone()));
     }
-    if job.state.can_pause() && ui.small_button("Pause").clicked() {
+    if job.state.can_pause()
+        && files_action_button(ui, "Pause", FilesActionTone::Quiet, "Pause this transfer").clicked()
+    {
         actions.push(Action::TransferPause(job.id.clone()));
     }
 }
@@ -839,7 +1161,7 @@ fn new_transfer_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>
                         .fill(Style::ACCENT);
                 if ui
                     .add_enabled(runnable, submit)
-                    .on_disabled_hover_text("Enter a source and a destination")
+                    .files_disabled_hover_text("Enter a source and a destination")
                     .clicked()
                 {
                     actions.push(Action::SubmitNewTransfer);
@@ -894,7 +1216,7 @@ fn destinations_window(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .small_button("New transfer\u{2026}")
-                            .on_hover_text("Open the New Transfer dialog pointed here")
+                            .files_hover_text("Open the New Transfer dialog pointed here")
                             .clicked()
                         {
                             actions.push(Action::OpenNewTransferTo(
@@ -921,7 +1243,8 @@ fn destinations_window(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>
 fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     let active = b.active_pane_index();
     egui::TopBottomPanel::top("files-top").show_inside(ui, |ui| {
-        ui.add_space(Style::SP_XS);
+        scope_files_toolbar_ui(ui);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
         ui.horizontal(|ui| {
             // View-mode segmented control (the FILES title now lives in the shared
             // MENUBAR-ALL bar above — no duplicate heading here).
@@ -939,7 +1262,7 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             let hidden = b.active_tab().show_hidden();
             if ui
                 .selectable_label(hidden, "Hidden")
-                .on_hover_text("Show hidden entries (Ctrl+H)")
+                .files_hover_text("Show hidden entries (Ctrl+H)")
                 .clicked()
             {
                 actions.push(Action::ToggleHidden(active));
@@ -947,14 +1270,14 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             let dirs_first = b.active_tab().sort().dirs_first;
             if ui
                 .selectable_label(dirs_first, "Dirs first")
-                .on_hover_text("Group directories ahead of files")
+                .files_hover_text("Group directories ahead of files")
                 .clicked()
             {
                 actions.push(Action::ToggleDirsFirst(active));
             }
             if ui
                 .selectable_label(b.is_dual(), "Dual pane")
-                .on_hover_text("Show a second pane for cross-folder work")
+                .files_hover_text("Show a second pane for cross-folder work")
                 .clicked()
             {
                 actions.push(Action::ToggleDual);
@@ -962,14 +1285,14 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             // FILEMGR-10 — the preview toggles.
             if ui
                 .selectable_label(b.list_thumbs(), "Thumbs")
-                .on_hover_text("Thumbnails in the List view (the Grid always thumbnails)")
+                .files_hover_text("Thumbnails in the List view (the Grid always thumbnails)")
                 .clicked()
             {
                 actions.push(Action::ToggleListThumbs);
             }
             if ui
                 .selectable_label(b.preview_pane_open(), "Preview")
-                .on_hover_text("Preview pane \u{2014} Space quick-looks the selection")
+                .files_hover_text("Preview pane \u{2014} Space quick-looks the selection")
                 .clicked()
             {
                 actions.push(Action::TogglePreviewPane);
@@ -977,7 +1300,7 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             // FILEMGR-4 — the recursive-search bar toggle.
             if ui
                 .selectable_label(b.search_form().open, "Search")
-                .on_hover_text("Recursive search from here (name + content, with filters)")
+                .files_hover_text("Recursive search from here (name + content, with filters)")
                 .clicked()
             {
                 actions.push(Action::ToggleSearchBar);
@@ -1004,7 +1327,7 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             ui.separator();
             search_bar(ui, b, actions);
         }
-        ui.add_space(Style::SP_XS);
+        ui.add_space(Style::TOOLBAR_INSET_Y);
     });
 }
 
@@ -1063,15 +1386,15 @@ fn search_query_row(
                 .hint_text("text in file"),
         );
         ui.selectable_value(&mut form.content_regex, true, "re")
-            .on_hover_text("Interpret the contents text as a regular expression");
+            .files_hover_text("Interpret the contents text as a regular expression");
         ui.selectable_value(&mut form.content_regex, false, "abc")
-            .on_hover_text("Interpret the contents text as a literal substring");
+            .files_hover_text("Interpret the contents text as a literal substring");
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if b.search_active() {
                 if ui
                     .button("Clear")
-                    .on_hover_text("Leave search and show the folder again")
+                    .files_hover_text("Leave search and show the folder again")
                     .clicked()
                 {
                     actions.push(Action::ClearSearch(active));
@@ -1079,7 +1402,7 @@ fn search_query_row(
                 if b.search_running()
                     && ui
                         .button(RichText::new("Cancel").color(Style::DANGER))
-                        .on_hover_text("Stop the search (results so far stay)")
+                        .files_hover_text("Stop the search (results so far stay)")
                         .clicked()
                 {
                     actions.push(Action::CancelSearch);
@@ -1090,7 +1413,7 @@ fn search_query_row(
                 .fill(Style::ACCENT);
             if ui
                 .add_enabled(runnable, btn)
-                .on_hover_text("Search this folder and everything under it")
+                .files_hover_text("Search this folder and everything under it")
                 .clicked()
             {
                 actions.push(Action::RunSearch(active));
@@ -1205,7 +1528,7 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             section_header(ui, "PLACES");
             for spot in LOCAL_SPOTS {
                 let here = matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
-                if ui.selectable_label(here, spot.label).clicked() {
+                if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
                     actions.push(Action::Navigate(active, Location::Local(spot.path.to_string())));
                 }
             }
@@ -1247,7 +1570,7 @@ fn destinations_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Ac
     for target in b.transfer_targets() {
         let resp = ui
             .selectable_label(false, format!("\u{2192} {}", target.label))
-            .on_hover_text(format!("{} \u{b7} {}", target.method.label(), target.dest));
+            .files_hover_text(format!("{} \u{b7} {}", target.method.label(), target.dest));
         if resp.clicked() {
             actions.push(Action::OpenNewTransferTo(
                 target.dest.clone(),
@@ -1294,7 +1617,7 @@ fn peer_row(
         if reachable {
             if ui
                 .selectable_label(browsing, peer.host.as_str())
-                .on_hover_text("Mount this peer over the mesh and browse it")
+                .files_hover_text("Mount this peer over the mesh and browse it")
                 .clicked()
             {
                 actions.push(Action::MountPeer(active, host.to_string()));
@@ -1307,14 +1630,14 @@ fn peer_row(
                 egui::Button::new(RichText::new(peer.host.as_str()).color(Style::TEXT_DIM))
                     .frame(false),
             )
-            .on_hover_text("Peer is offline \u{2014} can't be mounted");
+            .files_disabled_hover_text("Peer is offline \u{2014} can't be mounted");
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if reachable {
                 let is_dest = b.destination() == Some(peer.id.as_str());
                 if ui
                     .selectable_label(is_dest, "dest")
-                    .on_hover_text("Set as the Send-To destination")
+                    .files_hover_text("Set as the Send-To destination")
                     .clicked()
                 {
                     actions.push(Action::SetDestination(peer.id.clone()));
@@ -1335,7 +1658,7 @@ fn peer_row(
                 let full = mount.is_some_and(MountView::is_full);
                 if ui
                     .selectable_label(full, "Full FS")
-                    .on_hover_text(if full {
+                    .files_hover_text(if full {
                         "Mounted with full-filesystem access"
                     } else {
                         "Escalate this mount to full-filesystem (/) access"
@@ -1348,7 +1671,7 @@ fn peer_row(
                 if mount.is_some_and(|m| m.phase.is_mounted())
                     && ui
                         .small_button("Eject")
-                        .on_hover_text("Unmount this peer")
+                        .files_hover_text("Unmount this peer")
                         .clicked()
                 {
                     actions.push(Action::UnmountPeer(host.to_string()));
@@ -1378,7 +1701,7 @@ fn peer_mount_chip(ui: &mut egui::Ui, mount: Option<&MountView>) {
         RichText::new(label).size(Style::SMALL),
     );
     if let Some(reason) = mount.reason.as_deref() {
-        resp.on_hover_text(reason);
+        resp.files_hover_text(reason);
     }
 }
 
@@ -1427,84 +1750,78 @@ fn pane_view(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut V
 
 fn nav_row(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec<Action>) {
     let tab = b.pane(pane_ix).active_tab();
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(tab.can_back(), egui::Button::new("\u{2190}"))
-            .on_hover_text("Back")
-            .clicked()
-        {
-            actions.push(Action::Back(pane_ix));
-        }
-        if ui
-            .add_enabled(tab.can_forward(), egui::Button::new("\u{2192}"))
-            .on_hover_text("Forward")
-            .clicked()
-        {
-            actions.push(Action::Forward(pane_ix));
-        }
-        let can_up = tab.location().parent().is_some();
-        if ui
-            .add_enabled(can_up, egui::Button::new("\u{2191}"))
-            .on_hover_text("Up")
-            .clicked()
-        {
-            actions.push(Action::Up(pane_ix));
-        }
-        ui.separator();
-        let crumbs = tab.location().crumbs();
-        let last = crumbs.len().saturating_sub(1);
-        for (i, crumb) in crumbs.into_iter().enumerate() {
-            let strong = i == last;
-            let color = if strong { Style::TEXT } else { Style::TEXT_DIM };
-            if ui
-                .add(egui::Button::new(RichText::new(&crumb.label).color(color)).frame(false))
-                .clicked()
-            {
-                actions.push(Action::Navigate(pane_ix, crumb.location));
+    ui.scope(|ui| {
+        scope_files_toolbar_ui(ui);
+        ui.horizontal(|ui| {
+            let (back_icon, back_tip) = FILES_NAV_ICONS[0];
+            if files_nav_button(ui, back_icon, tab.can_back(), back_tip).clicked() {
+                actions.push(Action::Back(pane_ix));
             }
-            if i != last {
-                muted_note(ui, "\u{203a}");
+            let (forward_icon, forward_tip) = FILES_NAV_ICONS[1];
+            if files_nav_button(ui, forward_icon, tab.can_forward(), forward_tip).clicked() {
+                actions.push(Action::Forward(pane_ix));
             }
-        }
-    });
-    ui.horizontal(|ui| {
-        let mut buf = tab.path_edit().to_string();
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut buf)
-                .desired_width(f32::INFINITY)
-                .hint_text("path or peer:<id>"),
-        );
-        if resp.changed() {
-            actions.push(Action::SetPathEdit(pane_ix, buf.clone()));
-        }
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-            actions.push(Action::SetPathEdit(pane_ix, buf));
-            actions.push(Action::OpenPathEdit(pane_ix));
-        }
+            let can_up = tab.location().parent().is_some();
+            let (up_icon, up_tip) = FILES_NAV_ICONS[2];
+            if files_nav_button(ui, up_icon, can_up, up_tip).clicked() {
+                actions.push(Action::Up(pane_ix));
+            }
+            ui.separator();
+            let crumbs = tab.location().crumbs();
+            let last = crumbs.len().saturating_sub(1);
+            for (i, crumb) in crumbs.into_iter().enumerate() {
+                let strong = i == last;
+                let color = if strong { Style::TEXT } else { Style::TEXT_DIM };
+                if ui
+                    .add(egui::Button::new(RichText::new(&crumb.label).color(color)).frame(false))
+                    .clicked()
+                {
+                    actions.push(Action::Navigate(pane_ix, crumb.location));
+                }
+                if i != last {
+                    muted_note(ui, "\u{203a}");
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut buf = tab.path_edit().to_string();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut buf)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("path or peer:<id>"),
+            );
+            if resp.changed() {
+                actions.push(Action::SetPathEdit(pane_ix, buf.clone()));
+            }
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                actions.push(Action::SetPathEdit(pane_ix, buf));
+                actions.push(Action::OpenPathEdit(pane_ix));
+            }
+        });
     });
 }
 
 fn tab_strip(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec<Action>) {
     let pane = b.pane(pane_ix);
-    ui.horizontal(|ui| {
-        let closeable = pane.tabs().len() > 1;
-        for (i, tab) in pane.tabs().iter().enumerate() {
-            let active = i == pane.active_tab_index();
-            if ui.selectable_label(active, tab.title()).clicked() {
-                actions.push(Action::SelectTab(pane_ix, i));
+    ui.scope(|ui| {
+        scope_files_toolbar_ui(ui);
+        ui.horizontal(|ui| {
+            let closeable = pane.tabs().len() > 1;
+            let (close_icon, close_tip) = FILES_TAB_ICONS[0];
+            for (i, tab) in pane.tabs().iter().enumerate() {
+                let active = i == pane.active_tab_index();
+                if ui.selectable_label(active, tab.title()).clicked() {
+                    actions.push(Action::SelectTab(pane_ix, i));
+                }
+                if closeable && files_icon_button(ui, close_icon, true, close_tip).clicked() {
+                    actions.push(Action::CloseTab(pane_ix, i));
+                }
             }
-            if closeable
-                && ui
-                    .small_button("\u{00d7}")
-                    .on_hover_text("Close tab")
-                    .clicked()
-            {
-                actions.push(Action::CloseTab(pane_ix, i));
+            let (new_tab_icon, new_tab_tip) = FILES_TAB_ICONS[1];
+            if files_icon_button(ui, new_tab_icon, true, new_tab_tip).clicked() {
+                actions.push(Action::NewTab(pane_ix));
             }
-        }
-        if ui.small_button("+").on_hover_text("New tab").clicked() {
-            actions.push(Action::NewTab(pane_ix));
-        }
+        });
     });
 }
 
@@ -1645,13 +1962,25 @@ fn list_view(
             false
         };
         if !thumbed {
-            ui.painter().text(
-                egui::pos2(tag_x, cy),
-                Align2::LEFT_CENTER,
-                mime_tag(e.mime),
-                FontId::monospace(Style::SMALL),
-                Style::TEXT_DIM,
+            let icon_rect = Rect::from_center_size(
+                egui::pos2(tag_x + FILES_ROW_ICON * 0.5, cy),
+                egui::vec2(FILES_ROW_ICON, FILES_ROW_ICON),
             );
+            if !paint_files_icon(
+                ui,
+                file_type_icon(e.mime),
+                icon_rect,
+                FILES_ROW_ICON,
+                file_icon_tint(e),
+            ) {
+                ui.painter().text(
+                    egui::pos2(tag_x, cy),
+                    Align2::LEFT_CENTER,
+                    mime_tag(e.mime),
+                    FontId::monospace(Style::SMALL),
+                    Style::TEXT_DIM,
+                );
+            }
         }
         let name_clip = Rect::from_min_max(
             egui::pos2(name_x, rect.top()),
@@ -1690,17 +2019,25 @@ fn grid_view(
                 egui::pos2(rect.right() - Style::SP_XS, rect.bottom() - Style::SP_L),
             );
             if !draw_thumb(ui, b, e, art) {
-                ui.painter().text(
+                let icon_rect = Rect::from_center_size(
                     egui::pos2(rect.center().x, rect.top() + Style::SP_L),
-                    Align2::CENTER_CENTER,
-                    mime_tag(e.mime),
-                    FontId::monospace(Style::HEADING),
-                    if e.is_dir {
-                        Style::ACCENT
-                    } else {
-                        Style::TEXT_DIM
-                    },
+                    egui::vec2(FILES_GRID_ICON, FILES_GRID_ICON),
                 );
+                if !paint_files_icon(
+                    ui,
+                    file_type_icon(e.mime),
+                    icon_rect,
+                    FILES_GRID_ICON,
+                    file_icon_tint(e),
+                ) {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.top() + Style::SP_L),
+                        Align2::CENTER_CENTER,
+                        mime_tag(e.mime),
+                        FontId::monospace(Style::HEADING),
+                        file_icon_tint(e),
+                    );
+                }
             }
             let name_clip = Rect::from_min_max(
                 egui::pos2(rect.left() + Style::SP_XS, rect.bottom() - Style::SP_L),
@@ -1734,9 +2071,24 @@ fn details_view(
         paint_entry_bg(ui, resp.id, rect, e.selected, resp.hovered());
         let cols = detail_columns(rect);
         let cy = rect.center().y;
+        let icon_rect = Rect::from_center_size(
+            egui::pos2(cols.name.left() + FILES_ROW_ICON * 0.5, cy),
+            egui::vec2(FILES_ROW_ICON, FILES_ROW_ICON),
+        );
+        let icon_width = if paint_files_icon(
+            ui,
+            file_type_icon(e.mime),
+            icon_rect,
+            FILES_ROW_ICON,
+            file_icon_tint(e),
+        ) {
+            Style::SP_L
+        } else {
+            0.0
+        };
         // Name (clipped to its column).
         ui.painter().with_clip_rect(cols.name).text(
-            egui::pos2(cols.name.left(), cy),
+            egui::pos2(cols.name.left() + icon_width, cy),
             Align2::LEFT_CENTER,
             &e.name,
             FontId::monospace(Style::BODY),
@@ -1879,15 +2231,15 @@ fn entry_interactions(
             actions.push(Action::Click(pane_ix, e.idx));
         }
     }
-    resp.context_menu(|ui| {
+    files_context_menu(resp, |ui| {
         // FILEMGR-12 — Send-To a peer (reuse the mesh transfer) + Send-in-Chat
         // (reuse the mesh transfer + the NOTIFY-CHAT file message-kind). Both are
         // roster-driven submenus; offline peers are honestly greyed (no probe, no
         // hang — the cached roster is read).
-        ui.menu_button("Send to", |ui| {
+        files_submenu_button(ui, "Send to", |ui| {
             peer_send_submenu(ui, b, pane_ix, false, actions);
         });
-        ui.menu_button("Send in Chat", |ui| {
+        files_submenu_button(ui, "Send in Chat", |ui| {
             peer_send_submenu(ui, b, pane_ix, true, actions);
         });
         // TRANSFERS-8 — right-click "Transfer to →" (Q13 entry 2): queue a real
@@ -1988,7 +2340,7 @@ fn peer_send_submenu(
                 egui::Button::new(RichText::new(peer.host.as_str()).color(Style::TEXT_DIM))
                     .frame(false),
             )
-            .on_hover_text("Peer is offline \u{2014} can't receive a file");
+            .files_disabled_hover_text("Peer is offline \u{2014} can't receive a file");
         }
     }
 }
@@ -2004,11 +2356,11 @@ fn target_transfer_submenu(
     pane_ix: usize,
     actions: &mut Vec<Action>,
 ) {
-    ui.menu_button("Transfer to", |ui| {
+    files_submenu_button(ui, "Transfer to", |ui| {
         for target in b.transfer_targets() {
             if ui
                 .button(target.label.as_str())
-                .on_hover_text(format!("{} \u{b7} {}", target.method.label(), target.dest))
+                .files_hover_text(format!("{} \u{b7} {}", target.method.label(), target.dest))
                 .clicked()
             {
                 actions.push(Action::SendToTarget(pane_ix, target.clone()));
@@ -2691,7 +3043,7 @@ fn delete_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                 .fill(Style::DANGER);
                 if ui
                     .add_enabled(armed, del)
-                    .on_disabled_hover_text("Type the node name to arm this delete")
+                    .files_disabled_hover_text("Type the node name to arm this delete")
                     .clicked()
                 {
                     actions.push(Action::ConfirmDelete);
@@ -2894,18 +3246,46 @@ fn op_strip(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if op.is_done() {
-                    if ui.small_button("Dismiss").clicked() {
+                    if files_action_button(
+                        ui,
+                        "Dismiss",
+                        FilesActionTone::Quiet,
+                        "Dismiss this file operation",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::DismissOp(op.op_id));
                     }
                 } else {
-                    if ui.small_button("Cancel").clicked() {
+                    if files_action_button(
+                        ui,
+                        "Cancel",
+                        FilesActionTone::Danger,
+                        "Cancel this file operation",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::CancelOp(op.op_id));
                     }
                     if op.control.is_paused() {
-                        if ui.small_button("Resume").clicked() {
+                        if files_action_button(
+                            ui,
+                            "Resume",
+                            FilesActionTone::Primary,
+                            "Resume this file operation",
+                        )
+                        .clicked()
+                        {
                             actions.push(Action::ResumeOp(op.op_id));
                         }
-                    } else if ui.small_button("Pause").clicked() {
+                    } else if files_action_button(
+                        ui,
+                        "Pause",
+                        FilesActionTone::Quiet,
+                        "Pause this file operation",
+                    )
+                    .clicked()
+                    {
                         actions.push(Action::PauseOp(op.op_id));
                     }
                 }
@@ -3082,12 +3462,16 @@ const fn peer_color(status: PeerStatus) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::files_panel;
-    use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode};
+    use super::{
+        apply_files_popup_style, file_type_icon, files_panel, files_tooltip, local_place_icon,
+        scope_files_popup_ui, scope_files_toolbar_ui, tab_strip, ACTION_BUTTON_H,
+        FILES_ICON_BUTTON_ICON, FILES_NAV_ICONS, FILES_TAB_ICONS,
+    };
+    use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode, LOCAL_SPOTS};
     use crate::transfers::test_support::FakeTransfers;
     use crate::transfers::{Method, TransferJob, TransferPolicy, TransferState};
-    use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::Style;
+    use mde_egui::egui::{self, pos2, vec2, Color32, Rect, Stroke};
+    use mde_egui::{Density, Style, StyleColorScheme};
     use mde_files::backend::{
         AuditEntry, Backend, BackendError, ConflictPolicy, Destination, MeshOverlayBadge, OpId,
         SendMode,
@@ -3194,6 +3578,20 @@ mod tests {
         FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
     }
 
+    fn render_frame(browser: &mut FileBrowser) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                files_panel(ui, browser);
+            });
+        })
+    }
+
     /// Drive one headless egui frame that renders [`files_panel`] into a real
     /// `CentralPanel`, then tessellate the result on the CPU so any paint-path
     /// fault surfaces as a test failure. This is the harness's headless "mount"
@@ -3212,6 +3610,231 @@ mod tests {
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "files_panel produced no draw primitives");
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != Color32::PLACEHOLDER).then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill != Color32::TRANSPARENT => {
+                    out.push(rect.fill);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn rect_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<Stroke> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<Stroke>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
+                    out.push(rect.stroke);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn image_mesh_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty() => 1,
+                egui::Shape::Vec(shapes) => shapes.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+
+        shapes.iter().map(|clipped| walk(&clipped.shape)).sum()
+    }
+
+    fn assert_painted_text_color(texts: &[(String, Color32)], label: &str, color: Color32) {
+        assert!(
+            texts
+                .iter()
+                .any(|(text, painted)| text == label && *painted == color),
+            "expected {label:?} to paint with {color:?}, saw {texts:?}"
+        );
+    }
+
+    #[test]
+    fn files_context_menu_visuals_use_themed_text_and_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut style = (*ctx.style()).clone();
+        apply_files_popup_style(&ctx, &mut style);
+
+        assert_eq!(style.visuals.window_fill, Style::SURFACE);
+        assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+        assert_eq!(style.visuals.window_stroke.color, Style::BORDER);
+        assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+        assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+        assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+        assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT);
+        assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
+        assert_eq!(style.spacing.button_padding.y, Style::CONTROL_PAD_Y);
+
+        let light = egui::Context::default();
+        Style::install_color_scheme_with_density(&light, StyleColorScheme::Light, Density::Mouse);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+        let mut light_style = (*light.style()).clone();
+        apply_files_popup_style(&light, &mut light_style);
+
+        assert_eq!(light_style.visuals.window_fill, palette.surface);
+        assert_eq!(light_style.visuals.panel_fill, palette.surface);
+        assert_eq!(light_style.visuals.window_stroke.color, palette.border);
+        assert_eq!(light_style.visuals.override_text_color, Some(palette.text));
+        assert_eq!(
+            light_style.visuals.widgets.inactive.fg_stroke.color,
+            palette.text
+        );
+        assert_eq!(
+            light_style.visuals.widgets.hovered.bg_fill,
+            palette.surface_hi
+        );
+        assert_eq!(
+            light_style.visuals.widgets.hovered.fg_stroke.color,
+            palette.text
+        );
+        assert_ne!(
+            light_style.visuals.widgets.inactive.fg_stroke.color,
+            Style::TEXT,
+            "Files context menus must not leak dark-mode text into light-mode popups"
+        );
+    }
+
+    #[test]
+    fn files_nested_popup_scope_repairs_raw_menu_visuals() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+            ..Default::default()
+        };
+        let mut scoped_style = None;
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    ui.style_mut().visuals.override_text_color = None;
+                    ui.style_mut().visuals.widgets.inactive.fg_stroke.color = Style::TEXT;
+                    ui.style_mut().visuals.widgets.hovered.bg_fill = Color32::TRANSPARENT;
+                    ui.style_mut().visuals.widgets.hovered.fg_stroke.color = Color32::BLACK;
+
+                    scope_files_popup_ui(ui);
+                    scoped_style = Some((*ui.style()).clone());
+                });
+        });
+
+        let scoped_style = scoped_style.expect("test frame should capture scoped popup style");
+        assert_eq!(scoped_style.visuals.window_fill, palette.surface);
+        assert_eq!(
+            scoped_style.visuals.override_text_color,
+            Some(palette.text),
+            "nested Files popups must restore readable light-mode text"
+        );
+        assert_eq!(
+            scoped_style.visuals.widgets.inactive.fg_stroke.color,
+            palette.text
+        );
+        assert_eq!(
+            scoped_style.visuals.widgets.hovered.bg_fill,
+            palette.surface_hi
+        );
+        assert_eq!(
+            scoped_style.visuals.widgets.hovered.fg_stroke.color,
+            palette.text
+        );
+    }
+
+    #[test]
+    fn files_hover_tooltip_uses_themed_text_and_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    files_tooltip(ui, "Show hidden entries");
+                });
+        });
+
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Show hidden entries", Style::TEXT);
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "Show hidden entries" && *color == Color32::BLACK),
+            "Files tooltip leaked raw black popup text: {texts:?}"
+        );
+
+        let fills = rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&Style::SURFACE),
+            "Files tooltip should paint its own themed surface: {fills:?}"
+        );
     }
 
     #[test]
@@ -3282,6 +3905,206 @@ mod tests {
         assert_eq!(b.surface_tab(), SurfaceTab::Transfers);
         assert_eq!(b.transfers_view().len(), 2, "both ledger fixtures show");
         mount(&mut b);
+    }
+
+    #[test]
+    fn transfer_lifecycle_controls_use_files_action_button_tokens() {
+        let mut running = TransferJob::new(
+            "/src/a",
+            "peer:oak",
+            Method::Rsync,
+            TransferPolicy::default(),
+        );
+        running.state = TransferState::Running;
+        running.progress = Some(42);
+        let fake = FakeTransfers::new().with_jobs(vec![running]);
+        let mut b =
+            FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
+                .with_transfers(Box::new(fake));
+        b.set_surface_tab(SurfaceTab::Transfers);
+
+        let out = render_frame(&mut b);
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Cancel", Style::DANGER);
+        assert_painted_text_color(&texts, "Pause", Style::TEXT);
+
+        let fills = rect_fills(&out.shapes);
+        assert!(
+            fills.iter().any(|fill| *fill == Style::LAYER_02),
+            "Files transfer lifecycle controls must paint the shared action layer fill: {fills:?}"
+        );
+        let strokes = rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == Style::DANGER.gamma_multiply(0.72)),
+            "Files transfer cancel action must paint a danger outline: {strokes:?}"
+        );
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == Style::TEXT.gamma_multiply(0.72)),
+            "Files transfer pause action must paint a quiet outline: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn files_action_buttons_use_refined_shared_chrome_height() {
+        assert_eq!(
+            ACTION_BUTTON_H,
+            Style::TOOLBAR_CONTROL_H,
+            "Files action buttons should follow the shared refined toolbar control height"
+        );
+        assert!(
+            ACTION_BUTTON_H < Style::SP_L,
+            "Files should not carry the old full-gutter 24pt local action height"
+        );
+        assert!(
+            FILES_ICON_BUTTON_ICON < ACTION_BUTTON_H,
+            "navigation icons should fit within the refined action button rect"
+        );
+    }
+
+    #[test]
+    fn files_toolbar_scope_uses_refined_control_metrics() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 80.0))),
+            ..Default::default()
+        };
+        let mut metrics = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                scope_files_toolbar_ui(ui);
+                metrics = Some((
+                    ui.style().spacing.interact_size.y,
+                    ui.style().spacing.button_padding.y,
+                    ui.style().spacing.item_spacing.y,
+                ));
+            });
+        });
+        let (interact_h, pad_y, gap_y) = metrics.expect("test should capture Files toolbar style");
+        assert_eq!(interact_h, Style::TOOLBAR_CONTROL_H);
+        assert_eq!(pad_y, Style::CONTROL_PAD_Y);
+        assert_eq!(gap_y, Style::TOOLBAR_INSET_Y);
+    }
+
+    #[test]
+    fn files_navigation_toolbar_uses_yamis_icons() {
+        assert_eq!(FILES_NAV_ICONS.len(), 3);
+        for (icon, label) in FILES_NAV_ICONS {
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{label} navigation icon should resolve through the YAMIS catalog"
+            );
+            let img = mde_theme::brand::icons::icon_image(*icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| panic!("{label} navigation icon failed to rasterize: {err}"));
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{label} navigation icon rasterized empty"
+            );
+        }
+    }
+
+    #[test]
+    fn files_tab_strip_controls_use_yamis_icon_buttons() {
+        assert_eq!(
+            FILES_TAB_ICONS,
+            &[
+                (mde_theme::brand::icons::IconId::Close, "Close tab"),
+                (mde_theme::brand::icons::IconId::NewTab, "New tab"),
+            ]
+        );
+        for (icon, label) in FILES_TAB_ICONS {
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{label} tab-strip icon should resolve through the YAMIS catalog"
+            );
+            let img = mde_theme::brand::icons::icon_image(*icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| panic!("{label} tab-strip icon failed to rasterize: {err}"));
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{label} tab-strip icon rasterized empty"
+            );
+        }
+
+        let mut b = browser();
+        b.new_tab(0);
+        assert_eq!(b.pane(0).tabs().len(), 2, "test setup needs close buttons");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 80.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut actions = Vec::new();
+                tab_strip(ui, &b, 0, &mut actions);
+                assert!(
+                    actions.is_empty(),
+                    "render-only tab strip should not emit actions"
+                );
+            });
+        });
+
+        assert!(
+            image_mesh_count(&out.shapes) >= 3,
+            "two close controls plus the new-tab control should paint image icons"
+        );
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .all(|(text, _)| text != "\u{00d7}" && text != "+"),
+            "tab-strip icon buttons must not paint raw text controls: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn files_mime_glyphs_use_yamis_icons() {
+        for (mime, label) in [
+            (Mime::Folder, "folder"),
+            (Mime::Doc, "document"),
+            (Mime::Image, "image"),
+            (Mime::Pdf, "pdf"),
+            (Mime::Archive, "archive"),
+            (Mime::Disk, "disk"),
+        ] {
+            let icon = file_type_icon(mime);
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{label} MIME glyph should resolve through the YAMIS catalog"
+            );
+            let img = mde_theme::brand::icons::icon_image(icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| panic!("{label} MIME glyph failed to rasterize: {err}"));
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{label} MIME glyph rasterized empty"
+            );
+        }
+    }
+
+    #[test]
+    fn files_local_places_use_yamis_icons() {
+        for spot in LOCAL_SPOTS {
+            let icon = local_place_icon(spot.path);
+            assert!(
+                icon.name().starts_with("yamis-"),
+                "{} place glyph should resolve through the YAMIS catalog",
+                spot.label
+            );
+            let img = mde_theme::brand::icons::icon_image(icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
+                .unwrap_or_else(|err| {
+                    panic!("{} place glyph failed to rasterize: {err}", spot.label)
+                });
+            assert!(
+                img.rgba.chunks_exact(4).any(|px| px[3] > 0),
+                "{} place glyph rasterized empty",
+                spot.label
+            );
+        }
     }
 
     #[test]

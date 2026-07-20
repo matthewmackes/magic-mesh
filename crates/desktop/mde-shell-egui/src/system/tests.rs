@@ -1,6 +1,7 @@
 use super::*;
 use mde_egui::egui::{pos2, vec2, Rect};
 use mde_seat::{Battery, BatteryKind, BatteryState, ProfileState};
+use mde_theme::brand::icons::IconId;
 
 /// Drive one headless frame of the System panel over a real seat, and tessellate
 /// on the CPU (the DRM runner's path minus GPU).
@@ -15,6 +16,170 @@ fn renders(state: &mut SystemState) -> bool {
         egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
     });
     !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+}
+
+fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Mesh(mesh) => {
+                out.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+            }
+            egui::Shape::Path(path) => {
+                if path.fill != egui::Color32::TRANSPARENT {
+                    out.push(path.fill);
+                }
+            }
+            egui::Shape::Rect(rect) => {
+                if rect.fill != egui::Color32::TRANSPARENT {
+                    out.push(rect.fill);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push((text.galley.text().to_owned(), text_color(text)));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn render_settings_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 96.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    settings_tooltip(ui, "Move display left");
+                });
+        },
+    )
+}
+
+fn render_settings_choice_frame(ctx: &egui::Context, selected: bool) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 120.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    ui.set_width(300.0);
+                    settings_choice_tile(
+                        ui,
+                        selected,
+                        "Light",
+                        Some("Windows 2000 basic"),
+                        SettingsGroup::Personalization.accent(),
+                        Style::SP_XL,
+                    );
+                });
+        },
+    )
+}
+
+fn render_wallpaper_section_frame(ctx: &egui::Context) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(520.0, 280.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let mut config = WallpaperServiceConfig::default();
+                    let mut download = WallpaperDownloadRuntime::default();
+                    let mut actions = Vec::new();
+                    wallpaper_section(ui, &mut config, &mut download, &mut actions);
+                });
+        },
+    )
+}
+
+fn render_settings_combo_popup_frame(ctx: &egui::Context) -> egui::FullOutput {
+    fn input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 180.0))),
+            ..Default::default()
+        }
+    }
+
+    fn show_popup(ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                ui.set_width(240.0);
+                settings_popup_visual_scope(ui, |ui| {
+                    let popup_id = ui.make_persistent_id("settings-popup-choice-test");
+                    let response = ui.button("Right");
+                    ui.memory_mut(|mem| mem.open_popup(popup_id));
+                    let _ = egui::popup::popup_above_or_below_widget(
+                        ui,
+                        popup_id,
+                        &response,
+                        egui::AboveOrBelow::Below,
+                        egui::popup::PopupCloseBehavior::IgnoreClicks,
+                        |ui| {
+                            apply_settings_popup_style(ui.style_mut());
+                            let _ = ui.selectable_label(false, "Left");
+                            let _ = ui.selectable_label(true, "Right");
+                        },
+                    );
+                });
+            });
+    }
+
+    let _ = ctx.run(input(), show_popup);
+    ctx.run(input(), show_popup)
 }
 
 #[test]
@@ -40,6 +205,226 @@ fn default_state_is_unpolled_with_an_empty_layout() {
     assert!(st.snapshot().is_none());
     assert!(st.layout.outputs.is_empty());
     assert!(st.confirm.is_none());
+}
+
+#[test]
+fn settings_chrome_copy_is_ascii_and_nudges_use_yamis_icons() {
+    for copy in [
+        SYSTEM_READING_SEAT_COPY,
+        SYSTEM_SCANNING_COPY,
+        SYSTEM_MESH_READING_COPY,
+    ] {
+        assert!(copy.is_ascii(), "{copy:?} should stay ASCII");
+    }
+    assert_eq!(DISPLAY_NUDGE_LEFT_ICON, IconId::ArrowLeft);
+    assert_eq!(DISPLAY_NUDGE_RIGHT_ICON, IconId::ArrowRight);
+}
+
+#[test]
+fn settings_icon_tooltips_use_themed_text_and_surface() {
+    let ctx = egui::Context::default();
+    mde_egui::fonts::install(&ctx);
+
+    let out = render_settings_tooltip_frame(&ctx);
+    let texts = painted_text(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "Move display left" && *color == Style::TEXT),
+        "Settings icon tooltip should paint themed text: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|(text, color)| {
+            text == "Move display left"
+                && matches!(*color, egui::Color32::BLACK | Style::BG | Style::TEXT_DIM)
+        }),
+        "Settings icon tooltip leaked unreadable/shared shell text color: {texts:?}"
+    );
+
+    let fills = painted_fill_colors(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Settings icon tooltip should paint its own themed surface: {fills:?}"
+    );
+}
+
+#[test]
+fn settings_choice_tiles_use_themed_selected_and_hover_colors() {
+    let dark = egui::Context::default();
+    Style::install(&dark);
+    let accent = SettingsGroup::Personalization.accent();
+
+    let dark_selected = settings_choice_colors(&dark, true, false, accent);
+    assert_eq!(
+        dark_selected.fill,
+        Style::pressed_fill_for_scheme(StyleColorScheme::Dark, accent),
+        "dark selected choices should use the shared pressed fill"
+    );
+    assert_eq!(dark_selected.text, Style::TEXT_STRONG);
+
+    let dark_hover = settings_choice_colors(&dark, false, true, accent);
+    assert_eq!(
+        dark_hover.fill,
+        Style::SURFACE_HI,
+        "dark hover choices should use the highlighted surface"
+    );
+    assert_eq!(dark_hover.text, Style::TEXT);
+    assert_eq!(
+        dark_hover.stroke,
+        Style::accent_for_scheme(StyleColorScheme::Dark, accent)
+    );
+
+    let light = egui::Context::default();
+    Style::install_color_scheme_with_density(
+        &light,
+        StyleColorScheme::Light,
+        mde_egui::style::Density::Mouse,
+    );
+    let light_palette = Style::palette_for(StyleColorScheme::Light);
+    let light_selected = settings_choice_colors(&light, true, false, accent);
+    assert_eq!(
+        light_selected.fill,
+        Style::WIN2000_PRESSED_FACE,
+        "light selected choices should keep black text on the classic pressed face"
+    );
+    assert_eq!(light_selected.text, light_palette.text_strong);
+
+    let out = render_settings_choice_frame(&light, true);
+    let texts = painted_text(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "Light" && *color == light_palette.text_strong),
+        "selected Settings choices should paint themed readable text: {texts:?}"
+    );
+    let fills = painted_fill_colors(&out.shapes);
+    assert!(
+        fills.contains(&Style::WIN2000_PRESSED_FACE),
+        "selected Settings choices should paint their own selected fill: {fills:?}"
+    );
+}
+
+#[test]
+fn wallpaper_service_defaults_enable_bing_fallback_and_round_trip() {
+    let cfg = WallpaperServiceConfig::default();
+    assert!(cfg.network_fetch_enabled);
+    assert!(cfg.bing_daily_enabled);
+    assert!(cfg.desktop_page_url.is_empty());
+
+    let dir = nav_temp_dir("wallpaper-service");
+    let path = dir.join("settings-wallpaper-service.json");
+    let changed = WallpaperServiceConfig {
+        network_fetch_enabled: false,
+        bing_daily_enabled: true,
+        desktop_page_url: "  http://127.0.0.1:8787/  ".to_owned(),
+        last_image_path: Some(dir.join("wallpaper-cache").join("bing.jpg")),
+        last_image_title: "  Today  ".to_owned(),
+        last_image_copyright: "  Credit  ".to_owned(),
+        last_updated_ms: 42,
+    };
+    changed.save_to(&path).expect("save wallpaper service");
+    let loaded = WallpaperServiceConfig::load_from(&path);
+    assert!(!loaded.network_fetch_enabled);
+    assert!(loaded.bing_daily_enabled);
+    assert_eq!(loaded.desktop_page_url, "http://127.0.0.1:8787/");
+    assert_eq!(loaded.last_image_title, "Today");
+    assert_eq!(loaded.last_image_copyright, "Credit");
+    assert_eq!(loaded.last_updated_ms, 42);
+}
+
+#[test]
+fn bing_daily_archive_parser_resolves_relative_image_url() {
+    let value: serde_json::Value = serde_json::json!({
+        "images": [{
+            "url": "/th?id=OHR.TestImage_EN-US1234567890_1920x1080.jpg&rf=LaDigue_1920x1080.jpg",
+            "title": "Lake",
+            "copyright": "Lake credit"
+        }]
+    });
+    let image = bing_daily_image_from_archive(&value).expect("parse bing metadata");
+    assert_eq!(
+        image.image_url,
+        "https://www.bing.com/th?id=OHR.TestImage_EN-US1234567890_1920x1080.jpg&rf=LaDigue_1920x1080.jpg"
+    );
+    assert_eq!(image.title, "Lake");
+    assert_eq!(image.copyright, "Lake credit");
+}
+
+#[test]
+fn wallpaper_section_renders_bing_service_instead_of_static_gallery() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    mde_egui::fonts::install(&ctx);
+    let out = render_wallpaper_section_frame(&ctx);
+    let texts = painted_text(&out.shapes);
+
+    for label in [
+        "Desktop background service",
+        "Allow daily picture downloads",
+        "Use Bing image of the day as fallback",
+        "Download today's picture",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == label),
+            "Wallpaper service label {label:?} was not painted: {texts:?}"
+        );
+    }
+    assert!(
+        !texts.iter().any(|(text, _)| text.starts_with("Wallpaper 1")
+            || text.starts_with("Wallpaper 2")
+            || text.starts_with("Wallpaper 3")
+            || text.starts_with("Wallpaper 4")
+            || text.starts_with("Wallpaper 5")),
+        "retired static wallpaper gallery labels should not render: {texts:?}"
+    );
+}
+
+#[test]
+fn settings_combobox_popups_use_themed_readable_choice_colors() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    mde_egui::fonts::install(&ctx);
+
+    let mut style = (*ctx.style()).clone();
+    apply_settings_popup_style(&mut style);
+    assert_eq!(style.visuals.window_fill, Style::SURFACE);
+    assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+    assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+    assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.active.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.active.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.open.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.bg_stroke.color, Style::BORDER);
+    assert_eq!(
+        style.visuals.widgets.noninteractive.fg_stroke.color,
+        Style::TEXT_DIM
+    );
+
+    let out = render_settings_combo_popup_frame(&ctx);
+    let texts = painted_text(&out.shapes);
+    for label in ["Left", "Right"] {
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == label && *color == Style::TEXT),
+            "Settings ComboBox choice {label:?} should paint themed text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == label && *color == egui::Color32::BLACK),
+            "Settings ComboBox choice {label:?} leaked raw black popup text: {texts:?}"
+        );
+    }
+
+    let fills = painted_fill_colors(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Settings ComboBox popup should paint the Settings surface: {fills:?}"
+    );
 }
 
 #[test]
@@ -450,7 +835,7 @@ fn the_rail_lists_the_three_domain_groups_covering_every_section() {
 
 #[test]
 fn every_section_is_reachable_exactly_once() {
-    // Every section — the six host-control sections AND the four Mesh & System
+    // Every section — the host-control sections AND the Mesh & System
     // sections SETTINGS-4 wired — appears exactly once across the whole taxonomy
     // and routes to a real body (the live routing is the exhaustive match in
     // settings_detail; the render test proves each paints).
@@ -460,6 +845,7 @@ fn every_section_is_reachable_exactly_once() {
         .collect();
     for section in [
         SettingsSection::Displays,
+        SettingsSection::Mouse,
         SettingsSection::Audio,
         SettingsSection::Bluetooth,
         SettingsSection::Power,
@@ -470,6 +856,7 @@ fn every_section_is_reachable_exactly_once() {
         SettingsSection::Role,
         SettingsSection::Pairing,
         SettingsSection::Network,
+        SettingsSection::RemoteProofing,
     ] {
         assert_eq!(
             all.iter().filter(|&&s| s == section).count(),
@@ -478,8 +865,36 @@ fn every_section_is_reachable_exactly_once() {
             section.label()
         );
     }
-    // The whole taxonomy is exactly those eleven sections (no orphan leaf).
-    assert_eq!(all.len(), 11, "the taxonomy lists exactly eleven sections");
+    // The whole taxonomy is exactly those thirteen sections (no orphan leaf).
+    assert_eq!(
+        all.len(),
+        13,
+        "the taxonomy lists exactly thirteen sections"
+    );
+}
+
+#[test]
+fn every_settings_section_has_a_yamis_backed_icon() {
+    let all: Vec<SettingsSection> = SettingsGroup::ALL
+        .iter()
+        .flat_map(|g| g.sections().iter().copied())
+        .collect();
+
+    assert_eq!(SettingsSection::Mouse.icon_id(), IconId::Mouse);
+    for section in all {
+        let icon = section.icon_id();
+        assert!(
+            icon.name().starts_with("yamis-"),
+            "{} should use the shared YAMIS platform icon catalog, got {}",
+            section.label(),
+            icon.name()
+        );
+        assert!(
+            icon.svg().contains("<svg"),
+            "{} icon source should be embedded SVG",
+            section.label()
+        );
+    }
 }
 
 #[test]
@@ -575,6 +990,290 @@ fn theme_is_a_personalization_section_reachable_once() {
 }
 
 #[test]
+fn remote_proofing_is_a_mesh_system_section_reachable_once() {
+    // Sunshine/Moonlight and the VNC fallback are operator exposure controls, so
+    // they live in the Mesh & System settings workspace rather than the Browser
+    // toolbar or a hand-edited service file.
+    assert_eq!(
+        SettingsSection::RemoteProofing.group(),
+        SettingsGroup::MeshSystem
+    );
+    assert!(SettingsGroup::MeshSystem
+        .sections()
+        .contains(&SettingsSection::RemoteProofing));
+    let count = SettingsGroup::ALL
+        .iter()
+        .flat_map(|g| g.sections().iter())
+        .filter(|&&s| s == SettingsSection::RemoteProofing)
+        .count();
+    assert_eq!(count, 1, "Remote Proofing must be reachable exactly once");
+}
+
+#[test]
+fn mouse_touch_is_a_devices_section_reachable_once() {
+    // Mouse & Touch is a host-device control surface, not personalization. It must be
+    // one normal rail leaf so the Settings chrome, menubar routing, and detail router
+    // all treat it like Displays/Audio/Bluetooth/Power.
+    assert_eq!(SettingsSection::Mouse.group(), SettingsGroup::Devices);
+    assert!(SettingsGroup::Devices
+        .sections()
+        .contains(&SettingsSection::Mouse));
+    let count = SettingsGroup::ALL
+        .iter()
+        .flat_map(|g| g.sections().iter())
+        .filter(|&&s| s == SettingsSection::Mouse)
+        .count();
+    assert_eq!(count, 1, "Mouse & Touch must be reachable exactly once");
+}
+
+#[test]
+fn mouse_touch_config_defaults_round_trip_and_clamp() {
+    // Defaults lower the relative pointer speed for the native seat while keeping
+    // normal primary-button and scroll direction behavior. The policy object is what
+    // the DRM runner reads, so this proves the persisted values have a runtime shape.
+    let cfg = MouseTouchConfig::default();
+    assert_eq!(cfg.pointer_speed_percent, -35);
+    assert_eq!(cfg.primary_button, PrimaryButton::Left);
+    assert!(!cfg.natural_scroll);
+    assert_eq!(cfg.scroll_speed_percent, 100);
+    assert_eq!(cfg.double_click_ms, 300);
+    assert!(cfg.touchpad_tap_to_click);
+    assert!(cfg.two_finger_scroll);
+    assert!(cfg.touchscreen_enabled);
+    assert!(cfg.edge_gestures);
+    assert!(cfg.long_press_secondary);
+    assert!((cfg.input_policy().pointer_scale() - 0.65).abs() < f32::EPSILON);
+    assert!((cfg.mackesd_pointer_accel() + 0.35).abs() < f64::EPSILON);
+
+    let dir = nav_temp_dir("mouse-touch");
+    std::fs::create_dir_all(&dir).expect("mkroot");
+    let path = dir.join(MOUSE_TOUCH_CONFIG_FILE);
+    let changed = MouseTouchConfig {
+        pointer_speed_percent: 20,
+        primary_button: PrimaryButton::Right,
+        natural_scroll: true,
+        scroll_speed_percent: 140,
+        double_click_ms: 450,
+        touchpad_tap_to_click: false,
+        two_finger_scroll: false,
+        touchscreen_enabled: false,
+        edge_gestures: false,
+        long_press_secondary: false,
+    };
+    changed.save_to(&path).expect("save");
+    assert_eq!(MouseTouchConfig::load_from(&path), changed);
+    assert!(changed.input_policy().left_handed);
+    assert_eq!(changed.input_policy().scroll_speed_percent, 140);
+
+    std::fs::write(
+        &path,
+        r#"{"pointer_speed_percent":-500,"scroll_speed_percent":999,"double_click_ms":1200,"primary_button":"right"}"#,
+    )
+    .expect("write drifted config");
+    let clamped = MouseTouchConfig::load_from(&path);
+    assert_eq!(clamped.pointer_speed_percent, -100);
+    assert_eq!(clamped.scroll_speed_percent, 300);
+    assert_eq!(clamped.double_click_ms, 900);
+    assert_eq!(clamped.primary_button, PrimaryButton::Right);
+    assert!(clamped.touchpad_tap_to_click, "absent fields keep defaults");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mouse_touch_policy_publishes_to_runtime_input_and_egui_options() {
+    let original = mde_egui::input_policy();
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let st = SystemState {
+        mouse_touch: MouseTouchConfig {
+            pointer_speed_percent: -60,
+            primary_button: PrimaryButton::Right,
+            natural_scroll: true,
+            scroll_speed_percent: 175,
+            double_click_ms: 650,
+            touchpad_tap_to_click: true,
+            two_finger_scroll: false,
+            touchscreen_enabled: false,
+            edge_gestures: false,
+            long_press_secondary: false,
+        },
+        ..SystemState::default()
+    };
+
+    st.apply_mouse_touch(&ctx);
+    assert_eq!(mde_egui::input_policy(), st.mouse_touch.input_policy());
+    assert!(mde_egui::input_policy().left_handed);
+    assert!((mde_egui::input_policy().pointer_scale() - 0.4).abs() < f32::EPSILON);
+    let double_click = ctx.options(|o| o.input_options.max_double_click_delay);
+    assert!(
+        (double_click - 0.65).abs() < f64::EPSILON,
+        "double-click timing is applied to egui input options"
+    );
+
+    mde_egui::set_input_policy(original);
+}
+
+#[test]
+fn remote_proofing_config_defaults_and_round_trips() {
+    // Conservative defaults keep Sunshine/Moonlight policy grouped and safe:
+    // disabled until the operator enables it, mesh-only exposure, DRM/KMS capture
+    // for the native shell, local approval, on-seat indicator, remote input policy,
+    // VNC fallback, and a 30 FPS proof floor.
+    let cfg = RemoteProofingConfig::default();
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.exposure, RemoteProofingExposure::MeshOnly);
+    assert_eq!(cfg.capture, RemoteProofingCapture::Kms);
+    assert_eq!(cfg.encoder, RemoteProofingEncoder::Auto);
+    assert!(cfg.native_pairing_prompt);
+    assert!(cfg.require_local_approval);
+    assert!(cfg.show_shadowing_indicator);
+    assert!(cfg.allow_remote_input);
+    assert!(cfg.vnc_fallback);
+    assert_eq!(cfg.min_fps_target, 30);
+
+    let dir = nav_temp_dir("remote-proofing");
+    std::fs::create_dir_all(&dir).expect("mkroot");
+    let path = dir.join(REMOTE_PROOFING_CONFIG_FILE);
+    let changed = RemoteProofingConfig {
+        enabled: true,
+        exposure: RemoteProofingExposure::Lan,
+        capture: RemoteProofingCapture::Kms,
+        encoder: RemoteProofingEncoder::IntelVaapi,
+        native_pairing_prompt: true,
+        require_local_approval: true,
+        show_shadowing_indicator: true,
+        allow_remote_input: true,
+        vnc_fallback: true,
+        min_fps_target: 45,
+    };
+    changed.save_to(&path).expect("save");
+    assert_eq!(RemoteProofingConfig::load_from(&path), changed);
+
+    std::fs::write(
+        &path,
+        r#"{"enabled":true,"exposure":"public","min_fps_target":250}"#,
+    )
+    .expect("write drifted config");
+    let clamped = RemoteProofingConfig::load_from(&path);
+    assert_eq!(clamped.exposure, RemoteProofingExposure::Public);
+    assert_eq!(clamped.min_fps_target, 120);
+    assert_eq!(clamped.capture, RemoteProofingCapture::Kms);
+    assert!(clamped.require_local_approval);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remote_proofing_service_plan_maps_policy_to_sunshine_and_firewall() {
+    let mesh = MeshFacts {
+        seen: true,
+        identity: Some("eagle".to_owned()),
+        role: Some("workstation".to_owned()),
+        overlay_ip: Some("10.42.0.8".to_owned()),
+        default_gw: Some("172.20.0.1".to_owned()),
+        ..MeshFacts::default()
+    };
+    let cfg = RemoteProofingConfig {
+        enabled: true,
+        exposure: RemoteProofingExposure::MeshOnly,
+        capture: RemoteProofingCapture::Kms,
+        encoder: RemoteProofingEncoder::IntelVaapi,
+        native_pairing_prompt: true,
+        require_local_approval: true,
+        show_shadowing_indicator: true,
+        allow_remote_input: true,
+        vnc_fallback: true,
+        min_fps_target: 45,
+    };
+
+    let plan = cfg.service_plan(&mesh);
+    assert!(plan.enabled);
+    assert_eq!(plan.bind_scope, RemoteProofingBindScope::MeshOnly);
+    assert_eq!(plan.bind_address.as_deref(), Some("10.42.0.8"));
+    assert_eq!(plan.firewall, RemoteProofingFirewallPolicy::MeshOverlayOnly);
+    assert_eq!(plan.sunshine_capture, "kms");
+    assert_eq!(plan.sunshine_encoder, "vaapi");
+    assert_eq!(plan.min_fps_target, 45);
+    assert!(plan.require_local_approval);
+    assert!(plan.show_shadowing_indicator);
+    assert!(plan.allow_remote_input);
+    assert!(plan.vnc_fallback);
+    assert!(
+        plan.warnings.is_empty(),
+        "healthy mesh-only policy should not warn: {:?}",
+        plan.warnings
+    );
+}
+
+#[test]
+fn remote_proofing_service_plan_surfaces_degraded_or_public_exposure() {
+    let mesh_without_overlay = MeshFacts {
+        seen: true,
+        role: Some("workstation".to_owned()),
+        ..MeshFacts::default()
+    };
+    let mesh_plan = RemoteProofingConfig {
+        enabled: true,
+        exposure: RemoteProofingExposure::MeshOnly,
+        ..RemoteProofingConfig::default()
+    }
+    .service_plan(&mesh_without_overlay);
+    assert_eq!(mesh_plan.bind_scope, RemoteProofingBindScope::MeshOnly);
+    assert_eq!(mesh_plan.bind_address, None);
+    assert_eq!(
+        mesh_plan.firewall,
+        RemoteProofingFirewallPolicy::MeshOverlayOnly
+    );
+    assert!(
+        mesh_plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("Mesh address")),
+        "missing overlay IP must be an explicit degraded state"
+    );
+
+    let public_plan = RemoteProofingConfig {
+        enabled: true,
+        exposure: RemoteProofingExposure::Public,
+        require_local_approval: false,
+        show_shadowing_indicator: false,
+        ..RemoteProofingConfig::default()
+    }
+    .service_plan(&MeshFacts::default());
+    assert_eq!(public_plan.bind_scope, RemoteProofingBindScope::Public);
+    assert_eq!(public_plan.bind_address.as_deref(), Some("0.0.0.0"));
+    assert_eq!(
+        public_plan.firewall,
+        RemoteProofingFirewallPolicy::PublicExplicit
+    );
+    assert!(
+        public_plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("All-interfaces")),
+        "public exposure must carry an explicit warning"
+    );
+    assert!(
+        public_plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("Local approval")),
+        "turning off approval must stay visible in the plan"
+    );
+    assert!(
+        public_plan.warnings.iter().any(|w| w.contains("indicator")),
+        "turning off the on-seat indicator must stay visible in the plan"
+    );
+
+    let disabled_plan = RemoteProofingConfig::default().service_plan(&MeshFacts::default());
+    assert!(!disabled_plan.enabled);
+    assert_eq!(disabled_plan.bind_scope, RemoteProofingBindScope::Disabled);
+    assert_eq!(disabled_plan.firewall, RemoteProofingFirewallPolicy::Closed);
+    assert!(disabled_plan.warnings.is_empty());
+}
+
+#[test]
 fn every_accent_choice_maps_to_a_shared_style_token() {
     // Each accent choice paints an EXISTING shared Style::ACCENT* token (§4 — no
     // new hex), Brand is the interactive brand accent, and the non-Brand choices
@@ -625,26 +1324,80 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         AppearanceConfig::default(),
         "a missing file folds to the default"
     );
+    assert_eq!(
+        AppearanceConfig::default().color_scheme,
+        AppearanceColorScheme::Dark,
+        "dark mode preserves the current status-quo interface by default"
+    );
     assert_eq!(AppearanceConfig::default().accent, AccentChoice::Brand);
+    assert_eq!(
+        AppearanceConfig::default().layout_profile,
+        LayoutProfile::Workstation,
+        "Windows 2000 Workstation is the fresh-install layout"
+    );
     assert_eq!(AppearanceConfig::default().text_scale, TextScale::Default);
+    assert_eq!(
+        AppearanceConfig::default().motion_mode,
+        AppearanceMotionMode::Normal,
+        "motion defaults to the full normal mode"
+    );
     assert!(
-        !AppearanceConfig::default().reduce_motion,
-        "reduce-motion defaults OFF (motion on, the current behaviour)"
+        !AppearanceConfig::default().taskbar_autohide,
+        "taskbar auto-hide defaults off so the bottom strut remains reserved"
     );
 
     let cfg = AppearanceConfig {
+        color_scheme: AppearanceColorScheme::Light,
         accent: AccentChoice::Green,
+        layout_profile: LayoutProfile::Car,
         text_scale: TextScale::Larger,
-        reduce_motion: true,
+        motion_mode: AppearanceMotionMode::Disabled,
+        taskbar_autohide: true,
     };
     cfg.save_to(&path).expect("save");
     let back = AppearanceConfig::load_from(&path);
     assert_eq!(back, cfg, "the appearance round-trips through disk");
     assert_eq!(back.accent, AccentChoice::Green);
     assert_eq!(back.text_scale, TextScale::Larger);
+    assert_eq!(
+        back.layout_profile,
+        LayoutProfile::Car,
+        "the layout profile pick round-trips through disk"
+    );
+    assert_eq!(
+        back.motion_mode,
+        AppearanceMotionMode::Disabled,
+        "the motion-mode pick round-trips through disk"
+    );
+    assert_eq!(
+        back.color_scheme,
+        AppearanceColorScheme::Light,
+        "the color-mode pick round-trips through disk"
+    );
     assert!(
-        back.reduce_motion,
-        "the reduce-motion pick round-trips through disk"
+        back.taskbar_autohide,
+        "the taskbar auto-hide pick round-trips"
+    );
+    let json = std::fs::read_to_string(&path).expect("appearance json");
+    assert!(
+        json.contains("\"color_scheme\": \"light\""),
+        "the new color mode is persisted explicitly: {json}"
+    );
+    assert!(
+        json.contains("\"motion_mode\": \"disabled\""),
+        "the new runtime mode is persisted explicitly: {json}"
+    );
+    assert!(
+        json.contains("\"layout_profile\": \"car\""),
+        "the layout profile is persisted explicitly: {json}"
+    );
+    assert!(
+        json.contains("\"taskbar_autohide\": true"),
+        "the taskbar auto-hide setting is persisted explicitly: {json}"
+    );
+    assert!(
+        !json.contains("reduce_motion"),
+        "the legacy boolean should not be written back once migrated: {json}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -670,12 +1423,130 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
         TextScale::Default,
         "the absent field folds to its default"
     );
+    assert_eq!(
+        cfg.color_scheme,
+        AppearanceColorScheme::Dark,
+        "the absent color-mode field folds to dark"
+    );
+    assert_eq!(
+        cfg.layout_profile,
+        LayoutProfile::Workstation,
+        "the absent layout-profile field folds to Windows 2000 Workstation"
+    );
+    assert_eq!(
+        cfg.motion_mode,
+        AppearanceMotionMode::Normal,
+        "the absent motion-mode field folds to Normal"
+    );
     assert!(
-        !cfg.reduce_motion,
-        "the absent reduce-motion field folds to its default (OFF)"
+        !cfg.taskbar_autohide,
+        "the absent taskbar auto-hide field folds to the docked default"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
+    let cfg: AppearanceConfig =
+        serde_json::from_str(r#"{"accent":"green","text_scale":"large","reduce_motion":true}"#)
+            .expect("legacy appearance config");
+
+    assert_eq!(cfg.accent, AccentChoice::Green);
+    assert_eq!(cfg.text_scale, TextScale::Large);
+    assert_eq!(
+        cfg.motion_mode,
+        AppearanceMotionMode::Reduced,
+        "old reduce_motion=true configs migrate to the reduced runtime mode"
+    );
+    assert_eq!(
+        cfg.color_scheme,
+        AppearanceColorScheme::Dark,
+        "legacy appearance configs keep the dark status-quo palette"
+    );
+    assert_eq!(
+        cfg.layout_profile,
+        LayoutProfile::Workstation,
+        "legacy appearance configs keep the Windows 2000 Workstation layout"
+    );
+    assert!(
+        !cfg.taskbar_autohide,
+        "legacy configs keep the taskbar docked unless explicitly opted in"
+    );
+
+    let cfg: AppearanceConfig = serde_json::from_str(
+        r#"{"motion_mode":"disabled","taskbar_autohide":true,"reduce_motion":false}"#,
+    )
+    .expect("explicit appearance config");
+    assert_eq!(
+        cfg.motion_mode,
+        AppearanceMotionMode::Disabled,
+        "an explicit new motion_mode wins over any legacy field"
+    );
+    assert_eq!(
+        cfg.color_scheme,
+        AppearanceColorScheme::Dark,
+        "configs without color_scheme keep the dark status-quo palette"
+    );
+    assert!(
+        cfg.taskbar_autohide,
+        "an explicit taskbar auto-hide field is honoured"
+    );
+}
+
+#[test]
+fn appearance_taskbar_autohide_preference_is_exposed_to_shell_chrome() {
+    let st = SystemState {
+        appearance: AppearanceConfig {
+            taskbar_autohide: true,
+            ..AppearanceConfig::default()
+        },
+        ..SystemState::default()
+    };
+    assert!(
+        st.taskbar_autohide(),
+        "main.rs mirrors this persisted preference into DockState each frame"
+    );
+}
+
+#[test]
+fn appearance_layout_profile_drives_live_density() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    assert_eq!(
+        Style::density(&ctx),
+        LayoutProfile::Workstation.density(),
+        "the installed default is the Windows 2000 Workstation density"
+    );
+
+    let mut st = SystemState {
+        appearance: AppearanceConfig {
+            layout_profile: LayoutProfile::Car,
+            ..AppearanceConfig::default()
+        },
+        ..SystemState::default()
+    };
+    st.poll(&ctx);
+    assert_eq!(
+        st.layout_profile(),
+        LayoutProfile::Car,
+        "SystemState exposes the persisted profile to shell chrome"
+    );
+    assert_eq!(
+        st.layout_density(),
+        LayoutProfile::Car.density(),
+        "the shell mirrors the profile-selected density"
+    );
+    assert_eq!(
+        Style::density(&ctx),
+        LayoutProfile::Car.density(),
+        "poll applies the profile density to the live context"
+    );
+    assert_eq!(
+        ctx.style().spacing.interact_size.y,
+        LayoutProfile::Car.density().min_hit_target(),
+        "Car mode installs the larger touch hit target"
+    );
 }
 
 #[test]
@@ -688,9 +1559,12 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
     assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
     let mut st = SystemState {
         appearance: AppearanceConfig {
+            color_scheme: AppearanceColorScheme::Dark,
             accent: AccentChoice::Green,
+            layout_profile: LayoutProfile::Workstation,
             text_scale: TextScale::Default,
-            reduce_motion: false,
+            motion_mode: AppearanceMotionMode::Normal,
+            taskbar_autohide: false,
         },
         ..SystemState::default()
     };
@@ -704,6 +1578,52 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
         ctx.style().visuals.widgets.active.bg_fill,
         Style::pressed_fill(Style::ACCENT_MESH),
         "the pressed fill re-tinted to the darkened chosen accent"
+    );
+}
+
+#[test]
+fn the_theme_color_scheme_applies_windows_2000_light_visuals_on_poll() {
+    // The light-mode switch is a real palette change, not a dead setting: one poll
+    // applies classic Windows 2000 basic system colors to egui visuals, keeps dark as
+    // the default/status quo, and leaves explicit accent picks usable.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Dark);
+    assert_eq!(ctx.style().visuals.panel_fill, Style::BG);
+
+    let mut st = SystemState {
+        appearance: AppearanceConfig {
+            color_scheme: AppearanceColorScheme::Light,
+            accent: AccentChoice::Brand,
+            ..AppearanceConfig::default()
+        },
+        ..SystemState::default()
+    };
+    st.poll(&ctx);
+    let p = Style::palette_for(StyleColorScheme::Light);
+    assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Light);
+    assert_eq!(ctx.style().visuals.panel_fill, p.bg);
+    assert_eq!(ctx.style().visuals.window_fill, p.surface);
+    assert_eq!(ctx.style().visuals.widgets.hovered.bg_fill, p.surface_hi);
+    assert_eq!(ctx.style().visuals.override_text_color, Some(p.text));
+    assert_eq!(
+        ctx.style().visuals.widgets.active.bg_fill,
+        Style::WIN2000_PRESSED_FACE,
+        "pressed widgets use the classic gray face so black strong text stays readable"
+    );
+    assert_eq!(
+        ctx.style().visuals.hyperlink_color,
+        Style::WIN2000_ACTIVE_TITLE,
+        "the default brand accent becomes classic active-title blue in light mode"
+    );
+
+    st.appearance.color_scheme = AppearanceColorScheme::Dark;
+    st.poll(&ctx);
+    assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Dark);
+    assert_eq!(
+        ctx.style().visuals.panel_fill,
+        Style::BG,
+        "switching back restores the current dark status-quo palette"
     );
 }
 
@@ -726,9 +1646,12 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
     let base = ctx.zoom_factor();
     let mut st = SystemState {
         appearance: AppearanceConfig {
+            color_scheme: AppearanceColorScheme::Dark,
             accent: AccentChoice::default(),
+            layout_profile: LayoutProfile::Workstation,
             text_scale: TextScale::Larger,
-            reduce_motion: false,
+            motion_mode: AppearanceMotionMode::Normal,
+            taskbar_autohide: false,
         },
         ..SystemState::default()
     };
@@ -770,7 +1693,7 @@ fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
 
     let mut st = SystemState {
         appearance: AppearanceConfig {
-            reduce_motion: true,
+            motion_mode: AppearanceMotionMode::Reduced,
             ..AppearanceConfig::default()
         },
         ..SystemState::default()
@@ -785,10 +1708,23 @@ fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
         Motion::reduce_motion(),
         "…and flips the shared Motion global the eased helpers read"
     );
+    assert_eq!(
+        Motion::mode(),
+        mde_egui::MotionMode::Reduced,
+        "the full runtime enum is reduced, not just a boolean side effect"
+    );
+
+    st.appearance.motion_mode = AppearanceMotionMode::Disabled;
+    st.poll(&ctx);
+    assert_eq!(
+        Motion::mode(),
+        mde_egui::MotionMode::Disabled,
+        "disabled mode is a distinct endpoint-only runtime state"
+    );
 
     // Turning it back OFF restores the captured baseline cadence and clears the
     // global — motion resumes, proving the toggle is bidirectional, not one-way.
-    st.appearance.reduce_motion = false;
+    st.appearance.motion_mode = AppearanceMotionMode::Normal;
     st.poll(&ctx);
     assert!(
         (ctx.style().animation_time - base).abs() < f32::EPSILON,
@@ -799,7 +1735,7 @@ fn reduce_motion_damps_the_live_context_and_motion_global_on_poll() {
         "…and clears the shared Motion global"
     );
 
-    Motion::set_reduce_motion(false); // belt-and-braces restore for sibling tests
+    Motion::set_mode(mde_egui::MotionMode::Normal); // restore for sibling tests
 }
 
 // ── Categorical accent + Carbon layers (SETTINGS-2) ───────────────────────
@@ -1022,6 +1958,7 @@ fn the_reworked_sections_paint_across_a_wide_detail_pane() {
         snap
     };
     for section in [
+        SettingsSection::Mouse,
         SettingsSection::Audio,
         SettingsSection::Bluetooth,
         SettingsSection::Power,
@@ -1162,6 +2099,7 @@ fn each_mesh_system_section_renders_live_data_and_honest_unknown() {
         SettingsSection::Role,
         SettingsSection::Pairing,
         SettingsSection::Network,
+        SettingsSection::RemoteProofing,
     ] {
         for mesh in [live.clone(), MeshFacts::default()] {
             let mut st = SystemState {

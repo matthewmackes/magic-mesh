@@ -1,4 +1,4 @@
-# E12-13 / SEAT-BOOT-1 — the Quasar DRM-seat unit for both bootc and RPM lanes.
+# E12-13 / SEAT-BOOT-1 — the Construct DRM-seat unit for both bootc and RPM lanes.
 # org.magicmesh.Shell.desktop remains the session-launch face; this is the
 # boot-to-seat face.
 #
@@ -19,7 +19,7 @@
 # never disagree about what "workstation" means.
 
 [Unit]
-Description=MCNF Quasar egui shell (DRM seat, no compositor)
+Description=Construct egui shell (DRM seat, no compositor)
 Documentation=https://github.com/matthewmackes/magic-mesh
 # The wizard owns tty1 until a role is pinned; we own it after. Workstation
 # seats in the RPM lane may still boot to multi-user.target, so the install
@@ -56,6 +56,15 @@ Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 # root is intentional for now: DRM master + /dev/input/* need seat ownership and
 # there is no logind/seatd integration yet (follow-up noted in
 # packaging/bootc/README.md). Containment doctrine follows mackesd.service.
+# Browser helpers create per-tab child cgroups for memory/CPU caps. Without
+# delegation, systemd keeps the shell in a non-delegated service cgroup and the
+# helper can only log a degraded sandbox. Delegate the subtree so the OS sandbox's
+# cgroup layer is real on shipped Workstation seats. The shell itself runs in a
+# stable child subgroup, leaving the service root empty so helpers can enable
+# memory/cpu controllers there and move themselves into capped sibling cgroups.
+Delegate=yes
+DelegateSubgroup=shell
+Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell
 Restart=always
 RestartSec=2
 # If the shell gives up (start-limit hit / GPU dead), hand the VT to a getty so

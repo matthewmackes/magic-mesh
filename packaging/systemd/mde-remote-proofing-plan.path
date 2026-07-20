@@ -1,0 +1,11 @@
+[Unit]
+Description=MCNF - watch Remote Proofing policy and mesh status
+ConditionPathExists=/usr/libexec/mackesd/mde-remote-proofing-apply
+
+[Path]
+PathChanged=/run/mde-bus/settings-remote-proofing.json
+PathChanged=/run/mde/mesh-status.json
+Unit=mde-remote-proofing-plan.service
+
+[Install]
+WantedBy=multi-user.target

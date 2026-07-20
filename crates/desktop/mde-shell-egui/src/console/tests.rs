@@ -1,9 +1,9 @@
 use super::{
     console_confirm_id, console_content, console_entry_id, console_heading_id, console_power_id,
-    console_rail_id, custom_sync, entry_at, identity_line, jump_caption, launch_argv, static_rows,
-    tool_present, tool_present_in, total_rows, ConsoleRequest, ConsoleState, CustomEntry,
-    EntryKind, GateReason, PowerAction, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H, PANEL_W, PINNED,
-    POWER_H, RAIL_SECTION_GAP,
+    console_rail_id, custom_sync, entry_at, identity_line, jump_caption, launch_argv,
+    run_command_request, run_command_tab_name, static_rows, tool_present, tool_present_in,
+    total_rows, ConsoleRequest, ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction,
+    Provenance, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H, PANEL_W, PINNED, POWER_H, RAIL_SECTION_GAP,
 };
 use crate::dock::Surface;
 use crate::workbench::Plane;
@@ -149,6 +149,17 @@ fn the_entry_table_matches_the_locked_taxonomy_and_holds_no_dead_rows() {
     // The flat index space is coherent.
     assert_eq!(static_rows().count(), total_rows());
     assert_eq!(entry_at(0).label, "Terminal");
+}
+
+#[test]
+fn platform_provenance_label_uses_the_visible_product_name() {
+    assert_eq!(mde_theme::brand::logo::PRODUCT_NAME, "Construct");
+    assert_eq!(
+        Provenance::Construct.label(),
+        mde_theme::brand::logo::PRODUCT_NAME
+    );
+    assert_ne!(Provenance::Construct.label(), concat!("Qua", "zar"));
+    assert_eq!(Provenance::Construct.color(), Style::ACCENT);
 }
 
 #[test]
@@ -376,6 +387,36 @@ fn a_root_op_launches_through_the_documented_sudo_argv_path() {
     );
     assert_eq!(launch_argv("btop"), words(&["bash", "-lc", "btop"]));
     assert_eq!(launch_argv("sudo -i"), words(&["bash", "-lc", "sudo -i"]));
+}
+
+#[test]
+fn front_door_run_command_request_uses_console_spawn_tab_recipe() {
+    assert_eq!(
+        run_command_request("   "),
+        None,
+        "blank Front Door command mode input must not spawn a fake tab"
+    );
+    assert_eq!(
+        run_command_request("  journalctl -xe  "),
+        Some(ConsoleRequest::SpawnTab {
+            name: "Run: journalctl -xe".to_owned(),
+            argv: launch_argv("journalctl -xe"),
+        }),
+        "Front Door > command mode must reuse Console's typed terminal launch recipe"
+    );
+    assert_eq!(
+        run_command_request("sudo dnf update"),
+        Some(ConsoleRequest::SpawnTab {
+            name: "Run: sudo dnf update".to_owned(),
+            argv: launch_argv("sudo dnf update"),
+        }),
+        "sudo commands should keep Console's interactive sudo-in-PTY wrapping"
+    );
+    assert_eq!(
+        run_command_tab_name("abcdefghijklmnopqrstuvwxyz1234567890"),
+        "Run: abcdefghijklmnopqrstuvwxyz12...",
+        "long command tab names should stay compact"
+    );
 }
 
 #[test]

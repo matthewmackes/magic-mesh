@@ -1,6 +1,6 @@
 [package]
 name        = "mde-shell-egui"
-description = "MCNF E12 \"Quasar\" — the single egui shell (E12-3). One eframe app on the mde-egui harness: a thin persistent chrome bar (peers · sessions · status + an Expand toggle) over a central view that is either the session EmptyState (collapsed — a real session is a VM texture from mde-vdi, a later unit) or the Workbench five-plane nav (expanded). The skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view plug into."
+description = "MCNF E12 \"Construct\" — the single egui shell (E12-3). One eframe app on the mde-egui harness: a thin persistent chrome bar (peers · sessions · status + an Expand toggle) over a central view that is either the session EmptyState (collapsed — a real session is a VM texture from mde-vdi, a later unit) or the Workbench five-plane nav (expanded). The skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view plug into."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -108,12 +108,13 @@ qrcode = { version = "0.14", default-features = false }
 mde-lighthouse-health = { path = "../../platform/mde-lighthouse-health", default-features = false }
 
 # E12-3b EMBED — the three polished mesh-control surfaces are mounted as in-shell
-# panels (Quasar §5: panels in the one shell, not separate clients). Each is a
+# panels (Construct §5: panels in the one shell, not separate clients). Each is a
 # desktop-shell-tier lib the shell owns the App of and drives per-frame (pump +
 # header + `*_panel`). The dependency edge points sideways-inward within the
 # desktop-shell tier (§6) — the same toolkit resolution (`mde-egui`) flows through.
 mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
+mde-maps-location-egui = { path = "../mde-maps-location-egui" }
 mde-bookmarks-egui = { path = "../mde-bookmarks-egui" }
 # BOOKMARKS-BAR — the pure `mde-bookmarks` model (consumed WITHOUT its egui GUI,
 # like mde-files below), so the Browser surface can deserialize the daemon's
@@ -173,6 +174,17 @@ mde-vdi-core = { path = "../mde-vdi-core" }
 # on the shared services-tier model. The edge points inward (§6).
 mde-chat = { path = "../../services/mde-chat" }
 
+# WL-FUNC-011 — the Surface::Communications live mount. `mde-collab-egui` is the
+# pure `CommunicationsSurface` widget (Activity + Messages over the CollabReadModel
+# projections); the shell hands it a Bus-backed `CollabData` folded off the
+# `state/collab/*` mirrors and drains its `CommandSink` onto `action/collab/*`.
+# `mde-collab-types` is the stable JSON contract (read models · CollabCommand ·
+# topic builders) the fold + publish are written against — the shell never depends
+# on the mackesd collab worker crate (the mesh/desktop boundary is the Bus JSON
+# seam). Both edges point inward, sharing the one `mde-egui` toolkit resolution.
+mde-collab-egui = { path = "../mde-collab-egui" }
+mde-collab-types = { path = "../../shared/mde-collab-types" }
+
 # E12-15 — the Surface::System seat panel + the three read-only chrome status
 # icons render from `mde-seat`, the ONE hardware-access library (lock 1). The
 # shell consumes its typed `Seat::snapshot()` directly, in-process; every section
@@ -190,6 +202,10 @@ mde-seat = { path = "../mde-seat" }
 # through mde-seat (lock 1). Standard `org.freedesktop.login1` interop (§2 FDO
 # exception), matching mde-seat's build.
 zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+# BROWSER-DD-9 — the Browser MPRIS bridge owns a tiny current-thread tokio runtime
+# for the standard FDO `org.mpris.MediaPlayer2` session-bus service. Browser
+# control remains on mde-bus; tokio is only the zbus runtime surface.
+tokio = { version = "1", features = ["rt", "time"] }
 
 # BOOKMARKS-6 — the Surface::Browser IPC + shm texture bridge. The shell's `web`
 # panel is this crate's first caller: it spawns the sandboxed `mde-web-preview`

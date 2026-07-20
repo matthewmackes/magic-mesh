@@ -23,7 +23,7 @@ Rust code editor — adapted to the platform's egui shell + mesh. Mounts as a do
 **New crate `crates/desktop/mde-editor-egui`** exposing an `editor_panel(ctx, ...)` seam +
 `EditorSurface` (mirroring `mde_files_egui::files_panel`/`real_browser`), mounted in
 `mde-shell-egui/src/dock.rs` as `Surface::Editor` (enum + `ALL`/`SURFACES` + label + render
-arm), with a new `IconId::Editor` glyph (`assets/brand/quasar/surface-editor.svg` + the
+arm), with a new `IconId::Editor` glyph (`assets/brand/construct/surface-editor.svg` + the
 `brand::icons` registry).
 
 - **Buffer core** (`ropey`): open/save (encoding-aware), an efficient line index, undo/redo

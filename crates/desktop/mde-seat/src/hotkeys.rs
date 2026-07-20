@@ -1,6 +1,6 @@
 //! The fixed compiled-in hotkey table (lock 9).
 //!
-//! Quasar does **not** offer configurable bindings: the table is a compile-time
+//! Construct does **not** offer configurable bindings: the table is a compile-time
 //! constant so the mapping is auditable, cannot drift, and needs no persistence.
 //! Each entry maps a chord (an XF86 media/system key, or a leader-chord combo)
 //! to one **typed** [`HotkeyAction`] — never a shell string (§9, no raw exec).
@@ -18,6 +18,16 @@ pub enum HotkeyAction {
     VolumeDown,
     /// Toggle master mute.
     VolumeMute,
+    /// Toggle media playback for the active media surface.
+    MediaPlayPause,
+    /// Pause media playback for the active media surface.
+    MediaPause,
+    /// Stop media playback for the active media surface.
+    MediaStop,
+    /// Advance active media to the next item.
+    MediaNext,
+    /// Return active media to the previous item.
+    MediaPrevious,
     /// Toggle the active input (microphone) mute.
     MicMute,
     /// Raise the active output's brightness.
@@ -37,6 +47,8 @@ pub enum HotkeyAction {
     Lock,
     /// Open the System surface.
     OpenSystem,
+    /// Open the shell-owned unified search/omnibox front door.
+    OpenOmnibox,
 }
 
 impl HotkeyAction {
@@ -47,6 +59,11 @@ impl HotkeyAction {
             Self::VolumeUp => "Volume up",
             Self::VolumeDown => "Volume down",
             Self::VolumeMute => "Mute output",
+            Self::MediaPlayPause => "Play/pause media",
+            Self::MediaPause => "Pause media",
+            Self::MediaStop => "Stop media",
+            Self::MediaNext => "Next media",
+            Self::MediaPrevious => "Previous media",
             Self::MicMute => "Mute microphone",
             Self::BrightnessUp => "Brightness up",
             Self::BrightnessDown => "Brightness down",
@@ -56,6 +73,7 @@ impl HotkeyAction {
             Self::ReturnToChrome => "Return to chrome",
             Self::Lock => "Lock seat",
             Self::OpenSystem => "Open System panel",
+            Self::OpenOmnibox => "Open omnibox",
         }
     }
 
@@ -69,6 +87,11 @@ impl HotkeyAction {
             Self::VolumeUp
                 | Self::VolumeDown
                 | Self::VolumeMute
+                | Self::MediaPlayPause
+                | Self::MediaPause
+                | Self::MediaStop
+                | Self::MediaNext
+                | Self::MediaPrevious
                 | Self::MicMute
                 | Self::BrightnessUp
                 | Self::BrightnessDown
@@ -102,6 +125,26 @@ pub static HOTKEYS: &[Hotkey] = &[
     Hotkey {
         chord: "XF86AudioMute",
         action: HotkeyAction::VolumeMute,
+    },
+    Hotkey {
+        chord: "XF86AudioPlay",
+        action: HotkeyAction::MediaPlayPause,
+    },
+    Hotkey {
+        chord: "XF86AudioPause",
+        action: HotkeyAction::MediaPause,
+    },
+    Hotkey {
+        chord: "XF86AudioStop",
+        action: HotkeyAction::MediaStop,
+    },
+    Hotkey {
+        chord: "XF86AudioNext",
+        action: HotkeyAction::MediaNext,
+    },
+    Hotkey {
+        chord: "XF86AudioPrev",
+        action: HotkeyAction::MediaPrevious,
     },
     Hotkey {
         chord: "XF86AudioMicMute",
@@ -139,6 +182,10 @@ pub static HOTKEYS: &[Hotkey] = &[
         chord: "Super+s",
         action: HotkeyAction::OpenSystem,
     },
+    Hotkey {
+        chord: "Super+Space",
+        action: HotkeyAction::OpenOmnibox,
+    },
 ];
 
 /// Look up the action bound to a chord label, if any.
@@ -164,6 +211,11 @@ mod tests {
     fn xf86_media_keys_are_host_first_chords_are_not() {
         // The dedicated media/system keys must be host-first (lock 8)…
         assert!(action_for("XF86AudioMute").unwrap().host_first());
+        assert!(action_for("XF86AudioPlay").unwrap().host_first());
+        assert!(action_for("XF86AudioPause").unwrap().host_first());
+        assert!(action_for("XF86AudioStop").unwrap().host_first());
+        assert!(action_for("XF86AudioNext").unwrap().host_first());
+        assert!(action_for("XF86AudioPrev").unwrap().host_first());
         assert!(action_for("XF86MonBrightnessUp").unwrap().host_first());
         // …and the leader-chord actions must not be (they reach the guest first).
         assert!(!action_for("Super+Tab").unwrap().host_first());

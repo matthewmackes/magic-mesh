@@ -1,7 +1,7 @@
-//! `host_state` worker (E12-19, Quasar host controls; design
+//! `host_state` worker (E12-19, Construct host controls; design
 //! `docs/design/quasar-host-controls.md`, locks 1/9/10 + the safety interlocks).
 //!
-//! Under Quasar the **shell owns the seat hardware in-process** (lock 1) — audio,
+//! Under Construct the **shell owns the seat hardware in-process** (lock 1) — audio,
 //! Bluetooth, displays, power. This worker is the mesh side of that split: it
 //!
 //! * **mirrors** this node's seat snapshot (which the shell publishes locally) out

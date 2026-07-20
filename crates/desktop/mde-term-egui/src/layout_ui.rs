@@ -19,6 +19,7 @@ use mde_egui::egui::{
 use mde_egui::Style;
 
 use crate::layout::{LayoutStore, SavedLayout};
+use crate::tooltip::terminal_hover_text;
 
 /// How often the overlay re-reads the synced store while open (a cheap local dir
 /// scan, but not every frame — the same throttle the remote picker uses).
@@ -270,12 +271,13 @@ impl LayoutManager {
             .show(ui, |ui| {
                 for layout in &self.snapshot {
                     ui.horizontal(|ui| {
-                        if ui
-                            .add(egui::Button::new(
+                        if terminal_hover_text(
+                            ui.add(egui::Button::new(
                                 RichText::new(layout.name.as_str()).color(Style::TEXT),
-                            ))
-                            .on_hover_text("Launch this layout")
-                            .clicked()
+                            )),
+                            "Launch this layout",
+                        )
+                        .clicked()
                         {
                             intent = Some(LayoutIntent::Launch(layout.clone()));
                         }

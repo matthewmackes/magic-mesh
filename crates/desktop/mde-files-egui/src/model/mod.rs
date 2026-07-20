@@ -17,10 +17,11 @@
 //! queue runs over `LiveFileOps`; tests drive both with in-memory fakes.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use mde_egui::search_omnibox::{SearchDomain, SearchItem};
 use mde_files::backend::{Backend, BackendError, Destination, MeshOverlayBadge, OpId};
 use mde_files::fileops::{FileOps, LiveFileOps};
 use mde_files::model::{FileRow, Mime, Peer, SelfNode};
@@ -46,6 +47,7 @@ use mde_files::opqueue::{ConflictChoice, Resolution};
 /// is a cheap local spool scan; a worker transition surfaces within this window.
 /// Matches the other Bus surfaces' cadence.
 const MOUNT_POLL: Duration = Duration::from_secs(2);
+const HOME_SEARCH_LIMIT: usize = 32;
 
 /// The short mount hostname for a peer — the `<host>` verb slot.
 ///
@@ -60,6 +62,20 @@ pub fn mount_host_of(peer: &Peer) -> &str {
     } else {
         peer.label.as_str()
     }
+}
+
+fn truncate_operation_label(label: &str) -> String {
+    const MAX_CHARS: usize = 42;
+    let char_count = label.chars().count();
+    if char_count <= MAX_CHARS {
+        return label.to_owned();
+    }
+    let mut out = label
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -784,6 +800,90 @@ fn parse_within_days(s: &str) -> Option<SystemTime> {
     SystemTime::now().checked_sub(Duration::from_secs(secs))
 }
 
+fn file_search_target_label(row: &FileRow, location: &Location) -> String {
+    if let Some(path) = &row.path {
+        return path.clone();
+    }
+    let base = location.backend_path();
+    let name = row.name.trim_end_matches('/');
+    if base == "/" {
+        format!("/{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+fn file_search_terms(row: &FileRow, location: &Location) -> Vec<String> {
+    let mut terms = vec![
+        mime_search_label(row.mime).to_string(),
+        row.size.clone(),
+        row.age.clone(),
+        location.backend_path(),
+    ];
+    if row.is_dir() {
+        terms.push("folder".to_string());
+        terms.push("directory".to_string());
+    } else {
+        terms.push("file".to_string());
+    }
+    if let Some(peer) = &row.mesh {
+        terms.push(peer.clone());
+    }
+    if let Some(peer) = &row.from {
+        terms.push(peer.clone());
+    }
+    if row.has_conflict {
+        terms.push("conflict".to_string());
+    }
+    if let Some(sibling) = &row.conflict_sibling {
+        terms.push(sibling.clone());
+    }
+    if row.syncing {
+        terms.push("syncing".to_string());
+    }
+    terms
+}
+
+fn file_search_item(
+    pane: usize,
+    row_ix: usize,
+    row: &FileRow,
+    location: &Location,
+    source_rank: usize,
+) -> SearchItem<FileSearchTarget> {
+    SearchItem::new(
+        SearchDomain::File,
+        row.name.clone(),
+        file_search_target_label(row, location),
+        FileSearchTarget {
+            pane,
+            row: row_ix,
+            path: row.path.as_deref().map(PathBuf::from),
+        },
+    )
+    .with_terms(file_search_terms(row, location))
+    .with_source_rank(source_rank)
+}
+
+fn file_search_key(item: &SearchItem<FileSearchTarget>) -> String {
+    item.payload
+        .path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| item.target.clone())
+}
+
+const fn mime_search_label(mime: Mime) -> &'static str {
+    match mime {
+        Mime::Folder => "folder",
+        Mime::Doc => "document",
+        Mime::Image => "image",
+        Mime::Pdf => "pdf",
+        Mime::Archive => "archive",
+        Mime::Disk => "disk image",
+    }
+}
+
 /// A read-only snapshot of the live search, for the status line.
 #[derive(Debug, Clone)]
 pub struct SearchProgress {
@@ -799,6 +899,22 @@ pub struct SearchProgress {
     pub scanned: u64,
     /// The root is a mounted mesh path — the view shows the honest "slower" note.
     pub remote: bool,
+}
+
+/// Payload carried by Files candidates in the shared search/omnibox ranker.
+///
+/// The row index deliberately points back into the pane's displayed rows: current
+/// folders and recursive-search result sets already share that model, and
+/// activation must keep using [`FileBrowser::open_row`] instead of duplicating
+/// file/directory behavior in the search layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSearchTarget {
+    /// The pane whose active tab owns the row.
+    pub pane: usize,
+    /// The displayed row index in that pane's active tab.
+    pub row: usize,
+    /// The row's absolute path when this is a real local/mounted file.
+    pub path: Option<PathBuf>,
 }
 
 /// The in-flight search: the worker handle, where its results render (pane + tab
@@ -850,6 +966,23 @@ impl SurfaceTab {
             Self::Transfers => "Transfers",
         }
     }
+}
+
+/// A compact, reusable summary of active file work for shell chrome. It folds both
+/// the local op queue and the daemon transfer ledger without exposing either internal
+/// model to the bottom navigation bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationProgressSummary {
+    /// Active file jobs: queued/running/paused transfer jobs plus local ops that are
+    /// not dismissed/done.
+    pub active: usize,
+    /// The number of active jobs that reported a real percentage.
+    pub known_progress: usize,
+    /// Average of known real percentages, `None` while all active jobs are still
+    /// queued/starting/otherwise unknown.
+    pub fraction: Option<f32>,
+    /// Short human label for the global status strip.
+    pub label: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1147,7 +1280,7 @@ impl FileBrowser {
             return;
         };
         if !peer.status.is_reachable() {
-            self.last_note = Some(format!("{host} is offline \u{2014} can't mount it."));
+            self.last_note = Some(format!("{host} is offline - can't mount it."));
             return;
         }
         // Already mounted with a live path → browse it directly (and keep it warm
@@ -1182,14 +1315,12 @@ impl FileBrowser {
             .find(|p| mount_host_of(p) == host)
             .is_some_and(|p| !p.status.is_reachable())
         {
-            self.last_note = Some(format!("{host} is offline \u{2014} can't escalate it."));
+            self.last_note = Some(format!("{host} is offline - can't escalate it."));
             return;
         }
         match self.mesh.request(host, MeshMountVerb::Escalate) {
             Ok(()) => {
-                self.last_note = Some(format!(
-                    "Escalating {host} to full-filesystem access\u{2026}"
-                ));
+                self.last_note = Some(format!("Escalating {host} to full-filesystem access..."));
             }
             Err(e) => self.last_note = Some(e),
         }
@@ -1200,7 +1331,7 @@ impl FileBrowser {
     /// it. The sidebar's eject control.
     pub fn unmount_peer(&mut self, host: &str) {
         match self.mesh.request(host, MeshMountVerb::Unmount) {
-            Ok(()) => self.last_note = Some(format!("Unmounting {host}\u{2026}")),
+            Ok(()) => self.last_note = Some(format!("Unmounting {host}...")),
             Err(e) => self.last_note = Some(e),
         }
         self.read_mounts();
@@ -1242,6 +1373,11 @@ impl FileBrowser {
         }
     }
 
+    #[doc(hidden)]
+    pub fn mark_transfers_poll_due_for_test(&mut self) {
+        self.last_transfers_poll = Some(Instant::now() - TRANSFERS_POLL - Duration::from_millis(1));
+    }
+
     /// `true` while the ledger holds an in-flight job — the view keeps a repaint
     /// heartbeat alive so live progress updates without input.
     #[must_use]
@@ -1279,6 +1415,68 @@ impl FileBrowser {
     #[must_use]
     pub fn transfers_counts(&self) -> LedgerCounts {
         LedgerCounts::of(&self.transfers_jobs)
+    }
+
+    /// A compact active-work summary for shell chrome. This is the one model the
+    /// platform bottom rail can reuse for file operations instead of each caller
+    /// hand-rolling a progress strip.
+    #[must_use]
+    pub fn operation_progress_summary(&self) -> Option<OperationProgressSummary> {
+        let mut active = 0;
+        let mut local_active = 0;
+        let mut transfer_active = 0;
+        let mut known_progress = 0;
+        let mut progress_total = 0.0;
+        let mut first_label: Option<String> = None;
+
+        for op in self.ops.active().iter().filter(|op| !op.is_done()) {
+            active += 1;
+            local_active += 1;
+            if first_label.is_none() {
+                first_label = Some(op.label.clone());
+            }
+            if let Some(progress) = &op.progress {
+                known_progress += 1;
+                progress_total += progress.fraction().clamp(0.0, 1.0);
+            }
+        }
+
+        for job in self
+            .transfers_jobs
+            .iter()
+            .filter(|job| job.state.is_active())
+        {
+            active += 1;
+            transfer_active += 1;
+            if first_label.is_none() {
+                first_label = Some(job.route());
+            }
+            if let Some(progress) = job.progress {
+                known_progress += 1;
+                progress_total += (f32::from(progress) / 100.0).clamp(0.0, 1.0);
+            }
+        }
+
+        if active == 0 {
+            return None;
+        }
+
+        let label = if active == 1 {
+            first_label.unwrap_or_else(|| "File operation".to_owned())
+        } else if local_active > 0 && transfer_active > 0 {
+            format!("{active} file operations")
+        } else if local_active > 0 {
+            format!("{local_active} local file operations")
+        } else {
+            format!("{transfer_active} transfers")
+        };
+
+        Some(OperationProgressSummary {
+            active,
+            known_progress,
+            fraction: (known_progress > 0).then_some(progress_total / known_progress as f32),
+            label: truncate_operation_label(&label),
+        })
     }
 
     /// The auto-only destination registry (Q10): the two standing node-state
@@ -1587,6 +1785,118 @@ impl FileBrowser {
             scanned: s.scanned,
             remote: s.remote,
         })
+    }
+
+    /// Shared omnibox candidates for `pane`'s active tab.
+    ///
+    /// This is intentionally a projection of the Files model's current rows,
+    /// not a filesystem crawl. A normal folder listing and a running/finished
+    /// recursive search both render through the same rows, so the shared ranker
+    /// sees current-folder entries and streamed search hits with no fake indexer.
+    #[must_use]
+    pub fn search_omnibox_items(&self, pane: usize) -> Vec<SearchItem<FileSearchTarget>> {
+        if pane > 1 {
+            return Vec::new();
+        }
+        let tab = self.panes[pane].active_tab();
+        tab.rows()
+            .iter()
+            .enumerate()
+            .map(|(row_ix, row)| file_search_item(pane, row_ix, row, tab.location(), row_ix))
+            .collect()
+    }
+
+    /// Shared omnibox candidates for the focused pane.
+    #[must_use]
+    pub fn active_search_omnibox_items(&self) -> Vec<SearchItem<FileSearchTarget>> {
+        self.search_omnibox_items(self.active_pane)
+    }
+
+    /// Shared omnibox candidates for local home entries, even when Files is not
+    /// currently displaying the home folder.
+    ///
+    /// This is a bounded snapshot from the existing backend `list()` seam, not a
+    /// crawler or persistent index. It gives the shell front door the first
+    /// local-file slice required by unified search while keeping activation in
+    /// the Files model and keeping private paths local to this process.
+    #[must_use]
+    pub fn home_search_omnibox_items(&self) -> Vec<SearchItem<FileSearchTarget>> {
+        self.home_search_omnibox_items_with_rank(0)
+    }
+
+    fn home_search_omnibox_items_with_rank(
+        &self,
+        rank_base: usize,
+    ) -> Vec<SearchItem<FileSearchTarget>> {
+        let location = Location::Local(Self::HOME.to_string());
+        self.backend
+            .list(Self::HOME)
+            .into_iter()
+            .take(HOME_SEARCH_LIMIT)
+            .enumerate()
+            .map(|(row_ix, row)| {
+                file_search_item(
+                    self.active_pane,
+                    row_ix,
+                    &row,
+                    &location,
+                    rank_base + row_ix,
+                )
+            })
+            .collect()
+    }
+
+    /// Combined local file candidates for the shell front door.
+    ///
+    /// The focused pane stays first because those entries are closest to the
+    /// user's current workflow. Home entries are appended and de-duplicated by
+    /// path/target so opening Files on Home does not produce doubled results.
+    #[must_use]
+    pub fn unified_search_omnibox_items(&self) -> Vec<SearchItem<FileSearchTarget>> {
+        let mut items = self.active_search_omnibox_items();
+        let mut seen: HashSet<String> = items.iter().map(file_search_key).collect();
+        for item in self.home_search_omnibox_items_with_rank(items.len()) {
+            if seen.insert(file_search_key(&item)) {
+                items.push(item);
+            }
+        }
+        items
+    }
+
+    /// Activate a Files omnibox payload through the same path as Enter/double-click.
+    pub fn open_search_omnibox_target(&mut self, target: &FileSearchTarget) {
+        if target.pane <= 1 {
+            self.set_active_pane(target.pane);
+            let current_matches_path = target.path.as_ref().is_some_and(|path| {
+                let ti = self.tab_index(target.pane);
+                self.panes[target.pane].tabs[ti]
+                    .rows
+                    .get(target.row)
+                    .and_then(|row| row.path.as_deref())
+                    .is_some_and(|row_path| Path::new(row_path) == path.as_path())
+            });
+            if target.path.is_none() || current_matches_path {
+                self.open_row(target.pane, target.row);
+            } else if let Some(path) = &target.path {
+                self.open_path_target(target.pane, path);
+            }
+        }
+    }
+
+    fn open_path_target(&mut self, pane: usize, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        self.navigate(pane, Location::Local(parent.to_string_lossy().into_owned()));
+        let target = path.to_string_lossy();
+        let ti = self.tab_index(pane);
+        if let Some(idx) = self.panes[pane].tabs[ti]
+            .rows
+            .iter()
+            .position(|row| row.path.as_deref() == Some(target.as_ref()))
+        {
+            self.open_row(pane, idx);
+        }
     }
 
     /// Start a recursive search rooted at `pane`'s current directory, streaming
@@ -2199,8 +2509,7 @@ impl FileBrowser {
             };
             let Some(path) = row.path.clone() else {
                 self.last_note = Some(
-                    "This entry has no local path \u{2014} mount the peer to inspect it."
-                        .to_string(),
+                    "This entry has no local path - mount the peer to inspect it.".to_string(),
                 );
                 return;
             };
@@ -2604,7 +2913,7 @@ impl FileBrowser {
 
     /// EDITOR-9 — "Send-to-Editor": post the pane's focused **local** file onto
     /// [`ACTION_EDITOR_OPEN`](mde_files::editor_open::ACTION_EDITOR_OPEN) so the one
-    /// Quasar shell's editor mount opens it (`EditorSurface::open_path`) — the same
+    /// Construct shell's editor mount opens it (`EditorSurface::open_path`) — the same
     /// persist-first Bus verb pattern as Send-in-Chat (§6 reuse). A no-op with an
     /// honest note when nothing local is focused (peer/virtual rows carry no path),
     /// and a silent no-op on a node with no Bus.

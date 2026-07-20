@@ -5,7 +5,7 @@
 //! desktop. The shell/DRM-boot half (E12-2/E12-3) is hardware-gated and lands in
 //! its own units; THIS verb is the mackesd planner that **plans + offers the first
 //! cloud-backed VM desktop**: it selects a golden image, asks the VDI broker to
-//! place it as a Nova desktop, and offers the broker session the shell's Desktop
+//! place it as a cloud desktop, and offers the broker session the shell's Desktop
 //! surface renders.
 //!
 //! The shape mirrors the sibling onboard verbs ([`crate::onboard::spawn_lighthouse`]
@@ -21,7 +21,7 @@
 //!   ([`FirstDesktopApply::place_desktop`] → [`FirstDesktopApply::open_session`]).
 //!   Production [`LiveFirstDesktop`] returns a typed
 //!   [`FirstDesktopError::IntegrationGated`] naming exactly what the live call needs
-//!   (a live Nova+Heat cloud + the Bus); tests drive a recording fake.
+//!   (a live cloud placement path + the Bus); tests drive a recording fake.
 //! * [`execute`] — pure orchestration over the seam (place → open-session),
 //!   fully unit-tested through the fake.
 //!
@@ -32,21 +32,21 @@
 //!   the newest `vm`-kind (golden desktop) manifest ([`select_golden_image`]). No
 //!   VM golden image present ⇒ the honest [`FirstDesktopPlan::NoImage`] outcome
 //!   (LAN-only, "see Services ▸ Provisioning ▸ Images"), never a fake success.
-//! * The **VM** is a VDI broker [`DesktopSpec`](crate::workers::session_broker::DesktopSpec)
-//!   in `async-services` builds: image + client peer + owner + desktop class. The
-//!   broker owns Nova/Heat placement, flavor selection, metadata, and the final
-//!   serving host; this unit does not build a parallel OpenStack model.
+//! * The **VM** is described by a lean [`CloudDesktopSpec`]: image + client peer +
+//!   owner + flavor. The local-first libvirt placement path owns placement,
+//!   flavor selection, metadata, and the final serving host; this unit does not
+//!   build a parallel cloud model.
 //! * The **session** is the broker's
 //!   [`SessionRequest::Open`](crate::workers::session_broker::SessionRequest) wire
 //!   verb on [`ACTION_TOPIC`](crate::workers::session_broker::ACTION_TOPIC): after
-//!   Nova placement returns the server id and serving host, this verb emits a
+//!   placement returns the server id and serving host, this verb emits a
 //!   session-open ([`session_open_request`]) so the shell's Desktop surface renders
 //!   it. The verb reuses that type verbatim — it does not invent a parallel session
 //!   request.
 //!
 //! # This slice (QC-15): retire the local cloud-hypervisor first desktop
 //! The older mde-kvm/cloud-hypervisor plan is deleted from this onboarding verb.
-//! Live Nova placement and the real Bus publish land behind [`FirstDesktopApply`],
+//! Live placement and the real Bus publish land behind [`FirstDesktopApply`],
 //! exactly as OW-7's live provision sits behind
 //! [`crate::onboard::spawn_lighthouse::Provisioner`]. [`LiveFirstDesktop`]
 //! returning a typed `IntegrationGated` error (never a fake success) is §7-legal.
@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 
 use crate::image_catalog::{images_dir, ImageKind, ImageManifest};
 
-/// The default first-desktop Nova flavor. Mirrors the broker's Standard desktop
+/// The default first-desktop flavor. Mirrors the broker's Standard desktop
 /// class (`m1.medium`) without pulling the async worker module into lean builds.
 pub const DEFAULT_DESKTOP_FLAVOR: &str = "m1.medium";
 
@@ -75,7 +75,7 @@ const ACTION_TOPIC: &str = "action/vdi/session";
 /// The parameters of the broker session-open this desktop publishes once the VM is
 /// placed.
 ///
-/// Before placement, the planned serving peer is this node; Nova placement replaces
+/// Before placement, the planned serving peer is this node; placement replaces
 /// it with the selected compute host. The live [`FirstDesktopApply::open_session`]
 /// folds these into the broker's
 /// [`SessionRequest::Open`](crate::workers::session_broker::SessionRequest) wire
@@ -87,7 +87,7 @@ pub struct SessionOpen {
     pub session_id: String,
     /// The peer serving the VM desktop.
     pub serving_peer: String,
-    /// The target VM's id (the Nova server id / broker `vm_id`).
+    /// The target VM's id (the placement server id / broker `vm_id`).
     pub vm_id: String,
     /// The peer whose shell drives the desktop — this node, for the first local one.
     pub client_peer: String,
@@ -110,8 +110,8 @@ fn session_for(vm_id: &str, node_id: &str) -> SessionOpen {
 /// desktop already exists), a **place** plan the full ordered set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum FirstDesktopStep {
-    /// 1. Ask the VDI broker to place the desktop as a Nova instance.
-    PlaceNovaDesktop,
+    /// 1. Ask the VDI broker to place the desktop as a cloud VM.
+    PlaceDesktop,
     /// 2. Publish the broker session-open so the shell's Desktop surface renders it.
     OpenSession,
 }
@@ -120,24 +120,22 @@ impl FirstDesktopStep {
     /// The canonical ordered sequence for a fresh **place**.
     #[must_use]
     pub fn ordered_create() -> Vec<Self> {
-        vec![Self::PlaceNovaDesktop, Self::OpenSession]
+        vec![Self::PlaceDesktop, Self::OpenSession]
     }
 
     /// A one-line human description of the step.
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
-            Self::PlaceNovaDesktop => "place the desktop as a Nova instance through the VDI broker",
+            Self::PlaceDesktop => "place the desktop as a cloud VM through the VDI broker",
             Self::OpenSession => "open a broker session so the shell renders the desktop",
         }
     }
 }
 
-/// The cloud placement this onboarding verb asks the VDI broker to perform.
-///
-/// This is deliberately the lean-build mirror of
-/// [`crate::workers::session_broker::DesktopSpec`]. In `async-services` builds,
-/// [`broker_desktop_spec`] folds it into that exact worker type before placement.
+/// The desktop placement this onboarding verb asks the VDI broker to perform —
+/// the session/owner/image the local-first libvirt placement path (the
+/// `vm_lifecycle` worker) boots the desktop from once that leg is wired.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CloudDesktopSpec {
     /// The session id to mint for the placed desktop.
@@ -146,9 +144,9 @@ pub struct CloudDesktopSpec {
     pub client_peer: String,
     /// The owner used for quota attribution.
     pub owner: String,
-    /// The Glance image to boot.
+    /// The image to boot.
     pub image: String,
-    /// The selected Nova flavor.
+    /// The selected flavor.
     pub flavor: String,
 }
 
@@ -167,7 +165,7 @@ impl NoImageReason {
     pub const fn hint(self) -> &'static str {
         match self {
             Self::NoVmImage => {
-                "build or replicate a VM image into Glance (Services ▸ Provisioning ▸ Images), then retry"
+                "build or replicate a VM image (Services ▸ Provisioning ▸ Images), then retry"
             }
         }
     }
@@ -185,7 +183,7 @@ impl std::fmt::Display for NoImageReason {
 /// drives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstDesktopPlan {
-    /// No desktop exists yet and a golden image is available → place a fresh Nova
+    /// No desktop exists yet and a golden image is available → place a fresh cloud
     /// desktop, then open its broker session.
     Create {
         /// The mesh this desktop's VM enrolls into.
@@ -199,7 +197,7 @@ pub enum FirstDesktopPlan {
         /// The ordered create steps.
         steps: Vec<FirstDesktopStep>,
         /// The planned session-open; the live placement overwrites `vm_id` and
-        /// `serving_peer` with Nova's returned server id and compute host.
+        /// `serving_peer` with the placement's returned server id and compute host.
         session: SessionOpen,
     },
     /// A desktop VM already exists → **offer the existing one** (reconnect),
@@ -257,7 +255,7 @@ impl FirstDesktopPlan {
                 ..
             } => format!(
                 "create the first desktop for mesh `{mesh_id}` from golden image \
-                 `{}` v{} as Nova flavor {}, then open a session in {} step(s)",
+                 `{}` v{} as flavor {}, then open a session in {} step(s)",
                 image.name,
                 image.version,
                 desktop.flavor,
@@ -351,8 +349,8 @@ pub fn select_golden_image(catalog: &[ImageManifest]) -> Option<ImageManifest> {
 }
 
 /// Pure: the image artifact path for `image` inside the mesh image catalog
-/// (`<root>/images/<name>/<version>/<name>.img`). The current Nova path uses the
-/// image manifest name as the Glance image, but this helper keeps the catalog path
+/// (`<root>/images/<name>/<version>/<name>.img`). The current placement path uses the
+/// image manifest name as the boot image, but this helper keeps the catalog path
 /// explicit for audits and dry-run output.
 #[must_use]
 pub fn golden_base_disk(workgroup_root: &Path, image: &ImageManifest) -> PathBuf {
@@ -405,9 +403,9 @@ pub fn build_cloud_desktop_spec(
 /// The desktop a [`FirstDesktopApply::place_desktop`] placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootedDesktop {
-    /// The placed Nova server id — the broker session points at this.
+    /// The placed server id — the broker session points at this.
     pub vm_id: String,
-    /// The compute host Nova placed the desktop on — the session's serving peer.
+    /// The compute host the desktop was placed on — the session's serving peer.
     pub serving_peer: String,
 }
 
@@ -415,7 +413,7 @@ pub struct BootedDesktop {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstDesktopError {
     /// The live path is not runnable in this build/environment yet — it needs a real
-    /// prerequisite (a live Nova+Heat cloud / the Bus).
+    /// prerequisite (a live cloud placement path / the Bus).
     /// Names the step + what is missing. §7-legal: a real method returning a real
     /// typed error, exactly as OW-7's [`crate::onboard::spawn_lighthouse`] seam does.
     IntegrationGated {
@@ -447,13 +445,13 @@ impl std::fmt::Display for FirstDesktopError {
 impl std::error::Error for FirstDesktopError {}
 
 /// The injectable side-effect seam. Production is [`LiveFirstDesktop`]; tests use a
-/// recording fake so the pure orchestration is exercised without a real Nova
+/// recording fake so the pure orchestration is exercised without a real
 /// placement / Bus publish.
 pub trait FirstDesktopApply {
-    /// Place the desktop as a Nova instance.
+    /// Place the desktop as a cloud VM.
     ///
     /// # Errors
-    /// A [`FirstDesktopError`] — `IntegrationGated` until a live Nova+Heat cloud is
+    /// A [`FirstDesktopError`] — `IntegrationGated` until a live cloud placement path is
     /// reachable, else `Failed`.
     fn place_desktop(&self, desktop: &CloudDesktopSpec)
         -> Result<BootedDesktop, FirstDesktopError>;
@@ -486,7 +484,7 @@ pub fn session_open_request(open: &SessionOpen) -> crate::workers::session_broke
     }
 }
 
-/// Production [`FirstDesktopApply`] — live Nova placement + Bus session publish.
+/// Production [`FirstDesktopApply`] — live placement + Bus session publish.
 ///
 /// OW-8's **open-session** is a **day-2** remote push (the serving host is an
 /// enrolled mesh member): [`open_session`](Self::open_session) drives the shared
@@ -497,8 +495,8 @@ pub fn session_open_request(open: &SessionOpen) -> crate::workers::session_broke
 /// honestly-gated production `BusApply`; tests use a fake), and the live cross-node
 /// round-trip stays operator/live-gated (§7).
 ///
-/// `place_desktop` drives the same Nova placement seam the session broker owns; it
-/// stays honestly integration-gated until a live Nova+Heat cloud is reachable.
+/// `place_desktop` drives the placement seam the session broker owns; it
+/// stays honestly integration-gated until a live cloud placement path is reachable.
 pub struct LiveFirstDesktop {
     /// The OW-15 day-2 remote-push transport. Default: [`BusApply`]; tests inject a
     /// recording fake to prove the wiring without a live round-trip.
@@ -526,75 +524,23 @@ impl LiveFirstDesktop {
         self
     }
 
-    #[cfg(feature = "async-services")]
     fn place_desktop_impl(
         &self,
         desktop: &CloudDesktopSpec,
     ) -> Result<BootedDesktop, FirstDesktopError> {
-        use crate::workers::session_broker::NovaPlacement as _;
-
-        let spec = broker_desktop_spec(desktop);
-        let req = crate::workers::session_broker::build_placement(&spec);
-        crate::workers::session_broker::LiveNovaPlacement::new()
-            .place(&req)
-            .map(|placed| BootedDesktop {
-                vm_id: placed.vm_id,
-                serving_peer: placed.serving_host,
-            })
-            .map_err(|e| match e {
-                crate::workers::session_broker::PlacementError::IntegrationGated {
-                    verb,
-                    reason,
-                } => FirstDesktopError::IntegrationGated {
-                    step: "place-desktop",
-                    reason: format!(
-                        "desktop session `{}` → needs the live Nova placement path \
-                         (`{verb}` on `{}`): {reason}",
-                        desktop.session_id,
-                        req.topic()
-                    ),
-                },
-                crate::workers::session_broker::PlacementError::Failed { verb, reason } => {
-                    FirstDesktopError::Failed {
-                        step: "place-desktop",
-                        reason: format!("{verb}: {reason}"),
-                    }
-                }
-            })
-    }
-
-    #[cfg(not(feature = "async-services"))]
-    fn place_desktop_impl(
-        &self,
-        desktop: &CloudDesktopSpec,
-    ) -> Result<BootedDesktop, FirstDesktopError> {
+        // WL-ARCH-001 — VDI desktop placement is the local-first libvirt path (the
+        // `vm_lifecycle` worker over `action/vm/lifecycle`), which the onboarding
+        // flow does not yet drive. Honest-gate until that leg is wired — never a
+        // fabricated vm_id (§7).
         Err(FirstDesktopError::IntegrationGated {
             step: "place-desktop",
             reason: format!(
-                "desktop session `{}` → needs the async-services VDI broker and \
-                 live Nova+Heat placement path",
+                "desktop session `{}` → needs the local libvirt VDI placement path \
+                 (`action/vm/lifecycle` via the `vm_lifecycle` worker) to boot the desktop \
+                 and return its VM id",
                 desktop.session_id
             ),
         })
-    }
-}
-
-/// Fold the lean first-desktop request into the session broker's exact placement
-/// wire type. This is the §6 reuse proof for QC-15: first-desktop no longer owns a
-/// local hypervisor VM model.
-#[cfg(feature = "async-services")]
-#[must_use]
-pub fn broker_desktop_spec(
-    desktop: &CloudDesktopSpec,
-) -> crate::workers::session_broker::DesktopSpec {
-    crate::workers::session_broker::DesktopSpec {
-        session_id: desktop.session_id.clone(),
-        client_peer: desktop.client_peer.clone(),
-        owner: desktop.owner.clone(),
-        class: crate::workers::session_broker::DesktopClass::Standard,
-        image: desktop.image.clone(),
-        network: None,
-        mode: crate::workers::session_broker::PlacementMode::Create,
     }
 }
 
@@ -680,7 +626,7 @@ impl FirstDesktopOutcome {
 /// Pure orchestration over the [`FirstDesktopApply`] seam.
 ///
 /// For [`FirstDesktopPlan::Create`] run placement → open-session **in that order**
-/// (the session points at Nova's placed server id, mirroring how OW-7 threads
+/// (the session points at the placed server id, mirroring how OW-7 threads
 /// `provision`'s endpoint into `push-enroll`); for [`FirstDesktopPlan::Reconnect`]
 /// only re-open the session (the VM already exists); for [`FirstDesktopPlan::NoImage`]
 /// short-circuit to the retryable outcome (no seam calls).
@@ -708,7 +654,7 @@ pub fn execute(
             desktop, session, ..
         } => {
             let placed = apply.place_desktop(desktop)?;
-            // The session points at the PLACED VM (Nova is the authority on the
+            // The session points at the PLACED VM (the placement backend is the authority on the
             // server id and compute host), not the planned name.
             let open = SessionOpen {
                 vm_id: placed.vm_id.clone(),
@@ -800,7 +746,7 @@ mod tests {
         assert_eq!(desktop.owner, "peer:eagle");
         assert_eq!(desktop.image, "win10-gold");
         assert_eq!(desktop.flavor, DEFAULT_DESKTOP_FLAVOR);
-        // The planned session starts with the stable desktop name; live Nova
+        // The planned session starts with the stable desktop name; live placement
         // placement overwrites vm_id + serving_peer with the returned server.
         assert_eq!(session.serving_peer, "peer:eagle");
         assert_eq!(session.client_peer, "peer:eagle");
@@ -927,7 +873,7 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                FirstDesktopStep::PlaceNovaDesktop,
+                FirstDesktopStep::PlaceDesktop,
                 FirstDesktopStep::OpenSession
             ]
         );
@@ -1003,7 +949,7 @@ mod tests {
                 .map(|s| s.image.clone()),
             Some("win10-gold".into())
         );
-        // The session opened points at the placed Nova server and compute host.
+        // The session opened points at the placed VM and compute host.
         assert_eq!(
             apply.seen_open.borrow().as_ref().map(|o| o.vm_id.clone()),
             Some("uuid-boot".into())
@@ -1064,7 +1010,7 @@ mod tests {
             FirstDesktopError::IntegrationGated { step, reason } => {
                 assert_eq!(step, "place-desktop");
                 assert!(
-                    reason.contains("Nova") || reason.contains("async-services"),
+                    reason.contains("libvirt") || reason.contains("vm_lifecycle"),
                     "names the missing cloud placement path: {reason}"
                 );
                 assert!(
@@ -1148,21 +1094,14 @@ mod tests {
         assert!(matches!(&seen[0].1[0], Action::OpenBroker { .. }));
     }
 
-    #[cfg(feature = "async-services")]
     #[test]
-    fn cloud_desktop_spec_maps_to_the_broker_desktop_spec() {
-        use crate::workers::session_broker::{DesktopClass, PlacementMode};
-
+    fn build_cloud_desktop_spec_shapes_the_placement_request() {
         let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
         let desktop = build_cloud_desktop_spec("desktop-eagle", "peer:eagle", &image);
-        let broker = broker_desktop_spec(&desktop);
-        assert_eq!(broker.session_id, "first-desktop-desktop-eagle");
-        assert_eq!(broker.client_peer, "peer:eagle");
-        assert_eq!(broker.owner, "peer:eagle");
-        assert_eq!(broker.class, DesktopClass::Standard);
-        assert_eq!(broker.image, "win10-gold");
-        assert_eq!(broker.network, None);
-        assert_eq!(broker.mode, PlacementMode::Create);
+        assert_eq!(desktop.session_id, "first-desktop-desktop-eagle");
+        assert_eq!(desktop.client_peer, "peer:eagle");
+        assert_eq!(desktop.owner, "peer:eagle");
+        assert_eq!(desktop.image, "win10-gold");
     }
 
     #[test]

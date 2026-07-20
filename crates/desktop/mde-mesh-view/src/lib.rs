@@ -1,5 +1,5 @@
 //! `mde-mesh-view` — a live, procedural **mesh-state canvas** widget (MCNF E12
-//! "Quasar"). The egui reincarnation of the old MESHMAP.
+//! "Construct"). The egui reincarnation of the old MESHMAP.
 //!
 //! [`MeshView`] draws the *current* mesh — nodes by role + health, the links
 //! between them, the elected leader, and per-link activity — **procedurally with

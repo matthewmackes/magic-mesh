@@ -4,7 +4,7 @@
 //!
 //! This module is the **render-agnostic, fully-tested core** — the
 //! lighthouse-health panel indicator (LIGHTHOUSE-7). E12-14b stripped the
-//! Cosmic-era panel-shell binary; MCNF 12.0 "Quasar" reuses this core from the
+//! Cosmic-era panel-shell binary; MCNF 12.0 "Construct" reuses this core from the
 //! egui replacements (`mde-panel-egui` + `mde-shell-egui`) as thin glue, not
 //! logic. (APPLAUNCH-9, 2026-06-27: the app-launcher model that used to live
 //! here retired into the Front Door — one launcher.)

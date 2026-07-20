@@ -1,6 +1,6 @@
 //! The VDI **Desktop** surface — a remote VM desktop rendered egui-native.
 //!
-//! E12 "Quasar" brokers VM desktops *into* the one shell (§5 EMBED, lock 21):
+//! E12 "Construct" brokers VM desktops *into* the one shell (§5 EMBED, lock 21):
 //! there is no external viewer. The remote framebuffer is decoded by
 //! `mde-vdi-rdp` (RDP-primary), `mde-vdi-vnc` (VNC / XAPI-console fallback), or
 //! `mde-vdi-spice` (native QEMU/KVM console) into an [`egui::ColorImage`]; this
@@ -120,12 +120,14 @@ impl DesktopEndpoint {
 /// The retained Bus topic the serving peer's `console_broker` (VDI-VM-1) publishes
 /// brokered console endpoints to. MUST equal
 /// `mackesd::workers::console_broker::CONSOLE_TOPIC` (a cross-check test pins it).
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) const CONSOLE_TOPIC: &str = "state/vdi/console";
 
 /// The shell's read mirror of `console_broker`'s brokered-console status — only the
 /// fields the transport needs. serde ignores the rest (e.g. the record's `protocol`
 /// tag: the transport uses the operator's chosen protocol, the record only supplies
 /// the dialable `host:port`).
+#[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum BrokeredConsoleStatus {
@@ -144,6 +146,7 @@ enum BrokeredConsoleStatus {
 }
 
 /// The shell's read mirror of one `console_broker` record on [`CONSOLE_TOPIC`].
+#[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct BrokeredConsoleRecord {
     /// The session this console serves — the globally-unique correlation key the
@@ -154,6 +157,7 @@ struct BrokeredConsoleRecord {
 }
 
 /// The outcome of resolving a brokered console endpoint from the session record.
+#[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConsoleResolution {
     /// No record yet — the serving peer's broker hasn't published one (keep
@@ -170,6 +174,7 @@ pub(crate) enum ConsoleResolution {
 /// [`CONSOLE_TOPIC`] record bodies (the latest matching record wins — the broker
 /// republishes when a session's console state changes). Pure + headless-testable;
 /// the Bus read that feeds it is `read_console_bodies`.
+#[cfg(any(test, feature = "live-vdi"))]
 pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> ConsoleResolution {
     let mut out = ConsoleResolution::Pending;
     for body in bodies {
@@ -202,10 +207,11 @@ pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> C
 /// published), mirroring the Chooser's `BusDesktopSources::latest` read idiom.
 #[cfg(feature = "live-vdi")]
 fn read_console_bodies(bus_root: Option<&std::path::Path>) -> Vec<String> {
-    let Some(root) = bus_root else {
-        return Vec::new();
-    };
-    let Ok(persist) = mde_bus::persist::Persist::open(root.to_path_buf()) else {
+    // arch-11: open through the shared BusReader seam (full path — this fn is
+    // `live-vdi`-gated, so a top-level import would go unused off that feature).
+    let Some(persist) =
+        crate::bus_reader::BusReader::new(bus_root.map(std::path::Path::to_path_buf)).open()
+    else {
         return Vec::new();
     };
     persist
@@ -395,6 +401,21 @@ pub(crate) struct ConnectRequest {
     /// [`with_resolution`]: mde_vdi_rdp::RdpConfig::with_resolution
     /// [`with_size`]: mde_vdi_spice::SpiceConfig::with_size
     pub preferred_size: Option<(u16, u16)>,
+}
+
+/// Log-safe taskbar thumbnail source for the currently requested Desktop
+/// session. The GPU handle is an egui ref-counted texture clone, not a framebuffer
+/// copy.
+#[derive(Clone)]
+pub(crate) struct DesktopPreviewFrame {
+    /// Broker roster key when this desktop came from `action/vdi/session`.
+    pub(crate) broker_session_id: Option<String>,
+    /// Human target label.
+    pub(crate) label: String,
+    /// Short protocol badge.
+    pub(crate) protocol: &'static str,
+    /// Live desktop texture.
+    pub(crate) texture: TextureHandle,
 }
 
 impl ConnectRequest {
@@ -1187,6 +1208,20 @@ impl VdiState {
             .map(|r| (r.target.name.as_str(), r.protocol.label()))
     }
 
+    /// Return a live taskbar thumbnail source for the current Desktop session.
+    /// No texture means no frame has landed yet, so the dock keeps its static
+    /// protocol-card fallback.
+    pub(crate) fn taskbar_preview_frame(&self) -> Option<DesktopPreviewFrame> {
+        let request = self.requested.as_ref()?;
+        let texture = self.texture.clone()?;
+        Some(DesktopPreviewFrame {
+            broker_session_id: request.broker_session.as_ref().map(|b| b.id.clone()),
+            label: request.target.name.clone(),
+            protocol: request.protocol.label(),
+            texture,
+        })
+    }
+
     /// Record the connect the Chooser's picker chose (CHOOSER-4). The surface then
     /// shows a "connecting" state naming the target + chosen protocol until the
     /// gated wire transport attaches the live decoder session.
@@ -1576,9 +1611,13 @@ impl VdiState {
         }
     }
 
-    /// Whether any live transport handle is currently installed.
+    /// Whether any live transport handle is currently installed — i.e. an RDP,
+    /// VNC, or SPICE session is actually streaming (or connecting), not merely
+    /// requested. The shell host loop reads this to keep repainting while guest
+    /// frames are inbound (WL-PERF-002) without waking an idle seat for a
+    /// no-session / chooser-only desktop.
     #[cfg(feature = "live-vdi")]
-    fn has_live_transport(&self) -> bool {
+    pub(crate) fn has_live_transport(&self) -> bool {
         self.live_rdp.is_some() || self.live_vnc.is_some() || self.live_spice.is_some()
     }
 
@@ -2139,105 +2178,6 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState, rect: egui::Rect, desktop_
         if let Some(live) = state.live_spice.as_ref() {
             live.send_input(event);
         }
-    }
-}
-
-// ─────────────────────────── MENUBAR-ALL (Desktop) ──────────────────────────
-
-/// One action the Desktop menu bar dispatches — each routes to a real seam the
-/// shell already owns (§6, no new behaviour).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DesktopMenuAction {
-    /// Release the desktop back to the mesh-control chrome — the SAME seam the Esc
-    /// chord raises ([`VdiState::request_return_to_chrome`]).
-    ReturnToChrome,
-    /// Force the Chooser to re-read its published desktop-source roster now
-    /// ([`crate::chooser::ChooserState::refresh_now`]).
-    RefreshSources,
-}
-
-/// Render the Desktop surface's shared top bar (DESKTOP) and return the action the
-/// operator picked this frame, if any (MENUBAR-ALL). The Desktop surface has two
-/// honest faces — the **Chooser** (no session) and the brokered **desktop** (a
-/// pending / live connect) — so its two menus are gated to the face that owns the
-/// seam (§7 — a context-gated item disables, never a silent no-op):
-///
-/// * **Session → Return to Mesh Control** — the Esc-chord twin, live only while a
-///   desktop connect is pending / attached.
-/// * **View → Refresh Sources** — re-enumerate the Chooser's roster now, live only
-///   while the Chooser (no session) is showing.
-///
-/// The status cluster names the pending desktop + protocol, or the Chooser's live
-/// source count. The bar is decoupled from both states (it takes plain readouts) so
-/// the shell can mount it above whichever face renders below.
-pub(crate) fn desktop_menubar(
-    ui: &mut egui::Ui,
-    pending: Option<(&str, &str)>,
-    source_count: usize,
-) -> Option<DesktopMenuAction> {
-    use mde_egui::menubar::{MenuBar, MenuBarModel};
-    use mde_egui::Style;
-
-    let menus = build_desktop_menus(pending.is_some());
-    let status = build_desktop_status(pending, source_count);
-    let model = MenuBarModel {
-        // The dock tints the Show-Desktop cell with the brand accent (its
-        // system-quad cell carries no group hue), so the title matches (lock 2).
-        title: "Desktop",
-        accent: Style::ACCENT,
-        menus: &menus,
-        status: &status,
-    };
-    MenuBar::show(ui, &model)
-}
-
-/// The two Desktop menus, each gated to the face that owns its seam (§7): Session →
-/// Return to Mesh Control is live only while a connect is pending; View → Refresh
-/// Sources only on the Chooser. Every item is present, one is disabled — never a
-/// dead/omitted entry.
-fn build_desktop_menus(connected: bool) -> Vec<mde_egui::menubar::Menu<DesktopMenuAction>> {
-    use mde_egui::menubar::{Entry, Item, Menu};
-    vec![
-        Menu::new(
-            "Session",
-            vec![Entry::Item(
-                Item::new(DesktopMenuAction::ReturnToChrome, "Return to Mesh Control")
-                    .shortcut("Esc")
-                    .enabled(connected),
-            )],
-        ),
-        Menu::new(
-            "View",
-            vec![Entry::Item(
-                Item::new(DesktopMenuAction::RefreshSources, "Refresh Sources").enabled(!connected),
-            )],
-        ),
-    ]
-}
-
-/// The Desktop status cluster: the pending desktop + protocol, or the Chooser's
-/// live source count — real state either way (§7).
-fn build_desktop_status(
-    pending: Option<(&str, &str)>,
-    source_count: usize,
-) -> Vec<mde_egui::StatusChip> {
-    use mde_egui::{ChipTone, StatusChip};
-    match pending {
-        Some((name, protocol)) => vec![StatusChip::with_icon(
-            "\u{25B6}",
-            format!("{name} \u{00B7} {protocol}"),
-            ChipTone::Info,
-        )],
-        None => vec![
-            StatusChip::new("No desktop", ChipTone::Neutral),
-            StatusChip::new(
-                format!(
-                    "{source_count} source{}",
-                    if source_count == 1 { "" } else { "s" }
-                ),
-                ChipTone::Neutral,
-            ),
-        ],
     }
 }
 

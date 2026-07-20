@@ -333,6 +333,9 @@ pub struct SeatRemoteInputWorker {
     last_injected_ms: Option<u64>,
     /// Last-published indicator, so we only re-publish on a real transition.
     last_indicator: Option<RemoteInputIndicator>,
+    /// Last-published status, so an idle 40 ms tick does not flood retained
+    /// state and race the persistence verifier between file write and row insert.
+    last_published_status: Option<RemoteInputStatus>,
 }
 
 impl SeatRemoteInputWorker {
@@ -373,6 +376,7 @@ impl SeatRemoteInputWorker {
             arm_cursor: None,
             last_injected_ms: None,
             last_indicator: None,
+            last_published_status: None,
         }
     }
 
@@ -658,7 +662,8 @@ impl SeatRemoteInputWorker {
 
     /// One consume-drain-publish cycle: refresh arm state, expire stale grants,
     /// drain pending injections through the consent gate, and republish state.
-    fn tick_once(&mut self, persist: &Persist) {
+    fn tick_once(&mut self, persist: &mut Persist) {
+        persist.reopen_if_index_changed();
         self.drain_arm(persist);
         self.expire_arm(persist);
         self.drain_requests(persist);
@@ -666,11 +671,15 @@ impl SeatRemoteInputWorker {
         self.publish_status(persist);
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
+        if self.last_published_status.as_ref() == Some(&self.status) {
+            return;
+        }
         let topic = format!("{STATE_PREFIX}{}", self.node);
         if let Ok(body) = serde_json::to_string(&self.status) {
             let _ = persist.write(&topic, Priority::Min, None, Some(&body));
         }
+        self.last_published_status = Some(self.status.clone());
     }
 
     fn publish_event(
@@ -716,7 +725,7 @@ impl Worker for SeatRemoteInputWorker {
             tracing::debug!(target: "mackesd::seat_remote_input", "no bus root; worker idle");
             return Ok(());
         };
-        let persist = match Persist::open(bus_root) {
+        let mut persist = match Persist::open(bus_root) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(target: "mackesd::seat_remote_input", error = %e, "persist open failed; worker idle");
@@ -732,7 +741,7 @@ impl Worker for SeatRemoteInputWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.tick_once(&persist);
+                    self.tick_once(&mut persist);
                 }
                 () = shutdown.wait() => break,
             }
@@ -1193,7 +1202,7 @@ mod tests {
     #[test]
     fn unarmed_seat_drops_injection_and_audits() {
         let bus = tempfile::tempdir().expect("bus");
-        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         persist
             .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
             .expect("write injection");
@@ -1202,7 +1211,7 @@ mod tests {
             .with_now_fn(Arc::new(|| 1000));
 
         // No arm grant present.
-        worker.tick_once(&persist);
+        worker.tick_once(&mut persist);
 
         assert!(
             injector.calls.lock().unwrap().is_empty(),
@@ -1226,7 +1235,7 @@ mod tests {
     #[test]
     fn armed_seat_delivers_phone_injection() {
         let bus = tempfile::tempdir().expect("bus");
-        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         persist
             .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
             .expect("write arm");
@@ -1237,7 +1246,7 @@ mod tests {
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
             .with_now_fn(Arc::new(|| 1000));
 
-        worker.tick_once(&persist);
+        worker.tick_once(&mut persist);
 
         assert_eq!(
             *injector.calls.lock().unwrap(),
@@ -1251,7 +1260,7 @@ mod tests {
     #[test]
     fn arm_auto_disarms_after_ttl() {
         let bus = tempfile::tempdir().expect("bus");
-        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let (clk, now_fn) = clock(1_000);
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
@@ -1264,7 +1273,7 @@ mod tests {
         persist
             .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
             .expect("write injection 1");
-        worker.tick_once(&persist);
+        worker.tick_once(&mut persist);
         assert_eq!(worker.status.injected, 1);
         assert!(worker.arm.is_some());
 
@@ -1273,7 +1282,7 @@ mod tests {
         persist
             .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
             .expect("write injection 2");
-        worker.tick_once(&persist);
+        worker.tick_once(&mut persist);
 
         assert_eq!(
             worker.status.injected, 1,
@@ -1288,7 +1297,7 @@ mod tests {
     #[test]
     fn indicator_published_on_arm_and_cleared_on_disarm() {
         let bus = tempfile::tempdir().expect("bus");
-        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
             .with_now_fn(Arc::new(|| 1_000));
@@ -1301,7 +1310,7 @@ mod tests {
         persist
             .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
             .expect("write arm");
-        worker.tick_once(&persist);
+        worker.tick_once(&mut persist);
         let armed = latest_indicator(&persist, "node-a");
         assert!(armed.armed);
         assert_eq!(armed.source.as_deref(), Some("shell:seat-user"));
@@ -1316,10 +1325,64 @@ mod tests {
                 Some(&serde_json::json!({"op":"disarm","source":"shell:seat-user"}).to_string()),
             )
             .expect("write disarm");
-        worker.tick_once(&persist);
+        worker.tick_once(&mut persist);
         let cleared = latest_indicator(&persist, "node-a");
         assert!(!cleared.armed);
         assert_eq!(cleared.source, None);
+    }
+
+    #[test]
+    fn tick_reopens_recreated_bus_index_before_publishing_status() {
+        let bus = tempfile::tempdir().expect("bus");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let first = persist.index_inode();
+        let db = bus.path().join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+        let live_index = Persist::open(bus.path().to_path_buf()).expect("live index");
+        assert_ne!(
+            live_index.index_inode(),
+            first,
+            "test must recreate the index inode"
+        );
+        drop(live_index);
+
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
+            .with_now_fn(Arc::new(|| 1_000));
+
+        worker.tick_once(&mut persist);
+
+        assert!(
+            Persist::open(bus.path().to_path_buf())
+                .expect("reader")
+                .detect_divergence()
+                .expect("divergence")
+                .is_clean(),
+            "status publish must land in the live index, not a deleted inode"
+        );
+    }
+
+    #[test]
+    fn idle_tick_publishes_status_once_not_every_poll() {
+        let bus = tempfile::tempdir().expect("bus");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
+            .with_now_fn(Arc::new(|| 1_000));
+
+        worker.tick_once(&mut persist);
+        worker.tick_once(&mut persist);
+
+        assert_eq!(
+            persist
+                .list_since("state/seat-remote-input/node-a", None)
+                .expect("status")
+                .len(),
+            1,
+            "idle polling should not flood retained status"
+        );
     }
 
     #[test]

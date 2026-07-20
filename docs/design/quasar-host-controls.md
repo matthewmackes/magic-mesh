@@ -1,9 +1,9 @@
-# Quasar Host Controls — Bluetooth · Mixer · Displays · Power · Hotkeys (E12-15..E12-19)
+# Construct Host Controls — Bluetooth · Mixer · Displays · Power · Hotkeys (E12-15..E12-19)
 
 > **Status: LOCKED 2026-07-01** — 14-question operator survey (this session), one
 > question at a time per `/plan`. The host shell owns the DRM seat with no
 > compositor and no settings daemon, so every "system control" a desktop OS takes
-> for granted has no owner in Quasar until this epic. These are **seat services**:
+> for granted has no owner in Construct until this epic. These are **seat services**:
 > they belong to the one egui shell (§4/§5) and to `mackesd` (§9), never to a
 > per-app or per-desktop layer.
 

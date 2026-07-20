@@ -1,6 +1,6 @@
 //! `mde-vdi-rdp` — render a remote **RDP** desktop into an egui texture.
 //!
-//! MCNF 12.0 "Quasar" is a mesh-native thin-client desktop OS whose entire
+//! MCNF 12.0 "Construct" is a mesh-native thin-client desktop OS whose entire
 //! interface is egui (`docs/design/quasar-vdi-desktop.md`). RDP is the **primary**
 //! remote-desktop protocol (lock 21): a desktop on another mesh peer is connected
 //! over Nebula and **rendered egui-native** — the remote framebuffer is decoded

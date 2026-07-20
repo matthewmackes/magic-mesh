@@ -16,6 +16,11 @@
 #![forbid(unsafe_code)]
 
 pub mod cap_tags;
+// WL-ARCH-001 (2026-07-18) — provider-neutral Construct Cloud shared contracts.
+// The SOLE definition site for the mesh cloud's catalog/resource/health/stack
+// shapes + the `action/cloud/*` lifecycle command contract; all consumers bind
+// to `cloud::*`.
+pub mod cloud;
 pub mod connect;
 // CONNECT-1 (2026-06-19) — unified connectivity / exposure policy model + state.
 pub mod ddns;
@@ -48,13 +53,6 @@ pub mod lighthouse_probe;
 pub mod mesh_storage;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;
-// IAC-1 (2026-07-04) — the OpenStack service-directory + API-health schema: the
-// §6 JSON contract between the mesh-side producer (mackesd's `openstack` worker
-// + its clouds.yaml→Keystone→catalog→health client foundation) and the
-// desktop-side consumer (the IAC-2 "Infra as Code (IaC)" surface's API status
-// band + merged directory). Lands here (like `device_inventory`) so neither side
-// depends on the other.
-pub mod openstack;
 pub mod peer_probe;
 // PEERVER-1 (v2.7, 2026-05-29) — peer-data convergence records.
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
@@ -62,6 +60,19 @@ pub mod peer_probe;
 pub mod peers;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
+// WL-RUN-006 (2026-07-19) — the router firewall-edit verb (`action/router/*`
+// `RouterActionRequest`) + its tamper-evident audit schema. The "mutations
+// fast-follow" of the router-control read slice: the shell's Device-Manager
+// composes an edit; the mackesd `router_action` worker wraps it in Vyatta
+// commit-confirm behind a typed-confirm gate. Lands here (like `device_control`)
+// so neither side depends on the other.
+pub mod router_action;
+// WL-FUNC-008 (2026-07-19) — the unified service provenance/health record: the ONE
+// type merging published (`kdc-services`) + probe (`probe-inventory`) + enrichment
+// service facts. The mackesd `service_aggregator` worker produces it on
+// `state/services/<node>`; the shell's Phones-hub Services view renders it. Lands
+// here (like `mesh_storage` / `vdi_session`) so neither side depends on the other.
+pub mod service_record;
 // Portal-18.a (v6.0 R12 lock 2026-05-26) — universal tag schema +
 // per-peer storage layer. Lands here (rather than in a fresh crate)
 // because every existing consumer of `mackes-mesh-types` is also a

@@ -1,15 +1,14 @@
-# MDE Brand Asset Pack
+# Construct Brand Asset Pack
 
-This directory holds every piece of artwork the Mackes Desktop
-Environment shell loads at runtime. Every file in this pack is
+This directory holds every piece of artwork the Construct shell loads at
+runtime. Every file in this pack is
 **designed to be replaced** — drop in your own SVG/PNG with the
-same basename and the running MDE picks it up.
+same basename and the running shell picks it up.
 
-> **Current state (2026-07-03, QBRAND-9):** the product icon is
-> single-sourced from the official **Quazar** mark — the
-> `quasar/app-icon-<N>.png` crops (16–512 px, cut from
-> `MDE-QUAZAR-MAIN.png` box (40,88)→(768,816) by
-> `install-helpers/regen-app-icon.sh`) are installed by the RPM to
+> **Current state (2026-07-18, Construct):** the product icon is
+> single-sourced from the generated **Construct** mark - the
+> `construct/app-icon-<N>.png` crops (16–512 px, cut from
+> `construct/mark-source.png` by `install-helpers/regen-app-icon.sh`) are installed by the RPM to
 > `/usr/share/icons/hicolor/<N>x<N>/apps/magic-mesh.png`, and
 > `favicon.ico` here is a multi-res (16+32+48) cut of the same
 > crops. The previous placeholder SVGs remain in `baked/` as the
@@ -19,7 +18,7 @@ same basename and the running MDE picks it up.
 
 ---
 
-## Resolution order (how MDE finds your art)
+## Resolution order (how Construct finds your art)
 
 For each [slot](#slot-table), the loader probes each candidate
 file extension at each layer in order; **first hit wins**:
@@ -50,7 +49,7 @@ and leave the rest as-is.
 | `Wordmark` | `wordmark` | svg → png | `wordmark.png` (2508×627) | 4:1 | Sidebar header, About panel header |
 | `WordmarkHero` | `wordmark-hero` | svg → png | `wordmark-hero.png` (2508×627) | 4:1 | About panel hero, greeter |
 | `Monogram` | `monogram` | svg → png | `monogram.png` (1254×1254) | 1:1 | Empty states, favicon-scale uses |
-| `AppIcon` | `app-icon` | svg → png | `app-icon.png` (1254×1254) | 1:1 | Window manager icon, taskbar |
+| `AppIcon` | `app-icon` | svg → png | `app-icon.png` (512×512) | 1:1 | Window manager icon, taskbar |
 | `GreeterHero` | `greeter-hero` | png only | `greeter-hero.png` (1672×941) | 16:9-ish | sway greeter background |
 | `GreeterWordmark` | `greeter-wordmark` | svg → png | `greeter-wordmark.png` (2508×627) | 4:1 | Greeter foreground over greeter-hero |
 | `LogoLockup` | `logo-lockup` | svg → png | `logo-lockup.png` (1254×1254) | 1:1 | About hero, splash surfaces |
@@ -81,6 +80,9 @@ assets/brand/
 ├── greeter-hero.png        ← BR-5 greeter background
 ├── greeter-wordmark.png    ← BR-5 greeter foreground
 ├── logo-lockup.png         ← BR-4 about hero / splash (1:1 lockup)
+├── CONSTRUCT-MAIN.png      ← clean Construct lockup generated from the source image
+├── CONSTRUCT-WALLPAPER*.png← Construct wallpaper/splash set
+├── construct/              ← source image, mark crop, vector mark + hicolor icon ladder
 ├── raw/                    ← original AI outputs (audit trail)
 ├── baked/                  ← placeholder SVGs, embedded via include_bytes!
 ├── cursor/                 ← BR-5 cursor theme (not yet populated)
@@ -131,21 +133,20 @@ Generators output raster. The flow for net-new art:
 
 **Wordmark (4:1):**
 
-> Minimalist flat vector logo for **'MDE'** (Mackes Desktop
-> Environment). Geometric sans-serif letterforms with subtle
-> architectural feel. Single solid color (#FFFFFF) on transparent
+> Minimalist flat vector logo for **'Construct'**. Geometric sans-serif
+> letterforms with a software-studio feel. Single solid color (#FFFFFF) on transparent
 > background, no gradients, no shadows, no outline strokes, no
 > 3D, no photorealism. Hard edges suitable for tracing to SVG.
 > Aspect ratio 4:1. Output at 2048×512 PNG. Reference: Berkeley
 > Mono, Inter, Geist Mono, Söhne — confident, modern, software-tool
 > aesthetic, not corporate-tech.
 
-**Monogram (1:1):** same as above but `'M'` (single letter, not
-'MDE'), aspect ratio 1:1, output at 2048×2048 PNG.
+**Monogram (1:1):** same as above but `'C'` or the Construct mesh-node
+mark from `CONSTRUCT-MAIN.png`, aspect ratio 1:1, output at 2048×2048 PNG.
 
-**Logo lockup (1:1):** same as wordmark but lockup of the parent
-brand name "Mackes" stacked above the "MDE" monogram, aspect
-ratio 1:1, output at 2048×2048 PNG.
+**Logo lockup (1:1):** same as wordmark but lockup of "Construct",
+"Software Studio: MDE", and the Construct mark, aspect ratio 1:1,
+output at 2048×2048 PNG.
 
 **Greeter hero (raster, no vectorization step):**
 

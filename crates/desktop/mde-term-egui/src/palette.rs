@@ -18,12 +18,12 @@
 //! runtime value: a [`Palette`] carries the 16 ANSI slots plus the terminal's
 //! default foreground / background / cursor colours (the three "role" colours a
 //! `SGR 0` reset and the cursor resolve to). [`Palette::from_tokens`] is the
-//! **Quasar default, derived from `mde-theme`/`Style` tokens wherever a token
+//! **Construct default, derived from `mde-theme`/`Style` tokens wherever a token
 //! carries the same meaning** — red = `DANGER`, green = `OK`, yellow = `WARN`,
 //! blue = `ACCENT`, white = `TEXT`, bright blue = `ACCENT_HI`, black/bg = `BG`,
 //! fg/cursor = `TEXT` — so terminal content sits naturally on the platform
 //! look. Slots with no token equivalent (magenta, cyan, the remaining brights)
-//! are standard ANSI hues tuned for the dark Quasar background.
+//! are standard ANSI hues tuned for the dark Construct background.
 //!
 //! The **classic presets** (Solarized dark/light, Gruvbox, Nord), user-pickable
 //! via the appearance picker, are data in [`crate::presets`]: their defining hex
@@ -37,7 +37,7 @@ use mde_egui::Style;
 
 use crate::screen::{Cell, CellColor};
 
-// ── The 16 ANSI slots of the Quasar default (0..=7 normal, 8..=15 bright) ────
+// ── The 16 ANSI slots of the Construct default (0..=7 normal, 8..=15 bright) ────
 
 /// Slot 0 — black. The app background token, so "black" content melts into
 /// the chrome exactly as it does in a classic dark terminal.
@@ -74,7 +74,7 @@ pub const BRIGHT_CYAN: Color32 = Color32::from_rgb(0x8A, 0xD7, 0xE1);
 /// Slot 15 — bright white.
 pub const BRIGHT_WHITE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
 
-/// The Quasar default 16-slot ANSI table, indexed by slot number.
+/// The Construct default 16-slot ANSI table, indexed by slot number.
 pub const ANSI16: [Color32; 16] = [
     BLACK,
     RED,
@@ -117,7 +117,7 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// The **Quasar default**, derived from `mde-theme`/`Style` tokens — the
+    /// The **Construct default**, derived from `mde-theme`/`Style` tokens — the
     /// platform look (see the module docs). Not hand-picked hex: every slot that
     /// carries a token meaning *is* that token.
     #[must_use]
@@ -159,7 +159,7 @@ const fn cube_level(step: u8) -> u8 {
     }
 }
 
-/// Resolve a 256-colour palette slot against the **Quasar default**.
+/// Resolve a 256-colour palette slot against the **Construct default**.
 ///
 /// The 16 ANSI names, then the xterm 6×6×6 colour cube (`16..=231`), then the
 /// 24-step greyscale ramp (`232..=255`) — a total function, every `u8` a defined
@@ -203,7 +203,7 @@ const fn lift(c: Color32) -> Color32 {
 /// Resolve one cell to concrete `(fg, bg)` paint colours **through `palette`**.
 ///
 /// - `Default` maps to the palette's role colours (`fg` on `bg`) so untouched
-///   text *is* the active scheme (the Quasar default's are the platform tokens);
+///   text *is* the active scheme (the Construct default's are the platform tokens);
 /// - `Palette(n)` resolves through [`Palette::color`], with bold promoting the
 ///   low slots to their bright twins (the classic `SGR 1` behaviour);
 /// - `Rgb` passes straight through — **true-colour already works** (design
@@ -264,7 +264,7 @@ mod tests {
         for (slot, &c) in ANSI16.iter().enumerate() {
             assert_eq!(indexed(u8::try_from(slot).expect("slot fits")), c);
         }
-        // The Quasar-token derivations (the §4 carve-out's "derive where
+        // The Construct-token derivations (the §4 carve-out's "derive where
         // sensible" clause).
         assert_eq!(RED, Style::DANGER);
         assert_eq!(GREEN, Style::OK);
@@ -339,7 +339,7 @@ mod tests {
             &cell(CellColor::Default, CellColor::Default, CellAttrs::default()),
             &p,
         );
-        // The Quasar default's role colours are the chrome tokens.
+        // The Construct default's role colours are the chrome tokens.
         assert_eq!(fg, Style::TEXT);
         assert_eq!(bg, Style::BG);
     }

@@ -101,9 +101,10 @@ use mde_egui::egui::{
     self, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind,
     UiBuilder, Vec2,
 };
-use mde_egui::{muted_note, Motion, Style};
+use mde_egui::{muted_note, Motion, MotionMode, MotionPreset, Style};
 
 use crate::toast_bridge::TOAST_TOPIC;
+use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem, SourceHealth};
 
 /// The memory key the mount toggles the Mesh-Map surface's **Explorer** lens on
 /// (read in `main.rs`'s poll gate + the surface arm). Kept here so the one key
@@ -124,7 +125,7 @@ const REFRESH: Duration = Duration::from_secs(5);
 /// ambient idle auto-cycle begins (a living-wall display only comes alive after a
 /// clear pause). A behaviour cadence in the same `Duration` register as
 /// [`REFRESH`] — deliberately NOT a `Motion` easing token (§4 governs the *visual*
-/// transition, which the hero's `Motion::BASE` page-slide still owns).
+/// transition, which the hero's shared `Page` preset page-slide still owns).
 const AMBIENT_IDLE: Duration = Duration::from_secs(30);
 
 /// EXPLORER-12 — the deliberately slow dwell between ambient auto-advances once
@@ -228,6 +229,14 @@ const ZOOM_SECS: f32 = Motion::SLOW;
 /// The zoom/settle opacity floor: the hero starts this faint as it grows from the
 /// tile, and the mosaic settles back in from here on Back (O3).
 const ZOOM_FADE_FLOOR: f32 = 0.4;
+
+fn explorer_toolbar_margin() -> egui::Margin {
+    Style::toolbar_margin()
+}
+
+fn explorer_toolbar_frame() -> egui::Frame {
+    egui::Frame::NONE.inner_margin(explorer_toolbar_margin())
+}
 
 // ─────────────────────────── wire mirrors (§6) ───────────────────────────
 
@@ -552,6 +561,12 @@ impl Category {
 trait UnitsClient {
     /// Read the latest `state/units/<node>` body from every node's mirror.
     fn read(&self) -> Vec<UnitsState>;
+
+    /// Whether this reader has a configured substrate. A false value means the
+    /// shell can present mesh search as unavailable without performing a Bus scan.
+    fn configured(&self) -> bool {
+        true
+    }
 }
 
 /// The production units reader: enumerate every `state/units/<node>` topic by
@@ -586,14 +601,18 @@ impl UnitsClient for BusUnits {
         }
         states
     }
+
+    fn configured(&self) -> bool {
+        self.bus_root.is_some()
+    }
 }
 
 // ─────────────────────── the action-dispatch seam (EXPLORER-5) ───────────────────────
 
 /// The `action/cloud/` namespace prefix every QC-11 cloud verb request rides —
-/// a **local mirror** of `mackesd::workers::openstack::verbs::CLOUD_ACTION_PREFIX`
+/// a **local mirror** of `mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX`
 /// (§6: the shell mirrors the wire contract, never links the daemon crate). A
-/// byte-pinned test keeps it equal to the worker's prefix.
+/// byte-pinned test keeps it equal to the shared prefix.
 const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 
 /// The aggregator's E9 pull verb — a mirror of
@@ -1357,89 +1376,13 @@ pub fn local_hostname() -> String {
 
 // ─────────────── universal search (EXPLORER-14, design O7) ───────────────
 //
-// A self-contained fuzzy matcher — the editor's `fuzzy` idiom (EDITOR-7)
-// mirrored locally: that scorer is private to `mde-editor-egui`, and sharing it
-// would mean a new cross-cutting module this unit's scope forbids, so the small
-// subsequence scorer (boundary + contiguity bonuses, gap + leading penalties)
-// lives here. Pure data-in / data-out — unit-tested without a render.
+// Explorer feeds every real searchable unit field into the shared SEARCH-omnibox
+// ranker. The payload stays the absolute unit index, so dispatch still lands
+// through `jump_to_id` rather than a shared command layer.
 
 /// Max rows the ranked hit list shows — enough to disambiguate without burying
 /// the best match (typing more narrows the head).
 const SEARCH_MAX_HITS: usize = 8;
-
-/// Score awarded when a matched char sits on a word boundary (a separator or a
-/// camel-case hump) — the humps a human aims at.
-const BOUNDARY_BONUS: i32 = 16;
-/// Score awarded when a matched char immediately follows the previous match — a
-/// contiguous run of the query (e.g. `5900` inside `22,5900`).
-const CONTIGUOUS_BONUS: i32 = 8;
-/// Bonus when the matched char has the same case as the query char, so an
-/// exact-case hit edges out a case-folded one.
-const CASE_BONUS: i32 = 2;
-/// Penalty per skipped char in a gap between two matches (capped), so a tightly
-/// packed match outranks a scattered one.
-const GAP_PENALTY: i32 = -1;
-/// Penalty per leading unmatched char before the first match (capped), so a
-/// match near the start outranks one buried deep in the string.
-const LEADING_PENALTY: i32 = -1;
-/// Cap on the per-match gap / leading penalty so one very long field can't
-/// dominate the score with penalties alone.
-const PENALTY_CAP: usize = 12;
-
-/// Whether `cur` begins a new "word" given the char `prev` before it — a
-/// separator break (incl. the `:`/`,` the MAC / port-list fields carry) or a
-/// camel-case hump.
-const fn is_word_boundary(prev: char, cur: char) -> bool {
-    let separator = matches!(prev, '/' | '\\' | '_' | '-' | '.' | ' ' | ':' | ',');
-    let camel_hump = !prev.is_uppercase() && cur.is_uppercase();
-    separator || camel_hump
-}
-
-/// The penalty count for a `gap` of skipped chars, capped so a single long span
-/// can't swamp the score.
-fn capped_gap(gap: usize) -> i32 {
-    i32::try_from(gap.min(PENALTY_CAP)).unwrap_or(0)
-}
-
-/// Score `needle` against `haystack`, or `None` when `needle` is not an
-/// in-order, case-insensitive subsequence of `haystack`. Higher is better; an
-/// empty needle scores a neutral `0` (the caller decides what an empty query
-/// means). Greedy left-to-right — the standard lightweight fuzzy heuristic —
-/// with boundary/contiguity/case bonuses and gap/leading penalties folded in.
-fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    let hay: Vec<char> = haystack.chars().collect();
-    let ndl: Vec<char> = needle.chars().collect();
-
-    let mut total: i32 = 0;
-    let mut ni = 0usize;
-    let mut prev: Option<usize> = None;
-
-    for (hi, &hc) in hay.iter().enumerate() {
-        let Some(&nc) = ndl.get(ni) else { break };
-        if !hc.eq_ignore_ascii_case(&nc) {
-            continue;
-        }
-        // Exactly one of the three position scores applies per matched char.
-        total += match prev {
-            Some(p) if p + 1 == hi => CONTIGUOUS_BONUS,
-            Some(p) => GAP_PENALTY * capped_gap(hi - p - 1),
-            None => LEADING_PENALTY * capped_gap(hi),
-        };
-        if hi == 0 || is_word_boundary(hay[hi - 1], hc) {
-            total += BOUNDARY_BONUS;
-        }
-        if hc == nc {
-            total += CASE_BONUS;
-        }
-        prev = Some(hi);
-        ni += 1;
-    }
-
-    (ni == ndl.len()).then_some(total)
-}
 
 /// The searchable text fields of one unit (O7 "Everything"): name · address
 /// (IP) · the LAN id key (the host's MAC, or its IP fallback) · the kind's type
@@ -1447,6 +1390,20 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
 /// enrichment names. Only real discovered values — an absent field contributes
 /// nothing (§7, never a fabricated haystack). Fields score independently so a
 /// match can never straddle two unrelated fields.
+/// Map a discovered unit's coarse [`Health`] onto the shared omnibox ranking
+/// weight ([`SourceHealth`]) so a healthy node's rows rank above a degraded
+/// node's above a down node's for an equal text match. Unprobed health (§7
+/// `None`/`Unknown`) stays neutral — the ranker never fabricates a "healthy"
+/// lift for a node whose health we do not actually know.
+fn omnibox_source_health(unit: &Unit) -> SourceHealth {
+    match unit.health {
+        Some(Health::Healthy) => SourceHealth::Healthy,
+        Some(Health::Degraded) => SourceHealth::Degraded,
+        Some(Health::Critical | Health::Unreachable) => SourceHealth::Down,
+        Some(Health::Unknown) | None => SourceHealth::Unknown,
+    }
+}
+
 fn search_fields(unit: &Unit) -> Vec<&str> {
     let mut fields = vec![unit.name.as_str(), unit.kind.search_terms()];
     if let Some(addr) = unit.address.as_deref() {
@@ -1470,15 +1427,6 @@ fn search_fields(unit: &Unit) -> Vec<&str> {
         }
     }
     fields
-}
-
-/// The unit's best single-field score for `query`, or `None` when no field
-/// matches.
-fn unit_search_score(query: &str, unit: &Unit) -> Option<i32> {
-    search_fields(unit)
-        .into_iter()
-        .filter_map(|f| fuzzy_score(query, f))
-        .max()
 }
 
 /// The `/` search overlay's live state (EXPLORER-14): the query, the selected
@@ -2116,26 +2064,98 @@ impl ExplorerState {
         self.search = Some(SearchState::open(String::new()));
     }
 
+    /// Shared-search candidates for the current unit shelf. Each real field is
+    /// a candidate so typo-tolerant title matching applies to names, addresses,
+    /// type taxonomy, host nodes, services, and enrichment text.
+    fn search_items(&self) -> Vec<SearchItem<usize>> {
+        let mut items = Vec::new();
+        for (unit_idx, unit) in self.units.iter().enumerate() {
+            for field in search_fields(unit) {
+                let field = field.trim();
+                if field.is_empty() {
+                    continue;
+                }
+                let rank = items.len();
+                items.push(
+                    SearchItem::new(SearchDomain::Mesh, field, unit.id.clone(), unit_idx)
+                        .with_source_rank(rank),
+                );
+            }
+        }
+        items
+    }
+
+    /// Shared shell-front-door candidates for discovered mesh units. Payloads are
+    /// unit ids so activation can reuse [`Self::jump_to_id`] instead of copying
+    /// Explorer focus logic into the shell.
+    pub(crate) fn search_omnibox_items(&self) -> Vec<SearchItem<String>> {
+        let mut items = Vec::new();
+        for unit in &self.units {
+            let health = omnibox_source_health(unit);
+            for field in search_fields(unit) {
+                let field = field.trim();
+                if field.is_empty() {
+                    continue;
+                }
+                let rank = items.len();
+                items.push(
+                    SearchItem::new(SearchDomain::Mesh, field, unit.id.clone(), unit.id.clone())
+                        .with_source_rank(rank)
+                        .with_source_health(health),
+                );
+            }
+        }
+        items
+    }
+
+    /// Whether the Front Door can safely advertise mesh search as backed by a
+    /// configured local source. This is metadata only; it does not poll the Bus.
+    pub(crate) fn search_omnibox_source_configured(&self) -> bool {
+        self.client.configured()
+    }
+
+    /// Whether Explorer has already polled its source at least once in this shell
+    /// session. Front Door uses this to distinguish "warming" from "read and empty".
+    pub(crate) fn search_omnibox_source_polled(&self) -> bool {
+        self.last_poll.is_some()
+    }
+
+    /// Whether cached discovered units exist for Front Door mesh rows. The launcher
+    /// never waits for peer discovery; it uses only this existing shelf.
+    pub(crate) fn search_omnibox_source_ready(&self) -> bool {
+        !self.units.is_empty()
+    }
+
+    /// Activate a shell-front-door mesh result through Explorer's normal focus path.
+    pub(crate) fn open_search_omnibox_target(&mut self, id: &str) {
+        self.jump_to_search_hit(id);
+    }
+
     /// The ranked hits for `query` over the WHOLE shelf (O7 "Everything" — the
     /// search ignores the active category filter; the jump clears a hiding one):
-    /// each unit's best field score, best first, ties keeping shelf order (a
-    /// stable sort), capped at [`SEARCH_MAX_HITS`]. Returns absolute indices
-    /// into [`Self::units`]. An empty/blank query yields nothing (the box just
-    /// opened — no fake "everything matches" wall).
+    /// shared-ranked field candidates deduped back to unit rows, capped at
+    /// [`SEARCH_MAX_HITS`]. Returns absolute indices into [`Self::units`]. An
+    /// empty/blank query yields nothing (the box just opened — no fake
+    /// "everything matches" wall).
     fn search_hits(&self, query: &str) -> Vec<usize> {
         let query = query.trim();
         if query.is_empty() {
             return Vec::new();
         }
-        let mut scored: Vec<(usize, i32)> = self
-            .units
-            .iter()
-            .enumerate()
-            .filter_map(|(i, u)| unit_search_score(query, u).map(|s| (i, s)))
-            .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
-        scored.truncate(SEARCH_MAX_HITS);
-        scored.into_iter().map(|(i, _)| i).collect()
+        let items = self.search_items();
+        let cap = items.len();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for hit in ranked_hits(query, items, cap) {
+            let unit_idx = hit.item.payload;
+            if seen.insert(unit_idx) {
+                out.push(unit_idx);
+                if out.len() == SEARCH_MAX_HITS {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Land a search pick: jump the shared hero/mosaic focus to the hit (the ONE
@@ -2726,7 +2746,7 @@ impl ExplorerState {
                 ));
             if ui
                 .add(pin_button)
-                .on_hover_text("Pinned units sort to the front (P)")
+                .explorer_hover_text("Pinned units sort to the front (P)")
                 .clicked()
             {
                 self.toggle_pin(&unit.id);
@@ -2815,7 +2835,7 @@ impl ExplorerState {
         let resp = ui.add_enabled(seam.is_ok(), button);
         match &seam {
             Err(reason) => {
-                resp.on_disabled_hover_text(reason.clone());
+                resp.explorer_disabled_hover_text(reason.clone());
             }
             Ok(_) => {
                 if resp.clicked() {
@@ -3146,13 +3166,13 @@ impl ExplorerState {
         self.tick_ambient(ui.ctx());
 
         egui::TopBottomPanel::top(ui.id().with("explorer-chips"))
-            .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+            .frame(explorer_toolbar_frame())
             .show_inside(ui, |ui| self.header(ui));
         // The `/` universal-search overlay rides between the summary strip and
         // the active mode, so the hit list never covers the filter chips.
         if self.search.is_some() {
             egui::TopBottomPanel::top(ui.id().with("explorer-search"))
-                .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                .frame(explorer_toolbar_frame())
                 .show_inside(ui, |ui| self.search_overlay(ui));
         }
         match self.mode {
@@ -3162,7 +3182,7 @@ impl ExplorerState {
                 // the typed bulk arming, and the per-unit rollup.
                 if !self.marked.is_empty() {
                     egui::TopBottomPanel::bottom(ui.id().with("explorer-bulk"))
-                        .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                        .frame(explorer_toolbar_frame())
                         .show_inside(ui, |ui| self.bulk_bar(ui));
                 }
                 egui::CentralPanel::default()
@@ -3171,7 +3191,7 @@ impl ExplorerState {
             }
             SurfaceMode::Hero => {
                 egui::TopBottomPanel::bottom(ui.id().with("explorer-strip"))
-                    .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                    .frame(explorer_toolbar_frame())
                     .show_inside(ui, |ui| self.filmstrip(ui));
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
@@ -3412,16 +3432,21 @@ impl ExplorerState {
         // Carbon slide + cross-fade on a page change (#21).
         let anim_id = ui.id().with("explorer-hero-anim");
         let (child_rect, fade) = if let Some((rect, opacity)) = self.zoom_progress(full) {
-            ui.ctx()
-                .animate_value_with_time(anim_id, self.focus as f32, 0.0);
+            Motion::animate_typed_with_mode(
+                ui.ctx(),
+                anim_id,
+                self.focus as f32,
+                MotionPreset::Page,
+                MotionMode::Disabled,
+            );
             if opacity < 1.0 {
                 ui.ctx().request_repaint();
             }
             (rect, opacity)
         } else {
-            let visual = ui
-                .ctx()
-                .animate_value_with_time(anim_id, self.focus as f32, Motion::BASE);
+            let visual =
+                Motion::animate_scalar(ui.ctx(), anim_id, self.focus as f32, MotionPreset::Page)
+                    .value();
             let delta = self.focus as f32 - visual;
             let slide = (delta * full.width() * SLIDE_FRACTION).clamp(-full.width(), full.width());
             let fade = (1.0 - delta.abs()).clamp(0.0, 1.0);

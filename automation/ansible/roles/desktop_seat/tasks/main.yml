@@ -1,0 +1,58 @@
+---
+# WL-ARCH-006 (U13) — install/enable the Quasar VDI seat on a Desktop-VM.
+#
+# A Desktop-VM delivers a full native VDI seat: the DRM-native egui shell
+# (`mde-shell-egui.service` — the SEAT-BOOT-1 unit shipped in the bootc/RPM image)
+# driven directly on the KMS seat, greetd-style, with no compositor. This role
+# reuses the SAME path a hand-provisioned Workstation uses: pin the Workstation
+# role (the seat unit's rank-1 `mackesd role-gate --min-rank 1` ExecCondition) and
+# converge the Workstation systemd unit set via `mackesd onboard role-provision`.
+# The base `cloud_vm` role has already established the mackesd/mesh baseline.
+
+- name: Assert the Quasar shell binary is present (the seat unit's ExecStart)
+  ansible.builtin.stat:
+    path: "{{ desktop_seat_shell_bin }}"
+  register: desktop_seat_shell
+  failed_when: not desktop_seat_shell.stat.exists
+
+- name: Read the currently pinned role (if any)
+  ansible.builtin.slurp:
+    src: "{{ desktop_seat_role_path }}"
+  register: desktop_seat_role_toml
+  failed_when: false
+
+- name: Pin the Workstation role (satisfies the seat unit's rank-1 role-gate)
+  ansible.builtin.command: "mackesd role-pin {{ desktop_seat_role }}"
+  register: desktop_seat_pin
+  changed_when: "'role pinned' in desktop_seat_pin.stdout"
+  # Idempotent: only pin when the role is unset or is not already Workstation, so
+  # a converged seat reports no change (rather than re-printing "role pinned").
+  when: >-
+    desktop_seat_role_toml.content is not defined
+    or desktop_seat_role not in (desktop_seat_role_toml.content | b64decode)
+
+- name: Probe whether the seat unit is already boot-enabled (for honest change reporting)
+  ansible.builtin.command: "systemctl is-enabled {{ desktop_seat_unit }}"
+  register: desktop_seat_enabled
+  changed_when: false
+  failed_when: false
+
+- name: Converge the Workstation systemd unit set (enable the seat + rank-≤1 units)
+  # `role-provision` is idempotent (systemctl enable/mask are no-ops when already
+  # in state); we report changed only on the run that first enables the seat unit.
+  ansible.builtin.command: "mackesd onboard role-provision --role {{ desktop_seat_role }}"
+  register: desktop_seat_provision
+  changed_when: desktop_seat_enabled.stdout != 'enabled'
+  failed_when: desktop_seat_provision.rc != 0
+
+- name: Ensure mackesd is enabled and running (the seat's control-plane dependency)
+  ansible.builtin.systemd:
+    name: mackesd.service
+    enabled: true
+    state: started
+
+- name: Bring the Quasar DRM seat up now
+  ansible.builtin.systemd:
+    name: "{{ desktop_seat_unit }}"
+    state: started
+  when: desktop_seat_start_now | bool

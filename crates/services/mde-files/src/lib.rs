@@ -50,7 +50,7 @@ pub mod transfer;
 // ── E12-14b — the windowed Cosmic-era surface was stripped ──────────────────
 // The Cosmic-era iced file-manager GUI (`app`/`views`/`widgets`/`icons`/`theme`/
 // `loading`/`picker`/`prefs`/`cosmic_compat`/`mounts` + the `mde-files` binary)
-// is retired. MCNF 12.0 "Quasar" renders Files as an egui panel
+// is retired. MCNF 12.0 "Construct" renders Files as an egui panel
 // (`mde-files-egui::files_panel`) inside `mde-shell-egui`, reusing the
 // render-agnostic backend/model/send_to above. No `gui` feature remains.
 pub use archive::{browse as browse_archive, compress, extract, ArchiveEntry, ArchiveFormat};

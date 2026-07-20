@@ -2,7 +2,7 @@
 
 Operator-locked 2026-07-03 (`/plan`, 1-round survey). A **series of small throwaway
 XCP-ng VMs** that each expose a remote-desktop endpoint (Spice, VNC, RDP) so the
-"Quazar" shell's **Desktop / VDI surface** (the desktop chooser + the ironrdp / VNC /
+"Construct" shell's **Desktop / VDI surface** (the desktop chooser + the ironrdp / VNC /
 spice viewers, E12-4/5/6/7 + OW-8) has real targets to connect to. **Only basic
 connection is required** — the guests just need to accept a session; no rich desktop,
 no persistence, no auth hardening.

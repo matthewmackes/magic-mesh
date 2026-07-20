@@ -1,0 +1,23 @@
+---
+# WL-ARCH-006 (U13) — cuttlefish_host role defaults (runs inside the Android VM).
+
+# Local paths / URLs of the android-cuttlefish .deb host packages to install
+# (e.g. cuttlefish-base_*.deb, cuttlefish-user_*.deb). Empty = assume a pre-baked
+# golden Android image already carries cvd; the role then only asserts cvd and
+# (re)starts the device.
+cuttlefish_debs: []
+
+# The unprivileged user that owns the cvd runtime.
+cuttlefish_user: cvd
+
+# Groups cvd needs: KVM access + the cuttlefish bridge network.
+cuttlefish_groups:
+  - kvm
+  - cvdnetwork
+
+# Host bridge/network units the android-cuttlefish debs install (enabled if given).
+cuttlefish_host_services: []
+
+# Optional device shape passed through to `cvd start` (defaults = cvd's own).
+# cuttlefish_cpus: 4
+# cuttlefish_memory_mb: 8192

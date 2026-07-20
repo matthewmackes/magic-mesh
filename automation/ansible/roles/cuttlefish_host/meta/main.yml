@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  role_name: cuttlefish_host
+  namespace: magic_mesh
+  author: magic-mesh
+  description: >-
+    Install Cuttlefish + cvd on an Android-VM and start it with a VNC server
+    (WL-ARCH-006 U13). Runs inside the nested-KVM Debian VM: installs the
+    android-cuttlefish host packages, joins the run user to kvm/cvdnetwork, and
+    launches `cvd start --start_vnc_server`. Console = VNC/WebRTC.
+  license: proprietary
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+dependencies: []

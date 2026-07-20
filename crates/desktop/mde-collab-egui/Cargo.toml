@@ -1,0 +1,72 @@
+# MCNF E12 "Construct" — `mde-collab-egui`: the Communications surface (WL-FUNC-011
+# Phase 3). A PURE UI crate on the shared `mde-egui` harness that renders the
+# read-side `CollabReadModel` projections and emits typed `CollabCommand`s — it
+# owns NO authoritative state and calls NO providers. This phase ships the frame
+# (a persistent spaces rail + per-space mode tabs + a persistent call bar) and the
+# two fully-implemented core modes, Activity and Messages; the remaining modes are
+# honestly labeled "coming in Phase 3b", never faked.
+#
+# Tier (§6): desktop-shell. The dependency edges point inward — `mde-egui` (the
+# shared Style/Carbon-icon/Motion harness) and `mde-collab-types` (the stable
+# WL-FUNC-011 public contracts). The surface reads a `CollabData` trait it is
+# handed and pushes commands into a `CommandSink`; the real Bus wiring
+# (`BusReader` → projections, `CommandSink` → `action/collab/*`) is a later
+# shell-mount phase, so this crate stands alone with a fixture data source.
+[package]
+name        = "mde-collab-egui"
+description = "MCNF E12 Construct — the egui Communications surface (WL-FUNC-011 Phase 3): a CommunicationsSurface widget on the mde-egui harness that renders the CollabReadModel projections (SpaceDirectory rail, ActivityFeed, ConversationTimeline/ThreadTimeline, CallState) through the shared Construct Style with Mackes-Carbon icons and emits typed CollabCommands into a caller-drained sink. Frame (spaces rail + mode tabs + persistent call bar) plus the Activity and Messages core modes; other modes are labeled-for-later. Reads a CollabData source (a fixture here; the Bus wiring is a later phase), owns no authoritative state, calls no providers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_collab_egui"
+path = "src/lib.rs"
+
+[dependencies]
+# The §4/§5 egui harness — the shared `Style` (Construct look), the Mackes-Carbon
+# icon loader (`carbon_icon`/`paint_carbon`, the canonical platform icon set), and
+# the re-exported `egui` so this surface resolves to the one harness-pinned egui
+# version (no cross-surface skew).
+mde-egui = { path = "../../shared/mde-egui" }
+
+# The stable WL-FUNC-011 public contracts: the `CollabReadModel` projections this
+# surface renders and the `CollabCommand`s it emits. A pure leaf types crate; the
+# dependency edge points inward (§6).
+mde-collab-types = { path = "../../shared/mde-collab-types" }
+
+# WL-FUNC-011 Files mode — REUSE the file-manager's render-agnostic core (the
+# `LocalFsBackend` directory listing + the `FileRow`/`Mime` model, the exact core
+# `mde-files-egui` itself is built on) to drive the "link a file" picker, rather
+# than rewriting a filesystem lister. Only the static `LocalFsBackend::list_dir`
+# read + the `FileRow` shape are used (no `RealBackend`, so no Bus connect and no
+# `FileBrowser` worker threads on the paint path). A same-tier desktop edge, the
+# same reuse `mde-editor-egui`/`mde-term-egui` take on this crate.
+mde-files = { path = "../../services/mde-files" }
+
+# WL-FUNC-011 Documents mode — REUSE the whole "Construct" editor rather than
+# rewriting it. `mde-editor-egui`'s `EditorSurface` + `editor_panel` seam is
+# mounted directly: the Project sub-mode embeds the full IDE (rope, tabs/splits,
+# tree-sitter, LSP, palette, integrated terminal, Word-97 menu + Standard +
+# Formatting toolbars), and the Document sub-mode embeds a one-pane markdown
+# editor over the same rope, with the Visual view reusing the editor's own
+# `markdown::parse`/`markdown::show` render. A same-tier desktop edge; it pulls
+# the editor's heavy graph (tree-sitter grammars, yrs, lsp-types) — already
+# resolved once in the workspace — so the collab surface never re-implements an
+# editor. The embedded `EditorSurface` is headless-safe (its `Default`/`open_text`
+# path spawns no threads and connects no Bus; the mesh co-edit session + PTY are
+# opt-in), mirroring the `mde-files` render-agnostic reuse in Files mode.
+mde-editor-egui = { path = "../mde-editor-egui" }
+
+[dev-dependencies]
+# The Files-mode tests write a real temp file, then link it (read + SHA-256 hash)
+# to assert the emitted `FileRef` carries the true content address. `tempfile` is
+# already in the workspace lock (the services tier + other desktop crates use it),
+# so this is fetch-free on the airgapped farm.
+tempfile = "3"
+
+[lints]
+workspace = true

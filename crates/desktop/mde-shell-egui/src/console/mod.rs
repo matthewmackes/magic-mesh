@@ -8,7 +8,7 @@
 //! see the WIN7-5 update below for why identity moved to the top); the
 //! **right pane** is the pinned Terminal + Monitor pair (lock #31) above the
 //! grouped entry list — each row an icon + label + one-line description + a
-//! subtle Fedora/Quasar provenance tag (locks #33/#38). Full arrow-key nav
+//! subtle Fedora/Construct provenance tag (locks #33/#38). Full arrow-key nav
 //! with the EXPLORER-18 focus-ring posture (locks #40/#48).
 //!
 //! **WIN7-2 update:** this module used to mount its own floating `egui::Area`
@@ -53,7 +53,7 @@
 //! data: `ConsoleGroup` gained no field) in the SAME icon+label shape
 //! [`entry_row`] already uses, just condensed, so the rail reads as a
 //! smaller sibling of the list it jump-scrolls rather than a bare text menu
-//! bolted beside it. The Custom row wears the SAME `Provenance::Quasar`
+//! bolted beside it. The Custom row wears the SAME platform provenance
 //! accent every operator-owned entry already tags itself with, at rest,
 //! flagging "this one's yours" the way its own entries already do. The list
 //! pane's own group headings ([`heading`]) were investigated and found to
@@ -264,21 +264,21 @@ const FIELD_H: f32 = Style::SP_L;
 // ── the entry model (design "Entry model": a const table, no dead entries) ──
 
 /// The subtle per-entry provenance tag (lock #38): whether the op is stock
-/// Fedora tooling or the Quasar mesh platform's own layer.
+/// Fedora tooling or the Construct platform's own layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provenance {
     /// Stock Fedora / systemd tooling.
     Fedora,
     /// The mesh platform's layer (meshctl / mackesd / the Bus / the channel).
-    Quasar,
+    Construct,
 }
 
 impl Provenance {
     /// The tag's label text.
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Fedora => "Fedora",
-            Self::Quasar => "Quasar",
+            Self::Construct => platform_provenance_label(),
         }
     }
 
@@ -287,9 +287,14 @@ impl Provenance {
     const fn color(self) -> egui::Color32 {
         match self {
             Self::Fedora => Style::TEXT_DIM,
-            Self::Quasar => Style::ACCENT,
+            Self::Construct => Style::ACCENT,
         }
     }
+}
+
+/// The visible platform provenance chip follows the visible product name.
+fn platform_provenance_label() -> &'static str {
+    mde_theme::brand::logo::PRODUCT_NAME
 }
 
 /// What activating an entry does (the design's `kind`).
@@ -304,7 +309,7 @@ enum EntryKind {
     /// Route to a shell surface (lock #41's "open the correct GUI surface") —
     /// live NOW through [`ConsoleRequest::Goto`].
     Link(Surface),
-    /// Route to a Workbench plane, used for the QUASAR-CLOUD replacement plane.
+    /// Route to a Workbench plane, used for the cloud replacement plane.
     Plane(Plane),
 }
 
@@ -319,7 +324,7 @@ struct ConsoleEntry {
     /// The `$PATH` binary the entry needs (`""` = always available — surface
     /// links and shell built-ins). Absent → the row greys + reports it (§7).
     tool: &'static str,
-    /// The Fedora/Quasar provenance tag (lock #38).
+    /// The Fedora/Construct provenance tag (lock #38).
     provenance: Provenance,
     /// The row's **domain glyph** (lock #33's "icon"): a distinct brand glyph
     /// per operational domain (System / Network / Storage / Mesh / …), so the
@@ -340,6 +345,20 @@ struct ConsoleGroup {
     entries: &'static [ConsoleEntry],
 }
 
+/// One static Console entry exposed to the Start Menu's type-to-launch search.
+/// The payload is deliberately just enough for search/result rendering and a
+/// flat-index activation through [`ConsoleState::activate_index`]; all launch,
+/// gating, and close behavior still lives in Console's own activation path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsoleSearchHit {
+    pub(crate) flat: usize,
+    pub(crate) label: &'static str,
+    pub(crate) desc: &'static str,
+    pub(crate) group: &'static str,
+    pub(crate) tool: &'static str,
+    pub(crate) icon: IconId,
+}
+
 /// The pinned pair (lock #31): a plain Terminal + the Monitor. The Terminal is
 /// a LIVE surface link (the Terminal surface holds a real PTY shell today); the
 /// Monitor is a command entry, gated like the rest until CONSOLE-2.
@@ -348,7 +367,7 @@ const PINNED: [ConsoleEntry; 2] = [
         label: "Terminal",
         desc: "Open the Terminal surface — tabs, splits, mesh peers",
         tool: "",
-        provenance: Provenance::Quasar,
+        provenance: Provenance::Construct,
         icon: IconId::Terminal,
         kind: EntryKind::Link(Surface::Terminal),
     },
@@ -412,7 +431,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Network Status",
                 desc: "Mesh-aware summary: links, routes, overlay + peers",
                 tool: "ip",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::Signal,
                 kind: EntryKind::Tab(
                     "bash -lc 'ip -br addr; echo; ip route; echo; meshctl status'",
@@ -483,7 +502,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Platform Update",
                 desc: "Update the mesh platform from the signed channel",
                 tool: "dnf",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab("sudo dnf upgrade magic-mesh"),
             },
@@ -530,7 +549,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Mesh Storage",
                 desc: "The mesh share mount + Syncthing sync status",
                 tool: "findmnt",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::Storage,
                 kind: EntryKind::Tab(
                     "bash -lc 'findmnt /mnt/mesh-storage; echo; systemctl --no-pager status \"syncthing*\"'",
@@ -545,7 +564,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Mesh Status",
                 desc: "This node + fleet status roll-up (meshctl status)",
                 tool: "meshctl",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab("meshctl status"),
             },
@@ -553,25 +572,25 @@ const GROUPS: [ConsoleGroup; 7] = [
                 label: "Peers",
                 desc: "Fleet-wide peer directory (meshctl fleet status)",
                 tool: "meshctl",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::Node,
                 kind: EntryKind::Tab("meshctl fleet status"),
             },
             ConsoleEntry {
                 label: "Cloud Status",
-                desc: "The state/openstack mirror on the Bus spool",
+                desc: "The state/cloud mirror on the Bus spool",
                 tool: "",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab(
-                    "bash -lc 'ls -l \"${MDE_BUS_ROOT:-/run/mde-bus}/state/openstack\" 2>/dev/null || echo \"no cloud mirror published on this node\"'",
+                    "bash -lc 'ls -l \"${MDE_BUS_ROOT:-/run/mde-bus}/state/cloud\" 2>/dev/null || echo \"no cloud mirror published on this node\"'",
                 ),
             },
             ConsoleEntry {
                 label: "Cluster (etcd)",
                 desc: "Endpoint health + members (etcdctl)",
                 tool: "etcdctl",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::Server,
                 kind: EntryKind::Tab("bash -lc 'etcdctl endpoint health; etcdctl member list'"),
             },
@@ -597,18 +616,10 @@ const GROUPS: [ConsoleGroup; 7] = [
                 kind: EntryKind::Tab("virsh list --all"),
             },
             ConsoleEntry {
-                label: "OpenStack Servers",
-                desc: "The cloud's server roster (openstack server list)",
-                tool: "openstack",
-                provenance: Provenance::Quasar,
-                icon: IconId::Server,
-                kind: EntryKind::Tab("openstack server list"),
-            },
-            ConsoleEntry {
                 label: "Cloud Plane (GUI)",
                 desc: "Open the Workbench Cloud plane — the VM lifecycle GUI",
                 tool: "",
-                provenance: Provenance::Quasar,
+                provenance: Provenance::Construct,
                 icon: IconId::Server,
                 kind: EntryKind::Plane(Plane::Cloud),
             },
@@ -664,6 +675,53 @@ fn entry_at(flat: usize) -> &'static ConsoleEntry {
     static_rows()
         .nth(flat)
         .expect("flat index within total_rows()")
+}
+
+/// Static Console rows that the Start Menu can rank beside app surfaces.
+/// Custom entries remain Console-local for now because they are user data loaded
+/// by [`ConsoleState`] and will join the larger unified index work.
+pub(crate) fn static_search_candidates() -> Vec<ConsoleSearchHit> {
+    let mut out = Vec::with_capacity(total_rows());
+    for (flat, entry) in PINNED.iter().enumerate() {
+        out.push(ConsoleSearchHit {
+            flat,
+            label: entry.label,
+            desc: entry.desc,
+            group: "Pinned",
+            tool: entry.tool,
+            icon: entry.icon,
+        });
+    }
+    let mut flat = PINNED.len();
+    for group in &GROUPS {
+        for entry in group.entries {
+            out.push(ConsoleSearchHit {
+                flat,
+                label: entry.label,
+                desc: entry.desc,
+                group: group.label,
+                tool: entry.tool,
+                icon: entry.icon,
+            });
+            flat += 1;
+        }
+    }
+    out
+}
+
+/// Build the Console-owned request for a raw Front Door `>` command line.
+/// This keeps the command wrapping and terminal-tab launch semantics in the
+/// same module as static Console rows instead of teaching the launcher how to
+/// spawn shells.
+pub(crate) fn run_command_request(command: &str) -> Option<ConsoleRequest> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(ConsoleRequest::SpawnTab {
+        name: run_command_tab_name(command),
+        argv: launch_argv(command),
+    })
 }
 
 // ── the honest gate (§7 — typed, never a fake) ──────────────────────────────
@@ -987,6 +1045,7 @@ impl ConsoleState {
     /// refreshes the `$PATH` presence table. Kept for this module's own
     /// standalone tests (a one-line "open it" primer); production code drives
     /// [`Self::set_open`] instead, mirroring the Start Menu's own open state in.
+    #[cfg(test)]
     pub(crate) fn toggle(&mut self) {
         self.set_open(!self.open);
     }
@@ -1101,6 +1160,14 @@ impl ConsoleState {
                 }
             }
         }
+    }
+
+    /// Activate a static search result by flat index. This is the Start Menu
+    /// search seam; it intentionally delegates to [`Self::activate`] so search
+    /// results honor the same Goto/Plane/spawn/gate behavior as clicking the
+    /// Console row.
+    pub(crate) fn activate_index(&mut self, flat: usize) {
+        self.activate(flat);
     }
 
     /// Record the spawn-tab request that opens `cmd` in a `name`d Terminal tab,
@@ -1269,6 +1336,22 @@ fn shell_lc(cmd: &str) -> Vec<String> {
     vec!["bash".to_owned(), "-lc".to_owned(), cmd.to_owned()]
 }
 
+fn run_command_tab_name(command: &str) -> String {
+    let command = command.trim();
+    let mut preview = String::new();
+    let mut chars = command.chars();
+    for _ in 0..28 {
+        let Some(ch) = chars.next() else {
+            return format!("Run: {preview}");
+        };
+        preview.push(ch);
+    }
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    format!("Run: {preview}")
+}
+
 /// The rail identity block's `user@host` (lock #43): `$USER` / `$LOGNAME` →
 /// `operator` (the backdrop's identity precedence), at this node's hostname
 /// (the shared shell resolution — no second hostname idiom). Unchanged by
@@ -1415,8 +1498,8 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         if hovered {
             painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
         }
-        // The Custom row wears the SAME Quasar accent every operator-owned
-        // entry already tags itself with (`Provenance::Quasar`), at rest —
+        // The Custom row wears the SAME platform accent every operator-owned
+        // entry already tags itself with (`Provenance::Construct`), at rest —
         // not just on hover — flagging "this category is yours" at a
         // glance; every domain group stays the neutral TEXT/TEXT_DIM pair
         // the rest of this rail (and the tile grid beside it) already uses.
@@ -1424,7 +1507,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         // own desc-line-is-always-TEXT_DIM convention below.
         let is_custom = group.is_none();
         let label_color = if is_custom {
-            Provenance::Quasar.color()
+            Provenance::Construct.color()
         } else if hovered {
             Style::TEXT
         } else {
@@ -1901,7 +1984,7 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
 }
 
 /// CONSOLE-4 — one **Custom** row (lock #35): the operator's name over its
-/// command line, the Quasar tag (an operator entry is platform-layer config),
+/// command line, the platform tag (an operator entry is platform-layer config),
 /// the remove cross, and the same focus-ring / activation posture as a static
 /// row. Returns `(clicked, remove_clicked)` — the cross is its own hit target,
 /// registered after the row so it wins the pointer.
@@ -1972,9 +2055,9 @@ fn custom_row(
     painter.text(
         egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_XS),
         egui::Align2::RIGHT_TOP,
-        Provenance::Quasar.label(),
+        Provenance::Construct.label(),
         egui::FontId::proportional(Style::SMALL),
-        Provenance::Quasar.color(),
+        Provenance::Construct.color(),
     );
     // WIN7-5, lock #14 — reuses the SAME flat-index accesskit id space
     // `entry_row` above does (they already share `console_entry_id` for

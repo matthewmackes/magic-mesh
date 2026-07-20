@@ -22,6 +22,8 @@ use mde_egui::Style;
 use ropey::Rope;
 use tree_sitter::{Node, Tree};
 
+use crate::tooltip::editor_hover_text;
+
 /// The kind of a top-level declaration the outline surfaces — enough to pick an
 /// icon + color, mapped from the vendored grammars' node kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,15 +253,16 @@ fn symbol_row(ui: &mut Ui, symbol: &Symbol) -> bool {
                 .size(Style::SMALL)
                 .color(symbol.kind.token().color()),
         );
-        let clicked = ui
-            .selectable_label(
+        let clicked = editor_hover_text(
+            ui.selectable_label(
                 false,
                 RichText::new(&symbol.name)
                     .size(Style::SMALL)
                     .color(Style::TEXT),
-            )
-            .on_hover_text(format!("Go to line {}", symbol.line + 1))
-            .clicked();
+            ),
+            format!("Go to line {}", symbol.line + 1),
+        )
+        .clicked();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(Style::SP_S);
             ui.label(

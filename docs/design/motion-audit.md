@@ -1,5 +1,7 @@
 # MOTION-AUDIT-1 — static / no-feedback component gap list
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** a component gap-list taken against the retired iced/`mde-workbench`/`mde-cosmic-applet` GUIs. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). The motion *intent* still informs the shell, but the crate paths and component inventory below are stale.
+
 **Unit:** MOTION-AUDIT-1 (Epic 8, `docs/design/motion-system.md`). **Type:** survey
 / report (no code change). **Method:** a `/audit`-style sweep over the GUI crates
 (`mde-workbench`, `mde-files`, `mde-cosmic-applet`, `mde-music`, `mde-voice-hud`,

@@ -1,7 +1,7 @@
 //! The **surface panel seam** (EDITOR-1 → EDITOR-3): the code-editor surface the
-//! one Quasar shell (`mde-shell-egui`) embeds as `Surface::Editor`.
+//! one Construct shell (`mde-shell-egui`) embeds as `Surface::Editor`.
 //!
-//! Under E12 "Quasar" the mesh surfaces are **panels in the one shell**, not
+//! Under E12 "Construct" the mesh surfaces are **panels in the one shell**, not
 //! separate clients (§5 EMBED — there is no compositor). This module exposes the
 //! editor surface through the exact seam `mde-files-egui` gives the shell:
 //!
@@ -53,6 +53,7 @@ use crate::search::{self, FindEvent, FindState, ProjectSearch};
 use crate::spell::{self, SpellChecker, SpellMiss, SpellState};
 use crate::terminal::TerminalDock;
 use crate::toolbar;
+use crate::tooltip::editor_hover_text;
 use crate::widget::{editor_widget, EditorView, MatchHighlights};
 
 mod autosave;
@@ -111,6 +112,8 @@ const TERMINAL_MIN_HEIGHT: f32 = Style::SP_XL * 3.0;
 
 /// The About dialog's title (Help → About the Editor, EDTB-1).
 const ABOUT_TITLE: &str = "About the Editor";
+/// The user-facing product line shown in the About dialog.
+const ABOUT_PRODUCT_LINE: &str = "Construct Editor";
 
 /// The crate + version line the About dialog shows. `mde-egui` carries no
 /// brand/build module (and the iced-era `mde-theme` brand is deliberately not a
@@ -731,6 +734,16 @@ impl EditorSurface {
     #[must_use]
     pub fn current_path(&self) -> Option<&Path> {
         self.doc().and_then(|doc| doc.buffer.path())
+    }
+
+    /// The focused document's full text as an owned `String`, or `None` when the
+    /// focused pane has no open tab. The read seam an embedding surface (e.g. the
+    /// Communications Documents mode, WL-FUNC-011) reads the canonical text back
+    /// through to persist it — the analogue of [`current_path`](Self::current_path),
+    /// stringifying the live rope on demand (no per-frame cost; call it on save).
+    #[must_use]
+    pub fn current_text(&self) -> Option<String> {
+        self.doc().map(|doc| doc.buffer.rope().to_string())
     }
 
     // ── EDITOR-6: the focused pane's active tab is the "current document" ─────
@@ -2076,7 +2089,7 @@ impl EditorSurface {
                 .show(ctx, |ui| {
                     ui.set_min_width(DIALOG_W);
                     ui.label(
-                        RichText::new("Quasar Editor")
+                        RichText::new(ABOUT_PRODUCT_LINE)
                             .size(Style::HEADING)
                             .color(Style::TEXT)
                             .strong(),
@@ -2144,7 +2157,7 @@ impl EditorSurface {
 
     /// Render the EDTB-5 Print Preview overlay: the paginated pages (the same
     /// [`print::paginate`] the print job renders, so the preview is honest) in the
-    /// Quasar style, with a Print button that submits to CUPS and the last
+    /// Construct style, with a Print button that submits to CUPS and the last
     /// attempt's outcome shown inline. Escape / Close dismisses. Token-styled (§4).
     fn render_print_preview(&mut self, ctx: &egui::Context) {
         if !self.print.preview_open {
@@ -2359,19 +2372,21 @@ impl EditorSurface {
                         ui.horizontal(|ui| {
                             // Replace with the top suggestion (greyed with none).
                             let top = m.suggestions.first().cloned();
-                            if ui
-                                .add_enabled(top.is_some(), egui::Button::new("Replace"))
-                                .on_hover_text("Replace with the top suggestion")
-                                .clicked()
+                            if editor_hover_text(
+                                ui.add_enabled(top.is_some(), egui::Button::new("Replace")),
+                                "Replace with the top suggestion",
+                            )
+                            .clicked()
                             {
                                 replace_with = top;
                             }
                             ignore |= ui.button("Ignore").clicked();
                             ignore_all |= ui.button("Ignore All").clicked();
-                            add |= ui
-                                .button("Add to Dictionary")
-                                .on_hover_text("Add to the session dictionary")
-                                .clicked();
+                            add |= editor_hover_text(
+                                ui.button("Add to Dictionary"),
+                                "Add to the session dictionary",
+                            )
+                            .clicked();
                         });
                         ui.add_space(Style::SP_XS);
                         ui.horizontal(|ui| {
@@ -2631,48 +2646,53 @@ impl EditorSurface {
             ui.add_space(Style::SP_S);
             tree_toggle(ui, &mut self.show_tree);
             // EDITOR-12 — the symbol-outline toggle (mouse twin of Ctrl+Shift+O).
-            if ui
-                .selectable_label(
+            if editor_hover_text(
+                ui.selectable_label(
                     self.show_outline,
                     RichText::new("\u{2263}").size(Style::BODY),
-                )
-                .on_hover_text("Toggle the symbol outline (Ctrl+Shift+O)")
-                .clicked()
+                ),
+                "Toggle the symbol outline (Ctrl+Shift+O)",
+            )
+            .clicked()
             {
                 self.show_outline = !self.show_outline;
             }
             // EDITOR-10 — the integrated-terminal toggle (mouse twin of Ctrl+`).
-            if ui
-                .selectable_label(
+            if editor_hover_text(
+                ui.selectable_label(
                     self.terminal.is_shown(),
                     RichText::new("\u{2328}").size(Style::BODY),
-                )
-                .on_hover_text("Toggle the integrated terminal (Ctrl+`)")
-                .clicked()
+                ),
+                "Toggle the integrated terminal (Ctrl+`)",
+            )
+            .clicked()
             {
                 self.toggle_terminal();
             }
             ui.add_space(Style::SP_M);
-            if ui
-                .selectable_label(false, RichText::new("\u{2503}").size(Style::BODY))
-                .on_hover_text("Split right (Ctrl+\\)")
-                .clicked()
+            if editor_hover_text(
+                ui.selectable_label(false, RichText::new("\u{2503}").size(Style::BODY)),
+                "Split right (Ctrl+\\)",
+            )
+            .clicked()
             {
                 self.split_focused(SplitDir::V);
             }
-            if ui
-                .selectable_label(false, RichText::new("\u{2501}").size(Style::BODY))
-                .on_hover_text("Split down (Ctrl+Shift+\\)")
-                .clicked()
+            if editor_hover_text(
+                ui.selectable_label(false, RichText::new("\u{2501}").size(Style::BODY)),
+                "Split down (Ctrl+Shift+\\)",
+            )
+            .clicked()
             {
                 self.split_focused(SplitDir::H);
             }
             if self.tree.leaf_count() > 1 {
                 ui.add_space(Style::SP_M);
-                if ui
-                    .selectable_label(false, RichText::new("Close pane").size(Style::SMALL))
-                    .on_hover_text("Close the focused pane")
-                    .clicked()
+                if editor_hover_text(
+                    ui.selectable_label(false, RichText::new("Close pane").size(Style::SMALL)),
+                    "Close the focused pane",
+                )
+                .clicked()
                 {
                     let focus = self.focus;
                     self.close_pane(focus);
@@ -2793,10 +2813,11 @@ impl EditorSurface {
                     toggle_wrap = true;
                 }
                 ui.add_space(Style::SP_M);
-                if ui
-                    .selectable_label(autosave_on, RichText::new("Autosave").size(Style::SMALL))
-                    .on_hover_text("Save dirty buffers automatically after a short idle")
-                    .clicked()
+                if editor_hover_text(
+                    ui.selectable_label(autosave_on, RichText::new("Autosave").size(Style::SMALL)),
+                    "Save dirty buffers automatically after a short idle",
+                )
+                .clicked()
                 {
                     toggle_autosave = true;
                 }
@@ -3108,7 +3129,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         .frame(
             egui::Frame::default()
                 .fill(Style::SURFACE)
-                .inner_margin(Style::SP_XS),
+                .inner_margin(Style::toolbar_margin()),
         )
         .show_inside(ui, |ui| {
             action = menu_bar::show(ui, &cx);
@@ -3117,7 +3138,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         .frame(
             egui::Frame::default()
                 .fill(Style::SURFACE)
-                .inner_margin(Style::SP_XS),
+                .inner_margin(Style::toolbar_margin()),
         )
         .show_inside(ui, |ui| {
             if let Some(picked) = toolbar::show(ui, &cx, compact) {
@@ -3131,7 +3152,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         .frame(
             egui::Frame::default()
                 .fill(Style::SURFACE)
-                .inner_margin(Style::SP_XS),
+                .inner_margin(Style::toolbar_margin()),
         )
         .show_inside(ui, |ui| {
             if let Some(picked) = format_bar::show(ui, &cx, compact) {

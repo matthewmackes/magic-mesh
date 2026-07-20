@@ -39,11 +39,9 @@
 # script is drop-in for a gate. Output is greppable: each check prints one of
 #   [OK] / [FAIL] / [WARN] / [INFO] / [SKIP]
 #
-# ADVISORY / NOT AUTO-ENABLED. Nothing runs this for you yet. It is meant to gate
-# a release CUT — wire it into the farm CI gate (install-helpers/ci-gate.sh, the
-# always-on farm gate) as a pre-cut stage, or call it by hand right before
-# `/release`. It deliberately does NOT cut an RPM or run a release (both are
-# operator-gated); its job is only to VERIFY. The real-RPM mode expects an RPM a
+# The size-only check is wired into the RPM cut paths. The static payload/surface
+# checks remain useful as pre-cut gates and deliberately do NOT cut an RPM or run
+# a release; their job is only to VERIFY. The real-RPM mode expects an RPM a
 # gated build already produced.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,8 +53,10 @@
 #              * vendor/birthright/… → fetched+verified at build time; INFO, skipped.
 #              * anything else       → the file/glob exists in the tree now; a
 #                                      missing packaging source FAILs.
-#              Extra hard emphasis on the replacement bins mde-shell-egui, mackesd,
-#              mde-web-preview: each MUST appear as a target/release asset.
+#              Extra hard emphasis on the base replacement bins (mde-shell-egui,
+#              mackesd) and the Browser helper bins (mde-web-preview,
+#              mde-web-cef, cef-verify): each MUST appear as a target/release
+#              asset across the base + Browser package asset sets.
 #   surfaces : every mde-*-egui crate under crates/desktop (minus the shell host
 #              and the documented EXEMPT list) MUST be BOTH dock-mounted (named in
 #              the shell's dock.rs Surface enum) AND shipped (a path-dep of
@@ -69,13 +69,12 @@
 #
 # Size semantics (`size <rpm>`, build-deploy-12): the public dnf channel is served
 # from GitHub Pages (packaging/repo/magic-mesh.repo), a git branch, so the pushed
-# .rpm FILE is subject to GitHub's ~100 MiB hard per-file block. The monolithic RPM
-# is already ~one growth step from that cliff. This check measures the COMPRESSED
-# .rpm file (wc -c — the bytes actually pushed, not the uncompressed payload) and
+# .rpm FILE is subject to GitHub's ~100 MiB hard per-file block. This check
+# measures the COMPRESSED .rpm file (wc -c — the bytes actually pushed, not the
+# uncompressed payload) and
 # FAILs if it exceeds MCNF_RPM_SIZE_LIMIT_MIB (default 90 MiB — headroom under even
-# the strict 100 MB=95.37 MiB reading). Wire it into the release cut so the channel
-# can never be silently broken. See docs/design/rpm-size-split.md for the durable
-# fix (a co-installable magic-mesh-browser sub-package).
+# the strict 100 MB=95.37 MiB reading). Both base and Browser RPM cuts call it so
+# the channel cannot be silently broken.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # EXEMPT surface crates — mde-*-egui crates under crates/desktop that are NOT dock
@@ -110,8 +109,12 @@ DESKTOP_DIR="${DESKTOP_DIR:-$REPO_ROOT/crates/desktop}"
 readonly SHELL_HOST_CRATE="mde-shell-egui"
 EXEMPT_SURFACES=("mde-panel-egui")
 
-# The three replacement binaries the (a)-class regression is really about.
-readonly KEY_BINS=("mde-shell-egui" "mackesd" "mde-web-preview")
+# The replacement binaries the (a)-class regression is really about. Browser
+# helpers now live in the co-installable magic-mesh-browser package, so dry-run
+# validation checks the union while real-RPM validation checks the package shape.
+readonly BASE_KEY_BINS=("mde-shell-egui" "mackesd")
+readonly BROWSER_KEY_BINS=("mde-web-preview" "mde-web-cef" "cef-verify")
+readonly SERVER_KEY_BINS=("mackesd")
 
 # build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
 # so the pushed .rpm file hits GitHub's ~100 MiB hard per-file block. Fail a cut with
@@ -125,14 +128,14 @@ info() { printf '[INFO] %s\n' "$*"; }
 skip() { printf '[SKIP] %s\n' "$*"; }
 hdr()  { printf '\n=== %s ===\n' "$*"; }
 
-# ── parse_assets <cargo.toml> ────────────────────────────────────────────────
-# Emit one "source<TAB>dest" line per asset in the MAIN [package.metadata.
-# generate-rpm].assets array (NOT the .variants.server array — that headless
-# subset legitimately omits the GUI bins). Stops at the array's closing `]`.
-parse_assets() {
+# ── parse_assets_for <cargo.toml> <table> ────────────────────────────────────
+# Emit one "source<TAB>dest" line per asset in <table>.assets. Stops at the
+# asset array's closing `]` so nested variant tables do not leak into each other.
+parse_assets_for() {
   awk '
-    /^\[package\.metadata\.generate-rpm\]$/ { main = 1; next }
-    main && /^assets = \[/               { ina = 1; next }
+    $0 == "[" section "]" { main = 1; next }
+    main && /^\[/          { exit }
+    main && /^assets = \[/ { ina = 1; next }
     ina {
       if ($0 ~ /^[[:space:]]*\][[:space:]]*$/) { exit }
       if ($0 ~ /source[[:space:]]*=/) {
@@ -142,7 +145,16 @@ parse_assets() {
         print src "\t" dst
       }
     }
-  ' "$1"
+  ' section="$2" "$1"
+}
+
+# Main/base, browser subpackage, and server variant asset readers.
+parse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm"; }
+parse_browser_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.browser"; }
+parse_server_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.server"; }
+parse_all_shipped_assets() {
+  parse_assets "$1"
+  parse_browser_assets "$1"
 }
 
 # Does a path contain a glob metacharacter?
@@ -216,13 +228,13 @@ check_payload_dryrun() {
         fi
         ;;
     esac
-  done < <(parse_assets "$CARGO_TOML")
+  done < <(parse_all_shipped_assets "$CARGO_TOML")
 
-  info "parsed $total asset entries from the main generate-rpm array"
+  info "parsed $total asset entries from the base + browser generate-rpm arrays"
 
   hdr "key replacement binaries (must be shipped)"
   local kb
-  for kb in "${KEY_BINS[@]}"; do
+  for kb in "${BASE_KEY_BINS[@]}" "${BROWSER_KEY_BINS[@]}"; do
     if [ -n "${src_seen["target/release/$kb"]:-}" ]; then
       ok "key-bin        target/release/$kb  is in the asset set"
     else
@@ -275,19 +287,41 @@ check_payload_rpm() {
     return
   fi
 
+  local shape="base"
+  case "${rpm##*/}" in
+    magic-mesh-browser-*) shape="browser" ;;
+    magic-mesh-server-*) shape="server" ;;
+  esac
+
   # Key bins: exact install-path assertions (the DoD line for a strip/replace).
   hdr "key replacement binaries present in payload"
-  local want
-  for want in /usr/bin/mde-shell-egui /usr/bin/mackesd /usr/bin/mde-web-preview; do
+  local kb want
+  local -a key_bins=()
+  case "$shape" in
+    browser) key_bins=("${BROWSER_KEY_BINS[@]}") ;;
+    server)  key_bins=("${SERVER_KEY_BINS[@]}") ;;
+    *)       key_bins=("${BASE_KEY_BINS[@]}") ;;
+  esac
+  for kb in "${key_bins[@]}"; do
+    case "$kb" in
+      cef-verify) want="/usr/libexec/mackesd/cef-verify" ;;
+      *)          want="/usr/bin/$kb" ;;
+    esac
     if grep -Fxq "$want" <<<"$listing"; then
-      ok "key-bin        $want present in rpm -qlp"
+      ok "key-bin        $want present in ${shape} rpm -qlp"
     else
-      fail "key-bin        $want MISSING from the RPM payload"
+      fail "key-bin        $want MISSING from the ${shape} RPM payload"
     fi
   done
 
   hdr "every manifest asset present in payload"
   local src dst
+  local asset_stream
+  case "$shape" in
+    browser) asset_stream="parse_browser_assets" ;;
+    server)  asset_stream="parse_server_assets" ;;
+    *)       asset_stream="parse_assets" ;;
+  esac
   while IFS=$'\t' read -r src dst; do
     if [ -z "$src" ] || [ -z "$dst" ]; then continue; fi
     if has_glob "$src"; then
@@ -310,7 +344,7 @@ check_payload_rpm() {
         fail "asset          $want_path MISSING (source $src)"
       fi
     fi
-  done < <(parse_assets "$CARGO_TOML")
+  done < <($asset_stream "$CARGO_TOML")
 
   # Validating a REAL RPM also asserts it fits the channel ceiling (build-deploy-12).
   # Skip under the fake-list self-test hook (no real file to measure).

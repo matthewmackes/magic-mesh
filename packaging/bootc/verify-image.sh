@@ -40,7 +40,7 @@ ovs-vsctl --version >/dev/null 2>&1 \
     && ok "ovs-vsctl executes ($(ovs-vsctl --version | head -n 1))" \
     || bad "ovs-vsctl does not execute"
 [ ! -e /usr/bin/cloud-hypervisor ] \
-    && ok "cloud-hypervisor absent per QUASAR-CLOUD/QC-1" \
+    && ok "cloud-hypervisor absent per CONSTRUCT-CLOUD/QC-1" \
     || bad "cloud-hypervisor still present"
 [ -f /usr/lib/bootc/install/50-magic-mesh.toml ] \
     && ok "bootc install rootfs config present" \
@@ -66,6 +66,15 @@ find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -name '*.surface.*' | grep
     && ok "seat preset installed" || bad "seat preset missing"
 grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "typed role gate present in seat unit" || bad "typed role gate missing from seat unit"
+grep -q '^Delegate=yes$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit delegates cgroups for browser sandbox caps" \
+    || bad "seat unit missing Delegate=yes for browser sandbox caps"
+grep -q '^DelegateSubgroup=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit keeps shell in delegated subgroup for browser sandbox caps" \
+    || bad "seat unit missing DelegateSubgroup=shell for browser sandbox caps"
+grep -q '^Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit tells browser sandbox which delegated subgroup to escape" \
+    || bad "seat unit missing browser sandbox delegated-subgroup env"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \

@@ -1,4 +1,4 @@
-//! QC-12 (QUASAR-CLOUD) — the Workbench **Cloud** plane, the Controller plane's
+//! QC-12 (CONSTRUCT-CLOUD) — the Workbench **Cloud** plane, the Controller plane's
 //! successor (design Q70: "the Controller plane BECOMES the Cloud plane").
 //!
 //! One plane for **every mesh member** (Q82 — admin + self-service, no separate
@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::Style;
 
-use mackes_mesh_types::openstack::{ResourceTable, ServiceCatalog, HOT_TEMPLATE_VERSION};
+use mackes_mesh_types::cloud::{ResourceTable, ServiceCatalog, HOT_TEMPLATE_VERSION};
 use mackes_mesh_types::peers::default_workgroup_root;
 
 use mde_bus::hooks::config::Priority;
@@ -110,7 +110,7 @@ fn presets_dir(workgroup_root: &Path) -> PathBuf {
 // ─────────────────────────── the Bus reply mirror ───────────────────────────
 // Local serde mirrors of the mackesd `CloudReply` / mirror payloads (§6 — the
 // shell reads the JSON boundary without depending on the daemon crate; only the
-// mesh-neutral `mackes_mesh_types::openstack` shapes are shared).
+// mesh-neutral `mackes_mesh_types::cloud` shapes are shared).
 
 /// The shell-side mirror of the worker's unified `CloudReply` — only the fields
 /// this plane folds are named; `ok` + `gated` + `error` are the honest
@@ -231,8 +231,8 @@ struct MirrorServiceRow {
     status: ServiceState,
 }
 
-/// The node's `OpenStack` converge mirror — the `get-status` payload (a local
-/// mirror of the worker's `OpenStackState`).
+/// The node's cloud converge mirror — the `get-status` payload (a local
+/// mirror of the worker's converge state).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct MirrorStatus {
@@ -2459,7 +2459,7 @@ fn render_usage_tab(ui: &mut egui::Ui, state: &CloudPlaneState) {
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
-    use mackes_mesh_types::openstack::ResourceRow;
+    use mackes_mesh_types::cloud::ResourceRow;
     use mde_egui::egui::{pos2, vec2, Rect};
 
     /// Phase-C depth adoption — each Nova roster card carries the shared

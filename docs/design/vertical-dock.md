@@ -2,7 +2,7 @@
 
 > 🛑 **SUPERSEDED 2026-07-12 by [`win10-taskbar.md`](win10-taskbar.md) (WIN10-HYBRID).**
 > The operator reversed this direction: the left vertical dock is **retired** and the shell
-> chrome is a **single 48px bottom taskbar** again (Win10 structure + Quazar identity). Do
+> chrome is a **single 48px bottom taskbar** again (Win10 structure + Construct identity). Do
 > **NOT** implement the vertical dock from this doc — it is kept only as history. The Timers
 > & Alarms surface and the grouped-picker membership below carried forward; the *vertical
 > placement*, the removed clock, and the no-flyout tray did not. See `win10-taskbar.md`.

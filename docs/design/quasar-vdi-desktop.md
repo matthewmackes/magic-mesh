@@ -1,7 +1,7 @@
-# Quasar — the egui-native mesh thin-client desktop OS (E12, revised)
+# Construct — the egui-native mesh thin-client desktop OS (E12, revised)
 
 > **Status:** LOCKED (design) · 2026-06-30 · 50-question `/plan` survey.
-> **Series:** MCNF **12.0 "Quasar"** (package/repo id stays `magic-mesh`).
+> **Series:** MCNF **12.0 "Construct"** (package/repo id stays `magic-mesh`).
 > **Authority:** Memory > `AI_GOVERNANCE.md` > this doc > `docs/WORKLIST.md` body.
 > **Supersedes (in part):** `docs/design/cosmic-magic-mesh-egui.md` — the
 > **forked-compositor** desktop model (its locks 1/5/6/12: fork `cosmic-comp`,
@@ -10,7 +10,7 @@
 > (lock 2), the **fresh egui-native design / `Style` source** (locks 3/9), and
 > **egui built-in motion** (lock 10) — i.e. the `mde-egui` harness (E12-1, landed).
 >
-> **Revision 2026-07-03 — QUASAR-CLOUD supersession.** `docs/design/quasar-cloud.md`
+> **Revision 2026-07-03 — CONSTRUCT-CLOUD supersession.** `docs/design/quasar-cloud.md`
 > and `AI_GOVERNANCE.md §5` replace the local cloud-hypervisor target with
 > **Nova/libvirt/QEMU-KVM + OVN**. The cloud-hypervisor/`mde-kvm` text below is
 > preserved as the 2026-06-30 survey record and cutover context only; current
@@ -55,7 +55,7 @@ adopted capacity, never an install-time role.
 ### Round 2 — Local KVM (Workstation-local VMs)
 | # | Decision | Lock |
 |---|---|---|
-| 11 | VMM | **Superseded by QUASAR-CLOUD:** Nova/libvirt/QEMU-KVM + OVN replace the original cloud-hypervisor target. |
+| 11 | VMM | **Superseded by CONSTRUCT-CLOUD:** Nova/libvirt/QEMU-KVM + OVN replace the original cloud-hypervisor target. |
 | 12 | Local display | **virtio-gpu zero-copy** (dmabuf → wgpu texture) fast path; RDP/VNC fallback. |
 | 13 | GPU | **Operator choice per host** — shared virtio-gpu (virgl/venus) *or* dGPU passthrough (VFIO). |
 | 14 | Guest images | **Mesh-distributed golden images** (Syncthing) + operator ISOs. |
@@ -97,7 +97,7 @@ adopted capacity, never an install-time role.
 ### Round 5 — Identity, packaging, scope, sequencing
 | # | Decision | Lock |
 |---|---|---|
-| 41 | Identity | **Keep E12 "Quasar"; revise the design** (this doc + governance §4/§5/§6) to the VDI/egui-DRM model. |
+| 41 | Identity | **Keep E12 "Construct"; revise the design** (this doc + governance §4/§5/§6) to the VDI/egui-DRM model. |
 | 42 | Packaging | **Immutable bootc/ostree image** for the Workstation (image-based, appliance-style updates). |
 | 43 | Crate structure | **Many small crates** (granular: shell, chrome, each panel, RDP, VNC, KVM-broker, session-broker). |
 | 44 | Roles | **Lighthouse · XCP-NG · Workstation** (XCP-NG renamed from Server — the Xen host mirroring the xcp-ng toolstack) **+ a `desktop-host` capability tag** for peers that serve VMs. |
@@ -111,7 +111,7 @@ adopted capacity, never an install-time role.
 ## Resulting architecture
 
 ```
-                MCNF 12.0 "Quasar" — one egui shell, mesh VDI, no compositor
+                MCNF 12.0 "Construct" — one egui shell, mesh VDI, no compositor
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  desktop-shell (one egui binary on the DRM seat — immutable bootc spin)    │
   │    mde-shell-egui:  thin chrome bar  ⇕expand→  Workbench                   │
@@ -141,7 +141,7 @@ adopted capacity, never an install-time role.
 | `mde-vdi-rdp` | ironrdp → egui texture + input forward (RDP primary). |
 | `mde-vdi-vnc` | vnc-rs → egui texture (VNC/XAPI-console fallback). |
 | `mde-vdi-core` | Session model, adaptive codec, clipboard/audio/mesh-share bridges, protocol-agnostic surface the shell renders. |
-| `mde-kvm` | Superseded local cloud-hypervisor broker; retained only until QUASAR-CLOUD cutover deletes the replaced stack. |
+| `mde-kvm` | Superseded local cloud-hypervisor broker; retained only until CONSTRUCT-CLOUD cutover deletes the replaced stack. |
 | `mde-panel-*` | The mesh-native panels (Workbench/Files/Music/Voice) as in-shell modules reusing today's non-GUI logic. |
 | `mackesd` *(extend)* | `session_broker` + `vm_lifecycle` workers; the `desktop-host` capability. |
 | Reuse | `mde-bus`, `mackes-xcp` + the DATACENTER VM verbs (remote lifecycle/console), `mackes-mesh-types`, Nebula/etcd/Syncthing substrate. |
@@ -152,17 +152,17 @@ adopted capacity, never an install-time role.
 1. The Workstation **boots (bootc image) straight to the egui shell on the DRM seat** — no Wayland compositor, no X — and the shell renders through the shared `Style`.
 2. The **thin chrome bar** lists mesh peers + sessions + status and **expands into the full Workbench**; the mesh-control panels (Workbench/Files/Music/Voice) work live over the Bus.
 3. A **remote desktop** on another mesh peer (XCP-ng or Server) is **discovered**, connected over **Nebula via RDP (ironrdp)**, **rendered as an egui texture**, and is **interactive** (input forwarded; reserved escape chord returns to the shell). VNC/XAPI fallback works for a guest with no RDP.
-4. A **local QEMU/KVM desktop instance** runs through the libvirt/Nova host stack, uses the QEMU display path selected by QUASAR-CLOUD, and its desktop renders in the shell.
+4. A **local QEMU/KVM desktop instance** runs through the libvirt/Nova host stack, uses the QEMU display path selected by CONSTRUCT-CLOUD, and its desktop renders in the shell.
 5. **Sessions roam:** open sessions + layout persist to mesh state and reappear on a second Workstation; a disconnected VM **keeps running** and reconnects.
 6. **Clipboard + the mesh-share folder** move data host⇄guest⇄mesh; **audio** plays (virtio-sound local / protocol remote).
 7. `mackesd` runs the **session-broker + vm-lifecycle** workers; remote VM actions go through **typed verbs** to the hosting peer (no push-SSH); the leader coordinates.
-8. The **layered-tiers lint** passes and fails on a planted outward edge; **no libcosmic/iced/`mde-theme`** remains (`grep` empty); About/greeter reads `MCNF 12.0 "Quasar"`.
+8. The **layered-tiers lint** passes and fails on a planted outward edge; **no libcosmic/iced/`mde-theme`** remains (`grep` empty); About/greeter reads `MCNF 12.0 "Construct"`.
 9. v1 includes **GPU passthrough, USB redirection, per-monitor-different-VM, and live migration** (lock 48) — each runtime-demonstrated.
 
 ## Risks
 
 - **R1 — egui-on-DRM backend.** No winit KMS backend exists; the smithay DRM/GBM + libinput + wgpu/GBM path is real new engineering. *Mitigate:* smithay provides the DRM/GBM/libinput primitives; scope it inside `mde-egui` with a headless-testable seam; it is far less to own than a full compositor fork.
-- **R2 — QEMU/KVM display path + passthrough.** QUASAR-CLOUD deliberately moves the local VMM to the better-trodden libvirt/QEMU-KVM stack. *Mitigate:* pre-tooled images (virtio drivers); RDP/VNC/SPICE fallback if the virtio-gpu fast path lags; passthrough is operator-opt per host.
+- **R2 — QEMU/KVM display path + passthrough.** CONSTRUCT-CLOUD deliberately moves the local VMM to the better-trodden libvirt/QEMU-KVM stack. *Mitigate:* pre-tooled images (virtio drivers); RDP/VNC/SPICE fallback if the virtio-gpu fast path lags; passthrough is operator-opt per host.
 - **R3 — Guests as full flat-trust mesh peers (lock 47) + a raised envelope (lock 46).** A Windows guest on flat trust reaches every peer/service — a large blast radius, and more nodes stress etcd/Nebula. *Mitigate:* document the widened blast radius for operators (extends ENT-12); keep guests behind default-deny inbound; revisit per-service ACLs if the envelope grows materially.
 - **R4 — "Everything in v1" (lock 48).** Passthrough + USB + multi-mon + migration in the first cut is a large surface. *Mitigate:* the foundation-first sequence (lock 50) lands the core loop early; advanced features fan out across the farm once the shell + `mde-vdi` exist.
 - **R5 — Immutable bootc (lock 42).** A new delivery model vs RPM+kickstart; VM disks + mesh state must live on the writable/state partition, not the immutable image. *Mitigate:* `~/Local` + `/mnt/mesh-storage` are state, the egui shell + stack are the image.
@@ -186,7 +186,7 @@ adopted capacity, never an install-time role.
 6. **Advanced (fan out):** GPU passthrough · USB redirection · per-monitor VM · live migration · adaptive codec · clipboard/audio/mesh-share bridges.
 7. **Port the panels** — Files/Music/Voice as in-shell modules over their existing non-GUI logic.
 8. **Packaging** — the immutable **bootc** Workstation image; mesh-only set for headless roles; gh-pages channel.
-9. **Decommission** — remove libcosmic/iced + `mde-theme`/`mde-card`; strike the abandoned iced GUI + the retired cosmic-comp tasks; revise `AI_GOVERNANCE.md` §4/§5/§6/§8 + the About/version to 12.0 "Quasar".
+9. **Decommission** — remove libcosmic/iced + `mde-theme`/`mde-card`; strike the abandoned iced GUI + the retired cosmic-comp tasks; revise `AI_GOVERNANCE.md` §4/§5/§6/§8 + the About/version to 12.0 "Construct".
 
 ## Open items — resolved
 

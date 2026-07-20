@@ -1,5 +1,7 @@
 # Magic Setup Wizard — full-lifecycle TUI (SETUP epic, 2026-06-14)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the founding flow below has LH1 stand up a **LizardFS** cluster. **LizardFS is removed** — the live substrate is **etcd** (coordination) + **Syncthing** (files); see [`substrate-v2.md`](substrate-v2.md). The wizard's lifecycle intent carries forward; the LizardFS-specific founding steps are historical.
+
 A single verbose ratatui wizard, `magic-setup`, that takes a freshly-`dnf
 install`ed Fedora Server 43/44 node from zero to a fully-running mesh member —
 create or join a mesh, pick a role, stand up + keep running **all** services,

@@ -54,7 +54,7 @@ mtr, tmux, ncdu (to bundle), and the entire mesh layer beyond stock Fedora Serve
 | 35 | Custom | Yes — operator can add their own command entries (a Custom group) |
 | 36 | Confirm | **Typed arming** on destructive ops (reboot/shutdown/service-stop) |
 | 37 | Shells | **Multiple**: user shell, root shell (`sudo -i`), tmux session |
-| 38 | Provenance | A subtle per-entry **Fedora vs Quasar** tag |
+| 38 | Provenance | A subtle per-entry **Fedora vs Construct** tag |
 | 39 | Name | Title **"Console" / "Operations"**; the button is icon-only (terminal glyph) |
 | 40 | Keyboard | Full arrow-key nav + Enter; Esc closes |
 | 41 | Containers/VMs | Yes — a combined group (per Q50): **podman + virsh + OpenStack** ops together, **with a link to the correct GUI surface** (Instances/Cloud plane) |
@@ -86,7 +86,7 @@ mtr, tmux, ncdu (to bundle), and the entire mesh layer beyond stock Fedora Serve
   in `dock.rs` (far-left bottom rail, Start/Advanced tray glyph) that toggles it. The panel is a Win10 two-pane
   `Area` rising from the button (slide-up Motion); left rail = category jump-index +
   power/session + footer (user@host·version); right = pinned (Terminal+Monitor) + the
-  grouped entry list; each entry = icon + label + one-line desc + a Fedora/Quasar tag;
+  grouped entry list; each entry = icon + label + one-line desc + a Fedora/Construct tag;
   full arrow-key nav + focus ring (EXPLORER-18 posture). Selecting an entry closes the
   menu, switches to `Surface::Terminal`, and calls the terminal's `new_tab()` seam with
   the entry's command (named tab, stays-open-on-exit); root ops run under `sudo` in the

@@ -1,0 +1,59 @@
+---
+# WL-ARCH-001 Phase B / WL-ARCH-006 (U13) — the cloud configure entrypoint (the
+# successor to the retired cloud-config leg). The mackesd cloud worker runs this
+# (`ansible-playbook -i inventory/mesh.py playbooks/site.yml`) after an OpenTofu
+# apply provisions the VMs. It layers two passes over the mesh-derived dynamic
+# inventory:
+#
+#   1. a BASE convergence on every scope:cloud mesh VM (the `cloud_vm` group), then
+#   2. a per-delivery-type SPECIALIZATION selected by the node's delivery tag
+#      (the `delivery_<type>` groups the inventory builds from `delivery:<type>` /
+#      `scope:<type>` tags — see inventory/mesh.py).
+#
+# Each play targets a group the dynamic inventory populates from the live roster;
+# an empty group is skipped (Ansible warns, the run continues) — honest when no
+# workload of that delivery type is placed yet.
+
+# ── Pass 1 — base convergence on the mackesd mesh VMs (nodes tagged scope:cloud) ──
+- name: Configure cloud-provisioned mesh VMs (base)
+  hosts: cloud_vm
+  gather_facts: true
+  become: true
+  roles:
+    - role: cloud_vm
+
+# ── Pass 2 — per-delivery-type specialization (Workloads cockpit, WL-ARCH-006) ──
+- name: Desktop-VM — install/enable the Quasar VDI seat
+  hosts: delivery_desktop_vm
+  gather_facts: true
+  become: true
+  roles:
+    - role: desktop_seat
+
+- name: Service-VM — run the headless mesh service(s)
+  hosts: delivery_service_vm
+  gather_facts: true
+  become: true
+  roles:
+    - role: service
+
+- name: App-only-VM — VDI app-mode forwarding via the session_broker
+  hosts: delivery_app_vm
+  gather_facts: true
+  become: true
+  roles:
+    - role: app_forward
+
+- name: Android-VM — Cuttlefish host + cvd (VNC)
+  hosts: delivery_android_vm
+  gather_facts: true
+  become: true
+  roles:
+    - role: cuttlefish_host
+
+- name: Service-Container — Podman + Quadlet host prep
+  hosts: delivery_service_container
+  gather_facts: true
+  become: true
+  roles:
+    - role: container_host

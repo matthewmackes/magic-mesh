@@ -1,5 +1,7 @@
 # MUSIC-RFX — music client/interface refactor (sonixd-inspired)
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** locks the stack to the retired **iced/`libcosmic`/cosmic-text** toolkit. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Retained as a historical design record; the toolkit choices below are stale.
+
 Design survey locked 2026-06-17 (3-round `/plan`), prompted by "investigate using
 [sonixd](https://github.com/jeffvli/sonixd) to refactor the Music Client and
 Interface."

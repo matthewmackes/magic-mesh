@@ -3,7 +3,7 @@
 //!
 //! This is pure glue over `mde-term-egui` (§6) — it re-derives no terminal UI. It
 //! mirrors the TERM-16 mount seam (`TerminalSurface` / `terminal_pump` /
-//! `terminal_panel`) that mounts the terminal into the one Quasar shell, driving
+//! `terminal_panel`) that mounts the terminal into the one Construct shell, driving
 //! the reused [`TabbedTerminal`] with its own public [`dispatch_keys`] +
 //! [`show`] + the bundled monospace [`fonts::install`]. The one difference from
 //! `mde_term_egui::real_terminal()` is the **cwd**: the acceptance spawns the

@@ -1,7 +1,7 @@
 #!/bin/bash
 # setup-selinux-policy.sh - QC-22 SELinux tightening bootstrap.
 #
-# Quasar-cloud restored the Red Hat-conventions target: SELinux should be
+# Construct-cloud restored the Red Hat-conventions target: SELinux should be
 # Enforcing on shipped nodes, with MCNF/OpenStack policy loaded explicitly. This
 # helper is intentionally safe in RPM flows: it is run by a bounded systemd
 # oneshot, never synchronously from dnf %post.

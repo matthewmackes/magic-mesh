@@ -1,0 +1,19 @@
+---
+# WL-ARCH-006 (U13) — container_host role defaults.
+
+# Host packages to install (podman ships the Quadlet systemd generator).
+container_host_packages:
+  - podman
+
+# Rootless by default (plan U7): a lingering unprivileged user owns the containers,
+# its Quadlet units live in ~/.config/containers/systemd. Set false for a
+# system-wide (rootful) host under /etc/containers/systemd.
+container_host_rootless: true
+container_host_user: mesh-containers
+
+# Optional registry auth. The credential (a registry password/token) is an
+# age-sealed store name resolved via the mde_seal lookup — NO Ansible Vault. Leave
+# `container_host_registry_secret` empty to skip the login entirely.
+container_host_registry: ""
+container_host_registry_user: ""
+container_host_registry_secret: ""

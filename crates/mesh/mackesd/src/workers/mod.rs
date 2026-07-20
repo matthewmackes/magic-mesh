@@ -352,6 +352,13 @@ pub mod compute_registry;
 // and publishes a RouterEntry to `mesh/devices/router/<mac>` + the QNM-Shared
 // `<host>/router-registry.json`. Design: docs/design/router-control.md.
 pub mod router_registry;
+// WL-RUN-006 — the router_action worker: the privileged firewall-edit executor.
+// Drains this node's replicated `action/router/<self>/` dir, gates each edit
+// behind a typed-confirm token, wraps the Vyatta apply in commit-confirm
+// (auto-revert), and hash-chain audits every edit. Rank-0 universal like
+// device_control; the live mutation is operator-gated (MDE_ROUTER_ACTION_LIVE).
+// Design: docs/design/router-control.md (mutations fast-follow).
+pub mod router_action;
 // MEDIA-7 — the media_registry worker: on a Lighthouse_Media node only
 // (capability-gated on MEDIA-1's Capability::Media), register the local
 // navidrome/media instance into the mesh service registry — the per-peer
@@ -389,6 +396,13 @@ pub mod apps_installed;
 // per Q96 + rpc.rs convention (design doc §3's per-ULID notation
 // reinterpreted accordingly).
 pub mod cert_authority;
+// WL-ARCH-001 Phase B — the OpenTofu + Ansible cloud backend worker (the
+// successor to the deleted `openstack` worker tree). Drains `action/cloud/*`
+// verbs (leader-gated), shells OpenTofu (`infra/tofu/cloud`) + Ansible + virsh
+// with live mutation operator-gated behind `MDE_CLOUD_APPLY=1`, and publishes
+// `state/cloud/<node>` (provider health + resource roster via the neutral
+// `mackes_mesh_types::cloud` types). Rank-0 universal like service_aggregator.
+pub mod cloud;
 // VIRT-7 (v5.0.0) — per-network firewalld port forwarding. Each
 // peer subscribes to `compute/{expose,unexpose}/<own-peer-addr>`
 // and writes firewalld rich rules per selected network
@@ -478,7 +492,7 @@ pub mod hardware_probe;
 // hardware taxonomy sysfs-first + publishes `device-inventory/<host>.json` for
 // the About → Device-Manager surface (docs/design/about-device-manager.md).
 pub mod device_inventory;
-// E12-19 (Quasar host controls) — mirrors this node's seat snapshot to
+// E12-19 (Construct host controls) — mirrors this node's seat snapshot to
 // state/host/<node>/seat and executes remote typed verbs (volume/BT/
 // display/power) behind the allowlist + safety interlocks. Runs on every
 // node; spawned in run_serve.
@@ -647,19 +661,15 @@ pub mod vm_lifecycle;
 // `event/podman/containers`. Universal like vm_lifecycle — every node can host
 // datacenter containers.
 pub mod container;
-// QC-2 (QUASAR-CLOUD) — the mackesd `openstack` worker: the supervision root of
-// the mesh-becomes-an-OpenStack-cloud epic (docs/design/quasar-cloud.md). Reads
-// the fleet/one-state cloud doctrine for WHICH Kolla service containers this
-// node hosts (APIs on every node, leader-hosted MariaDB, no controller box —
-// Q5/Q15/Q22; the live etcd/Syncthing doctrine read is a typed IntegrationGated
-// until QC-4 authors the record), converges desired vs running under Podman via
-// the injectable PodmanRunner seam (start missing / restart killed / stop
-// extra; starts honestly gated on the operator-mirrored image (QC-3 airgap
-// lane, Q18) + the rendered Kolla config (QC-4)), and publishes the
-// `state/openstack/<node>` mirror. `[!]`-grade failures ride the mackesd::alert
-// lane (→ chat, NOTIFY-CHAT lock 11). Universal (rank 0) — the doctrine, not
-// the role, decides which services a node hosts.
-pub mod openstack;
+// WL-UX-005 — the peer_app_launch worker: the peer-app remote-execution executor.
+// Drains `action/apps/launch` (published by the shell's unified Front Door as
+// `{node, app_id, name}`) and, only for requests addressed to its own node id,
+// actually launches the requested app locally. Security is load-bearing: it execs
+// ONLY an app this node itself advertises in its own app catalog (resolves the
+// opaque `app_id` against `ipc::apps::scan_local_apps`, never an arbitrary command
+// from the wire), and logs every launch + refusal. Workstation-tier — a headless
+// relay has no seat to launch onto — and idles gracefully when no requests arrive.
+pub mod peer_app_launch;
 // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
 // explorer (docs/design/unit-explorer.md). Unions three sources into one typed
 // `Unit` stream and publishes `state/units/<node>`: the mesh mirror (peers +
@@ -671,6 +681,15 @@ pub mod openstack;
 // publish-on-change mirror + heartbeat, and the E9 `action/units/get-stream` read
 // verb. Universal (rank 0) — every node publishes its own unit view.
 pub mod unit_aggregator;
+// WL-FUNC-008 — the service_aggregator worker: the unified service
+// provenance/health view. Merges three service sources — the published KDC
+// directory (`kdc-services/<host>.json`), the nmap probe inventory
+// (`probe-inventory.json`), and the Explorer's `service → openable-action`
+// enrichment map — into one deduped `ServiceRecord` set (with stale-entry TTL
+// age-out) published on `state/services/<node>`. Two injectable source seams + a
+// pure fold, so the whole merge folds headless. Universal (rank 0) like
+// unit_aggregator — every node publishes its own mesh-wide service view, no center.
+pub mod service_aggregator;
 // E12-20 — the storage worker: the privileged owner of the Workbench Storage plane
 // (GParted for the mesh, docs/design/workbench-storage-plane.md). Owns a typed
 // StorageOp pending-queue executor over a live UDisks2 zbus topology — stage-time
@@ -821,6 +840,19 @@ pub mod onboard_apply;
 // renders. Bus + Syncthing roots are injectable seams so the whole worker is
 // headless-testable; live 2-node delivery + real backfill are integration-gated.
 pub mod chat;
+// WL-FUNC-011 Phase 2 — the mesh `collab` worker: the live spine of the
+// Communications suite, driving the headless `mde-collab-core` CollabEngine on
+// the mesh. Drains `action/collab/*` commands (validate + Ed25519-sign via this
+// node's identity → signed events), appends each to the per-space
+// Syncthing-replicable actor log + projects it into the SQLite read models,
+// publishes the live signed event on `collab/event/<space>/<actor>` +
+// republishes the affected `state/collab/*` read models, and converges by merging
+// foreign `collab/event/*` (bus fast-path) + replicated actor logs (Syncthing
+// durable-path) — signature-checked (forged events dropped), idempotent,
+// order-independent. Universal (rank 0), the same shape as the chat worker it
+// will EVENTUALLY replace (Phase 4; it runs ALONGSIDE chat for now). Bus + actor
+// -log roots are injectable seams so the whole flow is headless-testable.
+pub mod collab;
 // CHAT-FIX-2 — the local-notification producer worker (design
 // docs/design/console-frontdoor.md Q34/46/47). The real empty-Chat fix: with the
 // chat worker running but no peer chatter, nothing produced local system events,
@@ -833,6 +865,16 @@ pub mod chat;
 // an injectable probe (absent binary ⇒ skipped honestly), so the whole worker is
 // headless-testable with fixtures; runs on EVERY node (rank 0).
 pub mod notify;
+// WL-SEC-002 — the federation runtime-enforcement worker. Reads the accepted
+// cross-mesh grants (`federation.yaml`) and ENFORCES them at runtime: drains the
+// cross-mesh ingress spool through the DEFAULT-DENY decision gate (only granted,
+// non-excluded topics from accepted/non-revoked foreign meshes cross onto the local
+// bus; everything else is dropped + audited), drains the shell Federation panel's
+// accept/revoke/refuse-mint actions (accept installs the cross-mesh Nebula trust
+// cert; revoke deletes it), and publishes the `state/federation/<node>` mirror the
+// shell renders. Universal (rank 0): a lighthouse relays cross-mesh traffic so it
+// especially must enforce the boundary; a workstation enforces its own ingress too.
+pub mod federation_enforcer;
 // NODE-GRADE-1 — the per-node self-grade worker (design docs/design/node-grade.md).
 // Every node computes + publishes its OWN A–F capability grade from telemetry the
 // platform already gathers (§6, no new probes): CPU headroom, RAM + disk free,

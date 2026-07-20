@@ -2,7 +2,7 @@
 
 > ℹ️ **Taskbar chrome revised 2026-07-12 by [`win10-taskbar.md`](win10-taskbar.md)
 > (WIN10-HYBRID).** Where this survey's bottom-bar specifics conflict, the WIN10-HYBRID
-> single 48px bottom taskbar (Win10 structure + Quazar identity) wins. The desktop/icon/
+> single 48px bottom taskbar (Win10 structure + Construct identity) wins. The desktop/icon/
 > surface-roster decisions here still stand; only the taskbar anatomy is superseded.
 
 **Status:** locked 2026-07-10 via a 23-question one-at-a-time operator survey

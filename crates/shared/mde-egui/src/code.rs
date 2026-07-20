@@ -33,7 +33,7 @@ pub const LITERAL: Color32 = Color32::from_rgb(0xFF, 0x7E, 0xB6);
 /// Carbon cyan 40 — properties, fields, object/TOML keys.
 pub const PROPERTY: Color32 = Color32::from_rgb(0x33, 0xB1, 0xFF);
 /// Muted comment gray — dimmer than [`Style::TEXT_DIM`] so comments recede
-/// behind live code, tinted to the Quasar blue-gray ramp.
+/// behind live code, tinted to the Construct blue-gray ramp.
 pub const COMMENT: Color32 = Color32::from_rgb(0x6E, 0x6E, 0x7A);
 /// Operators + punctuation share the chrome's dim text tone: present, quiet.
 pub const PUNCT: Color32 = Style::TEXT_DIM;

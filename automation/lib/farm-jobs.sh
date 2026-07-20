@@ -3,12 +3,16 @@
 # automation capabilities. Turns the human worklist into a machine-readable job
 # list so a fleet-side automation (NOT an AI) can pick build work.
 #
-# CONVENTION: any worklist task line may carry a farm-build request:
-#     - [>] **BUS-RETENTION-1: …**  @farm:{cargo build -p mde-bus}
+# CONVENTION: any active worklist item may carry a farm-build request:
+#     ### WL-BUILD-002 - Farm shared cache
+#     - Status: Remaining
+#     - Verification method: @farm:{cargo build -p mde-bus}
 # The text inside @farm:{ … } is the exact command run on a build VM. A task may
-# carry more than one. Status comes from the task's checkbox:
-#     [ ] open · [>] in-progress · [✓] done · [!] blocked
-# Only OPEN + IN-PROGRESS tasks yield ACTIVE jobs (done/blocked are skipped).
+# carry more than one. Status comes from the reconciled worklist status:
+#     Remaining -> open; Blocked / Needs clarification -> blocked
+# Only OPEN tasks yield ACTIVE jobs (blocked/clarification-needed are skipped).
+# The parser also understands the retired checkbox format used by old fixtures:
+#     [ ] open · [>] in-progress · [✓] done · [!] blocked.
 #
 # A @farm:{…} payload counts as a REAL build job ONLY when its command is an actual
 # build command — i.e. it begins with `cargo ` (cargo build/test/clippy/generate-rpm
@@ -29,7 +33,7 @@
 #   farm-jobs.sh jobid <task> <cmd>   print the stable id for a task+command
 set -uo pipefail
 
-WORKLIST="${MCNF_WORKLIST:-$(cd "$(dirname "$0")/../.." && pwd)/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$(cd "$(dirname "$0")/../.." && pwd)/docs/platform/WORKLIST.md}"
 
 jobid() { printf '%s\037%s' "$1" "$2" | sha1sum | cut -c1-12; }
 
@@ -54,7 +58,20 @@ parse() {
   # Walk lines; remember the most recent task id + status, attach @farm jobs to it.
   local task_id="-" status="?"
   while IFS= read -r line; do
-    # Task header line?  - [x] **PREFIX-N: title …
+    # Reconciled task header?  ### WL-AREA-001 - title
+    if [[ "$line" =~ ^###[[:space:]]+([A-Z][A-Za-z0-9._-]*)[[:space:]]+-[[:space:]]+ ]]; then
+      task_id="${BASH_REMATCH[1]}"
+      status="?"
+    fi
+    # Reconciled status line. Remaining is the only unblocked/runnable state.
+    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]Status:[[:space:]]*(Remaining|Blocked|Needs[[:space:]]clarification)[[:space:]]*$ ]]; then
+      case "${BASH_REMATCH[1]}" in
+        Remaining) status="open" ;;
+        Blocked|Needs*) status="blocked" ;;
+        *) status="?" ;;
+      esac
+    fi
+    # Retired task header line?  - [x] **PREFIX-N: title …
     if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[([ x>!✓])\][[:space:]]*\*\*([A-Z][A-Za-z0-9._-]*): ]]; then
       case "${BASH_REMATCH[1]}" in
         " ") status="open" ;;
@@ -101,6 +118,28 @@ self_test() {
   check "empty payload → no"          "$(bc '')" no
   check "non-cargo verb → no"         "$(bc 'make all')" no
   check "cargo-prefixed non-word → no" "$(bc 'cargofoo build')" no
+  local td wl
+  td="$(mktemp -d "${TMPDIR:-/tmp}/farm-jobs-self.XXXXXX")" || return 1
+  trap "rm -rf '$td'" EXIT
+  wl="$td/WORKLIST.md"
+  {
+    printf '%s\n' '# Worklist'
+    printf '%s\n' '### WL-BUILD-002 - Real job'
+    printf '%s\n' '- Status: Remaining'
+    printf '%s\n' '- Verification method: @farm:{cargo build -p mde-bus}'
+    printf '%s\n' '### WL-CRIT-004 - Blocked job'
+    printf '%s\n' '- Status: Blocked'
+    printf '%s\n' '- Verification method: @farm:{cargo test -p mackesd}'
+    printf '%s\n' '### WL-DOC-001 - Placeholder'
+    printf '%s\n' '- Status: Remaining'
+    printf '%s\n' '- Verification method: @farm:{crate,verify}'
+  } >"$wl"
+  check "new worklist active job count → 1" \
+    "$(MCNF_WORKLIST="$wl" "$0" active | wc -l | tr -d ' ')" 1
+  check "new worklist list job count → 2" \
+    "$(MCNF_WORKLIST="$wl" "$0" list | wc -l | tr -d ' ')" 2
+  check "new worklist task id preserved" \
+    "$(MCNF_WORKLIST="$wl" "$0" active | awk -F'\t' 'NR==1 { print $3 }')" WL-BUILD-002
   if [ "$fails" -eq 0 ]; then echo "farm-jobs: self-test passed"; return 0; fi
   echo "farm-jobs: SELF-TEST FAILED ($fails)" >&2; return 1
 }

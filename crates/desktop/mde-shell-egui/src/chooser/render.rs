@@ -15,6 +15,103 @@
 
 use super::*;
 
+const CHOOSER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+
+pub(super) fn chooser_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(CHOOSER_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+fn chooser_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| chooser_tooltip(ui, text.as_str()))
+}
+
+fn chooser_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let previous_style = response.ctx.style();
+    let mut menu_style = (*previous_style).clone();
+    apply_chooser_popup_style(&response.ctx, &mut menu_style);
+    response.ctx.set_style(menu_style);
+    let _ = response.context_menu(|ui| {
+        let ctx = ui.ctx().clone();
+        apply_chooser_popup_style(&ctx, ui.style_mut());
+        add_contents(ui);
+    });
+    response.ctx.set_style(previous_style);
+}
+
+fn chooser_combo_menu<R>(
+    ui: &mut egui::Ui,
+    combo: egui::ComboBox,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ui.scope(|ui| {
+        let ctx = ui.ctx().clone();
+        apply_chooser_popup_style(&ctx, ui.style_mut());
+        combo.show_ui(ui, |ui| {
+            let ctx = ui.ctx().clone();
+            apply_chooser_popup_style(&ctx, ui.style_mut());
+            add_contents(ui)
+        })
+    })
+    .inner
+}
+
+pub(super) fn apply_chooser_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
+    let palette = Style::current_palette(ctx);
+    let border = egui::Stroke::new(1.0, palette.border);
+    let text = egui::Stroke::new(1.0, palette.text);
+    let text_dim = egui::Stroke::new(1.0, palette.text_dim);
+    let accent = Style::resolve_color(ctx, Style::ACCENT);
+    let visuals = &mut style.visuals;
+
+    visuals.window_fill = palette.surface;
+    visuals.panel_fill = palette.surface;
+    visuals.faint_bg_color = palette.surface;
+    visuals.extreme_bg_color = palette.bg;
+    visuals.window_stroke = border;
+    visuals.override_text_color = Some(palette.text);
+
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.bg_stroke = border;
+    visuals.widgets.noninteractive.fg_stroke = text_dim;
+
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    visuals.widgets.inactive.bg_stroke = border;
+    visuals.widgets.inactive.fg_stroke = text;
+
+    visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    visuals.widgets.hovered.fg_stroke = text;
+
+    visuals.widgets.active.bg_fill = palette.surface_hi;
+    visuals.widgets.active.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    visuals.widgets.active.fg_stroke = text;
+
+    visuals.widgets.open.bg_fill = palette.surface_hi;
+    visuals.widgets.open.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.open.bg_stroke = border;
+    visuals.widgets.open.fg_stroke = text;
+
+    visuals.selection.bg_fill = accent.gamma_multiply(0.25);
+    visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+    style.spacing.button_padding = egui::vec2(Style::SP_S, Style::CONTROL_PAD_Y);
+    style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::TOOLBAR_INSET_Y);
+}
+
 /// The scrollable grid body: the CHOOSER-8 live narrowing (filter → node groups
 /// ordered favorites-first + by the sort key), the "no match" copy when a filter
 /// zeroes the roster, the CHOOSER-4 connect picker, the CHOOSER-8 manual-source
@@ -142,48 +239,60 @@ pub(super) fn filter_bar(
         ui.add_space(Style::SP_S);
 
         // Node filter.
-        egui::ComboBox::from_id_salt("chooser-filter-node")
-            .selected_text(filter.node.as_deref().unwrap_or("All nodes"))
-            .show_ui(ui, |ui| {
+        chooser_combo_menu(
+            ui,
+            egui::ComboBox::from_id_salt("chooser-filter-node")
+                .selected_text(filter.node.as_deref().unwrap_or("All nodes")),
+            |ui| {
                 ui.selectable_value(&mut filter.node, None, "All nodes");
                 for node in nodes {
                     ui.selectable_value(&mut filter.node, Some(node.clone()), node);
                 }
-            });
+            },
+        );
         ui.add_space(Style::SP_S);
 
         // Protocol filter.
-        egui::ComboBox::from_id_salt("chooser-filter-proto")
-            .selected_text(filter.protocol.map_or("Any protocol", Protocol::badge))
-            .show_ui(ui, |ui| {
+        chooser_combo_menu(
+            ui,
+            egui::ComboBox::from_id_salt("chooser-filter-proto")
+                .selected_text(filter.protocol.map_or("Any protocol", Protocol::badge)),
+            |ui| {
                 ui.selectable_value(&mut filter.protocol, None, "Any protocol");
                 for proto in Protocol::ALL {
                     ui.selectable_value(&mut filter.protocol, Some(proto), proto.badge());
                 }
-            });
+            },
+        );
         ui.add_space(Style::SP_S);
 
         // Status filter.
-        egui::ComboBox::from_id_salt("chooser-filter-status")
-            .selected_text(filter.status.map_or("Any status", Reachability::label))
-            .show_ui(ui, |ui| {
+        chooser_combo_menu(
+            ui,
+            egui::ComboBox::from_id_salt("chooser-filter-status")
+                .selected_text(filter.status.map_or("Any status", Reachability::label)),
+            |ui| {
                 ui.selectable_value(&mut filter.status, None, "Any status");
                 for status in Reachability::ALL {
                     ui.selectable_value(&mut filter.status, Some(status), status.label());
                 }
-            });
+            },
+        );
         ui.add_space(Style::SP_S);
 
         // OS filter — only when the roster carries OS hints.
         if !oses.is_empty() {
-            egui::ComboBox::from_id_salt("chooser-filter-os")
-                .selected_text(filter.os.as_deref().unwrap_or("Any OS"))
-                .show_ui(ui, |ui| {
+            chooser_combo_menu(
+                ui,
+                egui::ComboBox::from_id_salt("chooser-filter-os")
+                    .selected_text(filter.os.as_deref().unwrap_or("Any OS")),
+                |ui| {
                     ui.selectable_value(&mut filter.os, None, "Any OS");
                     for os in oses {
                         ui.selectable_value(&mut filter.os, Some(os.clone()), os);
                     }
-                });
+                },
+            );
             ui.add_space(Style::SP_S);
         }
 
@@ -193,13 +302,15 @@ pub(super) fn filter_bar(
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL),
         );
-        egui::ComboBox::from_id_salt("chooser-sort")
-            .selected_text(filter.sort.label())
-            .show_ui(ui, |ui| {
+        chooser_combo_menu(
+            ui,
+            egui::ComboBox::from_id_salt("chooser-sort").selected_text(filter.sort.label()),
+            |ui| {
                 for key in SortKey::ALL {
                     ui.selectable_value(&mut filter.sort, key, key.label());
                 }
-            });
+            },
+        );
 
         // Clear — only while something is narrowing the grid.
         if filter.is_active() {
@@ -304,7 +415,7 @@ pub(super) fn source_card(
         .inner
     });
     let controls = scoped.inner;
-    let response = scoped.response.on_hover_text(card_tooltip(source));
+    let response = chooser_hover_text(scoped.response, card_tooltip(source));
 
     // a11y-05 — the card's own accesskit `Button` node (role + name + state +
     // bounds + Click), keyed by the response id so egui merges it onto this
@@ -323,7 +434,9 @@ pub(super) fn source_card(
     // CHOOSER-8 — the per-card context menu (right click). A menu pick takes
     // precedence over the inline controls + the primary click.
     let mut menu_action = None;
-    response.context_menu(|ui| card_context_menu(ui, source, favorite, &mut menu_action));
+    chooser_context_menu(&response, |ui| {
+        card_context_menu(ui, source, favorite, &mut menu_action);
+    });
     if menu_action.is_some() {
         return menu_action;
     }
@@ -442,7 +555,7 @@ pub(super) fn fit_centered(bounds: egui::Rect, img: egui::Vec2) -> egui::Rect {
 /// The card's content rows, top to bottom inside the plate. Returns the inline
 /// controls surfaced this frame — a CHOOSER-7 power op on a local-VM card, and/or
 /// the CHOOSER-8 offline Retry.
-pub(super) fn card_body(
+fn card_body(
     ui: &mut egui::Ui,
     source: &DesktopSource,
     recent: bool,
@@ -527,10 +640,8 @@ pub(super) fn card_body(
     if !source.connectable() && source.origin != SourceOrigin::LocalVm {
         ui.add_space(Style::SP_XS);
         ui.set_opacity(1.0);
-        if ui
-            .add(egui::Button::new(RichText::new("Retry").size(Style::SMALL)))
-            .on_hover_text("Re-check discovery — nothing is probed from here")
-            .clicked()
+        let retry = ui.add(egui::Button::new(RichText::new("Retry").size(Style::SMALL)));
+        if chooser_hover_text(retry, "Re-check discovery — nothing is probed from here").clicked()
         {
             controls.retry = true;
         }
@@ -609,7 +720,7 @@ pub(super) fn protocol_badge(ui: &mut egui::Ui, offer: ProtocolOffer) {
     ui.painter()
         .galley(rect.min + pad, galley, Style::ACCENT_HI);
     if let Some(port) = offer.port {
-        let _ = resp.on_hover_text(format!("port {port}"));
+        let _ = chooser_hover_text(resp, format!("port {port}"));
     }
 }
 

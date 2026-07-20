@@ -4,9 +4,12 @@
 //! is now just egui's built-in `animate_bool` driven by a handful of named
 //! durations, so every surface eases the same way without a separate framework.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    hash::Hash,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
-use egui::Context;
+use egui::{Color32, Context, Pos2, Rect, Vec2};
 
 /// Process-global **reduce-motion** preference (a11y-07): a motion / vestibular-comfort
 /// toggle. When set, the shared eased helpers ([`Motion::animate`] /
@@ -17,10 +20,216 @@ use egui::Context;
 /// UI-comfort flag, not a synchronisation edge). Deliberately global — every surface
 /// paints through the one shared `Motion` table, so one flag damps them all without
 /// threading a parameter through every widget.
-static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
+static MOTION_MODE: AtomicU8 = AtomicU8::new(MotionMode::Normal as u8);
 
 /// The shared motion table. Durations are in **seconds** (egui's animation unit).
 pub struct Motion;
+
+/// Runtime motion policy for every shared animation helper.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionMode {
+    /// Full movement and the normal preset timings.
+    Normal = 0,
+    /// Shortened/faded motion for vestibular comfort.
+    Reduced = 1,
+    /// No travel: values jump to their endpoints.
+    Disabled = 2,
+}
+
+impl Default for MotionMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl MotionMode {
+    #[must_use]
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Reduced,
+            2 => Self::Disabled,
+            _ => Self::Normal,
+        }
+    }
+
+    /// Whether this mode should report `Motion::reduce_motion() == true` for
+    /// backwards-compatible callers that only understand the old boolean.
+    #[must_use]
+    pub fn is_reduced(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+}
+
+/// Named motion presets for production chrome. They are deliberately semantic
+/// rather than caller-local duration literals so the shell can tune one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionPreset {
+    /// Hover, focus, press, and selected/toggle micro states.
+    Control,
+    /// Taskbar, drawers, sheets, and Start-like panels.
+    Panel,
+    /// Anchored menus, context menus, browser/site popups.
+    Popover,
+    /// Modal/dialog presentation and dismissal.
+    Dialog,
+    /// Workspace, browser page, or route changes.
+    Page,
+    /// List/card insert, remove, expand, collapse, and selection rails.
+    Layout,
+    /// Release/snap/cancel settling after direct manipulation.
+    DragSettle,
+}
+
+/// Easing curve used by a [`MotionSpec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionEasing {
+    /// Linear interpolation.
+    Linear,
+    /// Cubic smoothstep: eased in and out with no overshoot.
+    SmoothStep,
+}
+
+impl MotionEasing {
+    /// Sample this easing curve at normalized progress `t`.
+    #[must_use]
+    pub fn sample(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::SmoothStep => t * t * (3.0 - 2.0 * t),
+        }
+    }
+}
+
+/// A concrete timing/spring configuration resolved from a [`MotionPreset`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionSpec {
+    /// The semantic preset this spec came from.
+    pub preset: MotionPreset,
+    /// Normal-mode duration in seconds.
+    pub normal_secs: f32,
+    /// Reduced-mode duration in seconds. `0.0` means endpoint-only.
+    pub reduced_secs: f32,
+    /// Easing curve for duration-driven values.
+    pub easing: MotionEasing,
+    /// Optional spring parameters for callers that use spring settling.
+    pub spring: Option<Spring>,
+}
+
+impl MotionSpec {
+    /// Build a concrete motion spec.
+    #[must_use]
+    pub const fn new(
+        preset: MotionPreset,
+        normal_secs: f32,
+        reduced_secs: f32,
+        easing: MotionEasing,
+        spring: Option<Spring>,
+    ) -> Self {
+        Self {
+            preset,
+            normal_secs,
+            reduced_secs,
+            easing,
+            spring,
+        }
+    }
+
+    /// Resolve the canonical spec for a named preset.
+    #[must_use]
+    pub const fn for_preset(preset: MotionPreset) -> Self {
+        match preset {
+            MotionPreset::Control => Self::new(preset, 0.10, 0.0, MotionEasing::SmoothStep, None),
+            MotionPreset::Panel => Self::new(
+                preset,
+                0.18,
+                0.06,
+                MotionEasing::SmoothStep,
+                Some(Spring::SNAPPY),
+            ),
+            MotionPreset::Popover => Self::new(preset, 0.14, 0.06, MotionEasing::SmoothStep, None),
+            MotionPreset::Dialog => Self::new(preset, 0.18, 0.06, MotionEasing::SmoothStep, None),
+            MotionPreset::Page => Self::new(preset, 0.22, 0.08, MotionEasing::SmoothStep, None),
+            MotionPreset::Layout => Self::new(
+                preset,
+                0.18,
+                0.08,
+                MotionEasing::SmoothStep,
+                Some(Spring::SNAPPY),
+            ),
+            MotionPreset::DragSettle => Self::new(
+                preset,
+                0.24,
+                0.0,
+                MotionEasing::SmoothStep,
+                Some(Spring::SNAPPY),
+            ),
+        }
+    }
+
+    /// Duration in seconds for a runtime mode.
+    #[must_use]
+    pub fn duration_for(self, mode: MotionMode) -> f32 {
+        match mode {
+            MotionMode::Normal => self.normal_secs,
+            MotionMode::Reduced => self.reduced_secs,
+            MotionMode::Disabled => 0.0,
+        }
+        .max(0.0)
+    }
+
+    /// Eased progress for `elapsed` seconds in `mode`.
+    #[must_use]
+    pub fn progress_at(self, elapsed: f32, mode: MotionMode) -> f32 {
+        let duration = self.duration_for(mode);
+        if duration <= f32::EPSILON {
+            return 1.0;
+        }
+        self.easing
+            .sample((elapsed.max(0.0) / duration).clamp(0.0, 1.0))
+    }
+}
+
+/// Lifecycle phase for presentation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Not painted and not interactive.
+    Hidden,
+    /// Painted while moving toward visible.
+    Entering,
+    /// Painted, settled, and visible.
+    Visible,
+    /// Painted while moving toward hidden.
+    Exiting,
+}
+
+impl Phase {
+    /// Derive the next phase from the desired visible state and whether the
+    /// animation has reached its target.
+    #[must_use]
+    pub fn resolve(want_visible: bool, settled: bool) -> Self {
+        match (want_visible, settled) {
+            (false, true) => Self::Hidden,
+            (false, false) => Self::Exiting,
+            (true, false) => Self::Entering,
+            (true, true) => Self::Visible,
+        }
+    }
+
+    /// Whether a surface in this phase should still be painted.
+    #[must_use]
+    pub fn is_painted(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+
+    /// Whether background interaction should remain blocked by a modal in this
+    /// phase. Exiting remains blocking until the surface is actually hidden.
+    #[must_use]
+    pub fn modal_blocks_background(self) -> bool {
+        self.is_painted()
+    }
+}
 
 /// The visual parameters for a status/severity transition.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,6 +289,346 @@ impl Spring {
     }
 }
 
+/// Values that can be interpolated by the shared motion carrier.
+pub trait MotionValue: Copy + PartialEq + Send + Sync + 'static {
+    /// Distance threshold at which the value is considered settled.
+    const EPSILON: f32;
+
+    /// Interpolate from `self` to `target` at eased progress `t`.
+    #[must_use]
+    fn lerp(self, target: Self, t: f32) -> Self;
+
+    /// Scalar distance used for retarget/rest detection.
+    #[must_use]
+    fn distance(self, target: Self) -> f32;
+
+    /// Whether every component is finite.
+    #[must_use]
+    fn is_finite(self) -> bool;
+}
+
+impl MotionValue for f32 {
+    const EPSILON: f32 = 0.001;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        lerp_f32(self, target, t)
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        (target - self).abs()
+    }
+
+    fn is_finite(self) -> bool {
+        f32::is_finite(self)
+    }
+}
+
+impl MotionValue for Vec2 {
+    const EPSILON: f32 = 0.01;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self::new(lerp_f32(self.x, target.x, t), lerp_f32(self.y, target.y, t))
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        (target - self).length()
+    }
+
+    fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
+    }
+}
+
+impl MotionValue for Pos2 {
+    const EPSILON: f32 = 0.01;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self::new(lerp_f32(self.x, target.x, t), lerp_f32(self.y, target.y, t))
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        (target - self).length()
+    }
+
+    fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
+    }
+}
+
+impl MotionValue for Rect {
+    const EPSILON: f32 = 0.01;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        Self::from_min_max(
+            <Pos2 as MotionValue>::lerp(self.min, target.min, t),
+            <Pos2 as MotionValue>::lerp(self.max, target.max, t),
+        )
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        self.min
+            .distance(target.min)
+            .max(self.max.distance(target.max))
+    }
+
+    fn is_finite(self) -> bool {
+        self.min.x.is_finite()
+            && self.min.y.is_finite()
+            && self.max.x.is_finite()
+            && self.max.y.is_finite()
+    }
+}
+
+impl MotionValue for Color32 {
+    const EPSILON: f32 = 1.0;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let [sr, sg, sb, sa] = self.to_array();
+        let [tr, tg, tb, ta] = target.to_array();
+        Color32::from_rgba_premultiplied(
+            lerp_u8(sr, tr, t),
+            lerp_u8(sg, tg, t),
+            lerp_u8(sb, tb, t),
+            lerp_u8(sa, ta, t),
+        )
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        let [sr, sg, sb, sa] = self.to_array();
+        let [tr, tg, tb, ta] = target.to_array();
+        (i16::from(sr) - i16::from(tr))
+            .abs()
+            .max((i16::from(sg) - i16::from(tg)).abs())
+            .max((i16::from(sb) - i16::from(tb)).abs())
+            .max((i16::from(sa) - i16::from(ta)).abs()) as f32
+    }
+
+    fn is_finite(self) -> bool {
+        true
+    }
+}
+
+#[must_use]
+fn lerp_u8(start: u8, target: u8, t: f32) -> u8 {
+    lerp_f32(f32::from(start), f32::from(target), t)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+#[must_use]
+fn lerp_f32(start: f32, target: f32, t: f32) -> f32 {
+    start + (target - start) * t.clamp(0.0, 1.0)
+}
+
+/// A clamped opacity value (`0.0..=1.0`) for typed opacity animation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionOpacity(pub f32);
+
+impl MotionOpacity {
+    /// Construct opacity, clamped to `0.0..=1.0`.
+    #[must_use]
+    pub fn new(value: f32) -> Self {
+        Self(value.clamp(0.0, 1.0))
+    }
+
+    /// Return the clamped opacity value.
+    #[must_use]
+    pub fn value(self) -> f32 {
+        self.0
+    }
+}
+
+impl MotionValue for MotionOpacity {
+    const EPSILON: f32 = 0.001;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        Self::new(lerp_f32(self.0, target.0, t))
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        self.0.distance(target.0)
+    }
+
+    fn is_finite(self) -> bool {
+        self.0.is_finite()
+    }
+}
+
+/// A non-negative scale value for typed scale animation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionScale(pub f32);
+
+impl MotionScale {
+    /// Construct scale, clamped to `>= 0.0`.
+    #[must_use]
+    pub fn new(value: f32) -> Self {
+        Self(value.max(0.0))
+    }
+
+    /// Return the non-negative scale value.
+    #[must_use]
+    pub fn value(self) -> f32 {
+        self.0
+    }
+}
+
+impl MotionValue for MotionScale {
+    const EPSILON: f32 = 0.001;
+
+    fn lerp(self, target: Self, t: f32) -> Self {
+        Self::new(lerp_f32(self.0, target.0, t))
+    }
+
+    fn distance(self, target: Self) -> f32 {
+        self.0.distance(target.0)
+    }
+
+    fn is_finite(self) -> bool {
+        self.0.is_finite()
+    }
+}
+
+/// Reusable animation carrier for a typed value. It owns retargeting,
+/// completion detection, progress, and phase; the egui helpers below store this
+/// type in `Context` memory behind stable IDs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Animated<T: MotionValue> {
+    from: T,
+    value: T,
+    target: T,
+    elapsed: f32,
+    duration: f32,
+    progress: f32,
+    phase: Phase,
+}
+
+/// Scalar animated value.
+pub type AnimatedScalar = Animated<f32>;
+/// Two-dimensional animated value.
+pub type AnimatedVec2 = Animated<Vec2>;
+/// Size animated value (`Vec2::x = width`, `Vec2::y = height`).
+pub type AnimatedSize = Animated<Vec2>;
+/// Rect animated value.
+pub type AnimatedRect = Animated<Rect>;
+/// Opacity animated value.
+pub type AnimatedOpacity = Animated<MotionOpacity>;
+/// Scale animated value.
+pub type AnimatedScale = Animated<MotionScale>;
+/// Color animated value.
+pub type AnimatedColor = Animated<Color32>;
+
+impl<T: MotionValue> Animated<T> {
+    /// Create a carrier already settled at `value`.
+    #[must_use]
+    pub fn settled(value: T) -> Self {
+        Self {
+            from: value,
+            value,
+            target: value,
+            elapsed: 0.0,
+            duration: 0.0,
+            progress: 1.0,
+            phase: Phase::Visible,
+        }
+    }
+
+    /// Advance toward `target` by `dt` seconds under `spec`/`mode`.
+    ///
+    /// When the target changes mid-flight, the new animation starts from the
+    /// current visual value, preserving continuity. `dt` is clamped to a 30 FPS
+    /// floor so long stalls cannot produce giant jumps after a VT switch or a
+    /// delayed page flip.
+    pub fn advance(&mut self, target: T, spec: MotionSpec, mode: MotionMode, dt: f32) {
+        if !target.is_finite() {
+            return;
+        }
+
+        if self.target.distance(target) > T::EPSILON {
+            self.from = self.value;
+            self.target = target;
+            self.elapsed = 0.0;
+            self.progress = 0.0;
+            self.phase = Phase::Entering;
+        }
+
+        self.duration = spec.duration_for(mode);
+        if self.duration <= f32::EPSILON || matches!(mode, MotionMode::Disabled) {
+            self.from = target;
+            self.value = target;
+            self.target = target;
+            self.elapsed = 0.0;
+            self.progress = 1.0;
+            self.phase = Phase::Visible;
+            return;
+        }
+
+        if self.value.distance(self.target) <= T::EPSILON {
+            self.value = self.target;
+            self.progress = 1.0;
+            self.phase = Phase::Visible;
+            return;
+        }
+
+        let dt = dt.clamp(0.0, 1.0 / 30.0);
+        self.elapsed = (self.elapsed + dt).min(self.duration);
+        self.progress = spec.progress_at(self.elapsed, mode);
+        self.value = self.from.lerp(self.target, self.progress);
+
+        if self.progress >= 1.0 || self.value.distance(self.target) <= T::EPSILON {
+            self.value = self.target;
+            self.progress = 1.0;
+            self.phase = Phase::Visible;
+        } else {
+            self.phase = Phase::Entering;
+        }
+    }
+
+    #[must_use]
+    /// Current visual value.
+    pub fn value(self) -> T {
+        self.value
+    }
+
+    #[must_use]
+    /// Current target value.
+    pub fn target(self) -> T {
+        self.target
+    }
+
+    #[must_use]
+    /// Eased progress toward the current target, `0.0..=1.0`.
+    pub fn progress(self) -> f32 {
+        self.progress
+    }
+
+    #[must_use]
+    /// Elapsed seconds accumulated toward the current target.
+    pub fn elapsed(self) -> f32 {
+        self.elapsed
+    }
+
+    #[must_use]
+    /// Active duration in seconds after resolving the current mode.
+    pub fn duration(self) -> f32 {
+        self.duration
+    }
+
+    #[must_use]
+    /// Presentation phase implied by this animated value.
+    pub fn phase(self) -> Phase {
+        self.phase
+    }
+
+    #[must_use]
+    /// Whether the carrier is visually settled at its target.
+    pub fn is_settled(self) -> bool {
+        self.phase == Phase::Visible && self.value.distance(self.target) <= T::EPSILON
+    }
+}
+
 impl Motion {
     /// Quick feedback — hover, small toggles, focus.
     pub const FAST: f32 = 0.08;
@@ -100,13 +649,34 @@ impl Motion {
     /// One-shot status attention pulse duration for worsening only (NOTIF-1/Q26).
     pub const STATUS_PULSE: f32 = 0.48;
 
+    /// Set the process-global motion mode.
+    pub fn set_mode(mode: MotionMode) {
+        MOTION_MODE.store(mode as u8, Ordering::Relaxed);
+    }
+
+    /// Current process-global motion mode.
+    #[must_use]
+    pub fn mode() -> MotionMode {
+        MotionMode::from_u8(MOTION_MODE.load(Ordering::Relaxed))
+    }
+
+    /// Resolve one semantic preset into its concrete timing/spring table.
+    #[must_use]
+    pub fn spec(preset: MotionPreset) -> MotionSpec {
+        MotionSpec::for_preset(preset)
+    }
+
     /// Set the process-global **reduce-motion** preference (a11y-07). The shell calls
     /// this from its appearance apply seam — at startup and on every toggle change —
     /// with the persisted value, so every [`animate`](Self::animate) /
     /// [`animate_value`](Self::animate_value) caller settles instantly rather than
     /// easing. Idempotent; `Relaxed` is sufficient for a UI-comfort flag.
     pub fn set_reduce_motion(on: bool) {
-        REDUCE_MOTION.store(on, Ordering::Relaxed);
+        Self::set_mode(if on {
+            MotionMode::Reduced
+        } else {
+            MotionMode::Normal
+        });
     }
 
     /// Whether **reduce-motion** (a11y-07) is currently in force — the flag the eased
@@ -115,7 +685,111 @@ impl Motion {
     /// ignores this: an alarm outranks the comfort preference (NODE-GRADE-2 #16).
     #[must_use]
     pub fn reduce_motion() -> bool {
-        REDUCE_MOTION.load(Ordering::Relaxed)
+        Self::mode().is_reduced()
+    }
+
+    /// Drive a typed animated value from egui memory using the current global
+    /// motion mode. This is the shared stable-ID carrier for new components.
+    pub fn animate_typed<T: MotionValue>(
+        ctx: &Context,
+        id: impl Hash,
+        target: T,
+        preset: MotionPreset,
+    ) -> Animated<T> {
+        Self::animate_typed_with_mode(ctx, id, target, preset, Self::mode())
+    }
+
+    /// Drive a typed animated value using an explicit mode, useful for tests or
+    /// surfaces previewing a mode without mutating the process-global setting.
+    pub fn animate_typed_with_mode<T: MotionValue>(
+        ctx: &Context,
+        id: impl Hash,
+        target: T,
+        preset: MotionPreset,
+        mode: MotionMode,
+    ) -> Animated<T> {
+        let id = egui::Id::new(id);
+        let spec = Self::spec(preset);
+        let dt = ctx.input(|i| i.stable_dt);
+        let mut animated = ctx
+            .data_mut(|d| d.get_temp::<Animated<T>>(id))
+            .unwrap_or_else(|| Animated::settled(target));
+        animated.advance(target, spec, mode, dt);
+        ctx.data_mut(|d| d.insert_temp(id, animated));
+        if !animated.is_settled() {
+            ctx.request_repaint();
+        }
+        animated
+    }
+
+    /// Drive a scalar value using a named preset.
+    pub fn animate_scalar(
+        ctx: &Context,
+        id: impl Hash,
+        target: f32,
+        preset: MotionPreset,
+    ) -> AnimatedScalar {
+        Self::animate_typed(ctx, id, target, preset)
+    }
+
+    /// Drive a 2D/offset value using a named preset.
+    pub fn animate_vec2(
+        ctx: &Context,
+        id: impl Hash,
+        target: Vec2,
+        preset: MotionPreset,
+    ) -> AnimatedVec2 {
+        Self::animate_typed(ctx, id, target, preset)
+    }
+
+    /// Drive a size value using a named preset.
+    pub fn animate_size(
+        ctx: &Context,
+        id: impl Hash,
+        target: Vec2,
+        preset: MotionPreset,
+    ) -> AnimatedSize {
+        Self::animate_typed(ctx, id, target, preset)
+    }
+
+    /// Drive a rect value using a named preset.
+    pub fn animate_rect(
+        ctx: &Context,
+        id: impl Hash,
+        target: Rect,
+        preset: MotionPreset,
+    ) -> AnimatedRect {
+        Self::animate_typed(ctx, id, target, preset)
+    }
+
+    /// Drive an opacity value using a named preset.
+    pub fn animate_opacity(
+        ctx: &Context,
+        id: impl Hash,
+        target: MotionOpacity,
+        preset: MotionPreset,
+    ) -> AnimatedOpacity {
+        Self::animate_typed(ctx, id, target, preset)
+    }
+
+    /// Drive a scale value using a named preset.
+    pub fn animate_scale(
+        ctx: &Context,
+        id: impl Hash,
+        target: MotionScale,
+        preset: MotionPreset,
+    ) -> AnimatedScale {
+        Self::animate_typed(ctx, id, target, preset)
+    }
+
+    /// Drive a color value using a named preset.
+    pub fn animate_color(
+        ctx: &Context,
+        id: impl Hash,
+        target: Color32,
+        preset: MotionPreset,
+    ) -> AnimatedColor {
+        Self::animate_typed(ctx, id, target, preset)
     }
 
     /// Animate a boolean toward `on`, returning the eased `0.0..=1.0` progress.
@@ -309,7 +983,12 @@ impl Motion {
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {
-    use super::{Motion, Spring};
+    use super::{
+        AnimatedColor, AnimatedOpacity, AnimatedRect, AnimatedScalar, AnimatedScale, AnimatedSize,
+        AnimatedVec2, Motion, MotionEasing, MotionMode, MotionOpacity, MotionPreset, MotionScale,
+        MotionSpec, Phase, Spring,
+    };
+    use egui::{pos2, vec2, Color32, Rect};
 
     #[test]
     fn durations_are_positive_and_ordered() {
@@ -322,6 +1001,322 @@ mod tests {
         );
         assert!(Motion::STATUS_FADE > 0.0);
         assert!(Motion::STATUS_PULSE > Motion::STATUS_FADE);
+    }
+
+    #[test]
+    fn named_presets_resolve_to_accessible_mode_durations() {
+        for preset in [
+            MotionPreset::Control,
+            MotionPreset::Panel,
+            MotionPreset::Popover,
+            MotionPreset::Dialog,
+            MotionPreset::Page,
+            MotionPreset::Layout,
+            MotionPreset::DragSettle,
+        ] {
+            let spec = Motion::spec(preset);
+            assert_eq!(spec.preset, preset);
+            assert!(spec.duration_for(MotionMode::Normal) > 0.0);
+            assert!(
+                spec.duration_for(MotionMode::Reduced) <= spec.duration_for(MotionMode::Normal),
+                "{preset:?} reduced duration should not exceed normal"
+            );
+            assert_eq!(spec.duration_for(MotionMode::Disabled), 0.0);
+            assert_eq!(spec.progress_at(999.0, MotionMode::Disabled), 1.0);
+        }
+
+        assert_eq!(
+            Motion::spec(MotionPreset::Control).duration_for(MotionMode::Reduced),
+            0.0,
+            "micro-control motion collapses under reduced motion"
+        );
+        assert!(
+            Motion::spec(MotionPreset::Panel).spring.is_some(),
+            "panels carry a snappy spring option"
+        );
+        assert!(
+            Motion::spec(MotionPreset::DragSettle).spring.is_some(),
+            "drag release has a spring settle option"
+        );
+    }
+
+    #[test]
+    fn motion_phase_models_modal_lifecycle() {
+        assert_eq!(Phase::resolve(false, true), Phase::Hidden);
+        assert_eq!(Phase::resolve(false, false), Phase::Exiting);
+        assert_eq!(Phase::resolve(true, false), Phase::Entering);
+        assert_eq!(Phase::resolve(true, true), Phase::Visible);
+
+        assert!(!Phase::Hidden.is_painted());
+        assert!(Phase::Exiting.is_painted());
+        assert!(Phase::Entering.modal_blocks_background());
+        assert!(Phase::Exiting.modal_blocks_background());
+    }
+
+    #[test]
+    fn animated_scalar_retargets_from_current_visual_state_and_settles() {
+        let spec = Motion::spec(MotionPreset::Page);
+        let mut value = AnimatedScalar::settled(0.0);
+        value.advance(100.0, spec, MotionMode::Normal, 1.0 / 120.0);
+        assert!(value.value() > 0.0);
+        assert!(value.value() < 100.0);
+        assert_eq!(value.phase(), Phase::Entering);
+        assert!(!value.is_settled());
+
+        let before_retarget = value.value();
+        value.advance(50.0, spec, MotionMode::Normal, 1.0 / 120.0);
+        assert!(
+            value.value() >= before_retarget && value.value() < 50.0,
+            "retarget starts from the current visual value, got {} from {before_retarget}",
+            value.value()
+        );
+
+        for _ in 0..60 {
+            value.advance(50.0, spec, MotionMode::Normal, 1.0 / 60.0);
+        }
+        assert_eq!(value.value(), 50.0);
+        assert!(value.is_settled());
+        assert_eq!(value.phase(), Phase::Visible);
+    }
+
+    #[test]
+    fn animated_values_clamp_large_frame_gaps() {
+        let spec = Motion::spec(MotionPreset::Page);
+        let mut value = AnimatedScalar::settled(0.0);
+        value.advance(100.0, spec, MotionMode::Normal, 10.0);
+        assert!(
+            value.elapsed() <= 1.0 / 30.0 + f32::EPSILON,
+            "large frame gap was clamped, elapsed={}",
+            value.elapsed()
+        );
+        assert!(
+            value.value() < 100.0,
+            "clamping prevents a long pause from jumping straight to the target"
+        );
+    }
+
+    #[test]
+    fn animated_values_handle_common_refresh_intervals_without_poisoning_state() {
+        let refresh_intervals = [
+            1.0 / 240.0,
+            1.0 / 144.0,
+            1.0 / 120.0,
+            1.0 / 60.0,
+            1.0 / 30.0,
+            1.0 / 24.0,
+        ];
+        let presets = [
+            MotionPreset::Control,
+            MotionPreset::Panel,
+            MotionPreset::Popover,
+            MotionPreset::Dialog,
+            MotionPreset::Page,
+            MotionPreset::Layout,
+            MotionPreset::DragSettle,
+        ];
+
+        for preset in presets {
+            let spec = Motion::spec(preset);
+            for dt in refresh_intervals {
+                let mut value = AnimatedScalar::settled(0.0);
+                value.advance(100.0, spec, MotionMode::Normal, dt);
+                assert!(
+                    value.elapsed() <= dt.min(1.0 / 30.0) + f32::EPSILON,
+                    "{preset:?} did not clamp dt {dt}: elapsed={}",
+                    value.elapsed()
+                );
+                assert!(value.value().is_finite(), "{preset:?} value poisoned");
+                assert!(value.target().is_finite(), "{preset:?} target poisoned");
+                assert!(
+                    (0.0..=1.0).contains(&value.progress()),
+                    "{preset:?} progress out of range: {}",
+                    value.progress()
+                );
+            }
+
+            let mut value = AnimatedScalar::settled(0.0);
+            for frame in 0..120 {
+                let dt = refresh_intervals[frame % refresh_intervals.len()];
+                value.advance(100.0, spec, MotionMode::Normal, dt);
+                assert!(value.value().is_finite(), "{preset:?} value poisoned");
+                assert!(
+                    (0.0..=1.0).contains(&value.progress()),
+                    "{preset:?} progress out of range: {}",
+                    value.progress()
+                );
+            }
+            assert!(value.is_settled(), "{preset:?} did not settle");
+        }
+    }
+
+    #[test]
+    fn easing_curves_are_bounded_and_zero_duration_is_endpoint() {
+        assert_eq!(MotionEasing::SmoothStep.sample(0.0), 0.0);
+        assert_eq!(MotionEasing::SmoothStep.sample(1.0), 1.0);
+        assert_eq!(MotionEasing::Linear.sample(0.0), 0.0);
+        assert_eq!(MotionEasing::Linear.sample(1.0), 1.0);
+
+        let mut previous = 0.0;
+        for t in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+            let sampled = MotionEasing::SmoothStep.sample(t);
+            assert!((0.0..=1.0).contains(&sampled));
+            assert!(
+                sampled >= previous,
+                "smoothstep should not reverse at t={t}: {sampled} < {previous}"
+            );
+            previous = sampled;
+        }
+        assert_eq!(MotionEasing::SmoothStep.sample(-1.0), 0.0);
+        assert_eq!(MotionEasing::SmoothStep.sample(2.0), 1.0);
+
+        let zero = MotionSpec::new(MotionPreset::Page, 0.0, 0.0, MotionEasing::SmoothStep, None);
+        let mut value = AnimatedScalar::settled(0.0);
+        value.advance(100.0, zero, MotionMode::Normal, 0.0);
+        assert_eq!(value.value(), 100.0);
+        assert!(value.is_settled());
+    }
+
+    #[test]
+    fn reversal_and_non_finite_targets_do_not_snap_or_poison_state() {
+        let spec = Motion::spec(MotionPreset::Layout);
+        let mut value = AnimatedScalar::settled(0.0);
+        for _ in 0..4 {
+            value.advance(100.0, spec, MotionMode::Normal, 1.0 / 60.0);
+        }
+        let before_reverse = value.value();
+        assert!(before_reverse > 0.0 && before_reverse < 100.0);
+
+        value.advance(-50.0, spec, MotionMode::Normal, 1.0 / 60.0);
+        assert!(
+            value.value() < before_reverse && value.value() > -50.0,
+            "reversal continues from the live value: {} from {before_reverse}",
+            value.value()
+        );
+        assert!(value.value().is_finite());
+
+        let before_bad_target = value.value();
+        value.advance(f32::INFINITY, spec, MotionMode::Normal, 999.0);
+        assert_eq!(
+            value.value(),
+            before_bad_target,
+            "non-finite targets are ignored rather than poisoning the carrier"
+        );
+        assert!(value.value().is_finite());
+    }
+
+    #[test]
+    fn reduced_mode_substitutions_are_distinct_from_disabled_mode() {
+        let panel = Motion::spec(MotionPreset::Panel);
+        let mut reduced = AnimatedScalar::settled(0.0);
+        reduced.advance(100.0, panel, MotionMode::Reduced, 1.0 / 120.0);
+        assert!(
+            reduced.value() > 0.0 && reduced.value() < 100.0,
+            "panel reduced mode keeps a short fade/travel, got {}",
+            reduced.value()
+        );
+
+        let mut reduced_control = AnimatedScalar::settled(0.0);
+        reduced_control.advance(
+            100.0,
+            Motion::spec(MotionPreset::Control),
+            MotionMode::Reduced,
+            0.0,
+        );
+        assert_eq!(
+            reduced_control.value(),
+            100.0,
+            "control reduced mode is endpoint-only"
+        );
+
+        let mut disabled = AnimatedScalar::settled(0.0);
+        disabled.advance(100.0, panel, MotionMode::Disabled, 0.0);
+        assert_eq!(disabled.value(), 100.0);
+        assert!(disabled.is_settled());
+    }
+
+    #[test]
+    fn disabled_mode_lands_animated_values_on_endpoint() {
+        let spec = Motion::spec(MotionPreset::Panel);
+        let mut value = AnimatedScalar::settled(0.0);
+        value.advance(100.0, spec, MotionMode::Disabled, 0.0);
+        assert_eq!(value.value(), 100.0);
+        assert_eq!(value.progress(), 1.0);
+        assert!(value.is_settled());
+    }
+
+    #[test]
+    fn typed_interpolation_covers_size_rect_opacity_scale_and_color() {
+        let spec = MotionSpec::new(
+            MotionPreset::Layout,
+            2.0 / 30.0,
+            0.0,
+            MotionEasing::Linear,
+            None,
+        );
+
+        let mut offset = AnimatedVec2::settled(vec2(0.0, 10.0));
+        offset.advance(vec2(10.0, 30.0), spec, MotionMode::Normal, 1.0 / 30.0);
+        assert_eq!(offset.value(), vec2(5.0, 20.0));
+
+        let mut size = AnimatedSize::settled(vec2(0.0, 0.0));
+        size.advance(vec2(10.0, 20.0), spec, MotionMode::Normal, 1.0 / 30.0);
+        assert_eq!(size.value(), vec2(5.0, 10.0));
+
+        let mut rect = AnimatedRect::settled(Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0)));
+        rect.advance(
+            Rect::from_min_max(pos2(10.0, 20.0), pos2(30.0, 40.0)),
+            spec,
+            MotionMode::Normal,
+            1.0 / 30.0,
+        );
+        assert_eq!(
+            rect.value(),
+            Rect::from_min_max(pos2(5.0, 10.0), pos2(20.0, 25.0))
+        );
+
+        let mut opacity = AnimatedOpacity::settled(MotionOpacity::new(0.0));
+        opacity.advance(
+            MotionOpacity::new(2.0),
+            spec,
+            MotionMode::Normal,
+            1.0 / 30.0,
+        );
+        assert_eq!(opacity.value().value(), 0.5);
+
+        let mut scale = AnimatedScale::settled(MotionScale::new(1.0));
+        scale.advance(MotionScale::new(0.5), spec, MotionMode::Normal, 1.0 / 30.0);
+        assert_eq!(scale.value().value(), 0.75);
+
+        let mut color = AnimatedColor::settled(Color32::BLACK);
+        color.advance(Color32::WHITE, spec, MotionMode::Normal, 1.0 / 30.0);
+        assert_eq!(color.value(), Color32::from_rgb(128, 128, 128));
+    }
+
+    #[test]
+    fn egui_context_driver_uses_stable_ids_and_explicit_modes() {
+        let ctx = egui::Context::default();
+        let first = Motion::animate_typed_with_mode(
+            &ctx,
+            "typed-stable-id",
+            0.0,
+            MotionPreset::Control,
+            MotionMode::Normal,
+        );
+        assert!(first.is_settled());
+        assert_eq!(first.value(), 0.0);
+
+        let second = Motion::animate_typed_with_mode(
+            &ctx,
+            "typed-stable-id",
+            10.0,
+            MotionPreset::Panel,
+            MotionMode::Disabled,
+        );
+        assert!(second.is_settled());
+        assert_eq!(second.value(), 10.0);
+
+        let third = Motion::animate_scalar(&ctx, "typed-stable-id", 20.0, MotionPreset::Control);
+        assert_eq!(third.target(), 20.0);
     }
 
     #[test]

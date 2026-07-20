@@ -166,9 +166,9 @@ impl MountPhase {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Unmounted => "not mounted",
-            Self::Mounting => "mounting\u{2026}",
+            Self::Mounting => "mounting...",
             Self::Mounted => "mounted",
-            Self::Reconnecting => "reconnecting\u{2026}",
+            Self::Reconnecting => "reconnecting...",
             Self::Unreachable => "unreachable",
         }
     }
@@ -464,6 +464,10 @@ mod tests {
         assert_eq!(MountPhase::from_tag("unmounted"), MountPhase::Unmounted);
         // An unknown tag is an honest Unmounted, never a panic.
         assert_eq!(MountPhase::from_tag("wat"), MountPhase::Unmounted);
+        assert_eq!(MountPhase::Mounting.label(), "mounting...");
+        assert_eq!(MountPhase::Reconnecting.label(), "reconnecting...");
+        assert!(MountPhase::Mounting.label().is_ascii());
+        assert!(MountPhase::Reconnecting.label().is_ascii());
         assert!(MountPhase::Mounted.is_mounted());
         assert!(MountPhase::Mounting.is_transitional());
         assert!(MountPhase::Reconnecting.is_transitional());

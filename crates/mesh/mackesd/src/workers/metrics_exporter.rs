@@ -18,12 +18,14 @@
 //!
 //! Scope: the snapshot covers what is reliably derivable from the
 //! local store on every tick — mesh node counts bucketed by health,
-//! the audit-chain-intact flag, and the applied-migration count.
-//! Runtime in-process counters (drift events, reconcile failures,
-//! breaker trips) need a shared process-wide registry the workers
-//! increment, and cert days-remaining is its own probe (EFF-11);
-//! both are follow-ups that will append to the same `mackesd.prom`
-//! via additional `Counter`s here.
+//! the audit-chain-intact flag, and the applied-migration count. The
+//! runtime in-process counters that need a shared process-wide registry
+//! the producers increment now land too: breaker trips + worker restarts
+//! ride the supervisor's `WorkerStatusMap` (test-obs-9), and reconcile
+//! failures, drift events, and Bus publish errors ride
+//! [`crate::metrics::process_counters`] (WL-RUN-002). Cert days-remaining
+//! is its own probe (EFF-11). All append to the same `mackesd.prom` via
+//! additional `Counter`s here.
 
 #![cfg(feature = "async-services")]
 
@@ -245,6 +247,11 @@ pub fn tick_once(inputs: &TickInputs) {
         inputs.backup_passphrase_set || creds_backup_present(),
         now_unix(),
     ));
+    // WL-RUN-002 — process-wide runtime counters incremented live at
+    // their producer sites (reconcile-loop failures, drift events, Bus
+    // publish errors). Snapshot them into the same textfile so the
+    // observe-but-never-export seam the module header flagged is closed.
+    counters.extend(crate::metrics::process_counters());
     // AUD2-1 — snapshot the router's decision-time histogram (brief
     // lock + clone) so the SLO instrumentation actually reaches the
     // scrape instead of being observed-and-dropped.
@@ -621,6 +628,13 @@ mod tests {
         assert!(prom.contains("# TYPE mackesd_mesh_nodes_total counter"));
         assert!(prom.contains("mackesd_mesh_nodes_total 1"));
         assert!(prom.contains("mackesd_mesh_nodes_healthy 1"));
+        // WL-RUN-002 — the process-wide runtime counters render via the
+        // SAME exporter each tick, under their stable `mackesd_*_total`
+        // names (value-agnostic: they're process globals other tests may
+        // have bumped).
+        assert!(prom.contains("# TYPE mackesd_reconcile_failures_total counter"));
+        assert!(prom.contains("# TYPE mackesd_drift_events_total counter"));
+        assert!(prom.contains("# TYPE mackesd_bus_publish_errors_total counter"));
     }
 
     #[test]

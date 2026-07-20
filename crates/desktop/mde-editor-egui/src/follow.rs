@@ -33,6 +33,8 @@
 use mde_egui::egui::{self, RichText, Stroke};
 use mde_egui::Style;
 
+use crate::tooltip::editor_hover_text;
+
 use crate::buffer::Buffer;
 use crate::collab_session::FollowUpdate;
 use crate::widget::EditorView;
@@ -85,9 +87,7 @@ pub fn follow_banner(ui: &mut egui::Ui, name: &str) -> bool {
     let pill = egui::Button::new(text)
         .fill(Style::SURFACE_HI)
         .stroke(Stroke::new(BANNER_STROKE_W, Style::ACCENT));
-    ui.add(pill)
-        .on_hover_text("Typing or editing also stops following")
-        .clicked()
+    editor_hover_text(ui.add(pill), "Typing or editing also stops following").clicked()
 }
 
 #[cfg(test)]

@@ -1,18 +1,18 @@
 use super::{
-    build_connection_tree, build_node_tree, build_rail, cpu_line, derive_bus, device_a11y_label,
-    device_a11y_value, device_armed, device_status_display, device_target, export_dir,
-    format_mem_kb, header_lines, host_a11y_value, host_dot_tone, host_hover, humanize_ago,
-    humanize_uptime, now_ms, problem_code, render_device_details, render_json, render_report,
-    sanitize, scanned_label, status_tone, write_export, DeviceAction, DeviceArming,
-    DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness, MenuAction,
-    RowActionRequest, ViewMode, STALE_AFTER,
+    apply_devmgr_popup_style, build_connection_tree, build_node_tree, build_rail, cpu_line,
+    derive_bus, device_a11y_label, device_a11y_value, device_armed, device_status_display,
+    device_target, devmgr_tooltip, export_dir, format_mem_kb, header_lines, host_a11y_value,
+    host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code,
+    render_device_details, render_json, render_report, sanitize, scanned_label, status_tone,
+    write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection, DrawerTab,
+    HostEntry, HostFreshness, MenuAction, RouterEditDraft, RowActionRequest, ViewMode, STALE_AFTER,
 };
 use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
 use mackes_mesh_types::device_inventory::{
     self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
 use mde_egui::menubar::{Entry, Menu};
-use mde_egui::{egui, ChipTone, Style};
+use mde_egui::{egui, ChipTone, Density, Style, StyleColorScheme};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -81,6 +81,7 @@ fn state_with(inv: Option<DeviceInventory>, seen: bool) -> DeviceManagerState {
         active_tab: DrawerTab::General,
         show_about: false,
         arming: None,
+        router_edit: None,
     }
 }
 
@@ -101,6 +102,147 @@ fn drive(state: &mut DeviceManagerState) -> usize {
         egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
     });
     ctx.tessellate(out.shapes, out.pixels_per_point).len()
+}
+
+fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text_color(text))),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                out.push(rect.fill);
+            }
+            egui::Shape::Path(path) if path.fill != egui::Color32::TRANSPARENT => {
+                out.push(path.fill);
+            }
+            egui::Shape::Mesh(mesh) => {
+                out.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+#[test]
+fn device_manager_tooltip_uses_themed_text_and_surface() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(360.0, 120.0),
+        )),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                devmgr_tooltip(ui, "Refresh this host's inventory");
+            });
+    });
+
+    let texts = painted_text_colors(&out.shapes);
+    assert!(
+        texts.iter().any(|(text, color)| {
+            text == "Refresh this host's inventory" && *color == Style::TEXT
+        }),
+        "Device Manager tooltip should paint themed text: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|(text, color)| {
+            text == "Refresh this host's inventory" && *color == egui::Color32::BLACK
+        }),
+        "Device Manager tooltip leaked raw black popup text: {texts:?}"
+    );
+
+    let fills = painted_fills(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Device Manager tooltip should paint its own themed surface: {fills:?}"
+    );
+}
+
+#[test]
+fn device_manager_context_menu_uses_themed_text_and_surface() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut style = (*ctx.style()).clone();
+    apply_devmgr_popup_style(&ctx, &mut style);
+
+    assert_eq!(style.visuals.window_fill, Style::SURFACE);
+    assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+    assert_eq!(style.visuals.window_stroke.color, Style::BORDER);
+    assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+    assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.spacing.button_padding.y, Style::CONTROL_PAD_Y);
+    assert_eq!(style.spacing.item_spacing.y, Style::TOOLBAR_INSET_Y);
+
+    let light = egui::Context::default();
+    Style::install_color_scheme_with_density(&light, StyleColorScheme::Light, Density::Mouse);
+    let palette = Style::palette_for(StyleColorScheme::Light);
+    let mut light_style = (*light.style()).clone();
+    apply_devmgr_popup_style(&light, &mut light_style);
+
+    assert_eq!(light_style.visuals.window_fill, palette.surface);
+    assert_eq!(light_style.visuals.panel_fill, palette.surface);
+    assert_eq!(light_style.visuals.window_stroke.color, palette.border);
+    assert_eq!(light_style.visuals.override_text_color, Some(palette.text));
+    assert_eq!(
+        light_style.visuals.widgets.inactive.fg_stroke.color,
+        palette.text
+    );
+    assert_ne!(
+        light_style.visuals.widgets.inactive.fg_stroke.color,
+        Style::TEXT,
+        "light-mode Device Manager popups must resolve to the light palette, not raw dark text"
+    );
 }
 
 // ── a11y-05: the device-row + host-row accessible name/state seam ──
@@ -483,6 +625,17 @@ fn the_menu_bar_menus_drive_the_real_seams() {
     );
     // Help → the ⓘ dialog (now the 5th menu after MENU-5's Hosts + Device).
     assert_eq!(item_ids(&menus[4]), vec![MenuAction::About]);
+    let Entry::Item(help_item) = &menus[4].entries[0] else {
+        panic!("Help should carry the About item");
+    };
+    assert_eq!(
+        help_item.label,
+        format!("About {}", mde_theme::brand::logo::PRODUCT_NAME)
+    );
+    assert!(
+        !help_item.label.contains("Magic-Mesh"),
+        "Help menu should not show the retired product identity"
+    );
 }
 
 #[test]
@@ -935,6 +1088,14 @@ fn export_json_round_trips_the_fixture_inventory() {
 fn the_markdown_report_lists_the_host_every_device_and_the_problem_code() {
     let inv = DeviceInventory::fixture();
     let report = render_report(Some(&inv), &inv.host, ViewMode::ByType);
+    assert!(
+        report.contains(mde_theme::brand::logo::PRODUCT_NAME),
+        "the report should carry the canonical product name: {report}"
+    );
+    assert!(
+        !report.contains(concat!("Magic-Mesh ", "Qua", "sar")),
+        "the report must not export the superseded mixed product spelling: {report}"
+    );
     // The host header + the mirrored header-card summary fields (#20).
     assert!(report.contains("laptop-mm"), "the host header: {report}");
     assert!(report.contains("Fedora"), "the OS summary line: {report}");
@@ -2229,4 +2390,33 @@ fn view_jump_to_category_switches_to_by_type_and_expands() {
         s.expanded.contains(category::DISPLAY),
         "the jumped-to category is expanded so the operator lands on it"
     );
+}
+
+// ── WL-RUN-006 — the router firewall-edit composer's dispatch gates ────────────
+#[test]
+fn router_edit_draft_gates_on_validity_and_typed_confirm() {
+    let mut d = RouterEditDraft::for_router("46:6a:7c:96:e8:aa".into(), "eagle".into());
+    // Empty edit → not ready (nothing to apply).
+    assert!(!d.is_ready(), "an empty draft never dispatches");
+    // A well-formed Set with the correct typed-confirm echo → ready.
+    d.ruleset = "WAN_IN".into();
+    d.rule = "40".into();
+    d.action = "accept".into();
+    d.protocol = "tcp".into();
+    d.confirm = "46:6a:7c:96:e8:aa".into();
+    assert!(d.is_ready(), "a valid edit + matching typed-confirm arms");
+    assert_eq!(
+        d.edit().to_vyatta_commands(),
+        vec![
+            "set firewall name WAN_IN rule 40 action 'accept'",
+            "set firewall name WAN_IN rule 40 protocol 'tcp'",
+        ]
+    );
+    // A wrong typed-confirm echo → refused even with a valid edit (SAFETY 1 mirror).
+    d.confirm = "aa:bb:cc:dd:ee:ff".into();
+    assert!(!d.is_ready(), "a mismatched typed-confirm blocks dispatch");
+    // A missing rule number → invalid edit → refused even with the right echo.
+    d.confirm = "46:6a:7c:96:e8:aa".into();
+    d.rule = String::new();
+    assert!(!d.is_ready(), "a malformed edit blocks dispatch");
 }

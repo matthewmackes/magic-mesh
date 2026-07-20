@@ -1,7 +1,17 @@
 # RPM payload size — the 100 MB channel ceiling and the browser sub-package split
 
-**Status:** design + actionable plan (2026-07-11). The size GUARD (below) is implemented;
-the asset-array split is documented here as an operator-gated change, NOT yet applied.
+**Status:** implemented and release-cut verified (2026-07-15). The size GUARD
+(below) is wired into both RPM cut paths; the asset-array split now emits a base
+`magic-mesh` RPM plus a co-installable `magic-mesh-browser` RPM. BigBoy
+(`172.20.0.130`) cut the full release path through `install-helpers/xcp-build.sh rpm`
+and produced:
+
+| package | compressed RPM | SHA-256 |
+|---|---:|---|
+| `magic-mesh-12.0.0-1.x86_64.rpm` | **69.9 MiB** / 73,340,947 bytes | `a831d1014db25b1005f7bc4caefa8b8b2998efdf1a1b6598ea50b0dc4f0846d6` |
+| `magic-mesh-browser-12.0.0-1.x86_64.rpm` | **39.0 MiB** / 40,851,412 bytes | `96dd4637c3f04457be0dff5ea32020abee2117872c82d8b2d2945475dd519df7` |
+
+Both artifacts passed the 90 MiB cut limit and payload inspection.
 
 **Finding:** `build-deploy-12` (PLATFORM-REVIEW-2026-07-10) — *Monolithic ~186 MiB RPM is
 one growth step from breaking the public channel (GitHub 100 MB file limit).*
@@ -10,8 +20,8 @@ one growth step from breaking the public channel (GitHub 100 MB file limit).*
 
 ## 1. The cliff
 
-The one-artifact doctrine (PKG-1) packages every workspace binary + all packaging assets
-into a single `magic-mesh` RPM (`crates/mesh/mackesd/Cargo.toml`
+The earlier one-artifact doctrine (PKG-1) packaged every workspace binary + all
+packaging assets into a single `magic-mesh` RPM (`crates/mesh/mackesd/Cargo.toml`
 `[package.metadata.generate-rpm]`). The public dnf channel is served from GitHub Pages:
 
 ```
@@ -140,7 +150,7 @@ this asset set + these dependency tables". The plan therefore uses a THIRD varia
 
 ### 4.2 The split
 
-**New `[package.metadata.generate-rpm.variants.browser]`** — `magic-mesh-browser`, carrying
+**Implemented `[package.metadata.generate-rpm.variants.browser]`** — `magic-mesh-browser`, carrying
 ONLY the browser payload MOVED OUT of the base array:
 
 | moved asset | dest |
@@ -167,20 +177,44 @@ base array**.
   magic-mesh-browser` and keep a working desktop with the Browser surface honestly gated off.)
 - `server` variant → **no** browser recommend (headless roles already omit it).
 - `magic-mesh-browser` → `requires = { magic-mesh = "*" }` (the helpers are launched by the
-  shell; they are meaningless without the base) and keeps the CEF/bzip2 runtime `requires`.
+  shell; they are meaningless without the base), keeps the CEF/bzip2/runtime graphics
+  `requires`, and hard-requires `selinux-policy-devel` + `checkpolicy` so Enforcing
+  Workstation seats compile and load `mde_web_cef_t` / `mde_web_preview_t` instead of
+  silently leaving Browser helpers at `bin_t`.
 - **No `conflicts`** between base and browser — they co-install.
+- Note: RPM automatic ELF soname scanning still records shell-linked base requirements such as
+  `libfontconfig.so.1`, `libfreetype.so.6`, `libharfbuzz.so.0`, `libvulkan.so.1`, and
+  `libxkbcommon.so.0`. The split removes the Browser helper payload and Browser-only manual
+  dependency policy from the base package; it does not pretend the DRM shell has zero graphics
+  library dependencies.
 
-### 4.3 Expected sizes after the split
+### 4.3 Measured sizes after the split
 
-| package | contents | ~compressed (xz) | vs 100 MiB ceiling |
+| package | contents | compressed (xz) | vs 100 MiB ceiling |
 |---|---|---:|---|
-| `magic-mesh` (base) | everything except browser | **~55–60 MiB** | comfortable headroom |
-| `magic-mesh-browser` | Servo + CEF bridge + browser assets | **~45–55 MiB** | comfortable headroom |
+| `magic-mesh` (base) | everything except browser | **69.9 MiB** | comfortable headroom |
+| `magic-mesh-browser` | Servo + CEF bridge + browser assets | **39.0 MiB** | comfortable headroom |
 | `magic-mesh-server` | headless (unchanged) | ~25–30 MiB | unchanged |
 
 Both public-channel files drop **well under** the limit, and each can grow independently before
 either approaches the cliff. zstd could even be reconsidered per-file for faster installs on
 low-end lighthouses, since neither file is near the ceiling anymore.
+
+Fedora 44 deploy cut proof (2026-07-15, `install-helpers/build-rpm-fedora43.sh 44`):
+
+| package | compressed (xz) | bytes | SHA-256 |
+|---|---:|---:|---|
+| `magic-mesh-12.0.0-1.x86_64.rpm` | **70.0 MiB** | 73,349,769 | `b2e26d1aa557a74631d6a5a27da33904990c2da3a7eab5776b3aeff5d1b3ac95` |
+| `magic-mesh-browser-12.0.0-1.x86_64.rpm` | **39.1 MiB** | 41,012,002 | `d4e828adcb3f1b494bf9d664d86b4876b13f44fdf5112a1386d5de6b6816a44f` |
+
+Both F44 artifacts passed payload verification, `rpm -Uvh --test` on the Fedora
+44 `.15` Workstation, and installed together as co-installable split packages.
+Follow-up live Enforcing proof on `.15` found the Browser setup units must be
+started, not merely enabled, on already-booted installs; the Browser `%post`
+now queues `systemctl start --no-block $BROWSER_UNITS`. The SELinux policy
+loaders also stage hyphenated source files under underscore module names before
+calling the SELinux devel Makefile, matching `policy_module(mde_web_cef, ...)`
+and `policy_module(mde_web_preview, ...)`.
 
 ### 4.4 Cut-script change (the part that makes it real)
 
@@ -193,7 +227,7 @@ cargo build --release --manifest-path .../mde-web-preview/Cargo.toml   # Servo (
 cargo build --release --manifest-path .../mde-web-cef/Cargo.toml       # CEF bridge (excluded workspace)
 cargo build --release -p mde-shell-egui --features <drm,...>           # shell re-link
 cargo generate-rpm -p crates/mesh/mackesd                 # base  → magic-mesh-*.rpm
-cargo generate-rpm -p crates/mesh/mackesd --variant browser  # NEW → magic-mesh-browser-*.rpm
+cargo generate-rpm -p crates/mesh/mackesd --variant browser  # → magic-mesh-browser-*.rpm
 cargo generate-rpm -p crates/mesh/mackesd --variant server   # headless (existing)
 ```
 
@@ -240,30 +274,21 @@ install-helpers/verify-rpm-payload.sh payload <rpm>   # payload-completeness che
   not the uncompressed payload.
 - **Exit non-zero** on breach, so it is drop-in for a release-cut gate.
 
-### CI / cut-gate wiring note (operator-gated)
+### CI / cut-gate wiring
 
-The script is advisory / not auto-enabled by design (it deliberately never cuts an RPM). To make
-the ceiling un-breakable, wire the size check into the cut paths right after `generate-rpm`
-produces the file, e.g. in `install-helpers/build-rpm-fedora43.sh` after
-`ls -la .../generate-rpm/*.rpm` and in the `xcp-build.sh rpm` path after the RPM is pulled local:
-
-```
-install-helpers/verify-rpm-payload.sh size "$RPM" || { echo "RPM over channel ceiling"; exit 1; }
-```
-
-(That two-line wiring is intentionally left to the operator so the gate lands with the cut-script
-consolidation in `build-deploy-3`, not as a blind edit here.)
+The size check is now wired into the cut paths right after `generate-rpm`
+produces the files. `install-helpers/build-rpm-fedora43.sh` checks the server
+artifact in `--server` mode and both base/browser artifacts in full mode.
+`install-helpers/xcp-build.sh rpm` checks the remote generated artifacts before
+pulling and checks the pulled local artifacts again.
 
 ---
 
 ## 7. What is left as an operator decision
 
-- **Executing the asset-array split** (§4) — real manifest surgery + a 3-way cut + a dnf
-  `recommends`/`requires` relationship that cannot be validated on the airgapped tree without an
-  actual gated cut. Documented here; not applied.
+- **Publishing both artifacts in one repo transaction** so `dnf` can resolve the
+  weak dependency from `magic-mesh` to `magic-mesh-browser`.
 - **Choosing the channel strategy** — split (§4) vs GitHub-Releases-assets (§5A) vs
   sovereign-primary (§5B), or a combination.
-- **Wiring the size gate into the cut scripts** (§6) — trivial, but belongs with the
-  `build-deploy-3` cut-script consolidation.
 - **The ntfy-blob demotion** and the **`build-deploy-11` dead-asset sweep** — modest independent
   wins tracked under their own findings.

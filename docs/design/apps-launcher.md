@@ -1,5 +1,7 @@
 # APPS — Re-envisioned Applications Panel (Magic-Mesh launcher on Cosmic)
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** describes the retired `libcosmic`/Cosmic-applet launcher (`mde-cosmic-applet`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md); the launcher is now folded into the Front Door ([`app-launcher-rethink.md`](app-launcher-rethink.md)). Retained as a historical design record.
+
 Design survey locked 2026-06-17 (25-question `/plan`). The Applications Panel is
 a **Magic-Mesh app launcher that replaces Cosmic's app library** — a Start-menu-
 style **panel dropdown** that launches apps **anywhere in the mesh**: local apps,

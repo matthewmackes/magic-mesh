@@ -1,0 +1,103 @@
+---
+# WL-ARCH-006 (U13) — Podman + Quadlet host prep for a Service-Container.
+#
+# A Service-Container delivers a rootless Podman container managed as a systemd
+# service via a Quadlet `.container` unit (the container-deploy verb, U7/U12,
+# renders that unit). This role prepares the HOST so those units resolve: it
+# installs Podman, provisions the Quadlet drop-in directory, enables the Podman
+# API socket, and reloads the systemd generator. Rootless by default (plan U7).
+# The container host is itself a scope:cloud mesh VM, so the base cloud_vm role has
+# already established its mackesd/mesh baseline.
+
+- name: Install Podman (ships the Quadlet generator since podman ≥ 4.4)
+  ansible.builtin.package:
+    name: "{{ container_host_packages }}"
+    state: present
+
+# ── Rootless lane (default): a lingering unprivileged user owns the containers ──
+- name: Ensure the rootless container user exists
+  ansible.builtin.user:
+    name: "{{ container_host_user }}"
+    system: false
+    create_home: true
+  when: container_host_rootless | bool
+
+- name: Resolve the rootless user's uid (for its XDG runtime dir)
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ container_host_user }}"
+  when: container_host_rootless | bool
+
+- name: Enable lingering so the user's Quadlet services run without a login session
+  ansible.builtin.command: "loginctl enable-linger {{ container_host_user }}"
+  args:
+    creates: "/var/lib/systemd/linger/{{ container_host_user }}"
+  when: container_host_rootless | bool
+
+- name: Provision the rootless Quadlet drop-in dir (~/.config/containers/systemd)
+  ansible.builtin.file:
+    path: "~{{ container_host_user }}/.config/containers/systemd"
+    state: directory
+    owner: "{{ container_host_user }}"
+    group: "{{ container_host_user }}"
+    mode: "0755"
+  when: container_host_rootless | bool
+
+- name: Enable the rootless Podman API socket + reload the Quadlet generator (user scope)
+  ansible.builtin.systemd:
+    name: podman.socket
+    scope: user
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+  become_user: "{{ container_host_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ getent_passwd[container_host_user][1] }}"
+  when: container_host_rootless | bool
+
+- name: Log in to the container registry (rootless) with an age-sealed credential
+  ansible.builtin.command:
+    cmd: >-
+      podman login {{ container_host_registry }}
+      --username {{ container_host_registry_user }} --password-stdin
+    stdin: "{{ lookup('mde_seal', container_host_registry_secret) }}"
+  become: true
+  become_user: "{{ container_host_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ getent_passwd[container_host_user][1] }}"
+  register: container_host_login_rootless
+  changed_when: "'Login Succeeded' in container_host_login_rootless.stdout"
+  when:
+    - container_host_rootless | bool
+    - container_host_registry_secret | length > 0
+  no_log: true
+
+# ── Rootful lane (opt-in): system-wide Quadlet under /etc/containers/systemd ──
+- name: Provision the system Quadlet drop-in dir (/etc/containers/systemd)
+  ansible.builtin.file:
+    path: /etc/containers/systemd
+    state: directory
+    mode: "0755"
+  when: not container_host_rootless | bool
+
+- name: Enable the system Podman API socket + reload the Quadlet generator
+  ansible.builtin.systemd:
+    name: podman.socket
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not container_host_rootless | bool
+
+- name: Log in to the container registry (rootful) with an age-sealed credential
+  ansible.builtin.command:
+    cmd: >-
+      podman login {{ container_host_registry }}
+      --username {{ container_host_registry_user }} --password-stdin
+    stdin: "{{ lookup('mde_seal', container_host_registry_secret) }}"
+  register: container_host_login_rootful
+  changed_when: "'Login Succeeded' in container_host_login_rootful.stdout"
+  when:
+    - not container_host_rootless | bool
+    - container_host_registry_secret | length > 0
+  no_log: true

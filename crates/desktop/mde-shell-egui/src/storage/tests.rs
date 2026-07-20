@@ -9,6 +9,7 @@
 
 use super::*;
 use mde_egui::egui::{pos2, vec2, Rect};
+use mde_theme::brand::icons::{icon_image, IconId};
 
 /// A `state/storage/<node>` progress body.
 fn progress_body(
@@ -43,6 +44,324 @@ fn renders(state: &mut StorageState) -> bool {
         egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
     });
     !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+}
+
+fn storage_surface_shapes(state: &mut StorageState) -> Vec<egui::epaint::ClippedShape> {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 720.0))),
+        ..Default::default()
+    };
+    ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| state.show(ui));
+    })
+    .shapes
+}
+
+fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text_color(text))),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Mesh(mesh) => {
+                out.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+            }
+            egui::Shape::Path(path) => {
+                if path.fill != egui::Color32::TRANSPARENT {
+                    out.push(path.fill);
+                }
+            }
+            egui::Shape::Rect(rect) => {
+                if rect.fill != egui::Color32::TRANSPARENT {
+                    out.push(rect.fill);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+fn opaque_pixels(rgba: &[u8]) -> usize {
+    rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count()
+}
+
+#[test]
+fn storage_queue_controls_do_not_paint_unicode_pseudo_icons() {
+    assert_eq!(STORAGE_REFRESH_ICON, IconId::Reload);
+    assert_eq!(STORAGE_STAGE_ICON, IconId::Add);
+    assert_eq!(STORAGE_QUEUE_UP_ICON, IconId::ChevronUp);
+    assert_eq!(STORAGE_QUEUE_DOWN_ICON, IconId::ArrowDown);
+    assert_eq!(STORAGE_QUEUE_REMOVE_ICON, IconId::Close);
+
+    let mut state = StorageState {
+        nodes: project(&[state_body("this-node", 1, true)]),
+        local_host: "this-node".to_string(),
+        ..StorageState::default()
+    };
+    state.ensure_selection();
+    state.select_node("this-node");
+    state.selected_device = Some("/dev/sdb".to_string());
+    state.queue.push(StorageOp::DeletePartition {
+        partition: "/dev/sdb1".to_string(),
+    });
+    state.queue.push(StorageOp::SetLabel {
+        partition: "/dev/sdb1".to_string(),
+        label: "scratch".to_string(),
+    });
+    state.progress = project_progress(
+        &[progress_body(
+            "this-node",
+            0,
+            2,
+            "delete_partition",
+            3,
+            true,
+        )],
+        "this-node",
+    );
+
+    let mut shapes = storage_surface_shapes(&mut state);
+    let node = project(&[state_body("this-node", 1, true)])
+        .into_iter()
+        .next()
+        .expect("fixture projects one node");
+    let dev = node.topology.devices[1].clone();
+    let mut compose = Compose::default();
+    let mut compose_error = None;
+    let mut staged = None;
+    let mut queue = state.queue.clone();
+    let mut arming = String::new();
+    let mut apply = None;
+    let progress = state.progress.clone();
+    let mut goto_instances = false;
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 520.0))),
+        ..Default::default()
+    };
+    shapes.extend(
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    show_compose(
+                        ui,
+                        Some(&dev),
+                        &mut compose,
+                        &mut compose_error,
+                        &mut staged,
+                    );
+                    ui.separator();
+                    show_queue_and_apply(ui, &node, &mut queue, &mut arming, None, &mut apply);
+                    ui.separator();
+                    show_progress(ui, &progress, &mut goto_instances);
+                });
+        })
+        .shapes,
+    );
+    let mut progress_goto_instances = false;
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(520.0, 180.0))),
+        ..Default::default()
+    };
+    shapes.extend(
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    show_progress(ui, &progress, &mut progress_goto_instances);
+                });
+        })
+        .shapes,
+    );
+    let texts = painted_text(&shapes);
+    for expected in [
+        "Refresh topology",
+        "Stage",
+        "locked",
+        "staging target",
+        "Free the disk, then re-apply:",
+    ] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "{expected:?} label was not painted: {texts:?}"
+        );
+    }
+    assert!(
+        texts.iter().all(|text| {
+            !text.contains('\u{21BB}')
+                && !text.contains('\u{FF0B}')
+                && !text.contains('\u{2191}')
+                && !text.contains('\u{2193}')
+                && !text.contains('\u{2715}')
+                && !text.contains('\u{1F512}')
+                && !text.contains('\u{2699}')
+        }),
+        "Storage controls leaked Unicode pseudo-icons: {texts:?}"
+    );
+    for icon in [
+        STORAGE_REFRESH_ICON,
+        STORAGE_STAGE_ICON,
+        STORAGE_QUEUE_UP_ICON,
+        STORAGE_QUEUE_DOWN_ICON,
+        STORAGE_QUEUE_REMOVE_ICON,
+    ] {
+        let img = icon_image(icon, 16, Style::TEXT.to_array())
+            .unwrap_or_else(|err| panic!("{icon:?} failed to rasterize: {err}"));
+        assert_eq!(img.width, 16, "{icon:?} icon width");
+        assert_eq!(img.height, 16, "{icon:?} icon height");
+        assert!(opaque_pixels(&img.rgba) > 0, "{icon:?} rasterized empty");
+    }
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                storage_tooltip(ui, "Move this operation earlier in the queue.");
+            });
+    });
+    let tooltip_texts = painted_text_colors(&out.shapes);
+    assert!(
+        tooltip_texts.iter().any(|(text, color)| {
+            text == "Move this operation earlier in the queue." && *color == Style::TEXT
+        }),
+        "Storage tooltip should paint themed text: {tooltip_texts:?}"
+    );
+    assert!(
+        !tooltip_texts.iter().any(|(text, color)| {
+            text == "Move this operation earlier in the queue." && *color == egui::Color32::BLACK
+        }),
+        "Storage tooltip leaked raw black text: {tooltip_texts:?}"
+    );
+    let tooltip_fills = painted_fill_colors(&out.shapes);
+    assert!(
+        tooltip_fills.contains(&Style::SURFACE),
+        "Storage tooltip should paint its themed surface: {tooltip_fills:?}"
+    );
+}
+
+#[test]
+fn storage_action_buttons_use_refined_chrome_height() {
+    assert_eq!(
+        STORAGE_ACTION_BUTTON_H,
+        Style::TOOLBAR_CONTROL_H,
+        "Storage action controls should share the refined toolbar visual height"
+    );
+    assert!(
+        STORAGE_ACTION_BUTTON_H < Style::SP_L,
+        "Storage action controls should stay slimmer than the old 24pt button row"
+    );
+    assert_eq!(
+        STORAGE_ACTION_PAD_Y,
+        (STORAGE_ACTION_BUTTON_H - Style::SP_M) * 0.5,
+        "Storage icon+label padding keeps a 16pt icon inside the refined height"
+    );
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut heights = Vec::new();
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 80.0))),
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                heights.push(
+                    storage_icon_label_button(ui, STORAGE_REFRESH_ICON, "Refresh topology")
+                        .rect
+                        .height(),
+                );
+                heights.push(
+                    storage_icon_button(ui, STORAGE_QUEUE_REMOVE_ICON, "Remove", true)
+                        .rect
+                        .height(),
+                );
+            });
+        });
+    });
+
+    assert!(
+        heights
+            .iter()
+            .all(|height| (*height - STORAGE_ACTION_BUTTON_H).abs() <= f32::EPSILON),
+        "Storage action button heights should be {STORAGE_ACTION_BUTTON_H}, got {heights:?}"
+    );
 }
 
 #[test]
@@ -509,6 +828,8 @@ mod menubar_coverage {
     enum Coverage {
         /// The surface fronts the shared bar — its recorded title.
         Covered { title: &'static str },
+        /// The surface deliberately owns first-party chrome instead of the shared bar.
+        FirstPartyChrome { reason: &'static str },
         /// The surface is currently bare — the recorded reason + follow-on.
         Exempt { reason: &'static str },
     }
@@ -523,16 +844,25 @@ mod menubar_coverage {
             Surface::InfraCode => Coverage::Covered {
                 title: "Infra as Code", // IAC-5 (iac.rs)
             },
-            Surface::Desktop => Coverage::Covered {
-                title: "Desktop", // vdi.rs desktop_menubar, mounted by the shell
+            Surface::Desktop => Coverage::Exempt {
+                reason: "bare — the Remote Sessions workspace is a full-screen \
+                         session picker / remote desktop surface with no workspace \
+                         menu bar",
             },
-            Surface::Browser => Coverage::Covered {
-                title: "Browser", // MENU-3 (web.rs, the two-engine bar)
+            Surface::Browser => Coverage::FirstPartyChrome {
+                reason: "BROWSER-CHROME C0 — Browser retired the shared MENUBAR-ALL \
+                         top strip; first-party tabs, toolbar, omnibox, and menu \
+                         button own this surface's chrome",
             },
             Surface::Bookmarks => Coverage::Exempt {
                 reason: "bare — mde-bookmarks-egui mounts with its own manager \
                          header; folding it onto the shared bar is a MENUBAR-SWEEP \
                          follow-on",
+            },
+            Surface::MapsLocation => Coverage::FirstPartyChrome {
+                reason: "MAPS-LOCATION-1 — Maps & Location owns a native tab rail, \
+                         map canvas, driving dashboard, MG90 setup, and simulator \
+                         chrome instead of the shared MENUBAR-ALL top strip",
             },
             Surface::Chat => Coverage::Covered {
                 title: "Contacts", // MENU-2 (chat.rs)
@@ -574,6 +904,12 @@ mod menubar_coverage {
                 reason: "bare — the KDC-MESH-9 Phones hub carries its own tab header \
                          (Phones · Files · Commands · Pair); folding it onto the \
                          shared bar is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Communications => Coverage::Exempt {
+                reason: "bare — the WL-FUNC-011 Communications surface carries its own \
+                         frame (spaces rail · per-space mode tabs · persistent call \
+                         bar) instead of the shared MENUBAR-ALL top strip; folding it \
+                         onto the shared bar is a MENUBAR-SWEEP follow-on",
             },
             Surface::Terminal => Coverage::Exempt {
                 reason: "bare — mde-term-egui carries its own tmux/session menu \
@@ -620,6 +956,7 @@ mod menubar_coverage {
     #[test]
     fn every_routed_surface_records_a_menubar_posture() {
         let mut covered = 0usize;
+        let mut first_party = 0usize;
         let mut exempt = 0usize;
         for surface in every_routed() {
             match coverage(surface) {
@@ -630,17 +967,29 @@ mod menubar_coverage {
                     );
                     covered += 1;
                 }
+                Coverage::FirstPartyChrome { reason } => {
+                    assert!(
+                        reason.contains("BROWSER-CHROME") || reason.contains("MAPS-LOCATION"),
+                        "{surface:?}: first-party chrome records its owning epic"
+                    );
+                    first_party += 1;
+                }
                 Coverage::Exempt { reason } => {
                     assert!(
-                        reason.contains("MENUBAR-SWEEP"),
+                        reason.contains("MENUBAR-SWEEP")
+                            || reason.contains("no workspace menu bar"),
                         "{surface:?}: an exemption names its follow-on, not just a shrug"
                     );
                     exempt += 1;
                 }
             }
         }
-        assert_eq!(covered + exempt, every_routed().len());
-        assert_eq!(covered, 8, "the covered set is the eight landed bars");
+        assert_eq!(covered + first_party + exempt, every_routed().len());
+        assert_eq!(covered, 6, "the shared covered set is the six landed bars");
+        assert_eq!(
+            first_party, 2,
+            "Browser and Maps & Location are the routed first-party chrome surfaces"
+        );
         for (view, reason) in ROUTED_NON_SURFACE_VIEWS {
             assert!(
                 reason.contains("MENUBAR-SWEEP"),
@@ -660,6 +1009,7 @@ mod menubar_coverage {
             [
                 Surface::MeshView,
                 Surface::Explorer,
+                Surface::Desktop,
                 Surface::Music,
                 Surface::Media,
                 Surface::Files,
@@ -668,6 +1018,11 @@ mod menubar_coverage {
                 Surface::Terminal,
                 Surface::Editor,
                 Surface::Phones,
+                // WL-FUNC-011 — the Communications hub carries its own frame
+                // (rail · mode tabs · call bar), a MENUBAR-SWEEP follow-on. Sits
+                // here in `Surface::ALL` order (the twentieth surface), before the
+                // out-of-ALL Timers `every_routed` appends.
+                Surface::Communications,
                 Surface::Timers,
             ],
             "a surface leaving (or joining) the bare set updates this inventory \
@@ -717,7 +1072,7 @@ mod menubar_coverage {
     /// The three surfaces whose states construct cheaply from here render for
     /// real, and each bar's UPPERCASE DISPLAY title appears in the painted text —
     /// the register's `Covered` claim proven at the pixel-feed level for them.
-    /// The other five covered bars (Workbench / `IaC` / Desktop / Browser / System)
+    /// The other three covered bars (Workbench / `IaC` / System)
     /// need the shell's full wiring or testkit scaffolding owned by their own
     /// files' tests, so their register rows rest on those files' render tests.
     #[test]

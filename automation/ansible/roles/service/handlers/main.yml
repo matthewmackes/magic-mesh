@@ -1,0 +1,5 @@
+---
+# WL-ARCH-006 (U13) — service role handlers.
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true

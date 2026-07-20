@@ -23,6 +23,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mde_bus::persist::Persist;
@@ -172,11 +173,20 @@ impl Chime for SystemChime {
             Severity::Critical | Severity::Warning => "dialog-warning",
             Severity::Info => "message-new-instant",
         };
-        let _ = Command::new("canberra-gtk-play")
-            .args(["-i", event])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let event = event.to_owned();
+        let _ = thread::Builder::new()
+            .name("mde-toast-chime".to_owned())
+            .spawn(move || {
+                let Ok(mut child) = Command::new("canberra-gtk-play")
+                    .args(["-i", event.as_str()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    return;
+                };
+                let _ = child.wait();
+            });
     }
 }
 
@@ -219,13 +229,14 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // through this same grammar (accepting the `mde-mesh-view` variant name too).
         "mesh-map" | "meshview" | "mesh" => Some(Surface::MeshView),
         "desktop" => Some(Surface::Desktop),
-        // The Infra as Code (IaC) OpenStack control plane (IAC-2).
+        // The Infra as Code (IaC) cloud control plane (IAC-2).
         "iac" | "infra-code" | "infracode" | "infra" => Some(Surface::InfraCode),
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),
         "voice" => Some(Surface::Voice),
         "browser" => Some(Surface::Browser),
         "bookmarks" | "bookmark-manager" => Some(Surface::Bookmarks),
+        "maps" | "location" | "maps-location" | "mapslocation" => Some(Surface::MapsLocation),
         // The ONE notification interface (NOTIFY-CHAT-6) — the retired
         // `notifications` / `clipboard` verbs now resolve here so a forward emitter's
         // old `shell/goto/notifications` still reaches a live surface.

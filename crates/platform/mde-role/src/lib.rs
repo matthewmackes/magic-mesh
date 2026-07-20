@@ -1,7 +1,7 @@
 //! `mde-role` — the pinned deployment role (E1.1).
 //!
 //! Two rank-ordered deployment roles — `Lighthouse` (the always-on relay /
-//! control plane, no desktop) · `Workstation` (the full Quasar egui thin
+//! control plane, no desktop) · `Workstation` (the full Construct egui thin
 //! client). Rank gives the upgrade-only order. "Headless" is not a role: a
 //! headless box is a `Workstation` without a local display.
 //! The role is chosen once at install time (the role chooser / `mde-role`)
@@ -25,7 +25,7 @@ use std::str::FromStr;
 
 /// A deployment role — the install-time identity, rank-ordered for the
 /// upgrade-only invariant ([`Role::rank`]): **Lighthouse** (the always-on
-/// relay / control plane) · **Workstation** (the full Quasar egui thin
+/// relay / control plane) · **Workstation** (the full Construct egui thin
 /// client). "Headless" is not a role — a headless box is a `Workstation`
 /// without a local display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,7 +34,7 @@ pub enum Role {
     /// the media server, and the CA/signer. Always-on, no desktop. Rank 0.
     /// VPS-friendly.
     Lighthouse,
-    /// Full workstation — the Quasar stack: the egui-DRM shell + VDI +
+    /// Full workstation — the Construct stack: the egui-DRM shell + VDI +
     /// libvirt/QEMU-KVM + Podman. A headless box is a `Workstation` with no
     /// local display. Rank 1. *(The retired XCP-NG/Server role folded in here;
     /// the legacy `xcpng`/`server`/`headless` slugs stay accepted aliases.)*

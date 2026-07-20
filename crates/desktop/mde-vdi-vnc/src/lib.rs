@@ -1,6 +1,6 @@
 //! `mde-vdi-vnc` — render a remote **VNC/RFB** desktop into an egui texture.
 //!
-//! MCNF 12.0 "Quasar" is a mesh-native thin-client desktop OS whose entire
+//! MCNF 12.0 "Construct" is a mesh-native thin-client desktop OS whose entire
 //! interface is egui (`docs/design/quasar-vdi-desktop.md`). VNC/RFB is the
 //! **universal fallback** remote-desktop protocol (lock 21): when a guest has no
 //! RDP — a bare XCP-ng/XAPI `Xvnc` console, a guest mid-boot, any OS state — the

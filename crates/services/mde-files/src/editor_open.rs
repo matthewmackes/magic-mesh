@@ -1,6 +1,6 @@
 //! EDITOR-9 (Part B) — the **Files → Editor** cross-surface open seam.
 //!
-//! "Send-to-Editor" hands a selected file to the one Quasar shell's code-editor
+//! "Send-to-Editor" hands a selected file to the one Construct shell's code-editor
 //! surface. Reuse, not reimplementation (§6): it uses the **same persist-first Bus
 //! verb pattern** the other Send-To actions use (`chat_bridge`'s `action/chat/send`,
 //! `mesh_mount`'s `action/mesh-mount/*`) — a surface writes a typed verb onto a

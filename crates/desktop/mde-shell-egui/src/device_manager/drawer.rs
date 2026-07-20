@@ -94,16 +94,12 @@ pub(super) fn drawer_header(
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(RichText::new("\u{00D7}").size(Style::BODY)) // ×
-                .on_hover_text("Close the device details")
-                .clicked()
-            {
+            let close_response = ui.button(RichText::new("\u{00D7}").size(Style::BODY)); // ×
+            if devmgr_hover_text(close_response, "Close the device details").clicked() {
                 *close = true;
             }
-            if ui
-                .button(RichText::new("\u{29C9}").size(Style::BODY)) // ⧉ — copy details
-                .on_hover_text("Copy this device's details to the clipboard")
+            let copy_response = ui.button(RichText::new("\u{29C9}").size(Style::BODY)); // ⧉ — copy details
+            if devmgr_hover_text(copy_response, "Copy this device's details to the clipboard")
                 .clicked()
             {
                 *copy = true;

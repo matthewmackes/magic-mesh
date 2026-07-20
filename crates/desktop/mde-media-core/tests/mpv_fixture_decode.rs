@@ -107,13 +107,17 @@ fn fixture_decodes_through_real_mpv_with_a_nonblank_frame() {
     //    real ao resolved, or the `audio-fallback-to-null` gate did — mpv's
     //    `current-ao` property is empty only if audio never initialized at
     //    all, which is the one outcome this test treats as a real failure.
-    let current_ao: String = player
-        .engine()
-        .raw()
-        .get_property("current-ao")
-        .unwrap_or_default();
+    let mut current_ao = String::new();
+    let audio_resolved = pump_until(&mut player, |p| {
+        current_ao = p
+            .engine()
+            .raw()
+            .get_property("current-ao")
+            .unwrap_or_default();
+        !current_ao.is_empty()
+    });
     assert!(
-        !current_ao.is_empty(),
+        audio_resolved,
         "mpv's audio output never resolved to anything, not even the honest \
          `null` fallback (current-ao was empty) — audio init did not run at all"
     );

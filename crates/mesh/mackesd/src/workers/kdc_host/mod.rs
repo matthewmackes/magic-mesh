@@ -85,13 +85,12 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
-// KDC-MESH-8 — consume the QUASAR-CLOUD openstack worker's PUBLIC Bus verb
-// interface (design #12) to drive fleet instance lifecycle from the phone. This
-// is a read-only consumer of the public `verbs` surface — the openstack worker
-// itself (its state, its responder) is never touched.
-use crate::workers::openstack::verbs::{
-    cloud_action_topic, CloudInstance, CloudReply, LifecycleAction,
-};
+// KDC-MESH-8 — drive fleet instance lifecycle from the phone over the neutral
+// `action/cloud/*` Bus verb namespace (design #12). This is a read-only producer
+// of typed cloud requests + reader of the typed reply; the cloud backend that
+// answers them is provided by a later local-first worker. The neutral wire shapes
+// live in `mackes_mesh_types::cloud` (§6 — neither side depends on the other).
+use mackes_mesh_types::cloud::{cloud_action_topic, CloudInstance, CloudReply, LifecycleAction};
 
 // ARCH: this worker was split out of a 5.3K-line god-file into a directory
 // module (behavior-preserving relocation). The `Worker` impl + the public entry
@@ -200,7 +199,7 @@ const NOTIFY_FORWARD_TICK: Duration = Duration::from_secs(5);
 
 // ── KDC-MESH-9: the mesh-fanout endpoint (design #8) ─────────────────────────
 //
-// The designated endpoint advertises as "Quasar Mesh" (one device to stock KDE
+// The designated endpoint advertises as "Construct Mesh" (one device to stock KDE
 // Connect) and relays each follow-everywhere action (a phone clipboard copy / a
 // find-my-device ring) to EVERY node, aggregating their responses. The relay rides
 // the same own-row replicated substrate as the phone roster + notification relay
@@ -884,7 +883,7 @@ fn parse_inbound_notification(
 /// endpoint relays to every node (design #6/#10), or `None` for a packet that isn't
 /// fanned out. Pure (no I/O) so the endpoint's relay decision is unit-tested. Only
 /// the two v1 follow-everywhere actions are fanned out — a clipboard copy and a
-/// find-my-device ring — so a copy / ring on the single "Quasar Mesh" device
+/// find-my-device ring — so a copy / ring on the single "Construct Mesh" device
 /// reaches EVERY desktop, not just the endpoint one.
 fn fanout_action_for_packet(kind: &str, body: &Value) -> Option<FanoutAction> {
     match kind {
@@ -1060,19 +1059,19 @@ fn collect_local_notifies(
 }
 
 /// Build the outbound `kdeconnect.notification` packet for a forwarded mesh
-/// notification — appears on the phone as a "Quasar Mesh" notification. Pure.
+/// notification — appears on the phone as a "Construct Mesh" notification. Pure.
 fn mesh_notify_packet(n: &MeshNotify, ts_ms: i64) -> mde_kdc_proto::wire::Packet {
     let title = if n.host.is_empty() {
         format!("Mesh · {}", n.source)
     } else {
         format!("{} · {}", n.host, n.source)
     };
-    let ticker = format!("Quasar Mesh: {}", n.summary);
+    let ticker = format!("{}: {}", mde_kdc_host::MESH_ENDPOINT_NAME, n.summary);
     notification_packet(
         ts_ms,
         NotificationBody {
             id: n.id.clone(),
-            app_name: "Quasar Mesh".to_string(),
+            app_name: mde_kdc_host::MESH_ENDPOINT_NAME.to_string(),
             title,
             text: n.summary.clone(),
             ticker,
@@ -1195,7 +1194,7 @@ fn local_announce() -> Announce {
         // Ring this host (ring_local_device).
         "kdeconnect.findmyphone.request",
         // Curated command list + execution (handle_runcommand), incl. the
-        // KDC-MESH-8 OpenStack lifecycle commands.
+        // KDC-MESH-8 cloud lifecycle commands.
         "kdeconnect.runcommand.request",
         // KDC-MESH-7 — the phone's SFTP mount-info reply (browse the phone's FS
         // from this desktop; the request goes out below). Handled by mounting the
@@ -1322,12 +1321,12 @@ async fn run_host(
     // KDC-MESH-9 — elect the mesh-fanout endpoint (design #8): the stable primary
     // (lexicographically-lowest hostname) among the nodes that have published a KDC
     // service-directory row, plus THIS node. The designated endpoint advertises its
-    // KDE Connect identity as "Quasar Mesh" — the single device stock KDE Connect
+    // KDE Connect identity as "Construct Mesh" — the single device stock KDE Connect
     // shows for the follow-everywhere features — so its inbound clipboard/ring lands
     // here and fans out to the whole mesh. Elected once at start (the advertised KDC
     // name is the TLS-handshake identity, fixed for the link's life); a roster change
     // settles on the next restart. A first-ever boot (empty directory) elects self,
-    // so a lone node is honestly its own "Quasar Mesh".
+    // so a lone node is honestly its own "Construct Mesh".
     let mut mesh_hosts: Vec<String> = service_directory::collect_all_services(&shunt_root)
         .into_iter()
         .map(|n| n.node_host)
@@ -1443,7 +1442,7 @@ async fn run_host(
                     // KDC-PLUGINS / KDC-MESH-8 — Run Command: the phone asks for the
                     // command list (`requestCommandList`) or triggers a curated key.
                     // Results come back as a `kdeconnect.ping` notification. Cloud
-                    // (OpenStack lifecycle) keys drive the QC `action/cloud/*` verbs;
+                    // (cloud lifecycle) keys drive the QC `action/cloud/*` verbs;
                     // every executed command audits (#16). The cloud path is gated on
                     // a paired device (the auth, #16).
                     if packet.kind == "kdeconnect.runcommand.request" {
@@ -1490,7 +1489,23 @@ async fn run_host(
                         if let Ok(body) =
                             mde_kdc_proto::plugins::from_packet_body::<MprisBody>(packet)
                         {
-                            if let Some(command) =
+                            let host = hostname_for_shunt();
+                            let bus_root = mde_bus::default_data_dir();
+                            let browser_status =
+                                browser_media_status_from_bus(bus_root.as_deref(), &host);
+                            if let Some(command) = apply_browser_mpris_media_command(
+                                bus_root.as_deref(),
+                                &host,
+                                &body,
+                                browser_status.as_ref(),
+                            ) {
+                                audit_kdc_action(json!({
+                                    "action": "kdc_media_control",
+                                    "phone": peer.as_str(),
+                                    "command": command,
+                                    "target": "browser",
+                                }));
+                            } else if let Some(command) =
                                 apply_mpris_media_command(&PlayerctlMediaControl, &body)
                             {
                                 audit_kdc_action(json!({
@@ -1511,7 +1526,23 @@ async fn run_host(
                         if let Ok(body) =
                             mde_kdc_proto::plugins::from_packet_body::<MprisRequestBody>(packet)
                         {
-                            if let Some(command) =
+                            let host = hostname_for_shunt();
+                            let bus_root = mde_bus::default_data_dir();
+                            let browser_status =
+                                browser_media_status_from_bus(bus_root.as_deref(), &host);
+                            if let Some(command) = apply_browser_mpris_request_command(
+                                bus_root.as_deref(),
+                                &host,
+                                &body,
+                                browser_status.as_ref(),
+                            ) {
+                                audit_kdc_action(json!({
+                                    "action": "kdc_media_control",
+                                    "phone": peer.as_str(),
+                                    "command": command,
+                                    "target": "browser",
+                                }));
+                            } else if let Some(command) =
                                 apply_mpris_request_command(&PlayerctlMediaControl, &body)
                             {
                                 audit_kdc_action(json!({
@@ -1520,8 +1551,11 @@ async fn run_host(
                                     "command": command,
                                 }));
                             }
-                            let reports =
-                                mpris_response_bodies_for_request(&PlayerctlMediaControl, &body);
+                            let reports = mpris_response_bodies_for_request_with_browser(
+                                &PlayerctlMediaControl,
+                                &body,
+                                browser_status.as_ref(),
+                            );
                             for report in reports {
                                 let packet = build_packet(
                                     "kdeconnect.mpris",
@@ -1595,10 +1629,10 @@ async fn run_host(
                         }
                     }
                     // KDC-MESH-9 — the mesh-fanout endpoint (design #8): when THIS
-                    // node is the designated "Quasar Mesh" endpoint, a follow-
+                    // node is the designated "Construct Mesh" endpoint, a follow-
                     // everywhere action it just applied locally (a clipboard copy or a
                     // find-my-device ring, classified from the packet) is ALSO relayed
-                    // to every other node, so a copy/ring on the single "Quasar Mesh"
+                    // to every other node, so a copy/ring on the single "Construct Mesh"
                     // device reaches the whole mesh (#6/#10). The endpoint remembers
                     // the request id to aggregate the responses on the shunt tick.
                     if is_endpoint {
@@ -1922,7 +1956,7 @@ fn execute_runcommand(cmds: &[RunCmd], key: &str) -> String {
 /// the host event loop.
 ///
 /// KDC-MESH-8: the published list carries the shell commands PLUS the fleet
-/// OpenStack lifecycle commands ([`cloud_command_entries`]). A `cloud-*` key is
+/// cloud lifecycle commands ([`cloud_command_entries`]). A `cloud-*` key is
 /// routed through the QC `action/cloud/*` Bus verbs ([`handle_cloud_command`]) —
 /// gated on a `paired` device (the auth, #16) — instead of the shell. Every
 /// executed command audits (#16).
@@ -1946,7 +1980,7 @@ async fn handle_runcommand(
         return;
     }
     if let Some(key) = body.get("key").and_then(Value::as_str) {
-        // KDC-MESH-8 — a cloud lifecycle key drives the fleet OpenStack verbs over
+        // KDC-MESH-8 — a cloud lifecycle key drives the fleet cloud verbs over
         // the Bus (paired-gated), not the shell.
         if let Some(cmd) = CloudCommand::from_key(key) {
             if !paired {
@@ -2167,7 +2201,7 @@ fn default_shared_roots(config_dir: &std::path::Path) -> Vec<SharedRoot> {
 ///
 /// KDC-MESH-7 tokens: `files` (+ `sftp` for the phone-FS mount) plus the
 /// already-live `run-commands` / `battery` / `find-my-device`. KDC-MESH-8 extends
-/// this with `openstack` + `telephony`.
+/// this with the cloud service token + `telephony`.
 fn advertised_services() -> Vec<String> {
     vec![
         service_directory::service::FILES.to_string(),
@@ -2178,7 +2212,7 @@ fn advertised_services() -> Vec<String> {
         // honest-gates when `sshfs` is absent (it's a capability, not a promise
         // the tool is installed).
         service_directory::service::SFTP.to_string(),
-        // KDC-MESH-8 — fleet OpenStack lifecycle (drives the QC `action/cloud/*`
+        // KDC-MESH-8 — fleet cloud lifecycle (drives the QC `action/cloud/*`
         // verbs) + telephony (call/SMS) alerts.
         service_directory::service::OPENSTACK.to_string(),
         service_directory::service::TELEPHONY.to_string(),
@@ -2294,11 +2328,11 @@ fn serve_browse(config_dir: &std::path::Path, body: &Value) -> String {
     }
 }
 
-// ── KDC-MESH-8: run-commands (OpenStack lifecycle) + telephony + connectivity ──
+// ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ──
 //
-// The phone triggers fleet OpenStack lifecycle commands (design #12) that drive
-// the QC `action/cloud/*` typed verbs over the Bus — consuming the openstack
-// worker's PUBLIC interface, never touching the worker. Battery + connectivity
+// The phone triggers fleet cloud lifecycle commands (design #12) that drive
+// the QC `action/cloud/*` typed verbs over the Bus — the neutral cloud verb
+// namespace answered by the cloud backend, never a direct worker dependency. Battery + connectivity
 // report on desktops, telephony alerts surface, find-my-device works both ways;
 // pairing is the auth but EVERY action audits (#16, `audit_kdc_action`).
 

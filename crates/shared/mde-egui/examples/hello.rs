@@ -28,7 +28,7 @@ impl eframe::App for Hello {
             ui.add_space(Style::SP_S);
             ui.colored_label(
                 Style::TEXT_DIM,
-                "E12 · Quasar — one Style, one Motion table, one toolkit.",
+                "E12 · Construct — one Style, one Motion table, one toolkit.",
             );
             ui.add_space(Style::SP_M);
 

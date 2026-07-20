@@ -1,5 +1,6 @@
 use super::*;
 use mde_egui::egui::{pos2, vec2, Rect};
+use mde_egui::{Density, StyleColorScheme};
 
 /// A fixture body in the exact `CHOOSER-1` wire shape (the worker's
 /// `DesktopSourcesState` serde output — `snake_case` tags, optional ports
@@ -859,6 +860,174 @@ fn run_panel(state: &mut ChooserState) -> bool {
     !prims.is_empty()
 }
 
+fn panel_text_positions(state: &mut ChooserState) -> Vec<(String, egui::Pos2)> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text.pos)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| chooser_panel(ui, state));
+    });
+    let mut texts = Vec::new();
+    for clipped in out.shapes {
+        walk(&clipped.shape, &mut texts);
+    }
+    texts
+}
+
+fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text_color(text))),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut texts = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut texts);
+    }
+    texts
+}
+
+fn painted_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                out.push(rect.fill);
+            }
+            egui::Shape::Path(path) if path.fill != egui::Color32::TRANSPARENT => {
+                out.push(path.fill);
+            }
+            egui::Shape::Mesh(mesh) => {
+                out.extend(mesh.vertices.iter().map(|vertex| vertex.color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut fills = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut fills);
+    }
+    fills
+}
+
+#[test]
+fn chooser_hover_tooltip_uses_themed_text_and_surface() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                chooser_tooltip(ui, "Remote Sessions endpoint");
+            });
+    });
+
+    let texts = painted_text_colors(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "Remote Sessions endpoint" && *color == Style::TEXT),
+        "Remote Sessions tooltip should paint themed text: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, color)| text == "Remote Sessions endpoint"
+                && *color == egui::Color32::BLACK),
+        "Remote Sessions tooltip leaked raw black popup text: {texts:?}"
+    );
+
+    let fills = painted_fills(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Remote Sessions tooltip should paint its own themed surface: {fills:?}"
+    );
+}
+
+#[test]
+fn chooser_popup_surfaces_use_themed_text_and_compact_spacing() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut style = (*ctx.style()).clone();
+    apply_chooser_popup_style(&ctx, &mut style);
+
+    assert_eq!(style.visuals.window_fill, Style::SURFACE);
+    assert_eq!(style.visuals.panel_fill, Style::SURFACE);
+    assert_eq!(style.visuals.window_stroke.color, Style::BORDER);
+    assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
+    assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
+    assert_eq!(style.spacing.button_padding.y, Style::CONTROL_PAD_Y);
+    assert_eq!(style.spacing.item_spacing.y, Style::TOOLBAR_INSET_Y);
+
+    let light = egui::Context::default();
+    Style::install_color_scheme_with_density(&light, StyleColorScheme::Light, Density::Mouse);
+    let palette = Style::palette_for(StyleColorScheme::Light);
+    let mut light_style = (*light.style()).clone();
+    apply_chooser_popup_style(&light, &mut light_style);
+
+    assert_eq!(light_style.visuals.window_fill, palette.surface);
+    assert_eq!(light_style.visuals.panel_fill, palette.surface);
+    assert_eq!(light_style.visuals.window_stroke.color, palette.border);
+    assert_eq!(light_style.visuals.override_text_color, Some(palette.text));
+    assert_eq!(
+        light_style.visuals.widgets.inactive.fg_stroke.color,
+        palette.text
+    );
+    assert_ne!(
+        light_style.visuals.widgets.inactive.fg_stroke.color,
+        Style::TEXT,
+        "Remote Sessions chooser popups must resolve light text instead of raw dark text"
+    );
+}
+
 #[test]
 fn an_empty_roster_renders_the_backdrop_with_the_honest_reason() {
     // A published-but-quiet roster: the BRAND-1 hero + the quiet-lane copy.
@@ -886,6 +1055,24 @@ fn an_empty_roster_renders_the_backdrop_with_the_honest_reason() {
     let (title, _) = unreported.empty_copy();
     assert_eq!(title, "Desktop discovery hasn't reported yet");
     assert!(run_panel(&mut unreported));
+}
+
+#[test]
+fn empty_roster_title_renders_near_the_workspace_center() {
+    let mut state = state_with(Some(DesktopSourcesState {
+        sources: vec![],
+        lanes: vec![],
+    }));
+    let texts = panel_text_positions(&mut state);
+    let y = texts
+        .iter()
+        .find_map(|(text, pos)| (text == "No desktops discovered").then_some(pos.y))
+        .expect("empty title should paint");
+
+    assert!(
+        y > 250.0 && y < 360.0,
+        "No desktops discovered should be centered in the workspace, painted at y={y}; texts={texts:?}"
+    );
 }
 
 #[test]

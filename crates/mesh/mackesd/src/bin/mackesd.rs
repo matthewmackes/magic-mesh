@@ -454,7 +454,7 @@ enum Cmd {
         json: bool,
     },
 
-    /// QC-15 — audit a QUASAR-CLOUD cutover node for retired VM-stack leftovers
+    /// QC-15 — audit a CONSTRUCT-CLOUD cutover node for retired VM-stack leftovers
     /// and Q58 fresh-VM rebuild evidence. Exits nonzero when any check fails.
     CutoverAudit {
         /// Repository root to inspect for old-stack artifacts.
@@ -2704,35 +2704,29 @@ fn run_serve(
         // count + the router decision histogram into
         // <textfile_collector>/mackesd.prom every 30 s; a node_exporter
         // textfile collector scrapes it.
-        if mackesd_core::worker_role::runs("metrics_exporter", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::metrics_exporter::MetricsExporterWorker::new(
-                    db_path.clone(),
-                    mackesd_core::metrics::default_textfile_dir(),
-                    Some(mackesd_core::workers::cert_authority::default_ca_cert_path()),
-                )
-                .with_router_metrics(Arc::clone(&router_metrics))
-                // EFF-26 — worker/breaker gauges + trip alert.
-                .with_worker_status(Arc::clone(&worker_status))
-                // EFF-26 — disk headroom for the replicated volume + the
-                // store's filesystem.
-                .with_disk_paths(vec![
-                    workgroup_root.clone(),
-                    db_path.parent().map(PathBuf::from).unwrap_or_default(),
-                ])
-                // EFF-26 — backup staleness against the daily bundle.
-                .with_backup_file(
-                    mackesd_core::workers::nebula_ca_backup::backup_path_for(
-                        &workgroup_root,
-                        &node_id,
-                    ),
-                )
-                // EFF-21 — env is scrubbed at boot; presence rides this flag.
-                .with_backup_passphrase_set(backup_passphrase.is_some()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("metrics_exporter".into());
-        }
+        spawn_tiered(&mut sup, &worker_names, role_rank, "metrics_exporter", || {
+            mackesd_core::workers::metrics_exporter::MetricsExporterWorker::new(
+                db_path.clone(),
+                mackesd_core::metrics::default_textfile_dir(),
+                Some(mackesd_core::workers::cert_authority::default_ca_cert_path()),
+            )
+            .with_router_metrics(Arc::clone(&router_metrics))
+            // EFF-26 — worker/breaker gauges + trip alert.
+            .with_worker_status(Arc::clone(&worker_status))
+            // EFF-26 — disk headroom for the replicated volume + the
+            // store's filesystem.
+            .with_disk_paths(vec![
+                workgroup_root.clone(),
+                db_path.parent().map(PathBuf::from).unwrap_or_default(),
+            ])
+            // EFF-26 — backup staleness against the daily bundle.
+            .with_backup_file(mackesd_core::workers::nebula_ca_backup::backup_path_for(
+                &workgroup_root,
+                &node_id,
+            ))
+            // EFF-21 — env is scrubbed at boot; presence rides this flag.
+            .with_backup_passphrase_set(backup_passphrase.is_some())
+        });
         // VV-2 (v4.1.0) — voice_config worker. Seeds the
         // /var/lib/mackesd/voice-desired.json document on first
         // tick + triggers `systemctl try-reload-or-restart` on
@@ -2765,11 +2759,9 @@ fn run_serve(
         });
         if mackesd_core::worker_role::runs("voice_config", role_rank) {
             if voice_dir_writable {
-                sup.spawn(Spawn::new(
-                    VoiceConfigWorker::new(node_id.clone()),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names.lock().expect("worker_names mutex").push("voice_config".into());
+                spawn_tiered(&mut sup, &worker_names, role_rank, "voice_config", || {
+                    VoiceConfigWorker::new(node_id.clone())
+                });
             } else {
                 tracing::info!(
                     "voice_config: system voice dir not writable (per-user daemon); worker skipped"
@@ -2805,7 +2797,7 @@ fn run_serve(
             tracing::warn!(error = %e, "mesh-router: policy.toml load failed; baseline policy");
             mackes_transport::scorer::Policy::baseline()
         });
-        sup.spawn(Spawn::new(
+        spawn_tiered(&mut sup, &worker_names, role_rank, "mesh_router", || {
             // AUD2-1 — attach the shared decision-time histogram so the
             // router's per-tick observe() lands in the exporter's scrape.
             // AUD3 S-2/S-5 — scorer policy + the audit sink (path flips
@@ -2813,10 +2805,8 @@ fn run_serve(
             MeshRouterWorker::new(Arc::clone(&router_state), router_registry)
                 .with_metrics(Arc::clone(&router_metrics))
                 .with_policy(router_policy)
-                .with_audit_sink(db_path.clone(), node_id.clone()),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names.lock().expect("worker_names mutex").push("mesh_router".into());
+                .with_audit_sink(db_path.clone(), node_id.clone())
+        });
         // v4.0.1 Phase 12.17 wire (2026-05-23) — STUN candidate
         // gatherer. Shares router_state with the router so
         // reflexive candidates land on every tracked peer's
@@ -2824,13 +2814,9 @@ fn run_serve(
         // probe timeout 1.4 s; default server pool is Google's
         // public STUN cluster (IP-pinned so the worker doesn't
         // hit DNS on the hot path).
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::stun_gather::StunGatherWorker::new(
-                Arc::clone(&router_state),
-            ),
-            RestartPolicy::OnFailure,
-        ));
-        worker_names.lock().expect("worker_names mutex").push("stun_gather".into());
+        spawn_tiered(&mut sup, &worker_names, role_rank, "stun_gather", || {
+            mackesd_core::workers::stun_gather::StunGatherWorker::new(Arc::clone(&router_state))
+        });
         // BUS-4.2 (2026-05-26) — `notification_relay` retired.
         // Cross-peer notification routing is now a side-effect of
         // BUS-4.4's FDO bridge: every Notify call publishes to
@@ -2861,16 +2847,14 @@ fn run_serve(
                 // record once the operator types a name.
                 let mesh_id = std::env::var("MDE_MESH_ID")
                     .unwrap_or_else(|_| format!("mesh-{node_id}"));
-                sup.spawn(Spawn::new(
+                spawn_tiered(&mut sup, &worker_names, role_rank, "nebula_supervisor", || {
                     mackesd_core::workers::nebula_supervisor::NebulaSupervisor::new(
                         sup_store,
                         node_id.clone(),
                         mesh_id,
                         bundle_path,
-                    ),
-                    RestartPolicy::OnFailure,
-                ));
-                worker_names.lock().expect("worker_names mutex").push("nebula_supervisor".into());
+                    )
+                });
             }
             Err(e) => {
                 tracing::warn!(
@@ -3100,7 +3084,7 @@ fn run_serve(
         // responders that share shutdown/worker_status/worker_names) was factored
         // out of run_serve into the cohesive `start_*` helpers below. Each helper
         // holds the exact thread-spawn + `worker_names.push(...)` registration
-        // VERBATIM and runs its blocks in the original order, so the WORKER_TIERS
+        // VERBATIM and runs its blocks in the original order, so the WORKER_REGISTRY
         // census + the ARCH-5 drift guard stay byte-identical (round-1 factored the
         // sup.spawn worker blocks; this is the responder half).
         start_control_surface_bus_responders(
@@ -3132,11 +3116,9 @@ fn run_serve(
         // it just gets the same restart + back-off + breaker treatment as every
         // sibling. Still surfaced via Shell.Workers (the worker_names roster) AND
         // now the supervisor's status map.
-        worker_names.lock().expect("worker_names mutex").push("reconcile".into());
-        sup.spawn(Spawn::new(
-            ReconcileWorker::new(workgroup_root, node_id, db_path),
-            RestartPolicy::OnFailure,
-        ));
+        spawn_tiered(&mut sup, &worker_names, role_rank, "reconcile", || {
+            ReconcileWorker::new(workgroup_root, node_id, db_path)
+        });
 
         // BULLETPROOF-2 — the daemon is up (supervisor + all responders +
         // workers spawned). Tell systemd we're READY (Type=notify gate) and

@@ -59,6 +59,11 @@ pub fn publish_json<T: serde::Serialize>(
     let body = match serde_json::to_string(payload) {
         Ok(b) => b,
         Err(e) => {
+            // WL-RUN-002 — a serialize failure means the publish never
+            // reaches the store; count it as a bus publish error too so
+            // `mackesd_bus_publish_errors_total` captures every failed
+            // publish, not just store-write failures.
+            crate::metrics::record_bus_publish_error();
             tracing::debug!(
                 target: "mackesd::bus_publish",
                 topic,
@@ -97,6 +102,12 @@ fn write_body(persist: &mut Persist, topic: &str, body: &str) -> Option<StoredMe
     match persist.write(topic, Priority::Default, None, Some(body)) {
         Ok(msg) => Some(msg),
         Err(e) => {
+            // WL-RUN-002 — the single chokepoint every in-process bus
+            // publish (`publish_json` / `publish_body`) funnels through.
+            // A swallowed write failure still bumps the process-wide
+            // `mackesd_bus_publish_errors_total` counter so the
+            // best-effort degrade stays observable in the scrape.
+            crate::metrics::record_bus_publish_error();
             tracing::debug!(
                 target: "mackesd::bus_publish",
                 topic,

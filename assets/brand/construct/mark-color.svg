@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Construct mark color</title>
+  <desc>Full-color Construct product mark inspired by the generated Construct source artwork.</desc>
+  <circle cx="32" cy="32" r="30" fill="#141819"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="32" cy="32" r="24" stroke="#73777d" stroke-width="4"/>
+    <path stroke="#73777d" stroke-width="4" d="M32 3v8M32 53v8M3 32h8M53 32h8M11.5 11.5l5.7 5.7M46.8 46.8l5.7 5.7M52.5 11.5l-5.7 5.7M17.2 46.8l-5.7 5.7"/>
+    <path stroke="#7b45e8" stroke-width="3" d="M20 24a18 18 0 0 1 24 0"/>
+    <path stroke="#2e78f6" stroke-width="3" d="M18 32h28"/>
+    <path stroke="#7b45e8" stroke-width="3" d="M20 40a18 18 0 0 0 24 0"/>
+    <circle cx="32" cy="32" r="8" stroke="#d7d9dc" stroke-width="3"/>
+  </g>
+  <path fill="#e8eaed" d="M30 25h4l3.5 5.5 5.5 1.5-5.5 1.5L34 39h-4l2.4-5.8L27 32l5.4-1.2z"/>
+</svg>

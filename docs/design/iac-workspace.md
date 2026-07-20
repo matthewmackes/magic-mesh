@@ -15,7 +15,7 @@ capabilities through its standard IaaS APIs.** So the workspace is OpenStack-nat
 - the **service catalog** (Keystone) is the authoritative "what services exist" list,
 - **Heat** (HOT templates + stacks) is the native "as Code" / orchestration engine,
 - the per-service **standard APIs** provide status + every control.
-No external IaC tool. This aligns with **QUASAR-CLOUD** (`docs/design/quasar-cloud.md` —
+No external IaC tool. This aligns with **CONSTRUCT-CLOUD** (`docs/design/quasar-cloud.md` —
 the mesh becoming an OpenStack cloud). The **[[menubar-all]]** governing principle — *the
 menu bar surfaces ALL controls, incl. advanced/complex* — lands hardest here: the menus
 carry the full standard-API verb set.
@@ -57,7 +57,7 @@ A Rust OpenStack client layer authenticating via **clouds.yaml** (openstacksdk s
 exposing: the **Keystone catalog** (service list + endpoints), per-service **API health**
 (a real ping/version probe), and the **standard resource + verb calls** (Nova/Neutron/
 Glance/Cinder/Heat/…). Reuse/extend the platform's existing OpenStack integration
-(`mackesd` QC verbs / `ipc/datacenter` / `compute_registry` / the QUASAR-CLOUD epic) rather
+(`mackesd` QC verbs / `ipc/datacenter` / `compute_registry` / the CONSTRUCT-CLOUD epic) rather
 than a parallel client (§6). The catalog is the authoritative directory source.
 
 ### The surface — `Surface::InfraCode` (IAC-2..N) in `mde-shell-egui`
@@ -79,7 +79,7 @@ A new surface in the **Workloads** dock group (name "Infra as Code (IaC)"), usin
 ### Relationship to the platform
 - **Instances (QC-12)** stays the quick VM broker; IaC is the full admin; both share the
   OpenStack client (IAC-1); IaC → Instances jump for the deep compute view (#24).
-- **QUASAR-CLOUD** provides the underlying cloud; IaC is its operator control plane.
+- **CONSTRUCT-CLOUD** provides the underlying cloud; IaC is its operator control plane.
 - The **comprehensive menu bar** is the [[menubar-all]] governing-principle headline case.
 
 ## Acceptance (runtime-observable; per task — §7)

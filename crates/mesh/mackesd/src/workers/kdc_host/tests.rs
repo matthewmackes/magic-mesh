@@ -237,12 +237,13 @@ fn mpris_request_player_list_maps_playerctl_list_to_report() {
         .unwrap()
         .insert(vec!["-l".into()], "mde-music\nvlc\n".into());
 
-    let reports = mpris_response_bodies_for_request(
+    let reports = mpris_response_bodies_for_request_with_browser(
         &control,
         &MprisRequestBody {
             request_player_list: true,
             ..Default::default()
         },
+        None,
     );
 
     assert_eq!(reports.len(), 1);
@@ -279,7 +280,7 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
     );
     drop(outputs);
 
-    let reports = mpris_response_bodies_for_request(
+    let reports = mpris_response_bodies_for_request_with_browser(
         &control,
         &MprisRequestBody {
             player: "mde-music".into(),
@@ -287,6 +288,7 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
             request_volume: true,
             ..Default::default()
         },
+        None,
     );
 
     assert_eq!(reports.len(), 1);
@@ -304,6 +306,152 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
     assert_eq!(report.now_playing, "Test Artist - Test Title");
     assert_eq!(report.can_play, Some(true));
     assert_eq!(report.can_pause, Some(true));
+}
+
+#[test]
+fn mpris_request_player_list_includes_retained_browser_media_status() {
+    let control = RecordingMediaControl::default();
+    control
+        .outputs
+        .lock()
+        .unwrap()
+        .insert(vec!["-l".into()], "mde-music\n".into());
+    let browser = parse_browser_media_status(
+        r#"{
+            "op":"browser_media_status",
+            "state":"playing",
+            "tab_id":7,
+            "metadata":{"title":"Browser Track"}
+        }"#,
+    )
+    .expect("browser status");
+
+    let reports = mpris_response_bodies_for_request_with_browser(
+        &control,
+        &MprisRequestBody {
+            request_player_list: true,
+            ..Default::default()
+        },
+        Some(&browser),
+    );
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].kind(), MprisKind::PlayerList);
+    assert_eq!(reports[0].player_list, vec!["mde-music", "mde-browser"]);
+    assert_eq!(reports[0].support_album_art_payload, Some(false));
+}
+
+#[test]
+fn mpris_request_now_playing_maps_browser_media_status_to_report() {
+    let control = RecordingMediaControl::default();
+    let browser = parse_browser_media_status(
+        r#"{
+            "op":"browser_media_status",
+            "state":"playing",
+            "tab_id":7,
+            "metadata":{
+                "title":"Browser Track",
+                "artist":"Browser Artist",
+                "album":"Browser Album",
+                "artwork_url":"https://media.example/art.png",
+                "duration_ms":120000,
+                "position_ms":42000,
+                "volume_percent":42
+            }
+        }"#,
+    )
+    .expect("browser status");
+
+    let reports = mpris_response_bodies_for_request_with_browser(
+        &control,
+        &MprisRequestBody {
+            player: "mde-browser".into(),
+            request_now_playing: true,
+            request_volume: true,
+            ..Default::default()
+        },
+        Some(&browser),
+    );
+
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(report.kind(), MprisKind::State);
+    assert_eq!(report.player, "mde-browser");
+    assert!(report.is_playing);
+    assert_eq!(report.pos, 42_000);
+    assert_eq!(report.length, 120_000);
+    assert_eq!(report.volume, Some(42));
+    assert_eq!(report.artist, "Browser Artist");
+    assert_eq!(report.title, "Browser Track");
+    assert_eq!(report.album, "Browser Album");
+    assert_eq!(report.album_art_url, "https://media.example/art.png");
+    assert_eq!(report.now_playing, "Browser Artist - Browser Track");
+    assert_eq!(report.can_play, Some(true));
+    assert_eq!(report.can_pause, Some(true));
+}
+
+#[test]
+fn browser_targeted_mpris_request_publishes_browser_media_control() {
+    let bus = tempdir().expect("temp bus");
+    let browser = parse_browser_media_status(
+        r#"{
+            "op":"browser_media_status",
+            "state":"playing",
+            "tab_id":7,
+            "metadata":{"title":"Browser Track"}
+        }"#,
+    )
+    .expect("browser status");
+
+    assert_eq!(
+        apply_browser_mpris_request_command(
+            Some(bus.path()),
+            "node-a",
+            &MprisRequestBody {
+                player: "mde-browser".into(),
+                action: "Pause".into(),
+                ..Default::default()
+            },
+            Some(&browser),
+        ),
+        Some("pause")
+    );
+
+    let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+    let msgs = persist
+        .list_since("action/browser/media-control/node-a", None)
+        .expect("list browser media control");
+    assert_eq!(msgs.len(), 1);
+    let body: Value = serde_json::from_str(msgs[0].body.as_deref().expect("media control body"))
+        .expect("valid media control JSON");
+    assert_eq!(body["op"], "browser_media_control");
+    assert_eq!(body["source"], "kdc_host");
+    assert_eq!(body["player"], "mde-browser");
+    assert_eq!(body["action"], "pause");
+    assert_eq!(body["tab_id"], 7);
+
+    assert_eq!(
+        apply_browser_mpris_request_command(
+            Some(bus.path()),
+            "node-a",
+            &MprisRequestBody {
+                player: "mde-browser".into(),
+                action: "VolumeUp".into(),
+                ..Default::default()
+            },
+            Some(&browser),
+        ),
+        Some("volume-up")
+    );
+
+    let msgs = persist
+        .list_since("action/browser/media-control/node-a", None)
+        .expect("list browser media volume control");
+    assert_eq!(msgs.len(), 2);
+    let body: Value = serde_json::from_str(msgs[1].body.as_deref().expect("volume control body"))
+        .expect("valid volume control JSON");
+    assert_eq!(body["action"], "volume-up");
+    assert_eq!(body["tab_id"], 7);
 }
 
 #[test]
@@ -928,9 +1076,10 @@ fn mesh_notify_packet_builds_a_kdeconnect_notification() {
     let pkt = mesh_notify_packet(&n, 42);
     assert_eq!(pkt.kind, "kdeconnect.notification");
     let body: NotificationBody = mde_kdc_proto::plugins::from_packet_body(&pkt).expect("decodes");
-    assert_eq!(body.app_name, "Quasar Mesh");
+    assert_eq!(body.app_name, mde_kdc_host::MESH_ENDPOINT_NAME);
     assert_eq!(body.id, "01ULID");
     assert_eq!(body.text, "service sshd.service failed");
+    assert_eq!(body.ticker, "Construct Mesh: service sshd.service failed");
     assert!(body.title.contains("nyc3") && body.title.contains("service"));
     assert!(!body.is_cancel);
 }
@@ -1588,7 +1737,7 @@ fn connect_verb_sftp_requires_paired_and_enqueues_a_browse_request() {
     assert_eq!(queued[0].packet.kind, "kdeconnect.sftp.request");
 }
 
-// ── KDC-MESH-8: run-commands (OpenStack lifecycle) + telephony + connectivity ─
+// ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ─
 
 fn instance(name: &str, status: &str) -> CloudInstance {
     CloudInstance {
@@ -1625,10 +1774,17 @@ fn cloud_command_keys_map_and_the_list_includes_them() {
     }
     // Delete is deliberately NOT phone-exposed (safety).
     assert!(!list.contains("cloud-delete"));
+    let lower = list.to_ascii_lowercase();
+    for term in ["openstack", "nova", "keystone", "heat", "horizon"] {
+        assert!(
+            !lower.contains(term),
+            "phone-visible cloud command list must not expose {term}"
+        );
+    }
 }
 
 #[test]
-fn plan_cloud_lifecycle_filters_by_nova_status() {
+fn plan_cloud_lifecycle_filters_by_provider_status() {
     let fleet = [
         instance("web", "ACTIVE"),
         instance("db", "SHUTOFF"),
@@ -1654,7 +1810,7 @@ fn plan_cloud_lifecycle_filters_by_nova_status() {
 }
 
 #[test]
-fn lifecycle_bus_verb_maps_to_the_openstack_action_verb() {
+fn lifecycle_bus_verb_maps_to_the_cloud_action_verb() {
     assert_eq!(lifecycle_bus_verb(LifecycleAction::Start), "instance-start");
     assert_eq!(
         lifecycle_bus_verb(LifecycleAction::Reboot),
@@ -1720,7 +1876,7 @@ fn kdc_mesh8_a_phone_action_appends_a_hash_chained_audit_row() {
     std::env::set_var("MDE_HOME", tmp.path());
     let before = audit_row_count(&crate::default_db_path());
     audit_kdc_action(
-        json!({ "action": "kdc_openstack", "verb": "instance-reboot", "instance": "web" }),
+        json!({ "action": "kdc_cloud", "verb": "instance-reboot", "instance": "web" }),
     );
     let after = audit_row_count(&crate::default_db_path());
     assert_eq!(

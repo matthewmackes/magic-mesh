@@ -359,7 +359,7 @@ mod tests {
         );
         write(
             root.join("crates/mesh/mackesd/src/lib.rs").as_path(),
-            "pub mod openstack;\n",
+            "pub mod cloud;\n",
         );
         write(
             root.join("crates/desktop/mde-shell-egui/src/main.rs")

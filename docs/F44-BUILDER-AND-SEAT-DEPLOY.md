@@ -63,7 +63,7 @@ sshpass -p $LAB_PW ssh $SSHPW <user>@<ip>
 
 | seat | IP | user | notes |
 |---|---|---|---|
-| **.138** | 172.20.146.138 | `root` | physical F44, DRM-capable Quasar seat, `libmpv.so.2` present |
+| **.138** | 172.20.146.138 | `root` | physical F44, DRM-capable Construct seat, `libmpv.so.2` present |
 | **Eagle** | 172.20.146.13 | `mm`   | F44 workstation (`UNIT-EAGLE`); root is rejected → use `mm` |
 | **.2** | 172.20.146.2 | `mm`   | F44; also on the current mesh |
 | ~~.216~~ | 172.20.146.216 | — | **OFFLINE** ("No route to host"); power on before deploying |
@@ -118,6 +118,18 @@ The VM comes up as `mm@172.20.0.131` (mesh key). The script writes an NM keyfile
 directly (cloud-init's netplan→NM render is broken on Fedora+Xen — the historic
 "dark VM" root cause) and sets `auto_poweron=true`.
 
+**Operational note from the 2026-07-15 browser deploy:** the F44 builder may be
+halted while the regular BigBoy farm VM (`mcnf-build-52` / `.130`) is running.
+The safe handoff is: confirm no active BigBoy farm slots, shut down
+`mcnf-build-52`, wait for BigBoy `memory-free` to rise to roughly 30 GiB, start
+`mcnf-build-f44`, and only then run `MCNF_BUILD_HOST=172.20.0.131
+./install-helpers/xcp-build.sh rpm`. On boot, `.131` can report `No route to
+host` for several polls and then `Connection refused` before SSH is ready; XAPI
+may also show no guest metrics during this window even though the VM is healthy.
+Give it at least a minute and verify with SSH before treating it as a dark VM.
+After the cut, shut down `mcnf-build-f44` and restart `mcnf-build-52` so the
+normal BigBoy farm capacity returns.
+
 ## 4. Toolchain + build + cut
 
 **Toolchain gap found live (2026-07-12):** the DRM shell links `-linput`/`-lgbm`/
@@ -141,6 +153,13 @@ MCNF_BUILD_HOST=172.20.0.131 ./install-helpers/xcp-build.sh rpm
 - DoD for a media build: `rpm -qpR <rpm> | grep swresample` must show `.so.6`
   (ffmpeg-8), and `rpm -qlp <rpm>` must list all four binaries
   (`mackesd`, `mde-shell-egui`, `mde-web-cef`, `mde-web-preview`).
+- Artifact-name gotcha found during the 2026-07-15 browser deploy: a native F44
+  `xcp-build.sh rpm` may pull a fresh `magic-mesh-12.0.0-1.x86_64.rpm` while an
+  older `magic-mesh-12.0.0-1.f44.x86_64.rpm` is still present in
+  `/root/mcnf-release-artifacts`. Do not trust the filename suffix. Verify
+  `rpm -qip <rpm>` build time and `rpm -qpR <rpm> | grep -E
+  'libavcodec|libswresample|libswscale'` before copying to a physical seat; F44
+  should show `.so.62`/`.so.6`/`.so.9`.
 
 ## 5. Terraform representation (the machines run terraform)
 
@@ -274,4 +293,3 @@ grep 'not found'` returns **nothing** (all ffmpeg-8/mpv sonames resolve).
 
 **Still standalone after this** — role-pin activates the local seat but does NOT join the
 mesh. For overlay membership (chat/peers), follow §7 (`mackesd join`) after the shell is up.
-

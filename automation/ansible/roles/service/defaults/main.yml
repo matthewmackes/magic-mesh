@@ -1,0 +1,17 @@
+---
+# WL-ARCH-006 (U13) — service role defaults.
+
+# The directory sealed EnvironmentFiles land in (0600 each).
+service_dropin_dir: /etc/mackesd/service.d
+
+# The headless unit specs to converge on a Service-VM. Each item:
+#   name:        (required) the systemd unit basename (no .service suffix)
+#   exec_start:  (required) the ExecStart command line
+#   description, type, user, working_directory, restart, restart_sec: optional
+#   environment: optional {KEY: value} map of plain (non-secret) env
+#   after:       optional list of extra After= units
+#   secret:      optional age-sealed store name → resolved via the mde_seal lookup
+#                (NO Ansible Vault) into a 0600 EnvironmentFile
+#   env_secret_var: the env var name the sealed value binds to (default SECRET)
+# Empty by default — the reconcile/WorkloadSpec supplies these at run time.
+service_units: []

@@ -1,15 +1,16 @@
-//! `mde-shell-egui` — the single MCNF E12 "Quasar" egui shell (E12-3).
+//! `mde-shell-egui` — the single MCNF E12 "Construct" egui shell (E12-3).
 //!
 //! One eframe app on the `mde-egui` harness. The shell has **ONE chrome** — the
-//! left **vertical dock** (VDOCK, `dock::dock`: the slide-in, auto-hide app picker
-//! + bottom status/system quads; the old horizontal taskbar and the top chrome
-//! strip are both retired). Beside it, the central view is either:
+//! Win10-hybrid bottom taskbar (`dock::notification_rail_with_sources`: Start,
+//! sessions, tray/status, clock, action center, and show-desktop nub). The old
+//! horizontal taskbar, the top chrome strip, and the rendered left vertical dock
+//! are retired. Above that taskbar, the central view is either:
 //!
 //! * the **session `EmptyState`** (collapsed) — a real session is a fullscreen VM
 //!   texture from `mde-vdi`; or
 //! * the active **surface** (expanded) — Workbench / Mesh Map / the app
-//!   surfaces, selected on the dock (the dock IS the nav; any dock click
-//!   surfaces the body).
+//!   surfaces, selected through the Start Menu, front door, hotkeys, or taskbar
+//!   affordances.
 //!
 //! The session↔body transition eases through the shared `Motion` table and the
 //! whole surface renders through the shared `Style` (governance §4/§5/§7). This is
@@ -24,6 +25,7 @@ mod bus_reader;
 mod chat;
 mod chooser;
 mod chrome;
+mod communications;
 mod console;
 mod controller;
 mod curtain;
@@ -32,11 +34,15 @@ mod device_manager;
 mod discovery;
 mod dock;
 mod explorer;
+mod federation;
 mod formfactor;
+mod front_door;
+mod front_door_peer_apps;
 mod host_mirror;
 mod hotkeys;
 mod iac;
 mod keyboard;
+mod launcher_pins;
 mod lock_signal;
 mod logging;
 mod mesh_view;
@@ -52,12 +58,12 @@ mod provisioning;
 #[cfg(test)]
 mod screenshot;
 mod seat_pump;
+mod seat_remote_input_consent;
 mod services_flow;
 mod session;
 mod session_rail;
 mod spawn_lighthouse_flow;
 mod splash;
-mod start_menu;
 mod status;
 mod storage;
 mod surface_card;
@@ -71,7 +77,10 @@ mod workbench;
 
 use std::time::{Duration, Instant};
 
-use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
+use mde_egui::search_omnibox::SearchItem;
+use mde_egui::{eframe, egui, run_client, LayoutProfile, Motion, Style};
+use mde_theme::brand::icons::IconId;
+use mde_web_preview_client::MediaTransportAction;
 
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
@@ -81,7 +90,8 @@ use mde_bookmarks_egui::{
 };
 use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
 use mde_files::editor_open::EditorLaunchWatch;
-use mde_files_egui::{files_panel, FileBrowser};
+use mde_files_egui::{files_panel, model::SurfaceTab, FileBrowser};
+use mde_maps_location_egui::{maps_location_panel, real_maps_location, MapsLocationSurface};
 use mde_media_egui::{
     media_header, media_panel, media_pump, real_media, MediaSurface, VideoTextureCache,
 };
@@ -113,21 +123,524 @@ const WORKBENCH_POLL_STAGGER: [Duration; 7] = [
     Duration::from_millis(3500),
     Duration::from_millis(4200),
 ];
+const MENU_BAR_MINIMIZE_DURATION: Duration = Duration::from_millis(180);
+const LAYOUT_MODE_HOLD: Duration = Duration::from_secs(5);
+const LAYOUT_MODE_BUTTON_WORKSTATION: f32 = 44.0;
+const LAYOUT_MODE_BUTTON_TOUCH: f32 = 56.0;
+const LAYOUT_MODE_MENU_W: f32 = Style::SP_XL * 8.0;
+const LAYOUT_MODE_ROW_H: f32 = 56.0;
+const LAYOUT_MODE_GAP: f32 = Style::SP_S;
+const CAR_HUD_H: f32 = Style::SP_XL * 3.5;
+const CAR_HUD_TILE_W: f32 = Style::SP_XL * 4.5;
+const CAR_HUD_GAP: f32 = Style::SP_S;
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
 /// selected. Kept separate from the surface apps (which need an eframe
 /// `CreationContext` to build) so the nav invariants stay unit-testable without
-/// a GPU. The old chrome Expand/Collapse toggle is retired (the dock is the nav):
-/// any dock click, hotkey, chyron action, or edge swipe surfaces the body.
+/// a GPU. The old chrome Expand/Collapse toggle is retired; Start Menu,
+/// taskbar, hotkey, chyron, and edge-swipe navigation surface the body.
 #[derive(Default)]
 struct Nav {
     /// `true` while the shell body (the active surface) fills the central view.
     expanded: bool,
-    /// Which surface fills the shell body (Workbench by default).
+    /// Which surface fills the shell body (Remote Sessions by default).
     surface: Surface,
     /// The Workbench plane shown when the Workbench surface is active.
     plane: Plane,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MenuBarMinimizeEffect {
+    start: Instant,
+    from: egui::Rect,
+    to: egui::Rect,
+}
+
+impl MenuBarMinimizeEffect {
+    fn new(start: Instant, from: egui::Rect, to: egui::Rect) -> Self {
+        Self { start, from, to }
+    }
+
+    fn progress(self, now: Instant) -> f32 {
+        (now.saturating_duration_since(self.start).as_secs_f32()
+            / MENU_BAR_MINIMIZE_DURATION.as_secs_f32())
+        .clamp(0.0, 1.0)
+    }
+
+    fn done(self, now: Instant) -> bool {
+        self.progress(now) >= 1.0
+    }
+
+    fn current_rect(self, now: Instant) -> egui::Rect {
+        self.shuffle_rects(now)[0]
+    }
+
+    fn shuffle_rects(self, now: Instant) -> [egui::Rect; 3] {
+        let base = self.progress(now);
+        std::array::from_fn(|idx| {
+            let lag = idx as f32 * 0.12;
+            let phase = ((base - lag) / (1.0 - lag)).clamp(0.0, 1.0);
+            let eased = ease_out_cubic(phase);
+            let stack = idx as f32 * Style::SP_S * (1.0 - eased) * (1.0 - base * 0.25);
+            lerp_rect(self.from, self.to, eased).translate(egui::vec2(-stack, stack))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MenuBarShuffleCard {
+    rect: egui::Rect,
+    depth: f32,
+}
+
+fn menu_bar_shuffle_cards(effect: MenuBarMinimizeEffect, now: Instant) -> [MenuBarShuffleCard; 3] {
+    let rects = effect.shuffle_rects(now);
+    std::array::from_fn(|idx| MenuBarShuffleCard {
+        rect: rects[idx],
+        depth: 1.0 - idx as f32 * 0.18,
+    })
+}
+
+fn menu_bar_shuffle_paint_order(
+    effect: MenuBarMinimizeEffect,
+    now: Instant,
+) -> [MenuBarShuffleCard; 3] {
+    let cards = menu_bar_shuffle_cards(effect, now);
+    [cards[2], cards[1], cards[0]]
+}
+
+#[derive(Debug, Default)]
+struct LayoutModeControl {
+    hold_started: Option<Instant>,
+    menu_open: bool,
+}
+
+impl LayoutModeControl {
+    fn hold_progress(&self, now: Instant) -> f32 {
+        self.hold_started
+            .map_or(0.0, |start| {
+                now.saturating_duration_since(start).as_secs_f32() / LAYOUT_MODE_HOLD.as_secs_f32()
+            })
+            .clamp(0.0, 1.0)
+    }
+
+    fn update_hold(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        now: Instant,
+    ) -> bool {
+        if response.is_pointer_button_down_on() {
+            let start = *self.hold_started.get_or_insert(now);
+            let elapsed = now.saturating_duration_since(start);
+            if elapsed >= LAYOUT_MODE_HOLD {
+                self.hold_started = None;
+                self.menu_open = true;
+                true
+            } else {
+                ctx.request_repaint_after(LAYOUT_MODE_HOLD - elapsed);
+                false
+            }
+        } else {
+            self.hold_started = None;
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarKeyRoute {
+    Map,
+    Engine,
+    Direction,
+    Media,
+    Voip,
+}
+
+impl CarKeyRoute {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Map => "Map",
+            Self::Engine => "Engine",
+            Self::Direction => "Next",
+            Self::Media => "Media",
+            Self::Voip => "VoIP",
+        }
+    }
+
+    const fn surface(self) -> Surface {
+        match self {
+            Self::Map | Self::Engine | Self::Direction => Surface::MapsLocation,
+            Self::Media => Surface::Media,
+            Self::Voip => Surface::Voice,
+        }
+    }
+}
+
+fn layout_mode_button_size(profile: LayoutProfile) -> f32 {
+    match profile {
+        LayoutProfile::Workstation => LAYOUT_MODE_BUTTON_WORKSTATION,
+        LayoutProfile::Tablet | LayoutProfile::Car => LAYOUT_MODE_BUTTON_TOUCH,
+    }
+}
+
+fn layout_mode_button_rect(screen: egui::Rect, rail_h: f32, profile: LayoutProfile) -> egui::Rect {
+    let size = layout_mode_button_size(profile);
+    let margin = Style::SP_M;
+    let left = (screen.right() - margin - size).max(screen.left() + Style::SP_XS);
+    let top = (screen.bottom() - rail_h - margin - size).max(screen.top() + Style::SP_XS);
+    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(size, size))
+}
+
+fn layout_mode_menu_rect(button: egui::Rect, screen: egui::Rect) -> egui::Rect {
+    let w = LAYOUT_MODE_MENU_W.min((screen.width() - Style::SP_M).max(button.width()));
+    let h = Style::SP_S + LayoutProfile::ALL.len() as f32 * LAYOUT_MODE_ROW_H + Style::SP_S;
+    let left = (button.right() - w).clamp(screen.left() + Style::SP_XS, screen.right() - w);
+    let bottom = (button.top() - LAYOUT_MODE_GAP).max(screen.top() + h);
+    egui::Rect::from_min_size(egui::pos2(left, bottom - h), egui::vec2(w, h))
+}
+
+fn car_key_route(key: egui::Key) -> Option<CarKeyRoute> {
+    Some(match key {
+        egui::Key::Num1 | egui::Key::F1 => CarKeyRoute::Map,
+        egui::Key::Num2 | egui::Key::F2 => CarKeyRoute::Engine,
+        egui::Key::Num3 | egui::Key::F3 => CarKeyRoute::Direction,
+        egui::Key::Num4 | egui::Key::F4 => CarKeyRoute::Media,
+        egui::Key::Num5 | egui::Key::F5 => CarKeyRoute::Voip,
+        _ => return None,
+    })
+}
+
+fn layout_profile_icon(profile: LayoutProfile) -> IconId {
+    match profile {
+        LayoutProfile::Workstation => IconId::Workstation,
+        LayoutProfile::Tablet => IconId::Touchpad,
+        LayoutProfile::Car => IconId::MapsLocation,
+    }
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+fn layout_mode_button_accesskit_id() -> egui::Id {
+    egui::Id::new("shell-layout-profile-button-accesskit")
+}
+
+fn layout_profile_row_accesskit_id(profile: LayoutProfile) -> egui::Id {
+    egui::Id::new(("shell-layout-profile-row-accesskit", profile.short_label()))
+}
+
+fn layout_mode_button_accesskit_value(profile: LayoutProfile, menu_open: bool) -> String {
+    format!(
+        "Current layout: {}; menu {}",
+        profile.label(),
+        if menu_open { "open" } else { "closed" }
+    )
+}
+
+fn layout_profile_row_accesskit_value(profile: LayoutProfile, selected: bool) -> String {
+    format!(
+        "{} layout. {}",
+        if selected { "Current" } else { "Available" },
+        profile.description()
+    )
+}
+
+fn install_layout_mode_button_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    profile: LayoutProfile,
+    menu_open: bool,
+) {
+    let _ = ctx.accesskit_node_builder(layout_mode_button_accesskit_id(), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label("Layout mode");
+        node.set_value(layout_mode_button_accesskit_value(profile, menu_open));
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+fn install_layout_profile_row_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    profile: LayoutProfile,
+    selected: bool,
+) {
+    let _ = ctx.accesskit_node_builder(layout_profile_row_accesskit_id(profile), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(profile.label());
+        node.set_value(layout_profile_row_accesskit_value(profile, selected));
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+        if selected {
+            node.set_selected(true);
+        }
+    });
+}
+
+fn layout_profile_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::resolve_color(ui.ctx(), Style::SURFACE))
+        .stroke(egui::Stroke::new(
+            1.0,
+            Style::resolve_color(ui.ctx(), Style::BORDER),
+        ))
+        .corner_radius(Style::RADIUS_M)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(280.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(Style::SMALL)
+                        .color(Style::resolve_color(ui.ctx(), Style::TEXT)),
+                )
+                .wrap(),
+            );
+        });
+}
+
+fn layout_profile_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| layout_profile_tooltip(ui, text.as_str()))
+}
+
+fn paint_layout_mode_button(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    profile: LayoutProfile,
+    hold_progress: f32,
+    open: bool,
+) {
+    let ctx = ui.ctx();
+    let fill = if open {
+        Style::resolve_color(ctx, Style::SURFACE_HI)
+    } else {
+        Style::resolve_color(ctx, Style::SURFACE)
+    };
+    let stroke = if open {
+        egui::Stroke::new(2.0, Style::resolve_color(ctx, Style::ACCENT))
+    } else {
+        egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::BORDER))
+    };
+    ui.painter().rect(
+        rect,
+        Style::RADIUS_L,
+        fill,
+        stroke,
+        egui::StrokeKind::Outside,
+    );
+    let icon_size = rect.height().min(Style::SP_L);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + Style::SP_S + icon_size * 0.5),
+        egui::vec2(icon_size, icon_size),
+    );
+    if let Some(tex) = dock::icon_texture(
+        ctx,
+        layout_profile_icon(profile),
+        icon_size,
+        Style::resolve_color(ctx, Style::TEXT),
+    ) {
+        ui.painter().image(
+            tex.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - Style::SP_XS),
+        egui::Align2::CENTER_BOTTOM,
+        profile.short_label(),
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT),
+    );
+    if hold_progress > 0.0 {
+        let track = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + Style::SP_XS, rect.bottom() - 3.0),
+            egui::pos2(rect.right() - Style::SP_XS, rect.bottom() - 1.0),
+        );
+        ui.painter().rect_filled(
+            track,
+            Style::RADIUS_S,
+            Style::resolve_color(ctx, Style::BORDER),
+        );
+        let fill = egui::Rect::from_min_max(
+            track.min,
+            egui::pos2(track.left() + track.width() * hold_progress, track.bottom()),
+        );
+        ui.painter().rect_filled(
+            fill,
+            Style::RADIUS_S,
+            Style::resolve_color(ctx, Style::ACCENT),
+        );
+    }
+}
+
+fn layout_profile_menu_row(
+    ui: &mut egui::Ui,
+    profile: LayoutProfile,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), LAYOUT_MODE_ROW_H),
+        egui::Sense::click(),
+    );
+    install_layout_profile_row_accessibility(ui.ctx(), rect, profile, selected);
+    let ctx = ui.ctx();
+    let fill = if selected {
+        Style::resolve_color(ctx, Style::SURFACE_HI)
+    } else if response.hovered() {
+        Style::resolve_color(ctx, Style::SURFACE)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Style::RADIUS_M, fill);
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            Style::RADIUS_M,
+            egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::ACCENT)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let icon_size = Style::SP_L;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + Style::SP_M + icon_size * 0.5, rect.center().y),
+        egui::vec2(icon_size, icon_size),
+    );
+    if let Some(tex) = dock::icon_texture(
+        ctx,
+        layout_profile_icon(profile),
+        icon_size,
+        Style::resolve_color(ctx, Style::TEXT),
+    ) {
+        ui.painter().image(
+            tex.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    let text_x = icon_rect.right() + Style::SP_M;
+    ui.painter().text(
+        egui::pos2(text_x, rect.top() + Style::SP_S),
+        egui::Align2::LEFT_TOP,
+        profile.label(),
+        egui::FontId::proportional(Style::BODY),
+        Style::resolve_color(ctx, Style::TEXT),
+    );
+    ui.painter().text(
+        egui::pos2(
+            text_x,
+            rect.top() + Style::SP_S + Style::BODY + Style::SP_XS,
+        ),
+        egui::Align2::LEFT_TOP,
+        profile.description(),
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT_DIM),
+    );
+    response
+}
+
+fn car_hud_tile(ui: &mut egui::Ui, width: f32, label: &str, value: &str, key: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, CAR_HUD_H - Style::SP_M),
+        egui::Sense::hover(),
+    );
+    let ctx = ui.ctx();
+    ui.painter().rect(
+        rect,
+        Style::RADIUS_M,
+        Style::resolve_color(ctx, Style::SURFACE),
+        egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::BORDER)),
+        egui::StrokeKind::Outside,
+    );
+    ui.painter().text(
+        rect.left_top() + egui::vec2(Style::SP_S, Style::SP_S),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT_DIM),
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_S, rect.center().y - Style::SP_XS),
+        egui::Align2::LEFT_CENTER,
+        value,
+        egui::FontId::proportional(if label == "MPH" { 36.0 } else { Style::HEADING }),
+        Style::resolve_color(ctx, Style::TEXT_STRONG),
+    );
+    ui.painter().text(
+        rect.right_bottom() - egui::vec2(Style::SP_S, Style::SP_S),
+        egui::Align2::RIGHT_BOTTOM,
+        key,
+        egui::FontId::proportional(Style::SMALL),
+        Style::resolve_color(ctx, Style::TEXT_DIM),
+    );
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn lerp_rect(from: egui::Rect, to: egui::Rect, t: f32) -> egui::Rect {
+    egui::Rect::from_min_max(from.min.lerp(to.min, t), from.max.lerp(to.max, t))
+}
+
+fn complete_menu_bar_minimize(
+    nav: &mut Nav,
+    effect: &mut Option<MenuBarMinimizeEffect>,
+    now: Instant,
+) -> bool {
+    if effect.is_some_and(|effect| effect.done(now)) {
+        nav.expanded = true;
+        nav.surface = Surface::Desktop;
+        *effect = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
+    match surface {
+        Surface::Workbench
+        | Surface::InfraCode
+        | Surface::Chat
+        | Surface::Communications
+        | Surface::System
+        | Surface::Storage
+        | Surface::About => false,
+        Surface::Desktop => false,
+        Surface::MeshView
+        | Surface::Explorer
+        | Surface::Music
+        | Surface::Media
+        | Surface::Files
+        | Surface::Voice
+        | Surface::Browser
+        | Surface::Bookmarks
+        | Surface::MapsLocation
+        | Surface::Terminal
+        | Surface::Editor
+        | Surface::Phones
+        | Surface::Timers => true,
+    }
+}
+
+fn remote_sessions_fallback_pos(screen: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        screen.right() - Style::SP_XS - mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+        screen.top() + Style::TOOLBAR_INSET_Y,
+    )
 }
 
 /// The whole shell: the nav state, the live chrome/Fleet Bus state, and the three
@@ -194,31 +707,34 @@ struct Shell {
     critical_edge: status::CriticalEdgeCue,
     /// Local hostname used to decide whether a critical belongs to this seat.
     local_host: String,
-    /// VDOCK-1/2/3/4 — the left vertical dock's state: the auto-hide half (the
-    /// Super-tap reveal latch + the pin), the app picker's `active` surface, the
-    /// bottom status-strip inputs, and the system-quad power menu + pending request.
-    /// `dock::dock` reads + drives it each frame; the Super-tap reveal toggles it on
-    /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
-    /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
+    /// The retained dock/taskbar state. WIN10-HYBRID retired the rendered left
+    /// vertical dock, but this state still owns the bottom taskbar's active
+    /// surface, Start-cell latch, session rail, status/progress inputs, auto-hide
+    /// pin, and pending lock/power requests. `mount_dock_chrome` mirrors
+    /// `nav.surface` in/out and drains those requests each frame.
     vdock: dock::DockState,
-    /// WIN7-2 — the Start Menu's cross-frame state (the fixed-size overlay
-    /// panel's own open latch + click-away guard, `docs/design/
-    /// win7-desktop-survey.md` lock #13). The dock's Start cell AND a clean
-    /// Super tap both latch its toggle (see `start_menu`'s module doc for how
-    /// the Super tap fans out to this alongside VDOCK-1's own dock toggle);
-    /// the shell drains it, mirrored open-state into [`Self::console`], and
-    /// mounts the panel each frame (`start_menu::start_menu_panel`).
-    start_menu: start_menu::StartMenuState,
+    /// WL-UX-005 — the unified launcher's persisted pin store. The legacy Start
+    /// Menu (the duplicate launcher) was removed; its one surviving local
+    /// capability — the operator's pinned launcher surfaces — lives here now and
+    /// the Front Door reads/mutates it through this single store.
+    launcher_pins: launcher_pins::LauncherPins,
+    /// SEARCH-omnibox — the shell-owned focused entry that ranks apps, current
+    /// Files rows, discovered mesh units, Browser bookmarks/history, and a real
+    /// Browser web-search action through the shared ranker. It is also the
+    /// Start/Super panel-mode launcher for WL-UX-005.
+    front_door: front_door::FrontDoorState,
+    /// WL-UX-005 peer-app lazy-load: non-blocking `action/apps/peer-list` cache
+    /// for the mesh node currently focused in Front Door.
+    front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState,
     /// CONSOLE-1 — the Console front door (`docs/design/console-frontdoor.md`):
-    /// the Win10-style taxonomy of operational entries. Pre-WIN7-2 this was
-    /// its own standalone panel the dock's Start cell toggled directly; it is
-    /// now embedded as the Start Menu's right pane ([`Self::start_menu`],
-    /// lock #10) — `console::console_content` renders it there, and this
-    /// field's own `open` bit is a mirror of the Start Menu's, not a second
-    /// independent latch. The shell still drives its typed
-    /// [`console::ConsoleRequest`]s the same way (a live surface-link routes
-    /// the nav; command launches stay honest-gated on the CONSOLE-2 spawn-tab
-    /// seam, §7).
+    /// the Win10-style taxonomy of operational entries. WL-UX-005 removed the
+    /// legacy Start Menu that used to embed the Console panel as its right pane;
+    /// the Console now survives purely as a search/command backend the unified
+    /// Front Door draws on (`console::static_search_candidates`,
+    /// `console::run_command_request`, `activate_index`). The shell still drives
+    /// its typed [`console::ConsoleRequest`]s the same way (a live surface-link
+    /// routes the nav; command launches stay honest-gated on the CONSOLE-2
+    /// spawn-tab seam, §7).
     console: console::ConsoleState,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
@@ -259,8 +775,8 @@ struct Shell {
     /// rail. Falls back to the pending `VdiState` request until the broker log has
     /// a matching session for this seat.
     session_rail: session_rail::SessionRailState,
-    /// The Infra as Code (`IaC`) surface — the `OpenStack` `IaaS` control plane
-    /// (IAC-2). Consumes the Keystone service catalog + per-service API health off
+    /// The Infra as Code (`IaC`) surface — the cloud `IaaS` control plane
+    /// (IAC-2). Consumes the cloud service catalog + per-service API health off
     /// the Bus read verb `action/cloud/get-catalog` (no shell→mackesd dep, §6) and renders
     /// the Overview: the API status band + the merged service directory. Honest
     /// "not configured / unreachable" when the cloud/verb is absent (§7).
@@ -269,6 +785,15 @@ struct Shell {
     /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
     /// read-model. A pure renderer; sends via `action/chat/send`.
     chat: chat::ChatState,
+    /// The Communications surface (WL-FUNC-011) — the unified collaboration hub
+    /// (`mde-collab-egui`'s `CommunicationsSurface`) mounted live: a Bus-backed
+    /// `CollabData` folded off the collab worker's `state/collab/*` mirrors
+    /// (directory · per-space Activity · per-space conversation · aggregated
+    /// call-state) and a `CommandSink` drained onto `action/collab/*`. A pure
+    /// renderer over the worker's read-model — it never depends on the mackesd
+    /// crate (the Bus JSON is the seam); Activity + Messages are live, the
+    /// labeled-for-later modes stay labeled. Polled while in view.
+    communications: communications::CommunicationsState,
     /// The Phones hub surface (KDC-MESH-9) — the desktop-side management surface for
     /// the mesh's paired phone(s). A thin client of the `kdc_host` worker: it renders
     /// the live device roster (`action/connect/devices`) + the mesh service directory
@@ -319,12 +844,20 @@ struct Shell {
     /// until the gated `live-helper` spawn attaches one; the panel shows its honest
     /// gated EmptyState until then, exactly like the VDI Desktop surface.
     web: web::WebState,
+    /// Browser-owned freedesktop MPRIS adapter. It exposes the Browser's retained
+    /// now-playing Bus mirror as `org.mpris.MediaPlayer2.mde-browser` and routes
+    /// methods back through the existing Browser media-control Bus action path.
+    _browser_mpris: web::BrowserMprisHandle,
     /// The Bookmarks manager surface (BOOKMARKS-4), mounted in-shell so Browser
     /// users can reach folders/tags/search/dead-link workflows without leaving the
     /// platform chrome. Persistence and mesh sync remain owned by the bookmarks
     /// worker; this is the existing egui manager over the CRDT model.
     bookmarks: BookmarksManager,
     bookmarks_bus: BookmarksBus,
+    /// The Maps & Location surface — native offline navigation, location-source
+    /// management, simulator-backed MG90 local management, vehicle telemetry, GPIO,
+    /// firmware, backups, recovery, and encrypted-at-rest-ready trip/location data.
+    maps_location: MapsLocationSurface,
     /// The Terminal surface (TERM-16) — the production `TerminalSurface` (the
     /// TERM-4/5/8 `TabbedTerminal`: tabs / splits / broadcast / a shell on any mesh
     /// peer) over a real local PTY, built once by `mde_term_egui::real_terminal()`.
@@ -350,7 +883,7 @@ struct Shell {
     /// mesh" EmptyState until a snapshot lands.
     mesh_view: mesh_view::MeshViewState,
     /// The Discovery hero-card surface (EXPLORER-3) — the cinematic one-unit-at-a-
-    /// time view over every discovered unit (mesh peers · LAN hosts · `OpenStack`
+    /// time view over every discovered unit (mesh peers · LAN hosts · cloud
     /// objects), folded from the aggregator's `state/units/*` mirrors (EXPLORER-1).
     /// A thin renderer (§6): it reads the Bus, never scans. Reachable two ways
     /// (shell-ux-8): as the first-class [`Surface::Explorer`] (its own dock/menu
@@ -395,6 +928,16 @@ struct Shell {
     /// every open re-staggers the seven planes' 5 s cadences instead of firing them
     /// on one frame. `None` while the Workbench is not in view.
     workbench_poll_epoch: Option<Instant>,
+    /// Title-bar/menu-bar minimize cue. A click on the shared top-right menu-bar
+    /// minimize control animates the active workspace toward that button, then routes
+    /// to [`Surface::Desktop`] ("Remote Sessions").
+    menu_bar_minimize: Option<MenuBarMinimizeEffect>,
+    /// Last central workspace rect, captured from the active [`CentralPanel`] so the
+    /// minimize cue starts from the actual workspace area.
+    last_workspace_rect: Option<egui::Rect>,
+    /// Lower-right layout profile button. A 5-second hold opens the touch-friendly
+    /// Workstation/Tablet/Car menu; Settings persists the same profile.
+    layout_mode: LayoutModeControl,
 }
 
 impl Shell {
@@ -420,7 +963,9 @@ impl Shell {
             critical_edge: status::CriticalEdgeCue::default(),
             local_host: local_hostname(),
             vdock: dock::DockState::default(),
-            start_menu: start_menu::StartMenuState::default(),
+            launcher_pins: launcher_pins::LauncherPins::load(),
+            front_door: front_door::FrontDoorState::default(),
+            front_door_peer_apps: front_door_peer_apps::FrontDoorPeerAppsState::default(),
             // WIN7-8 (lock #21) — `for_shell` (not bare `default`) so the real
             // shell also gets mesh-wide Custom-entry sync; see `console.rs`'s
             // `custom_sync` field doc for why the two constructors are split.
@@ -435,6 +980,7 @@ impl Shell {
             session_rail: session_rail::SessionRailState::new(),
             infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
+            communications: communications::CommunicationsState::default(),
             phones_hub: phones_hub::PhonesHubState::default(),
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
@@ -444,8 +990,10 @@ impl Shell {
             formfactor: formfactor::FormfactorPublisher::default(),
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
+            _browser_mpris: web::spawn_browser_mpris(),
             bookmarks: real_manager(),
             bookmarks_bus: BookmarksBus::default(),
+            maps_location: real_maps_location(),
             terminal: real_terminal(),
             editor: real_editor(),
             editor_launch: EditorLaunchWatch::from_env(),
@@ -457,6 +1005,9 @@ impl Shell {
             curtain: curtain::Curtain::pam(),
             lock_signal: lock_signal::LogindLockSource::new(ctx),
             workbench_poll_epoch: None,
+            menu_bar_minimize: None,
+            last_workspace_rect: None,
+            layout_mode: LayoutModeControl::default(),
         };
 
         // CURTAIN-3 boot-gate (design lock 2): when the persisted policy requires a
@@ -470,6 +1021,18 @@ impl Shell {
             shell.curtain.lock();
         }
         shell
+    }
+
+    fn open_front_door_panel(&mut self) {
+        self.front_door.open();
+    }
+
+    fn toggle_front_door_panel(&mut self) {
+        if self.front_door.is_open() {
+            self.front_door.close();
+        } else {
+            self.open_front_door_panel();
+        }
     }
 
     /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE
@@ -496,6 +1059,29 @@ impl Shell {
             HotkeyAction::OpenSystem => {
                 self.nav.expanded = true;
                 self.nav.surface = Surface::System;
+            }
+            HotkeyAction::OpenOmnibox => {
+                self.open_front_door_panel();
+            }
+            HotkeyAction::MediaPlayPause => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::PlayPause);
+            }
+            HotkeyAction::MediaPause => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::Pause);
+            }
+            HotkeyAction::MediaStop => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::Stop);
+            }
+            HotkeyAction::MediaNext => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::Next);
+            }
+            HotkeyAction::MediaPrevious => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::Previous);
             }
             HotkeyAction::Lock => {
                 // CURTAIN-1 — Super+L drops the lock curtain (design lock 2).
@@ -603,8 +1189,8 @@ impl Shell {
         });
     }
 
-    /// The expanded shell body: the one active surface. (The dock chrome is NOT
-    /// mounted here — `render` mounts the floating dock before the central view,
+    /// The expanded shell body: the one active surface. (Taskbar chrome is NOT
+    /// mounted here — `render` mounts the bottom taskbar before the central view,
     /// session and body alike.)
     ///
     /// The shell owns the frame loop, so it drives the active surface itself —
@@ -616,6 +1202,12 @@ impl Shell {
     /// surface's in the shell's one `Context`. The Workbench keeps its live Fleet
     /// plane (MV-6).
     fn body(&mut self, ui: &mut egui::Ui) {
+        // Surface-level occlusion: only one surface renders per frame, so a
+        // backgrounded Browser's per-tab reconciler never runs. Tell it whether it
+        // is the foreground surface so a backgrounded Browser hides ALL its tabs
+        // (stopping their engine paint + shm readback) until it is shown again.
+        self.web
+            .note_surface_foreground(self.nav.surface == Surface::Browser);
         match self.nav.surface {
             Surface::Workbench => {
                 workbench::show(
@@ -635,24 +1227,6 @@ impl Shell {
             Surface::MeshView => self.show_mesh_map(ui),
             Surface::Explorer => self.show_explorer(ui),
             Surface::Desktop => {
-                // MENUBAR-ALL — the shared top bar (DESKTOP), mounted above whichever
-                // face renders below (the Chooser or the brokered desktop). Its two
-                // menus are gated to the face that owns the seam: Session → Return to
-                // Mesh Control (the Esc-chord twin, live while a connect is pending)
-                // and View → Refresh Sources (live on the Chooser). Rendered first so
-                // a picked action applies this frame; the `take_return_to_chrome`
-                // drain below still catches a menu-raised return like an Esc.
-                let pending = self.vdi.requested_summary();
-                let sources = self.chooser.source_count();
-                if let Some(action) = vdi::desktop_menubar(ui, pending, sources) {
-                    match action {
-                        vdi::DesktopMenuAction::ReturnToChrome => {
-                            self.vdi.request_return_to_chrome();
-                        }
-                        vdi::DesktopMenuAction::RefreshSources => self.chooser.refresh_now(),
-                    }
-                }
-                ui.separator();
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
                 // requested it shows the discovered-desktop card grid over the
@@ -691,10 +1265,22 @@ impl Shell {
                         self.vdi.clear_target();
                         self.nav.surface = Surface::Workbench;
                     }
+                    // WL-PERF-002 — keep the frame loop ticking while a live VDI
+                    // transport is actually streaming so its incoming guest frames
+                    // wake an otherwise-idle seat (mirrors the media `is_playing`
+                    // repaint in the Media arm above). Gated on a LIVE transport
+                    // handle (`has_live_transport`) — not merely a requested
+                    // session — so a chooser / connecting-but-dead desktop with no
+                    // live stream leaves the loop idle: the whole point of the
+                    // occlusion work is to NOT repaint at 60Hz when nothing is live.
+                    #[cfg(feature = "live-vdi")]
+                    if self.vdi.has_live_transport() {
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
             Surface::InfraCode => {
-                // The OpenStack IaaS control plane (IAC-2) — the Overview tab: the
+                // The cloud IaaS control plane (IAC-2) — the Overview tab: the
                 // API status band + the merged service directory, consumed off the
                 // Bus (`action/cloud/get-catalog`). Scoped under its own `push_id`
                 // like every mounted surface so its egui ids can't collide in the
@@ -767,6 +1353,10 @@ impl Shell {
                     self.web.note_seat_px(ui.ctx());
                     self.web.ensure_live_tab(seat_present);
                 }
+                if self.web.wants_file_omnibox_items() {
+                    let file_omnibox_items = self.files.unified_search_omnibox_items();
+                    self.web.set_file_omnibox_items(file_omnibox_items);
+                }
                 let web = &mut self.web;
                 ui.push_id("shell-web", |ui| {
                     web::web_panel(ui, web);
@@ -798,6 +1388,12 @@ impl Shell {
                 self.bookmarks_bus.pump(bookmarks);
                 ui.push_id("shell-bookmarks", |ui| {
                     bookmarks_panel(ui, bookmarks);
+                });
+            }
+            Surface::MapsLocation => {
+                let maps_location = &mut self.maps_location;
+                ui.push_id("shell-maps-location", |ui| {
+                    maps_location_panel(ui, maps_location);
                 });
             }
             Surface::Terminal => {
@@ -842,6 +1438,17 @@ impl Shell {
                 // `push_id` like every mounted surface.
                 let phones = &mut self.phones_hub;
                 ui.push_id("shell-phones", |ui| phones.show(ui));
+            }
+            Surface::Communications => {
+                // The unified Communications hub (WL-FUNC-011) — the
+                // `mde-collab-egui` surface over a Bus-backed `CollabData` folded
+                // from `state/collab/*` and a `CommandSink` drained onto
+                // `action/collab/*`. Its fold is refreshed in `render` while in
+                // view; `show` renders the surface and publishes the frame's emitted
+                // commands. Scoped under its own `push_id` like every mounted surface
+                // so its egui ids can't collide in the shell's one `Context`.
+                let communications = &mut self.communications;
+                ui.push_id("shell-communications", |ui| communications.show(ui));
             }
             Surface::System => {
                 // This seat's host controls, folded from the one `mde-seat` Seat
@@ -1087,7 +1694,7 @@ impl Shell {
             self.storage.poll(ctx);
         }
 
-        // The Infra as Code surface polls the OpenStack catalog off the Bus
+        // The Infra as Code surface polls the cloud catalog off the Bus
         // (`action/cloud/get-catalog`) while it's in view — a non-blocking
         // request/reply on its ~15 s cadence; the request is published sync and its
         // reply read on a later tick, so the frame never stalls (IAC-2).
@@ -1109,6 +1716,15 @@ impl Shell {
         // shared cadence; the verb replies land on a later tick (§7).
         if self.nav.expanded && self.nav.surface == Surface::Phones {
             self.phones_hub.poll(ctx);
+        }
+
+        // The Communications hub re-folds the collab worker's `state/collab/*`
+        // mirrors (directory · per-space Activity · per-space conversation ·
+        // aggregated call-state) on its cadence while in view (WL-FUNC-011) — a
+        // cheap local latest-wins read; the honest empty rail until the worker's
+        // projections land (§7).
+        if self.nav.expanded && self.nav.surface == Surface::Communications {
+            self.communications.poll(ctx);
         }
 
         // The seat snapshot feeds BOTH the System surface and the dock's status
@@ -1155,24 +1771,30 @@ impl Shell {
         // product, no second poll.
         self.chrome.poll(ctx);
 
-        // The shell's dock chrome (VDOCK), mounted BEFORE the central view so it
-        // frames the session + shell body: the left vertical dock, the sole chrome.
-        // Extracted to a helper so `render` stays within the line budget.
+        // The shell's bottom taskbar chrome, mounted BEFORE the central view so
+        // its strut can frame the session + shell body. Extracted to a helper so
+        // `render` stays within the line budget.
         self.mount_dock_chrome(ctx);
 
-        // WIN7-2 — the Start Menu: the panel + its toggle/request drains, split
-        // to a helper (the mount_dock_chrome idiom) so `render` stays within
-        // the line budget. Its Super-tap trigger drains later, alongside
-        // VDOCK-1's own dock toggle (see below).
-        self.mount_start_menu(ctx);
+        // WL-UX-005 — the legacy Start Menu (a duplicate launcher) was removed;
+        // the ONE launcher is the unified Front Door, mounted below
+        // (`mount_front_door`). The clean Super-tap and OpenOmnibox hotkey are
+        // its live entry points (drained alongside VDOCK-1's dock toggle below);
+        // the retired taskbar Start cell is a compatibility no-op in `dock`.
+
+        let now = Instant::now();
+        self.finish_menu_bar_minimize_if_done(now);
 
         // The central view: the session↔body cross-fade — or nothing at all
         // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
         self.central_view(ctx);
+        self.mount_remote_sessions_fallback(ctx);
+        self.drain_menu_bar_minimize_request(ctx, now);
+        self.paint_menu_bar_minimize_effect(ctx, now);
 
         // QC-13 — Cloud row → Desktop SPICE handoff. The Cloud plane lives inside
         // Workbench and its state is a Shell field; after Workbench renders, a
-        // dialable Nova console descriptor can queue one native VDI attach here.
+        // dialable cloud console descriptor can queue one native VDI attach here.
         if let Some(request) = self.cloud_plane.take_console_attach() {
             self.vdi
                 .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
@@ -1200,14 +1822,9 @@ impl Shell {
         // SURFACE-10 (lock 14): the same flip feeds the OSK so it auto-raises on Tablet.
         if let Some(formfactor) = self.formfactor.pump() {
             self.keyboard.set_formfactor(formfactor);
-            // SURFACE-11 (lock 16): the same flip re-installs the interaction density —
-            // Tablet grows hit targets + spacing (touch), Laptop reverts to the compact
-            // pointer metrics. Keyed off the real SURFACE-9 signal, mesh-wide.
-            let density = Density::for_formfactor(formfactor);
-            Style::install_with_density(ctx, density);
-            // NAVBAR-8: the bottom rail consumes the same shell density instead of
-            // growing its own compact/expanded toggle.
-            self.vdock.set_density(density);
+            // Layout density is now profile-owned (Workstation / Tablet / Car) so a
+            // hardware formfactor flip never silently overrides the user's selected
+            // shell placement model. The formfactor still drives the OSK.
         }
 
         // SURFACE-11 (lock 16): a swipe from the left/bottom edge reveals the shell body
@@ -1239,31 +1856,27 @@ impl Shell {
                 self.apply_nav_slot(slot);
             }
         }
-        // VDOCK-1 (lock 13) — a clean Super *tap* (press+release with no leader
-        // chord used in between) toggles the vertical dock. Always DRAINED so the
-        // router's latch never backs up; but, like every chord above, swallowed
-        // while the curtain is engaged (lock 10).
-        //
-        // WIN7-2 (win7-desktop-survey lock #13) reuses this SAME drain for the
-        // Start Menu: the survey never anticipated VDOCK-1's pre-existing claim
-        // on Super, and stranding the vertical dock behind an unreachable
-        // hotkey would break the shell's only surface launcher until WIN7-3
-        // lands real tiles in the Start Menu. So one clean Super tap now
-        // reveals BOTH — not a UX collision in practice, since the Start Menu
-        // already mounts immediately beside the dock column (`x = DOCK_W`), so
-        // the two read as one "reveal the nav chrome" gesture. A flagged
-        // judgment call (see `start_menu`'s module doc), not a surveyed answer.
+        // A clean Super *tap* (press+release with no leader chord used in
+        // between) opens/closes the unified Front Door launcher. Always DRAINED
+        // so the router's latch never backs up; but, like every chord above,
+        // swallowed while the curtain is engaged (lock 10).
         if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
-            self.vdock.toggle();
-            self.start_menu.toggle();
+            self.toggle_front_door_panel();
         }
+        self.apply_car_keyboard_routes(ctx);
+
+        // SEARCH-omnibox — mounted after hotkey dispatch so Super+Space opens and
+        // focuses it in the same frame, above the active surface and taskbar.
+        self.mount_front_door(ctx);
+        self.mount_layout_profile_control(ctx, now);
 
         // The KIRON alert/OSD bridge (KIRON-2) — driven late so its centered OSD
         // pill floats (Foreground order) above the chrome, the surface, and any
         // fullscreen guest. Refresh the suppression posture (lock 10) first: a
         // fullscreen VDI guest in front is a per-session focus mute, and the seat's
         // audio-mute hushes a non-critical's sound. DND is owned by Chat's
-        // notification lane and mutes ambient pushes.
+        // notification lane and mutes non-critical ambient pushes; Critical alerts
+        // still break through.
         let focus_mute =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
         let muted = self.system.snapshot().is_some_and(seat_master_muted);
@@ -1310,57 +1923,60 @@ impl Shell {
         // NOTIF-6 — no-text critical edge cue. Drawn after the curtain so an
         // own-seat critical can still light the edges with the dock hidden/covered;
         // the cue only acknowledges itself and never routes past the lock.
-        self.critical_edge.update(
-            self.notify_status.segments(),
-            &self.local_host,
-            dnd || focus_mute,
-        );
+        self.critical_edge
+            .update(self.notify_status.segments(), &self.local_host);
         self.critical_edge.show(ctx);
 
-        // WIN7-6 (win7-desktop-survey lock #9) — a Critical firing (or an
-        // existing one unmuting into view) auto-closes the Start Menu if it's
-        // open, so the cue gets a clear field: a deliberate STRENGTHENING of
-        // the cue's own "always wins" posture above, not a weakening of
+        // WIN7-6 (win7-desktop-survey lock #9) — a Critical firing auto-closes
+        // the Start Menu if it's open, so the cue gets a clear field: a
+        // deliberate STRENGTHENING of the cue's own "always wins" posture above,
+        // not a weakening of
         // anything WIN7-2 built. Edge-triggered off `take_became_visible` — a
         // one-shot hidden->visible latch, NOT a per-frame "is it visible
-        // right now" poll — so this closes an open Start Menu exactly once
+        // right now" poll — so this closes an open launcher exactly once
         // per real firing and never re-fights an operator who reopens the
-        // Start Menu afterward: not while the SAME critical is still up but
+        // launcher afterward: not while the SAME critical is still up but
         // acknowledged (`visible()` stays false, so no further edge fires),
         // and not while it's still up and un-acknowledged either (no NEW
-        // edge without a real change). `StartMenuState::close` already
-        // no-ops while closed, so this is safe to call unconditionally, and
-        // closing it also closes the embedded Console pane for free — its
-        // own `open` bit is a same-frame mirror of the Start Menu's
-        // (`start_menu.rs`'s `console.set_open(state.open)`), not a second
-        // latch this call would need to touch separately.
+        // edge without a real change). WL-UX-005: the ONE launcher is now the
+        // unified Front Door (the legacy Start Menu was removed);
+        // `FrontDoorState::close` already no-ops while closed, so this is safe
+        // to call unconditionally.
         if self.critical_edge.take_became_visible() {
-            self.start_menu.close();
+            self.front_door.close();
         }
     }
 
-    /// Mount the shell's **dock chrome** for this frame (VDOCK) — the left
-    /// **vertical dock** (`dock::dock`), the shell's sole chrome: a floating,
-    /// slide-in, auto-hide `Area` that reserves NO gutter of its own (the central
-    /// view fills the full width AND height; `central_view` insets an empty gutter
-    /// in lockstep with the slide so the dock never overlaps the surface). A routed
-    /// click surfaces the shell body (the dock IS the nav — a navigation is never a
-    /// no-op behind the session). Split out of `render` so each stays within the
-    /// line budget.
+    /// Mount the shell's bottom taskbar chrome for this frame. The rendered left
+    /// dock is retired; the surviving `DockState` now drives the session rail,
+    /// tray/status area, clock, action center, show-desktop nub, and taskbar-sourced
+    /// navigation. Split out of `render` so each stays within the line budget.
     fn mount_dock_chrome(&mut self, ctx: &egui::Context) {
-        // The dock owns its own picker `active`; the shell keeps `nav.surface` as
-        // the ONE source of truth every other nav path (hotkeys, chyron, self-test,
-        // chooser) writes. So MIRROR the live surface INTO the dock before `dock()`
-        // (the picker then highlights whatever is showing), feed the bottom status
-        // status strip its live inputs, then read the picker's selection
-        // straight back OUT so a picker-cell click routes the body.
+        // The taskbar owns an `active` mirror; the shell keeps `nav.surface` as
+        // the ONE source of truth every other nav path (hotkeys, search, self-test,
+        // chooser) writes. So mirror the live surface into the taskbar state,
+        // feed the bottom status strip its live inputs, then read taskbar-originated
+        // selection straight back out.
         self.vdock.set_active(self.nav.surface);
         self.vdock
-            .set_transfer_active_count(self.files.transfers_counts().active);
-        // WIN7-2 — mirror the Start Menu's open state in first, so the Start
-        // cell's active tint follows the real panel (the set_active idiom).
-        self.vdock.set_start_menu_open(self.start_menu.is_open());
-        self.notify_status.poll(ctx);
+            .set_pinned_surfaces(self.launcher_pins.pinned_surfaces());
+        self.files.pump_transfers();
+        self.web.pump_downloads_for_shell_chrome();
+        self.vdock
+            .set_file_operation_progress(shell_file_operation_progress(
+                self.files.operation_progress_summary(),
+                self.web.operation_progress_summary(),
+            ));
+        // Compatibility no-op for the retired taskbar Start cell (WL-UX-005:
+        // the legacy Start Menu launcher was removed; the Front Door is the ONE
+        // launcher whose open state the retired cell would have mirrored).
+        self.vdock.set_start_menu_open(self.front_door.is_open());
+        // WIN10-HYBRID B3 — Settings owns the persisted preference; DockState owns
+        // the bottom-edge reveal, animation, and strut behavior.
+        self.vdock
+            .set_taskbar_autohide(self.system.taskbar_autohide());
+        self.vdock.set_density(self.system.layout_density());
+        self.notify_status.poll(ctx, &self.local_host);
         let mut rail_sessions = self.session_rail.entries(&self.local_host);
         let has_visible_desktop_session = !rail_sessions.is_empty();
         if rail_sessions.is_empty() {
@@ -1370,6 +1986,15 @@ impl Shell {
                 .map(|(name, protocol)| vec![dock::SessionRailEntry::new(name, protocol)])
                 .unwrap_or_default();
         }
+        self.vdock
+            .set_session_preview(self.vdi.taskbar_preview_frame().map(|frame| {
+                dock::SessionPreviewTexture::new(
+                    frame.broker_session_id,
+                    frame.label,
+                    frame.protocol,
+                    frame.texture,
+                )
+            }));
         self.vdock.set_status_inputs(
             self.chrome.summary().clone(),
             self.system.snapshot().cloned(),
@@ -1380,14 +2005,15 @@ impl Shell {
             self.notify_status.segments().clone(),
         );
         let desktop_sources = self.chooser.rail_sources();
-        // WIN10-HYBRID (B4) — the left vertical dock is retired: launching folds into
-        // the single bottom taskbar, whose Start cell opens the Start-menu grid of all
-        // 18 Surface::ALL. Only the taskbar mounts now; the surface-picker dock
-        // (`dock::dock`) is no longer rendered. `DockState` stays — the taskbar owns
-        // it — and with the dock unshown its left gutter reserves nothing.
+        // WIN10-HYBRID (B4) — the left vertical dock is retired. Launching uses the
+        // Front Door/Super paths; the single bottom taskbar owns sessions, tray,
+        // clock, notifications, and show-desktop routing.
         let bar_clicked =
             dock::notification_rail_with_sources(ctx, &mut self.vdock, &desktop_sources);
         self.nav.surface = self.vdock.active();
+        if self.vdock.take_file_operation_progress_request() {
+            route_file_operation_progress_request(&mut self.files, &mut self.nav);
+        }
         if let Some(id) = self.vdock.take_desktop_source_pick() {
             if let Some(request) = self.chooser.connect_source_id(&id) {
                 self.vdi
@@ -1423,80 +2049,203 @@ impl Shell {
         }
     }
 
-    /// WIN7-2 — mount the **Start Menu** for this frame: drain the dock Start
-    /// cell's toggle latch (ALWAYS drained so it never backs up — the
-    /// Super-tap idiom), mount the panel (the fixed-size floating slide-up
-    /// beside the dock, `start_menu::start_menu_panel`, which embeds the
-    /// Console front door as its right pane), and drive Console's typed
-    /// requests exactly as before (the panel is a presentation change, lock
-    /// #10 says the underlying requests/data don't move). Everything but the
-    /// drain sits behind the curtain gate (CURTAIN-1 lock 10): the panel reads
-    /// raw Esc/arrow/Enter presses, which must never act past the lock — the
-    /// hotkey-gate posture. Split out of `render` (the `mount_dock_chrome`
-    /// idiom) so each stays within the line budget.
-    ///
-    /// WIN7-3 — also drains a live-tile click (the left pane) after Console's
-    /// own requests: the SAME "route + expand the body" outcome as a Console
-    /// `Goto`, just raised from `StartMenuState::take_tile_activation`
-    /// instead.
-    fn mount_start_menu(&mut self, ctx: &egui::Context) {
-        let toggled = self.vdock.take_start_menu_toggle();
+    fn apply_car_keyboard_routes(&mut self, ctx: &egui::Context) {
+        if self.curtain.engaged()
+            || self.system.layout_profile() != LayoutProfile::Car
+            || ctx.wants_keyboard_input()
+        {
+            return;
+        }
+        for key in [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::F1,
+            egui::Key::F2,
+            egui::Key::F3,
+            egui::Key::F4,
+            egui::Key::F5,
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+                if let Some(route) = car_key_route(key) {
+                    self.front_door.close();
+                    self.nav.expanded = true;
+                    self.nav.surface = route.surface();
+                }
+                break;
+            }
+        }
+    }
+
+    fn mount_layout_profile_control(&mut self, ctx: &egui::Context, now: Instant) {
         if self.curtain.engaged() {
             return;
         }
-        if toggled {
-            self.start_menu.toggle();
+        let profile = self.system.layout_profile();
+        if profile == LayoutProfile::Car {
+            self.mount_car_hud(ctx);
         }
-        // WIN7-4 — refresh the live-tile fact inputs before the panel renders
-        // (the `set_status_inputs`/`mount_dock_chrome` idiom): every field
-        // below reads the SAME already-published accessor an existing dock
-        // pip / the surface's own status chip already reads (§7 — see
-        // `TileFactInputs`'s own field docs for each exact source), cloned/
-        // copied out now so `start_menu::start_menu_panel` needs no extra
-        // parameters of its own.
-        let media_loaded = self.media.player().media().is_some();
-        self.start_menu.set_tile_inputs(start_menu::TileFactInputs {
-            chat_unread: self.chat.total_unread(),
-            chat_recent_sender: self.chat.most_recent_sender().map(str::to_owned),
-            mesh: self.chrome.summary().clone(),
-            segments: self.notify_status.segments().clone(),
-            media_title: media_loaded
-                .then(|| mde_media_egui::model::now_playing_title(self.media.player())),
-            media_playing: media_loaded && self.media.is_playing(),
-            music_now_playing: self
-                .music
-                .now_playing()
-                .map(|song| (song.title.clone(), song.artist.clone())),
-            voice_call_label: {
-                let label = self.voice.call_state().label();
-                (!label.is_empty()).then_some(label)
-            },
-            files_active_transfers: self.files.transfers_counts().active,
-            storage_local: self.storage.local_summary(),
-            bookmarks_total: self.bookmarks.total(),
-            phones: self.phones_hub.device_counts(),
-            workbench_seen: self.controller.seen(),
-            workbench_peer_count: self.controller.peer_count(),
-            workbench_leader: self.controller.leader().map(str::to_owned),
-            desktop_sources: self.chooser.source_count(),
-            desktop_session: self
-                .vdi
-                .requested_summary()
-                .map(|(name, protocol)| (name.to_owned(), protocol)),
-            infra_services: self.infra_code.service_summary(),
-            browser_tabs: self.web.tab_count(),
-            terminal_tabs: self.terminal.tab_count(),
-        });
-        // WIN7-DESKTOP-1 regression fix — reserve the SAME live taskbar height
-        // `mount_dock_chrome` just rendered the rail at, so the Start Menu's
-        // Power-anchored bottom sits flush above the taskbar rather than under
-        // it (see `start_menu::start_menu_panel`'s own doc comment).
-        start_menu::start_menu_panel(
-            ctx,
-            &mut self.start_menu,
-            &mut self.console,
-            self.vdock.rail_height(),
+        let screen = ctx.screen_rect();
+        let button = layout_mode_button_rect(screen, self.vdock.rail_height(), profile);
+        let mut open_menu = false;
+        egui::Area::new(egui::Id::new("shell-layout-profile-button"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(button.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(button.size());
+                let (rect, response) =
+                    ui.allocate_exact_size(button.size(), egui::Sense::click_and_drag());
+                let primary_down_on_button = ctx.input(|i| {
+                    i.pointer.primary_down()
+                        && i.pointer
+                            .latest_pos()
+                            .is_some_and(|pos| button.contains(pos))
+                });
+                if response.clicked()
+                    || response.secondary_clicked()
+                    || response.is_pointer_button_down_on()
+                    || primary_down_on_button
+                {
+                    open_menu = true;
+                }
+                if self.layout_mode.update_hold(ctx, &response, now) {
+                    open_menu = true;
+                }
+                install_layout_mode_button_accessibility(
+                    ctx,
+                    rect,
+                    profile,
+                    self.layout_mode.menu_open || open_menu,
+                );
+                paint_layout_mode_button(
+                    ui,
+                    rect,
+                    profile,
+                    self.layout_mode.hold_progress(now),
+                    self.layout_mode.menu_open || open_menu,
+                );
+                let _ = layout_profile_hover_text(
+                    response,
+                    format!(
+                        "Click or hold for 5 seconds to choose {}",
+                        LayoutProfile::ALL
+                            .iter()
+                            .map(|p| p.short_label())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                );
+            });
+        if open_menu {
+            self.layout_mode.menu_open = true;
+        }
+        if self.layout_mode.menu_open {
+            self.mount_layout_profile_menu(ctx, button);
+        }
+    }
+
+    fn mount_layout_profile_menu(&mut self, ctx: &egui::Context, button: egui::Rect) {
+        let screen = ctx.screen_rect();
+        let menu = layout_mode_menu_rect(button, screen);
+        let current = self.system.layout_profile();
+        let mut picked = None;
+        egui::Area::new(egui::Id::new("shell-layout-profile-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(menu.size());
+                let frame = egui::Frame::NONE
+                    .fill(Style::resolve_color(ctx, Style::SURFACE))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        Style::resolve_color(ctx, Style::BORDER),
+                    ))
+                    .inner_margin(egui::Margin::same(Style::SP_S as i8));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(menu.width() - Style::SP_M);
+                    for profile in LayoutProfile::ALL {
+                        if layout_profile_menu_row(ui, profile, profile == current).clicked() {
+                            picked = Some(profile);
+                        }
+                    }
+                });
+            });
+        if let Some(profile) = picked {
+            self.system.set_layout_profile(profile, ctx);
+            self.vdock.set_density(profile.density());
+            self.layout_mode.menu_open = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.layout_mode.menu_open = false;
+        }
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            let pos = ctx.input(|i| i.pointer.latest_pos());
+            if pos.is_some_and(|pos| !menu.contains(pos) && !button.contains(pos)) {
+                self.layout_mode.menu_open = false;
+            }
+        }
+    }
+
+    fn mount_car_hud(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let top = screen.top() + Style::SP_M;
+        let left = screen.left() + Style::SP_M;
+        let max_w = (screen.width() - Style::SP_M * 2.0).max(CAR_HUD_TILE_W);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, top),
+            egui::vec2(
+                max_w.min(CAR_HUD_TILE_W * 5.0 + CAR_HUD_GAP * 4.0),
+                CAR_HUD_H,
+            ),
         );
+        let media_label = self
+            .media
+            .player()
+            .media()
+            .map_or_else(|| "Idle".to_owned(), |_| "Playing".to_owned());
+        let voice_label = {
+            let label = self.voice.call_state().label();
+            if label.is_empty() {
+                "Ready".to_owned()
+            } else {
+                label.to_owned()
+            }
+        };
+        let tiles = [
+            ("MPH", "--".to_owned(), "1/F1"),
+            ("Engine", "--".to_owned(), "2/F2"),
+            ("Next", "--".to_owned(), "3/F3"),
+            ("Media", media_label, "4/F4"),
+            ("VoIP", voice_label, "5/F5"),
+        ];
+        egui::Area::new(egui::Id::new("shell-car-layout-hud"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(rect.size());
+                let frame = egui::Frame::NONE
+                    .fill(Style::resolve_color(ctx, Style::BG).gamma_multiply(0.88))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        Style::resolve_color(ctx, Style::BORDER),
+                    ))
+                    .inner_margin(egui::Margin::same(Style::SP_S as i8));
+                frame.show(ui, |ui| {
+                    let tile_w =
+                        ((rect.width() - CAR_HUD_GAP * 4.0) / 5.0).clamp(96.0, CAR_HUD_TILE_W);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = CAR_HUD_GAP;
+                        for (label, value, key) in tiles {
+                            car_hud_tile(ui, tile_w, label, &value, key);
+                        }
+                    });
+                });
+            });
+    }
+
+    fn drain_console_request(&mut self, source: &'static str) {
         match self.console.take_request() {
             Some(console::ConsoleRequest::Goto(surface)) => {
                 // A live surface-link entry (the pinned Terminal, the Cloud-plane
@@ -1523,6 +2272,7 @@ impl Shell {
                 if !self.terminal.spawn_tab(name.clone(), &argv) {
                     tracing::warn!(
                         target: "shell::terminal",
+                        source = %source,
                         tab = %name,
                         argv = ?argv,
                         "console SpawnTab did not open a terminal tab",
@@ -1540,7 +2290,7 @@ impl Shell {
                     tracing::error!(
                         target: "shell::power",
                         verb = verb.label(),
-                        source = "console",
+                        source = %source,
                         error = %e,
                         "power verb refused by the seat",
                     );
@@ -1548,14 +2298,315 @@ impl Shell {
             }
             None => {}
         }
-        // WIN7-3 — a live-tile click (the left pane) ends in the SAME
-        // outcome as an embedded Console `Goto` above: route the body and
-        // expand it (a navigation raised from the Start Menu is never a
-        // no-op behind the session, matching every other nav path here).
-        if let Some(surface) = self.start_menu.take_tile_activation() {
-            self.nav.expanded = true;
-            self.nav.surface = surface;
+    }
+
+    fn front_door_base_items(&self) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
+        self.front_door_items_from_peer_apps(Vec::new())
+    }
+
+    fn front_door_items(&self) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
+        self.front_door_items_from_peer_apps(self.front_door_peer_apps.items())
+    }
+
+    fn front_door_items_from_peer_apps(
+        &self,
+        peer_apps: Vec<front_door::FrontDoorPeerApp>,
+    ) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
+        let mut items =
+            front_door::app_search_items_with_pins(self.launcher_pins.pinned_surfaces());
+        let mut rank = items.len();
+
+        items.extend(front_door::peer_app_search_items(peer_apps, rank));
+        rank = items.len();
+
+        items.extend(front_door::workflow_search_items(rank));
+        rank = items.len();
+
+        items.extend(front_door::service_lifecycle_search_items(
+            self.datacenter.front_door_lifecycle_candidates(),
+            rank,
+        ));
+        rank = items.len();
+
+        items.extend(console::static_search_candidates().into_iter().map(|hit| {
+            let mapped = front_door::console_command_search_item(hit, rank);
+            rank += 1;
+            mapped
+        }));
+
+        items.extend(
+            self.files
+                .unified_search_omnibox_items()
+                .into_iter()
+                .map(|item| {
+                    let mapped = SearchItem::new(
+                        item.domain,
+                        item.title,
+                        item.target,
+                        front_door::FrontDoorTarget::File(item.payload),
+                    )
+                    .with_terms(item.terms)
+                    .with_source_rank(rank);
+                    rank += 1;
+                    mapped
+                }),
+        );
+
+        items.extend(
+            self.explorer
+                .search_omnibox_items()
+                .into_iter()
+                .map(|item| {
+                    // Carry the mesh source's health weight across the re-wrap so
+                    // the front door ranks a healthy node above a degraded one
+                    // above a down one for an equal text match (WL-FUNC-005).
+                    let health = item.source_health();
+                    let mapped = SearchItem::new(
+                        item.domain,
+                        item.title,
+                        item.target,
+                        front_door::FrontDoorTarget::Mesh(item.payload),
+                    )
+                    .with_terms(item.terms)
+                    .with_source_rank(rank)
+                    .with_source_health(health);
+                    rank += 1;
+                    mapped
+                }),
+        );
+
+        items.extend(
+            self.web
+                .search_omnibox_items(self.front_door.query())
+                .into_iter()
+                .map(|item| {
+                    let mapped = SearchItem::new(
+                        item.domain,
+                        item.title,
+                        item.target,
+                        front_door::FrontDoorTarget::Browser(item.payload),
+                    )
+                    .with_terms(item.terms)
+                    .with_source_rank(rank);
+                    rank += 1;
+                    mapped
+                }),
+        );
+
+        items
+    }
+
+    fn activate_front_door_target(&mut self, target: front_door::FrontDoorTarget) {
+        self.nav.expanded = true;
+        match target {
+            front_door::FrontDoorTarget::App(surface) => {
+                self.nav.surface = surface;
+            }
+            front_door::FrontDoorTarget::PeerApp(target) => {
+                if let Err(err) = self.publish_front_door_peer_app_launch(&target) {
+                    tracing::warn!(
+                        target: "shell::front_door",
+                        node = %target.node,
+                        app_id = %target.app_id,
+                        error = %err,
+                        "Front Door peer app launch request did not publish",
+                    );
+                }
+                self.nav.surface = Surface::Desktop;
+            }
+            front_door::FrontDoorTarget::Workflow(card) => {
+                self.nav.surface = card.surface;
+                if let Some(plane) = card.workbench_plane {
+                    self.nav.plane = plane;
+                }
+            }
+            front_door::FrontDoorTarget::ServiceLifecycle(_) => {
+                self.nav.surface = Surface::Workbench;
+                self.nav.plane = Plane::Fleet;
+            }
+            front_door::FrontDoorTarget::File(target) => {
+                self.nav.surface = Surface::Files;
+                self.files.open_search_omnibox_target(&target);
+            }
+            front_door::FrontDoorTarget::Mesh(id) => {
+                self.nav.surface = Surface::Explorer;
+                self.explorer.open_search_omnibox_target(&id);
+            }
+            front_door::FrontDoorTarget::Browser(target) => {
+                self.nav.surface = Surface::Browser;
+                self.web.open_search_omnibox_target(&target);
+            }
+            front_door::FrontDoorTarget::ConsoleCommand(command) => {
+                self.console.activate_index(command.flat);
+                self.drain_console_request("front-door");
+            }
+            front_door::FrontDoorTarget::RunCommand(command) => {
+                self.nav.surface = Surface::Terminal;
+                if let Some(console::ConsoleRequest::SpawnTab { name, argv }) =
+                    console::run_command_request(&command)
+                {
+                    if !self.terminal.spawn_tab(name.clone(), &argv) {
+                        tracing::warn!(
+                            target: "shell::terminal",
+                            tab = %name,
+                            argv = ?argv,
+                            "Front Door run command did not open a terminal tab",
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    fn connect_front_door_desktop_source(&mut self, ctx: &egui::Context, id: &str) {
+        self.nav.expanded = true;
+        self.nav.surface = Surface::Desktop;
+        if let Some(request) = self.chooser.connect_source_id(id) {
+            self.vdi
+                .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
+        }
+    }
+
+    fn publish_front_door_instance_lifecycle(
+        &self,
+        unit_id: &str,
+        op: front_door::FrontDoorInstanceLifecycleOp,
+    ) -> Result<(), String> {
+        let root = mde_bus::client_data_dir()
+            .ok_or_else(|| "No mesh Bus directory configured for lifecycle request.".to_string())?;
+        publish_front_door_instance_lifecycle_to_bus(&root, unit_id, op)
+    }
+
+    fn publish_front_door_service_lifecycle(
+        &self,
+        target: &front_door::FrontDoorServiceLifecycleTarget,
+        op: front_door::FrontDoorServiceLifecycleOp,
+    ) -> Result<(), String> {
+        let root = mde_bus::client_data_dir().ok_or_else(|| {
+            "No mesh Bus directory configured for service lifecycle request.".to_string()
+        })?;
+        publish_front_door_service_lifecycle_to_bus(&root, target, op)
+    }
+
+    fn publish_front_door_peer_app_launch(
+        &self,
+        target: &front_door::FrontDoorPeerAppTarget,
+    ) -> Result<String, String> {
+        let root = mde_bus::client_data_dir().ok_or_else(|| {
+            "No mesh Bus directory configured for app launch request.".to_string()
+        })?;
+        publish_front_door_peer_app_launch_to_bus(&root, target)
+    }
+
+    fn handle_front_door_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: front_door::FrontDoorRequest,
+    ) {
+        match request {
+            front_door::FrontDoorRequest::Activate(target) => {
+                self.activate_front_door_target(target)
+            }
+            front_door::FrontDoorRequest::LaunchPeerApp(target) => {
+                if let Err(err) = self.publish_front_door_peer_app_launch(&target) {
+                    tracing::warn!(
+                        target: "shell::front_door",
+                        node = %target.node,
+                        app_id = %target.app_id,
+                        error = %err,
+                        "Front Door peer app launch request did not publish",
+                    );
+                }
+                self.connect_front_door_desktop_source(ctx, &target.desktop_source_id());
+            }
+            front_door::FrontDoorRequest::ConnectDesktopSource(id) => {
+                self.connect_front_door_desktop_source(ctx, &id);
+            }
+            front_door::FrontDoorRequest::InstanceLifecycle { unit_id, op } => {
+                if let Err(err) = self.publish_front_door_instance_lifecycle(&unit_id, op) {
+                    tracing::warn!(
+                        target: "shell::front_door",
+                        unit_id = %unit_id,
+                        op = ?op,
+                        error = %err,
+                        "Front Door instance lifecycle request did not publish",
+                    );
+                }
+            }
+            front_door::FrontDoorRequest::ServiceLifecycle { target, op } => {
+                if let Err(err) = self.publish_front_door_service_lifecycle(&target, op) {
+                    tracing::warn!(
+                        target: "shell::front_door",
+                        host = %target.host,
+                        kind = %target.kind.label(),
+                        name = %target.name,
+                        op = ?op,
+                        error = %err,
+                        "Front Door service lifecycle request did not publish",
+                    );
+                }
+            }
+            front_door::FrontDoorRequest::OpenWorkbenchPlane(plane) => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Workbench;
+                self.nav.plane = plane;
+            }
+            front_door::FrontDoorRequest::TogglePin(surface) => {
+                self.launcher_pins.toggle_surface_pin(surface);
+            }
+            front_door::FrontDoorRequest::MovePin { surface, direction } => match direction {
+                front_door::FrontDoorPinMoveDirection::Up => {
+                    self.launcher_pins.move_surface_pin_up(surface);
+                }
+                front_door::FrontDoorPinMoveDirection::Down => {
+                    self.launcher_pins.move_surface_pin_down(surface);
+                }
+            },
+        }
+    }
+
+    fn mount_front_door(&mut self, ctx: &egui::Context) {
+        if self.curtain.engaged() {
+            self.front_door.close();
+            return;
+        }
+        let pinned = self.launcher_pins.pinned_surfaces().to_vec();
+        let sources = self.front_door_source_status();
+        let base_items = self.front_door_base_items();
+        self.drive_front_door_peer_apps(&base_items, sources);
+        let items = self.front_door_items();
+        if let Some(request) = front_door::front_door_panel_with_sources(
+            ctx,
+            &mut self.front_door,
+            items,
+            &pinned,
+            sources,
+        ) {
+            self.handle_front_door_request(ctx, request);
+        }
+    }
+
+    fn drive_front_door_peer_apps(
+        &mut self,
+        items: &[SearchItem<front_door::FrontDoorTarget>],
+        sources: front_door::FrontDoorSourceStatus,
+    ) {
+        let focused = self.front_door.selected_peer_node(items.to_vec(), sources);
+        self.front_door_peer_apps
+            .drive_for_focus(focused.as_deref());
+    }
+
+    fn front_door_source_status(&self) -> front_door::FrontDoorSourceStatus {
+        let mesh = if !self.explorer.search_omnibox_source_configured() {
+            front_door::FrontDoorMeshSourceStatus::Unavailable
+        } else if self.explorer.search_omnibox_source_ready() {
+            front_door::FrontDoorMeshSourceStatus::Ready
+        } else if self.explorer.search_omnibox_source_polled() {
+            front_door::FrontDoorMeshSourceStatus::Unavailable
+        } else {
+            front_door::FrontDoorMeshSourceStatus::Pending
+        };
+        front_door::FrontDoorSourceStatus::new(mesh)
     }
 
     /// The central view: the session↔body cross-fade through the expand
@@ -1567,18 +2618,14 @@ impl Shell {
     /// sliding sheet.
     fn central_view(&mut self, ctx: &egui::Context) {
         // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (the
-        // active surface). The floating dock rides outside the fade.
+        // active surface). Bottom taskbar chrome rides outside the fade.
         let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
 
-        // DOCK-OVERLAP — when the dock is shown and we are NOT in a
-        // full-screen remote desktop, reserve a left gutter equal to the dock's
-        // live eased slide width so the central content is NOT covered by the dock
-        // (it insets in lockstep with the slide, no overlap). In a full-screen
-        // remote desktop the dock instead floats as an overlay (it reveals OVER the
-        // edge-to-edge remote), so NO gutter is reserved; hidden → no gutter (full
-        // width). Mounted as an empty left `SidePanel` BEFORE the `CentralPanel`,
-        // which the floating dock `Area` paints over. Reuses the EXACT
-        // full-screen-remote condition the KIRON focus-mute uses (`render`).
+        // The rendered left dock is retired, so this gutter normally stays at
+        // 0.0. Keep the legacy helper in the frame path as a regression guard:
+        // even if old reveal/pin state flips, the central content must not shift
+        // behind a blank left column. Reuses the exact full-screen-remote
+        // condition the KIRON focus-mute uses (`render`).
         let full_screen_remote_desktop =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
         // WIN10-HYBRID bottom strut — reserve the taskbar's height at the bottom
@@ -1606,6 +2653,7 @@ impl Shell {
 
         let covered = self.curtain.covers_fully();
         egui::CentralPanel::default().show(ctx, |ui| {
+            self.last_workspace_rect = Some(ui.max_rect());
             if covered {
                 return;
             }
@@ -1629,15 +2677,149 @@ impl Shell {
             ctx.request_repaint();
         }
     }
+
+    fn finish_menu_bar_minimize_if_done(&mut self, now: Instant) {
+        complete_menu_bar_minimize(&mut self.nav, &mut self.menu_bar_minimize, now);
+    }
+
+    fn mount_remote_sessions_fallback(&self, ctx: &egui::Context) {
+        if !self.nav.expanded
+            || !surface_needs_remote_sessions_fallback(self.nav.surface)
+            || self.curtain.covers_fully()
+            || self.menu_bar_minimize.is_some()
+        {
+            return;
+        }
+
+        let pos = remote_sessions_fallback_pos(ctx.screen_rect());
+        egui::Area::new(egui::Id::new("shell-remote-sessions-fallback-button"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                mde_egui::menubar::remote_sessions_button(ui);
+            });
+    }
+
+    fn drain_menu_bar_minimize_request(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some(source) = mde_egui::menubar::take_remote_sessions_request(ctx) else {
+            return;
+        };
+        self.front_door.close();
+        self.nav.expanded = true;
+        if ctx.style().animation_time <= 0.0 {
+            self.nav.surface = Surface::Desktop;
+            self.menu_bar_minimize = None;
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let from = self
+            .last_workspace_rect
+            .unwrap_or(screen)
+            .intersect(screen)
+            .shrink(Style::SP_S);
+        self.menu_bar_minimize = Some(MenuBarMinimizeEffect::new(
+            now,
+            from,
+            source.expand(Style::SP_XS),
+        ));
+        ctx.request_repaint();
+    }
+
+    fn paint_menu_bar_minimize_effect(&self, ctx: &egui::Context, now: Instant) {
+        let Some(effect) = self.menu_bar_minimize else {
+            return;
+        };
+        let progress = effect.progress(now);
+        let opacity = (1.0 - progress).clamp(0.0, 1.0);
+        let accent = Style::resolve_color(ctx, Style::ACCENT);
+        let surface = Style::resolve_color(ctx, Style::SURFACE);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("shell-menu-bar-minimize-effect"),
+        ));
+        for card in menu_bar_shuffle_paint_order(effect, now) {
+            let card_opacity = opacity * card.depth;
+            painter.rect_filled(
+                card.rect,
+                Style::RADIUS_L,
+                surface.gamma_multiply(card_opacity * 0.22),
+            );
+            painter.rect_stroke(
+                card.rect,
+                Style::RADIUS_L,
+                egui::Stroke::new(1.5, accent.gamma_multiply(card_opacity.max(0.18))),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ctx.request_repaint();
+    }
 }
 
-/// DOCK-OVERLAP — the width of the left gutter the shell reserves for the vertical
-/// dock this frame so the central content is never covered by it. It is the dock's
-/// live eased slide width ([`dock::gutter_width`], `0.0` when hidden + settled) —
-/// but reserved ONLY when we are NOT in a full-screen remote desktop. In a
-/// full-screen remote desktop the dock floats as an overlay (it reveals OVER the
-/// edge-to-edge remote), so nothing is reserved. Split out (and pure but for the
-/// dock's slide read) so the gate is unit-testable.
+fn publish_front_door_instance_lifecycle_to_bus(
+    bus_root: &std::path::Path,
+    unit_id: &str,
+    op: front_door::FrontDoorInstanceLifecycleOp,
+) -> Result<(), String> {
+    let (topic, body) = front_door::cloud_instance_lifecycle_wire(unit_id, op)
+        .ok_or_else(|| format!("Front Door lifecycle target is not a cloud instance: {unit_id}"))?;
+    mde_bus::persist::Persist::open(bus_root.to_path_buf())
+        .and_then(|persist| {
+            persist.write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+        })
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn publish_front_door_service_lifecycle_to_bus(
+    bus_root: &std::path::Path,
+    target: &front_door::FrontDoorServiceLifecycleTarget,
+    op: front_door::FrontDoorServiceLifecycleOp,
+) -> Result<(), String> {
+    let (topic, body) = front_door::service_lifecycle_wire(target, op);
+    mde_bus::persist::Persist::open(bus_root.to_path_buf())
+        .and_then(|persist| {
+            persist.write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+        })
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn publish_front_door_peer_app_launch_to_bus(
+    bus_root: &std::path::Path,
+    target: &front_door::FrontDoorPeerAppTarget,
+) -> Result<String, String> {
+    let (topic, body) = front_door::peer_app_launch_wire(target).ok_or_else(|| {
+        format!(
+            "Front Door peer app launch target is incomplete: node='{}' app_id='{}'",
+            target.node, target.app_id
+        )
+    })?;
+    let persist =
+        mde_bus::persist::Persist::open(bus_root.to_path_buf()).map_err(|err| err.to_string())?;
+    mde_bus::rpc::publish_request(
+        &persist,
+        &topic,
+        mde_bus::hooks::config::Priority::Default,
+        None,
+        Some(&body),
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Width of the retired left-dock gutter. The helper remains so old reveal/pin
+/// state cannot accidentally reintroduce a blank `DOCK_W` column; current
+/// production behavior is always `0.0`, apart from the explicit full-screen
+/// guard also returning `0.0`.
 fn reserved_dock_gutter(
     full_screen_remote_desktop: bool,
     ctx: &egui::Context,
@@ -1662,6 +2844,21 @@ fn reserved_taskbar_strut(full_screen_remote_desktop: bool, vdock: &dock::DockSt
     } else {
         dock::taskbar_strut_height(vdock)
     }
+}
+
+fn shell_file_operation_progress(
+    files: Option<mde_files_egui::model::OperationProgressSummary>,
+    browser: Option<mde_files_egui::model::OperationProgressSummary>,
+) -> Option<dock::FileOperationProgress> {
+    files.or(browser).map(|summary| {
+        dock::FileOperationProgress::new(summary.active, summary.fraction, summary.label)
+    })
+}
+
+fn route_file_operation_progress_request(files: &mut FileBrowser, nav: &mut Nav) {
+    files.set_surface_tab(SurfaceTab::Transfers);
+    nav.surface = Surface::Files;
+    nav.expanded = true;
 }
 
 /// The seat's master-output mute, if the mixer probe answered — gates a
@@ -1742,16 +2939,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The windowed fallback boots through the SAME driver — splash, milestones,
     // then the shell (built mid-boot from the window's egui context).
-    run_client("org.magicmesh.Shell", "MCNF", |_cc| Boot::default()).map_err(Into::into)
+    run_client(
+        "org.magicmesh.Shell",
+        mde_theme::brand::logo::PRODUCT_NAME,
+        |_cc| Boot::default(),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        chat, console, desktop_reconnect_should_query_recents, dock, editor_panel, files_panel,
-        media_header, media_panel, real_editor, real_media, real_terminal, reserved_dock_gutter,
-        reserved_taskbar_strut, screenshot, splash, start_menu, status, terminal_panel, Boot, Nav,
-        Plane, Shell, Surface, VideoTextureCache,
+        car_key_route, chat, complete_menu_bar_minimize, console, datacenter,
+        desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
+        front_door_peer_apps, install_layout_mode_button_accessibility,
+        install_layout_profile_row_accessibility, launcher_pins,
+        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_menu_rect,
+        layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
+        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
+        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
+        publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
+        remote_sessions_fallback_pos, reserved_dock_gutter, reserved_taskbar_strut,
+        route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
+        status, surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
+        MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
+        LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -1760,18 +2972,833 @@ mod tests {
         Roster, Severity,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::Style;
-    use std::path::Path;
+    use mde_egui::{LayoutProfile, Style};
+    use mde_files::backend::{
+        AuditEntry, Backend, BackendError, ConflictPolicy, Destination, SendMode,
+    };
+    use mde_files::fileops::{FakeFileOps, FileOps};
+    use mde_files::model::{FileRow, Mime, Peer, SelfNode};
+    use mde_files_egui::transfers::{
+        Method as TransferMethod, TransferJob, TransferPolicy, TransferState, TransferVerb,
+        TransfersClient,
+    };
+    use mde_seat::HotkeyAction;
+    use std::path::{Path, PathBuf};
+
+    struct ShellFilesBackend {
+        rows: Vec<FileRow>,
+    }
+
+    impl ShellFilesBackend {
+        fn new(rows: Vec<FileRow>) -> Self {
+            Self { rows }
+        }
+    }
+
+    impl Backend for ShellFilesBackend {
+        fn self_node(&self) -> SelfNode {
+            SelfNode {
+                host: "shell-test".to_owned(),
+                ..SelfNode::default()
+            }
+        }
+
+        fn peers(&self) -> Vec<Peer> {
+            Vec::new()
+        }
+
+        fn list(&self, _path: &str) -> Vec<FileRow> {
+            self.rows.clone()
+        }
+
+        fn audit_log(&self) -> Vec<AuditEntry> {
+            Vec::new()
+        }
+
+        fn send_to(
+            &mut self,
+            _sources: &[PathBuf],
+            _destination: Destination,
+            _mode: SendMode,
+            _conflict: ConflictPolicy,
+        ) -> Result<mde_files::backend::OpId, BackendError> {
+            Err(BackendError::Rejected(
+                "send-to is not used by this shell fixture".to_owned(),
+            ))
+        }
+
+        fn rollback(
+            &mut self,
+            op_id: mde_files::backend::OpId,
+        ) -> Result<mde_files::backend::OpId, BackendError> {
+            Err(BackendError::NotFound(op_id))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ShellRecordingTransfers {
+        jobs: std::sync::Arc<std::sync::Mutex<Vec<TransferJob>>>,
+        verbs: std::sync::Arc<std::sync::Mutex<Vec<TransferVerb>>>,
+    }
+
+    impl ShellRecordingTransfers {
+        fn set_jobs(&self, jobs: Vec<TransferJob>) {
+            *self.jobs.lock().expect("transfer jobs mutex poisoned") = jobs;
+        }
+    }
+
+    impl TransfersClient for ShellRecordingTransfers {
+        fn jobs(&self) -> Vec<TransferJob> {
+            self.jobs
+                .lock()
+                .expect("transfer jobs mutex poisoned")
+                .clone()
+        }
+
+        fn worker_present(&self) -> bool {
+            true
+        }
+
+        fn dispatch(&self, verb: &TransferVerb) -> Result<(), String> {
+            self.verbs
+                .lock()
+                .expect("transfer verbs mutex poisoned")
+                .push(verb.clone());
+            Ok(())
+        }
+    }
+
+    fn shell_transfer_job(id: &str, method: TransferMethod, progress: Option<u8>) -> TransferJob {
+        let mut job = TransferJob::new(
+            format!("/tmp/{id}.bin"),
+            "/home/mm/Downloads",
+            method,
+            TransferPolicy::default(),
+        );
+        job.id = id.to_owned();
+        job.state = TransferState::Running;
+        job.progress = progress;
+        job
+    }
 
     #[test]
-    fn shell_starts_collapsed_on_the_workbench() {
+    fn shell_starts_collapsed_on_remote_sessions() {
         let n = Nav::default();
         assert!(
             !n.expanded,
             "the shell opens to the session view, not the shell body"
         );
-        assert_eq!(n.surface, Surface::Workbench);
+        assert_eq!(n.surface, Surface::Desktop);
         assert_eq!(n.plane, Plane::ThisNode);
+    }
+
+    fn accesskit_nodes(
+        out: &egui::FullOutput,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone()
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Path(path) => {
+                    if path.fill != egui::Color32::TRANSPARENT {
+                        out.push(path.fill);
+                    }
+                }
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_layout_profile_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 96.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        layout_profile_tooltip(ui, "Choose Workstation / Tablet / Car");
+                    });
+            },
+        )
+    }
+
+    #[test]
+    fn layout_profile_tooltip_uses_shell_themed_text_and_surface() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        Style::install(&ctx);
+
+        let out = render_layout_profile_tooltip_frame(&ctx);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+        let tooltip_text = "Choose Workstation / Tablet / Car";
+
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == tooltip_text && *color == text_color),
+            "layout profile tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == tooltip_text && *color == egui::Color32::BLACK),
+            "layout profile tooltip leaked the raw shared popup text color: {texts:?}"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "layout profile tooltip should paint its own themed surface: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn layout_profile_button_sits_lower_right_above_the_taskbar() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let rect = layout_mode_button_rect(
+            screen,
+            dock::DockState::default().rail_height(),
+            LayoutProfile::Workstation,
+        );
+        assert!(
+            rect.right() <= screen.right() - Style::SP_M + f32::EPSILON,
+            "layout button must stay inside the right edge: {rect:?}"
+        );
+        assert!(
+            rect.bottom()
+                <= screen.bottom() - dock::DockState::default().rail_height() - Style::SP_M
+                    + f32::EPSILON,
+            "layout button must sit above the bottom taskbar: {rect:?}"
+        );
+        assert_eq!(
+            rect.size(),
+            vec2(
+                LAYOUT_MODE_BUTTON_WORKSTATION,
+                LAYOUT_MODE_BUTTON_WORKSTATION
+            )
+        );
+
+        let touch = layout_mode_button_rect(screen, 48.0, LayoutProfile::Car);
+        assert_eq!(
+            touch.size(),
+            vec2(LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_TOUCH),
+            "Car/Tablet use a touch-sized lower-right control"
+        );
+    }
+
+    #[test]
+    fn layout_profile_menu_opens_above_the_mode_button_and_stays_onscreen() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 360.0));
+        let button = layout_mode_button_rect(screen, 48.0, LayoutProfile::Car);
+        let menu = layout_mode_menu_rect(button, screen);
+        assert!(
+            screen.contains_rect(menu),
+            "menu should stay on-screen: {menu:?}"
+        );
+        assert!(
+            menu.bottom() <= button.top() + f32::EPSILON,
+            "mode menu opens above the lower-right button: menu={menu:?} button={button:?}"
+        );
+    }
+
+    #[test]
+    fn layout_profile_button_primary_click_opens_the_profile_menu() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(LayoutProfile::Workstation, &ctx);
+        shell
+            .vdock
+            .set_density(LayoutProfile::Workstation.density());
+
+        let size = vec2(1280.0, 800.0);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), size);
+        let button = layout_mode_button_rect(
+            screen,
+            shell.vdock.rail_height(),
+            LayoutProfile::Workstation,
+        );
+        let pos = button.center();
+        let now = std::time::Instant::now();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            shell.mount_layout_profile_control(ctx, now)
+        });
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, true),
+            ]),
+            |ctx| shell.mount_layout_profile_control(ctx, now),
+        );
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, false),
+            ]),
+            |ctx| shell.mount_layout_profile_control(ctx, now),
+        );
+
+        assert!(
+            shell.layout_mode.menu_open,
+            "a normal primary click should open the layout profile menu"
+        );
+    }
+
+    #[test]
+    fn layout_profile_control_exports_accesskit_button_and_rows() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 480.0));
+        let button = Rect::from_min_size(pos2(568.0, 404.0), vec2(44.0, 44.0));
+        let row = Rect::from_min_size(pos2(376.0, 220.0), vec2(240.0, 56.0));
+
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                install_layout_mode_button_accessibility(
+                    ctx,
+                    button,
+                    LayoutProfile::Workstation,
+                    true,
+                );
+                install_layout_profile_row_accessibility(
+                    ctx,
+                    row,
+                    LayoutProfile::Workstation,
+                    true,
+                );
+                install_layout_profile_row_accessibility(
+                    ctx,
+                    row.translate(vec2(0.0, 56.0)),
+                    LayoutProfile::Tablet,
+                    false,
+                );
+            },
+        );
+
+        let nodes = accesskit_nodes(&out);
+        let button = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Layout mode"))
+            .expect("layout mode button accesskit node");
+        let expected_button_value =
+            layout_mode_button_accesskit_value(LayoutProfile::Workstation, true);
+        assert_eq!(button.role(), egui::accesskit::Role::Button);
+        assert_eq!(button.value(), Some(expected_button_value.as_str()));
+        assert!(button.supports_action(egui::accesskit::Action::Click));
+
+        let workstation = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some(LayoutProfile::Workstation.label()))
+            .expect("selected workstation row accesskit node");
+        let expected_workstation_value =
+            layout_profile_row_accesskit_value(LayoutProfile::Workstation, true);
+        assert_eq!(workstation.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            workstation.value(),
+            Some(expected_workstation_value.as_str())
+        );
+        assert_eq!(workstation.is_selected(), Some(true));
+        assert!(workstation.supports_action(egui::accesskit::Action::Click));
+
+        let tablet = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some(LayoutProfile::Tablet.label()))
+            .expect("available tablet row accesskit node");
+        let expected_tablet_value =
+            layout_profile_row_accesskit_value(LayoutProfile::Tablet, false);
+        assert_eq!(tablet.value(), Some(expected_tablet_value.as_str()));
+        assert_ne!(tablet.is_selected(), Some(true));
+        assert!(tablet.supports_action(egui::accesskit::Action::Click));
+    }
+
+    #[test]
+    fn car_layout_external_keyboard_routes_cover_required_hud_categories() {
+        let routes = [
+            (egui::Key::Num1, CarKeyRoute::Map, Surface::MapsLocation),
+            (egui::Key::F1, CarKeyRoute::Map, Surface::MapsLocation),
+            (egui::Key::Num2, CarKeyRoute::Engine, Surface::MapsLocation),
+            (
+                egui::Key::Num3,
+                CarKeyRoute::Direction,
+                Surface::MapsLocation,
+            ),
+            (egui::Key::Num4, CarKeyRoute::Media, Surface::Media),
+            (egui::Key::Num5, CarKeyRoute::Voip, Surface::Voice),
+        ];
+        for (key, route, surface) in routes {
+            let got = car_key_route(key).expect("key should be routed in Car layout");
+            assert_eq!(got, route);
+            assert_eq!(got.surface(), surface);
+            assert!(!got.label().is_empty());
+        }
+        assert_eq!(car_key_route(egui::Key::Num6), None);
+    }
+
+    #[test]
+    fn menu_bar_minimize_effect_completes_by_routing_to_remote_sessions() {
+        let start = std::time::Instant::now();
+        let workspace = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0));
+        let button = Rect::from_min_size(pos2(960.0, 4.0), vec2(32.0, 24.0));
+        let effect = MenuBarMinimizeEffect::new(start, workspace, button);
+        let mid = effect.current_rect(start + MENU_BAR_MINIMIZE_DURATION / 2);
+        assert!(
+            mid.width() < workspace.width() && mid.right() > workspace.right() * 0.5,
+            "the cue shrinks toward the top-right menu-bar button: {mid:?}"
+        );
+
+        let mut nav = Nav {
+            expanded: true,
+            surface: Surface::Browser,
+            plane: Plane::default(),
+        };
+        let mut pending = Some(effect);
+        assert!(
+            !complete_menu_bar_minimize(
+                &mut nav,
+                &mut pending,
+                start + MENU_BAR_MINIMIZE_DURATION / 2
+            ),
+            "the route waits for the cue to finish"
+        );
+        assert_eq!(nav.surface, Surface::Browser);
+
+        assert!(complete_menu_bar_minimize(
+            &mut nav,
+            &mut pending,
+            start + MENU_BAR_MINIMIZE_DURATION
+        ));
+        assert_eq!(nav.surface, Surface::Desktop);
+        assert!(
+            nav.expanded,
+            "Remote Sessions opens as the active workspace"
+        );
+        assert!(pending.is_none(), "the cue is one-shot");
+    }
+
+    #[test]
+    fn menu_bar_minimize_effect_uses_staggered_card_shuffle_geometry() {
+        let start = std::time::Instant::now();
+        let workspace = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0));
+        let button = Rect::from_min_size(pos2(960.0, 4.0), vec2(32.0, 24.0));
+        let effect = MenuBarMinimizeEffect::new(start, workspace, button);
+        let mid = start + MENU_BAR_MINIMIZE_DURATION / 2;
+        let cards = menu_bar_shuffle_cards(effect, mid);
+
+        assert_eq!(cards.len(), 3, "the cue should paint a small card stack");
+        assert!(
+            cards[0].rect.width() < cards[1].rect.width()
+                && cards[1].rect.width() < cards[2].rect.width(),
+            "front card should lead while the trailing cards lag: {cards:?}"
+        );
+        assert!(
+            cards[1].rect.left() < cards[0].rect.left()
+                && cards[2].rect.left() < cards[1].rect.left(),
+            "trailing cards should remain visibly staggered behind the lead: {cards:?}"
+        );
+
+        let paint_order = menu_bar_shuffle_paint_order(effect, mid);
+        assert!(
+            paint_order[0].depth < paint_order[1].depth
+                && paint_order[1].depth < paint_order[2].depth,
+            "back cards should paint before the strongest front card: {paint_order:?}"
+        );
+    }
+
+    #[test]
+    fn menu_bar_remote_sessions_request_uses_shell_transition_and_closes_launchers() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.20);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Browser;
+        shell.front_door.open();
+
+        let size = vec2(1280.0, 720.0);
+        let workspace = Rect::from_min_size(pos2(40.0, 72.0), vec2(920.0, 520.0));
+        let menus: [mde_egui::menubar::Menu<&'static str>; 0] = [];
+        let status = [mde_egui::menubar::StatusChip::new(
+            "ready",
+            mde_egui::menubar::ChipTone::Ok,
+        )];
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            events,
+            ..Default::default()
+        };
+        let render_menu_bar = |ctx: &egui::Context| {
+            egui::TopBottomPanel::top("test-shell-menu-bar")
+                .exact_height(mde_egui::menubar::BAR_HEIGHT)
+                .show(ctx, |ui| {
+                    let model = mde_egui::menubar::MenuBarModel {
+                        title: "Browser",
+                        accent: Style::ACCENT,
+                        menus: &menus,
+                        status: &status,
+                    };
+                    let picked: Option<&'static str> = mde_egui::menubar::MenuBar::show(ui, &model);
+                    assert!(picked.is_none(), "the minimize control is shell-owned");
+                });
+        };
+
+        let _ = ctx.run(input(Vec::new()), render_menu_bar);
+        let button = ctx
+            .read_response(mde_egui::menubar::remote_sessions_button_id())
+            .expect("the shared menubar registered its top-right Remote Sessions control")
+            .rect;
+        assert!(
+            button.right() > size.x - 48.0 && button.top() < mde_egui::menubar::BAR_HEIGHT,
+            "the control should stay in the menu-bar/window-title-bar corner: {button:?}"
+        );
+
+        let pos = button.center();
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, true),
+            ]),
+            render_menu_bar,
+        );
+        let start = std::time::Instant::now();
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, false),
+            ]),
+            |ctx| {
+                render_menu_bar(ctx);
+                shell.last_workspace_rect = Some(workspace);
+                shell.drain_menu_bar_minimize_request(ctx, start);
+            },
+        );
+
+        assert!(
+            mde_egui::menubar::take_remote_sessions_request(&ctx).is_none(),
+            "the shell should consume the menu-bar request exactly once"
+        );
+        assert!(
+            !shell.front_door.is_open(),
+            "the launcher overlay must clear before the minimize cue routes to Remote Sessions"
+        );
+        assert_eq!(
+            shell.nav.surface,
+            Surface::Browser,
+            "the active surface should stay put until the visible cue finishes"
+        );
+        assert!(
+            shell.nav.expanded,
+            "the shell body remains visible during the cue"
+        );
+        let effect = shell
+            .menu_bar_minimize
+            .expect("the shell should start a visible minimize transition");
+        assert!(
+            effect.to.contains(pos),
+            "the transition target should be the clicked top-right control: {:?}",
+            effect.to
+        );
+        assert!(
+            (effect.from.left() - (workspace.left() + Style::SP_S)).abs() < 0.5
+                && (effect.from.bottom() - (workspace.bottom() - Style::SP_S)).abs() < 0.5,
+            "the transition should originate from the current workspace rect: {:?}",
+            effect.from
+        );
+
+        assert!(complete_menu_bar_minimize(
+            &mut shell.nav,
+            &mut shell.menu_bar_minimize,
+            start + MENU_BAR_MINIMIZE_DURATION
+        ));
+        assert_eq!(shell.nav.surface, Surface::Desktop);
+        assert!(
+            shell.nav.expanded,
+            "Remote Sessions opens as the shell-managed session surface"
+        );
+    }
+
+    #[test]
+    fn desktop_workspace_body_does_not_mount_the_shared_menu_bar_button() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Desktop;
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                shell.body(ui);
+            });
+        });
+
+        assert!(
+            ctx.read_response(mde_egui::menubar::remote_sessions_button_id())
+                .is_none(),
+            "Remote Sessions itself should be a bare workspace with no top-right menu-bar button"
+        );
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the bare Desktop workspace should still paint"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_policy_covers_only_missing_workspace_controls() {
+        for surface in Surface::ALL {
+            let expected = !matches!(
+                surface,
+                Surface::Workbench
+                    | Surface::InfraCode
+                    | Surface::Desktop
+                    | Surface::Chat
+                    | Surface::System
+                    | Surface::Storage
+                    | Surface::About
+            );
+            assert_eq!(
+                surface_needs_remote_sessions_fallback(surface),
+                expected,
+                "{surface:?} fallback policy should match its chrome ownership"
+            );
+        }
+        assert!(
+            surface_needs_remote_sessions_fallback(Surface::Timers),
+            "the clock-routed Timers surface also needs the shell fallback"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_position_tracks_the_top_right_title_slot() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0));
+        let pos = remote_sessions_fallback_pos(screen);
+        assert_eq!(
+            pos,
+            pos2(
+                screen.right() - Style::SP_XS - mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+                Style::TOOLBAR_INSET_Y
+            ),
+            "fallback placement should be derived from the active viewport"
+        );
+
+        let button = Rect::from_min_size(
+            pos,
+            vec2(
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_H,
+            ),
+        );
+        assert!(
+            button.right() <= screen.right() - Style::SP_XS + f32::EPSILON
+                && button.top() <= Style::SP_XS,
+            "fallback control should sit in the top-right window-title slot: {button:?}"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_mounts_for_bare_non_desktop_workspaces() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Files;
+
+        let size = vec2(1024.0, 640.0);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            shell.mount_remote_sessions_fallback(ctx);
+        });
+        let button = ctx
+            .read_response(mde_egui::menubar::remote_sessions_button_id())
+            .expect(
+                "bare non-Desktop workspaces should receive a top-right Remote Sessions control",
+            )
+            .rect;
+
+        assert_eq!(
+            button.size(),
+            vec2(
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_W,
+                mde_egui::menubar::REMOTE_SESSIONS_BUTTON_H,
+            ),
+            "fallback should reuse the shared Remote Sessions chrome primitive"
+        );
+        assert!(
+            button.is_finite() && button.width() > 0.0 && button.height() > 0.0,
+            "fallback control should mount as a bounded foreground response: {button:?}"
+        );
+
+        let desktop = egui::Context::default();
+        Style::install(&desktop);
+        let mut shell = Shell::new_for_ctx(&desktop);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Desktop;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let _ = desktop.run(input, |ctx| {
+            shell.mount_remote_sessions_fallback(ctx);
+        });
+        assert!(
+            desktop
+                .read_response(mde_egui::menubar::remote_sessions_button_id())
+                .is_none(),
+            "Remote Sessions itself remains the bare lowest-level workspace"
+        );
+    }
+
+    #[test]
+    fn shell_remote_sessions_fallback_request_uses_shell_transition() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.20);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Files;
+
+        let size = vec2(1024.0, 640.0);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            shell.mount_remote_sessions_fallback(ctx);
+        });
+        let button = ctx
+            .read_response(mde_egui::menubar::remote_sessions_button_id())
+            .expect("fallback Remote Sessions control should be registered")
+            .rect;
+        let pos = button.center();
+        let start = std::time::Instant::now();
+        let workspace = Rect::from_min_size(pos2(40.0, 72.0), vec2(920.0, 520.0));
+        mde_egui::menubar::queue_remote_sessions_request(&ctx, button);
+        let source = mde_egui::menubar::take_remote_sessions_request(&ctx)
+            .expect("fallback should use the shared Remote Sessions request channel");
+        assert!(
+            source.contains(pos),
+            "the fallback request should carry the source rect for the shell animation"
+        );
+        mde_egui::menubar::queue_remote_sessions_request(&ctx, source);
+        shell.last_workspace_rect = Some(workspace);
+        shell.drain_menu_bar_minimize_request(&ctx, start);
+
+        assert!(
+            mde_egui::menubar::take_remote_sessions_request(&ctx).is_none(),
+            "the shell should consume the fallback request exactly once"
+        );
+        assert_eq!(
+            shell.nav.surface,
+            Surface::Files,
+            "the active surface should stay put until the visible cue finishes"
+        );
+        let effect = shell
+            .menu_bar_minimize
+            .expect("fallback click should start the shared minimize cue");
+        assert!(
+            effect.to.contains(pos),
+            "the transition should target the fallback top-right control: {:?}",
+            effect.to
+        );
+
+        assert!(complete_menu_bar_minimize(
+            &mut shell.nav,
+            &mut shell.menu_bar_minimize,
+            start + MENU_BAR_MINIMIZE_DURATION
+        ));
+        assert_eq!(shell.nav.surface, Surface::Desktop);
     }
 
     #[test]
@@ -1809,14 +3836,14 @@ mod tests {
         );
     }
 
-    // ── DOCK-OVERLAP: the vertical dock reserves a gutter so it never overlaps ──
+    // ── Retired left-dock gutter regression guards ─────────────────────────
 
     #[test]
     fn the_retired_left_dock_never_reserves_a_gutter() {
         // DEDUPE-1 regression guard (review `dedupe-gutter-regression`): the vertical
         // dock's `dock()` render was deleted, so the left gutter must be reserved
-        // NEVER — even when a stray Super-tap or the taskbar Pin flips
-        // `revealed`/`pinned` (making `shown()` true). Before the fix, a shown dock
+        // NEVER — even when stale dock `revealed`/`pinned` state makes `shown()`
+        // true. Before the fix, a shown dock
         // reserved a DOCK_W gutter, shifting the whole surface body 48px right behind a
         // blank column that persisted after the Start Menu closed. Now it is always 0;
         // the single bottom taskbar (`taskbar_strut_height`) is the only reserved chrome.
@@ -1875,10 +3902,10 @@ mod tests {
     fn a_reserved_gutter_insets_the_central_content_by_dock_w() {
         // The reservation MECHANISM (mirrors `central_view`): an empty left
         // SidePanel of the reserved width pushes the CentralPanel's content right by
-        // exactly that width, so the floating dock Area over x∈[0,DOCK_W] covers only
-        // the empty gutter — never the surface. The CentralPanel's own inner frame
-        // margin is constant, so the DOCK_W inset shows as the DELTA between the
-        // reserved and the unreserved content left.
+        // exactly that width. If the retired dock path ever came back, it would
+        // have to cover only that empty gutter, never the surface. The
+        // CentralPanel's own inner frame margin is constant, so the DOCK_W inset
+        // shows as the DELTA between the reserved and the unreserved content left.
         let with = central_left_after_gutter(dock::DOCK_W);
         let without = central_left_after_gutter(0.0);
         assert!(
@@ -2246,23 +4273,24 @@ mod tests {
     }
 
     #[test]
-    fn win7_6_a_critical_firing_closes_an_open_start_menu() {
-        // WIN7-6 (win7-desktop-survey lock #9): the NOTIF-6 edge-cue now also
-        // auto-closes the Start Menu if it's open the instant a Critical
-        // rollup fires, so the cue gets a clear field — a strengthening of
-        // the cue's existing "always wins" posture, not a weakening of
-        // anything WIN7-2 built.
+    fn win7_6_a_critical_firing_closes_an_open_launcher() {
+        // WIN7-6 (win7-desktop-survey lock #9): the NOTIF-6 edge-cue also
+        // auto-closes the open launcher the instant a Critical rollup fires, so
+        // the cue gets a clear field. WL-UX-005: the ONE launcher is now the
+        // unified Front Door (the legacy Start Menu was removed), so the cue
+        // clears the Front Door rather than a duplicate surface.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
         shell.local_host = "eagle".to_string();
-        shell.start_menu.toggle();
+        shell.front_door.open();
 
-        // Frame 1: the menu is open, no critical has fired yet.
+        // Frame 1: the launcher is open, no critical has fired yet.
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
         assert!(
-            shell.start_menu.is_open(),
-            "test setup: the Start Menu opens with no critical firing"
+            shell.front_door.is_open(),
+            "test setup: the Front Door opens with no critical firing"
         );
 
         // Frame 2: an own-seat Critical fires.
@@ -2276,22 +4304,23 @@ mod tests {
             "the own-seat critical keeps the shell edge cue visible"
         );
         assert!(
-            !shell.start_menu.is_open(),
-            "a Critical firing must auto-close an open Start Menu (lock #9)"
+            !shell.front_door.is_open(),
+            "a Critical firing must auto-close the open launcher (lock #9)"
         );
     }
 
     #[test]
-    fn win7_6_a_warning_alert_does_not_close_the_start_menu() {
+    fn win7_6_a_warning_alert_does_not_close_the_launcher() {
         // The strengthening is specifically for Critical severities
         // (`is_critical_severity`) — a Warning rollup must not touch the
-        // Start Menu at all, matching the edge cue's own existing severity
+        // launcher at all, matching the edge cue's own existing severity
         // gate (it never lights up for anything less than Critical either).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
         shell.local_host = "eagle".to_string();
-        shell.start_menu.toggle();
+        shell.front_door.open();
 
         shell
             .notify_status
@@ -2303,8 +4332,8 @@ mod tests {
             "a Warning severity never lights the own-seat edge cue"
         );
         assert!(
-            shell.start_menu.is_open(),
-            "a non-Critical rollup must not touch the Start Menu's open state"
+            shell.front_door.is_open(),
+            "a non-Critical rollup must not touch the launcher's open state"
         );
     }
 
@@ -2313,28 +4342,29 @@ mod tests {
         // WIN7-6's auto-close is edge-triggered off `take_became_visible`,
         // not a per-frame "is it visible" poll — so once the operator has
         // acknowledged the SAME critical (silencing the cue), reopening the
-        // Start Menu afterward must not be immediately fought shut again.
+        // launcher afterward must not be immediately fought shut again.
         // This is the precise "strengthening, not an annoying loop" behavior
         // the design lock calls for.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
         shell.local_host = "eagle".to_string();
-        shell.start_menu.toggle();
+        shell.front_door.open();
 
-        // Frame 1: menu open, no critical yet.
+        // Frame 1: launcher open, no critical yet.
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
-        assert!(shell.start_menu.is_open(), "test setup: opens clean");
+        assert!(shell.front_door.is_open(), "test setup: opens clean");
 
-        // Frame 2: the critical fires and auto-closes the menu (the exact
-        // behavior `win7_6_a_critical_firing_closes_an_open_start_menu`
+        // Frame 2: the critical fires and auto-closes the launcher (the exact
+        // behavior `win7_6_a_critical_firing_closes_an_open_launcher`
         // covers in detail; re-confirmed here as this test's own setup).
         shell
             .notify_status
             .set_segments_for_test(win7_6_own_seat_segments("critical", 42));
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
         assert!(
-            !shell.start_menu.is_open(),
+            !shell.front_door.is_open(),
             "test setup: the firing auto-closed it"
         );
 
@@ -2344,14 +4374,14 @@ mod tests {
         // test drives the same `acknowledge` entry point directly.
         shell.critical_edge.acknowledge();
 
-        // Frame 3: the operator reopens the Start Menu. The SAME critical
+        // Frame 3: the operator reopens the launcher. The SAME critical
         // rollup is still technically active (just acknowledged/silent) —
         // reopening must not be immediately fought shut again.
-        shell.start_menu.toggle();
+        shell.front_door.open();
         let _ = ctx.run(win7_6_test_input(), |ctx| shell.render(ctx));
 
         assert!(
-            shell.start_menu.is_open(),
+            shell.front_door.is_open(),
             "reopening after acknowledging the critical must not be re-closed \
              (WIN7-6 must never become an annoying open/slam loop)"
         );
@@ -2375,7 +4405,7 @@ mod tests {
     }
 
     /// Drive one headless frame that reproduces the shell's **body mount** — the
-    /// vertical dock chrome, then a surface scoped under `push_id` in the
+    /// bottom taskbar chrome, then a surface scoped under `push_id` in the
     /// shell's `CentralPanel` — then tessellate it on the CPU so any paint-path
     /// fault surfaces as a failure. This is the same `Context::run` → `tessellate`
     /// path the DRM runner drives, minus the GPU (no window, no wgpu).
@@ -2410,6 +4440,894 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mounted surface produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn shell_mirrors_files_operation_progress_into_the_bottom_rail() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+
+        let fileops = FakeFileOps::new();
+        fileops
+            .create_dir_all(Path::new("/src"))
+            .expect("seed source dir");
+        fileops
+            .create_dir_all(Path::new("/dst"))
+            .expect("seed destination dir");
+        fileops
+            .seed_file("/src/report.txt", b"report")
+            .expect("seed source file");
+
+        let rows = vec![
+            FileRow::local("report.txt", Mime::Doc, "6 B", "now").with_path("/src/report.txt")
+        ];
+        let mut files = mde_files_egui::FileBrowser::with_file_ops(
+            Box::new(ShellFilesBackend::new(rows)),
+            fileops,
+        );
+        files.click(0, 0);
+        assert!(
+            files
+                .drop_transfer(0, PathBuf::from("/dst"), true)
+                .is_some(),
+            "the fixture should submit a real Files copy operation"
+        );
+        assert!(
+            files.operation_progress_summary().is_some(),
+            "the active file operation must produce the shell summary"
+        );
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.files = files;
+        shell.nav.surface = Surface::Workbench;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+
+        let rect = ctx
+            .read_response(status::segment_pip_id(
+                status::StatusSegment::FileOperations,
+            ))
+            .expect("the shell bottom rail must render Files operation status")
+            .rect;
+        assert!(
+            rect.bottom() > 400.0,
+            "file-operation status must render inside the bottom navigation bar"
+        );
+
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let progress = nodes
+            .iter()
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("the shell progress segment exports accesskit");
+        assert_eq!(progress.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            progress.value(),
+            Some("File operations active: 1 active file operation, progress pending")
+        );
+        let live = nodes
+            .iter()
+            .find(|node| node.label() == Some("Notification status"))
+            .expect("notification status live region is exported");
+        assert!(
+            live.value()
+                .is_some_and(|value| value.contains("File operations active: 1 active")),
+            "Files operation progress must be folded into Notification status"
+        );
+    }
+
+    #[test]
+    fn shell_file_operation_progress_uses_browser_downloads_when_files_has_no_summary() {
+        let browser = mde_files_egui::model::OperationProgressSummary {
+            active: 2,
+            known_progress: 1,
+            fraction: Some(0.42),
+            label: "2 browser downloads".to_owned(),
+        };
+
+        let progress = shell_file_operation_progress(None, Some(browser.clone()))
+            .expect("Browser active downloads should feed the shared progress cell");
+        assert_eq!(
+            progress,
+            dock::FileOperationProgress::new(2, Some(0.42), "2 browser downloads")
+        );
+        let segments = status::StatusSegments {
+            file_operations: Some(progress.clone()),
+            ..status::StatusSegments::default()
+        };
+        assert!(
+            status::segment_accessibility_value(status::StatusSegment::FileOperations, &segments)
+                .contains("2 active file operations, 42% average progress"),
+            "Browser downloads feed the same FileOperations status segment"
+        );
+
+        let files = mde_files_egui::model::OperationProgressSummary {
+            active: 1,
+            known_progress: 0,
+            fraction: None,
+            label: "Copy report.txt".to_owned(),
+        };
+        let progress = shell_file_operation_progress(Some(files), Some(browser))
+            .expect("Files remains the canonical platform transfer summary");
+        assert_eq!(
+            progress,
+            dock::FileOperationProgress::new(1, None, "Copy report.txt")
+        );
+    }
+
+    #[test]
+    fn shell_taskbar_pumps_file_transfers_even_when_files_is_not_rendered() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let transfers = ShellRecordingTransfers::default();
+        let files = mde_files_egui::FileBrowser::with_file_ops(
+            Box::new(ShellFilesBackend::new(Vec::new())),
+            FakeFileOps::new(),
+        )
+        .with_transfers(Box::new(transfers.clone()));
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.files = files;
+        shell.nav.surface = Surface::Workbench;
+
+        assert!(
+            shell.files.operation_progress_summary().is_none(),
+            "fixture starts with no cached file-transfer progress"
+        );
+        transfers.set_jobs(vec![shell_transfer_job(
+            "active-file-transfer",
+            TransferMethod::Http,
+            Some(67),
+        )]);
+        shell.files.mark_transfers_poll_due_for_test();
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let progress = nodes
+            .iter()
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("the shell bottom rail exports transfer progress");
+        assert_eq!(
+            progress.value(),
+            Some("File operations active: 1 active file operation, 67% average progress")
+        );
+    }
+
+    #[test]
+    fn shell_taskbar_pumps_browser_downloads_even_when_browser_is_not_rendered() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let transfers = ShellRecordingTransfers::default();
+        let web = super::web::WebState::default().with_transfers(Box::new(transfers.clone()));
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.web = web;
+        shell.nav.surface = Surface::Workbench;
+
+        assert!(
+            shell.web.operation_progress_summary().is_none(),
+            "fixture starts with no cached Browser-download progress"
+        );
+        transfers.set_jobs(vec![shell_transfer_job(
+            "browser-download",
+            TransferMethod::BrowserDownload,
+            Some(42),
+        )]);
+        shell.web.mark_downloads_poll_due_for_test();
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+        let nodes = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let progress = nodes
+            .iter()
+            .find(|node| node.label() == Some("File operations status"))
+            .expect("the shell bottom rail exports Browser download progress");
+        assert_eq!(
+            progress.value(),
+            Some("File operations active: 1 active file operation, 42% average progress")
+        );
+    }
+
+    #[test]
+    fn file_operation_progress_request_routes_files_to_the_transfers_tab() {
+        let mut files = mde_files_egui::real_browser();
+        files.set_surface_tab(mde_files_egui::model::SurfaceTab::Files);
+        let mut nav = Nav {
+            expanded: false,
+            surface: Surface::Workbench,
+            plane: Plane::Fleet,
+        };
+
+        route_file_operation_progress_request(&mut files, &mut nav);
+
+        assert_eq!(nav.surface, Surface::Files);
+        assert!(nav.expanded);
+        assert_eq!(
+            files.surface_tab(),
+            mde_files_egui::model::SurfaceTab::Transfers
+        );
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn shell_launcher_frame(
+        ctx: &egui::Context,
+        shell: &mut Shell,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                shell.mount_dock_chrome(ctx);
+                shell.mount_front_door(ctx);
+            },
+        );
+    }
+
+    #[test]
+    fn open_omnibox_hotkey_opens_the_shell_front_door() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        shell.apply_hotkey(HotkeyAction::OpenOmnibox);
+
+        assert!(
+            shell.front_door.is_open(),
+            "the full omnibox owns the focused front door while open"
+        );
+    }
+
+    #[test]
+    fn clean_super_tap_opens_front_door_without_the_start_button() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        let actions = shell.hotkeys.dispatch(
+            &[
+                mde_egui::hostkeys::HostScan {
+                    code: 125,
+                    pressed: true,
+                },
+                mde_egui::hostkeys::HostScan {
+                    code: 125,
+                    pressed: false,
+                },
+            ],
+            &[],
+        );
+        for action in actions {
+            shell.apply_hotkey(action);
+        }
+        if shell.hotkeys.take_dock_toggle() {
+            shell.toggle_front_door_panel();
+        }
+
+        assert!(
+            shell.front_door.is_open(),
+            "a non-button launcher entry must use the same Front Door owner"
+        );
+    }
+
+    #[test]
+    fn retired_start_taskbar_button_is_absent_and_front_door_still_opens() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        let size = vec2(960.0, 640.0);
+
+        shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
+        shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
+        assert!(
+            ctx.read_response(dock::start_cell_id()).is_none(),
+            "the retired Start taskbar button must not register a response"
+        );
+
+        shell.toggle_front_door_panel();
+
+        assert!(
+            shell.front_door.is_open(),
+            "launcher ownership lives on the one Front Door"
+        );
+
+        shell_launcher_frame(&ctx, &mut shell, Vec::new(), size);
+
+        assert!(
+            shell.front_door.is_open(),
+            "Front Door should remain open after the taskbar re-renders without a Start button"
+        );
+    }
+
+    #[test]
+    fn start_launcher_toggle_opens_and_closes_the_one_front_door() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        shell.toggle_front_door_panel();
+        assert!(
+            shell.front_door.is_open(),
+            "Start/Super launcher ownership lives on the Front Door panel mode"
+        );
+
+        shell.toggle_front_door_panel();
+        assert!(
+            !shell.front_door.is_open(),
+            "toggling the Front Door closed leaves no other launcher open"
+        );
+    }
+
+    /// WL-UX-005 AC12 — there is exactly ONE launcher entry point. The legacy
+    /// Start Menu was removed; every launcher trigger the shell exposes (the
+    /// OpenOmnibox hotkey, the clean Super tap via `take_dock_toggle`, the
+    /// taskbar Start-cell toggle) routes into the SAME `open_front_door_panel`/
+    /// `toggle_front_door_panel` pair over the ONE `front_door` state. This test
+    /// exercises each trigger and asserts they all drive that single surface —
+    /// a duplicate launcher would have to expose a second openable state for
+    /// this to still pass, which the type system no longer allows (there is no
+    /// second launcher field to open).
+    #[test]
+    fn every_launcher_entry_point_opens_the_single_front_door() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        // Trigger 1 — the OpenOmnibox hotkey.
+        shell.apply_hotkey(HotkeyAction::OpenOmnibox);
+        assert!(
+            shell.front_door.is_open(),
+            "OpenOmnibox opens the one launcher"
+        );
+        shell.toggle_front_door_panel();
+        assert!(!shell.front_door.is_open(), "toggle closes it");
+
+        // Trigger 2 — the clean Super tap (`take_dock_toggle`).
+        let actions = shell.hotkeys.dispatch(
+            &[
+                mde_egui::hostkeys::HostScan {
+                    code: 125,
+                    pressed: true,
+                },
+                mde_egui::hostkeys::HostScan {
+                    code: 125,
+                    pressed: false,
+                },
+            ],
+            &[],
+        );
+        for action in actions {
+            shell.apply_hotkey(action);
+        }
+        if shell.hotkeys.take_dock_toggle() {
+            shell.toggle_front_door_panel();
+        }
+        assert!(
+            shell.front_door.is_open(),
+            "the clean Super tap opens the SAME single launcher"
+        );
+        shell.toggle_front_door_panel();
+
+        // Trigger 3 — the retired taskbar Start-cell toggle drain. It is a
+        // compatibility no-op (`take_start_menu_toggle` always returns false),
+        // so it can never open a second launcher; draining it leaves the one
+        // Front Door closed and untouched.
+        if shell.vdock.take_start_menu_toggle() {
+            shell.toggle_front_door_panel();
+        }
+        assert!(
+            !shell.front_door.is_open(),
+            "the retired Start cell drains to a no-op, opening no second launcher"
+        );
+    }
+
+    #[test]
+    fn front_door_app_activation_routes_through_shell_nav() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Workbench;
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::App(Surface::Browser));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Browser);
+    }
+
+    #[test]
+    fn front_door_workflow_cards_route_to_their_owner_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Browser;
+        let card = front_door::workflow_search_items(0)
+            .into_iter()
+            .find_map(|item| match item.payload {
+                front_door::FrontDoorTarget::Workflow(card)
+                    if card.surface == Surface::InfraCode =>
+                {
+                    Some(card)
+                }
+                _ => None,
+            })
+            .expect("Infra as Code workflow card");
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::Workflow(card));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(
+            shell.nav.surface,
+            Surface::InfraCode,
+            "Front Door workflow cards should navigate to their real owner surface"
+        );
+    }
+
+    #[test]
+    fn front_door_service_workflow_routes_to_workbench_provisioning_plane() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Browser;
+        shell.nav.plane = Plane::Cloud;
+        let card = front_door::workflow_search_items(0)
+            .into_iter()
+            .find_map(|item| {
+                if item.title != "Mesh services" {
+                    return None;
+                }
+                match item.payload {
+                    front_door::FrontDoorTarget::Workflow(card) => Some(card),
+                    _ => None,
+                }
+            })
+            .expect("Mesh services workflow card");
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::Workflow(card));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert_eq!(
+            shell.nav.plane,
+            Plane::Provisioning,
+            "Mesh services should deep-link to the real Workbench service-add/provisioning plane"
+        );
+    }
+
+    #[test]
+    fn front_door_service_lifecycle_row_opens_workbench_fleet() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Browser;
+        shell.nav.plane = Plane::Provisioning;
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::ServiceLifecycle(
+            front_door::FrontDoorServiceLifecycleTarget {
+                host: "oak".to_owned(),
+                kind: datacenter::FrontDoorLifecycleKind::Vm,
+                name: "dispatch-vm".to_owned(),
+                state: "running".to_owned(),
+            },
+        ));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert_eq!(shell.nav.plane, Plane::Fleet);
+    }
+
+    #[test]
+    fn front_door_workflow_quick_action_routes_to_requested_workbench_plane() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Browser;
+        shell.nav.plane = Plane::Provisioning;
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::OpenWorkbenchPlane(Plane::Fleet),
+        );
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert_eq!(shell.nav.plane, Plane::Fleet);
+    }
+
+    #[test]
+    fn front_door_instance_lifecycle_request_writes_cloud_bus_action() {
+        let dir = tempfile::tempdir().expect("temp bus");
+
+        publish_front_door_instance_lifecycle_to_bus(
+            dir.path(),
+            "cloud:instance:i-9",
+            front_door::FrontDoorInstanceLifecycleOp::Reboot,
+        )
+        .expect("publish Front Door lifecycle");
+
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since("action/cloud/instance-reboot", None)
+            .expect("list lifecycle topic");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body.as_deref(), Some(r#"{"instance":"i-9"}"#));
+        assert!(
+            publish_front_door_instance_lifecycle_to_bus(
+                dir.path(),
+                "peer:browser-node",
+                front_door::FrontDoorInstanceLifecycleOp::Start,
+            )
+            .is_err(),
+            "Shell must reject lifecycle requests for mesh rows without a cloud instance id"
+        );
+    }
+
+    #[test]
+    fn front_door_service_lifecycle_request_writes_directory_bus_action() {
+        let dir = tempfile::tempdir().expect("temp bus");
+        let target = front_door::FrontDoorServiceLifecycleTarget {
+            host: "oak".to_owned(),
+            kind: datacenter::FrontDoorLifecycleKind::Container,
+            name: "mesh-api".to_owned(),
+            state: "running".to_owned(),
+        };
+
+        publish_front_door_service_lifecycle_to_bus(
+            dir.path(),
+            &target,
+            front_door::FrontDoorServiceLifecycleOp::Restart,
+        )
+        .expect("publish Front Door service lifecycle");
+
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since("action/services/lifecycle", None)
+            .expect("list service lifecycle topic");
+        assert_eq!(msgs.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().unwrap_or("{}")).expect("json body");
+        assert_eq!(body["peer"], "oak");
+        assert_eq!(body["kind"], "container");
+        assert_eq!(body["name"], "mesh-api");
+        assert_eq!(body["op"], "restart");
+    }
+
+    #[test]
+    fn front_door_items_include_static_console_commands() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let shell = Shell::new_for_ctx(&ctx);
+
+        let items = shell.front_door_items();
+
+        assert!(items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                front_door::FrontDoorTarget::ConsoleCommand(hit)
+                    if hit.label == "Terminal" && hit.group == "Pinned"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            item.title == "Mesh services"
+                && matches!(
+                    item.payload,
+                    front_door::FrontDoorTarget::Workflow(card)
+                        if card.surface == Surface::Workbench
+                )
+        }));
+    }
+
+    #[test]
+    fn front_door_pin_request_updates_the_persisted_launcher_pin_store() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.launcher_pins = launcher_pins::LauncherPins::default();
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::TogglePin(Surface::Files),
+        );
+
+        assert_eq!(shell.launcher_pins.pinned_surfaces(), &[Surface::Files]);
+        let first_app = shell
+            .front_door_items()
+            .into_iter()
+            .find_map(|item| match item.payload {
+                front_door::FrontDoorTarget::App(surface) => Some(surface),
+                _ => None,
+            })
+            .expect("Front Door app row");
+        assert_eq!(
+            first_app,
+            Surface::Files,
+            "Front Door should read the same ordered favorites the launcher store persists"
+        );
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::TogglePin(Surface::Browser),
+        );
+        assert_eq!(
+            shell.launcher_pins.pinned_surfaces(),
+            &[Surface::Files, Surface::Browser]
+        );
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::MovePin {
+                surface: Surface::Browser,
+                direction: front_door::FrontDoorPinMoveDirection::Up,
+            },
+        );
+        assert_eq!(
+            shell.launcher_pins.pinned_surfaces(),
+            &[Surface::Browser, Surface::Files],
+            "Front Door reorder requests should update the launcher-owned favorite order"
+        );
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::MovePin {
+                surface: Surface::Browser,
+                direction: front_door::FrontDoorPinMoveDirection::Down,
+            },
+        );
+        assert_eq!(
+            shell.launcher_pins.pinned_surfaces(),
+            &[Surface::Files, Surface::Browser]
+        );
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::TogglePin(Surface::Files),
+        );
+
+        assert!(
+            !shell
+                .launcher_pins
+                .pinned_surfaces()
+                .contains(&Surface::Files),
+            "a second Front Door pin request should unpin through the same launcher store"
+        );
+    }
+
+    #[test]
+    fn launcher_pins_are_mirrored_to_the_taskbar_application_bar() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.launcher_pins = launcher_pins::LauncherPins::default();
+        shell.nav.surface = Surface::Workbench;
+
+        assert!(
+            shell.launcher_pins.toggle_surface_pin(Surface::Browser),
+            "the launcher pin action should add Browser to the ordered pin store"
+        );
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| shell.mount_dock_chrome(ctx));
+        let _ = ctx.run(input, |ctx| shell.mount_dock_chrome(ctx));
+
+        let browser = ctx
+            .read_response(dock::pinned_app_cell_id(Surface::Browser))
+            .expect("a launcher pin should render Browser on the application bar")
+            .rect;
+        assert!(
+            browser.bottom() > 400.0,
+            "application pins should render inside the bottom taskbar"
+        );
+    }
+
+    #[test]
+    fn front_door_console_command_activation_routes_through_console_state() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Workbench;
+        let terminal = console::static_search_candidates()
+            .into_iter()
+            .find(|hit| hit.label == "Terminal")
+            .expect("static Terminal Console command");
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::ConsoleCommand(terminal));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(
+            shell.nav.surface,
+            Surface::Terminal,
+            "Front Door command rows should activate through ConsoleState and drain its Goto request"
+        );
+    }
+
+    #[test]
+    fn front_door_peer_connect_request_routes_to_desktop_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Workbench;
+
+        shell.handle_front_door_request(
+            &ctx,
+            front_door::FrontDoorRequest::ConnectDesktopSource("peer:oak".to_owned()),
+        );
+
+        assert!(shell.nav.expanded);
+        assert_eq!(
+            shell.nav.surface,
+            Surface::Desktop,
+            "Front Door peer Connect should enter the Desktop chooser/connect path"
+        );
+    }
+
+    #[test]
+    fn front_door_peer_app_launch_request_publishes_app_launch_body() {
+        let dir = tempfile::tempdir().expect("temp bus");
+        let target = front_door::FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.mozilla.Firefox.desktop".to_owned(),
+            name: "Firefox".to_owned(),
+        };
+
+        let ulid =
+            publish_front_door_peer_app_launch_to_bus(dir.path(), &target).expect("publish launch");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+        let requests = persist
+            .list_since("action/apps/launch", None)
+            .expect("app launch requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].ulid, ulid);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("request body"))
+                .expect("request json");
+        assert_eq!(body["node"], "oak");
+        assert_eq!(body["app_id"], "org.mozilla.Firefox.desktop");
+        assert_eq!(body["name"], "Firefox");
+    }
+
+    #[test]
+    fn front_door_selected_mesh_peer_lazy_loads_peer_apps_from_bus() {
+        let ctx = egui::Context::default();
+        let mut shell = Shell::new_for_ctx(&ctx);
+        let dir = tempfile::tempdir().expect("temp bus");
+        let root = dir.path().to_path_buf();
+        shell.front_door_peer_apps =
+            front_door_peer_apps::FrontDoorPeerAppsState::new(Some(root.clone()));
+        shell.front_door.open();
+
+        let items = vec![mde_egui::search_omnibox::SearchItem::new(
+            mde_egui::search_omnibox::SearchDomain::Mesh,
+            "oak",
+            "peer:oak",
+            front_door::FrontDoorTarget::Mesh("peer:oak".to_owned()),
+        )];
+        shell.drive_front_door_peer_apps(&items, front_door::FrontDoorSourceStatus::default());
+
+        let persist = Persist::open(root.clone()).expect("open bus");
+        let requests = persist
+            .list_since("action/apps/peer-list", None)
+            .expect("peer-list requests");
+        assert_eq!(requests.len(), 1);
+        let request_body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("request body"))
+                .expect("request json");
+        assert_eq!(request_body["node"], "oak");
+
+        let ulid = shell
+            .front_door_peer_apps
+            .pending_ulid()
+            .expect("pending peer-list request")
+            .to_owned();
+        let reply = serde_json::json!({
+            "ok": true,
+            "node": "oak",
+            "entries": [{
+                "id": "org.mozilla.Firefox.desktop",
+                "name": "Firefox",
+                "source": "flatpak",
+                "icon": "firefox",
+                "health": "online",
+                "state": "installed"
+            }]
+        })
+        .to_string();
+        persist
+            .write(
+                &mde_bus::rpc::reply_topic(&ulid),
+                Priority::Default,
+                None,
+                Some(&reply),
+            )
+            .expect("write reply");
+
+        shell.drive_front_door_peer_apps(&items, front_door::FrontDoorSourceStatus::default());
+        let peer_app = shell
+            .front_door_items()
+            .into_iter()
+            .find_map(|item| match item.payload {
+                front_door::FrontDoorTarget::PeerApp(target) => Some(target),
+                _ => None,
+            })
+            .expect("peer app row");
+        assert_eq!(peer_app.node, "oak");
+        assert_eq!(peer_app.app_id, "org.mozilla.Firefox.desktop");
+        assert_eq!(peer_app.name, "Firefox");
+    }
+
+    #[test]
+    fn front_door_run_command_activation_routes_to_terminal() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Workbench;
+
+        shell.activate_front_door_target(front_door::FrontDoorTarget::RunCommand(
+            "printf front-door".to_owned(),
+        ));
+
+        assert!(shell.nav.expanded);
+        assert_eq!(
+            shell.nav.surface,
+            Surface::Terminal,
+            "Front Door > command activation should use the terminal command seam"
         );
     }
 
@@ -2583,81 +5501,5 @@ mod tests {
         canvas.write_png(&path).expect("write the proof PNG");
         let written = std::fs::metadata(&path).expect("the PNG must exist on disk");
         assert!(written.len() > 0, "write_png must produce a non-empty file");
-    }
-
-    /// Paint the SAME two free functions `Shell::render` composes in production for
-    /// this exact slice (`dock::notification_rail_with_sources`,
-    /// `start_menu::start_menu_panel`) — bypassing `Shell`/`Curtain` entirely,
-    /// exactly like `dock.rs`'s own standalone tests already drive the taskbar
-    /// without a `Shell`. Going through the full `Shell` would hit the CURTAIN-3 boot
-    /// gate (`Shell::new_for_ctx` starts locked under the shipped
-    /// `require_login_at_boot` default), which would hide the whole nav — including
-    /// the Start Menu — behind the PAM curtain on any host/CI sandbox with no
-    /// persisted power-honor config.
-    fn paint_taskbar_and_start_menu(
-        ctx: &egui::Context,
-        vdock: &mut dock::DockState,
-        menu: &mut start_menu::StartMenuState,
-        console: &mut console::ConsoleState,
-    ) {
-        let _ = dock::notification_rail_with_sources(ctx, vdock, &[]);
-        // Mirrors main.rs's real `mount_start_menu` wiring (WIN7-DESKTOP-1
-        // regression fix) so this fixture's Start Menu reserves the SAME live
-        // taskbar height the rail above just rendered at, exactly like
-        // production — load-bearing for this test's own screenshot to show
-        // the accumulated chrome correctly, not just each piece in isolation.
-        start_menu::start_menu_panel(ctx, menu, console, vdock.rail_height());
-    }
-
-    /// WIN7-SHOT-1's actual payoff: the FIRST real look at the accumulated
-    /// WIN7-1..5 result (the bottom taskbar + the open two-pane Start Menu) —
-    /// every prior WIN7 unit was verified by layout-rect/accesskit assertions
-    /// alone. Writes a REAL file at a stable, reportable path (unlike the
-    /// proof above's tempdir) — this PNG IS the deliverable a human opens.
-    #[test]
-    fn win7_shot_2_start_menu_screenshot_shows_the_accumulated_win7_chrome() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut vdock = dock::DockState::default();
-        let mut menu = start_menu::StartMenuState::default();
-        let mut console = console::ConsoleState::with_store(None);
-        // The start_menu.rs idiom throughout this crate: toggle, then settle a
-        // quiet frame before the shot (e.g.
-        // `the_open_start_menu_does_not_cover_the_rest_of_the_screen`).
-        menu.toggle();
-        vdock.set_start_menu_open(true);
-
-        let size = vec2(1280.0, 800.0);
-        let input = || egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
-            ..Default::default()
-        };
-
-        let mut cap = screenshot::Capture::new();
-        let _settle = cap.frame(&ctx, input(), |ctx| {
-            paint_taskbar_and_start_menu(ctx, &mut vdock, &mut menu, &mut console);
-        });
-        let canvas = cap.frame(&ctx, input(), |ctx| {
-            paint_taskbar_and_start_menu(ctx, &mut vdock, &mut menu, &mut console);
-        });
-
-        assert!(
-            menu.is_open(),
-            "the fixture must really have the Start Menu open"
-        );
-        assert_eq!((canvas.width(), canvas.height()), (1280, 800));
-        assert!(
-            !canvas.is_blank(),
-            "the Start Menu screenshot must not be blank"
-        );
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("screenshots")
-            .join("win7-start-menu.png");
-        canvas
-            .write_png(&path)
-            .expect("write the WIN7 Start Menu screenshot");
-        println!("WIN7 Start Menu screenshot written to {}", path.display());
     }
 }

@@ -1,5 +1,7 @@
 # Mesh-Map Wallpaper — EtherApe-like global mesh traffic (MESHMAP)
 
+> **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** describes the retired `mde-workbench` mesh-map wallpaper binary. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and [`mesh-map-wallpaper`](mesh-map-wallpaper.md) as carried into the egui shell. Read the `mde-workbench` crate references below as historical.
+
 **Status:** Locked (survey 2026-06-27). **Vision:** turn the static topology
 wallpaper into an **EtherApe-like animated global-mesh-traffic map** — nodes placed
 **geographically**, with **per-direction packet-particle trails colored by the

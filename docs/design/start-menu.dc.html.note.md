@@ -1,5 +1,7 @@
 # Start Menu design (APPS-STYLE-2)
 
+> **HISTORICAL / SUPERSEDED (2026-07-19):** an imported note implemented against the retired `mde-cosmic-applet` apps-applet (`mde-apps-applet.rs`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` with the launcher folded into the Front Door — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and [`app-launcher-rethink.md`](app-launcher-rethink.md). Retained as a historical design record.
+
 Source: Claude Design project "Start menu improvement design"
 (claude.ai/design/p/45e0d4a5-09a2-4531-8d5d-e6284ecae313, file `Start Menu.dc.html`),
 imported 2026-06-18. Implemented in `crates/platform/mde-cosmic-applet/src/bin/mde-apps-applet.rs`.

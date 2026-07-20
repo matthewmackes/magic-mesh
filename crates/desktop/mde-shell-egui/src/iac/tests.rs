@@ -1,68 +1,60 @@
 use super::*;
-use mackes_mesh_types::openstack::{shape_health, ProbeOutcome};
+use mackes_mesh_types::cloud::{EndpointInterface, ResourceRow};
 use mde_egui::egui::{pos2, vec2, Rect};
 
-/// A realistic Keystone v3 token catalog — a three-interface compute service,
-/// a single-interface identity service, and an image service (mirrors the
-/// shared crate's fixture, so the surface is exercised against the real shape).
-const V3_TOKEN: &str = r#"{
-      "token": {
-        "catalog": [
-          {
-            "type": "compute", "name": "nova",
-            "endpoints": [
-              {"interface": "public",   "url": "http://nova.mesh:8774/v2.1", "region": "RegionOne"},
-              {"interface": "internal", "url": "http://nova.mesh:8774/v2.1", "region": "RegionOne"},
-              {"interface": "admin",    "url": "http://nova.mesh:8774/v2.1", "region": "RegionOne"}
-            ]
-          },
-          {
-            "type": "identity", "name": "keystone",
-            "endpoints": [
-              {"interface": "public", "url": "http://keystone.mesh:5000/v3", "region": "RegionOne"}
-            ]
-          },
-          {
-            "type": "image", "name": "glance",
-            "endpoints": [
-              {"interface": "public", "url": "http://glance.mesh:9292", "region": "RegionOne"}
-            ]
-          }
-        ]
-      }
-    }"#;
+/// One backend-tool health row in a fixture mirror.
+fn health(tool: &str, state: HealthState) -> ServiceHealth {
+    ServiceHealth {
+        service_type: tool.to_string(),
+        interface: EndpointInterface::Internal,
+        url: "(local)".to_string(),
+        state,
+        latency_ms: Some(3),
+        microversion: None,
+        version_id: None,
+        detail: Some("probe".to_string()),
+    }
+}
 
-/// A fixture view: the real catalog + health rows where compute + identity
-/// probe **up** and image probes **down** (2 of 3 healthy) — so the render +
-/// the status counts are exercised over a mixed-health directory.
-pub(super) fn fixture_view() -> CatalogView {
-    let catalog = ServiceCatalog::from_keystone_token_json(V3_TOKEN).expect("fixture catalog");
-    let up = |ty: &str, url: &str| {
-        shape_health(
-            ty,
-            EndpointInterface::Public,
-            url,
-            &ProbeOutcome::Reachable {
-                http_status: 200,
-                body: String::new(),
-                elapsed_ms: 12,
-            },
-        )
+/// A one-instance roster table (the shape the worker publishes on the mirror).
+fn roster_table() -> ResourceTable {
+    ResourceTable {
+        service_type: "compute".to_string(),
+        collection: "instances".to_string(),
+        columns: vec!["name".to_string(), "status".to_string()],
+        rows: vec![ResourceRow {
+            id: "vm-1".to_string(),
+            cells: vec!["mesh-worker".to_string(), "running".to_string()],
+        }],
+    }
+}
+
+/// A fixture `state/cloud` mirror: OpenTofu **up**, Ansible **down**, libvirt
+/// **absent** (the honest Up/Down/Absent tri-state), plus a one-instance roster,
+/// plan-only (apply not armed).
+fn fixture_state() -> CloudState {
+    CloudState {
+        host: "eagle".to_string(),
+        adapter: CloudProviderAdapter::ConstructCloud,
+        health: vec![
+            health("opentofu", HealthState::Up),
+            health("ansible", HealthState::Down),
+            health("libvirt", HealthState::Absent),
+        ],
+        resources: vec![roster_table()],
+        apply_armed: false,
+        published_at_ms: 42,
+    }
+}
+
+/// A surface state on `mode` with the fixture mirror folded in.
+fn state_on(mode: Mode) -> InfraCodeState {
+    let mut state = InfraCodeState {
+        mode,
+        ..InfraCodeState::default()
     };
-    let health = vec![
-        up("compute", "http://nova.mesh:8774/v2.1"),
-        up("identity", "http://keystone.mesh:5000/v3"),
-        shape_health(
-            "image",
-            EndpointInterface::Public,
-            "http://glance.mesh:9292",
-            &ProbeOutcome::Unreachable {
-                elapsed_ms: 2000,
-                reason: "connection refused".to_string(),
-            },
-        ),
-    ];
-    CatalogView { catalog, health }
+    state.states = vec![fixture_state()];
+    state
 }
 
 /// Drive one headless frame of `infra_code_panel` and tessellate it on the CPU
@@ -83,8 +75,8 @@ fn run_panel(state: &mut InfraCodeState) -> bool {
 
 #[test]
 fn the_surface_is_reachable_in_the_dock() {
-    // §7 reachability: the surface is in Surface::ALL and wears the server /
-    // infrastructure brand glyph (the group membership is pinned by dock.rs).
+    // §7 reachability: the surface stays in Surface::ALL and wears the server /
+    // infrastructure brand glyph (the dock mount is unchanged by the recreate).
     use crate::dock::Surface;
     assert!(Surface::ALL.contains(&Surface::InfraCode));
     assert_eq!(
@@ -94,570 +86,266 @@ fn the_surface_is_reachable_in_the_dock() {
 }
 
 #[test]
-fn overview_renders_from_a_fixture_catalog() {
-    let mut state = InfraCodeState {
-        outcome: CatalogOutcome::Ready(fixture_view()),
-        ..InfraCodeState::default()
-    };
-    assert!(
-        run_panel(&mut state),
-        "the Overview (status band + directory) produced no draw primitives"
-    );
-    // Expanding the endpoint URLs still tessellates cleanly.
-    state.show_urls = true;
-    assert!(run_panel(&mut state), "the URL-expanded tiles drew nothing");
-}
-
-#[test]
-fn the_honest_not_configured_state_renders() {
-    // A node with no clouds.yaml reads "not configured", never fake data (§7).
-    let mut state = InfraCodeState {
-        outcome: CatalogOutcome::NotConfigured("no clouds.yaml on this node".to_string()),
-        ..InfraCodeState::default()
-    };
-    assert!(
-        run_panel(&mut state),
-        "the not-configured empty state produced no draw primitives"
-    );
-}
-
-#[test]
-fn the_querying_and_failed_states_render() {
-    let mut querying = InfraCodeState::default();
-    assert!(matches!(querying.outcome, CatalogOutcome::Querying));
-    assert!(run_panel(&mut querying), "the querying state drew nothing");
-
-    let mut failed = InfraCodeState {
-        outcome: CatalogOutcome::Failed("keystone auth failed".to_string()),
-        ..InfraCodeState::default()
-    };
-    assert!(run_panel(&mut failed), "the failed state drew nothing");
-}
-
-#[test]
-fn fold_reply_maps_the_reply_tri_state_honestly() {
-    // A successful reply (the real wire shape mackesd emits) folds to Ready.
-    let view = fixture_view();
-    let ok_body = serde_json::json!({
-        "ok": true,
-        "verb": "get-catalog",
-        "audited": false,
-        "catalog": view.catalog,
-        "health": view.health,
-    })
-    .to_string();
-    let reply: CatalogReply = serde_json::from_str(&ok_body).expect("ok reply parses");
-    match fold_reply(reply) {
-        CatalogOutcome::Ready(v) => {
-            assert_eq!(v.catalog.services.len(), 3);
-            assert_eq!(v.healthy_count(), 2);
-        }
-        other => panic!("an ok reply must fold to Ready, got {other:?}"),
-    }
-
-    // A gated reply → NotConfigured (the honest "no clouds.yaml").
-    let gated: CatalogReply = serde_json::from_str(
-        r#"{"ok":false,"verb":"get-catalog","audited":false,"gated":"no clouds.yaml on node-a"}"#,
-    )
-    .expect("gated reply parses");
-    assert!(matches!(
-        fold_reply(gated),
-        CatalogOutcome::NotConfigured(r) if r.contains("clouds.yaml")
-    ));
-
-    // An error reply → Failed.
-    let errored: CatalogReply = serde_json::from_str(
-        r#"{"ok":false,"verb":"get-catalog","audited":false,"error":"keystone auth failed"}"#,
-    )
-    .expect("error reply parses");
-    assert!(matches!(
-        fold_reply(errored),
-        CatalogOutcome::Failed(r) if r.contains("auth failed")
-    ));
-
-    // An `ok` reply with no directory is a failure, never a fabricated empty
-    // catalog (§7).
-    let empty: CatalogReply =
-        serde_json::from_str(r#"{"ok":true,"verb":"get-catalog","audited":false}"#)
-            .expect("bare ok reply parses");
-    assert!(matches!(fold_reply(empty), CatalogOutcome::Failed(_)));
-}
-
-#[test]
-fn services_group_into_buckets_by_type() {
-    assert_eq!(service_bucket("compute"), "Compute");
-    assert_eq!(service_bucket("network"), "Network");
-    assert_eq!(service_bucket("image"), "Image");
-    assert_eq!(service_bucket("volumev3"), "Volume");
-    assert_eq!(service_bucket("orchestration"), "Orchestration");
-    assert_eq!(service_bucket("identity"), "Identity");
-    assert_eq!(service_bucket("object-store"), "Object Storage");
-    // An unknown/new service type is grouped honestly, never dropped.
-    assert_eq!(service_bucket("load-balancer"), "Other");
-    // Every bucket a service can map to is one of the rendered BUCKETS.
-    for ty in ["compute", "network", "image", "volumev3", "dns", "weird"] {
-        assert!(BUCKETS.contains(&service_bucket(ty)));
-    }
-}
-
-#[test]
-fn health_for_prefers_the_public_interface() {
-    let view = fixture_view();
-    let compute = view.catalog.service("compute").expect("compute");
-    let health = view.health_for(compute).expect("compute health");
-    assert_eq!(health.interface, EndpointInterface::Public);
-    assert_eq!(health.state, HealthState::Up);
-    // A service with no health row reads unprobed (None), never a faked up.
-    let mut bare = view.clone();
-    bare.health.clear();
-    assert!(bare.health_for(compute).is_none());
-}
-
-#[test]
-fn authority_extracts_host_and_port() {
-    assert_eq!(authority("http://nova.mesh:8774/v2.1"), "nova.mesh:8774");
-    assert_eq!(
-        authority("https://keystone.mesh:5000/v3"),
-        "keystone.mesh:5000"
-    );
-    assert_eq!(
-        authority("http://user@glance.mesh:9292"),
-        "glance.mesh:9292"
-    );
-    assert_eq!(authority("glance.mesh:9292"), "glance.mesh:9292");
-}
-
-// ─────────────────────────── IAC-3: Resources tab ───────────────────────────
-
-/// A two-row Nova compute table — the fixture the Resources tab renders.
-pub(super) fn fixture_resource_table() -> ResourceTable {
-    ResourceTable::from_collection_json(
-        "compute",
-        "servers/detail",
-        r#"{"servers":[
-                {"id":"i-1","name":"web","status":"ACTIVE"},
-                {"id":"i-2","name":"db","status":"SHUTOFF"}
-            ]}"#,
-    )
-    .expect("fixture table")
-}
-
-/// A surface state on the Resources tab over the fixture catalog, with the
-/// compute pane populated (`ready` = its resource table landed).
-fn resources_state(ready: bool) -> InfraCodeState {
-    let mut state = InfraCodeState {
-        outcome: CatalogOutcome::Ready(fixture_view()),
-        tab: IacTab::Resources,
-        ..InfraCodeState::default()
-    };
-    if ready {
-        state.resources.insert(
-            "compute".to_string(),
-            ResourcePane {
-                outcome: Some(ResourceOutcome::Ready(fixture_resource_table())),
-                ..ResourcePane::default()
-            },
+fn the_workspace_renders_all_six_modes_headless() {
+    // Every mode tessellates over the fixture mirror — the six-mode workspace.
+    for mode in Mode::ALL {
+        let mut state = state_on(mode);
+        assert!(
+            run_panel(&mut state),
+            "{:?} mode drew nothing",
+            mode.label()
         );
     }
-    state
 }
 
 #[test]
-fn the_tab_bar_switches_and_the_heat_tab_is_an_honest_empty_state() {
-    // The three tabs render; the default is Overview (IAC-2 render).
-    let mut state = InfraCodeState {
-        outcome: CatalogOutcome::Ready(fixture_view()),
-        ..InfraCodeState::default()
-    };
-    assert_eq!(state.tab, IacTab::Overview);
-    assert!(run_panel(&mut state), "Overview drew nothing");
-    // Heat is an honest forward-looking empty state (not a disabled tab, §7).
-    state.tab = IacTab::Heat;
-    assert!(run_panel(&mut state), "the Heat empty state drew nothing");
-}
-
-#[test]
-fn resources_renders_honestly_empty_with_no_reply_and_rows_with_one() {
-    // Resources tab, catalog Ready, but no pane reply yet → honest "querying"
-    // per service, never fabricated rows (§7).
-    let mut empty = resources_state(false);
-    assert!(
-        run_panel(&mut empty),
-        "the querying Resources tab drew nothing"
-    );
-    // A landed fixture list-resources reply renders the rows.
-    let mut ready = resources_state(true);
-    assert!(
-        run_panel(&mut ready),
-        "the populated Resources table drew nothing"
-    );
-    // Selecting a row + re-render (bulk selection is a real toggle set).
-    ready
-        .selected
-        .insert(("compute".to_string(), "i-1".to_string()));
-    assert!(
-        run_panel(&mut ready),
-        "the selected-row render drew nothing"
-    );
-}
-
-#[test]
-fn resources_reads_honestly_when_the_catalog_is_absent() {
-    // Until the catalog answers, the Resources tab reads the same honest
-    // catalog-absent story as the Overview (never an empty table of nothing).
-    let mut not_configured = InfraCodeState {
-        outcome: CatalogOutcome::NotConfigured("no clouds.yaml".to_string()),
-        tab: IacTab::Resources,
-        ..InfraCodeState::default()
-    };
-    assert!(run_panel(&mut not_configured), "drew nothing");
-}
-
-#[test]
-fn fold_resource_reply_maps_the_reply_tri_state_honestly() {
-    let table = fixture_resource_table();
-    let ok_body = serde_json::json!({
-        "ok": true, "verb": "list-resources", "audited": false, "resources": table,
-    })
-    .to_string();
-    let reply: CatalogReply = serde_json::from_str(&ok_body).expect("ok reply parses");
-    match fold_resource_reply(reply) {
-        ResourceOutcome::Ready(t) => assert_eq!(t.rows.len(), 2),
-        other => panic!("an ok reply with a table must fold to Ready, got {other:?}"),
+fn switching_modes_works() {
+    let mut state = state_on(Mode::Provision);
+    assert_eq!(state.mode(), Mode::Provision);
+    for mode in Mode::ALL {
+        state.set_mode(mode);
+        assert_eq!(state.mode(), mode);
+        assert!(run_panel(&mut state), "{:?} render failed", mode.label());
     }
-    // A gated reply → NotConfigured; an error → Failed; ok-with-no-table →
-    // Failed (never a fabricated empty table).
-    let gated: CatalogReply = serde_json::from_str(
-        r#"{"ok":false,"verb":"list-resources","audited":false,"gated":"no clouds.yaml"}"#,
-    )
-    .unwrap();
-    assert!(matches!(
-        fold_resource_reply(gated),
-        ResourceOutcome::NotConfigured(_)
-    ));
-    let errored: CatalogReply = serde_json::from_str(
-        r#"{"ok":false,"verb":"list-resources","audited":false,"error":"HTTP 500"}"#,
-    )
-    .unwrap();
-    assert!(matches!(
-        fold_resource_reply(errored),
-        ResourceOutcome::Failed(r) if r.contains("500")
-    ));
-    let bare: CatalogReply =
-        serde_json::from_str(r#"{"ok":true,"verb":"list-resources","audited":false}"#).unwrap();
-    assert!(matches!(
-        fold_resource_reply(bare),
-        ResourceOutcome::Failed(_)
-    ));
 }
 
 #[test]
-fn typed_arming_blocks_an_unconfirmed_mutation() {
-    // The arming gate: only an exact (trimmed) name match arms the mutation.
-    assert!(armed("web", "web"));
-    assert!(armed("  web ", "web"), "surrounding space is tolerated");
-    assert!(!armed("we", "web"), "a partial echo does not arm");
-    assert!(!armed("", "web"), "an empty echo does not arm");
+fn the_empty_mirror_reads_honestly_never_fabricated() {
+    // No mirror published yet → honest empty states per mode, never fake rows.
+    for mode in [Mode::Provision, Mode::Status, Mode::Network] {
+        let mut state = InfraCodeState {
+            mode,
+            ..InfraCodeState::default()
+        };
+        assert!(
+            run_panel(&mut state),
+            "{:?} empty state drew nothing",
+            mode.label()
+        );
+    }
+}
 
-    // Applying a destructive verb OPENS the typed-arming confirm — it does
-    // NOT publish anything (no note, no Bus request) until the name is typed.
-    let mut state = resources_state(true);
-    state
-        .selected
-        .insert(("compute".to_string(), "i-1".to_string()));
-    menubar::apply(
-        &mut state,
-        menubar::MenuAction::ArmLifecycle {
-            verb: "instance-delete",
-            instance_id: "i-1".to_string(),
-            name: "web".to_string(),
-        },
-    );
-    let arming = state
-        .arming
-        .as_ref()
-        .expect("delete opens the arming confirm");
-    assert_eq!(arming.verb, "instance-delete");
-    assert_eq!(arming.target_name, "web");
+#[test]
+fn provision_renders_a_fixture_cloudstate_resource_table() {
+    let mut state = state_on(Mode::Provision);
+    // The roster comes straight from the mirror's resource table.
+    assert_eq!(state.states()[0].resources[0].rows.len(), 1);
+    assert!(is_instance_roster(&state.states()[0].resources[0]));
+    assert!(run_panel(&mut state), "the Provision roster drew nothing");
+}
+
+#[test]
+fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm() {
+    // Dry-run default: a plan is a direct emit (no confirm). Apply is gated.
+    let mut state = state_on(Mode::Provision);
+
+    // Arming a live apply OPENS the confirm and publishes NOTHING (§ RUN-006).
+    state.arm_provision();
+    let arming = state.arming.as_ref().expect("apply opens the confirm");
+    assert_eq!(arming.action, ArmAction::Provision);
+    assert_eq!(arming.action.verb(), "provision");
     assert!(arming.typed.is_empty());
     assert!(
-        state.note.is_none(),
-        "an unconfirmed mutation publishes nothing (no action note)"
+        state.mutation_pending.is_none() && state.note.is_none(),
+        "an unconfirmed apply publishes nothing"
     );
-}
 
-#[test]
-fn drill_and_refresh_menu_actions_drive_their_real_seams() {
-    let mut state = resources_state(false);
-    state.tab = IacTab::Overview;
-    // Drill switches to Resources + focuses the service (the linked view).
-    menubar::apply(
-        &mut state,
-        menubar::MenuAction::Drill("network".to_string()),
-    );
-    assert_eq!(state.tab, IacTab::Resources);
-    assert_eq!(state.linked_focus.as_deref(), Some("network"));
-    // Refresh queues an immediate re-poll of that service's pane.
-    menubar::apply(
-        &mut state,
-        menubar::MenuAction::RefreshResources("compute".to_string()),
-    );
-    assert!(state.resources.get("compute").expect("pane").forced);
-}
-
-#[test]
-fn single_selected_instance_is_some_only_for_exactly_one_compute_row() {
-    let mut state = resources_state(true);
-    assert!(state.single_selected_instance().is_none(), "none selected");
-    state
-        .selected
-        .insert(("compute".to_string(), "i-1".to_string()));
-    // Resolves the name from the compute pane's table.
-    assert_eq!(
-        state.single_selected_instance(),
-        Some(("i-1".to_string(), "web".to_string()))
-    );
-    // A second compute selection makes the destructive target ambiguous → None.
-    state
-        .selected
-        .insert(("compute".to_string(), "i-2".to_string()));
-    assert!(state.single_selected_instance().is_none(), "two selected");
-}
-
-// ─────────────────────────── IAC-4: Heat tab ───────────────────────────
-
-/// A catalog view that advertises orchestration (Heat) — so the Heat tab is
-/// live — plus compute (a reverse-generate source).
-pub(super) fn heat_view() -> CatalogView {
-    let catalog = ServiceCatalog::from_keystone_token_json(
-        r#"{"token":{"catalog":[
-                {"type":"orchestration","name":"heat","endpoints":[
-                    {"interface":"public","url":"http://heat.mesh:8004/v1/p","region":"RegionOne"}
-                ]},
-                {"type":"compute","name":"nova","endpoints":[
-                    {"interface":"public","url":"http://nova.mesh:8774/v2.1","region":"RegionOne"}
-                ]}
-            ]}}"#,
-    )
-    .expect("heat catalog");
-    CatalogView {
-        catalog,
-        health: vec![],
-    }
-}
-
-/// A fixture Heat stack list (the orchestration `list-resources` table).
-fn fixture_stack_table() -> ResourceTable {
-    ResourceTable::from_collection_json(
-        "orchestration",
-        "stacks",
-        r#"{"stacks":[
-                {"id":"s-1","stack_name":"mesh-net","stack_status":"CREATE_COMPLETE"},
-                {"id":"s-2","stack_name":"web","stack_status":"UPDATE_COMPLETE"}
-            ]}"#,
-    )
-    .expect("fixture stacks")
-}
-
-/// A fixture stack detail with resources, events, outputs, and a template.
-fn fixture_stack_detail() -> HeatStackDetail {
-    HeatStackDetail::from_stack_json(
-            r#"{"stack":{"id":"s-1","stack_name":"mesh-net","stack_status":"CREATE_COMPLETE",
-                "stack_status_reason":"Stack CREATE completed successfully",
-                "outputs":[{"output_key":"net_id","output_value":"n-9","description":"the net id"}]}}"#,
-        )
-        .unwrap()
-        .with_resources_json(
-            r#"{"resources":[{"resource_name":"net","resource_type":"OS::Neutron::Net","resource_status":"CREATE_COMPLETE","physical_resource_id":"n-9"}]}"#,
-        )
-        .with_events_json(
-            r#"{"events":[{"event_time":"2026-07-05T00:00:00Z","resource_name":"net","resource_status":"CREATE_COMPLETE","resource_status_reason":"state changed"}]}"#,
-        )
-        .with_template_json(r#"{"heat_template_version":"2021-04-16","resources":{}}"#)
-}
-
-/// A Heat-tab state over the Heat catalog with the stack list ready +,
-/// optionally, the selected stack's detail + editable buffer loaded.
-fn heat_tab_state(with_detail: bool) -> InfraCodeState {
-    let mut state = InfraCodeState {
-        outcome: CatalogOutcome::Ready(heat_view()),
-        tab: IacTab::Heat,
-        ..InfraCodeState::default()
-    };
-    state.resources.insert(
-        "orchestration".to_string(),
-        ResourcePane {
-            outcome: Some(ResourceOutcome::Ready(fixture_stack_table())),
-            ..ResourcePane::default()
-        },
-    );
-    if with_detail {
-        let detail = fixture_stack_detail();
-        state.heat.template_buf = detail.template.clone();
-        state.heat.template_for = Some("s-1".to_string());
-        state.heat.selected = Some(("s-1".to_string(), "mesh-net".to_string()));
-        state.heat.show_for = Some("s-1".to_string());
-        state.heat.detail = Some(HeatOutcome::Ready(detail));
-    }
-    state
-}
-
-#[test]
-fn the_heat_tab_renders_honestly_empty_with_no_reply_and_a_list_with_one() {
-    // No orchestration service in the catalog → an honest "no Heat", never a
-    // fabricated engine (§7).
-    let mut no_heat = InfraCodeState {
-        outcome: CatalogOutcome::Ready(fixture_view()),
-        tab: IacTab::Heat,
-        ..InfraCodeState::default()
-    };
-    assert!(run_panel(&mut no_heat), "the no-Heat state drew nothing");
-    // Heat cataloged but no stack reply yet → honest querying, no fake stacks.
-    let mut querying = InfraCodeState {
-        outcome: CatalogOutcome::Ready(heat_view()),
-        tab: IacTab::Heat,
-        ..InfraCodeState::default()
-    };
+    // The gate: only the exact echo arms; a partial/empty echo does not.
+    assert!(armed("apply", &ArmAction::Provision.echo()));
     assert!(
-        run_panel(&mut querying),
-        "the querying Heat tab drew nothing"
+        armed("  apply ", &ArmAction::Provision.echo()),
+        "space tolerated"
     );
-    // A landed stack list renders the table.
-    let mut ready = heat_tab_state(false);
-    assert!(run_panel(&mut ready), "the stack list drew nothing");
-}
-
-#[test]
-fn a_fixture_heat_show_renders_resources_events_outputs_and_template() {
-    let mut state = heat_tab_state(true);
-    // The fixture detail carries each section (proves the fold + the render).
-    match &state.heat.detail {
-        Some(HeatOutcome::Ready(d)) => {
-            assert_eq!(d.resources.len(), 1);
-            assert_eq!(d.events.len(), 1);
-            assert_eq!(d.outputs.len(), 1);
-            assert!(d.template.contains("heat_template_version"));
-        }
-        other => panic!("expected a ready detail, got {other:?}"),
-    }
     assert!(
-        run_panel(&mut state),
-        "the stack detail (resources/events/outputs/template) drew nothing"
+        !armed("appl", &ArmAction::Provision.echo()),
+        "partial does not arm"
     );
-}
-
-#[test]
-fn the_preview_update_diff_renders_a_fixture_diff() {
-    let mut state = heat_tab_state(true);
-    state.heat.preview = Some(HeatOutcome::Ready(HeatPreview {
-        added: vec!["new_net".to_string()],
-        replaced: vec!["server".to_string()],
-        unchanged: vec!["router".to_string()],
-        ..HeatPreview::default()
-    }));
-    assert!(run_panel(&mut state), "the preview diff drew nothing");
-    // A no-change diff renders honestly too.
-    state.heat.preview = Some(HeatOutcome::Ready(HeatPreview::default()));
-    assert!(run_panel(&mut state), "the no-change preview drew nothing");
-}
-
-#[test]
-fn typed_arming_blocks_an_unconfirmed_stack_delete() {
-    // The arming gate is the shared exact-name match.
-    assert!(armed("mesh-net", "mesh-net"));
-    assert!(!armed("mesh", "mesh-net"), "a partial echo does not arm");
-    // Arming a delete OPENS the confirm — it publishes nothing (no mutation
-    // request) until the name is typed (#22).
-    let mut state = heat_tab_state(true);
-    state.arm_heat_delete();
-    let arming = state
-        .heat
-        .arming
-        .as_ref()
-        .expect("delete opens the arming confirm");
-    assert_eq!(arming.op, HeatOp::Delete);
-    assert_eq!(arming.stack_name, "mesh-net");
-    assert_eq!(arming.stack_id, "s-1");
-    assert!(arming.typed.is_empty());
     assert!(
-        state.heat.mutation_pending.is_none(),
-        "an unconfirmed delete publishes nothing"
+        !armed("", &ArmAction::Provision.echo()),
+        "empty does not arm"
     );
-    // The armed render still tessellates (the confirm panel).
+
+    // Past the gate, perform reaches the publish seam (no Bus in the test → an
+    // honest error note naming the provision verb; the request was attempted).
+    state.perform(ArmAction::Provision);
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("provision")),
+        "the confirmed apply emits the provision verb: {:?}",
+        state.note
+    );
+}
+
+#[test]
+fn destroy_and_lifecycle_reboot_delete_are_typed_confirm_gated() {
+    let mut state = state_on(Mode::Provision);
+    // Destroy opens the confirm on the DESTROY echo, publishes nothing yet.
+    state.arm_destroy();
+    let arming = state.arming.take().expect("destroy opens the confirm");
+    assert_eq!(arming.action, ArmAction::Destroy);
+    assert_eq!(arming.action.verb(), "destroy");
+    assert!(armed("destroy", &arming.action.echo()));
+    assert!(state.mutation_pending.is_none());
+
+    // A destructive lifecycle op arms on the instance name.
+    state.arm_lifecycle("instance-delete", "vm-1", "mesh-worker");
+    let arming = state.arming.as_ref().expect("delete opens the confirm");
+    assert_eq!(arming.action.verb(), "instance-delete");
+    assert_eq!(arming.action.echo(), "mesh-worker");
+    assert!(state.mutation_pending.is_none() && state.note.is_none());
+    // The armed confirm panel still tessellates.
     assert!(run_panel(&mut state), "the arming confirm drew nothing");
 }
 
 #[test]
-fn reverse_generate_output_renders_and_create_arms_on_the_typed_name() {
-    // The reverse-generated HOT (produced mesh-side) renders as a copyable view.
-    let mut state = heat_tab_state(false);
-    state.heat.reverse = Some(HeatOutcome::Ready(
-        "heat_template_version: 2021-04-16\nresources: {}\n".to_string(),
-    ));
-    assert!(run_panel(&mut state), "the reverse output drew nothing");
-    // Create is typed-armed on the entered name; an empty name refuses to arm.
-    state.heat.create_name = String::new();
-    state.arm_heat_create();
-    assert!(
-        state.heat.arming.is_none(),
-        "an empty name does not arm a create"
+fn status_renders_per_tool_health_up_down_absent_honestly() {
+    let st = fixture_state();
+    // The mirror carries the honest tri-state — never a fabricated up.
+    assert_eq!(
+        st.tool_health("opentofu").map(|h| h.state),
+        Some(HealthState::Up)
     );
-    state.heat.create_name = "fresh".to_string();
-    state.heat.create_template = "heat_template_version: 2021-04-16".to_string();
-    state.arm_heat_create();
-    let arming = state.heat.arming.as_ref().expect("create arms on a name");
-    assert_eq!(arming.op, HeatOp::Create);
-    assert_eq!(arming.stack_name, "fresh");
+    assert_eq!(
+        st.tool_health("ansible").map(|h| h.state),
+        Some(HealthState::Down)
+    );
+    assert_eq!(
+        st.tool_health("libvirt").map(|h| h.state),
+        Some(HealthState::Absent)
+    );
+    // An Absent/Down tool drops backend readiness (never faked ready).
+    assert!(!st.backend_ready());
+
+    // The state → glyph mapping is honest per state (all registered glyphs).
+    assert_eq!(health_icon(HealthState::Up), "emblem-ok");
+    assert_eq!(health_icon(HealthState::Down), "dialog-warning");
+    assert_eq!(health_icon(HealthState::Absent), "changes-prevent");
+
+    let mut state = state_on(Mode::Status);
+    assert!(run_panel(&mut state), "the Status health rows drew nothing");
+}
+
+#[test]
+fn images_network_and_containers_show_an_honest_backend_pending_note() {
+    // Modes with no landed action/cloud verb render a backend-pending card and
+    // never emit a fabricated verb (§7). Rendering them leaves nothing pending.
+    for mode in [Mode::Images, Mode::Network, Mode::Containers] {
+        let mut state = state_on(mode);
+        assert!(run_panel(&mut state), "{:?} drew nothing", mode.label());
+        assert!(
+            state.mutation_pending.is_none() && state.note.is_none(),
+            "{:?} must not emit a verb",
+            mode.label()
+        );
+    }
+}
+
+#[test]
+fn carbon_icons_are_registered_for_every_mode_and_health_state() {
+    // "Carbon icons paint (mesh present), no glyph text" — every mode tab + every
+    // health/status glyph resolves in the embedded Mackes-Carbon registry.
+    for mode in Mode::ALL {
+        assert!(
+            mde_egui::carbon_svg_bytes(mode.icon()).is_some(),
+            "{:?} icon `{}` is not a registered Carbon glyph",
+            mode.label(),
+            mode.icon()
+        );
+    }
+    for state in [HealthState::Up, HealthState::Down, HealthState::Absent] {
+        assert!(
+            mde_egui::carbon_svg_bytes(health_icon(state)).is_some(),
+            "health glyph for {state:?} is not registered"
+        );
+    }
+    for glyph in [
+        "view-refresh",
+        "list-add",
+        "process-stop",
+        "document-edit",
+        "dialog-warning",
+        "changes-prevent",
+    ] {
+        assert!(
+            mde_egui::carbon_svg_bytes(glyph).is_some(),
+            "toolbar glyph `{glyph}` is not registered"
+        );
+    }
+}
+
+#[test]
+fn fold_mutation_maps_the_reply_tri_state_honestly() {
+    // An `ok` reply reads applied.
+    let ok: CloudReply = serde_json::from_str(r#"{"ok":true,"verb":"provision","audited":false}"#)
+        .expect("ok reply parses");
+    let (note, entry) = fold_mutation(&ok);
+    assert!(note.contains("applied"), "{note}");
+    assert_eq!(entry.outcome, AuditOutcome::Applied);
+
+    // A `gated` mutation reply reads STAGED (a dry-run — nothing applied) and
+    // carries the staged plan summary honestly.
+    let gated: CloudReply = serde_json::from_str(
+        r#"{"ok":false,"verb":"provision","gated":"live apply is operator-gated — tofu plan (staged): 2 to add — nothing applied"}"#,
+    )
+    .expect("gated reply parses");
+    let (note, entry) = fold_mutation(&gated);
     assert!(
-        state.heat.mutation_pending.is_none(),
-        "arming publishes nothing"
+        note.contains("staged") && note.contains("dry-run"),
+        "{note}"
+    );
+    assert_eq!(entry.outcome, AuditOutcome::Staged);
+    assert!(entry.detail.contains("to add"), "the plan summary is kept");
+
+    // An `error` reply reads failed.
+    let failed: CloudReply =
+        serde_json::from_str(r#"{"ok":false,"verb":"destroy","error":"tofu destroy failed"}"#)
+            .expect("error reply parses");
+    let (note, entry) = fold_mutation(&failed);
+    assert!(note.contains("failed"), "{note}");
+    assert_eq!(entry.outcome, AuditOutcome::Failed);
+}
+
+#[test]
+fn armed_hosts_reads_the_apply_posture_from_the_mirror() {
+    // Plan-only by default → no armed hosts.
+    let plan_only = fixture_state();
+    assert!(armed_hosts(std::slice::from_ref(&plan_only)).is_empty());
+    // A node with apply armed is reported honestly.
+    let mut live = fixture_state();
+    live.apply_armed = true;
+    assert_eq!(
+        armed_hosts(std::slice::from_ref(&live)),
+        vec!["eagle".to_string()]
     );
 }
 
 #[test]
-fn reverse_services_exclude_orchestration_itself() {
-    // Reverse-generate captures raw infra (compute/…), not existing stacks.
-    let state = InfraCodeState {
-        outcome: CatalogOutcome::Ready(heat_view()),
-        ..InfraCodeState::default()
-    };
-    let services = state.heat_reverse_services();
-    assert!(services.iter().any(|(ty, _)| ty == "compute"));
-    assert!(
-        !services.iter().any(|(ty, _)| ty == "orchestration"),
-        "orchestration is excluded from the reverse-generate source set"
-    );
-}
-
-/// The Heat panel's form / preview / arming cards cast the shared
-/// `Elevation::Raised` soft shadow (Phase-C depth adoption): every field of
-/// [`card_shadow`] comes straight from the token — offset/blur/spread and,
-/// critically, the umbra colour (no minted `Color32`, §4) — and the umbra stays
-/// translucent (design lock #2), so the cards read as genuinely lifted, never an
-/// opaque fill.
-#[test]
-fn heat_card_shadow_is_the_raised_depth_token() {
-    let raised = mde_egui::style::Elevation::Raised.shadow();
-    let shadow = card_shadow();
-    assert_eq!(
-        shadow.offset,
-        [raised.offset[0] as i8, raised.offset[1] as i8],
-        "the card shadow offset comes from the Raised token"
-    );
-    assert_eq!(
-        shadow.blur, raised.blur as u8,
-        "the card shadow blur comes from the Raised token"
-    );
-    assert_eq!(
-        shadow.spread, raised.spread as u8,
-        "the card shadow spread comes from the Raised token"
-    );
-    assert_eq!(
-        shadow.color, raised.umbra,
-        "the card shadow umbra is the Raised token's, not a minted colour"
-    );
-    assert!(
-        shadow.color.a() > 0 && shadow.color.a() < 255,
-        "the depth is a translucent umbra (lock #2), never an opaque fill"
-    );
+fn recreated_labels_carry_no_legacy_backend_terminology() {
+    // The recreated workspace is provider-neutral: zero OpenStack-family terms in
+    // its user-facing copy (grep-clean, §6).
+    let mut labels: Vec<String> =
+        vec![CLOUD_PRODUCT_LABEL.to_string(), WORKSPACE_TITLE.to_string()];
+    labels.extend(Mode::ALL.iter().map(|m| m.label().to_string()));
+    for tool in BACKEND_TOOLS {
+        labels.push(tool.1.to_string());
+    }
+    for label in labels {
+        for banned in [
+            "OpenStack",
+            "Nova",
+            "Heat",
+            "Keystone",
+            "Glance",
+            "Cinder",
+            "Neutron",
+            "Horizon",
+        ] {
+            assert!(
+                !label.contains(banned),
+                "user-facing label `{label}` leaked the legacy backend term `{banned}`"
+            );
+        }
+    }
 }

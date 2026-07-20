@@ -3,7 +3,12 @@
 //! Storage layout (all under `<bus_root>/`):
 //!   `federation-mints/<ulid>.json`   — pending mint envelopes (mode 0600)
 //!   `federation.yaml`                — established pairs + topic grants
-//!   *(cert install at `/etc/nebula/federation-trusts/<id>.crt` — revoke only)*
+//!   *(cross-mesh trust cert at `/etc/nebula/federation-trusts/<id>.crt` —
+//!    `accept` INSTALLS it, `revoke` REMOVES it; WL-SEC-002)*
+//!
+//! The grant-store / mint / accept-revoke core + the runtime enforcement gate live
+//! in the shared [`crate::federation`] module so both this CLI and the mackesd
+//! `federation_enforcer` worker drive ONE implementation (WL-SEC-002).
 //!
 //! Subcommands:
 //!   `mint-passcode [--json]`                   — 6-word mnemonic + envelope
@@ -28,15 +33,17 @@
 #![forbid(unsafe_code)]
 
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::federation::{
+    accept_passcode, mint_path, now_rfc3339, now_unix_ms, read_grants as read_federation_yaml,
+    revoke_pair, trust_dir, write_grants as write_federation_yaml, write_mint_envelope,
+    MintEnvelope,
+};
 use crate::hooks::config::Priority;
 use crate::persist::Persist;
 
@@ -70,38 +77,10 @@ const WORDS: &[&str; 256] = &[
     "nice", "node", "none", "norm",
 ];
 
-// ── Envelope (pending mint) ───────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize)]
-struct MintEnvelope {
-    ulid: String,
-    mnemonic: String,
-    expires_at_unix_ms: i64,
-    used: bool,
-}
-
-// ── Grant store ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct FederationYaml {
-    #[serde(default)]
-    pairs: Vec<FederationPair>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct FederationPair {
-    #[serde(rename = "peer-mesh-id")]
-    peer_mesh_id: String,
-    #[serde(rename = "peer-mesh-label")]
-    peer_mesh_label: String,
-    established: String,
-    #[serde(rename = "subscribe-topics", default)]
-    subscribe_topics: Vec<String>,
-    #[serde(rename = "publish-topics", default)]
-    publish_topics: Vec<String>,
-    #[serde(rename = "excluded-topics", default)]
-    excluded_topics: Vec<String>,
-}
+// The mint envelope + grant-store types + the accept/revoke core now live in the
+// shared runtime module [`crate::federation`] (WL-SEC-002), so both this CLI and
+// the mackesd `federation_enforcer` worker drive one implementation. This file
+// keeps only the operator-facing CLI verbs + the wordlist/mnemonic generator.
 
 // ── Subcommand enum ───────────────────────────────────────────────────────────
 
@@ -129,6 +108,12 @@ pub enum FederationOp {
         /// Human label for the remote mesh (shown in the Workbench).
         #[arg(long, default_value = "Remote mesh")]
         label: String,
+        /// Path to the peer mesh's CA certificate (PEM). When supplied it is
+        /// installed verbatim as the cross-mesh Nebula trust anchor; otherwise a
+        /// self-describing trust-anchor record is written so the accept↔revoke
+        /// trust lifecycle still holds (WL-SEC-002).
+        #[arg(long)]
+        peer_ca: Option<String>,
         /// Emit JSON `{"peer-mesh-id": ..., "peer-mesh-label": ...}`.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -166,28 +151,6 @@ fn default_bus_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("no $HOME / $XDG_DATA_HOME — no bus root available"))
 }
 
-fn mints_dir(bus_root: &Path) -> PathBuf {
-    bus_root.join("federation-mints")
-}
-
-fn mint_path(bus_root: &Path, ulid: &str) -> PathBuf {
-    mints_dir(bus_root).join(format!("{ulid}.json"))
-}
-
-fn federation_yaml_path(bus_root: &Path) -> PathBuf {
-    bus_root.join("federation.yaml")
-}
-
-fn default_excluded_topics() -> Vec<String> {
-    vec![
-        "passcode/*".to_string(),
-        "federation/*".to_string(),
-        "clipboard/*".to_string(),
-        "voip/presence/*".to_string(),
-        "input/*".to_string(),
-    ]
-}
-
 fn random_bytes(n: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     std::fs::File::open("/dev/urandom")
@@ -200,38 +163,6 @@ fn generate_mnemonic() -> Result<String> {
     let bytes = random_bytes(6)?;
     let words: Vec<&str> = bytes.iter().map(|&b| WORDS[b as usize]).collect();
     Ok(words.join(" "))
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as i64
-}
-
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-fn read_federation_yaml(bus_root: &Path) -> Result<FederationYaml> {
-    let path = federation_yaml_path(bus_root);
-    if !path.exists() {
-        return Ok(FederationYaml::default());
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_yaml::from_str(&text).with_context(|| format!("parse {}", path.display()))
-}
-
-fn write_federation_yaml(bus_root: &Path, yaml: &FederationYaml) -> Result<()> {
-    let path = federation_yaml_path(bus_root);
-    let text = serde_yaml::to_string(yaml).context("serialize federation.yaml")?;
-    // Atomic write via temp + rename.
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
-    Ok(())
 }
 
 fn publish_audit_event(bus_root: &Path, topic: &str, payload: &serde_json::Value) {
@@ -249,30 +180,15 @@ fn cmd_mint_passcode(json: bool, bus_root: &Path) -> Result<()> {
     let ulid = Ulid::new().to_string();
     let expires_at_unix_ms = now_unix_ms() + 86_400_000; // 24 h
 
-    // Write envelope at mode 0600 — contains plaintext mnemonic.
-    let dir = mints_dir(bus_root);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-    let path = mint_path(bus_root, &ulid);
+    // Write the single-use envelope (mode 0600 — it holds the plaintext mnemonic)
+    // through the shared runtime helper.
     let envelope = MintEnvelope {
         ulid: ulid.clone(),
         mnemonic: mnemonic.clone(),
         expires_at_unix_ms,
         used: false,
     };
-    let envelope_json =
-        serde_json::to_string_pretty(&envelope).context("serialize mint envelope")?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(envelope_json.as_bytes())
-        })
-        .with_context(|| format!("write {}", path.display()))?;
+    write_mint_envelope(bus_root, &envelope)?;
 
     // Audit event.
     publish_audit_event(
@@ -320,117 +236,63 @@ fn cmd_revoke_mint(ulid: &str, bus_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Normalize a mnemonic/passcode for comparison: trim ends, lowercase, and
-/// collapse internal runs of whitespace to single spaces.
-fn normalize_passcode(s: &str) -> String {
-    s.split_whitespace()
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Find the pending mint envelope whose mnemonic matches `passcode`, verify it
-/// is unexpired and not already consumed, mark it `used` on disk (consume), and
-/// return it. **Fails closed:** a passcode with no matching live envelope is
-/// rejected. This enforces the documented single-use contract (§8 — a claimed
-/// security control must be enforced in code, not just prose).
-fn consume_matching_mint(bus_root: &Path, passcode: &str) -> Result<MintEnvelope> {
-    let want = normalize_passcode(passcode);
-    let dir = mints_dir(bus_root);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        bail!("no pending mints — mint a passcode on the peer mesh first");
+fn cmd_accept(
+    passcode: &str,
+    label: &str,
+    peer_ca_path: Option<&str>,
+    json_out: bool,
+    bus_root: &Path,
+    trust_dir: &Path,
+) -> Result<()> {
+    // §8 / TUNE-15.c — the mnemonic is a documented single-use secret; the shared
+    // [`accept_passcode`] core consumes the matching mint (fail-closed), writes the
+    // established pair, AND installs the cross-mesh Nebula trust cert. Reading the
+    // optional peer-CA PEM here keeps the CLI the thin operator surface.
+    let peer_ca_pem = match peer_ca_path {
+        Some(p) => {
+            Some(std::fs::read_to_string(p).with_context(|| format!("read peer CA cert {p}"))?)
+        }
+        None => None,
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue; // skip *.json.tmp and anything else
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(mut env) = serde_json::from_str::<MintEnvelope>(&text) else {
-            continue;
-        };
-        if normalize_passcode(&env.mnemonic) != want {
-            continue;
-        }
-        if env.used {
-            bail!("that passcode has already been consumed (single-use)");
-        }
-        if env.expires_at_unix_ms <= now_unix_ms() {
-            bail!("that passcode has expired (mints are valid for 24 h)");
-        }
-        // Consume: mark used + rewrite atomically (temp + rename) so a crash
-        // mid-write can't leave a half-truncated envelope that re-opens the door.
-        env.used = true;
-        let json = serde_json::to_string_pretty(&env).context("serialize consumed mint")?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
-        return Ok(env);
-    }
-    bail!("no pending mint matches that passcode — check the words (they may be mistyped, expired, or already consumed)")
-}
-
-fn cmd_accept(passcode: &str, label: &str, json_out: bool, bus_root: &Path) -> Result<()> {
-    let word_count = passcode.split_whitespace().count();
-    if word_count != 6 {
-        bail!("passcode must be exactly 6 words ({word_count} provided)");
-    }
-
-    // §8 / TUNE-15.c — the mnemonic is a documented single-use secret, so it MUST
-    // match a pending, unexpired, unconsumed local mint envelope. The old path
-    // minted a fresh ULID and wrote a pair for ANY 6-word string — anyone who
-    // matched the word *count* established a federation pair (an auth bypass).
-    // Consuming the matching envelope closes the hole and prevents replay.
-    let env = consume_matching_mint(bus_root, passcode)?;
-    let peer_mesh_id = env.ulid;
-    let established = now_rfc3339();
-
-    let mut fed = read_federation_yaml(bus_root)?;
-    // Idempotent: if a pair with the same mnemonic-derived id already exists, skip.
-    // (In practice the ULID is always fresh; this guards re-runs.)
-    if fed.pairs.iter().any(|p| p.peer_mesh_id == peer_mesh_id) {
-        bail!("pair with id {peer_mesh_id} already exists");
-    }
-    fed.pairs.push(FederationPair {
-        peer_mesh_id: peer_mesh_id.clone(),
-        peer_mesh_label: label.to_string(),
-        established: established.clone(),
-        subscribe_topics: vec!["#".to_string()],
-        publish_topics: vec![],
-        excluded_topics: default_excluded_topics(),
-    });
-    write_federation_yaml(bus_root, &fed)?;
+    let outcome = accept_passcode(bus_root, trust_dir, passcode, label, peer_ca_pem.as_deref())?;
 
     publish_audit_event(
         bus_root,
-        &format!("federation/pair-established/{peer_mesh_id}"),
+        &format!("federation/pair-established/{}", outcome.peer_mesh_id),
         &serde_json::json!({
             "ulid": Ulid::new().to_string(),
             "event": "pair-established",
-            "peer-mesh-id": peer_mesh_id,
-            "peer-mesh-label": label,
-            "established": established,
+            "peer-mesh-id": outcome.peer_mesh_id,
+            "peer-mesh-label": outcome.label,
+            "established": outcome.established,
             "subscribe-topics": ["#"],
             "publish-topics": [],
-            "excluded-topics": default_excluded_topics(),
+            "excluded-topics": outcome.excluded_topics,
+            "trust-cert-installed": outcome.cert_path.is_some(),
         }),
     );
 
-    tracing::info!(%peer_mesh_id, label, "federation pair established");
+    tracing::info!(
+        peer_mesh_id = %outcome.peer_mesh_id,
+        label,
+        trust_cert = ?outcome.cert_path,
+        "federation pair established"
+    );
 
     if json_out {
         println!(
             "{}",
             serde_json::json!({
-                "peer-mesh-id": peer_mesh_id,
-                "peer-mesh-label": label,
+                "peer-mesh-id": outcome.peer_mesh_id,
+                "peer-mesh-label": outcome.label,
+                "trust-cert-installed": outcome.cert_path.is_some(),
             })
         );
     } else {
-        println!("pair established: {peer_mesh_id} ({label})");
+        println!(
+            "pair established: {} ({})",
+            outcome.peer_mesh_id, outcome.label
+        );
     }
     Ok(())
 }
@@ -464,28 +326,11 @@ fn cmd_grant_publish(peer_mesh_id: &str, topic_pattern: &str, bus_root: &Path) -
     Ok(())
 }
 
-fn cmd_revoke(peer_mesh_id: &str, bus_root: &Path) -> Result<()> {
-    let mut fed = read_federation_yaml(bus_root)?;
-    let before = fed.pairs.len();
-    fed.pairs.retain(|p| p.peer_mesh_id != peer_mesh_id);
-    if fed.pairs.len() == before {
-        bail!("no pair found for peer-mesh-id {peer_mesh_id}");
-    }
-    write_federation_yaml(bus_root, &fed)?;
-
-    // Best-effort cert deletion.
-    let cert_path = PathBuf::from(format!("/etc/nebula/federation-trusts/{peer_mesh_id}.crt"));
-    if cert_path.exists() {
-        if let Err(e) = std::fs::remove_file(&cert_path) {
-            tracing::warn!(
-                path = %cert_path.display(),
-                error = %e,
-                "federation cert removal failed (non-fatal)"
-            );
-        } else {
-            tracing::info!(path = %cert_path.display(), "federation cert removed");
-        }
-    }
+fn cmd_revoke(peer_mesh_id: &str, bus_root: &Path, trust_dir: &Path) -> Result<()> {
+    // The shared [`revoke_pair`] core removes the pair from federation.yaml AND
+    // deletes the cross-mesh trust cert (symmetric with accept's install), so a
+    // revoked mesh is default-denied again at routing.
+    revoke_pair(bus_root, trust_dir, peer_mesh_id)?;
 
     publish_audit_event(
         bus_root,
@@ -534,19 +379,30 @@ fn cmd_rotate(peer_mesh_id: &str, bus_root: &Path) -> Result<()> {
 /// Execute the federation subcommand.
 pub fn run(op: FederationOp) -> Result<()> {
     let bus_root = default_bus_root()?;
+    // The cross-mesh trust-cert dir (env-overridable; defaults to
+    // /etc/nebula/federation-trusts). accept installs here, revoke removes here.
+    let trusts = trust_dir();
     match op {
         FederationOp::MintPasscode { json } => cmd_mint_passcode(json, &bus_root),
         FederationOp::RevokeMint { ulid } => cmd_revoke_mint(&ulid, &bus_root),
         FederationOp::Accept {
             passcode,
             label,
+            peer_ca,
             json,
-        } => cmd_accept(&passcode, &label, json, &bus_root),
+        } => cmd_accept(
+            &passcode,
+            &label,
+            peer_ca.as_deref(),
+            json,
+            &bus_root,
+            &trusts,
+        ),
         FederationOp::GrantPublish {
             peer_mesh_id,
             topic_pattern,
         } => cmd_grant_publish(&peer_mesh_id, &topic_pattern, &bus_root),
-        FederationOp::Revoke { peer_mesh_id } => cmd_revoke(&peer_mesh_id, &bus_root),
+        FederationOp::Revoke { peer_mesh_id } => cmd_revoke(&peer_mesh_id, &bus_root, &trusts),
         FederationOp::Rotate { peer_mesh_id } => cmd_rotate(&peer_mesh_id, &bus_root),
     }
 }
@@ -556,10 +412,20 @@ pub fn run(op: FederationOp) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::{default_excluded_topics, federation_yaml_path, mints_dir};
     use tempfile::TempDir;
 
     fn tmp() -> TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A trust dir whose PARENT exists (rooted in the tempdir, never `/etc`), so
+    /// accept's best-effort cert install lands in the tempdir + never touches the
+    /// build host's `/etc/nebula`.
+    fn trusts(dir: &Path) -> PathBuf {
+        let parent = dir.join("nebula");
+        std::fs::create_dir_all(&parent).unwrap();
+        parent.join("federation-trusts")
     }
 
     /// Read the (single) mint envelope in a test bus root.
@@ -586,7 +452,7 @@ mod tests {
             .find(|env| !env.used)
             .map(|env| env.mnemonic)
             .expect("a fresh unused mint");
-        cmd_accept(&mnemonic, label, false, dir).unwrap();
+        cmd_accept(&mnemonic, label, None, false, dir, &trusts(dir)).unwrap();
         read_federation_yaml(dir)
             .unwrap()
             .pairs
@@ -775,13 +641,22 @@ mod tests {
     #[test]
     fn accept_rejects_wrong_word_count() {
         let dir = tmp();
-        let r = cmd_accept("only five words here now", "TestMesh", false, dir.path());
+        let r = cmd_accept(
+            "only five words here now",
+            "TestMesh",
+            None,
+            false,
+            dir.path(),
+            &trusts(dir.path()),
+        );
         assert!(r.is_err());
         let r2 = cmd_accept(
             "seven words is too many for this test now",
             "TestMesh",
+            None,
             false,
             dir.path(),
+            &trusts(dir.path()),
         );
         assert!(r2.is_err());
     }
@@ -795,8 +670,10 @@ mod tests {
         let r = cmd_accept(
             "mesh node link mint mode myth",
             "Imposter",
+            None,
             false,
             dir.path(),
+            &trusts(dir.path()),
         );
         assert!(r.is_err(), "arbitrary 6 words must not establish a pair");
         assert!(
@@ -825,9 +702,24 @@ mod tests {
         let dir = tmp();
         cmd_mint_passcode(false, dir.path()).unwrap();
         let mnemonic = read_one_mint(dir.path()).mnemonic;
-        cmd_accept(&mnemonic, "First", false, dir.path()).unwrap();
+        cmd_accept(
+            &mnemonic,
+            "First",
+            None,
+            false,
+            dir.path(),
+            &trusts(dir.path()),
+        )
+        .unwrap();
         // Replaying the same words must fail — single-use.
-        let r = cmd_accept(&mnemonic, "Replay", false, dir.path());
+        let r = cmd_accept(
+            &mnemonic,
+            "Replay",
+            None,
+            false,
+            dir.path(),
+            &trusts(dir.path()),
+        );
         assert!(r.is_err(), "a consumed passcode must not be replayable");
         assert_eq!(
             read_federation_yaml(dir.path()).unwrap().pairs.len(),
@@ -851,7 +743,14 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         env.expires_at_unix_ms = now_unix_ms() - 1;
         std::fs::write(&path, serde_json::to_string(&env).unwrap()).unwrap();
-        let r = cmd_accept(&env.mnemonic, "Stale", false, dir.path());
+        let r = cmd_accept(
+            &env.mnemonic,
+            "Stale",
+            None,
+            false,
+            dir.path(),
+            &trusts(dir.path()),
+        );
         assert!(r.is_err(), "an expired passcode must be rejected");
     }
 
@@ -902,7 +801,7 @@ mod tests {
             let fed = read_federation_yaml(dir.path()).unwrap();
             fed.pairs[0].peer_mesh_id.clone()
         };
-        cmd_revoke(&peer_id, dir.path()).unwrap();
+        cmd_revoke(&peer_id, dir.path(), &trusts(dir.path())).unwrap();
         let fed = read_federation_yaml(dir.path()).unwrap();
         assert!(fed.pairs.is_empty());
     }
@@ -910,7 +809,7 @@ mod tests {
     #[test]
     fn revoke_errors_on_missing_peer() {
         let dir = tmp();
-        let r = cmd_revoke("NO_SUCH_PEER", dir.path());
+        let r = cmd_revoke("NO_SUCH_PEER", dir.path(), &trusts(dir.path()));
         assert!(r.is_err());
     }
 

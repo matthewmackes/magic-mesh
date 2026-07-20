@@ -2,7 +2,7 @@
 # install-helpers/lint-layered-tiers.sh — E12 layered-tiers boundary gate.
 #
 # Replaces the old two-bucket `lint-mesh-boundary.sh` (mesh↔shell). Under E12
-# "Quasar" (AI_GOVERNANCE §6 / docs/design/quasar-vdi-desktop.md) the workspace
+# "Construct" (AI_GOVERNANCE §6 / docs/design/quasar-vdi-desktop.md) the workspace
 # is THREE NESTED tiers and dependencies may point only INWARD:
 #
 #     mesh-substrate  ⊂  platform-services  ⊂  desktop-shell

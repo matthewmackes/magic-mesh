@@ -693,68 +693,44 @@ fn requested_summary_names_the_pending_desktop_and_protocol() {
 }
 
 #[test]
-fn the_desktop_menus_gate_each_face_to_its_own_seam() {
-    use super::{build_desktop_menus, build_desktop_status};
-    use mde_egui::menubar::Entry;
-    use mde_egui::ChipTone;
+fn taskbar_session_preview_frame_requires_a_real_texture_and_carries_the_broker_id() {
+    let mut state = VdiState::default();
+    assert!(
+        state.taskbar_preview_frame().is_none(),
+        "no requested desktop means no taskbar thumbnail"
+    );
 
-    // The enable state of each menu item is a pure function of `connected`:
-    // Return-to-Chrome is live only while connected, Refresh only on the Chooser.
-    // Every item is present in both faces — one is disabled, never omitted (§7).
-    for connected in [false, true] {
-        let menus = build_desktop_menus(connected);
-        let item_enabled = |title: &str| -> bool {
-            menus
-                .iter()
-                .find(|m| m.title == title)
-                .and_then(|m| {
-                    m.entries.iter().find_map(|e| match e {
-                        Entry::Item(i) => Some(i.enabled),
-                        _ => None,
-                    })
-                })
-                .expect("the menu's item is present")
-        };
-        assert_eq!(
-            item_enabled("Session"),
-            connected,
-            "Return is live iff connected"
-        );
-        assert_eq!(
-            item_enabled("View"),
-            !connected,
-            "Refresh is live iff on the Chooser"
-        );
-    }
+    state.request_connect(
+        ConnectRequest::new(
+            RequestedTarget::new("node-a", "web1"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("node-a"),
+        )
+        .with_broker_session(BrokerSessionLifecycle::new("session-1", None)),
+    );
+    assert!(
+        state.taskbar_preview_frame().is_none(),
+        "a requested desktop still has no taskbar thumbnail until a frame lands"
+    );
 
-    // The status cluster reflects the live face.
-    let chooser = build_desktop_status(None, 3);
-    assert!(chooser.iter().any(|c| c.text == "3 sources"));
-    assert!(chooser.iter().any(|c| c.text == "No desktop"));
-    let connected = build_desktop_status(Some(("win11", "RDP")), 3);
-    assert!(connected
-        .iter()
-        .any(|c| c.text.contains("win11") && c.text.contains("RDP") && c.tone == ChipTone::Info));
-}
-
-#[test]
-fn the_desktop_bar_renders_headless_in_both_faces() {
-    use mde_egui::egui::{pos2, vec2, Rect};
     let ctx = egui::Context::default();
-    Style::install(&ctx);
-    let input = egui::RawInput {
-        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
-        ..Default::default()
-    };
-    for pending in [None, Some(("win11", "RDP"))] {
-        let out = ctx.run(input.clone(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = desktop_menubar(ui, pending, 3);
-            });
-        });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "a Desktop bar face drew nothing");
-    }
+    state.texture = Some(ctx.load_texture(
+        "vdi-taskbar-preview-test",
+        egui::ColorImage {
+            size: [4, 3],
+            pixels: vec![egui::Color32::WHITE; 12],
+        },
+        egui::TextureOptions::LINEAR,
+    ));
+    let preview = state
+        .taskbar_preview_frame()
+        .expect("a requested desktop with a texture publishes a taskbar thumbnail");
+    assert_eq!(preview.broker_session_id.as_deref(), Some("session-1"));
+    assert_eq!(preview.label, "web1");
+    assert_eq!(preview.protocol, "RDP");
+    assert_eq!(preview.texture.size(), [4, 3]);
 }
 
 #[test]
@@ -1487,6 +1463,56 @@ fn live_spice_target_parser_accepts_optional_ticket() {
     assert_eq!(
         parse_live_spice_target("spice.mesh:5900,secret"),
         ("spice.mesh", 5900, Some("secret"))
+    );
+}
+
+// WL-PERF-002 — the predicate the shell host loop gates its per-frame VDI
+// repaint on. It must report a LIVE transport (frames actually inbound), never
+// merely a REQUESTED session, so an idle chooser / a session with no live
+// stream never wakes the seat at 60Hz (the whole point of the occlusion work).
+#[cfg(feature = "live-vdi")]
+#[test]
+fn has_live_transport_is_true_only_while_a_transport_handle_is_installed() {
+    // A live RDP transport handle is installed → streaming → wake the loop.
+    let rdp = live_rdp_state();
+    assert!(
+        rdp.has_live_transport(),
+        "an installed RDP transport handle is a live stream that must drive repaints"
+    );
+
+    // A VNC-only session is equally live.
+    let mut vnc = VdiState::default();
+    vnc.live_vnc = Some(dummy_vnc_handle());
+    vnc.requested = Some(rdp_connect_request());
+    assert!(
+        vnc.has_live_transport(),
+        "an installed VNC transport handle is a live stream too"
+    );
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn has_live_transport_stays_false_for_an_idle_or_requested_only_session() {
+    // A fresh idle state (no session at all) must leave the loop idle.
+    let idle = VdiState::default();
+    assert!(
+        !idle.has_live_transport(),
+        "a default idle VdiState has no live transport — the seat must stay idle"
+    );
+
+    // A session that has been REQUESTED but has no live transport handle yet
+    // (or has lost it) must NOT wake the loop — this is the regression the
+    // repaint gate exists to avoid: `requested_target().is_some()` is true here
+    // but there is nothing streaming.
+    let mut requested_only = VdiState::default();
+    requested_only.requested = Some(rdp_connect_request());
+    assert!(
+        requested_only.requested_target().is_some(),
+        "the session IS requested (the naive gate would have repainted)…"
+    );
+    assert!(
+        !requested_only.has_live_transport(),
+        "…but with no live transport handle the loop must stay idle"
     );
 }
 

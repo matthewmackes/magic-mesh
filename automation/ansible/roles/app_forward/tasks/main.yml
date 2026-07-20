@@ -1,0 +1,38 @@
+---
+# WL-ARCH-006 (U13) — VDI app-mode forwarding on an App-only-VM.
+#
+# An App-VM delivers individual apps forwarded into the MDE desktop rather than a
+# whole seat. The forwarding transport is the EXISTING mackesd `session_broker` (a
+# rank-0 universal worker that runs on every node the moment mackesd is up —
+# crates/mesh/mackesd/src/workers/session_broker.rs), so there is no new daemon:
+# the base cloud_vm role already brought mackesd (and thus session_broker) up.
+# This role marks the VM as an app-mode provider and declares + installs the
+# forwarded app set the broker projects into the client shell's app rail.
+
+- name: Ensure the mackesd cloud drop-in dir exists
+  ansible.builtin.file:
+    path: /etc/mackesd/cloud.d
+    state: directory
+    mode: "0755"
+
+- name: Publish this VM's app-mode marker + forwarded app catalog
+  ansible.builtin.template:
+    src: app-forward.j2
+    dest: /etc/mackesd/cloud.d/app-forward
+    mode: "0644"
+  notify: converge mackesd site
+
+- name: Install the forwarded app packages (so app-mode has real apps to forward)
+  ansible.builtin.package:
+    name: "{{ app_forward_packages }}"
+    state: present
+  when: app_forward_packages | length > 0
+
+- name: Ensure mackesd (and its session_broker worker) is enabled and running
+  ansible.builtin.systemd:
+    name: mackesd.service
+    enabled: true
+    state: started
+
+- name: Apply pending convergence
+  ansible.builtin.meta: flush_handlers

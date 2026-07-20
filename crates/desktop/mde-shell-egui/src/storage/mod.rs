@@ -63,12 +63,14 @@ use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::Style;
+use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 use crate::bus_reader::BusReader;
+use crate::dock::icon_texture;
 
 use crate::toast_bridge::TOAST_TOPIC;
 
@@ -81,12 +83,121 @@ const REFRESH: Duration = Duration::from_secs(5);
 
 /// A filled-circle status glyph — the shared dot the other planes render.
 const DOT: &str = "\u{25CF}";
+const STORAGE_REFRESH_ICON: IconId = IconId::Reload;
+const STORAGE_STAGE_ICON: IconId = IconId::Add;
+const STORAGE_QUEUE_UP_ICON: IconId = IconId::ChevronUp;
+const STORAGE_QUEUE_DOWN_ICON: IconId = IconId::ArrowDown;
+const STORAGE_QUEUE_REMOVE_ICON: IconId = IconId::Close;
+const STORAGE_ACTION_BUTTON_H: f32 = Style::TOOLBAR_CONTROL_H;
+const STORAGE_ACTION_PAD_Y: f32 = (STORAGE_ACTION_BUTTON_H - Style::SP_M) * 0.5;
 
 /// The mountpoints that mark a whole disk as the node's protected root/boot/EFI
 /// chain (mirrors the worker's `protected_from_mountinfo`, advisory here).
 const ROOT_BOOT_MOUNTS: [&str; 4] = ["/", "/boot", "/boot/efi", "/efi"];
 /// The mesh shared-storage mountpoint — its backing disk is protected.
 const MESH_STORAGE_MOUNT: &str = "/mnt/mesh-storage";
+
+fn storage_tooltip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+            );
+        });
+}
+
+fn storage_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| storage_tooltip(ui, text.as_str()))
+}
+
+fn storage_button_hover_text(
+    response: egui::Response,
+    enabled: bool,
+    text: impl Into<String>,
+) -> egui::Response {
+    let text = text.into();
+    if enabled {
+        response.on_hover_ui(move |ui| storage_tooltip(ui, text.as_str()))
+    } else {
+        response.on_disabled_hover_ui(move |ui| storage_tooltip(ui, text.as_str()))
+    }
+}
+
+fn scope_storage_action_button<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        style.spacing.button_padding.y = STORAGE_ACTION_PAD_Y.max(0.0);
+        style.spacing.interact_size.y = STORAGE_ACTION_BUTTON_H;
+        add(ui)
+    })
+    .inner
+}
+
+fn storage_icon_label_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> egui::Response {
+    let response = scope_storage_action_button(ui, |ui| {
+        let Some(tex) = icon_texture(ui.ctx(), icon, Style::SP_M, Style::TEXT) else {
+            return ui.add(
+                egui::Button::new(RichText::new(label).size(Style::SMALL))
+                    .min_size(egui::vec2(0.0, STORAGE_ACTION_BUTTON_H)),
+            );
+        };
+        let image = egui::Image::new(egui::load::SizedTexture::new(
+            tex.id(),
+            egui::vec2(Style::SP_M, Style::SP_M),
+        ));
+        ui.add(
+            egui::Button::image_and_text(image, RichText::new(label).size(Style::SMALL))
+                .min_size(egui::vec2(0.0, STORAGE_ACTION_BUTTON_H)),
+        )
+    });
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    response
+}
+
+fn storage_icon_button(
+    ui: &mut egui::Ui,
+    icon: IconId,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
+    let response = scope_storage_action_button(ui, |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new("")
+                .min_size(egui::vec2(STORAGE_ACTION_BUTTON_H, STORAGE_ACTION_BUTTON_H)),
+        )
+    });
+    let tint = if enabled {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    if let Some(tex) = icon_texture(ui.ctx(), icon, Style::SP_M, tint) {
+        let side = Style::SP_M;
+        let icon_rect =
+            egui::Rect::from_center_size(response.rect.center(), egui::vec2(side, side));
+        egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
+            .paint_at(ui, icon_rect);
+    } else {
+        ui.painter().text(
+            response.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(Style::SMALL),
+            tint,
+        );
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response
+}
 
 // ───────────────────────── JSON boundary (read side) ─────────────────────────
 // Local mirrors of the `mackesd::workers::storage` payloads. serde ignores wire
@@ -1156,12 +1267,11 @@ impl StorageState {
         // for the worker's slow heartbeat.
         if let Some(node) = self.selected_node.clone() {
             ui.add_space(Style::SP_XS);
-            if ui
-                .button(RichText::new("\u{21BB} Refresh topology").size(Style::SMALL))
-                .on_hover_text(
-                    "Ask this peer's storage worker to re-enumerate + re-publish its disks.",
-                )
-                .clicked()
+            if storage_hover_text(
+                storage_icon_label_button(ui, STORAGE_REFRESH_ICON, "Refresh topology"),
+                "Ask this peer's storage worker to re-enumerate + re-publish its disks.",
+            )
+            .clicked()
             {
                 self.publish(&node, &StorageRequest::Refresh);
             }
@@ -1208,7 +1318,7 @@ impl StorageState {
                 "{} \u{00B7} {} GiB{}",
                 dev.name,
                 dev.size_mib / 1024,
-                if locked { " \u{1F512}" } else { "" }
+                if locked { " \u{00B7} locked" } else { "" }
             ))
             .size(Style::SMALL);
             // A locked disk stays visible for orientation but can't become the
@@ -1629,7 +1739,7 @@ fn show_disk(
             ui.add_space(Style::SP_XS);
             ui.colored_label(
                 Style::ACCENT,
-                RichText::new("\u{2699} staging target").size(Style::SMALL),
+                RichText::new("staging target").size(Style::SMALL),
             );
         }
     });
@@ -1638,10 +1748,7 @@ fn show_disk(
     if let Some(reason) = protected {
         ui.add_space(Style::SP_XS);
         ui.horizontal_wrapped(|ui| {
-            ui.colored_label(
-                Style::DANGER,
-                RichText::new("\u{1F512} locked").size(Style::SMALL),
-            );
+            ui.colored_label(Style::DANGER, RichText::new("locked").size(Style::SMALL));
             ui.add_space(Style::SP_XS);
             mde_egui::muted_note(ui, format!("{reason} — the worker refuses ops on it."));
         });
@@ -1678,10 +1785,11 @@ fn show_disk(
             ui,
             "A disk backing a running VM/container is refused at apply-time —",
         );
-        if ui
-            .button(RichText::new("free it in Cloud").size(Style::SMALL))
-            .on_hover_text("Jump to the Cloud plane to stop the guest holding this disk.")
-            .clicked()
+        if storage_hover_text(
+            ui.button(RichText::new("free it in Cloud").size(Style::SMALL)),
+            "Jump to the Cloud plane to stop the guest holding this disk.",
+        )
+        .clicked()
         {
             *goto_instances = true;
         }
@@ -1888,9 +1996,11 @@ fn show_compose(
     }
 
     ui.add_space(Style::SP_XS);
-    if ui
-        .button(RichText::new("\u{FF0B} Stage").size(Style::SMALL))
-        .clicked()
+    if storage_hover_text(
+        storage_icon_label_button(ui, STORAGE_STAGE_ICON, "Stage"),
+        "Stage this storage operation in the pending queue.",
+    )
+    .clicked()
     {
         match compose.build(dev) {
             Ok(op) => *staged = Some(op),
@@ -2013,7 +2123,7 @@ fn show_queue_and_apply(
         return;
     }
 
-    // Queue rows with reorder (↑ ↓) + undo (✕). At most one mutation per frame.
+    // Queue rows with icon-backed reorder + undo controls. At most one mutation per frame.
     let mut mv_up: Option<usize> = None;
     let mut mv_down: Option<usize> = None;
     let mut remove: Option<usize> = None;
@@ -2028,27 +2138,31 @@ fn show_queue_and_apply(
                     .size(Style::SMALL),
             );
             ui.add_space(Style::SP_S);
-            if ui
-                .add_enabled(
-                    i > 0,
-                    egui::Button::new(RichText::new("\u{2191}").size(Style::SMALL)),
-                )
-                .clicked()
+            let move_up_enabled = i > 0;
+            if storage_button_hover_text(
+                storage_icon_button(ui, STORAGE_QUEUE_UP_ICON, "Move up", move_up_enabled),
+                move_up_enabled,
+                "Move this operation earlier in the queue.",
+            )
+            .clicked()
             {
                 mv_up = Some(i);
             }
-            if ui
-                .add_enabled(
-                    i + 1 < len,
-                    egui::Button::new(RichText::new("\u{2193}").size(Style::SMALL)),
-                )
-                .clicked()
+            let move_down_enabled = i + 1 < len;
+            if storage_button_hover_text(
+                storage_icon_button(ui, STORAGE_QUEUE_DOWN_ICON, "Move down", move_down_enabled),
+                move_down_enabled,
+                "Move this operation later in the queue.",
+            )
+            .clicked()
             {
                 mv_down = Some(i);
             }
-            if ui
-                .button(RichText::new("\u{2715}").size(Style::SMALL))
-                .clicked()
+            if storage_hover_text(
+                storage_icon_button(ui, STORAGE_QUEUE_REMOVE_ICON, "Remove", true),
+                "Remove this operation from the queue.",
+            )
+            .clicked()
             {
                 remove = Some(i);
             }
@@ -2103,16 +2217,17 @@ fn show_queue_and_apply(
                 // The same pure decision the Edit → Apply All menu item gates on
                 // (§6 one path): a request exists only when the echo matches.
                 let request = armed_apply_request(node, queue, arming);
-                if ui
-                    .add_enabled(
-                        request.is_some(),
+                let apply_enabled = request.is_some();
+                if storage_button_hover_text(
+                    ui.add_enabled(
+                        apply_enabled,
                         egui::Button::new(RichText::new("Apply").size(Style::SMALL)),
-                    )
-                    .on_hover_text(
-                        "Publishes action/storage/<node>::Apply. The worker re-validates, \
-                         re-checks the arming + walls, and streams per-op progress.",
-                    )
-                    .clicked()
+                    ),
+                    apply_enabled,
+                    "Publishes action/storage/<node>::Apply. The worker re-validates, \
+                     re-checks the arming + walls, and streams per-op progress.",
+                )
+                .clicked()
                 {
                     *apply = request;
                 }
@@ -2160,13 +2275,12 @@ fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress], goto_instances
                 mde_egui::muted_note(ui, detail);
                 if matches!(p.state, ProgressState::Refused { .. }) {
                     ui.horizontal_wrapped(|ui| {
-                        mde_egui::muted_note(ui, "\u{2192} free the disk, then re-apply:");
-                        if ui
-                            .button(RichText::new("Open Cloud").size(Style::SMALL))
-                            .on_hover_text(
-                                "Jump to the Cloud plane to stop the guest holding this disk.",
-                            )
-                            .clicked()
+                        mde_egui::muted_note(ui, "Free the disk, then re-apply:");
+                        if storage_hover_text(
+                            ui.button(RichText::new("Open Cloud").size(Style::SMALL)),
+                            "Jump to the Cloud plane to stop the guest holding this disk.",
+                        )
+                        .clicked()
                         {
                             *goto_instances = true;
                         }

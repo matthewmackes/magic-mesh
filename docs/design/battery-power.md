@@ -1,4 +1,4 @@
-# POWER — battery indicator + full power settings (Quazar shell)
+# POWER — battery indicator + full power settings (Construct shell)
 
 Operator-locked 2026-07-03 (live bug "battery does not show" + "include power settings",
 after a 4-reader recon + 3-fork survey). Battery/power is **not** dead: `mde-seat`'s

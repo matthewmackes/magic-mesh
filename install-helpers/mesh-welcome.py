@@ -1,9 +1,9 @@
 #!/usr/bin/python3
-"""MESHSHELL SHELL-3 — the MCNF welcome greeting.
+"""MESHSHELL SHELL-3 - the MCNF welcome greeting.
 
 Renders a Carbon-styled banner from the cached /run/mde/mesh-status.json
-(refreshed ~30s by mesh-status.timer — the read is instant, so a shell never
-hangs even when the mesh is down). Shows: a Mackes ASCII wordmark, color-coded
+(refreshed ~30s by mesh-status.timer - the read is instant, so a shell never
+hangs even when the mesh is down). Shows: a Construct wordmark, color-coded
 per-node health + summary, a per-node service matrix, and per-node updates.
 Printed on every interactive bash shell by /etc/profile.d/zz-mde-welcome.sh.
 """
@@ -23,6 +23,10 @@ BLUE, GRAY, GREEN, AMBER, RED, BOLD, RST = (
 
 def c(s, color):
     return f"{color}{s}{RST}"
+
+
+def box_line(text, color):
+    print(c("│", BLUE) + c(text[:52].ljust(52), color) + c("│", BLUE))
 
 
 def load():
@@ -46,10 +50,8 @@ def main():
     line = "─" * 52
     print()
     print(c(f"┌{line}┐", BLUE))
-    print(c("│", BLUE) + c("  ⬢  M A G I C   M E S H", BOLD + BLUE)
-          + " " * 27 + c("│", BLUE))
-    print(c("│", BLUE) + c("     Mackes Desktop Environment", GRAY)
-          + " " * 21 + c("│", BLUE))
+    box_line("  ⬢  C O N S T R U C T", BOLD + BLUE)
+    box_line("     Software Studio: MDE", GRAY)
     print(c(f"└{line}┘", BLUE))
 
     if not d:

@@ -5,12 +5,81 @@
 //! these constants and call [`Style::install`]; they never hand-roll a colour or a
 //! spacing value.
 //!
-//! The palette is the **Quasar dark** identity (the platform default). Values
+//! The palette is the **Construct dark** identity (the platform default). Values
 //! are render-agnostic data, so they are unit-tested without a GPU.
 
-use egui::{Color32, Context, Stroke};
+use egui::{
+    epaint::{ClippedShape, ColorMode},
+    Color32, Context, FontFamily, FontId, Stroke, TextStyle,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::formfactor::Formfactor;
+
+/// The shell-wide layout profile. Profiles are not just density presets: each one
+/// names a distinct placement model the shell can branch on while still sharing
+/// the same `Style` palette and Inter-first font system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutProfile {
+    /// Windows 2000 Workstation: classic bottom taskbar + Start lower-left.
+    #[default]
+    Workstation,
+    /// Touch tablet: bottom touch bar, larger targets, slide-up controls.
+    Tablet,
+    /// Vehicle HUD: glanceable driving/vehicle/media/comms controls.
+    Car,
+}
+
+impl LayoutProfile {
+    /// Visible picker order.
+    pub const ALL: [Self; 3] = [Self::Workstation, Self::Tablet, Self::Car];
+
+    /// Human label for settings/menu rows.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Workstation => "Windows 2000 Workstation",
+            Self::Tablet => "Tablet",
+            Self::Car => "Car",
+        }
+    }
+
+    /// Compact shell-control label for constrained mode buttons.
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Workstation => "WS",
+            Self::Tablet => "TAB",
+            Self::Car => "CAR",
+        }
+    }
+
+    /// Settings/menu description.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Workstation => "Classic desktop placement",
+            Self::Tablet => "Bottom touch bar and larger targets",
+            Self::Car => "Driving HUD and keyboard actions",
+        }
+    }
+
+    /// Runtime interaction density installed for this profile.
+    #[must_use]
+    pub const fn density(self) -> Density {
+        match self {
+            Self::Workstation => Density::Mouse,
+            Self::Tablet | Self::Car => Density::Touch,
+        }
+    }
+
+    /// Whether this profile is the vehicle HUD model.
+    #[must_use]
+    pub const fn is_car(self) -> bool {
+        matches!(self, Self::Car)
+    }
+}
 
 /// The **interaction density** of a surface — how large hit targets and spacing are
 /// (SURFACE-11, design lock 16).
@@ -75,12 +144,50 @@ impl Density {
     }
 }
 
+/// The platform colour mode applied by Personalization → Theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StyleColorScheme {
+    /// The current Construct dark palette. This is the default and preserves the
+    /// status-quo colours for operators that do not opt into light mode.
+    #[default]
+    Dark,
+    /// A Windows 2000 basic-inspired light palette: classic button-face gray,
+    /// white raised surfaces, gray borders, black text, and active-title blue.
+    Light,
+}
+
+impl StyleColorScheme {
+    /// Visible mode order.
+    pub const ALL: [Self; 2] = [Self::Dark, Self::Light];
+}
+
+/// Runtime-resolved surface/text palette for a [`StyleColorScheme`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StylePalette {
+    /// Top-level app and panel background.
+    pub bg: Color32,
+    /// Raised control/card/input surface.
+    pub surface: Color32,
+    /// Hovered or highlighted raised surface.
+    pub surface_hi: Color32,
+    /// Hairline border and separator color.
+    pub border: Color32,
+    /// Blank capture clear color for this mode.
+    pub capture_clear: Color32,
+    /// Primary readable text.
+    pub text: Color32,
+    /// Secondary or de-emphasized text.
+    pub text_dim: Color32,
+    /// Strong/emphasis text.
+    pub text_strong: Color32,
+}
+
 /// The shared egui design system. All fields are `const` so they are usable in
 /// `const` contexts and read directly at call sites.
 pub struct Style;
 
 impl Style {
-    // ── Palette (Quasar dark) ───────────────────────────────────────────────
+    // ── Palette (Construct dark) ───────────────────────────────────────────────
     /// Window / app background — the deepest surface.
     pub const BG: Color32 = Color32::from_rgb(0x16, 0x16, 0x1A);
     /// Raised surface — panels, cards, inputs.
@@ -89,6 +196,22 @@ impl Style {
     pub const SURFACE_HI: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x32);
     /// Hairline borders + separators.
     pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x33, 0x3D);
+
+    // ── Palette (Windows 2000 basic light) ──────────────────────────────────
+    /// Windows 2000 classic `ButtonFace`.
+    pub const WIN2000_BUTTON_FACE: Color32 = Color32::from_rgb(0xD4, 0xD0, 0xC8);
+    /// Windows 2000 classic raised/light face.
+    pub const WIN2000_BUTTON_HIGHLIGHT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    /// Windows 2000 classic shadow/border.
+    pub const WIN2000_BUTTON_SHADOW: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
+    /// Windows 2000 classic `WindowText`.
+    pub const WIN2000_WINDOW_TEXT: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
+    /// A readable dim text on classic button-face gray.
+    pub const WIN2000_DIM_TEXT: Color32 = Color32::from_rgb(0x40, 0x40, 0x40);
+    /// Windows 2000 classic active title/highlight blue.
+    pub const WIN2000_ACTIVE_TITLE: Color32 = Color32::from_rgb(0x0A, 0x24, 0x6A);
+    /// Windows 2000 classic pressed button face.
+    pub const WIN2000_PRESSED_FACE: Color32 = Color32::from_rgb(0xB8, 0xB4, 0xAC);
 
     // ── Carbon elevation layers ─────────────────────────────────────────────
     // The Carbon "layer" model for nested regions: a page rests one tonal step
@@ -129,7 +252,30 @@ impl Style {
     /// paints bold spans + heading titles with it.
     pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
 
-    /// Interactive / brand accent (Quasar azure).
+    // ── Bottom taskbar chrome ──────────────────────────────────────────────
+    // The platform taskbar is deliberately a black shell strip with white glyphs
+    // and a Windows-11-style tray island. Keep the exact palette in shared Style
+    // so dock rendering and visual tests do not mint private shell colours.
+    /// Full-width bottom taskbar strip.
+    pub const TASKBAR_BG: Color32 = Color32::BLACK;
+    /// Taskbar hairline/separator.
+    pub const TASKBAR_BORDER: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
+    /// Hover fill for taskbar-owned cells.
+    pub const TASKBAR_HOVER_FILL: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
+    /// Active/selected fill for taskbar-owned cells.
+    pub const TASKBAR_ACTIVE_FILL: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
+    /// Taskbar-owned control glyph tint.
+    pub const TASKBAR_ICON: Color32 = Color32::WHITE;
+    /// Windows 11-style tray island fill.
+    pub const TASKBAR_TRAY_ISLAND_FILL: Color32 = Color32::from_rgb(0x17, 0x17, 0x17);
+    /// Active Windows 11-style tray island fill.
+    pub const TASKBAR_TRAY_ISLAND_ACTIVE_FILL: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
+    /// Windows 11-style tray island border.
+    pub const TASKBAR_TRAY_ISLAND_BORDER: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3A);
+    /// Secondary date text in the taskbar clock stack.
+    pub const TASKBAR_CLOCK_DATE: Color32 = Color32::from_rgb(0xD6, 0xD6, 0xD6);
+
+    /// Interactive / brand accent (Construct azure).
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
     /// Accent, hovered.
     pub const ACCENT_HI: Color32 = Color32::from_rgb(0x7A, 0xA2, 0xFF);
@@ -162,7 +308,7 @@ impl Style {
     pub const SPELL: Color32 = Color32::from_rgb(0xDA, 0x1E, 0x28);
 
     // ── Categorical accents (picker groups · explorer categories) ───────────
-    // Six distinct Carbon **categorical** hues that key a group's / category's
+    // Distinct categorical hues that key a group's / category's
     // identity — the ONE colour language shared across the bottom picker's group
     // labels (PICKER-2, design L4) and the unit explorer's per-category accent
     // (EXPLORER-15, design O8). Defined **once** here so both surfaces speak the
@@ -175,6 +321,8 @@ impl Style {
     pub const ACCENT_WORKLOADS: Color32 = Color32::from_rgb(0xA5, 0x6E, 0xFF);
     /// Categorical accent — **Terminals** (Carbon teal).
     pub const ACCENT_TERMINALS: Color32 = Color32::from_rgb(0x08, 0xBD, 0xBA);
+    /// Categorical accent — **Web** (Chrome primary blue).
+    pub const ACCENT_WEB: Color32 = Color32::from_rgb(0x0B, 0x57, 0xD0);
     /// Categorical accent — **Mesh** (Carbon green).
     pub const ACCENT_MESH: Color32 = Color32::from_rgb(0x42, 0xBE, 0x65);
     /// Categorical accent — **System** (Carbon gold).
@@ -238,6 +386,38 @@ impl Style {
     /// Display heading (Carbon productive-heading-06) — the largest type rung,
     /// the markdown-preview H1 title size (EDTB-7).
     pub const DISPLAY: f32 = 26.0;
+    /// Top-left workspace title text: the display rung reduced by two points for
+    /// refined shell chrome.
+    pub const WORKSPACE_TITLE: f32 = Self::DISPLAY - 2.0;
+    /// Shared menu/button chrome text: the body rung reduced by one point so
+    /// menus read as controls, not body copy.
+    pub const MENU_TEXT: f32 = Self::BODY - 1.0;
+    /// Vertical padding for ordinary egui buttons. Kept well below the base 8px
+    /// gutter so toolbar rows read refined without changing the minimum hit target.
+    pub const CONTROL_PAD_Y: f32 = Self::SP_XS;
+    /// Decorative vertical inset for stacked toolbar/header strips. This is
+    /// intentionally near-zero; the hit target still comes from egui's
+    /// interaction size, not from toolbar padding.
+    pub const TOOLBAR_INSET_Y: f32 = 0.0;
+    /// Refined pointer-toolbar visual control height. Derived from the menu text
+    /// rung plus a compact vertical cushion so local toolbar rows can slim down
+    /// without carrying unrelated 24pt literals.
+    pub const TOOLBAR_CONTROL_H: f32 = Self::MENU_TEXT + Self::SP_S + Self::SP_XS * 0.5;
+
+    /// A shared toolbar/header frame margin: normal horizontal inset, refined
+    /// vertical inset. Use this for chrome strips that surround controls, not for
+    /// content cards or body panels.
+    #[must_use]
+    pub const fn toolbar_margin() -> egui::Margin {
+        egui::Margin::symmetric(Self::SP_XS as i8, Self::TOOLBAR_INSET_Y as i8)
+    }
+
+    /// Shared tooltip/hover-card frame margin. This keeps transient chrome lighter
+    /// than content cards while still leaving enough breathing room for small text.
+    #[must_use]
+    pub const fn tooltip_margin() -> egui::Margin {
+        egui::Margin::symmetric(Self::SP_S as i8, Self::SP_XS as i8)
+    }
 
     /// The point size for a markdown/rich-text heading `level` on the shared
     /// type ramp: H1 → [`DISPLAY`](Self::DISPLAY), H2 → [`HEADING`](Self::HEADING),
@@ -269,78 +449,216 @@ impl Style {
     /// metrics (hit-target size + spacing) grow under [`Density::Touch`], so the shell
     /// can flip Tablet↔Laptop by re-installing at the new density.
     pub fn install_with_density(ctx: &Context, density: Density) {
+        Self::install_color_scheme_with_density(ctx, StyleColorScheme::Dark, density);
+    }
+
+    /// Install the shared look at an explicit colour mode and density.
+    pub fn install_color_scheme_with_density(
+        ctx: &Context,
+        scheme: StyleColorScheme,
+        density: Density,
+    ) {
         // Inter is the proportional platform face; Intel One Mono stays reserved
         // for fixed-width surfaces that require monospace glyphs.
         crate::fonts::install(ctx);
 
-        let mut v = egui::Visuals::dark();
-
-        v.panel_fill = Self::BG;
-        v.window_fill = Self::SURFACE;
-        v.extreme_bg_color = Self::BG;
-        v.faint_bg_color = Self::SURFACE;
-        v.override_text_color = Some(Self::TEXT);
-        v.window_stroke = Stroke::new(1.0, Self::BORDER);
-
-        let border = Stroke::new(1.0, Self::BORDER);
-        let text = Stroke::new(1.0, Self::TEXT);
-        let text_dim = Stroke::new(1.0, Self::TEXT_DIM);
-
-        // Non-interactive chrome (labels, separators).
-        v.widgets.noninteractive.bg_fill = Self::BG;
-        v.widgets.noninteractive.weak_bg_fill = Self::BG;
-        v.widgets.noninteractive.bg_stroke = border;
-        v.widgets.noninteractive.fg_stroke = text_dim;
-
-        // Resting interactive widgets.
-        v.widgets.inactive.bg_fill = Self::SURFACE;
-        v.widgets.inactive.weak_bg_fill = Self::SURFACE;
-        v.widgets.inactive.bg_stroke = border;
-        v.widgets.inactive.fg_stroke = text;
-
-        // Hover.
-        v.widgets.hovered.bg_fill = Self::SURFACE_HI;
-        v.widgets.hovered.weak_bg_fill = Self::SURFACE_HI;
-        v.widgets.hovered.fg_stroke = text;
-
-        // Pressed / active. A BRIGHT label over a DARKENED accent fill (the fill is
-        // derived in [`accent_visuals`](Self::accent_visuals)). This `fg_stroke` is
-        // ALSO exactly what egui returns from `Visuals::strong_text_color()` (it is
-        // hardcoded to `widgets.active.fg_stroke`), so it MUST stay bright — a dark
-        // value here paints every `.strong()` label across the shell in near-black,
-        // which reads as "disabled". Guarded by `strong_text_stays_bright` +
-        // `pressed_accent_text_stays_wcag_legible` (a11y, P3).
-        v.widgets.active.fg_stroke = Stroke::new(1.0, Self::TEXT_STRONG);
-
-        // The interactive **accent** — the ONE re-tintable field group: the
-        // hyperlink, the text-selection wash + ring, the hover ring, and the
-        // pressed fill + ring. Applied here from the brand [`ACCENT`](Self::ACCENT);
-        // a Personalization → Theme pick (SETTINGS-5) re-applies the SAME derivation
-        // over the live context with a chosen accent (see [`set_accent`]), so the
-        // default look + a runtime override share one source of truth (§4/§6).
-        Self::accent_visuals(&mut v, Self::ACCENT, Self::ACCENT_HI);
+        let v = Self::visuals_for(scheme, Self::ACCENT, Self::ACCENT_HI);
 
         // SURFACE-11: the density scales the interaction metrics — targets and spacing
         // grow under touch, the palette does not.
         let sp = density.spacing_scale();
         ctx.style_mut(|s| {
             s.visuals = v;
+            s.text_styles.insert(
+                TextStyle::Small,
+                FontId::new(Self::SMALL, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Body,
+                FontId::new(Self::BODY, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Button,
+                FontId::new(Self::MENU_TEXT, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Heading,
+                FontId::new(Self::HEADING, FontFamily::Proportional),
+            );
+            s.text_styles.insert(
+                TextStyle::Monospace,
+                FontId::new(Self::BODY, FontFamily::Monospace),
+            );
             s.spacing.item_spacing = egui::vec2(Self::SP_S * sp, Self::SP_S * sp);
-            s.spacing.button_padding = egui::vec2(Self::SP_M * sp, Self::SP_S * sp);
+            s.spacing.button_padding = egui::vec2(Self::SP_M * sp, Self::CONTROL_PAD_Y * sp);
             s.spacing.indent = Self::SP_M * sp;
             // The minimum interactive size is the finger/pointer hit target.
             s.spacing.interact_size.y = density.min_hit_target();
         });
+        ctx.data_mut(|d| {
+            d.insert_temp(Self::color_scheme_id(), scheme);
+            d.insert_temp(Self::density_id(), density);
+        });
     }
 
-    /// Apply the interactive-accent derivation to `v` — the field group a runtime
-    /// accent choice re-tints (SETTINGS-5): the hyperlink colour, the text-selection
-    /// wash + ring, the hover ring, and the pressed/active fill + ring. Factored so
-    /// [`install_with_density`](Self::install_with_density) (the default brand accent)
-    /// and [`set_accent`](Self::set_accent) (a chosen accent) share ONE derivation and
-    /// can never fork the look (§4/§6). `accent_hi` is the slightly-lifted variant for
-    /// the pressed ring (the brand pair passes [`ACCENT`](Self::ACCENT)/[`ACCENT_HI`](Self::ACCENT_HI)).
-    fn accent_visuals(v: &mut egui::Visuals, accent: Color32, accent_hi: Color32) {
+    /// The current colour mode installed on `ctx`.
+    #[must_use]
+    pub fn color_scheme(ctx: &Context) -> StyleColorScheme {
+        ctx.data(|d| {
+            d.get_temp::<StyleColorScheme>(Self::color_scheme_id())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The current density installed on `ctx`.
+    #[must_use]
+    pub fn density(ctx: &Context) -> Density {
+        ctx.data(|d| {
+            d.get_temp::<Density>(Self::density_id())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The runtime palette installed on `ctx`.
+    #[must_use]
+    pub fn current_palette(ctx: &Context) -> StylePalette {
+        Self::palette_for(Self::color_scheme(ctx))
+    }
+
+    /// The runtime palette for `scheme`.
+    #[must_use]
+    pub const fn palette_for(scheme: StyleColorScheme) -> StylePalette {
+        match scheme {
+            StyleColorScheme::Dark => StylePalette {
+                bg: Self::BG,
+                surface: Self::SURFACE,
+                surface_hi: Self::SURFACE_HI,
+                border: Self::BORDER,
+                capture_clear: Self::CAPTURE_CLEAR,
+                text: Self::TEXT,
+                text_dim: Self::TEXT_DIM,
+                text_strong: Self::TEXT_STRONG,
+            },
+            StyleColorScheme::Light => StylePalette {
+                bg: Self::WIN2000_BUTTON_FACE,
+                surface: Self::WIN2000_BUTTON_FACE,
+                surface_hi: Self::WIN2000_BUTTON_HIGHLIGHT,
+                border: Self::WIN2000_BUTTON_SHADOW,
+                capture_clear: Self::WIN2000_BUTTON_FACE,
+                text: Self::WIN2000_WINDOW_TEXT,
+                text_dim: Self::WIN2000_DIM_TEXT,
+                text_strong: Self::WIN2000_WINDOW_TEXT,
+            },
+        }
+    }
+
+    /// Resolve one of the static [`Style`] colour tokens into the live colour mode.
+    /// Non-token colours pass through untouched.
+    #[must_use]
+    pub fn resolve_color(ctx: &Context, color: Color32) -> Color32 {
+        Self::resolve_color_for_scheme(Self::color_scheme(ctx), color)
+    }
+
+    /// Resolve one of the static [`Style`] colour tokens into `scheme`.
+    #[must_use]
+    pub fn resolve_color_for_scheme(scheme: StyleColorScheme, color: Color32) -> Color32 {
+        if scheme == StyleColorScheme::Dark {
+            return color;
+        }
+        let p = Self::palette_for(scheme);
+        match color {
+            Self::BG => p.bg,
+            Self::SURFACE => p.surface,
+            Self::SURFACE_HI => p.surface_hi,
+            Self::BORDER => p.border,
+            Self::CAPTURE_CLEAR => p.capture_clear,
+            Self::TEXT => p.text,
+            Self::TEXT_DIM => p.text_dim,
+            Self::TEXT_STRONG => p.text_strong,
+            Self::ACCENT => Self::WIN2000_ACTIVE_TITLE,
+            Self::ACCENT_HI => Self::WIN2000_ACTIVE_TITLE,
+            _ => color,
+        }
+    }
+
+    /// Apply `scheme` and `accent` to the live egui visuals without touching density,
+    /// spacing, text scale, or animation cadence.
+    pub fn set_color_scheme_and_accent(ctx: &Context, scheme: StyleColorScheme, accent: Color32) {
+        ctx.style_mut(|s| {
+            s.visuals = Self::visuals_for(scheme, accent, accent);
+        });
+        ctx.data_mut(|d| d.insert_temp(Self::color_scheme_id(), scheme));
+    }
+
+    fn color_scheme_id() -> egui::Id {
+        egui::Id::new("mde-egui-style-color-scheme")
+    }
+
+    fn density_id() -> egui::Id {
+        egui::Id::new("mde-egui-style-density")
+    }
+
+    fn visuals_for(scheme: StyleColorScheme, accent: Color32, accent_hi: Color32) -> egui::Visuals {
+        let p = Self::palette_for(scheme);
+        let mut v = match scheme {
+            StyleColorScheme::Dark => egui::Visuals::dark(),
+            StyleColorScheme::Light => egui::Visuals::light(),
+        };
+
+        v.panel_fill = p.bg;
+        v.window_fill = p.surface;
+        v.extreme_bg_color = p.bg;
+        v.faint_bg_color = p.surface;
+        v.override_text_color = Some(p.text);
+        v.window_stroke = Stroke::new(1.0, p.border);
+
+        let border = Stroke::new(1.0, p.border);
+        let text = Stroke::new(1.0, p.text);
+        let text_dim = Stroke::new(1.0, p.text_dim);
+
+        // Non-interactive chrome (labels, separators).
+        v.widgets.noninteractive.bg_fill = p.bg;
+        v.widgets.noninteractive.weak_bg_fill = p.bg;
+        v.widgets.noninteractive.bg_stroke = border;
+        v.widgets.noninteractive.fg_stroke = text_dim;
+
+        // Resting interactive widgets.
+        v.widgets.inactive.bg_fill = p.surface;
+        v.widgets.inactive.weak_bg_fill = p.surface;
+        v.widgets.inactive.bg_stroke = border;
+        v.widgets.inactive.fg_stroke = text;
+
+        // Hover.
+        v.widgets.hovered.bg_fill = p.surface_hi;
+        v.widgets.hovered.weak_bg_fill = p.surface_hi;
+        v.widgets.hovered.fg_stroke = text;
+
+        // Pressed / active. egui's `.strong()` text colour is hardwired to this
+        // stroke. Dark mode keeps the historical bright-on-dark pressed style;
+        // light mode keeps strong text black and uses a classic gray pressed face.
+        v.widgets.active.fg_stroke = Stroke::new(1.0, p.text_strong);
+
+        // The interactive **accent** — the ONE re-tintable field group: the
+        // hyperlink, the text-selection wash + ring, the hover ring, and the
+        // pressed fill + ring.
+        Self::accent_visuals_for_scheme(&mut v, scheme, accent, accent_hi);
+        v
+    }
+
+    /// Apply the interactive-accent derivation to `v` for one colour scheme.
+    ///
+    /// This field group is what a runtime accent choice re-tints (SETTINGS-5): the
+    /// hyperlink colour, the text-selection wash + ring, the hover ring, and the
+    /// pressed/active fill + ring. Factored so install and runtime picks share one
+    /// derivation and can never fork the look (§4/§6).
+    fn accent_visuals_for_scheme(
+        v: &mut egui::Visuals,
+        scheme: StyleColorScheme,
+        accent: Color32,
+        accent_hi: Color32,
+    ) {
+        let accent = Self::accent_for_scheme(scheme, accent);
+        let accent_hi = Self::accent_for_scheme(scheme, accent_hi);
         v.hyperlink_color = accent;
         v.selection.bg_fill = accent.gamma_multiply(0.35);
         v.selection.stroke = Stroke::new(1.0, accent);
@@ -350,20 +668,41 @@ impl Style {
         // it, while a bright accent ring keeps the pressed state unmistakably
         // accent-coloured. Opaque (blend, not `gamma_multiply`, which would fade the
         // alpha into a translucent wash like `selection.bg_fill` above).
-        let pressed = Self::pressed_fill(accent);
+        let pressed = Self::pressed_fill_for_scheme(scheme, accent);
         v.widgets.active.bg_fill = pressed;
         v.widgets.active.weak_bg_fill = pressed;
         v.widgets.active.bg_stroke = Stroke::new(1.0, accent_hi);
+    }
+
+    /// The visible accent for `scheme`. The default brand accent becomes the classic
+    /// Windows active-title blue in light mode; explicit user accent picks remain
+    /// their chosen hue.
+    #[must_use]
+    pub fn accent_for_scheme(scheme: StyleColorScheme, accent: Color32) -> Color32 {
+        if scheme == StyleColorScheme::Light && accent == Self::ACCENT {
+            Self::WIN2000_ACTIVE_TITLE
+        } else {
+            accent
+        }
     }
 
     /// The pressed/active **fill** for an accent: the accent darkened toward
     /// [`BG`](Self::BG) so the bright pressed label ([`TEXT_STRONG`](Self::TEXT_STRONG),
     /// which is also egui's `strong_text_color`) stays WCAG AA legible on it for every
     /// selectable accent. The canonical derivation, so a caller (or a test) never
-    /// re-hardcodes the darken factor. See [`accent_visuals`](Self::accent_visuals).
+    /// re-hardcodes the darken factor.
     #[must_use]
     pub fn pressed_fill(accent: Color32) -> Color32 {
         Self::blend(accent, Self::BG, Self::PRESSED_FILL_DARKEN)
+    }
+
+    /// The pressed/active fill for `scheme`.
+    #[must_use]
+    pub fn pressed_fill_for_scheme(scheme: StyleColorScheme, accent: Color32) -> Color32 {
+        match scheme {
+            StyleColorScheme::Dark => Self::pressed_fill(accent),
+            StyleColorScheme::Light => Self::WIN2000_PRESSED_FACE,
+        }
     }
 
     /// Fraction the pressed/active fill is darkened toward [`BG`](Self::BG) from the
@@ -381,14 +720,110 @@ impl Style {
 
     /// Re-tint the live interactive **accent** on `ctx` to `accent` (SETTINGS-5 — the
     /// Personalization → Theme accent choice). Re-applies ONLY the accent-derived
-    /// visual fields (via [`accent_visuals`](Self::accent_visuals)) over the
+    /// visual fields (via [`accent_visuals_for_scheme`](Self::accent_visuals_for_scheme)) over the
     /// already-installed look, so the palette / density / type scale are untouched.
     /// The shell re-applies this each frame from its Settings poll, so a chosen accent
     /// survives a formfactor [`install_with_density`](Self::install_with_density)
     /// re-install. A user pick has no separate "hi" token, so the chosen accent doubles
     /// as the pressed-ring highlight.
     pub fn set_accent(ctx: &Context, accent: Color32) {
-        ctx.style_mut(|s| Self::accent_visuals(&mut s.visuals, accent, accent));
+        let scheme = Self::color_scheme(ctx);
+        ctx.style_mut(|s| Self::accent_visuals_for_scheme(&mut s.visuals, scheme, accent, accent));
+    }
+
+    /// Remap exact static `Style::*` token colours in paint output to `scheme`.
+    ///
+    /// Many shell surfaces custom-paint shapes and YAMIS glyphs with static tokens.
+    /// Installing `egui::Visuals` cannot recolour those already-built primitives, so
+    /// the DRM runner applies this before tessellation. Exact matching keeps status,
+    /// provider, media, and arbitrary content colours intact.
+    pub fn remap_clipped_shapes_for_color_scheme(
+        shapes: &mut [ClippedShape],
+        scheme: StyleColorScheme,
+    ) {
+        if scheme == StyleColorScheme::Dark {
+            return;
+        }
+        for clipped in shapes {
+            Self::remap_shape_for_color_scheme(&mut clipped.shape, scheme);
+        }
+    }
+
+    fn remap_shape_for_color_scheme(shape: &mut egui::Shape, scheme: StyleColorScheme) {
+        match shape {
+            egui::Shape::Noop | egui::Shape::Callback(_) => {}
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    Self::remap_shape_for_color_scheme(shape, scheme);
+                }
+            }
+            egui::Shape::Circle(circle) => {
+                circle.fill = Self::resolve_color_for_scheme(scheme, circle.fill);
+                circle.stroke.color = Self::resolve_color_for_scheme(scheme, circle.stroke.color);
+            }
+            egui::Shape::Ellipse(ellipse) => {
+                ellipse.fill = Self::resolve_color_for_scheme(scheme, ellipse.fill);
+                ellipse.stroke.color = Self::resolve_color_for_scheme(scheme, ellipse.stroke.color);
+            }
+            egui::Shape::LineSegment { stroke, .. } => {
+                stroke.color = Self::resolve_color_for_scheme(scheme, stroke.color);
+            }
+            egui::Shape::Path(path) => {
+                path.fill = Self::resolve_color_for_scheme(scheme, path.fill);
+                Self::remap_path_stroke_for_color_scheme(&mut path.stroke, scheme);
+            }
+            egui::Shape::Rect(rect) => {
+                rect.fill = Self::resolve_color_for_scheme(scheme, rect.fill);
+                rect.stroke.color = Self::resolve_color_for_scheme(scheme, rect.stroke.color);
+            }
+            egui::Shape::Text(text) => {
+                text.fallback_color = Self::resolve_color_for_scheme(scheme, text.fallback_color);
+                if let Some(color) = &mut text.override_text_color {
+                    *color = Self::resolve_color_for_scheme(scheme, *color);
+                }
+                text.underline.color = Self::resolve_color_for_scheme(scheme, text.underline.color);
+                let galley = std::sync::Arc::make_mut(&mut text.galley);
+                let job = std::sync::Arc::make_mut(&mut galley.job);
+                for section in &mut job.sections {
+                    section.format.color =
+                        Self::resolve_color_for_scheme(scheme, section.format.color);
+                    section.format.background =
+                        Self::resolve_color_for_scheme(scheme, section.format.background);
+                    section.format.underline.color =
+                        Self::resolve_color_for_scheme(scheme, section.format.underline.color);
+                    section.format.strikethrough.color =
+                        Self::resolve_color_for_scheme(scheme, section.format.strikethrough.color);
+                }
+                for row in &mut galley.rows {
+                    for vertex in &mut row.visuals.mesh.vertices {
+                        vertex.color = Self::resolve_color_for_scheme(scheme, vertex.color);
+                    }
+                }
+            }
+            egui::Shape::Mesh(mesh) => {
+                let mesh = std::sync::Arc::make_mut(mesh);
+                for vertex in &mut mesh.vertices {
+                    vertex.color = Self::resolve_color_for_scheme(scheme, vertex.color);
+                }
+            }
+            egui::Shape::QuadraticBezier(bezier) => {
+                bezier.fill = Self::resolve_color_for_scheme(scheme, bezier.fill);
+                Self::remap_path_stroke_for_color_scheme(&mut bezier.stroke, scheme);
+            }
+            egui::Shape::CubicBezier(bezier) => {
+                bezier.fill = Self::resolve_color_for_scheme(scheme, bezier.fill);
+                Self::remap_path_stroke_for_color_scheme(&mut bezier.stroke, scheme);
+            }
+        }
+    }
+
+    fn remap_path_stroke_for_color_scheme(
+        stroke: &mut egui::epaint::PathStroke,
+        scheme: StyleColorScheme,
+    ) {
+        if let ColorMode::Solid(color) = &mut stroke.color {
+            *color = Self::resolve_color_for_scheme(scheme, *color);
+        }
     }
 
     /// The **load-bar fill** colour for a 0–100 capability score: a smooth blend
@@ -642,7 +1077,7 @@ impl Elevation {
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants, clippy::float_cmp)]
 mod tests {
-    use super::{Density, Elevation, GradeBand, Style};
+    use super::{Density, Elevation, GradeBand, LayoutProfile, Style, StyleColorScheme};
     use crate::formfactor::Formfactor;
 
     /// WCAG 2.1 **relative luminance** of an sRGB colour (`0.0..=1.0`; alpha ignored).
@@ -727,6 +1162,7 @@ mod tests {
             ("ACCENT_COMMS (Cyan)", Style::ACCENT_COMMS),
             ("ACCENT_WORKLOADS (Purple)", Style::ACCENT_WORKLOADS),
             ("ACCENT_TERMINALS (Teal)", Style::ACCENT_TERMINALS),
+            ("ACCENT_WEB (Chrome blue)", Style::ACCENT_WEB),
             ("ACCENT_MESH (Green)", Style::ACCENT_MESH),
             ("ACCENT_SYSTEM (Gold)", Style::ACCENT_SYSTEM),
             ("ACCENT_MEDIA (Magenta)", Style::ACCENT_MEDIA),
@@ -813,6 +1249,33 @@ mod tests {
     }
 
     #[test]
+    fn taskbar_palette_keeps_black_bar_white_glyphs_and_grouped_tray() {
+        assert_eq!(Style::TASKBAR_BG, egui::Color32::BLACK);
+        assert_eq!(Style::TASKBAR_ICON, egui::Color32::WHITE);
+        assert_ne!(Style::TASKBAR_BORDER, Style::TASKBAR_BG);
+        assert_ne!(Style::TASKBAR_HOVER_FILL, Style::TASKBAR_BG);
+        assert_ne!(Style::TASKBAR_ACTIVE_FILL, Style::TASKBAR_HOVER_FILL);
+        assert_ne!(
+            Style::TASKBAR_TRAY_ISLAND_ACTIVE_FILL,
+            Style::TASKBAR_TRAY_ISLAND_FILL,
+            "active tray island needs its own tone"
+        );
+        assert_ne!(
+            Style::TASKBAR_TRAY_ISLAND_BORDER,
+            Style::TASKBAR_TRAY_ISLAND_FILL,
+            "tray island border must remain visible on the island fill"
+        );
+        assert!(
+            wcag_contrast_ratio(Style::TASKBAR_ICON, Style::TASKBAR_BG) >= 7.0,
+            "white taskbar icons must remain high contrast on the black bar"
+        );
+        assert!(
+            wcag_contrast_ratio(Style::TASKBAR_CLOCK_DATE, Style::TASKBAR_BG) >= 7.0,
+            "taskbar date text must remain readable on the black bar"
+        );
+    }
+
+    #[test]
     fn spell_underline_is_a_distinct_red() {
         // EDTB-6: the spelling squiggle is its own token, a red that reads as
         // "misspelling" yet is visibly distinct from the DANGER error squiggle,
@@ -835,14 +1298,15 @@ mod tests {
 
     #[test]
     fn categorical_accents_are_a_distinct_palette() {
-        // PICKER-2 / EXPLORER-15 O8: the six shared picker-group / explorer-category
-        // accents must be mutually distinguishable — one colour language, six hues —
+        // PICKER-2 / EXPLORER-15 O8: the shared picker-group / explorer-category
+        // accents must be mutually distinguishable — one colour language —
         // and each set apart from the single interactive brand accent so a category
         // tint never reads as an interaction affordance.
         let cats = [
             Style::ACCENT_COMMS,
             Style::ACCENT_WORKLOADS,
             Style::ACCENT_TERMINALS,
+            Style::ACCENT_WEB,
             Style::ACCENT_MESH,
             Style::ACCENT_SYSTEM,
             Style::ACCENT_MEDIA,
@@ -1010,6 +1474,24 @@ mod tests {
         assert!(Style::BODY < Style::TITLE);
         assert!(Style::TITLE < Style::HEADING);
         assert!(Style::HEADING < Style::DISPLAY);
+        assert_eq!(
+            Style::MENU_TEXT,
+            Style::BODY - 1.0,
+            "menu/control chrome text is one point below body text"
+        );
+        assert!(
+            Style::SMALL < Style::MENU_TEXT && Style::MENU_TEXT < Style::BODY,
+            "menu text should stay between captions and body copy"
+        );
+        assert_eq!(
+            Style::WORKSPACE_TITLE,
+            Style::DISPLAY - 2.0,
+            "top-left workspace title chrome is two points below display text"
+        );
+        assert!(
+            Style::HEADING < Style::WORKSPACE_TITLE && Style::WORKSPACE_TITLE < Style::DISPLAY,
+            "workspace title should stay between section and display headings"
+        );
     }
 
     #[test]
@@ -1059,6 +1541,19 @@ mod tests {
         assert_eq!(ctx.style().visuals.panel_fill, Style::BG);
         assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
         assert_eq!(ctx.style().spacing.indent, Style::SP_M);
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Body].size,
+            Style::BODY
+        );
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Button].size,
+            Style::MENU_TEXT,
+            "raw egui buttons and stray menu rows inherit the refined chrome text size"
+        );
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Heading].size,
+            Style::HEADING
+        );
         // The refactored install routes the accent through the shared derivation, so
         // the whole interactive-accent field group lands on the (darkened) brand accent,
         // with a bright pressed label — the same colour egui reuses for strong text.
@@ -1071,6 +1566,121 @@ mod tests {
             Style::TEXT_STRONG
         );
         assert_eq!(ctx.style().visuals.selection.stroke.color, Style::ACCENT);
+    }
+
+    #[test]
+    fn light_install_uses_windows_2000_basic_palette() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let visuals = &ctx.style().visuals;
+        let p = Style::palette_for(StyleColorScheme::Light);
+
+        assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Light);
+        assert_eq!(visuals.panel_fill, Style::WIN2000_BUTTON_FACE);
+        assert_eq!(visuals.window_fill, p.surface);
+        assert_eq!(visuals.extreme_bg_color, p.bg);
+        assert_eq!(visuals.window_stroke.color, Style::WIN2000_BUTTON_SHADOW);
+        assert_eq!(
+            visuals.override_text_color,
+            Some(Style::WIN2000_WINDOW_TEXT)
+        );
+        assert_eq!(
+            visuals.widgets.hovered.bg_fill,
+            Style::WIN2000_BUTTON_HIGHLIGHT
+        );
+        assert_eq!(
+            visuals.widgets.active.bg_fill,
+            Style::WIN2000_PRESSED_FACE,
+            "light-mode pressed state uses classic gray, not dark-mode accent fill"
+        );
+        assert_eq!(
+            visuals.widgets.active.fg_stroke.color,
+            Style::WIN2000_WINDOW_TEXT,
+            "strong text remains black and readable in light mode"
+        );
+        assert_eq!(
+            visuals.hyperlink_color,
+            Style::WIN2000_ACTIVE_TITLE,
+            "default brand accent resolves to classic active-title blue"
+        );
+    }
+
+    #[test]
+    fn color_scheme_remaps_explicit_style_token_shapes() {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(egui::pos2(0.0, 0.0), Style::TEXT_DIM);
+        mesh.colored_vertex(egui::pos2(1.0, 0.0), Style::SURFACE);
+        mesh.colored_vertex(egui::pos2(0.0, 1.0), Style::ACCENT);
+
+        let font_id = egui::FontId::new(Style::BODY, egui::FontFamily::Proportional);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "Token text",
+            0.0,
+            egui::TextFormat {
+                font_id,
+                color: Style::TEXT,
+                background: Style::SURFACE,
+                underline: egui::Stroke::new(1.0, Style::BORDER),
+                ..Default::default()
+            },
+        );
+        let ctx = egui::Context::default();
+        let mut galley = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            Style::install(ctx);
+            galley = Some(ctx.fonts(|fonts| fonts.layout_job(job.clone())));
+        });
+        let galley = galley.expect("headless frame laid out test text");
+        let text = egui::epaint::TextShape::new(egui::pos2(0.0, 0.0), galley, Style::TEXT_DIM);
+
+        let mut shapes = vec![
+            egui::epaint::ClippedShape {
+                clip_rect: egui::Rect::EVERYTHING,
+                shape: egui::Shape::Rect(egui::epaint::RectShape::new(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(10.0)),
+                    0.0,
+                    Style::BG,
+                    egui::Stroke::new(1.0, Style::BORDER),
+                    egui::StrokeKind::Outside,
+                )),
+            },
+            egui::epaint::ClippedShape {
+                clip_rect: egui::Rect::EVERYTHING,
+                shape: egui::Shape::Text(text),
+            },
+            egui::epaint::ClippedShape {
+                clip_rect: egui::Rect::EVERYTHING,
+                shape: egui::Shape::Mesh(mesh.into()),
+            },
+        ];
+
+        Style::remap_clipped_shapes_for_color_scheme(&mut shapes, StyleColorScheme::Light);
+        let p = Style::palette_for(StyleColorScheme::Light);
+        match &shapes[0].shape {
+            egui::Shape::Rect(rect) => {
+                assert_eq!(rect.fill, p.bg);
+                assert_eq!(rect.stroke.color, p.border);
+            }
+            other => panic!("unexpected rect shape: {other:?}"),
+        }
+        match &shapes[1].shape {
+            egui::Shape::Text(text) => {
+                assert_eq!(text.fallback_color, p.text_dim);
+                assert_eq!(text.galley.job.sections[0].format.color, p.text);
+                assert_eq!(text.galley.job.sections[0].format.background, p.surface);
+                assert_eq!(text.galley.job.sections[0].format.underline.color, p.border);
+            }
+            other => panic!("unexpected text shape: {other:?}"),
+        }
+        match &shapes[2].shape {
+            egui::Shape::Mesh(mesh) => {
+                assert_eq!(mesh.vertices[0].color, p.text_dim);
+                assert_eq!(mesh.vertices[1].color, p.surface);
+                assert_eq!(mesh.vertices[2].color, Style::WIN2000_ACTIVE_TITLE);
+            }
+            other => panic!("unexpected mesh shape: {other:?}"),
+        }
     }
 
     #[test]
@@ -1120,6 +1730,24 @@ mod tests {
         // to the two anchor densities.
         assert_eq!(Density::for_formfactor(Formfactor::Tablet), Density::Touch);
         assert_eq!(Density::for_formfactor(Formfactor::Laptop), Density::Mouse);
+    }
+
+    #[test]
+    fn layout_profiles_have_locked_order_and_density() {
+        assert_eq!(
+            LayoutProfile::ALL,
+            [
+                LayoutProfile::Workstation,
+                LayoutProfile::Tablet,
+                LayoutProfile::Car
+            ]
+        );
+        assert_eq!(LayoutProfile::default(), LayoutProfile::Workstation);
+        assert_eq!(LayoutProfile::Workstation.density(), Density::Mouse);
+        assert_eq!(LayoutProfile::Tablet.density(), Density::Touch);
+        assert_eq!(LayoutProfile::Car.density(), Density::Touch);
+        assert!(LayoutProfile::Car.is_car());
+        assert_eq!(LayoutProfile::Workstation.short_label(), "WS");
     }
 
     #[test]
@@ -1179,6 +1807,66 @@ mod tests {
         assert_eq!(
             d.style().spacing.interact_size.y,
             mouse.style().spacing.interact_size.y
+        );
+    }
+
+    #[test]
+    fn button_padding_keeps_toolbars_refined_without_shrinking_hit_targets() {
+        assert!(
+            Style::CONTROL_PAD_Y < Style::SP_S,
+            "toolbar buttons should use a slimmer vertical pad than the base gutter"
+        );
+        assert_eq!(
+            Style::CONTROL_PAD_Y,
+            Style::SP_XS,
+            "refined toolbar controls keep to the half-gutter vertical padding"
+        );
+        assert!(
+            Style::TOOLBAR_INSET_Y < Style::SP_XS,
+            "stacked toolbar strips should use a refined vertical inset"
+        );
+        assert_eq!(
+            Style::TOOLBAR_INSET_Y,
+            0.0,
+            "toolbar strip chrome should not add decorative vertical bulk"
+        );
+        assert_eq!(
+            Style::TOOLBAR_CONTROL_H,
+            Style::MENU_TEXT + Style::SP_S + Style::SP_XS * 0.5,
+            "refined toolbar visual controls derive from the menu text rung"
+        );
+        assert!(
+            Style::TOOLBAR_CONTROL_H < Density::Mouse.min_hit_target(),
+            "the refined visual height stays slimmer than the pointer hit-target floor"
+        );
+        assert_eq!(
+            Style::toolbar_margin(),
+            egui::Margin::symmetric(Style::SP_XS as i8, Style::TOOLBAR_INSET_Y as i8)
+        );
+
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, Density::Mouse);
+        assert_eq!(
+            ctx.style().spacing.button_padding.y,
+            Style::CONTROL_PAD_Y,
+            "the shared egui install owns the uniform toolbar/button vertical padding"
+        );
+        assert_eq!(
+            ctx.style().spacing.interact_size.y,
+            Density::Mouse.min_hit_target(),
+            "refined padding must not reduce the minimum pointer hit target"
+        );
+    }
+
+    #[test]
+    fn tooltip_margin_stays_compact_and_uniform() {
+        assert_eq!(
+            Style::tooltip_margin(),
+            egui::Margin::symmetric(Style::SP_S as i8, Style::SP_XS as i8)
+        );
+        assert!(
+            Style::tooltip_margin().top < Style::SP_S as i8,
+            "tooltips should not inherit thick content-card vertical padding"
         );
     }
 

@@ -1,0 +1,17 @@
+---
+# WL-ARCH-006 (U13) — desktop_seat defaults.
+
+# The deployment role that gates the DRM seat (rank 1). `mackesd role-pin` writes
+# /var/lib/mde/role.toml; the seat unit's ExecCondition (`mackesd role-gate
+# --min-rank 1`) then passes.
+desktop_seat_role: workstation
+desktop_seat_role_path: /var/lib/mde/role.toml
+
+# The SEAT-BOOT-1 DRM-seat unit shipped in the bootc/RPM image.
+desktop_seat_unit: mde-shell-egui.service
+
+# The seat's ExecStart binary (DRM-linked at RPM build time).
+desktop_seat_shell_bin: /usr/bin/mde-shell-egui
+
+# Start the seat immediately after converging (vs leaving it for the next boot).
+desktop_seat_start_now: true

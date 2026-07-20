@@ -1505,8 +1505,18 @@ fn publish(persist: &Persist, topic: &str, body: &str) {
     }
 }
 
+fn resolve_default_bus_root(
+    env_root: Option<std::ffi::OsString>,
+    data_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = env_root.filter(|root| !root.is_empty()) {
+        return Some(PathBuf::from(root));
+    }
+    Some(data_dir?.join("mde").join("bus"))
+}
+
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    resolve_default_bus_root(std::env::var_os("MDE_BUS_ROOT"), dirs::data_dir())
 }
 
 fn now_unix_ms() -> i64 {
@@ -1571,6 +1581,21 @@ mod tests {
     }
 
     // ── pure helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn default_bus_root_resolution_honors_mde_bus_root() {
+        assert_eq!(
+            resolve_default_bus_root(
+                Some(std::ffi::OsString::from("/run/mde-bus")),
+                Some(PathBuf::from("/root/.local/share")),
+            ),
+            Some(PathBuf::from("/run/mde-bus")),
+        );
+        assert_eq!(
+            resolve_default_bus_root(None, Some(PathBuf::from("/root/.local/share"))),
+            Some(PathBuf::from("/root/.local/share/mde/bus")),
+        );
+    }
 
     #[test]
     fn dm_key_is_order_independent() {

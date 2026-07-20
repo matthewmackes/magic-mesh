@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One Prometheus counter — monotonically increasing, never resets
 /// (except on process restart).
@@ -140,6 +141,105 @@ pub fn kdc2_router_decision_us() -> Histogram {
         "Mesh-router tick decision time in microseconds",
         &kdc2_router_decision_us_buckets(),
     )
+}
+
+// ─────────────────────────────────────────────────────────
+// WL-RUN-002 — process-wide runtime counters.
+//
+// The metrics_exporter's per-tick snapshot
+// (`workers::metrics_exporter::tick_once`) derives most series from the
+// local store, but three signals are pure in-process runtime EVENTS with
+// no store row to read back: reconcile-loop tick failures, drift rows
+// detected, and in-process Bus publish errors. Each is a process-wide
+// monotonic `AtomicU64` the PRODUCER increments at its real site — the
+// same "increment at the producer, render via the one exporter" shape
+// the worker-restart registry (`workers::WorkerStatusMap`) already uses.
+// `process_counters()` snapshots all three into `mackesd.prom` each tick
+// under stable `mackesd_*_total` names. Counters are cumulative since
+// daemon start (they reset only on process restart, per the [`Counter`]
+// contract).
+// ─────────────────────────────────────────────────────────
+
+/// Cumulative reconcile-loop tick failures since daemon start —
+/// incremented at the `Err` arm of `worker::run_loop`. Rendered as
+/// `mackesd_reconcile_failures_total`.
+static RECONCILE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative drift rows detected by the reconcile loop since daemon
+/// start — incremented for every row a tick's `reconcile::plan_tick`
+/// classifies (auto-repair + inbox). Rendered as
+/// `mackesd_drift_events_total`.
+static DRIFT_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative in-process Bus publish errors since daemon start — the
+/// swallowed serialize/write failures in `bus_publish`. Rendered as
+/// `mackesd_bus_publish_errors_total`.
+static BUS_PUBLISH_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one reconcile-loop tick failure. Called from the reconcile
+/// loop's failure path (`worker::run_loop`'s `Err` arm).
+pub fn record_reconcile_failure() {
+    RECONCILE_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record `n` drift rows detected in one reconcile tick. No-op for `0`
+/// so a clean tick doesn't touch the atomic.
+pub fn record_drift_events(n: u64) {
+    if n > 0 {
+        DRIFT_EVENTS.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Record one in-process Bus publish error — a swallowed serialize or
+/// store-write failure on the `bus_publish` path.
+pub fn record_bus_publish_error() {
+    BUS_PUBLISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Current cumulative reconcile-loop failure count.
+#[must_use]
+pub fn reconcile_failures() -> u64 {
+    RECONCILE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Current cumulative drift-event count.
+#[must_use]
+pub fn drift_events() -> u64 {
+    DRIFT_EVENTS.load(Ordering::Relaxed)
+}
+
+/// Current cumulative Bus publish error count.
+#[must_use]
+pub fn bus_publish_errors() -> u64 {
+    BUS_PUBLISH_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Snapshot the process-wide runtime counters as Prometheus [`Counter`]s
+/// for the textfile exporter. Called each tick by
+/// `workers::metrics_exporter::tick_once`, which appends these to the
+/// store-derived series before writing `mackesd.prom`.
+#[must_use]
+pub fn process_counters() -> Vec<Counter> {
+    vec![
+        Counter {
+            name: "mackesd_reconcile_failures_total",
+            help: "Cumulative reconcile-loop tick failures since daemon start",
+            value: reconcile_failures(),
+            labels: BTreeMap::new(),
+        },
+        Counter {
+            name: "mackesd_drift_events_total",
+            help: "Cumulative drift rows detected by the reconcile loop since daemon start",
+            value: drift_events(),
+            labels: BTreeMap::new(),
+        },
+        Counter {
+            name: "mackesd_bus_publish_errors_total",
+            help: "Cumulative in-process Bus publish errors since daemon start",
+            value: bus_publish_errors(),
+            labels: BTreeMap::new(),
+        },
+    ]
 }
 
 /// Render a counter's `# HELP`/`# TYPE` header rows. Emitted at most
@@ -462,5 +562,55 @@ mod tests {
         );
         assert!(content.contains(r#"mackesd_worker_restarts_total{worker="chat"} 2"#));
         assert!(content.contains(r#"mackesd_worker_restarts_total{worker="heartbeat"} 5"#));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // WL-RUN-002 — process-wide runtime counters (reconcile
+    // failures / drift events / Bus publish errors).
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn reconcile_failure_increments_process_counter() {
+        // Acceptance: a reconcile-loop failure — the `Err` arm of
+        // `worker::run_loop` calls `record_reconcile_failure()` —
+        // bumps the cumulative `mackesd_reconcile_failures_total`
+        // counter the exporter renders. The registry is a process-wide
+        // atomic, so assert the DELTA around the call (no other producer
+        // touches it in the test binary) rather than an absolute value.
+        let before = reconcile_failures();
+        record_reconcile_failure();
+        assert_eq!(reconcile_failures(), before + 1);
+
+        // The bump reaches the exporter's counter set under the stable
+        // `mackesd_*_total` name, and renders as a Prometheus counter.
+        let counters = process_counters();
+        let c = counters
+            .iter()
+            .find(|c| c.name == "mackesd_reconcile_failures_total")
+            .expect("reconcile-failures counter present in the exported set");
+        assert!(c.value >= before + 1);
+        let mut out = String::new();
+        render_counter(&mut out, c);
+        assert!(out.contains("# TYPE mackesd_reconcile_failures_total counter"));
+    }
+
+    #[test]
+    fn drift_and_bus_error_counters_increment_and_render() {
+        // The sibling producers (`record_drift_events` for the
+        // reconcile loop's classified drift rows, `record_bus_publish_error`
+        // for a swallowed `bus_publish` write) increment their own
+        // cumulative counters and land in the same exported set.
+        let drift_before = drift_events();
+        record_drift_events(3);
+        record_drift_events(0); // no-op for a clean tick
+        assert_eq!(drift_events(), drift_before + 3);
+
+        let bus_before = bus_publish_errors();
+        record_bus_publish_error();
+        assert_eq!(bus_publish_errors(), bus_before + 1);
+
+        let names: Vec<&str> = process_counters().iter().map(|c| c.name).collect();
+        assert!(names.contains(&"mackesd_drift_events_total"));
+        assert!(names.contains(&"mackesd_bus_publish_errors_total"));
     }
 }

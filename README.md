@@ -1,19 +1,21 @@
 <p align="center">
-  <img src="assets/brand/logo-lockup.png" alt="MCNF — Mackes Cosmic Nebula Fedora, Network Mesh Platform" width="340">
+  <img src="assets/brand/logo-lockup.png" alt="Construct — Software Studio: MDE" width="340">
 </p>
 
-# MCNF / magic-mesh
+# Construct
+
+Repository and package lineage: MCNF / magic-mesh.
 
 **A secure, no-fixed-center workgroup mesh — and an egui-native, DRM-native
 thin-client VDI desktop OS — on stock Fedora.**
 
-MCNF turns a small workgroup of machines into one private, encrypted mesh with
+Construct turns a small workgroup of machines into one private, encrypted mesh with
 **no central server**: any node can author fleet policy, every node enforces it
 itself, and the whole thing runs over a [Nebula](https://github.com/slackhq/nebula)
 overlay with [etcd](https://etcd.io/) for coordination and
 [Syncthing](https://syncthing.net/) replicating the shared disk.
 
-On top of that mesh sits the **desktop**. Since the **E12 "Quasar" pivot**, MCNF
+On top of that mesh sits the **desktop**. Since the **E12 "Construct" pivot**, MCNF
 is **not** a general desktop with a compositor and native apps. It is a single
 **egui shell that owns the DRM/KMS seat directly** — a winit-less smithay
 DRM/GBM + libinput runner, **no Wayland compositor**. The desktop you actually
@@ -26,7 +28,7 @@ Editor, Bookmarks, Mesh View, Chat) are **panels inside the one shell**.
 > Split out of the [MackesWorkstation](https://github.com/matthewmackes/MackesWorkstation)
 > monorepo (the labwc/Windows-era *MackesDE* desktop, now end-of-life) by the
 > **E11 "MCNF" pivot**, then re-based onto the egui/DRM/VDI stack by **E12
-> "Quasar"**. The design docs for the current stack live in
+> "Construct"**. The design docs for the current stack live in
 > [`docs/design/`](docs/design/).
 
 ---
@@ -82,7 +84,7 @@ build**. There are **two roles**, and a box is re-roled without a reinstall:
 | Role | What it is | Typical host |
 |---|---|---|
 | **Lighthouse** (rank 0) | The always-on relay + Nebula CA/signer + leader control plane + media server. No local display. | a VPS / always-on box |
-| **Workstation** (rank 1) | The full Quasar egui thin client — brokers & displays VM desktops, runs libvirt/QEMU-KVM + Podman. | a daily-driver laptop |
+| **Workstation** (rank 1) | The full Construct egui thin client — brokers & displays VM desktops, runs libvirt/QEMU-KVM + Podman. | a daily-driver laptop |
 
 A **headless machine is a Workstation without a local display** (daemon stack
 only, no egui seat, serving VMs/containers to the mesh). "Headless" is a
@@ -246,15 +248,11 @@ multi-name reality reads as intentional rather than accidental:
   in `AI_GOVERNANCE.md` and this repo's front-door docs.
 - **magic-mesh** — the infra/mesh name and the stable identifier for the package,
   dnf repo, release tags (`magic-mesh-v<version>`), and `org.magicmesh.*` IDs.
-- **MDE Quazar / Quasar** — the 12.x desktop **codename**. ⚠️ **The exact
-  spelling is an open operator decision.** The operator-locked branding
-  (`docs/design/quasar-branding.md`, QBRAND #9/#10) sets the canonical spelling
-  to **"Quazar"** (Z) and the user-facing name to *"MDE Quazar — Mackes Display
-  Environment"*; the brand crate ships that, but a large majority of shipped UI
-  strings, design docs, and the `magic-mesh-v12.0.0` release still use the older
-  **"Quasar"** (S). The consolidation (and how far it extends) is queued in
-  [`docs/NEEDS-OPERATOR.md`](docs/NEEDS-OPERATOR.md) — **do not mass-rename either
-  way until it is decided.**
+- **Construct** — the visible product name shown in About, splash, Browser
+  chrome, packaging entries, and other user-facing surfaces. The 12.x desktop
+  codename is now aligned with the same Construct identity.
+  `magic-mesh` remains the package, repo, release-tag, and infrastructure
+  identifier.
 - Crate prefixes: `mde-*` (desktop / surfaces), `mackes-*` / `mackesd`
   (mesh control plane), `magic-*` (fleet / infra).
 

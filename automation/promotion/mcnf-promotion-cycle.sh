@@ -23,6 +23,7 @@ EAGLE_USER="${MCNF_EAGLE_USER:-mm}"
 EAGLE_PASS_FILE="${MCNF_EAGLE_PASS_FILE:-/root/.mcnf-xapi-cred}"
 SSH_KEY="${MCNF_SSH_KEY:-/root/.ssh/id_ed25519}"
 DECLARATION_FILE="${MCNF_RELEASE_DECLARATION:-$ROOT/docs/ops/production-release-declaration.md}"
+WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -72,53 +73,58 @@ record_gate() {
 
 worklist_open_count() {
   awk '
-    /^[[:space:]]*- \[[^]]+\]/ {
-      marker = substr($0, index($0, "[") + 1, index($0, "]") - index($0, "[") - 1)
-      if (marker == " " || marker == ">" || marker == "!" || marker == "→" || marker == "~" || marker == "◐") {
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == "Remaining") {
         count++
       }
     }
     END { print count + 0 }
-  ' "$ROOT/docs/WORKLIST.md"
+  ' "$WORKLIST"
 }
 
 worklist_marker_count() {
   local want="$1"
   awk -v want="$want" '
-    /^[[:space:]]*- \[[^]]+\]/ {
-      marker = substr($0, index($0, "[") + 1, index($0, "]") - index($0, "[") - 1)
-      if (marker == want) {
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == want) {
         count++
       }
     }
     END { print count + 0 }
-  ' "$ROOT/docs/WORKLIST.md"
+  ' "$WORKLIST"
 }
 
 worklist_active_breakdown() {
-  printf 'open=%s in_progress=%s blocked=%s delegated=%s partial=%s review=%s\n' \
-    "$(worklist_marker_count ' ')" \
-    "$(worklist_marker_count '>')" \
-    "$(worklist_marker_count '!')" \
-    "$(worklist_marker_count '→')" \
-    "$(worklist_marker_count '~')" \
-    "$(worklist_marker_count '◐')"
+  printf 'remaining=%s blocked=%s needs_clarification=%s\n' \
+    "$(worklist_marker_count 'Remaining')" \
+    "$(worklist_marker_count 'Blocked')" \
+    "$(worklist_marker_count 'Needs clarification')"
 }
 
 worklist_next_candidates() {
   local limit="${1:-8}"
   awk -v limit="$limit" '
-    /^[[:space:]]*- \[[ >]\][[:space:]]+\*\*[A-Za-z0-9._-]+[: ]/ {
-      line = $0
-      sub(/^[[:space:]]*- \[[ >]\][[:space:]]+\*\*/, "", line)
-      sub(/\*\*.*/, "", line)
-      print line
-      count++
-      if (count >= limit) {
-        exit
+    /^### WL-[A-Z0-9-]+ - / {
+      item = $0
+      sub(/^### /, "", item)
+      next
+    }
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == "Remaining" && item != "") {
+        print item
+        count++
+        if (count >= limit) {
+          exit
+        }
       }
     }
-  ' "$ROOT/docs/WORKLIST.md"
+  ' "$WORKLIST"
 }
 
 worklist_farm_job_count() {

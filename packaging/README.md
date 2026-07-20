@@ -3,10 +3,12 @@
 Top-level home for everything the RPM/ISO installs that isn't a crate:
 desktop entries, autostart files, (future) systemd units, kickstarts,
 and .repo files. The PKG epic's cargo-generate-rpm metadata maps these
-into the filesystem; the hicolor icon set lives in `../assets/icons/`.
+into the filesystem; the Construct hicolor app icon lives in `../assets/brand/`,
+and the default YAMIS platform icon theme lives in `../assets/icons/YAMIS/`.
 
 - `applications/` → `/usr/share/applications/` (app launchers; Icon=magic-mesh
-  resolves via the hicolor set)
+  resolves via the Construct hicolor app icon, while toolkit/default icons resolve
+  through `/usr/share/icons/YAMIS`)
 - `autostart/`    → `/etc/xdg/autostart/` (the SVC-4 voice agent autostart —
   Cosmic honors XDG autostart)
 - `systemd/`      → `/usr/lib/systemd/system/` (ENT-6: `mackesd.service`,
@@ -23,7 +25,7 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   unit + preset + `build-image.sh` (typed-gated) + `verify-image.sh` (static
   image acceptance); doctrine + verification status in `bootc/README.md`.
 - `kickstart/`    → the install ISO kickstarts + boot-menu profile snippets.
-  `magic-on-quasar.ks` (OW-12) is the current **Quasar Workstation** kickstart:
+  `magic-on-quasar.ks` (OW-12) is the current **Construct Workstation** kickstart:
   a bootc/ostree-native installer that `ostreecontainer`-deploys the immutable
   bootc WS image (`bootc/`, so the magic-mesh RPM + the egui DRM-seat unit +
   QC-1 libvirt/QEMU-KVM/OVN host bits arrive baked in — it references that

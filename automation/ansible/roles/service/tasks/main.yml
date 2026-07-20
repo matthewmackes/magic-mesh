@@ -1,0 +1,63 @@
+---
+# WL-ARCH-006 (U13) — run a headless systemd service on a Service-VM.
+#
+# A Service-VM delivers a headless daemon exposed on the mesh (no seat). The
+# operator's WorkloadSpec form (or the reconcile that renders it) supplies the
+# unit spec(s) as the `service_units` variable; this role templates each into a
+# system unit, reloads systemd, and enables + starts it. Empty by default — an
+# undeclared Service-VM converges to "mackesd baseline only" (the base cloud_vm
+# role) and does nothing here, honestly (no fabricated units).
+
+- name: Assert each declared unit has the required keys (name + exec_start)
+  ansible.builtin.assert:
+    that:
+      - item.name is defined and item.name | length > 0
+      - item.exec_start is defined and item.exec_start | length > 0
+    fail_msg: "service_units entries require both `name` and `exec_start`"
+    quiet: true
+  loop: "{{ service_units }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+
+- name: Ensure the service drop-in dir exists
+  ansible.builtin.file:
+    path: "{{ service_dropin_dir }}"
+    state: directory
+    mode: "0755"
+  when: service_units | length > 0
+
+# Secrets ride the mde-seal / age store (decided-stack #8 — NO Ansible Vault): a
+# unit that declares `secret: <store-name>` gets a 0600 EnvironmentFile with the
+# unsealed value, resolved through the shared `mde_seal` lookup at run time.
+- name: Write age-sealed EnvironmentFiles for units that declare a secret (mde-seal, no Vault)
+  ansible.builtin.copy:
+    dest: "{{ service_dropin_dir }}/{{ item.name }}.env"
+    content: "{{ item.env_secret_var | default('SECRET') }}={{ lookup('mde_seal', item.secret) }}\n"
+    mode: "0600"
+  loop: "{{ service_units | selectattr('secret', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+
+- name: Template each headless service unit
+  ansible.builtin.template:
+    src: service.j2
+    dest: "/etc/systemd/system/{{ item.name }}.service"
+    mode: "0644"
+  loop: "{{ service_units }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload systemd
+
+# Materialise any just-written unit files before we enable/start them.
+- name: Apply pending unit-file changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable + start each headless service
+  ansible.builtin.systemd:
+    name: "{{ item.name }}.service"
+    enabled: true
+    state: started
+  loop: "{{ service_units }}"
+  loop_control:
+    label: "{{ item.name }}"

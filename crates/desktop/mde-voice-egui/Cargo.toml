@@ -1,4 +1,4 @@
-# MCNF E12 "Quasar" — `mde-voice-egui`: the egui Voice/SIP surface (E12-11).
+# MCNF E12 "Construct" — `mde-voice-egui`: the egui Voice/SIP surface (E12-11).
 #
 # A standalone eframe surface on the shared `mde-egui` harness that REUSES the
 # shipped pure-Rust SIP stack in `mde-voice-hud` — its register/call state
@@ -13,7 +13,7 @@
 # no mesh-substrate crate, so the substrate stays headless-capable.
 [package]
 name        = "mde-voice-egui"
-description = "MCNF E12 Quasar — the egui-native Voice/SIP surface. Reuses mde-voice-hud's shipped pure-Rust SIP register/call state machine (REGISTER + INVITE/ACK/BYE + inbound answer/decline) and RTP/G.711 media engine to register, dial a mesh peer or number, and take an inbound call, rendered through the shared mde-egui Style. The blocking/!Send SIP work runs on worker threads; the render-agnostic view-model is unit-tested without a socket or a sound device."
+description = "MCNF E12 Construct — the egui-native Voice/SIP surface. Reuses mde-voice-hud's shipped pure-Rust SIP register/call state machine (REGISTER + INVITE/ACK/BYE + inbound answer/decline) and RTP/G.711 media engine to register, dial a mesh peer or number, and take an inbound call, rendered through the shared mde-egui Style. The blocking/!Send SIP work runs on worker threads; the render-agnostic view-model is unit-tested without a socket or a sound device."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

@@ -1,7 +1,7 @@
 //! KDC-MESH-9 — the mesh-fanout endpoint (design #8).
 //!
 //! Stock KDE Connect lists every host as a separate device (the Android-side
-//! constraint, `docs/design/kdc-mesh.md`). Lock #8 realizes the "one **Quasar
+//! constraint, `docs/design/kdc-mesh.md`). Lock #8 realizes the "one **Construct
 //! Mesh** device" experience **host-side**: a single **designated endpoint** node
 //! advertises its KDE Connect identity as [`MESH_ENDPOINT_NAME`] — the one device
 //! the user drives for the *follow-everywhere* features (#6/#10) — and a
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// The single device name a designated endpoint advertises to stock KDE Connect
 /// (#8) — the one "device" the user interacts with for follow-everywhere actions.
-pub const MESH_ENDPOINT_NAME: &str = "Quasar Mesh";
+pub const MESH_ENDPOINT_NAME: &str = "Construct Mesh";
 
 /// The replicated directory holding the fanout request + response rows.
 #[must_use]
@@ -91,7 +91,7 @@ pub fn endpoint_device_name(is_endpoint: bool, fallback: &str) -> String {
 ///
 /// The v1 set is the two follow-everywhere actions already wired on the receiving
 /// node — a phone clipboard copy and a find-my-device ring — so a copy / ring on
-/// the single "Quasar Mesh" device reaches EVERY desktop, not just the endpoint.
+/// the single "Construct Mesh" device reaches EVERY desktop, not just the endpoint.
 /// Media control (#10) lands with KDC-MESH-6; a new variant slots in here without
 /// touching the substrate shape (forward-compatible serde tag).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,7 +362,8 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_device_name_is_quasar_mesh_only_for_the_endpoint() {
+    fn endpoint_device_name_is_construct_mesh_only_for_the_endpoint() {
+        assert_eq!(MESH_ENDPOINT_NAME, "Construct Mesh");
         assert_eq!(
             endpoint_device_name(true, "MDE-MESH eagle"),
             MESH_ENDPOINT_NAME

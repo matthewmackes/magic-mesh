@@ -1,4 +1,4 @@
-# OW-12 — the Magic-on-Quasar Workstation ISO kickstart. A bootc/ostree-native
+# OW-12 — the Magic-on-Construct Workstation ISO kickstart. A bootc/ostree-native
 # installer for the ONE immutable MCNF image (E12-13, §5 delivery lock): the
 # egui-DRM shell Workstation + mackesd + Podman + Nebula + the QC-1
 # libvirt/QEMU-KVM/OVN host bits, with the desktop seat gated on the role flag
@@ -8,7 +8,7 @@
 # Supersedes the heritage magic-on-cosmic.ks, which installed the RETIRED
 # @^fedora-cosmic-desktop-environment via the package lane. This kickstart does
 # NOT %packages-install anything: it deploys the pre-built **bootc Workstation
-# image** with `ostreecontainer`, so the magic-mesh RPM, the Quasar DRM-seat unit
+# image** with `ostreecontainer`, so the magic-mesh RPM, the Construct DRM-seat unit
 # (packaging/bootc/units/mde-shell-egui.service) + its preset
 # (packaging/bootc/system-preset/45-mcnf-quasar.preset), the host virt bits and
 # graphical.target default ALL arrive baked in from the image
@@ -47,9 +47,9 @@ rootpw --lock
 # reconciliation, 2026-07-11). The prior `--disabled` here cited a 2026-06-20
 # "disabled" fleet standard as docs/THREAT_MODEL.md §5 — but §5 is "Out of scope /
 # non-goals" (nothing about SELinux) and that standard is SUPERSEDED for
-# Quasar-cloud nodes: THREAT_MODEL §3.2 (platform note) + §4.5 both state "shipped
+# Construct-cloud nodes: THREAT_MODEL §3.2 (platform note) + §4.5 both state "shipped
 # nodes target SELinux Enforcing and load the MCNF policy modules through the
-# bounded boot-time policy oneshot." This kickstart installs QC (Quasar-cloud)
+# bounded boot-time policy oneshot." This kickstart installs QC (Construct-cloud)
 # nodes, so it must NOT leave SELinux off — doing so silently defeated the whole
 # Enforcing stack the RPM ships:
 #   - The RPM SHIPS + ENABLES that stack: the SELINUX-1/QC-22 CIL policy modules +
@@ -80,7 +80,7 @@ autopart --type=plain --nohome
 
 # ── Deploy the ONE immutable bootc Workstation image (§5) ─────────────────────
 # NOT a %packages install: `ostreecontainer` lays the pre-built bootc image down
-# whole, bringing the magic-mesh RPM + the Quasar DRM-seat unit + its preset +
+# whole, bringing the magic-mesh RPM + the Construct DRM-seat unit + its preset +
 # libvirt/QEMU-KVM/OVN + the graphical.target default already materialized by the
 # Containerfile's `systemctl enable` / `set-default`.
 #
@@ -162,11 +162,11 @@ else
   systemctl set-default graphical.target || true
 fi
 
-# First-boot hint (Quasar wording — the egui shell, not the retired Cosmic chooser).
+# First-boot hint (Construct wording — the egui shell, not the retired Cosmic chooser).
 SEATNOTE=""
 [ "$HEADLESS" = 1 ] && SEATNOTE=" (headless — no seat)"
 cat > /etc/magic-mesh/first-boot.txt <<HINT
-MCNF Quasar is installed as role: ${ROLE}${SEATNOTE}.
+MCNF Construct is installed as role: ${ROLE}${SEATNOTE}.
 
 A fresh node is UNPINNED until a role lands in /var/lib/mde/role.toml; this
 install pinned "${ROLE}" so mackesd starts and, on a Workstation seat, the egui

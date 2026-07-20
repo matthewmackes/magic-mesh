@@ -1,0 +1,16 @@
+# tofu state holds provisioned domain ids + the mde-seal-unsealed join token
+# (the `external` data-source result) — never commit it; the etcd state plane
+# (backend.tf) is the durable, DR-sealed record.
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+tfplan
+crash.log
+# The per-mesh backend address is generated (gen-backend-config.sh), never committed.
+*.backend.hcl
+# Real per-deployment VM sets carry site-specific hostnames/sizes — only the
+# *.example template + README are tracked.
+terraform.tfvars
+!terraform.tfvars.example
+# Generated env (source ./env.sh) — never committed.
+env.sh

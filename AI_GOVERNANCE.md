@@ -8,8 +8,10 @@
 > elsewhere, the **newer lock wins**; authority ranks **Memory > this file > design
 > docs > worklist body**.
 >
-> **Series (E12 pivot, 2026-06-30; design revised same day):** the **12.0 series is
-> codenamed "Quasar"**, surfaced as `MCNF 12.0 "Quasar"` in the About/greeter. The
+> **Series (E12 pivot, 2026-06-30; design revised same day; rebranded 2026-07-18):**
+> the **12.0 series is codenamed "Construct"**, and the visible product name in
+> About, splash, Browser chrome, packaging entries, and other user-facing surfaces
+> is **Construct**. The
 > package + infra id + GitHub repo **stay `magic-mesh`** so the live-node upgrade
 > path is unbroken. Internal identifiers (`mackesd`, `mde-*`, `org.magicmesh.*`,
 > `magic-mesh.repo`, `magic-mesh-v*` tags, the `magic-mesh` icon name) are
@@ -19,7 +21,7 @@
 > `docs/design/quasar-vdi-desktop.md`.
 
 This rewrites the 11.x/Cosmic-era governance for the **E12 pivot** (the 12.0
-series, "Quasar"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
+series, "Construct"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
 Cosmic; E12 makes the desktop a first-class, mesh-native part of the platform —
 every surface **egui**. The **revised** E12 (50-Q survey, 2026-06-30) is a
 **thin-client VDI** desktop: a single egui shell **owns the DRM seat directly (no
@@ -64,7 +66,7 @@ master rule.)*
 - **Public boundary — 3 tiers (CONNECT):** Public (Nebula/4242 + SSH/22 +
   enroll/4243) · Mesh · Ingress-exposed (lighthouse reverse-proxy). Posture is
   **mesh-allow / public-deny**, drift-corrected firewalld on every node.
-- **QUASAR-CLOUD additions (2026-07-03, `docs/design/quasar-cloud.md`):** the
+- **CONSTRUCT-CLOUD additions (2026-07-03, `docs/design/quasar-cloud.md`):** the
   mesh etcd also serves **tooz** coordination for the OpenStack services;
   **Designate becomes the mesh name service**, fed (and re-seedable) by the
   etcd peer directory. Nebula remains the substrate — Neutron/OVN rides on top
@@ -86,7 +88,7 @@ values, asserted by config tests: **Ed25519** node identity · **AES-256-GCM** /
 **ChaCha20-Poly1305** · **XChaCha20-Poly1305** CA backup · **RSA-4096** KDC device
 identity. No OpenSSL — **rustls** throughout. The loopback debug-SSH
 (NET-INTROSPECT) and documented MD5 interop exceptions (thumbnail cache, Subsonic
-auth, SIP digest) stand as recorded. **Clarified 2026-07-03 (QUASAR-CLOUD Q13):
+auth, SIP digest) stand as recorded. **Clarified 2026-07-03 (CONSTRUCT-CLOUD Q13):
 the no-OpenSSL/rustls lock governs MCNF's own code; hosted workloads (e.g. the
 Kolla OpenStack containers) bring their own crypto stacks.** The OpenStack APIs
 bind **plaintext to the Nebula interface only** — the overlay is their transport
@@ -105,9 +107,20 @@ security (Q23).
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use
   the shared `Style`. *(Deliberate §0-Simple lever: there is **no** raw-literal /
   Carbon-token lint gate — the shared `Style` module is the discipline.)*
-- **Motion** uses egui's built-in animation (`animate_bool` / `ctx` animation)
-  driven by a small shared duration+easing table in `mde-egui`. There is no
-  bespoke motion module and no motion lint gate.
+- **Browser workspace exception (operator 2026-07-15).** Browser chrome,
+  Bookmarks, engine controls, tabs, toolbar, menus, and Browser page/action
+  surfaces are **not** constrained by Carbon wording and should apply Material
+  Design 3 principles locally: adaptive layouts, clear top-app-bar/tab hierarchy,
+  tonal surfaces/elevation, explicit interaction states, accessible focus/contrast,
+  and purposeful motion. This is a Browser-only design direction, not permission
+  to migrate unrelated shell/workspace surfaces away from `mde-egui::Style`.
+- **Motion** is governed by the operator-locked **MOTION-DRM** epic
+  (2026-07-15). The old `animate_bool`-only guidance is superseded: `mde-egui`
+  may own a small centralized, DRM-aware motion subsystem with shared durations,
+  easing, spring presets, animated values, lifecycle phases, reduced-motion
+  handling, and repaint scheduling for the production egui_glow/EGL/GBM/DRM path.
+  Compositor-provided animation, Wayland/Xorg dependencies, a renderer rewrite,
+  and scattered per-widget timing literals remain out of bounds.
 - **Accessibility is deferred** for the 12.0 cutover (egui/eframe carries an
   accesskit path to wire later). A11y is a post-cutover epic, not a Definition-of-
   Done gate for E12 surfaces.
@@ -120,7 +133,7 @@ security (Q23).
 > The forked-`cosmic-comp` desktop is **retired** before any code landed; MCNF does
 > **not** fork or ship a Wayland compositor.
 
-> **REVISED 2026-07-03 — QUASAR-CLOUD (90-Q `/plan` survey →
+> **REVISED 2026-07-03 — CONSTRUCT-CLOUD (90-Q `/plan` survey →
 > `docs/design/quasar-cloud.md`). The VM plane is now OpenStack.**
 > **Nova + Placement replace the mesh-native VM scheduler** (the
 > `mesh-virt-management.md` "mesh-native #5" lock is superseded); the hypervisor
@@ -135,6 +148,15 @@ security (Q23).
 > console retires at cutover**; the Podman container plane, ISO installer, and
 > build farm are unchanged. Old-stack code is **deleted on per-node hard
 > cutover** (§7).
+
+> **NEWER LOCK 2026-07-18 — CONSTRUCT-CLOUD provider-neutral runway.** The
+> OpenStack/Kolla/Nova/Heat implementation above remains a valid installed
+> backend while replacement work is underway, but it is no longer the product
+> architecture target. New Construct Cloud work must move shell surfaces, Bus
+> verbs, persisted mirrors, docs, and operator copy toward provider-neutral
+> contracts where OpenStack is only one adapter. Do not delete or disable the
+> current backend before a provider-neutral seam, compatibility tests, and a
+> replacement-provider proof can carry list/launch/lifecycle behavior.
 
 - **The host is an egui thin client, not a general desktop.** The whole UI is a
   single **egui shell that owns the DRM/KMS seat directly** (the §4 `mde-egui` smithay
@@ -235,7 +257,7 @@ revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
 > operators** (extends ENT-12), guests stay **default-deny inbound**, and
 > per-service ACLs are revisited if the envelope grows materially.
 
-> **QUASAR-CLOUD revision (2026-07-03 — `docs/design/quasar-cloud.md`).**
+> **CONSTRUCT-CLOUD revision (2026-07-03 — `docs/design/quasar-cloud.md`).**
 > **Cloud instances are "inside" without certs:** they live on one flat
 > Neutron/OVN provider network bridged into the mesh, with **default-open
 > security groups** — no per-instance Nebula certs (the VDI dual-homing
@@ -261,7 +283,7 @@ the renderers-not-authorities doctrine are unchanged. **E12 adds** the desktop
 plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 (etcd/Syncthing-backed).
 
-> **QUASAR-CLOUD revision (2026-07-03).** **The Controller plane BECOMES the
+> **CONSTRUCT-CLOUD revision (2026-07-03).** **The Controller plane BECOMES the
 > Cloud plane** — OpenStack is now the control brain this plane described:
 > instances · volumes+snapshots · images · networks+stacks, self-served by
 > **every mesh member** (invisible SSO via the Keystone identity bridge;
@@ -272,6 +294,13 @@ plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 > RabbitMQ is OpenStack-internal RPC only (§2 untouched). One amendment:
 > **hard per-user quotas** are enforced in the cloud plane (see §8) — the
 > documented exception to "no RBAC".
+
+> **CONSTRUCT-CLOUD provider-neutral amendment (2026-07-18).** The Cloud plane
+> remains the Controller plane, but product-facing architecture must be Construct
+> Cloud contracts first and provider adapters second. OpenStack-specific API,
+> identity, orchestration, notification, and mirror names are backend details;
+> user-facing surfaces and new contracts should not require those names except
+> in explicit diagnostics for the installed OpenStack adapter.
 
 ## §10 — Build & development environment (canonical — do not rediscover)
 
@@ -313,6 +342,13 @@ XEN-194 → `mcnf-build-53` → `.170`). Run `./install-helpers/farm-topology.sh
 at the start of every run for a **verified** utilization table — it probes all 4
 nodes and **fails if one is missing** (XEN-194/.170 sat idle a whole session once,
 under a stale 3-node roster). Never hardcode the node list or chart from memory.
+Stale `10.0.0.x` farm pins are invalid; the build VMs live on the `172.20.0.x`
+lanes above. Browser/CEF live probes are not generic farm assumptions: use the
+packaged `/opt/mde/cef` runtime only where installation has staged it, or the
+known warm `.50` bundle at `$HOME/mde-cef-active`. Cold Servo/browser test
+builds can exhaust small-node slot disks through Rust incremental caches; put
+those long-pole jobs on BigBoy and use `CARGO_INCREMENTAL=0` after any ENOSPC
+failure.
 
 ---
 

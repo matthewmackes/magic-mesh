@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: app_forward
+  namespace: magic_mesh
+  author: magic-mesh
+  description: >-
+    VDI app-mode forwarding on an App-only-VM (WL-ARCH-006 U13). Marks the VM as an
+    app-mode provider and declares/installs its forwarded app catalog; the existing
+    mackesd session_broker (a universal rank-0 worker) is the forwarding transport.
+  license: proprietary
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+dependencies: []

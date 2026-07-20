@@ -6,6 +6,11 @@ live audit → MEDIA-LIGHTHOUSE verify → fd/EMFILE soak.
 The loop repeats until the worklist is clear, all gates are green, and the
 operator declares the release complete.
 
+Rollback (the inverse: re-point the channel to the previous NEVRA and downgrade
+the fleet) is a separate, typed-confirm path documented in
+[`docs/RELEASE-ROLLBACK.md`](../RELEASE-ROLLBACK.md)
+(`automation/promotion/mcnf-channel-rollback.sh`).
+
 Entrypoint:
 
 ```bash
@@ -82,13 +87,13 @@ bytes, built 13:19 EDT, sha256
 carries the Inter platform font, the bottom Windows-style notification rail, the
 session rail, the bounded Caddy/SELinux install behavior, the fd-budget guards,
 the packaged `mackesd` stop-policy drop-in, and the `%post` cleanup for stale
-local `mde-shell.service` Quasar units. It passed L1 clean install (6 passed),
+local `mde-shell.service` Construct units. It passed L1 clean install (6 passed),
 L2 mini-mesh (15 passed), L3 stability/fd budget (14 passed), and L4 staged
 lighthouse replacement (33 passed). It promoted to Eagle and both DO lighthouses
 by force-replacing the same NEVRA package, then passed post-roll `live-smoke`,
 `live-audit`, and the one-hour fd/EMFILE soak. Eagle needed the expected
 seat-owner correction after the RPM
-replacement stopped Quasar: Cosmic was terminated, `mde-shell-egui.service` was
+replacement stopped Construct: Cosmic was terminated, `mde-shell-egui.service` was
 started, `/dev/dri/card1` and `/dev/tty1` were owned by `/usr/bin/mde-shell-egui`,
 and the stale local `/etc/systemd/system/mde-shell.service` stayed absent. The
 soak (`automation/promotion/live-fd-soak.sh`, start

@@ -28,6 +28,9 @@ use mde_egui::egui::{self, Button, RichText, Ui};
 use mde_egui::Style;
 
 use crate::menu_bar::{Gate, MenuAction, MenuContext, OVERFLOW_GLYPH};
+use crate::tooltip::editor_menu_button;
+
+const EDITOR_TOOLBAR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 /// The Word-97 zoom steps the dropdown offers.
 pub const ZOOM_STEPS: [u16; 6] = [50, 75, 100, 125, 150, 200];
@@ -237,13 +240,13 @@ pub fn show(ui: &mut Ui, cx: &MenuContext, compact: bool) -> Option<MenuAction> 
 /// greyed by its context gate exactly like its menu twin. Returns its action if
 /// the operator clicked it this frame.
 fn tool_button(ui: &mut Ui, cx: &MenuContext, button: &ToolButton) -> Option<MenuAction> {
-    let resp = ui
-        .add_enabled(
+    let resp = editor_toolbar_hover_text(
+        ui.add_enabled(
             button.gate.enabled(cx),
             Button::new(RichText::new(button.glyph).size(Style::BODY)),
-        )
-        .on_hover_text(button.name)
-        .on_disabled_hover_text(button.name);
+        ),
+        button.name,
+    );
     resp.clicked().then_some(button.action)
 }
 
@@ -252,13 +255,13 @@ fn tool_button(ui: &mut Ui, cx: &MenuContext, button: &ToolButton) -> Option<Men
 /// like a command button. Returns its action if the operator clicked it this frame.
 fn toggle_button(ui: &mut Ui, cx: &MenuContext, button: &ToolButton) -> Option<MenuAction> {
     let on = toggle_checked(cx, button.action);
-    let resp = ui
-        .add_enabled(
+    let resp = editor_toolbar_hover_text(
+        ui.add_enabled(
             button.gate.enabled(cx),
             egui::SelectableLabel::new(on, RichText::new(button.glyph).size(Style::BODY)),
-        )
-        .on_hover_text(button.name)
-        .on_disabled_hover_text(button.name);
+        ),
+        button.name,
+    );
     resp.clicked().then_some(button.action)
 }
 
@@ -281,7 +284,7 @@ fn zoom_dropdown(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
             }
         })
         .response
-        .on_hover_text("Zoom");
+        .on_hover_ui(|ui| editor_toolbar_tooltip(ui, "Zoom"));
     action
 }
 
@@ -293,30 +296,168 @@ fn zoom_dropdown(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
 fn overflow(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
     let percent = cx.zoom_percent?;
     let mut action = None;
-    ui.menu_button(OVERFLOW_GLYPH, |ui| {
-        ui.label(
-            RichText::new("Zoom")
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
-        for step in ZOOM_STEPS {
-            if ui
-                .selectable_label(step == percent, format!("{step}%"))
-                .clicked()
-            {
-                action = Some(MenuAction::Zoom(step));
-                ui.close_menu();
-            }
-        }
+    editor_menu_button(ui, OVERFLOW_GLYPH, |ui| {
+        overflow_contents(ui, percent, &mut action);
     })
     .response
-    .on_hover_text("More controls");
+    .on_hover_ui(|ui| editor_toolbar_tooltip(ui, "More controls"));
     action
+}
+
+fn overflow_contents(ui: &mut Ui, percent: u16, action: &mut Option<MenuAction>) {
+    ui.label(
+        RichText::new("Zoom")
+            .size(Style::SMALL)
+            .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
+    );
+    for step in ZOOM_STEPS {
+        if ui
+            .selectable_label(step == percent, format!("{step}%"))
+            .clicked()
+        {
+            *action = Some(MenuAction::Zoom(step));
+            ui.close_menu();
+        }
+    }
+}
+
+fn editor_toolbar_tooltip(ui: &mut Ui, text: &str) {
+    let ctx = ui.ctx().clone();
+    let surface = Style::resolve_color(&ctx, Style::SURFACE);
+    let border = Style::resolve_color(&ctx, Style::BORDER);
+    let text_color = Style::resolve_color(&ctx, Style::TEXT);
+    egui::Frame::NONE
+        .fill(surface)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(EDITOR_TOOLBAR_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
+            );
+        });
+}
+
+fn editor_toolbar_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    response
+        .on_hover_ui({
+            let text = text.clone();
+            move |ui| editor_toolbar_tooltip(ui, text.as_str())
+        })
+        .on_disabled_hover_ui(move |ui| editor_toolbar_tooltip(ui, text.as_str()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Gate, MenuAction, StripEntry, STRIP, ZOOM_STEPS};
+    use mde_egui::{egui, Density, Style, StyleColorScheme};
+
+    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_toolbar_tooltip_frame(ctx: &egui::Context, text: &str) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 96.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        super::editor_toolbar_tooltip(ui, text);
+                    });
+            },
+        )
+    }
+
+    fn render_toolbar_overflow_menu_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 220.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        crate::tooltip::editor_popup_visual_scope(ui, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                let mut action = None;
+                                super::overflow_contents(ui, 100, &mut action);
+                                assert!(action.is_none());
+                            });
+                        });
+                    });
+            },
+        )
+    }
 
     #[test]
     fn the_strip_is_the_word_97_standard_order() {
@@ -447,6 +588,68 @@ mod tests {
         assert!(
             ZOOM_STEPS.windows(2).all(|w| w[0] < w[1]),
             "the ladder ascends"
+        );
+    }
+
+    #[test]
+    fn toolbar_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let tooltip = "More controls";
+        let out = render_toolbar_tooltip_frame(&ctx, tooltip);
+        let text_color = Style::resolve_color(&ctx, Style::TEXT);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == tooltip && *color == text_color),
+            "Editor toolbar tooltip should paint themed text: {texts:?}"
+        );
+        assert!(
+            text_color != surface,
+            "Editor toolbar tooltip text and surface must stay distinct in light mode"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&surface),
+            "Editor toolbar tooltip should paint its themed surface: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn toolbar_overflow_menu_uses_themed_text_in_light_mode() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
+        let palette = Style::palette_for(StyleColorScheme::Light);
+        let out = render_toolbar_overflow_menu_frame(&ctx);
+
+        let texts = painted_text_colors(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Zoom" && *color == palette.text_dim),
+            "Editor toolbar overflow caption should use light-mode dim text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "Zoom" && *color == Style::TEXT_DIM),
+            "Editor toolbar overflow caption leaked raw dark-shell dim text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "100%" && *color == palette.text),
+            "Editor toolbar overflow rows should use light-mode text: {texts:?}"
+        );
+
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&palette.surface),
+            "Editor toolbar overflow menu should paint the themed popup surface: {fills:?}"
         );
     }
 }

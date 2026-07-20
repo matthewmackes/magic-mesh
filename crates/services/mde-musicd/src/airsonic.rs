@@ -323,25 +323,36 @@ pub struct AlbumDetail {
     pub songs: Vec<Song>,
 }
 
-/// An authenticated Airsonic client.
 /// MUSIC-HOME-1 — a snapshot of the server's library for the Music Home page.
 /// All counts are live Airsonic data; `reachable` is false when the server can't
 /// be reached (the GUI then shows a connection-down server card).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct LibraryStats {
+    /// Whether the Airsonic server answered the stats sweep.
     pub reachable: bool,
+    /// The configured server base URL or host label shown in the UI.
     pub host: String,
+    /// The negotiated Subsonic API version reported by the server/client.
     pub version: String,
+    /// Total song count reported by the library.
     pub songs: u64,
+    /// Whether the server reports an active library scan.
     pub scanning: bool,
+    /// Total artist count reported by the library.
     pub artists: u64,
+    /// Total album count reported by the library.
     pub albums: u64,
+    /// Total genre count reported by the library.
     pub genres: u64,
+    /// Total playlist count reported by the library.
     pub playlists: u64,
+    /// Total internet radio station count reported by the library.
     pub radio: u64,
+    /// Total podcast count reported by the library.
     pub podcasts: u64,
 }
 
+/// Authenticated Subsonic/Airsonic REST client with negotiated API version state.
 pub struct Client {
     base_url: String,
     user: String,

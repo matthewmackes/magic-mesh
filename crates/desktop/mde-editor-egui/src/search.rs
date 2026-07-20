@@ -37,6 +37,8 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::tooltip::editor_hover_text;
+
 use regex::{Regex, RegexBuilder};
 
 // ── bounds (mirroring the finder's honest, bounded walk, §7) ─────────────────
@@ -798,17 +800,19 @@ pub fn show_find(ctx: &egui::Context, find: &mut FindState) -> FindEvent {
                 if toggled {
                     find.last_replaced = None;
                 }
-                if ui
-                    .button(RichText::new("\u{2191}").size(Style::SMALL))
-                    .on_hover_text("Previous (Shift+Enter)")
-                    .clicked()
+                if editor_hover_text(
+                    ui.button(RichText::new("\u{2191}").size(Style::SMALL)),
+                    "Previous (Shift+Enter)",
+                )
+                .clicked()
                 {
                     event = FindEvent::Prev;
                 }
-                if ui
-                    .button(RichText::new("\u{2193}").size(Style::SMALL))
-                    .on_hover_text("Next (Enter)")
-                    .clicked()
+                if editor_hover_text(
+                    ui.button(RichText::new("\u{2193}").size(Style::SMALL)),
+                    "Next (Enter)",
+                )
+                .clicked()
                 {
                     event = FindEvent::Next;
                 }
@@ -836,17 +840,19 @@ pub fn show_find(ctx: &egui::Context, find: &mut FindState) -> FindEvent {
                     if rf.changed() {
                         find.last_replaced = None;
                     }
-                    if ui
-                        .button(RichText::new("Replace").size(Style::SMALL))
-                        .on_hover_text("Replace the current match")
-                        .clicked()
+                    if editor_hover_text(
+                        ui.button(RichText::new("Replace").size(Style::SMALL)),
+                        "Replace the current match",
+                    )
+                    .clicked()
                     {
                         event = FindEvent::ReplaceCurrent;
                     }
-                    if ui
-                        .button(RichText::new("All").size(Style::SMALL))
-                        .on_hover_text("Replace every match")
-                        .clicked()
+                    if editor_hover_text(
+                        ui.button(RichText::new("All").size(Style::SMALL)),
+                        "Replace every match",
+                    )
+                    .clicked()
                     {
                         event = FindEvent::ReplaceAll;
                     }
@@ -885,10 +891,11 @@ fn counter_label(find: &FindState) -> (String, Color32) {
 
 /// One toggle chip bound to `flag`; returns `true` when it was clicked this frame.
 fn toggle(ui: &mut egui::Ui, flag: &mut bool, label: &str, hover: &str) -> bool {
-    let clicked = ui
-        .selectable_label(*flag, RichText::new(label).size(Style::SMALL))
-        .on_hover_text(hover)
-        .clicked();
+    let clicked = editor_hover_text(
+        ui.selectable_label(*flag, RichText::new(label).size(Style::SMALL)),
+        hover,
+    )
+    .clicked();
     if clicked {
         *flag = !*flag;
     }

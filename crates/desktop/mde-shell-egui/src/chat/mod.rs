@@ -49,6 +49,10 @@ use crate::toast_bridge::{resolve_action, TOAST_TOPIC};
 /// Poll cadence — matches the chat worker's own 2s tick so the roster and open
 /// conversation stay live without a cold-start wait.
 const REFRESH: Duration = Duration::from_secs(2);
+const CHAT_ROSTER_FRACTION: f32 = 0.25;
+const CHAT_BROWSER_PAD_X: f32 = Style::SP_M;
+const CHAT_BROWSER_PAD_Y: f32 = Style::SP_S;
+const CHAT_PANE_TITLE: f32 = Style::HEADING - 2.0;
 
 /// The presence roster mirror the worker publishes (latest-wins).
 const ROSTER_TOPIC: &str = "state/chat/roster";
@@ -184,12 +188,21 @@ impl Delivery {
         }
     }
 
-    /// The ICQ-style checkmark glyph + label.
-    const fn badge(self) -> (&'static str, &'static str) {
+    /// Compact text label used in the Chat chrome. This deliberately avoids
+    /// pseudo-icon glyphs so delivery state reads consistently across fonts.
+    const fn label(self) -> &'static str {
         match self {
-            Self::Sent => ("✓", "Sent"),
-            Self::Delivered => ("✓✓", "Delivered"),
-            Self::Queued => ("⧗", "Queued — offline"),
+            Self::Sent => "Sent",
+            Self::Delivered => "Delivered",
+            Self::Queued => "Queued",
+        }
+    }
+
+    const fn hover_text(self) -> &'static str {
+        match self {
+            Self::Sent => "Sent",
+            Self::Delivered => "Delivered",
+            Self::Queued => "Queued offline",
         }
     }
 
@@ -202,6 +215,23 @@ impl Delivery {
             Self::Queued => Style::TEXT_DIM,
         }
     }
+}
+
+const CHAT_HINT_SET_STATUS: &str = "Set a status...";
+const CHAT_HINT_NEW_ROOM: &str = "New room name...";
+const CHAT_HINT_MESSAGE: &str = "Message...";
+const CHAT_HINT_ATTACH_FILE: &str = "File path or drop a file here...";
+const CHAT_HINT_ROOM_MESSAGE: &str = "Message the room...";
+const CHAT_ATTACH_LABEL: &str = "File";
+const CHAT_ALERT_GO_TO_LABEL: &str = "Go to";
+const CHAT_SENT_FILE_PREFIX: &str = "Sent file";
+
+fn delivery_preview_text(delivery: Delivery, presence: &str) -> String {
+    format!("{} - {presence}", delivery.label())
+}
+
+fn room_member_note(members: usize) -> String {
+    format!("{members} members")
 }
 
 /// Map a contact's [`Presence`] to its roster status-dot color (§4 — no raw hex).
@@ -221,6 +251,79 @@ const fn severity_color(s: Severity) -> Color32 {
         Severity::Warning => Style::SUPPORT_WARNING,
         Severity::Info => Style::SUPPORT_INFO,
     }
+}
+
+struct ChatMetric<'a> {
+    label: &'a str,
+    value: String,
+    detail: String,
+    tone: Color32,
+}
+
+struct RecentMessageItem<'a> {
+    title: String,
+    msg: &'a Message,
+    recipient: Option<&'a Contact>,
+}
+
+fn chat_roster_pane_id() -> egui::Id {
+    egui::Id::new("chat-roster-pane")
+}
+
+fn chat_message_pane_id() -> egui::Id {
+    egui::Id::new("chat-message-browser-pane")
+}
+
+fn chat_split_widths(available_width: f32) -> (f32, f32) {
+    let width = available_width.max(0.0);
+    let roster = (width * CHAT_ROSTER_FRACTION).floor();
+    (roster, (width - roster).max(0.0))
+}
+
+fn chat_metric_columns(ui: &mut egui::Ui, metrics: &[ChatMetric<'_>]) {
+    let columns = if ui.available_width() < 420.0 {
+        1
+    } else if ui.available_width() < 760.0 {
+        2
+    } else {
+        metrics.len().clamp(1, 4)
+    };
+    ui.columns(columns, |cols| {
+        for (idx, metric) in metrics.iter().enumerate() {
+            let col = &mut cols[idx % columns];
+            chat_metric_tile(
+                col,
+                metric.label,
+                &metric.value,
+                &metric.detail,
+                metric.tone,
+            );
+            col.add_space(Style::SP_S);
+        }
+    });
+}
+
+fn chat_metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, tone: Color32) {
+    egui::Frame::group(ui.style())
+        .shadow(card_shadow())
+        .show(ui, |ui| {
+            ui.set_min_height(Style::SP_XL * 3.0);
+            ui.label(
+                RichText::new(label)
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new(value)
+                    .color(tone)
+                    .size(Style::HEADING)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_XS);
+            mde_egui::muted_note(ui, detail);
+        });
 }
 
 /// The ICQ self-presence picker options (lock 5) — the operator-settable subset
@@ -630,18 +733,68 @@ impl ChatState {
         ui.separator();
 
         let Some(roster) = self.roster.clone() else {
-            let (title, subtitle) = empty_copy(self.bus_root.is_some());
-            crate::session::empty_state(ui, title, subtitle);
+            self.waiting_pane(ui);
             return;
         };
 
-        egui::SidePanel::left("chat-roster")
-            .resizable(true)
-            .default_width(Style::SP_XL * 7.0)
-            .show_inside(ui, |ui| {
-                self.roster_rail(ui, &roster);
-            });
+        let available = ui.available_size_before_wrap();
+        let pane_h = available.y.max(0.0);
+        let (roster_w, message_w) = chat_split_widths(available.x);
 
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let roster_pane = ui.allocate_ui_with_layout(
+                egui::vec2(roster_w, pane_h),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_min_width(roster_w);
+                    ui.set_max_width(roster_w);
+                    ui.set_min_height(pane_h);
+                    ui.set_max_height(pane_h);
+                    self.roster_rail(ui, &roster);
+                },
+            );
+            ui.interact(
+                roster_pane.response.rect,
+                chat_roster_pane_id(),
+                egui::Sense::hover(),
+            );
+
+            let message = ui.allocate_ui_with_layout(
+                egui::vec2(message_w, pane_h),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_min_width(message_w);
+                    ui.set_max_width(message_w);
+                    ui.set_min_height(pane_h);
+                    ui.set_max_height(pane_h);
+                    self.message_browser(ui, &roster);
+                },
+            );
+            ui.interact(
+                message.response.rect,
+                chat_message_pane_id(),
+                egui::Sense::hover(),
+            );
+        });
+    }
+
+    fn message_browser(&mut self, ui: &mut egui::Ui, roster: &Roster) {
+        egui::Frame::NONE
+            .fill(Style::SURFACE)
+            .stroke(egui::Stroke::new(1.0, Style::BORDER))
+            .corner_radius(egui::CornerRadius::same(Style::RADIUS as u8))
+            .inner_margin(egui::Margin::symmetric(
+                CHAT_BROWSER_PAD_X as i8,
+                CHAT_BROWSER_PAD_Y as i8,
+            ))
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                self.message_browser_contents(ui, roster);
+            });
+    }
+
+    fn message_browser_contents(&mut self, ui: &mut egui::Ui, roster: &Roster) {
         match self.selected.clone() {
             Some(Selection::Notifications) => {
                 let now = self.notification_items().len();
@@ -659,15 +812,250 @@ impl ChatState {
                 self.seen.insert(room_key(&id), now);
                 self.room_pane(ui, &roster, &id);
             }
-            _ => {
-                crate::session::empty_state(
-                    ui,
-                    "Pick a contact or room",
-                    "Select a host or a room on the left to open its conversation — a contact's \
-                     messages and its alerts share one timeline.",
+            _ => self.home_pane(ui, roster),
+        }
+    }
+
+    /// The no-roster state is still honest about missing data, but it must read
+    /// as a live surface waiting on its real worker mirror rather than a blank
+    /// desktop placeholder.
+    fn waiting_pane(&self, ui: &mut egui::Ui) {
+        let (title, subtitle) = empty_copy(self.bus_root.is_some());
+        ui.add_space(Style::SP_L);
+        egui::Frame::group(ui.style())
+            .shadow(card_shadow())
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .color(Style::TEXT)
+                            .size(CHAT_PANE_TITLE)
+                            .strong(),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    mde_egui::muted_note(ui, subtitle);
+                    ui.add_space(Style::SP_M);
+                    chat_metric_columns(
+                        ui,
+                        &[
+                            ChatMetric {
+                                label: "Bus",
+                                value: if self.bus_root.is_some() {
+                                    "visible".to_string()
+                                } else {
+                                    "missing".to_string()
+                                },
+                                detail: "local read path".to_string(),
+                                tone: if self.bus_root.is_some() {
+                                    Style::OK
+                                } else {
+                                    Style::SUPPORT_WARNING
+                                },
+                            },
+                            ChatMetric {
+                                label: "Roster",
+                                value: "waiting".to_string(),
+                                detail: ROSTER_TOPIC.to_string(),
+                                tone: Style::TEXT_DIM,
+                            },
+                            ChatMetric {
+                                label: "Alerts",
+                                value: "waiting".to_string(),
+                                detail: NOTIFY_TOPIC.to_string(),
+                                tone: Style::TEXT_DIM,
+                            },
+                        ],
+                    );
+                });
+            });
+    }
+
+    /// The default right-side message browser for the loaded-roster/no-selection
+    /// state. It previews recent message rows without selecting a lane or clearing
+    /// unread watermarks on the operator's behalf.
+    fn home_pane(&mut self, ui: &mut egui::Ui, roster: &Roster) {
+        let peer_count = roster
+            .contacts()
+            .filter(|contact| !roster.is_self(&contact.host))
+            .count();
+        let online_peers = roster
+            .online()
+            .into_iter()
+            .filter(|contact| !roster.is_self(&contact.host))
+            .count();
+        let room_count = self.rooms.len();
+        let alert_count = self.notification_items().len();
+        let unread_count = self.home_unread_count();
+        let latest = self.latest_activity_label();
+        let mut open_notifications = false;
+        let bus_root = self.bus_root.clone();
+        let self_host = roster.self_host().to_string();
+
+        ui.add_space(Style::SP_M);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Messages")
+                        .color(Style::TEXT)
+                        .size(CHAT_PANE_TITLE)
+                        .strong(),
                 );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let summary = if unread_count > 0 {
+                        format!("{unread_count} unread")
+                    } else {
+                        "caught up".to_string()
+                    };
+                    mde_egui::muted_note(ui, summary);
+                });
+            });
+            mde_egui::muted_note(
+                ui,
+                "Contacts, rooms, and folded alerts are live from the local mesh read model.",
+            );
+            ui.add_space(Style::SP_M);
+            chat_metric_columns(
+                ui,
+                &[
+                    ChatMetric {
+                        label: "Peers",
+                        value: peer_count.to_string(),
+                        detail: "enrolled contacts".to_string(),
+                        tone: Style::TEXT,
+                    },
+                    ChatMetric {
+                        label: "Online",
+                        value: online_peers.to_string(),
+                        detail: "available now".to_string(),
+                        tone: if online_peers > 0 {
+                            Style::OK
+                        } else {
+                            Style::TEXT_DIM
+                        },
+                    },
+                    ChatMetric {
+                        label: "Alerts",
+                        value: alert_count.to_string(),
+                        detail: "folded notifications".to_string(),
+                        tone: if alert_count > 0 {
+                            Style::SUPPORT_WARNING
+                        } else {
+                            Style::TEXT_DIM
+                        },
+                    },
+                    ChatMetric {
+                        label: "Rooms",
+                        value: room_count.to_string(),
+                        detail: latest.unwrap_or_else(|| "no timeline activity".to_string()),
+                        tone: Style::ACCENT,
+                    },
+                ],
+            );
+            ui.add_space(Style::SP_M);
+
+            {
+                let notifications_unread = self.notifications_unread();
+                let recent = self.latest_message_items(roster);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Recent messages")
+                            .color(Style::TEXT)
+                            .size(Style::BODY)
+                            .strong(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if notifications_unread > 0 && ui.button("Open notifications").clicked() {
+                            open_notifications = true;
+                        }
+                    });
+                });
+                ui.separator();
+                if recent.is_empty() {
+                    crate::session::empty_state(
+                        ui,
+                        "No messages",
+                        "Select a contact or room on the left when mesh chat activity arrives.",
+                    );
+                } else {
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for item in recent.iter().take(8) {
+                                mde_egui::muted_note(ui, &item.title);
+                                message_row(
+                                    ui,
+                                    item.msg,
+                                    &self_host,
+                                    item.recipient,
+                                    bus_root.as_deref(),
+                                );
+                                ui.add_space(Style::SP_S);
+                            }
+                        });
+                }
+            }
+        });
+
+        if open_notifications {
+            self.selected = Some(Selection::Notifications);
+            self.draft.clear();
+        }
+    }
+
+    fn latest_activity_label(&self) -> Option<String> {
+        self.convos
+            .values()
+            .flat_map(|conv| conv.messages())
+            .chain(self.room_convos.values().flat_map(|conv| conv.messages()))
+            .map(|msg| msg.ts_unix_ms)
+            .max()
+            .map(|ts| {
+                let clock = fmt_hh_mm(ts);
+                if clock.is_empty() {
+                    "latest activity recorded".to_string()
+                } else {
+                    format!("latest {clock}")
+                }
+            })
+    }
+
+    fn home_unread_count(&self) -> usize {
+        // The aggregate Notifications lane is a view over contact timelines, so
+        // use the larger watermark count rather than summing and double-counting
+        // the same folded alert.
+        self.total_unread().max(self.notifications_unread())
+    }
+
+    fn latest_message_items<'a>(&'a self, roster: &'a Roster) -> Vec<RecentMessageItem<'a>> {
+        let mut items = Vec::new();
+        for (host, conv) in &self.convos {
+            if let Some(msg) = conv.latest() {
+                let recipient = roster.get(host);
+                let title = recipient
+                    .map(|contact| contact.display_name().to_string())
+                    .unwrap_or_else(|| host.clone());
+                items.push(RecentMessageItem {
+                    title,
+                    msg,
+                    recipient,
+                });
             }
         }
+        for (id, conv) in &self.room_convos {
+            if let Some(msg) = conv.latest() {
+                let title = self
+                    .room_descriptor(id)
+                    .map(|room| format!("# {}", room.name))
+                    .unwrap_or_else(|| format!("# {id}"));
+                items.push(RecentMessageItem {
+                    title,
+                    msg,
+                    recipient: None,
+                });
+            }
+        }
+        items.sort_by(|a, b| b.msg.ts_unix_ms.cmp(&a.msg.ts_unix_ms));
+        items
     }
 
     /// The registry descriptor for room `id`, if the worker has published it.
@@ -704,14 +1092,14 @@ impl ChatState {
                 }
             });
         });
-        // Status: a muted read-only line + an ✎ edit affordance, or the inline
+        // Status: a muted read-only line + a YAMIS edit affordance, or the inline
         // editor when open. Committing posts the status (empty ⇒ clear) via the
         // same presence action the worker republishes on the self roster entry.
         if self.editing_status {
             ui.horizontal(|ui| {
                 let field = egui::TextEdit::singleline(&mut self.status_draft)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Set a status…");
+                    .hint_text(CHAT_HINT_SET_STATUS);
                 let resp = ui.add(field);
                 let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui.button("Save").clicked() || commit {
@@ -733,10 +1121,11 @@ impl ChatState {
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{270E}")
-                        .on_hover_text("Edit your status")
-                        .clicked()
+                    if chat_hover_text(
+                        yamis_icon_button(ui, CHAT_STATUS_EDIT_ICON, "Edit"),
+                        "Edit your status",
+                    )
+                    .clicked()
                     {
                         self.status_draft = me.status_message.clone().unwrap_or_default();
                         self.editing_status = true;
@@ -749,6 +1138,26 @@ impl ChatState {
 
     /// The roster rail — the ICQ Online / Offline groups (lock 4).
     fn roster_rail(&mut self, ui: &mut egui::Ui, roster: &Roster) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Contacts")
+                    .color(Style::TEXT)
+                    .size(Style::BODY)
+                    .strong(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let unread = self.home_unread_count();
+                if unread > 0 {
+                    ui.label(
+                        RichText::new(unread.to_string())
+                            .color(Style::ACCENT)
+                            .size(Style::SMALL)
+                            .strong(),
+                    );
+                }
+            });
+        });
+        ui.add_space(Style::SP_XS);
         // Self line, pinned at the top with its own presence (lock 17).
         self.self_line(ui, roster);
         self.notifications_row(ui);
@@ -856,7 +1265,7 @@ impl ChatState {
         ui.horizontal(|ui| {
             let field = egui::TextEdit::singleline(&mut self.new_room)
                 .desired_width(f32::INFINITY)
-                .hint_text("New room name…");
+                .hint_text(CHAT_HINT_NEW_ROOM);
             let resp = ui.add(field);
             create = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let ready = !self.new_room.trim().is_empty();
@@ -952,10 +1361,11 @@ impl ChatState {
 
         let resp = ui.horizontal(|ui| {
             mde_egui::status_dot(ui, presence_color(contact.presence));
-            let clicked = ui
-                .selectable_label(selected, name)
-                .on_hover_text(contact.presence.label())
-                .clicked();
+            let clicked = chat_hover_text(
+                ui.selectable_label(selected, name),
+                contact.presence.label(),
+            )
+            .clicked();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if unread > 0 {
                     ui.label(
@@ -995,7 +1405,7 @@ impl ChatState {
                 ui.label(
                     RichText::new(contact.display_name())
                         .color(Style::TEXT)
-                        .size(Style::HEADING),
+                        .size(CHAT_PANE_TITLE),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     mde_egui::muted_note(ui, contact.presence.label());
@@ -1070,7 +1480,7 @@ impl ChatState {
             ui.label(
                 RichText::new("Notifications")
                     .color(Style::TEXT)
-                    .size(Style::HEADING),
+                    .size(CHAT_PANE_TITLE),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let count = if unread > 0 {
@@ -1112,9 +1522,10 @@ impl ChatState {
         ui.add_space(Style::SP_XS);
         ui.horizontal_wrapped(|ui| {
             let mut dnd = self.dnd_active();
-            let dnd_resp = ui
-                .checkbox(&mut dnd, "Do Not Disturb")
-                .on_hover_text("Mute notification surfaces; the feed and Alerts pip still fill");
+            let dnd_resp = chat_hover_text(
+                ui.checkbox(&mut dnd, "Do Not Disturb"),
+                "Mute notification surfaces; the feed and Alerts pip still fill",
+            );
             let _stable = ui.interact(
                 dnd_resp.rect,
                 notification_dnd_toggle_id(),
@@ -1144,10 +1555,11 @@ impl ChatState {
                 mde_egui::muted_note(ui, "sources");
                 for source in sources {
                     let mut muted = self.is_source_muted(&source);
-                    if ui
-                        .checkbox(&mut muted, source.as_str())
-                        .on_hover_text(format!("Mute {source} notification surfaces"))
-                        .changed()
+                    if chat_hover_text(
+                        ui.checkbox(&mut muted, source.as_str()),
+                        format!("Mute {source} notification surfaces"),
+                    )
+                    .changed()
                     {
                         // Best-effort: this &self control holds a borrow of `items`,
                         // so it can't reach `last_error`; the toggle is retriable and
@@ -1168,7 +1580,7 @@ impl ChatState {
         ui.horizontal(|ui| {
             let field = egui::TextEdit::singleline(&mut self.draft)
                 .desired_width(f32::INFINITY)
-                .hint_text("Message…");
+                .hint_text(CHAT_HINT_MESSAGE);
             let resp = ui.add(field);
             send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("Send").clicked() {
@@ -1177,8 +1589,8 @@ impl ChatState {
         });
         // The recipient's presence previews how this message will deliver.
         if let Some(c) = recipient {
-            let (glyph, label) = Delivery::for_recipient(Some(c)).badge();
-            mde_egui::muted_note(ui, format!("{glyph} {label} → {}", c.presence.label()));
+            let delivery = Delivery::for_recipient(Some(c));
+            mde_egui::muted_note(ui, delivery_preview_text(delivery, c.presence.label()));
         }
 
         // Send-To affordance (lock 15, file kind): a drag-dropped or typed path is
@@ -1192,10 +1604,10 @@ impl ChatState {
         }
         let mut send_file = false;
         ui.horizontal(|ui| {
-            mde_egui::muted_note(ui, "\u{1F4CE}"); // 📎
+            mde_egui::muted_note(ui, CHAT_ATTACH_LABEL);
             let field = egui::TextEdit::singleline(&mut self.attach_path)
                 .desired_width(f32::INFINITY)
-                .hint_text("Attach a file — path, or drop one here…");
+                .hint_text(CHAT_HINT_ATTACH_FILE);
             ui.add(field);
             let ready = !self.attach_path.trim().is_empty();
             if ui
@@ -1271,7 +1683,7 @@ impl ChatState {
         let offer = serde_json::json!({
             "scope": "peer",
             "to": to,
-            "text": format!("\u{1F4CE} sent file {name} ({size_bytes} bytes)"),
+            "text": format!("{CHAT_SENT_FILE_PREFIX} {name} ({size_bytes} bytes)"),
             "file": { "name": name, "size_bytes": size_bytes },
         })
         .to_string();
@@ -1307,9 +1719,13 @@ impl ChatState {
             ui.label(
                 RichText::new("\u{0023}")
                     .color(Style::ACCENT)
-                    .size(Style::HEADING),
+                    .size(CHAT_PANE_TITLE),
             );
-            ui.label(RichText::new(&name).color(Style::TEXT).size(Style::HEADING));
+            ui.label(
+                RichText::new(&name)
+                    .color(Style::TEXT)
+                    .size(CHAT_PANE_TITLE),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let tag = match kind {
                     RoomKind::System => "system room",
@@ -1324,17 +1740,11 @@ impl ChatState {
         ui.horizontal(|ui| {
             if is_member {
                 mde_egui::muted_note(ui, "joined");
-            } else if ui
-                .button("Join")
-                .on_hover_text("Self-join this open room")
-                .clicked()
-            {
+            } else if chat_hover_text(ui.button("Join"), "Self-join this open room").clicked() {
                 self.room_action("join", id, None);
             }
             if can_dissolve
-                && ui
-                    .button("Dissolve")
-                    .on_hover_text("Dissolve this room you created")
+                && chat_hover_text(ui.button("Dissolve"), "Dissolve this room you created")
                     .clicked()
             {
                 self.room_action("dissolve", id, None);
@@ -1403,14 +1813,14 @@ impl ChatState {
         ui.horizontal(|ui| {
             let field = egui::TextEdit::singleline(&mut self.draft)
                 .desired_width(f32::INFINITY)
-                .hint_text("Message the room…");
+                .hint_text(CHAT_HINT_ROOM_MESSAGE);
             let resp = ui.add(field);
             send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("Send").clicked() {
                 send = true;
             }
         });
-        mde_egui::muted_note(ui, format!("\u{2192} {members} members"));
+        mde_egui::muted_note(ui, room_member_note(members));
         ui.add_space(Style::SP_XS);
         let text = self.draft.trim().to_string();
         if send && !text.is_empty() {
@@ -1586,7 +1996,8 @@ impl ChatState {
 ///   conversation), *Clear Unread* (watermark everything read), *Close
 ///   Conversation* (deselect).
 /// * **Presence** — this seat's `action/chat/presence` (the self-line picker's
-///   seam) + *Edit Status…* (the ✎ editor). Omitted until a roster exists.
+///   seam) + *Edit Status...* (the YAMIS edit affordance). Omitted until a
+///   roster exists.
 /// * **Help** — the honest surface identity + the delivery-semantics truth
 ///   (captions, never a dead activatable entry — §7/§8).
 ///
@@ -1629,7 +2040,7 @@ mod menubar {
         ClearUnread,
         /// Set this seat's presence (`action/chat/presence`).
         SetPresence(PresenceChoice),
-        /// Open the inline self-status editor (the self-line ✎ seam).
+        /// Open the inline self-status editor (the self-line edit seam).
         EditStatus,
     }
 
@@ -1853,7 +2264,7 @@ mod menubar {
             .collect();
         entries.push(Entry::Separator);
         entries.push(Entry::Item(
-            Item::new(MenuAction::EditStatus, "Edit Status\u{2026}").enabled(!state.editing_status),
+            Item::new(MenuAction::EditStatus, "Edit Status...").enabled(!state.editing_status),
         ));
         Menu::new("Presence", entries)
     }
@@ -1865,13 +2276,13 @@ mod menubar {
             "Help",
             vec![
                 Entry::Caption(
-                    "Contacts \u{2014} every mesh host is a contact; its alerts and clipboard \
+                    "Contacts - every mesh host is a contact; its alerts and clipboard \
                      clips arrive as its messages."
                         .to_owned(),
                 ),
                 Entry::Caption(
-                    "Delivery marks are presence-derived (\u{2713} sent \u{00B7} \u{2713}\u{2713} \
-                     delivered \u{00B7} \u{29D7} queued) \u{2014} never a fabricated read receipt."
+                    "Delivery marks are presence-derived: Sent, Delivered, or Queued - never a \
+                     fabricated read receipt."
                         .to_owned(),
                 ),
             ],
@@ -2066,6 +2477,53 @@ mod menubar {
             state.convos.insert("nyc3".into(), conv);
             state.seen.insert("nyc3".into(), 0); // one unread
             state
+        }
+
+        fn assert_ascii_entries(entries: &[Entry<MenuAction>]) {
+            for entry in entries {
+                match entry {
+                    Entry::Item(item) => {
+                        assert!(
+                            item.label.is_ascii(),
+                            "menu item copy should stay ASCII: {:?}",
+                            item.label
+                        );
+                        if let Some(shortcut) = &item.shortcut {
+                            assert!(
+                                shortcut.is_ascii(),
+                                "shortcut copy should stay ASCII: {shortcut:?}"
+                            );
+                        }
+                    }
+                    Entry::Submenu { label, entries, .. } => {
+                        assert!(
+                            label.is_ascii(),
+                            "submenu copy should stay ASCII: {label:?}"
+                        );
+                        assert_ascii_entries(entries);
+                    }
+                    Entry::Separator => {}
+                    Entry::Caption(caption) => {
+                        assert!(
+                            caption.is_ascii(),
+                            "caption copy should stay ASCII: {caption:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn menu_copy_uses_ascii_labels_instead_of_pseudo_icons() {
+            let menus = build_menus(&peered_state());
+            for menu in &menus {
+                assert!(
+                    menu.title.is_ascii(),
+                    "menu title should stay ASCII: {:?}",
+                    menu.title
+                );
+                assert_ascii_entries(&menu.entries);
+            }
         }
 
         #[test]

@@ -24,7 +24,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/WORKLIST.md}"
+WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
 KEY="${MCNF_FARM_KEY:-/root/.ssh/mackes_mesh_ed25519}"
 SSH_USER="${MCNF_FARM_USER:-mm}"
 
@@ -64,14 +64,28 @@ cmd_slots() {
   echo "TOTAL_FREE=$total"
 }
 
-# List up to N open, UNBLOCKED worklist unit ids (open = [ ] or [>]; not [!]/[~]).
+# List up to N unblocked worklist unit ids (`Status: Remaining`).
 # Honest: these are candidates — the coordinator still picks file-disjoint ones.
 cmd_next() {
   local n="${1:-7}"
   [ -f "$WORKLIST" ] || { echo "drain-coordinator: no worklist at $WORKLIST" >&2; return 2; }
-  grep -E '^- \[[ >]\] \*\*[A-Za-z0-9][A-Za-z0-9-]*[: ]' "$WORKLIST" \
-    | sed -E 's/^- \[[ >]\] \*\*([A-Za-z0-9][A-Za-z0-9-]*).*/\1/' \
-    | head -n "$n"
+  awk -v limit="$n" '
+    /^### WL-[A-Z0-9-]+ - / {
+      item = $2
+      next
+    }
+    /^[[:space:]]*-[[:space:]]Status:[[:space:]]*/ {
+      status = $0
+      sub(/^[[:space:]]*-[[:space:]]Status:[[:space:]]*/, "", status)
+      if (status == "Remaining" && item != "") {
+        print item
+        count++
+        if (count >= limit) {
+          exit
+        }
+      }
+    }
+  ' "$WORKLIST"
 }
 
 cmd_plan() {

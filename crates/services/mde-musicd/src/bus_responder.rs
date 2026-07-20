@@ -982,6 +982,7 @@ fn refresh_airsonic_client(cache: &mut Option<(creds::Creds, Client)>) -> Option
     }
 }
 
+/// Run the single-threaded music bus responder until `should_stop` returns true.
 pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop: F) {
     let mut persist = match Persist::open(bus_root.clone()) {
         Ok(p) => p,

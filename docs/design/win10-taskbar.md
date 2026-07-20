@@ -1,9 +1,9 @@
-# WIN10-HYBRID — the single 48px bottom taskbar (Win10 structure · Quazar identity)
+# WIN10-HYBRID — the single 48px bottom taskbar (Win10 structure · Construct identity)
 
 Operator-locked 2026-07-12 (25-Q `/plan` survey). **This supersedes
 [`vertical-dock.md`](vertical-dock.md) (VDOCK, 2026-07-04).** The shell chrome is a
 **single horizontal bottom taskbar** modeled on the Windows 10 taskbar's *structure*,
-wearing the **Quazar-dark *identity***. The left vertical dock is **retired**; launching
+wearing the **Construct-dark *identity***. The left vertical dock is **retired**; launching
 folds into the taskbar's Start button.
 
 > ⚠️ **Design-lock reversal, intentional and operator-approved.** VDOCK ripped out the
@@ -15,10 +15,10 @@ folds into the taskbar's Start button.
 
 ## Direction
 
-**Win10 chrome *structure* + Quazar *identity*.** Adopt the Windows-10 taskbar's familiar
+**Win10 chrome *structure* + Construct *identity*.** Adopt the Windows-10 taskbar's familiar
 anatomy and proportions (a real 48px bottom bar that reserves a strut, a Start launcher, a
 running-app strip, a full tray with clock+date and an action-center) — but render it in the
-locked Quazar-dark language (azure `#5B8CFF` accent, IBM Plex mono-first type, subtle-alpha
+locked Construct-dark language (azure `#5B8CFF` accent, IBM Plex mono-first type, subtle-alpha
 translucency, square chrome). It is a **structural** borrow, not a visual reskin toward
 Microsoft's Fluent look.
 
@@ -38,7 +38,7 @@ Microsoft's Fluent look.
 | Thumbnails | **Hover thumbnails for running (VDI) sessions** — only VDI sessions have a real frame source; static protocol badge first, live thumbnail later |
 | Corners | **Square** on taskbar + Start; **rounded** (4/6/8px tiers) on surfaces |
 | Translucency | **Subtle** — slight alpha, no gaussian blur (reuses the existing rail alpha) |
-| Identity | **Kept:** IBM Plex mono-first (mono headings/nav/data, Inter prose); Quazar azure `#5B8CFF` |
+| Identity | **Kept:** IBM Plex mono-first (mono headings/nav/data, Inter prose); Construct azure `#5B8CFF` |
 | Polish axes | **Build all four** as shared `mde_egui` tokens *with backing tests*, then adopt per-surface: **Motion** (spring chrome transitions, inertial + rubber-band scroll, hover-lift/press-scale/focus-glow/animated-toggle; reduce-motion best-effort), **Depth** (soft-shadow `Elevation` tiers + 4/6/8 radius), **Focus** (shared 2px ring), **Density** (Compact/Mouse/Comfortable/Touch, spacing-only) |
 | Scope | All surfaces swept via the farm `/polish` loop; then cut an F44 RPM and deploy to the seats |
 

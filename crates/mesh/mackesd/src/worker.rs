@@ -242,6 +242,10 @@ pub fn run_loop(workgroup_root: &Path, node_id: &str, db_path: &Path, shutdown: 
                 );
             }
             Err(e) => {
+                // WL-RUN-002 — the reconcile loop's real failure path.
+                // Bump the process-wide `mackesd_reconcile_failures_total`
+                // counter the metrics exporter renders each tick.
+                crate::metrics::record_reconcile_failure();
                 warn!(error = %e, "reconcile tick failed; will retry next interval");
             }
         }
@@ -341,6 +345,13 @@ pub fn tick_with(
     // `auto_repair = false` in the daemon config falls the entire
     // reconciler back to observe-only.
     let plan = plan_tick(&topology_diff, policy.enabled);
+
+    // WL-RUN-002 — every drift row this tick classified (auto-repair +
+    // inbox) is a drift EVENT; record them for the process-wide
+    // `mackesd_drift_events_total` counter the metrics exporter renders.
+    crate::metrics::record_drift_events(
+        u64::try_from(plan.repair_now.len() + plan.inbox.len()).unwrap_or(u64::MAX),
+    );
 
     // mackesd-03 — APPLY the safe subset of the drift. Runs BEFORE the
     // audit transaction so the (potentially blocking) probes never sit

@@ -2837,11 +2837,11 @@ mod tests {
     #[test]
     fn loudness_and_replaygain_and_gapless_fold_to_engine_properties() {
         let mut c = controller();
-        // Default: PipeWire ao pinned (seat audio), gapless on.
+        // Default: PipeWire ao pinned first, null fallback available, gapless on.
         assert!(c
             .audio_config()
             .properties()
-            .contains(&("ao".to_owned(), "pipewire".to_owned())));
+            .contains(&("ao".to_owned(), "pipewire,null".to_owned())));
 
         c.dispatch(TransportAction::SetLoudness(EBU_R128_DEFAULT));
         assert_eq!(c.audio_config().loudness, EBU_R128_DEFAULT);
