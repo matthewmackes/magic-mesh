@@ -965,7 +965,7 @@ impl TerminalWidget {
             Style::SURFACE
         };
         painter.rect_filled(rect, 0.0, bg);
-        painter.hline(rect.x_range(), rect.max.y, Stroke::new(1.0, Style::BORDER));
+        painter.hline(rect.x_range(), rect.max.y, Style::hairline());
 
         let font = FontId::proportional(Style::SMALL);
         let (text, color) = if editing {
@@ -1997,15 +1997,16 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &Paint
         );
     }
 
-    // Selection overlay — the same token blend `Style::install` uses for
-    // egui's own text selection, so highlights read identically platform-wide.
+    // Selection overlay — the shared `Style::selection_fill()` blend `Style::install`
+    // lands on egui's own text selection, so highlights read identically
+    // platform-wide and the accent alpha is never re-mixed by hand (§4).
     if let Some(sel) = &spec.selection {
         for row in 0..screen.rows() {
             if let Some((a, b)) = sel.row_span(spec.first_abs + row, screen.cols()) {
                 painter.rect_filled(
                     cell_span_rect(rect.min, spec.cell, row, a, b - a),
                     0.0,
-                    Style::ACCENT.gamma_multiply(0.35),
+                    Style::selection_fill(),
                 );
             }
         }
@@ -2173,7 +2174,7 @@ pub(crate) fn chip(
     painter.rect_stroke(
         text_rect,
         Style::RADIUS,
-        Stroke::new(1.0, Style::BORDER),
+        Style::hairline(),
         StrokeKind::Inside,
     );
     painter.galley(text_rect.min + Vec2::splat(Style::SP_XS), galley, color);
@@ -2330,7 +2331,11 @@ mod tests {
                 "Terminal selection-menu caption {label:?} leaked raw dark-shell dim text: {texts:?}"
             );
         }
-        for label in ["Search selection", "Send selection to Chat", "Open path in Files"] {
+        for label in [
+            "Search selection",
+            "Send selection to Chat",
+            "Open path in Files",
+        ] {
             assert!(
                 texts
                     .iter()
@@ -2628,8 +2633,8 @@ mod tests {
         });
         let has = |c: egui::Color32| colors.contains(&c);
         assert!(
-            has(Style::ACCENT.gamma_multiply(0.35)),
-            "selection overlay uses the token blend"
+            has(Style::selection_fill()),
+            "selection overlay uses the shared selection-fill blend"
         );
         assert!(has(Style::SURFACE), "chip plate");
         assert!(has(Style::TEXT_DIM), "chip label");

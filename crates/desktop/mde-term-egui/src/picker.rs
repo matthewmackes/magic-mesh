@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{
-    self, Align2, Area, Color32, Key, Order, RichText, ScrollArea, Sense, Stroke, StrokeKind, Vec2,
+    self, Align2, Area, Color32, Key, Order, RichText, ScrollArea, Sense, StrokeKind, Vec2,
 };
 use mde_egui::Style;
 
@@ -233,7 +233,7 @@ impl RemotePicker {
                     egui::Shape::rect_stroke(
                         plate,
                         Style::RADIUS,
-                        Stroke::new(1.0, Style::BORDER),
+                        Style::hairline(),
                         StrokeKind::Inside,
                     ),
                 );

@@ -1983,7 +1983,7 @@ fn status_bar(ui: &mut Ui, model: &TmuxModel, current: u32, intents: &mut Vec<Tm
     let rect = ui.available_rect_before_wrap();
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, Style::SURFACE);
-    painter.hline(rect.x_range(), rect.min.y, Stroke::new(1.0, Style::BORDER));
+    painter.hline(rect.x_range(), rect.min.y, Style::hairline());
 
     ui.horizontal_centered(|ui| {
         ui.add_space(Style::SP_S);

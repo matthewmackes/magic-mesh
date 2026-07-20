@@ -13,7 +13,7 @@
 //! carve-out the grid renders under, shown so a scheme is pickable by eye.
 
 use mde_egui::egui::{
-    self, Align, Align2, Area, Key, Layout, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    self, Align, Align2, Area, Key, Layout, Order, Pos2, Rect, RichText, Sense, StrokeKind,
     UiBuilder, Vec2,
 };
 use mde_egui::Style;
@@ -194,7 +194,7 @@ impl AppearancePicker {
                     egui::Shape::rect_stroke(
                         plate,
                         Style::RADIUS,
-                        Stroke::new(1.0, Style::BORDER),
+                        Style::hairline(),
                         StrokeKind::Inside,
                     ),
                 );
@@ -289,12 +289,7 @@ impl AppearancePicker {
                 color,
             );
         }
-        painter.rect_stroke(
-            strip,
-            0.0,
-            Stroke::new(1.0, Style::BORDER),
-            StrokeKind::Inside,
-        );
+        painter.rect_stroke(strip, 0.0, Style::hairline(), StrokeKind::Inside);
         // The name, accent when active.
         painter.text(
             Pos2::new(strip.max.x + Style::SP_S, rect.center().y),

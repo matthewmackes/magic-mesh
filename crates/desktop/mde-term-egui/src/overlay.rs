@@ -10,37 +10,24 @@
 //! genuinely lifted off the grid, not flat on it.
 //!
 //! §4: it mints **no** colour of its own — the umbra comes straight from the
-//! shared [`Elevation::Overlay`] token in `mde_egui`, and the surface-side
-//! conversion into egui's shadow type lives here only because the token module
-//! deliberately stays free of egui (design lock #2 — "layered soft shadows",
-//! a translucent depth, never an opaque fill).
+//! shared [`Elevation::Overlay`] token in `mde_egui`, cast into egui's shadow
+//! type by the foundation's own [`Elevation::egui_shadow`] converter (design
+//! lock #2 — "layered soft shadows", a translucent depth, never an opaque fill).
+//! No surface hand-rolls the `Elevation → Shadow` field mapping anymore.
 
 use mde_egui::egui::{self, Rect};
 use mde_egui::style::Elevation;
 use mde_egui::Style;
 
-/// Build an [`egui::Shadow`] from a shared [`Elevation`] depth token — the
-/// surface-side conversion the token module defers (it stays free of egui's
-/// shadow type). Reads the token's offset/blur/spread/umbra, casting the
-/// logical-px floats onto epaint's small integer fields; mints **no** colour of
-/// its own (the umbra comes straight from the token), so the look still reads
-/// only from `mde_egui` (§4). Mirrors the shell's `system::elevation_shadow`.
-fn elevation_shadow(elevation: Elevation) -> egui::Shadow {
-    let token = elevation.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
-}
-
 /// The soft-shadow shape a floating overlay card casts behind its `plate` — the
-/// shared [`Elevation::Overlay`] token, shaped to the card's [`Style::RADIUS`]
-/// corner. Reserve a `Shape::Noop` slot *before* the plate fill and `set` it to
-/// this so the shadow paints behind the card without changing a pixel of layout.
+/// shared [`Elevation::Overlay`] token, cast to egui by the foundation's shared
+/// [`Elevation::egui_shadow`] converter and shaped to the card's
+/// [`Style::RADIUS`] corner. Reserve a `Shape::Noop` slot *before* the plate
+/// fill and `set` it to this so the shadow paints behind the card without
+/// changing a pixel of layout.
 pub(crate) fn overlay_shadow(plate: Rect) -> egui::Shape {
-    elevation_shadow(Elevation::Overlay)
+    Elevation::Overlay
+        .egui_shadow()
         .as_shape(plate, Style::RADIUS)
         .into()
 }
@@ -48,17 +35,17 @@ pub(crate) fn overlay_shadow(plate: Rect) -> egui::Shape {
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
-    use super::{elevation_shadow, overlay_shadow};
+    use super::overlay_shadow;
     use mde_egui::egui::{self, pos2, Rect};
     use mde_egui::style::Elevation;
 
     #[test]
     fn overlay_card_casts_the_shared_overlay_elevation_no_minted_colour() {
         let token = Elevation::Overlay.shadow();
-        let shadow = elevation_shadow(Elevation::Overlay);
-        // Every field is the token's value, just cast onto epaint's small ints —
-        // nothing hand-tuned, and (crucially) no minted Color32: the umbra is the
-        // token's own translucent black.
+        let shadow = Elevation::Overlay.egui_shadow();
+        // Every field is the token's value, just cast onto epaint's small ints by
+        // the shared foundation converter — nothing hand-tuned, and (crucially) no
+        // minted Color32: the umbra is the token's own translucent black.
         assert_eq!(
             shadow.offset,
             [token.offset[0] as i8, token.offset[1] as i8]
