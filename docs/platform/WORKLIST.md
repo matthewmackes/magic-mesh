@@ -146,6 +146,7 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-001 - Remove OpenStack; OpenTofu + Ansible IaC workspace for all cloud operations
 
 - Status: Remaining
+- Progress (2026-07-20): CODE-COMPLETE. Phase A delete (222e1980, -19k LOC) + Phase B OpenTofu/Ansible/libvirt backend + mackesd cloud worker (1dad89d2) + Phase C recreated six-mode iac/ cloud-ops workspace (19e0089038 -> c2a3f76d) all landed + tested green; zero OpenStack in production code. Only Phase D remains: the live local-libvirt provision+configure smoke (MDE_CLOUD_APPLY=1 on a libvirt host) — operator/hardware-gated.
 - Priority: P1
 - Complexity: Epic
 - Problem: Construct Cloud is coupled to OpenStack (Nova/Heat/Keystone/Kolla,
