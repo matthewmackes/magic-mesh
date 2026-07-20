@@ -11,9 +11,9 @@ use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
 use mde_collab_types::value::{
-    sha256_hex, AlertAction, AlertActionKind, AlertPayload, CallKind, ClipItemKind, ClipboardItem,
-    DocumentChange, FileRef, MessageBody, PayloadRef, PresenceState, Severity, TransferDirection,
-    TransferMethod,
+    sha256_hex, AlertAction, AlertActionKind, AlertPayload, CallKind, CallParticipantState,
+    ClipItemKind, ClipboardItem, DocumentChange, FileRef, MessageBody, PayloadRef, PresenceState,
+    Severity, TransferDirection, TransferMethod,
 };
 use mde_collab_types::{
     ActorClock, ActorId, CollabCommand, CollabEventEnvelope, SpaceKind, SpaceRole, TransferControl,
@@ -1272,6 +1272,117 @@ fn alert_ack_is_projected_into_the_inbox() {
     .expect("ack");
     let inbox = a.projection().alert_inbox().expect("inbox");
     assert!(inbox.alerts[0].acknowledged);
+}
+
+#[test]
+fn start_call_flows_into_the_call_state_projection() {
+    // A focused command → event → projection round-trip for calls (WL-FUNC-011):
+    // StartCall mints a CallStarted event the projection folds into CallState (the
+    // read model the egui call bar + Calls mode render); AnswerCall connects a
+    // second participant; HangUpCall by the last one ends the call and drops it
+    // from the active set. This is the call STATE — the live media transport
+    // (WebRTC/LiveKit/SIP) is the separate, marked media-plane follow-up.
+    let sa = sig(1);
+    let sb = sig(2);
+    let mut ia = SeqIds::new(1);
+    let mut ib = SeqIds::new(1_000);
+    let mut a = engine("alice");
+
+    // Alice creates a space and adds bob (so bob may join the call).
+    let created = a
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &sa,
+            &mut ia,
+            1000,
+        )
+        .expect("create");
+    let space = created[0].space_id;
+    a.apply(
+        &CollabCommand::AddMember {
+            space,
+            actor: ActorId::new("bob"),
+            role: SpaceRole::Member,
+        },
+        &sa,
+        &mut ia,
+        1050,
+    )
+    .expect("add bob");
+
+    // Alice starts an audio call → exactly one CallStarted, initiator = alice.
+    let call = CallId::new();
+    let events = a
+        .apply(
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+            &sa,
+            &mut ia,
+            1100,
+        )
+        .expect("start call");
+    assert_eq!(events.len(), 1, "StartCall mints exactly one event");
+    assert!(
+        matches!(
+            &events[0].kind,
+            CollabEventKind::CallStarted { call: c, kind: CallKind::Audio, initiator }
+                if *c == call && initiator == &ActorId::new("alice")
+        ),
+        "StartCall must mint CallStarted(alice, audio)"
+    );
+
+    // The projection folds it into CallState — the read model the surface renders.
+    let cs = a.projection().call_state(Some(space)).expect("call_state");
+    assert_eq!(cs.active.len(), 1, "one active call in the projection");
+    assert_eq!(cs.active[0].call, call);
+    assert_eq!(cs.active[0].kind, CallKind::Audio);
+    assert!(
+        cs.active[0].participants.iter().any(|p| p.actor == ActorId::new("alice")
+            && p.state == CallParticipantState::Connected),
+        "the initiator is Connected in the projection"
+    );
+
+    // Bob replicates alice's log and answers → CallParticipantChanged(Connected).
+    let mut b = engine("bob");
+    b.merge(a.all_events()).expect("bob syncs");
+    b.apply(&CollabCommand::AnswerCall { call }, &sb, &mut ib, 1200)
+        .expect("bob answers");
+    a.merge(b.all_events()).expect("alice syncs bob");
+    let cs = a.projection().call_state(Some(space)).expect("call_state");
+    assert!(
+        cs.active[0]
+            .participants
+            .iter()
+            .any(|p| p.actor == ActorId::new("bob") && p.state == CallParticipantState::Connected),
+        "AnswerCall connects bob in the projection"
+    );
+
+    // Alice hangs up while bob is still Connected → the call stays active.
+    a.apply(&CollabCommand::HangUpCall { call }, &sa, &mut ia, 1300)
+        .expect("alice hangs up");
+    let cs = a.projection().call_state(Some(space)).expect("call_state");
+    assert_eq!(
+        cs.active.len(),
+        1,
+        "still active while bob remains connected"
+    );
+
+    // Bob (the last participant) hangs up → CallEnded drops it from the active set.
+    b.merge(a.all_events()).expect("bob syncs alice hangup");
+    b.apply(&CollabCommand::HangUpCall { call }, &sb, &mut ib, 1350)
+        .expect("bob hangs up");
+    a.merge(b.all_events()).expect("alice syncs bob hangup");
+    let cs = a.projection().call_state(Some(space)).expect("call_state");
+    assert!(
+        cs.active.is_empty(),
+        "once the last participant hangs up, CallEnded drops the call from the active set"
+    );
 }
 
 // Ensure unused-import guards don't trip: BTreeSet is used by the purge model.

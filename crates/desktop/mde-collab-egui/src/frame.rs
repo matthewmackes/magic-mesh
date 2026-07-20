@@ -255,8 +255,8 @@ fn unread_badge(ui: &mut egui::Ui, unread: u32) {
         });
 }
 
-/// A human label for a call's [`CallKind`].
-const fn call_kind_label(kind: CallKind) -> &'static str {
+/// A human label for a call's [`CallKind`]. Shared with the Calls mode roster.
+pub(crate) const fn call_kind_label(kind: CallKind) -> &'static str {
     match kind {
         CallKind::Audio => "Audio call",
         CallKind::Video => "Video call",

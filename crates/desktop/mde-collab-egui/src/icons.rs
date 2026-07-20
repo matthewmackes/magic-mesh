@@ -31,6 +31,7 @@ pub const fn mode_icon(mode: Mode) -> &'static str {
     match mode {
         Mode::Activity => "view",
         Mode::Messages => "share",
+        Mode::Calls => "audio-volume-high",
         Mode::Files => "download",
         Mode::Transfers => "view-refresh",
         Mode::Documents => "document-edit",
@@ -105,6 +106,30 @@ pub const CALL_DECLINE: &str = "window-close";
 pub const CALL_MUTE: &str = "audio-volume-muted";
 /// Unmute the local microphone in a call.
 pub const CALL_UNMUTE: &str = "audio-volume-high";
+
+// ---- Calls mode (WL-FUNC-011) --------------------------------------------
+/// The Calls-mode roster leading glyph + the "start audio call" affordance.
+pub const CALL_AUDIO: &str = "audio-volume-high";
+/// Start a **video** call (audio + camera) in the selected space.
+pub const CALL_VIDEO: &str = "camera-photo";
+/// Start a **screen-share** session in the selected space.
+pub const CALL_SCREEN: &str = "system-lock-screen";
+/// Toggle the local **camera** in a call (the outgoing video track is a marked
+/// media-plane follow-up; the toggle records the seat's intent).
+pub const CALL_CAMERA: &str = "camera-photo";
+/// Toggle local **screen sharing** in a call (the outgoing screen track is a
+/// marked media-plane follow-up; the toggle records the seat's intent).
+pub const CALL_SHARE_SCREEN: &str = "system-lock-screen";
+/// Open the in-call **DTMF keypad** (each press emits a `SendDtmf` command).
+pub const CALL_DTMF: &str = "view-grid";
+/// A **ringing** call participant (invited, not yet connected).
+pub const CALL_PARTICIPANT_RINGING: &str = "notification";
+/// A **connected** call participant.
+pub const CALL_PARTICIPANT_CONNECTED: &str = "emblem-ok";
+/// A participant who **declined** the call.
+pub const CALL_PARTICIPANT_DECLINED: &str = "window-close";
+/// A participant who **left** the call.
+pub const CALL_PARTICIPANT_LEFT: &str = "process-stop";
 
 // ---- Files mode ----------------------------------------------------------
 /// Link a canonical file into the space (open the picker / add a reference).
@@ -200,12 +225,14 @@ pub const ALL_COLLAB_ICONS: &[&str] = &[
     // message + thread actions
     "list-remove",
     "go-next",
-    // call bar
+    // call bar + Calls mode (start audio/video/screen, roster states, DTMF keypad)
     "media-playback-start",
     "process-stop",
     "window-close",
     "audio-volume-muted",
     "audio-volume-high",
+    "camera-photo",
+    "system-lock-screen",
     // Files mode (link / unlink / permanent-delete + transfer controls + picker)
     "list-add",
     "media-playback-pause",

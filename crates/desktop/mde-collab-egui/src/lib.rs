@@ -16,8 +16,9 @@
 //!   [`SpaceDirectory`](mde_collab_types::SpaceDirectory) with per-space unread
 //!   badges (the selection key for every other pane);
 //! * per-space **mode tabs** across the top — [`Mode::Activity`],
-//!   [`Mode::Messages`], [`Mode::Files`], [`Mode::Transfers`], [`Mode::Documents`],
-//!   [`Mode::Alerts`], and [`Mode::Clipboard`] are all implemented. Documents
+//!   [`Mode::Messages`], [`Mode::Calls`], [`Mode::Files`], [`Mode::Transfers`],
+//!   [`Mode::Documents`], [`Mode::Alerts`], and [`Mode::Clipboard`] are all
+//!   implemented. Documents
 //!   (WL-FUNC-011 Phase 3c foundation) embeds the real `mde-editor-egui` editor —
 //!   a Project sub-mode (the full IDE) and a default Document sub-mode (a one-pane
 //!   Markdown editor) — and emits the collab document commands; the CRDT live
@@ -26,7 +27,15 @@
 //! * a persistent **call bar** across the bottom that renders the
 //!   [`CallState`](mde_collab_types::CallState) read model and survives every
 //!   mode/space switch, with controls wired to the call commands even though the
-//!   media plane lands later.
+//!   media plane lands later. The [`Mode::Calls`] tab is the full roster + controls
+//!   view of that same read model — start (audio / video / screen-share), the
+//!   per-call participant roster, mute / camera / screen-source toggles, an in-call
+//!   DTMF keypad, and hang up — all emitting typed call
+//!   [`CollabCommand`](mde_collab_types::CollabCommand)s. The live media transport
+//!   (WebRTC P2P for direct calls, an elected LiveKit SFU for group/failover, and
+//!   the existing SIP account/DID/G.711 behind a LiveKit SIP gateway) is the
+//!   explicit, in-code-marked media-plane follow-up; there is **no** recording or
+//!   transcription anywhere (deliberately absent from the UI, commands, and state).
 //!
 //! # The core modes
 //!
@@ -62,6 +71,7 @@
 
 mod activity;
 mod alerts;
+mod calls;
 mod clipboard;
 mod data;
 mod documents;
@@ -85,7 +95,7 @@ pub use icons::ALL_COLLAB_ICONS;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use mde_collab_types::{EventId, Severity, SpaceId, ThreadId};
+use mde_collab_types::{CallId, EventId, Severity, SpaceId, ThreadId};
 
 pub use files::file_ref_of_path;
 
@@ -104,6 +114,10 @@ pub enum Mode {
     Activity,
     /// The Markdown conversation timeline + anchored threads.
     Messages,
+    /// The calls roster + controls — the full view of the persistent call bar's
+    /// [`CallState`](mde_collab_types::CallState): start / answer / decline /
+    /// mute / DTMF / hang up. The live media transport is a marked follow-up.
+    Calls,
     /// The files linked into a space (their references + shared transfers).
     Files,
     /// The shared transfer jobs (the WL-FUNC-006 ledger mirror) + their controls.
@@ -119,9 +133,10 @@ pub enum Mode {
 
 impl Mode {
     /// The tabs in display order.
-    pub const TABS: [Self; 7] = [
+    pub const TABS: [Self; 8] = [
         Self::Activity,
         Self::Messages,
+        Self::Calls,
         Self::Files,
         Self::Transfers,
         Self::Documents,
@@ -135,6 +150,7 @@ impl Mode {
         match self {
             Self::Activity => "Activity",
             Self::Messages => "Messages",
+            Self::Calls => "Calls",
             Self::Files => "Files",
             Self::Transfers => "Transfers",
             Self::Documents => "Documents",
@@ -151,6 +167,7 @@ impl Mode {
         match self {
             Self::Activity
             | Self::Messages
+            | Self::Calls
             | Self::Files
             | Self::Transfers
             | Self::Documents
@@ -287,6 +304,17 @@ pub struct CommunicationsSurface {
     /// toggles. Reuses `mde-editor-egui`; owns no authoritative content (the
     /// canonical Markdown lives in the editor rope and is read back on save).
     documents: documents::DocumentsState,
+    /// Calls mode — the local seat's media device selection (mic/camera/screen) and
+    /// its outgoing camera/screen-share intents. Seat-level **view state**: the real
+    /// device enumeration and the act of binding a device to the live media plane
+    /// (WebRTC/LiveKit sender) are the marked media-plane follow-up, never faked in
+    /// this pure UI crate. The mic/camera/screen *mute*-vs-live *audio* mute stays a
+    /// real convergent command ([`SetCallMuted`](mde_collab_types::CollabCommand::SetCallMuted)).
+    call_media: calls::CallMediaPrefs,
+    /// Calls mode — the call whose in-call **DTMF keypad** is open, or `None`. A
+    /// per-view intent (a space switch closes it); each keypad press emits a real
+    /// [`SendDtmf`](mde_collab_types::CollabCommand::SendDtmf) command.
+    dtmf_pad: Option<CallId>,
 }
 
 impl CommunicationsSurface {
@@ -319,6 +347,10 @@ impl CommunicationsSurface {
             // A pending armed destructive alert action is a per-view intent — a
             // space switch disarms it (it must be re-armed deliberately).
             self.alert_arming = None;
+            // The open in-call DTMF keypad is a per-view intent — a space switch
+            // closes it. The seat-level media device prefs (mic/camera/screen)
+            // deliberately survive: they are the seat's, not the space's.
+            self.dtmf_pad = None;
             // The picked document is a per-space intent — reset it (the editor
             // content is replaced on the next load, so nothing stale leaks across
             // spaces). The embedded editors themselves survive as scratch state.
@@ -398,6 +430,7 @@ impl CommunicationsSurface {
         match self.mode {
             Mode::Activity => self.activity_body(ui, data),
             Mode::Messages => self.messages_body(ui, data, sink),
+            Mode::Calls => self.calls_body(ui, data, sink),
             Mode::Files => self.files_body(ui, data, sink),
             Mode::Transfers => self.transfers_body(ui, data, sink),
             Mode::Documents => self.documents_body(ui, data, sink),

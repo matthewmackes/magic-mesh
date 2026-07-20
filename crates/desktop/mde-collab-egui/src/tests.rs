@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 
 use mde_collab_types::{
     ActivityFeed, ActorId, AlertAction, AlertActionKind, AlertInbox, AlertPayload, AlertView,
-    ClipItemKind, ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState,
-    DocumentId, DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
+    CallId, CallKind, CallParticipantState, CallParticipantView, CallView, ClipItemKind,
+    ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState, DocumentId,
+    DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
     FileReferences, Severity, SpaceId, SpaceKind, SpaceRole, TransferControl, TransferDirection,
     TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
 };
@@ -1214,4 +1215,225 @@ fn switching_space_resets_the_picked_document() {
         None,
         "a space switch must reset the picked document"
     );
+}
+
+// ── Calls mode (WL-FUNC-011) ─────────────────────────────────────────────────
+
+/// A one-space fixture with a single active call — the seat (`eagle`) connected,
+/// a peer (`falcon`) still ringing — so the Calls roster + both control branches
+/// (connected vs ringing) render from real projection data.
+fn calls_fixture(space: SpaceId, call: CallId) -> FixtureData {
+    let me = ActorId::new("eagle");
+    let peer = ActorId::new("falcon");
+    FixtureData::new(me.clone(), 2_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            3,
+            1_900_000,
+        ))
+        .with_call(CallView {
+            call,
+            space,
+            kind: CallKind::Audio,
+            started_unix_ms: 1_950_000,
+            participants: vec![
+                CallParticipantView {
+                    actor: me,
+                    state: CallParticipantState::Connected,
+                    muted: false,
+                },
+                CallParticipantView {
+                    actor: peer,
+                    state: CallParticipantState::Ringing,
+                    muted: false,
+                },
+            ],
+        })
+}
+
+#[test]
+fn calls_mode_renders_a_fixture_call_state() {
+    // The Calls mode renders the CallState projection headless — the active call,
+    // its participants, and the controls — painting Carbon icons as image meshes.
+    let space = SpaceId::new();
+    let data = calls_fixture(space, CallId::new());
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Calls);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the Calls roster painted nothing");
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the Calls mode must paint Carbon icons as image meshes"
+    );
+}
+
+#[test]
+fn calls_mode_empty_state_is_honest() {
+    // No active call → an honest "No active calls" state (never a faked call),
+    // with the start cluster still available. Renders without panic.
+    assert!(Mode::Calls.is_implemented());
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        2,
+        1_000,
+    ));
+    assert!(data.call_state().active.is_empty());
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Calls);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the empty Calls state painted nothing");
+}
+
+#[test]
+fn call_bar_shows_the_active_call() {
+    // The persistent call bar (bottom, mode-independent) renders the active call:
+    // in the default Activity mode, a fixture with an active call still paints it.
+    let space = SpaceId::new();
+    let data = calls_fixture(space, CallId::new());
+    let mut surface = CommunicationsSurface::new();
+    // Deliberately NOT in Calls mode — the bar is persistent across modes.
+    assert_eq!(surface.mode(), Mode::Activity);
+    assert!(
+        !data.call_state().active.is_empty(),
+        "the fixture must carry an active call"
+    );
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the persistent call bar must paint the active call's controls"
+    );
+}
+
+#[test]
+fn start_emits_start_call_for_each_kind() {
+    // The start cluster emits StartCall with the picked kind for the selected space.
+    let space = SpaceId::new();
+    let surface = CommunicationsSurface::new();
+    for kind in [CallKind::Audio, CallKind::Video, CallKind::Screen] {
+        let mut sink = CommandSink::new();
+        surface.start_call(&mut sink, space, kind);
+        assert!(
+            matches!(
+                sink.queued().first(),
+                Some(CollabCommand::StartCall { space: s, kind: k, .. }) if *s == space && *k == kind
+            ),
+            "start ({kind:?}) must emit StartCall with that kind"
+        );
+    }
+}
+
+#[test]
+fn answer_and_decline_emit_the_right_commands() {
+    let call = CallId::new();
+    let surface = CommunicationsSurface::new();
+
+    let mut sink = CommandSink::new();
+    surface.answer_call(&mut sink, call);
+    assert!(
+        matches!(sink.queued().first(), Some(CollabCommand::AnswerCall { call: c }) if *c == call),
+        "Answer must emit AnswerCall"
+    );
+
+    let mut sink = CommandSink::new();
+    surface.decline_call(&mut sink, call);
+    assert!(
+        matches!(sink.queued().first(), Some(CollabCommand::DeclineCall { call: c }) if *c == call),
+        "Decline must emit DeclineCall"
+    );
+}
+
+#[test]
+fn hang_up_emits_hang_up_call() {
+    let call = CallId::new();
+    let surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+    surface.hang_up_call(&mut sink, call);
+    assert!(
+        matches!(sink.queued().first(), Some(CollabCommand::HangUpCall { call: c }) if *c == call),
+        "Hang up must emit HangUpCall"
+    );
+}
+
+#[test]
+fn mute_toggle_emits_set_call_muted() {
+    let call = CallId::new();
+    let surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+    surface.set_call_muted(&mut sink, call, true);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SetCallMuted { call: c, muted: true }) if *c == call
+        ),
+        "the mute control must emit SetCallMuted"
+    );
+}
+
+#[test]
+fn dtmf_keypad_emits_send_dtmf() {
+    // Opening the in-call keypad is a per-view intent; a press emits SendDtmf.
+    let call = CallId::new();
+    let mut surface = CommunicationsSurface::new();
+    surface.open_dtmf_pad(call);
+    assert_eq!(
+        surface.dtmf_pad_target(),
+        Some(call),
+        "opening the keypad must target the call"
+    );
+    let mut sink = CommandSink::new();
+    surface.send_dtmf(&mut sink, call, '5');
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SendDtmf { call: c, digit: '5' }) if *c == call
+        ),
+        "a DTMF keypad press must emit SendDtmf"
+    );
+}
+
+#[test]
+fn no_recording_or_transcription_control_exists_anywhere() {
+    // Spec §7: recording + transcription are deliberately absent from the UI, the
+    // icon standard, and the call commands. No glyph names them...
+    for name in ALL_COLLAB_ICONS {
+        let n = name.to_ascii_lowercase();
+        assert!(
+            !n.contains("record") && !n.contains("transcri"),
+            "no Carbon glyph may name recording/transcription (found {name:?})"
+        );
+    }
+    // ...and every call command the surface can emit is a call-control verb, never
+    // a record/transcribe one.
+    let call = CallId::new();
+    let space = SpaceId::new();
+    let commands = [
+        CollabCommand::StartCall {
+            space,
+            call,
+            kind: CallKind::Audio,
+        },
+        CollabCommand::AnswerCall { call },
+        CollabCommand::DeclineCall { call },
+        CollabCommand::HangUpCall { call },
+        CollabCommand::SetCallMuted { call, muted: true },
+        CollabCommand::SendDtmf { call, digit: '1' },
+    ];
+    for c in commands {
+        let verb = c.verb();
+        assert!(
+            !verb.contains("record") && !verb.contains("transcri"),
+            "no call command may be a recording/transcription verb (found {verb:?})"
+        );
+    }
 }
