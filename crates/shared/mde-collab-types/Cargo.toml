@@ -1,0 +1,46 @@
+# mde-collab-types — the stable public contracts for the Communications suite
+# (WL-FUNC-011 Phase 0). A LEAF crate: pure types + serialization + Ed25519
+# signing, ZERO business logic and ZERO I/O (no Bus, no SQLite, no wall-clock —
+# every timestamp/clock is caller-injected). The whole Communications suite
+# (mde-collab-core, the collab mackesd worker, mde-collab-egui) compiles against
+# these contracts, so they must be stable and spec-faithful.
+#
+# The seven replaced subsystems (Chat/Messaging, Voice/Calls/SIP, Editor, File
+# manager, Transfers, Alerts, Clipboard) are catalogued in the 519-row parity
+# ledger docs/platform/WL-FUNC-011-parity-ledger.md; every event class there has
+# a covering CollabEventKind here (asserted by the coverage test).
+[package]
+name        = "mde-collab-types"
+description = "WL-FUNC-011 Phase 0 public contracts for the Communications suite: opaque UUID identifiers (Space/Event/Thread/Document/FileRef/Transfer/Call), the versioned Ed25519-signed CollabEventEnvelope with deterministic canonical signing bytes and content-addressed (SHA-256) payload references, the CollabEventKind event taxonomy, the typed CollabCommand operations, the CollabReadModel projections the egui surface consumes, and the action/collab, state/collab, collab/event topic helpers. Pure types + serde + signing — no business logic, no I/O."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_collab_types"
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# Stable, opaque identifiers. v4 mints a fresh random id (stable across path
+# moves / reconnects / replay / multi-space linking); serde round-trips it as
+# the bare UUID string. Same crate + features the shell + mackesd already use.
+uuid = { version = "1", features = ["v4", "serde"] }
+# The unforgeable actor identity binding: rustls-family Ed25519, the SAME dep +
+# version + features mde-chat signs messages with (lock 10) — never openssl.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Content-addressed payload references: SHA-256 of an out-of-band payload's
+# bytes. `sha2` 0.10 is the platform's pure-Rust digest (mackesd, mde-bookmarks).
+sha2 = "0.10"
+
+[dev-dependencies]
+# Only the tests mint fresh keypairs; the contracts themselves are handed a
+# SigningKey by the caller and never touch an RNG (the mde-chat pattern).
+rand = "0.8"
+
+[lints]
+workspace = true
