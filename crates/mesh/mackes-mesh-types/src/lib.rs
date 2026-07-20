@@ -85,6 +85,11 @@ pub mod tags;
 // byte-compatible copies. Lands here (like `mesh_storage` / `device_control`) so
 // the desktop tier never depends on the heavy daemon crate.
 pub mod vdi_session;
+/// Rolling Node — the provider-neutral vehicle-gateway (`state/vehicle/<node>`) mirror
+/// + `action/vehicle/*` command contract + a pure NMEA GGA parser. A workstation-side
+/// adapter (mackesd `vehicle` worker) SSH/HTTP-polls a mobile gateway (AirLink MG90) and
+/// the maps-location cockpit folds this mirror into its live models.
+pub mod vehicle;
 /// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
 pub mod vpn;
 /// VPN-GW-3 — selective egress: fwmark/ip-rule policy routing + nftables
