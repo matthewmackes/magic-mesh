@@ -143,76 +143,72 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Core Architecture
 
-### WL-ARCH-001 - Construct Cloud provider-neutral runway and OpenStack exit
+### WL-ARCH-001 - Remove OpenStack; OpenTofu + Ansible IaC workspace for all cloud operations
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Construct Cloud is still coupled to OpenStack service names, Kolla
-  topology, Nova/Heat resource verbs, and `state/openstack/*` mirrors while the
-  user has directed a new track to move away from OpenStack. The existing
-  backend must remain honest and usable until a replacement provider path carries
-  the same typed behavior.
-- Required outcome: Cloud UI, Bus verbs, persisted mirrors, orchestration forms,
-  image/network lifecycle, and docs use provider-neutral Construct Cloud
-  contracts; OpenStack becomes a replaceable backend adapter instead of the
-  product architecture, and replacement provider work can be introduced without
-  rewiring shell surfaces.
-- Scope: Cloud provider contracts, OpenStack adapter boundaries, provider
-  registry/configuration, IaC UI labels and verbs, image pipeline, networking,
-  old-stack deletion after replacement proof, docs cleanup, and live cloud
-  status.
-- Relevant files/components: `crates/mesh/mackesd/src/workers/openstack/`,
-  `docs/design/quasar-cloud.md`, `docs/ops/quasar-cloud-runbook.md`,
-  `packaging/bootc/`, cloud UI, `crates/desktop/mde-shell-egui/src/iac/`, and
-  unit-aggregator cloud mirror consumers.
-- Dependencies: Replacement provider decision/prototype, farm dev cloud/test bed,
-  and live cloud credentials.
-- Current evidence: A 2026-07-18 provider-neutral runway pass updated
-  `AI_GOVERNANCE.md` with the newer Construct Cloud provider-neutral lock, then
-  moved the native IaC surface's user-facing copy from OpenStack/Keystone/Heat/
-  HOT wording to Construct Cloud, Cloud provider, Cloud API status,
-  Orchestration, and Template language while preserving backend diagnostics and
-  existing wire contracts. Farm evidence: BigBoy `.130` slot
-  `openstack-exit-iac`
-  `cargo test -p mde-shell-egui iac -- --nocapture` passed 31 tests; focused
-  rustfmt over the three edited IaC files passed. Whole-crate `cargo fmt
-  --package mde-shell-egui -- --check` is still blocked by unrelated existing
-  formatting drift in other dirty shell files. A follow-up 2026-07-18
-  unit-aggregator slice made the Bus cloud mirror reader prefer provider-neutral
-  `state/cloud/<node>` mirrors while accepting legacy `state/openstack/<node>`
-  adapter mirrors for backward-compatible reads and diagnostics. Farm evidence:
-  the post-cleanup `.50` slot `openstack-exit-units3`
-  `cargo test -p mackesd unit_aggregator::sources -- --nocapture` passed 8
-  focused source tests, including persisted cloud+legacy topic folding into
-  units and invalid/empty topic rejection after disambiguating the provider-
-  neutral `CloudMirrorSource::read` call from the legacy compatibility trait;
-  `.90` slot `openstack-exit-fmt3` `cargo fmt -p mackesd -- --check` passed.
-  A third 2026-07-18 OpenStack-exit track added the provider-neutral
-  `mackes_mesh_types::cloud` facade so new consumers can import Construct Cloud
-  catalog, health, resource table, and orchestration aliases without binding to
-  the legacy `openstack` module path. The facade accepts direct provider-neutral
-  catalog/resource JSON from a non-OpenStack fake while preserving Keystone and
-  OpenStack collection fallback parsing for the installed adapter. Farm
-  evidence: `.90` slot `cloud-facade-test`
-  `cargo test -p mackes-mesh-types cloud -- --nocapture` passed 6 focused tests;
-  `.50` slot `cloud-facade-fmt`
-  `cargo fmt -p mackes-mesh-types -- --check` passed.
-- Acceptance criteria: User-facing shell surfaces no longer require OpenStack,
-  Keystone, Nova, Heat, or Horizon terminology; typed Bus and persisted cloud
-  contracts can be satisfied by at least one non-OpenStack fake/provider in
-  tests; the existing OpenStack backend can be disabled without breaking the UI;
-  a replacement backend can list and launch a test workload over mesh networking;
-  stale OpenStack-only docs are archived or bannered once the replacement path is
-  live.
-- Verification method: Provider-neutral UI and contract fixture tests, OpenStack
-  adapter compatibility tests while it remains installed, provider-disabled UI
-  smoke, replacement-provider smoke, and `/audit` grep for product-facing
-  OpenStack terminology.
-- Origin or merged source IDs: QC-1 through QC-15, OW-8, E12 supersession notes,
-  old worklist lines 3457-3567, user directive 2026-07-18 to start moving away
-  from OpenStack.
-
+- Problem: Construct Cloud is coupled to OpenStack (Nova/Heat/Keystone/Kolla,
+  state/openstack/* mirrors, cloud_plane.rs/console/front_door OpenStack copy).
+  Operator directive 2026-07-19: REMOVE ALL OpenStack and rebuild cloud operations
+  on OpenTofu + Ansible against local libvirt, with the IaC workspace recreated as
+  the single surface for every cloud operation.
+- Required outcome: Zero OpenStack anywhere (workers, surfaces, mirrors, docs,
+  deps). A recreated `iac/` workspace drives ALL cloud operations end to end via
+  OpenTofu (provision) + Ansible (configure) against local libvirt/KVM, and can
+  provision + configure a workload with no OpenStack code present.
+- Decided stack (operator 2026-07-19, Red Hat / cloud-native standards):
+  1. **Provision = OpenTofu** (declarative; replaces Heat/HOT + Nova verbs).
+     libvirt provider for local VMs; networks + images declared as Tofu resources.
+  2. **Configure = Ansible core** (playbooks/roles; replaces OpenStack config).
+     Ansible roles drive the EXISTING mackesd-written `/etc/mackesd/site.yml`
+     convergence (boot-durable, reuses the SEC-001 join path).
+  3. **VM/workload backend = local libvirt/KVM** (E12 local-first; no external cloud).
+  4. **Images = bootc image-mode + osbuild/image-builder** (extends packaging/bootc/).
+  5. **Containers = Podman + Quadlet** systemd units (replaces Kolla), Ansible-managed.
+  6. **Tofu state = etcd-backed** (mesh-native; consistent with infra/tofu/*).
+  7. **Inventory = mesh-derived dynamic inventory** — a plugin reads the live mesh
+     roster (etcd node-tags /mcnf/node-tags/<id> + mackesd peers); roles/scopes
+     drive Ansible groups; no static host files.
+  8. **Secrets = mde-seal/age** (mesh-native, role/scope-sealed per SEC-003) bridged
+     to Ansible via a lookup plugin + a Tofu external data source. NO Ansible Vault
+     (single secret system).
+  9. **Networking = Nebula overlay** (mesh) + libvirt networks via nmstate/
+     NetworkManager (replaces Neutron).
+  10. **Removal sequencing = delete OpenStack immediately, build in its place** —
+      accept a temporary cloud-ops gap; no permanent compat shim; single cutover.
+- Recreate the IaC workspace: rebuild `crates/desktop/mde-shell-egui/src/iac/` as
+  the unified cloud-operations surface with modes for Provision (Tofu plan/apply +
+  state), Configure (Ansible playbook/role runs), Images (bootc/osbuild), Network,
+  Containers (Quadlet), and Status/day-2. Reads provider-neutral state/cloud/*
+  mirrors; the `mackes_mesh_types::cloud` facade becomes the live contract (wire
+  its real consumers; drop the dormant openstack module import at iac/mod.rs:53).
+- Relevant files/components: DELETE `crates/mesh/mackesd/src/workers/openstack/`,
+  the OpenStack copy in `cloud_plane.rs`/`console/mod.rs:619`/`front_door.rs:415,462`,
+  `state/openstack/*` producers, and OpenStack docs; NEW `infra/tofu/cloud/`
+  (libvirt provider, etcd backend, modules), NEW Ansible tree (roles + dynamic
+  inventory plugin + site.yml integration), rebuilt `iac/`, the
+  `mackes_mesh_types::cloud` facade, `packaging/bootc/`, a new mackesd cloud worker
+  (Tofu/Ansible runner + status publisher) registered in WORKER_REGISTRY.
+- Dependencies: a farm dev libvirt host to prove list+launch (local; the farm/XCP
+  dom0s or a seat). No external cloud creds required (local-first).
+- Acceptance criteria: (1) `/audit` grep finds zero product-facing OpenStack/Nova/
+  Heat/Keystone/Kolla terminology or code; the `openstack/` worker tree is gone.
+  (2) The recreated IaC workspace runs a Tofu apply that provisions a local libvirt
+  VM and an Ansible play that configures it, end to end, over mesh networking, with
+  no OpenStack present. (3) Tofu state persists in etcd; inventory is mesh-derived;
+  secrets resolve via the mde-seal lookup (no Vault). (4) A Podman/Quadlet service
+  workload and a bootc image build are driveable from the workspace. (5) Stale
+  OpenStack docs archived/bannered.
+- Verification method: Tofu+Ansible fixture tests (plan/apply against a libvirt
+  fake + a real libvirt host smoke), inventory-plugin unit tests over an etcd
+  roster fixture, mde-seal-lookup resolution test, workspace UI fixture tests per
+  mode, an `/audit` OpenStack-terminology grep gate, and a live local-libvirt
+  provision+configure smoke on a farm/seat host.
+- Origin or merged source IDs: QC-1..QC-15, OW-8, E12 supersession notes, operator
+  directive 2026-07-19 (remove all OpenStack; OpenTofu provision + Ansible
+  configure; recreate IaC workspace for all cloud ops; 10-question Red Hat-standards
+  survey).
 ## Runtime Reliability
 
 ### WL-RUN-003 - Lighthouse full/equal join and push-button add/retire
