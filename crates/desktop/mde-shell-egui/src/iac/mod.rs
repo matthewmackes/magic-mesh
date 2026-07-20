@@ -1,41 +1,37 @@
-//! The **Infra as Code (`IaC`)** surface — the single workspace for ALL cloud
-//! operations on the local-first **OpenTofu + Ansible** backend (WL-ARCH-001).
+//! The **Workloads** cockpit (WL-ARCH-006) — the single workspace for every
+//! delivery-type workload on the local-first **OpenTofu + Ansible + libvirt +
+//! Podman** backend (WL-ARCH-001).
 //!
-//! The operator directive (2026-07-19) removed the old provider control plane and
-//! rebuilt cloud operations on OpenTofu (provision) + Ansible (configure) over
-//! local libvirt/KVM. This surface is the desktop face of that stack — a
-//! six-mode workspace:
+//! The surface is organized around the plan's central metaphor: **five
+//! delivery-type views**, each placeable on an explicit mesh node, over the
+//! Tofu/Ansible/libvirt/Podman substrate. The primary axis is *what a workload
+//! delivers* ([`DeliveryView`]); the secondary axis is *which lens* you view it
+//! through ([`Panel`] — the roster, or one of the provision / configure / status
+//! / images / containers panels).
 //!
-//! 1. **Provision** — compose + run OpenTofu: the live resource roster (from the
-//!    `state/cloud` mirror) plus the plan/apply gate (dry-run default; a
-//!    typed-confirm to actually apply) and the per-instance lifecycle verbs.
-//! 2. **Configure** — run Ansible: pick a playbook + target group and converge.
-//! 3. **Images** — bootc / osbuild image builds (honest backend-pending until the
-//!    verb lands, §7 — never faked).
-//! 4. **Network** — libvirt networks (Nebula-adjacent): the libvirt backend
-//!    health is real; list/compose is honestly backend-pending.
-//! 5. **Containers** — Podman / Quadlet workloads (honest backend-pending).
-//! 6. **Status** — day-2: per-tool backend health (OpenTofu / Ansible / libvirt),
-//!    the resource roster, honest degraded states, and the session audit trail.
+//! ## Layout (the U3 seam)
+//!
+//! This module owns the durable seam the six panel workers (U14–U19) plug into:
+//! the nav, the folded `state/cloud` mirror, the typed-arming + audit backend
+//! wiring, and the dispatch to each panel's own render fn. Each panel lives in
+//! its own file and owns its own `State` sub-struct, so a downstream worker adds
+//! panel-specific state + rendering in THEIR file and never edits this one.
 //!
 //! ## How the cloud is consumed (§6)
 //!
 //! The shell never depends on `mackesd`. It **reads** the per-node status mirror
-//! `state/cloud/<node>` ([`CloudState`], folded across every node) off the Bus,
-//! and **emits** `action/cloud/*` verbs (provision / configure / destroy /
-//! instance-{start,stop,reboot,delete}) as typed request/reply — the reply lands
-//! on `reply/<request-ulid>`. Only the mesh-neutral
-//! [`mackes_mesh_types::cloud`] shapes are shared; the worker owns the actual
-//! `tofu` / `ansible-playbook` / `virsh` execution. The surface never shells a
-//! tool itself.
+//! `state/cloud/<node>` ([`CloudState`], folded across every node — now carrying
+//! per-workload rows / drift / capacity) off the Bus, and **emits**
+//! `action/cloud/*` verbs as typed request/reply (the reply lands on
+//! `reply/<request-ulid>`). Only the mesh-neutral [`mackes_mesh_types::cloud`]
+//! shapes are shared; the worker owns the actual `tofu` / `ansible-playbook` /
+//! `virsh` / `podman` execution. The surface never shells a tool itself.
 //!
-//! Every state is honest (§7): an off-mesh Bus is a silent degrade, an unprobed
-//! backend reads its honest health (`Up` / `Down` / `Absent`, never a fabricated
-//! up), an empty roster is a real "no instances", and a mode with no landed
-//! backend verb renders an honest **backend pending** note rather than fake data.
-//! Live mutation is operator-gated on the worker (`MDE_CLOUD_APPLY=1`); the mirror
-//! carries each node's `apply_armed`, so the workspace shows plan-only vs. live
-//! honestly, and every destructive intent passes a typed-confirm echo first.
+//! Every state is honest (§7): an off-mesh Bus is a silent degrade, an empty
+//! roster is a real "no workloads", and a panel with no landed backend render
+//! draws an honest **not yet built** stub rather than fake data. Every
+//! destructive intent passes a typed-confirm echo first (RUN-006), and every
+//! performed op lands in the session audit trail.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -43,11 +39,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use mde_egui::egui::{self, Color32, RichText, Sense};
-use mde_egui::{carbon_icon, ChipTone, Style};
+use mde_egui::{carbon_icon, Style};
 
-use mackes_mesh_types::cloud::{
-    CloudProviderAdapter, CloudState, HealthState, ResourceTable, ServiceHealth, CLOUD_STATE_PREFIX,
-};
+use mackes_mesh_types::cloud::{CloudState, DeliveryType, WorkloadRow, CLOUD_STATE_PREFIX};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -56,29 +50,12 @@ use mde_bus::rpc::{publish_request, reply_topic};
 use crate::bus_reader::BusReader;
 
 /// User-facing cloud product name. The backend toolchain (OpenTofu / Ansible /
-/// libvirt) stays behind the Bus + shared payload contracts, so a later backend
-/// can satisfy the same UI seam.
+/// libvirt / Podman) stays behind the Bus + shared payload contracts, so a later
+/// backend can satisfy the same UI seam.
 pub(super) const CLOUD_PRODUCT_LABEL: &str = "Construct Cloud";
 
 /// The workspace title the MENUBAR-ALL bar wears.
-pub(super) const WORKSPACE_TITLE: &str = "Infra as Code";
-
-// ── the backend tools the mirror reports health for (the worker's `service_type`
-//    on each health row) — provider-neutral local-first toolchain. ──
-/// OpenTofu (the provision leg).
-const TOOL_TOFU: &str = "opentofu";
-/// Ansible (the configure leg).
-const TOOL_ANSIBLE: &str = "ansible";
-/// libvirt/KVM (the local VM + network backend).
-const TOOL_LIBVIRT: &str = "libvirt";
-
-/// Every backend tool the Status mode reads, in render order, with its display
-/// label.
-const BACKEND_TOOLS: [(&str, &str); 3] = [
-    (TOOL_TOFU, "OpenTofu"),
-    (TOOL_ANSIBLE, "Ansible"),
-    (TOOL_LIBVIRT, "libvirt"),
-];
+pub(super) const WORKSPACE_TITLE: &str = "Workloads";
 
 /// The typed-confirm echo an apply intent must match before the verb publishes
 /// (RUN-006's typed-arming idiom — the destructive-op hard wall).
@@ -102,59 +79,126 @@ const POLL_REPAINT: Duration = Duration::from_secs(1);
 /// it requested this session — the newest are kept).
 const MAX_AUDIT: usize = 24;
 
-// ─────────────────────────────── the six modes ──────────────────────────────
+// ───────────────────────────── the delivery-type axis ───────────────────────
 
-/// Which mode of the workspace is showing — the six cloud-ops surfaces.
+/// Which delivery-type view is showing — the cockpit's primary organizing axis
+/// (delivery type × placement). Mirrors [`DeliveryType`] on the UI side, adding
+/// the nav label + Mackes-Carbon glyph each view tab wears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum Mode {
-    /// Compose + run OpenTofu: the resource roster + the plan/apply gate.
+pub(super) enum DeliveryView {
+    /// A full VM desktop delivered as a native VDI seat.
     #[default]
-    Provision,
-    /// Run Ansible: pick a playbook + group and converge.
-    Configure,
-    /// bootc / osbuild image builds (honest backend-pending).
-    Images,
-    /// libvirt networks (real backend health; list/compose backend-pending).
-    Network,
-    /// Podman / Quadlet workloads (honest backend-pending).
-    Containers,
-    /// Day-2: per-tool backend health, roster, degraded states, audit trail.
-    Status,
+    DesktopVm,
+    /// A headless VM running a service exposed on the mesh.
+    ServiceVm,
+    /// A VM whose individual apps are forwarded into the MDE desktop.
+    AppVm,
+    /// A VM providing Android via the two-layer Cuttlefish backend.
+    AndroidVm,
+    /// A Podman / Quadlet service container.
+    ServiceContainer,
 }
 
-impl Mode {
-    /// Every mode, in tab order.
-    const ALL: [Self; 6] = [
-        Self::Provision,
-        Self::Configure,
-        Self::Images,
-        Self::Network,
-        Self::Containers,
-        Self::Status,
+impl DeliveryView {
+    /// Every delivery view, in tab order.
+    pub(super) const ALL: [Self; 5] = [
+        Self::DesktopVm,
+        Self::ServiceVm,
+        Self::AppVm,
+        Self::AndroidVm,
+        Self::ServiceContainer,
     ];
 
-    /// The tab label.
-    const fn label(self) -> &'static str {
+    /// The wire delivery type this view renders — the key the roster filters the
+    /// mirror's `workloads` on.
+    pub(super) const fn delivery_type(self) -> DeliveryType {
         match self {
-            Self::Provision => "Provision",
-            Self::Configure => "Configure",
-            Self::Images => "Images",
-            Self::Network => "Network",
-            Self::Containers => "Containers",
-            Self::Status => "Status",
+            Self::DesktopVm => DeliveryType::DesktopVm,
+            Self::ServiceVm => DeliveryType::ServiceVm,
+            Self::AppVm => DeliveryType::AppVm,
+            Self::AndroidVm => DeliveryType::AndroidVm,
+            Self::ServiceContainer => DeliveryType::ServiceContainer,
         }
     }
 
-    /// The Mackes-Carbon glyph name this mode's tab wears (§4 — a registered
-    /// symbolic icon, never a text glyph).
-    const fn icon(self) -> &'static str {
+    /// The delivery-view tab label.
+    pub(super) const fn label(self) -> &'static str {
         match self {
-            Self::Provision => "view-grid",
+            Self::DesktopVm => "Desktop VM",
+            Self::ServiceVm => "Service VM",
+            Self::AppVm => "App VM",
+            Self::AndroidVm => "Android VM",
+            Self::ServiceContainer => "Container",
+        }
+    }
+
+    /// The Mackes-Carbon glyph this view's tab wears (§4 — a registered symbolic
+    /// icon, never a text glyph).
+    pub(super) const fn icon(self) -> &'static str {
+        match self {
+            Self::DesktopVm => "view-grid",
+            Self::ServiceVm => "globe",
+            Self::AppVm => "overlay",
+            Self::AndroidVm => "system-lock-screen",
+            Self::ServiceContainer => "text-x-generic",
+        }
+    }
+}
+
+// ─────────────────────────────── the lens axis ──────────────────────────────
+
+/// Which lens (panel) the main area shows for the selected [`DeliveryView`] —
+/// the secondary nav axis. `Roster` is the selected view's own workload roster;
+/// the rest are the cross-cutting panels the U14–U19 workers own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum Panel {
+    /// The selected delivery view's live workload roster (the default lens).
+    #[default]
+    Roster,
+    /// Author + place a new workload (U14 placement · U15 form).
+    Provision,
+    /// Run Ansible + the live inventory (U17).
+    Configure,
+    /// Day-2 status, metrics + drift (U18).
+    Status,
+    /// Golden per-type image roster (U19).
+    Images,
+    /// Podman / Quadlet containers (U19).
+    Containers,
+}
+
+impl Panel {
+    /// Every panel lens, in sub-nav order.
+    pub(super) const ALL: [Self; 6] = [
+        Self::Roster,
+        Self::Provision,
+        Self::Configure,
+        Self::Status,
+        Self::Images,
+        Self::Containers,
+    ];
+
+    /// The panel sub-nav label.
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Roster => "Roster",
+            Self::Provision => "Provision",
+            Self::Configure => "Configure",
+            Self::Status => "Status",
+            Self::Images => "Images",
+            Self::Containers => "Containers",
+        }
+    }
+
+    /// The Mackes-Carbon glyph this panel's tab wears.
+    pub(super) const fn icon(self) -> &'static str {
+        match self {
+            Self::Roster => "view",
+            Self::Provision => "list-add",
             Self::Configure => "document-edit",
-            Self::Images => "camera-photo",
-            Self::Network => "globe",
-            Self::Containers => "overlay",
             Self::Status => "emblem-ok",
+            Self::Images => "camera-photo",
+            Self::Containers => "overlay",
         }
     }
 }
@@ -203,20 +247,22 @@ pub(super) enum ArmAction {
     Configure,
     /// An infrastructure `destroy` — echo [`DESTROY_ECHO`].
     Destroy,
-    /// A destructive per-instance lifecycle op (`instance-reboot` /
-    /// `instance-delete`) — echo the instance name.
+    /// A destructive per-workload lifecycle op (`instance-reboot` /
+    /// `instance-delete`) — echo the workload name.
     Lifecycle {
         /// The lifecycle verb.
         verb: &'static str,
-        /// The target instance id.
+        /// The target workload/instance id.
         instance_id: String,
-        /// The instance's display name — the required echo.
+        /// The workload's display name — the required echo.
         name: String,
     },
 }
 
 impl ArmAction {
-    /// The `action/cloud/*` verb this action publishes.
+    /// The `action/cloud/*` verb this action publishes (test seam — the perform
+    /// path matches the variant directly).
+    #[cfg(test)]
     const fn verb(&self) -> &'static str {
         match self {
             Self::Provision => "provision",
@@ -250,7 +296,7 @@ impl ArmAction {
             Self::Provision => "the OpenTofu-managed infrastructure (live apply)".to_string(),
             Self::Configure => "the Ansible convergence (live apply)".to_string(),
             Self::Destroy => "ALL OpenTofu-managed infrastructure".to_string(),
-            Self::Lifecycle { name, .. } => format!("instance {name}"),
+            Self::Lifecycle { name, .. } => format!("workload {name}"),
         }
     }
 }
@@ -310,7 +356,7 @@ impl AuditOutcome {
 /// op it requested (verb · verdict · detail). Distinct from the daemon's durable
 /// hash-chained events log; this is the local "what did I do here" list.
 #[derive(Debug, Clone)]
-struct AuditEntry {
+pub(super) struct AuditEntry {
     /// The verb performed (`provision` / `instance-delete` / …).
     verb: String,
     /// The honest verdict.
@@ -321,16 +367,22 @@ struct AuditEntry {
 
 // ─────────────────────────────── the surface state ──────────────────────────
 
-/// The **Infra as Code** workspace state — the folded `state/cloud` mirror, the
-/// active mode, the Configure inputs, the typed-arming confirm, the one in-flight
-/// mutation, and the session audit trail. A plain field on the shell's struct,
-/// borrowed `&mut` while the surface is in view.
-pub struct InfraCodeState {
+/// The **Workloads** cockpit state — the folded `state/cloud` mirror, the active
+/// delivery view + lens, the selected placement node, each panel's own sub-state,
+/// the typed-arming confirm, the one in-flight mutation, and the session audit
+/// trail. A plain field on the shell's struct, borrowed `&mut` while the surface
+/// is in view. Every panel owns its `State` in its own file, so a downstream
+/// worker adds panel-specific state without touching this struct.
+///
+/// `#[derive(Debug)]` deliberately: it keeps every sub-panel `State` field a live
+/// read (the panel workers fill them incrementally), so the seam compiles clean
+/// as the panels land one by one.
+#[derive(Debug)]
+pub struct WorkloadsState {
+    // ── preserved backend wiring (do not repurpose) ──
     /// The Bus persist root (the client data dir). `None` when the Bus is
     /// unavailable — an honest off-mesh degrade (§7), never a crash.
     bus_root: Option<PathBuf>,
-    /// Which mode is showing.
-    mode: Mode,
     /// The per-node status mirrors, folded across every `state/cloud/<node>`
     /// topic (host-sorted). Empty when nothing has published yet — an honest
     /// pre-mirror state, never fabricated.
@@ -339,10 +391,6 @@ pub struct InfraCodeState {
     loaded_at: Option<Instant>,
     /// A manual refresh is queued — re-reads the mirror on the next poll.
     forced: bool,
-    /// The Configure mode's playbook selection (the Ansible entrypoint).
-    configure_playbook: String,
-    /// The Configure mode's target group (the mesh inventory group to converge).
-    configure_group: String,
     /// A pending typed-arming confirm for a destructive intent, if any.
     arming: Option<Arming>,
     /// The one in-flight mutation — its reply resolves into the note + audit.
@@ -351,27 +399,92 @@ pub struct InfraCodeState {
     note: Option<String>,
     /// The session audit trail (newest last), capped at [`MAX_AUDIT`].
     audit: Vec<AuditEntry>,
+
+    // ── the cockpit nav ──
+    /// The active delivery-type view (the primary axis).
+    view: DeliveryView,
+    /// The active lens (the secondary axis).
+    panel: Panel,
+    /// The placement node the provision panel targets (from the placement
+    /// picker); `None` until one is chosen.
+    selected_node: Option<String>,
+
+    // ── the per-panel sub-state (each panel worker owns its own file) ──
+    //
+    // `allow(dead_code)`: these are the fan-out seam — each panel worker (U14–U19)
+    // reads + fills its own `State` in its own file. They are honestly unread
+    // until then; the allow drops off the moment a worker consumes the field.
+    // (`configure` is already consumed by `configure_body` + the Configure lens.)
+    /// U14 — placement picker state.
+    #[allow(dead_code)]
+    placement: placement::State,
+    /// U15 — provision form state.
+    #[allow(dead_code)]
+    form: provision_form::State,
+    /// U17 — configure + inventory state (holds the Ansible playbook/group).
+    configure: configure::State,
+    /// U18 — status + metrics state.
+    #[allow(dead_code)]
+    status: status::State,
+    /// U19 — images panel state.
+    #[allow(dead_code)]
+    images: images::State,
+    /// U19 — containers panel state.
+    #[allow(dead_code)]
+    containers: containers::State,
+
+    // ── the per-delivery-view sub-state (each U16 view worker owns its file) ──
+    /// Desktop VM view state.
+    #[allow(dead_code)]
+    desktop_vm: views::desktop_vm::State,
+    /// Service VM view state.
+    #[allow(dead_code)]
+    service_vm: views::service_vm::State,
+    /// App VM view state.
+    #[allow(dead_code)]
+    app_vm: views::app_vm::State,
+    /// Android VM view state.
+    #[allow(dead_code)]
+    android_vm: views::android_vm::State,
+    /// Service Container view state.
+    #[allow(dead_code)]
+    service_container: views::container::State,
 }
 
-impl Default for InfraCodeState {
+impl Default for WorkloadsState {
     fn default() -> Self {
         Self {
             bus_root: mde_bus::client_data_dir(),
-            mode: Mode::default(),
             states: Vec::new(),
             loaded_at: None,
             forced: false,
-            configure_playbook: "site.yml".to_string(),
-            configure_group: "cloud_vm".to_string(),
             arming: None,
             mutation_pending: None,
             note: None,
             audit: Vec::new(),
+            view: DeliveryView::default(),
+            panel: Panel::default(),
+            selected_node: None,
+            placement: placement::State::default(),
+            form: provision_form::State::default(),
+            configure: configure::State::default(),
+            status: status::State::default(),
+            images: images::State::default(),
+            containers: containers::State::default(),
+            desktop_vm: views::desktop_vm::State::default(),
+            service_vm: views::service_vm::State::default(),
+            app_vm: views::app_vm::State::default(),
+            android_vm: views::android_vm::State::default(),
+            service_container: views::container::State::default(),
         }
     }
 }
 
-impl InfraCodeState {
+/// The external seam name main.rs (and any other caller) binds to — an alias so
+/// the rename to [`WorkloadsState`] stays source-compatible.
+pub(super) type InfraCodeState = WorkloadsState;
+
+impl WorkloadsState {
     /// Poll the Bus on the shared cadence + keep the repaint heartbeat alive —
     /// the shell calls this each frame while the surface is in view. Resolves any
     /// in-flight mutation reply, then re-folds the `state/cloud` mirror when due
@@ -497,13 +610,14 @@ impl InfraCodeState {
         }
     }
 
-    /// The Configure mode's request body — the picked playbook + target group.
+    /// The Configure lens's request body — the picked playbook + target group.
     /// (The worker converges `cloud_vm` on `site.yml`; the selection is honest
-    /// operator context the reply echoes.)
+    /// operator context the reply echoes.) The inputs live in [`configure::State`]
+    /// so the U17 worker owns them without touching this struct.
     fn configure_body(&self) -> String {
         serde_json::json!({
-            "playbook": self.configure_playbook.trim(),
-            "group": self.configure_group.trim(),
+            "playbook": self.configure.playbook.trim(),
+            "group": self.configure.group.trim(),
         })
         .to_string()
     }
@@ -536,8 +650,7 @@ impl InfraCodeState {
     // ── the plan/apply gate seams (§6, shared by the body + the menubar) ──
 
     /// Emit a provision **plan** (dry-run) — direct, no confirm. On a plan-only
-    /// node (the default, live apply operator-gated) the worker stages a
-    /// `tofu plan` and returns it in the reply.
+    /// node the worker stages a `tofu plan` and returns it in the reply.
     pub(super) fn plan_provision(&mut self) {
         self.issue("provision", None, "provision plan (dry-run)");
     }
@@ -574,8 +687,14 @@ impl InfraCodeState {
     }
 
     /// Emit a non-destructive lifecycle op (`instance-start` / `instance-stop`)
-    /// directly — armed to the backend, no typed confirm (never destructive).
-    fn issue_lifecycle_direct(&mut self, verb: &'static str, instance_id: &str, name: &str) {
+    /// directly — armed to the backend, no typed confirm (never destructive). The
+    /// roster rows drive this seam.
+    pub(super) fn issue_lifecycle_direct(
+        &mut self,
+        verb: &'static str,
+        instance_id: &str,
+        name: &str,
+    ) {
         let body = serde_json::json!({ "instance": instance_id }).to_string();
         self.issue(
             verb,
@@ -586,8 +705,8 @@ impl InfraCodeState {
 
     /// Open the typed-arming confirm for a destructive lifecycle op
     /// (`instance-reboot` / `instance-delete`) — nothing publishes until the
-    /// instance name is typed (RUN-006).
-    fn arm_lifecycle(&mut self, verb: &'static str, instance_id: &str, name: &str) {
+    /// workload name is typed (RUN-006). The roster rows drive this seam.
+    pub(super) fn arm_lifecycle(&mut self, verb: &'static str, instance_id: &str, name: &str) {
         self.arming = Some(Arming {
             action: ArmAction::Lifecycle {
                 verb,
@@ -598,7 +717,7 @@ impl InfraCodeState {
         });
     }
 
-    // ── the menubar seam (§6, one dispatch path shared with the body) ──
+    // ── the nav + menubar seam (§6, one dispatch path shared with the body) ──
 
     /// The folded per-node `state/cloud` mirror (the menubar status cluster reads
     /// the same fold the body renders — no second read, §7).
@@ -606,14 +725,44 @@ impl InfraCodeState {
         &self.states
     }
 
-    /// Which mode is showing.
-    pub(super) fn mode(&self) -> Mode {
-        self.mode
+    /// Every workload of a given delivery type, across every node — the idiom a
+    /// delivery view uses to read its own rows from the mirror.
+    pub(super) fn workloads_of(
+        &self,
+        view: DeliveryView,
+    ) -> impl Iterator<Item = &WorkloadRow> + '_ {
+        let dt = view.delivery_type();
+        self.states
+            .iter()
+            .flat_map(|s| s.workloads.iter())
+            .filter(move |w| w.delivery_type == dt)
     }
 
-    /// Switch the active mode.
-    pub(super) fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
+    /// Which delivery view is showing (test seam; production reads the field).
+    #[cfg(test)]
+    pub(super) fn view(&self) -> DeliveryView {
+        self.view
+    }
+
+    /// Switch the active delivery view.
+    pub(super) fn set_view(&mut self, view: DeliveryView) {
+        self.view = view;
+    }
+
+    /// Which lens is showing (test seam; production reads the field).
+    #[cfg(test)]
+    pub(super) fn panel(&self) -> Panel {
+        self.panel
+    }
+
+    /// Switch the active lens.
+    pub(super) fn set_panel(&mut self, panel: Panel) {
+        self.panel = panel;
+    }
+
+    /// The placement node the provision panel targets, if one is chosen.
+    pub(super) fn selected_node(&self) -> Option<&str> {
+        self.selected_node.as_deref()
     }
 
     /// Queue an immediate re-fold of the `state/cloud` mirror.
@@ -624,7 +773,7 @@ impl InfraCodeState {
     /// Surface the honest apply-gate + audit posture in the action note (Help).
     pub(super) fn set_help_note(&mut self) {
         self.note = Some(
-            "Live apply is operator-gated per node (MDE_CLOUD_APPLY=1); provision, configure, and \
+            "Live apply is capability-gated per node (armed token); provision, configure, and \
              destroy stage as dry-runs otherwise. Every destructive op passes a typed-confirm; \
              performed ops land in the Status audit trail."
                 .to_string(),
@@ -632,11 +781,13 @@ impl InfraCodeState {
     }
 
     /// Whether a typed-arming confirm is open (test seam).
+    #[cfg(test)]
     pub(super) fn has_arming(&self) -> bool {
         self.arming.is_some()
     }
 
     /// The current action note text, if any (test seam).
+    #[cfg(test)]
     pub(super) fn note_text(&self) -> Option<&str> {
         self.note.as_deref()
     }
@@ -705,56 +856,24 @@ fn verb_label(verb: &str) -> &'static str {
     }
 }
 
-// ─────────────────────────── honest read helpers (pure) ──────────────────────
-
-/// The Mackes-Carbon glyph a health state paints (§4 — a registered symbolic
-/// icon, never a text dot).
-const fn health_icon(state: HealthState) -> &'static str {
-    match state {
-        HealthState::Up => "emblem-ok",
-        HealthState::Down => "dialog-warning",
-        HealthState::Absent => "changes-prevent",
-    }
-}
-
-/// The semantic tone a health state reads in.
-const fn health_tone(state: HealthState) -> ChipTone {
-    match state {
-        HealthState::Up => ChipTone::Ok,
-        HealthState::Down => ChipTone::Danger,
-        HealthState::Absent => ChipTone::Warn,
-    }
-}
-
-/// The hosts where live apply is armed (`apply_armed`) — the operator's honest
-/// "these nodes execute for real" set.
-fn armed_hosts(states: &[CloudState]) -> Vec<String> {
-    states
-        .iter()
-        .filter(|s| s.apply_armed)
-        .map(|s| s.host.clone())
-        .collect()
-}
-
-/// Whether a resource table is the instance roster (the lifecycle verbs act on
-/// its rows). The worker publishes the roster as `compute`/`instances`.
-fn is_instance_roster(table: &ResourceTable) -> bool {
-    table.collection == "instances" || table.service_type == "compute"
-}
-
 // ───────────────────────────────── the render ───────────────────────────────
 
-/// Render the Infra-as-Code workspace into `ui`: the shared MENUBAR-ALL bar, the
-/// six-mode tab strip, the typed-arming confirm + action note, then the active
-/// mode's body.
-pub fn infra_code_panel(ui: &mut egui::Ui, state: &mut InfraCodeState) {
+/// Render the Workloads cockpit into `ui`: the shared MENUBAR-ALL bar, the
+/// delivery-view selector, the lens sub-nav, the typed-arming confirm + action
+/// note, then the active lens's body.
+///
+/// The name is the stable external entry seam (main.rs binds it); the state type
+/// is [`WorkloadsState`] (aliased as `InfraCodeState`).
+pub fn infra_code_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     if let Some(action) = menubar::show(ui, state) {
         menubar::apply(state, action);
     }
     ui.separator();
     ui.add_space(Style::SP_XS);
 
-    mode_bar(ui, state);
+    delivery_view_bar(ui, state);
+    ui.add_space(Style::SP_XS);
+    panel_bar(ui, state);
     ui.add_space(Style::SP_S);
 
     render_arming(ui, state);
@@ -762,38 +881,74 @@ pub fn infra_code_panel(ui: &mut egui::Ui, state: &mut InfraCodeState) {
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| match state.mode {
-            Mode::Provision => render_provision(ui, state),
-            Mode::Configure => render_configure(ui, state),
-            Mode::Images => render_images(ui),
-            Mode::Network => render_network(ui, state),
-            Mode::Containers => render_containers(ui),
-            Mode::Status => render_status(ui, state),
+        .show(ui, |ui| match state.panel {
+            Panel::Roster => {
+                let view = state.view;
+                views::dispatch(ui, state, view);
+            }
+            Panel::Provision => {
+                if let Some(node) = placement::placement_picker(ui, state) {
+                    state.selected_node = Some(node);
+                }
+                provision_form::provision_form(ui, state);
+            }
+            Panel::Configure => configure::configure_panel(ui, state),
+            Panel::Status => status::status_panel(ui, state),
+            Panel::Images => images::images_panel(ui, state),
+            Panel::Containers => containers::containers_panel(ui, state),
         });
 }
 
-/// The six-mode tab strip — each a Carbon icon + label, tinted the Workloads
-/// accent when active (§4).
-fn mode_bar(ui: &mut egui::Ui, state: &mut InfraCodeState) {
+/// The delivery-view selector — the primary axis. Each tab is a Carbon icon +
+/// label, tinted the Workloads accent when active (§4). Selecting a view snaps
+/// the lens back to its roster.
+fn delivery_view_bar(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = Style::SP_M;
-        for mode in Mode::ALL {
-            if mode_tab(ui, state.mode == mode, mode.icon(), mode.label()).clicked() {
-                state.mode = mode;
+        for view in DeliveryView::ALL {
+            let selected = state.view == view;
+            if nav_tab(
+                ui,
+                selected,
+                view.icon(),
+                view.label(),
+                Style::ACCENT_WORKLOADS,
+            )
+            .clicked()
+            {
+                state.set_view(view);
+                state.set_panel(Panel::Roster);
             }
         }
     });
 }
 
-/// One mode tab — a clickable icon + label row. The icon is drawn through
+/// The lens sub-nav — the secondary axis (roster + the cross-cutting panels).
+/// Tinted the blue action accent when active, so it reads as subordinate to the
+/// delivery-view selector above it.
+fn panel_bar(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = Style::SP_S;
+        for panel in Panel::ALL {
+            let selected = state.panel == panel;
+            if nav_tab(ui, selected, panel.icon(), panel.label(), Style::ACCENT).clicked() {
+                state.set_panel(panel);
+            }
+        }
+    });
+}
+
+/// One nav tab — a clickable icon + label row. The icon is drawn through
 /// [`carbon_icon`] with the tab's accent as the current text color, so the glyph
-/// glows Workloads-purple when active.
-fn mode_tab(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str) -> egui::Response {
-    let color = if selected {
-        Style::ACCENT_WORKLOADS
-    } else {
-        Style::TEXT_DIM
-    };
+/// glows the axis accent when active.
+fn nav_tab(
+    ui: &mut egui::Ui,
+    selected: bool,
+    icon: &str,
+    label: &str,
+    accent: Color32,
+) -> egui::Response {
+    let color = if selected { accent } else { Style::TEXT_DIM };
     let resp = ui
         .horizontal(|ui| {
             ui.scope(|ui| {
@@ -811,36 +966,7 @@ fn mode_tab(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str) -> egui:
     resp
 }
 
-/// A framed icon + label button (Carbon icon tinted `accent`) — the workspace's
-/// primary action affordance.
-fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str, accent: Color32) -> egui::Response {
-    let resp = egui::Frame::NONE
-        .fill(Style::SURFACE_HI)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
-        .corner_radius(Style::RADIUS_S)
-        .inner_margin(egui::Margin::symmetric(
-            Style::SP_S as i8,
-            Style::SP_XS as i8,
-        ))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.scope(|ui| {
-                    ui.visuals_mut().override_text_color = Some(accent);
-                    carbon_icon(ui, icon, Style::SMALL + 2.0);
-                });
-                ui.add_space(Style::SP_XS);
-                ui.label(RichText::new(label).size(Style::SMALL).color(Style::TEXT));
-            });
-        })
-        .response
-        .interact(Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    resp
-}
-
-/// A small text button sized for a table row's inline lifecycle verb.
+/// A small text button sized for a roster row's inline lifecycle verb.
 fn row_button(ui: &mut egui::Ui, label: &str, danger: bool) -> egui::Response {
     let color = if danger { Style::DANGER } else { Style::TEXT };
     ui.add(egui::Button::new(
@@ -850,7 +976,7 @@ fn row_button(ui: &mut egui::Ui, label: &str, danger: bool) -> egui::Response {
 
 /// The transient one-line action note (last issued op / its outcome) with a
 /// dismiss affordance — honest feedback, never a silent op.
-fn render_note(ui: &mut egui::Ui, state: &mut InfraCodeState) {
+fn render_note(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let Some(note) = state.note.clone() else {
         return;
     };
@@ -866,7 +992,7 @@ fn render_note(ui: &mut egui::Ui, state: &mut InfraCodeState) {
 /// The pending typed-arming confirm (RUN-006) — the operator types the required
 /// echo; the confirm button is disabled (never omitted) until it matches, then
 /// releases the action. Cancel clears it. Nothing reaches the Bus until armed.
-fn render_arming(ui: &mut egui::Ui, state: &mut InfraCodeState) {
+fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let Some(arming) = state.arming.as_mut() else {
         return;
     };
@@ -931,495 +1057,59 @@ fn render_arming(ui: &mut egui::Ui, state: &mut InfraCodeState) {
     }
 }
 
-/// The apply-posture banner — plan-only vs. live, folded straight from each
-/// node's `apply_armed` (the mirror's honest plan/apply signal).
-fn render_apply_posture(ui: &mut egui::Ui, states: &[CloudState]) {
-    let armed = armed_hosts(states);
-    if armed.is_empty() {
-        ui.horizontal(|ui| {
-            ui.scope(|ui| {
-                ui.visuals_mut().override_text_color = Some(Style::OK);
-                carbon_icon(ui, "changes-prevent", Style::SMALL + 2.0);
-            });
-            ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                Style::OK,
-                RichText::new(
-                    "Plan-only — live apply is operator-gated (MDE_CLOUD_APPLY=1) on every node; \
-                     provision, configure, and destroy stage as dry-runs.",
-                )
-                .size(Style::SMALL),
-            );
-        });
-    } else {
-        ui.horizontal_wrapped(|ui| {
-            ui.scope(|ui| {
-                ui.visuals_mut().override_text_color = Some(Style::DANGER);
-                carbon_icon(ui, "dialog-warning", Style::SMALL + 2.0);
-            });
-            ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                Style::DANGER,
-                RichText::new(format!(
-                    "LIVE — apply is armed on {}. Provision, configure, and destroy execute for \
-                     real there.",
-                    armed.join(", ")
-                ))
-                .size(Style::SMALL),
-            );
-        });
-    }
-    ui.add_space(Style::SP_S);
-}
+// ─────────────────────────── shared panel-body helpers ──────────────────────
 
-/// A mode heading — the icon + title + one-line blurb.
-fn mode_heading(ui: &mut egui::Ui, icon: &str, title: &str, blurb: &str) {
-    ui.horizontal(|ui| {
-        ui.scope(|ui| {
-            ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, icon, Style::BODY + 2.0);
-        });
-        ui.add_space(Style::SP_XS);
-        ui.label(
-            RichText::new(title)
-                .size(Style::BODY)
-                .strong()
-                .color(Style::ACCENT_WORKLOADS),
-        );
-    });
-    mde_egui::muted_note(ui, blurb);
-    ui.add_space(Style::SP_S);
-}
-
-/// The **Provision** mode — the OpenTofu resource roster (from the mirror) + the
-/// plan/apply gate + the per-instance lifecycle verbs.
-fn render_provision(ui: &mut egui::Ui, state: &mut InfraCodeState) {
-    let states = state.states.clone();
-    mode_heading(
-        ui,
-        Mode::Provision.icon(),
-        "Provision \u{2014} OpenTofu",
-        "Compose + run OpenTofu against local libvirt. The roster below is the live \
-         state/cloud mirror; the worker owns tofu plan/apply.",
-    );
-    render_apply_posture(ui, &states);
-
-    // The plan/apply gate: Plan is the dry-run default (direct); Apply + Destroy
-    // pass a typed-confirm echo first (RUN-006).
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = Style::SP_S;
-        if icon_button(ui, "view-refresh", "Plan (dry-run)", Style::ACCENT).clicked() {
-            state.plan_provision();
-        }
-        if icon_button(ui, "list-add", "Apply infrastructure\u{2026}", Style::OK).clicked() {
-            state.arm_provision();
-        }
-        if icon_button(
-            ui,
-            "process-stop",
-            "Destroy infrastructure\u{2026}",
-            Style::DANGER,
-        )
-        .clicked()
-        {
-            state.arm_destroy();
-        }
-    });
-    ui.add_space(Style::SP_M);
-
-    if states.is_empty() {
-        crate::session::empty_state(
-            ui,
-            "No cloud mirror yet",
-            "The OpenTofu + Ansible worker publishes state/cloud/<node> from each node. This roster \
-             fills once a node answers.",
-        );
-        return;
-    }
-
-    for st in &states {
-        render_node_roster(ui, st, state);
-    }
-}
-
-/// One node's resource roster — its header + each published resource table, with
-/// the instance roster carrying the inline lifecycle verbs.
-fn render_node_roster(ui: &mut egui::Ui, st: &CloudState, state: &mut InfraCodeState) {
+/// The honest **not yet built** stub every seam panel renders for its
+/// unimplemented body (§7) — a Workloads-accent glyph + `<unit> · <what>` +
+/// the honest reason. Downstream (U14–U19) replaces the panel's body with the
+/// real render; the backend (WL-ARCH-001) is already live behind the Bus.
+pub(super) fn workloads_pending(ui: &mut egui::Ui, unit: &str, what: &str) {
     egui::Frame::group(ui.style())
-        .shadow(card_shadow())
-        .show(ui, |ui| {
-            node_header(ui, st);
-            if st.resources.is_empty() {
-                mde_egui::muted_note(ui, "No resource roster reported by this node yet.");
-                return;
-            }
-            for table in &st.resources {
-                render_table(ui, st, table, state);
-            }
-        });
-    ui.add_space(Style::SP_S);
-}
-
-/// A node card's header — host, backend adapter, and apply posture chip.
-fn node_header(ui: &mut egui::Ui, st: &CloudState) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(&st.host)
-                .size(Style::BODY)
-                .strong()
-                .color(Style::TEXT),
-        );
-        ui.add_space(Style::SP_S);
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(adapter_label(st.adapter)).size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        let (word, tone) = if st.apply_armed {
-            ("live-armed", ChipTone::Danger)
-        } else {
-            ("plan-only", ChipTone::Ok)
-        };
-        ui.colored_label(tone.color(), RichText::new(word).size(Style::SMALL));
-    });
-    ui.add_space(Style::SP_XS);
-}
-
-/// Render one resource table as a grid; when it is the instance roster, each row
-/// carries inline Start / Stop / Reboot… / Delete… verbs (destructive ones armed).
-fn render_table(
-    ui: &mut egui::Ui,
-    st: &CloudState,
-    table: &ResourceTable,
-    state: &mut InfraCodeState,
-) {
-    let roster = is_instance_roster(table);
-    ui.label(
-        RichText::new(format!(
-            "{} \u{00B7} {} ({} row{})",
-            table.service_type,
-            table.collection,
-            table.rows.len(),
-            if table.rows.len() == 1 { "" } else { "s" }
-        ))
-        .size(Style::SMALL)
-        .color(Style::TEXT_DIM),
-    );
-    if table.rows.is_empty() {
-        mde_egui::muted_note(ui, "No resources of this kind (an honest empty roster).");
-        return;
-    }
-
-    egui::Grid::new((
-        "iac-table",
-        &st.host,
-        &table.service_type,
-        &table.collection,
-    ))
-    .striped(true)
-    .spacing(egui::vec2(Style::SP_M, Style::SP_XS))
-    .show(ui, |ui| {
-        for col in &table.columns {
-            ui.label(
-                RichText::new(col)
-                    .size(Style::SMALL)
-                    .strong()
-                    .color(Style::TEXT_DIM),
-            );
-        }
-        if roster {
-            ui.label(
-                RichText::new("actions")
-                    .size(Style::SMALL)
-                    .strong()
-                    .color(Style::TEXT_DIM),
-            );
-        }
-        ui.end_row();
-
-        for row in &table.rows {
-            for cell in &row.cells {
-                ui.label(RichText::new(cell).size(Style::SMALL).color(Style::TEXT));
-            }
-            if roster {
-                let id = row.id.clone();
-                let name = table.row_label(row).to_string();
-                ui.horizontal(|ui| {
-                    if row_button(ui, "Start", false).clicked() {
-                        state.issue_lifecycle_direct("instance-start", &id, &name);
-                    }
-                    if row_button(ui, "Stop", false).clicked() {
-                        state.issue_lifecycle_direct("instance-stop", &id, &name);
-                    }
-                    if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                        state.arm_lifecycle("instance-reboot", &id, &name);
-                    }
-                    if row_button(ui, "Delete\u{2026}", true).clicked() {
-                        state.arm_lifecycle("instance-delete", &id, &name);
-                    }
-                });
-            }
-            ui.end_row();
-        }
-    });
-    ui.add_space(Style::SP_XS);
-}
-
-/// The **Configure** mode — pick a playbook + target group and run Ansible; the
-/// check is the dry-run default, the apply is typed-confirm gated.
-fn render_configure(ui: &mut egui::Ui, state: &mut InfraCodeState) {
-    mode_heading(
-        ui,
-        Mode::Configure.icon(),
-        "Configure \u{2014} Ansible",
-        "Converge the mesh inventory with Ansible. The backend converges cloud_vm on site.yml; \
-         pick the playbook + group below.",
-    );
-
-    egui::Frame::group(ui.style())
+        .fill(Style::SURFACE_HI)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
         .shadow(card_shadow())
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.scope(|ui| {
+                    ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
+                    carbon_icon(ui, "view-grid", Style::BODY + 2.0);
+                });
+                ui.add_space(Style::SP_XS);
                 ui.label(
-                    RichText::new("Playbook")
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                    RichText::new(format!("{unit} \u{00B7} {what}"))
+                        .size(Style::BODY)
+                        .strong()
+                        .color(Style::TEXT),
                 );
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.configure_playbook)
-                        .hint_text("site.yml")
-                        .desired_width(Style::SP_XL * 5.0),
-                );
-                ui.add_space(Style::SP_M);
-                ui.label(
-                    RichText::new("Group")
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
-                egui::ComboBox::from_id_salt("iac-configure-group")
-                    .selected_text(state.configure_group.clone())
-                    .show_ui(ui, |ui| {
-                        for group in ["cloud_vm", "all", "compute", "network"] {
-                            ui.selectable_value(
-                                &mut state.configure_group,
-                                group.to_string(),
-                                group,
-                            );
-                        }
-                    });
             });
+            mde_egui::muted_note(
+                ui,
+                "This cockpit panel is a seam stub \u{2014} not yet built. The Workloads backend \
+                 (OpenTofu + Ansible + libvirt + Podman) is live behind the Bus; this surface \
+                 panel lands with its build unit.",
+            );
         });
-    ui.add_space(Style::SP_M);
+    ui.add_space(Style::SP_S);
+}
 
-    render_apply_posture(ui, &state.states.clone());
-
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = Style::SP_S;
-        if icon_button(ui, "view-refresh", "Check (dry-run)", Style::ACCENT).clicked() {
-            state.check_configure();
-        }
-        if icon_button(
-            ui,
-            "document-edit",
-            "Apply configuration\u{2026}",
-            Style::OK,
-        )
-        .clicked()
-        {
-            state.arm_configure();
-        }
-    });
-    ui.add_space(Style::SP_M);
+/// An honest one-line summary of the folded `state/cloud` mirror — the shared
+/// context line the stub panels show so the seam's live data flow is visible
+/// even before a panel's body lands.
+pub(super) fn mirror_summary(ui: &mut egui::Ui, state: &WorkloadsState) {
+    let nodes = state.states.len();
+    let workloads: usize = state.states.iter().map(|s| s.workloads.len()).sum();
     mde_egui::muted_note(
         ui,
-        "The run status appears in the action note above and in the Status mode's audit trail.",
+        format!("state/cloud mirror: {nodes} node(s) \u{00B7} {workloads} workload(s) folded."),
     );
-}
-
-/// The **Images** mode — bootc / osbuild builds. No backend verb is landed yet,
-/// so this renders an honest backend-pending note rather than faking a build
-/// list (§7).
-fn render_images(ui: &mut egui::Ui) {
-    mode_heading(
-        ui,
-        Mode::Images.icon(),
-        "Images \u{2014} bootc / osbuild",
-        "Build + register base images with bootc / osbuild.",
-    );
-    render_backend_pending(
-        ui,
-        "Image builds",
-        "The cloud backend does not yet expose an image build/list verb. Nothing is shown here \
-         rather than fabricated data; this mode goes live when the worker lands the verb.",
-    );
-}
-
-/// The **Network** mode — libvirt networks. The libvirt backend health is real
-/// (from the mirror); the network list/compose verb is honestly backend-pending.
-fn render_network(ui: &mut egui::Ui, state: &mut InfraCodeState) {
-    let states = state.states.clone();
-    mode_heading(
-        ui,
-        Mode::Network.icon(),
-        "Network \u{2014} libvirt",
-        "libvirt (Nebula-adjacent) networks. The libvirt backend health below is live from the \
-         mirror.",
-    );
-
-    if states.is_empty() {
-        crate::session::empty_state(
-            ui,
-            "No cloud mirror yet",
-            "libvirt health appears here once a node publishes its state/cloud mirror.",
-        );
-    } else {
-        for st in &states {
-            egui::Frame::group(ui.style())
-                .shadow(card_shadow())
-                .show(ui, |ui| {
-                    node_header(ui, st);
-                    render_tool_health(ui, st, TOOL_LIBVIRT, "libvirt");
-                });
-            ui.add_space(Style::SP_S);
-        }
-    }
-
-    render_backend_pending(
-        ui,
-        "Network list + compose",
-        "The cloud backend does not yet expose a libvirt-network list/compose verb. The network \
-         roster and the compose form go live when the worker lands them; nothing is faked (§7).",
-    );
-}
-
-/// The **Containers** mode — Podman / Quadlet workloads. A separate runtime plane
-/// with no `action/cloud` verb yet, so this is honestly backend-pending.
-fn render_containers(ui: &mut egui::Ui) {
-    mode_heading(
-        ui,
-        Mode::Containers.icon(),
-        "Containers \u{2014} Podman / Quadlet",
-        "Podman / Quadlet service workloads.",
-    );
-    render_backend_pending(
-        ui,
-        "Container workloads",
-        "Podman / Quadlet is a separate runtime plane; the cloud backend exposes no container \
-         list/control verb here yet. This mode goes live when the worker lands it — no faked \
-         workloads (§7).",
-    );
-}
-
-/// The **Status** mode — day-2: per-tool backend health, the roster summary,
-/// honest degraded states, and the session audit trail.
-fn render_status(ui: &mut egui::Ui, state: &mut InfraCodeState) {
-    let states = state.states.clone();
-    mode_heading(
-        ui,
-        Mode::Status.icon(),
-        "Status \u{2014} day-2",
-        "Per-tool backend health, the live roster, honest degraded states, and the ops performed \
-         from this workspace.",
-    );
-
-    if states.is_empty() {
-        crate::session::empty_state(
-            ui,
-            "No cloud mirror yet",
-            "Each node publishes state/cloud/<node> with per-tool health + its roster. This fills \
-             once a node answers.",
-        );
-    } else {
-        for st in &states {
-            egui::Frame::group(ui.style())
-                .shadow(card_shadow())
-                .show(ui, |ui| {
-                    node_header(ui, st);
-                    let ready = st.backend_ready();
-                    ui.colored_label(
-                        if ready { Style::OK } else { Style::WARN },
-                        RichText::new(if ready {
-                            "backend ready"
-                        } else {
-                            "backend degraded"
-                        })
-                        .size(Style::SMALL),
-                    );
-                    ui.add_space(Style::SP_XS);
-                    for (tool, label) in BACKEND_TOOLS {
-                        render_tool_health(ui, st, tool, label);
-                    }
-                    let roster: usize = st.resources.iter().map(|t| t.rows.len()).sum();
-                    ui.add_space(Style::SP_XS);
-                    ui.colored_label(
-                        Style::TEXT_DIM,
-                        RichText::new(format!("{roster} resource row(s) in the roster"))
-                            .size(Style::SMALL),
-                    );
-                });
-            ui.add_space(Style::SP_S);
-        }
-    }
-
-    render_audit(ui, &state.audit);
-}
-
-/// One tool's health row — a Carbon Up/Down/Absent glyph + label + the honest
-/// detail (the "why" of a Down/Absent). An unprobed tool reads honestly.
-fn render_tool_health(ui: &mut egui::Ui, st: &CloudState, tool: &str, label: &str) {
-    ui.horizontal_wrapped(|ui| match st.tool_health(tool) {
-        Some(h) => {
-            let tone = health_tone(h.state);
-            ui.scope(|ui| {
-                ui.visuals_mut().override_text_color = Some(tone.color());
-                carbon_icon(ui, health_icon(h.state), Style::SMALL + 2.0);
-            });
-            ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                tone.color(),
-                RichText::new(label).size(Style::SMALL).strong(),
-            );
-            let state_word = match h.state {
-                HealthState::Up => "up",
-                HealthState::Down => "down",
-                HealthState::Absent => "absent",
-            };
-            ui.colored_label(tone.color(), RichText::new(state_word).size(Style::SMALL));
-            render_health_detail(ui, h);
-        }
-        None => {
-            ui.scope(|ui| {
-                ui.visuals_mut().override_text_color = Some(Style::TEXT_DIM);
-                carbon_icon(ui, "changes-prevent", Style::SMALL + 2.0);
-            });
-            ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(format!("{label} unprobed")).size(Style::SMALL),
-            );
-        }
-    });
-}
-
-/// The honest "why" trailer for a health row — latency + the detail reason.
-fn render_health_detail(ui: &mut egui::Ui, h: &ServiceHealth) {
-    if let Some(ms) = h.latency_ms {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(format!("{ms} ms")).size(Style::SMALL),
-        );
-    }
-    if let Some(detail) = &h.detail {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(format!("\u{2014} {detail}")).size(Style::SMALL),
-        );
-    }
 }
 
 /// The session audit trail — the workspace's honest record of the ops it
-/// requested (verb · verdict · detail). An empty trail reads honestly.
-fn render_audit(ui: &mut egui::Ui, audit: &[AuditEntry]) {
+/// requested (verb · verdict · detail), newest first. An empty trail reads
+/// honestly. The preserved audit machinery renders here (the Status lens's home);
+/// U18 enriches the rest of the day-2 view around it.
+pub(super) fn render_audit(ui: &mut egui::Ui, audit: &[AuditEntry]) {
     ui.add_space(Style::SP_S);
     ui.label(
         RichText::new("Audit trail (this session)")
@@ -1447,35 +1137,100 @@ fn render_audit(ui: &mut egui::Ui, audit: &[AuditEntry]) {
     }
 }
 
-/// An honest **backend pending** card (§7) — a warning glyph + the honest reason
-/// a mode has no landed backend verb yet. Never a faked list, never a dead
-/// button.
-fn render_backend_pending(ui: &mut egui::Ui, what: &str, reason: &str) {
+/// Render one delivery view's live roster — the U3 seam the five U16 view files
+/// share: the view heading, each matching [`WorkloadRow`] from the mirror with
+/// its inline lifecycle verbs (Start/Stop direct, Reboot…/Delete… armed), and an
+/// honest note that the rich per-type body is U16. An empty roster reads
+/// honestly (§7), never fabricated.
+pub(super) fn roster(ui: &mut egui::Ui, state: &mut WorkloadsState, view: DeliveryView) {
+    view_heading(ui, view);
+
+    // Snapshot the matching rows so the immutable mirror borrow ends before the
+    // lifecycle verbs take `&mut state`.
+    let rows: Vec<WorkloadRow> = state.workloads_of(view).cloned().collect();
+    if rows.is_empty() {
+        crate::session::empty_state(
+            ui,
+            "No workloads of this type yet",
+            "This delivery-type roster fills once a placement node reports a matching workload in \
+             its state/cloud mirror.",
+        );
+    } else {
+        for row in &rows {
+            workload_row(ui, state, row);
+        }
+    }
+
+    mde_egui::muted_note(
+        ui,
+        "U16 \u{2014} the rich per-type view (live metrics, drift, console attach) lands with its \
+         build unit.",
+    );
+}
+
+/// A delivery-view heading — the view's icon + label + the placement blurb.
+fn view_heading(ui: &mut egui::Ui, view: DeliveryView) {
+    ui.horizontal(|ui| {
+        ui.scope(|ui| {
+            ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
+            carbon_icon(ui, view.icon(), Style::BODY + 2.0);
+        });
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(view.label())
+                .size(Style::BODY)
+                .strong()
+                .color(Style::ACCENT_WORKLOADS),
+        );
+    });
+    mde_egui::muted_note(
+        ui,
+        "Workloads of this delivery type, placed on their mesh nodes.",
+    );
+    ui.add_space(Style::SP_S);
+}
+
+/// One workload roster row — its name · status · node, then the inline lifecycle
+/// verbs wired to the preserved seams (destructive ones typed-armed).
+fn workload_row(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
     egui::Frame::group(ui.style())
         .shadow(card_shadow())
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.scope(|ui| {
-                    ui.visuals_mut().override_text_color = Some(Style::WARN);
-                    carbon_icon(ui, "dialog-warning", Style::BODY + 2.0);
-                });
-                ui.add_space(Style::SP_XS);
-                ui.colored_label(
-                    Style::WARN,
-                    RichText::new(format!("{what} \u{2014} backend pending"))
+                ui.label(
+                    RichText::new(&row.name)
                         .size(Style::BODY)
-                        .strong(),
+                        .strong()
+                        .color(Style::TEXT),
+                );
+                ui.add_space(Style::SP_S);
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new(&row.status).size(Style::SMALL),
+                );
+                ui.add_space(Style::SP_S);
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new(format!("on {}", row.node)).size(Style::SMALL),
                 );
             });
-            mde_egui::muted_note(ui, reason);
+            ui.add_space(Style::SP_XS);
+            ui.horizontal(|ui| {
+                if row_button(ui, "Start", false).clicked() {
+                    state.issue_lifecycle_direct("instance-start", &row.name, &row.name);
+                }
+                if row_button(ui, "Stop", false).clicked() {
+                    state.issue_lifecycle_direct("instance-stop", &row.name, &row.name);
+                }
+                if row_button(ui, "Reboot\u{2026}", true).clicked() {
+                    state.arm_lifecycle("instance-reboot", &row.name, &row.name);
+                }
+                if row_button(ui, "Delete\u{2026}", true).clicked() {
+                    state.arm_lifecycle("instance-delete", &row.name, &row.name);
+                }
+            });
         });
     ui.add_space(Style::SP_S);
-}
-
-/// The display label for a backend adapter (provider-neutral; the compatibility
-/// backend is honestly labeled, never product-default).
-fn adapter_label(adapter: CloudProviderAdapter) -> &'static str {
-    adapter.label()
 }
 
 /// The shared **Raised** depth token the workspace's cards cast (Phase-C depth
@@ -1492,9 +1247,19 @@ fn card_shadow() -> egui::Shadow {
     }
 }
 
-// ─────────────────────────── the MENUBAR-ALL bar ────────────────────────────
+// ─────────────────────────── the seam module layout ─────────────────────────
 
 mod menubar;
+
+mod placement;
+mod provision_form;
+
+mod configure;
+mod containers;
+mod images;
+mod status;
+
+mod views;
 
 #[cfg(test)]
 #[allow(clippy::panic)]

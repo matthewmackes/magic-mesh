@@ -1,12 +1,12 @@
-//! MENUBAR-ALL (Infra as Code) — the shared bar over the six-mode cloud-ops
-//! workspace. Every item is a real seam (§6): the **Cloud** spine (Refresh), the
-//! **Provision** + **Configure** action menus (the plan/apply gate as mouse
-//! twins of the body's own buttons), a **View** menu that jumps to any of the six
-//! modes, and **Help**. The status cluster reads the live `state/cloud` fold
-//! (nodes · backend-ready · apply posture). Every entry maps to a landed seam;
-//! nothing is a dead entry (§8).
+//! MENUBAR-ALL (Workloads) — the shared bar over the delivery-type cockpit. Every
+//! item is a real seam (§6): the **Cloud** spine (Refresh), the **Provision** +
+//! **Configure** action menus (the plan/apply gate as mouse twins of the body's
+//! own buttons), a **View** menu that jumps to any of the five delivery views, a
+//! **Panels** menu that opens any lens, and **Help**. The status cluster reads the
+//! live `state/cloud` fold (nodes · backend-ready · apply posture). Every entry
+//! maps to a landed seam; nothing is a dead entry (§8).
 
-use super::{InfraCodeState, Mode, CLOUD_PRODUCT_LABEL};
+use super::{DeliveryView, Panel, WorkloadsState, CLOUD_PRODUCT_LABEL};
 use mde_egui::egui::Ui;
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{ChipTone, StatusChip, Style};
@@ -16,8 +16,10 @@ use mde_egui::{ChipTone, StatusChip, Style};
 pub(super) enum MenuAction {
     /// Force an immediate re-fold of the `state/cloud` mirror (`Cloud → Refresh`).
     Refresh,
-    /// Jump to a mode (`View → <mode>`).
-    Goto(Mode),
+    /// Jump to a delivery view (`View → <view>`) — snaps the lens to its roster.
+    Goto(DeliveryView),
+    /// Open a lens (`Panels → <panel>`).
+    Open(Panel),
     /// Emit a provision plan (dry-run) — direct (`Provision → Plan`).
     ProvisionPlan,
     /// Open the typed-confirm for a live provision apply (`Provision → Apply`).
@@ -32,13 +34,12 @@ pub(super) enum MenuAction {
     HelpAbout,
 }
 
-/// Render the INFRA AS CODE bar and return the action picked this frame.
-pub(super) fn show(ui: &mut Ui, state: &InfraCodeState) -> Option<MenuAction> {
+/// Render the WORKLOADS bar and return the action picked this frame.
+pub(super) fn show(ui: &mut Ui, state: &WorkloadsState) -> Option<MenuAction> {
     let menus = build_menus();
     let status = build_status(state);
     let model = MenuBarModel {
-        // The dock groups Infra as Code under **Workloads** (purple), so the
-        // title wears that categorical accent (§4).
+        // The dock groups Workloads under its purple categorical accent (§4).
         title: super::WORKSPACE_TITLE,
         accent: Style::ACCENT_WORKLOADS,
         menus: &menus,
@@ -47,8 +48,8 @@ pub(super) fn show(ui: &mut Ui, state: &InfraCodeState) -> Option<MenuAction> {
     MenuBar::show(ui, &model)
 }
 
-/// Build the Cloud / Provision / Configure / View / Help menus — every item a
-/// real landed seam (§8).
+/// Build the Cloud / Provision / Configure / View / Panels / Help menus — every
+/// item a real landed seam (§8).
 fn build_menus() -> Vec<Menu<MenuAction>> {
     vec![
         Menu::new(
@@ -84,17 +85,30 @@ fn build_menus() -> Vec<Menu<MenuAction>> {
             ],
         ),
         build_view_menu(),
+        build_panels_menu(),
         build_help_menu(),
     ]
 }
 
-/// The **View** menu — one jump per mode (the mouse twin of the tab strip).
+/// The **View** menu — one jump per delivery view (the mouse twin of the
+/// delivery-view selector).
 fn build_view_menu() -> Menu<MenuAction> {
     Menu::new(
         "View",
-        Mode::ALL
+        DeliveryView::ALL
             .iter()
-            .map(|mode| Entry::Item(Item::new(MenuAction::Goto(*mode), mode.label())))
+            .map(|view| Entry::Item(Item::new(MenuAction::Goto(*view), view.label())))
+            .collect(),
+    )
+}
+
+/// The **Panels** menu — one jump per lens (the mouse twin of the lens sub-nav).
+fn build_panels_menu() -> Menu<MenuAction> {
+    Menu::new(
+        "Panels",
+        Panel::ALL
+            .iter()
+            .map(|panel| Entry::Item(Item::new(MenuAction::Open(*panel), panel.label())))
             .collect(),
     )
 }
@@ -106,8 +120,8 @@ fn build_help_menu() -> Menu<MenuAction> {
         "Help",
         vec![
             Entry::Caption(format!(
-                "Infra as Code \u{2014} the {CLOUD_PRODUCT_LABEL} control plane (OpenTofu + \
-                 Ansible)."
+                "Workloads \u{2014} the {CLOUD_PRODUCT_LABEL} delivery-type cockpit (OpenTofu + \
+                 Ansible + libvirt + Podman)."
             )),
             Entry::Item(Item::new(
                 MenuAction::HelpAbout,
@@ -119,7 +133,7 @@ fn build_help_menu() -> Menu<MenuAction> {
 
 /// The live status cluster — nodes · backend-ready · apply posture, folded from
 /// the `state/cloud` mirror (§7 — honest, never a placeholder).
-fn build_status(state: &InfraCodeState) -> Vec<StatusChip> {
+fn build_status(state: &WorkloadsState) -> Vec<StatusChip> {
     let states = state.states();
     if states.is_empty() {
         return vec![StatusChip::new("no cloud mirror", ChipTone::Warn)];
@@ -152,29 +166,33 @@ fn build_status(state: &InfraCodeState) -> Vec<StatusChip> {
 }
 
 /// Apply a picked action to its real seam (§6) — each the exact affordance the
-/// body's own button drives.
-pub(super) fn apply(state: &mut InfraCodeState, action: MenuAction) {
+/// body's own control drives.
+pub(super) fn apply(state: &mut WorkloadsState, action: MenuAction) {
     match action {
         MenuAction::Refresh => state.request_refresh(),
-        MenuAction::Goto(mode) => state.set_mode(mode),
+        MenuAction::Goto(view) => {
+            state.set_view(view);
+            state.set_panel(Panel::Roster);
+        }
+        MenuAction::Open(panel) => state.set_panel(panel),
         MenuAction::ProvisionPlan => {
-            state.set_mode(Mode::Provision);
+            state.set_panel(Panel::Provision);
             state.plan_provision();
         }
         MenuAction::ProvisionApply => {
-            state.set_mode(Mode::Provision);
+            state.set_panel(Panel::Provision);
             state.arm_provision();
         }
         MenuAction::Destroy => {
-            state.set_mode(Mode::Provision);
+            state.set_panel(Panel::Provision);
             state.arm_destroy();
         }
         MenuAction::ConfigureCheck => {
-            state.set_mode(Mode::Configure);
+            state.set_panel(Panel::Configure);
             state.check_configure();
         }
         MenuAction::ConfigureApply => {
-            state.set_mode(Mode::Configure);
+            state.set_panel(Panel::Configure);
             state.arm_configure();
         }
         MenuAction::HelpAbout => state.set_help_note(),
@@ -184,7 +202,7 @@ pub(super) fn apply(state: &mut InfraCodeState, action: MenuAction) {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::super::{InfraCodeState, Mode};
+    use super::super::{DeliveryView, Panel, WorkloadsState};
     use super::{apply, build_help_menu, build_menus, build_status, MenuAction};
     use mde_egui::menubar::{Entry, Menu};
     use mde_egui::ChipTone;
@@ -206,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_carries_the_plan_apply_gate_and_all_six_mode_jumps() {
+    fn the_bar_carries_the_plan_apply_gate_and_every_view_and_panel_jump() {
         let menus = build_menus();
         // The plan/apply gate lives in the Provision menu.
         let provision = menu(&menus, "Provision").expect("Provision menu");
@@ -221,26 +239,33 @@ mod tests {
         let configure = menu(&menus, "Configure").expect("Configure menu");
         assert!(ids(configure).contains(&MenuAction::ConfigureCheck));
         assert!(ids(configure).contains(&MenuAction::ConfigureApply));
-        // View jumps to every one of the six modes.
+        // View jumps to every delivery view.
         let view = menu(&menus, "View").expect("View menu");
-        assert_eq!(ids(view).len(), Mode::ALL.len());
-        for mode in Mode::ALL {
-            assert!(
-                ids(view).contains(&MenuAction::Goto(mode)),
-                "missing {mode:?}"
-            );
+        assert_eq!(ids(view).len(), DeliveryView::ALL.len());
+        for v in DeliveryView::ALL {
+            assert!(ids(view).contains(&MenuAction::Goto(v)), "missing {v:?}");
+        }
+        // Panels opens every lens.
+        let panels = menu(&menus, "Panels").expect("Panels menu");
+        assert_eq!(ids(panels).len(), Panel::ALL.len());
+        for p in Panel::ALL {
+            assert!(ids(panels).contains(&MenuAction::Open(p)), "missing {p:?}");
         }
     }
 
     #[test]
     fn apply_drives_the_real_seams() {
-        let mut state = InfraCodeState::default();
-        // A jump switches the mode.
-        apply(&mut state, MenuAction::Goto(Mode::Status));
-        assert_eq!(state.mode(), Mode::Status);
+        let mut state = WorkloadsState::default();
+        // A view jump switches the view + snaps the lens to the roster.
+        apply(&mut state, MenuAction::Goto(DeliveryView::AndroidVm));
+        assert_eq!(state.view(), DeliveryView::AndroidVm);
+        assert_eq!(state.panel(), Panel::Roster);
+        // A panel jump opens the lens.
+        apply(&mut state, MenuAction::Open(Panel::Status));
+        assert_eq!(state.panel(), Panel::Status);
         // Apply infrastructure opens the typed-confirm (nothing publishes yet).
         apply(&mut state, MenuAction::ProvisionApply);
-        assert_eq!(state.mode(), Mode::Provision);
+        assert_eq!(state.panel(), Panel::Provision);
         assert!(state.has_arming(), "Apply opens the typed-confirm");
         // Destroy also opens the confirm.
         apply(&mut state, MenuAction::Destroy);
@@ -270,7 +295,7 @@ mod tests {
     #[test]
     fn status_reads_the_mirror_fold_honestly() {
         // No mirror → an honest "no cloud mirror" warn chip.
-        let empty = InfraCodeState::default();
+        let empty = WorkloadsState::default();
         assert!(build_status(&empty)
             .iter()
             .any(|c| c.text == "no cloud mirror" && c.tone == ChipTone::Warn));

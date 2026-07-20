@@ -1,5 +1,8 @@
 use super::*;
-use mackes_mesh_types::cloud::{EndpointInterface, ResourceRow};
+use mackes_mesh_types::cloud::{
+    CloudProviderAdapter, DriftFlag, DriftSummary, EndpointInterface, HealthState, NodeCapacity,
+    ServiceHealth,
+};
 use mde_egui::egui::{pos2, vec2, Rect};
 
 /// One backend-tool health row in a fixture mirror.
@@ -16,22 +19,25 @@ fn health(tool: &str, state: HealthState) -> ServiceHealth {
     }
 }
 
-/// A one-instance roster table (the shape the worker publishes on the mirror).
-fn roster_table() -> ResourceTable {
-    ResourceTable {
-        service_type: "compute".to_string(),
-        collection: "instances".to_string(),
-        columns: vec!["name".to_string(), "status".to_string()],
-        rows: vec![ResourceRow {
-            id: "vm-1".to_string(),
-            cells: vec!["mesh-worker".to_string(), "running".to_string()],
-        }],
+/// One workload row (the shape the worker folds onto the mirror from virsh + the
+/// desired doc).
+fn workload(name: &str, delivery_type: DeliveryType, status: &str) -> WorkloadRow {
+    WorkloadRow {
+        name: name.to_string(),
+        delivery_type,
+        node: "eagle".to_string(),
+        status: status.to_string(),
+        cpu_pct: 12,
+        mem_mb: 2048,
+        disk_gb: 40,
+        reachable: true,
+        drift: DriftFlag::InSync,
     }
 }
 
 /// A fixture `state/cloud` mirror: OpenTofu **up**, Ansible **down**, libvirt
-/// **absent** (the honest Up/Down/Absent tri-state), plus a one-instance roster,
-/// plan-only (apply not armed).
+/// **absent** (the honest Up/Down/Absent tri-state), plus one Desktop VM + one
+/// Service VM workload, plan-only (apply not armed).
 fn fixture_state() -> CloudState {
     CloudState {
         host: "eagle".to_string(),
@@ -41,25 +47,35 @@ fn fixture_state() -> CloudState {
             health("ansible", HealthState::Down),
             health("libvirt", HealthState::Absent),
         ],
-        resources: vec![roster_table()],
+        resources: Vec::new(),
         apply_armed: false,
         published_at_ms: 42,
+        workloads: vec![
+            workload("seat-1", DeliveryType::DesktopVm, "running"),
+            workload("svc-1", DeliveryType::ServiceVm, "running"),
+        ],
+        drift_summary: DriftSummary::default(),
+        node_capacity: NodeCapacity {
+            vcpu_total: 16,
+            vcpu_used: 4,
+            mem_total_mb: 32768,
+            mem_used_mb: 4096,
+        },
     }
 }
 
-/// A surface state on `mode` with the fixture mirror folded in.
-fn state_on(mode: Mode) -> InfraCodeState {
-    let mut state = InfraCodeState {
-        mode,
-        ..InfraCodeState::default()
-    };
+/// A surface state on `(view, panel)` with the fixture mirror folded in.
+fn state_on(view: DeliveryView, panel: Panel) -> WorkloadsState {
+    let mut state = WorkloadsState::default();
+    state.set_view(view);
+    state.set_panel(panel);
     state.states = vec![fixture_state()];
     state
 }
 
 /// Drive one headless frame of `infra_code_panel` and tessellate it on the CPU
 /// (the DRM runner's path minus the GPU). Returns whether it drew primitives.
-fn run_panel(state: &mut InfraCodeState) -> bool {
+fn run_panel(state: &mut WorkloadsState) -> bool {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let input = egui::RawInput {
@@ -76,7 +92,7 @@ fn run_panel(state: &mut InfraCodeState) -> bool {
 #[test]
 fn the_surface_is_reachable_in_the_dock() {
     // §7 reachability: the surface stays in Surface::ALL and wears the server /
-    // infrastructure brand glyph (the dock mount is unchanged by the recreate).
+    // infrastructure brand glyph (the dock mount is unchanged by the reshape).
     use crate::dock::Surface;
     assert!(Surface::ALL.contains(&Surface::InfraCode));
     assert_eq!(
@@ -86,58 +102,89 @@ fn the_surface_is_reachable_in_the_dock() {
 }
 
 #[test]
-fn the_workspace_renders_all_six_modes_headless() {
-    // Every mode tessellates over the fixture mirror — the six-mode workspace.
-    for mode in Mode::ALL {
-        let mut state = state_on(mode);
+fn every_delivery_view_roster_renders_headless() {
+    // Every delivery view's roster tessellates over the fixture mirror.
+    for view in DeliveryView::ALL {
+        let mut state = state_on(view, Panel::Roster);
         assert!(
             run_panel(&mut state),
-            "{:?} mode drew nothing",
-            mode.label()
+            "{:?} roster drew nothing",
+            view.label()
         );
     }
 }
 
 #[test]
-fn switching_modes_works() {
-    let mut state = state_on(Mode::Provision);
-    assert_eq!(state.mode(), Mode::Provision);
-    for mode in Mode::ALL {
-        state.set_mode(mode);
-        assert_eq!(state.mode(), mode);
-        assert!(run_panel(&mut state), "{:?} render failed", mode.label());
+fn every_lens_renders_headless() {
+    // Every panel lens tessellates over the fixture mirror (each honest stub or
+    // the roster).
+    for panel in Panel::ALL {
+        let mut state = state_on(DeliveryView::DesktopVm, panel);
+        assert!(
+            run_panel(&mut state),
+            "{:?} lens drew nothing",
+            panel.label()
+        );
+    }
+}
+
+#[test]
+fn switching_views_and_lenses_works() {
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+    assert_eq!(state.view(), DeliveryView::DesktopVm);
+    assert_eq!(state.panel(), Panel::Roster);
+    for view in DeliveryView::ALL {
+        state.set_view(view);
+        assert_eq!(state.view(), view);
+        assert!(run_panel(&mut state), "{:?} render failed", view.label());
+    }
+    for panel in Panel::ALL {
+        state.set_panel(panel);
+        assert_eq!(state.panel(), panel);
+        assert!(run_panel(&mut state), "{:?} render failed", panel.label());
     }
 }
 
 #[test]
 fn the_empty_mirror_reads_honestly_never_fabricated() {
-    // No mirror published yet → honest empty states per mode, never fake rows.
-    for mode in [Mode::Provision, Mode::Status, Mode::Network] {
-        let mut state = InfraCodeState {
-            mode,
-            ..InfraCodeState::default()
-        };
+    // No mirror published yet → honest empty rosters / stubs per lens, never fake.
+    for panel in [Panel::Roster, Panel::Status, Panel::Provision] {
+        let mut state = WorkloadsState::default();
+        state.set_panel(panel);
         assert!(
             run_panel(&mut state),
             "{:?} empty state drew nothing",
-            mode.label()
+            panel.label()
+        );
+        assert!(
+            state.mutation_pending.is_none() && state.note.is_none(),
+            "{:?} must not emit a verb from an empty mirror",
+            panel.label()
         );
     }
 }
 
 #[test]
-fn provision_renders_a_fixture_cloudstate_resource_table() {
-    let mut state = state_on(Mode::Provision);
-    // The roster comes straight from the mirror's resource table.
-    assert_eq!(state.states()[0].resources[0].rows.len(), 1);
-    assert!(is_instance_roster(&state.states()[0].resources[0]));
-    assert!(run_panel(&mut state), "the Provision roster drew nothing");
+fn the_roster_reads_its_workloads_by_delivery_type() {
+    // The idiom the U16 views share: filter the mirror's workloads by type.
+    let state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+    assert_eq!(state.workloads_of(DeliveryView::DesktopVm).count(), 1);
+    assert_eq!(state.workloads_of(DeliveryView::ServiceVm).count(), 1);
+    assert_eq!(state.workloads_of(DeliveryView::AppVm).count(), 0);
+    assert_eq!(state.workloads_of(DeliveryView::AndroidVm).count(), 0);
+    assert_eq!(
+        state.workloads_of(DeliveryView::ServiceContainer).count(),
+        0
+    );
+    // The DesktopVm roster tessellates with its single matching row.
+    let mut state = state;
+    assert!(run_panel(&mut state), "the Desktop VM roster drew nothing");
 }
 
 #[test]
 fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm() {
     // Dry-run default: a plan is a direct emit (no confirm). Apply is gated.
-    let mut state = state_on(Mode::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
 
     // Arming a live apply OPENS the confirm and publishes NOTHING (§ RUN-006).
     state.arm_provision();
@@ -180,7 +227,7 @@ fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm
 
 #[test]
 fn destroy_and_lifecycle_reboot_delete_are_typed_confirm_gated() {
-    let mut state = state_on(Mode::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
     // Destroy opens the confirm on the DESTROY echo, publishes nothing yet.
     state.arm_destroy();
     let arming = state.arming.take().expect("destroy opens the confirm");
@@ -189,90 +236,14 @@ fn destroy_and_lifecycle_reboot_delete_are_typed_confirm_gated() {
     assert!(armed("destroy", &arming.action.echo()));
     assert!(state.mutation_pending.is_none());
 
-    // A destructive lifecycle op arms on the instance name.
-    state.arm_lifecycle("instance-delete", "vm-1", "mesh-worker");
+    // A destructive lifecycle op arms on the workload name (the roster row seam).
+    state.arm_lifecycle("instance-delete", "seat-1", "seat-1");
     let arming = state.arming.as_ref().expect("delete opens the confirm");
     assert_eq!(arming.action.verb(), "instance-delete");
-    assert_eq!(arming.action.echo(), "mesh-worker");
+    assert_eq!(arming.action.echo(), "seat-1");
     assert!(state.mutation_pending.is_none() && state.note.is_none());
     // The armed confirm panel still tessellates.
     assert!(run_panel(&mut state), "the arming confirm drew nothing");
-}
-
-#[test]
-fn status_renders_per_tool_health_up_down_absent_honestly() {
-    let st = fixture_state();
-    // The mirror carries the honest tri-state — never a fabricated up.
-    assert_eq!(
-        st.tool_health("opentofu").map(|h| h.state),
-        Some(HealthState::Up)
-    );
-    assert_eq!(
-        st.tool_health("ansible").map(|h| h.state),
-        Some(HealthState::Down)
-    );
-    assert_eq!(
-        st.tool_health("libvirt").map(|h| h.state),
-        Some(HealthState::Absent)
-    );
-    // An Absent/Down tool drops backend readiness (never faked ready).
-    assert!(!st.backend_ready());
-
-    // The state → glyph mapping is honest per state (all registered glyphs).
-    assert_eq!(health_icon(HealthState::Up), "emblem-ok");
-    assert_eq!(health_icon(HealthState::Down), "dialog-warning");
-    assert_eq!(health_icon(HealthState::Absent), "changes-prevent");
-
-    let mut state = state_on(Mode::Status);
-    assert!(run_panel(&mut state), "the Status health rows drew nothing");
-}
-
-#[test]
-fn images_network_and_containers_show_an_honest_backend_pending_note() {
-    // Modes with no landed action/cloud verb render a backend-pending card and
-    // never emit a fabricated verb (§7). Rendering them leaves nothing pending.
-    for mode in [Mode::Images, Mode::Network, Mode::Containers] {
-        let mut state = state_on(mode);
-        assert!(run_panel(&mut state), "{:?} drew nothing", mode.label());
-        assert!(
-            state.mutation_pending.is_none() && state.note.is_none(),
-            "{:?} must not emit a verb",
-            mode.label()
-        );
-    }
-}
-
-#[test]
-fn carbon_icons_are_registered_for_every_mode_and_health_state() {
-    // "Carbon icons paint (mesh present), no glyph text" — every mode tab + every
-    // health/status glyph resolves in the embedded Mackes-Carbon registry.
-    for mode in Mode::ALL {
-        assert!(
-            mde_egui::carbon_svg_bytes(mode.icon()).is_some(),
-            "{:?} icon `{}` is not a registered Carbon glyph",
-            mode.label(),
-            mode.icon()
-        );
-    }
-    for state in [HealthState::Up, HealthState::Down, HealthState::Absent] {
-        assert!(
-            mde_egui::carbon_svg_bytes(health_icon(state)).is_some(),
-            "health glyph for {state:?} is not registered"
-        );
-    }
-    for glyph in [
-        "view-refresh",
-        "list-add",
-        "process-stop",
-        "document-edit",
-        "dialog-warning",
-        "changes-prevent",
-    ] {
-        assert!(
-            mde_egui::carbon_svg_bytes(glyph).is_some(),
-            "toolbar glyph `{glyph}` is not registered"
-        );
-    }
 }
 
 #[test]
@@ -287,7 +258,7 @@ fn fold_mutation_maps_the_reply_tri_state_honestly() {
     // A `gated` mutation reply reads STAGED (a dry-run — nothing applied) and
     // carries the staged plan summary honestly.
     let gated: CloudReply = serde_json::from_str(
-        r#"{"ok":false,"verb":"provision","gated":"live apply is operator-gated — tofu plan (staged): 2 to add — nothing applied"}"#,
+        r#"{"ok":false,"verb":"provision","gated":"live apply is capability-gated — tofu plan (staged): 2 to add — nothing applied"}"#,
     )
     .expect("gated reply parses");
     let (note, entry) = fold_mutation(&gated);
@@ -308,29 +279,37 @@ fn fold_mutation_maps_the_reply_tri_state_honestly() {
 }
 
 #[test]
-fn armed_hosts_reads_the_apply_posture_from_the_mirror() {
-    // Plan-only by default → no armed hosts.
-    let plan_only = fixture_state();
-    assert!(armed_hosts(std::slice::from_ref(&plan_only)).is_empty());
-    // A node with apply armed is reported honestly.
-    let mut live = fixture_state();
-    live.apply_armed = true;
-    assert_eq!(
-        armed_hosts(std::slice::from_ref(&live)),
-        vec!["eagle".to_string()]
-    );
+fn carbon_icons_are_registered_for_every_view_and_lens() {
+    // Every delivery-view tab + every lens tab resolves in the embedded
+    // Mackes-Carbon registry (no glyph text, mesh present).
+    for view in DeliveryView::ALL {
+        assert!(
+            mde_egui::carbon_svg_bytes(view.icon()).is_some(),
+            "{:?} icon `{}` is not a registered Carbon glyph",
+            view.label(),
+            view.icon()
+        );
+    }
+    for panel in Panel::ALL {
+        assert!(
+            mde_egui::carbon_svg_bytes(panel.icon()).is_some(),
+            "{:?} icon `{}` is not a registered Carbon glyph",
+            panel.label(),
+            panel.icon()
+        );
+    }
+    // The stub-card glyph resolves too.
+    assert!(mde_egui::carbon_svg_bytes("view-grid").is_some());
 }
 
 #[test]
-fn recreated_labels_carry_no_legacy_backend_terminology() {
-    // The recreated workspace is provider-neutral: zero OpenStack-family terms in
-    // its user-facing copy (grep-clean, §6).
+fn labels_carry_no_legacy_backend_terminology() {
+    // The cockpit is provider-neutral: zero OpenStack-family terms in its
+    // user-facing copy (grep-clean, §6).
     let mut labels: Vec<String> =
         vec![CLOUD_PRODUCT_LABEL.to_string(), WORKSPACE_TITLE.to_string()];
-    labels.extend(Mode::ALL.iter().map(|m| m.label().to_string()));
-    for tool in BACKEND_TOOLS {
-        labels.push(tool.1.to_string());
-    }
+    labels.extend(DeliveryView::ALL.iter().map(|v| v.label().to_string()));
+    labels.extend(Panel::ALL.iter().map(|p| p.label().to_string()));
     for label in labels {
         for banned in [
             "OpenStack",
