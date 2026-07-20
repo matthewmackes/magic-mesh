@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mde_collab_types::envelope::SCHEMA_VERSION;
+use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::ids::{EventId, SpaceId};
 use mde_collab_types::{ActorClock, ActorId, CollabCommand, CollabEventEnvelope};
 
@@ -128,6 +129,36 @@ impl CollabEngine {
         self.clock = ctx.clock;
         self.ingest(&events)?;
         Ok(events)
+    }
+
+    /// Author a worker-adapted event `kind` in `space` directly, with **no**
+    /// originating command: mint + HLC-stamp + sign it with the local actor's
+    /// identity, ingest it, and return the signed envelope. The fold path for the
+    /// event classes no command produces —
+    /// [`AlertRaised`](CollabEventKind::AlertRaised) and
+    /// [`ClipboardPublished`](CollabEventKind::ClipboardPublished) adapted from a
+    /// truthful external Bus lane. Mirrors [`apply`](Self::apply)'s clock-advance +
+    /// ingest, but skips command validation (the caller vouches for the local
+    /// fact); the resulting event replicates + converges like any other.
+    pub fn author<S: EventSigner, I: IdSource>(
+        &mut self,
+        space: SpaceId,
+        kind: CollabEventKind,
+        signer: &S,
+        ids: &mut I,
+        now_unix_ms: i64,
+    ) -> Result<CollabEventEnvelope> {
+        let mut ctx = ApplyCtx {
+            actor: self.actor.clone(),
+            now_unix_ms,
+            clock: self.clock,
+            signer,
+            ids,
+        };
+        let env = ctx.author(space, kind);
+        self.clock = ctx.clock;
+        self.ingest(std::slice::from_ref(&env))?;
+        Ok(env)
     }
 
     /// Merge replicated events from a peer: signature-check (drop invalid),

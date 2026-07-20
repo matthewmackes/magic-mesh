@@ -11,8 +11,9 @@
 //! [`FixtureData`](crate::FixtureData).
 
 use mde_collab_types::{
-    ActivityFeed, ActorId, CallState, CollabCommand, ConversationTimeline, EventId, FileReferences,
-    MessageView, SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs,
+    ActivityFeed, ActorId, AlertInbox, CallState, ClipboardLane, CollabCommand,
+    ConversationTimeline, EventId, FileReferences, MessageView, SpaceDirectory, SpaceId, ThreadId,
+    ThreadTimeline, TransferJobs,
 };
 
 /// The message **edit/delete window** in milliseconds: an author may amend
@@ -92,6 +93,27 @@ pub trait CollabData {
     /// renders the honest "not shared yet" state.
     #[must_use]
     fn transfer_jobs(&self) -> Option<&TransferJobs> {
+        None
+    }
+
+    /// The fleet-wide alert inbox (the
+    /// [`AlertInbox`](mde_collab_types::AlertInbox) projection the Alerts mode
+    /// renders). It aggregates every space's folded alerts — the worker folds the
+    /// truthful Bus alert lanes into `alert_raised` events and this rolls them up.
+    /// Defaults to `None` so a source that has not folded any alerts yet still
+    /// renders the honest "no alerts" empty state, never faked.
+    #[must_use]
+    fn alert_inbox(&self) -> Option<&AlertInbox> {
+        None
+    }
+
+    /// A space's clipboard lane (the
+    /// [`ClipboardLane`](mde_collab_types::ClipboardLane) projection the Clipboard
+    /// mode renders). `None` until the worker has projected any clip for the space
+    /// — the honest empty state. Defaults to `None`.
+    #[must_use]
+    fn clipboard_lane(&self, space: SpaceId) -> Option<&ClipboardLane> {
+        let _ = space;
         None
     }
 }

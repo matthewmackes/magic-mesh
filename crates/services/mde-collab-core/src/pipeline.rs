@@ -69,6 +69,18 @@ impl<'a, S: EventSigner, I: IdSource> ApplyCtx<'a, S, I> {
         self
     }
 
+    /// Author one worker-adapted event directly, with no originating command:
+    /// mint, HLC-stamp, and sign it. This is the fold path for event classes that
+    /// have **no** authoring command — [`AlertRaised`](CollabEventKind::AlertRaised)
+    /// and [`ClipboardPublished`](CollabEventKind::ClipboardPublished) adapted from
+    /// external Bus lanes (the emitters keep publishing their truthful events; the
+    /// collab worker adapts them into a signed collab fact here). It performs no
+    /// validation — the caller vouches for the fact (it originates from a trusted
+    /// local subsystem, not a peer command).
+    pub fn author(&mut self, space: SpaceId, kind: CollabEventKind) -> CollabEventEnvelope {
+        self.emit(space, kind)
+    }
+
     /// Mint, HLC-stamp, and sign one envelope for `kind` in `space`.
     fn emit(&mut self, space: SpaceId, kind: CollabEventKind) -> CollabEventEnvelope {
         let now = u64::try_from(self.now_unix_ms).unwrap_or(0);

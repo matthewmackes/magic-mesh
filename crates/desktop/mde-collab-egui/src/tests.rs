@@ -9,10 +9,14 @@
 use mde_egui::egui;
 use mde_egui::Style;
 
+use std::collections::BTreeMap;
+
 use mde_collab_types::{
-    ActivityFeed, ActorId, CollabCommand, ConversationTimeline, DeliveryState, EventId, FileRef,
-    FileRefId, FileReferenceView, FileReferences, SpaceId, SpaceKind, SpaceRole, TransferControl,
-    TransferDirection, TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
+    ActivityFeed, ActorId, AlertAction, AlertActionKind, AlertInbox, AlertPayload, AlertView,
+    ClipItemKind, ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState,
+    EventId, FileRef, FileRefId, FileReferenceView, FileReferences, Severity, SpaceId, SpaceKind,
+    SpaceRole, TransferControl, TransferDirection, TransferId, TransferJobView, TransferJobs,
+    TransferMethod, TransferState,
 };
 
 use crate::fixture::{activity, message, space_summary, FixtureData};
@@ -368,23 +372,29 @@ fn activity_body_renders_the_feed() {
 
 #[test]
 fn labeled_for_later_modes_are_honest() {
-    // Documents/Alerts/Clipboard are placeholders, not faked data — they carry a
-    // Phase-3b note and are not marked implemented. (Files graduated to a full
-    // mode with WL-FUNC-011 and is asserted implemented below.)
-    for mode in [Mode::Documents, Mode::Alerts, Mode::Clipboard] {
-        assert!(!mode.is_implemented(), "{mode:?} is a Phase-3b placeholder");
-        assert!(
-            mode.phase_3b_note().contains("Phase 3b"),
-            "{mode:?} must carry an honest labeled-for-later note"
-        );
-    }
+    // Documents is the only remaining placeholder — it carries a Phase-3b note and
+    // is not marked implemented. (Files/Transfers/Alerts/Clipboard graduated to
+    // full modes with WL-FUNC-011 and are asserted implemented below.)
     assert!(
-        Mode::Activity.is_implemented()
-            && Mode::Messages.is_implemented()
-            && Mode::Files.is_implemented()
+        !Mode::Documents.is_implemented(),
+        "Documents is a placeholder"
     );
-    // An implemented mode never renders a placeholder note.
-    assert_eq!(Mode::Files.phase_3b_note(), "");
+    assert!(
+        Mode::Documents.phase_3b_note().contains("Phase 3b"),
+        "Documents must carry an honest labeled-for-later note"
+    );
+    for mode in [
+        Mode::Activity,
+        Mode::Messages,
+        Mode::Files,
+        Mode::Transfers,
+        Mode::Alerts,
+        Mode::Clipboard,
+    ] {
+        assert!(mode.is_implemented(), "{mode:?} must be implemented");
+        // An implemented mode never renders a placeholder note.
+        assert_eq!(mode.phase_3b_note(), "", "{mode:?} must not carry a note");
+    }
 }
 
 #[test]
@@ -631,5 +641,391 @@ fn permanent_delete_is_typed_confirm_gated() {
             Some(CollabCommand::UnlinkFile { space: s, file: f }) if *s == space && *f == file
         ),
         "a confirmed permanent delete must emit UnlinkFile"
+    );
+}
+
+// ── Transfers mode (WL-FUNC-011) ─────────────────────────────────────────────
+
+#[test]
+fn transfers_mode_renders_the_shared_job_list() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_transfer_jobs(TransferJobs {
+            jobs: vec![TransferJobView {
+                transfer: TransferId::new(),
+                file: FileRefId::new(),
+                method: TransferMethod::Node,
+                direction: TransferDirection::Outbound,
+                state: TransferState::Active,
+                moved: 1024,
+                total: 4096,
+            }],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Transfers);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the Transfers job list painted nothing");
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the Transfers mode must paint Carbon icons as image meshes"
+    );
+}
+
+#[test]
+fn transfers_mode_empty_state_is_honest() {
+    assert!(Mode::Transfers.is_implemented());
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        2,
+        1_000,
+    ));
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Transfers);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(
+        !shapes.is_empty(),
+        "the empty Transfers state painted nothing"
+    );
+}
+
+#[test]
+fn transfers_mode_control_emits_control_transfer() {
+    // The Transfers mode drives the shared control seam; a cancel emits
+    // ControlTransfer (state is read from the mirror, never recomputed).
+    let surface = CommunicationsSurface::new();
+    let transfer = TransferId::new();
+    let mut sink = CommandSink::new();
+    surface.control_transfer(&mut sink, transfer, TransferControl::Cancel);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::ControlTransfer {
+                transfer: t,
+                control: TransferControl::Cancel,
+            }) if *t == transfer
+        ),
+        "a Transfers-mode control must emit ControlTransfer"
+    );
+}
+
+// ── Alerts mode (WL-FUNC-011) ────────────────────────────────────────────────
+
+/// Build an [`AlertView`] fixture row.
+fn alert_view(
+    space: SpaceId,
+    severity: Severity,
+    source: &str,
+    headline: &str,
+    actions: Vec<AlertAction>,
+) -> AlertView {
+    let mut fields = BTreeMap::new();
+    fields.insert("disk".to_owned(), "94%".to_owned());
+    AlertView {
+        event_id: EventId::new(),
+        space,
+        alert: AlertPayload {
+            severity,
+            source: source.to_owned(),
+            headline: headline.to_owned(),
+            fields,
+            actions,
+            goto: None,
+        },
+        acknowledged: false,
+        snoozed_until_unix_ms: None,
+    }
+}
+
+#[test]
+fn alerts_mode_renders_a_fixture_inbox() {
+    let space = SpaceId::new();
+    let alert = alert_view(
+        space,
+        Severity::Warning,
+        "nyc3",
+        "disk pre-fail",
+        vec![AlertAction {
+            id: "restart".to_owned(),
+            label: "Restart".to_owned(),
+            verb: Some("action/node/restart".to_owned()),
+            kind: AlertActionKind::Destructive,
+        }],
+    );
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Incident,
+            "Incident 42",
+            SpaceRole::Owner,
+            0,
+            3,
+            1_000_000,
+        ))
+        .with_alert_inbox(AlertInbox {
+            alerts: vec![alert],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Alerts);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the Alerts inbox painted nothing");
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the Alerts mode must paint Carbon icons as image meshes"
+    );
+}
+
+#[test]
+fn acknowledge_and_snooze_emit_the_right_commands() {
+    let space = SpaceId::new();
+    let alert = EventId::new();
+    let surface = CommunicationsSurface::new();
+
+    let mut sink = CommandSink::new();
+    surface.acknowledge_alert(&mut sink, space, alert);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::AckAlert { space: s, alert: a }) if *s == space && *a == alert
+        ),
+        "acknowledge must emit AckAlert"
+    );
+
+    let mut sink = CommandSink::new();
+    surface.snooze_alert(&mut sink, space, alert, 5_000);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SnoozeAlert {
+                space: s,
+                alert: a,
+                until_unix_ms: 5_000,
+            }) if *s == space && *a == alert
+        ),
+        "snooze must emit SnoozeAlert with the injected expiry"
+    );
+}
+
+#[test]
+fn destructive_alert_action_is_arm_then_confirm_gated() {
+    // A destructive inline action must not fire until it is armed AND confirmed —
+    // mirroring the core's DestructiveNotArmed guard.
+    let space = SpaceId::new();
+    let alert = EventId::new();
+    let mut surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+
+    // No arm → confirm fires nothing.
+    assert!(!surface.confirm_alert_action(&mut sink, space));
+    assert!(
+        sink.is_empty(),
+        "an unarmed destructive action must not fire"
+    );
+
+    // Arm then confirm → RunAlertAction with armed:true.
+    surface.arm_alert_action(alert, "restart".to_owned());
+    assert!(surface.confirm_alert_action(&mut sink, space));
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::RunAlertAction {
+                space: s,
+                alert: a,
+                action_id,
+                armed: true,
+            }) if *s == space && *a == alert && action_id == "restart"
+        ),
+        "a confirmed destructive action must emit RunAlertAction armed"
+    );
+
+    // A safe action fires immediately, unarmed.
+    let mut sink = CommandSink::new();
+    surface.run_alert_action(&mut sink, space, alert, "open".to_owned(), false);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::RunAlertAction { armed: false, .. })
+        ),
+        "a safe action fires unarmed"
+    );
+}
+
+#[test]
+fn mute_threshold_and_dnd_emit_commands_and_hush() {
+    let space = SpaceId::new();
+    let info = alert_view(space, Severity::Info, "chatty-node", "fyi", vec![]);
+    let critical = alert_view(space, Severity::Critical, "core-1", "meltdown", vec![]);
+    let mut surface = CommunicationsSurface::new();
+
+    // Threshold at Warning hushes the Info alert but not the Critical one.
+    let mut sink = CommandSink::new();
+    surface.set_severity_threshold(&mut sink, Severity::Warning);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SetSeverityThreshold {
+                threshold: Severity::Warning
+            })
+        ),
+        "threshold change must emit SetSeverityThreshold"
+    );
+    assert!(
+        surface.alert_hushed(&info),
+        "below-threshold alert is hushed"
+    );
+    assert!(
+        !surface.alert_hushed(&critical),
+        "an at/above-threshold alert still rings"
+    );
+
+    // Muting a source hushes it regardless of severity.
+    let mut sink = CommandSink::new();
+    surface.set_alert_mute(&mut sink, "core-1".to_owned(), true);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SetAlertMute { source, muted: true }) if source == "core-1"
+        ),
+        "muting must emit SetAlertMute"
+    );
+    assert!(
+        surface.alert_hushed(&critical),
+        "a muted source is hushed even at Critical"
+    );
+
+    // DND emits SetDoNotDisturb.
+    let mut sink = CommandSink::new();
+    surface.set_dnd(&mut sink, true);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SetDoNotDisturb { enabled: true })
+        ),
+        "DND toggle must emit SetDoNotDisturb"
+    );
+}
+
+// ── Clipboard mode (WL-FUNC-011) ─────────────────────────────────────────────
+
+#[test]
+fn clipboard_mode_renders_a_fixture_lane() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_clipboard_lane(ClipboardLane {
+            space,
+            items: vec![ClipboardView {
+                event_id: EventId::new(),
+                kind: ClipItemKind::Text,
+                preview: "deploy token".to_owned(),
+                sha256_hex: "b".repeat(64),
+                source: "falcon".to_owned(),
+                at_unix_ms: 900_000,
+                pinned: false,
+            }],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Clipboard);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the Clipboard lane painted nothing");
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the Clipboard mode must paint Carbon icons as image meshes"
+    );
+}
+
+#[test]
+fn publishing_a_clip_emits_publish_clipboard_with_the_real_hash() {
+    let space = SpaceId::new();
+    let surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+    surface.publish_clip_text(&mut sink, space, "https://example.test/page", "eagle");
+    let published = sink.queued().iter().find_map(|c| match c {
+        CollabCommand::PublishClipboard { space: s, item } => Some((*s, item.clone())),
+        _ => None,
+    });
+    let (s, item) = published.expect("PublishClipboard emitted");
+    assert_eq!(s, space);
+    assert_eq!(item.kind, ClipItemKind::Uri, "an http(s) clip is a URI");
+    assert_eq!(item.source, "eagle");
+    assert_eq!(
+        item.sha256_hex,
+        mde_collab_types::value::sha256_hex(b"https://example.test/page"),
+        "the clip carries the real content hash, not a fake"
+    );
+    assert_eq!(item.len, "https://example.test/page".len() as u64);
+}
+
+#[test]
+fn clip_actions_emit_attach_pin_and_delete() {
+    let space = SpaceId::new();
+    let clip = EventId::new();
+    let surface = CommunicationsSurface::new();
+
+    let mut sink = CommandSink::new();
+    surface.attach_clip(&mut sink, space, clip);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::AttachClipboard { space: s, clip: c }) if *s == space && *c == clip
+        ),
+        "attach must emit AttachClipboard"
+    );
+
+    // Not pinned → toggling pins it.
+    let mut sink = CommandSink::new();
+    surface.toggle_clip_pin(&mut sink, space, clip, false);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::PinClipboard { space: s, clip: c }) if *s == space && *c == clip
+        ),
+        "toggling an unpinned clip must emit PinClipboard"
+    );
+
+    // Pinned → toggling unpins it.
+    let mut sink = CommandSink::new();
+    surface.toggle_clip_pin(&mut sink, space, clip, true);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::UnpinClipboard { .. })
+        ),
+        "toggling a pinned clip must emit UnpinClipboard"
+    );
+
+    let mut sink = CommandSink::new();
+    surface.delete_clip(&mut sink, space, clip);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::DeleteClipboard { space: s, clip: c }) if *s == space && *c == clip
+        ),
+        "delete must emit DeleteClipboard"
     );
 }

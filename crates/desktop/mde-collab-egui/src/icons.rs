@@ -10,7 +10,7 @@
 
 use mde_egui::egui;
 
-use mde_collab_types::{DeliveryState, SpaceKind};
+use mde_collab_types::{ClipItemKind, DeliveryState, Severity, SpaceKind};
 
 use crate::{ActivityFilter, Mode};
 
@@ -32,9 +32,30 @@ pub const fn mode_icon(mode: Mode) -> &'static str {
         Mode::Activity => "view",
         Mode::Messages => "share",
         Mode::Files => "download",
+        Mode::Transfers => "view-refresh",
         Mode::Documents => "document-edit",
         Mode::Alerts => "notification",
         Mode::Clipboard => "text-x-generic",
+    }
+}
+
+/// The Carbon glyph for an alert's severity band (the leading row glyph). Info
+/// rings quietly (a plain bell); Warning + Critical carry the warning glyph and
+/// are told apart by tint at the call site.
+#[must_use]
+pub const fn severity_icon(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "notification",
+        Severity::Warning | Severity::Critical => "dialog-warning",
+    }
+}
+
+/// The Carbon glyph for a clipboard item's kind (text vs. a shared URI/link).
+#[must_use]
+pub const fn clip_kind_icon(kind: ClipItemKind) -> &'static str {
+    match kind {
+        ClipItemKind::Text => "text-x-generic",
+        ClipItemKind::Uri => "globe",
     }
 }
 
@@ -108,6 +129,38 @@ pub const PICKER_FOLDER: &str = "view-grid";
 /// Ascend to the parent directory in the link picker.
 pub const PICKER_UP: &str = "go-up";
 
+// ---- Alerts mode ---------------------------------------------------------
+/// Acknowledge an alert (mark handled for the seat).
+pub const ALERT_ACK: &str = "emblem-ok";
+/// Snooze an alert until a time.
+pub const ALERT_SNOOZE: &str = "document-open-recent";
+/// Run a (safe) typed inline alert action.
+pub const ALERT_RUN: &str = "go-next";
+/// A destructive typed inline alert action (danger, arm-then-confirm gated).
+pub const ALERT_DESTRUCTIVE: &str = "dialog-warning";
+/// Mute an alert source for the local seat (block it from ringing).
+pub const ALERT_MUTE: &str = "changes-prevent";
+/// Toggle fleet Do-Not-Disturb (only Critical breaks through).
+pub const ALERT_DND: &str = "weather-clear-night";
+
+// ---- Clipboard mode ------------------------------------------------------
+/// Pin a clipboard item (survives the cap + clear).
+pub const CLIP_PIN: &str = "star";
+/// Attach / re-share a clipboard item into the space.
+pub const CLIP_ATTACH: &str = "share";
+/// Delete a single clipboard item.
+pub const CLIP_DELETE: &str = "list-remove";
+/// Publish a new clipboard item into the lane.
+pub const CLIP_PUBLISH: &str = "list-add";
+
+// ---- Transfers mode ------------------------------------------------------
+/// A transfer row's leading glyph.
+pub const XFER_ROW: &str = "download";
+/// Bytes arriving at this seat (inbound direction).
+pub const XFER_INBOUND: &str = "go-down";
+/// Bytes leaving this seat (outbound direction).
+pub const XFER_OUTBOUND: &str = "go-up";
+
 /// Every Carbon glyph name this surface can paint — the icon-standard set a test
 /// asserts is registered in the shared loader and rasterizes to a non-blank
 /// tinted mask. Keep this in sync with the mappings above.
@@ -139,6 +192,13 @@ pub const ALL_COLLAB_ICONS: &[&str] = &[
     "media-playback-pause",
     "media-playback-stop",
     "go-up",
+    // Transfers/Alerts/Clipboard modes (WL-FUNC-011)
+    "view-refresh",
+    "go-down",
+    "changes-prevent",
+    "weather-clear-night",
+    "globe",
+    "star",
 ];
 
 /// Paint a Carbon glyph `name` at `size` logical points tinted `color`, sensing

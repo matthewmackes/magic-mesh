@@ -47,14 +47,58 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::str::FromStr;
+
 use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_collab_core::{ActorLog, CollabEngine, Ed25519Signer, FileActorLog, Projection, RandomIds};
 use mde_collab_types::topics::{self, projection as proj};
-use mde_collab_types::{ActorId, CollabCommand, CollabEventEnvelope, SpaceId};
+use mde_collab_types::value::{
+    sha256_hex, AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity,
+};
+use mde_collab_types::{
+    ActorId, CollabCommand, CollabEventEnvelope, CollabEventKind, SpaceId, SpaceKind, SpaceRole,
+};
 
 use super::{ShutdownToken, Worker};
+
+/// The alert-source topic prefixes the collab worker folds into
+/// [`AlertRaised`](CollabEventKind::AlertRaised) events — the same truthful lanes
+/// the `super::chat` worker's `ALERT_LANE_PREFIXES` subscribes to (the emitters
+/// keep publishing their own events unchanged; we adapt them). Kept in step with
+/// the chat set so a node's alerts fold identically into both suites during the
+/// Phase-4 overlap.
+const ALERT_LANE_PREFIXES: &[&str] = &[
+    "event/security/",
+    "fleet/sec",
+    "event/firewall",
+    "compute/event/",
+    "event/compute/",
+    "event/kvm/",
+    "event/dc/",
+    "event/vm/",
+    "event/podman/",
+    "fdo/",
+    "event/notify/",
+    "fleet/health/",
+];
+
+/// The cross-mesh clipboard-capture lane the `clipboard_sync` worker broadcasts
+/// on. Its body is `{ id, text, source, time }` (text-only, uncapped); we fold
+/// each capture into a [`ClipboardPublished`](CollabEventKind::ClipboardPublished)
+/// event, recomputing the full content address + gating on size.
+const CLIPBOARD_CAPTURE_TOPIC: &str = "event/clipboard/clip";
+
+/// The clipboard-lane size ceiling: a clip up to 100 MB rides the lane; anything
+/// larger is a Transfer, not a clip, so it is **not** folded here (never
+/// truncated) — it belongs to the WL-FUNC-006 transfer path.
+const MAX_CLIP_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The name of the node's own **system space** — a per-node space the worker owns
+/// that holds its folded node-level facts (alerts + clipboard captures), so those
+/// facts land in a real, ackable, member space rather than a headless id.
+const SYSTEM_SPACE_NAME: &str = "System";
 
 /// The default poll cadence (tests override with a short value; the loop is
 /// entirely edge-driven off the Bus so the interval only bounds latency).
@@ -172,7 +216,200 @@ impl CollabWorker {
         self.drain_commands(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_inbound(persist, state, &mut touched, &mut changed);
         self.backfill_logs(state, &mut touched, &mut changed);
+        // Fold the node's external subsystems into collab facts (WL-FUNC-011): the
+        // truthful Bus alert lanes → AlertRaised, and the cross-mesh clipboard
+        // captures → ClipboardPublished. Each folds into the node's own system
+        // space, which is bootstrapped LAZILY — only the first time the node
+        // actually has a node-level fact to record — so a node that never sees an
+        // alert or clip carries no system space. The emitters publish unchanged.
+        self.drain_alert_lanes(persist, state, now_ms, &mut touched, &mut changed);
+        self.drain_clipboard_captures(persist, state, now_ms, &mut touched, &mut changed);
         self.publish_read_models(persist, state, &touched, changed);
+    }
+
+    /// The node's own **system space** id — derived deterministically from this
+    /// node's actor so a restart finds the same space in its rebuilt log rather
+    /// than minting a fresh one each boot. (A stable UUID formed from the actor's
+    /// SHA-256, via the id contract's `FromStr`, so we take no direct `uuid` dep.)
+    fn system_space_id(&self) -> SpaceId {
+        let hex = sha256_hex(self.self_actor.as_str().as_bytes());
+        let uuid = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32],
+        );
+        SpaceId::from_str(&uuid).unwrap_or_else(|_| SpaceId::nil())
+    }
+
+    /// Find-or-create the node's system space: if the folded state already holds
+    /// it (a prior boot's log rebuilt it), reuse it; otherwise bootstrap it by
+    /// authoring `SpaceCreated` + `MemberJoined` (this node an Owner) so the folded
+    /// alerts/clips land in a real member space whose ack/pin/snooze validate.
+    /// Returns the id, or `None` if the (logged) bootstrap could not land.
+    fn ensure_system_space(
+        &self,
+        persist: &Persist,
+        state: &mut CollabState,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) -> Option<SpaceId> {
+        let system = self.system_space_id();
+        if system.is_nil() {
+            return None;
+        }
+        if state.engine.state().space(system).is_some() {
+            return Some(system);
+        }
+        self.author_and_relay(
+            persist,
+            state,
+            system,
+            CollabEventKind::SpaceCreated {
+                kind: SpaceKind::Team,
+                name: format!("{SYSTEM_SPACE_NAME} \u{b7} {}", self.self_actor),
+            },
+            now_ms,
+            touched,
+            changed,
+        );
+        self.author_and_relay(
+            persist,
+            state,
+            system,
+            CollabEventKind::MemberJoined {
+                actor: self.self_actor.clone(),
+                role: SpaceRole::Owner,
+            },
+            now_ms,
+            touched,
+            changed,
+        );
+        state.engine.state().space(system).map(|_| system)
+    }
+
+    /// Author one worker-adapted event into `space`, then relay it exactly as a
+    /// command-produced event is: durable-append to this node's own actor log
+    /// BEFORE publishing, publish it live, and mark the space touched + changed.
+    /// The shared tail of the fold + bootstrap paths.
+    fn author_and_relay(
+        &self,
+        persist: &Persist,
+        state: &mut CollabState,
+        space: SpaceId,
+        kind: CollabEventKind,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) {
+        let signer = Ed25519Signer::new(self.signing_key.clone());
+        let env = match state
+            .engine
+            .author(space, kind, &signer, &mut state.ids, now_ms)
+        {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(target: "mackesd::collab", error = %e, "collab author (fold) failed");
+                return;
+            }
+        };
+        match self.append_own(state, &env) {
+            Ok(()) => {
+                self.publish_event(persist, &env);
+                if !env.space_id.is_nil() {
+                    touched.insert(env.space_id);
+                }
+                *changed = true;
+            }
+            Err(e) => tracing::warn!(
+                target: "mackesd::collab",
+                error = %e,
+                "actor-log append failed; not publishing folded event",
+            ),
+        }
+    }
+
+    /// Drain every alert lane (mirroring the chat worker's set) forward-only and
+    /// fold each truthful alert body into an [`AlertRaised`](CollabEventKind)
+    /// event in the node's system space (bootstrapped lazily on the first fold).
+    /// Forward-only (seed-to-head on first sight) so a restart never re-raises a
+    /// stale alert backlog.
+    fn drain_alert_lanes(
+        &self,
+        persist: &Persist,
+        state: &mut CollabState,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) {
+        let all_topics = persist.list_topics().unwrap_or_default();
+        for topic in &all_topics {
+            if !is_alert_lane(topic) {
+                continue;
+            }
+            for m in take_new_forward(persist, &mut state.cursors, topic) {
+                let Some(body) = m.body.as_deref() else {
+                    continue;
+                };
+                if let Some(alert) = fold_alert_payload(topic, body, self.self_actor.as_str()) {
+                    let Some(system) =
+                        self.ensure_system_space(persist, state, now_ms, touched, changed)
+                    else {
+                        continue;
+                    };
+                    self.author_and_relay(
+                        persist,
+                        state,
+                        system,
+                        CollabEventKind::AlertRaised { alert },
+                        now_ms,
+                        touched,
+                        changed,
+                    );
+                } else {
+                    tracing::debug!(target: "mackesd::collab", topic = topic.as_str(), "alert body not foldable; skipped");
+                }
+            }
+        }
+    }
+
+    /// Drain the cross-mesh clipboard-capture lane forward-only and fold each
+    /// capture into a [`ClipboardPublished`](CollabEventKind) event in the node's
+    /// system space (bootstrapped lazily on the first fold; the full content
+    /// address is recomputed, and a >100 MB clip is skipped, not truncated — it
+    /// belongs to the Transfers path).
+    fn drain_clipboard_captures(
+        &self,
+        persist: &Persist,
+        state: &mut CollabState,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) {
+        for m in take_new_forward(persist, &mut state.cursors, CLIPBOARD_CAPTURE_TOPIC) {
+            let Some(body) = m.body.as_deref() else {
+                continue;
+            };
+            if let Some(item) = fold_clip_item(body) {
+                let Some(system) =
+                    self.ensure_system_space(persist, state, now_ms, touched, changed)
+                else {
+                    continue;
+                };
+                self.author_and_relay(
+                    persist,
+                    state,
+                    system,
+                    CollabEventKind::ClipboardPublished { item },
+                    now_ms,
+                    touched,
+                    changed,
+                );
+            }
+        }
     }
 
     /// Drain every `action/collab/<verb>` lane: decode the [`CollabCommand`], run
@@ -648,6 +885,219 @@ fn read_log_envelopes(path: &Path) -> Vec<CollabEventEnvelope> {
     out
 }
 
+/// Whether `topic` is a truthful alert lane the collab worker folds — one of the
+/// [`ALERT_LANE_PREFIXES`], and not one of the collab suite's own lanes (so a
+/// republished `state/collab/*` model or a `collab/event/*` delivery is never
+/// mistaken for an alert to re-raise).
+fn is_alert_lane(topic: &str) -> bool {
+    if topic.starts_with(topics::ACTION_PREFIX)
+        || topic.starts_with(topics::STATE_PREFIX)
+        || topic.starts_with(topics::EVENT_PREFIX)
+    {
+        return false;
+    }
+    ALERT_LANE_PREFIXES.iter().any(|p| topic.starts_with(p))
+}
+
+/// Fold a truthful Bus alert body into an [`AlertPayload`], mirroring `mde-chat`'s
+/// `fold_alert`: read `severity`/`priority` loosely, prefer a
+/// `summary`/`headline`/`title`/`alert`/`message` line for the headline (else the
+/// topic-derived flag), attribute the `source` (explicit `source`, else
+/// `host`/`hostname`, else this node), copy the remaining string fields verbatim,
+/// and map any typed `actions` array. A non-object body is not an alert we fold.
+fn fold_alert_payload(topic: &str, body: &str, origin: &str) -> Option<AlertPayload> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = value.as_object()?;
+    let str_field = |k: &str| obj.get(k).and_then(serde_json::Value::as_str);
+
+    let severity = str_field("severity")
+        .or_else(|| str_field("priority"))
+        .map_or(Severity::Info, classify_severity);
+    let source = str_field("source")
+        .or_else(|| str_field("host"))
+        .or_else(|| str_field("hostname"))
+        .unwrap_or(origin)
+        .to_owned();
+    let headline = ["summary", "headline", "title", "alert", "message"]
+        .iter()
+        .find_map(|k| str_field(k).filter(|s| !s.is_empty()))
+        .map_or_else(|| alert_flag(topic).to_owned(), str::to_owned);
+
+    let mut fields = BTreeMap::new();
+    for (k, v) in obj {
+        if matches!(
+            k.as_str(),
+            "severity"
+                | "priority"
+                | "source"
+                | "summary"
+                | "headline"
+                | "title"
+                | "alert"
+                | "message"
+                | "actions"
+                | "goto"
+                | "ts_unix_ms"
+                | "host"
+                | "hostname"
+        ) {
+            continue;
+        }
+        if let Some(s) = v.as_str() {
+            fields.insert(k.clone(), s.to_owned());
+        }
+    }
+
+    let actions = obj
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(fold_alert_action).collect())
+        .unwrap_or_default();
+    let goto = str_field("goto").map(str::to_owned);
+
+    Some(AlertPayload {
+        severity,
+        source,
+        headline,
+        fields,
+        actions,
+        goto,
+    })
+}
+
+/// Fold one typed inline alert action object (`{ id, label, verb, kind }`).
+fn fold_alert_action(value: &serde_json::Value) -> Option<AlertAction> {
+    let obj = value.as_object()?;
+    let id = obj
+        .get("id")
+        .and_then(serde_json::Value::as_str)?
+        .to_owned();
+    let label = obj
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&id)
+        .to_owned();
+    let verb = obj
+        .get("verb")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let kind = obj
+        .get("kind")
+        .or_else(|| obj.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .map_or(AlertActionKind::Safe, classify_action_kind);
+    Some(AlertAction {
+        id,
+        label,
+        verb,
+        kind,
+    })
+}
+
+/// Classify a loose severity string into the collab [`Severity`] band (mirrors
+/// the chat classifier's tokens).
+fn classify_severity(s: &str) -> Severity {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "crit" | "critical" | "error" | "err" | "fatal" | "urgent" => Severity::Critical,
+        "warn" | "warning" | "high" => Severity::Warning,
+        _ => Severity::Info,
+    }
+}
+
+/// Classify a loose action-kind string into an [`AlertActionKind`].
+fn classify_action_kind(s: &str) -> AlertActionKind {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "destructive" | "danger" | "armed" => AlertActionKind::Destructive,
+        "ack" | "acknowledge" => AlertActionKind::Ack,
+        "snooze" => AlertActionKind::Snooze,
+        _ => AlertActionKind::Safe,
+    }
+}
+
+/// A coarse category flag for an alert topic (the headline fallback), mirroring
+/// the chat worker's `alert_flag` families.
+fn alert_flag(topic: &str) -> &'static str {
+    if topic.starts_with("event/security/") || topic.starts_with("fleet/sec") {
+        "security"
+    } else if topic.starts_with("event/firewall") {
+        "firewall"
+    } else if topic.starts_with("fleet/health/") {
+        "health"
+    } else if topic.starts_with("event/notify/") {
+        "notify"
+    } else if topic.starts_with("fdo/") {
+        "desktop"
+    } else if topic.starts_with("compute/event/")
+        || topic.starts_with("event/compute/")
+        || topic.starts_with("event/kvm/")
+        || topic.starts_with("event/vm/")
+        || topic.starts_with("event/podman/")
+        || topic.starts_with("event/dc/")
+    {
+        "compute"
+    } else {
+        "system"
+    }
+}
+
+/// Fold a cross-mesh clipboard capture body (`{ id, text, source, time }`) into a
+/// [`ClipboardItem`]: recompute the full SHA-256 content address (the capture
+/// carries only a 16-hex prefix), compute the byte length, detect a URI vs. text,
+/// and carry the source. A clip over [`MAX_CLIP_BYTES`] is **not** folded (it is a
+/// Transfer, never truncated into the lane).
+fn fold_clip_item(body: &str) -> Option<ClipboardItem> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = value.as_object()?;
+    let text = obj.get("text").and_then(serde_json::Value::as_str)?;
+    let len = text.len() as u64;
+    if !clip_fits_lane(len) {
+        tracing::info!(
+            target: "mackesd::collab",
+            len,
+            "clip exceeds the clipboard-lane cap; it belongs to Transfers, not folded",
+        );
+        return None;
+    }
+    let source = obj
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let trimmed = text.trim_start();
+    let kind = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        ClipItemKind::Uri
+    } else {
+        ClipItemKind::Text
+    };
+    Some(ClipboardItem {
+        kind,
+        preview: clip_preview(text),
+        sha256_hex: sha256_hex(text.as_bytes()),
+        len,
+        source,
+    })
+}
+
+/// Whether a clip of `len` bytes rides the clipboard lane (≤ [`MAX_CLIP_BYTES`]);
+/// a larger clip is a Transfer instead. A pure boundary seam so the size gate is
+/// testable without allocating a 100 MB fixture.
+const fn clip_fits_lane(len: u64) -> bool {
+    len <= MAX_CLIP_BYTES
+}
+
+/// A capped, single-line preview of clip content for the lane row (never the full
+/// possibly-large payload).
+fn clip_preview(text: &str) -> String {
+    const PREVIEW_MAX: usize = 160;
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > PREVIEW_MAX {
+        let head: String = one_line.chars().take(PREVIEW_MAX).collect();
+        format!("{head}\u{2026}")
+    } else {
+        one_line
+    }
+}
+
 fn resolve_default_bus_root(
     env_root: Option<std::ffi::OsString>,
     data_dir: Option<PathBuf>,
@@ -725,11 +1175,11 @@ impl Worker for CollabWorker {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use mde_collab_types::value::{sha256_hex, MessageBody};
+    use mde_collab_types::value::MessageBody;
     use mde_collab_types::{
-        CollabEventKind, ConversationTimeline, FileRef, FileRefId, FileReferences, PresenceState,
-        SpaceDirectory, SpaceKind, SpaceRole, TransferControl, TransferDirection, TransferId,
-        TransferJobs, TransferMethod, TransferState,
+        AlertInbox, ClipboardLane, CollabEventKind, ConversationTimeline, FileRef, FileRefId,
+        FileReferences, PresenceState, SpaceDirectory, SpaceKind, SpaceRole, TransferControl,
+        TransferDirection, TransferId, TransferJobs, TransferMethod, TransferState,
     };
     use rand::rngs::OsRng;
 
@@ -1297,6 +1747,178 @@ mod tests {
             fa, fb,
             "the two workers converge to identical projected state"
         );
+    }
+
+    fn write_raw(persist: &Persist, topic: &str, body: &str) {
+        persist
+            .write(topic, Priority::Default, None, Some(body))
+            .expect("write raw body");
+    }
+
+    // ── WL-FUNC-011 worker folds ─────────────────────────────────────────
+
+    #[test]
+    fn alert_lane_folds_into_an_alert_raised_event() {
+        // A truthful alert published on a real alert lane (event/notify/*) is
+        // folded — worker-side — into an AlertRaised collab event in the node's
+        // system space, and rolls up into the fleet-wide alert inbox.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+
+        // The lane is discovered via list_topics, so it must exist before the
+        // cursor is seeded; the drain is forward-only (a restart never re-raises a
+        // stale backlog), so the pre-seed message is skipped, not folded.
+        write_raw(
+            &persist,
+            "event/notify/disk",
+            r#"{"severity":"info","source":"nyc3","summary":"seed"}"#,
+        );
+        w.tick_once(&persist, &mut state, 100); // seed the lane cursor (forward-only)
+
+        // No fold has happened yet, so the system space is NOT created (it is
+        // bootstrapped lazily, only when the node actually has a fact to record).
+        let system = w.system_space_id();
+        assert!(
+            state.engine.state().space(system).is_none(),
+            "the system space is not materialized until the first fold",
+        );
+
+        write_raw(
+            &persist,
+            "event/notify/disk",
+            r#"{"severity":"warning","source":"nyc3","summary":"disk pre-fail","disk":"94%"}"#,
+        );
+        w.tick_once(&persist, &mut state, 200); // drain + fold → lazily bootstrap + author
+
+        // The first fold lazily bootstrapped the node's system space (a real,
+        // owned member space) and authored the alert into it.
+        assert!(
+            state.engine.state().is_owner(system, &w.self_actor),
+            "the node owns its lazily-bootstrapped system space",
+        );
+
+        let topic = topics::state_topic(proj::ALERT_INBOX);
+        assert_eq!(topic, "state/collab/alert-inbox");
+        let msg = persist
+            .read_latest(&topic)
+            .expect("read inbox")
+            .expect("alert inbox published");
+        let inbox: AlertInbox =
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode inbox");
+        assert_eq!(inbox.alerts.len(), 1, "exactly the post-seed alert folded");
+        let a = &inbox.alerts[0];
+        assert_eq!(a.alert.headline, "disk pre-fail");
+        assert_eq!(a.alert.source, "nyc3");
+        assert_eq!(a.alert.severity, Severity::Warning);
+        assert_eq!(
+            a.alert.fields.get("disk").map(String::as_str),
+            Some("94%"),
+            "the folded alert carries the truthful structured fields",
+        );
+        assert_eq!(
+            a.space, system,
+            "the folded alert lives in the system space"
+        );
+    }
+
+    #[test]
+    fn clipboard_capture_folds_into_clipboard_published() {
+        // A cross-mesh clipboard capture on event/clipboard/clip is folded into a
+        // ClipboardPublished collab event with the RECOMPUTED full content address.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+
+        write_raw(
+            &persist,
+            "event/clipboard/clip",
+            r#"{"id":"seed","text":"seed clip","source":"falcon","time":"t"}"#,
+        );
+        w.tick_once(&persist, &mut state, 100); // seed the capture cursor (forward-only)
+        write_raw(
+            &persist,
+            "event/clipboard/clip",
+            r#"{"id":"def","text":"https://example.test/x","source":"falcon","time":"t"}"#,
+        );
+        w.tick_once(&persist, &mut state, 200); // drain + fold → lazily bootstrap + author
+
+        let system = w.system_space_id();
+        let topic = topics::space_state_topic(proj::CLIPBOARD_LANE, system);
+        let msg = persist
+            .read_latest(&topic)
+            .expect("read lane")
+            .expect("clipboard lane published");
+        let lane: ClipboardLane =
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode lane");
+        assert_eq!(lane.items.len(), 1, "exactly the post-seed clip folded");
+        let item = &lane.items[0];
+        assert_eq!(item.kind, ClipItemKind::Uri, "an http(s) clip is a URI");
+        assert_eq!(item.source, "falcon");
+        assert_eq!(
+            item.sha256_hex,
+            sha256_hex(b"https://example.test/x"),
+            "the fold recomputes the real full content address (not the 16-hex capture prefix)",
+        );
+    }
+
+    #[test]
+    fn fold_alert_payload_reads_fields_and_actions() {
+        let body = r#"{"severity":"crit","host":"core-1","summary":"meltdown","zone":"a",
+            "actions":[{"id":"restart","label":"Restart","kind":"destructive","verb":"action/node/restart"}]}"#;
+        let p = fold_alert_payload("fleet/health/breaker/x", body, "self").expect("fold");
+        assert_eq!(p.severity, Severity::Critical);
+        assert_eq!(p.source, "core-1");
+        assert_eq!(p.headline, "meltdown");
+        assert_eq!(p.fields.get("zone").map(String::as_str), Some("a"));
+        assert_eq!(p.actions.len(), 1);
+        assert_eq!(p.actions[0].kind, AlertActionKind::Destructive);
+        assert_eq!(p.actions[0].id, "restart");
+    }
+
+    #[test]
+    fn fold_alert_payload_falls_back_and_rejects_non_objects() {
+        let p = fold_alert_payload("event/security/x", "{}", "eagle").expect("fold empty obj");
+        assert_eq!(p.source, "eagle", "source falls back to the origin node");
+        assert_eq!(
+            p.headline, "security",
+            "headline falls back to the topic flag"
+        );
+        assert_eq!(p.severity, Severity::Info);
+        // A non-object body is not an alert we fold.
+        assert!(fold_alert_payload("event/security/x", "not json", "eagle").is_none());
+        assert!(fold_alert_payload("event/security/x", "\"a string\"", "eagle").is_none());
+    }
+
+    #[test]
+    fn fold_clip_item_recomputes_hash_and_the_size_gate_holds() {
+        let body = r#"{"id":"p","text":"hello mesh","source":"falcon","time":"t"}"#;
+        let item = fold_clip_item(body).expect("fold clip");
+        assert_eq!(item.kind, ClipItemKind::Text);
+        assert_eq!(item.len, 10);
+        assert_eq!(item.sha256_hex, sha256_hex(b"hello mesh"));
+        assert_eq!(item.source, "falcon");
+        // The >100MB → Transfers gate is a pure boundary (no 100MB fixture needed).
+        assert!(clip_fits_lane(MAX_CLIP_BYTES));
+        assert!(!clip_fits_lane(MAX_CLIP_BYTES + 1));
+    }
+
+    #[test]
+    fn is_alert_lane_excludes_the_suites_own_lanes() {
+        assert!(is_alert_lane("event/notify/disk"));
+        assert!(is_alert_lane("fleet/health/breaker/x"));
+        assert!(is_alert_lane("event/security/audit"));
+        // The clipboard capture lane is not an alert lane.
+        assert!(!is_alert_lane("event/clipboard/clip"));
+        // Collab's own lanes are never re-folded.
+        assert!(!is_alert_lane("state/collab/alert-inbox"));
+        assert!(!is_alert_lane("action/collab/ack_alert"));
+        assert!(!is_alert_lane(&format!(
+            "collab/event/{}/eagle",
+            SpaceId::new()
+        )));
     }
 
     #[tokio::test]

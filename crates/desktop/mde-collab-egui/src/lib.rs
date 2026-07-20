@@ -15,9 +15,10 @@
 //! * a **spaces rail** down the left, listing the
 //!   [`SpaceDirectory`](mde_collab_types::SpaceDirectory) with per-space unread
 //!   badges (the selection key for every other pane);
-//! * per-space **mode tabs** across the top —
-//!   [`Mode::Activity`], [`Mode::Messages`], and [`Mode::Files`] are implemented
-//!   in full; the rest are honestly labeled "coming in Phase 3b", never faked;
+//! * per-space **mode tabs** across the top — [`Mode::Activity`],
+//!   [`Mode::Messages`], [`Mode::Files`], [`Mode::Transfers`], [`Mode::Alerts`],
+//!   and [`Mode::Clipboard`] are implemented in full; [`Mode::Documents`] is
+//!   honestly labeled "coming in Phase 3b", never faked;
 //! * a persistent **call bar** across the bottom that renders the
 //!   [`CallState`](mde_collab_types::CallState) read model and survives every
 //!   mode/space switch, with controls wired to the call commands even though the
@@ -56,12 +57,15 @@
 #![doc(html_no_source)]
 
 mod activity;
+mod alerts;
+mod clipboard;
 mod data;
 mod files;
 mod fixture;
 mod frame;
 mod icons;
 mod messages;
+mod transfers;
 
 #[cfg(test)]
 mod tests;
@@ -72,10 +76,10 @@ pub use data::{
 pub use fixture::FixtureData;
 pub use icons::ALL_COLLAB_ICONS;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use mde_collab_types::{EventId, SpaceId, ThreadId};
+use mde_collab_types::{EventId, Severity, SpaceId, ThreadId};
 
 pub use files::file_ref_of_path;
 
@@ -83,10 +87,10 @@ pub use files::file_ref_of_path;
 // pinned toolkit version through this crate alone.
 pub use mde_egui::egui;
 
-/// A per-space mode tab. [`Activity`](Self::Activity) and
-/// [`Messages`](Self::Messages) are implemented in full; the rest render an
-/// honest "coming in Phase 3b" placeholder (they map to real read models the
-/// later phase renders — never faked data).
+/// A per-space mode tab. Every tab but [`Documents`](Self::Documents) is
+/// implemented in full; Documents renders an honest "coming in Phase 3b"
+/// placeholder (it maps to a real read model the later phase renders — never
+/// faked data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// The action-oriented chronological Activity feed.
@@ -96,20 +100,23 @@ pub enum Mode {
     Messages,
     /// The files linked into a space (their references + shared transfers).
     Files,
+    /// The shared transfer jobs (the WL-FUNC-006 ledger mirror) + their controls.
+    Transfers,
     /// The live co-edited documents (Phase 3b).
     Documents,
-    /// The space's alert inbox (Phase 3b).
+    /// The fleet-wide alert inbox (severity/source/state + ack/snooze/actions).
     Alerts,
-    /// The space's clipboard lane (Phase 3b).
+    /// The space's clipboard lane (MIME items + publish/attach/pin/delete).
     Clipboard,
 }
 
 impl Mode {
     /// The tabs in display order.
-    pub const TABS: [Self; 6] = [
+    pub const TABS: [Self; 7] = [
         Self::Activity,
         Self::Messages,
         Self::Files,
+        Self::Transfers,
         Self::Documents,
         Self::Alerts,
         Self::Clipboard,
@@ -122,17 +129,18 @@ impl Mode {
             Self::Activity => "Activity",
             Self::Messages => "Messages",
             Self::Files => "Files",
+            Self::Transfers => "Transfers",
             Self::Documents => "Documents",
             Self::Alerts => "Alerts",
             Self::Clipboard => "Clipboard",
         }
     }
 
-    /// Whether this mode is implemented in this phase (Activity + Messages +
-    /// Files) or is a labeled-for-later placeholder.
+    /// Whether this mode is implemented (every mode but Documents, which is a
+    /// labeled-for-later placeholder).
     #[must_use]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Activity | Self::Messages | Self::Files)
+        !matches!(self, Self::Documents)
     }
 
     /// The honest placeholder line a not-yet-implemented mode shows instead of
@@ -141,10 +149,13 @@ impl Mode {
     pub const fn phase_3b_note(self) -> &'static str {
         match self {
             Self::Documents => "Documents mode arrives in Phase 3b.",
-            Self::Alerts => "Alerts mode arrives in Phase 3b.",
-            Self::Clipboard => "Clipboard mode arrives in Phase 3b.",
             // The implemented modes never render this note.
-            Self::Activity | Self::Messages | Self::Files => "",
+            Self::Activity
+            | Self::Messages
+            | Self::Files
+            | Self::Transfers
+            | Self::Alerts
+            | Self::Clipboard => "",
         }
     }
 }
@@ -251,6 +262,26 @@ pub struct CommunicationsSurface {
     /// not read to hash). Shown once, cleared on the next successful action; never
     /// a silent swallow (§7).
     files_notice: Option<String>,
+    /// Alerts mode — the local seat's least-severe level that still rings. Held as
+    /// view state (the worker treats [`SetSeverityThreshold`] as a per-seat local
+    /// preference, not a convergent event) and mirrored out as the command. Below
+    /// this level (and, under DND, below Critical) an alert is dimmed as hushed.
+    alert_threshold: Severity,
+    /// Alerts mode — fleet Do-Not-Disturb: only Critical alerts ring. View state,
+    /// mirrored out as [`SetDoNotDisturb`].
+    alert_dnd: bool,
+    /// Alerts mode — the alert sources the seat has muted (a local preference,
+    /// mirrored out as [`SetAlertMute`]). A muted source's alerts are shown dimmed
+    /// as hushed, never hidden (§7 — a muted alert is still a real fact).
+    alert_muted_sources: BTreeSet<String>,
+    /// Alerts mode — the pending **armed** destructive alert action (its alert +
+    /// action id), or `None`. A destructive action arms on the first click and
+    /// fires [`RunAlertAction`] with `armed: true` only on the confirm click — the
+    /// same two-step gate the core's `DestructiveNotArmed` guard enforces.
+    alert_arming: Option<(EventId, String)>,
+    /// Clipboard mode — per-space publish-composer drafts (persist locally across
+    /// mode/space switches, like the message composer draft).
+    clip_drafts: HashMap<SpaceId, String>,
 }
 
 impl CommunicationsSurface {
@@ -280,6 +311,9 @@ impl CommunicationsSurface {
             self.file_picker = None;
             self.files_confirm_delete = None;
             self.files_notice = None;
+            // A pending armed destructive alert action is a per-view intent — a
+            // space switch disarms it (it must be re-armed deliberately).
+            self.alert_arming = None;
         }
     }
 
@@ -356,6 +390,9 @@ impl CommunicationsSurface {
             Mode::Activity => self.activity_body(ui, data),
             Mode::Messages => self.messages_body(ui, data, sink),
             Mode::Files => self.files_body(ui, data, sink),
+            Mode::Transfers => self.transfers_body(ui, data, sink),
+            Mode::Alerts => self.alerts_body(ui, data, sink),
+            Mode::Clipboard => self.clipboard_body(ui, data, sink),
             other => frame::phase_3b_body(ui, other),
         }
     }

@@ -672,7 +672,8 @@ fn picker_start_dir() -> PathBuf {
 
 /// A short display form of a 64-char lower-hex SHA-256 (`abcd1234…`). The content
 /// address is the file's version identity; the row shows a recognisable prefix.
-fn short_hash(sha256_hex: &str) -> String {
+/// Shared with the Clipboard mode (a clip carries the same content-hash identity).
+pub(crate) fn short_hash(sha256_hex: &str) -> String {
     let head: String = sha256_hex.chars().take(12).collect();
     if sha256_hex.len() > 12 {
         format!("{head}\u{2026}")
@@ -681,8 +682,8 @@ fn short_hash(sha256_hex: &str) -> String {
     }
 }
 
-/// The honest label for a transfer state.
-const fn transfer_state_label(state: TransferState) -> &'static str {
+/// The honest label for a transfer state. Shared with the Transfers mode.
+pub(crate) const fn transfer_state_label(state: TransferState) -> &'static str {
     match state {
         TransferState::Queued => "Queued",
         TransferState::Active => "Transferring",
@@ -693,8 +694,8 @@ const fn transfer_state_label(state: TransferState) -> &'static str {
     }
 }
 
-/// The Carbon tint for a transfer state.
-const fn transfer_state_color(state: TransferState) -> egui::Color32 {
+/// The Carbon tint for a transfer state. Shared with the Transfers mode.
+pub(crate) const fn transfer_state_color(state: TransferState) -> egui::Color32 {
     match state {
         TransferState::Queued | TransferState::Paused => Style::WARN,
         TransferState::Active => Style::ACCENT,
@@ -707,7 +708,8 @@ const fn transfer_state_color(state: TransferState) -> egui::Color32 {
 /// A compact byte-size label (`512 B`, `2 KB`, `5.0 MB`, `3.0 GB`) — the surface's
 /// own small formatter (the file-manager's `fmt_bytes` is `pub(crate)` to its own
 /// crate), so a linked file's size + a transfer's mirrored progress read alike.
-fn fmt_bytes(n: u64) -> String {
+/// Shared with the Transfers + Clipboard modes.
+pub(crate) fn fmt_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;

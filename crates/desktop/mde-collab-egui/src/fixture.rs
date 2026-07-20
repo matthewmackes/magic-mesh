@@ -9,10 +9,10 @@
 use std::collections::HashMap;
 
 use mde_collab_types::{
-    ActivityEntry, ActivityFeed, ActorClock, ActorId, CallKind, CallParticipantState,
-    CallParticipantView, CallState, CallView, ConversationTimeline, DeliveryState, EventId,
-    FileReferences, MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
-    ThreadId, ThreadTimeline, TransferJobs,
+    ActivityEntry, ActivityFeed, ActorClock, ActorId, AlertInbox, CallKind, CallParticipantState,
+    CallParticipantView, CallState, CallView, ClipboardLane, ConversationTimeline, DeliveryState,
+    EventId, FileReferences, MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
+    SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -30,6 +30,8 @@ pub struct FixtureData {
     call_state: CallState,
     file_references: HashMap<SpaceId, FileReferences>,
     transfer_jobs: TransferJobs,
+    alert_inbox: AlertInbox,
+    clipboard_lanes: HashMap<SpaceId, ClipboardLane>,
 }
 
 impl FixtureData {
@@ -48,6 +50,8 @@ impl FixtureData {
             call_state: CallState::default(),
             file_references: HashMap::new(),
             transfer_jobs: TransferJobs::default(),
+            alert_inbox: AlertInbox::default(),
+            clipboard_lanes: HashMap::new(),
         }
     }
 
@@ -97,10 +101,25 @@ impl FixtureData {
     }
 
     /// Set the transfer-jobs mirror (the read-side of the WL-FUNC-006 ledger the
-    /// Files mode's transfer controls read state from).
+    /// Files + Transfers modes read state from).
     #[must_use]
     pub fn with_transfer_jobs(mut self, jobs: TransferJobs) -> Self {
         self.transfer_jobs = jobs;
+        self
+    }
+
+    /// Set the fleet-wide alert inbox (the Alerts mode's read model).
+    #[must_use]
+    pub fn with_alert_inbox(mut self, inbox: AlertInbox) -> Self {
+        self.alert_inbox = inbox;
+        self
+    }
+
+    /// Set a space's clipboard lane (the Clipboard mode's read model, keyed by
+    /// its own `space`).
+    #[must_use]
+    pub fn with_clipboard_lane(mut self, lane: ClipboardLane) -> Self {
+        self.clipboard_lanes.insert(lane.space, lane);
         self
     }
 
@@ -314,6 +333,14 @@ impl CollabData for FixtureData {
 
     fn transfer_jobs(&self) -> Option<&TransferJobs> {
         Some(&self.transfer_jobs)
+    }
+
+    fn alert_inbox(&self) -> Option<&AlertInbox> {
+        Some(&self.alert_inbox)
+    }
+
+    fn clipboard_lane(&self, space: SpaceId) -> Option<&ClipboardLane> {
+        self.clipboard_lanes.get(&space)
     }
 }
 
