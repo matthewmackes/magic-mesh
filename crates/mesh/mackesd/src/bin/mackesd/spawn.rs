@@ -1270,6 +1270,21 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             workgroup_root.clone(),
         )
     });
+    // WL-FUNC-008 — the service_aggregator worker: the unified service
+    // provenance/health view. Merges the three service sources — the published KDC
+    // directory (`kdc-services/<host>.json`), the nmap probe inventory
+    // (`probe-inventory.json`), and the Explorer's `service → openable-action`
+    // enrichment map — into one deduped `ServiceRecord` set with stale-entry TTL
+    // age-out, published on `state/services/<node>` for the shell's Services view.
+    // Universal (rank 0) like unit_aggregator — every node folds + publishes its own
+    // mesh-wide service view (no center). node_id is the mirror `host` stamp;
+    // workgroup_root seeds both the directory + inventory readers.
+    spawn_tiered(sup, worker_names, role_rank, "service_aggregator", || {
+        mackesd_core::workers::service_aggregator::ServiceAggregatorWorker::new(
+            node_id.clone(),
+            workgroup_root.clone(),
+        )
+    });
     // MV-5a — the scheduler worker: the placement slice of the no-center
     // scheduler. Drains `action/schedule/place`, folds each node's latest
     // `event/kvm/services` capacity, chooses the target node (healthy pin →

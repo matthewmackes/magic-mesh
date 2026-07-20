@@ -680,6 +680,15 @@ pub mod openstack;
 // publish-on-change mirror + heartbeat, and the E9 `action/units/get-stream` read
 // verb. Universal (rank 0) — every node publishes its own unit view.
 pub mod unit_aggregator;
+// WL-FUNC-008 — the service_aggregator worker: the unified service
+// provenance/health view. Merges three service sources — the published KDC
+// directory (`kdc-services/<host>.json`), the nmap probe inventory
+// (`probe-inventory.json`), and the Explorer's `service → openable-action`
+// enrichment map — into one deduped `ServiceRecord` set (with stale-entry TTL
+// age-out) published on `state/services/<node>`. Two injectable source seams + a
+// pure fold, so the whole merge folds headless. Universal (rank 0) like
+// unit_aggregator — every node publishes its own mesh-wide service view, no center.
+pub mod service_aggregator;
 // E12-20 — the storage worker: the privileged owner of the Workbench Storage plane
 // (GParted for the mesh, docs/design/workbench-storage-plane.md). Owns a typed
 // StorageOp pending-queue executor over a live UDisks2 zbus topology — stage-time

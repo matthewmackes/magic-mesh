@@ -63,6 +63,12 @@ pub mod peer_probe;
 pub mod peers;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
+// WL-FUNC-008 (2026-07-19) — the unified service provenance/health record: the ONE
+// type merging published (`kdc-services`) + probe (`probe-inventory`) + enrichment
+// service facts. The mackesd `service_aggregator` worker produces it on
+// `state/services/<node>`; the shell's Phones-hub Services view renders it. Lands
+// here (like `mesh_storage` / `vdi_session`) so neither side depends on the other.
+pub mod service_record;
 // Portal-18.a (v6.0 R12 lock 2026-05-26) — universal tag schema +
 // per-peer storage layer. Lands here (rather than in a fresh crate)
 // because every existing consumer of `mackes-mesh-types` is also a
