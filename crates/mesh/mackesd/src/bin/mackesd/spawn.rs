@@ -3099,6 +3099,42 @@ pub(crate) fn spawn_messaging_sync_workers(
         }
     }
 
+    // WL-FUNC-011 Phase 2 — the `collab` worker: the live spine that makes the
+    // headless mde-collab-core CollabEngine real on the mesh. Drains
+    // action/collab/* commands (validate + Ed25519-sign via this node's identity
+    // → signed events), appends each to the per-space Syncthing-replicable actor
+    // log + projects it into the SQLite read models, publishes the live signed
+    // event on collab/event/<space>/<actor> + republishes the affected
+    // state/collab/* read models, and converges by merging foreign
+    // collab/event/* (bus fast-path) + replicated actor logs (Syncthing durable-
+    // path). UNIVERSAL (rank 0) like the chat worker it will EVENTUALLY replace
+    // (Phase 4; it runs ALONGSIDE chat for now) — every node, headless included,
+    // participates. Same persisted node identity + bare-hostname actor as chat.
+    if mackesd_core::worker_role::runs("collab", role_rank) {
+        match mackesd_core::node_key::load_or_create(std::path::Path::new(
+            mackesd_core::node_key::DEFAULT_KEY_PATH,
+        )) {
+            Ok(signing_key) => {
+                let self_host = node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string();
+                spawn_tiered(sup, worker_names, role_rank, "collab", || {
+                    mackesd_core::workers::collab::CollabWorker::new(
+                        workgroup_root.clone(),
+                        self_host,
+                        signing_key,
+                    )
+                });
+            }
+            Err(e) => tracing::warn!(
+                target: "mackesd::collab",
+                error = %e,
+                "collab worker: node signing key unavailable; not spawning",
+            ),
+        }
+    }
+
     // CHAT-FIX-2 — the `notify` worker: the local-notification PRODUCER that
     // makes Chat non-empty absent peer chatter. It watches this node's OWN
     // event sources (mesh peer join/leave via the replicated directory,

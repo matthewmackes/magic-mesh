@@ -846,6 +846,19 @@ pub mod onboard_apply;
 // renders. Bus + Syncthing roots are injectable seams so the whole worker is
 // headless-testable; live 2-node delivery + real backfill are integration-gated.
 pub mod chat;
+// WL-FUNC-011 Phase 2 — the mesh `collab` worker: the live spine of the
+// Communications suite, driving the headless `mde-collab-core` CollabEngine on
+// the mesh. Drains `action/collab/*` commands (validate + Ed25519-sign via this
+// node's identity → signed events), appends each to the per-space
+// Syncthing-replicable actor log + projects it into the SQLite read models,
+// publishes the live signed event on `collab/event/<space>/<actor>` +
+// republishes the affected `state/collab/*` read models, and converges by merging
+// foreign `collab/event/*` (bus fast-path) + replicated actor logs (Syncthing
+// durable-path) — signature-checked (forged events dropped), idempotent,
+// order-independent. Universal (rank 0), the same shape as the chat worker it
+// will EVENTUALLY replace (Phase 4; it runs ALONGSIDE chat for now). Bus + actor
+// -log roots are injectable seams so the whole flow is headless-testable.
+pub mod collab;
 // CHAT-FIX-2 — the local-notification producer worker (design
 // docs/design/console-frontdoor.md Q34/46/47). The real empty-Chat fix: with the
 // chat worker running but no peer chatter, nothing produced local system events,

@@ -4194,6 +4194,8 @@ dependencies = [
  "mde-browser-workers",
  "mde-bus",
  "mde-chat",
+ "mde-collab-core",
+ "mde-collab-types",
  "mde-kdc-host",
  "mde-kdc-proto",
  "mde-role",

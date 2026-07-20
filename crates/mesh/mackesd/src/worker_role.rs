@@ -206,6 +206,14 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // it always had, now EXPLICIT + counted. Pairs with `notify` (CHAT-FIX-2), the
     // producer whose events it folds.
     WorkerSpec::tier("chat", 0, RestartPolicy::OnFailure),
+    // WL-FUNC-011 Phase 2 — the mesh `collab` worker: the live spine that makes the
+    // headless mde-collab-core CollabEngine real (drain action/collab/* → sign +
+    // project + publish state/collab/* + live events → converge). UNIVERSAL (rank
+    // 0) exactly like the `chat` worker it will EVENTUALLY replace (Phase 4; it
+    // runs ALONGSIDE chat for now): every node, headless Lighthouse included,
+    // participates in the Communications suite. A deliberate rank-0 census entry
+    // (the BUG-STORAGE-1 lesson), spawned via spawn_tiered like chat.
+    WorkerSpec::tier("collab", 0, RestartPolicy::OnFailure),
     // ── ARCH-5 (drift guard) — universal (rank-0) workers that were spawned in
     //    `run_serve` gated on `worker_role::runs(...)` but OMITTED from this census,
     //    so they silently rode the "unknown worker ⇒ rank 0" default: they DID run
@@ -1067,7 +1075,10 @@ mod tests {
         // executor; rank-0 45 → 46, len 73 → 74).
         // +1 federation_enforcer (WL-SEC-002 — the universal rank-0 cross-mesh
         // federation runtime-enforcement worker; rank-0 46 → 47, len 74 → 75).
-        assert_eq!(WORKER_REGISTRY.len(), 75);
+        // +1 collab (WL-FUNC-011 Phase 2 — the universal rank-0 Communications-suite
+        // worker driving mde-collab-core, sibling of chat it will replace in Phase 4;
+        // rank-0 47 → 48, len 75 → 76).
+        assert_eq!(WORKER_REGISTRY.len(), 76);
     }
 
     #[test]
@@ -1095,8 +1106,8 @@ mod tests {
         };
         assert_eq!(
             count(0),
-            47,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
+            48,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + collab (WL-FUNC-011 Phase 2, universal Communications-suite worker driving mde-collab-core, chat's Phase-4 successor) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
         );
         assert_eq!(
             count(1),
@@ -1369,8 +1380,10 @@ mod tests {
         // peer_app_launch (WL-UX-005, previously uncounted) → ws = 45 + 28 = 73.
         // WL-RUN-006 +1 rank-0 router_action (universal) → lh 46, ws = 46 + 28 = 74.
         // WL-SEC-002 +1 rank-0 federation_enforcer (universal) → lh 47, ws = 47 + 28 = 75.
-        assert_eq!(lh.len(), 47);
-        assert_eq!(ws.len(), 75);
+        // WL-FUNC-011 Phase 2 +1 rank-0 collab (universal, chat's Phase-4 successor)
+        // → lh 48, ws = 48 + 28 = 76.
+        assert_eq!(lh.len(), 48);
+        assert_eq!(ws.len(), 76);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -1439,15 +1452,16 @@ mod tests {
         // chat worker + the DEVMGR-8 universal device_control executor + the
         // WL-RUN-006 universal router_action executor + the WL-SEC-002 universal
         // federation_enforcer + the ARCH-5 14 universal
-        // rank-0 workers + the WL-FUNC-008 service_aggregator) + navidrome.
-        assert_eq!(set.len(), 48);
+        // rank-0 workers + the WL-FUNC-008 service_aggregator + the WL-FUNC-011
+        // Phase 2 collab worker) + navidrome.
+        assert_eq!(set.len(), 49);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 47);
+        assert_eq!(workers_for_class(plain_lh).len(), 48);
     }
 
     #[test]

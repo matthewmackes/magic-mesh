@@ -109,6 +109,13 @@ mde-bus = { path = "../../platform/mde-bus", optional = true }
 # notification path now (the retired shared-alert-mirror worker folded into it,
 # NOTIFY-CHAT-6). Optional under async-services (the worker is async-services-gated).
 mde-chat = { path = "../../services/mde-chat", optional = true }
+# WL-FUNC-011 Phase 2 — the collab worker drives the headless mde-collab-core
+# CollabEngine (validate command → Ed25519-sign events → SQLite projection →
+# convergent merge) over the mde-collab-types Phase-0 contracts (CollabCommand /
+# CollabEventEnvelope / topics). Both optional under async-services (the worker is
+# async-services-gated), like mde-chat/mde-bookmarks.
+mde-collab-types = { path = "../../shared/mde-collab-types", optional = true }
+mde-collab-core = { path = "../../services/mde-collab-core", optional = true }
 # BOOKMARKS-2 — the bookmarks worker drives the pure mde-bookmarks CRDT model
 # (Collection / Op / HLC / fractional-index order). It mints ops, folds every
 # peer's Syncthing op segment into one converged collection, and publishes
@@ -364,6 +371,8 @@ async-services = [
     "dep:etcd-client",
     "dep:mde-bus",
     "dep:mde-chat",
+    "dep:mde-collab-types",
+    "dep:mde-collab-core",
     "dep:mde-bookmarks",
     "dep:mde-adblock",
     "dep:uuid",
