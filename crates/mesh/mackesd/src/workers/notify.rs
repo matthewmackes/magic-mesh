@@ -126,7 +126,7 @@ pub enum NotifySource {
     Disk,
     /// Journal entries at WARN-or-above (coalesced).
     Journal,
-    /// OpenStack/cloud notifications emitted by the cloud worker.
+    /// Cloud notifications emitted by the cloud worker.
     Cloud,
     /// A node capability grade entered D/F.
     NodeGrade,

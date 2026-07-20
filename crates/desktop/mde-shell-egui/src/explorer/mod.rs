@@ -610,9 +610,9 @@ impl UnitsClient for BusUnits {
 // ─────────────────────── the action-dispatch seam (EXPLORER-5) ───────────────────────
 
 /// The `action/cloud/` namespace prefix every QC-11 cloud verb request rides —
-/// a **local mirror** of `mackesd::workers::openstack::verbs::CLOUD_ACTION_PREFIX`
+/// a **local mirror** of `mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX`
 /// (§6: the shell mirrors the wire contract, never links the daemon crate). A
-/// byte-pinned test keeps it equal to the worker's prefix.
+/// byte-pinned test keeps it equal to the shared prefix.
 const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 
 /// The aggregator's E9 pull verb — a mirror of

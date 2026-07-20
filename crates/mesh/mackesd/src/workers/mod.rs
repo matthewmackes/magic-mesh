@@ -663,19 +663,6 @@ pub mod container;
 // from the wire), and logs every launch + refusal. Workstation-tier — a headless
 // relay has no seat to launch onto — and idles gracefully when no requests arrive.
 pub mod peer_app_launch;
-// QC-2 (CONSTRUCT-CLOUD) — the mackesd `openstack` worker: the supervision root of
-// the mesh-becomes-an-OpenStack-cloud epic (docs/design/quasar-cloud.md). Reads
-// the fleet/one-state cloud doctrine for WHICH Kolla service containers this
-// node hosts (APIs on every node, leader-hosted MariaDB, no controller box —
-// Q5/Q15/Q22; the live etcd/Syncthing doctrine read is a typed IntegrationGated
-// until QC-4 authors the record), converges desired vs running under Podman via
-// the injectable PodmanRunner seam (start missing / restart killed / stop
-// extra; starts honestly gated on the operator-mirrored image (QC-3 airgap
-// lane, Q18) + the rendered Kolla config (QC-4)), and publishes the
-// `state/openstack/<node>` mirror. `[!]`-grade failures ride the mackesd::alert
-// lane (→ chat, NOTIFY-CHAT lock 11). Universal (rank 0) — the doctrine, not
-// the role, decides which services a node hosts.
-pub mod openstack;
 // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
 // explorer (docs/design/unit-explorer.md). Unions three sources into one typed
 // `Unit` stream and publishes `state/units/<node>`: the mesh mirror (peers +

@@ -17,8 +17,9 @@
 
 pub mod cap_tags;
 // WL-ARCH-001 (2026-07-18) — provider-neutral Construct Cloud shared contracts.
-// The current OpenStack/Kolla backend remains as a compatibility adapter, but
-// new consumers should prefer `cloud::*` for catalog/resource/health shapes.
+// The SOLE definition site for the mesh cloud's catalog/resource/health/stack
+// shapes + the `action/cloud/*` lifecycle command contract; all consumers bind
+// to `cloud::*`.
 pub mod cloud;
 pub mod connect;
 // CONNECT-1 (2026-06-19) — unified connectivity / exposure policy model + state.
@@ -52,10 +53,6 @@ pub mod lighthouse_probe;
 pub mod mesh_storage;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;
-// IAC-1 (2026-07-04) — the legacy OpenStack service-directory + API-health
-// schema. Kept as the installed adapter contract while provider-neutral
-// consumers move to `cloud::*`.
-pub mod openstack;
 pub mod peer_probe;
 // PEERVER-1 (v2.7, 2026-05-29) — peer-data convergence records.
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer

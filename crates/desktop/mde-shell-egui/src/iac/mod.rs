@@ -29,7 +29,7 @@
 //! **`action/cloud/get-catalog`** (a typed request/reply — the answer lands on
 //! `reply/<request-ulid>`). This surface publishes an empty `get-catalog`
 //! request on its poll cadence, reads the reply off the Bus, and folds the
-//! shared [`mackes_mesh_types::openstack`] types ([`ServiceCatalog`] /
+//! shared [`mackes_mesh_types::cloud`] types ([`ServiceCatalog`] /
 //! [`ServiceHealth`]) it carries. Neither crate depends on the other — only the
 //! mesh-neutral shape crate is shared ([`fold_reply`] mirrors the reply's
 //! payload fields).
@@ -48,7 +48,7 @@ use serde::Deserialize;
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::Style;
 
-use mackes_mesh_types::openstack::{
+use mackes_mesh_types::cloud::{
     default_collection, CatalogService, EndpointInterface, HealthState, HeatPreview,
     HeatStackDetail, ResourceRow, ResourceTable, ServiceCatalog, ServiceHealth,
 };

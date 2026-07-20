@@ -1,5 +1,5 @@
 use super::*;
-use mackes_mesh_types::openstack::{shape_health, ProbeOutcome};
+use mackes_mesh_types::cloud::{shape_health, ProbeOutcome};
 use mde_egui::egui::{pos2, vec2, Rect};
 
 /// A realistic Keystone v3 token catalog — a three-interface compute service,

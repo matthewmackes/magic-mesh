@@ -85,13 +85,12 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
-// KDC-MESH-8 — consume the CONSTRUCT-CLOUD openstack worker's PUBLIC Bus verb
-// interface (design #12) to drive fleet instance lifecycle from the phone. This
-// is a read-only consumer of the public `verbs` surface — the openstack worker
-// itself (its state, its responder) is never touched.
-use crate::workers::openstack::verbs::{
-    cloud_action_topic, CloudInstance, CloudReply, LifecycleAction,
-};
+// KDC-MESH-8 — drive fleet instance lifecycle from the phone over the neutral
+// `action/cloud/*` Bus verb namespace (design #12). This is a read-only producer
+// of typed cloud requests + reader of the typed reply; the cloud backend that
+// answers them is provided by a later local-first worker. The neutral wire shapes
+// live in `mackes_mesh_types::cloud` (§6 — neither side depends on the other).
+use mackes_mesh_types::cloud::{cloud_action_topic, CloudInstance, CloudReply, LifecycleAction};
 
 // ARCH: this worker was split out of a 5.3K-line god-file into a directory
 // module (behavior-preserving relocation). The `Worker` impl + the public entry
@@ -1195,7 +1194,7 @@ fn local_announce() -> Announce {
         // Ring this host (ring_local_device).
         "kdeconnect.findmyphone.request",
         // Curated command list + execution (handle_runcommand), incl. the
-        // KDC-MESH-8 OpenStack lifecycle commands.
+        // KDC-MESH-8 cloud lifecycle commands.
         "kdeconnect.runcommand.request",
         // KDC-MESH-7 — the phone's SFTP mount-info reply (browse the phone's FS
         // from this desktop; the request goes out below). Handled by mounting the
@@ -1443,7 +1442,7 @@ async fn run_host(
                     // KDC-PLUGINS / KDC-MESH-8 — Run Command: the phone asks for the
                     // command list (`requestCommandList`) or triggers a curated key.
                     // Results come back as a `kdeconnect.ping` notification. Cloud
-                    // (OpenStack lifecycle) keys drive the QC `action/cloud/*` verbs;
+                    // (cloud lifecycle) keys drive the QC `action/cloud/*` verbs;
                     // every executed command audits (#16). The cloud path is gated on
                     // a paired device (the auth, #16).
                     if packet.kind == "kdeconnect.runcommand.request" {
@@ -1957,7 +1956,7 @@ fn execute_runcommand(cmds: &[RunCmd], key: &str) -> String {
 /// the host event loop.
 ///
 /// KDC-MESH-8: the published list carries the shell commands PLUS the fleet
-/// OpenStack lifecycle commands ([`cloud_command_entries`]). A `cloud-*` key is
+/// cloud lifecycle commands ([`cloud_command_entries`]). A `cloud-*` key is
 /// routed through the QC `action/cloud/*` Bus verbs ([`handle_cloud_command`]) —
 /// gated on a `paired` device (the auth, #16) — instead of the shell. Every
 /// executed command audits (#16).
@@ -1981,7 +1980,7 @@ async fn handle_runcommand(
         return;
     }
     if let Some(key) = body.get("key").and_then(Value::as_str) {
-        // KDC-MESH-8 — a cloud lifecycle key drives the fleet OpenStack verbs over
+        // KDC-MESH-8 — a cloud lifecycle key drives the fleet cloud verbs over
         // the Bus (paired-gated), not the shell.
         if let Some(cmd) = CloudCommand::from_key(key) {
             if !paired {
@@ -2202,7 +2201,7 @@ fn default_shared_roots(config_dir: &std::path::Path) -> Vec<SharedRoot> {
 ///
 /// KDC-MESH-7 tokens: `files` (+ `sftp` for the phone-FS mount) plus the
 /// already-live `run-commands` / `battery` / `find-my-device`. KDC-MESH-8 extends
-/// this with `openstack` + `telephony`.
+/// this with the cloud service token + `telephony`.
 fn advertised_services() -> Vec<String> {
     vec![
         service_directory::service::FILES.to_string(),
@@ -2213,7 +2212,7 @@ fn advertised_services() -> Vec<String> {
         // honest-gates when `sshfs` is absent (it's a capability, not a promise
         // the tool is installed).
         service_directory::service::SFTP.to_string(),
-        // KDC-MESH-8 — fleet OpenStack lifecycle (drives the QC `action/cloud/*`
+        // KDC-MESH-8 — fleet cloud lifecycle (drives the QC `action/cloud/*`
         // verbs) + telephony (call/SMS) alerts.
         service_directory::service::OPENSTACK.to_string(),
         service_directory::service::TELEPHONY.to_string(),
@@ -2329,11 +2328,11 @@ fn serve_browse(config_dir: &std::path::Path, body: &Value) -> String {
     }
 }
 
-// ── KDC-MESH-8: run-commands (OpenStack lifecycle) + telephony + connectivity ──
+// ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ──
 //
-// The phone triggers fleet OpenStack lifecycle commands (design #12) that drive
-// the QC `action/cloud/*` typed verbs over the Bus — consuming the openstack
-// worker's PUBLIC interface, never touching the worker. Battery + connectivity
+// The phone triggers fleet cloud lifecycle commands (design #12) that drive
+// the QC `action/cloud/*` typed verbs over the Bus — the neutral cloud verb
+// namespace answered by the cloud backend, never a direct worker dependency. Battery + connectivity
 // report on desktops, telephony alerts surface, find-my-device works both ways;
 // pairing is the auth but EVERY action audits (#16, `audit_kdc_action`).
 

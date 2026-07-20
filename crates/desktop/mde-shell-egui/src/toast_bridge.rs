@@ -229,7 +229,7 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // through this same grammar (accepting the `mde-mesh-view` variant name too).
         "mesh-map" | "meshview" | "mesh" => Some(Surface::MeshView),
         "desktop" => Some(Surface::Desktop),
-        // The Infra as Code (IaC) OpenStack control plane (IAC-2).
+        // The Infra as Code (IaC) cloud control plane (IAC-2).
         "iac" | "infra-code" | "infracode" | "infra" => Some(Surface::InfraCode),
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),

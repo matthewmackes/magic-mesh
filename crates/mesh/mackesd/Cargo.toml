@@ -160,16 +160,9 @@ mde-theme = { path = "../../shared/mde-theme" }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
-# IAC-1 (docs/design/iac-workspace.md) — the OpenStack client foundation.
-# `clouds.yaml` (the openstacksdk-standard auth file, Q20) is YAML: serde_yaml
-# 0.9 is the same version magic-fleet + mde-bus already vendor. reqwest (blocking,
-# no-TLS — the mesh reaches every OpenStack API over the plaintext Nebula overlay,
-# the overlay IS the transport security) mints the Keystone token, probes
-# per-service health, and issues the standard resource/verb REST calls; blocking
-# because the `openstack` worker drives it on a `spawn_blocking` thread (reqwest's
-# blocking client offloads to its own runtime). Both are gated behind
-# async-services with the rest of the client, so a sync-only consumer skips them.
-serde_yaml  = { version = "0.9", optional = true }
+# reqwest (blocking, no-TLS — mesh services are reached over the plaintext Nebula
+# overlay, the overlay IS the transport security) backs the HTTP consumers
+# (music_autoconfig + transfers/lane/browser_media). Gated behind async-services.
 reqwest     = { version = "0.12", default-features = false, features = ["json", "blocking"], optional = true }
 
 # EPIC-MESH-PROBE (MESH-PROBE-2) — read-only DOM parser for nmap's
@@ -376,10 +369,8 @@ async-services = [
     "dep:mde-bookmarks",
     "dep:mde-adblock",
     "dep:uuid",
-    # IAC-1 — the OpenStack client foundation (clouds.yaml + Keystone + health +
-    # the resource/verb REST seam) lives in the async-services-gated `openstack`
-    # worker module.
-    "dep:serde_yaml",
+    # reqwest backs the async-services HTTP consumers (music_autoconfig,
+    # transfers/lane/browser_media).
     "dep:reqwest",
 ]
 

@@ -52,7 +52,7 @@ pub enum Surface {
     MeshView,
     /// The **Explorer** — the EXPLORER-epic discovery surface (`crate::explorer`):
     /// a cinematic one-unit-at-a-time hero view over every discovered unit (mesh
-    /// peers · off-mesh LAN hosts · `OpenStack` objects), folded from the
+    /// peers · off-mesh LAN hosts · cloud objects), folded from the
     /// aggregator's `state/units/*` mirrors. A first-class dock surface (its Mesh
     /// sibling beside the Mesh Map); it is ALSO reachable as the Mesh Map's
     /// segmented Explorer lens, which powers the NODE-GRADE-2 node-focus jump.
@@ -61,11 +61,11 @@ pub enum Surface {
     /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Construct".
     #[default]
     Desktop,
-    /// The **Infra as Code (`IaC`)** surface — the `OpenStack` `IaaS` control
-    /// plane (`docs/design/iac-workspace.md`, IAC-2): the Keystone service
-    /// catalog + per-service API health + the merged service directory, consumed
-    /// off the Bus (`action/cloud/get-catalog`). The comprehensive `OpenStack`
-    /// admin beside the member-facing Cloud plane (#24).
+    /// The **Infra as Code (`IaC`)** surface — the cloud `IaaS` control plane
+    /// (`docs/design/iac-workspace.md`, IAC-2): the service catalog + per-service
+    /// API health + the merged service directory, consumed off the Bus
+    /// (`action/cloud/get-catalog`). The comprehensive infrastructure admin beside
+    /// the member-facing Cloud plane (#24).
     InfraCode,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
@@ -106,7 +106,7 @@ pub enum Surface {
     /// The **Phones** hub surface (KDC-MESH-9) — the desktop-side management surface
     /// for the mesh's paired phone(s): mesh identity + battery/signal, per-feature
     /// toggles, the node-targeted file browser, the run-command catalog (incl. the
-    /// OpenStack lifecycle set), fast mesh-wide unpair, and the pair-a-phone flow. A
+    /// cloud lifecycle set), fast mesh-wide unpair, and the pair-a-phone flow. A
     /// thin client of the `kdc_host` worker (the `action/connect/*` verbs + the mesh
     /// service directory) — it renders published state + drives Bus verbs, never
     /// reimplementing the host (§6).
@@ -185,7 +185,7 @@ impl Surface {
             // topology glyph beside it in the Mesh group.
             Surface::Explorer => IconId::Instances,
             // The IaC surface wears the **Server** (infrastructure/rack) badge —
-            // the OpenStack IaaS control plane reads as "infrastructure".
+            // the cloud IaaS control plane reads as "infrastructure".
             Surface::InfraCode => IconId::Server,
             Surface::Desktop => IconId::Desktop,
             Surface::Music => IconId::Music,

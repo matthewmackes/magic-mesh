@@ -137,28 +137,18 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // reported the Workstation as NOT running storage. Only the READ/publish path
     // is enabled here; the live UDisks2Executor stays IntegrationGated as-is.
     WorkerSpec::tier("storage", 0, RestartPolicy::OnFailure),
-    // QC-2 — the OpenStack supervision worker: UNIVERSAL (rank 0). The
-    // CONSTRUCT-CLOUD design's universal-node premise (quasar-cloud.md Q1/Q5/Q22:
-    // any-role node, APIs on every node, no controller box) means every node —
-    // lighthouse included — can carry cloud duties; the fleet/one-state
-    // doctrine (not the role) decides WHICH Kolla services a node hosts, and a
-    // node assigned none (or a pre-doctrine mesh, where the read is honestly
-    // IntegrationGated) still publishes its `state/openstack/<node>` mirror.
-    // A deliberate census entry like storage's (BUG-STORAGE-1), never the
-    // silent unknown-worker default.
-    WorkerSpec::tier("openstack", 0, RestartPolicy::OnFailure),
     // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
-    // explorer (unit-explorer.md #18). UNIVERSAL (rank 0) like storage/openstack:
-    // every node folds its OWN unit view (self-first #23) — the mesh mirror it
-    // already reads + the union of every node's openstack mirror + its LAN scan —
-    // and publishes `state/units/<node>`. There is no leader/center to elect (lock
+    // explorer (unit-explorer.md #18). UNIVERSAL (rank 0) like storage: every
+    // node folds its OWN unit view (self-first #23) — the mesh mirror it already
+    // reads + the union of every node's cloud mirror + its LAN scan — and
+    // publishes `state/units/<node>`. There is no leader/center to elect (lock
     // #20: "no center"); a lighthouse publishes an honest units view too. A
     // deliberate rank-0 entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
     WorkerSpec::tier("unit_aggregator", 0, RestartPolicy::OnFailure),
     // WL-FUNC-008 — the service_aggregator worker: the unified service
-    // provenance/health view. UNIVERSAL (rank 0) like unit_aggregator/storage/
-    // openstack — every node folds its OWN mesh-wide merge of the three service
+    // provenance/health view. UNIVERSAL (rank 0) like unit_aggregator/storage
+    // — every node folds its OWN mesh-wide merge of the three service
     // sources (published KDC directory + probe inventory + Explorer enrichment) and
     // publishes `state/services/<node>`; there is no center. A deliberate rank-0
     // census entry (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
@@ -1019,10 +1009,6 @@ mod tests {
         // +1 storage (BUG-STORAGE-1 — the E12-20 universal per-node topology mirror,
         // pinned at rank 0 so it is a deliberate census entry on every role instead
         // of riding the silent unknown-worker default that hid it from role-workers).
-        // +1 openstack (QC-2 — the CONSTRUCT-CLOUD Kolla-service supervision worker,
-        // pinned at rank 0: the universal-node premise (quasar-cloud.md Q1/Q5/Q22)
-        // puts cloud duties on any role; the fleet doctrine, not the rank, decides
-        // which services a node hosts).
         // +1 unit_aggregator (EXPLORER-1 — the Hero unit-explorer daemon spine,
         // pinned at rank 0: every node folds + publishes its OWN unit view
         // (state/units/<node>), no center; the BUG-STORAGE-1 deliberate-entry lesson).
@@ -1072,13 +1058,11 @@ mod tests {
         // registry entry that was never counted here — so the real split is 45/28,
         // len 73 (this assertion + the tier-split counts below stale-asserted 71/27).
         // +1 router_action (WL-RUN-006 — the universal rank-0 router firewall-edit
-        // executor; rank-0 45 → 46, len 73 → 74).
+        // executor; rank-0 44 → 45, len 72 → 73).
         // +1 federation_enforcer (WL-SEC-002 — the universal rank-0 cross-mesh
-        // federation runtime-enforcement worker; rank-0 46 → 47, len 74 → 75).
-        // +1 collab (WL-FUNC-011 Phase 2 — the universal rank-0 Communications-suite
-        // worker driving mde-collab-core, sibling of chat it will replace in Phase 4;
-        // rank-0 47 → 48, len 75 → 76).
-        assert_eq!(WORKER_REGISTRY.len(), 76);
+        // WL-SEC-002 +1 federation_enforcer; WL-FUNC-011 Phase 2 +1 collab
+        // (chat's Phase-4 successor); WL-ARCH-001 -1 openstack (removed) => len 75.
+        assert_eq!(WORKER_REGISTRY.len(), 75);
     }
 
     #[test]
@@ -1106,8 +1090,8 @@ mod tests {
         };
         assert_eq!(
             count(0),
-            48,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + collab (WL-FUNC-011 Phase 2, universal Communications-suite worker driving mde-collab-core, chat's Phase-4 successor) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
+            47,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + collab (WL-FUNC-011 Phase 2, universal Communications-suite worker driving mde-collab-core, chat's Phase-4 successor) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
         );
         assert_eq!(
             count(1),
@@ -1194,36 +1178,6 @@ mod tests {
         // The read/publish eligibility carries no capability gate — a plain rank
         // is enough (the live UDisks2 executor is gated inside the worker, not here).
         assert_eq!(required_capability("storage"), None);
-    }
-
-    #[test]
-    fn openstack_worker_runs_on_every_role() {
-        // QC-2 — the CONSTRUCT-CLOUD universal-node premise (Q1/Q5/Q22: any-role
-        // node, APIs on every node, no controller box). The worker MUST spawn on
-        // every role — the fleet doctrine, not the rank, decides which Kolla
-        // services a node hosts — and a node assigned none (or a pre-doctrine
-        // mesh) still publishes an honest `state/openstack/<node>` mirror.
-        assert_eq!(
-            min_rank("openstack"),
-            0,
-            "openstack is a universal (rank-0) worker"
-        );
-        assert!(
-            runs("openstack", Role::Workstation.rank()),
-            "a Workstation carries cloud duties (universal node)"
-        );
-        assert!(
-            runs("openstack", Role::Lighthouse.rank()),
-            "a Lighthouse carries cloud duties too — no controller box, no exempt role"
-        );
-        // A DELIBERATE census entry (like storage's BUG-STORAGE-1 lesson), so
-        // `mackesd role-workers` lists it on both roles rather than riding the
-        // silent unknown-worker default.
-        assert!(workers_for_rank(Role::Workstation.rank()).contains(&"openstack"));
-        assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"openstack"));
-        // No capability tag — the doctrine gate lives inside the worker's fleet
-        // seam, not in the role census.
-        assert_eq!(required_capability("openstack"), None);
     }
 
     #[test]
@@ -1361,7 +1315,7 @@ mod tests {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
         // 30 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
-        // storage mirror + the QC-2 universal openstack worker + the EXPLORER-1
+        // storage mirror + the EXPLORER-1
         // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
         // NODE-GRADE-1 universal node_grade self-grade + the KDC-MESH-3 universal
         // kdc_host + the CHAT-FIX-1 universal chat worker + the DEVMGR-8 universal
@@ -1378,12 +1332,10 @@ mod tests {
         // so both roles grow by 14: lh 30 → 44, ws 57 → 71.
         // WL-FUNC-008 +1 rank-0 service_aggregator → lh 45; reconcile +1 rank-1
         // peer_app_launch (WL-UX-005, previously uncounted) → ws = 45 + 28 = 73.
-        // WL-RUN-006 +1 rank-0 router_action (universal) → lh 46, ws = 46 + 28 = 74.
-        // WL-SEC-002 +1 rank-0 federation_enforcer (universal) → lh 47, ws = 47 + 28 = 75.
-        // WL-FUNC-011 Phase 2 +1 rank-0 collab (universal, chat's Phase-4 successor)
-        // → lh 48, ws = 48 + 28 = 76.
-        assert_eq!(lh.len(), 48);
-        assert_eq!(ws.len(), 76);
+        // WL-SEC-002 +1 federation_enforcer; WL-FUNC-011 Phase 2 +1 collab;
+        // WL-ARCH-001 -1 openstack (removed) => lh 47, ws = 47 + 28 = 75.
+        assert_eq!(lh.len(), 47);
+        assert_eq!(ws.len(), 75);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -1445,23 +1397,23 @@ mod tests {
         );
         let set = workers_for_class(media_lh);
         // = the 30 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
-        // BUG-STORAGE-1 universal storage mirror, the QC-2 universal openstack
-        // worker, the EXPLORER-1 universal unit_aggregator, the CHAT-FIX-2
+        // BUG-STORAGE-1 universal storage mirror, the EXPLORER-1 universal
+        // unit_aggregator, the CHAT-FIX-2
         // universal notify producer, the NODE-GRADE-1 universal node_grade
         // self-grade, the KDC-MESH-3 universal kdc_host, the CHAT-FIX-1 universal
         // chat worker + the DEVMGR-8 universal device_control executor + the
         // WL-RUN-006 universal router_action executor + the WL-SEC-002 universal
         // federation_enforcer + the ARCH-5 14 universal
-        // rank-0 workers + the WL-FUNC-008 service_aggregator + the WL-FUNC-011
-        // Phase 2 collab worker) + navidrome.
-        assert_eq!(set.len(), 49);
+        // rank-0 workers + WL-FUNC-008 service_aggregator + WL-FUNC-011 Phase 2
+        // collab, minus the removed openstack) + navidrome.
+        assert_eq!(set.len(), 48);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 48);
+        assert_eq!(workers_for_class(plain_lh).len(), 47);
     }
 
     #[test]

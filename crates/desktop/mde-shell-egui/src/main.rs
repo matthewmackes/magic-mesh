@@ -33,9 +33,9 @@ mod device_manager;
 mod discovery;
 mod dock;
 mod explorer;
+mod federation;
 mod formfactor;
 mod front_door;
-mod federation;
 mod front_door_peer_apps;
 mod host_mirror;
 mod hotkeys;
@@ -773,8 +773,8 @@ struct Shell {
     /// rail. Falls back to the pending `VdiState` request until the broker log has
     /// a matching session for this seat.
     session_rail: session_rail::SessionRailState,
-    /// The Infra as Code (`IaC`) surface — the `OpenStack` `IaaS` control plane
-    /// (IAC-2). Consumes the Keystone service catalog + per-service API health off
+    /// The Infra as Code (`IaC`) surface — the cloud `IaaS` control plane
+    /// (IAC-2). Consumes the cloud service catalog + per-service API health off
     /// the Bus read verb `action/cloud/get-catalog` (no shell→mackesd dep, §6) and renders
     /// the Overview: the API status band + the merged service directory. Honest
     /// "not configured / unreachable" when the cloud/verb is absent (§7).
@@ -872,7 +872,7 @@ struct Shell {
     /// mesh" EmptyState until a snapshot lands.
     mesh_view: mesh_view::MeshViewState,
     /// The Discovery hero-card surface (EXPLORER-3) — the cinematic one-unit-at-a-
-    /// time view over every discovered unit (mesh peers · LAN hosts · `OpenStack`
+    /// time view over every discovered unit (mesh peers · LAN hosts · cloud
     /// objects), folded from the aggregator's `state/units/*` mirrors (EXPLORER-1).
     /// A thin renderer (§6): it reads the Bus, never scans. Reachable two ways
     /// (shell-ux-8): as the first-class [`Surface::Explorer`] (its own dock/menu
@@ -1268,7 +1268,7 @@ impl Shell {
                 }
             }
             Surface::InfraCode => {
-                // The OpenStack IaaS control plane (IAC-2) — the Overview tab: the
+                // The cloud IaaS control plane (IAC-2) — the Overview tab: the
                 // API status band + the merged service directory, consumed off the
                 // Bus (`action/cloud/get-catalog`). Scoped under its own `push_id`
                 // like every mounted surface so its egui ids can't collide in the
@@ -1671,7 +1671,7 @@ impl Shell {
             self.storage.poll(ctx);
         }
 
-        // The Infra as Code surface polls the OpenStack catalog off the Bus
+        // The Infra as Code surface polls the cloud catalog off the Bus
         // (`action/cloud/get-catalog`) while it's in view — a non-blocking
         // request/reply on its ~15 s cadence; the request is published sync and its
         // reply read on a later tick, so the frame never stalls (IAC-2).
@@ -1762,7 +1762,7 @@ impl Shell {
 
         // QC-13 — Cloud row → Desktop SPICE handoff. The Cloud plane lives inside
         // Workbench and its state is a Shell field; after Workbench renders, a
-        // dialable Nova console descriptor can queue one native VDI attach here.
+        // dialable cloud console descriptor can queue one native VDI attach here.
         if let Some(request) = self.cloud_plane.take_console_attach() {
             self.vdi
                 .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
@@ -2280,7 +2280,8 @@ impl Shell {
         &self,
         peer_apps: Vec<front_door::FrontDoorPeerApp>,
     ) -> Vec<SearchItem<front_door::FrontDoorTarget>> {
-        let mut items = front_door::app_search_items_with_pins(self.launcher_pins.pinned_surfaces());
+        let mut items =
+            front_door::app_search_items_with_pins(self.launcher_pins.pinned_surfaces());
         let mut rank = items.len();
 
         items.extend(front_door::peer_app_search_items(peer_apps, rank));
@@ -2919,16 +2920,16 @@ mod tests {
     use super::{
         car_key_route, chat, complete_menu_bar_minimize, console, datacenter,
         desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
-        front_door_peer_apps, launcher_pins, install_layout_mode_button_accessibility,
-        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
-        layout_mode_button_rect, layout_mode_menu_rect, layout_profile_row_accesskit_value,
-        layout_profile_tooltip, media_header, media_panel, menu_bar_shuffle_cards,
-        menu_bar_shuffle_paint_order, publish_front_door_instance_lifecycle_to_bus,
-        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
-        real_editor, real_media, real_terminal, remote_sessions_fallback_pos, reserved_dock_gutter,
-        reserved_taskbar_strut, route_file_operation_progress_request, screenshot,
-        shell_file_operation_progress, splash, status,
-        surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
+        front_door_peer_apps, install_layout_mode_button_accessibility,
+        install_layout_profile_row_accessibility, launcher_pins,
+        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_menu_rect,
+        layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
+        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
+        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
+        publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
+        remote_sessions_fallback_pos, reserved_dock_gutter, reserved_taskbar_strut,
+        route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
+        status, surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
         LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
     };
@@ -4790,7 +4791,10 @@ mod tests {
 
         // Trigger 1 — the OpenOmnibox hotkey.
         shell.apply_hotkey(HotkeyAction::OpenOmnibox);
-        assert!(shell.front_door.is_open(), "OpenOmnibox opens the one launcher");
+        assert!(
+            shell.front_door.is_open(),
+            "OpenOmnibox opens the one launcher"
+        );
         shell.toggle_front_door_panel();
         assert!(!shell.front_door.is_open(), "toggle closes it");
 
@@ -5100,7 +5104,10 @@ mod tests {
         );
 
         assert!(
-            !shell.launcher_pins.pinned_surfaces().contains(&Surface::Files),
+            !shell
+                .launcher_pins
+                .pinned_surfaces()
+                .contains(&Surface::Files),
             "a second Front Door pin request should unpin through the same launcher store"
         );
     }

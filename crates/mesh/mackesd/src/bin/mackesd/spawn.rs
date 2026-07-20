@@ -1233,25 +1233,6 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     spawn_tiered(sup, worker_names, role_rank, "storage", || {
         mackesd_core::workers::storage::StorageWorker::new(node_id.clone())
     });
-    // QC-2 — the openstack worker: the CONSTRUCT-CLOUD supervision root
-    // (docs/design/quasar-cloud.md). Reads the fleet/one-state cloud
-    // doctrine for WHICH Kolla service containers this node hosts (the
-    // live etcd/Syncthing doctrine read is a typed IntegrationGated until
-    // QC-4 authors the record), converges desired vs running under Podman
-    // via the injectable PodmanRunner seam (start missing / restart
-    // killed / stop extra; starts honestly gated on the operator-mirrored
-    // image (QC-3 airgap lane) + the rendered Kolla config (QC-4)), and
-    // publishes the `state/openstack/<node>` mirror. Universal — the
-    // design's any-role-node premise (Q1/Q5/Q22) — so it is a deliberate
-    // rank-0 census entry like storage's; the doctrine, not the role,
-    // decides which services land here. node_id is the mirror `host`
-    // stamp; the workgroup root seeds the doctrine seam's Syncthing leg.
-    spawn_tiered(sup, worker_names, role_rank, "openstack", || {
-        mackesd_core::workers::openstack::OpenstackWorker::new(
-            node_id.clone(),
-            workgroup_root.clone(),
-        )
-    });
     // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero
     // unit explorer (docs/design/unit-explorer.md). Unions three sources into
     // one typed `Unit` stream and publishes `state/units/<node>`: the mesh

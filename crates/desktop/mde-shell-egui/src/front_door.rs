@@ -433,11 +433,10 @@ const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 2] = [
         surface: Surface::InfraCode,
         workbench_plane: None,
         title: "Cloud workloads",
-        target: "OpenStack instances, volumes, networks",
+        target: "Instances, volumes, networks",
         terms: &[
             "workloads",
             "cloud",
-            "openstack",
             "instances",
             "volumes",
             "networks",
@@ -480,16 +479,15 @@ const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
         surface: Surface::InfraCode,
         workbench_plane: None,
         title: "Cloud API services",
-        target: "OpenStack catalog, endpoints, health",
+        target: "Service catalog, endpoints, health",
         terms: &[
             "services",
             "cloud",
-            "openstack",
             "catalog",
             "api",
-            "keystone",
-            "nova",
-            "neutron",
+            "endpoints",
+            "compute",
+            "network",
         ],
         icon: IconId::Server,
     },
@@ -712,7 +710,7 @@ fn app_search_item(surface: Surface, idx: usize) -> SearchItem<FrontDoorTarget> 
 const fn app_surface_keywords(surface: Surface) -> &'static str {
     match surface {
         Surface::Workbench => "services provisioning fleet mesh control",
-        Surface::InfraCode => "workloads services openstack iaas cloud catalog",
+        Surface::InfraCode => "workloads services iaas cloud catalog",
         Surface::Desktop => "workloads sessions vdi virtual machines remote desktop",
         _ => "",
     }
@@ -3857,7 +3855,7 @@ mod tests {
         assert_eq!(items.len(), 4);
         assert!(items.iter().any(|item| {
             item.title == "Cloud workloads"
-                && item.target == "OpenStack instances, volumes, networks"
+                && item.target == "Instances, volumes, networks"
                 && matches!(
                     item.payload,
                     FrontDoorTarget::Workflow(FrontDoorWorkflowCard {
@@ -5385,7 +5383,7 @@ mod tests {
         assert_eq!(cloud.role(), egui::accesskit::Role::Button);
         assert_eq!(
             cloud.value(),
-            Some("Workflow action: Workbench Cloud plane; OpenStack instances, volumes, networks")
+            Some("Workflow action: Workbench Cloud plane; Instances, volumes, networks")
         );
         assert!(cloud.supports_action(egui::accesskit::Action::Click));
 

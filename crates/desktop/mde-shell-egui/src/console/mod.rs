@@ -578,12 +578,12 @@ const GROUPS: [ConsoleGroup; 7] = [
             },
             ConsoleEntry {
                 label: "Cloud Status",
-                desc: "The state/openstack mirror on the Bus spool",
+                desc: "The state/cloud mirror on the Bus spool",
                 tool: "",
                 provenance: Provenance::Construct,
                 icon: IconId::MeshView,
                 kind: EntryKind::Tab(
-                    "bash -lc 'ls -l \"${MDE_BUS_ROOT:-/run/mde-bus}/state/openstack\" 2>/dev/null || echo \"no cloud mirror published on this node\"'",
+                    "bash -lc 'ls -l \"${MDE_BUS_ROOT:-/run/mde-bus}/state/cloud\" 2>/dev/null || echo \"no cloud mirror published on this node\"'",
                 ),
             },
             ConsoleEntry {
@@ -614,14 +614,6 @@ const GROUPS: [ConsoleGroup; 7] = [
                 provenance: Provenance::Fedora,
                 icon: IconId::Instances,
                 kind: EntryKind::Tab("virsh list --all"),
-            },
-            ConsoleEntry {
-                label: "OpenStack Servers",
-                desc: "The cloud's server roster (openstack server list)",
-                tool: "openstack",
-                provenance: Provenance::Construct,
-                icon: IconId::Server,
-                kind: EntryKind::Tab("openstack server list"),
             },
             ConsoleEntry {
                 label: "Cloud Plane (GUI)",

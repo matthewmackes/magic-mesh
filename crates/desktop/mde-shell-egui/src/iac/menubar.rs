@@ -16,7 +16,7 @@ use super::{
     service_bucket, service_display_name, Arming, CatalogOutcome, HeatOp, IacTab, InfraCodeState,
     BUCKETS, CLOUD_PRODUCT_LABEL, DOT, HEAT_SERVICE,
 };
-use mackes_mesh_types::openstack::default_collection;
+use mackes_mesh_types::cloud::default_collection;
 use mde_egui::egui::Ui;
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{ChipTone, StatusChip, Style};
@@ -633,7 +633,7 @@ mod tests {
     /// A `CatalogView` over a Keystone token, no health rows.
     fn view_from(token: &str) -> super::super::CatalogView {
         super::super::CatalogView {
-            catalog: mackes_mesh_types::openstack::ServiceCatalog::from_keystone_token_json(token)
+            catalog: mackes_mesh_types::cloud::ServiceCatalog::from_keystone_token_json(token)
                 .expect("fixture catalog"),
             health: Vec::new(),
         }

@@ -341,7 +341,7 @@ pub struct UnitsState {
 
 impl UnitsState {
     /// Equality ignoring publish time + per-unit timestamps — the worker's
-    /// publish-on-change gate (mirrors `OpenStackState::same_ignoring_time`).
+    /// publish-on-change gate (mirrors the cloud converge state's `same_ignoring_time`).
     ///
     /// The edge set is compared in full: edges are time-independent (derived from
     /// content, not timestamps), so an unchanged fold yields identical edges — but
