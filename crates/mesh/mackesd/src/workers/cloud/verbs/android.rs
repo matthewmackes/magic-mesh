@@ -20,9 +20,11 @@
 //! reports the leg is not yet wired WHILE still doing — and echoing — the real work
 //! of constructing the correct Cuttlefish workload spec. It never fakes a provision.
 
+use std::path::Path;
+
 use mackes_mesh_types::cloud::{CloudReply, DeliveryType, WorkloadSpec};
 
-use super::super::reconcile::PlacementPlanner;
+use super::super::reconcile;
 use super::super::CloudWorker;
 use super::CloudActionBody;
 
@@ -35,17 +37,14 @@ const CUTTLEFISH_MIN_DISK_GB: u32 = 80;
 
 /// Handle one `action/cloud/android-provision` request → a typed [`CloudReply`].
 pub(super) fn handle(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -> CloudReply {
-    build_reply(w.planner.as_ref(), verb_name, body)
+    build_reply(&w.state_root, verb_name, body)
 }
 
-/// Construct the Cuttlefish [`WorkloadSpec`] and route it through the reconcile /
-/// set-desired seam. Pure over the [`PlacementPlanner`] seam so both the wired and
-/// the honest not-yet-wired paths are tested without a live backend.
-fn build_reply(
-    planner: &dyn PlacementPlanner,
-    verb_name: &str,
-    body: &CloudActionBody,
-) -> CloudReply {
+/// Construct the Cuttlefish [`WorkloadSpec`] and route it through the normal
+/// set-desired seam (`reconcile::write_desired_doc`), exactly as `set-desired`
+/// does. Pure over the desired-doc `state_root` so it is tested without a live
+/// backend.
+fn build_reply(state_root: &Path, verb_name: &str, body: &CloudActionBody) -> CloudReply {
     let node = body.node.trim();
     if node.is_empty() {
         return CloudReply {
@@ -60,23 +59,23 @@ fn build_reply(
     let name = workload_name(body, node);
     let spec = android_spec(node, &name);
 
-    match planner.render_tfvars(node, std::slice::from_ref(&spec)) {
-        // The reconcile render is live (U4/U5) — the Cuttlefish L1-VM desired slice
-        // is accepted; the operator applies it via the normal armed `provision`.
-        Ok(_rendered) => CloudReply {
+    // Route the Cuttlefish L1-VM through the normal set-desired path: persist this
+    // node's desired slice; the operator then applies it via the armed `provision`.
+    // A persist failure is an honest error — the spec is still echoed, never a fake
+    // success.
+    match reconcile::write_desired_doc(state_root, &spec) {
+        Ok(()) => CloudReply {
             ok: true,
             verb: verb_name.to_string(),
             desired: Some(vec![spec]),
             ..Default::default()
         },
-        // Not yet wired — honest, but still echo the constructed Cuttlefish spec so
-        // the caller sees exactly what would be provisioned (never a fake success).
-        Err(not_yet) => CloudReply {
+        Err(e) => CloudReply {
             ok: false,
             verb: verb_name.to_string(),
-            gated: Some(format!(
-                "android-provision built the Cuttlefish Android VM `{name}` on `{node}`; \
-                 the set-desired reconcile leg is not yet wired: {not_yet}"
+            error: Some(format!(
+                "android-provision built the Cuttlefish Android VM `{name}` on `{node}` \
+                 but could not persist its desired slice: {e}"
             )),
             desired: Some(vec![spec]),
             ..Default::default()
@@ -114,30 +113,14 @@ pub(super) fn android_spec(node: &str, name: &str) -> WorkloadSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::reconcile::{NotYetPlanner, ReconcileNotYet};
     use super::*;
-    use mackes_mesh_types::cloud::PlanCounts;
+    use tempfile::tempdir;
 
     fn body(node: &str, name: Option<&str>) -> CloudActionBody {
         CloudActionBody {
             node: node.to_string(),
             name: name.map(str::to_string),
             ..Default::default()
-        }
-    }
-
-    /// A planner whose render leg is live (simulates U4/U5 landed).
-    struct WiredPlanner;
-    impl PlacementPlanner for WiredPlanner {
-        fn render_tfvars(
-            &self,
-            _node: &str,
-            _specs: &[WorkloadSpec],
-        ) -> Result<String, ReconcileNotYet> {
-            Ok("{\"vms\":{}}".to_string())
-        }
-        fn plan(&self, _node: &str) -> Result<PlanCounts, ReconcileNotYet> {
-            Ok(PlanCounts::default())
         }
     }
 
@@ -157,35 +140,36 @@ mod tests {
 
     #[test]
     fn a_request_without_a_placement_node_is_honestly_rejected() {
-        let reply = build_reply(&NotYetPlanner, "android-provision", &body("", None));
+        let tmp = tempdir().unwrap();
+        let reply = build_reply(tmp.path(), "android-provision", &body("", None));
         assert!(!reply.ok);
         assert!(reply.desired.is_none());
         assert!(reply.error.unwrap().contains("placement `node`"));
     }
 
     #[test]
-    fn until_the_reconcile_leg_lands_the_spec_is_built_and_echoed_but_honestly_gated() {
-        let reply = build_reply(&NotYetPlanner, "android-provision", &body("eagle", None));
-        assert!(!reply.ok, "never a fake provision");
-        let gated = reply.gated.unwrap();
-        assert!(gated.contains("not yet wired"), "{gated}");
-        // The real work (spec construction) is done + echoed even while gated.
+    fn android_provision_persists_and_echoes_the_cuttlefish_desired_slice() {
+        let tmp = tempdir().unwrap();
+        let reply = build_reply(tmp.path(), "android-provision", &body("eagle", Some("droid")));
+        assert!(reply.ok, "err: {:?}", reply.error);
+        // The constructed AndroidVm spec is echoed …
         let desired = reply.desired.expect("echoed spec");
         assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].name, "droid");
         assert_eq!(desired[0].delivery_type, DeliveryType::AndroidVm);
-        assert_eq!(desired[0].name, "android-eagle", "default name");
+        // … and actually persisted to this node's desired slice.
+        let slice = reconcile::read_desired_slice(tmp.path(), "eagle");
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].name, "droid");
+        assert_eq!(slice[0].delivery_type, DeliveryType::AndroidVm);
     }
 
     #[test]
-    fn a_wired_reconcile_seam_accepts_the_cuttlefish_desired_slice() {
-        let reply = build_reply(
-            &WiredPlanner,
-            "android-provision",
-            &body("eagle", Some("droid")),
-        );
-        assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
+    fn a_default_named_request_uses_the_stable_android_node_name() {
+        let tmp = tempdir().unwrap();
+        let reply = build_reply(tmp.path(), "android-provision", &body("eagle", None));
+        assert!(reply.ok, "err: {:?}", reply.error);
         let desired = reply.desired.expect("echoed spec");
-        assert_eq!(desired[0].name, "droid");
-        assert_eq!(desired[0].delivery_type, DeliveryType::AndroidVm);
+        assert_eq!(desired[0].name, "android-eagle", "default name");
     }
 }
