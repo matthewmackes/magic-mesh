@@ -1286,6 +1286,23 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             workgroup_root.clone(),
         )
     });
+    // Rolling Node — the vehicle worker: the workstation-side adapter that
+    // SSH/HTTP-polls a mobile Sierra AirLink MG90 (oMG) gateway and publishes a
+    // latest-wins `state/vehicle/<node>` mirror (GPS/IMU + WAN + MCU power via the
+    // neutral `mackes_mesh_types::vehicle` types). Universal (rank 0) like cloud —
+    // every node publishes its own per-node mirror (no center) — but a genuine no-op
+    // on the majority of nodes with no gateway attached (`MDE_VEHICLE_GATEWAY` unset
+    // ⇒ the worker idles, publishing nothing). `host` is node_id stripped of the
+    // `peer:` prefix (the state-topic namespace); the gateway endpoint + root
+    // password come from the env (`MDE_VEHICLE_GATEWAY` / `MDE_VEHICLE_ROOT_PW`).
+    spawn_tiered(sup, worker_names, role_rank, "vehicle", || {
+        mackesd_core::workers::vehicle::VehicleWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // MV-5a — the scheduler worker: the placement slice of the no-center
     // scheduler. Drains `action/schedule/place`, folds each node's latest
     // `event/kvm/services` capacity, chooses the target node (healthy pin →
