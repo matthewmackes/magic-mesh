@@ -119,6 +119,19 @@
 //! **jump** ([`DeviceManagerState::select_node_device`]) — the inspected host
 //! follows the click so the drawer + any armed op always resolve against the
 //! right node, never a mismatched host.
+//!
+//! **Rolling Node Phase 3a adds the vehicle-gateway host kind (#6/#22)** — a
+//! fifth non-PC source alongside DEVMGR-11's four: every node's
+//! `state/vehicle/<node>` mirror ([`mackes_mesh_types::vehicle::VehicleState`],
+//! the workstation-side MG90/oMG adapter's latest-wins publish) folds into a
+//! [`HostKind::Vehicle`] rail row under its own **Vehicle gateways** section.
+//! The synthesized tree stays honest-partial (#22): **System** (model/ESN/
+//! firmware) always shows since the mirror always carries it; **Network** (the
+//! active WAN uplink, signal/technology when cellular) and **Sensors** (the
+//! GNSS receiver) show only once the gateway is online / holds a fix, and the
+//! source note says so plus surfaces any adapter-reported gap
+//! ([`VehicleState::gaps`]) — never a fabricated device (§7). Power/OBD/CAN
+//! telemetry stays the maps-location cockpit's job, not this tree's.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -143,6 +156,8 @@ use mackes_mesh_types::router_action::{
     self, typed_confirm_matches, FirewallEdit, FirewallEditOp, FirewallLeaf, RouterActionRequest,
     DEFAULT_COMMIT_CONFIRM_MIN,
 };
+// Rolling Node Phase 3a — the vehicle-gateway rail source.
+use mackes_mesh_types::vehicle::{VehicleState, VEHICLE_STATE_PREFIX};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -510,7 +525,7 @@ fn host_freshness(published_at_ms: Option<u64>, now_ms: u64) -> HostFreshness {
 }
 
 /// What kind of host a rail row represents (DEVMGR-11, #6): a mesh node with a
-/// published mackesd inventory, or one of the four non-PC sources — each mapping
+/// published mackesd inventory, or one of the five non-PC sources — each mapping
 /// to its own inventory source (#22) and rendering only the categories that
 /// source can honestly answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,11 +541,21 @@ enum HostKind {
     Lan,
     /// A discovered `VyOS` / `EdgeOS` router appliance (`<host>/router-registry.json`).
     Router,
+    /// A Rolling Node vehicle gateway (the `state/vehicle/<node>` mirror —
+    /// `mackes_mesh_types::vehicle::VehicleState`).
+    Vehicle,
 }
 
 impl HostKind {
     /// Rail render order: mesh nodes first, then the non-PC sections (#6).
-    const ORDER: [Self; 5] = [Self::Node, Self::Nova, Self::Phone, Self::Lan, Self::Router];
+    const ORDER: [Self; 6] = [
+        Self::Node,
+        Self::Nova,
+        Self::Phone,
+        Self::Lan,
+        Self::Router,
+        Self::Vehicle,
+    ];
 
     /// The rail section header for this kind.
     const fn section(self) -> &'static str {
@@ -540,12 +565,14 @@ impl HostKind {
             Self::Phone => "Phones",
             Self::Lan => "LAN hosts",
             Self::Router => "Routers",
+            Self::Vehicle => "Vehicle gateways",
         }
     }
 
     /// Whether privileged DEVMGR-8 device ops can route to this host — only a
     /// mesh node runs the mackesd `device_control` worker that drains them (§7:
-    /// offering the verbs on a phone / router / instance would be a placebo).
+    /// offering the verbs on a phone / router / instance / vehicle gateway would
+    /// be a placebo).
     const fn controllable(self) -> bool {
         matches!(self, Self::Node)
     }
@@ -639,7 +666,8 @@ fn build_rail(all: &[DeviceInventory], local: &str) -> Vec<HostEntry> {
 
 /// Append the DEVMGR-11 non-PC hosts to the mesh-node rail (#6): the node rows
 /// keep their local-first order, then each non-PC kind in [`HostKind::ORDER`]
-/// (Cloud → Phones → LAN → Routers), label-sorted within a kind. Pure, so the
+/// (Cloud → Phones → LAN → Routers → Vehicle gateways), label-sorted within a
+/// kind. Pure, so the
 /// grouped rail model is tested without a substrate.
 fn merge_rail(mut nodes: Vec<HostEntry>, non_pc: &[NonPcHost]) -> Vec<HostEntry> {
     for kind in HostKind::ORDER {
@@ -939,6 +967,34 @@ fn read_routers(workgroup_root: &Path) -> Vec<RouterMirror> {
     by_id.into_values().collect()
 }
 
+/// Read every node's `state/vehicle/<node>` mirror off the Bus spool (Rolling
+/// Node Phase 3a) — one topic per node, so unlike [`read_units`] there is no
+/// cross-node id to fold: the newest retained body on each `vehicle:`-prefixed
+/// topic ([`Persist::read_latest`], the perf-4 latest-value seam) decodes
+/// straight into the real wire type
+/// ([`mackes_mesh_types::vehicle::VehicleState`]) — no local mirror struct is
+/// needed since this crate already shares that type with the publisher. `None`
+/// / no spool reads empty — the honest solo-host state.
+fn read_vehicles(bus_root: Option<&Path>) -> Vec<VehicleState> {
+    // arch-11: open through the shared BusReader seam.
+    let Some(persist) = BusReader::new(bus_root.map(Path::to_path_buf)).open() else {
+        return Vec::new();
+    };
+    let topics = persist.list_topics().unwrap_or_default();
+    let mut out = Vec::new();
+    for topic in topics.iter().filter(|t| t.starts_with(VEHICLE_STATE_PREFIX)) {
+        let Ok(Some(msg)) = persist.read_latest(topic) else {
+            continue;
+        };
+        let Some(body) = msg.body else { continue };
+        let Ok(state) = serde_json::from_str::<VehicleState>(&body) else {
+            continue;
+        };
+        out.push(state);
+    }
+    out
+}
+
 /// Map a unit's health token onto an honest device status: a reported
 /// degraded/critical tier is a real problem (Code 10 with the real tier as the
 /// reason); `unreachable` is an honest [`Unknown`](DeviceStatus::Unknown); a
@@ -1208,12 +1264,126 @@ fn router_host(r: &RouterMirror) -> NonPcHost {
     }
 }
 
+/// Synthesize the honest tree for a Rolling Node vehicle gateway (#22 —
+/// "vehicle → System / Network / Sensors", Rolling Node Phase 3a): **System**
+/// carries the real gateway identity (model + ESN + firmware) the mirror
+/// always reports; **Network** the active WAN uplink (signal/technology/carrier
+/// when it's cellular); **Sensors** the GNSS receiver, only once the gateway
+/// actually holds a fix. An unreachable gateway degrades to the honest
+/// `offline` snapshot the wire type already publishes — System still shows
+/// (unreachable badge), Network + Sensors are simply absent, and the note says
+/// so, never fabricated (§7). Any adapter-reported gap
+/// ([`VehicleState::gaps`]) rides the note too.
+fn vehicle_host(v: &VehicleState) -> NonPcHost {
+    let status = if v.online {
+        DeviceStatus::Ok
+    } else {
+        DeviceStatus::Unknown
+    };
+    let mut categories = Vec::new();
+
+    let mut sys = DeviceRecord::new(
+        if v.model.is_empty() {
+            "Vehicle gateway".to_string()
+        } else {
+            format!("{} gateway", v.model)
+        },
+        status,
+    );
+    if !v.online {
+        sys.problem = Some("gateway unreachable".to_string());
+    }
+    if !v.esn.is_empty() {
+        sys.events.push(format!("ESN {}", v.esn));
+    }
+    if !v.mgos_version.is_empty() {
+        sys.events.push(format!("firmware {}", v.mgos_version));
+    }
+    categories.push(DeviceCategory {
+        key: "system".to_string(),
+        label: "System".to_string(),
+        devices: vec![sys],
+    });
+
+    if v.online && !v.wan.active_wan.is_empty() {
+        let mut nic = DeviceRecord::new(format!("WAN uplink ({})", v.wan.active_wan), status);
+        if let Some(link) = v.wan.active_cellular() {
+            if !link.carrier.is_empty() {
+                nic.vendor = Some(link.carrier.clone());
+            }
+            nic.events
+                .push(format!("{} dBm \u{2014} {}", link.signal_dbm, link.technology));
+            if !link.wan_ip.is_empty() {
+                nic.events.push(format!("WAN IP {}", link.wan_ip));
+            }
+            if !link.healthy {
+                nic.status = DeviceStatus::Degraded;
+                nic.problem = Some("link reports unhealthy".to_string());
+            }
+        }
+        if !v.wan.link_quality.is_empty() {
+            nic.events.push(format!("link quality: {}", v.wan.link_quality));
+        }
+        categories.push(DeviceCategory::new(category::NETWORK_ADAPTERS, vec![nic]));
+    }
+
+    // Gated on `online` too, not just `has_fix()`: once the adapter can't
+    // reach the gateway the last-read fix is stale-and-unverifiable, so the
+    // honest read is "unreported" (the note says so), never a fabricated
+    // live position (§7) — matches the WAN gate below.
+    if v.online && v.gps.has_fix() {
+        let mut gps = DeviceRecord::new("GNSS receiver", DeviceStatus::Ok);
+        gps.events
+            .push(format!("{:.5}, {:.5}", v.gps.latitude, v.gps.longitude));
+        gps.events.push(format!(
+            "{} satellites \u{2014} hdop {:.1}",
+            v.gps.satellites, v.gps.hdop
+        ));
+        categories.push(DeviceCategory::new(category::SENSORS, vec![gps]));
+    }
+
+    let mut note_parts = Vec::new();
+    if !v.online {
+        note_parts.push(
+            "The gateway is currently unreachable \u{2014} WAN uplink and GNSS state are \
+             unreported, not empty."
+                .to_string(),
+        );
+    } else if !v.gps.has_fix() {
+        note_parts.push("No GNSS lock yet \u{2014} location is unreported.".to_string());
+    }
+    if !v.gaps.is_empty() {
+        note_parts.push(format!(
+            "The adapter reports it cannot answer: {}.",
+            v.gaps.join(", ")
+        ));
+    }
+    note_parts.push(
+        "A vehicle gateway shows only System / Network / Sensors from its own mirror \u{2014} \
+         power/OBD telemetry rides the maps-location cockpit, not this tree."
+            .to_string(),
+    );
+
+    NonPcHost {
+        key: format!("vehicle:{}", v.host),
+        kind: HostKind::Vehicle,
+        inventory: DeviceInventory {
+            host: v.host.clone(),
+            published_at_ms: u64::try_from(v.published_at_ms).unwrap_or(0),
+            summary: blank_summary(),
+            tools: mackes_mesh_types::device_inventory::ToolAvailability::default(),
+            categories,
+        },
+        note: Some(note_parts.join(" ")),
+    }
+}
+
 /// Gather every DEVMGR-11 non-PC host from its real source (#6).
 ///
 /// Nova instances + LAN hosts come off the `state/units` Bus mirrors, phones
 /// off the replicated KDC pairing rosters, routers off the router-registry
-/// mirrors. Each maps through its pure builder to an honest partial tree
-/// (#22/§7).
+/// mirrors, vehicle gateways off the `state/vehicle/<node>` Bus mirrors. Each
+/// maps through its pure builder to an honest partial tree (#22/§7).
 fn read_non_pc(workgroup_root: &Path, bus_root: Option<&Path>) -> Vec<NonPcHost> {
     let mut out = Vec::new();
     for unit in read_units(bus_root) {
@@ -1228,6 +1398,9 @@ fn read_non_pc(workgroup_root: &Path, bus_root: Option<&Path>) -> Vec<NonPcHost>
     }
     for router in read_routers(workgroup_root) {
         out.push(router_host(&router));
+    }
+    for vehicle in read_vehicles(bus_root) {
+        out.push(vehicle_host(&vehicle));
     }
     out
 }
@@ -1262,10 +1435,12 @@ pub(crate) struct DeviceManagerState {
     /// By-connection views read only [`Self::inventory`] and ignore it.
     all_inventories: Vec<DeviceInventory>,
     /// The DEVMGR-11 non-PC hosts (#6) — Nova instances, paired phones, LAN
-    /// hosts, routers — each with its synthesized honest-partial tree (#22),
-    /// gathered from their real sources on every [`Self::refresh`].
+    /// hosts, routers, vehicle gateways — each with its synthesized
+    /// honest-partial tree (#22), gathered from their real sources on every
+    /// [`Self::refresh`].
     non_pc: Vec<NonPcHost>,
-    /// The Bus spool the `state/units/<node>` mirrors are read from (DEVMGR-11)
+    /// The Bus spool the `state/units/<node>` + `state/vehicle/<node>` mirrors
+    /// are read from (DEVMGR-11 + Rolling Node Phase 3a)
     /// — [`mde_bus::client_data_dir`] in production; tests point at a tempdir.
     /// `None` reads no units (the honest no-Bus seat).
     bus_root: Option<PathBuf>,
