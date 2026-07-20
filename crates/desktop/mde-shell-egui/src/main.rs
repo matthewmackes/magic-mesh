@@ -2323,6 +2323,10 @@ impl Shell {
                 .search_omnibox_items()
                 .into_iter()
                 .map(|item| {
+                    // Carry the mesh source's health weight across the re-wrap so
+                    // the front door ranks a healthy node above a degraded one
+                    // above a down one for an equal text match (WL-FUNC-005).
+                    let health = item.source_health();
                     let mapped = SearchItem::new(
                         item.domain,
                         item.title,
@@ -2330,7 +2334,8 @@ impl Shell {
                         front_door::FrontDoorTarget::Mesh(item.payload),
                     )
                     .with_terms(item.terms)
-                    .with_source_rank(rank);
+                    .with_source_rank(rank)
+                    .with_source_health(health);
                     rank += 1;
                     mapped
                 }),

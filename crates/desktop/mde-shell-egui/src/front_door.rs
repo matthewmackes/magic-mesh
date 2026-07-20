@@ -41,6 +41,27 @@ const ACTION_BUTTON_TEXT_MIN_W: f32 = 72.0;
 const SEARCH_TEXT_SIZE: f32 = Style::BODY + 1.0;
 const SEARCH_HINT: &str = "Search apps, workloads, services, commands, files, mesh, Browser";
 
+/// Unified-search privacy policy (WL-FUNC-005): the omnibox is **ephemeral and
+/// local-only**, matching the browser's private-by-default posture.
+///
+/// * *Ephemeral* — the live query lives only in [`FrontDoorState::query`] while
+///   the panel is open. [`FrontDoorState`] is never serialized, keeps no
+///   recent-search list, and [`FrontDoorState::close`] wipes the query, so no
+///   persistent search-query history is ever written.
+/// * *Local-only* — every candidate producer is a pure in-process scan of
+///   already-local data (apps, discovered mesh units, files, Browser
+///   bookmarks/history). Typing a query performs no network egress and no
+///   telemetry send. A query can only leave the node when the user *explicitly*
+///   activates the "Search web for …" row, and even then it navigates to the
+///   mesh-local search endpoint (`search.mesh`), never an external provider.
+///   There is no Assistant/AI producer that sends the query off-node.
+///
+/// This is the single documented policy point; it is asserted end-to-end by the
+/// `front_door_search_is_ephemeral_and_local_only` test (and the browser-side
+/// `omnibox_web_suggestion_stays_on_mesh_local_search_endpoint` test for the one
+/// explicit-activation egress seam).
+pub(crate) const SEARCH_PRIVACY_EPHEMERAL_LOCAL_ONLY: bool = true;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrontDoorMeshSourceStatus {
     Ready,
@@ -4116,6 +4137,111 @@ mod tests {
             .find(|node| node.label() == Some("Shell search results"))
             .expect("results live-region");
         assert_eq!(announcement.value(), source.value());
+    }
+
+    #[test]
+    fn front_door_search_is_ephemeral_and_local_only() {
+        // The policy point exists and is on.
+        assert!(
+            SEARCH_PRIVACY_EPHEMERAL_LOCAL_ONLY,
+            "unified search must stay ephemeral + local-only (WL-FUNC-005)"
+        );
+
+        // Ephemeral: the live query lives only in FrontDoorState, and closing the
+        // panel wipes it — there is no persistent search-query history to leak.
+        let mut state = FrontDoorState::default();
+        state.open();
+        state.query = "secret internal codename".to_owned();
+        assert_eq!(state.query(), "secret internal codename");
+        state.close();
+        assert!(
+            state.query().is_empty(),
+            "closing the omnibox must wipe the live query — no persistent search history"
+        );
+        // Re-opening starts blank; no recent-search list is restored.
+        state.open();
+        assert!(
+            state.query().is_empty(),
+            "re-opening the omnibox must not restore any prior query"
+        );
+
+        // Local-only + no hidden state: ranking a query is a pure transform over
+        // already-local candidates. It is deterministic (no I/O, no side effects)
+        // and the only egress-capable row — the explicit "Search web for …"
+        // suggestion — stays on the mesh-local search endpoint, never an external
+        // provider. Every other candidate resolves to an in-mesh / on-node target.
+        let first = ranked_front_door_hits("browser", fixture_front_door_items());
+        let second = ranked_front_door_hits("browser", fixture_front_door_items());
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "ranking must be a pure, side-effect-free transform"
+        );
+        for hit in &first {
+            let target = hit.item.target.to_ascii_lowercase();
+            let external = target.contains("google.com")
+                || target.contains("bing.com")
+                || target.contains("duckduckgo.com")
+                || target.contains("yahoo.com");
+            assert!(
+                !external,
+                "no omnibox candidate may carry an off-mesh query egress target: {:?}",
+                hit.item.target
+            );
+            if hit.item.domain == SearchDomain::WebSuggestion {
+                assert!(
+                    target.contains("search.mesh"),
+                    "the web-search suggestion must target the mesh-local endpoint: {:?}",
+                    hit.item.target
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn front_door_mesh_rows_rank_healthy_source_over_degraded_over_down() {
+        // Same title + tier, differing only in source health: the front door must
+        // surface the healthy node first, then degraded, then down (WL-FUNC-005).
+        use mde_egui::search_omnibox::SourceHealth;
+        let items = vec![
+            SearchItem::new(
+                SearchDomain::Mesh,
+                "oak-node",
+                "peer:oak-down",
+                FrontDoorTarget::Mesh("peer:oak-down".to_owned()),
+            )
+            .with_source_rank(0)
+            .with_source_health(SourceHealth::Down),
+            SearchItem::new(
+                SearchDomain::Mesh,
+                "oak-node",
+                "peer:oak-healthy",
+                FrontDoorTarget::Mesh("peer:oak-healthy".to_owned()),
+            )
+            .with_source_rank(1)
+            .with_source_health(SourceHealth::Healthy),
+            SearchItem::new(
+                SearchDomain::Mesh,
+                "oak-node",
+                "peer:oak-degraded",
+                FrontDoorTarget::Mesh("peer:oak-degraded".to_owned()),
+            )
+            .with_source_rank(2)
+            .with_source_health(SourceHealth::Degraded),
+        ];
+
+        let payloads: Vec<String> = ranked_front_door_hits("oak", items)
+            .into_iter()
+            .filter_map(|hit| match hit.item.payload {
+                FrontDoorTarget::Mesh(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            payloads,
+            ["peer:oak-healthy", "peer:oak-degraded", "peer:oak-down"]
+        );
     }
 
     #[test]

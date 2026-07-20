@@ -6,6 +6,42 @@
 //! any one widget. Existing surfaces can adopt it incrementally while keeping
 //! their own action dispatch paths.
 
+/// The health of the node/source that produced a search candidate.
+///
+/// This is an **explicit ranking weight**, not a searchable text term: within a
+/// single lexical tier (and fuzzy-cost bracket), a candidate from a healthier
+/// source ranks above one from a degraded source, which ranks above one from a
+/// down source — deterministically. Mesh rows carry the discovered unit's health
+/// here; every other domain (and any unprobed source) is [`SourceHealth::Unknown`],
+/// treated as a neutral baseline so health weighting only ever *penalises* an
+/// unhealthy mesh source and never reorders unrelated local rows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SourceHealth {
+    /// The source reports no active alarms.
+    Healthy,
+    /// A warning-tier alarm is active on the source.
+    Degraded,
+    /// The source is critical or unreachable.
+    Down,
+    /// Health is unprobed or the candidate is not a mesh source — neutral.
+    #[default]
+    Unknown,
+}
+
+impl SourceHealth {
+    /// The ranking penalty for this tier; **lower sorts first**, so a healthy (or
+    /// unknown/neutral) source leads, then degraded, then down. Healthy and
+    /// Unknown share the neutral `0` so an unprobed or non-mesh row is never
+    /// demoted below a genuinely-healthy one.
+    const fn penalty(self) -> u8 {
+        match self {
+            Self::Healthy | Self::Unknown => 0,
+            Self::Degraded => 1,
+            Self::Down => 2,
+        }
+    }
+}
+
 /// The origin bucket of one unified omnibox candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchDomain {
@@ -40,6 +76,7 @@ pub struct SearchItem<T> {
     pub payload: T,
     source_rank: usize,
     model_score: Option<i32>,
+    source_health: SourceHealth,
 }
 
 impl<T> SearchItem<T> {
@@ -58,6 +95,7 @@ impl<T> SearchItem<T> {
             payload,
             source_rank: 0,
             model_score: None,
+            source_health: SourceHealth::Unknown,
         }
     }
 
@@ -81,6 +119,26 @@ impl<T> SearchItem<T> {
     pub const fn with_model_score(mut self, score: i32) -> Self {
         self.model_score = Some(score);
         self
+    }
+
+    /// Set the health of the source node that produced this candidate. Mesh rows
+    /// use it so a healthy node ranks above a degraded one above a down one for an
+    /// equal text match; other domains leave it [`SourceHealth::Unknown`] (neutral).
+    /// It is an explicit ranking weight, applied *after* lexical exactness and
+    /// *before* the softer `model_score` tie-break — a degraded source can never
+    /// bury a stronger typed match.
+    #[must_use]
+    pub const fn with_source_health(mut self, health: SourceHealth) -> Self {
+        self.source_health = health;
+        self
+    }
+
+    /// The health weight of this candidate's source node. Callers that re-wrap a
+    /// candidate (e.g. the shell folding Explorer's mesh rows into the front door)
+    /// use this to carry the weight across the copy.
+    #[must_use]
+    pub const fn source_health(&self) -> SourceHealth {
+        self.source_health
     }
 }
 
@@ -111,8 +169,11 @@ pub enum MatchTier {
 /// Rank `items` for `query`, best first, capped at `cap`.
 ///
 /// Lexical exactness always wins: title prefix, target/URL prefix, title
-/// substring, auxiliary field substring, then fuzzy title. Model score is a
-/// tie-breaker within one tier, not a license to bury a direct typed match.
+/// substring, auxiliary field substring, then fuzzy title. Within one lexical
+/// tier the order is then, in decreasing strength: source health (healthy/unknown
+/// over degraded over down — see [`SourceHealth`]), then model score, then stable
+/// source order. Neither health nor model score is a license to bury a stronger
+/// typed match: both only break ties inside the same tier.
 #[must_use]
 pub fn ranked_hits<T: Clone>(
     query: &str,
@@ -124,13 +185,14 @@ pub fn ranked_hits<T: Clone>(
         return Vec::new();
     }
 
-    let mut scored: Vec<(MatchTier, (usize, usize), i32, usize, SearchItem<T>)> = items
+    let mut scored: Vec<(MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>)> = items
         .into_iter()
         .filter_map(|item| {
             let (tier, cost) = score_item(&q, &item)?;
             Some((
                 tier,
                 cost,
+                item.source_health.penalty(),
                 item.model_score.unwrap_or(0),
                 item.source_rank,
                 item,
@@ -140,13 +202,14 @@ pub fn ranked_hits<T: Clone>(
     scored.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then(a.1.cmp(&b.1))
-            .then(b.2.cmp(&a.2))
-            .then(a.3.cmp(&b.3))
+            .then(a.2.cmp(&b.2))
+            .then(b.3.cmp(&a.3))
+            .then(a.4.cmp(&b.4))
     });
     scored
         .into_iter()
         .take(cap)
-        .map(|(tier, _, _, _, item)| SearchHit { item, tier })
+        .map(|(tier, _, _, _, _, item)| SearchHit { item, tier })
         .collect()
 }
 
@@ -366,6 +429,96 @@ mod tests {
             .collect();
 
         assert_eq!(ids, ["high-prefix", "low-prefix", "high-aux"]);
+    }
+
+    #[test]
+    fn mesh_health_weight_ranks_healthy_over_degraded_over_down_for_equal_match() {
+        // Same title, same lexical tier, same source order — only source health
+        // differs, and it decides the order: healthy first, then degraded, then down.
+        let items = vec![
+            item(SearchDomain::Mesh, "oak-node", "peer:oak-down", "down")
+                .with_source_health(SourceHealth::Down)
+                .with_source_rank(0),
+            item(
+                SearchDomain::Mesh,
+                "oak-node",
+                "peer:oak-healthy",
+                "healthy",
+            )
+            .with_source_health(SourceHealth::Healthy)
+            .with_source_rank(1),
+            item(
+                SearchDomain::Mesh,
+                "oak-node",
+                "peer:oak-degraded",
+                "degraded",
+            )
+            .with_source_health(SourceHealth::Degraded)
+            .with_source_rank(2),
+        ];
+
+        let ids: Vec<&str> = ranked_hits("oak", items, 8)
+            .into_iter()
+            .map(|hit| hit.item.payload)
+            .collect();
+
+        assert_eq!(ids, ["healthy", "degraded", "down"]);
+    }
+
+    #[test]
+    fn source_health_never_overrides_a_stronger_lexical_match() {
+        // A down source with a title *prefix* match still beats a healthy source
+        // that only matches lexically weaker — health is a within-tier tie-break,
+        // never a license to bury a stronger typed match.
+        let items = vec![
+            item(SearchDomain::Mesh, "oak-router", "peer:oak", "down-prefix")
+                .with_source_health(SourceHealth::Down),
+            item(
+                SearchDomain::Mesh,
+                "core oak relay",
+                "peer:core",
+                "healthy-substr",
+            )
+            .with_source_health(SourceHealth::Healthy),
+        ];
+
+        let ids: Vec<&str> = ranked_hits("oak", items, 8)
+            .into_iter()
+            .map(|hit| hit.item.payload)
+            .collect();
+
+        assert_eq!(ids, ["down-prefix", "healthy-substr"]);
+    }
+
+    #[test]
+    fn unknown_source_health_is_neutral_and_leaves_existing_order_intact() {
+        // Default (Unknown) health shares the neutral weight of Healthy, so a
+        // healthy row and an unprobed/non-mesh row tie on health and fall through
+        // to stable source order — no collateral reordering of local rows.
+        let items = vec![
+            item(
+                SearchDomain::App,
+                "oak console",
+                "surface:oak",
+                "app-unknown",
+            )
+            .with_source_rank(0),
+            item(
+                SearchDomain::Mesh,
+                "oak console",
+                "peer:oak",
+                "mesh-healthy",
+            )
+            .with_source_health(SourceHealth::Healthy)
+            .with_source_rank(1),
+        ];
+
+        let ids: Vec<&str> = ranked_hits("oak", items, 8)
+            .into_iter()
+            .map(|hit| hit.item.payload)
+            .collect();
+
+        assert_eq!(ids, ["app-unknown", "mesh-healthy"]);
     }
 
     #[test]

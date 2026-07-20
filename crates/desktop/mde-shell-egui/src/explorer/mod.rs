@@ -104,7 +104,7 @@ use mde_egui::egui::{
 use mde_egui::{muted_note, Motion, MotionMode, MotionPreset, Style};
 
 use crate::toast_bridge::TOAST_TOPIC;
-use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
+use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem, SourceHealth};
 
 /// The memory key the mount toggles the Mesh-Map surface's **Explorer** lens on
 /// (read in `main.rs`'s poll gate + the surface arm). Kept here so the one key
@@ -1390,6 +1390,20 @@ const SEARCH_MAX_HITS: usize = 8;
 /// enrichment names. Only real discovered values — an absent field contributes
 /// nothing (§7, never a fabricated haystack). Fields score independently so a
 /// match can never straddle two unrelated fields.
+/// Map a discovered unit's coarse [`Health`] onto the shared omnibox ranking
+/// weight ([`SourceHealth`]) so a healthy node's rows rank above a degraded
+/// node's above a down node's for an equal text match. Unprobed health (§7
+/// `None`/`Unknown`) stays neutral — the ranker never fabricates a "healthy"
+/// lift for a node whose health we do not actually know.
+fn omnibox_source_health(unit: &Unit) -> SourceHealth {
+    match unit.health {
+        Some(Health::Healthy) => SourceHealth::Healthy,
+        Some(Health::Degraded) => SourceHealth::Degraded,
+        Some(Health::Critical | Health::Unreachable) => SourceHealth::Down,
+        Some(Health::Unknown) | None => SourceHealth::Unknown,
+    }
+}
+
 fn search_fields(unit: &Unit) -> Vec<&str> {
     let mut fields = vec![unit.name.as_str(), unit.kind.search_terms()];
     if let Some(addr) = unit.address.as_deref() {
@@ -2077,6 +2091,7 @@ impl ExplorerState {
     pub(crate) fn search_omnibox_items(&self) -> Vec<SearchItem<String>> {
         let mut items = Vec::new();
         for unit in &self.units {
+            let health = omnibox_source_health(unit);
             for field in search_fields(unit) {
                 let field = field.trim();
                 if field.is_empty() {
@@ -2085,7 +2100,8 @@ impl ExplorerState {
                 let rank = items.len();
                 items.push(
                     SearchItem::new(SearchDomain::Mesh, field, unit.id.clone(), unit.id.clone())
-                        .with_source_rank(rank),
+                        .with_source_rank(rank)
+                        .with_source_health(health),
                 );
             }
         }
