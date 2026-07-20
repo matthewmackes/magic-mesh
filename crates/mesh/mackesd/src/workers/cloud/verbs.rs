@@ -31,6 +31,10 @@ use super::CloudWorker;
 // Disjoint per-verb handler modules (one unit each, `cloud/verbs/<unit>.rs`).
 mod container;
 mod image;
+// Disjoint per-verb handler modules (one unit each owns its file).
+mod android; // U9 · android-provision
+mod console; // U8 · console-attach
+mod inventory; // U10 · inventory + output
 
 /// A drained `action/cloud/<verb>` classified for dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,9 +189,9 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
         // ── implemented READS — served locally on every node ──
         CloudVerb::List | CloudVerb::Status => handle_read_roster(w, verb_name),
 
-        // ── skeleton READS (U10 fills the bodies) ──
-        CloudVerb::Inventory => not_yet(verb_name, "U4"),
-        CloudVerb::Output => not_yet(verb_name, "U5"),
+        // ── implemented READS — served locally on every node (U10) ──
+        CloudVerb::Inventory => inventory::handle_inventory(w, verb_name),
+        CloudVerb::Output => inventory::handle_output(w, verb_name),
         // U4 — `set-desired` persists the node's desired doc; `plan` renders its
         // slice + shells `tofu plan -json` → PlanCounts (honest gate on failure).
         CloudVerb::Plan => desired::handle_plan(w, verb_name, body_str),
@@ -197,9 +201,9 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
         CloudVerb::ImageBuild => image::handle(w, verb_name, raw),
         CloudVerb::ContainerDeploy => container::handle(w, verb_name, raw),
 
-        // ── skeleton MUTATIONS (U8–U10 fill the bodies) ──
-        CloudVerb::ConsoleAttach => not_yet(verb_name, "U9"),
-        CloudVerb::AndroidProvision => not_yet(verb_name, "U10"),
+        // ── wired MUTATIONS — console-attach (U8) + android-provision (U9) ──
+        CloudVerb::ConsoleAttach => console::handle(verb_name, &body),
+        CloudVerb::AndroidProvision => android::handle(w, verb_name, &body),
 
         // ── implemented MUTATIONS — the armed-token gate ──
         CloudVerb::Provision => {

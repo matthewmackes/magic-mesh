@@ -158,6 +158,26 @@ pub trait CloudRunner: Send + Sync {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+    /// Resolve the mesh Ansible inventory (`ansible-inventory --list`) as raw JSON —
+    /// a READ (U10). `Err` when the tool is absent or the resolve fails (an honest
+    /// gate, never a fabricated inventory). The default is "unsupported by this
+    /// runner" so a partial runner degrades honestly.
+    ///
+    /// # Errors
+    /// The tool's failure/absence, as an honest message.
+    fn resolve_inventory(&self) -> Result<String, String> {
+        Err("inventory resolution not supported by this runner".to_string())
+    }
+
+    /// The tofu outputs (`tofu output -json`) for this node's workloads as raw JSON —
+    /// a READ (U10). `Err` when `tofu` is absent or the read fails. Default:
+    /// unsupported.
+    ///
+    /// # Errors
+    /// The tool's failure/absence, as an honest message.
+    fn tofu_outputs(&self) -> Result<String, String> {
+        Err("tofu outputs not supported by this runner".to_string())
+    }
 }
 
 /// Normalize a libvirt domain state to the OpenStack-style status token the
@@ -460,6 +480,24 @@ impl CloudRunner for ShellCloudRunner {
         }
         Ok(out)
     }
+    fn resolve_inventory(&self) -> Result<String, String> {
+        let inventory = self.ansible_dir.join("inventory").join("mesh.py");
+        let inventory_str = inventory.display().to_string();
+        match Self::run("ansible-inventory", &["-i", &inventory_str, "--list"]) {
+            Ok((true, out, _)) => Ok(out),
+            Ok((false, _, err)) => Err(format!("ansible-inventory failed: {}", summary_line(&err))),
+            Err(e) => Err(format!("ansible-inventory unavailable: {e}")),
+        }
+    }
+
+    fn tofu_outputs(&self) -> Result<String, String> {
+        let chdir = self.tofu_chdir();
+        match Self::run("tofu", &[&chdir, "output", "-json", "-no-color"]) {
+            Ok((true, out, _)) => Ok(out),
+            Ok((false, _, err)) => Err(format!("tofu output failed: {}", summary_line(&err))),
+            Err(e) => Err(format!("tofu output unavailable: {e}")),
+        }
+    }
 }
 
 // ─────────────────────────── small helpers ───────────────────────────
@@ -532,6 +570,10 @@ pub(crate) mod fake {
         /// Suppress the simulated artifact write even on success (exercises the honest
         /// "build reported success but produced no artifact" branch).
         pub tool_no_artifact: bool,
+        /// Scripted `ansible-inventory --list` result (U10). `None` ⇒ no fake wired.
+        pub inventory_json: Option<Result<String, String>>,
+        /// Scripted `tofu output -json` result (U10). `None` ⇒ no fake wired.
+        pub outputs_json: Option<Result<String, String>>,
     }
 
     impl FakeRunner {
@@ -638,6 +680,16 @@ pub(crate) mod fake {
                     String::new()
                 },
             })
+        }
+        fn resolve_inventory(&self) -> Result<String, String> {
+            self.inventory_json
+                .clone()
+                .unwrap_or_else(|| Err("no fake inventory scripted".to_string()))
+        }
+        fn tofu_outputs(&self) -> Result<String, String> {
+            self.outputs_json
+                .clone()
+                .unwrap_or_else(|| Err("no fake outputs scripted".to_string()))
         }
     }
 

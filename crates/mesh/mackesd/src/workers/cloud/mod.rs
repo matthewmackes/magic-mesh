@@ -703,22 +703,31 @@ mod tests {
     }
 
     #[test]
-    fn the_remaining_workloads_skeleton_verbs_are_honestly_not_yet_wired() {
-        // image-build (U6) + container-deploy (U7) are now wired (their own tests
-        // cover them); the rest still surface an honest not-yet-wired skeleton.
+    fn every_workloads_verb_is_wired_no_skeleton_remains() {
+        // All eight Workloads verbs are wired: set-desired/plan (U4), image-build (U6),
+        // container-deploy (U7), inventory/output (U10), console-attach (U8),
+        // android-provision (U9). None may still surface the U2 "not yet wired"
+        // skeleton — a verb may honestly gate (armed-token / tool-absent), but the
+        // skeleton message is a regression. Each verb's real behavior is covered by
+        // its own module tests.
         let w = staged_worker(Arc::new(FakeRunner::default()));
-        // `set-desired` + `plan` are wired by U4 (see the verbs::desired tests); the
-        // remainder stay honest not-yet-wired skeletons for U6–U10 to fill.
         for verb in [
+            "set-desired",
+            "plan",
+            "image-build",
+            "container-deploy",
             "inventory",
             "output",
             "console-attach",
             "android-provision",
         ] {
             let reply = w.handle(verb, r#"{"node":"me"}"#);
-            assert!(!reply.ok, "{verb} must not fake success");
             let gated = reply.gated.unwrap_or_default();
-            assert!(gated.contains("not yet wired"), "{verb} gated msg: {gated}");
+            let err = reply.error.unwrap_or_default();
+            assert!(
+                !gated.contains("not yet wired") && !err.contains("not yet wired"),
+                "{verb} still returns the not-yet-wired skeleton: gated={gated} err={err}"
+            );
         }
     }
 
