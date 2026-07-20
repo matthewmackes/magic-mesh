@@ -112,6 +112,63 @@ fn heading(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// A selectable **choice tile** — the shared [`mde_egui::card`] surface (base
+/// fill, hairline border, the mid radius, and the Raised soft shadow for depth)
+/// carrying a strong `title` over a dim `blurb`, with a pointer affordance and the
+/// shared hover / 2 px accent focus ring. An `enabled == false` tile is a quiet,
+/// non-interactive card in the [`Style::DISABLED`] tone — the honest "unavailable"
+/// state, never a live-looking button that does nothing. Returns `true` the frame
+/// it is activated (click or keyboard). One place for the role / intent tiles so
+/// their look and interaction never fork.
+fn choice_card(ui: &mut egui::Ui, title: &str, blurb: &str, enabled: bool) -> bool {
+    let (title_color, blurb_color) = if enabled {
+        (Style::TEXT_STRONG, Style::TEXT_DIM)
+    } else {
+        (Style::DISABLED, Style::DISABLED)
+    };
+    let inner = mde_egui::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            egui::RichText::new(title)
+                .size(Style::TITLE)
+                .color(title_color),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            egui::RichText::new(blurb)
+                .size(Style::BODY)
+                .color(blurb_color),
+        );
+    });
+    if !enabled {
+        return false;
+    }
+    let response = inner
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // The shared visible-focus / hover treatment: the 2 px accent focus ring
+    // (`Style::focus_stroke`, FOCUS_RING_W) when keyboard-focused, a quieter accent
+    // hairline on hover. Depth already comes from the card's Raised shadow, so a
+    // resting tile needs no ring at all.
+    let ring = if response.has_focus() {
+        Some(Style::focus_stroke())
+    } else if response.hovered() {
+        Some(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT))
+    } else {
+        None
+    };
+    if let Some(stroke) = ring {
+        ui.painter().rect_stroke(
+            response.rect,
+            mde_egui::corner(Style::RADIUS_M),
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.clicked()
+}
+
 /// The chooser surface — a thin egui renderer over the [`Onboard`] state machine.
 struct RoleChooser {
     /// The render-agnostic onboarding state machine.
@@ -161,7 +218,7 @@ impl RoleChooser {
         let label = egui::RichText::new("I understand — continue").color(if ready {
             Style::BG
         } else {
-            Style::TEXT_DIM
+            Style::DISABLED
         });
         let button =
             egui::Button::new(label).fill(if ready { Style::ACCENT } else { Style::SURFACE });
@@ -184,11 +241,7 @@ impl RoleChooser {
 
         for role in Role::all() {
             let (name, blurb) = role_blurb(role);
-            let button = egui::Button::new(
-                egui::RichText::new(format!("{name}\n{blurb}")).color(Style::TEXT),
-            )
-            .fill(Style::SURFACE);
-            if ui.add_sized([ui.available_width(), 0.0], button).clicked() {
+            if choice_card(ui, name, blurb, true) {
                 self.flow.choose_role(role);
             }
             ui.add_space(Style::SP_S);
@@ -205,23 +258,16 @@ impl RoleChooser {
         dim(ui, format!("Role: {}.", role_blurb(role).0));
         ui.add_space(Style::SP_M);
 
-        // Create New Mesh — a Workstation founds the mesh (§5); disabled + explained
-        // on a Lighthouse (the honest "Workstation founds the mesh" lock).
+        // Create New Mesh — a Workstation founds the mesh (§5); a non-Workstation
+        // gets the quiet disabled tile plus the honest "Workstation founds the
+        // mesh" note.
         let can_create = self.flow.can_create();
-        let create = egui::Button::new(
-            egui::RichText::new(
-                "Create New Mesh\nFound a brand-new mesh — this machine mints the \
-                 CA and mesh identity.",
-            )
-            .color(if can_create {
-                Style::TEXT
-            } else {
-                Style::TEXT_DIM
-            }),
-        )
-        .fill(Style::SURFACE)
-        .min_size(egui::vec2(ui.available_width(), 0.0));
-        if ui.add_enabled(can_create, create).clicked() {
+        if choice_card(
+            ui,
+            "Create New Mesh",
+            "Found a brand-new mesh — this machine mints the CA and mesh identity.",
+            can_create,
+        ) {
             match self.flow.choose_intent(Intent::CreateNewMesh) {
                 Ok(()) => self.status.clear(),
                 Err(e) => self.status = e.to_string(),
@@ -240,16 +286,12 @@ impl RoleChooser {
         ui.add_space(Style::SP_S);
 
         // Join Existing Mesh — valid for any role.
-        let join = egui::Button::new(
-            egui::RichText::new(
-                "Join Existing Mesh\nScan a QR code / type a short code from a node \
-                 already in the mesh.",
-            )
-            .color(Style::TEXT),
-        )
-        .fill(Style::SURFACE)
-        .min_size(egui::vec2(ui.available_width(), 0.0));
-        if ui.add(join).clicked() {
+        if choice_card(
+            ui,
+            "Join Existing Mesh",
+            "Scan a QR code / type a short code from a node already in the mesh.",
+            true,
+        ) {
             self.status.clear();
             // Join is valid for every role; the state machine never refuses it.
             let _ = self.flow.choose_intent(Intent::JoinExistingMesh);
@@ -276,16 +318,13 @@ impl RoleChooser {
         );
         ui.add_space(Style::SP_M);
 
-        ui.group(|ui| {
-            ui.colored_label(
-                Style::TEXT,
-                format!("Role:  {}", role_blurb(outcome.role).0),
-            );
+        // The captured hand-off, reviewed in a raised card of shared
+        // labelled-value rows (the `field()` primitive) before the one-way pin.
+        mde_egui::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            mde_egui::field(ui, "Role", role_blurb(outcome.role).0, Style::TEXT);
             ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                Style::TEXT,
-                format!("Next:  {}", intent_label(outcome.intent)),
-            );
+            mde_egui::field(ui, "Next", intent_label(outcome.intent), Style::TEXT);
         });
         ui.add_space(Style::SP_M);
 
@@ -364,7 +403,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{intent_label, onboard_path, role_blurb};
+    use super::{intent_label, onboard_path, role_blurb, RoleChooser};
     use crate::flow::Intent;
     use mde_role::Role;
 
@@ -416,5 +455,49 @@ mod tests {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+    }
+
+    #[test]
+    fn role_screen_renders_through_the_card_primitive() {
+        // Headless render: with the shared Style installed, the role screen lays
+        // out its `choice_card` tiles and paints real shapes without panicking —
+        // proof the adopted surface is live (not dead code) and renders through
+        // the shared `card()` primitive.
+        let ctx = mde_egui::egui::Context::default();
+        mde_egui::Style::install(&ctx);
+        let mut app = RoleChooser::new();
+        app.flow.ack(); // advance past the disclaimer gate to the role tiles
+        let out = ctx.run(mde_egui::egui::RawInput::default(), |ctx| {
+            mde_egui::egui::CentralPanel::default().show(ctx, |ui| {
+                app.view_role(ui);
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "the role screen must paint visible card tiles"
+        );
+    }
+
+    #[test]
+    fn confirm_screen_renders_through_the_card_primitive() {
+        // Headless render: the confirm review renders its captured hand-off
+        // through the shared `card()` + `field()` primitives.
+        let ctx = mde_egui::egui::Context::default();
+        mde_egui::Style::install(&ctx);
+        let mut app = RoleChooser::new();
+        app.flow.ack();
+        app.flow.choose_role(Role::Workstation);
+        app.flow
+            .choose_intent(Intent::CreateNewMesh)
+            .expect("a workstation may create");
+        let out = ctx.run(mde_egui::egui::RawInput::default(), |ctx| {
+            mde_egui::egui::CentralPanel::default().show(ctx, |ui| {
+                app.view_confirm(ui);
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "the confirm review must paint its raised card"
+        );
     }
 }
