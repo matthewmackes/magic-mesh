@@ -124,21 +124,14 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-/// The Chat card shadow — the surface-side conversion of the shared
-/// [`Elevation::Raised`](mde_egui::style::Elevation::Raised) depth token into an
-/// [`egui::Shadow`] (the token module stays free of egui's shadow type). Reads the
-/// token's offset/blur/spread/umbra, casting the logical-px floats onto epaint's
-/// small integer fields; mints **no** colour of its own (the umbra comes straight
-/// from the token), so a message / notification card reads as genuinely lifted off
-/// the timeline while the look still comes only from `mde_egui` (§4).
+/// The Chat card shadow — now a thin delegate to the shared foundation converter
+/// [`Elevation::Raised::egui_shadow`](mde_egui::style::Elevation::egui_shadow), the
+/// single `Elevation → egui::Shadow` mapping (the per-surface hand-cast body this
+/// used to copy is retired). Kept as a `pub(super)` seam because the sibling chat
+/// panes (`chat::mod`) and the depth-token test consume it by name; the look still
+/// comes only from `mde_egui` (§4).
 pub(super) fn card_shadow() -> egui::Shadow {
-    let token = mde_egui::style::Elevation::Raised.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
+    mde_egui::style::Elevation::Raised.egui_shadow()
 }
 
 pub(super) fn chat_tooltip(ui: &mut egui::Ui, text: &str) {

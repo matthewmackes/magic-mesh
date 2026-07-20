@@ -250,7 +250,7 @@ impl Splash {
             painter.rect_stroke(
                 track,
                 Style::RADIUS,
-                egui::Stroke::new(1.0, Style::BORDER),
+                Style::hairline(),
                 egui::StrokeKind::Inside,
             );
 

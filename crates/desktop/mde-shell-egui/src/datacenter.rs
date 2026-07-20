@@ -832,15 +832,13 @@ impl DatacenterState {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for node in nodes.iter() {
-                    // Each mesh node is a genuinely raised Fleet card: the same
-                    // `Frame::group` `ui.group` builds (identical
-                    // fill/stroke/radius/margin — no layout change), lifted off
-                    // the page by the shared `Elevation::Raised` soft shadow.
-                    egui::Frame::group(ui.style())
-                        .shadow(card_shadow())
-                        .show(ui, |ui| {
-                            show_node(ui, node, create_for, form, &mut pending, stop_arm, stopping);
-                        });
+                    // Each mesh node is a genuinely raised Fleet card via the shared
+                    // `mde_egui::card()` primitive — the single source of the surface
+                    // fill, hairline, radius, padding, and the `Elevation::Raised`
+                    // soft shadow (§4).
+                    mde_egui::card().show(ui, |ui| {
+                        show_node(ui, node, create_for, form, &mut pending, stop_arm, stopping);
+                    });
                     ui.add_space(Style::SP_S);
                 }
                 if !nodes.is_empty() {
@@ -864,13 +862,10 @@ impl DatacenterState {
                     );
                     ui.add_space(Style::SP_XS);
                     for row in browser.iter() {
-                        // Same raised Fleet card as the node rows above — the
-                        // shared `Elevation::Raised` shadow, no layout change.
-                        egui::Frame::group(ui.style())
-                            .shadow(card_shadow())
-                            .show(ui, |ui| {
-                                show_browser_row(ui, row);
-                            });
+                        // Same shared `mde_egui::card()` primitive as the node rows above.
+                        mde_egui::card().show(ui, |ui| {
+                            show_browser_row(ui, row);
+                        });
                         ui.add_space(Style::SP_S);
                     }
                 }
@@ -901,23 +896,6 @@ fn read_bodies_by_prefix(persist: &Persist, topics: &[String], prefix: &str) -> 
         .filter(|t| t.starts_with(prefix))
         .flat_map(|t| read_bodies(persist, t))
         .collect()
-}
-
-/// Convert the shared [`Elevation::Raised`](mde_egui::style::Elevation::Raised)
-/// depth token into an [`egui::Shadow`] (the token module stays free of egui's
-/// shadow type). Reads the token's offset/blur/spread/umbra, casting the
-/// logical-px floats onto epaint's small integer fields; mints **no** colour of
-/// its own (the umbra comes straight from the token), so the Fleet node/browser
-/// cards read as genuinely lifted off the page while the look still comes only
-/// from `mde_egui` (§4).
-fn card_shadow() -> egui::Shadow {
-    let token = mde_egui::style::Elevation::Raised.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
-    }
 }
 
 fn datacenter_tooltip(ui: &mut egui::Ui, text: &str) {
@@ -1564,32 +1542,6 @@ fn form_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Phase-C depth adoption — each Fleet node/browser card carries the shared
-    /// [`Elevation::Raised`](mde_egui::style::Elevation) soft shadow verbatim from
-    /// the token (no hand-rolled colour, design lock #2 / §4). The surface-side
-    /// [`card_shadow`] conversion must reproduce the token's offset/blur/spread
-    /// and its exact translucent umbra, and cast a real (non-zero) shadow so the
-    /// node reads as genuinely lifted off the page.
-    #[test]
-    fn fleet_card_wears_the_raised_elevation_token() {
-        let token = mde_egui::style::Elevation::Raised.shadow();
-        let shadow = card_shadow();
-        assert_eq!(
-            shadow.color, token.umbra,
-            "the Fleet card's umbra comes straight from the token — no minted colour"
-        );
-        assert_eq!(
-            shadow.offset,
-            [token.offset[0] as i8, token.offset[1] as i8]
-        );
-        assert_eq!(shadow.blur, token.blur as u8);
-        assert_eq!(shadow.spread, token.spread as u8);
-        assert!(
-            shadow.color.a() > 0 && shadow.color.a() < 255 && shadow.blur > 0,
-            "Raised casts a real, soft, translucent shadow — the card is lifted off the page"
-        );
-    }
 
     fn health_body(host: &str, all_healthy: bool, at: u64) -> String {
         // A minimal but faithful `event/kvm/services` body.

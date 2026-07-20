@@ -259,7 +259,6 @@ fn power_combo_menu_style(ui: &egui::Ui) -> egui::Style {
     style.visuals.extreme_bg_color = palette.bg;
     style.visuals.override_text_color = Some(palette.text);
     style.visuals.window_stroke = border;
-    style.visuals.menu_corner_radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
 
     style.visuals.widgets.noninteractive.bg_fill = palette.surface;
     style.visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
@@ -643,9 +642,15 @@ mod tests {
             assert_eq!(style.visuals.window_stroke.color, palette.border);
             assert_eq!(style.visuals.widgets.inactive.weak_bg_fill, palette.surface);
             assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, palette.text);
-            assert_eq!(style.visuals.widgets.hovered.weak_bg_fill, palette.surface_hi);
+            assert_eq!(
+                style.visuals.widgets.hovered.weak_bg_fill,
+                palette.surface_hi
+            );
             assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, palette.text);
-            assert_eq!(style.visuals.widgets.open.fg_stroke.color, palette.text_strong);
+            assert_eq!(
+                style.visuals.widgets.open.fg_stroke.color,
+                palette.text_strong
+            );
             assert_eq!(
                 style.visuals.widgets.open.weak_bg_fill,
                 Style::pressed_fill_for_scheme(
