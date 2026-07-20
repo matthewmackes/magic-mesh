@@ -1,0 +1,42 @@
+# MCNF E12 "Construct" — `mde-collab-egui`: the Communications surface (WL-FUNC-011
+# Phase 3). A PURE UI crate on the shared `mde-egui` harness that renders the
+# read-side `CollabReadModel` projections and emits typed `CollabCommand`s — it
+# owns NO authoritative state and calls NO providers. This phase ships the frame
+# (a persistent spaces rail + per-space mode tabs + a persistent call bar) and the
+# two fully-implemented core modes, Activity and Messages; the remaining modes are
+# honestly labeled "coming in Phase 3b", never faked.
+#
+# Tier (§6): desktop-shell. The dependency edges point inward — `mde-egui` (the
+# shared Style/Carbon-icon/Motion harness) and `mde-collab-types` (the stable
+# WL-FUNC-011 public contracts). The surface reads a `CollabData` trait it is
+# handed and pushes commands into a `CommandSink`; the real Bus wiring
+# (`BusReader` → projections, `CommandSink` → `action/collab/*`) is a later
+# shell-mount phase, so this crate stands alone with a fixture data source.
+[package]
+name        = "mde-collab-egui"
+description = "MCNF E12 Construct — the egui Communications surface (WL-FUNC-011 Phase 3): a CommunicationsSurface widget on the mde-egui harness that renders the CollabReadModel projections (SpaceDirectory rail, ActivityFeed, ConversationTimeline/ThreadTimeline, CallState) through the shared Construct Style with Mackes-Carbon icons and emits typed CollabCommands into a caller-drained sink. Frame (spaces rail + mode tabs + persistent call bar) plus the Activity and Messages core modes; other modes are labeled-for-later. Reads a CollabData source (a fixture here; the Bus wiring is a later phase), owns no authoritative state, calls no providers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_collab_egui"
+path = "src/lib.rs"
+
+[dependencies]
+# The §4/§5 egui harness — the shared `Style` (Construct look), the Mackes-Carbon
+# icon loader (`carbon_icon`/`paint_carbon`, the canonical platform icon set), and
+# the re-exported `egui` so this surface resolves to the one harness-pinned egui
+# version (no cross-surface skew).
+mde-egui = { path = "../../shared/mde-egui" }
+
+# The stable WL-FUNC-011 public contracts: the `CollabReadModel` projections this
+# surface renders and the `CollabCommand`s it emits. A pure leaf types crate; the
+# dependency edge points inward (§6).
+mde-collab-types = { path = "../../shared/mde-collab-types" }
+
+[lints]
+workspace = true

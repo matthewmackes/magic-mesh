@@ -4429,6 +4429,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-collab-egui"
+version = "12.0.0"
+dependencies = [
+ "mde-collab-types",
+ "mde-egui",
+]
+
+[[package]]
 name = "mde-collab-types"
 version = "12.0.0"
 dependencies = [
