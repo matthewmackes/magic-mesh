@@ -1,0 +1,12 @@
+---
+# WL-ARCH-001 Phase B — cloud_vm role defaults.
+
+# Run the SETUP-7 /etc/mackesd/site.yml convergence after configuring.
+cloud_vm_converge: true
+
+# The mackesd site convergence playbook the VM re-applies (SETUP-7 default).
+cloud_vm_site_yml: /etc/mackesd/site.yml
+
+# The role/scope tags this VM publishes at mesh init (SEC-003). `cloud` puts it in
+# the `cloud_vm` dynamic-inventory group so this role targets it.
+cloud_vm_node_scopes: cloud

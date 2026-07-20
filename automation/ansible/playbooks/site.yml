@@ -1,0 +1,12 @@
+---
+# WL-ARCH-001 Phase B — the cloud configure entrypoint (the OpenStack-config
+# replacement). The mackesd cloud worker runs this (`ansible-playbook -i
+# inventory/mesh.py playbooks/site.yml`) after an OpenTofu apply provisions the
+# VMs. It targets the `cloud_vm` group the mesh-derived dynamic inventory builds
+# from the live roster (nodes tagged scope:cloud).
+- name: Configure cloud-provisioned mesh VMs
+  hosts: cloud_vm
+  gather_facts: true
+  become: true
+  roles:
+    - role: cloud_vm

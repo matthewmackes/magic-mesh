@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    { "id": "lh1", "role": "lighthouse", "scopes": [], "alive": true, "ip": "10.42.0.1" },
+    { "id": "eagle", "role": "workstation", "scopes": ["media"], "alive": true, "ip": "10.42.0.13" },
+    { "id": "worker-a", "role": "workstation", "scopes": ["cloud"], "alive": true, "ip": "10.44.0.10" },
+    { "id": "worker-b", "role": "workstation", "scopes": ["cloud"], "alive": false, "ip": "10.44.0.11" }
+  ]
+}

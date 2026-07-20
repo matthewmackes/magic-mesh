@@ -1417,6 +1417,71 @@ pub fn parse_resource_table_json(
 pub fn default_resource_collection(service_type: &str) -> Option<&'static str> {
     default_collection(service_type)
 }
+
+// ─────────────────── the per-node cloud backend status mirror ───────────────────
+//
+// WL-ARCH-001 Phase B — the provider-neutral `state/cloud/<node>` mirror the
+// mackesd cloud worker (OpenTofu provision + Ansible configure over local
+// libvirt/KVM) publishes and the recreated IaC surface (Phase C) consumes.
+// Composed ENTIRELY of the neutral shapes above — [`CloudProviderAdapter`] (which
+// backend), [`ServiceHealth`] (per-tool backend health), [`ResourceTable`] (the
+// resource roster) — so the surface renders provider health + a resource table
+// without ever depending on `mackesd` (the §6 layered-tiers boundary).
+
+/// The Bus topic prefix every per-node cloud status mirror rides: `state/cloud/`.
+pub const CLOUD_STATE_PREFIX: &str = "state/cloud/";
+
+/// The per-node cloud status mirror topic: `state/cloud/<node>`.
+#[must_use]
+pub fn cloud_state_topic(node: &str) -> String {
+    format!("{CLOUD_STATE_PREFIX}{node}")
+}
+
+/// The per-node cloud backend status the mackesd cloud worker publishes on
+/// [`cloud_state_topic`].
+///
+/// Honest by construction (§7): `health` reports whether each toolchain leg
+/// (OpenTofu / Ansible / libvirt) is actually present + reachable — an absent
+/// tool reads [`HealthState::Absent`], never a fabricated `up`; `resources`
+/// carries the live roster the READ verbs discovered (an empty table is a real
+/// "no instances", never invented). `apply_armed` mirrors whether the operator
+/// gate (`MDE_CLOUD_APPLY=1`) is set, so the surface shows plan-only vs. live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudState {
+    /// This node's id (the mirror `host` stamp + the topic namespace).
+    pub host: String,
+    /// Which backend adapter produced this mirror (Phase B = the
+    /// [`CloudProviderAdapter::ConstructCloud`] OpenTofu+Ansible backend over
+    /// local libvirt).
+    pub adapter: CloudProviderAdapter,
+    /// Per-tool backend health (OpenTofu / Ansible / libvirt), honestly probed.
+    pub health: Vec<ServiceHealth>,
+    /// The resource tables the READ verbs discovered (the instance roster, …).
+    pub resources: Vec<ResourceTable>,
+    /// Whether the live-mutation gate (`MDE_CLOUD_APPLY=1`) is armed on this node.
+    /// `false` ⇒ every provision/configure/destroy verb is staged (plan/`--check`).
+    pub apply_armed: bool,
+    /// Wall-clock publish time (ms since the Unix epoch).
+    pub published_at_ms: i64,
+}
+
+impl CloudState {
+    /// The health row for a named backend tool (`opentofu` / `ansible` /
+    /// `libvirt`), if this mirror carries one.
+    #[must_use]
+    pub fn tool_health(&self, service_type: &str) -> Option<&ServiceHealth> {
+        self.health.iter().find(|h| h.service_type == service_type)
+    }
+
+    /// Whether every backend tool this mirror reports is healthy (`Up`) — the
+    /// honest "the backend is ready to provision" read. `false` when any tool is
+    /// Down/Absent, or when no tool is reported at all.
+    #[must_use]
+    pub fn backend_ready(&self) -> bool {
+        !self.health.is_empty() && self.health.iter().all(|h| h.state == HealthState::Up)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2048,5 +2113,67 @@ mod facade_tests {
             Some("servers/detail")
         );
         assert_eq!(default_resource_collection("identity"), None);
+    }
+
+    #[test]
+    fn cloud_state_topic_is_the_per_node_mirror_namespace() {
+        assert_eq!(cloud_state_topic("eagle"), "state/cloud/eagle");
+        assert!(cloud_state_topic("x").starts_with(CLOUD_STATE_PREFIX));
+    }
+
+    #[test]
+    fn cloud_state_round_trips_json_and_reads_backend_readiness_honestly() {
+        // A mirror composed entirely of the neutral facade shapes: two healthy
+        // tools + an absent one, plus a one-instance resource table.
+        let up = |svc: &str| ServiceHealth {
+            service_type: svc.to_string(),
+            interface: EndpointInterface::Internal,
+            url: "(local)".to_string(),
+            state: HealthState::Up,
+            latency_ms: Some(1),
+            microversion: None,
+            version_id: None,
+            detail: Some("present".to_string()),
+        };
+        let table = parse_resource_table_json(
+            "compute",
+            "instances",
+            r#"{"service_type":"compute","collection":"instances","columns":["name","status"],
+                "rows":[{"id":"vm-1","cells":["mesh-worker","running"]}]}"#,
+        )
+        .expect("table");
+        let state = CloudState {
+            host: "eagle".to_string(),
+            adapter: CloudProviderAdapter::ConstructCloud,
+            health: vec![up("opentofu"), up("ansible")],
+            resources: vec![table],
+            apply_armed: false,
+            published_at_ms: 42,
+        };
+        assert!(state.backend_ready(), "both tools Up ⇒ ready");
+        assert_eq!(
+            state.tool_health("opentofu").map(|h| h.state),
+            Some(HealthState::Up)
+        );
+        assert!(state.tool_health("libvirt").is_none());
+
+        let s = serde_json::to_string(&state).unwrap();
+        let back: CloudState = serde_json::from_str(&s).unwrap();
+        assert_eq!(state, back);
+        assert!(s.contains(r#""adapter":"construct_cloud""#));
+
+        // An Absent tool drops readiness (never a fabricated up).
+        let mut degraded = state.clone();
+        degraded.health.push(ServiceHealth {
+            service_type: "libvirt".to_string(),
+            interface: EndpointInterface::Internal,
+            url: String::new(),
+            state: HealthState::Absent,
+            latency_ms: None,
+            microversion: None,
+            version_id: None,
+            detail: Some("libvirtd not reachable".to_string()),
+        });
+        assert!(!degraded.backend_ready(), "an Absent tool ⇒ not ready");
     }
 }

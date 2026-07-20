@@ -1,0 +1,35 @@
+---
+# WL-ARCH-001 Phase B — configure a cloud-provisioned VM by driving the EXISTING
+# mackesd-written /etc/mackesd/site.yml convergence (SETUP-7). The OpenTofu cloud
+# root already provisioned the VM + its cloud-init did the SEC-001 mesh join; this
+# role converges the box to its cloud role (the OpenStack-config replacement).
+
+- name: Ensure the mackesd config dir exists
+  ansible.builtin.file:
+    path: /etc/mackesd
+    state: directory
+    mode: "0755"
+
+- name: Assert mackesd is installed on the provisioned VM
+  ansible.builtin.command: mackesd --version
+  register: cloud_vm_mackesd_version
+  changed_when: false
+  failed_when: cloud_vm_mackesd_version.rc != 0
+
+- name: Publish this VM's cloud role/scope tags (SEC-003; scope:cloud groups it under cloud_vm)
+  ansible.builtin.copy:
+    dest: /etc/mackesd/cloud.d/scopes
+    content: "{{ cloud_vm_node_scopes }}\n"
+    mode: "0644"
+  notify: converge mackesd site
+
+- name: Ensure mackesd is enabled and running
+  ansible.builtin.systemd:
+    name: mackesd
+    enabled: true
+    state: started
+
+# On first run (or a tag change) the notified handler runs the SETUP-7
+# convergence; flush now so the VM is fully configured before the play ends.
+- name: Apply pending convergence
+  ansible.builtin.meta: flush_handlers

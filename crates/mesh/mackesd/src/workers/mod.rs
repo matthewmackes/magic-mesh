@@ -396,6 +396,13 @@ pub mod apps_installed;
 // per Q96 + rpc.rs convention (design doc §3's per-ULID notation
 // reinterpreted accordingly).
 pub mod cert_authority;
+// WL-ARCH-001 Phase B — the OpenTofu + Ansible cloud backend worker (the
+// successor to the deleted `openstack` worker tree). Drains `action/cloud/*`
+// verbs (leader-gated), shells OpenTofu (`infra/tofu/cloud`) + Ansible + virsh
+// with live mutation operator-gated behind `MDE_CLOUD_APPLY=1`, and publishes
+// `state/cloud/<node>` (provider health + resource roster via the neutral
+// `mackes_mesh_types::cloud` types). Rank-0 universal like service_aggregator.
+pub mod cloud;
 // VIRT-7 (v5.0.0) — per-network firewalld port forwarding. Each
 // peer subscribes to `compute/{expose,unexpose}/<own-peer-addr>`
 // and writes firewalld rich rules per selected network

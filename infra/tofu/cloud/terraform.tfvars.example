@@ -1,0 +1,36 @@
+# cp to terraform.tfvars (gitignored) and edit for your deployment. This is the
+# declarative cloud desired-state: OpenTofu converges the local hypervisor to
+# EXACTLY the VM set below (add/remove a key to create/destroy a VM), then Ansible
+# (automation/ansible/) configures each over the mesh-derived dynamic inventory.
+
+# The local hypervisor. A remote dom0/seat: qemu+ssh://root@10.42.0.13/system.
+libvirt_uri = "qemu:///system"
+
+# The base OS image every VM clones (bootc image-mode; extends packaging/bootc/).
+base_image_source = "/var/lib/libvirt/images/mde-base.qcow2"
+
+# The cloud network on the Nebula-adjacent bridge (replaces Neutron).
+network = {
+  name      = "mde-cloud"
+  mode      = "nat"       # nat | bridge | none | route
+  bridge    = "br-mesh"   # host bridge for bridge mode
+  cidr      = "10.44.0.0/24"
+  autostart = true
+}
+
+# The VM set. name => { vcpu, memory_mb, disk_gb }.
+vms = {
+  worker-a = { vcpu = 2, memory_mb = 4096, disk_gb = 20 }
+  worker-b = { vcpu = 4, memory_mb = 8192, disk_gb = 40 }
+}
+
+# Mesh-join parameters baked into each VM's cloud-init (SEC-001). The join TOKEN
+# is NOT here — it is unsealed from the mesh store at apply time (see
+# join_token_secret + secrets.tf).
+mesh_join = {
+  lighthouse_overlay_ip = "10.42.0.1"
+  ssh_authorized_key    = "ssh-ed25519 AAAA... operator@mesh"
+}
+
+# The mesh-secret-store key the Nebula join token is sealed under.
+join_token_secret = "nebula-join-token"

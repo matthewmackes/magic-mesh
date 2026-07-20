@@ -1266,6 +1266,26 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             workgroup_root.clone(),
         )
     });
+    // WL-ARCH-001 Phase B — the cloud worker: the OpenTofu + Ansible cloud backend
+    // (the successor to the deleted openstack worker). Drains `action/cloud/*`
+    // verbs (leader-gated internally so a flat topic executes exactly once), shells
+    // OpenTofu (`infra/tofu/cloud`) + Ansible + virsh with live mutation
+    // operator-gated behind MDE_CLOUD_APPLY=1, and publishes `state/cloud/<node>`
+    // (per-tool backend health + the local libvirt roster via the neutral
+    // mackes_mesh_types::cloud types). Universal (rank 0) like service_aggregator —
+    // every node publishes its own per-node mirror (no center). `host` is node_id
+    // stripped of the `peer:` prefix (the state topic namespace); node_id is the
+    // leader-lease holder + the audit actor.
+    spawn_tiered(sup, worker_names, role_rank, "cloud", || {
+        mackesd_core::workers::cloud::CloudWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+            node_id.clone(),
+            workgroup_root.clone(),
+        )
+    });
     // MV-5a — the scheduler worker: the placement slice of the no-center
     // scheduler. Drains `action/schedule/place`, folds each node's latest
     // `event/kvm/services` capacity, chooses the target node (healthy pin →

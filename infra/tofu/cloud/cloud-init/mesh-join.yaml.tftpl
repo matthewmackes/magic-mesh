@@ -1,0 +1,26 @@
+#cloud-config
+# WL-ARCH-001 Phase B — mesh-join cloud-init (SEC-001 join path). Baked into each
+# VM's cloud-init disk by the vm module. The join token is unsealed from the mesh
+# secret store by the mde-seal bridge (secrets.tf), never a literal here.
+hostname: ${hostname}
+preserve_hostname: false
+
+%{ if ssh_authorized_key != "" ~}
+ssh_authorized_keys:
+  - ${ssh_authorized_key}
+%{ endif ~}
+
+write_files:
+  - path: /etc/mackesd/join-token
+    permissions: "0600"
+    owner: root:root
+    content: ${join_token}
+  - path: /etc/mackesd/lighthouse
+    permissions: "0644"
+    owner: root:root
+    content: ${lighthouse_overlay_ip}
+
+runcmd:
+  # SEC-001 join: mackesd reads /etc/mackesd/join-token + the lighthouse address
+  # and enrolls into the Nebula overlay on first boot, then converges site.yml.
+  - [systemctl, enable, --now, mackesd]

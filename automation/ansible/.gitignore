@@ -1,0 +1,5 @@
+# Python bytecode from the inventory plugin / lookup plugin (py_compile in tests).
+__pycache__/
+*.pyc
+# Ansible run artifacts.
+*.retry

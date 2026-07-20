@@ -1,0 +1,14 @@
+---
+# WL-ARCH-001 Phase B — the SETUP-7 site.yml convergence, run when this VM's
+# cloud config changes. `mackesd converge --site …` re-applies
+# /etc/mackesd/site.yml locally (ansible-playbook -c local). A very fresh join
+# may not have generated site.yml yet — tolerate that honestly rather than fail
+# the whole play.
+- name: converge mackesd site
+  ansible.builtin.command: "mackesd converge --site {{ cloud_vm_site_yml }}"
+  register: cloud_vm_converge_out
+  changed_when: "'converge complete' in cloud_vm_converge_out.stdout"
+  failed_when:
+    - cloud_vm_converge_out.rc != 0
+    - "'no convergence playbook' not in cloud_vm_converge_out.stderr"
+  when: cloud_vm_converge | bool

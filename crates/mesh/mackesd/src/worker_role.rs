@@ -204,6 +204,15 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // participates in the Communications suite. A deliberate rank-0 census entry
     // (the BUG-STORAGE-1 lesson), spawned via spawn_tiered like chat.
     WorkerSpec::tier("collab", 0, RestartPolicy::OnFailure),
+    // WL-ARCH-001 Phase B — the `cloud` worker: the OpenTofu + Ansible cloud
+    // backend that succeeds the deleted OpenStack worker tree. UNIVERSAL (rank 0)
+    // like service_aggregator/storage — every node publishes its OWN
+    // `state/cloud/<node>` mirror (per-tool backend health + the local libvirt
+    // roster, no center); the flat `action/cloud/*` verb drain is leader-gated
+    // internally so a mutation executes exactly once, and live mutation is
+    // operator-gated (MDE_CLOUD_APPLY=1). A deliberate rank-0 census entry (the
+    // BUG-STORAGE-1 lesson), spawned via spawn_tiered.
+    WorkerSpec::tier("cloud", 0, RestartPolicy::OnFailure),
     // ── ARCH-5 (drift guard) — universal (rank-0) workers that were spawned in
     //    `run_serve` gated on `worker_role::runs(...)` but OMITTED from this census,
     //    so they silently rode the "unknown worker ⇒ rank 0" default: they DID run
@@ -1062,7 +1071,9 @@ mod tests {
         // +1 federation_enforcer (WL-SEC-002 — the universal rank-0 cross-mesh
         // WL-SEC-002 +1 federation_enforcer; WL-FUNC-011 Phase 2 +1 collab
         // (chat's Phase-4 successor); WL-ARCH-001 -1 openstack (removed) => len 75.
-        assert_eq!(WORKER_REGISTRY.len(), 75);
+        // WL-ARCH-001 Phase B +1 cloud (the OpenTofu+Ansible backend, the universal
+        // rank-0 successor to the removed openstack worker) => len 76.
+        assert_eq!(WORKER_REGISTRY.len(), 76);
     }
 
     #[test]
@@ -1090,8 +1101,8 @@ mod tests {
         };
         assert_eq!(
             count(0),
-            47,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + collab (WL-FUNC-011 Phase 2, universal Communications-suite worker driving mde-collab-core, chat's Phase-4 successor) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
+            48,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + collab (WL-FUNC-011 Phase 2, universal Communications-suite worker driving mde-collab-core, chat's Phase-4 successor) + cloud (WL-ARCH-001 Phase B, universal per-node OpenTofu+Ansible cloud backend — publishes state/cloud/<node>, leader-gated action drain, the successor to the removed openstack worker) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
         );
         assert_eq!(
             count(1),
@@ -1334,8 +1345,10 @@ mod tests {
         // peer_app_launch (WL-UX-005, previously uncounted) → ws = 45 + 28 = 73.
         // WL-SEC-002 +1 federation_enforcer; WL-FUNC-011 Phase 2 +1 collab;
         // WL-ARCH-001 -1 openstack (removed) => lh 47, ws = 47 + 28 = 75.
-        assert_eq!(lh.len(), 47);
-        assert_eq!(ws.len(), 75);
+        // WL-ARCH-001 Phase B +1 rank-0 cloud (the OpenTofu+Ansible backend) → lh 48,
+        // ws = 48 + 28 = 76.
+        assert_eq!(lh.len(), 48);
+        assert_eq!(ws.len(), 76);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -1405,15 +1418,15 @@ mod tests {
         // WL-RUN-006 universal router_action executor + the WL-SEC-002 universal
         // federation_enforcer + the ARCH-5 14 universal
         // rank-0 workers + WL-FUNC-008 service_aggregator + WL-FUNC-011 Phase 2
-        // collab, minus the removed openstack) + navidrome.
-        assert_eq!(set.len(), 48);
+        // collab + WL-ARCH-001 Phase B cloud, minus the removed openstack) + navidrome.
+        assert_eq!(set.len(), 49);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 47);
+        assert_eq!(workers_for_class(plain_lh).len(), 48);
     }
 
     #[test]
