@@ -89,64 +89,77 @@ fn dialer_tab(ui: &mut egui::Ui, app: &mut VoiceApp) {
 
 /// A ringing inbound call: the caller, plus Answer / Decline.
 fn incoming_card(ui: &mut egui::Ui, state: &VoiceState, cmds: &mut Vec<Command>) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(Style::SP_L);
-        // The breathing ringing emblem — a live pulse on the shared Motion cadence
-        // so a ringing call reads as urgent, not a frozen card (§4 micro-interaction).
-        ringing_emblem(ui);
-        ui.add_space(Style::SP_S);
-        ui.label(
-            RichText::new("Incoming call")
-                .size(Style::HEADING)
-                .color(Style::TEXT),
-        );
-        ui.add_space(Style::SP_XS);
-        if let CallState::Incoming { from } = &state.call {
-            // The caller identity is data — mono, one rung up, so it reads as the
-            // card's key fact rather than a caption (mono-first, lock #3).
-            ui.label(
-                RichText::new(from)
-                    .monospace()
-                    .size(Style::TITLE)
-                    .color(Style::ACCENT),
-            );
-        }
-        ui.add_space(Style::SP_L);
-        ui.horizontal(|ui| {
-            let answer = egui::Button::new(RichText::new("Answer").color(Style::BG).strong())
-                .fill(Style::OK)
-                .min_size(CALL_ACTION_MIN);
-            if ui.add(answer).clicked() {
-                cmds.push(Command::Answer);
-            }
+    // The ringing call rides the shared `card()` primitive — the base surface fill,
+    // a hairline border, the mid radius, and a Raised soft shadow — so it reads as a
+    // lifted, urgent surface over the panel, lifting the same one way as the fleet
+    // board's node cards (UI-VIS surface hierarchy, depth via the primitive).
+    mde_egui::card().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            // The card supplies its own comfortable padding; a single SP_S over it
+            // holds the original rhythm (the card's SP_M margin + SP_S == the old SP_L).
             ui.add_space(Style::SP_S);
-            let decline = egui::Button::new("Decline").min_size(CALL_ACTION_MIN);
-            if ui.add(decline).clicked() {
-                cmds.push(Command::Decline);
+            // The breathing ringing emblem — a live pulse on the shared Motion cadence
+            // so a ringing call reads as urgent, not a frozen card (§4 micro-interaction).
+            ringing_emblem(ui);
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new("Incoming call")
+                    .size(Style::HEADING)
+                    .color(Style::TEXT),
+            );
+            ui.add_space(Style::SP_XS);
+            if let CallState::Incoming { from } = &state.call {
+                // The caller identity is data — mono, one rung up, so it reads as the
+                // card's key fact rather than a caption (mono-first, lock #3).
+                ui.label(
+                    RichText::new(from)
+                        .monospace()
+                        .size(Style::TITLE)
+                        .color(Style::ACCENT),
+                );
             }
+            ui.add_space(Style::SP_L);
+            ui.horizontal(|ui| {
+                let answer = egui::Button::new(RichText::new("Answer").color(Style::BG).strong())
+                    .fill(Style::OK)
+                    .min_size(CALL_ACTION_MIN);
+                if ui.add(answer).clicked() {
+                    cmds.push(Command::Answer);
+                }
+                ui.add_space(Style::SP_S);
+                let decline = egui::Button::new("Decline").min_size(CALL_ACTION_MIN);
+                if ui.add(decline).clicked() {
+                    cmds.push(Command::Decline);
+                }
+            });
         });
     });
 }
 
 /// An active (dialing / connected) call: its shipped status label + Hang up.
 fn active_card(ui: &mut egui::Ui, state: &VoiceState, cmds: &mut Vec<Command>) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(Style::SP_L);
-        // The live call state is a status metric — mono, so it reads as a readout
-        // rather than prose (mono-first, lock #3).
-        ui.label(
-            RichText::new(state.call.label())
-                .monospace()
-                .size(Style::HEADING)
-                .color(tone_color(call_tone(&state.call))),
-        );
-        ui.add_space(Style::SP_M);
-        let hang = egui::Button::new(RichText::new("Hang up").color(Style::BG).strong())
-            .fill(Style::DANGER)
-            .min_size(CALL_ACTION_MIN);
-        if ui.add(hang).clicked() {
-            cmds.push(Command::HangUp);
-        }
+    // The active call rides the same shared `card()` as the incoming face, so a live
+    // call reads as a lifted surface consistent with the rest of the shell.
+    mde_egui::card().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            // The card margin + SP_S holds the original SP_L top rhythm.
+            ui.add_space(Style::SP_S);
+            // The live call state is a status metric — mono, so it reads as a readout
+            // rather than prose (mono-first, lock #3).
+            ui.label(
+                RichText::new(state.call.label())
+                    .monospace()
+                    .size(Style::HEADING)
+                    .color(tone_color(call_tone(&state.call))),
+            );
+            ui.add_space(Style::SP_M);
+            let hang = egui::Button::new(RichText::new("Hang up").color(Style::BG).strong())
+                .fill(Style::DANGER)
+                .min_size(CALL_ACTION_MIN);
+            if ui.add(hang).clicked() {
+                cmds.push(Command::HangUp);
+            }
+        });
     });
 }
 
@@ -240,11 +253,15 @@ fn ringing_emblem(ui: &mut egui::Ui) {
     let center = rect.center();
 
     // The ripple grows from the core outward and fades as it goes, so it reads as a
-    // wave leaving the dot — a 1 px stroke (geometry discipline), alpha on the
-    // inverse breath (bright at the core, gone at the edge).
+    // wave leaving the dot — a hairline stroke ([`Style::STROKE_HAIRLINE`], geometry
+    // discipline), alpha on the inverse breath (bright at the core, gone at the edge).
     let ripple_r = RING_CORE_R + RING_RIPPLE_TRAVEL * breath;
     let ripple = Style::ACCENT.gamma_multiply(1.0 - breath);
-    painter.circle_stroke(center, ripple_r, egui::Stroke::new(1.0, ripple));
+    painter.circle_stroke(
+        center,
+        ripple_r,
+        egui::Stroke::new(Style::STROKE_HAIRLINE, ripple),
+    );
     // The steady accent core.
     painter.circle_filled(center, RING_CORE_R, Style::ACCENT);
 
