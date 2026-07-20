@@ -25,6 +25,7 @@ mod bus_reader;
 mod chat;
 mod chooser;
 mod chrome;
+mod communications;
 mod console;
 mod controller;
 mod curtain;
@@ -614,6 +615,7 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         Surface::Workbench
         | Surface::InfraCode
         | Surface::Chat
+        | Surface::Communications
         | Surface::System
         | Surface::Storage
         | Surface::About => false,
@@ -783,6 +785,15 @@ struct Shell {
     /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
     /// read-model. A pure renderer; sends via `action/chat/send`.
     chat: chat::ChatState,
+    /// The Communications surface (WL-FUNC-011) — the unified collaboration hub
+    /// (`mde-collab-egui`'s `CommunicationsSurface`) mounted live: a Bus-backed
+    /// `CollabData` folded off the collab worker's `state/collab/*` mirrors
+    /// (directory · per-space Activity · per-space conversation · aggregated
+    /// call-state) and a `CommandSink` drained onto `action/collab/*`. A pure
+    /// renderer over the worker's read-model — it never depends on the mackesd
+    /// crate (the Bus JSON is the seam); Activity + Messages are live, the
+    /// labeled-for-later modes stay labeled. Polled while in view.
+    communications: communications::CommunicationsState,
     /// The Phones hub surface (KDC-MESH-9) — the desktop-side management surface for
     /// the mesh's paired phone(s). A thin client of the `kdc_host` worker: it renders
     /// the live device roster (`action/connect/devices`) + the mesh service directory
@@ -969,6 +980,7 @@ impl Shell {
             session_rail: session_rail::SessionRailState::new(),
             infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
+            communications: communications::CommunicationsState::default(),
             phones_hub: phones_hub::PhonesHubState::default(),
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
@@ -1427,6 +1439,17 @@ impl Shell {
                 let phones = &mut self.phones_hub;
                 ui.push_id("shell-phones", |ui| phones.show(ui));
             }
+            Surface::Communications => {
+                // The unified Communications hub (WL-FUNC-011) — the
+                // `mde-collab-egui` surface over a Bus-backed `CollabData` folded
+                // from `state/collab/*` and a `CommandSink` drained onto
+                // `action/collab/*`. Its fold is refreshed in `render` while in
+                // view; `show` renders the surface and publishes the frame's emitted
+                // commands. Scoped under its own `push_id` like every mounted surface
+                // so its egui ids can't collide in the shell's one `Context`.
+                let communications = &mut self.communications;
+                ui.push_id("shell-communications", |ui| communications.show(ui));
+            }
             Surface::System => {
                 // This seat's host controls, folded from the one `mde-seat` Seat
                 // (E12-15). Under SETTINGS-1 the surface is a master-detail shell —
@@ -1693,6 +1716,15 @@ impl Shell {
         // shared cadence; the verb replies land on a later tick (§7).
         if self.nav.expanded && self.nav.surface == Surface::Phones {
             self.phones_hub.poll(ctx);
+        }
+
+        // The Communications hub re-folds the collab worker's `state/collab/*`
+        // mirrors (directory · per-space Activity · per-space conversation ·
+        // aggregated call-state) on its cadence while in view (WL-FUNC-011) — a
+        // cheap local latest-wins read; the honest empty rail until the worker's
+        // projections land (§7).
+        if self.nav.expanded && self.nav.surface == Surface::Communications {
+            self.communications.poll(ctx);
         }
 
         // The seat snapshot feeds BOTH the System surface and the dock's status

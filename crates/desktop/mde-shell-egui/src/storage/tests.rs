@@ -905,6 +905,12 @@ mod menubar_coverage {
                          (Phones · Files · Commands · Pair); folding it onto the \
                          shared bar is a MENUBAR-SWEEP follow-on",
             },
+            Surface::Communications => Coverage::Exempt {
+                reason: "bare — the WL-FUNC-011 Communications surface carries its own \
+                         frame (spaces rail · per-space mode tabs · persistent call \
+                         bar) instead of the shared MENUBAR-ALL top strip; folding it \
+                         onto the shared bar is a MENUBAR-SWEEP follow-on",
+            },
             Surface::Terminal => Coverage::Exempt {
                 reason: "bare — mde-term-egui carries its own tmux/session menu \
                          strip; migrating it onto the shared bar is a MENUBAR-SWEEP \
@@ -1012,6 +1018,11 @@ mod menubar_coverage {
                 Surface::Terminal,
                 Surface::Editor,
                 Surface::Phones,
+                // WL-FUNC-011 — the Communications hub carries its own frame
+                // (rail · mode tabs · call bar), a MENUBAR-SWEEP follow-on. Sits
+                // here in `Surface::ALL` order (the twentieth surface), before the
+                // out-of-ALL Timers `every_routed` appends.
+                Surface::Communications,
                 Surface::Timers,
             ],
             "a surface leaving (or joining) the bare set updates this inventory \

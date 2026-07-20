@@ -104,7 +104,7 @@ fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
     // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
     // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
     // and the About surface (the platform-identity screen, QBRAND-6).
-    assert_eq!(Surface::ALL.len(), 19);
+    assert_eq!(Surface::ALL.len(), 20);
     assert_eq!(Surface::ALL[0], Surface::Workbench);
     for s in [
         Surface::MeshView,
@@ -126,6 +126,8 @@ fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
         Surface::System,
         Surface::Storage,
         Surface::About,
+        // The unified Communications hub (WL-FUNC-011) — lands alongside Chat/Voice.
+        Surface::Communications,
     ] {
         assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");
     }
@@ -160,6 +162,8 @@ fn every_surface_maps_to_a_named_brand_glyph() {
         (Surface::Chat, IconId::Chat),
         // The Phones hub wears its own smartphone glyph (KDC-MESH-9).
         (Surface::Phones, IconId::Phones),
+        // The Communications hub wears the shared-emblem collaboration glyph.
+        (Surface::Communications, IconId::Share),
         // The System surface is the right-side Settings button — the cog glyph.
         (Surface::System, IconId::Settings),
         (Surface::Storage, IconId::Storage),
@@ -174,9 +178,9 @@ fn every_surface_maps_to_a_named_brand_glyph() {
             "{surface:?} maps to the blank wordmark"
         );
     }
-    // The map is injective — 19 surfaces, 19 distinct glyph names (IaC wears
-    // the Server badge, Explorer the stacked-cards Instances glyph, each
-    // unshared by any other surface).
+    // The map is injective — 20 surfaces, 20 distinct glyph names (IaC wears
+    // the Server badge, Explorer the stacked-cards Instances glyph, Communications
+    // the shared-emblem collaboration glyph, each unshared by any other surface).
     let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
     names.sort_unstable();
     names.dedup();
@@ -208,6 +212,7 @@ fn every_surface_maps_to_a_nonempty_display_label() {
         (Surface::Editor, "Editor"),
         (Surface::Chat, "Chat"),
         (Surface::Phones, "Phones"),
+        (Surface::Communications, "Communications"),
         (Surface::System, "System"),
         (Surface::Storage, "Storage"),
         (Surface::About, "About"),
@@ -217,7 +222,7 @@ fn every_surface_maps_to_a_nonempty_display_label() {
         assert_eq!(surface.label(), label, "{surface:?} → wrong label");
         assert!(!label.is_empty(), "{surface:?} has a blank label");
     }
-    // Injective over Surface::ALL — 19 surfaces, 19 distinct labels.
+    // Injective over Surface::ALL — 20 surfaces, 20 distinct labels.
     let mut labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
     labels.sort_unstable();
     labels.dedup();

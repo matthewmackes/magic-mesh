@@ -712,6 +712,9 @@ const fn app_surface_keywords(surface: Surface) -> &'static str {
         Surface::Workbench => "services provisioning fleet mesh control",
         Surface::InfraCode => "workloads services iaas cloud catalog",
         Surface::Desktop => "workloads sessions vdi virtual machines remote desktop",
+        Surface::Communications => {
+            "communications collaboration spaces activity messages chat threads calls presence comms"
+        }
         _ => "",
     }
 }

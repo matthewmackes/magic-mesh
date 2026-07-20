@@ -111,6 +111,14 @@ pub enum Surface {
     /// service directory) — it renders published state + drives Bus verbs, never
     /// reimplementing the host (§6).
     Phones,
+    /// The **Communications** surface (WL-FUNC-011) — the unified collaboration
+    /// hub (`mde-collab-egui`): a spaces rail + per-space Activity feed and Markdown
+    /// Messages timeline, folded from the collab worker's `state/collab/*` mirrors
+    /// and driven back via typed `action/collab/*` commands. Lands ALONGSIDE the
+    /// standalone Chat/Voice surfaces (the cutover that retires them is a later
+    /// phase); the labeled-for-later modes (Files/Documents/Alerts/Clipboard) stay
+    /// labeled — no faked data.
+    Communications,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
     /// (E12-15). Owns ALL host-control interaction (lock 3); dock status keeps
@@ -148,7 +156,7 @@ impl Surface {
     /// and the System / Storage / About screens. [`LAUNCHER_GROUPS`] gathers these
     /// into the shared launcher taxonomy, preserving this relative order within
     /// each group; a compile-time guard keeps the two tables in sync.
-    pub(crate) const ALL: [Surface; 19] = [
+    pub(crate) const ALL: [Surface; 20] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Explorer,
@@ -168,6 +176,10 @@ impl Surface {
         Surface::System,
         Surface::Storage,
         Surface::About,
+        // WL-FUNC-011 — the unified Communications hub lands as the twentieth
+        // surface (Super+Shift+0 in the REACH-2 nav tiers, the slot the prior
+        // 19-surface set left open). It joins the Comms launcher group below.
+        Surface::Communications,
     ];
 
     /// The [`brand::icons`](mde_theme::brand::icons) glyph this surface draws in
@@ -200,6 +212,10 @@ impl Surface {
             Surface::Chat => IconId::Chat,
             // The Phones hub wears the dedicated smartphone glyph (KDC-MESH-9).
             Surface::Phones => IconId::Phones,
+            // The Communications hub wears the shared-emblem (`network-workgroup`
+            // collaboration) glyph — distinct from Chat's speech bubble and Voice's
+            // handset, reading as "the shared collaboration space" (WL-FUNC-011).
+            Surface::Communications => IconId::Share,
             // The System (host-controls) surface is the dock's right-side Settings
             // button (PICKER-2) — it wears the toothed **cog** glyph, the Win10
             // settings-gear idiom, distinct from the spoked legacy System glyph.
@@ -244,6 +260,7 @@ impl Surface {
             Surface::Editor => "Editor",
             Surface::Chat => "Chat",
             Surface::Phones => "Phones",
+            Surface::Communications => "Communications",
             Surface::System => "System",
             Surface::Storage => "Storage",
             Surface::About => "About",
@@ -299,7 +316,12 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
     LauncherGroup {
         label: "Comms",
         accent: Style::ACCENT_COMMS,
-        surfaces: &[Surface::Voice, Surface::Chat, Surface::Phones],
+        surfaces: &[
+            Surface::Voice,
+            Surface::Chat,
+            Surface::Phones,
+            Surface::Communications,
+        ],
     },
     LauncherGroup {
         label: "System",

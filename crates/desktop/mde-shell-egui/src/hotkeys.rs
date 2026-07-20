@@ -269,16 +269,19 @@ impl HotkeyRouter {
 }
 
 /// Map a leader-held number key (+ its Shift state) to the surface slot it
-/// selects. Two tiers cover **all 19** `Surface::ALL` entries (REACH-2):
+/// selects. Two tiers cover **all 20** `Surface::ALL` entries (REACH-2):
 ///
 /// * plain **`Super`+`1`…`9`/`0`** → `Surface::ALL[0..=9]` (the Win10 taskbar
 ///   convention, `Super+0` = the tenth slot);
-/// * **`Super`+`Shift`+`1`…`9`** → `Surface::ALL[10..=18]` — the nine surfaces
-///   beyond the first ten.
+/// * **`Super`+`Shift`+`1`…`9`/`0`** → `Surface::ALL[10..=19]` — the ten surfaces
+///   beyond the first ten (`Super+Shift+0` = the twentieth slot, `ALL[19]`, the
+///   Communications hub that WL-FUNC-011 landed in the slot the prior 19-surface
+///   set left open).
 ///
-/// `Super+Shift+0` maps past the last surface (slot 19); the
-/// [`NavSlot`] consumer (`apply_nav_slot`) indexes `Surface::ALL` bounds-safely,
-/// so an overshoot is a no-op rather than a panic or a wrap.
+/// A slot past the last surface (only reachable if `Surface::ALL` shrinks below
+/// 20) is handled bounds-safely: the [`NavSlot`] consumer (`apply_nav_slot`)
+/// indexes `Surface::ALL` with `.get`, so an overshoot is a no-op, never a panic
+/// or a wrap.
 const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
     let digit = match key {
         egui::Key::Num1 => 0,
@@ -294,7 +297,7 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
         _ => return None,
     };
     // Shift shifts to the second tier: its ten-surface offset lands Num1..Num9 on
-    // ALL[10..=18]. The overshooting shifted zero resolves to nothing downstream.
+    // ALL[10..=18] and the shifted Num0 on ALL[19] (the twentieth surface).
     Some(NavSlot(if shift { digit + 10 } else { digit }))
 }
 
@@ -303,7 +306,7 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
 /// host-first (evdev 125/126, [`decode_scan`]), so a chord is the leader latch
 /// crossed with a `(key, shift)` press. Shift selects the **second** Super-number
 /// nav tier (REACH-2): `Super+1..0` reaches `Surface::ALL[0..=9]`,
-/// `Super+Shift+1..9` reaches `ALL[10..=18]`, so all 19 surfaces are reachable.
+/// `Super+Shift+1..9/0` reaches `ALL[10..=19]`, so all 20 surfaces are reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyPress {
     /// The pressed egui key.
@@ -620,6 +623,8 @@ mod tests {
             (egui::Key::Num7, true),
             (egui::Key::Num8, true),
             (egui::Key::Num9, true),
+            // Super+Shift+0 → ALL[19], the twentieth surface (WL-FUNC-011).
+            (egui::Key::Num0, true),
         ];
         let mut reached = BTreeSet::new();
         for (key, shift) in tier1.into_iter().chain(tier2) {
@@ -631,38 +636,45 @@ mod tests {
                 .expect("a Super-number chord latches a slot");
             reached.insert(slot.index());
         }
-        // REACH-2 — the two tiers together cover all 19 Surface::ALL indices.
+        // REACH-2 — the two tiers together cover all 20 Surface::ALL indices.
         let all: BTreeSet<usize> = (0..crate::dock::Surface::ALL.len()).collect();
-        assert_eq!(all.len(), 19, "Surface::ALL is the 19-surface set");
+        assert_eq!(all.len(), 20, "Surface::ALL is the 20-surface set");
         assert_eq!(
             reached, all,
-            "every Surface::ALL index 0..=18 has a Super-number chord"
+            "every Surface::ALL index 0..=19 has a Super-number chord"
         );
     }
 
     #[test]
-    fn an_out_of_range_shift_slot_is_a_safe_no_op() {
-        // Super+Shift+0 overshoots past the last surface (slot 19). It still
-        // latch (so the hold is a chord, not a dock-toggling tap), but indexing
-        // Surface::ALL yields nothing — a no-op, never a panic (REACH-2 bounds).
-        for key in [egui::Key::Num0] {
-            let mut r = HotkeyRouter::default();
-            let _ = r.dispatch(&[scan(125, true)], &[shift_press(key)]);
-            let slot = r
-                .take_nav_slot()
-                .expect("an overshooting shift chord still latches a slot");
-            assert!(slot.index() >= crate::dock::Surface::ALL.len());
-            assert!(
-                crate::dock::Surface::ALL.get(slot.index()).is_none(),
-                "slot {} is out of range and resolves to no surface",
-                slot.index()
-            );
-            // It consumed the hold, so releasing does not toggle the dock.
-            let _ = r.dispatch(&[scan(125, false)], &[]);
-            assert!(
-                !r.take_dock_toggle(),
-                "an overshooting shift chord is a hold, not a clean Super tap"
-            );
-        }
+    fn a_slot_past_the_last_surface_is_a_safe_no_op() {
+        // With 20 surfaces every Super-number chord now lands on a real slot:
+        // Super+Shift+0 reaches ALL[19] (the twentieth surface, WL-FUNC-011), no
+        // longer the overshoot it was for the 19-surface set. Prove the chord
+        // latches that VALID slot and still consumes the hold (so releasing does
+        // not toggle the dock)…
+        let mut r = HotkeyRouter::default();
+        let _ = r.dispatch(&[scan(125, true)], &[shift_press(egui::Key::Num0)]);
+        let slot = r
+            .take_nav_slot()
+            .expect("Super+Shift+0 latches the twentieth slot");
+        assert_eq!(slot.index(), 19, "Super+Shift+0 → ALL[19]");
+        assert!(
+            crate::dock::Surface::ALL.get(slot.index()).is_some(),
+            "slot 19 now resolves to a real surface",
+        );
+        // It consumed the hold, so releasing does not toggle the dock.
+        let _ = r.dispatch(&[scan(125, false)], &[]);
+        assert!(
+            !r.take_dock_toggle(),
+            "a Super+Shift+0 chord is a hold, not a clean Super tap"
+        );
+        // …and prove the consumer stays bounds-safe for a genuinely out-of-range
+        // slot (one past the last surface, only reachable if `ALL` shrinks): the
+        // `apply_nav_slot` `.get` indexing yields nothing — a no-op, never a panic.
+        let past_end = NavSlot(crate::dock::Surface::ALL.len());
+        assert!(
+            crate::dock::Surface::ALL.get(past_end.index()).is_none(),
+            "a slot past the last surface resolves to no surface",
+        );
     }
 }
