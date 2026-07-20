@@ -12,6 +12,10 @@
 //! implemented mutations; placement routing (which node dispatches at all) is the
 //! drain's job in [`super`].
 
+// U4 owns this verb handler (set-desired + plan); U6–U10 add their own disjoint
+// `verbs/<unit>.rs` submodules here.
+mod desired;
+
 use serde::Deserialize;
 
 use mackes_mesh_types::cloud::{
@@ -21,8 +25,7 @@ use mackes_mesh_types::cloud::{
 };
 
 use super::gate::{self, CloudDecision, TokenVerdict};
-use super::reconcile::PlacementPlanner;
-use super::runner::{CloudRunOutcome, CloudRunner};
+use super::runner::CloudRunOutcome;
 use super::CloudWorker;
 
 /// A drained `action/cloud/<verb>` classified for dispatch.
@@ -160,7 +163,7 @@ impl CloudActionBody {
 /// [`CloudReply`]. Reads serve the roster (or an honest skeleton `not-yet`);
 /// implemented mutations run the armed-token gate; skeleton mutations return an
 /// honest `not-yet-wired`. Never panics.
-pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body: &str) -> CloudReply {
+pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> CloudReply {
     let Some(verb) = CloudVerb::from_verb(verb_name) else {
         return CloudReply {
             ok: false,
@@ -169,19 +172,19 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body: &str) -> CloudRep
             ..Default::default()
         };
     };
-    let body = CloudActionBody::parse(body);
+    let body = CloudActionBody::parse(body_str);
 
     match verb {
         // ── implemented READS — served locally on every node ──
         CloudVerb::List | CloudVerb::Status => handle_read_roster(w, verb_name),
 
-        // ── skeleton READS (U4/U5 fill the bodies) ──
+        // ── skeleton READS (U10 fills the bodies) ──
         CloudVerb::Inventory => not_yet(verb_name, "U4"),
         CloudVerb::Output => not_yet(verb_name, "U5"),
-        // `plan` + `set-desired` route through the reconcile seam so U5/U4 fill it
-        // in one place; U2's seam returns an honest `not-yet`.
-        CloudVerb::Plan => plan_skeleton(w, verb_name, &body),
-        CloudVerb::SetDesired => set_desired_skeleton(w, verb_name, &body),
+        // U4 — `set-desired` persists the node's desired doc; `plan` renders its
+        // slice + shells `tofu plan -json` → PlanCounts (honest gate on failure).
+        CloudVerb::Plan => desired::handle_plan(w, verb_name, body_str),
+        CloudVerb::SetDesired => desired::handle_set_desired(w, verb_name, body_str),
 
         // ── skeleton MUTATIONS (U4–U10 fill the bodies) ──
         CloudVerb::ImageBuild => not_yet(verb_name, "U7"),
@@ -232,41 +235,6 @@ fn not_yet(verb_name: &str, unit: &str) -> CloudReply {
         gated: Some(format!(
             "cloud verb `{verb_name}` is recognized but not yet wired ({unit})"
         )),
-        ..Default::default()
-    }
-}
-
-/// The `plan` skeleton — consults the reconcile seam (U2 returns an honest
-/// `not-yet`; U5 fills the placement plan). Never fabricates an all-zero
-/// "in sync" [`PlanCounts`].
-fn plan_skeleton(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -> CloudReply {
-    match w.planner.plan(body.node.trim()) {
-        Ok(counts) => CloudReply {
-            ok: true,
-            verb: verb_name.to_string(),
-            plan: Some(counts),
-            ..Default::default()
-        },
-        Err(nope) => reconcile_gated(verb_name, &nope),
-    }
-}
-
-/// The `set-desired` skeleton — consults the reconcile seam's tfvars render (U2
-/// returns an honest `not-yet`; U4 persists the desired-state doc).
-fn set_desired_skeleton(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -> CloudReply {
-    match w.planner.render_tfvars(body.node.trim(), &[]) {
-        // A real render lands in U4; until then the seam never returns Ok.
-        Ok(_) => not_yet(verb_name, "U4"),
-        Err(nope) => reconcile_gated(verb_name, &nope),
-    }
-}
-
-/// The honest reply for a reconcile leg the seam reports as not-yet-wired.
-fn reconcile_gated(verb_name: &str, nope: &super::reconcile::ReconcileNotYet) -> CloudReply {
-    CloudReply {
-        ok: false,
-        verb: verb_name.to_string(),
-        gated: Some(format!("cloud verb `{verb_name}` is not yet wired: {nope}")),
         ..Default::default()
     }
 }

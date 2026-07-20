@@ -36,6 +36,7 @@
 
 mod gate;
 mod reconcile;
+mod render;
 mod runner;
 mod verbs;
 
@@ -46,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use mackes_mesh_types::cloud::{
     cloud_state_topic, CloudProviderAdapter, CloudReply, CloudState, DriftSummary, NodeCapacity,
-    ServiceHealth, CLOUD_ACTION_PREFIX,
+    ServiceHealth, WorkloadRow, CLOUD_ACTION_PREFIX,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -55,7 +56,6 @@ use mde_bus::rpc::reply_topic;
 use super::{ShutdownToken, Worker};
 
 use gate::{placement_match, HmacTokenSigner, NullSigner, Placement, TokenSigner};
-use reconcile::{NotYetPlanner, PlacementPlanner};
 use runner::{
     default_iac_root, default_libvirt_uri, instances_table, CloudRunOutcome, CloudRunner,
     ShellCloudRunner, BACKEND_TOOLS,
@@ -72,6 +72,11 @@ pub const POLL: Duration = Duration::from_secs(3);
 
 /// Unconditional `state/cloud/<node>` republish cadence (between change publishes).
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// The throttled drift-plan cadence — a periodic `tofu plan` of THIS node's desired
+/// slice, decoupled from [`PUBLISH_HEARTBEAT`] because a plan is far heavier than a
+/// health probe (U5). A fresh drift snapshot forces an out-of-band mirror republish.
+pub const DRIFT_POLL: Duration = Duration::from_secs(300);
 
 /// A placement node is considered reachable while its `state/cloud/<node>` mirror
 /// is fresher than this (3× the publish heartbeat — a wide margin so a node
@@ -96,15 +101,13 @@ pub struct CloudWorker {
     /// [`HmacTokenSigner`]; a node with no arming key uses [`NullSigner`], staging
     /// every mutation).
     signer: Arc<dyn TokenSigner>,
-    /// The placement / tfvars-render reconcile seam (U2 = the honest
-    /// [`NotYetPlanner`]; U4/U5 swap it).
-    planner: Arc<dyn PlacementPlanner>,
     /// Whether token-arming is available on this node (a capability, published as
     /// `CloudState.apply_armed`). `false` ⇒ this node has no arming key and stages
     /// every mutation honestly.
     arm_capable: bool,
-    /// The workgroup / desired-state root (threaded to the reconcile seam by U4/U5).
-    #[allow(dead_code)]
+    /// The workgroup / desired-state root — the per-node desired store
+    /// (`<state_root>/mcnf/cloud/desired/<node>/…`) U4's `set-desired` writes and
+    /// U5's reconcile/drift tick reads.
     state_root: PathBuf,
     /// The hash-chain audit DB (destructive performed ops audit here).
     db_path: PathBuf,
@@ -118,6 +121,12 @@ pub struct CloudWorker {
     /// Test-only reachability override (the set of nodes considered reachable).
     /// `None` ⇒ the real bus-mirror freshness check.
     reachable_override: Option<HashSet<String>>,
+    /// The throttled drift-plan cadence (decoupled from the mirror heartbeat).
+    drift_interval: Duration,
+    /// The most recent drift snapshot — per-workload [`WorkloadRow`]s + the node
+    /// [`DriftSummary`] the throttled tick ([`Self::refresh_drift`]) computed, folded
+    /// into every `state/cloud/<node>` mirror. Empty until the first tick.
+    drift: std::sync::Mutex<(Vec<WorkloadRow>, DriftSummary)>,
 }
 
 impl CloudWorker {
@@ -146,7 +155,6 @@ impl CloudWorker {
             node_id,
             runner,
             signer,
-            planner: Arc::new(NotYetPlanner),
             arm_capable,
             state_root: workgroup_root,
             db_path: crate::default_db_path(),
@@ -154,6 +162,8 @@ impl CloudWorker {
             poll: POLL,
             heartbeat: PUBLISH_HEARTBEAT,
             reachable_override: None,
+            drift_interval: DRIFT_POLL,
+            drift: std::sync::Mutex::new((Vec::new(), DriftSummary::default())),
         }
     }
 
@@ -199,6 +209,14 @@ impl CloudWorker {
     #[must_use]
     pub const fn with_poll(mut self, poll: Duration) -> Self {
         self.poll = poll;
+        self
+    }
+
+    /// Override the drift-plan cadence (tests, to force a tick — or to push it far
+    /// out so a fast-poll test never shells `tofu`).
+    #[must_use]
+    pub const fn with_drift_interval(mut self, interval: Duration) -> Self {
+        self.drift_interval = interval;
         self
     }
 
@@ -374,8 +392,27 @@ impl CloudWorker {
         }
     }
 
+    /// Run one throttled drift tick: render + `tofu plan` THIS node's desired slice,
+    /// fold the live roster into per-workload rows + the node drift rollup, and cache
+    /// it for the next `state/cloud/<node>` publish. Best-effort + honest (§7) — a
+    /// plan the backend can't run leaves each row's drift `Unknown`, never a
+    /// fabricated in-sync. A no-op when the node has nothing declared (empty slice).
+    fn refresh_drift(&self) {
+        let snapshot = reconcile::drift_snapshot(
+            self.runner.as_ref(),
+            &self.state_root,
+            &self.host,
+            &default_libvirt_uri(),
+            now_ms(),
+        );
+        if let Ok(mut guard) = self.drift.lock() {
+            *guard = snapshot;
+        }
+    }
+
     /// Build the current `state/cloud/<node>` mirror: probe each backend tool's
-    /// health + fold the live roster into a resource table (all neutral types).
+    /// health + fold the live roster into a resource table (all neutral types), plus
+    /// the latest drift tick's per-workload rows + rollup (U5).
     #[must_use]
     pub fn build_state(&self) -> CloudState {
         let health: Vec<ServiceHealth> = BACKEND_TOOLS
@@ -386,6 +423,9 @@ impl CloudWorker {
             Ok(instances) => vec![instances_table(&instances)],
             Err(_) => Vec::new(),
         };
+        // Fold in the throttled drift tick's latest snapshot (empty until the first
+        // tick / a node with nothing declared).
+        let (workloads, drift_summary) = self.drift.lock().map(|g| g.clone()).unwrap_or_default();
         CloudState {
             host: self.host.clone(),
             adapter: CloudProviderAdapter::ConstructCloud,
@@ -395,9 +435,8 @@ impl CloudWorker {
             // retired env wall — whether this node can honor an armed mutation.
             apply_armed: self.arm_capable,
             published_at_ms: now_ms(),
-            // Populated by the workloads engine (U6+); empty until then.
-            workloads: Vec::new(),
-            drift_summary: DriftSummary::default(),
+            workloads,
+            drift_summary,
             node_capacity: NodeCapacity::default(),
         }
     }
@@ -436,9 +475,17 @@ impl Worker for CloudWorker {
         // Publish an initial mirror so a surface doesn't wait a full tick.
         self.publish_state();
         let mut last_pub = Instant::now();
+        // The drift plan runs on its own (heavier) cadence, decoupled from the
+        // health heartbeat; a fresh snapshot forces an out-of-band republish.
+        let mut last_drift = Instant::now();
         loop {
             let acted = self.drain_actions(&mut cursors);
-            if acted || last_pub.elapsed() >= self.heartbeat {
+            let drift_due = last_drift.elapsed() >= self.drift_interval;
+            if drift_due {
+                self.refresh_drift();
+                last_drift = Instant::now();
+            }
+            if acted || drift_due || last_pub.elapsed() >= self.heartbeat {
                 self.publish_state();
                 last_pub = Instant::now();
             }
@@ -658,9 +705,9 @@ mod tests {
     #[test]
     fn the_workloads_skeleton_verbs_are_honestly_not_yet_wired() {
         let w = staged_worker(Arc::new(FakeRunner::default()));
+        // `set-desired` + `plan` are wired by U4 (see the verbs::desired tests); the
+        // remainder stay honest not-yet-wired skeletons for U6–U10 to fill.
         for verb in [
-            "set-desired",
-            "plan",
             "inventory",
             "output",
             "image-build",
@@ -705,6 +752,46 @@ mod tests {
         // A node without an arming key advertises no capability (stages).
         let w2 = staged_worker(Arc::new(FakeRunner::default()));
         assert!(!w2.build_state().apply_armed);
+    }
+
+    // ── the U5 drift tick folds workloads + rollup into the mirror ──
+    #[test]
+    fn a_drift_tick_folds_workload_rows_and_the_rollup_into_the_mirror() {
+        use mackes_mesh_types::cloud::{DeliveryType, DriftFlag, WorkloadSpec};
+        let tmp = tempfile::tempdir().unwrap();
+        // Declare a workload on this node in its per-node desired slice.
+        let spec = WorkloadSpec {
+            name: "web".into(),
+            delivery_type: DeliveryType::ServiceVm,
+            node: "me".into(),
+            vcpu: 2,
+            memory_mb: 2048,
+            disk_gb: 20,
+            image: None,
+            network_isolation: false,
+            raw_hcl: None,
+        };
+        super::reconcile::write_desired_doc(tmp.path(), &spec).unwrap();
+        // A plan that reports pending changes ⇒ the workload is drifted.
+        let runner = Arc::new(FakeRunner {
+            roster: vec![instance("web", "ACTIVE")],
+            plan_ndjson: Some(
+                r#"{"type":"change_summary","changes":{"add":1,"change":0,"remove":0}}"#.into(),
+            ),
+            ..Default::default()
+        });
+        let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(runner)
+            .with_bus_root(None);
+        // Before a tick the mirror carries no workloads (never fabricated).
+        assert!(w.build_state().workloads.is_empty());
+        w.refresh_drift();
+        let state = w.build_state();
+        assert_eq!(state.workloads.len(), 1);
+        assert_eq!(state.workloads[0].name, "web");
+        assert_eq!(state.workloads[0].drift, DriftFlag::Drift);
+        assert_eq!(state.drift_summary.drift_count, 1);
+        assert!(state.drift_summary.last_plan_ms > 0);
     }
 
     // ── placement-routed drain ──

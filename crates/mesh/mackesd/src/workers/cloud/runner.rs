@@ -111,6 +111,17 @@ pub trait CloudRunner: Send + Sync {
 
     /// A per-instance lifecycle op via `virsh`. `apply` ⇒ the real op; else staged.
     fn lifecycle(&self, action: LifecycleAction, instance: &str, apply: bool) -> CloudRunOutcome;
+
+    /// Workloads U4/U5 — write the caller-rendered `terraform.tfvars.json` into the
+    /// OpenTofu root and run `tofu plan -json`, returning the raw newline-delimited
+    /// JSON stream (the caller parses the `change_summary` into `PlanCounts`).
+    ///
+    /// A staged READ (never applies): it renders + plans a node's desired slice.
+    ///
+    /// # Errors
+    /// An honest `Err` when the tfvars can't be written or `tofu` can't run (tool
+    /// absent / plan failed) — never a fabricated empty plan.
+    fn plan_json(&self, tfvars_json: &str) -> Result<String, String>;
 }
 
 /// Normalize a libvirt domain state to the OpenStack-style status token the
@@ -381,6 +392,38 @@ impl CloudRunner for ShellCloudRunner {
             &format!("virsh {subcmd} {instance}"),
         )
     }
+
+    fn plan_json(&self, tfvars_json: &str) -> Result<String, String> {
+        // Persist the rendered slice as the tofu root's auto-loaded var file, so
+        // `tofu plan` converges to exactly this node's declared workloads.
+        let tfvars_path = self.tofu_dir.join("terraform.tfvars.json");
+        std::fs::write(&tfvars_path, tfvars_json)
+            .map_err(|e| format!("write {}: {e}", tfvars_path.display()))?;
+        let chdir = self.tofu_chdir();
+        let (ok, out, err) = Self::run(
+            "tofu",
+            &[&chdir, "plan", "-json", "-input=false", "-no-color"],
+        )
+        .map_err(|e| format!("tofu unavailable: {e}"))?;
+        // `plan -json` writes its ndjson stream to stdout even on a non-zero exit
+        // (a plan error rides the stream as a `diagnostic`), so hand back stdout —
+        // the parser surfaces the error honestly. A hard failure with no stream is
+        // an honest Err.
+        if out.trim().is_empty() {
+            let reason = summary_line(&err);
+            let reason = if reason.is_empty() {
+                "tofu plan produced no output".to_string()
+            } else {
+                reason
+            };
+            return Err(if ok {
+                reason
+            } else {
+                format!("tofu plan failed: {reason}")
+            });
+        }
+        Ok(out)
+    }
 }
 
 // ─────────────────────────── small helpers ───────────────────────────
@@ -434,6 +477,14 @@ pub(crate) mod fake {
         pub tofu_up: bool,
         /// (verb, apply) calls the worker made — proves the gate.
         pub calls: Mutex<Vec<(String, bool)>>,
+        /// Canned `tofu plan -json` ndjson the fake returns from `plan_json`
+        /// (`None` ⇒ a default all-zero no-op summary).
+        pub plan_ndjson: Option<String>,
+        /// When set, `plan_json` returns this as an honest `Err` (tool absent /
+        /// plan failed) instead of a stream.
+        pub plan_err: Option<String>,
+        /// The tfvars documents `plan_json` was handed — proves the renderer ran.
+        pub tfvars_written: Mutex<Vec<String>>,
     }
 
     impl FakeRunner {
@@ -486,6 +537,19 @@ pub(crate) mod fake {
         ) -> CloudRunOutcome {
             self.record(&format!("lifecycle-{}", action.cli_verb()), apply);
             CloudRunOutcome::ok(format!("virsh {} {instance}", action.cli_verb()), apply)
+        }
+
+        fn plan_json(&self, tfvars_json: &str) -> Result<String, String> {
+            self.tfvars_written
+                .lock()
+                .unwrap()
+                .push(tfvars_json.to_string());
+            if let Some(e) = &self.plan_err {
+                return Err(e.clone());
+            }
+            Ok(self.plan_ndjson.clone().unwrap_or_else(|| {
+                r#"{"type":"change_summary","changes":{"add":0,"change":0,"remove":0}}"#.to_string()
+            }))
         }
     }
 
