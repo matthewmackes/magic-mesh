@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, RichText};
-use mde_egui::{eframe, run_client, status_dot, Motion, Style};
+use mde_egui::{eframe, overlay, run_client, status_dot, Motion, Style};
 
 use mde_bus::dnd;
 use mde_panel_egui::{PanelModel, DND_LABEL};
@@ -228,13 +228,19 @@ impl Panel {
 
 fn panel_tooltip(ui: &mut egui::Ui, text: &str) {
     let ctx = ui.ctx().clone();
-    let surface = Style::resolve_color(&ctx, Style::SURFACE);
-    let border = Style::resolve_color(&ctx, Style::BORDER);
     let text_color = Style::resolve_color(&ctx, Style::TEXT);
-    egui::Frame::NONE
-        .fill(surface)
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(6))
+    // The shared floating-surface primitive (`overlay()` — hairline border, mid
+    // corner radius, soft overlay shadow; UI-VIS-111) replaces the hand-rolled
+    // tooltip frame. It stays theme-aware by resolving its fill and border into the
+    // live colour mode (the panel's light-mode contract), keeps the compact
+    // `tooltip_margin()`, and sources its stroke width from `STROKE_HAIRLINE` — no
+    // literal radius/stroke left in this crate.
+    overlay()
+        .fill(Style::resolve_color(&ctx, Style::SURFACE))
+        .stroke(egui::Stroke::new(
+            Style::STROKE_HAIRLINE,
+            Style::resolve_color(&ctx, Style::BORDER),
+        ))
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(PANEL_TOOLTIP_MAX_W);
@@ -344,7 +350,7 @@ mod tests {
         fn walk(shape: &mde_egui::egui::Shape, out: &mut Vec<(String, mde_egui::egui::Color32)>) {
             match shape {
                 mde_egui::egui::Shape::Text(text) => {
-                    out.push((text.galley.text().to_owned(), text_color(text)))
+                    out.push((text.galley.text().to_owned(), text_color(text)));
                 }
                 mde_egui::egui::Shape::Vec(shapes) => {
                     for shape in shapes {
