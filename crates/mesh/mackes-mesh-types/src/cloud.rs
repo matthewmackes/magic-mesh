@@ -1273,6 +1273,31 @@ pub struct CloudReply {
     /// Whether a destructive op (delete/reboot) was performed + audited.
     #[serde(default)]
     pub audited: bool,
+    /// `plan` — the pending-change counts (add/change/destroy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanCounts>,
+    /// `output` — tofu outputs (instance roster / IPs) for a workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<TofuOutput>>,
+    /// `configure` / `container-deploy` — the Ansible run summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ansible: Option<AnsibleSummary>,
+    /// `inventory` — the resolved mesh Ansible inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Vec<InventoryHost>>,
+    /// `image-build` — the image roster (name / sha256 / promoted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageRow>>,
+    /// `console-attach` — the SPICE/VNC console handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ConsoleEndpoint>,
+    /// `set-desired` — echo of the accepted desired-state specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired: Option<Vec<WorkloadSpec>>,
+    /// Raw tool stdout/stderr, surfaced behind the shell's "expandable raw log"
+    /// (the honest failure detail for a tofu/ansible/virsh run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_log: Option<String>,
 }
 
 // ─────────────────────────── provider-neutral aliases ───────────────────────────
@@ -1458,11 +1483,22 @@ pub struct CloudState {
     pub health: Vec<ServiceHealth>,
     /// The resource tables the READ verbs discovered (the instance roster, …).
     pub resources: Vec<ResourceTable>,
-    /// Whether the live-mutation gate (`MDE_CLOUD_APPLY=1`) is armed on this node.
-    /// `false` ⇒ every provision/configure/destroy verb is staged (plan/`--check`).
+    /// Whether armed-token live mutation is available on this node (capability,
+    /// not the retired `MDE_CLOUD_APPLY` env wall). `false` ⇒ this node cannot
+    /// currently honor an armed provision/configure/destroy.
     pub apply_armed: bool,
     /// Wall-clock publish time (ms since the Unix epoch).
     pub published_at_ms: i64,
+    /// Per-workload rows folded from this placement node's live domains + the
+    /// node's desired-state slice. Empty until the workloads engine populates it.
+    #[serde(default)]
+    pub workloads: Vec<WorkloadRow>,
+    /// Drift rollup for this node (count of drifted workloads + last plan time).
+    #[serde(default)]
+    pub drift_summary: DriftSummary,
+    /// This node's compute capacity — feeds the placement picker's capacity bars.
+    #[serde(default)]
+    pub node_capacity: NodeCapacity,
 }
 
 impl CloudState {
@@ -1480,6 +1516,284 @@ impl CloudState {
     pub fn backend_ready(&self) -> bool {
         !self.health.is_empty() && self.health.iter().all(|h| h.state == HealthState::Up)
     }
+}
+
+// ─────────────────────────── Workloads cockpit contract ───────────────────────────
+//
+// The neutral verb vocabulary + payload shapes the reenvisioned "Workloads" surface
+// and the mackesd cloud worker exchange over `action/cloud/*` + `reply/<ulid>`. These
+// extend the lifecycle/list contract above; the worker answers them, the shell renders
+// them. Provider-neutral by construction (OpenTofu + Ansible + libvirt, no OpenStack).
+
+/// `set-desired` — write a node's desired-state workload doc (`/mcnf/cloud/desired/…`).
+pub const VERB_SET_DESIRED: &str = "set-desired";
+/// `plan` — render the node's tfvars slice and return the pending-change counts.
+pub const VERB_PLAN: &str = "plan";
+/// `inventory` — the resolved mesh Ansible inventory the configure leg would target.
+pub const VERB_INVENTORY: &str = "inventory";
+/// `output` — the tofu outputs (instance roster / IPs) for a node's workloads.
+pub const VERB_OUTPUT: &str = "output";
+/// `image-build` — drive a bootc/osbuild image build (+ optional promote).
+pub const VERB_IMAGE_BUILD: &str = "image-build";
+/// `container-deploy` — render a Quadlet unit and hand it to the container-host role.
+pub const VERB_CONTAINER_DEPLOY: &str = "container-deploy";
+/// `console-attach` — return a SPICE/VNC/WebRTC console handle for a workload.
+pub const VERB_CONSOLE_ATTACH: &str = "console-attach";
+/// `android-provision` — the two-layer Cuttlefish path (Linux VM then `cvd`).
+pub const VERB_ANDROID_PROVISION: &str = "android-provision";
+
+/// What a workload *delivers* — the cockpit's primary organizing axis (delivery type
+/// × placement). Each maps to a provision + configure recipe under the hood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryType {
+    /// A full VM desktop delivered as a native VDI seat.
+    DesktopVm,
+    /// A headless VM running a service exposed on the mesh.
+    ServiceVm,
+    /// A VM whose individual apps are forwarded into the MDE desktop (VDI app-mode).
+    AppVm,
+    /// A VM providing Android via the two-layer Cuttlefish (`cvd`) backend.
+    AndroidVm,
+    /// A Podman/Quadlet service container (rootless by default).
+    ServiceContainer,
+}
+
+impl DeliveryType {
+    /// Stable token used in desired-state docs, Ansible tags, and fixtures.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DesktopVm => "desktop_vm",
+            Self::ServiceVm => "service_vm",
+            Self::AppVm => "app_vm",
+            Self::AndroidVm => "android_vm",
+            Self::ServiceContainer => "service_container",
+        }
+    }
+
+    /// Product-facing label for the delivery-type view header.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DesktopVm => "Desktop",
+            Self::ServiceVm => "Service",
+            Self::AppVm => "Application",
+            Self::AndroidVm => "Android",
+            Self::ServiceContainer => "Container",
+        }
+    }
+
+    /// Whether this delivery type is realized as a libvirt VM (vs a container).
+    #[must_use]
+    pub const fn is_vm(self) -> bool {
+        !matches!(self, Self::ServiceContainer)
+    }
+}
+
+/// One workload's desired state — the row the GUI form (or raw-HCL escape hatch)
+/// authors and `set-desired` persists into the node's desired-state doc. The worker
+/// renders these into `terraform.tfvars.json` for the placement node's slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadSpec {
+    /// Stable workload name (unique within the placement node).
+    pub name: String,
+    /// What this workload delivers.
+    pub delivery_type: DeliveryType,
+    /// The mesh node this workload is placed on (its host id).
+    pub node: String,
+    /// Virtual CPUs (VM workloads).
+    #[serde(default)]
+    pub vcpu: u16,
+    /// Memory in MiB (VM workloads).
+    #[serde(default)]
+    pub memory_mb: u32,
+    /// Root disk in GiB (VM workloads).
+    #[serde(default)]
+    pub disk_gb: u32,
+    /// The base image name (convention-path auto-discovery in the libvirt pool);
+    /// `None` uses the delivery type's golden default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Whether the workload gets its own isolated network segment (opt-in; default
+    /// = the shared managed mesh network).
+    #[serde(default)]
+    pub network_isolation: bool,
+    /// The raw-HCL escape hatch: operator-supplied HCL fragment merged into the
+    /// rendered tfvars (validated before `tofu`). `None` = pure form authoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_hcl: Option<String>,
+}
+
+/// The `tofu plan` change counts — the lean, counts-only preview the surface renders
+/// before an armed apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCounts {
+    /// Resources the plan would create.
+    pub add: u32,
+    /// Resources the plan would update in place / replace.
+    pub change: u32,
+    /// Resources the plan would destroy.
+    pub destroy: u32,
+}
+
+impl PlanCounts {
+    /// Whether the plan is a no-op (nothing to add/change/destroy) — in sync.
+    #[must_use]
+    pub const fn is_noop(self) -> bool {
+        self.add == 0 && self.change == 0 && self.destroy == 0
+    }
+}
+
+/// The Ansible run tally the configure/container-deploy verbs return (summary +
+/// changed-count, per the lean-output decision).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsibleSummary {
+    /// Tasks that ran ok (unchanged).
+    pub ok: u32,
+    /// Tasks that reported a change.
+    pub changed: u32,
+    /// Tasks that failed.
+    pub failed: u32,
+    /// Hosts unreachable.
+    pub unreachable: u32,
+    /// The names of the tasks that changed (for the "what changed" line).
+    #[serde(default)]
+    pub changed_tasks: Vec<String>,
+}
+
+/// One resolved host in the mesh dynamic inventory (`inventory` verb) — what the live
+/// inventory panel renders so the operator sees what a configure run would target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryHost {
+    /// The mesh node id.
+    pub id: String,
+    /// The `ansible_host` address (overlay ip or id).
+    pub node: String,
+    /// The inventory groups this host lands in (`role_*` / `scope_*` / `delivery_*`).
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Whether the host holds a live keepalive lease (alive).
+    pub reachable: bool,
+}
+
+/// A single `tofu output` value (`output` verb) — the instance roster / IPs a
+/// workload exposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TofuOutput {
+    /// The output name.
+    pub name: String,
+    /// The output value rendered to a string.
+    pub value: String,
+    /// Whether tofu marked the output sensitive (render masked).
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+/// One image in the libvirt pool / airgap lane (`image-build`/list) — the per-type
+/// golden image roster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRow {
+    /// The image name (convention-path base name).
+    pub name: String,
+    /// The verified content hash (the SHA256 the Syncthing lane checks).
+    pub sha256: String,
+    /// Whether this image is the promoted (active-base) version for its type.
+    pub promoted: bool,
+}
+
+/// The console protocol a `console-attach` handle speaks.
+///
+/// A normal libvirt VM head is `Spice`; an Android/Cuttlefish workload's screen lives
+/// inside crosvm-inside-the-L1-VM (invisible to `virsh domdisplay`), so it is handed
+/// back as a `Vnc`/`WebRtc` in-guest endpoint instead of a libvirt display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleProto {
+    /// A libvirt SPICE display head (the standard VM/desktop path → VDI attach).
+    Spice,
+    /// A VNC endpoint (the Cuttlefish `--start_vnc_server` path, or a VNC head).
+    Vnc,
+    /// A WebRTC endpoint URL (the Cuttlefish host-orchestrator default).
+    WebRtc,
+}
+
+/// The console handle a `console-attach` verb returns — bridged to the shell's
+/// SPICE/VNC → VDI attach path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleEndpoint {
+    /// The protocol this handle speaks.
+    pub proto: ConsoleProto,
+    /// The address the shell attaches to (`spice://…` / `vnc://host:port` / an
+    /// https WebRTC URL), mesh-tunneled over the overlay.
+    pub uri: String,
+    /// An optional one-time attach ticket/token, when the head is ticketed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+}
+
+/// Whether a workload's live state matches its declared desired-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftFlag {
+    /// Live == desired (last plan was a no-op).
+    InSync,
+    /// Live diverges from desired (last plan had changes).
+    Drift,
+    /// Not yet planned / indeterminate.
+    #[default]
+    Unknown,
+}
+
+/// One workload row in the per-node `state/cloud` mirror — the Status/Day-2 view's
+/// source of truth (live metrics + drift), folded from virsh + the desired doc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadRow {
+    /// The workload name.
+    pub name: String,
+    /// What it delivers.
+    pub delivery_type: DeliveryType,
+    /// The placement node it runs on.
+    pub node: String,
+    /// The live domain/container status (`running` / `shutoff` / `paused` / …).
+    pub status: String,
+    /// Live CPU utilization, whole percent (0–100) — integer to keep the mirror
+    /// `Eq`/deterministic over the Bus.
+    #[serde(default)]
+    pub cpu_pct: u16,
+    /// Live memory use in MiB.
+    #[serde(default)]
+    pub mem_mb: u32,
+    /// Allocated disk in GiB.
+    #[serde(default)]
+    pub disk_gb: u32,
+    /// Whether the workload's `*.mesh` name resolves + overlay path is up.
+    pub reachable: bool,
+    /// Desired-vs-actual drift.
+    #[serde(default)]
+    pub drift: DriftFlag,
+}
+
+/// Drift rollup for a node's `state/cloud` mirror.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftSummary {
+    /// How many of this node's workloads are drifted.
+    pub drift_count: u32,
+    /// Wall-clock time (ms) of the last drift plan, `0` if never planned.
+    pub last_plan_ms: i64,
+}
+
+/// A placement node's compute capacity — feeds the explicit node picker's bars.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCapacity {
+    /// Total virtual CPUs the node can allocate.
+    pub vcpu_total: u16,
+    /// Virtual CPUs currently allocated to workloads.
+    pub vcpu_used: u16,
+    /// Total allocatable memory (MiB).
+    pub mem_total_mb: u32,
+    /// Memory currently allocated to workloads (MiB).
+    pub mem_used_mb: u32,
 }
 
 #[cfg(test)]
@@ -2149,6 +2463,9 @@ mod facade_tests {
             resources: vec![table],
             apply_armed: false,
             published_at_ms: 42,
+            workloads: Vec::new(),
+            drift_summary: DriftSummary::default(),
+            node_capacity: NodeCapacity::default(),
         };
         assert!(state.backend_ready(), "both tools Up ⇒ ready");
         assert_eq!(
