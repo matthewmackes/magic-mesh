@@ -1,0 +1,538 @@
+//! Workloads U2 — the backend-execution seam of the `cloud` worker: shell
+//! OpenTofu / Ansible / virsh through the injectable [`CloudRunner`] trait.
+//!
+//! Split out of the pre-U2 monolith (behavior-preserving relocation): the runner
+//! trait, its production [`ShellCloudRunner`], the [`CloudRunOutcome`] result, the
+//! per-tool health probe, the roster fold, and the injectable test fake all live
+//! here so the drain / gate / reply paths (in the sibling modules) are exercised
+//! WITHOUT a live hypervisor. Nothing here changed in U2 — only its home did.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+
+use mackes_mesh_types::cloud::{
+    CloudInstance, EndpointInterface, HealthState, LifecycleAction, ResourceRow, ResourceTable,
+    ServiceHealth,
+};
+
+// ── IaC tree + libvirt env overrides ──
+
+/// The env override for the IaC tree root (holds `infra/tofu/cloud` + the Ansible
+/// tree). Defaults to [`DEFAULT_IAC_ROOT`] when unset.
+pub(crate) const IAC_ROOT_ENV: &str = "MDE_IAC_ROOT";
+
+/// The env override for the libvirt connection URI the runner drives.
+pub(crate) const LIBVIRT_URI_ENV: &str = "MDE_LIBVIRT_URI";
+
+/// Default IaC tree root when [`IAC_ROOT_ENV`] is unset (a deployed node ships the
+/// tree here; a dev checkout sets `MDE_IAC_ROOT` to the repo root).
+pub(crate) const DEFAULT_IAC_ROOT: &str = "/usr/share/mde/iac";
+
+/// Default libvirt connection URI (local system KVM — E12 local-first).
+pub(crate) const DEFAULT_LIBVIRT_URI: &str = "qemu:///system";
+
+/// The OpenTofu root (provision), relative to the IaC root.
+pub(crate) const TOFU_SUBDIR: &str = "infra/tofu/cloud";
+
+/// The Ansible tree (configure), relative to the IaC root.
+pub(crate) const ANSIBLE_SUBDIR: &str = "automation/ansible";
+
+// ── backend tool identifiers (the `service_type` on each health row) ──
+/// OpenTofu (provision leg).
+pub(crate) const TOOL_TOFU: &str = "opentofu";
+/// Ansible (configure leg).
+pub(crate) const TOOL_ANSIBLE: &str = "ansible";
+/// libvirt/KVM (the local VM backend).
+pub(crate) const TOOL_LIBVIRT: &str = "libvirt";
+
+/// Every backend tool the state mirror reports health for, in render order.
+pub(crate) const BACKEND_TOOLS: [&str; 3] = [TOOL_TOFU, TOOL_ANSIBLE, TOOL_LIBVIRT];
+
+/// The honest outcome of one runner op — its success, a short human summary, and
+/// whether a live mutation was actually attempted (drives the reply's `audited`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudRunOutcome {
+    /// Whether the op succeeded.
+    pub ok: bool,
+    /// A short human summary (a `tofu`/`ansible` result line, or the failure).
+    pub summary: String,
+    /// Whether a live mutation was attempted (`apply == true`). A staged dry-run is
+    /// `false` (nothing was applied).
+    pub applied: bool,
+}
+
+impl CloudRunOutcome {
+    /// A successful outcome.
+    #[must_use]
+    pub fn ok(summary: impl Into<String>, applied: bool) -> Self {
+        Self {
+            ok: true,
+            summary: summary.into(),
+            applied,
+        }
+    }
+
+    /// A failed outcome (never marked applied — a failure durably changed nothing
+    /// we can claim).
+    #[must_use]
+    pub fn failed(summary: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            summary: summary.into(),
+            applied: false,
+        }
+    }
+}
+
+/// The backend-execution seam the worker drives: shell OpenTofu / Ansible / virsh.
+///
+/// Production is [`ShellCloudRunner`]; tests inject a fake so the drain, gate,
+/// reply, audit, and state-publish paths are exercised WITHOUT a live hypervisor
+/// (the `router_action` applier-injection idiom).
+pub trait CloudRunner: Send + Sync {
+    /// Honestly probe whether backend tool `tool` ([`BACKEND_TOOLS`]) is present +
+    /// reachable, as a [`ServiceHealth`] row (`Up` / `Down` / `Absent`, never a
+    /// fabricated up).
+    fn probe_tool(&self, tool: &str) -> ServiceHealth;
+
+    /// List the local cloud instances (a READ — `virsh list`). `Err` when the
+    /// backend can't be reached (an honest gate, never a fabricated empty roster).
+    fn list_instances(&self) -> Result<Vec<CloudInstance>, String>;
+
+    /// Provision via OpenTofu. `apply` ⇒ `tofu apply`; else `tofu plan` (staged).
+    fn provision(&self, apply: bool) -> CloudRunOutcome;
+
+    /// Configure via Ansible. `apply` ⇒ `ansible-playbook`; else `--check` (staged).
+    fn configure(&self, apply: bool) -> CloudRunOutcome;
+
+    /// Destroy via OpenTofu. `apply` ⇒ `tofu destroy`; else `tofu plan -destroy`.
+    fn destroy(&self, apply: bool) -> CloudRunOutcome;
+
+    /// A per-instance lifecycle op via `virsh`. `apply` ⇒ the real op; else staged.
+    fn lifecycle(&self, action: LifecycleAction, instance: &str, apply: bool) -> CloudRunOutcome;
+}
+
+/// Normalize a libvirt domain state to the OpenStack-style status token the
+/// neutral [`CloudInstance`] carries (the roster the KDC client filters on
+/// `ACTIVE`/`SHUTOFF`). Unknown states pass through upper-cased (honest).
+#[must_use]
+pub(crate) fn normalize_domain_state(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "running" => "ACTIVE".to_string(),
+        "shut off" | "shutoff" => "SHUTOFF".to_string(),
+        "paused" => "PAUSED".to_string(),
+        "" => "UNKNOWN".to_string(),
+        other => other.to_ascii_uppercase(),
+    }
+}
+
+/// Build the `compute`/`instances` [`ResourceTable`] for a roster (name · status).
+#[must_use]
+pub(crate) fn instances_table(instances: &[CloudInstance]) -> ResourceTable {
+    ResourceTable {
+        service_type: "compute".to_string(),
+        collection: "instances".to_string(),
+        columns: vec!["name".to_string(), "status".to_string()],
+        rows: instances
+            .iter()
+            .map(|i| ResourceRow {
+                id: i.id.clone(),
+                cells: vec![i.name.clone(), i.status.clone()],
+            })
+            .collect(),
+    }
+}
+
+/// The production runner: shells `tofu` / `ansible-playbook` / `virsh` rooted at
+/// the deployed IaC tree + the local libvirt URI.
+pub(crate) struct ShellCloudRunner {
+    /// The OpenTofu root (`<iac_root>/infra/tofu/cloud`).
+    tofu_dir: PathBuf,
+    /// The Ansible tree (`<iac_root>/automation/ansible`).
+    ansible_dir: PathBuf,
+    /// The libvirt connection URI (`qemu:///system` by default).
+    libvirt_uri: String,
+}
+
+impl ShellCloudRunner {
+    /// Construct from an IaC tree root + a libvirt URI.
+    #[must_use]
+    pub fn new(iac_root: &Path, libvirt_uri: String) -> Self {
+        Self {
+            tofu_dir: iac_root.join(TOFU_SUBDIR),
+            ansible_dir: iac_root.join(ANSIBLE_SUBDIR),
+            libvirt_uri,
+        }
+    }
+
+    /// Run `bin args…`, returning `(success, stdout, stderr)`. `Err` only on a
+    /// spawn failure (binary absent) so the caller can report an honest "tool
+    /// unavailable" rather than a fake failure.
+    fn run(bin: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+        let out = Command::new(bin)
+            .args(args)
+            .output()
+            .map_err(|e| format!("{bin}: {e}"))?;
+        Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+
+    /// Map a shell result into a [`CloudRunOutcome`] for `action` (`applied` is the
+    /// requested apply flag; a failed apply is reported but not marked applied).
+    fn outcome(
+        res: Result<(bool, String, String), String>,
+        applied: bool,
+        action: &str,
+    ) -> CloudRunOutcome {
+        match res {
+            Ok((true, out, _)) => {
+                CloudRunOutcome::ok(format!("{action}: {}", summary_line(&out)), applied)
+            }
+            Ok((false, _, err)) => {
+                CloudRunOutcome::failed(format!("{action} failed: {}", summary_line(&err)))
+            }
+            Err(e) => CloudRunOutcome::failed(format!("{action} unavailable: {e}")),
+        }
+    }
+
+    fn tofu_chdir(&self) -> String {
+        format!("-chdir={}", self.tofu_dir.display())
+    }
+}
+
+impl CloudRunner for ShellCloudRunner {
+    fn probe_tool(&self, tool: &str) -> ServiceHealth {
+        let start = Instant::now();
+        let uri = self.libvirt_uri.clone();
+        let (bin, args, url): (&str, Vec<&str>, &str) = match tool {
+            TOOL_TOFU => ("tofu", vec!["version"], "(local)"),
+            TOOL_ANSIBLE => ("ansible-playbook", vec!["--version"], "(local)"),
+            TOOL_LIBVIRT => ("virsh", vec!["-c", uri.as_str(), "version"], uri.as_str()),
+            _ => {
+                return ServiceHealth {
+                    service_type: tool.to_string(),
+                    interface: EndpointInterface::Internal,
+                    url: String::new(),
+                    state: HealthState::Absent,
+                    latency_ms: None,
+                    microversion: None,
+                    version_id: None,
+                    detail: Some("unknown backend tool".to_string()),
+                }
+            }
+        };
+        match Self::run(bin, &args) {
+            Ok((true, out, _)) => ServiceHealth {
+                service_type: tool.to_string(),
+                interface: EndpointInterface::Internal,
+                url: url.to_string(),
+                state: HealthState::Up,
+                latency_ms: Some(elapsed_ms(start)),
+                microversion: None,
+                version_id: None,
+                detail: Some(summary_line(&out)),
+            },
+            // Present but errored (e.g. libvirtd unreachable) ⇒ Down, not faked up.
+            Ok((false, _, err)) => ServiceHealth {
+                service_type: tool.to_string(),
+                interface: EndpointInterface::Internal,
+                url: url.to_string(),
+                state: HealthState::Down,
+                latency_ms: Some(elapsed_ms(start)),
+                microversion: None,
+                version_id: None,
+                detail: Some(summary_line(&err)),
+            },
+            // Binary absent ⇒ honestly Absent (nothing to reach).
+            Err(e) => ServiceHealth {
+                service_type: tool.to_string(),
+                interface: EndpointInterface::Internal,
+                url: String::new(),
+                state: HealthState::Absent,
+                latency_ms: None,
+                microversion: None,
+                version_id: None,
+                detail: Some(e),
+            },
+        }
+    }
+
+    fn list_instances(&self) -> Result<Vec<CloudInstance>, String> {
+        let (ok, out, err) = Self::run(
+            "virsh",
+            &["-c", &self.libvirt_uri, "list", "--all", "--name"],
+        )
+        .map_err(|e| format!("libvirt unavailable: {e}"))?;
+        if !ok {
+            return Err(format!("virsh list failed: {}", summary_line(&err)));
+        }
+        let mut instances = Vec::new();
+        for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let status = match Self::run("virsh", &["-c", &self.libvirt_uri, "domstate", name]) {
+                Ok((true, sout, _)) => normalize_domain_state(&sout),
+                _ => "UNKNOWN".to_string(),
+            };
+            instances.push(CloudInstance {
+                id: name.to_string(),
+                name: name.to_string(),
+                status,
+                flavor: None,
+                image: None,
+                networks: None,
+            });
+        }
+        Ok(instances)
+    }
+
+    fn provision(&self, apply: bool) -> CloudRunOutcome {
+        let chdir = self.tofu_chdir();
+        let args: Vec<&str> = if apply {
+            vec![
+                &chdir,
+                "apply",
+                "-auto-approve",
+                "-input=false",
+                "-no-color",
+            ]
+        } else {
+            vec![&chdir, "plan", "-input=false", "-no-color"]
+        };
+        Self::outcome(
+            Self::run("tofu", &args),
+            apply,
+            if apply {
+                "tofu apply"
+            } else {
+                "tofu plan (staged)"
+            },
+        )
+    }
+
+    fn destroy(&self, apply: bool) -> CloudRunOutcome {
+        let chdir = self.tofu_chdir();
+        let args: Vec<&str> = if apply {
+            vec![
+                &chdir,
+                "destroy",
+                "-auto-approve",
+                "-input=false",
+                "-no-color",
+            ]
+        } else {
+            vec![&chdir, "plan", "-destroy", "-input=false", "-no-color"]
+        };
+        Self::outcome(
+            Self::run("tofu", &args),
+            apply,
+            if apply {
+                "tofu destroy"
+            } else {
+                "tofu plan -destroy (staged)"
+            },
+        )
+    }
+
+    fn configure(&self, apply: bool) -> CloudRunOutcome {
+        let playbook = self.ansible_dir.join("playbooks").join("site.yml");
+        let playbook_str = playbook.display().to_string();
+        let inventory = self.ansible_dir.join("inventory").join("mesh.py");
+        let inventory_str = inventory.display().to_string();
+        let mut args: Vec<&str> = vec!["-i", &inventory_str, &playbook_str];
+        if !apply {
+            args.push("--check");
+        }
+        Self::outcome(
+            Self::run("ansible-playbook", &args),
+            apply,
+            if apply {
+                "ansible-playbook"
+            } else {
+                "ansible-playbook --check (staged)"
+            },
+        )
+    }
+
+    fn lifecycle(&self, action: LifecycleAction, instance: &str, apply: bool) -> CloudRunOutcome {
+        if !apply {
+            return CloudRunOutcome::ok(
+                format!("virsh {} {instance} (staged)", action.cli_verb()),
+                false,
+            );
+        }
+        // Map the neutral lifecycle action onto the virsh subcommand.
+        let subcmd = match action {
+            LifecycleAction::Start => "start",
+            LifecycleAction::Stop => "shutdown",
+            LifecycleAction::Reboot => "reboot",
+            LifecycleAction::Delete => "undefine",
+        };
+        // A Delete first force-stops the domain (best-effort) so the undefine
+        // succeeds on a running persistent domain.
+        if matches!(action, LifecycleAction::Delete) {
+            let _ = Self::run("virsh", &["-c", &self.libvirt_uri, "destroy", instance]);
+        }
+        Self::outcome(
+            Self::run("virsh", &["-c", &self.libvirt_uri, subcmd, instance]),
+            true,
+            &format!("virsh {subcmd} {instance}"),
+        )
+    }
+}
+
+// ─────────────────────────── small helpers ───────────────────────────
+
+pub(crate) fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The first non-empty line of a command's output, trimmed + length-capped — the
+/// human "why" carried in a health/reply detail (never a multi-KB dump).
+pub(crate) fn summary_line(s: &str) -> String {
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if line.len() > 200 {
+        format!("{}…", &line[..200])
+    } else {
+        line
+    }
+}
+
+/// The default IaC tree root: [`IAC_ROOT_ENV`] or [`DEFAULT_IAC_ROOT`].
+pub(crate) fn default_iac_root() -> PathBuf {
+    std::env::var_os(IAC_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IAC_ROOT))
+}
+
+/// The default libvirt URI: [`LIBVIRT_URI_ENV`] or [`DEFAULT_LIBVIRT_URI`].
+pub(crate) fn default_libvirt_uri() -> String {
+    std::env::var(LIBVIRT_URI_ENV).unwrap_or_else(|_| DEFAULT_LIBVIRT_URI.to_string())
+}
+
+// ─────────────────────────── the injectable test fake ───────────────────────────
+
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A scripted fake runner: records the `apply` flag each mutation was called
+    /// with, returns canned outcomes, and serves a fixed roster. Shared by the
+    /// sibling modules' tests (the drain / gate / verb paths).
+    #[derive(Default)]
+    pub(crate) struct FakeRunner {
+        pub roster: Vec<CloudInstance>,
+        pub roster_err: Option<String>,
+        pub tofu_up: bool,
+        /// (verb, apply) calls the worker made — proves the gate.
+        pub calls: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl FakeRunner {
+        fn record(&self, verb: &str, apply: bool) {
+            self.calls.lock().unwrap().push((verb.to_string(), apply));
+        }
+    }
+
+    impl CloudRunner for FakeRunner {
+        fn probe_tool(&self, tool: &str) -> ServiceHealth {
+            let state = if tool == TOOL_TOFU && self.tofu_up {
+                HealthState::Up
+            } else {
+                HealthState::Absent
+            };
+            ServiceHealth {
+                service_type: tool.to_string(),
+                interface: EndpointInterface::Internal,
+                url: "(local)".to_string(),
+                state,
+                latency_ms: Some(1),
+                microversion: None,
+                version_id: None,
+                detail: Some("fake".to_string()),
+            }
+        }
+        fn list_instances(&self) -> Result<Vec<CloudInstance>, String> {
+            match &self.roster_err {
+                Some(e) => Err(e.clone()),
+                None => Ok(self.roster.clone()),
+            }
+        }
+        fn provision(&self, apply: bool) -> CloudRunOutcome {
+            self.record("provision", apply);
+            CloudRunOutcome::ok("2 to add, 0 to change", apply)
+        }
+        fn configure(&self, apply: bool) -> CloudRunOutcome {
+            self.record("configure", apply);
+            CloudRunOutcome::ok("ok=3 changed=1", apply)
+        }
+        fn destroy(&self, apply: bool) -> CloudRunOutcome {
+            self.record("destroy", apply);
+            CloudRunOutcome::ok("1 to destroy", apply)
+        }
+        fn lifecycle(
+            &self,
+            action: LifecycleAction,
+            instance: &str,
+            apply: bool,
+        ) -> CloudRunOutcome {
+            self.record(&format!("lifecycle-{}", action.cli_verb()), apply);
+            CloudRunOutcome::ok(format!("virsh {} {instance}", action.cli_verb()), apply)
+        }
+    }
+
+    /// A one-line [`CloudInstance`] fixture (name == id).
+    pub(crate) fn instance(name: &str, status: &str) -> CloudInstance {
+        CloudInstance {
+            id: name.to_string(),
+            name: name.to_string(),
+            status: status.to_string(),
+            flavor: None,
+            image: None,
+            networks: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_domain_state_maps_libvirt_states_to_neutral_status() {
+        assert_eq!(normalize_domain_state("running"), "ACTIVE");
+        assert_eq!(normalize_domain_state("shut off"), "SHUTOFF");
+        assert_eq!(normalize_domain_state("paused"), "PAUSED");
+        assert_eq!(normalize_domain_state("pmsuspended"), "PMSUSPENDED");
+        assert_eq!(normalize_domain_state(""), "UNKNOWN");
+    }
+
+    #[test]
+    fn instances_table_folds_name_and_status_cells() {
+        let rows = vec![
+            fake::instance("web", "ACTIVE"),
+            fake::instance("db", "SHUTOFF"),
+        ];
+        let t = instances_table(&rows);
+        assert_eq!(t.service_type, "compute");
+        assert_eq!(t.collection, "instances");
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.row_label(&t.rows[0]), "web");
+    }
+
+    #[test]
+    fn a_run_outcome_failure_is_never_marked_applied() {
+        let f = CloudRunOutcome::failed("boom");
+        assert!(!f.ok && !f.applied);
+        let ok = CloudRunOutcome::ok("done", true);
+        assert!(ok.ok && ok.applied);
+    }
+}
