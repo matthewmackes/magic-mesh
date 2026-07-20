@@ -32,6 +32,15 @@ use std::path::PathBuf;
 
 use rand::RngCore;
 
+// WL-SEC-003 — role/scope-targeted sealing: the pure resolver that narrows a
+// secret's recipient set from the whole mesh down to the nodes whose published
+// role / capability-scope tags match a `--scope` selector. The asymmetric
+// multi-recipient seal itself stays `age`'s job (in `mcnf-secret.sh`); this crate
+// owns the selector grammar + the recipient-set resolution both the shell helper
+// and any Rust caller share.
+pub mod scope;
+pub use scope::{recipients_for, NodeRecipient, ScopeError, SealScope};
+
 /// Bundle magic — distinguishes our envelope from generic
 /// base64 blobs. ASCII "MNCA".
 pub const BUNDLE_MAGIC: &[u8; 4] = b"MNCA";
