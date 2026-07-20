@@ -12,8 +12,8 @@
 
 use mde_collab_types::{
     ActivityFeed, ActorId, AlertInbox, CallState, ClipboardLane, CollabCommand,
-    ConversationTimeline, EventId, FileReferences, MessageView, SpaceDirectory, SpaceId, ThreadId,
-    ThreadTimeline, TransferJobs,
+    ConversationTimeline, DocumentId, DocumentSessions, EventId, FileReferences, MessageView,
+    SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 /// The message **edit/delete window** in milliseconds: an author may amend
@@ -114,6 +114,36 @@ pub trait CollabData {
     #[must_use]
     fn clipboard_lane(&self, space: SpaceId) -> Option<&ClipboardLane> {
         let _ = space;
+        None
+    }
+
+    /// A space's live document co-edit sessions (the
+    /// [`DocumentSessions`](mde_collab_types::DocumentSessions) projection the
+    /// Documents mode's picker lists). `None` until the worker has projected any
+    /// for the space — the honest "no documents yet" empty state, never faked.
+    /// Defaults to `None`.
+    #[must_use]
+    fn document_sessions(&self, space: SpaceId) -> Option<&DocumentSessions> {
+        let _ = space;
+        None
+    }
+
+    /// The **resolved canonical Markdown** for `document` — the plain-text body a
+    /// `DocumentUpdated` change's content address
+    /// ([`PayloadRef`](mde_collab_types::PayloadRef)) points at, resolved to bytes
+    /// by the data source (the shell mount's blob store, WL-FUNC-006 content-
+    /// addressed payloads). This pure UI crate never fetches the bytes itself: it
+    /// reads the already-resolved body here and hands it to the embedded editor.
+    /// `None` when no body has been resolved yet — the Documents mode then opens a
+    /// blank editable buffer, never a faked one (§7). Defaults to `None`.
+    ///
+    /// WL-FUNC-011 Phase 3c: today this returns a resolved *snapshot*; the live
+    /// Yrs CRDT co-edit stream (shared cursors/presence, follow-mode) that keeps
+    /// the body converging in real time across seats is the next slice, wired
+    /// through `mde_editor_egui::CollabSession` over the Mackes Bus.
+    #[must_use]
+    fn document_body(&self, document: DocumentId) -> Option<&str> {
+        let _ = document;
         None
     }
 }

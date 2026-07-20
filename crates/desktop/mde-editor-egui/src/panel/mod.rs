@@ -736,6 +736,16 @@ impl EditorSurface {
         self.doc().and_then(|doc| doc.buffer.path())
     }
 
+    /// The focused document's full text as an owned `String`, or `None` when the
+    /// focused pane has no open tab. The read seam an embedding surface (e.g. the
+    /// Communications Documents mode, WL-FUNC-011) reads the canonical text back
+    /// through to persist it — the analogue of [`current_path`](Self::current_path),
+    /// stringifying the live rope on demand (no per-frame cost; call it on save).
+    #[must_use]
+    pub fn current_text(&self) -> Option<String> {
+        self.doc().map(|doc| doc.buffer.rope().to_string())
+    }
+
     // ── EDITOR-6: the focused pane's active tab is the "current document" ─────
 
     /// The focused pane's active document — the "current document" every seam

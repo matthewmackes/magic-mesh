@@ -47,6 +47,20 @@ mde-collab-types = { path = "../../shared/mde-collab-types" }
 # same reuse `mde-editor-egui`/`mde-term-egui` take on this crate.
 mde-files = { path = "../../services/mde-files" }
 
+# WL-FUNC-011 Documents mode — REUSE the whole "Construct" editor rather than
+# rewriting it. `mde-editor-egui`'s `EditorSurface` + `editor_panel` seam is
+# mounted directly: the Project sub-mode embeds the full IDE (rope, tabs/splits,
+# tree-sitter, LSP, palette, integrated terminal, Word-97 menu + Standard +
+# Formatting toolbars), and the Document sub-mode embeds a one-pane markdown
+# editor over the same rope, with the Visual view reusing the editor's own
+# `markdown::parse`/`markdown::show` render. A same-tier desktop edge; it pulls
+# the editor's heavy graph (tree-sitter grammars, yrs, lsp-types) — already
+# resolved once in the workspace — so the collab surface never re-implements an
+# editor. The embedded `EditorSurface` is headless-safe (its `Default`/`open_text`
+# path spawns no threads and connects no Bus; the mesh co-edit session + PTY are
+# opt-in), mirroring the `mde-files` render-agnostic reuse in Files mode.
+mde-editor-egui = { path = "../mde-editor-egui" }
+
 [dev-dependencies]
 # The Files-mode tests write a real temp file, then link it (read + SHA-256 hash)
 # to assert the emitted `FileRef` carries the true content address. `tempfile` is

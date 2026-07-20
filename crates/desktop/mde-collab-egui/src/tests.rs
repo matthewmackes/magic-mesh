@@ -14,15 +14,16 @@ use std::collections::BTreeMap;
 use mde_collab_types::{
     ActivityFeed, ActorId, AlertAction, AlertActionKind, AlertInbox, AlertPayload, AlertView,
     ClipItemKind, ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState,
-    EventId, FileRef, FileRefId, FileReferenceView, FileReferences, Severity, SpaceId, SpaceKind,
-    SpaceRole, TransferControl, TransferDirection, TransferId, TransferJobView, TransferJobs,
-    TransferMethod, TransferState,
+    DocumentId, DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
+    FileReferences, Severity, SpaceId, SpaceKind, SpaceRole, TransferControl, TransferDirection,
+    TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
 };
 
 use crate::fixture::{activity, message, space_summary, FixtureData};
 use crate::{
     amend_affordance, file_ref_of_path, ActivityFilter, AmendAffordance, CollabData, CommandSink,
-    CommunicationsSurface, Mode, ALL_COLLAB_ICONS, EDIT_WINDOW_MS,
+    CommunicationsSurface, DocSubMode, DocTemplate, DocView, Mode, ALL_COLLAB_ICONS,
+    EDIT_WINDOW_MS,
 };
 
 /// A `1000 x 700` headless input with the given events.
@@ -371,29 +372,12 @@ fn activity_body_renders_the_feed() {
 }
 
 #[test]
-fn labeled_for_later_modes_are_honest() {
-    // Documents is the only remaining placeholder — it carries a Phase-3b note and
-    // is not marked implemented. (Files/Transfers/Alerts/Clipboard graduated to
-    // full modes with WL-FUNC-011 and are asserted implemented below.)
-    assert!(
-        !Mode::Documents.is_implemented(),
-        "Documents is a placeholder"
-    );
-    assert!(
-        Mode::Documents.phase_3b_note().contains("Phase 3b"),
-        "Documents must carry an honest labeled-for-later note"
-    );
-    for mode in [
-        Mode::Activity,
-        Mode::Messages,
-        Mode::Files,
-        Mode::Transfers,
-        Mode::Alerts,
-        Mode::Clipboard,
-    ] {
+fn every_mode_is_implemented() {
+    // No tab is a labeled-for-later placeholder any more: Documents (WL-FUNC-011
+    // Phase 3c foundation) embeds the real editor and emits the collab document
+    // commands, joining the other six fully-implemented modes.
+    for mode in Mode::TABS {
         assert!(mode.is_implemented(), "{mode:?} must be implemented");
-        // An implemented mode never renders a placeholder note.
-        assert_eq!(mode.phase_3b_note(), "", "{mode:?} must not carry a note");
     }
 }
 
@@ -1027,5 +1011,207 @@ fn clip_actions_emit_attach_pin_and_delete() {
             Some(CollabCommand::DeleteClipboard { space: s, clip: c }) if *s == space && *c == clip
         ),
         "delete must emit DeleteClipboard"
+    );
+}
+
+// ── Documents mode (WL-FUNC-011 Phase 3c foundation) ─────────────────────────
+
+/// A one-space fixture with a single document session + its resolved body, so the
+/// Documents-mode tests exercise the real read models (never faked data).
+fn documents_fixture(space: SpaceId, document: DocumentId, body: &str) -> FixtureData {
+    FixtureData::new("eagle", 1_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Project,
+            "Docs",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000,
+        ))
+        .with_document_sessions(
+            space,
+            DocumentSessions {
+                sessions: vec![DocumentSession {
+                    document,
+                    space,
+                    title: "Runbook".to_owned(),
+                    participants: vec![ActorId::new("eagle")],
+                    call: None,
+                }],
+            },
+        )
+        .with_document_body(document, body)
+}
+
+#[test]
+fn documents_mode_renders_in_both_sub_modes() {
+    // The Documents mode renders headless in both the default Document sub-mode
+    // (the one-pane Markdown editor) and the Project sub-mode (the full embedded
+    // IDE), and switching sub-mode/view is real view state.
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let data = documents_fixture(space, document, "# Runbook\n\nbody\n");
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Documents);
+
+    // Default sub-mode is Document, default view is Source.
+    assert_eq!(surface.doc_submode(), DocSubMode::Document);
+    assert_eq!(surface.doc_view(), DocView::Source);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "Documents mode must paint Carbon icons as image meshes"
+    );
+
+    // Visual view renders the rendered Markdown (still the same mode).
+    surface.set_doc_view(DocView::Visual);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the Visual view painted nothing");
+    assert_eq!(surface.doc_view(), DocView::Visual);
+
+    // Project sub-mode embeds the full IDE editor and renders.
+    surface.set_doc_submode(DocSubMode::Project);
+    let shapes = render_shapes(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the Project sub-mode painted nothing");
+    assert_eq!(surface.doc_submode(), DocSubMode::Project);
+}
+
+#[test]
+fn opening_a_document_session_loads_its_canonical_markdown() {
+    // Opening a fixture DocumentSessions entry loads the resolved canonical
+    // Markdown body into the embedded editor — a real load, never faked.
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Runbook\n\n## Steps\n\n1. deploy\n";
+    let data = documents_fixture(space, document, body);
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.open_document(&data, document, "Runbook");
+
+    assert_eq!(surface.active_document(), Some(document));
+    assert_eq!(
+        surface.document_editor_text().as_deref(),
+        Some(body),
+        "the editor must hold the session's resolved canonical Markdown"
+    );
+}
+
+#[test]
+fn saving_a_document_emits_update_document_with_the_canonical_markdown() {
+    // Editing + save emits UpdateDocument whose change payload IS the content
+    // address of the canonical Markdown (text/markdown) — the Markdown path stays
+    // source of truth.
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Runbook\n\nedited body\n";
+    let data = documents_fixture(space, document, body);
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.open_document(&data, document, "Runbook");
+
+    let mut sink = CommandSink::new();
+    assert!(surface.save_document(&mut sink, space), "save must emit");
+
+    let update = sink.queued().iter().find_map(|c| match c {
+        CollabCommand::UpdateDocument {
+            space: s,
+            document: d,
+            change,
+        } => Some((*s, *d, change.clone())),
+        _ => None,
+    });
+    let (s, d, change) = update.expect("UpdateDocument emitted");
+    assert_eq!(s, space);
+    assert_eq!(d, document);
+    assert_eq!(
+        change.payload.sha256_hex,
+        mde_collab_types::value::sha256_hex(body.as_bytes()),
+        "the UpdateDocument payload must be the content address of the canonical Markdown"
+    );
+    assert_eq!(change.payload.len, body.len() as u64);
+    assert_eq!(
+        change.payload.content_type.as_deref(),
+        Some("text/markdown"),
+        "the canonical payload is Markdown"
+    );
+}
+
+#[test]
+fn new_document_from_a_template_emits_create_document_and_seeds_the_rope() {
+    // The New affordance emits CreateDocument and seeds the editor with the
+    // template's real Markdown skeleton (a real editable rope, never a locked form).
+    let space = SpaceId::new();
+    let data = documents_fixture(space, DocumentId::new(), "irrelevant");
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+
+    let mut sink = CommandSink::new();
+    let created = surface.new_document(&mut sink, space, DocTemplate::Runbook);
+
+    assert_eq!(surface.active_document(), Some(created));
+    let create = sink.queued().iter().find_map(|c| match c {
+        CollabCommand::CreateDocument {
+            space: s,
+            document: d,
+            title,
+        } => Some((*s, *d, title.clone())),
+        _ => None,
+    });
+    let (s, d, title) = create.expect("CreateDocument emitted");
+    assert_eq!(s, space);
+    assert_eq!(d, created);
+    assert_eq!(title, "Runbook");
+    // The rope holds the real template skeleton.
+    let text = surface.document_editor_text().unwrap_or_default();
+    assert!(
+        text.contains("# Runbook") && text.contains("## Rollback"),
+        "the new document must be seeded with the Runbook template markdown"
+    );
+    let _ = data; // fixture only needed for the space selection
+}
+
+#[test]
+fn markdown_export_returns_the_canonical_markdown() {
+    // Markdown is the only export: export_markdown returns the editor's canonical
+    // Markdown (the same bytes an UpdateDocument would carry).
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let body = "# Doc\n\nexport me\n";
+    let data = documents_fixture(space, document, body);
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.open_document(&data, document, "Doc");
+
+    assert_eq!(
+        surface.export_markdown().as_deref(),
+        Some(body),
+        "the Markdown export path must yield the canonical Markdown"
+    );
+}
+
+#[test]
+fn switching_space_resets_the_picked_document() {
+    // The picked document is a per-space intent — a space switch clears it so the
+    // new space's sessions drive the picker (no stale document leaks across spaces).
+    let a = SpaceId::new();
+    let b = SpaceId::new();
+    let document = DocumentId::new();
+    let data = documents_fixture(a, document, "# A\n");
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(a);
+    surface.open_document(&data, document, "A");
+    assert_eq!(surface.active_document(), Some(document));
+
+    surface.select_space(b);
+    assert_eq!(
+        surface.active_document(),
+        None,
+        "a space switch must reset the picked document"
     );
 }

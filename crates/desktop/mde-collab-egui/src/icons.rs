@@ -153,6 +153,25 @@ pub const CLIP_DELETE: &str = "list-remove";
 /// Publish a new clipboard item into the lane.
 pub const CLIP_PUBLISH: &str = "list-add";
 
+// ---- Documents mode (WL-FUNC-011) ----------------------------------------
+/// The Document sub-mode tab (the one-pane Markdown editor).
+pub const DOC_SUBMODE_DOCUMENT: &str = "document-edit";
+/// The Project sub-mode tab (the embedded full "Construct" IDE editor).
+pub const DOC_SUBMODE_PROJECT: &str = "view-grid";
+/// The Source view (edit the raw Markdown rope).
+pub const DOC_VIEW_SOURCE: &str = "text-x-generic";
+/// The Visual view (the rendered Markdown, via the editor's own render).
+pub const DOC_VIEW_VISUAL: &str = "view";
+/// Start a new document (opens the ops-oriented template picker).
+pub const DOC_NEW: &str = "list-add";
+/// Save the document — emits `UpdateDocument` with the canonical Markdown.
+pub const DOC_SAVE: &str = "emblem-ok";
+/// Export the canonical Markdown (the only export; print/preview live in the
+/// embedded editor's File menu, off this default toolbar).
+pub const DOC_EXPORT: &str = "go-up";
+/// A document row in the session picker.
+pub const DOC_ROW: &str = "document-edit";
+
 // ---- Transfers mode ------------------------------------------------------
 /// A transfer row's leading glyph.
 pub const XFER_ROW: &str = "download";

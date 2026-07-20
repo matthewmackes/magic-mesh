@@ -34,24 +34,6 @@ pub fn body_frame() -> egui::Frame {
     egui::Frame::NONE.fill(Style::BG).inner_margin(Style::SP_M)
 }
 
-/// The honest labeled-for-later body a Phase-3b mode renders instead of faking
-/// data: the mode's Carbon glyph, its name, and a one-line "arrives in Phase 3b"
-/// note.
-pub fn phase_3b_body(ui: &mut egui::Ui, mode: Mode) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(Style::SP_XL);
-        icons::icon(ui, icons::mode_icon(mode), Style::SP_XL, Style::TEXT_DIM);
-        ui.add_space(Style::SP_S);
-        ui.label(
-            egui::RichText::new(mode.label())
-                .size(Style::TITLE)
-                .strong()
-                .color(Style::TEXT),
-        );
-        ui.label(egui::RichText::new(mode.phase_3b_note()).color(Style::TEXT_DIM));
-    });
-}
-
 impl CommunicationsSurface {
     /// The persistent spaces rail: one selectable row per
     /// [`SpaceSummary`](mde_collab_types::SpaceSummary), with a kind glyph, the
@@ -105,8 +87,8 @@ impl CommunicationsSurface {
             });
     }
 
-    /// The per-space mode tabs. Every tab is selectable; an unimplemented tab is
-    /// dimmed and its body carries the Phase-3b note.
+    /// The per-space mode tabs. Every tab is selectable and implemented; the
+    /// selected tab is accent-tinted, the rest read as dim-but-live.
     pub(crate) fn mode_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for mode in Mode::TABS {

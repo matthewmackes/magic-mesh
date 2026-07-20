@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use mde_collab_types::{
     ActivityEntry, ActivityFeed, ActorClock, ActorId, AlertInbox, CallKind, CallParticipantState,
     CallParticipantView, CallState, CallView, ClipboardLane, ConversationTimeline, DeliveryState,
-    EventId, FileReferences, MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
-    SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
+    DocumentId, DocumentSessions, EventId, FileReferences, MessageView, SpaceDirectory, SpaceId,
+    SpaceKind, SpaceRole, SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -32,6 +32,8 @@ pub struct FixtureData {
     transfer_jobs: TransferJobs,
     alert_inbox: AlertInbox,
     clipboard_lanes: HashMap<SpaceId, ClipboardLane>,
+    document_sessions: HashMap<SpaceId, DocumentSessions>,
+    document_bodies: HashMap<DocumentId, String>,
 }
 
 impl FixtureData {
@@ -52,6 +54,8 @@ impl FixtureData {
             transfer_jobs: TransferJobs::default(),
             alert_inbox: AlertInbox::default(),
             clipboard_lanes: HashMap::new(),
+            document_sessions: HashMap::new(),
+            document_bodies: HashMap::new(),
         }
     }
 
@@ -120,6 +124,23 @@ impl FixtureData {
     #[must_use]
     pub fn with_clipboard_lane(mut self, lane: ClipboardLane) -> Self {
         self.clipboard_lanes.insert(lane.space, lane);
+        self
+    }
+
+    /// Set a space's live document co-edit sessions (the Documents mode's picker
+    /// read model, keyed by `space`).
+    #[must_use]
+    pub fn with_document_sessions(mut self, space: SpaceId, sessions: DocumentSessions) -> Self {
+        self.document_sessions.insert(space, sessions);
+        self
+    }
+
+    /// Set the resolved canonical Markdown body for `document` — the bytes the
+    /// shell's content-addressed blob store would resolve a document's payload to,
+    /// so a test's "open this session and it loads" is real, never faked.
+    #[must_use]
+    pub fn with_document_body(mut self, document: DocumentId, body: impl Into<String>) -> Self {
+        self.document_bodies.insert(document, body.into());
         self
     }
 
@@ -341,6 +362,14 @@ impl CollabData for FixtureData {
 
     fn clipboard_lane(&self, space: SpaceId) -> Option<&ClipboardLane> {
         self.clipboard_lanes.get(&space)
+    }
+
+    fn document_sessions(&self, space: SpaceId) -> Option<&DocumentSessions> {
+        self.document_sessions.get(&space)
+    }
+
+    fn document_body(&self, document: DocumentId) -> Option<&str> {
+        self.document_bodies.get(&document).map(String::as_str)
     }
 }
 

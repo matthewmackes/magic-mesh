@@ -16,9 +16,13 @@
 //!   [`SpaceDirectory`](mde_collab_types::SpaceDirectory) with per-space unread
 //!   badges (the selection key for every other pane);
 //! * per-space **mode tabs** across the top — [`Mode::Activity`],
-//!   [`Mode::Messages`], [`Mode::Files`], [`Mode::Transfers`], [`Mode::Alerts`],
-//!   and [`Mode::Clipboard`] are implemented in full; [`Mode::Documents`] is
-//!   honestly labeled "coming in Phase 3b", never faked;
+//!   [`Mode::Messages`], [`Mode::Files`], [`Mode::Transfers`], [`Mode::Documents`],
+//!   [`Mode::Alerts`], and [`Mode::Clipboard`] are all implemented. Documents
+//!   (WL-FUNC-011 Phase 3c foundation) embeds the real `mde-editor-egui` editor —
+//!   a Project sub-mode (the full IDE) and a default Document sub-mode (a one-pane
+//!   Markdown editor) — and emits the collab document commands; the CRDT live
+//!   co-edit / three-way merge / review sidecar / versioning are marked in-code
+//!   follow-ups, never faked;
 //! * a persistent **call bar** across the bottom that renders the
 //!   [`CallState`](mde_collab_types::CallState) read model and survives every
 //!   mode/space switch, with controls wired to the call commands even though the
@@ -60,6 +64,7 @@ mod activity;
 mod alerts;
 mod clipboard;
 mod data;
+mod documents;
 mod files;
 mod fixture;
 mod frame;
@@ -73,6 +78,7 @@ mod tests;
 pub use data::{
     amend_affordance, relative_age, AmendAffordance, CollabData, CommandSink, EDIT_WINDOW_MS,
 };
+pub use documents::{DocSubMode, DocTemplate, DocView};
 pub use fixture::FixtureData;
 pub use icons::ALL_COLLAB_ICONS;
 
@@ -87,10 +93,10 @@ pub use files::file_ref_of_path;
 // pinned toolkit version through this crate alone.
 pub use mde_egui::egui;
 
-/// A per-space mode tab. Every tab but [`Documents`](Self::Documents) is
-/// implemented in full; Documents renders an honest "coming in Phase 3b"
-/// placeholder (it maps to a real read model the later phase renders — never
-/// faked data).
+/// A per-space mode tab. Every tab is implemented, including
+/// [`Documents`](Self::Documents), which embeds the real `mde-editor-egui` editor
+/// (its Project sub-mode is the full IDE; its default Document sub-mode is a
+/// one-pane Markdown editor) and emits the collab document commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// The action-oriented chronological Activity feed.
@@ -102,7 +108,8 @@ pub enum Mode {
     Files,
     /// The shared transfer jobs (the WL-FUNC-006 ledger mirror) + their controls.
     Transfers,
-    /// The live co-edited documents (Phase 3b).
+    /// The documents mode — the embedded editor (a Project IDE sub-mode + a
+    /// default one-pane Markdown Document sub-mode) over the space's documents.
     Documents,
     /// The fleet-wide alert inbox (severity/source/state + ack/snooze/actions).
     Alerts,
@@ -136,26 +143,19 @@ impl Mode {
         }
     }
 
-    /// Whether this mode is implemented (every mode but Documents, which is a
-    /// labeled-for-later placeholder).
+    /// Whether this mode is implemented. Every mode is now implemented, including
+    /// Documents (WL-FUNC-011 Phase 3c foundation) — no tab is a labeled-for-later
+    /// placeholder. Retained as the mode-tab tint predicate.
     #[must_use]
     pub const fn is_implemented(self) -> bool {
-        !matches!(self, Self::Documents)
-    }
-
-    /// The honest placeholder line a not-yet-implemented mode shows instead of
-    /// faking data.
-    #[must_use]
-    pub const fn phase_3b_note(self) -> &'static str {
         match self {
-            Self::Documents => "Documents mode arrives in Phase 3b.",
-            // The implemented modes never render this note.
             Self::Activity
             | Self::Messages
             | Self::Files
             | Self::Transfers
+            | Self::Documents
             | Self::Alerts
-            | Self::Clipboard => "",
+            | Self::Clipboard => true,
         }
     }
 }
@@ -282,6 +282,11 @@ pub struct CommunicationsSurface {
     /// Clipboard mode — per-space publish-composer drafts (persist locally across
     /// mode/space switches, like the message composer draft).
     clip_drafts: HashMap<SpaceId, String>,
+    /// Documents mode — the embedded editors (a one-pane Markdown Document editor +
+    /// the full Project IDE editor) plus the picked-document/title + sub-mode/view
+    /// toggles. Reuses `mde-editor-egui`; owns no authoritative content (the
+    /// canonical Markdown lives in the editor rope and is read back on save).
+    documents: documents::DocumentsState,
 }
 
 impl CommunicationsSurface {
@@ -314,6 +319,10 @@ impl CommunicationsSurface {
             // A pending armed destructive alert action is a per-view intent — a
             // space switch disarms it (it must be re-armed deliberately).
             self.alert_arming = None;
+            // The picked document is a per-space intent — reset it (the editor
+            // content is replaced on the next load, so nothing stale leaks across
+            // spaces). The embedded editors themselves survive as scratch state.
+            self.documents.on_space_switch();
         }
     }
 
@@ -391,9 +400,9 @@ impl CommunicationsSurface {
             Mode::Messages => self.messages_body(ui, data, sink),
             Mode::Files => self.files_body(ui, data, sink),
             Mode::Transfers => self.transfers_body(ui, data, sink),
+            Mode::Documents => self.documents_body(ui, data, sink),
             Mode::Alerts => self.alerts_body(ui, data, sink),
             Mode::Clipboard => self.clipboard_body(ui, data, sink),
-            other => frame::phase_3b_body(ui, other),
         }
     }
 }
