@@ -64,6 +64,10 @@ external account, signing/release authority).** The autonomous drain is complete
 its ceiling; the remaining 25 are honestly categorized with their gate named -
 beta-readiness needs them *parked-with-a-gate*, not *done*.
 
+**Post-reconciliation operator addition:** WL-FUNC-011 was added after the
+43-epic 2026-07-19 drain audit. It is outside that historical count and evidence
+ledger; the audit's totals remain a snapshot of the worklist it evaluated.
+
 ## Status Vocabulary
 
 - `Remaining` - valid unfinished work that can proceed.
@@ -667,6 +671,334 @@ These decisions refine acceptance and sequencing for the active items below.
 - Verification method: Fixture tests with mixed service sources and live registry
   smoke.
 - Origin or merged source IDs: COMPUTE-DISCOVERY, old worklist line 1736.
+
+### WL-FUNC-011 - Communications collaboration suite full replacement
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
+  separate surfaces with disconnected identities, histories, workflows, and
+  state. Users cannot move naturally between conversation, document editing,
+  calls, alerts, shared clipboard content, and file operations inside one
+  collaboration context. The existing implementations contain substantial
+  working behavior, so a superficial shell around them would leave competing
+  stores, navigation, and ownership boundaries rather than deliver one product.
+- Required outcome: One complete `Communications` surface replaces all seven
+  surfaces without losing existing behavior. Collaboration spaces become the
+  organizing object, with messaging, documents, files, transfers, calls, alerts,
+  clipboard content, search, and assistive AI sharing one durable, offline-first
+  model. The replacement is released only after every surveyed requirement and
+  every current-feature parity row is runtime-reachable, tested, and accepted by
+  the operator.
+- Scope: Full subsystem rewrite; shared collaboration contracts; mesh replication;
+  one native egui surface; messaging and threads; document editing and review;
+  file management and transfer; alerts; clipboard; voice/video/screen calls; SIP
+  interoperability; DigitalOcean-hosted LLM assistance; migration; rollback;
+  removal of superseded surfaces, workers, crates, state writers, routes, and
+  documentation. Recording, transcription, autonomous AI actions, a competing
+  suite-wide omnibox, per-space E2E encryption, partial release, and permanent
+  compatibility shims are out of scope.
+- Relevant files/components: new `crates/shared/mde-collab-types/`,
+  `crates/services/mde-collab-core/`, and
+  `crates/desktop/mde-collab-egui/`; `crates/desktop/mde-shell-egui/`;
+  collaboration workers under `crates/mesh/mackesd/src/workers/`; existing
+  `mde-chat`, `mde-editor-egui`, `mde-files`, `mde-files-egui`, `mde-voice-egui`,
+  `mde-voice-hud`, transfer, alert-relay, and clipboard-sync implementations;
+  `AI_GOVERNANCE.md` and superseded design notes.
+- Dependencies: Coordinate with, but do not duplicate or absorb, WL-ARCH-003 for
+  the shared Bus/Persist client, WL-ARCH-004 for worker registration and restart
+  policy, WL-FUNC-005 for Start Search indexing, WL-FUNC-006 for shared file
+  operation progress, and WL-UX-005 for launcher integration. Final live proof
+  requires a sealed DigitalOcean model-access key, multi-node mesh fixtures,
+  microphone/camera/display hardware, and SIP test connectivity.
+
+#### Governance, parity, and delivery locks
+
+1. Amend `AI_GOVERNANCE.md` with the newer Communications collaboration lock.
+   It supersedes the ICQ-style Chat lock while preserving its signed-message,
+   Nebula-transit, Bus-live, and Syncthing-history guarantees. Mark the old Chat,
+   notification, clipboard, editor, file-manager, transfer, and voice design
+   notes `HISTORICAL / SUPERSEDED`; do not create another active tracker.
+2. Before implementation, build a parity ledger inside this epic's evidence trail
+   that maps every reachable command, hotkey, menu action, state path, worker,
+   CLI verb, migration source, test, and user workflow in the seven replaced
+   systems to a Communications replacement or an explicit surveyed retirement.
+   No row may be silently dropped.
+3. Develop on one integration branch with reviewable commits and internal phase
+   gates, but do not release a partial suite, retain a user-facing old/new switch,
+   or land dead placeholders on the release branch. The cutover is one immutable
+   image release after full parity and operator signoff.
+4. Apply `AI_GOVERNANCE.md` section 7 literally: no `todo!()`,
+   `unimplemented!()`, stub match arms, mock data presented as functionality,
+   unreachable modules, dead controls, or deferred acceptance rows.
+
+#### Public contracts and ownership
+
+1. Add stable identifiers `SpaceId`, `EventId`, `ThreadId`, `DocumentId`,
+   `FileRefId`, `TransferId`, and `CallId`. Identifiers are opaque UUID values and
+   remain stable across path moves, reconnects, replay, and multi-space linking.
+2. Define `SpaceKind` as `Direct`, `Team`, `Incident`, or `Project`, and
+   `SpaceRole` as `Owner` or `Member`. A Direct space contains only its named
+   participants. Other kinds default to all current mesh members while allowing
+   the owner to narrow membership. Owners manage membership and delete spaces;
+   members can create and edit content and fully control shared transfer jobs.
+3. Define a versioned, Ed25519-signed `CollabEventEnvelope` containing schema
+   version, event ID, space ID, actor identity, actor clock, creation timestamp,
+   event kind, payload or content-addressed payload reference, and signature.
+   Event kinds cover space lifecycle, membership, messages, threads, alerts,
+   clipboard items, documents, reviews, file references, transfers, calls, and
+   AI suggestion metadata.
+4. Define typed `CollabCommand` operations for creating and deleting spaces;
+   membership; sending, editing, and deleting messages; thread replies; alert
+   acknowledgement and snooze; clipboard publication and attachment; document
+   updates and review actions; file linking and deletion; transfer control; call
+   lifecycle; and AI suggestion requests. Publish commands under
+   `action/collab/*`, retained read models under `state/collab/*`, and live signed
+   events under `collab/event/<space>/<actor>`.
+5. Define `CollabReadModel` projections for the space directory, Activity,
+   conversation/thread timelines, document sessions, file references, transfer
+   jobs, alert inbox, clipboard lane, presence, and call state. The egui surface
+   reads projections and emits typed commands; it never owns authoritative state
+   or calls provider APIs directly.
+
+#### Data flow, replication, and deletion
+
+1. The local collaboration worker validates a command, checks membership and
+   time-window policy, signs one or more events, appends them to the actor's
+   durable per-space log, projects them transactionally into SQLite, publishes
+   the live event over `mde-bus`, and updates retained read models.
+2. Syncthing replicates actor logs and content-addressed blobs for offline
+   backfill; Bus publication provides the low-latency path. Replayed events are
+   idempotent, order-independent, signature-checked, and merged by actor clock
+   plus stable event-ID tie-breaking. A disconnected node remains fully usable
+   against cached state and converges after reconnection without a fixed center.
+3. Store arbitrary MIME payloads and transferred collaboration artifacts by
+   SHA-256 in the existing per-user MDE data root. Events carry metadata and blob
+   references rather than embedding large payloads in JSON. Verify hash and size
+   before projection or materialization.
+4. Durable history remains until an authorized explicit deletion. Replicated
+   deletion tombstones prevent stale peers from resurrecting data. Purge payloads
+   only after every currently known member has acknowledged the tombstone or the
+   member has been explicitly removed; retain the minimal tombstone thereafter.
+5. Space deletion is direct rather than archive-first and requires confirmation.
+   It emits a convergent tombstone for the space and owned collaboration state;
+   referenced canonical files are not deleted merely because a space is deleted.
+
+#### Communications surface and navigation
+
+1. Add `Surface::Communications` and remove `Surface::Chat`, `Surface::Voice`,
+   `Surface::Editor`, and `Surface::Files` only at final parity. Migrate launcher
+   pins, Start Search targets, toast routes, status actions, file-open requests,
+   call handoffs, and saved last-surface state to Communications.
+2. Use one Office 97 Construct-themed frame built from shared `mde-egui::Style`.
+   A persistent left rail lists spaces. Focused mode tabs expose Activity,
+   Messages, Documents, Files, Transfers, Alerts, and Clipboard. Direct and
+   space-call controls feed one persistent call bar that survives mode and space
+   switches.
+3. First entry to a space opens Activity; later entries restore that space's last
+   focused mode. Activity is an action-oriented chronological feed of meaningful
+   messages, edits, comments, file changes, transfers, calls, and alerts, with
+   filters but no competing global search box.
+4. Desktop and narrow/tablet layouts keep a fixed split between the rail and
+   content. Narrow mode compacts the rail to stable icon-sized geometry instead
+   of hiding it. Menus, two-row editor toolbars, tabs, call controls, counters,
+   and status areas have bounded dimensions and cannot shift or overlap as state
+   changes.
+5. Connect Communications entities and actions to the existing main Start Search
+   index. Panel-local find and filters are allowed; a second suite-wide omnibox
+   is not. Notifications use badge counts plus the existing policy-driven toast
+   path and route into the exact originating space and object.
+
+#### Messaging, alerting, and clipboard
+
+1. Every space has a Markdown conversation timeline and anchored threads. Enter
+   sends by default, drafts persist locally, delivery state is honest, and edits
+   and deletion are accepted only for the author's message during the first five
+   minutes. A later attempt remains visible as a denied action, not a silent
+   no-op.
+2. Keep message and thread history until explicit deletion. Preserve sender,
+   signature, timestamps, edit history, reply anchor, delivery state, and any
+   linked document, file, alert, clipboard item, transfer, or call.
+3. Alerting combines source rules with one global inbox projected into relevant
+   spaces. Supported workflow actions are acknowledge and snooze; alert severity,
+   source, state, and policy determine badges and toasts. Existing emitters keep
+   publishing their truthful events and are adapted at the collaboration worker.
+4. Clipboard capture is automatic across the mesh and enters one global lane
+   before optional attachment to a space or thread. Support arbitrary MIME
+   bundles up to 100 MB, previews where safe, copy/materialize actions, source
+   attribution, content hashes, and explicit deletion. Larger data must be saved
+   or sent through Transfers rather than silently truncated.
+
+#### Ultimate editor and document collaboration
+
+1. Markdown is the canonical document format and the original path remains the
+   source of truth. Document mode is the default and provides a one-pane
+   Source/Visual toggle, full block editing, ops-oriented templates, optional
+   outline, and an Office 97 menu plus two toolbars. Markdown is the only export
+   format; print and preview remain available but hidden from the default toolbar.
+2. Preserve every existing editor capability in a separate Project mode:
+   rope-backed editing, undo/redo, multicursor and column selection, tree-sitter
+   highlighting, LSP diagnostics/navigation/rename/format, tabs and split panes,
+   project and buffer search, terminal, folding, symbol outline, file finder,
+   command palette, and keyboard workflows.
+3. Provide full Markdown block semantics, complete table creation and cell/row/
+   column editing, hybrid local spell checking plus opt-in cloud grammar review,
+   link validation, and image insertion through a file picker. Store document
+   images under `<document-stem>.assets/` and write relative Markdown links.
+4. Autosave versioned document state, take idle snapshots, and show a timeline
+   with rendered word-level diffs and actor attribution. Use an existing Git
+   repository when present; otherwise offer, but never silently perform, local
+   Git initialization. Do not overwrite unrelated repository history.
+5. Use Yrs CRDT updates for live co-editing, shared cursor/selection/viewport
+   presence, host/guest access, and follow mode. External or offline writes to
+   the canonical path enter a reviewable three-way merge using the last shared
+   base, current collaborative state, and disk state; never choose a winner
+   silently.
+6. Comments, suggestions, message threads, and document annotations use one
+   anchored thread model. A portable, versioned review sidecar travels and
+   commits with the document. The same `DocumentId` linked into multiple spaces
+   shares content and version history while each space keeps separate discussion
+   anchors.
+
+#### Files and transfers
+
+1. Preserve complete local and mesh file-manager parity: list/grid/details,
+   sorting, hidden files, breadcrumbs, editable paths, history, tabs, dual pane,
+   Places/Mesh navigation, selection, drag/drop, previews, archives, search,
+   permissions, file operations, and honest degraded states.
+2. A space owns references, not a private folder. `FileRefId` maps a stable logical
+   identity to owner node, canonical path, filesystem identity where available,
+   current content hash, and version history. Suite-driven moves update the path;
+   external moves are reconciled by filesystem identity and hash before being
+   reported missing.
+3. Removing a file from a space deletes only that space's reference. Permanently
+   deleting a file is a distinct confirmed action that deletes the canonical file
+   and managed replicas, emits a tombstone, and leaves an honest deleted reference
+   in historical events. It cannot be presented as undoable.
+4. Linking a file to a space starts a resumable, hash-verified transfer to every
+   current member. Joining a space automatically backfills all current shared
+   files and durable transfer metadata. Every member may pause, resume, cancel,
+   retry, reprioritize, and inspect shared jobs through the daemon-owned ledger.
+5. Continue reporting all file, archive, browser-download, and collaboration
+   transfer progress through the shared bottom-navigation progress model owned by
+   WL-FUNC-006; Communications must not create a second progress authority.
+
+#### Calls and media
+
+1. Support direct and space calls with voice, video, and screen sharing. Provide
+   complete device selection, mute, camera, screen-source selection, participant
+   state, join/leave, retry, and hang-up controls; keep the active call bar visible
+   throughout Communications.
+2. Use WebRTC P2P for viable direct calls. Use an elected, mesh-reachable LiveKit
+   SFU for group calls, failed direct paths, and topology changes. The SFU is an
+   ephemeral media relay with no durable collaboration authority and can fail over
+   to another capable node.
+3. Reuse existing SIP account, DID, provisioning, failover, and G.711 behavior
+   behind a LiveKit SIP gateway so PSTN and mesh contacts participate through the
+   same call model. Do not maintain a second call history or contact model.
+4. Recording and transcription are absent from UI, commands, workers, and storage.
+   Audit the selected WebRTC/LiveKit dependency graph and deployment boundary;
+   `openssl` and `openssl-sys` remain forbidden in MCNF code, and any necessary
+   hosted-media crypto exception requires an explicit governance amendment before
+   merge.
+
+#### DigitalOcean LLM integration
+
+1. DigitalOcean Serverless Inference is the only hosted LLM provider. A typed
+   `mackesd` adapter calls `https://inference.do-ai.run/v1/responses`, discovers
+   permitted models through `/v1/models`, reads a sealed model-access key, and
+   exposes provider health and bounded request state through the collaboration
+   Bus contract. There is no direct surface HTTP call and no non-DigitalOcean
+   fallback.
+2. AI is assistive only: rewrite, clarify, summarize, draft, and grammar-review
+   operations produce reviewable suggestions. Context is limited to the current
+   thread or unread window plus explicitly attached documents/files. Global cloud
+   consent is required before the first request and remains revocable.
+3. AI never sends messages, edits canonical content, acknowledges alerts, changes
+   files, controls transfers, starts calls, or performs other actions. Accepting a
+   suggestion is an explicit user edit carrying provider/model attribution in
+   document or message history.
+4. Timeouts, cancellation, rate limiting, provider unavailability, invalid model
+   access, and offline operation surface honest retryable states while every
+   non-AI collaboration workflow remains available.
+
+#### Migration, cutover, and removal
+
+1. Add an idempotent importer for signed Chat ring history and rooms, notification
+   preferences and alert state, clipboard history, editor open/session/review
+   state, file-manager locations and references, transfer ledgers and sync pairs,
+   SIP configuration, launcher pins, saved routes, and status/toast destinations.
+2. Import into new identifiers using a durable source-to-target map. Re-running
+   after interruption must create no duplicate events, blobs, files, transfers,
+   or spaces. Preserve canonical files and old state in place so the previous
+   OSTree deployment remains a valid rollback target.
+3. Before cutover, run read-only parity comparison against old and new projections
+   and require zero unexplained differences. On first boot after cutover, perform
+   a preflight, backup migration metadata, migrate transactionally, and fail back
+   to the previous deployment without partially deleting source state.
+4. After all acceptance gates pass, remove the old shell variants, standalone
+   routes, duplicate workers, old state writers, retired crates, stale package
+   entries, and superseded tests/docs in the same release. Keep only deliberate
+   migration readers required to import pre-cutover state; remove them after the
+   documented support window rather than retaining general compatibility glue.
+
+- Acceptance criteria:
+  1. One Communications entry replaces Chat, Voice, Editor, Files, Transfers,
+     Notifications, and Clipboard in the dock, launcher, Start Search, toast,
+     status, keyboard, and file-open paths; no competing surface remains.
+  2. Direct, Team, Incident, and Project spaces enforce membership and Owner/
+     Member behavior, retain their last mode, and remain usable with no peers.
+  3. Three nodes creating and editing data during partitions converge after
+     reconnect without duplicate events, lost acknowledged work, invalid
+     signatures, or resurrection of deleted content.
+  4. Markdown messages, threads, five-minute edit/delete, Activity, alert rules,
+     acknowledge/snooze, badges/toasts, and 100 MB arbitrary-MIME clipboard
+     sharing work with real persisted data and explicit failure states.
+  5. Document and Project modes satisfy every editor requirement, live CRDT
+     sessions converge, external writes produce a three-way review, comments and
+     suggestions remain anchored, and history/Git behavior never destroys user
+     data.
+  6. The same file can be linked into multiple spaces with one content/version
+     identity and separate discussions; reference removal and permanent deletion
+     remain distinct; current and newly joined members receive verified files.
+  7. Every member can control shared transfers, interrupted transfers resume, and
+     all operation progress survives surface and node switches through the shared
+     status projection.
+  8. Direct P2P and SFU-relayed space calls pass with real advancing audio/video/
+     screen frames, SIP ingress and egress pass, call controls remain reachable,
+     relay failover is honest, and no recording or transcription artifact exists.
+  9. DigitalOcean suggestions use only consented bounded context, are never
+     applied automatically, retain provider/model attribution, cancel cleanly,
+     and fail without impairing local collaboration.
+  10. Office 97 Construct styling, persistent rail, mode tabs, menus, toolbars,
+      call bar, dialogs, and dynamic text render without overlap at supported
+      desktop and narrow/tablet viewports.
+  11. Migration fixtures are repeatable and rollback-safe, the old/new parity
+      ledger has no open rows, forbidden dependencies and private D-Bus names are
+      absent, and all superseded runtime code is removed after cutover.
+  12. The operator completes live visual and workflow signoff with every feature
+      present; no incomplete, disabled, placeholder, or deferred behavior remains.
+- Verification method: Unit and property tests cover event serialization,
+  signatures, ordering, deduplication, permissions, message windows, tombstones,
+  blob collection, CRDT convergence, three-way merge, file identity, transfer
+  state, call state, AI consent, and migration idempotence. Deterministic two- and
+  three-node fixtures cover partition, replay, new-member backfill, member removal,
+  duplicate delivery, stale peers, and rollback. Farm gates include focused tests
+  for every new crate, affected legacy parity tests, `cargo test --workspace
+  --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo fmt --all -- --check`, with the longest job on BigBoy and independent
+  jobs parallelized. Live gates cover microphone, camera, screen capture, WebRTC
+  P2P, SFU failover, SIP/PSTN, DigitalOcean inference with a sealed key, real file
+  backfill, RPM/bootc install and OSTree rollback, plus rendered screenshot and
+  canvas-pixel inspection on the production DRM seat at desktop and narrow sizes.
+  Final closure requires a reviewed parity ledger and explicit operator visual
+  signoff.
+- Origin or merged source IDs: `NOTIFY-CHAT`, `EDITOR-1..12`,
+  `EDITOR-LSP-1..3`, `EDITOR-COLLAB-1..3`, `EDTB-1..7`, `FILEMGR-*`,
+  `TRANSFERS-*`, `E12-11`, `VOIP-GW-*`, Clipboard and alert-relay workstreams,
+  operator text-editor survey, and operator 50-question Communications
+  collaboration survey completed 2026-07-19.
 
 ## User Interface And Experience
 
