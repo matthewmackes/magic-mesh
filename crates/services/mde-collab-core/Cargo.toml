@@ -1,0 +1,55 @@
+# mde-collab-core — the headless collaboration core for the Communications suite
+# (WL-FUNC-011 Phase 1). The data-flow spine + offline-first convergence engine:
+# the command -> signed-events pipeline, a durable per-space actor log, a
+# transactional SQLite projection that backs the CollabReadModel shapes, the
+# order-independent convergence engine, a content-addressed blob store, and
+# convergent tombstones.
+#
+# A PURE LIBRARY: it builds ON the mde-collab-types Phase-0 contracts and never
+# redefines them. It has NO egui, NO provider HTTP, and NO long-running I/O loop
+# (those are Phase 2 + the mackesd collab worker). All time, ids, and signing
+# are caller-injected so the same event log replays deterministically, and every
+# I/O boundary (the actor log, the blob store) is a trait a test can back with
+# memory.
+[package]
+name        = "mde-collab-core"
+description = "WL-FUNC-011 Phase 1 headless collaboration core: the CollabCommand -> signed CollabEventEnvelope pipeline (membership + Owner/Member permission + 5-minute edit/delete-window validation, injected Ed25519 signer, HLC actor-clock stamping), a durable idempotent per-space actor log (memory + Syncthing-replicable file impls), a transactional idempotent SQLite projection folding the signed log into the CollabReadModel tables, an order-independent signature-checked convergence engine that makes any two nodes converge to byte-identical projected state, a SHA-256 content-addressed blob store (memory + fs impls, hash+size verified), and convergent deletion tombstones with all-members-acked payload-purge gating. Injectable I/O, no egui, no HTTP, no loops."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_collab_core"
+path = "src/lib.rs"
+
+[dependencies]
+# The Phase-0 public contracts we build ON (never redefine).
+mde-collab-types = { path = "../../shared/mde-collab-types" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# The transactional read-side projection store. The mesh's pinned rusqlite
+# (mackesd, mde-bus, mde-bookmarks all use 0.32 + bundled) so this crate shares
+# the workspace's single libsqlite3-sys.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# The injected signer's concrete Ed25519 impl — the SAME dep + version + feature
+# the contracts + mde-chat sign with (lock 10), never openssl.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Content-addressing: the platform's pure-Rust SHA-256 (mackesd, mde-bookmarks).
+sha2 = "0.10"
+# Typed errors (the mde-bus convention).
+thiserror = "1"
+# The default per-user MDE data root for the fs blob store + file actor log.
+dirs = "5"
+
+[dev-dependencies]
+# Deterministic event ids in tests (Uuid::from_u128) — no RNG, so a replay is
+# byte-stable. The same `uuid` the contracts + shell use.
+uuid = "1"
+# Temp dirs for the fs blob store + file actor log + on-disk SQLite tests.
+tempfile = "3"
+
+[lints]
+workspace = true

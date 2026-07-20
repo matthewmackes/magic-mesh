@@ -61,6 +61,7 @@ members = [
     "crates/services/mde-adblock",
     "crates/services/mde-bookmarks",
     "crates/services/mde-chat",
+    "crates/services/mde-collab-core",
     "crates/services/mde-files",
     "crates/services/mde-musicd",
     "crates/services/mde-voice-config",
