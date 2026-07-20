@@ -2109,6 +2109,11 @@ fn a_requested_desktop_session_renders_as_a_named_bottom_rail_entry() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let mut s = DockState::default();
+    // Desktop is now the default active surface (Construct desktop-first pivot),
+    // so start off it — matching
+    // `win10_hybrid_31_the_show_desktop_nub_routes_to_desktop` — for the
+    // session-entry click below to be an observable route TO Desktop.
+    s.set_active(Surface::Browser);
     s.toggle();
     let entry = SessionRailEntry::with_session_id("session-1", "Accounting VM", "RDP");
     s.set_status_inputs(
