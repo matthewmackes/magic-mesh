@@ -1,12 +1,12 @@
-//! EXPLORER-1 — in-memory fakes for the three source seams (mirrors the QC-2
-//! openstack `testkit`): one fake per seam, shared by the worker unit tests so
+//! EXPLORER-1 — in-memory fakes for the three source seams (the cloud worker's
+//! `testkit` shape): one fake per seam, shared by the worker unit tests so
 //! the fold + publish + verb-drain pipeline runs with no etcd / Bus / network.
 
 use std::sync::Mutex;
 
 use super::sources::{
-    CloudObjectRecord, LanHostRecord, LanScanSource, MeshMirrorSource, MeshSnapshot,
-    OpenstackMirrorSource,
+    CloudMirrorSource, CloudObjectRecord, LanHostRecord, LanScanSource, MeshMirrorSource,
+    MeshSnapshot,
 };
 
 /// A [`MeshMirrorSource`] answering a fixed (mutable) snapshot.
@@ -29,12 +29,12 @@ impl MeshMirrorSource for FakeMeshMirror {
     }
 }
 
-/// An [`OpenstackMirrorSource`] answering a fixed union of cloud objects.
-pub struct FakeOpenstack {
+/// A [`CloudMirrorSource`] answering a fixed union of cloud objects.
+pub struct FakeCloud {
     recs: Mutex<Vec<CloudObjectRecord>>,
 }
 
-impl FakeOpenstack {
+impl FakeCloud {
     /// Answer `recs` on every read.
     pub fn new(recs: Vec<CloudObjectRecord>) -> Self {
         Self {
@@ -43,7 +43,7 @@ impl FakeOpenstack {
     }
 }
 
-impl OpenstackMirrorSource for FakeOpenstack {
+impl CloudMirrorSource for FakeCloud {
     fn read(&self) -> Vec<CloudObjectRecord> {
         self.recs.lock().unwrap().clone()
     }

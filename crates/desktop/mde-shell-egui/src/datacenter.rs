@@ -68,7 +68,7 @@ const BROWSER_POLICY_STATE_PREFIX: &str = "state/browser-policy/";
 const BROWSER_SECURITY_UPDATE_STATE_PREFIX: &str = "state/browser-security-update/";
 const DATACENTER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 const CLOUD_MANAGED_TOOLTIP: &str =
-    "Managed by the Cloud plane - start/stop this instance there, not from the Fleet roster.";
+    "Managed by the Workloads surface - start/stop this instance there, not from the Fleet roster.";
 
 /// Poll cadence for the two live topics — a node's health flip or a new VM
 /// surfaces within this window. Matches the panel shell's 5 s refresh; the read
@@ -797,15 +797,15 @@ impl DatacenterState {
             ui.add_space(Style::SP_S);
         }
 
-        // docs-consistency-8 — name this lens so it reads distinctly from the
-        // Cloud plane: the Fleet view is the raw per-node libvirt/KVM (and
-        // Podman) reality, NOT the OpenStack tenant cloud (whose Nova
-        // *instances* live in the Cloud plane). Same word discipline both ways:
-        // here a guest is a "VM"; in the Cloud plane it is an "instance".
+        // docs-consistency-8 / WL-ARCH-006 — name this lens so it reads distinctly
+        // from the Workloads surface: the Fleet view is the raw per-node
+        // libvirt/KVM (and Podman) reality, NOT the tenant cloud (whose
+        // *instances* live in the Workloads surface). Same word discipline both
+        // ways: here a guest is a "VM"; in Workloads it is an "instance".
         mde_egui::muted_note(
             ui,
             "Raw per-node libvirt/KVM and Podman reality across the fleet. \
-             OpenStack tenant instances live in the Cloud plane.",
+             Tenant cloud instances live in the Workloads surface.",
         );
         ui.add_space(Style::SP_XS);
 
@@ -1341,7 +1341,7 @@ fn roster_shows_running(nodes: &[NodeView], host: &str, name: &str) -> bool {
 /// followed by **exactly eight lowercase hex digits**. This is the only Nova
 /// signal available to the Fleet plane: the roster's wire [`Instance`] carries
 /// just `{name, state}` (no `managed_by`/metadata field), and this plane does
-/// not consume the Cloud plane's Nova id list, so there is nothing to
+/// not consume the Workloads surface's Nova id list, so there is nothing to
 /// cross-reference — the name shape is the whole signal.
 ///
 /// The anchoring is deliberate, not a fragile prefix match. The mesh's own VM
@@ -1369,9 +1369,9 @@ fn is_nova_managed(name: &str) -> bool {
 ///
 /// docs-consistency-8 / review-608: a Nova-managed guest ([`is_nova_managed`])
 /// also appears here (unfiltered `virsh list --all`), where its lifecycle
-/// belongs to the Cloud plane. Such rows are badged "Cloud-managed" and their
-/// Stop confirm carries a "prefer the Cloud plane" warning, so the Fleet plane
-/// cannot silently tear down a Nova instance out from under the Cloud plane's
+/// belongs to the Workloads surface. Such rows are badged "Cloud-managed" and their
+/// Stop confirm carries a "prefer Workloads" warning, so the Fleet plane
+/// cannot silently tear down a Nova instance out from under the Workloads surface's
 /// lifecycle — without hiding the row or removing the honest raw control.
 fn show_instance_row(
     ui: &mut egui::Ui,
@@ -1383,8 +1383,8 @@ fn show_instance_row(
 ) {
     let running = inst.state.trim() == "running";
     // review-608: a Nova-managed guest also surfaces in this raw `virsh list`
-    // roster, but its lifecycle belongs to the Cloud plane — badge it and warn
-    // on Stop so the Fleet plane can't silently tear it down.
+    // roster, but its lifecycle belongs to the Workloads surface — badge it and
+    // warn on Stop so the Fleet plane can't silently tear it down.
     let nova = is_nova_managed(&inst.name);
     let dot = if running { Style::OK } else { Style::TEXT_DIM };
     ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
@@ -1398,8 +1398,8 @@ fn show_instance_row(
     mde_egui::muted_note(ui, &inst.state);
     ui.add_space(Style::SP_S);
     if nova {
-        // Info-tone badge + a Cloud-plane cross-hint. This plane can't switch
-        // planes without reaching outside its scope, so the pointer is a hover.
+        // Info-tone badge + a Workloads-surface cross-hint. This plane can't
+        // switch surfaces without reaching outside its scope, so it is a hover.
         let nova_response = ui.label(
             RichText::new("Cloud-managed")
                 .color(Style::ACCENT)
@@ -1419,11 +1419,11 @@ fn show_instance_row(
             // one-VM stop; the explicit second click is the gate) + a Cancel.
             if nova {
                 // review-608: extend the confirm copy for a Nova-managed guest so
-                // the operator is told the Cloud plane owns this lifecycle before
-                // the second (dispatching) click. The existing two-step arm is the
-                // gate; this only adds the warning line.
+                // the operator is told the Workloads surface owns this lifecycle
+                // before the second (dispatching) click. The existing two-step arm
+                // is the gate; this only adds the warning line.
                 ui.label(
-                    RichText::new("Cloud-managed - prefer the Cloud plane")
+                    RichText::new("Cloud-managed - prefer Workloads")
                         .color(Style::WARN)
                         .size(Style::SMALL),
                 );

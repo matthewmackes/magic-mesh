@@ -2,7 +2,7 @@
 //!
 //! Before this, ~16 shell poll/render sites each hand-rolled the SAME two-step
 //! "resolve the client `bus_root`, then `Persist::open` it fail-soft" prelude,
-//! and three modules (`phones_hub`, `iac`, `cloud_plane`) each carried a private
+//! and several reader modules (e.g. `phones_hub`, `iac`) each carried a private
 //! copy of the identical `Persist::open(root).ok()` helper. There was no single
 //! seam — every reader re-derived the open. This module is that ONE seam: the
 //! fail-soft readers borrow it instead of re-deriving how to open the store.

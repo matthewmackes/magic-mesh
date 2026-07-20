@@ -104,7 +104,7 @@
 //! its shell syntax is honored, and a **root op** (a leading `sudo`, lock #29)
 //! runs that shell under [`sudo_argv`] so sudo prompts interactively in the
 //! tab's PTY. Surface-link entries (the pinned Terminal, the Containers&VMs
-//! "Cloud plane" link, lock #41) route for real through the shell nav. A command
+//! "Workloads" link, lock #41) route for real through the shell nav. A command
 //! whose underlying tool is absent from `$PATH` renders greyed and reports the
 //! missing tool by name — the one honest gate that remains (the design's "no
 //! dead entries" rule, §7).
@@ -157,7 +157,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::chooser::chooser_prefs::unix_millis;
 use crate::dock::{icon_texture, Surface};
-use crate::workbench::Plane;
 
 // ── geometry (all §4 token math, the dock's 8px grid) ───────────────────────
 
@@ -309,8 +308,6 @@ enum EntryKind {
     /// Route to a shell surface (lock #41's "open the correct GUI surface") —
     /// live NOW through [`ConsoleRequest::Goto`].
     Link(Surface),
-    /// Route to a Workbench plane, used for the cloud replacement plane.
-    Plane(Plane),
 }
 
 /// One Console entry: icon + label + one-line description + provenance
@@ -616,12 +613,14 @@ const GROUPS: [ConsoleGroup; 7] = [
                 kind: EntryKind::Tab("virsh list --all"),
             },
             ConsoleEntry {
-                label: "Cloud Plane (GUI)",
-                desc: "Open the Workbench Cloud plane — the VM lifecycle GUI",
+                // WL-ARCH-006 — the retired Cloud plane's GUI is the unified
+                // Workloads surface (Infra as Code) now; this row opens it.
+                label: "Cloud Workloads (GUI)",
+                desc: "Open the Workloads surface — the VM & cloud lifecycle GUI",
                 tool: "",
                 provenance: Provenance::Construct,
                 icon: IconId::Server,
-                kind: EntryKind::Plane(Plane::Cloud),
+                kind: EntryKind::Link(Surface::InfraCode),
             },
         ],
     },
@@ -767,8 +766,6 @@ impl GateNotice {
 pub enum ConsoleRequest {
     /// Route the shell body to a surface (a live surface-link entry).
     Goto(Surface),
-    /// Route the shell body to a Workbench plane.
-    Plane(Plane),
     /// CONSOLE-5 — open a **named terminal tab** running `argv`: the shell
     /// switches to `Surface::Terminal` (lock #7) and drives
     /// `TerminalSurface::spawn_tab` (§6, the deferred-wire idiom — the panel
@@ -1145,10 +1142,6 @@ impl ConsoleState {
                 self.pending = Some(ConsoleRequest::Goto(surface));
                 self.close();
             }
-            EntryKind::Plane(plane) => {
-                self.pending = Some(ConsoleRequest::Plane(plane));
-                self.close();
-            }
             EntryKind::Tab(cmd) => {
                 if self.present.get(flat).copied().unwrap_or(false) {
                     self.launch(entry.label.to_owned(), cmd);
@@ -1164,7 +1157,7 @@ impl ConsoleState {
 
     /// Activate a static search result by flat index. This is the Start Menu
     /// search seam; it intentionally delegates to [`Self::activate`] so search
-    /// results honor the same Goto/Plane/spawn/gate behavior as clicking the
+    /// results honor the same Goto/spawn/gate behavior as clicking the
     /// Console row.
     pub(crate) fn activate_index(&mut self, flat: usize) {
         self.activate(flat);

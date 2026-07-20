@@ -22,7 +22,7 @@
 //!   noted typed.
 //! - **Power & Battery** — confirm-gated local lock/suspend/reboot/poweroff
 //!   (logind, lock 12), and multi-battery telemetry (incl. BT-peripheral batteries,
-//!   lock 6). VM lifecycle now lives in the CONSTRUCT-CLOUD plane, not a local
+//!   lock 6). VM lifecycle now lives in the Workloads surface, not a local
 //!   cloud-hypervisor broker.
 //!
 //! Mixer / Bluetooth stay read-only here (their interaction is E12-16 / E12-17).

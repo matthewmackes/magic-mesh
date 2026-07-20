@@ -1,28 +1,26 @@
 //! EXPLORER-1 — the injectable source seams the aggregator unions.
 //!
-//! Three seams, each headless-testable with a fake (mirrors the QC-2 openstack
-//! worker's two-seam + testkit shape):
+//! Three seams, each headless-testable with a fake (the cloud worker's two-seam
+//! + testkit shape):
 //!
 //! - [`MeshMirrorSource`] — the mesh half (source (a), lock #2): the replicated
 //!   peer directory + the `/mesh/leader` lease + per-peer health the tray/Fleet
 //!   already read. Production: [`MeshDirectoryMirror`] over
 //!   `crate::substrate::peers::read_directory` + `current_leader_blocking`.
 //! - [`CloudMirrorSource`] — the cloud half (source (b), lock #20): the union of
-//!   every node's provider-neutral `state/cloud/<node>` Bus mirror, plus legacy
-//!   `state/openstack/<node>` adapter mirrors for compatibility, decoded into
+//!   every node's provider-neutral `state/cloud/<node>` Bus mirror, decoded into
 //!   host-tagged cloud objects. Production: [`BusCloudMirror`] reads the
-//!   persisted Bus tree. It consumes cloud mirrors through the Bus read path — it
-//!   never touches an openstack worker file.
+//!   persisted Bus tree. It consumes cloud mirrors through the Bus read path.
 //! - [`LanScanSource`] — the off-mesh half (EXPLORER-2 producer seam): the
 //!   active LAN scan, gated on the surface's scan-active flag (lock #24).
 //!   Production here is [`NoScan`] (empty); EXPLORER-2 swaps in the real
 //!   nmap-style scan.
 //!
-//! Forward-compat honesty (§7): today's legacy `state/openstack/<node>` mirror carries
-//! Kolla *service* supervision, not tenant *objects*, so [`BusCloudMirror`]
-//! decodes zero cloud objects on the live fleet — cloud units are simply absent,
-//! never faked. When a later QC slice publishes a resource `objects` array on the
-//! provider-neutral mirror, [`CloudMirrorBody`]'s tolerant decode picks it up.
+//! Forward-compat honesty (§7): today's `state/cloud/<node>` mirror carries
+//! *service* supervision, not tenant *objects*, so [`BusCloudMirror`] decodes zero
+//! cloud objects on the live fleet — cloud units are simply absent, never faked.
+//! When a later slice publishes a resource `objects` array on the mirror,
+//! [`CloudMirrorBody`]'s tolerant decode picks it up.
 
 use std::path::PathBuf;
 
@@ -98,7 +96,7 @@ impl MeshMirrorSource for MeshDirectoryMirror {
 
 // ─────────────────────────── cloud seam ───────────────────────────
 
-/// The kind of an `OpenStack` object (lock #4: the four resource kinds).
+/// The kind of a cloud object (lock #4: the four resource kinds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudKind {
@@ -166,7 +164,7 @@ pub struct CloudObjectRecord {
     /// The host node id — the object's own `host` when the mirror carries it,
     /// else the publishing node (the `<node>` in the topic).
     pub node: String,
-    /// The `OpenStack` object id (the dedup key across nodes).
+    /// The cloud object id (the dedup key across nodes).
     pub id: String,
     /// The resource kind.
     pub kind: CloudKind,
@@ -190,42 +188,16 @@ pub trait CloudMirrorSource: Send + Sync {
     fn read(&self) -> Vec<CloudObjectRecord>;
 }
 
-/// Backward-compatible source trait name used by existing unit-aggregator
-/// callers while the provider-neutral runway lands.
-pub trait OpenstackMirrorSource: Send + Sync {
-    /// Read the raw union of cloud objects across every node's mirror.
-    fn read(&self) -> Vec<CloudObjectRecord>;
-}
-
-impl<T> OpenstackMirrorSource for T
-where
-    T: CloudMirrorSource + ?Sized,
-{
-    fn read(&self) -> Vec<CloudObjectRecord> {
-        CloudMirrorSource::read(self)
-    }
-}
-
-/// The preferred Bus topic prefix every node's provider-neutral cloud mirror
-/// publishes under.
+/// The Bus topic prefix every node's provider-neutral cloud mirror publishes
+/// under.
 pub const CLOUD_TOPIC_PREFIX: &str = "state/cloud/";
-
-/// The legacy Bus topic prefix every node's OpenStack adapter mirror published
-/// under. Kept only for backward-compatible reads and diagnostics.
-pub const OPENSTACK_TOPIC_PREFIX: &str = "state/openstack/";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloudMirrorTopicKind {
-    Preferred,
-    LegacyOpenstack,
-}
 
 /// The tolerant decode of one `state/cloud/<node>` body.
 ///
 /// Only the fields the aggregator cares about are declared; serde ignores the
-/// rest (QC-2's doctrine/runtime/services). `objects` is absent on today's
-/// service-only legacy adapter mirror (⇒ empty, honest §7) and populated once a
-/// provider-neutral publisher carries tenant resources on the cloud topic.
+/// rest (the mirror's doctrine/runtime/services). `objects` is absent on today's
+/// service-only mirror (⇒ empty, honest §7) and populated once a publisher
+/// carries tenant resources on the cloud topic.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudMirrorBody {
     /// The publishing node id (the mirror `host` stamp), if present.
@@ -236,13 +208,10 @@ pub struct CloudMirrorBody {
     pub objects: Vec<CloudObjectWire>,
 }
 
-/// Backward-compatible decode type name for the old adapter mirror contract.
-pub type OpenstackMirrorBody = CloudMirrorBody;
-
 /// One cloud object as it rides the mirror wire.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudObjectWire {
-    /// The `OpenStack` object id.
+    /// The cloud object id.
     pub id: String,
     /// The resource kind.
     pub kind: CloudKind,
@@ -334,25 +303,8 @@ pub fn cloud_topic_node(topic: &str) -> Option<&str> {
         .filter(valid_topic_leaf)
 }
 
-/// The `<node>` leaf of a legacy `state/openstack/<node>` adapter topic, or
-/// `None` if `topic` isn't under the adapter prefix (or names no node).
-#[must_use]
-pub fn openstack_topic_node(topic: &str) -> Option<&str> {
-    topic
-        .strip_prefix(OPENSTACK_TOPIC_PREFIX)
-        .filter(valid_topic_leaf)
-}
-
 fn valid_topic_leaf(node: &&str) -> bool {
     !node.is_empty() && !node.contains('/')
-}
-
-fn cloud_mirror_topic_node(topic: &str) -> Option<(&str, CloudMirrorTopicKind)> {
-    cloud_topic_node(topic)
-        .map(|node| (node, CloudMirrorTopicKind::Preferred))
-        .or_else(|| {
-            openstack_topic_node(topic).map(|node| (node, CloudMirrorTopicKind::LegacyOpenstack))
-        })
 }
 
 /// Fold one mirror body (published by `topic_node`) into cloud object records.
@@ -404,8 +356,7 @@ pub fn records_from_body(topic_node: &str, body: &CloudMirrorBody) -> Vec<CloudO
 /// Production [`CloudMirrorSource`] — reads the persisted Bus tree.
 ///
 /// Takes the latest body on each provider-neutral `state/cloud/<node>` topic and
-/// folds its objects. Also accepts legacy `state/openstack/<node>` adapter
-/// topics for backward-compatible reads.
+/// folds its objects.
 pub struct BusCloudMirror {
     bus_root: PathBuf,
 }
@@ -417,9 +368,6 @@ impl BusCloudMirror {
         Self { bus_root }
     }
 }
-
-/// Backward-compatible production reader name for existing callers.
-pub type BusOpenstackMirror = BusCloudMirror;
 
 impl CloudMirrorSource for BusCloudMirror {
     fn read(&self) -> Vec<CloudObjectRecord> {
@@ -439,12 +387,9 @@ impl CloudMirrorSource for BusCloudMirror {
         };
         let mut out = Vec::new();
         for topic in topics {
-            let Some((node, kind)) = cloud_mirror_topic_node(&topic) else {
+            let Some(node) = cloud_topic_node(&topic) else {
                 continue;
             };
-            if kind == CloudMirrorTopicKind::LegacyOpenstack {
-                tracing::debug!(target: "mackesd::units", topic = %topic, "legacy openstack mirror: compatibility read");
-            }
             let Ok(msgs) = persist.list_since(&topic, None) else {
                 continue;
             };
@@ -526,29 +471,15 @@ mod tests {
     use crate::workers::unit_aggregator::unit::UnitKind;
 
     #[test]
-    fn topic_node_accepts_cloud_and_legacy_openstack_prefixes() {
+    fn topic_node_accepts_the_cloud_prefix() {
         assert_eq!(cloud_topic_node("state/cloud/node-a"), Some("node-a"));
-        assert_eq!(
-            openstack_topic_node("state/openstack/node-a"),
-            Some("node-a")
-        );
-        assert_eq!(
-            cloud_mirror_topic_node("state/cloud/node-a"),
-            Some(("node-a", CloudMirrorTopicKind::Preferred))
-        );
-        assert_eq!(
-            cloud_mirror_topic_node("state/openstack/node-b"),
-            Some(("node-b", CloudMirrorTopicKind::LegacyOpenstack))
-        );
-        // Not a cloud mirror topic → None.
+        // Not a cloud mirror topic → None (the retired legacy openstack prefix is
+        // gone — a `state/openstack/*` topic no longer resolves to a node).
         assert_eq!(cloud_topic_node("state/storage/node-a"), None);
-        assert_eq!(openstack_topic_node("state/storage/node-a"), None);
-        assert_eq!(cloud_mirror_topic_node("state/storage/node-a"), None);
+        assert_eq!(cloud_topic_node("state/openstack/node-a"), None);
         // Empty or nested leaves are invalid.
         assert_eq!(cloud_topic_node("state/cloud/"), None);
-        assert_eq!(openstack_topic_node("state/openstack/"), None);
         assert_eq!(cloud_topic_node("state/cloud/node-a/extra"), None);
-        assert_eq!(openstack_topic_node("state/openstack/node-a/extra"), None);
     }
 
     #[test]
@@ -578,7 +509,7 @@ mod tests {
             "extras":[],
             "published_at_ms":1
         }"#;
-        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let body: CloudMirrorBody = serde_json::from_str(body_str).expect("decode");
         assert_eq!(body.host.as_deref(), Some("node-a"));
         assert!(records_from_body("node-a", &body).is_empty());
     }
@@ -594,7 +525,7 @@ mod tests {
                 {"id":"n1","kind":"network","name":"tenant-net","host":"node-b"}
             ]
         }"#;
-        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let body: CloudMirrorBody = serde_json::from_str(body_str).expect("decode");
         let recs = records_from_body("node-a", &body);
         assert_eq!(recs.len(), 2);
         // Object without its own host → tagged with the publishing node.
@@ -607,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn bus_cloud_source_folds_cloud_and_legacy_openstack_topics_into_units() {
+    fn bus_cloud_source_folds_cloud_topics_into_units() {
         let bus = tempfile::tempdir().expect("temp bus");
         let persist =
             mde_bus::persist::Persist::open(bus.path().to_path_buf()).expect("open temp bus");
@@ -626,9 +557,10 @@ mod tests {
                 ),
             )
             .expect("publish cloud mirror");
+        // A second node's provider-neutral cloud mirror — the union folds both.
         persist
             .write(
-                "state/openstack/node-b",
+                "state/cloud/node-b",
                 Priority::Default,
                 None,
                 Some(
@@ -640,7 +572,7 @@ mod tests {
                 }"#,
                 ),
             )
-            .expect("publish legacy mirror");
+            .expect("publish cloud mirror");
 
         let reader = BusCloudMirror::new(bus.path().to_path_buf());
         let records = CloudMirrorSource::read(&reader);
@@ -677,7 +609,7 @@ mod tests {
                 {"id":"img1","kind":"image","name":"cirros"}
             ]
         }"#;
-        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let body: CloudMirrorBody = serde_json::from_str(body_str).expect("decode");
         let recs = records_from_body("node-a", &body);
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].links.networks, vec!["n1".to_string()]);
@@ -708,7 +640,7 @@ mod tests {
                 {"id":"img1","kind":"image","name":"cirros"}
             ]
         }"#;
-        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let body: CloudMirrorBody = serde_json::from_str(body_str).expect("decode");
         let recs = records_from_body("node-a", &body);
         assert_eq!(recs.len(), 3);
         let inst = &recs[0].detail;

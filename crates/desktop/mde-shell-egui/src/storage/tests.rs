@@ -746,11 +746,12 @@ fn unavailable_backend_renders_the_typed_not_available_state() {
 #[test]
 fn cloud_compat_deep_link_resolves_through_the_shell_nav_grammar() {
     // The walled-row deep-link keeps the old `instances` verb for forward
-    // compatibility, but QC-15 routes it to the Workbench Cloud plane.
+    // compatibility; WL-ARCH-006 routes it to the unified Workloads surface
+    // (Infra as Code — the retired Cloud plane's successor).
     assert!(matches!(
         crate::toast_bridge::resolve_action(&format!("shell/goto/{CLOUD_COMPAT_SURFACE}")),
-        Some(crate::toast_bridge::Navigate::Plane(
-            crate::workbench::Plane::Cloud
+        Some(crate::toast_bridge::Navigate::Surface(
+            crate::dock::Surface::InfraCode
         ))
     ));
 }

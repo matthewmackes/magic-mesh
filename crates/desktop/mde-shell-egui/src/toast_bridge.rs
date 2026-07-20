@@ -210,8 +210,11 @@ pub(crate) enum Navigate {
 pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
     let rest = verb.strip_prefix("shell/")?;
     if let Some(name) = rest.strip_prefix("goto/") {
+        // WL-ARCH-006 — the retired Cloud plane's `instances`/`cloud` deep-links
+        // land on the unified Workloads surface (Infra as Code) now, so a forward
+        // emitter's old cloud verb still reaches a live cloud surface.
         if matches!(name.to_ascii_lowercase().as_str(), "instances" | "cloud") {
-            return Some(Navigate::Plane(Plane::Cloud));
+            return Some(Navigate::Surface(Surface::InfraCode));
         }
         return surface_by_name(name).map(Navigate::Surface);
     }
@@ -264,10 +267,10 @@ fn surface_by_name(name: &str) -> Option<Surface> {
 fn plane_by_name(name: &str) -> Option<Plane> {
     match name.to_ascii_lowercase().as_str() {
         "thisnode" => Some(Plane::ThisNode),
-        // QC-12 (Q70) — the Controller plane became the Cloud plane; a forward
-        // emitter's old `shell/plane/controller` still reaches the live plane
-        // (the retired-verb aliasing idiom `notifications`/`clipboard` use).
-        "cloud" | "controller" => Some(Plane::Cloud),
+        // WL-ARCH-006 — `cloud`/`controller` are no longer Workbench planes (the
+        // mesh cloud is the standalone Workloads surface); a forward emitter's old
+        // cloud verb reaches it through `shell/goto/cloud` instead (see
+        // `resolve_action`), not a plane deep-link.
         "network" => Some(Plane::Network),
         "fleet" => Some(Plane::Fleet),
         "provisioning" => Some(Plane::Provisioning),
@@ -603,13 +606,15 @@ mod tests {
             resolve_action("shell/goto/bookmarks"),
             Some(Navigate::Surface(Surface::Bookmarks))
         ));
+        // WL-ARCH-006 — the retired Cloud plane's `instances`/`cloud` verbs now
+        // land on the unified Workloads surface (Infra as Code).
         assert!(matches!(
             resolve_action("shell/goto/instances"),
-            Some(Navigate::Plane(Plane::Cloud))
+            Some(Navigate::Surface(Surface::InfraCode))
         ));
         assert!(matches!(
             resolve_action("shell/goto/cloud"),
-            Some(Navigate::Plane(Plane::Cloud))
+            Some(Navigate::Surface(Surface::InfraCode))
         ));
         assert!(matches!(
             resolve_action("shell/plane/fleet"),
@@ -648,10 +653,20 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_controller_plane_verb_reaches_the_cloud_plane() {
-        // QC-12 (Q70) — the rename must not strand a forward emitter's old verb.
-        assert_eq!(plane_by_name("cloud"), Some(Plane::Cloud));
-        assert_eq!(plane_by_name("controller"), Some(Plane::Cloud));
+    fn the_retired_cloud_plane_verb_reaches_the_workloads_surface() {
+        // WL-ARCH-006 — the Cloud plane retired into the Workloads surface; a
+        // forward emitter's old `cloud`/`instances` goto verb lands there, and
+        // `cloud`/`controller` are no longer Workbench planes.
+        assert!(matches!(
+            resolve_action("shell/goto/cloud"),
+            Some(Navigate::Surface(Surface::InfraCode))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/instances"),
+            Some(Navigate::Surface(Surface::InfraCode))
+        ));
+        assert_eq!(plane_by_name("cloud"), None);
+        assert_eq!(plane_by_name("controller"), None);
     }
 
     // ── suppress policy is pure ────────────────────────────────────────────────

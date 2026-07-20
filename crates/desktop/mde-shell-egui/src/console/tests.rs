@@ -6,7 +6,6 @@ use super::{
     Provenance, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H, PANEL_W, PINNED, POWER_H, RAIL_SECTION_GAP,
 };
 use crate::dock::Surface;
-use crate::workbench::Plane;
 use mde_egui::egui;
 use mde_egui::Style;
 use mde_seat::PowerVerb;
@@ -135,7 +134,8 @@ fn the_entry_table_matches_the_locked_taxonomy_and_holds_no_dead_rows() {
     assert_eq!(PINNED.len(), 2);
     assert_eq!(PINNED[0].kind, EntryKind::Link(Surface::Terminal));
     assert_eq!(PINNED[1].kind, EntryKind::Tab("btop"));
-    // Lock #41 — Containers & VMs carries the Cloud-plane surface link.
+    // Lock #41 / WL-ARCH-006 — Containers & VMs carries the Workloads surface
+    // link (the retired Cloud plane's GUI is the Workloads surface now).
     let cvm = GROUPS
         .iter()
         .find(|g| g.label == "Containers & VMs")
@@ -143,8 +143,8 @@ fn the_entry_table_matches_the_locked_taxonomy_and_holds_no_dead_rows() {
     assert!(
         cvm.entries
             .iter()
-            .any(|e| e.kind == EntryKind::Plane(Plane::Cloud)),
-        "the Containers & VMs group links to the Cloud plane"
+            .any(|e| e.kind == EntryKind::Link(Surface::InfraCode)),
+        "the Containers & VMs group links to the Workloads surface"
     );
     // The flat index space is coherent.
     assert_eq!(static_rows().count(), total_rows());
@@ -234,19 +234,20 @@ fn every_declared_tool_resolves_against_a_fixture_path() {
 }
 
 #[test]
-fn the_containers_and_vms_plane_link_routes_to_the_cloud_plane() {
-    // Q41/Q50 — the combined Containers & VMs group carries the surface
-    // link that routes to the Cloud plane (a GUI plane), NOT a terminal tab.
+fn the_containers_and_vms_link_routes_to_the_workloads_surface() {
+    // Q41/Q50 / WL-ARCH-006 — the combined Containers & VMs group carries the
+    // surface link that routes to the Workloads surface (Infra as Code, a GUI
+    // surface), NOT a terminal tab.
     let flat = static_rows()
-        .position(|e| e.kind == EntryKind::Plane(Plane::Cloud))
-        .expect("the Cloud-plane surface link exists");
+        .position(|e| e.kind == EntryKind::Link(Surface::InfraCode))
+        .expect("the Workloads surface link exists");
     let mut s = ConsoleState::with_store(None);
     s.toggle();
     s.activate(flat);
     assert_eq!(
         s.take_request(),
-        Some(ConsoleRequest::Plane(Plane::Cloud)),
-        "the Containers & VMs plane link routes to the Cloud plane"
+        Some(ConsoleRequest::Goto(Surface::InfraCode)),
+        "the Containers & VMs link routes to the Workloads surface"
     );
     assert!(!s.is_open(), "a routed surface link closes the panel");
 }

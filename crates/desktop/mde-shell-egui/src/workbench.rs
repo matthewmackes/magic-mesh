@@ -1,42 +1,36 @@
-//! The Workbench — the five-plane mesh-control nav the chrome bar expands into.
+//! The Workbench — the four-plane mesh-control nav the chrome bar expands into.
 //!
-//! E12-3 shipped the *skeleton*: the five scope-first planes as a selectable rail
+//! E12-3 shipped the *skeleton*: the scope-first planes as a selectable rail
 //! beside an honest content pane. Live data then wires into each plane: **This
 //! Node** (WB-ThisNode — this host's role / overlay IP / presence + heartbeat /
-//! daemon health, off the mesh-status snapshot), **Cloud** (QC-12 — the
-//! CONSTRUCT-CLOUD Q70 lock: *the Controller plane BECOMES the Cloud plane*; the
-//! five cloud resource kinds + the full launch picker + fleet-state launch
-//! presets over the typed QC-11 verbs, with the old Controller view — the
-//! elected leader + control-service rollup — kept live inside it, collapsed),
+//! daemon health, off the mesh-status snapshot),
 //! **Network** (WB-Network — the overlay IP + cipher, elected leader, the peer
 //! directory as network links, and overlay routing), **Fleet** (MV-6 — per-node
 //! KVM reality off the Bus), and **Provisioning** (WB-Provisioning — per-node
 //! deployment tier + role rollup, the fleet version target vs each node's build,
-//! and per-node enrollment readiness) — all five planes are live off the
+//! and per-node enrollment readiness) — every plane is live off the
 //! mesh-status snapshot / Bus. Nothing here fakes a metric (governance §7) — a
 //! plane shows live data or an honest blurb, never stand-in data.
+//!
+//! WL-ARCH-006 — the mesh cloud left the Workbench: the old **Cloud** plane
+//! retired into the first-class **Workloads** surface (`Surface::InfraCode`),
+//! reached directly from the dock. The Workbench is now node/network/fleet
+//! control only.
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
 
-// QC-12 — the Cloud plane's own module file, mounted here (rather than from
-// `main.rs`) because the crate root is owned by parallel wave units; the
-// `#[path]` mount keeps the plane in its own file while this module stays the
-// one place the planes meet.
-#[path = "cloud_plane.rs"]
-pub mod cloud_plane;
-
-/// One of the five top-level control planes of the Workbench, ordered by blast
+/// One of the four top-level control planes of the Workbench, ordered by blast
 /// radius — from the local host outward to the whole fleet.
+///
+/// WL-ARCH-006 — the old Cloud plane was retired here: the mesh cloud is now its
+/// own first-class **Workloads** surface (`Surface::InfraCode`), reached straight
+/// from the dock, not folded into the Workbench.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Plane {
     /// This host — hardware, the local desktop seat, node-local services.
     #[default]
     ThisNode,
-    /// The mesh cloud — `OpenStack` self-service for every member (QC-12; the
-    /// Q70 lock renamed the Controller plane: `OpenStack` IS the control brain
-    /// the old plane described).
-    Cloud,
     /// Network fabric — the Nebula overlay, lighthouses, routes, reachability.
     Network,
     /// The fleet — every peer and the VM desktops they serve.
@@ -46,10 +40,9 @@ pub enum Plane {
 }
 
 impl Plane {
-    /// The five planes in nav order (local host → fleet-wide).
-    pub(crate) const ALL: [Self; 5] = [
+    /// The four planes in nav order (local host → fleet-wide).
+    pub(crate) const ALL: [Self; 4] = [
         Self::ThisNode,
-        Self::Cloud,
         Self::Network,
         Self::Fleet,
         Self::Provisioning,
@@ -59,7 +52,6 @@ impl Plane {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::ThisNode => "This Node",
-            Self::Cloud => "Cloud",
             Self::Network => "Network",
             Self::Fleet => "Fleet",
             Self::Provisioning => "Provisioning",
@@ -73,10 +65,6 @@ impl Plane {
             Self::ThisNode => {
                 "This host — hardware, the local desktop seat, and node-local services."
             }
-            Self::Cloud => {
-                "The mesh cloud — instances, volumes, images, networks, and stacks, \
-                 self-served by every member."
-            }
             Self::Network => {
                 "Mesh fabric — the Nebula overlay, lighthouses, routes, and reachability."
             }
@@ -89,10 +77,7 @@ impl Plane {
 /// Render the expanded Workbench: a title, the plane rail, and the selected
 /// plane's content pane. `selected` is read and written, so a rail click changes
 /// the active plane. The This Node plane renders this host's live status from
-/// `thisnode` (WB-ThisNode), the Cloud plane (QC-12) renders the mesh cloud off
-/// the typed QC-11 Bus verbs (its mutable picker/arming state is the Shell-owned
-/// `cloud` field, borrowed like every other surface; the old Controller view
-/// stays live inside it via `controller`),
+/// `thisnode` (WB-ThisNode),
 /// the Network plane from `network` (WB-Network), the Fleet plane's live
 /// per-node KVM reality from `datacenter` (MV-6), and the Provisioning plane's
 /// live deployment / version / enrollment posture from `provisioning`
@@ -118,11 +103,10 @@ pub fn show(
     // arm inputs + the in-process display controller).
     surface_card: &mut crate::surface_card::SurfaceCardState,
     network: &crate::network::NetworkState,
+    // Read-only: the menubar's live status cluster reads the elected leader +
+    // peer count from the controller snapshot (the retired Cloud plane no longer
+    // embeds a controller view).
     controller: &crate::controller::ControllerState,
-    // Mutable: the Cloud plane (QC-12) holds its own poll/picker/arming state,
-    // borrowed from the Shell field like every other surface (it embeds the
-    // read-only `controller` view collapsed inside it).
-    cloud: &mut cloud_plane::CloudPlaneState,
     provisioning: &crate::provisioning::ProvisioningState,
     // Mutable like `datacenter`: the Services flow publishes service-add
     // requests onto the Bus and holds the daemon's typed answer.
@@ -134,21 +118,13 @@ pub fn show(
     // MENU-1 — the shared top bar, retitled **State of the Mesh** (operator
     // retitle; the `Surface` enum name stays Workbench). The full MenuBarModel:
     // **View** (plane navigation — the same `selected` seam the rail below
-    // drives), the **active plane's verb menu** (Cloud verbs into the
-    // egui-memory Cloud state; Fleet → Refresh onto the datacenter poll seam),
-    // and **Help** (the bar-owned plane guide). The status cluster carries live
-    // mesh state — active plane · elected leader · peer count · fleet update
-    // target — each chip only when the fact is live (§7).
+    // drives), the **active plane's verb menu** (Fleet → Refresh onto the
+    // datacenter poll seam), and **Help** (the bar-owned plane guide). The status
+    // cluster carries live mesh state — active plane · elected leader · peer count
+    // · fleet update target — each chip only when the fact is live (§7).
     if let Some(action) = menubar::show(ui, *selected, controller, provisioning) {
         match action {
             menubar::MenuAction::Plane(plane) => *selected = plane,
-            menubar::MenuAction::Cloud(verb) => {
-                // The same Shell-owned state the Cloud plane body drives — a
-                // menu pick opens the exact affordance the body's button opens
-                // (§6, one seam), and View lands on the plane it acted on.
-                cloud.apply_menu_verb(verb);
-                *selected = Plane::Cloud;
-            }
             menubar::MenuAction::FleetRefresh => datacenter.refresh_now(),
             // Handled inside the bar (it owns the guide window's open flag);
             // unreachable here, kept explicit so a new action can't fall
@@ -210,14 +186,6 @@ pub fn show(
                         surface_card.show(ui);
                     }
                 }
-                // QC-12 — the Cloud plane (the Q70 lock: the Controller plane
-                // BECOMES the Cloud plane). Renders the mesh cloud off the typed
-                // QC-11 Bus verbs; its mutable picker/arming/poll state is the
-                // Shell-owned `cloud` field, borrowed here like every other
-                // surface. The old Controller view stays live inside the plane,
-                // collapsed (§6 reuse — the leader lease the leader-hosted
-                // MariaDB follows is part of the cloud story).
-                Plane::Cloud => cloud_plane::show(ui, cloud, controller),
                 // WB-Network — the mesh fabric's live status (overlay IP + cipher,
                 // elected leader, the peer directory as network links, network
                 // service health, overlay routing) off the same snapshot.
@@ -258,21 +226,18 @@ pub fn show(
 /// - **View** — plane navigation: one radio item per [`Plane`] in blast-radius
 ///   order, the mouse twin of the rail's `selectable_label`s (§6, one seam).
 /// - **The active plane's verb menu** — only for a plane with a real mutable
-///   seam behind this bar: **Cloud** (the QC-12 verbs, applied to the plane's
-///   egui-memory state — refresh + the launch picker + the per-kind New forms)
-///   and **Fleet** (Refresh now, onto the datacenter poll seam). The This Node /
-///   Network / Provisioning planes render read-only snapshot views behind
-///   `&self` here — no mutable verb seam exists, so no verb menu is invented
-///   (§7 — honest omission, never a dead entry; the Provisioning flows carry
-///   their own in-body controls).
-/// - **Help** — the bar-owned **Plane Guide** window (the five planes + their
-///   real blurbs; the voice bar's bar-owned-overlay idiom).
+///   seam behind this bar: **Fleet** (Refresh now, onto the datacenter poll
+///   seam). The This Node / Network / Provisioning planes render read-only
+///   snapshot views behind `&self` here — no mutable verb seam exists, so no verb
+///   menu is invented (§7 — honest omission, never a dead entry; the Provisioning
+///   flows carry their own in-body controls).
+/// - **Help** — the bar-owned **Plane Guide** window (every plane + its
+///   real blurb; the voice bar's bar-owned-overlay idiom).
 ///
 /// The status cluster is live mesh state: the active plane, the elected
 /// leader + peer count (the controller's parsed snapshot — chips gated on
 /// `ControllerState::seen`, §7), and the fleet update target (provisioning).
 mod menubar {
-    use super::cloud_plane::CloudMenuVerb;
     use super::Plane;
     use crate::controller::ControllerState;
     use crate::provisioning::ProvisioningState;
@@ -289,8 +254,6 @@ mod menubar {
     pub(super) enum MenuAction {
         /// View → jump to this plane (the rail's `selected` seam).
         Plane(Plane),
-        /// Cloud → a QC-12 verb into the Cloud plane's egui-memory state.
-        Cloud(CloudMenuVerb),
         /// Fleet → queue an immediate datacenter re-read.
         FleetRefresh,
         /// Help → toggle the bar-owned Plane Guide window.
@@ -348,7 +311,7 @@ mod menubar {
             .show(ui.ctx(), |ui| {
                 mde_egui::muted_note(
                     ui,
-                    "The Workbench's five control planes, ordered by blast radius.",
+                    "The Workbench's control planes, ordered by blast radius.",
                 );
                 ui.add_space(Style::SP_S);
                 for plane in Plane::ALL {
@@ -374,33 +337,6 @@ mod menubar {
         let mut menus = vec![Menu::new("View", view)];
 
         match active {
-            // The Cloud plane's verbs (QC-12) — each the mouse twin of an
-            // affordance the plane body renders (§6, one seam).
-            Plane::Cloud => menus.push(Menu::new(
-                "Cloud",
-                vec![
-                    Entry::Item(Item::new(
-                        MenuAction::Cloud(CloudMenuVerb::Refresh),
-                        "Refresh now",
-                    )),
-                    Entry::Item(Item::new(
-                        MenuAction::Cloud(CloudMenuVerb::LaunchInstance),
-                        "Launch instance\u{2026}",
-                    )),
-                    Entry::Item(Item::new(
-                        MenuAction::Cloud(CloudMenuVerb::NewVolume),
-                        "New volume\u{2026}",
-                    )),
-                    Entry::Item(Item::new(
-                        MenuAction::Cloud(CloudMenuVerb::RegisterImage),
-                        "Register image\u{2026}",
-                    )),
-                    Entry::Item(Item::new(
-                        MenuAction::Cloud(CloudMenuVerb::NewNetwork),
-                        "New network\u{2026}",
-                    )),
-                ],
-            )),
             // The Fleet plane's one honest verb: queue an immediate re-read of
             // the Bus projection (the datacenter poll seam).
             Plane::Fleet => menus.push(Menu::new(
@@ -462,7 +398,7 @@ mod menubar {
 
     #[cfg(test)]
     mod tests {
-        use super::{build_menus, build_status, CloudMenuVerb, MenuAction, Plane};
+        use super::{build_menus, build_status, MenuAction, Plane};
         use crate::controller::ControllerState;
         use crate::provisioning::ProvisioningState;
         use mde_egui::menubar::Entry;
@@ -516,24 +452,6 @@ mod menubar {
 
         #[test]
         fn verb_menus_appear_only_at_plane_depth() {
-            // Cloud active → View · Cloud · Help, with every QC-12 verb.
-            let menus = build_menus(Plane::Cloud);
-            assert_eq!(menus.len(), 3);
-            assert_eq!(menus[1].title, "Cloud");
-            let cloud = ids(&menus[1]);
-            for verb in [
-                CloudMenuVerb::Refresh,
-                CloudMenuVerb::LaunchInstance,
-                CloudMenuVerb::NewVolume,
-                CloudMenuVerb::RegisterImage,
-                CloudMenuVerb::NewNetwork,
-            ] {
-                assert!(
-                    cloud.contains(&MenuAction::Cloud(verb)),
-                    "{verb:?} missing from the Cloud menu"
-                );
-            }
-
             // Fleet active → View · Fleet · Help, with the refresh verb.
             let menus = build_menus(Plane::Fleet);
             assert_eq!(menus.len(), 3);
@@ -588,7 +506,7 @@ mod menubar {
             };
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = super::show(ui, Plane::Cloud, &controller, &provisioning);
+                    let _ = super::show(ui, Plane::Fleet, &controller, &provisioning);
                 });
             });
             let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -605,22 +523,21 @@ mod tests {
     use super::Plane;
 
     #[test]
-    fn there_are_five_planes_in_blast_radius_order() {
-        assert_eq!(Plane::ALL.len(), 5);
+    fn there_are_four_planes_in_blast_radius_order() {
+        // WL-ARCH-006 — the Cloud plane retired into the Workloads surface, so
+        // the Workbench is node/network/fleet control only (This Node → Fleet).
+        assert_eq!(Plane::ALL.len(), 4);
         assert_eq!(Plane::ALL[0], Plane::ThisNode);
-        // QC-12 / Q70 — the Controller slot is now the Cloud plane.
-        assert_eq!(Plane::ALL[1], Plane::Cloud);
-        assert_eq!(Plane::ALL[4], Plane::Provisioning);
+        assert_eq!(Plane::ALL[3], Plane::Provisioning);
     }
 
     #[test]
-    fn the_controller_plane_became_the_cloud_plane() {
-        // The Q70 lock: no plane is labelled Controller any more, and the Cloud
-        // plane is reachable with an honest cloud blurb.
-        assert!(Plane::ALL.iter().all(|p| p.label() != "Controller"));
-        assert_eq!(Plane::Cloud.label(), "Cloud");
-        assert!(Plane::Cloud.blurb().contains("instances"));
-        assert!(Plane::Cloud.blurb().contains("stacks"));
+    fn no_plane_is_the_retired_controller_or_cloud_plane() {
+        // WL-ARCH-006 / Q70 — neither the old Controller nor the Cloud plane
+        // survives; the mesh cloud is the standalone Workloads surface now.
+        assert!(Plane::ALL
+            .iter()
+            .all(|p| p.label() != "Controller" && p.label() != "Cloud"));
     }
 
     #[test]
@@ -634,7 +551,7 @@ mod tests {
         let mut labels: Vec<&str> = Plane::ALL.iter().map(|p| p.label()).collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 5, "plane labels must be distinct");
+        assert_eq!(labels.len(), 4, "plane labels must be distinct");
     }
 
     #[test]

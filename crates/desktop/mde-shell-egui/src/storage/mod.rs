@@ -44,7 +44,7 @@
 //! or `/mnt/mesh-storage` — and disables staging against them. The VM/container
 //! in-use wall isn't visible in the topology, so it's enforced at apply-time by the
 //! worker and surfaces as a `Refused` progress row with a deep-link hint to free it
-//! in the Cloud plane. **Typed arming** (lock 8) is always demanded before an
+//! in the Workloads surface. **Typed arming** (lock 8) is always demanded before an
 //! Apply: the operator types the exact target device, matched against the queue's
 //! single resolved disk (the worker re-checks authoritatively).
 //!
@@ -1453,7 +1453,7 @@ impl StorageState {
         }
 
         // A walled row (advisory in-use note here, or a `Refused` progress row
-        // below) can deep-link to the Cloud plane to free the guest holding the disk.
+        // below) can deep-link to the Workloads surface to free the guest holding the disk.
         // Collected across the render, published once after the borrows end.
         let mut goto_instances = false;
 
@@ -1541,9 +1541,9 @@ impl StorageState {
         ui.add_space(Style::SP_M);
         show_progress(ui, &self.progress, &mut goto_instances);
 
-        // A walled-row deep-link hands off to the Cloud plane via the shell's one
-        // nav grammar (a `shell/goto/instances` compatibility toast resolves
-        // there after QC-15).
+        // A walled-row deep-link hands off to the Workloads surface via the
+        // shell's one nav grammar (a `shell/goto/instances` compatibility toast
+        // resolves to Infra as Code after WL-ARCH-006).
         if goto_instances {
             self.emit_goto(&node.host, CLOUD_COMPAT_SURFACE);
         }
@@ -1787,7 +1787,7 @@ fn show_disk(
         );
         if storage_hover_text(
             ui.button(RichText::new("free it in Cloud").size(Style::SMALL)),
-            "Jump to the Cloud plane to stop the guest holding this disk.",
+            "Jump to the Workloads surface to stop the guest holding this disk.",
         )
         .clicked()
         {
@@ -2278,7 +2278,7 @@ fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress], goto_instances
                         mde_egui::muted_note(ui, "Free the disk, then re-apply:");
                         if storage_hover_text(
                             ui.button(RichText::new("Open Cloud").size(Style::SMALL)),
-                            "Jump to the Cloud plane to stop the guest holding this disk.",
+                            "Jump to the Workloads surface to stop the guest holding this disk.",
                         )
                         .clicked()
                         {

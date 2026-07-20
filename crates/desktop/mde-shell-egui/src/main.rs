@@ -671,13 +671,6 @@ struct Shell {
     /// same world-readable mesh-status snapshot (WB-Controller). Reads no `mackesd`
     /// IPC.
     controller: controller::ControllerState,
-    /// Cloud plane (QC-12) — the Controller plane's successor: the five cloud
-    /// resource kinds + launch picker + fleet-state presets, driven over the
-    /// typed QC-11 Bus verbs. Its mutable poll/picker/arming state is a plain
-    /// Shell field like every other surface (single-threaded UI state); the
-    /// Workbench borrows it while the Cloud plane is in view and the shell
-    /// drains its one-shot console-attach hand-off after the frame.
-    cloud_plane: workbench::cloud_plane::CloudPlaneState,
     /// Provisioning plane — the mesh's live onboarding / deployment posture
     /// (per-node deployment tier + role rollup, the fleet version target vs each
     /// node's build + update flag, and per-node enrollment readiness), folded from
@@ -954,7 +947,6 @@ impl Shell {
             surface_card: surface_card::SurfaceCardState::default(),
             network: network::NetworkState::default(),
             controller: controller::ControllerState::default(),
-            cloud_plane: workbench::cloud_plane::CloudPlaneState::default(),
             provisioning: provisioning::ProvisioningState::default(),
             services: services_flow::ServicesFlowState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
@@ -1218,7 +1210,6 @@ impl Shell {
                     &mut self.surface_card,
                     &self.network,
                     &self.controller,
-                    &mut self.cloud_plane,
                     &self.provisioning,
                     &mut self.services,
                     &mut self.spawn_lighthouse,
@@ -1792,16 +1783,6 @@ impl Shell {
         self.drain_menu_bar_minimize_request(ctx, now);
         self.paint_menu_bar_minimize_effect(ctx, now);
 
-        // QC-13 — Cloud row → Desktop SPICE handoff. The Cloud plane lives inside
-        // Workbench and its state is a Shell field; after Workbench renders, a
-        // dialable cloud console descriptor can queue one native VDI attach here.
-        if let Some(request) = self.cloud_plane.take_console_attach() {
-            self.vdi
-                .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
-            self.nav.expanded = true;
-            self.nav.surface = Surface::Desktop;
-        }
-
         // Route the System surface's own control-error alerts (a refused / absent
         // Bluetooth write, a pairing-agent registration failure — §7) into the ONE
         // ToastBridge, applying the same suppression + sound policy as a Bus alert.
@@ -2248,14 +2229,11 @@ impl Shell {
     fn drain_console_request(&mut self, source: &'static str) {
         match self.console.take_request() {
             Some(console::ConsoleRequest::Goto(surface)) => {
-                // A live surface-link entry (the pinned Terminal, the Cloud-plane
+                // A live surface-link entry (the pinned Terminal, the Workloads
                 // link) routes the shell body — a navigation is never a no-op
                 // behind the session.
                 self.nav.expanded = true;
                 self.nav.surface = surface;
-            }
-            Some(console::ConsoleRequest::Plane(plane)) => {
-                self.apply_nav(toast_bridge::Navigate::Plane(plane));
             }
             // CONSOLE-5 — the front door opens a real tab: a command / Custom
             // entry switches the body to the Terminal surface (lock #7) and
@@ -4919,7 +4897,7 @@ mod tests {
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.nav.expanded = false;
         shell.nav.surface = Surface::Browser;
-        shell.nav.plane = Plane::Cloud;
+        shell.nav.plane = Plane::ThisNode;
         let card = front_door::workflow_search_items(0)
             .into_iter()
             .find_map(|item| {

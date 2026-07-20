@@ -5,12 +5,12 @@
 //! publishes it on the Bus, so the Discovery-surface hero fold (EXPLORER-3) stays
 //! a thin renderer (§6 — scanning + privilege live in the daemon, never the GUI).
 //!
-//! ## Shape (mirrors the QC-2 `openstack` / BUG-STORAGE-1 `storage` workers)
+//! ## Shape (mirrors the `cloud` / BUG-STORAGE-1 `storage` workers)
 //!
 //! - **Three injectable seams** ([`sources`]), each headless-testable with a fake
 //!   ([`testkit`]): [`sources::MeshMirrorSource`] (the peer directory + leader +
-//!   health — source (a), lock #2), [`sources::OpenstackMirrorSource`] (the union
-//!   of every node's `state/openstack/<node>` mirror — source (b), lock #20), and
+//!   health — source (a), lock #2), [`sources::CloudMirrorSource`] (the union
+//!   of every node's `state/cloud/<node>` mirror — source (b), lock #20), and
 //!   [`sources::LanScanSource`] (the surface-gated active LAN scan — the
 //!   EXPLORER-2 producer seam, [`sources::NoScan`] today).
 //! - **A pure fold** ([`fold::aggregate`]): self-first (lock #23), then peers,
@@ -22,7 +22,7 @@
 //!   adjacency, host placement, storage usage — deduped + sorted.
 //! - **The `state/units/<node>` mirror** ([`unit::UnitsState`]) — the folded units
 //!   AND the derived edges, published on change + a heartbeat via the `mde-bus`
-//!   fire-and-reap path (the same idiom `state/openstack/<node>` uses).
+//!   fire-and-reap path (the same idiom `state/cloud/<node>` uses).
 //! - **The E9 read verb** ([`verb`]) — `action/units/get-stream` → a
 //!   `reply/<ulid>` carrying the current stream (units + edges), for any Rust/CLI
 //!   mesh client.
@@ -33,7 +33,7 @@
 //!   surface toggles (lock #24). The `LanHost` unit producer already lands here.
 //! - EXPLORER-9 ([`enrich`]) fills [`unit::Extras`] (offline MAC-OUI vendor,
 //!   service→openable-action, fingerprint→type) + the [`unit::CloudDetail`] E4
-//!   instance/volume detail folded from the `OpenStack` mirror objects. Every field
+//!   instance/volume detail folded from the cloud mirror objects. Every field
 //!   an unprobed source can't answer stays an explicit `None`/empty (§7).
 //!
 //! [`scan_flag`]: UnitAggregatorWorker::scan_flag
@@ -65,14 +65,14 @@ use edges::derive_edges;
 use fold::{aggregate, SeenTracker};
 use lan_scan::LanScan;
 use sources::{
-    BusOpenstackMirror, LanScanSource, MeshDirectoryMirror, MeshMirrorSource, NoCloud,
-    OpenstackMirrorSource,
+    BusCloudMirror, CloudMirrorSource, LanScanSource, MeshDirectoryMirror, MeshMirrorSource,
+    NoCloud,
 };
 use unit::UnitsState;
 use verb::{handle_units_request, UNITS_REQUEST_TOPIC};
 
 /// Fold cadence — one mesh + cloud read (+ the gated scan tick) per interval.
-/// Same order of cost as the sibling `openstack` worker's heartbeat.
+/// Same order of cost as the sibling `cloud` worker's heartbeat.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Unconditional mirror republish cadence.
@@ -148,7 +148,7 @@ pub struct UnitAggregatorWorker {
     /// The mesh half (source (a)).
     mesh: Arc<dyn MeshMirrorSource>,
     /// The cloud half (source (b)).
-    cloud: Arc<dyn OpenstackMirrorSource>,
+    cloud: Arc<dyn CloudMirrorSource>,
     /// The off-mesh half (EXPLORER-2 producer seam).
     scan: Arc<dyn LanScanSource>,
     /// The surface-gated scan-active flag (lock #24) — the shell sets it only
@@ -166,16 +166,16 @@ pub struct UnitAggregatorWorker {
 
 impl UnitAggregatorWorker {
     /// Construct with production defaults: the replicated peer directory + etcd
-    /// leader as the mesh seam, the persisted Bus tree as the openstack-union
+    /// leader as the mesh seam, the persisted Bus tree as the cloud-union
     /// seam, the surface-gated active LAN scan ([`LanScan`], EXPLORER-2) as the
     /// off-mesh seam, and the default cadences. `host` is this node's id;
     /// `workgroup_root` seeds the peer-directory reader.
     #[must_use]
     pub fn new(host: String, workgroup_root: PathBuf) -> Self {
         let bus_root = default_bus_root();
-        let cloud: Arc<dyn OpenstackMirrorSource> = bus_root.clone().map_or_else(
-            || Arc::new(NoCloud) as Arc<dyn OpenstackMirrorSource>,
-            |root| Arc::new(BusOpenstackMirror::new(root)),
+        let cloud: Arc<dyn CloudMirrorSource> = bus_root.clone().map_or_else(
+            || Arc::new(NoCloud) as Arc<dyn CloudMirrorSource>,
+            |root| Arc::new(BusCloudMirror::new(root)),
         );
         Self {
             mesh: Arc::new(MeshDirectoryMirror::new(workgroup_root, host.clone())),
@@ -197,9 +197,9 @@ impl UnitAggregatorWorker {
         self
     }
 
-    /// Inject the openstack-union source (tests).
+    /// Inject the cloud-union source (tests).
     #[must_use]
-    pub fn with_cloud(mut self, cloud: Arc<dyn OpenstackMirrorSource>) -> Self {
+    pub fn with_cloud(mut self, cloud: Arc<dyn CloudMirrorSource>) -> Self {
         self.cloud = cloud;
         self
     }
@@ -259,7 +259,7 @@ impl UnitAggregatorWorker {
 
     /// One fold cycle: build the current state, and publish it when the content
     /// changed or the heartbeat elapsed (publish-on-change, mirroring the
-    /// openstack worker).
+    /// cloud worker).
     fn cycle_and_publish(
         &mut self,
         last: &mut Option<UnitsState>,
@@ -320,7 +320,7 @@ impl Worker for UnitAggregatorWorker {
 #[cfg(test)]
 mod tests {
     use super::sources::{CloudKind, CloudObjectRecord, LanHostRecord, MeshSnapshot, NoScan};
-    use super::testkit::{FakeLanScan, FakeMeshMirror, FakeOpenstack};
+    use super::testkit::{FakeCloud, FakeLanScan, FakeMeshMirror};
     use super::unit::UnitKind;
     use super::*;
     use mackes_mesh_types::peers::PeerRecord;
@@ -333,7 +333,7 @@ mod tests {
         UnitAggregatorWorker::new("me".into(), PathBuf::from("/tmp"))
             .with_bus_root(None)
             .with_mesh(Arc::new(FakeMeshMirror::new(mesh)))
-            .with_cloud(Arc::new(FakeOpenstack::new(cloud)))
+            .with_cloud(Arc::new(FakeCloud::new(cloud)))
             .with_scan(scan)
     }
 
@@ -452,7 +452,7 @@ mod tests {
         let mut w = UnitAggregatorWorker::new("node".into(), PathBuf::from("/tmp"))
             .with_bus_root(None)
             .with_mesh(Arc::new(FakeMeshMirror::new(mesh)))
-            .with_cloud(Arc::new(FakeOpenstack::new(vec![])))
+            .with_cloud(Arc::new(FakeCloud::new(vec![])))
             .with_scan(Arc::new(NoScan))
             .with_poll(Duration::from_millis(10));
         let (tx, rx) = tokio::sync::watch::channel(false);

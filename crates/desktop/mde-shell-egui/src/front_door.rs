@@ -2098,25 +2098,33 @@ fn service_lifecycle_action_clicked(
     })
 }
 
-fn workflow_quick_action_for_card(card: FrontDoorWorkflowCard) -> FrontDoorWorkflowQuickAction {
+/// The related-Workbench-plane quick action for a workflow card, or `None` when
+/// the card's home is a standalone surface rather than a Workbench plane.
+///
+/// WL-ARCH-006 — the cloud workflow cards (Cloud workloads / Cloud API services)
+/// open the standalone **Workloads** surface (`Surface::InfraCode`); they have no
+/// Workbench plane to deep-link to, so they export no plane quick action (§7 —
+/// honest omission, never a dead affordance). Only the Desktop-session and mesh-
+/// service cards relate to a live Workbench plane (Fleet).
+fn workflow_quick_action_for_card(
+    card: FrontDoorWorkflowCard,
+) -> Option<FrontDoorWorkflowQuickAction> {
     match (card.kind, card.surface, card.workbench_plane) {
-        (FrontDoorWorkflowKind::Workload, Surface::Desktop, _) => FrontDoorWorkflowQuickAction {
-            label: "Fleet",
-            plane: Plane::Fleet,
-            icon: IconId::Desktop,
-        },
+        (FrontDoorWorkflowKind::Workload, Surface::Desktop, _) => {
+            Some(FrontDoorWorkflowQuickAction {
+                label: "Fleet",
+                plane: Plane::Fleet,
+                icon: IconId::Desktop,
+            })
+        }
         (FrontDoorWorkflowKind::Service, Surface::Workbench, Some(Plane::Provisioning)) => {
-            FrontDoorWorkflowQuickAction {
+            Some(FrontDoorWorkflowQuickAction {
                 label: "Fleet",
                 plane: Plane::Fleet,
                 icon: IconId::Workbench,
-            }
+            })
         }
-        _ => FrontDoorWorkflowQuickAction {
-            label: "Cloud",
-            plane: Plane::Cloud,
-            icon: IconId::Server,
-        },
+        _ => None,
     }
 }
 
@@ -2124,7 +2132,7 @@ fn workflow_quick_action_for_hit(
     hit: &SearchHit<FrontDoorTarget>,
 ) -> Option<FrontDoorWorkflowQuickAction> {
     match hit.item.payload {
-        FrontDoorTarget::Workflow(card) => Some(workflow_quick_action_for_card(card)),
+        FrontDoorTarget::Workflow(card) => workflow_quick_action_for_card(card),
         _ => None,
     }
 }
@@ -5369,6 +5377,9 @@ mod tests {
         ctx.enable_accesskit();
         mde_egui::fonts::install(&ctx);
 
+        // WL-ARCH-006 — the Cloud workloads card opens the standalone Workloads
+        // surface (Infra as Code), not a Workbench plane, so it exports NO plane
+        // quick action (honest omission, §7). Its primary open action still routes.
         let workload_out = render_front_door_accesskit_frame_with_filter(
             &ctx,
             "",
@@ -5378,17 +5389,12 @@ mod tests {
             FrontDoorFilter::Workloads,
         );
         let workload_nodes = accesskit_nodes(&workload_out);
-        let cloud = workload_nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.label() == Some("Open Cloud plane for Cloud workloads"))
-            .expect("selected workload card should expose the real Workbench Cloud plane");
-        assert_eq!(cloud.role(), egui::accesskit::Role::Button);
-        assert_eq!(
-            cloud.value(),
-            Some("Workflow action: Workbench Cloud plane; Instances, volumes, networks")
+        assert!(
+            workload_nodes.iter().all(|(_, node)| node
+                .label()
+                .is_none_or(|label| !label.contains("plane for Cloud workloads"))),
+            "the Cloud workloads card must expose no Workbench-plane quick action — it opens the Workloads surface"
         );
-        assert!(cloud.supports_action(egui::accesskit::Action::Click));
 
         let service_out = render_front_door_accesskit_frame_with_filter(
             &ctx,

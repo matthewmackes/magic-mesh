@@ -61,11 +61,11 @@ pub enum Surface {
     /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Construct".
     #[default]
     Desktop,
-    /// The **Infra as Code (`IaC`)** surface — the cloud `IaaS` control plane
-    /// (`docs/design/iac-workspace.md`, IAC-2): the service catalog + per-service
-    /// API health + the merged service directory, consumed off the Bus
-    /// (`action/cloud/get-catalog`). The comprehensive infrastructure admin beside
-    /// the member-facing Cloud plane (#24).
+    /// The **Infra as Code (`IaC`)** surface — the unified **Workloads** control
+    /// plane (`docs/design/iac-workspace.md`, IAC-2; WL-ARCH-006): the service
+    /// catalog + per-service API health + the merged service directory, consumed
+    /// off the Bus (`action/cloud/get-catalog`). The mesh's one member-facing
+    /// cloud/workloads surface — the retired Cloud plane's successor (#24).
     InfraCode,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
