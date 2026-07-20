@@ -143,67 +143,62 @@ impl CommunicationsSurface {
         item: &ClipboardView,
         now_unix_ms: i64,
     ) {
-        egui::Frame::NONE
-            .fill(Style::LAYER_01)
-            .inner_margin(Style::SP_S)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    icons::icon(
-                        ui,
-                        icons::clip_kind_icon(item.kind),
-                        Style::SP_M,
-                        Style::ACCENT,
-                    );
-                    ui.label(egui::RichText::new(clip_preview(&item.preview)).color(Style::TEXT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icons::icon_button(
-                            ui,
-                            icons::CLIP_DELETE,
-                            Style::SP_M,
-                            Style::DANGER,
-                            "Delete clip",
-                        )
-                        .clicked()
-                        {
-                            self.delete_clip(sink, space, item.event_id);
-                        }
-                        if icons::icon_button(
-                            ui,
-                            icons::CLIP_ATTACH,
-                            Style::SP_M,
-                            Style::TEXT_DIM,
-                            "Attach to a message in this space",
-                        )
-                        .clicked()
-                        {
-                            self.attach_clip(sink, space, item.event_id);
-                        }
-                        // Pin toggle — a pinned clip survives the cap + clear.
-                        let (tint, hint) = if item.pinned {
-                            (Style::WARN, "Unpin")
-                        } else {
-                            (Style::TEXT_DIM, "Pin")
-                        };
-                        if icons::icon_button(ui, icons::CLIP_PIN, Style::SP_M, tint, hint)
-                            .clicked()
-                        {
-                            self.toggle_clip_pin(sink, space, item.event_id, item.pinned);
-                        }
-                    });
-                });
-
-                // Honest facts: who captured it, when, and its content address.
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}  ·  {}  ·  content {}",
-                        item.source,
-                        relative_age(now_unix_ms, item.at_unix_ms),
-                        short_hash(&item.sha256_hex),
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
+        mde_egui::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::icon(
+                    ui,
+                    icons::clip_kind_icon(item.kind),
+                    Style::SP_M,
+                    Style::ACCENT,
                 );
+                ui.label(egui::RichText::new(clip_preview(&item.preview)).color(Style::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::icon_button(
+                        ui,
+                        icons::CLIP_DELETE,
+                        Style::SP_M,
+                        Style::DANGER,
+                        "Delete clip",
+                    )
+                    .clicked()
+                    {
+                        self.delete_clip(sink, space, item.event_id);
+                    }
+                    if icons::icon_button(
+                        ui,
+                        icons::CLIP_ATTACH,
+                        Style::SP_M,
+                        Style::TEXT_DIM,
+                        "Attach to a message in this space",
+                    )
+                    .clicked()
+                    {
+                        self.attach_clip(sink, space, item.event_id);
+                    }
+                    // Pin toggle — a pinned clip survives the cap + clear.
+                    let (tint, hint) = if item.pinned {
+                        (Style::WARN, "Unpin")
+                    } else {
+                        (Style::TEXT_DIM, "Pin")
+                    };
+                    if icons::icon_button(ui, icons::CLIP_PIN, Style::SP_M, tint, hint).clicked() {
+                        self.toggle_clip_pin(sink, space, item.event_id, item.pinned);
+                    }
+                });
             });
+
+            // Honest facts: who captured it, when, and its content address.
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  ·  {}  ·  content {}",
+                    item.source,
+                    relative_age(now_unix_ms, item.at_unix_ms),
+                    short_hash(&item.sha256_hex),
+                ))
+                .small()
+                .color(Style::TEXT_DIM),
+            );
+        });
     }
 
     // ── testable command seams (the UI above drives these same methods) ──────

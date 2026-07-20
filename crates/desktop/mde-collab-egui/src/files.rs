@@ -165,9 +165,7 @@ impl CommunicationsSurface {
         job: Option<&TransferJobView>,
         now_unix_ms: i64,
     ) {
-        egui::Frame::NONE
-            .fill(Style::LAYER_01)
-            .inner_margin(Style::SP_S)
+        mde_egui::card()
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     icons::icon(ui, icons::FILE_ROW, Style::SP_M, Style::ACCENT);
@@ -452,49 +450,46 @@ impl CommunicationsSurface {
         let name = pending.name.clone();
         let mut confirm = false;
         let mut cancel = false;
-        egui::Frame::NONE
-            .fill(Style::LAYER_01)
-            .inner_margin(Style::SP_M)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    icons::icon(ui, icons::FILE_DELETE_PERMANENT, Style::SP_M, Style::DANGER);
-                    ui.label(
-                        egui::RichText::new("Delete permanently")
-                            .strong()
-                            .color(Style::DANGER),
-                    );
-                });
+        mde_egui::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::icon(ui, icons::FILE_DELETE_PERMANENT, Style::SP_M, Style::DANGER);
                 ui.label(
-                    egui::RichText::new(format!(
-                        "Permanently deletes \u{201c}{name}\u{201d} for everyone. This removes the \
+                    egui::RichText::new("Delete permanently")
+                        .strong()
+                        .color(Style::DANGER),
+                );
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "Permanently deletes \u{201c}{name}\u{201d} for everyone. This removes the \
                          reference and lets the canonical file be purged once no space keeps it. \
                          This cannot be undone.",
-                    ))
-                    .color(Style::TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Type the file name to confirm: {name}"))
-                        .small()
-                        .color(Style::TEXT_DIM),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut pending.typed)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Exact file name"),
-                );
-                let armed = pending.typed.trim() == name;
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(armed, egui::Button::new("Delete permanently"))
-                        .clicked()
-                    {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
+                ))
+                .color(Style::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(format!("Type the file name to confirm: {name}"))
+                    .small()
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut pending.typed)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Exact file name"),
+            );
+            let armed = pending.typed.trim() == name;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(armed, egui::Button::new("Delete permanently"))
+                    .clicked()
+                {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
             });
+        });
         if confirm {
             self.confirm_permanent_delete(sink, space);
         } else if cancel {

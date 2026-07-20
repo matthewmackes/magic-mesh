@@ -79,68 +79,65 @@ impl CommunicationsSurface {
         sink: &mut crate::CommandSink,
         job: &TransferJobView,
     ) {
-        egui::Frame::NONE
-            .fill(Style::LAYER_01)
-            .inner_margin(Style::SP_S)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (glyph, dir_hint) = match job.direction {
-                        TransferDirection::Inbound => (icons::XFER_INBOUND, "Inbound"),
-                        TransferDirection::Outbound => (icons::XFER_OUTBOUND, "Outbound"),
-                    };
-                    icons::icon(ui, icons::XFER_ROW, Style::SP_M, Style::ACCENT);
-                    icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).on_hover_text(dir_hint);
+        mde_egui::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (glyph, dir_hint) = match job.direction {
+                    TransferDirection::Inbound => (icons::XFER_INBOUND, "Inbound"),
+                    TransferDirection::Outbound => (icons::XFER_OUTBOUND, "Outbound"),
+                };
+                icons::icon(ui, icons::XFER_ROW, Style::SP_M, Style::ACCENT);
+                icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).on_hover_text(dir_hint);
+                ui.label(
+                    egui::RichText::new(short_file(job))
+                        .strong()
+                        .color(Style::TEXT_STRONG),
+                );
+                ui.label(
+                    egui::RichText::new(format!("· {}", method_label(job.method)))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(transfer_state_label(job.state))
+                        .small()
+                        .strong()
+                        .color(transfer_state_color(job.state)),
+                );
+                // Mirrored byte progress (WL-FUNC-006). `total == 0` means the
+                // ledger has not reported a size yet — shown honestly, never
+                // faked to a full bar.
+                if job.total > 0 {
                     ui.label(
-                        egui::RichText::new(short_file(job))
-                            .strong()
-                            .color(Style::TEXT_STRONG),
+                        egui::RichText::new(format!(
+                            "{} / {}",
+                            fmt_bytes(job.moved),
+                            fmt_bytes(job.total)
+                        ))
+                        .small()
+                        .color(Style::TEXT_DIM),
                     );
+                } else if job.moved > 0 {
                     ui.label(
-                        egui::RichText::new(format!("· {}", method_label(job.method)))
+                        egui::RichText::new(fmt_bytes(job.moved))
                             .small()
                             .color(Style::TEXT_DIM),
                     );
-                });
-
-                ui.horizontal(|ui| {
+                } else {
                     ui.label(
-                        egui::RichText::new(transfer_state_label(job.state))
-                            .small()
-                            .strong()
-                            .color(transfer_state_color(job.state)),
-                    );
-                    // Mirrored byte progress (WL-FUNC-006). `total == 0` means the
-                    // ledger has not reported a size yet — shown honestly, never
-                    // faked to a full bar.
-                    if job.total > 0 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} / {}",
-                                fmt_bytes(job.moved),
-                                fmt_bytes(job.total)
-                            ))
+                        egui::RichText::new("progress pending")
                             .small()
                             .color(Style::TEXT_DIM),
-                        );
-                    } else if job.moved > 0 {
-                        ui.label(
-                            egui::RichText::new(fmt_bytes(job.moved))
-                                .small()
-                                .color(Style::TEXT_DIM),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("progress pending")
-                                .small()
-                                .color(Style::TEXT_DIM),
-                        );
-                    }
+                    );
+                }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.transfer_controls_row(ui, sink, job);
-                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.transfer_controls_row(ui, sink, job);
                 });
             });
+        });
     }
 
     /// The controls appropriate to a job's state (terminal states carry none) —

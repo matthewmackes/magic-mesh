@@ -278,31 +278,28 @@ impl CommunicationsSurface {
             .filter(|p| p.state == CallParticipantState::Connected)
             .count();
 
-        egui::Frame::NONE
-            .fill(Style::LAYER_01)
-            .inner_margin(Style::SP_S)
-            .show(ui, |ui| {
-                call_card_header(ui, directory, now_unix_ms, call, connected);
-                for p in &call.participants {
-                    call_roster_row(ui, me, p);
+        mde_egui::card().show(ui, |ui| {
+            call_card_header(ui, directory, now_unix_ms, call, connected);
+            for p in &call.participants {
+                call_roster_row(ui, me, p);
+            }
+            match mine.as_ref().map(|p| p.state) {
+                Some(CallParticipantState::Ringing) => {
+                    self.ringing_controls(ui, sink, call.call);
                 }
-                match mine.as_ref().map(|p| p.state) {
-                    Some(CallParticipantState::Ringing) => {
-                        self.ringing_controls(ui, sink, call.call);
+                Some(CallParticipantState::Connected) => {
+                    let muted = mine.as_ref().is_some_and(|p| p.muted);
+                    self.connected_controls(ui, sink, call.call, muted);
+                    if self.dtmf_pad == Some(call.call) {
+                        self.dtmf_keypad(ui, sink, call.call);
                     }
-                    Some(CallParticipantState::Connected) => {
-                        let muted = mine.as_ref().is_some_and(|p| p.muted);
-                        self.connected_controls(ui, sink, call.call, muted);
-                        if self.dtmf_pad == Some(call.call) {
-                            self.dtmf_keypad(ui, sink, call.call);
-                        }
-                    }
-                    // Declined/Left this call, or only watching it (not a
-                    // participant): the roster is shown read-only — no faked
-                    // "rejoin" control, because there is no such command today.
-                    _ => {}
                 }
-            });
+                // Declined/Left this call, or only watching it (not a
+                // participant): the roster is shown read-only — no faked
+                // "rejoin" control, because there is no such command today.
+                _ => {}
+            }
+        });
     }
 
     /// The ringing-invitation controls: Answer / Decline.

@@ -244,6 +244,7 @@ fn unread_badge(ui: &mut egui::Ui, unread: u32) {
     };
     egui::Frame::NONE
         .fill(Style::ACCENT)
+        .corner_radius(mde_egui::corner(Style::RADIUS_S))
         .inner_margin(egui::Margin::symmetric(Style::SP_XS as i8, 0))
         .show(ui, |ui| {
             ui.label(

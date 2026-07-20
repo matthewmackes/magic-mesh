@@ -128,54 +128,51 @@ impl CommunicationsSurface {
     ) {
         let hushed = self.alert_hushed(view);
         let sev = view.alert.severity;
-        egui::Frame::NONE
-            .fill(Style::LAYER_01)
-            .inner_margin(Style::SP_S)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let glyph_tint = if hushed {
-                        Style::BORDER
-                    } else {
-                        severity_color(sev)
-                    };
-                    icons::icon(ui, icons::severity_icon(sev), Style::SP_M, glyph_tint);
-                    ui.label(
-                        egui::RichText::new(&view.alert.headline)
-                            .strong()
-                            .color(if hushed {
-                                Style::TEXT_DIM
-                            } else {
-                                Style::TEXT_STRONG
-                            }),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("· {}", view.alert.source))
-                            .small()
-                            .color(Style::TEXT_DIM),
-                    );
-                    // Honest state chips — never a faked "handled".
-                    if view.acknowledged {
-                        ui.label(egui::RichText::new("acknowledged").small().color(Style::OK));
-                    }
-                    if view.snoozed_until_unix_ms.is_some() {
-                        ui.label(egui::RichText::new("snoozed").small().color(Style::WARN));
-                    }
-                    if hushed {
-                        ui.label(egui::RichText::new("hushed").small().color(Style::TEXT_DIM));
-                    }
-                });
-
-                // A few key detail fields (the folded structured payload).
-                for (k, v) in view.alert.fields.iter().take(4) {
-                    ui.label(
-                        egui::RichText::new(format!("{k}: {v}"))
-                            .small()
-                            .color(Style::TEXT_DIM),
-                    );
+        mde_egui::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let glyph_tint = if hushed {
+                    Style::BORDER
+                } else {
+                    severity_color(sev)
+                };
+                icons::icon(ui, icons::severity_icon(sev), Style::SP_M, glyph_tint);
+                ui.label(
+                    egui::RichText::new(&view.alert.headline)
+                        .strong()
+                        .color(if hushed {
+                            Style::TEXT_DIM
+                        } else {
+                            Style::TEXT_STRONG
+                        }),
+                );
+                ui.label(
+                    egui::RichText::new(format!("· {}", view.alert.source))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
+                // Honest state chips — never a faked "handled".
+                if view.acknowledged {
+                    ui.label(egui::RichText::new("acknowledged").small().color(Style::OK));
                 }
-
-                self.alert_actions(ui, sink, view, now_unix_ms);
+                if view.snoozed_until_unix_ms.is_some() {
+                    ui.label(egui::RichText::new("snoozed").small().color(Style::WARN));
+                }
+                if hushed {
+                    ui.label(egui::RichText::new("hushed").small().color(Style::TEXT_DIM));
+                }
             });
+
+            // A few key detail fields (the folded structured payload).
+            for (k, v) in view.alert.fields.iter().take(4) {
+                ui.label(
+                    egui::RichText::new(format!("{k}: {v}"))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
+            }
+
+            self.alert_actions(ui, sink, view, now_unix_ms);
+        });
     }
 
     /// The alert action row: ack (until acknowledged), snooze, mute-source, and
