@@ -352,6 +352,13 @@ pub mod compute_registry;
 // and publishes a RouterEntry to `mesh/devices/router/<mac>` + the QNM-Shared
 // `<host>/router-registry.json`. Design: docs/design/router-control.md.
 pub mod router_registry;
+// WL-RUN-006 — the router_action worker: the privileged firewall-edit executor.
+// Drains this node's replicated `action/router/<self>/` dir, gates each edit
+// behind a typed-confirm token, wraps the Vyatta apply in commit-confirm
+// (auto-revert), and hash-chain audits every edit. Rank-0 universal like
+// device_control; the live mutation is operator-gated (MDE_ROUTER_ACTION_LIVE).
+// Design: docs/design/router-control.md (mutations fast-follow).
+pub mod router_action;
 // MEDIA-7 — the media_registry worker: on a Lighthouse_Media node only
 // (capability-gated on MEDIA-1's Capability::Media), register the local
 // navidrome/media instance into the mesh service registry — the per-peer

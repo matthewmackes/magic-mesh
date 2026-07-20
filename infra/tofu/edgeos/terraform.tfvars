@@ -1,3 +1,9 @@
+# WL-RUN-006 — this file is the AUTO-LOADED default instance: the farm gateway
+# (172.20.0.1). `appliance_id = "gateway"` is the reserved alias for it. A SECOND
+# router is managed as its own instance — `appliances/<mac>.tfvars` selected via
+# `scripts/tofu-appliance.sh <mac> …` (see appliances/README.md).
+appliance_id = "gateway"
+
 # DHCP static reservations on the EdgeRouter (172.20.0.1), source of truth.
 # Imported 2026-06-24 from the live `show configuration commands` output.
 # tofu converges the router to EXACTLY this set — to add a reservation, add an

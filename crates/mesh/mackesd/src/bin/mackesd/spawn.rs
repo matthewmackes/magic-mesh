@@ -1442,7 +1442,7 @@ pub(crate) fn spawn_mesh_plumbing_workers(
 ) {
     use mackesd_core::workers::{
         device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile, job_exec,
-        lifecycle_exec, mesh_dns, netstate_apply, presence_watch, ssh_pubkey_gossip,
+        lifecycle_exec, mesh_dns, netstate_apply, presence_watch, router_action, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, validation_suite, RestartPolicy, Spawn,
     };
     // NF-21.1 — sshd overlay-bind worker. Polls
@@ -1478,6 +1478,21 @@ pub(crate) fn spawn_mesh_plumbing_workers(
     // it, and notifies on failure. Universal (rank 0) like lifecycle_exec.
     spawn_tiered(sup, worker_names, role_rank, "device_control", || {
         device_control::DeviceControlExecWorker::new(
+            workgroup_root.clone(),
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+            node_id.clone(),
+        )
+    });
+    // WL-RUN-006 — router-action executor: drains this node's replicated
+    // action/router/<self> firewall-edit requests, gates each on a typed-confirm
+    // token, applies inside a Vyatta commit-confirm window (auto-revert), and
+    // hash-chain audits every edit. Universal (rank 0) like device_control; the
+    // live mutation is operator-gated (MDE_ROUTER_ACTION_LIVE=1).
+    spawn_tiered(sup, worker_names, role_rank, "router_action", || {
+        router_action::RouterActionWorker::new(
             workgroup_root.clone(),
             node_id
                 .strip_prefix("peer:")

@@ -138,6 +138,11 @@ use mackes_mesh_types::device_inventory::{
     self, category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
 use mackes_mesh_types::peers::default_workgroup_root;
+// WL-RUN-006 — the router firewall-edit verb + its audit trail (the mutation panel).
+use mackes_mesh_types::router_action::{
+    self, typed_confirm_matches, FirewallEdit, FirewallEditOp, FirewallLeaf, RouterActionRequest,
+    DEFAULT_COMMIT_CONFIRM_MIN,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -1287,6 +1292,10 @@ pub(crate) struct DeviceManagerState {
     /// if any — the destructive Enable/Disable/Reload/Rescan verbs stage here and
     /// dispatch only once the operator echoes the device name.
     arming: Option<DeviceArming>,
+    /// WL-RUN-006 — the router firewall-edit composer, when a `HostKind::Router` is
+    /// selected. (Re)targeted per appliance; a submit writes an `action/router/*`
+    /// request behind the typed-confirm + commit-confirm safety layers.
+    router_edit: Option<RouterEditDraft>,
 }
 
 impl Default for DeviceManagerState {
@@ -1309,6 +1318,7 @@ impl Default for DeviceManagerState {
             active_tab: DrawerTab::default(),
             show_about: false,
             arming: None,
+            router_edit: None,
         }
     }
 }
@@ -1560,6 +1570,12 @@ impl DeviceManagerState {
                         muted_note(ui, note);
                     }
                     ui.add_space(Style::SP_S);
+                    // WL-RUN-006 — a selected router appliance gets the firewall-edit
+                    // mutation panel above its synthesized tree (typed-confirm +
+                    // commit-confirm + the audit trail).
+                    if self.selected_kind() == HostKind::Router {
+                        self.router_mutation_panel(ui);
+                    }
                     // Only the tree grouping/nesting changes between view modes
                     // (#3) — the header card, drawer + rows are shared.
                     match self.view {
@@ -2247,6 +2263,298 @@ impl DeviceManagerState {
             Err(err) => raise_toast(
                 "warning",
                 &format!("Could not dispatch {} to {target_host}: {err}", op.as_str()),
+            ),
+        }
+    }
+
+    /// WL-RUN-006 — the **router firewall-edit** mutation panel, shown when a
+    /// [`HostKind::Router`] appliance is selected (the design cited the retired
+    /// `mde-workbench`; the live seam is HERE, where the router already renders).
+    /// It composes a typed [`FirewallEdit`], echoes the appliance id as the
+    /// typed-confirm token, shows the commit-confirm auto-revert window, and — on a
+    /// gated submit — writes a [`RouterActionRequest`] to the `action/router/*`
+    /// plane (the node's `router_action` worker drains + applies + audits it). An
+    /// **unmanaged** router (no sealed cred) honestly offers no composer (§7). The
+    /// appliance's **audit trail** (every prior edit's outcome) renders below.
+    fn router_mutation_panel(&mut self, ui: &mut egui::Ui) {
+        // Resolve the selected router from its rail key + the registry mirror
+        // (immutable reads first, so the &mut draft borrow below is clean).
+        let Some(id) = self
+            .selected_host
+            .strip_prefix("router:")
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(mirror) = read_routers(&self.workgroup_root)
+            .into_iter()
+            .find(|r| r.id == id)
+        else {
+            return;
+        };
+        let target_host = mirror
+            .node_id
+            .strip_prefix("peer:")
+            .unwrap_or(&mirror.node_id)
+            .to_string();
+        let root = self.workgroup_root.clone();
+        let local_host = self.local_host.clone();
+
+        // (Re)target the draft when the selected appliance changes.
+        if self
+            .router_edit
+            .as_ref()
+            .map_or(true, |d| d.appliance_id != id)
+        {
+            self.router_edit = Some(RouterEditDraft::for_router(id.clone(), target_host.clone()));
+        }
+
+        // §7 — an unmanaged router has no sealed credential, so no mutation is
+        // possible; say so plainly rather than offer a placebo composer.
+        if !mirror.managed {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new("Firewall edit").size(Style::BODY).strong(),
+                );
+                muted_note(
+                    ui,
+                    format!(
+                        "No credential is sealed for this appliance (router/{id}) \u{2014} \
+                         firewall edits are unavailable until one is. Seal a `router/{id}` \
+                         credential in the mesh secret store first.",
+                    ),
+                );
+            });
+            ui.add_space(Style::SP_S);
+            return;
+        }
+
+        // The appliance's audit trail (immutable read, newest last).
+        let audit = router_action::read_audit(&router_action::audit_log_path(&root, &target_host));
+
+        let mut submit = false;
+        if let Some(d) = self.router_edit.as_mut() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        Style::ACCENT,
+                        RichText::new("Firewall edit").size(Style::BODY).strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} @ {} \u{00B7} via {}",
+                            id, mirror.ip, target_host
+                        ))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                    );
+                });
+                muted_note(
+                    ui,
+                    "Compose ONE rule in ONE ruleset. It applies on the node inside a \
+                     commit-confirm window \u{2014} if the edit locks the node out of the \
+                     router, it auto-reverts.",
+                );
+
+                // The typed edit fields.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Ruleset").size(Style::SMALL));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.ruleset)
+                            .desired_width(Style::SP_XL * 4.0)
+                            .hint_text("WAN_IN"),
+                    );
+                    ui.label(RichText::new("Rule #").size(Style::SMALL));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.rule)
+                            .desired_width(Style::SP_XL * 2.0)
+                            .hint_text("40"),
+                    );
+                    ui.checkbox(&mut d.delete, "Delete this rule");
+                });
+
+                if !d.delete {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("action").size(Style::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.action)
+                                .desired_width(Style::SP_XL * 3.0)
+                                .hint_text("accept"),
+                        );
+                        ui.label(RichText::new("protocol").size(Style::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.protocol)
+                                .desired_width(Style::SP_XL * 3.0)
+                                .hint_text("tcp"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("dest port").size(Style::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.dest_port)
+                                .desired_width(Style::SP_XL * 3.0)
+                                .hint_text("443"),
+                        );
+                        ui.label(RichText::new("source addr").size(Style::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.source_addr)
+                                .desired_width(Style::SP_XL * 4.0)
+                                .hint_text("10.42.0.0/17"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("ruleset default-action").size(Style::SMALL));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.default_action)
+                                .desired_width(Style::SP_XL * 3.0)
+                                .hint_text("drop (optional)"),
+                        );
+                    });
+                }
+
+                // The synthesized Vyatta lines (transparency — the exact config the
+                // node will apply, §9). An invalid edit shows an honest note.
+                let edit = d.edit();
+                let cmds = edit.to_vyatta_commands();
+                if cmds.is_empty() {
+                    muted_note(ui, "Incomplete or invalid edit \u{2014} fill a ruleset, a rule number, and at least one leaf (or a default-action).");
+                } else {
+                    ui.add_space(Style::SP_XS);
+                    for line in &cmds {
+                        ui.label(
+                            RichText::new(line)
+                                .size(Style::SMALL)
+                                .monospace()
+                                .color(Style::TEXT_DIM),
+                        );
+                    }
+                }
+
+                // Commit-confirm window.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("commit-confirm window").size(Style::SMALL));
+                    ui.add(egui::Slider::new(&mut d.commit_min, 1..=10).suffix(" min"));
+                });
+
+                // SAFETY 1 — the typed-confirm echo: arm by typing the appliance id.
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!(
+                        "Type the appliance id \u{201C}{id}\u{201D} to arm this edit.",
+                    ))
+                    .size(Style::SMALL),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.confirm)
+                        .desired_width(Style::SP_XL * 6.0)
+                        .hint_text(id.as_str()),
+                );
+
+                let ready = d.is_ready();
+                ui.horizontal(|ui| {
+                    let apply = ui.add_enabled(
+                        ready,
+                        egui::Button::new(
+                            RichText::new("Submit firewall edit").color(if ready {
+                                Style::DANGER
+                            } else {
+                                Style::TEXT_DIM
+                            }),
+                        ),
+                    );
+                    if apply.clicked() && ready {
+                        submit = true;
+                    }
+                });
+
+                // The audit trail (newest first) — every prior edit's outcome.
+                ui.add_space(Style::SP_S);
+                ui.label(
+                    RichText::new("Audit trail")
+                        .size(Style::SMALL)
+                        .strong()
+                        .color(Style::TEXT_DIM),
+                );
+                if audit.is_empty() {
+                    muted_note(ui, "No firewall edits recorded for this appliance yet.");
+                } else {
+                    for rec in audit.iter().rev().take(6) {
+                        let tone = match rec.outcome.as_str() {
+                            "applied" => Style::OK,
+                            "auto-reverted" => Style::WARN,
+                            "staged-parked" => Style::TEXT_DIM,
+                            _ => Style::DANGER,
+                        };
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                tone,
+                                RichText::new(format!("#{} {}", rec.seq, rec.outcome))
+                                    .size(Style::SMALL),
+                            );
+                            ui.label(
+                                RichText::new(format!("{} \u{00B7} {}", rec.summary, rec.from))
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT_DIM),
+                            );
+                        });
+                    }
+                }
+            });
+            ui.add_space(Style::SP_S);
+        }
+
+        if submit {
+            if let Some(d) = self.router_edit.take() {
+                self.dispatch_router_edit(&root, &local_host, &d);
+            }
+            // A fresh draft for the same appliance (the echo is spent).
+            self.router_edit = Some(RouterEditDraft::for_router(id, target_host));
+        }
+    }
+
+    /// WL-RUN-006 — write an armed router firewall edit to the `action/router/*`
+    /// plane (the node behind the router drains + applies it). Backstops the two
+    /// safety gates the panel already enforced (a valid edit + a matching
+    /// typed-confirm token), then writes the typed [`RouterActionRequest`]; a
+    /// failed write is an honest error toast, never a silent no-op.
+    fn dispatch_router_edit(&self, root: &Path, local_host: &str, draft: &RouterEditDraft) {
+        let edit = draft.edit();
+        if !edit.is_valid() {
+            raise_toast(
+                "warning",
+                "The firewall edit is incomplete or invalid \u{2014} not dispatched",
+            );
+            return;
+        }
+        if !typed_confirm_matches(&draft.confirm, &draft.appliance_id) {
+            raise_toast(
+                "warning",
+                "Type the appliance id to arm the firewall edit before submitting",
+            );
+            return;
+        }
+        let summary = edit.summary();
+        let req = RouterActionRequest {
+            id: next_request_id(),
+            appliance_id: draft.appliance_id.clone(),
+            target_host: draft.target_host.clone(),
+            from: format!("peer:{local_host}"),
+            edit,
+            confirm_token: draft.confirm.trim().to_string(),
+            commit_confirm_min: draft.commit_min,
+        };
+        match router_action::write_request(root, &req) {
+            Ok(_) => raise_toast(
+                "info",
+                &format!(
+                    "Dispatched \u{201C}{summary}\u{201D} to {} (commit-confirm {} min)",
+                    draft.target_host, draft.commit_min,
+                ),
+            ),
+            Err(err) => raise_toast(
+                "warning",
+                &format!("Could not dispatch the firewall edit: {err}"),
             ),
         }
     }
@@ -3530,6 +3838,97 @@ struct DeviceArming {
 /// button + the tests share, so "unconfirmed ⇒ blocked" is proven without a render.
 fn device_armed(typed: &str, device_name: &str) -> bool {
     typed.trim() == device_name
+}
+
+/// WL-RUN-006 — the composer state for a router firewall edit (the Device-Manager
+/// mutation panel, shown when a [`HostKind::Router`] is selected). Held in
+/// [`DeviceManagerState::router_edit`] and (re)targeted whenever the selected
+/// appliance changes. A submit builds a [`FirewallEdit`] + a [`RouterActionRequest`]
+/// and writes it to the `action/router/*` plane (the mackesd `router_action` worker
+/// drains it behind the typed-confirm + commit-confirm safety layers).
+#[derive(Debug, Clone, Default)]
+struct RouterEditDraft {
+    /// The router this edit targets — the gateway MAC (the typed-confirm token).
+    appliance_id: String,
+    /// The mesh node behind the router (the request's `target_host`).
+    target_host: String,
+    /// The `firewall name` ruleset (`WAN_IN`, …).
+    ruleset: String,
+    /// The rule number.
+    rule: String,
+    /// When set, the edit DELETEs the rule; else it SETs the leaves below.
+    delete: bool,
+    /// `action` leaf (accept/drop/reject).
+    action: String,
+    /// `protocol` leaf (tcp/udp/…).
+    protocol: String,
+    /// `destination port` leaf.
+    dest_port: String,
+    /// `source address` leaf (an IP/CIDR).
+    source_addr: String,
+    /// Optional ruleset `default-action` (drop/accept/reject).
+    default_action: String,
+    /// The operator's typed-confirm echo — must equal `appliance_id` to arm.
+    confirm: String,
+    /// The commit-confirm auto-revert window (minutes).
+    commit_min: u32,
+}
+
+impl RouterEditDraft {
+    /// A fresh draft targeting `appliance_id` behind `target_host`.
+    fn for_router(appliance_id: String, target_host: String) -> Self {
+        Self {
+            appliance_id,
+            target_host,
+            commit_min: DEFAULT_COMMIT_CONFIRM_MIN,
+            ..Self::default()
+        }
+    }
+
+    /// Build the typed [`FirewallEdit`] from the composer fields (empty leaves are
+    /// dropped; a Delete carries none).
+    fn edit(&self) -> FirewallEdit {
+        let op = if self.delete {
+            FirewallEditOp::Delete
+        } else {
+            FirewallEditOp::Set
+        };
+        let mut attrs = Vec::new();
+        if !self.delete {
+            for (attr, val) in [
+                ("action", &self.action),
+                ("protocol", &self.protocol),
+                ("destination port", &self.dest_port),
+                ("source address", &self.source_addr),
+            ] {
+                let val = val.trim();
+                if !val.is_empty() {
+                    attrs.push(FirewallLeaf::new(attr, val));
+                }
+            }
+        }
+        let default_action = {
+            let d = self.default_action.trim();
+            if self.delete || d.is_empty() {
+                None
+            } else {
+                Some(d.to_string())
+            }
+        };
+        FirewallEdit {
+            ruleset: self.ruleset.trim().to_string(),
+            rule: self.rule.trim().to_string(),
+            op,
+            default_action,
+            attrs,
+        }
+    }
+
+    /// Ready to dispatch: a valid edit AND a matching typed-confirm echo (both
+    /// safety gates the shell mirrors before it ever writes the request).
+    fn is_ready(&self) -> bool {
+        self.edit().is_valid() && typed_confirm_matches(&self.confirm, &self.appliance_id)
+    }
 }
 
 /// A process-unique request id for a dispatched device op (the correlation key the

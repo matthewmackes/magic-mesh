@@ -12,3 +12,14 @@ output "managed_reservations" {
   description = "The static-mappings tofu manages (the converged desired state)."
   value       = var.static_mappings
 }
+
+# WL-RUN-006 — which appliance this instance manages + its per-appliance state key.
+# `gateway` is grandfathered at `state/edgeos`; any other id keys `state/router/<mac>`.
+output "appliance" {
+  description = "The router appliance this instance manages: id, host, and state key."
+  value = {
+    id        = var.appliance_id
+    host      = var.edgeos_host
+    state_key = var.appliance_id == "gateway" ? "state/edgeos" : "state/router/${lower(replace(var.appliance_id, ":", "-"))}"
+  }
+}

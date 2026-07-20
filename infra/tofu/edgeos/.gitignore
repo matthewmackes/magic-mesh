@@ -7,3 +7,8 @@ tfplan
 crash.log
 # DAR-8: the per-mesh backend address is generated (gen-backend-config.sh), never committed.
 *.backend.hcl
+# WL-RUN-006: real per-appliance instances carry per-site reservations + backend
+# addresses — never commit them; only the *.example templates + README are tracked.
+appliances/*.tfvars
+appliances/*.backend.hcl
+!appliances/*.example

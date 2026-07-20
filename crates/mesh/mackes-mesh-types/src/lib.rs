@@ -63,6 +63,13 @@ pub mod peer_probe;
 pub mod peers;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
+// WL-RUN-006 (2026-07-19) — the router firewall-edit verb (`action/router/*`
+// `RouterActionRequest`) + its tamper-evident audit schema. The "mutations
+// fast-follow" of the router-control read slice: the shell's Device-Manager
+// composes an edit; the mackesd `router_action` worker wraps it in Vyatta
+// commit-confirm behind a typed-confirm gate. Lands here (like `device_control`)
+// so neither side depends on the other.
+pub mod router_action;
 // WL-FUNC-008 (2026-07-19) — the unified service provenance/health record: the ONE
 // type merging published (`kdc-services`) + probe (`probe-inventory`) + enrichment
 // service facts. The mackesd `service_aggregator` worker produces it on

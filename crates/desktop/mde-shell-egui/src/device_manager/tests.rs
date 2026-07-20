@@ -5,7 +5,7 @@ use super::{
     host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code,
     render_device_details, render_json, render_report, sanitize, scanned_label, status_tone,
     write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection, DrawerTab,
-    HostEntry, HostFreshness, MenuAction, RowActionRequest, ViewMode, STALE_AFTER,
+    HostEntry, HostFreshness, MenuAction, RouterEditDraft, RowActionRequest, ViewMode, STALE_AFTER,
 };
 use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
 use mackes_mesh_types::device_inventory::{
@@ -81,6 +81,7 @@ fn state_with(inv: Option<DeviceInventory>, seen: bool) -> DeviceManagerState {
         active_tab: DrawerTab::General,
         show_about: false,
         arming: None,
+        router_edit: None,
     }
 }
 
@@ -2389,4 +2390,33 @@ fn view_jump_to_category_switches_to_by_type_and_expands() {
         s.expanded.contains(category::DISPLAY),
         "the jumped-to category is expanded so the operator lands on it"
     );
+}
+
+// ── WL-RUN-006 — the router firewall-edit composer's dispatch gates ────────────
+#[test]
+fn router_edit_draft_gates_on_validity_and_typed_confirm() {
+    let mut d = RouterEditDraft::for_router("46:6a:7c:96:e8:aa".into(), "eagle".into());
+    // Empty edit → not ready (nothing to apply).
+    assert!(!d.is_ready(), "an empty draft never dispatches");
+    // A well-formed Set with the correct typed-confirm echo → ready.
+    d.ruleset = "WAN_IN".into();
+    d.rule = "40".into();
+    d.action = "accept".into();
+    d.protocol = "tcp".into();
+    d.confirm = "46:6a:7c:96:e8:aa".into();
+    assert!(d.is_ready(), "a valid edit + matching typed-confirm arms");
+    assert_eq!(
+        d.edit().to_vyatta_commands(),
+        vec![
+            "set firewall name WAN_IN rule 40 action 'accept'",
+            "set firewall name WAN_IN rule 40 protocol 'tcp'",
+        ]
+    );
+    // A wrong typed-confirm echo → refused even with a valid edit (SAFETY 1 mirror).
+    d.confirm = "aa:bb:cc:dd:ee:ff".into();
+    assert!(!d.is_ready(), "a mismatched typed-confirm blocks dispatch");
+    // A missing rule number → invalid edit → refused even with the right echo.
+    d.confirm = "46:6a:7c:96:e8:aa".into();
+    d.rule = String::new();
+    assert!(!d.is_ready(), "a malformed edit blocks dispatch");
 }

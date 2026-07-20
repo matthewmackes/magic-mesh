@@ -1,0 +1,12 @@
+# WL-RUN-006 — per-appliance BACKEND-CONFIG template. Copy to
+# `appliances/<mac>.backend.hcl` and fill in. Supplies the etcd http backend
+# ADDRESS + the PER-APPLIANCE state key `state/router/<mac>` at init:
+#   ./scripts/tofu-appliance.sh <mac> init
+# (the wrapper passes `-backend-config=appliances/<mac>.backend.hcl`).
+#
+# The address host is your mesh state node's overlay IP (as gen-backend-config.sh
+# emits for the gateway's edgeos.backend.hcl). Real *.backend.hcl are gitignored.
+
+address        = "http://10.42.0.1:2379/v3/tofu/state/router/aa-bb-cc-dd-ee-ff"
+lock_address   = "http://10.42.0.1:2379/v3/tofu/state/router/aa-bb-cc-dd-ee-ff/lock"
+unlock_address = "http://10.42.0.1:2379/v3/tofu/state/router/aa-bb-cc-dd-ee-ff/lock"

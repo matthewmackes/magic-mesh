@@ -1,0 +1,28 @@
+# WL-RUN-006 — per-appliance tfvars TEMPLATE for a SECOND Vyatta-family router.
+# Copy to `appliances/<mac>.tfvars` (MAC with `-` or `:`) and fill in. Selected by
+#   ./scripts/tofu-appliance.sh <mac> <cmd…>
+# Real appliances/*.tfvars are gitignored; only this .example is tracked.
+
+# The stable appliance id — the gateway MAC (the `router/<mac>` cred key). This
+# keys the per-appliance state at `state/router/<mac>`.
+appliance_id = "aa:bb:cc:dd:ee:ff"
+
+# The appliance management IP + SSH user.
+edgeos_host = "10.0.0.1"
+edgeos_user = "ubnt"
+
+# The dhcp-server shared-network + subnet this appliance serves (if it does DHCP).
+shared_network = "Branch-Office"
+subnet         = "10.0.0.0/24"
+
+# Declarative DHCP reservations for THIS appliance (source of truth; empty = none).
+static_mappings = {
+  # "some-host" = { mac = "00:11:22:33:44:55", ip = "10.0.0.20" }
+}
+
+# ROUTER-7/8/9 — additive firewall / NAT / VPN this appliance manages (empty =
+# manage nothing). Every real edit applies inside a commit-confirm auto-revert
+# window (apply-firewall.sh / apply-nat.sh / apply-vpn.sh).
+firewall_rulesets = {}
+nat_rules         = {}
+vpn_config        = {}
