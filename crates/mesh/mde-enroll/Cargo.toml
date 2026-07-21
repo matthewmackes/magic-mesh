@@ -25,6 +25,9 @@ path = "src/bin/magic-setup.rs"
 mackesd = { path = "../mackesd" }
 # SETUP — detect whether a deployment role is pinned (configured vs first-run).
 mde-role = { path = "../../platform/mde-role" }
+# SETUP §43 — the canonical Warning/Disclaimer/Mission text shown on the
+# first-run Welcome gate (single source of truth, embedded from DISCLAIMER.md).
+mde-disclaimer = { path = "../../shared/mde-disclaimer" }
 # Terminal UI + raw-mode/event backend. ratatui ships with the crossterm
 # backend; pin crossterm to match for the event loop.
 ratatui = "0.29"

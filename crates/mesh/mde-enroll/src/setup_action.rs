@@ -101,6 +101,19 @@ pub fn is_active_argv(unit: &str) -> Vec<String> {
     ]
 }
 
+/// `mackesd onboard self-test` — the node self-diagnostic (design §47: overlay
+/// reachable + role daemons active + CA-signed + lighthouse pingable). The
+/// wizard runs this after a successful Create/Join and narrates the human report
+/// into the log so the operator sees a per-item green/red verdict.
+#[must_use]
+pub fn self_test_argv() -> Vec<String> {
+    vec![
+        "mackesd".to_owned(),
+        "onboard".to_owned(),
+        "self-test".to_owned(),
+    ]
+}
+
 /// The service set the wizard reports/guarantees (design §"Service set").
 pub const WIZARD_SERVICES: [&str; 5] = [
     "nebula.service",
@@ -196,6 +209,11 @@ mod tests {
             is_active_argv("syncthing.service"),
             vec!["systemctl", "is-active", "syncthing.service"]
         );
+    }
+
+    #[test]
+    fn self_test_shape() {
+        assert_eq!(self_test_argv(), vec!["mackesd", "onboard", "self-test"]);
     }
 
     #[test]

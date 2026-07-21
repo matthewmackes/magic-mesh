@@ -12,6 +12,11 @@
 /// Which top-level screen the wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// First-run welcome + disclaimer gate (design §43). Shown once on an
+    /// unconfigured node before the menu is reachable; a configured node skips
+    /// straight to [`Screen::Menu`]. Acknowledging it ([`Wizard::acknowledge_welcome`])
+    /// opens the menu.
+    Welcome,
     /// The top menu (entries depend on configured-state).
     Menu,
     /// Create a new mesh — found LH1 (SETUP-2).
@@ -53,6 +58,25 @@ impl MenuItem {
         }
     }
 
+    /// A one-line, plain-language description shown under the menu label so a
+    /// first-time operator can tell the entries apart at a glance.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            MenuItem::CreateMesh => {
+                "Found a brand-new private mesh — this node mints the CA and becomes the founder."
+            }
+            MenuItem::JoinMesh => {
+                "Enroll this node into an existing mesh with a join token from another node."
+            }
+            MenuItem::ManagePeers => {
+                "Invite peers, add lighthouses, and remove nodes from the mesh."
+            }
+            MenuItem::Status => "Check the overlay, role daemons, and mesh services.",
+            MenuItem::Quit => "Leave the wizard.",
+        }
+    }
+
     /// The screen this entry opens (Quit has none).
     #[must_use]
     pub fn screen(self) -> Option<Screen> {
@@ -89,12 +113,21 @@ impl Wizard {
     /// `configured` is whether a role is pinned (`mde_role::load().is_ok()`);
     /// the caller passes it so the model stays I/O-free. Unconfigured nodes
     /// see Create/Join; configured nodes see Manage/Status.
+    ///
+    /// A fresh (unconfigured) node opens on the [`Screen::Welcome`] disclaimer
+    /// gate (§43); an already-configured node — which has necessarily passed the
+    /// gate once — opens straight on the [`Screen::Menu`].
     #[must_use]
     pub fn new(configured: bool) -> Self {
         let menu_items = Self::menu_for(configured);
+        let screen = if configured {
+            Screen::Menu
+        } else {
+            Screen::Welcome
+        };
         Self {
             configured,
-            screen: Screen::Menu,
+            screen,
             menu_items,
             menu_index: 0,
             log: Vec::new(),
@@ -152,6 +185,15 @@ impl Wizard {
         }
     }
 
+    /// Acknowledge the first-run welcome + disclaimer (§43) and open the menu.
+    /// A no-op off [`Screen::Welcome`], so nothing behind the gate is reachable
+    /// without an explicit acknowledgement.
+    pub fn acknowledge_welcome(&mut self) {
+        if self.screen == Screen::Welcome {
+            self.screen = Screen::Menu;
+        }
+    }
+
     /// Return from a sub-screen to the top menu.
     pub fn back_to_menu(&mut self) {
         self.screen = Screen::Menu;
@@ -174,7 +216,47 @@ mod tests {
             w.menu_items,
             vec![MenuItem::CreateMesh, MenuItem::JoinMesh, MenuItem::Quit]
         );
+    }
+
+    #[test]
+    fn unconfigured_node_opens_on_the_welcome_gate() {
+        // §43: a fresh box lands on the welcome/disclaimer gate, not the menu.
+        let w = Wizard::new(false);
+        assert_eq!(w.screen, Screen::Welcome);
+    }
+
+    #[test]
+    fn configured_node_skips_the_welcome_gate() {
+        // An already-configured node has passed the gate once — straight to menu.
+        let w = Wizard::new(true);
         assert_eq!(w.screen, Screen::Menu);
+    }
+
+    #[test]
+    fn acknowledging_welcome_opens_the_menu() {
+        let mut w = Wizard::new(false);
+        assert_eq!(w.screen, Screen::Welcome);
+        w.acknowledge_welcome();
+        assert_eq!(w.screen, Screen::Menu);
+        // Idempotent / no-op off the gate: acking again from the menu is inert.
+        w.acknowledge_welcome();
+        assert_eq!(w.screen, Screen::Menu);
+    }
+
+    #[test]
+    fn every_menu_item_has_a_nonempty_description() {
+        for item in [
+            MenuItem::CreateMesh,
+            MenuItem::JoinMesh,
+            MenuItem::ManagePeers,
+            MenuItem::Status,
+            MenuItem::Quit,
+        ] {
+            assert!(
+                !item.description().is_empty(),
+                "{item:?} has no description"
+            );
+        }
     }
 
     #[test]
