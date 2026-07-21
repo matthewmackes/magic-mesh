@@ -141,6 +141,13 @@ pub enum Surface {
     /// in [`Surface::ALL`]/the picker: its one home is the dock's clock-glyph
     /// cell ([`clock_cell`] — the live time IS the glyph, lock #20).
     Timers,
+    /// The **Auto Mode home** (AUTO-HOME) — the glanceable Ford SYNC 3 tile
+    /// launcher a driver lands on in Car Mode: big Nav / Media / Phone / Comms /
+    /// Vehicle / Settings tiles with live glance data, routing `nav.surface` on
+    /// tap or a bound physical key. Deliberately NOT in [`Surface::ALL`]/the
+    /// picker (like [`Surface::Timers`]): it is reached by Car-Mode auto-select
+    /// and the Home key/tile, not the normal launcher grid.
+    AutoHome,
 }
 
 // This nav enum spells its variants `Surface::Music` rather than `Self::Music` on
@@ -229,6 +236,9 @@ impl Surface {
             // ("shows the time as its glyph"), never a brand SVG, and it sits
             // outside `ALL`/the picker — no picker cell ever asks for this glyph.
             Surface::About | Surface::Timers => IconId::Mark,
+            // The Auto Mode home wears the Workbench dashboard-grid glyph — it
+            // reads as "the launcher of tiles" the Car home is.
+            Surface::AutoHome => IconId::Workbench,
         }
     }
 
@@ -265,6 +275,7 @@ impl Surface {
             Surface::Storage => "Storage",
             Surface::About => "About",
             Surface::Timers => "Timers & Alarms",
+            Surface::AutoHome => "Auto Mode",
         }
     }
 }

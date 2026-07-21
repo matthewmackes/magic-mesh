@@ -927,6 +927,11 @@ mod menubar_coverage {
                          deliberately chrome-light; a bar is a MENUBAR-SWEEP \
                          follow-on",
             },
+            Surface::AutoHome => Coverage::Exempt {
+                reason: "bare — the Auto Mode home (AUTO-HOME) is a full-bleed \
+                         glanceable tile launcher with no workspace menu bar by \
+                         design (Car Mode is chrome-light)",
+            },
         }
     }
 
@@ -951,6 +956,7 @@ mod menubar_coverage {
     fn every_routed() -> Vec<Surface> {
         let mut all = Surface::ALL.to_vec();
         all.push(Surface::Timers);
+        all.push(Surface::AutoHome);
         all
     }
 
@@ -1025,6 +1031,10 @@ mod menubar_coverage {
                 // out-of-ALL Timers `every_routed` appends.
                 Surface::Communications,
                 Surface::Timers,
+                // AUTO-HOME — the out-of-ALL Auto Mode home, appended after Timers
+                // by `every_routed`; a full-bleed Car-Mode tile launcher, bare by
+                // design.
+                Surface::AutoHome,
             ],
             "a surface leaving (or joining) the bare set updates this inventory \
              consciously — that's the backstop"

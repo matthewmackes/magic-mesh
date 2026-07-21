@@ -22,6 +22,8 @@ mod auth;
 mod backdrop;
 mod bt_pairing;
 mod bus_reader;
+mod car_home;
+mod car_keymap;
 mod chat;
 mod chooser;
 mod chrome;
@@ -249,35 +251,6 @@ impl LayoutModeControl {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CarKeyRoute {
-    Map,
-    Engine,
-    Direction,
-    Media,
-    Voip,
-}
-
-impl CarKeyRoute {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Map => "Map",
-            Self::Engine => "Engine",
-            Self::Direction => "Next",
-            Self::Media => "Media",
-            Self::Voip => "VoIP",
-        }
-    }
-
-    const fn surface(self) -> Surface {
-        match self {
-            Self::Map | Self::Engine | Self::Direction => Surface::MapsLocation,
-            Self::Media => Surface::Media,
-            Self::Voip => Surface::Voice,
-        }
-    }
-}
-
 fn layout_mode_button_size(profile: LayoutProfile) -> f32 {
     match profile {
         LayoutProfile::Workstation => LAYOUT_MODE_BUTTON_WORKSTATION,
@@ -299,17 +272,6 @@ fn layout_mode_menu_rect(button: egui::Rect, screen: egui::Rect) -> egui::Rect {
     let left = (button.right() - w).clamp(screen.left() + Style::SP_XS, screen.right() - w);
     let bottom = (button.top() - LAYOUT_MODE_GAP).max(screen.top() + h);
     egui::Rect::from_min_size(egui::pos2(left, bottom - h), egui::vec2(w, h))
-}
-
-fn car_key_route(key: egui::Key) -> Option<CarKeyRoute> {
-    Some(match key {
-        egui::Key::Num1 | egui::Key::F1 => CarKeyRoute::Map,
-        egui::Key::Num2 | egui::Key::F2 => CarKeyRoute::Engine,
-        egui::Key::Num3 | egui::Key::F3 => CarKeyRoute::Direction,
-        egui::Key::Num4 | egui::Key::F4 => CarKeyRoute::Media,
-        egui::Key::Num5 | egui::Key::F5 => CarKeyRoute::Voip,
-        _ => return None,
-    })
 }
 
 fn layout_profile_icon(profile: LayoutProfile) -> IconId {
@@ -636,7 +598,10 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         // Chat/System/Storage/etc), so it still needs the shell's top-right
         // remote-sessions fallback control.
         | Surface::Communications
-        | Surface::Timers => true,
+        | Surface::Timers
+        // The Auto Mode home is a plain self-contained panel (car_home_panel),
+        // like Timers — it needs the shell's remote-sessions fallback control.
+        | Surface::AutoHome => true,
     }
 }
 
@@ -1497,6 +1462,36 @@ impl Shell {
                     timers::timers_panel(ui, timers);
                 });
             }
+            Surface::AutoHome => {
+                // Auto Mode home (AUTO-HOME) — the glanceable Ford SYNC 3 tile
+                // launcher a driver lands on in Car Mode. The tiles route the active
+                // surface; the Vehicle tile carries the live MG90 telematics glance
+                // (voltage / speed) when the gateway is the primary location source.
+                let glance = car_home::CarHomeGlance {
+                    vehicle: self.maps_location.vehicle_glance(),
+                    ..Default::default()
+                };
+                let picked = ui
+                    .push_id("shell-auto-home", |ui| {
+                        car_home::car_home_panel(ui, &glance)
+                    })
+                    .inner;
+                if let Some(tile) = picked {
+                    self.apply_car_tile(tile);
+                }
+            }
+        }
+    }
+
+    /// Route an Auto Mode home tile (a tap or a bound key) to its surface — the
+    /// Vehicle tile lands on the Maps cockpit's telematics tab, the rest on their
+    /// own surface.
+    fn apply_car_tile(&mut self, tile: car_home::CarTile) {
+        self.front_door.close();
+        self.nav.expanded = true;
+        self.nav.surface = tile.surface();
+        if tile == car_home::CarTile::Vehicle {
+            self.maps_location.focus_vehicle_tab();
         }
     }
 }
@@ -2041,6 +2036,11 @@ impl Shell {
         }
     }
 
+    /// Route a physical USB-keyboard press to its bound [`car_keymap::CarAction`]
+    /// while Auto Mode is active (AUTO-KEYMAP-INPUT). The bindings are the
+    /// operator's persisted map (editable in Settings → Key Mapping); the default
+    /// layout reproduces a driver-friendly digit + function-row set. Only fires in
+    /// Car Mode, off the curtain, and when no text field wants the keystroke.
     fn apply_car_keyboard_routes(&mut self, ctx: &egui::Context) {
         if self.curtain.engaged()
             || self.system.layout_profile() != LayoutProfile::Car
@@ -2048,25 +2048,50 @@ impl Shell {
         {
             return;
         }
-        for key in [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-            egui::Key::Num5,
-            egui::Key::F1,
-            egui::Key::F2,
-            egui::Key::F3,
-            egui::Key::F4,
-            egui::Key::F5,
-        ] {
+        for key in car_keymap::bindable_keys() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
-                if let Some(route) = car_key_route(key) {
-                    self.front_door.close();
-                    self.nav.expanded = true;
-                    self.nav.surface = route.surface();
+                if let Some(action) = self.system.car_keys().action_for(key) {
+                    self.apply_car_action(action);
                 }
                 break;
+            }
+        }
+    }
+
+    /// Execute one Auto Mode action — a surface jump, a media-transport verb, or a
+    /// call action — dispatched through the shell's existing effect paths. The
+    /// single place a `CarAction` (from a bound key or, in future, a voice cue)
+    /// becomes a real effect.
+    fn apply_car_action(&mut self, action: car_keymap::CarAction) {
+        use car_keymap::CarAction;
+        self.front_door.close();
+        match action {
+            CarAction::GoHome => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::AutoHome;
+            }
+            CarAction::GoNav => self.apply_car_tile(car_home::CarTile::Nav),
+            CarAction::GoMedia => self.apply_car_tile(car_home::CarTile::Media),
+            CarAction::GoPhone => self.apply_car_tile(car_home::CarTile::Phone),
+            CarAction::GoComms => self.apply_car_tile(car_home::CarTile::Comms),
+            CarAction::GoVehicle => self.apply_car_tile(car_home::CarTile::Vehicle),
+            CarAction::MediaPlayPause => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::PlayPause);
+            }
+            CarAction::MediaNext => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::Next);
+            }
+            CarAction::MediaPrev => {
+                self.web
+                    .selected_media_transport(MediaTransportAction::Previous);
+            }
+            // A physical Answer / Hang-up key brings the driver to the (car-large)
+            // Phone screen to confirm; direct in-place answer is a fast follow once
+            // the Voice surface exposes a programmatic call verb.
+            CarAction::CallAnswer | CarAction::CallHangup => {
+                self.apply_car_tile(car_home::CarTile::Phone);
             }
         }
     }
@@ -2168,6 +2193,12 @@ impl Shell {
             self.system.set_layout_profile(profile, ctx);
             self.vdock.set_density(profile.density());
             self.layout_mode.menu_open = false;
+            // Entering Auto Mode lands the driver on the glanceable home launcher
+            // (AUTO-HOME) rather than whatever workstation surface was up.
+            if profile == LayoutProfile::Car {
+                self.nav.surface = Surface::AutoHome;
+                self.nav.expanded = true;
+            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.layout_mode.menu_open = false;
@@ -2939,7 +2970,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        car_key_route, chat, complete_menu_bar_minimize, console, datacenter,
+        car_home, car_keymap, chat, complete_menu_bar_minimize, console, datacenter,
         desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
         front_door_peer_apps, install_layout_mode_button_accessibility,
         install_layout_profile_row_accessibility, launcher_pins,
@@ -2950,7 +2981,7 @@ mod tests {
         publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
         remote_sessions_fallback_pos, reserved_dock_gutter, reserved_taskbar_strut,
         route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
-        status, surface_needs_remote_sessions_fallback, terminal_panel, Boot, CarKeyRoute,
+        status, surface_needs_remote_sessions_fallback, terminal_panel, Boot,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
         LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
     };
@@ -3383,26 +3414,38 @@ mod tests {
     }
 
     #[test]
-    fn car_layout_external_keyboard_routes_cover_required_hud_categories() {
-        let routes = [
-            (egui::Key::Num1, CarKeyRoute::Map, Surface::MapsLocation),
-            (egui::Key::F1, CarKeyRoute::Map, Surface::MapsLocation),
-            (egui::Key::Num2, CarKeyRoute::Engine, Surface::MapsLocation),
-            (
-                egui::Key::Num3,
-                CarKeyRoute::Direction,
-                Surface::MapsLocation,
-            ),
-            (egui::Key::Num4, CarKeyRoute::Media, Surface::Media),
-            (egui::Key::Num5, CarKeyRoute::Voip, Surface::Voice),
-        ];
-        for (key, route, surface) in routes {
-            let got = car_key_route(key).expect("key should be routed in Car layout");
-            assert_eq!(got, route);
-            assert_eq!(got.surface(), surface);
-            assert!(!got.label().is_empty());
-        }
-        assert_eq!(car_key_route(egui::Key::Num6), None);
+    fn car_home_tiles_and_default_key_bindings_cover_the_vehicle_apps() {
+        use car_home::CarTile;
+        use car_keymap::{CarAction, CarKeyBindings};
+
+        // The Auto Mode home tiles route to the vehicle apps.
+        assert_eq!(CarTile::Nav.surface(), Surface::MapsLocation);
+        assert_eq!(CarTile::Media.surface(), Surface::Media);
+        assert_eq!(CarTile::Phone.surface(), Surface::Voice);
+        assert_eq!(CarTile::Comms.surface(), Surface::Communications);
+        assert_eq!(CarTile::Vehicle.surface(), Surface::MapsLocation);
+        assert_eq!(CarTile::Settings.surface(), Surface::System);
+
+        // The default physical-key bindings cover the six Auto apps on both the
+        // digit row and the aligned function row (AUTO-KEYMAP), replacing the old
+        // hardcoded Num1-5/F1-5 route table with the persisted, editable map.
+        let bindings = CarKeyBindings::defaults();
+        assert_eq!(bindings.action_for(egui::Key::Num1), Some(CarAction::GoNav));
+        assert_eq!(bindings.action_for(egui::Key::F1), Some(CarAction::GoNav));
+        assert_eq!(
+            bindings.action_for(egui::Key::Num2),
+            Some(CarAction::GoMedia)
+        );
+        assert_eq!(
+            bindings.action_for(egui::Key::Num4),
+            Some(CarAction::GoComms)
+        );
+        assert_eq!(
+            bindings.action_for(egui::Key::Num5),
+            Some(CarAction::GoVehicle)
+        );
+        // A letter key is not in the bindable set, so it never routes in Car Mode.
+        assert_eq!(bindings.action_for(egui::Key::A), None);
     }
 
     #[test]

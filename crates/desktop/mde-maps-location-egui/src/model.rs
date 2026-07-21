@@ -447,6 +447,33 @@ impl MapsLocationSurface {
             self.refresh_from_vehicle(&mirror);
         }
     }
+
+    /// The Auto Mode home's **Vehicle**-tile glance line: a live telematics
+    /// summary when the MG90 gateway is the primary location source, else `None`
+    /// (the home then shows a plain descriptor, never a simulated reading). Speed
+    /// while moving, otherwise the gateway's live battery voltage — the two facts
+    /// a driver glances for.
+    #[must_use]
+    pub fn vehicle_glance(&self) -> Option<String> {
+        if self.locations.primary != LocationSourceKind::Mg90Gnss {
+            return None;
+        }
+        let t = &self.vehicle.telemetry;
+        if t.moving && t.speed_mph > 0.5 {
+            Some(format!("{:.0} mph", t.speed_mph))
+        } else if t.battery_v > 0.1 {
+            Some(format!("MG90 · {:.1} V", t.battery_v))
+        } else {
+            Some("MG90 linked".to_string())
+        }
+    }
+
+    /// Open the cockpit directly on its **Vehicle** telematics tab — the target of
+    /// the Auto Mode home's Vehicle tile, so it lands on telematics rather than the
+    /// default Drive HUD.
+    pub fn focus_vehicle_tab(&mut self) {
+        self.active = WorkspaceTab::Vehicle;
+    }
 }
 
 /// `mackes_mesh_types::vehicle::CellLink` -> the cockpit's `CellularLink` —

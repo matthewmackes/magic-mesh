@@ -52,6 +52,7 @@ fn surface_wire_id(surface: Surface) -> &'static str {
         Surface::Storage => "storage",
         Surface::About => "about",
         Surface::Timers => "timers",
+        Surface::AutoHome => "auto_home",
     }
 }
 
@@ -80,6 +81,7 @@ fn surface_from_wire_id(id: &str) -> Option<Surface> {
         "storage" => Some(Surface::Storage),
         "about" => Some(Surface::About),
         "timers" => Some(Surface::Timers),
+        "auto_home" => Some(Surface::AutoHome),
         _ => None,
     }
 }

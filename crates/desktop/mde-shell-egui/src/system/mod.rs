@@ -180,6 +180,11 @@ pub(crate) struct SystemState {
     /// a pick, and applied live to the context every frame by
     /// [`Self::apply_appearance`] (the [`SettingsNav`] client-data-dir JSON idiom).
     appearance: AppearanceConfig,
+    /// The Auto Mode (Car) physical-keyboard → action bindings (AUTO-KEYMAP),
+    /// persisted to `settings-car-keys.json`. Owned here beside [`appearance`] as
+    /// a sibling persisted setting; the shell reads it every frame while Car Mode
+    /// is active (`car_keys()`), and the Settings → Key Mapping page edits it.
+    car_keys: crate::car_keymap::CarKeyBindings,
     /// The seat's DPI zoom base — the egui `zoom_factor` the runner set from the panel
     /// (or 1.0 windowed), captured ONCE on the first appearance apply so the text-scale
     /// step composes with the panel DPI instead of clobbering it (SETTINGS-5). `None`
@@ -225,6 +230,7 @@ impl Default for SystemState {
             wallpaper_service: WallpaperServiceConfig::load(),
             wallpaper_download: WallpaperDownloadRuntime::default(),
             appearance: AppearanceConfig::load(),
+            car_keys: crate::car_keymap::CarKeyBindings::load(),
             zoom_base: None,
             animation_base: None,
             federation: crate::federation::FederationPanel::default(),
@@ -350,7 +356,15 @@ impl SystemState {
     fn apply_appearance(&mut self, ctx: &egui::Context) {
         // Colour mode + accent — re-tint only when the live look drifts from the pick
         // (a settings change, a fresh context, OR a formfactor re-install reset it).
-        let want_scheme = self.appearance.color_scheme.runtime();
+        // Auto Mode (Car layout) installs the mode-scoped Ford SYNC 3 black/white/blue
+        // skin over whatever Dark/Light theme the operator picked (AUTO-THEME-2); the
+        // pick is restored automatically the moment the profile leaves Car, since this
+        // choke point re-derives `want_scheme` every frame.
+        let want_scheme = if self.appearance.layout_profile.is_car() {
+            StyleColorScheme::AutoSync3
+        } else {
+            self.appearance.color_scheme.runtime()
+        };
         let want_accent = self.appearance.accent.color();
         let want_live_accent = Style::accent_for_scheme(want_scheme, want_accent);
         let want_density = self.appearance.layout_profile.density();
@@ -456,6 +470,12 @@ impl SystemState {
         self.appearance.layout_profile
     }
 
+    /// The Auto Mode (Car) key bindings, read by the shell's Car key router every
+    /// frame while Car Mode is active.
+    pub(crate) const fn car_keys(&self) -> &crate::car_keymap::CarKeyBindings {
+        &self.car_keys
+    }
+
     /// The profile-selected density mirrored into the taskbar and other shell chrome.
     pub(crate) const fn layout_density(&self) -> Density {
         self.appearance.layout_profile.density()
@@ -550,6 +570,7 @@ impl SystemState {
                 wallpaper_service,
                 wallpaper_download,
                 appearance,
+                car_keys,
                 federation,
                 ..
             } = self;
@@ -605,6 +626,7 @@ impl SystemState {
                                 wallpaper_service,
                                 wallpaper_download,
                                 appearance,
+                                car_keys,
                                 agent_active,
                                 prompt_in_flight,
                                 &mut actions,
@@ -1181,6 +1203,9 @@ enum SettingsSection {
     Wallpaper,
     /// The compiled-in hotkey table (`hotkeys_section`).
     Hotkeys,
+    /// The editable Auto Mode (Car) physical-key → action bindings
+    /// (`key_mapping_section`, AUTO-KEYMAP-SETTINGS).
+    KeyMapping,
     /// Appearance — accent + text-scale (`theme_section`, SETTINGS-5).
     Theme,
     /// Mesh identity name + overlay/cipher (`identity_section`, SETTINGS-4).
@@ -1206,6 +1231,7 @@ impl SettingsSection {
             Self::Power => "Power & Battery",
             Self::Wallpaper => "Wallpaper",
             Self::Hotkeys => "Hotkeys",
+            Self::KeyMapping => "Key Mapping",
             Self::Theme => "Theme",
             Self::Identity => "Identity",
             Self::Role => "Role",
@@ -1226,6 +1252,7 @@ impl SettingsSection {
             Self::Power => IconId::PowerBattery,
             Self::Wallpaper => IconId::Wallpaper,
             Self::Hotkeys => IconId::Keyboard,
+            Self::KeyMapping => IconId::Keyboard,
             Self::Theme => IconId::Appearance,
             Self::Identity => IconId::Node,
             Self::Role => IconId::Workstation,
@@ -1242,7 +1269,9 @@ impl SettingsSection {
             Self::Displays | Self::Mouse | Self::Audio | Self::Bluetooth | Self::Power => {
                 SettingsGroup::Devices
             }
-            Self::Wallpaper | Self::Hotkeys | Self::Theme => SettingsGroup::Personalization,
+            Self::Wallpaper | Self::Hotkeys | Self::KeyMapping | Self::Theme => {
+                SettingsGroup::Personalization
+            }
             Self::Identity | Self::Role | Self::Pairing | Self::Network | Self::RemoteProofing => {
                 SettingsGroup::MeshSystem
             }
@@ -1308,6 +1337,7 @@ impl SettingsGroup {
             Self::Personalization => &[
                 SettingsSection::Wallpaper,
                 SettingsSection::Hotkeys,
+                SettingsSection::KeyMapping,
                 SettingsSection::Theme,
             ],
             Self::MeshSystem => &[
@@ -2848,6 +2878,7 @@ fn settings_detail(
     wallpaper_service: &mut WallpaperServiceConfig,
     wallpaper_download: &mut WallpaperDownloadRuntime,
     appearance: &mut AppearanceConfig,
+    car_keys: &mut crate::car_keymap::CarKeyBindings,
     agent_active: bool,
     prompt_in_flight: bool,
     actions: &mut Vec<SysAction>,
@@ -2878,6 +2909,7 @@ fn settings_detail(
             wallpaper_section(ui, wallpaper_service, wallpaper_download, actions);
         }
         SettingsSection::Hotkeys => hotkeys_section(ui),
+        SettingsSection::KeyMapping => key_mapping_section(ui, car_keys),
         SettingsSection::Theme => theme_section(ui, appearance),
         SettingsSection::Identity => identity_section(ui, mesh),
         SettingsSection::Role => role_section(ui, mesh),
@@ -4120,6 +4152,77 @@ fn hotkeys_section(ui: &mut egui::Ui) {
             field(ui, hotkey.chord, hotkey.action.label(), Style::TEXT);
         });
     });
+}
+
+/// Settings → **Key Mapping** (AUTO-KEYMAP-SETTINGS) — the editable Auto Mode
+/// (Car) physical-key → action bindings. Unlike the read-only compiled-in
+/// [`hotkeys_section`] above (the fixed seat table), these are operator-editable
+/// and persisted: each bindable key (digit row + function row) gets an action
+/// picker; a change writes `settings-car-keys.json` immediately. The bindings
+/// take effect only while Car Mode ([`LayoutProfile::Car`]) is active — the shell's
+/// Car key router reads them every frame.
+fn key_mapping_section(ui: &mut egui::Ui, car_keys: &mut crate::car_keymap::CarKeyBindings) {
+    use crate::car_keymap::{bindable_keys, key_label, CarAction};
+
+    ui.label(
+        RichText::new(
+            "Assign a physical keyboard key to an Auto Mode action. A USB keyboard mounted in \
+             the vehicle jumps straight to Navigation, Media, or a call with a single key — these \
+             bindings drive Car Mode.",
+        )
+        .color(Style::TEXT_DIM)
+        .size(Style::SMALL),
+    );
+    ui.add_space(Style::SP_S);
+
+    if ui
+        .button(RichText::new("Reset to defaults").size(Style::BODY))
+        .clicked()
+    {
+        car_keys.reset();
+        car_keys.save();
+    }
+    ui.add_space(Style::SP_M);
+
+    let keys = bindable_keys();
+    let mut changed = false;
+    across_grid(ui, &keys, 3, |ui, key| {
+        let Some(label) = key_label(*key) else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            // The key cap — monospace so the digit / F-row reads as a keyboard key.
+            ui.label(
+                RichText::new(label)
+                    .color(Style::TEXT_STRONG)
+                    .monospace()
+                    .size(Style::BODY),
+            );
+            ui.add_space(Style::SP_S);
+            let mut selected = car_keys.action_for(*key);
+            settings_popup_visual_scope(ui, |ui| {
+                ComboBox::from_id_salt(ui.id().with(("car-key", label)))
+                    .selected_text(selected.map_or("—", CarAction::label))
+                    .show_ui(ui, |ui| {
+                        apply_settings_popup_style(ui.style_mut());
+                        ui.selectable_value(&mut selected, None, "—");
+                        for action in CarAction::ALL {
+                            ui.selectable_value(&mut selected, Some(action), action.label());
+                        }
+                    });
+            });
+            if selected != car_keys.action_for(*key) {
+                match selected {
+                    Some(action) => car_keys.set(*key, action),
+                    None => car_keys.clear(*key),
+                }
+                changed = true;
+            }
+        });
+    });
+    if changed {
+        car_keys.save();
+    }
 }
 
 /// The Theme section (SETTINGS-5) under Personalization — the appearance controls
