@@ -114,6 +114,7 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 fn render_active_tab(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     match state.active {
         WorkspaceTab::Drive => show_drive(ui, state),
+        WorkspaceTab::Airspace => crate::airspace::airspace_panel(ui, &mut state.airspace),
         WorkspaceTab::Map => show_map(ui, state),
         WorkspaceTab::RoutesTrips => show_routes_trips(ui, state),
         WorkspaceTab::Vehicle => show_vehicle(ui, &state.vehicle),
@@ -4968,6 +4969,7 @@ mod tests {
             labels,
             vec![
                 "Drive",
+                "Airspace",
                 "Map",
                 "Routes & Trips",
                 "Vehicle",

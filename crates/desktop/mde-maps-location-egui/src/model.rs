@@ -25,6 +25,8 @@ pub enum WorkspaceTab {
     /// Default in-motion navigation view.
     #[default]
     Drive,
+    /// Airspace — real-time wardriving radar (WiFi / cell / BT around the vehicle).
+    Airspace,
     /// Full map exploration and layer control.
     Map,
     /// Trips, routes, saved places, replay, and export.
@@ -49,8 +51,9 @@ pub enum WorkspaceTab {
 
 impl WorkspaceTab {
     /// All tabs in stable product order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Drive,
+        Self::Airspace,
         Self::Map,
         Self::RoutesTrips,
         Self::Vehicle,
@@ -68,6 +71,7 @@ impl WorkspaceTab {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Drive => "Drive",
+            Self::Airspace => "Airspace",
             Self::Map => "Map",
             Self::RoutesTrips => "Routes & Trips",
             Self::Vehicle => "Vehicle",
@@ -87,6 +91,9 @@ impl WorkspaceTab {
 pub struct MapsLocationSurface {
     /// Selected workspace tab.
     pub active: WorkspaceTab,
+    /// Airspace — the real-time wardriving radar state (WiFi/cell/BT around the
+    /// vehicle). Live-only; simulated feed until the MG90 `airspace` worker lands.
+    pub airspace: crate::airspace::AirspaceState,
     /// Whether the pre-drive route-preview screen is showing over the Drive tab.
     pub route_preview: bool,
     /// Whether the "Where to?" destination-search screen is showing over Drive.
@@ -133,6 +140,7 @@ impl MapsLocationSurface {
     pub fn simulated() -> Self {
         Self {
             active: WorkspaceTab::Drive,
+            airspace: crate::airspace::AirspaceState::simulated(),
             route_preview: false,
             destination_search: false,
             arrived: false,
@@ -497,6 +505,13 @@ impl MapsLocationSurface {
     /// default Drive HUD.
     pub fn focus_vehicle_tab(&mut self) {
         self.active = WorkspaceTab::Vehicle;
+    }
+
+    /// Open the cockpit on the **Airspace** wardriving radar (and arm scanning) —
+    /// the target of the Airspace keyboard action + feature-bar item.
+    pub fn focus_airspace_tab(&mut self) {
+        self.active = WorkspaceTab::Airspace;
+        self.airspace.active = true;
     }
 }
 

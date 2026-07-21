@@ -7,6 +7,7 @@
 //! launch without hardware, prove location-health behavior, and leave clear gaps
 //! for the real adapters.
 
+pub mod airspace;
 pub mod car_status;
 pub mod model;
 pub mod view;

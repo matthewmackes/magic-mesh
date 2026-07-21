@@ -2189,6 +2189,23 @@ impl Shell {
             CarAction::GoComms => self.apply_car_tile(car_home::CarTile::Comms),
             CarAction::GoVehicle => self.apply_car_tile(car_home::CarTile::Vehicle),
             CarAction::GoSettings => self.apply_car_tile(car_home::CarTile::Settings),
+            CarAction::GoAirspace => {
+                self.maps_location.focus_airspace_tab();
+                self.nav.expanded = true;
+                self.nav.surface = Surface::MapsLocation;
+            }
+            CarAction::AirspaceWifi => self
+                .maps_location
+                .airspace
+                .toggle_kind(mde_maps_location_egui::airspace::SignalKind::Wifi),
+            CarAction::AirspaceCell => self
+                .maps_location
+                .airspace
+                .toggle_kind(mde_maps_location_egui::airspace::SignalKind::Cell),
+            CarAction::AirspaceBt => self
+                .maps_location
+                .airspace
+                .toggle_kind(mde_maps_location_egui::airspace::SignalKind::Bluetooth),
             CarAction::MediaPlayPause => {
                 self.web
                     .selected_media_transport(MediaTransportAction::PlayPause);

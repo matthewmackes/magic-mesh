@@ -46,6 +46,14 @@ pub enum CarAction {
     GoVehicle,
     /// Jump to Settings (incl. the Key Mapping page).
     GoSettings,
+    /// Open the Airspace wardriving radar.
+    GoAirspace,
+    /// Airspace: toggle the WiFi filter.
+    AirspaceWifi,
+    /// Airspace: toggle the cellular filter.
+    AirspaceCell,
+    /// Airspace: toggle the Bluetooth filter.
+    AirspaceBt,
     /// Toggle media play / pause on the active player.
     MediaPlayPause,
     /// Skip to the next track / chapter.
@@ -66,7 +74,7 @@ pub enum CarAction {
 
 impl CarAction {
     /// Every action, in the order the Key Mapping settings page lists them.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 19] = [
         Self::GoHome,
         Self::GoNav,
         Self::GoMedia,
@@ -74,6 +82,10 @@ impl CarAction {
         Self::GoComms,
         Self::GoVehicle,
         Self::GoSettings,
+        Self::GoAirspace,
+        Self::AirspaceWifi,
+        Self::AirspaceCell,
+        Self::AirspaceBt,
         Self::MediaPlayPause,
         Self::MediaNext,
         Self::MediaPrev,
@@ -95,6 +107,10 @@ impl CarAction {
             Self::GoComms => "Comms",
             Self::GoVehicle => "Vehicle",
             Self::GoSettings => "Settings",
+            Self::GoAirspace => "Airspace",
+            Self::AirspaceWifi => "Airspace: WiFi",
+            Self::AirspaceCell => "Airspace: Cellular",
+            Self::AirspaceBt => "Airspace: Bluetooth",
             Self::MediaPlayPause => "Play / Pause",
             Self::MediaNext => "Next Track",
             Self::MediaPrev => "Previous Track",
@@ -119,6 +135,7 @@ impl CarAction {
                 | Self::GoComms
                 | Self::GoVehicle
                 | Self::GoSettings
+                | Self::GoAirspace
         )
     }
 }
@@ -236,8 +253,8 @@ impl CarKeyBindings {
     #[must_use]
     pub fn defaults() -> Self {
         use egui::Key::{
-            Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, F1, F10, F11, F12, F2, F3,
-            F4, F5, F6, F7, F8, F9,
+            Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, A, B, C, F1, F10, F11, F12,
+            F2, F3, F4, F5, F6, F7, F8, F9, W,
         };
         let mut bindings = BTreeMap::new();
         let mut set = |key: egui::Key, action: CarAction| {
@@ -270,6 +287,11 @@ impl CarKeyBindings {
         set(F10, CarAction::VolumeDown);
         set(F11, CarAction::VolumeUp);
         set(F12, CarAction::VolumeMute);
+        // Airspace on letter-key mnemonics (A = open, W/C/B = WiFi/Cell/BT filters).
+        set(A, CarAction::GoAirspace);
+        set(W, CarAction::AirspaceWifi);
+        set(C, CarAction::AirspaceCell);
+        set(B, CarAction::AirspaceBt);
         Self { bindings }
     }
 
