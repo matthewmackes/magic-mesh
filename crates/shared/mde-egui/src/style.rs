@@ -154,10 +154,18 @@ pub enum StyleColorScheme {
     /// A Windows 2000 basic-inspired light palette: classic button-face gray,
     /// white raised surfaces, gray borders, black text, and active-title blue.
     Light,
+    /// **Ford Sync 3 Auto skin** — a black / white / blue in-vehicle palette,
+    /// applied automatically while the [`LayoutProfile::Car`] Auto Mode is active
+    /// (never a manually-pickable Personalization theme, so it is deliberately
+    /// **absent from [`ALL`](Self::ALL)**). Deep black ground for glare-free night
+    /// driving, pure-white glanceable text, and a bright Sync-3 blue accent.
+    AutoSync3,
 }
 
 impl StyleColorScheme {
-    /// Visible mode order.
+    /// Visible mode order in the Personalization → Theme picker. Deliberately only
+    /// the two operator-pickable schemes — [`AutoSync3`](Self::AutoSync3) is
+    /// mode-derived (installed by Car/Auto Mode), not a manual theme.
     pub const ALL: [Self; 2] = [Self::Dark, Self::Light];
 }
 
@@ -212,6 +220,32 @@ impl Style {
     pub const WIN2000_ACTIVE_TITLE: Color32 = Color32::from_rgb(0x0A, 0x24, 0x6A);
     /// Windows 2000 classic pressed button face.
     pub const WIN2000_PRESSED_FACE: Color32 = Color32::from_rgb(0xB8, 0xB4, 0xAC);
+
+    // ── Palette (Ford Sync 3 Auto skin — black / white / blue) ───────────────
+    // The in-vehicle [`StyleColorScheme::AutoSync3`] palette, applied while Car
+    // Mode is active. A near-black ground (glare-free at night), pure-white
+    // glanceable text, and a bright Sync-3 blue accent — the Ford SYNC 3 dark
+    // interface's black/white/blue language. Kept as its own token block (like
+    // `WIN2000_*`) so the scheme projection in `palette_for` reads named tokens,
+    // never inline literals.
+    /// Sync-3 deepest ground — near-black with a faint cool tint.
+    pub const SYNC3_BG: Color32 = Color32::from_rgb(0x04, 0x07, 0x0B);
+    /// Sync-3 raised tile / card charcoal.
+    pub const SYNC3_SURFACE: Color32 = Color32::from_rgb(0x12, 0x17, 0x1E);
+    /// Sync-3 hovered / highlighted tile.
+    pub const SYNC3_SURFACE_HI: Color32 = Color32::from_rgb(0x1C, 0x24, 0x2E);
+    /// Sync-3 cool hairline / separator.
+    pub const SYNC3_BORDER: Color32 = Color32::from_rgb(0x2B, 0x35, 0x40);
+    /// Sync-3 primary text — pure white for maximum at-a-glance contrast.
+    pub const SYNC3_TEXT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    /// Sync-3 secondary text — cool light gray.
+    pub const SYNC3_TEXT_DIM: Color32 = Color32::from_rgb(0xA6, 0xB4, 0xC2);
+    /// Sync-3 emphasis text — pure white.
+    pub const SYNC3_TEXT_STRONG: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    /// Sync-3 signature accent — a bright sky/cyan Ford SYNC blue.
+    pub const SYNC3_ACCENT: Color32 = Color32::from_rgb(0x2E, 0x9B, 0xE6);
+    /// Sync-3 accent highlight — one rung brighter for pressed rings.
+    pub const SYNC3_ACCENT_HI: Color32 = Color32::from_rgb(0x5F, 0xB8, 0xF2);
 
     // ── Carbon elevation layers ─────────────────────────────────────────────
     // The Carbon "layer" model for nested regions: a page rests one tonal step
@@ -604,6 +638,16 @@ impl Style {
                 text_dim: Self::WIN2000_DIM_TEXT,
                 text_strong: Self::WIN2000_WINDOW_TEXT,
             },
+            StyleColorScheme::AutoSync3 => StylePalette {
+                bg: Self::SYNC3_BG,
+                surface: Self::SYNC3_SURFACE,
+                surface_hi: Self::SYNC3_SURFACE_HI,
+                border: Self::SYNC3_BORDER,
+                capture_clear: Self::SYNC3_BG,
+                text: Self::SYNC3_TEXT,
+                text_dim: Self::SYNC3_TEXT_DIM,
+                text_strong: Self::SYNC3_TEXT_STRONG,
+            },
         }
     }
 
@@ -630,8 +674,14 @@ impl Style {
             Self::TEXT => p.text,
             Self::TEXT_DIM => p.text_dim,
             Self::TEXT_STRONG => p.text_strong,
-            Self::ACCENT => Self::WIN2000_ACTIVE_TITLE,
-            Self::ACCENT_HI => Self::WIN2000_ACTIVE_TITLE,
+            Self::ACCENT => match scheme {
+                StyleColorScheme::AutoSync3 => Self::SYNC3_ACCENT,
+                _ => Self::WIN2000_ACTIVE_TITLE,
+            },
+            Self::ACCENT_HI => match scheme {
+                StyleColorScheme::AutoSync3 => Self::SYNC3_ACCENT_HI,
+                _ => Self::WIN2000_ACTIVE_TITLE,
+            },
             _ => color,
         }
     }
@@ -656,7 +706,8 @@ impl Style {
     fn visuals_for(scheme: StyleColorScheme, accent: Color32, accent_hi: Color32) -> egui::Visuals {
         let p = Self::palette_for(scheme);
         let mut v = match scheme {
-            StyleColorScheme::Dark => egui::Visuals::dark(),
+            // Sync-3 is a dark-on-black skin, so it derives from the dark base.
+            StyleColorScheme::Dark | StyleColorScheme::AutoSync3 => egui::Visuals::dark(),
             StyleColorScheme::Light => egui::Visuals::light(),
         };
 
@@ -759,10 +810,18 @@ impl Style {
     /// their chosen hue.
     #[must_use]
     pub fn accent_for_scheme(scheme: StyleColorScheme, accent: Color32) -> Color32 {
-        if scheme == StyleColorScheme::Light && accent == Self::ACCENT {
-            Self::WIN2000_ACTIVE_TITLE
-        } else {
-            accent
+        match scheme {
+            // Dark keeps every accent exactly as chosen.
+            StyleColorScheme::Dark => accent,
+            // Windows-2000 light folds the DEFAULT brand accent to the classic
+            // active-title blue; an explicit user accent pick keeps its hue.
+            StyleColorScheme::Light if accent == Self::ACCENT => Self::WIN2000_ACTIVE_TITLE,
+            StyleColorScheme::Light => accent,
+            // Sync-3 folds the default brand accent (both rungs) to the bright
+            // Ford SYNC blue; a user pick keeps its hue.
+            StyleColorScheme::AutoSync3 if accent == Self::ACCENT => Self::SYNC3_ACCENT,
+            StyleColorScheme::AutoSync3 if accent == Self::ACCENT_HI => Self::SYNC3_ACCENT_HI,
+            StyleColorScheme::AutoSync3 => accent,
         }
     }
 
@@ -780,7 +839,9 @@ impl Style {
     #[must_use]
     pub fn pressed_fill_for_scheme(scheme: StyleColorScheme, accent: Color32) -> Color32 {
         match scheme {
-            StyleColorScheme::Dark => Self::pressed_fill(accent),
+            // Sync-3's near-black ground darkens the accent toward black just like
+            // dark mode, keeping the bright pressed label WCAG-legible.
+            StyleColorScheme::Dark | StyleColorScheme::AutoSync3 => Self::pressed_fill(accent),
             StyleColorScheme::Light => Self::WIN2000_PRESSED_FACE,
         }
     }
@@ -1788,6 +1849,61 @@ mod tests {
             visuals.hyperlink_color,
             Style::WIN2000_ACTIVE_TITLE,
             "default brand accent resolves to classic active-title blue"
+        );
+    }
+
+    #[test]
+    fn auto_sync3_install_uses_black_white_blue_palette() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::AutoSync3, Density::Touch);
+        let visuals = &ctx.style().visuals;
+        let p = Style::palette_for(StyleColorScheme::AutoSync3);
+
+        // The Ford SYNC 3 Auto skin: near-black ground, pure-white text, blue accent.
+        assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::AutoSync3);
+        assert_eq!(p.bg, Style::SYNC3_BG);
+        assert_eq!(p.text, Style::SYNC3_TEXT);
+        assert_eq!(
+            p.text,
+            egui::Color32::WHITE,
+            "Sync-3 primary text is pure white"
+        );
+        assert_eq!(visuals.panel_fill, Style::SYNC3_BG);
+        assert_eq!(visuals.extreme_bg_color, Style::SYNC3_BG);
+        assert_eq!(visuals.override_text_color, Some(Style::SYNC3_TEXT));
+        assert_eq!(
+            visuals.hyperlink_color,
+            Style::SYNC3_ACCENT,
+            "the default brand accent resolves to the bright Ford SYNC blue"
+        );
+        assert_eq!(
+            visuals.widgets.active.bg_stroke.color,
+            Style::SYNC3_ACCENT_HI,
+            "the pressed ring is the Sync-3 accent highlight"
+        );
+
+        // The near-black ground is strictly darker than the Construct-dark ground,
+        // so the Sync-3 skin reads as its own blacker night palette, not dark mode.
+        let luma = |c: egui::Color32| u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b());
+        assert!(
+            luma(Style::SYNC3_BG) < luma(Style::BG),
+            "Sync-3 ground is blacker than Construct dark"
+        );
+
+        // The DRM shape-remap path resolves the static brand accent to the blue too.
+        assert_eq!(
+            Style::resolve_color_for_scheme(StyleColorScheme::AutoSync3, Style::ACCENT),
+            Style::SYNC3_ACCENT
+        );
+        assert_eq!(
+            Style::resolve_color_for_scheme(StyleColorScheme::AutoSync3, Style::TEXT),
+            Style::SYNC3_TEXT
+        );
+
+        // AutoSync3 is mode-derived, never an operator-pickable Personalization theme.
+        assert!(
+            !StyleColorScheme::ALL.contains(&StyleColorScheme::AutoSync3),
+            "Sync-3 is installed by Car Mode, not offered in the theme picker"
         );
     }
 
