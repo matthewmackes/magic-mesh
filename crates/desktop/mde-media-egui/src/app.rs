@@ -77,6 +77,16 @@ const TRANSPORT_ICON: f32 = Style::SP_M;
 const TRANSPORT_ICON_BUTTON_W: f32 = TRANSPORT_BUTTON_H + Style::SP_XS;
 const TRANSPORT_LABEL_GAP: f32 = Style::SP_XS;
 
+/// Car-Mode (Ford SYNC 3) transport metrics — the oversized, glanceable hit targets
+/// the Player view swaps to while the shell has installed the [`AutoSync3`] skin
+/// (Car Mode, Touch density). All are multiples of the shared 8px grid (§4 — never
+/// magic px): the primary play/pause is the largest target, previous/next a step
+/// down, and the painted geometry mark scales to fill each.
+const CAR_PRIMARY_BUTTON: f32 = Style::SP_XL * 3.0;
+const CAR_SECONDARY_BUTTON: f32 = Style::SP_XL * 2.0;
+const CAR_PRIMARY_ICON: f32 = Style::SP_XL + Style::SP_M;
+const CAR_SECONDARY_ICON: f32 = Style::SP_L;
+
 /// The media surface: the controller plus the applied-fullscreen mirror so the app
 /// only issues a viewport command when the immersive state actually flips.
 pub struct MediaApp {
@@ -1165,6 +1175,15 @@ fn player_view<E: MediaEngine>(
     controller: &mut MediaController<E>,
     video: &mut VideoTextureCache,
 ) {
+    // Car Mode (AUTO-MEDIA): while the shell has installed the Ford SYNC 3 skin the
+    // surface is on a moving dash at Touch density — swap the dense desktop transport
+    // for a large, glanceable now-playing block + oversized play/prev/next. The normal
+    // (non-car) layout below is left untouched; this is a pure branch, not a rewrite.
+    if mde_egui::Style::color_scheme(ui.ctx()) == mde_egui::StyleColorScheme::AutoSync3 {
+        player_view_car(ui, controller, video);
+        return;
+    }
+
     // The stage + OSD. Clicking it toggles play/pause; the controls below override.
     let mut action: Option<TransportAction> = player_stage(ui, controller, video)
         .clicked()
@@ -1330,6 +1349,145 @@ fn player_view<E: MediaEngine>(
     // just-broadcast control is reflected; it drives the controller directly.
     ui.add_space(Style::SP_XS);
     party_cast_controls(ui, controller);
+}
+
+/// The **Car Mode** Player view (AUTO-MEDIA): the large, glanceable transport shown
+/// while the shell has installed the Ford SYNC 3 [`AutoSync3`](mde_egui::StyleColorScheme::AutoSync3)
+/// skin (Car Mode active → Touch density). Fewer, bigger targets than the desktop
+/// [`player_view`]: the art/video stage, a big now-playing block (title + artist), a
+/// taller seek scrubber, and an oversized play / previous / next. The dense secondary
+/// controls (frame-step / snapshot / chapter / speed / A-B / EQ / party) are
+/// deliberately dropped here so the driver has three unmissable targets; they stay in
+/// the normal layout. All chrome is shared [`Style`]/[`fonts`](mde_egui::fonts) tokens
+/// (§4) and the transport reuses the same [`TransportAction`]s as the desktop row (§6).
+fn player_view_car<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+    video: &mut VideoTextureCache,
+) {
+    // The art / video stage. Clicking it toggles play/pause, exactly as on the desktop.
+    let mut action: Option<TransportAction> = player_stage(ui, controller, video)
+        .clicked()
+        .then_some(TransportAction::TogglePlay);
+
+    ui.add_space(Style::SP_M);
+
+    // The big now-playing block: the title as a display heading on the shared "heading"
+    // family, then the artist dimmed beneath it — read from the current media's library
+    // metadata and shown only when it is genuinely known (§7 — no fabricated artist).
+    let title = now_playing_title(controller.player());
+    let artist = controller
+        .player()
+        .media()
+        .map(str::to_owned)
+        .and_then(|path| {
+            controller
+                .library()
+                .get(&path)
+                .and_then(|item| item.metadata.artist.clone())
+        });
+    ui.label(
+        RichText::new(title)
+            .font(car_heading_font(Style::DISPLAY))
+            .color(Style::TEXT_STRONG),
+    );
+    if let Some(artist) = artist {
+        ui.label(
+            RichText::new(artist)
+                .font(car_heading_font(Style::HEADING))
+                .color(Style::TEXT_DIM),
+        );
+    }
+
+    ui.add_space(Style::SP_L);
+
+    // The seek scrubber stays — kept large, with the time readouts stepped up so they
+    // are legible at a glance.
+    let position = controller.player().position();
+    let duration = controller.player().duration();
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format_time(position))
+                .monospace()
+                .size(Style::TITLE)
+                .color(Style::TEXT_DIM),
+        );
+        if let Some(dur) = duration {
+            let mut seek = position.min(dur);
+            let resp = ui.add(
+                Slider::new(&mut seek, 0.0..=dur)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            if resp.changed() {
+                action = Some(TransportAction::SeekTo(seek));
+            }
+            ui.label(
+                RichText::new(format_time(dur))
+                    .monospace()
+                    .size(Style::TITLE)
+                    .color(Style::TEXT_DIM),
+            );
+        } else {
+            muted_note(ui, "live / unknown length");
+        }
+    });
+
+    ui.add_space(Style::SP_L);
+
+    // The oversized transport: big previous / play-pause / next — the only three
+    // targets the driver needs. Reuses the desktop transport actions (§6), just larger.
+    ui.horizontal(|ui| {
+        ui.add_space(Style::SP_M);
+        if car_transport_button(
+            ui,
+            TransportIcon::Back,
+            "Previous track",
+            MediaButtonTone::Quiet,
+            CAR_SECONDARY_BUTTON,
+            CAR_SECONDARY_ICON,
+        )
+        .clicked()
+        {
+            action = Some(TransportAction::Prev);
+        }
+        ui.add_space(Style::SP_L);
+        let state = controller.player().state();
+        let icon = if state == PlayerState::Playing {
+            TransportIcon::Pause
+        } else {
+            TransportIcon::Play
+        };
+        if car_transport_button(
+            ui,
+            icon,
+            "Play / pause",
+            MediaButtonTone::Primary,
+            CAR_PRIMARY_BUTTON,
+            CAR_PRIMARY_ICON,
+        )
+        .clicked()
+        {
+            action = Some(TransportAction::TogglePlay);
+        }
+        ui.add_space(Style::SP_L);
+        if car_transport_button(
+            ui,
+            TransportIcon::Forward,
+            "Next track",
+            MediaButtonTone::Quiet,
+            CAR_SECONDARY_BUTTON,
+            CAR_SECONDARY_ICON,
+        )
+        .clicked()
+        {
+            action = Some(TransportAction::Next);
+        }
+    });
+
+    if let Some(action) = action {
+        controller.dispatch(action);
+    }
 }
 
 /// A click intent from the [`party_cast_controls`] section — collected while rendering
@@ -2157,6 +2315,50 @@ fn transport_text_button(ui: &mut egui::Ui, label: &str, tip: &str) -> Response 
     )
 }
 
+/// A single **Car-Mode** transport control (AUTO-MEDIA): a large square hit target with
+/// the painted [`TransportIcon`] geometry centred and scaled up, sized for a glance at
+/// the wheel. It shares the [`MediaButtonTone`] fill/tint tokens and the same geometry
+/// as [`media_icon_button`] (§4), only oversized — no new colour or metric is minted.
+fn car_transport_button(
+    ui: &mut egui::Ui,
+    icon: TransportIcon,
+    tip: &str,
+    tone: MediaButtonTone,
+    button: f32,
+    icon_size: f32,
+) -> Response {
+    let size = egui::vec2(button, button);
+    let enabled = ui.is_enabled();
+    let mut widget = egui::Button::new(RichText::new("")).min_size(size);
+    if let Some(fill) = tone.fill() {
+        widget = widget.fill(fill);
+    }
+    let response = ui.add_sized(size, widget);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+
+    let tint = if enabled {
+        tone.text_color()
+    } else {
+        Style::TEXT_DIM
+    };
+    let icon_rect =
+        egui::Rect::from_center_size(response.rect.center(), egui::vec2(icon_size, icon_size));
+    paint_transport_icon(ui.painter(), icon_rect, icon, tint);
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+
+    media_hover_text(response, tip).on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A [`FontId`] on the shared `"heading"` font family
+/// ([`mde_egui::fonts::HEADING_FAMILY`]) at `size` — the large-type family the Car-Mode
+/// now-playing block reads with (§4 — the shared family, never a crate-local face).
+fn car_heading_font(size: f32) -> FontId {
+    FontId::new(
+        size,
+        egui::FontFamily::Name(std::sync::Arc::from(mde_egui::fonts::HEADING_FAMILY)),
+    )
+}
+
 fn media_text_button_sized(
     ui: &mut egui::Ui,
     size: egui::Vec2,
@@ -2763,6 +2965,79 @@ mod tests {
         // Idle-hidden OSD branch.
         c.ui_mut().osd_idle_secs = crate::model::OSD_HIDE_SECS + 1.0;
         render_with_video(&mut c, &mut video, player_view);
+    }
+
+    #[test]
+    fn player_view_car_mode_renders_large_glanceable_transport() {
+        let mut c = controller();
+        // A library entry for the playing path so the now-playing block has an artist to
+        // render (the Car-Mode block reads the current media's library metadata).
+        c.library_mut().upsert(
+            "clip.mkv",
+            MediaMetadata::from_path("clip.mkv")
+                .expect("video")
+                .with_artist("Nightdrive"),
+        );
+        let mut video = VideoTextureCache::default();
+        c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
+        c.pump();
+        assert_eq!(c.player().state(), PlayerState::Playing);
+
+        // Install the Ford SYNC 3 skin at Touch density exactly as the shell does while
+        // Car Mode is active, then render the Player view — it must take the car branch
+        // and tessellate on the CPU without panicking (§7).
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            mde_egui::StyleColorScheme::AutoSync3,
+            mde_egui::Density::Touch,
+        );
+        assert_eq!(
+            Style::color_scheme(&ctx),
+            mde_egui::StyleColorScheme::AutoSync3
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| player_view(ui, &mut c, &mut video));
+        });
+        let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "car player view produced no draw primitives"
+        );
+
+        // The car branch was taken: the big now-playing title + artist paint, and the
+        // dense desktop controls (frame-step / snapshot / speed / stop / A-B) are dropped
+        // — so this is the glanceable layout, not the desktop one.
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().any(|t| t == "clip"),
+            "car layout should paint the large now-playing title: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Nightdrive"),
+            "car layout should paint the dim artist line: {texts:?}"
+        );
+        for dropped in ["Frame", "Snapshot", "Speed", "Stop", "A-B loop", "10s"] {
+            assert!(
+                !texts.iter().any(|t| t == dropped),
+                "car layout must drop the dense desktop control {dropped:?}: {texts:?}"
+            );
+        }
+
+        // The oversized previous / next paint their geometry marks (closed triangles on
+        // the transport tint), proving the large transport rendered, not a text glyph.
+        let icons = transport_icon_shape_count(&out.shapes);
+        assert!(
+            icons >= 2,
+            "car transport must paint geometry icons for previous/next; got {icons}"
+        );
     }
 
     #[test]
