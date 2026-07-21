@@ -183,6 +183,11 @@ impl VehicleProbe for SshHttpProbe {
         let remote_cmd = format!("cat {GPS_INFO_PATH}");
         // The oMG SSH host runs legacy crypto — hence the explicit +ssh-rsa /
         // group1 / aes128-cbc allowances (a modern OpenSSH refuses it otherwise).
+        // `ssh-dss` must NOT appear here: modern OpenSSH REMOVED it (not merely
+        // deprecated), so listing it makes ssh reject the whole option value
+        // ("command-line: Bad key types") and every SSH read (GPS/IMU/control)
+        // fails before connecting — the MG90 offers an ssh-rsa (and ed25519) host
+        // key, so +ssh-rsa alone connects. Verified live against the bench MG90.
         let out = Command::new("sshpass")
             .args([
                 "-p",
@@ -195,7 +200,7 @@ impl VehicleProbe for SshHttpProbe {
                 "-o",
                 "UserKnownHostsFile=/dev/null",
                 "-o",
-                "HostKeyAlgorithms=+ssh-rsa,ssh-dss",
+                "HostKeyAlgorithms=+ssh-rsa",
                 "-o",
                 "KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1",
                 "-o",
