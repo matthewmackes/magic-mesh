@@ -169,7 +169,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-ARCH-001 - Remove OpenStack; OpenTofu + Ansible IaC workspace for all cloud operations
 
-- Status: Remaining
+- Status: Blocked
 - Progress (2026-07-20): CODE-COMPLETE. Phase A delete (222e1980, -19k LOC) + Phase B OpenTofu/Ansible/libvirt backend + mackesd cloud worker (1dad89d2) + Phase C recreated six-mode iac/ cloud-ops workspace (19e0089038 -> c2a3f76d) all landed + tested green; zero OpenStack in production code. Only Phase D remains: the live local-libvirt provision+configure smoke (MDE_CLOUD_APPLY=1 on a libvirt host) — operator/hardware-gated. NB: the coarse Phase-C six-mode iac/ is being reenvisioned by WL-ARCH-006 (Workloads cockpit — delivery-type x mesh placement); WL-ARCH-006 is the surface successor over this same OpenTofu+Ansible+libvirt backend.
 - Priority: P1
 - Complexity: Epic
@@ -236,13 +236,13 @@ These decisions refine acceptance and sequencing for the active items below.
   survey).
 ### WL-ARCH-006 - Workloads cockpit (reenvision the IaC surface: delivery-type x mesh placement)
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P1
 - Complexity: Epic
 - Problem: WL-ARCH-001 landed a real-but-coarse OpenTofu+Ansible+libvirt backend + a 6-mode iac/ workspace, but the surface is organized by raw Tofu concepts, cannot place a workload on a specific mesh node, and does not drive the five real delivery types. The operator's 50-question design reenvisions it as "Workloads".
 - Required outcome: The iac/ surface (user-facing "Workloads"; seam Surface::InfraCode kept) presents five first-class delivery-type views (Desktop-VM / Service-VM / App-only-VM (VDI app-mode) / Android-VM (Cuttlefish) / Service-Container), each placeable on an explicit mesh node, provisioning + configuring real libvirt workloads end to end over OpenTofu+Ansible. Delete cloud_plane.rs. One-big-cutover.
 - Plan: docs/plans/workloads-cockpit.md (locked 50-Q design + 21-unit fan-out + wire contract + per-node-apply reconciliation + ranked risks). Extends WL-ARCH-001 Phase B; supersedes its coarse Phase-C iac/.
-- Progress (2026-07-20): **CODE-COMPLETE — all 21 units landed + `cargo build --workspace` green + pushed (origin/master `bae119e6`).** Tier-0 U1a/U2/U3 (wire contract `c7cc9b77` + worker split `bbe859f7` + delivery-type cockpit scaffold `c68e65ec`), Tier-1 U4-U10 backend verbs, Tier-2 U11-U13 (tofu modules + ansible roles), Tier-3 U14-U19 (`74636845` placement picker + provision form; `eeb36d76` 5 delivery-views; `7be0e3ec` configure/inventory + status/metrics; `d13a623f` images/containers), Tier-4 U20+U21 (`bae119e6` — deleted `cloud_plane.rs`/`Plane::Cloud`, Workbench 5→4 planes, de-OpenStacked `unit_aggregator`; `kdc_host/cloud.rs` + `session_broker.rs` were already on the unified path). `Surface::InfraCode`/Workloads reachable + renders. REMAINING (deferred, NOT autonomous): live-seat `.15` provision→configure→console→destroy smoke (operator/hardware-gated); the scaffold's `CloudReply` mirror doesn't yet decode rich reply payloads (ImageRow roster / live inventory-outputs / ConsoleEndpoint→VDI paint) so those panels render honest "pending decode" — a `iac/mod.rs` enhancement for full data display.
+- Progress (2026-07-20): **CODE-COMPLETE — all 21 units landed + `cargo build --workspace` green + pushed (origin/master `bae119e6`).** Tier-0 U1a/U2/U3 (wire contract `c7cc9b77` + worker split `bbe859f7` + delivery-type cockpit scaffold `c68e65ec`), Tier-1 U4-U10 backend verbs, Tier-2 U11-U13 (tofu modules + ansible roles), Tier-3 U14-U19 (`74636845` placement picker + provision form; `eeb36d76` 5 delivery-views; `7be0e3ec` configure/inventory + status/metrics; `d13a623f` images/containers), Tier-4 U20+U21 (`bae119e6` — deleted `cloud_plane.rs`/`Plane::Cloud`, Workbench 5→4 planes, de-OpenStacked `unit_aggregator`; `kdc_host/cloud.rs` + `session_broker.rs` were already on the unified path). `Surface::InfraCode`/Workloads reachable + renders. REMAINING (hardware-gated only): live-seat `.15` provision→configure→console→destroy smoke (operator/hardware-gated). The CloudReply rich-payload decode LANDED 2026-07-20 (`72159c31`): `iac/images.rs` decodes the ImageRow roster + console-attach decodes `ConsoleEndpoint` into an honest console section across the delivery views (33 iac tests green); full VDI-paint is a separate subsystem (`main.rs` VdiState). No autonomous work remains — only the hardware-gated live smoke.
 - Dependencies: WL-ARCH-001 backend (landed). Live smoke needs a libvirt host (.15) with nested-KVM for the Cuttlefish/Android type (else Android-x86 fallback).
 - Acceptance criteria: five delivery-type views each provision+configure a real libvirt workload on a picked node; apply-on-placement-node; armed-token per-request auth; destroy=preview+typed-arm; drift via periodic plan; cloud_plane.rs deleted; zero OpenStack terminology; live provision+configure+destroy smoke on .15.
 - Verification method: per-mode egui fixtures; libvirt-fake CloudRunner tests per verb; inventory/mesh.py selftest; /audit OpenStack-terminology grep; live .15 smoke (SSH-verify virsh list + state/cloud JSON + mackesd journal).
@@ -252,7 +252,14 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-RUN-003 - Lighthouse full/equal join and push-button add/retire
 
-- Status: Remaining
+- Status: Blocked
+- Progress (2026-07-20): CODE-COMPLETE per `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md` —
+  typed `lighthouse_add`/`lighthouse_retire` (`cli/node_admin.rs:164`/`:205`), etcd voter
+  membership (`cli/join.rs` `add_self_as_voter_blocking`, no manual etcdctl), CA
+  inheritance, quorum-preserving `drain_gate` (`lighthouse_lifecycle.rs`), and the
+  `spawn_lighthouse_onboard` worker + shell flow all landed. BLOCKED-on: the live
+  multi-lighthouse fleet add-retire-add cycle drill + DO provisioning creds — operator/
+  live-infra gated, not autonomously drainable.
 - Priority: P1
 - Complexity: Large
 - Problem: Lighthouse management still has manual parts around CA custody,
@@ -274,7 +281,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
-- Status: Remaining
+- Status: Blocked
 - Progress (2026-07-20): PARITY-COMPLETE (tip 61288006). Full stack landed: mde-collab-types contracts + mde-collab-core (property-tested convergence) + mackesd collab worker (state/collab/* + action/collab/*) + mde-collab-egui surface + shell mount (Surface::Communications, live). All 6 parity modes: Files, Alerts, Clipboard, Transfers, Documents (embeds mde-editor-egui), Calls (media WebRTC/SFU/SIP = marked follow-up). Parity ledger docs/platform/WL-FUNC-011-parity-ledger.md (519 rows). REMAINING (operator-gated per delivery lock): the one-big cutover (retire Surface::Chat/Voice/Editor/Files) after the migration importer + a parity-ledger sign-through + operator signoff. Phase-3c follow-ups (editor CRDT/three-way-merge/review; call media plane) are co-edit/hardware-gated.
 - Priority: P0
 - Complexity: Epic
