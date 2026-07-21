@@ -6,7 +6,9 @@
 #
 # Usage:
 #   build-image.sh                         # channel lane: install magic-mesh from the gh-pages dnf repo
-#   build-image.sh --rpm <path>            # local lane: bake a locally-built magic-mesh-*.rpm
+#   build-image.sh --rpm <path> [--rpm <path>...]   # local lane: bake locally-built
+#                                          # magic-mesh-*.rpm(s); repeat --rpm to stage
+#                                          # the base + browser pair into one seat image
 #   build-image.sh --tag <image:tag>       # default localhost/magic-mesh-bootc:latest
 #   build-image.sh --base <bootc-base>     # default quay.io/fedora/fedora-bootc:42
 #   build-image.sh --disk <qcow2|raw|anaconda-iso> [--out <dir>]
@@ -36,7 +38,7 @@ RPMS_DIR="$BOOTC_DIR/rpms"
 TAG="localhost/magic-mesh-bootc:latest"
 BASE=""
 LANE="repo"
-RPM_PATH=""
+RPM_PATHS=()
 DISK_TYPE=""
 OUT_DIR="$BOOTC_DIR/out"
 OUT_DIR_SET=""
@@ -84,7 +86,7 @@ resolve_image() { # $1 = image ref, $2 = what it is (for the message)
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --rpm)  RPM_PATH="${2:?--rpm needs a path}"; LANE="local"; shift 2 ;;
+        --rpm)  RPM_PATHS+=("${2:?--rpm needs a path}"); LANE="local"; shift 2 ;;
         --tag)  TAG="${2:?--tag needs an image:tag}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image ref}"; shift 2 ;;
         --disk) DISK_TYPE="${2:?--disk needs qcow2|raw|anaconda-iso}"; shift 2 ;;
@@ -102,14 +104,16 @@ command -v podman >/dev/null 2>&1 || missing+=("podman is not installed / not on
 [ -f "$REPO/packaging/repo/magic-mesh.repo" ] || missing+=("channel repo file missing: $REPO/packaging/repo/magic-mesh.repo")
 
 if [ "$LANE" = "local" ]; then
-    if [ ! -f "$RPM_PATH" ]; then
-        missing+=("--rpm path does not exist: $RPM_PATH")
-    else
-        case "$(basename "$RPM_PATH")" in
-            magic-mesh-*.rpm) : ;;
-            *) missing+=("--rpm must be a magic-mesh-*.rpm (got: $(basename "$RPM_PATH"))") ;;
-        esac
-    fi
+    for _rpm in "${RPM_PATHS[@]}"; do
+        if [ ! -f "$_rpm" ]; then
+            missing+=("--rpm path does not exist: $_rpm")
+        else
+            case "$(basename "$_rpm")" in
+                magic-mesh-*.rpm) : ;;
+                *) missing+=("--rpm must be a magic-mesh-*.rpm (got: $(basename "$_rpm"))") ;;
+            esac
+        fi
+    done
 fi
 
 [ -n "$OUT_DIR_SET" ] && [ -z "$DISK_TYPE" ] && \
@@ -136,7 +140,7 @@ fi
 # an old build; keep .gitkeep so the repo-lane COPY still has a dir to copy.
 find "$RPMS_DIR" -maxdepth 1 -name '*.rpm' -delete
 if [ "$LANE" = "local" ]; then
-    cp -v "$RPM_PATH" "$RPMS_DIR/"
+    cp -v "${RPM_PATHS[@]}" "$RPMS_DIR/"
 fi
 
 # ── The base-image gate, THEN the build ──────────────────────────────────────
