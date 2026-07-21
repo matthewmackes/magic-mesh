@@ -4,7 +4,7 @@ use mde_egui::egui::{
     self, Align, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape,
     Stroke, StrokeKind, Vec2,
 };
-use mde_egui::{paint_carbon, Style};
+use mde_egui::{paint_carbon, Style, StyleColorScheme};
 
 use crate::model::{
     BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination, DeviceIoState,
@@ -54,6 +54,28 @@ const HUD_RADIUS_S: f32 = 12.0;
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     ui.visuals_mut().override_text_color = Some(Style::TEXT);
+
+    // Auto Mode (Car): the cockpit is on a dash — drop the header + tab rail so the
+    // active tab (the Drive HUD by default) is edge-to-edge full-bleed. Tab
+    // switching in Car Mode is driven by the Auto Home tiles / bound keys (Nav →
+    // Drive, Vehicle → telematics), not the rail.
+    if Style::color_scheme(ui.ctx()) == StyleColorScheme::AutoSync3 {
+        egui::Frame::NONE.fill(Style::BG).show(ui, |ui| {
+            let content_size = ui.available_size();
+            ui.allocate_ui_with_layout(
+                content_size,
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("maps-location-car", state.active))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| render_active_tab(ui, state));
+                },
+            );
+        });
+        return;
+    }
+
     egui::Frame::NONE
         .fill(Style::BG)
         .inner_margin(Style::SP_M)
@@ -80,33 +102,31 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
                             egui::ScrollArea::vertical()
                                 .id_salt(("maps-location-tab", state.active))
                                 .auto_shrink([false, false])
-                                .show(ui, |ui| match state.active {
-                                    WorkspaceTab::Drive => show_drive(ui, state),
-                                    WorkspaceTab::Map => show_map(ui, state),
-                                    WorkspaceTab::RoutesTrips => show_routes_trips(ui, state),
-                                    WorkspaceTab::Vehicle => show_vehicle(ui, &state.vehicle),
-                                    WorkspaceTab::Connectivity => {
-                                        show_connectivity(ui, &state.mg90)
-                                    }
-                                    WorkspaceTab::DevicesIo => {
-                                        show_devices_io(ui, &mut state.devices)
-                                    }
-                                    WorkspaceTab::LocationSources => {
-                                        show_location_sources(ui, &mut state.locations)
-                                    }
-                                    WorkspaceTab::Mg90Setup => {
-                                        show_mg90_setup(ui, &mut state.mg90, &state.offline_maps)
-                                    }
-                                    WorkspaceTab::Mg90Settings => show_mg90_settings(ui, state),
-                                    WorkspaceTab::FirmwareRecovery => {
-                                        show_firmware_recovery(ui, &state.firmware, &state.devices)
-                                    }
-                                    WorkspaceTab::Simulator => show_simulator(ui, state),
-                                });
+                                .show(ui, |ui| render_active_tab(ui, state));
                         });
                 },
             );
         });
+}
+
+/// Render the active workspace tab's body — shared by the normal (rail) layout and
+/// the Car Mode full-bleed layout.
+fn render_active_tab(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    match state.active {
+        WorkspaceTab::Drive => show_drive(ui, state),
+        WorkspaceTab::Map => show_map(ui, state),
+        WorkspaceTab::RoutesTrips => show_routes_trips(ui, state),
+        WorkspaceTab::Vehicle => show_vehicle(ui, &state.vehicle),
+        WorkspaceTab::Connectivity => show_connectivity(ui, &state.mg90),
+        WorkspaceTab::DevicesIo => show_devices_io(ui, &mut state.devices),
+        WorkspaceTab::LocationSources => show_location_sources(ui, &mut state.locations),
+        WorkspaceTab::Mg90Setup => show_mg90_setup(ui, &mut state.mg90, &state.offline_maps),
+        WorkspaceTab::Mg90Settings => show_mg90_settings(ui, state),
+        WorkspaceTab::FirmwareRecovery => {
+            show_firmware_recovery(ui, &state.firmware, &state.devices)
+        }
+        WorkspaceTab::Simulator => show_simulator(ui, state),
+    }
 }
 
 fn header(ui: &mut egui::Ui, state: &MapsLocationSurface) {
