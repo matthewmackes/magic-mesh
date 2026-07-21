@@ -912,6 +912,70 @@ libwacom = "*"
 # Lighthouse VPS or a desktop-only Workstation shouldn't drag in the
 # whole ansible stack; `dnf install` still pulls it by default
 # (weak deps on), and `--setopt=install_weak_deps=False` opts out.
+
+# BOOTC-COMPLETENESS (2026-07-21, operator: "go full Atomic — add every soft-dep
+# + the full virtualization stack as hard RPM Requires so any `dnf install
+# magic-mesh` AND the offline bootc compose carry the COMPLETE runtime"). Sourced
+# from the runtime-externals audit (every binary the platform Command::new's + lib
+# it dlopens + the node-virt.yml virt role). All fedora-resolvable; the two that
+# cannot be plain hard Requires stay Containerfile-only: power-profiles-daemon
+# (conflicts with tuned → --allowerasing) and the rpmfusion `ffmpeg` codec swap
+# (mpv-libs links the crippled ffmpeg-free; real H.264/H.265 needs rpmfusion).
+# Deliberately NOT added (audit role-gates): swtpm (SELinux scriptlet stalls a
+# lighthouse dnf txn — compute-image only), doctl (not a Fedora package),
+# ipmitool/createrepo_c/ovn-central (specialized roles), sway/wl-clipboard (dead
+# on the compositor-less DRM seat).
+#   Networking: nmstate (nmstatectl, magic-fleet netstate apply), nftables (nft,
+#     link_traffic shaping), socat (VM serial/VNC console brokering).
+nmstate = "*"
+nftables = "*"
+socat = "*"
+#   Audio/media: the shipped shell is re-linked media-mpv, so it dlopens REAL
+#     libmpv (mpv-libs) — without it the Media surface silently ships FakeMpv;
+#     pipewire-utils (pw-dump, the F44 split-out the seat mixer reads);
+#     pulseaudio-utils (paplay, the notification-bell fallback).
+mpv-libs = "*"
+pipewire-utils = "*"
+pulseaudio-utils = "*"
+#   Brightness: brightnessctl (backlight fallback when logind SetBrightness is
+#     unavailable). (power-profiles-daemon is Containerfile-only — tuned conflict.)
+brightnessctl = "*"
+#   Automation/convergence: ansible-runner (the local-apply primitive magic-fleet
+#     drives — distinct from the weak ansible-core above).
+python3-ansible-runner = "*"
+#   Mesh/remote: fuse-sshfs (MeshFS/SFTP mounts), sshpass (non-interactive SSH to
+#     routers/DC hosts/vehicle gateway), git-core (the GitOps promote/action worker
+#     at runtime), rsync + openssh-clients (mesh transport, promoted weak→hard).
+fuse-sshfs = "*"
+sshpass = "*"
+git-core = "*"
+rsync = "*"
+openssh-clients = "*"
+#   Network stack (promoted weak→hard, code-critical): NetworkManager (nmcli, the
+#     onboarding NIC config + connectivity), firewalld (firewall-cmd, the mesh
+#     firewall worker).
+NetworkManager = "*"
+firewalld = "*"
+#   Editor/terminal/shell utils: ripgrep (rg, editor find-in-files), tmux (terminal
+#     session multiplexing), xdg-utils (xdg-open, external URLs).
+ripgrep = "*"
+tmux = "*"
+xdg-utils = "*"
+#   FULL VIRTUALIZATION / VDI HOST STACK (node-virt.yml: "every mesh node carries
+#     this"). The base Containerfile cherry-picked libvirt drivers; hard-Require the
+#     full libvirt meta so the daemon + all drivers + the virbr0 NAT (dnsmasq) are
+#     present, plus the pieces the compute worker actually invokes:
+#       libvirt                        — full daemon + all drivers + dnsmasq NAT
+#       libvirt-daemon-driver-storage  — the `virsh pool-define-as dir` backend
+#       guestfs-tools                  — virt-customize/sysprep/guestfish golden-image ops
+#       genisoimage                    — the NoCloud cloud-init seed ISO virt-install --cloud-init needs
+#       virtiofsd                      — the virtiofs daemon libvirt launches for the MeshFS share
+libvirt = "*"
+libvirt-daemon-driver-storage = "*"
+guestfs-tools = "*"
+genisoimage = "*"
+virtiofsd = "*"
+
 [package.metadata.generate-rpm.recommends]
 # BROWSER-SPLIT — default Workstation installs still pull the production Browser
 # engines, but as a separate public-channel artifact that can be size-gated and

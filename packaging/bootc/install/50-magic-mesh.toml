@@ -1,2 +1,29 @@
+# Drive geometry for a Quasar Workstation = a KVM/libvirt VM host + VDI node
+# (operator 2026-07-21: "a drive geometry suited for these use cases").
+#
+# ── Why a single whole-disk XFS root (and NOT a fragmented /var) ──────────────
+# bootc/ostree keeps /usr immutable and swaps it wholesale on upgrade; /var is the
+# machine-local writable lane that PERSISTS across image swaps. On this platform
+# /var is where the heavy state lives (README "writable-partition doctrine"):
+#     /var/lib/libvirt/images   VM disk images (the compute/VDI workload)
+#     /var/lib/containers       podman/Quadlet workload storage
+#     /var/home                 ~/Local VM disks (/home → var/home)
+#     /var/mnt/mesh-storage     the Syncthing-replicated workgroup volume
+#     /var/lib/{etcd,mackesd,mcnf-syncthing}   mesh substrate + daemon state
+# A box whose job is to HOST VMs must not cap any of these behind a small /var
+# partition. A single XFS root spanning the whole disk gives every one of them the
+# full free space, to be shared dynamically — the right geometry for an
+# unpredictable mix of VM images, container layers and mesh data.
+#
+# ── Why XFS ──────────────────────────────────────────────────────────────────
+# XFS is chosen for large-file throughput AND reflink (copy-on-write clones,
+# mkfs.xfs default on F44): `qemu-img create -b … -F qcow2`, virt-clone and the
+# mesh VM lifecycle (compute_provision / vm_lifecycle) reflink-clone a golden image
+# into a new desktop instantly instead of a full copy — the fast-spawn path the
+# VDI cockpit depends on. XFS also grows online (`xfs_growfs`), so expanding the
+# underlying disk/LV grows the VM store with no downtime.
+#
+# Kernel args (IOMMU / VFIO passthrough / nested virt) live in the sibling
+# kargs.d/00-mcnf-virt.toml so they apply on install and survive image upgrades.
 [install.filesystem.root]
 type = "xfs"

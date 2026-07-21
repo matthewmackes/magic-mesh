@@ -1,0 +1,25 @@
+# BOOTC-COMPLETENESS (2026-07-21, operator: "a drive geometry suited for these
+# use cases") — kernel args that make a Quasar Workstation a first-class KVM/libvirt
+# VM host + VDI node. bootc bakes these into the image via kargs.d; the installed
+# system (and the anaconda ISO install) picks them up. All are inert on hardware
+# that lacks the feature, so ONE image serves every node (the lock-10 doctrine).
+#
+#   · intel_iommu=on / amd_iommu=on — turn on the IOMMU on whichever platform this
+#     lands on (the other vendor's knob is ignored). Required for VFIO, i.e. handing
+#     a real GPU / USB controller / NIC through to a VM desktop — the designed
+#     "real hardware to the guest" passthrough path (e12-9-10-libvirt-rescope.md,
+#     DATACENTER-22, quasar-cloud Q37 vGPU/PCI flavors).
+#   · iommu=pt — passthrough mode: DMA is only remapped for devices actually handed
+#     to a guest, so host I/O keeps native performance when nothing is passed
+#     through. This is why enabling the IOMMU here costs an idle node nothing.
+#   · kvm_intel.nested=1 / kvm_amd.nested=1 — nested virtualization, so a guest can
+#     itself run a hypervisor (a test XCP-ng, a Windows guest with WSL2/Hyper-V,
+#     nested test beds). Inert where the CPU can't nest.
+kargs = [
+    "intel_iommu=on",
+    "amd_iommu=on",
+    "iommu=pt",
+    "kvm_intel.nested=1",
+    "kvm_amd.nested=1",
+]
+match-architectures = ["x86_64"]

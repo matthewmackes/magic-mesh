@@ -216,11 +216,49 @@ RUN set -eux; \
     fi; \
     dnf clean all
 
+# BOOTC-COMPLETENESS (2026-07-21, operator: "go full Atomic — complete runtime +
+# full virt") — the runtime pieces the base RPM Requires CANNOT express, per the
+# externals audit. Egress needed here (like the SURFACE layer); an airgapped
+# builder points dnf at a LAN mirror. The Requires block in mackesd/Cargo.toml
+# carries everything Fedora-resolvable; this block carries the four exceptions:
+#   1. RPMFusion `ffmpeg` codec swap — the shipped shell links libmpv (mpv-libs is
+#      a hard Require now), but Fedora's mpv-libs links codec-crippled `ffmpeg-free`;
+#      real H.264/H.265/AAC playback in the Media surface needs full RPMFusion
+#      ffmpeg. Cannot be a plain Require (lives outside Fedora), so enable
+#      rpmfusion-free + swap here. skip_if_unavailable-style: degrade to ffmpeg-free.
+#   2. power-profiles-daemon — the seat power-profile control (settings/power.rs);
+#      it CONFLICTS with `tuned`, so --allowerasing swaps it in. Containerfile-only
+#      for exactly that conflict (a plain Require would break a tuned-carrying node).
+#   3. Live-CEF Chromium userspace — the first-boot-fetched CEF binary dynamically
+#      links a Chromium set neither RPM lists; without it live CEF won't start.
+#      The .so's arrive at runtime, so no Fedora pkg is a Require — these are the
+#      host libs they load against.
+#   4. Full virt stack (node-virt.yml "every mesh node") — the base RPM now Requires
+#      these, but re-install explicitly like the seat/storage blocks so an offline
+#      local-RPM compose can't miss them.
+RUN set -eux; \
+    dnf -y install \
+        "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+      && dnf -y install --allowerasing ffmpeg \
+      || echo "GATED[BOOTC-COMPLETENESS/rpmfusion]: rpmfusion unreachable — Media plays via ffmpeg-free (no H.264/H.265)"; \
+    dnf -y install --allowerasing power-profiles-daemon; \
+    dnf -y install \
+        nss nspr atk at-spi2-atk cups-libs libdrm mesa-libgbm \
+        libXcomposite libXdamage libXrandr libXtst libXScrnSaver \
+        pango cairo; \
+    dnf -y install \
+        libvirt libvirt-daemon-driver-storage guestfs-tools \
+        genisoimage virtiofsd dnsmasq; \
+    dnf clean all
+
 # The DRM-seat unit + its preset. Boot-to-seat: quasar-vdi-desktop.md lock 34.
 # The RPM lane ships the same unit through generate-rpm (SEAT-BOOT-1).
 COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-shell-egui.service
 COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
 COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-mesh.toml
+# Virtualization/VDI kernel args (IOMMU + VFIO passthrough + nested virt) baked
+# into the image so install + every upgrade carries them (BOOTC-COMPLETENESS).
+COPY packaging/bootc/kargs.d/00-mcnf-virt.toml /usr/lib/bootc/kargs.d/00-mcnf-virt.toml
 
 # Workstation-role wiring. The RPM post-install already enabled the all-roles
 # set (mackesd, nebula, mesh-health.timer, mesh-status.timer, the first-boot
