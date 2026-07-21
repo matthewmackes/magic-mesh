@@ -123,9 +123,16 @@ unwrap_used = "deny"
 panic       = "warn"
 todo        = "deny"
 
+# Release is tuned for SPEED, not minimum size (PERF-1): this platform is an
+# interactive desktop OS — the egui/wgpu shell paint loop, media/CEF decode glue,
+# the crypto/mesh stack, and per-frame layout are all CPU-bound hot paths where
+# `opt-level = 3` is materially faster than the old size-first `"z"`. Fat LTO +
+# one codegen unit maximize cross-crate inlining; `strip` keeps the shipped image
+# lean without costing runtime speed. (Was `opt-level = "z"`; the size increase is
+# an accepted trade for a fast, joyful seat.)
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 strip = true
 
