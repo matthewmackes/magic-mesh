@@ -17,6 +17,12 @@
 //! 3. **Publishes `state/vehicle/<node>`** (latest-wins) on a ~5 s poll that
 //!    doubles as the heartbeat, via [`crate::bus_publish::publish_json`] — exactly
 //!    like the `cloud` worker's mirror publish.
+//! 4. **Drains `action/vehicle/*` control verbs** off the Bus
+//!    ([`VEHICLE_ACTION_PREFIX`]) and answers each on `reply/<ulid>` with a
+//!    [`VehicleReply`] — `get-config` (a READ that pulls a committed oMG config
+//!    file over SSH) and `reboot` (a destructive MUTATION, typed-armed on the
+//!    gateway ESN + audited). Only a node WITH a gateway (`MDE_VEHICLE_GATEWAY`
+//!    set) drains; every other node idles and ignores the queue.
 //!
 //! ## Config (env for now; mde-seal later)
 //! - `MDE_VEHICLE_GATEWAY` — the gateway endpoint, an IP or `ip:sshport`. **When
@@ -34,6 +40,7 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
@@ -41,8 +48,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::vehicle::{
-    parse_gpgga, vehicle_state_topic, GpsFix, ImuSample, VehicleState, VehicleTelem, WanStatus,
+    parse_gpgga, vehicle_state_topic, CellLink, GpsFix, ImuSample, VehicleReply, VehicleState,
+    VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
 };
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
+use mde_bus::rpc::reply_topic;
+use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
 
@@ -91,6 +103,15 @@ pub trait VehicleProbe: Send + Sync {
     /// # Errors
     /// The HTTP transport's failure.
     fn read_lci_wan(&self) -> io::Result<String>;
+
+    /// Run an arbitrary command on the gateway over SSH, returning its stdout — the
+    /// seam the `action/vehicle/*` control verbs (`get-config` / `reboot`) shell
+    /// through. Real: the same legacy-crypto SSH as [`Self::read_gps_nmea`]; tests
+    /// inject a canned response + record the invocation.
+    ///
+    /// # Errors
+    /// The SSH transport's failure (host unreachable / `sshpass` absent / auth).
+    fn run_ssh(&self, cmd: &str) -> io::Result<String>;
 }
 
 /// The production probe: shells `sshpass`/`ssh` for the NMEA blob and `curl` for the
@@ -174,15 +195,14 @@ impl SshHttpProbe {
         // 3) the authed page fetch.
         Self::curl(&["-s", "-b", &jar_str, &page])
     }
-}
 
-impl VehicleProbe for SshHttpProbe {
-    fn read_gps_nmea(&self) -> io::Result<String> {
+    /// Run `remote_cmd` on the gateway over SSH, returning stdout. The oMG SSH host
+    /// runs legacy crypto — hence the explicit `+ssh-rsa` / `group1` / `aes128-cbc`
+    /// allowances (a modern OpenSSH refuses it otherwise). Shared by
+    /// [`VehicleProbe::read_gps_nmea`] and [`VehicleProbe::run_ssh`].
+    fn ssh(&self, remote_cmd: &str) -> io::Result<String> {
         let port = self.ssh_port.to_string();
         let target = format!("root@{}", self.ip);
-        let remote_cmd = format!("cat {GPS_INFO_PATH}");
-        // The oMG SSH host runs legacy crypto — hence the explicit +ssh-rsa /
-        // group1 / aes128-cbc allowances (a modern OpenSSH refuses it otherwise).
         let out = Command::new("sshpass")
             .args([
                 "-p",
@@ -203,7 +223,7 @@ impl VehicleProbe for SshHttpProbe {
                 "-o",
                 "Ciphers=+aes128-cbc,3des-cbc",
                 &target,
-                &remote_cmd,
+                remote_cmd,
             ])
             .output()?;
         if !out.status.success() {
@@ -218,6 +238,12 @@ impl VehicleProbe for SshHttpProbe {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+}
+
+impl VehicleProbe for SshHttpProbe {
+    fn read_gps_nmea(&self) -> io::Result<String> {
+        self.ssh(&format!("cat {GPS_INFO_PATH}"))
+    }
 
     fn read_lci_general(&self) -> io::Result<String> {
         self.http_authed_get(LCI_GENERAL_URL)
@@ -225,6 +251,10 @@ impl VehicleProbe for SshHttpProbe {
 
     fn read_lci_wan(&self) -> io::Result<String> {
         self.http_authed_get(LCI_WAN_URL)
+    }
+
+    fn run_ssh(&self, cmd: &str) -> io::Result<String> {
+        self.ssh(cmd)
     }
 }
 
@@ -253,9 +283,12 @@ pub struct VehicleWorker {
     /// The transport seam (production [`SshHttpProbe`]). `None` ⇒ no
     /// `MDE_VEHICLE_GATEWAY` configured ⇒ the worker idles (publishes nothing).
     probe: Option<Arc<dyn VehicleProbe>>,
-    /// The Bus root the mirror publish targets (`None` ⇒ publish is a swallowed
-    /// no-op — a pre-RPM dev box / a test).
+    /// The Bus root the mirror publish targets + the `action/vehicle/*` drain reads
+    /// (`None` ⇒ publish/drain is a swallowed no-op — a pre-RPM dev box / a test).
     bus_root: Option<PathBuf>,
+    /// The hash-chain audit DB (a performed `reboot` audits here — mirrors the
+    /// `cloud` worker's destructive-op audit).
+    db_path: PathBuf,
     /// Poll + heartbeat cadence.
     poll: Duration,
 }
@@ -274,6 +307,7 @@ impl VehicleWorker {
             host,
             probe,
             bus_root: crate::bus_publish::default_bus_root(),
+            db_path: crate::default_db_path(),
             poll: POLL,
         }
     }
@@ -290,6 +324,13 @@ impl VehicleWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
         self.bus_root = root;
+        self
+    }
+
+    /// Override the audit DB path (tests point it at a tempdir).
+    #[must_use]
+    pub fn with_db_path(mut self, p: PathBuf) -> Self {
+        self.db_path = p;
         self
     }
 
@@ -403,6 +444,283 @@ impl VehicleWorker {
             crate::bus_publish::publish_json(&mut persist, &vehicle_state_topic(&self.host), state);
         }
     }
+
+    // ─────────────────────── Phase 4 · action/vehicle/* control drain ───────────────────────
+
+    /// Handle one `action/vehicle/<verb>` request end to end → a typed
+    /// [`VehicleReply`]. A node with no gateway attached (`probe: None`) honestly
+    /// gates every verb (`no gateway on this node`) rather than faking a result; the
+    /// run loop only reaches this on a gateway node (a no-gateway worker idles).
+    #[must_use]
+    pub fn handle(&self, verb_name: &str, body: &str) -> VehicleReply {
+        let Some(verb) = VehicleVerb::from_verb(verb_name) else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(format!("unknown vehicle verb `{verb_name}`")),
+                ..Default::default()
+            };
+        };
+        let Some(probe) = self.probe.clone() else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some("no gateway on this node".to_string()),
+                ..Default::default()
+            };
+        };
+        let body = VehicleActionBody::parse(body);
+        match verb {
+            VehicleVerb::GetConfig => self.handle_get_config(probe.as_ref(), verb_name, &body),
+            VehicleVerb::Reboot => self.handle_reboot(probe.as_ref(), verb_name, &body),
+        }
+    }
+
+    /// `get-config` (READ) — pull a committed oMG config file over SSH
+    /// (`omgconf latest <file>`). `file` MUST be a bare `*.yaml` name (no path
+    /// components / traversal), else an honest rejection.
+    fn handle_get_config(
+        &self,
+        probe: &dyn VehicleProbe,
+        verb_name: &str,
+        body: &VehicleActionBody,
+    ) -> VehicleReply {
+        let Some(file) = body
+            .file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some("`get-config` requires a `file` field in the request body".to_string()),
+                ..Default::default()
+            };
+        };
+        if !is_safe_yaml_name(file) {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(format!(
+                    "`file` must be a bare `*.yaml` name with no path components: `{file}`"
+                )),
+                ..Default::default()
+            };
+        }
+        match probe.run_ssh(&format!("omgconf latest {file}")) {
+            Ok(yaml) => VehicleReply {
+                ok: true,
+                verb: verb_name.to_string(),
+                applied: Some(yaml),
+                ..Default::default()
+            },
+            Err(e) => VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(format!("gateway ssh unavailable: {e}")),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `reboot` (MUTATION, destructive) — typed-armed on the gateway ESN. The body's
+    /// `typed_name` MUST equal the live gateway ESN BEFORE the SSH `reboot` runs;
+    /// otherwise nothing is performed and the reply is honestly gated. A performed
+    /// reboot is audited on the events plane (so `audited: true` is truthful),
+    /// mirroring the `cloud` worker's destructive-op gate + audit.
+    fn handle_reboot(
+        &self,
+        probe: &dyn VehicleProbe,
+        verb_name: &str,
+        body: &VehicleActionBody,
+    ) -> VehicleReply {
+        // Typed-arming: `typed_name` must equal the live gateway ESN.
+        let esn = self.gateway_esn(probe);
+        let typed = body.typed_name.as_deref().map(str::trim).unwrap_or("");
+        let armed = !typed.is_empty() && !esn.is_empty() && typed == esn;
+        if !armed {
+            return VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(
+                    "typed-arm required: `typed_name` must equal the gateway ESN".to_string(),
+                ),
+                ..Default::default()
+            };
+        }
+        match probe.run_ssh("reboot") {
+            Ok(_) => {
+                self.audit_reboot(&esn);
+                VehicleReply {
+                    ok: true,
+                    verb: verb_name.to_string(),
+                    applied: Some("reboot issued".to_string()),
+                    audited: true,
+                    ..Default::default()
+                }
+            }
+            Err(e) => VehicleReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(format!("reboot ssh failed: {e}")),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The live gateway ESN (the reboot typed-arming target) — parsed from the LCI
+    /// general page. Empty when the gateway is unreachable / the page omits it (so a
+    /// reboot can NEVER arm without a confirmed ESN).
+    fn gateway_esn(&self, probe: &dyn VehicleProbe) -> String {
+        probe
+            .read_lci_general()
+            .ok()
+            .map(|h| strip_html(&h))
+            .and_then(|t| find_token_after(&t, "ESN"))
+            .unwrap_or_default()
+    }
+
+    /// Write one hash-chain audit row for a performed `reboot` through the EXISTING
+    /// events plane (best-effort — a store fault is logged, never fatal). Makes the
+    /// reply's `audited: true` truthful. Mirrors [`CloudWorker::audit`].
+    fn audit_reboot(&self, esn: &str) {
+        crate::events::append_and_alert(
+            &self.db_path,
+            &format!("peer:{}", self.host),
+            crate::events::EventKind::AdminAction,
+            serde_json::json!({
+                "action": "vehicle",
+                "verb": "reboot",
+                "host": self.host,
+                "esn": esn,
+            }),
+        );
+    }
+
+    /// Drain every new `action/vehicle/*` request, advance the per-topic cursors, and
+    /// answer each on `reply/<ulid>` with a typed [`VehicleReply`]. Returns `true`
+    /// when any request was handled. A no-bus worker is a swallowed no-op.
+    fn drain_actions(&self, cursors: &mut HashMap<String, String>) -> bool {
+        let Some(root) = self.bus_root.clone() else {
+            return false;
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return false;
+        };
+        let Ok(topics) = persist.list_topics() else {
+            return false;
+        };
+        let mut acted = false;
+        for topic in topics {
+            let Some(verb_name) = topic.strip_prefix(VEHICLE_ACTION_PREFIX) else {
+                continue;
+            };
+            let verb_name = verb_name.to_string();
+            let cursor = cursors.get(&topic).cloned();
+            let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
+                continue;
+            };
+            for msg in msgs {
+                cursors.insert(topic.clone(), msg.ulid.clone());
+                let body = msg.body.as_deref().unwrap_or("{}");
+                let reply = self.handle(&verb_name, body);
+                tracing::info!(
+                    target: "mackesd::vehicle",
+                    ulid = %msg.ulid, verb = %verb_name, ok = reply.ok,
+                    audited = reply.audited, "vehicle action handled"
+                );
+                self.write_reply(&persist, &msg.ulid, &reply);
+                acted = true;
+            }
+        }
+        acted
+    }
+
+    /// Seed each existing `action/vehicle/*` topic's cursor to its newest message so
+    /// a (re)start doesn't replay a backlog of verbs.
+    fn prime_cursors(&self, cursors: &mut HashMap<String, String>) {
+        let Some(root) = self.bus_root.clone() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return;
+        };
+        let Ok(topics) = persist.list_topics() else {
+            return;
+        };
+        for topic in topics {
+            if !topic.starts_with(VEHICLE_ACTION_PREFIX) {
+                continue;
+            }
+            if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
+                cursors.insert(topic, ulid);
+            }
+        }
+    }
+
+    /// Write a typed reply to `reply/<request-ulid>` (best-effort).
+    fn write_reply(&self, persist: &Persist, req_ulid: &str, reply: &VehicleReply) {
+        let body = serde_json::to_string(reply).unwrap_or_default();
+        if let Err(e) = persist.write(&reply_topic(req_ulid), Priority::Default, None, Some(&body))
+        {
+            tracing::warn!(target: "mackesd::vehicle", ulid = %req_ulid, error = %e, "vehicle reply write failed");
+        }
+    }
+}
+
+/// A drained `action/vehicle/<verb>` classified for dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VehicleVerb {
+    /// `get-config` — pull a committed oMG config file over SSH (READ).
+    GetConfig,
+    /// `reboot` — reboot the gateway (MUTATION, destructive; typed-armed on the ESN).
+    Reboot,
+}
+
+impl VehicleVerb {
+    /// Classify a verb token, or `None` for an unrecognized verb (never guessed).
+    fn from_verb(verb: &str) -> Option<Self> {
+        Some(match verb {
+            "get-config" => Self::GetConfig,
+            "reboot" => Self::Reboot,
+            _ => return None,
+        })
+    }
+}
+
+/// The parsed `action/vehicle/*` request body — the fields the verbs read off the
+/// wire JSON. Every field is optional so a legacy `{}` request still parses; each
+/// handler enforces what it actually requires.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VehicleActionBody {
+    /// `get-config`'s target config file (a bare `*.yaml` name).
+    #[serde(default)]
+    file: Option<String>,
+    /// `reboot`'s typed-arming confirmation (must equal the gateway ESN).
+    #[serde(default)]
+    typed_name: Option<String>,
+}
+
+impl VehicleActionBody {
+    /// Parse a request body, degrading a malformed body to an all-empty request
+    /// (the per-verb handlers then honestly reject what they require).
+    fn parse(body: &str) -> Self {
+        serde_json::from_str(body.trim()).unwrap_or_default()
+    }
+}
+
+/// Whether `name` is a safe bare `*.yaml` config-file name — no path components, no
+/// `..` traversal, only sane filename chars. Guards the `get-config` SSH arg.
+fn is_safe_yaml_name(name: &str) -> bool {
+    name.len() > ".yaml".len()
+        && name.ends_with(".yaml")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 #[async_trait::async_trait]
@@ -424,7 +742,12 @@ impl Worker for VehicleWorker {
             shutdown.wait().await;
             return Ok(());
         };
+        // Seed the action cursors so a (re)start doesn't replay a backlog of verbs.
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        self.prime_cursors(&mut cursors);
         loop {
+            // Phase 4 — drain any queued `action/vehicle/*` control verbs first.
+            self.drain_actions(&mut cursors);
             let state = self.build_state(probe.as_ref());
             self.publish(&state);
             tokio::select! {
@@ -483,47 +806,160 @@ fn parse_psiwmmpu(line: &str) -> Option<ImuSample> {
     })
 }
 
-/// TOLERANT WAN-status fold: strip the HTML, then pull the labels we recognize into
-/// [`WanStatus`], recording an honest `gaps` note for every field the page didn't
-/// yield (never a fabricated value, §7). The full per-modem A/B breakdown of the
-/// extended status table is gated on a live captured fixture; the first `dBm`
-/// reading is folded into cellular A as a best-effort signal.
+/// TOLERANT WAN-status fold. Strips the HTML, then parses the extended status table's
+/// per-interface rows: each cellular A/B section yields a full [`CellLink`]
+/// (signal/technology/SIM/carrier/WAN-IP), and the section carrying an `IP Address` is
+/// the active uplink. Degrades to a `gaps` note for anything genuinely absent (never a
+/// fabricated value, §7). The simplified/general format (an explicit `Active WAN` label
+/// + a single `dBm` reading, no per-modem rows) still folds through the fallbacks.
 fn parse_wan(html: &str, gaps: &mut Vec<String>) -> WanStatus {
     let text = strip_html(html);
     let mut wan = WanStatus::default();
 
-    match find_token_after(&text, "Active WAN").or_else(|| find_token_after(&text, "Active Link")) {
-        Some(v) => wan.active_wan = v,
-        None => gaps.push("wan.active_wan not reported".to_string()),
+    // The extended table's per-interface sections (empty on the simplified format).
+    let sections = wan_sections(&text);
+    let section = |label: &str| sections.iter().find(|(l, _)| *l == label).map(|(_, s)| *s);
+
+    // ── Cellular A / B — a full per-modem link when the extended rows are present ──
+    if let Some(s) = section("Cellular A") {
+        wan.cellular_a = parse_cell_link(s);
+    } else {
+        // Simplified format: fold the single dBm reading into cellular A best-effort.
+        match find_signal_dbm(&text) {
+            Some(dbm) => {
+                wan.cellular_a.signal_dbm = dbm;
+                wan.cellular_a.healthy = dbm > -110;
+            }
+            None => gaps.push("wan.cellular_a signal_dbm not reported".to_string()),
+        }
     }
-    match find_token_after(&text, "Wi-Fi").or_else(|| find_token_after(&text, "Wifi")) {
-        Some(v) => wan.wifi_state = v,
-        None => gaps.push("wan.wifi_state not reported".to_string()),
+    if let Some(s) = section("Cellular B") {
+        wan.cellular_b = parse_cell_link(s);
     }
-    match find_token_after(&text, "Ethernet") {
-        Some(v) => wan.ethernet_state = v,
-        None => gaps.push("wan.ethernet_state not reported".to_string()),
+
+    // ── active WAN — the explicit label (simplified) or the IP-bearing section ──
+    if let Some(v) =
+        find_token_after(&text, "Active WAN").or_else(|| find_token_after(&text, "Active Link"))
+    {
+        wan.active_wan = v;
+    } else if let Some((label, _)) = sections.iter().find(|(_, s)| s.contains("IP Address")) {
+        wan.active_wan = (*label).to_string();
+    } else {
+        gaps.push("wan.active_wan not reported".to_string());
+    }
+
+    // ── Ethernet / Wi-Fi state — derived from their extended section (active vs a
+    // present-but-backup standby), else the simplified label, else a gap ──
+    match section("Ethernet") {
+        Some(_) => {
+            wan.ethernet_state = if wan.active_wan == "Ethernet" {
+                "active".to_string()
+            } else {
+                "standby".to_string()
+            };
+        }
+        None => match find_token_after(&text, "Ethernet") {
+            Some(v) => wan.ethernet_state = v,
+            None => gaps.push("wan.ethernet_state not reported".to_string()),
+        },
+    }
+    match section("WiFi") {
+        Some(_) => {
+            wan.wifi_state = if wan.active_wan == "WiFi" {
+                "active".to_string()
+            } else {
+                "standby".to_string()
+            };
+        }
+        None => {
+            match find_token_after(&text, "Wi-Fi").or_else(|| find_token_after(&text, "Wifi")) {
+                Some(v) => wan.wifi_state = v,
+                None => gaps.push("wan.wifi_state not reported".to_string()),
+            }
+        }
     }
     match find_token_after(&text, "VPN") {
         Some(v) => wan.vpn_state = v,
         None => gaps.push("wan.vpn_state not reported".to_string()),
     }
-    match find_signal_dbm(&text) {
-        Some(dbm) => {
-            wan.cellular_a.signal_dbm = dbm;
-            wan.cellular_a.healthy = dbm > -100;
-        }
-        None => gaps.push("wan.cellular signal_dbm not reported".to_string()),
-    }
-    // The structured per-modem carrier/technology/sim-state + the B-modem split need
-    // the extended status table's row structure — honestly gapped until a live
-    // wan-status fixture pins the parse (§7 honest-partial, never fabricated).
-    gaps.push(
-        "wan: per-modem carrier/technology/sim-state + B-modem not yet parsed (needs live \
-         wan-status fixture)"
-            .to_string(),
-    );
     wan
+}
+
+/// The extended WAN table's per-interface section markers: `(section-label, needle)`.
+/// Each WAN row starts with a device descriptor carrying one of these needles (e.g.
+/// `... (Cellular A)`, `Panel Ethernet 5`, `... PCIe WiFi A`).
+const WAN_SECTION_MARKERS: &[(&str, &str)] = &[
+    ("Cellular A", "Cellular A"),
+    ("Cellular B", "Cellular B"),
+    ("Ethernet", "Panel Ethernet"),
+    ("WiFi", "WiFi A"),
+];
+
+/// Slice the stripped WAN text into per-interface sections (document order). Each
+/// section runs from its marker to the start of the next present marker, so a label
+/// scan within a section stays scoped to that one interface's row.
+fn wan_sections(text: &str) -> Vec<(&'static str, &str)> {
+    let mut found: Vec<(&'static str, usize)> = WAN_SECTION_MARKERS
+        .iter()
+        .filter_map(|(label, needle)| text.find(needle).map(|i| (*label, i)))
+        .collect();
+    found.sort_by_key(|&(_, i)| i);
+    let mut out = Vec::with_capacity(found.len());
+    for k in 0..found.len() {
+        let (label, start) = found[k];
+        let end = found.get(k + 1).map_or(text.len(), |&(_, i)| i);
+        out.push((label, &text[start..end]));
+    }
+    out
+}
+
+/// Fold one cellular section (scoped to a single modem's extended row) into a
+/// [`CellLink`]: the primary RSSI dBm, the RAT, the SIM presence, the carrier, and
+/// the WAN IP (present ⇒ this modem is the active uplink). Honest defaults for
+/// anything the section omits.
+fn parse_cell_link(section: &str) -> CellLink {
+    let signal_dbm = rssi_dbm_in(section).unwrap_or(0);
+    let sim_present = find_token_after(section, "SIM ID").is_some();
+    let sim_state = if sim_present { "ready" } else { "absent" }.to_string();
+    let carrier = find_token_after(section, "Carrier PRI ID").unwrap_or_default();
+    let technology = if section.contains("5G") {
+        "5G"
+    } else if section.contains("LTE") {
+        "LTE"
+    } else {
+        ""
+    }
+    .to_string();
+    let wan_ip =
+        find_token_after(section, "IP Address").unwrap_or_else(|| "not active".to_string());
+    let healthy = signal_dbm > -110 && sim_present;
+    CellLink {
+        sim_state,
+        carrier,
+        signal_dbm,
+        technology,
+        wan_ip,
+        healthy,
+    }
+}
+
+/// The primary RSSI reading (dBm) in a cellular section: the FIRST `dBm` value after
+/// the `RSSI` label, e.g. `RSSI  -98.0dBm / -102.0dBm` ⇒ `-98`. Parses the leading
+/// signed (possibly-decimal) number before `dBm`, truncated to a whole dBm. `None`
+/// when the section has no `RSSI` reading.
+fn rssi_dbm_in(section: &str) -> Option<i32> {
+    let rssi = section.find("RSSI")?;
+    let after = &section[rssi..];
+    let dbm = after.find("dBm")?;
+    let prefix = &after[..dbm];
+    // Walk back over the trailing float run (digits, one '.', a leading '-').
+    let tail: String = prefix
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    let num: String = tail.chars().rev().collect();
+    num.trim().parse::<f32>().ok().map(|f| f as i32)
 }
 
 // ─────────────────────────── tolerant HTML extractors ───────────────────────────
@@ -621,14 +1057,35 @@ pub(crate) fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    /// A scripted fake probe: each read yields a canned `Ok(text)` or `Err(msg)`.
-    /// (`Result<String, String>` is `Clone`, unlike `io::Result`, so the fixtures
-    /// are reusable across the per-read calls `build_state` makes.)
+    /// The canned `omgconf latest <file>` YAML the fake SSH seam returns for
+    /// `get-config`.
+    const FAKE_YAML: &str = "gateway:\n  mode: failover\nwan:\n  primary: cellular-a\n";
+
+    /// The extended MG-LCI `wan/status` structure (tags already stripped, per the
+    /// live layout): a per-modem A/B cellular table + a panel-ethernet + a Wi-Fi row.
+    /// Cellular A carries the `IP Address` (the active uplink); B is SIM-ready but
+    /// idle. Fed straight through `strip_html` (a no-op on tag-free text).
+    const WAN_EXTENDED: &str = "\
+Sierra Wireless EM75XX @ MiniCard USB3 CA (Cellular A)   Cellular   IP Address 100.65.12.34   \
+Cellular Info   SIM ID 8901410123456789012   LTE   Band Number 4   Bandwidth 20MHz   \
+RSSI  -98.0dBm / -102.0dBm   RSRP  -123.0dBm / -131.0dBm   Carrier PRI ID 9990198   LTE   \
+Panel Ethernet 5   Ethernet   Standby   \
+Sierra Wireless EM75XX @ MiniCard USB3 CB (Cellular B)   Cellular   Cellular Info   \
+SIM ID 8901410987654321098   RSSI  -105.0dBm / -110.0dBm   Carrier PRI ID 9990199   LTE   \
+WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
+
+    /// A scripted fake probe: each read yields a canned `Ok(text)` or `Err(msg)`, and
+    /// `run_ssh` returns [`Self::ssh_out`] while recording the command in
+    /// [`Self::ssh_calls`] (shared through the `Arc` across clones, so a test asserts
+    /// what ran). (`Result<String, String>` is `Clone`, unlike `io::Result`, so the
+    /// fixtures are reusable across the per-read calls `build_state` makes.)
     #[derive(Clone)]
     struct FakeProbe {
         nmea: Result<String, String>,
         general: Result<String, String>,
         wan: Result<String, String>,
+        ssh_out: Result<String, String>,
+        ssh_calls: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeProbe {
@@ -658,7 +1115,14 @@ mod tests {
                 nmea: Ok(nmea),
                 general: Ok(general),
                 wan: Ok(wan),
+                ssh_out: Ok(FAKE_YAML.to_string()),
+                ssh_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        /// The commands `run_ssh` has been asked to run (a shared, clone-stable log).
+        fn ssh_calls(&self) -> Vec<String> {
+            self.ssh_calls.lock().unwrap().clone()
         }
     }
 
@@ -676,6 +1140,10 @@ mod tests {
         }
         fn read_lci_wan(&self) -> io::Result<String> {
             to_io(&self.wan)
+        }
+        fn run_ssh(&self, cmd: &str) -> io::Result<String> {
+            self.ssh_calls.lock().unwrap().push(cmd.to_string());
+            to_io(&self.ssh_out)
         }
     }
 
@@ -840,5 +1308,193 @@ mod tests {
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "the idle worker still exits promptly");
         assert!(joined.unwrap().expect("join").is_ok());
+    }
+
+    // ─────────────────────── Change 1 · per-modem cellular A/B parser ───────────────────────
+
+    #[test]
+    fn parses_per_modem_cellular_a_b_from_extended_wan_status() {
+        let probe = FakeProbe {
+            wan: Ok(WAN_EXTENDED.to_string()),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        // Cellular A — the active modem (carries the WAN IP).
+        assert_eq!(state.wan.cellular_a.signal_dbm, -98, "primary RSSI dBm");
+        assert_eq!(state.wan.cellular_a.technology, "LTE");
+        assert_eq!(state.wan.cellular_a.sim_state, "ready");
+        assert_eq!(state.wan.cellular_a.carrier, "9990198");
+        assert_eq!(state.wan.cellular_a.wan_ip, "100.65.12.34");
+        assert!(state.wan.cellular_a.healthy, "-98 dBm + SIM ⇒ healthy");
+
+        // Cellular B — SIM-ready but idle (no IP Address ⇒ not active).
+        assert_eq!(state.wan.cellular_b.signal_dbm, -105);
+        assert_eq!(state.wan.cellular_b.sim_state, "ready");
+        assert_eq!(state.wan.cellular_b.wan_ip, "not active");
+
+        // The active WAN is derived from the IP-bearing section.
+        assert_eq!(state.wan.active_wan, "Cellular A");
+        assert_eq!(state.wan.active_cellular().map(|c| c.signal_dbm), Some(-98));
+
+        // The now-satisfied "per-modem … not yet parsed" gap is gone.
+        assert!(
+            !state.gaps.iter().any(|g| g.contains("not yet parsed")),
+            "stale per-modem gap removed: {:?}",
+            state.gaps
+        );
+    }
+
+    #[test]
+    fn old_simplified_wan_fixture_still_folds_through_the_fallback() {
+        // The simplified format (explicit `Active WAN` + a single `Signal … dBm`)
+        // has no per-modem rows — it must still fold through the fallbacks.
+        let state = worker().build_state(&FakeProbe::real());
+        assert_eq!(state.wan.active_wan, "CellularA");
+        assert_eq!(state.wan.cellular_a.signal_dbm, -72);
+        assert_eq!(state.wan.vpn_state, "Connected");
+        assert_eq!(state.wan.ethernet_state, "Down");
+        assert_eq!(state.wan.wifi_state, "Disabled");
+    }
+
+    // ─────────────────────── Change 2 · action/vehicle/* control drain ───────────────────────
+
+    #[test]
+    fn get_config_returns_the_committed_yaml_over_ssh() {
+        let fake = FakeProbe::real();
+        let w = worker().with_probe(Arc::new(fake.clone()));
+        let reply = w.handle("get-config", r#"{"file":"wan.yaml"}"#);
+        assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
+        assert_eq!(reply.applied.as_deref(), Some(FAKE_YAML));
+        assert_eq!(fake.ssh_calls().as_slice(), &["omgconf latest wan.yaml"]);
+    }
+
+    #[test]
+    fn get_config_rejects_a_non_bare_yaml_or_path_traversal() {
+        let fake = FakeProbe::real();
+        let w = worker().with_probe(Arc::new(fake.clone()));
+        for bad in [
+            "../etc/passwd.yaml",
+            "/etc/wan.yaml",
+            "sub/wan.yaml",
+            "wan.txt",
+            "wan",
+            "..yaml",
+        ] {
+            let reply = w.handle("get-config", &format!(r#"{{"file":"{bad}"}}"#));
+            assert!(!reply.ok, "`{bad}` must be rejected");
+            assert!(reply.error.is_some(), "`{bad}` is an honest error");
+        }
+        // A missing `file` is an honest error, too.
+        assert!(!w.handle("get-config", "{}").ok);
+        // Nothing was ever shelled for the rejected inputs.
+        assert!(fake.ssh_calls().is_empty(), "no rejected input reached ssh");
+    }
+
+    #[test]
+    fn reboot_without_typed_name_is_gated_and_runs_no_ssh() {
+        let fake = FakeProbe::real();
+        let w = worker().with_probe(Arc::new(fake.clone()));
+        let reply = w.handle("reboot", "{}");
+        assert!(!reply.ok);
+        assert!(
+            reply.gated.unwrap().contains("typed-arm"),
+            "a bare reboot is typed-arm gated"
+        );
+        assert!(!reply.audited);
+        assert!(fake.ssh_calls().is_empty(), "a gated reboot never runs ssh");
+    }
+
+    #[test]
+    fn reboot_with_the_wrong_typed_name_is_gated() {
+        let fake = FakeProbe::real();
+        let w = worker().with_probe(Arc::new(fake.clone()));
+        // A typed_name that is NOT the gateway ESN does not arm.
+        let reply = w.handle("reboot", r#"{"typed_name":"reboot"}"#);
+        assert!(!reply.ok);
+        assert!(reply.gated.unwrap().contains("typed-arm"));
+        assert!(fake.ssh_calls().is_empty());
+    }
+
+    #[test]
+    fn reboot_with_the_correct_esn_performs_and_audits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeProbe::real();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_db_path(tmp.path().join("events.sqlite"));
+        // The FakeProbe general.html reports ESN ND84720078011035.
+        let reply = w.handle("reboot", r#"{"typed_name":"ND84720078011035"}"#);
+        assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
+        assert!(reply.audited, "a performed reboot is audited");
+        assert_eq!(reply.applied.as_deref(), Some("reboot issued"));
+        assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+    }
+
+    #[test]
+    fn verbs_gate_when_this_node_has_no_gateway() {
+        let mut w = worker();
+        w.probe = None; // the MDE_VEHICLE_GATEWAY-unset node.
+        let reply = w.handle("get-config", r#"{"file":"wan.yaml"}"#);
+        assert!(!reply.ok);
+        assert!(reply.gated.unwrap().contains("no gateway on this node"));
+    }
+
+    #[test]
+    fn an_unknown_verb_is_an_honest_error() {
+        let w = worker().with_probe(Arc::new(FakeProbe::real()));
+        let reply = w.handle("frobnicate", "{}");
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("unknown vehicle verb"));
+    }
+
+    #[tokio::test]
+    async fn drain_answers_get_config_on_the_reply_topic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().to_path_buf();
+        let persist = Persist::open(bus.clone()).unwrap();
+        let req = persist
+            .write(
+                "action/vehicle/get-config",
+                Priority::Default,
+                None,
+                Some(r#"{"file":"wan.yaml"}"#),
+            )
+            .unwrap();
+        let w = worker()
+            .with_probe(Arc::new(FakeProbe::real()))
+            .with_bus_root(Some(bus.clone()));
+        let mut cursors = HashMap::new();
+        assert!(w.drain_actions(&mut cursors), "the gateway node acted");
+        let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
+        assert_eq!(replies.len(), 1, "exactly one reply");
+        let reply: VehicleReply =
+            serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
+        assert!(reply.ok);
+        assert_eq!(reply.applied.as_deref(), Some(FAKE_YAML));
+    }
+
+    #[tokio::test]
+    async fn prime_cursors_skips_the_backlog_so_a_restart_does_not_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().to_path_buf();
+        let persist = Persist::open(bus.clone()).unwrap();
+        persist
+            .write(
+                "action/vehicle/get-config",
+                Priority::Default,
+                None,
+                Some(r#"{"file":"wan.yaml"}"#),
+            )
+            .unwrap();
+        let w = worker()
+            .with_probe(Arc::new(FakeProbe::real()))
+            .with_bus_root(Some(bus.clone()));
+        let mut cursors = HashMap::new();
+        w.prime_cursors(&mut cursors);
+        assert!(
+            !w.drain_actions(&mut cursors),
+            "the backlog is not replayed after prime"
+        );
     }
 }
