@@ -60,37 +60,52 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         .show(ui, |ui| {
             header(ui, state);
             ui.add_space(Style::SP_S);
-            ui.horizontal(|ui| {
-                tab_rail(ui, state);
-                ui.add_space(Style::SP_M);
-                egui::Frame::NONE
-                    .fill(Style::LAYER_01)
-                    .inner_margin(Style::SP_M)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt(("maps-location-tab", state.active))
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| match state.active {
-                                WorkspaceTab::Drive => show_drive(ui, state),
-                                WorkspaceTab::Map => show_map(ui, state),
-                                WorkspaceTab::RoutesTrips => show_routes_trips(ui, state),
-                                WorkspaceTab::Vehicle => show_vehicle(ui, &state.vehicle),
-                                WorkspaceTab::Connectivity => show_connectivity(ui, &state.mg90),
-                                WorkspaceTab::DevicesIo => show_devices_io(ui, &mut state.devices),
-                                WorkspaceTab::LocationSources => {
-                                    show_location_sources(ui, &mut state.locations)
-                                }
-                                WorkspaceTab::Mg90Setup => {
-                                    show_mg90_setup(ui, &mut state.mg90, &state.offline_maps)
-                                }
-                                WorkspaceTab::Mg90Settings => show_mg90_settings(ui, state),
-                                WorkspaceTab::FirmwareRecovery => {
-                                    show_firmware_recovery(ui, &state.firmware, &state.devices)
-                                }
-                                WorkspaceTab::Simulator => show_simulator(ui, state),
-                            });
-                    });
-            });
+            // Bind the tab-rail + content row to the FULL remaining height. A bare
+            // `ui.horizontal` sizes to content, and a vertical ScrollArea nested in
+            // an unbounded-height layout collapses its viewport — which starved the
+            // full-bleed Drive HUD down to a top strip (only the banner visible; the
+            // FABs / ETA sheet / speedometer fell below the fold). Allocating the
+            // exact remaining size gives the HUD the whole screen.
+            let content_size = ui.available_size();
+            ui.allocate_ui_with_layout(
+                content_size,
+                egui::Layout::left_to_right(egui::Align::TOP),
+                |ui| {
+                    tab_rail(ui, state);
+                    ui.add_space(Style::SP_M);
+                    egui::Frame::NONE
+                        .fill(Style::LAYER_01)
+                        .inner_margin(Style::SP_M)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("maps-location-tab", state.active))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| match state.active {
+                                    WorkspaceTab::Drive => show_drive(ui, state),
+                                    WorkspaceTab::Map => show_map(ui, state),
+                                    WorkspaceTab::RoutesTrips => show_routes_trips(ui, state),
+                                    WorkspaceTab::Vehicle => show_vehicle(ui, &state.vehicle),
+                                    WorkspaceTab::Connectivity => {
+                                        show_connectivity(ui, &state.mg90)
+                                    }
+                                    WorkspaceTab::DevicesIo => {
+                                        show_devices_io(ui, &mut state.devices)
+                                    }
+                                    WorkspaceTab::LocationSources => {
+                                        show_location_sources(ui, &mut state.locations)
+                                    }
+                                    WorkspaceTab::Mg90Setup => {
+                                        show_mg90_setup(ui, &mut state.mg90, &state.offline_maps)
+                                    }
+                                    WorkspaceTab::Mg90Settings => show_mg90_settings(ui, state),
+                                    WorkspaceTab::FirmwareRecovery => {
+                                        show_firmware_recovery(ui, &state.firmware, &state.devices)
+                                    }
+                                    WorkspaceTab::Simulator => show_simulator(ui, state),
+                                });
+                        });
+                },
+            );
         });
 }
 
