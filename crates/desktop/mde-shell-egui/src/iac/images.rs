@@ -9,17 +9,25 @@
 //! and `promote` re-verifies that hash before marking a version the active base.
 //!
 //! This lens emits the [`VERB_IMAGE_BUILD`] verb through the cockpit's preserved
-//! emit path (the same `issue` seam the provision lens uses); a live build/promote
-//! is armed-token gated on the placement node, so an un-armed request stages / plans
-//! honestly rather than performing. The roster itself is sourced from the
-//! `image-build` / `list` reply, but the shell's `CloudReply` mirror does not decode
-//! the [`ImageRow`] list yet — so the roster reads an honest "pending backend
-//! decode" note (never fabricated rows, §7) until that decode lands.
+//! emit path (the same `issue` seam the provision lens uses) for `build` /
+//! `promote`; a live build/promote is armed-token gated on the placement node, so
+//! an un-armed request stages / plans honestly rather than performing.
+//!
+//! The roster itself is sourced from the `image-build` `list` reply. Because the
+//! shell's lean mutation mirror (this crate's own `CloudReply`) deliberately
+//! drops the rich `images` payload, `list` runs through a small self-contained
+//! resolve lane here (mirroring `configure.rs`'s inventory/outputs lane): it
+//! fetches the full-payload wire [`WireCloudReply`] once on first entry, the
+//! operator drives Refresh after, and the roster reads honestly — an empty list
+//! is a real "not resolved yet", never fabricated (§7).
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::{carbon_icon, Style};
 
-use mackes_mesh_types::cloud::{DeliveryType, VERB_IMAGE_BUILD};
+use mackes_mesh_types::cloud::{
+    CloudReply as WireCloudReply, DeliveryType, ImageRow, VERB_IMAGE_BUILD,
+};
+use mde_bus::rpc::reply_topic;
 
 use super::WorkloadsState;
 
@@ -34,7 +42,8 @@ const BUILDABLE: [DeliveryType; 4] = [
 ];
 
 /// The Images lens's own state (U19 owns its fields): the delivery type the build
-/// controls target plus the optional name / version overrides.
+/// controls target plus the optional name / version overrides, and the
+/// self-contained roster-resolve lane.
 #[derive(Debug)]
 pub(super) struct State {
     /// The delivery type whose golden image the build / promote controls act on.
@@ -44,6 +53,19 @@ pub(super) struct State {
     name: String,
     /// An optional version; blank ⇒ `latest` (build) / the resolved default.
     version: String,
+    /// The resolved golden-image roster (the `image-build` `list` reply's
+    /// `images` payload) for the selected delivery type. Empty until a resolve
+    /// lands — an honest "not resolved yet", never fabricated (§7).
+    roster: Vec<ImageRow>,
+    /// The in-flight roster `list` READ, if any (its reply resolves
+    /// [`Self::roster`]).
+    roster_req: Option<super::Pending>,
+    /// An honest one-line resolve status (resolving / N image(s) / gated /
+    /// failed) — the READ lane is never a silent op.
+    status: Option<String>,
+    /// Whether the first-entry auto-resolve has fired (fetch once on entry, then
+    /// the operator drives Refresh — a live panel never re-emits every frame).
+    requested: bool,
 }
 
 impl Default for State {
@@ -52,6 +74,10 @@ impl Default for State {
             dtype: DeliveryType::DesktopVm,
             name: String::new(),
             version: String::new(),
+            roster: Vec::new(),
+            roster_req: None,
+            status: None,
+            requested: false,
         }
     }
 }
@@ -79,34 +105,116 @@ fn build_request_body(
 
 /// Render the Images lens.
 pub(super) fn images_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    // A live panel resolves its roster on first entry; the operator drives
+    // Refresh after (fetch once, never re-emit every frame).
+    if !state.images.requested {
+        state.images.requested = true;
+        resolve(state);
+    }
+    advance(state);
+    if state.images.roster_req.is_some() {
+        ui.ctx().request_repaint_after(super::POLL_REPAINT);
+    }
+
     header(ui);
     ui.add_space(Style::SP_S);
 
     if let Some(action) = build_controls(ui, state) {
-        // Snapshot the request inputs (owned) so the immutable field borrows end
-        // before the mutable emit seam runs.
-        let node = state
-            .selected_node()
-            .map(str::to_string)
-            .unwrap_or_default();
-        let dtype = state.images.dtype;
-        let body = build_request_body(
-            action,
-            dtype,
-            &state.images.name,
-            &state.images.version,
-            &node,
-        );
-        let label = match action {
-            "list" => "golden-image roster refresh".to_string(),
-            "promote" => format!("promote golden image for {}", dtype.label()),
-            _ => format!("golden image build for {}", dtype.label()),
-        };
-        state.issue(VERB_IMAGE_BUILD, Some(&body), &label);
+        if action == "list" {
+            // The roster read runs through its own self-contained resolve lane
+            // (never the shared mutation seam) so it can decode the rich
+            // full-payload wire reply.
+            resolve(state);
+        } else {
+            // Snapshot the request inputs (owned) so the immutable field borrows
+            // end before the mutable emit seam runs.
+            let node = state
+                .selected_node()
+                .map(str::to_string)
+                .unwrap_or_default();
+            let dtype = state.images.dtype;
+            let body = build_request_body(
+                action,
+                dtype,
+                &state.images.name,
+                &state.images.version,
+                &node,
+            );
+            let label = if action == "promote" {
+                format!("promote golden image for {}", dtype.label())
+            } else {
+                format!("golden image build for {}", dtype.label())
+            };
+            state.issue(VERB_IMAGE_BUILD, Some(&body), &label);
+        }
     }
 
     ui.add_space(Style::SP_S);
-    image_roster(ui);
+    image_roster(ui, state);
+}
+
+/// Issue the `image-build` `list` READ for the selected delivery type, tracking
+/// its reply — an honest resolve (never fabricated rows). A missing Bus degrades
+/// to an honest status, never a panic (§7).
+fn resolve(state: &mut WorkloadsState) {
+    let node = state
+        .selected_node()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let body = build_request_body("list", state.images.dtype, "", "", &node);
+    match state.publish(VERB_IMAGE_BUILD, Some(&body)) {
+        Ok(pending) => {
+            state.images.roster_req = Some(pending);
+            state.images.status = Some("Resolving the golden-image roster\u{2026}".to_string());
+        }
+        Err(e) => {
+            state.images.status = Some(format!("Could not request the image roster: {e}"));
+        }
+    }
+}
+
+/// Advance the in-flight roster READ into its resolved rows + honest status (or
+/// an honest timeout). Called each frame the lens is shown.
+fn advance(state: &mut WorkloadsState) {
+    let Some((ulid, sent)) = state
+        .images
+        .roster_req
+        .as_ref()
+        .map(|p| (p.ulid.clone(), p.sent))
+    else {
+        return;
+    };
+    if let Some(reply) = read_reply(state, &ulid) {
+        state.images.roster_req = None;
+        if let Some(rows) = reply.images {
+            state.images.status = Some(format!("Resolved {} golden image(s).", rows.len()));
+            state.images.roster = rows;
+        } else if let Some(gated) = reply.gated {
+            state.images.status = Some(format!("Image roster staged/gated: {gated}"));
+        } else if let Some(error) = reply.error {
+            state.images.status = Some(format!("Image roster resolve failed: {error}"));
+        } else {
+            state.images.status = Some("The image-build verb returned no images.".to_string());
+        }
+    } else if sent.elapsed() >= super::REQUEST_TIMEOUT {
+        state.images.roster_req = None;
+        state.images.status = Some(
+            "The cloud backend did not answer the image roster request \u{2014} it may not be \
+             running on any reachable node."
+                .to_string(),
+        );
+    }
+}
+
+/// Read the wire cloud reply on `reply/<ulid>` off the Bus, if one has landed —
+/// the full-payload [`WireCloudReply`] (carrying `images`), which the shell's own
+/// lean mutation mirror deliberately drops. Returns owned data so the immutable
+/// Bus borrow ends before the caller writes the result back.
+fn read_reply(state: &WorkloadsState, ulid: &str) -> Option<WireCloudReply> {
+    let persist = state.persist()?;
+    let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
+    let body = msgs.first()?.body.as_deref()?;
+    serde_json::from_str(body).ok()
 }
 
 /// The lens header card — the Workloads-accent glyph, the title, and the honest
@@ -231,11 +339,10 @@ fn build_controls(ui: &mut egui::Ui, state: &mut WorkloadsState) -> Option<&'sta
     action
 }
 
-/// The image-roster card. The `image-build` / `list` reply carries the golden-image
-/// rows, but the shell's `CloudReply` mirror does not decode the `ImageRow` list
-/// yet, so this reads an honest "pending backend decode" note rather than
-/// fabricating rows (§7).
-fn image_roster(ui: &mut egui::Ui) {
+/// The image-roster card — the resolved `image-build` `list` reply's rows (name
+/// · SHA256 · promoted), plus the honest resolve status. An empty roster after a
+/// real resolve reads honestly; nothing here is fabricated (§7).
+fn image_roster(ui: &mut egui::Ui, state: &WorkloadsState) {
     mde_egui::card().show(ui, |ui| {
         ui.label(
             RichText::new("Image roster")
@@ -243,14 +350,67 @@ fn image_roster(ui: &mut egui::Ui) {
                 .strong()
                 .color(Style::TEXT),
         );
-        mde_egui::muted_note(
-            ui,
-            "Roster pending backend decode \u{2014} the image-build / list reply carries the \
-             golden-image rows (name \u{00B7} SHA256 \u{00B7} promoted), but the shell's reply \
-             mirror does not decode the ImageRow list yet. Rows appear once that decode lands; \
-             nothing is fabricated here. Promoted images wear a success badge when they render.",
-        );
+        if let Some(status) = &state.images.status {
+            mde_egui::muted_note(ui, status.clone());
+        }
+        if state.images.roster.is_empty() {
+            if state.images.roster_req.is_none() {
+                mde_egui::muted_note(
+                    ui,
+                    "No golden images resolved yet \u{2014} Refresh roster to fetch the \
+                     airgap-lane image list for this delivery type.",
+                );
+            }
+        } else {
+            for row in &state.images.roster {
+                image_row(ui, row);
+            }
+        }
     });
+}
+
+/// One resolved golden-image row — the name, a shortened SHA256, and a
+/// success-badge dot + word when it's the promoted (active-base) version.
+fn image_row(ui: &mut egui::Ui, row: &ImageRow) {
+    mde_egui::inset().show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(&row.name)
+                    .size(Style::BODY)
+                    .strong()
+                    .color(Style::TEXT),
+            );
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new(sha_short(&row.sha256))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_S);
+            if row.promoted {
+                mde_egui::status_dot(ui, Style::SUPPORT_SUCCESS);
+                ui.colored_label(
+                    Style::SUPPORT_SUCCESS,
+                    RichText::new("promoted").size(Style::SMALL).strong(),
+                );
+            } else {
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new("not promoted").size(Style::SMALL),
+                );
+            }
+        });
+    });
+    ui.add_space(Style::SP_XS);
+}
+
+/// A SHA256 shown short (its first 12 hex chars + an ellipsis) — the full-length
+/// hex wraps ugly in a compact row; the full value still lives in [`ImageRow`].
+fn sha_short(sha: &str) -> String {
+    match sha.get(..12) {
+        Some(head) => format!("{head}\u{2026}"),
+        None => sha.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +433,104 @@ mod tests {
         // A ServiceContainer ships via container-deploy, not image-build.
         assert!(!BUILDABLE.contains(&DeliveryType::ServiceContainer));
         assert_eq!(BUILDABLE.len(), 4);
+    }
+
+    #[test]
+    fn a_wire_reply_with_images_decodes_into_rows() {
+        let body = serde_json::json!({
+            "ok": true,
+            "verb": "image-build",
+            "images": [
+                {
+                    "name": "desktop_vm-golden",
+                    "sha256": "abc123def456789000000000000000000000000000000000000000000000",
+                    "promoted": true
+                },
+                {
+                    "name": "desktop_vm-golden",
+                    "sha256": "999888777666000000000000000000000000000000000000000000000000",
+                    "promoted": false
+                }
+            ]
+        })
+        .to_string();
+        let reply: WireCloudReply = serde_json::from_str(&body).expect("the wire reply parses");
+        let rows = reply.images.expect("the images payload decodes");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "desktop_vm-golden");
+        assert!(rows[0].promoted);
+        assert!(!rows[1].promoted);
+    }
+
+    #[test]
+    fn the_roster_renders_the_decoded_rows_never_the_pending_decode_note() {
+        let mut state = WorkloadsState::default();
+        state.images.roster = vec![
+            ImageRow {
+                name: "desktop_vm-golden".to_string(),
+                sha256: "abc123def456789000000000000000000000000000000000000000000000".to_string(),
+                promoted: true,
+            },
+            ImageRow {
+                name: "app_vm-golden".to_string(),
+                sha256: "0011223344".to_string(),
+                promoted: false,
+            },
+        ];
+        let text = rendered_text(|ui| image_roster(ui, &state));
+        assert!(text.contains("desktop_vm-golden"), "{text}");
+        assert!(text.contains("app_vm-golden"), "{text}");
+        assert!(text.contains("promoted"), "{text}");
+        assert!(
+            !text.contains("pending backend decode"),
+            "the decoded roster must replace the honest-pending note: {text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_roster_still_reads_honestly() {
+        let state = WorkloadsState::default();
+        let text = rendered_text(|ui| image_roster(ui, &state));
+        assert!(
+            text.contains("No golden images resolved"),
+            "an empty roster must read honestly, never fabricated: {text}"
+        );
+    }
+
+    /// Drive `run` in a headless frame and collect every text run painted — the
+    /// pixel-feed proof a fixture decode actually renders (the same
+    /// `Context::run` path the DRM runner drives, minus the GPU).
+    fn rendered_text(mut run: impl FnMut(&mut egui::Ui)) -> String {
+        fn collect(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        collect(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1100.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| run(ui));
+        });
+        let mut text = String::new();
+        for clipped in &out.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
     }
 }

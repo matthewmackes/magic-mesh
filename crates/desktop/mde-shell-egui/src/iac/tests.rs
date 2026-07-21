@@ -302,6 +302,110 @@ fn carbon_icons_are_registered_for_every_view_and_lens() {
     assert!(mde_egui::carbon_svg_bytes("view-grid").is_some());
 }
 
+/// Drive `run` in a headless frame and collect every text run painted — the
+/// pixel-feed proof a fixture decode actually renders (the same `Context::run`
+/// path the DRM runner drives, minus the GPU).
+fn rendered_text(mut run: impl FnMut(&mut egui::Ui)) -> String {
+    fn collect(shape: &egui::epaint::Shape, out: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 720.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| run(ui));
+    });
+    let mut text = String::new();
+    for clipped in &out.shapes {
+        collect(&clipped.shape, &mut text);
+    }
+    text
+}
+
+#[test]
+fn console_attach_decodes_the_endpoint_and_renders_it_honestly() {
+    // Before any resolve, the section reads honestly — no fabricated handle.
+    let unresolved = WorkloadsState::default();
+    let before = rendered_text(|ui| console_section(ui, &unresolved));
+    assert!(
+        before.contains("No console resolved"),
+        "an unresolved console must read honestly: {before}"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bus_root = tmp.path().join("bus");
+    let mut state = WorkloadsState::default();
+    state.bus_root = Some(bus_root.clone());
+
+    // Dispatch console-attach the way the roster's Console button does.
+    state.issue_console_attach("seat-1", "seat-1");
+    let ulid = state
+        .mutation_pending
+        .as_ref()
+        .expect("console-attach published a pending request")
+        .ulid
+        .clone();
+
+    // Write the fixture full-payload WireCloudReply the worker would answer with.
+    let persist = Persist::open(bus_root).expect("open the fixture bus");
+    let body = serde_json::json!({
+        "ok": true,
+        "verb": "console-attach",
+        "audited": false,
+        "console": {
+            "proto": "spice",
+            "uri": "spice://10.42.0.7:5901",
+            "ticket": "one-time-token"
+        }
+    })
+    .to_string();
+    persist
+        .write(&reply_topic(&ulid), Priority::Default, None, Some(&body))
+        .expect("write the fixture reply");
+
+    state.resolve_mutation();
+
+    let resolved = state
+        .console
+        .as_ref()
+        .expect("the console endpoint decoded from the full-payload wire reply");
+    assert_eq!(resolved.name, "seat-1");
+    assert_eq!(
+        resolved.endpoint.proto,
+        mackes_mesh_types::cloud::ConsoleProto::Spice
+    );
+    assert_eq!(resolved.endpoint.uri, "spice://10.42.0.7:5901");
+    assert_eq!(resolved.endpoint.ticket.as_deref(), Some("one-time-token"));
+    assert!(
+        state.console_target.is_none(),
+        "the target is cleared once resolved"
+    );
+
+    // The panel renders the resolved handle; the one-time ticket stays masked
+    // (never painted in the clear, §7).
+    let after = rendered_text(|ui| console_section(ui, &state));
+    assert!(after.contains("spice://10.42.0.7:5901"), "{after}");
+    assert!(after.contains("SPICE"), "{after}");
+    assert!(
+        !after.contains("one-time-token"),
+        "the ticket must render masked: {after}"
+    );
+}
+
 #[test]
 fn labels_carry_no_legacy_backend_terminology() {
     // The cockpit is provider-neutral: zero OpenStack-family terms in its

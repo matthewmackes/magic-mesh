@@ -32,10 +32,10 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             "An app VM appears here once a placement node reports an app_vm workload in its \
              state/cloud mirror.",
         );
-        return;
-    }
-    for row in &rows {
-        app_card(ui, state, row);
+    } else {
+        for row in &rows {
+            app_card(ui, state, row);
+        }
     }
     muted_note(
         ui,
@@ -43,6 +43,7 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
          desktop rides session_broker (VDI app-mode) and is not yet a distinct cloud verb — that \
          per-app launch leg lands with the app-mode forwarding unit.",
     );
+    super::super::console_section(ui, state);
 }
 
 /// One app-VM card — name · `app-mode` tag · status · drift, the metrics, then the
@@ -54,7 +55,7 @@ fn app_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Console", false).clicked() {
-                state.issue_lifecycle_direct("console-attach", &row.name, &row.name);
+                state.issue_console_attach(&row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
                 state.issue_lifecycle_direct("instance-start", &row.name, &row.name);

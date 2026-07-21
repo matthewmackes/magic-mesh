@@ -36,17 +36,17 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             "An Android VM appears here once a placement node reports an android_vm workload in its \
              state/cloud mirror.",
         );
-        return;
-    }
-    for row in &rows {
-        android_card(ui, state, row);
+    } else {
+        for row in &rows {
+            android_card(ui, state, row);
+        }
     }
     muted_note(
         ui,
         "Start / Stop / Reboot / Destroy act on the outer L1 VM; the inner Android (cvd) boots \
-         within it. Console returns the cvd VNC/WebRTC head — bridging that into an in-cockpit \
-         surface lands with the VDI-attach unit.",
+         within it. Console returns the cvd's VNC/WebRTC head, not a libvirt SPICE display.",
     );
+    super::super::console_section(ui, state);
 }
 
 /// One Android card — name · the `L1 VM \u{203A} cvd` two-layer tag · status ·
@@ -58,7 +58,7 @@ fn android_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Console", false).clicked() {
-                state.issue_lifecycle_direct("console-attach", &row.name, &row.name);
+                state.issue_console_attach(&row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
                 state.issue_lifecycle_direct("instance-start", &row.name, &row.name);

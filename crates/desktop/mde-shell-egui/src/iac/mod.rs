@@ -41,7 +41,10 @@ use serde::Deserialize;
 use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::{carbon_icon, Style};
 
-use mackes_mesh_types::cloud::{CloudState, DeliveryType, WorkloadRow, CLOUD_STATE_PREFIX};
+use mackes_mesh_types::cloud::{
+    CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, WorkloadRow,
+    CLOUD_STATE_PREFIX,
+};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -236,6 +239,20 @@ struct Pending {
     sent: Instant,
 }
 
+/// The most recently resolved `console-attach` handle — the workload it answers
+/// paired with its [`ConsoleEndpoint`] (decoded from the full-payload
+/// [`WireCloudReply`], which the lean mutation mirror above deliberately drops).
+/// Rendered by every delivery view that offers a Console verb; `None` reads
+/// honestly as "not resolved yet" (§7 — never a fabricated handle).
+#[derive(Debug, Clone)]
+struct ResolvedConsole {
+    /// The workload name the handle was requested for (recorded at issue time,
+    /// so the resolve is attributed rather than guessed).
+    name: String,
+    /// The resolved endpoint.
+    endpoint: ConsoleEndpoint,
+}
+
 // ─────────────────────────────── typed arming ───────────────────────────────
 
 /// What a confirmed typed-arming echo releases onto the Bus (RUN-006 idiom).
@@ -399,6 +416,13 @@ pub struct WorkloadsState {
     note: Option<String>,
     /// The session audit trail (newest last), capped at [`MAX_AUDIT`].
     audit: Vec<AuditEntry>,
+    /// The workload name a just-issued `console-attach` targeted, so the reply's
+    /// decoded [`ConsoleEndpoint`] is attributed honestly rather than guessed.
+    /// Cleared once the mutation settles (resolved or not).
+    console_target: Option<String>,
+    /// The most recently resolved console-attach handle. `None` until a reply
+    /// decodes one — an honest "not resolved yet", never fabricated (§7).
+    console: Option<ResolvedConsole>,
 
     // ── the cockpit nav ──
     /// The active delivery-type view (the primary axis).
@@ -462,6 +486,8 @@ impl Default for WorkloadsState {
             mutation_pending: None,
             note: None,
             audit: Vec::new(),
+            console_target: None,
+            console: None,
             view: DeliveryView::default(),
             panel: Panel::default(),
             selected_node: None,
@@ -518,6 +544,9 @@ impl WorkloadsState {
             return;
         };
         if let Some(reply) = self.read_reply(&ulid) {
+            if reply.verb == "console-attach" {
+                self.resolve_console_endpoint(&ulid, reply.ok);
+            }
             let (note, entry) = fold_mutation(&reply);
             self.record_audit(entry);
             if reply.ok {
@@ -532,6 +561,25 @@ impl WorkloadsState {
                     .to_string(),
             );
             self.mutation_pending = None;
+            self.console_target = None;
+        }
+    }
+
+    /// Decode the settled `console-attach` reply's [`ConsoleEndpoint`] (the
+    /// full-payload [`WireCloudReply`] the lean mutation mirror above drops) and
+    /// pair it with the workload name recorded at issue time
+    /// ([`Self::console_target`]) — an honest resolve, never fabricated (§7).
+    /// Clears the target either way so a stale target never mislabels a later
+    /// console.
+    fn resolve_console_endpoint(&mut self, ulid: &str, ok: bool) {
+        let Some(name) = self.console_target.take() else {
+            return;
+        };
+        if !ok {
+            return;
+        }
+        if let Some(endpoint) = self.read_wire_reply(ulid).and_then(|r| r.console) {
+            self.console = Some(ResolvedConsole { name, endpoint });
         }
     }
 
@@ -565,6 +613,17 @@ impl WorkloadsState {
         let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
         let body = msgs.first()?.body.as_deref()?;
         serde_json::from_str::<CloudReply>(body).ok()
+    }
+
+    /// Read the reply on `reply/<ulid>` as the full-payload [`WireCloudReply`] —
+    /// the same body [`Self::read_reply`] reads, decoded a second time for the
+    /// one rich payload field a caller needs (`console` here). `None` when
+    /// nothing has landed yet or the body doesn't decode.
+    fn read_wire_reply(&self, ulid: &str) -> Option<WireCloudReply> {
+        let persist = self.persist()?;
+        let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
+        let body = msgs.first()?.body.as_deref()?;
+        serde_json::from_str(body).ok()
     }
 
     /// Open the Bus persist mirror at the client data dir, if reachable
@@ -701,6 +760,15 @@ impl WorkloadsState {
             Some(&body),
             &format!("{} on {name}", verb_label(verb)),
         );
+    }
+
+    /// Issue the `console-attach` lifecycle verb, tracking the target workload
+    /// name ([`Self::console_target`]) so the resolved [`ConsoleEndpoint`] is
+    /// attributed honestly rather than guessed. The roster rows' Console button
+    /// calls this instead of the generic direct-issue seam.
+    pub(super) fn issue_console_attach(&mut self, instance_id: &str, name: &str) {
+        self.console_target = Some(name.to_string());
+        self.issue_lifecycle_direct("console-attach", instance_id, name);
     }
 
     /// Open the typed-arming confirm for a destructive lifecycle op
@@ -1103,6 +1171,68 @@ pub(super) fn mirror_summary(ui: &mut egui::Ui, state: &WorkloadsState) {
         ui,
         format!("state/cloud mirror: {nodes} node(s) \u{00B7} {workloads} workload(s) folded."),
     );
+}
+
+/// The most recently resolved console-attach handle — the workload it answers +
+/// its [`ConsoleEndpoint`] (protocol, dial uri, and a masked one-time ticket when
+/// the head is ticketed). Rendered by every delivery view that offers a Console
+/// verb, below its roster; `None` reads an honest "not resolved yet" (§7 — never
+/// a fabricated handle). Painting the endpoint into an in-cockpit VDI surface is
+/// a distinct system (`crate::vdi`'s mesh-brokered `console_broker` path,
+/// unrelated to this cloud backend's console-attach verb) — out of reach here;
+/// the resolved handle surfaces honestly meanwhile.
+pub(super) fn console_section(ui: &mut egui::Ui, state: &WorkloadsState) {
+    ui.label(
+        RichText::new("Console")
+            .size(Style::BODY)
+            .strong()
+            .color(Style::TEXT),
+    );
+    match &state.console {
+        None => {
+            mde_egui::muted_note(
+                ui,
+                "No console resolved yet \u{2014} Console requests the live SPICE/VNC/WebRTC head \
+                 via the backend console-attach verb.",
+            );
+        }
+        Some(resolved) => {
+            mde_egui::card().show(ui, |ui| {
+                mde_egui::field(ui, "workload", &resolved.name, Style::TEXT);
+                mde_egui::field(
+                    ui,
+                    "protocol",
+                    console_proto_label(resolved.endpoint.proto),
+                    Style::TEXT,
+                );
+                mde_egui::field(ui, "uri", &resolved.endpoint.uri, Style::TEXT);
+                if resolved.endpoint.ticket.is_some() {
+                    mde_egui::field(
+                        ui,
+                        "ticket",
+                        "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} (one-time, masked)",
+                        Style::TEXT_DIM,
+                    );
+                }
+            });
+            mde_egui::muted_note(
+                ui,
+                "Painting this handle into an in-cockpit VDI surface lands with the cockpit's \
+                 VDI-attach unit; the resolved handle surfaces honestly here meanwhile.",
+            );
+        }
+    }
+    ui.add_space(Style::SP_S);
+}
+
+/// The console protocol's display word.
+const fn console_proto_label(proto: mackes_mesh_types::cloud::ConsoleProto) -> &'static str {
+    use mackes_mesh_types::cloud::ConsoleProto;
+    match proto {
+        ConsoleProto::Spice => "SPICE",
+        ConsoleProto::Vnc => "VNC",
+        ConsoleProto::WebRtc => "WebRTC",
+    }
 }
 
 /// The session audit trail — the workspace's honest record of the ops it

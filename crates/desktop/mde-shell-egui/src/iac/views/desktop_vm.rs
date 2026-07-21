@@ -34,16 +34,12 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             "A desktop seat appears here once a placement node reports a desktop_vm workload in \
              its state/cloud mirror.",
         );
-        return;
+    } else {
+        for row in &rows {
+            seat_card(ui, state, row);
+        }
     }
-    for row in &rows {
-        seat_card(ui, state, row);
-    }
-    muted_note(
-        ui,
-        "Console resolves the seat's live SPICE head via the backend console-attach verb; painting \
-         it into an in-cockpit VDI surface lands with the cockpit's VDI-attach unit.",
-    );
+    super::super::console_section(ui, state);
 }
 
 /// One seat card — name · placement · live status · drift, the live metrics, then
@@ -55,7 +51,7 @@ fn seat_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Console", false).clicked() {
-                state.issue_lifecycle_direct("console-attach", &row.name, &row.name);
+                state.issue_console_attach(&row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
                 state.issue_lifecycle_direct("instance-start", &row.name, &row.name);
