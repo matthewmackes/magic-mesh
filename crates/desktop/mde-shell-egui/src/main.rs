@@ -1386,7 +1386,14 @@ impl Shell {
                 });
             }
             Surface::MapsLocation => {
+                // Fold this seat's live `state/vehicle/<node>` mirror onto the
+                // cockpit before drawing, using the same node-id convention every
+                // other per-host reader here uses (`self.local_host`, sourced from
+                // `local_hostname()`). Fail-soft: no mirror yet (no adapter worker,
+                // no spool) leaves the simulated seed untouched. Per-frame is fine
+                // for v1 — one bounded `read_latest` index probe, not a full load.
                 let maps_location = &mut self.maps_location;
+                maps_location.refresh_from_bus(&self.local_host);
                 ui.push_id("shell-maps-location", |ui| {
                     maps_location_panel(ui, maps_location);
                 });
