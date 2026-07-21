@@ -70,6 +70,8 @@ impl WorkspaceTab {
 pub struct MapsLocationSurface {
     /// Selected workspace tab.
     pub active: WorkspaceTab,
+    /// Whether the pre-drive route-preview screen is showing over the Drive tab.
+    pub route_preview: bool,
     /// Simulators are first-class and on by default.
     pub simulator_enabled: bool,
     /// Current map view model.
@@ -104,6 +106,7 @@ impl MapsLocationSurface {
     pub fn simulated() -> Self {
         Self {
             active: WorkspaceTab::Drive,
+            route_preview: false,
             simulator_enabled: true,
             map: MapViewState::simulated(),
             offline_maps: OfflineMapManagerState::simulated_default(),
@@ -604,6 +607,10 @@ pub struct LocalNavigationState {
     pub active_route: RoutePlan,
     /// Recent/favorite destinations.
     pub destinations: Vec<Destination>,
+    /// Selectable route options shown on the pre-drive route-preview screen.
+    pub route_options: Vec<RouteOption>,
+    /// Index of the currently selected route option.
+    pub selected_route: usize,
 }
 
 impl LocalNavigationState {
@@ -655,19 +662,61 @@ impl LocalNavigationState {
                     label: "Station".to_string(),
                     category: "favorite".to_string(),
                     distance_mi: 3.2,
+                    address: "1200 Public Safety Blvd".to_string(),
                 },
                 Destination {
                     label: "Hospital entrance".to_string(),
                     category: "recent".to_string(),
                     distance_mi: 8.7,
+                    address: "500 Medical Center Dr, Emergency".to_string(),
                 },
                 Destination {
                     label: "Command post".to_string(),
                     category: "favorite".to_string(),
                     distance_mi: 14.1,
+                    address: "US-30 W Mile 214, staging area".to_string(),
                 },
             ],
+            route_options: vec![
+                RouteOption {
+                    label: "Fastest".to_string(),
+                    via: "US-30 W".to_string(),
+                    eta: "14:32".to_string(),
+                    remaining_time_min: 18,
+                    remaining_distance_mi: 11.6,
+                    traffic: RouteTraffic::Slow,
+                },
+                RouteOption {
+                    label: "Less traffic".to_string(),
+                    via: "PA-51 S".to_string(),
+                    eta: "14:39".to_string(),
+                    remaining_time_min: 25,
+                    remaining_distance_mi: 13.2,
+                    traffic: RouteTraffic::Clear,
+                },
+            ],
+            selected_route: 0,
         }
+    }
+
+    /// Apply a route option's summary onto the active route.
+    ///
+    /// Called when the operator taps an option on the route-preview screen.
+    /// Out-of-range indices are ignored, so the call is always crash-safe.
+    pub fn apply_route_option(&mut self, idx: usize) {
+        let Some(option) = self.route_options.get(idx).cloned() else {
+            return;
+        };
+        self.selected_route = idx;
+        self.active_route.eta = option.eta;
+        self.active_route.remaining_time_min = option.remaining_time_min;
+        self.active_route.remaining_distance_mi = option.remaining_distance_mi;
+        self.active_route.current_road = option.via;
+        self.active_route.traffic_alert = match option.traffic {
+            RouteTraffic::Clear => String::new(),
+            RouteTraffic::Slow => "Slowdown +4 min ahead".to_string(),
+            RouteTraffic::Heavy => "Heavy traffic ahead".to_string(),
+        };
     }
 }
 
@@ -703,6 +752,51 @@ pub struct Destination {
     pub category: String,
     /// Distance from current location.
     pub distance_mi: f32,
+    /// Street address / locality line shown in the route-preview summary.
+    pub address: String,
+}
+
+/// Coarse traffic condition on a route option, shown as an OK/WARN/DANGER dot on
+/// the route-preview cards (Waze/Google-Maps grammar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTraffic {
+    /// Light/clear traffic — green.
+    Clear,
+    /// Slower than usual — amber.
+    Slow,
+    /// Heavy/stopped traffic — red.
+    Heavy,
+}
+
+impl RouteTraffic {
+    /// Human label for the route-option traffic line.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Clear => "Light traffic",
+            Self::Slow => "Slower than usual",
+            Self::Heavy => "Heavy traffic",
+        }
+    }
+}
+
+/// One selectable route on the pre-drive route-preview screen. Alternates are
+/// mocked from the active route so the preview has a "fastest / less-traffic"
+/// choice even when the routing seam only returns a single plan.
+#[derive(Debug, Clone)]
+pub struct RouteOption {
+    /// Short option label ("Fastest", "Less traffic").
+    pub label: String,
+    /// Primary road the option runs on ("US-30 W").
+    pub via: String,
+    /// Arrival clock label.
+    pub eta: String,
+    /// Total minutes for this option.
+    pub remaining_time_min: u32,
+    /// Total miles for this option.
+    pub remaining_distance_mi: f32,
+    /// Traffic condition dot.
+    pub traffic: RouteTraffic,
 }
 
 /// MG90 model/status.
@@ -2291,5 +2385,53 @@ mod tests {
         assert_eq!(recorded.selected_wan, "Cellular A");
         assert_eq!(recorded.severity, DeadZoneSeverity::Outage);
         assert!(state.dead_zones.route_risk.contains("outage"));
+    }
+
+    #[test]
+    fn route_preview_offers_selectable_alternates() {
+        let nav = LocalNavigationState::simulated();
+        assert!(
+            nav.route_options.len() >= 2,
+            "preview needs at least a fastest + alternate"
+        );
+        // Option 0 mirrors the active route so entering preview is consistent.
+        assert_eq!(nav.selected_route, 0);
+        assert_eq!(nav.route_options[0].eta, nav.active_route.eta);
+        assert_eq!(
+            nav.route_options[0].remaining_time_min,
+            nav.active_route.remaining_time_min
+        );
+    }
+
+    #[test]
+    fn applying_a_route_option_updates_the_active_route() {
+        let mut nav = LocalNavigationState::simulated();
+        let alt = nav.route_options[1].clone();
+        nav.apply_route_option(1);
+        assert_eq!(nav.selected_route, 1);
+        assert_eq!(nav.active_route.eta, alt.eta);
+        assert_eq!(nav.active_route.remaining_time_min, alt.remaining_time_min);
+        assert!((nav.active_route.remaining_distance_mi - alt.remaining_distance_mi).abs() < 1e-6);
+        assert_eq!(nav.active_route.current_road, alt.via);
+        // A clear alternate clears the traffic alert strip.
+        assert!(nav.active_route.traffic_alert.is_empty());
+    }
+
+    #[test]
+    fn applying_out_of_range_route_option_is_a_no_op() {
+        let mut nav = LocalNavigationState::simulated();
+        let before = nav.active_route.eta.clone();
+        nav.apply_route_option(99);
+        assert_eq!(nav.selected_route, 0);
+        assert_eq!(nav.active_route.eta, before);
+    }
+
+    #[test]
+    fn destinations_carry_an_address_for_the_preview_summary() {
+        let nav = LocalNavigationState::simulated();
+        assert!(nav
+            .destinations
+            .iter()
+            .all(|destination| !destination.address.trim().is_empty()));
     }
 }

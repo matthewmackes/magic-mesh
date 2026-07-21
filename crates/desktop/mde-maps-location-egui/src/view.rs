@@ -7,12 +7,12 @@ use mde_egui::egui::{
 use mde_egui::{paint_carbon, Style};
 
 use crate::model::{
-    BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, DeviceIoState, EncryptedVaultState,
-    FirmwareWorkflow, LocationManager, LocationSample, LocationSource, MapViewState,
-    Mg90ManagementMethod, Mg90SettingCategory, Mg90SettingDescriptor, Mg90State,
+    BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination, DeviceIoState,
+    EncryptedVaultState, FirmwareWorkflow, LocationManager, LocationSample, LocationSource,
+    MapViewState, Mg90ManagementMethod, Mg90SettingCategory, Mg90SettingDescriptor, Mg90State,
     OfflineMapManagerState, OfflineNavigationReadiness, OfflineNavigationStatus, ProviderContract,
-    RoutePlan, SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleState,
-    WorkspaceTab,
+    RouteOption, RoutePlan, RouteTraffic, SettingValueType, SetupStep, SourceStatus,
+    TripRecorderState, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
@@ -28,15 +28,28 @@ const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3); // style-leak-ok
 const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8); // style-leak-ok: map-content-color
 const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54); // style-leak-ok: map-content-color
                                                               // --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quasar-dark route palette) ---
-const MANEUVER_BLUE: Color32 = Color32::from_rgb(0x14, 0x40, 0x78); // style-leak-ok: map-content-color
-const MANEUVER_BLUE_HI: Color32 = Color32::from_rgb(0x1B, 0x53, 0x99); // style-leak-ok: map-content-color
+                                                              // A premium GMaps-navigation blue, painted as a top-lit vertical gradient
+                                                              // (HI at the top edge → BASE → DEEP at the bottom) so the banner reads with
+                                                              // depth instead of a single flat fill.
+const MANEUVER_BLUE: Color32 = Color32::from_rgb(0x1A, 0x66, 0xE0); // style-leak-ok: map-content-color
+const MANEUVER_BLUE_HI: Color32 = Color32::from_rgb(0x3E, 0x86, 0xFF); // style-leak-ok: map-content-color
+const MANEUVER_BLUE_DEEP: Color32 = Color32::from_rgb(0x11, 0x4C, 0xB6); // style-leak-ok: map-content-color
+const LANE_BG: Color32 = Color32::from_rgb(0x0E, 0x2A, 0x54); // style-leak-ok: map-content-color
+const LANE_DIM: Color32 = Color32::from_rgb(0x6A, 0x7E, 0xA2); // style-leak-ok: map-content-color
 const ROUTE_CASING: Color32 = Color32::from_rgb(0x14, 0x4C, 0x92); // style-leak-ok: map-content-color
 const SIGN_WHITE: Color32 = Color32::from_rgb(0xF4, 0xF6, 0xFA); // style-leak-ok: map-content-color
 const SIGN_RED: Color32 = Color32::from_rgb(0xD4, 0x2A, 0x2A); // style-leak-ok: map-content-color
 const SIGN_INK: Color32 = Color32::from_rgb(0x15, 0x17, 0x1D); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
+const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
 const ROAD_CASING_DARK: Color32 = Color32::from_rgb(0x24, 0x2C, 0x33); // style-leak-ok: map-content-color
 const ROAD_CASING_LIGHT: Color32 = Color32::from_rgb(0x9C, 0xA8, 0x9C); // style-leak-ok: map-content-color
+
+/// Corner radius for the floating HUD cards (banner, ETA sheet, lane strip) —
+/// larger than the shared card radius so the nav surface reads modern/premium.
+const HUD_RADIUS: f32 = 16.0;
+/// Corner radius for smaller HUD chips (speed sign chips, option cards).
+const HUD_RADIUS_S: f32 = 12.0;
 
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
@@ -259,6 +272,58 @@ fn maneuver_kind(text: &str) -> ManeuverKind {
     }
 }
 
+/// One lane in the lane-guidance strip: the arrow it shows and whether it is a
+/// recommended lane for the upcoming maneuver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaneCue {
+    dir: ManeuverKind,
+    recommended: bool,
+}
+
+/// Mock a lane set for the upcoming maneuver (Waze / Google-Maps lane guidance).
+/// Turn maneuvers get a small bank of lanes with the turn lane(s) highlighted;
+/// non-turn maneuvers return an empty set so the strip stays hidden.
+fn mock_lanes(kind: ManeuverKind) -> Vec<LaneCue> {
+    let lane = |dir, recommended| LaneCue { dir, recommended };
+    match kind {
+        ManeuverKind::Right => vec![
+            lane(ManeuverKind::Straight, false),
+            lane(ManeuverKind::Straight, false),
+            lane(ManeuverKind::Right, true),
+        ],
+        ManeuverKind::SlightRight | ManeuverKind::Merge => vec![
+            lane(ManeuverKind::Straight, false),
+            lane(ManeuverKind::Straight, false),
+            lane(ManeuverKind::SlightRight, true),
+        ],
+        ManeuverKind::Left => vec![
+            lane(ManeuverKind::Left, true),
+            lane(ManeuverKind::Straight, false),
+            lane(ManeuverKind::Straight, false),
+        ],
+        ManeuverKind::SlightLeft => vec![
+            lane(ManeuverKind::SlightLeft, true),
+            lane(ManeuverKind::Straight, false),
+            lane(ManeuverKind::Straight, false),
+        ],
+        ManeuverKind::UTurn => vec![
+            lane(ManeuverKind::UTurn, true),
+            lane(ManeuverKind::Straight, false),
+        ],
+        // Straight / Roundabout / Arrive: no lane strip.
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the lane-guidance strip should show: a live fix, a lane set exists for
+/// the maneuver, and the maneuver is near (within a half mile). A non-finite
+/// distance hides the strip (crash-safe).
+fn lane_guidance_active(route: &RoutePlan, kind: ManeuverKind, has_fix: bool) -> bool {
+    has_fix
+        && finite_or(route.distance_to_maneuver_mi, f32::INFINITY) <= 0.5
+        && !mock_lanes(kind).is_empty()
+}
+
 /// Mock a posted speed limit from the road classification (no live sign data in
 /// the simulator slice); the HUD keys the over-limit colour off this.
 fn mock_speed_limit(route: &RoutePlan) -> u32 {
@@ -352,6 +417,10 @@ fn elide(painter: &Painter, text: &str, font: FontId, max_w: f32) -> String {
 // ===========================================================================
 
 fn show_drive(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    if state.route_preview {
+        show_route_preview(ui, state);
+        return;
+    }
     let primary = state.locations.primary_sample().cloned();
     let has_fix = primary.as_ref().is_some_and(LocationSample::has_fix);
     let offline = state.offline_navigation_status();
@@ -399,8 +468,8 @@ fn drive_hud(
     let fab_gap = Style::SP_S + Style::SP_XS;
     let fab_cx = rect.right() - margin - fab_r;
     let stack_bottom = rect.bottom() - margin - 96.0 - fab_r;
-    let fab_keys = ["recenter", "mute", "overview"];
-    let mut fab_states: [Option<(Pos2, bool, bool)>; 3] = [None; 3];
+    let fab_keys = ["recenter", "mute", "overview", "preview"];
+    let mut fab_states: [Option<(Pos2, bool, bool)>; 4] = [None; 4];
     let muted_id = egui::Id::new(("maps-drive-hud", "muted"));
     let mut muted = ui
         .ctx()
@@ -425,6 +494,7 @@ fn drive_hud(
                     state.map.zoom = 13.0;
                 }
                 "overview" => state.map.zoom = 6.5,
+                "preview" => state.route_preview = true,
                 "mute" => {
                     muted = !muted;
                     ui.ctx().data_mut(|d| d.insert_temp(muted_id, muted));
@@ -456,18 +526,26 @@ fn drive_hud(
         width - 2.0 * margin,
         96.0,
     );
-    paint_soft_shadow(&painter, banner, Style::RADIUS_L);
-    paint_maneuver_banner(
-        &painter,
-        banner,
-        route,
-        maneuver_kind(&route.next_maneuver),
-        has_fix,
-    );
+    let kind = maneuver_kind(&route.next_maneuver);
+    paint_soft_shadow(&painter, banner, HUD_RADIUS);
+    paint_maneuver_banner(&painter, banner, route, kind, has_fix);
 
-    // Alert pills stacked under the banner (Waze-style report chips).
+    // Lane-guidance strip directly under the banner (only when a turn is near).
+    let mut below_banner = banner.bottom() + Style::SP_S;
+    if lane_guidance_active(route, kind, has_fix) {
+        let lanes = mock_lanes(kind);
+        // Never exceed the banner width; `paint_lane_guidance` skips a too-narrow
+        // strip, so a tiny viewport simply drops the lanes (no min>max clamp).
+        let lane_w = (lanes.len() as f32 * 56.0).min(banner.width().max(1.0));
+        let lane_rect = safe_rect(banner.left(), below_banner, lane_w, 48.0);
+        paint_soft_shadow(&painter, lane_rect, HUD_RADIUS_S);
+        paint_lane_guidance(&painter, lane_rect, &lanes);
+        below_banner = lane_rect.bottom() + Style::SP_S;
+    }
+
+    // Alert pills stacked under the banner/lane strip (Waze-style report chips).
     let pill_x = rect.left() + margin;
-    let mut pill_y = banner.bottom() + Style::SP_S;
+    let mut pill_y = below_banner;
     if !has_fix {
         pill_y = paint_alert_pill(
             &painter,
@@ -505,7 +583,7 @@ fn drive_hud(
         eta_w,
         72.0,
     );
-    paint_soft_shadow(&painter, eta, Style::RADIUS_L);
+    paint_soft_shadow(&painter, eta, HUD_RADIUS);
     paint_eta_bar(&painter, eta, route, eta_tone(route, offline));
 
     // Bottom-left speedometer + round speed-limit sign.
@@ -528,6 +606,439 @@ fn drive_hud(
             paint_fab(&painter, center, fab_r, hovered, pressed, key, muted);
         }
     }
+}
+
+// ===========================================================================
+// Route preview — the pre-drive "review the route" screen (GMaps / Waze GO).
+// ===========================================================================
+
+/// Precomputed rects for the route-preview screen (so interaction + paint agree).
+struct PreviewLayout {
+    back: Rect,
+    sheet: Rect,
+    dest: Rect,
+    options: Vec<Rect>,
+    start: Rect,
+}
+
+/// Lay out the route-preview chrome over `rect`: a back button top-left and a
+/// bottom sheet holding the destination summary, one card per route option, and
+/// a full-width Start button. Every rect is crash-safe.
+fn preview_layout(rect: Rect, n_options: usize) -> PreviewLayout {
+    let margin = Style::SP_M;
+    let back_r = 22.0;
+    let back = Rect::from_center_size(
+        egui::pos2(rect.left() + margin + back_r, rect.top() + margin + back_r),
+        egui::vec2(back_r * 2.0, back_r * 2.0),
+    );
+
+    let sheet_w = (rect.width() - 2.0 * margin).max(1.0);
+    let dest_h = 58.0;
+    let opt_h = 74.0;
+    let start_h = 52.0;
+    let gap = Style::SP_S;
+    let pad = Style::SP_M;
+    let n = n_options as f32;
+    let mut sheet_h =
+        pad + dest_h + gap + n * opt_h + (n - 1.0).max(0.0) * gap + gap + start_h + pad;
+    let max_sheet = (rect.height() - 2.0 * margin - 40.0).max(120.0);
+    if sheet_h > max_sheet {
+        sheet_h = max_sheet;
+    }
+    let sheet = safe_rect(
+        rect.left() + margin,
+        rect.bottom() - margin - sheet_h,
+        sheet_w,
+        sheet_h,
+    );
+
+    let inner_x = sheet.left() + pad;
+    let inner_w = (sheet.width() - 2.0 * pad).max(1.0);
+    let mut y = sheet.top() + pad;
+    let dest = safe_rect(inner_x, y, inner_w, dest_h);
+    y = dest.bottom() + gap;
+    let mut options = Vec::with_capacity(n_options);
+    for _ in 0..n_options {
+        let r = safe_rect(inner_x, y, inner_w, opt_h);
+        options.push(r);
+        y = r.bottom() + gap;
+    }
+    let start = safe_rect(inner_x, sheet.bottom() - pad - start_h, inner_w, start_h);
+
+    PreviewLayout {
+        back,
+        sheet,
+        dest,
+        options,
+        start,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    let width = safe_width(ui);
+    let avail_h = ui.available_height();
+    let height = if avail_h.is_finite() && avail_h > 1.0 {
+        avail_h.clamp(320.0, 1400.0)
+    } else {
+        520.0
+    };
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let n_options = state.local_navigation.route_options.len();
+    let layout = preview_layout(rect, n_options);
+
+    // --- Interactions first, so the painter borrow of `ui` stays clean. -----
+    let back_resp = ui.interact(
+        layout.back,
+        egui::Id::new("maps-preview-back"),
+        Sense::click(),
+    );
+    if back_resp.clicked() {
+        state.route_preview = false;
+    }
+    let back_hovered = back_resp.hovered();
+
+    let mut option_states: Vec<(bool, bool)> = Vec::with_capacity(n_options);
+    for (idx, orect) in layout.options.iter().enumerate() {
+        let resp = ui.interact(
+            *orect,
+            egui::Id::new(("maps-preview-option", idx)),
+            Sense::click(),
+        );
+        if resp.clicked() {
+            state.local_navigation.apply_route_option(idx);
+        }
+        option_states.push((resp.hovered(), resp.is_pointer_button_down_on()));
+    }
+
+    let start_resp = ui.interact(
+        layout.start,
+        egui::Id::new("maps-preview-start"),
+        Sense::click(),
+    );
+    if start_resp.clicked() {
+        let selected = state.local_navigation.selected_route;
+        state.local_navigation.apply_route_option(selected);
+        state.route_preview = false;
+    }
+    let start_hovered = start_resp.hovered();
+    let start_pressed = start_resp.is_pointer_button_down_on();
+
+    // --- Paint. -------------------------------------------------------------
+    let primary = state.locations.primary_sample();
+    let has_fix = primary.is_some_and(LocationSample::has_fix);
+    let painter = ui.painter_at(rect);
+
+    // Overview map showing the whole route (does not touch persistent view state).
+    let mut overview = state.map.clone();
+    overview.zoom = 6.5;
+    overview.pan = [0.0, 0.0];
+    overview.route_visible = true;
+    paint_map_scene(
+        &painter,
+        rect,
+        &overview,
+        &state.locations,
+        &state.dead_zones,
+        primary,
+        has_fix,
+    );
+    // Gentle scrim so the sheet + chrome read cleanly over the map.
+    painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.18));
+
+    // Back button + screen title.
+    paint_round_button(&painter, layout.back.center(), 22.0, back_hovered, false);
+    paint_back_glyph(&painter, layout.back.center(), 22.0);
+    painter.text(
+        egui::pos2(layout.back.right() + Style::SP_M, layout.back.center().y),
+        Align2::LEFT_CENTER,
+        "Route preview",
+        FontId::proportional(Style::TITLE),
+        Style::TEXT_STRONG,
+    );
+
+    // Bottom sheet.
+    paint_soft_shadow(&painter, layout.sheet, HUD_RADIUS);
+    painter.rect_filled(layout.sheet, HUD_RADIUS, HUD_CARD_BG);
+    paint_card_sheen(
+        &painter,
+        layout.sheet,
+        HUD_RADIUS,
+        HUD_CARD_HI.gamma_multiply(0.5),
+        Color32::BLACK.gamma_multiply(0.12),
+    );
+    painter.rect_stroke(
+        layout.sheet,
+        HUD_RADIUS,
+        Stroke::new(1.0, Style::BORDER),
+        StrokeKind::Inside,
+    );
+
+    // Destination summary.
+    paint_destination_summary(
+        &painter,
+        layout.dest,
+        state.local_navigation.destinations.first(),
+    );
+
+    // Route option cards.
+    let selected = state.local_navigation.selected_route;
+    for (idx, orect) in layout.options.iter().enumerate() {
+        if let Some(option) = state.local_navigation.route_options.get(idx) {
+            let (hovered, pressed) = option_states.get(idx).copied().unwrap_or((false, false));
+            paint_route_option_card(&painter, *orect, option, idx == selected, hovered, pressed);
+        }
+    }
+
+    // Start button.
+    paint_start_button(
+        &painter,
+        layout.start,
+        start_hovered,
+        start_pressed,
+        has_fix,
+    );
+}
+
+/// A circular chrome button (back / close), matching the FAB elevation language.
+fn paint_round_button(painter: &Painter, center: Pos2, r: f32, hovered: bool, pressed: bool) {
+    if center.any_nan() {
+        return;
+    }
+    painter.circle_filled(
+        center + egui::vec2(0.0, 2.0),
+        r,
+        Color32::BLACK.gamma_multiply(0.3),
+    );
+    let fill = if pressed {
+        Style::pressed_fill(Style::ACCENT)
+    } else if hovered {
+        Style::SURFACE_HI
+    } else {
+        HUD_CARD_BG
+    };
+    painter.circle_filled(center, r, fill);
+    painter.circle_stroke(center, r, Stroke::new(1.0, Style::BORDER));
+}
+
+/// A left-pointing back chevron centered in a round button.
+fn paint_back_glyph(painter: &Painter, center: Pos2, r: f32) {
+    if center.any_nan() {
+        return;
+    }
+    let s = r * 0.4;
+    let x = center.x + s * 0.28;
+    painter.add(Shape::line(
+        vec![
+            egui::pos2(x, center.y - s),
+            egui::pos2(x - s, center.y),
+            egui::pos2(x, center.y + s),
+        ],
+        Stroke::new(2.4, Style::TEXT_STRONG),
+    ));
+}
+
+/// The destination summary row: a location pin, the place name, and its address.
+fn paint_destination_summary(painter: &Painter, rect: Rect, destination: Option<&Destination>) {
+    let pin_box = safe_rect(rect.left() + 4.0, rect.center().y - 13.0, 26.0, 26.0);
+    if !paint_carbon(painter, pin_box, "location", ROUTE_BLUE) {
+        painter.circle_filled(pin_box.center(), 11.0, MANEUVER_BLUE);
+        painter.circle_filled(pin_box.center(), 4.0, Color32::WHITE);
+    }
+    let tx = pin_box.right() + Style::SP_S;
+    let max_w = (rect.right() - tx).max(1.0);
+    let (name, addr) = destination.map_or(("Destination", "Select a place"), |destination| {
+        (destination.label.as_str(), destination.address.as_str())
+    });
+    let name_s = elide(painter, name, FontId::proportional(Style::TITLE), max_w);
+    painter.text(
+        egui::pos2(tx, rect.center().y - Style::SP_S),
+        Align2::LEFT_CENTER,
+        &name_s,
+        FontId::proportional(Style::TITLE),
+        Style::TEXT_STRONG,
+    );
+    let addr_s = elide(painter, addr, FontId::proportional(Style::BODY), max_w);
+    painter.text(
+        egui::pos2(tx, rect.center().y + Style::SP_M - 2.0),
+        Align2::LEFT_CENTER,
+        &addr_s,
+        FontId::proportional(Style::BODY),
+        Style::TEXT_DIM,
+    );
+}
+
+fn route_traffic_tone(traffic: RouteTraffic) -> Color32 {
+    match traffic {
+        RouteTraffic::Clear => Style::OK,
+        RouteTraffic::Slow => Style::WARN,
+        RouteTraffic::Heavy => Style::DANGER,
+    }
+}
+
+/// One selectable route-option card: label tag, big ETA (traffic-toned), the
+/// distance · via road line, and a traffic dot + label on the right.
+fn paint_route_option_card(
+    painter: &Painter,
+    rect: Rect,
+    option: &RouteOption,
+    selected: bool,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        Style::pressed_fill(Style::ACCENT)
+    } else if selected {
+        Style::ACCENT.gamma_multiply(0.16)
+    } else if hovered {
+        HUD_CARD_HI
+    } else {
+        Style::LAYER_02
+    };
+    painter.rect_filled(rect, HUD_RADIUS_S, fill);
+    let (bw, border) = if selected {
+        (2.0, Style::ACCENT)
+    } else {
+        (1.0, Style::BORDER)
+    };
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS_S,
+        Stroke::new(bw, border),
+        StrokeKind::Inside,
+    );
+
+    let pad = Style::SP_M;
+    let tone = route_traffic_tone(option.traffic);
+
+    // Option label tag (top-left).
+    painter.text(
+        egui::pos2(rect.left() + pad, rect.top() + 9.0),
+        Align2::LEFT_TOP,
+        &option.label,
+        FontId::proportional(Style::SMALL),
+        if selected {
+            Style::ACCENT_HI
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+
+    // Hero: total minutes for this option, coloured by traffic.
+    let minutes = option.remaining_time_min.to_string();
+    let num_g = painter.layout_no_wrap(minutes, FontId::proportional(27.0), tone);
+    let num_size = num_g.size();
+    painter.galley(
+        egui::pos2(rect.left() + pad, rect.top() + 24.0),
+        num_g,
+        tone,
+    );
+    painter.text(
+        egui::pos2(
+            rect.left() + pad + num_size.x + Style::SP_XS,
+            rect.top() + 24.0 + num_size.y - 9.0,
+        ),
+        Align2::LEFT_BOTTOM,
+        "min",
+        FontId::proportional(Style::BODY),
+        tone.gamma_multiply(0.92),
+    );
+
+    // Distance · via road (bottom-left).
+    let sub = format!(
+        "{:.1} mi   \u{00B7}   via {}",
+        finite_or(option.remaining_distance_mi, 0.0).max(0.0),
+        option.via
+    );
+    let sub_max = (rect.right() - (rect.left() + pad) - 96.0).max(1.0);
+    let sub_s = elide(painter, &sub, FontId::proportional(Style::SMALL), sub_max);
+    painter.text(
+        egui::pos2(rect.left() + pad, rect.bottom() - 9.0),
+        Align2::LEFT_BOTTOM,
+        &sub_s,
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+
+    // Traffic dot + label (right, vertically centered).
+    let label_g = painter.layout_no_wrap(
+        option.traffic.label().to_string(),
+        FontId::proportional(Style::BODY),
+        tone,
+    );
+    let label_size = label_g.size();
+    let label_x = rect.right() - pad - label_size.x;
+    painter.galley(
+        egui::pos2(label_x, rect.center().y - label_size.y * 0.5),
+        label_g,
+        tone,
+    );
+    painter.circle_filled(
+        egui::pos2(label_x - Style::SP_S, rect.center().y),
+        4.0,
+        tone,
+    );
+}
+
+/// The full-width GMaps-blue Start button that begins turn-by-turn guidance.
+fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: bool, has_fix: bool) {
+    paint_soft_shadow(painter, rect, HUD_RADIUS_S);
+    let base = if !has_fix {
+        MANEUVER_BLUE.gamma_multiply(0.7)
+    } else if pressed {
+        MANEUVER_BLUE_DEEP
+    } else if hovered {
+        MANEUVER_BLUE_HI
+    } else {
+        MANEUVER_BLUE
+    };
+    painter.rect_filled(rect, HUD_RADIUS_S, base);
+    paint_card_sheen(
+        painter,
+        rect,
+        HUD_RADIUS_S,
+        MANEUVER_BLUE_HI.gamma_multiply(0.5),
+        MANEUVER_BLUE_DEEP.gamma_multiply(0.5),
+    );
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS_S,
+        Stroke::new(1.0, MANEUVER_BLUE_HI),
+        StrokeKind::Inside,
+    );
+
+    // Nav-arrow glyph + "Start", centered as a group.
+    let label = "Start";
+    let g = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::proportional(Style::HEADING),
+        Color32::WHITE,
+    );
+    let gw = g.size().x;
+    let glyph_w = 22.0;
+    let total = glyph_w + Style::SP_S + gw;
+    let start_x = rect.center().x - total * 0.5;
+    if start_x.is_finite() {
+        paint_vehicle_chevron(
+            painter,
+            egui::pos2(start_x + glyph_w * 0.5, rect.center().y),
+            0.0,
+            Color32::WHITE,
+            false,
+        );
+    }
+    painter.galley(
+        egui::pos2(
+            start_x + glyph_w + Style::SP_S,
+            rect.center().y - g.size().y * 0.5,
+        ),
+        g,
+        Color32::WHITE,
+    );
 }
 
 // --- Scene: the beautiful synthetic map (shared by Drive + Map tabs). ------
@@ -847,16 +1358,23 @@ fn paint_vehicle_chevron(
     let a = finite_or(heading_deg, 0.0).to_radians();
     let f = egui::vec2(a.sin(), -a.cos());
     let rt = egui::vec2(a.cos(), a.sin());
-    let size = 15.0;
+    let size = 16.0;
     if glow {
-        for r in [30.0_f32, 22.0, 15.0] {
-            painter.circle_filled(center, r, ROUTE_BLUE.gamma_multiply(0.09));
+        for r in [34.0_f32, 27.0, 20.0, 14.0] {
+            painter.circle_filled(center, r, ROUTE_BLUE.gamma_multiply(0.07));
         }
+        // Soft contact shadow so the puck reads as lifted off the map.
+        painter.circle_filled(
+            center + egui::vec2(0.0, 2.5),
+            size * 0.95,
+            Color32::BLACK.gamma_multiply(0.28),
+        );
     }
-    let tip = center + f * (size * 1.15);
-    let bl = center - f * (size * 0.85) - rt * (size * 0.9);
-    let br = center - f * (size * 0.85) + rt * (size * 0.9);
-    let notch = center - f * (size * 0.25);
+    // Sleek concave-back navigation arrowhead.
+    let tip = center + f * (size * 1.2);
+    let bl = center - f * (size * 0.82) - rt * (size * 0.82);
+    let br = center - f * (size * 0.82) + rt * (size * 0.82);
+    let notch = center - f * (size * 0.2);
     painter.add(Shape::convex_polygon(
         vec![tip, br, notch],
         tone,
@@ -869,9 +1387,8 @@ fn paint_vehicle_chevron(
     ));
     painter.add(Shape::closed_line(
         vec![tip, br, notch, bl],
-        Stroke::new(2.0, Color32::WHITE),
+        Stroke::new(2.2, Color32::WHITE),
     ));
-    painter.circle_filled(center, 2.5, Color32::WHITE);
 }
 
 /// A translucent "flashlight" accuracy cone ahead of the vehicle.
@@ -880,11 +1397,11 @@ fn paint_heading_cone(painter: &Painter, apex: Pos2, heading_deg: f32, tone: Col
         return;
     }
     let a0 = finite_or(heading_deg, 0.0).to_radians();
-    let spread = 22.0_f32.to_radians();
-    let len = 92.0;
-    let n: u32 = 12;
+    let spread = 20.0_f32.to_radians();
+    let len = 108.0;
+    let n: u32 = 16;
     let mut mesh = Mesh::default();
-    mesh.colored_vertex(apex, tone.gamma_multiply(0.30));
+    mesh.colored_vertex(apex, tone.gamma_multiply(0.34));
     for i in 0..=n {
         let t = i as f32 / n as f32;
         let a = 2.0f32.mul_add(spread * t, a0 - spread);
@@ -927,13 +1444,54 @@ fn paint_acquiring_chip(painter: &Painter, center_top: Pos2) {
 
 // --- Floating cards --------------------------------------------------------
 
-/// A soft drop shadow behind an elevated card (stacked translucent layers).
+/// A soft drop shadow behind an elevated card. Many thin, low-alpha layers with
+/// a downward bias give a smooth, diffuse penumbra (a premium Material feel)
+/// rather than a hard stacked edge.
 fn paint_soft_shadow(painter: &Painter, rect: Rect, radius: f32) {
-    for i in (1..=5).rev() {
-        let f = i as f32;
-        let r = rect.expand(f * 1.4).translate(egui::vec2(0.0, f * 0.7));
-        painter.rect_filled(r, radius + f, Color32::BLACK.gamma_multiply(0.06));
+    if rect.left().is_nan() || rect.top().is_nan() {
+        return;
     }
+    for i in (1..=9).rev() {
+        let f = i as f32;
+        let r = rect.expand(f * 1.7).translate(egui::vec2(0.0, f * 0.85));
+        painter.rect_filled(r, radius + f, Color32::BLACK.gamma_multiply(0.04));
+    }
+}
+
+/// Overlay a top-lit vertical sheen inside a rounded card: a light band at the
+/// top fading out and a soft shade toward the bottom, giving flat fills a sense
+/// of depth. Inset off the rounded corners so the silhouette stays clean.
+fn paint_card_sheen(painter: &Painter, rect: Rect, radius: f32, top: Color32, bottom: Color32) {
+    if !rect.width().is_finite() || !rect.height().is_finite() {
+        return;
+    }
+    if rect.width() < radius * 2.0 + 2.0 || rect.height() < 8.0 {
+        return;
+    }
+    let x0 = rect.left() + radius * 0.5;
+    let x1 = rect.right() - radius * 0.5;
+    let mid = rect.top() + rect.height() * 0.5;
+    let clear = Color32::TRANSPARENT;
+    fill_quad(
+        painter,
+        [
+            egui::pos2(x0, rect.top() + 1.5),
+            egui::pos2(x1, rect.top() + 1.5),
+            egui::pos2(x1, mid),
+            egui::pos2(x0, mid),
+        ],
+        [top, top, clear, clear],
+    );
+    fill_quad(
+        painter,
+        [
+            egui::pos2(x0, mid),
+            egui::pos2(x1, mid),
+            egui::pos2(x1, rect.bottom() - 1.5),
+            egui::pos2(x0, rect.bottom() - 1.5),
+        ],
+        [clear, clear, bottom, bottom],
+    );
 }
 
 fn paint_maneuver_banner(
@@ -943,34 +1501,43 @@ fn paint_maneuver_banner(
     kind: ManeuverKind,
     has_fix: bool,
 ) {
-    let fill = if has_fix {
-        MANEUVER_BLUE
-    } else {
-        MANEUVER_BLUE.gamma_multiply(0.6)
-    };
-    painter.rect_filled(rect, Style::RADIUS_L, fill);
+    let dim = if has_fix { 1.0 } else { 0.62 };
+    // Premium GMaps-blue card: base fill + top-lit gradient sheen for depth.
+    painter.rect_filled(rect, HUD_RADIUS, MANEUVER_BLUE.gamma_multiply(dim));
+    paint_card_sheen(
+        painter,
+        rect,
+        HUD_RADIUS,
+        MANEUVER_BLUE_HI.gamma_multiply(0.5 * dim),
+        MANEUVER_BLUE_DEEP.gamma_multiply(0.55 * dim),
+    );
     painter.rect_stroke(
         rect,
-        Style::RADIUS_L,
-        Stroke::new(1.0, MANEUVER_BLUE_HI),
+        HUD_RADIUS,
+        Stroke::new(1.0, MANEUVER_BLUE_HI.gamma_multiply(0.9 * dim)),
         StrokeKind::Inside,
     );
 
+    // Bold turn arrow on a subtle lighter chip (GMaps seats the arrow on a panel).
     let inset = Style::SP_S;
-    let arrow_side = (rect.height() - 2.0 * inset).max(1.0);
-    let arrow_rect = safe_rect(
+    let chip_side = (rect.height() - 2.0 * inset).max(1.0);
+    let chip = safe_rect(
         rect.left() + inset,
         rect.top() + inset,
-        arrow_side,
-        arrow_side,
+        chip_side,
+        chip_side,
     );
+    painter.rect_filled(chip, HUD_RADIUS_S, Color32::WHITE.gamma_multiply(0.12));
+    let arrow_rect = chip.shrink(chip_side * 0.18);
     paint_maneuver_arrow(painter, arrow_rect, kind, Color32::WHITE);
 
-    let tx = arrow_rect.right() + Style::SP_M;
+    // Text column: distance (hero) · maneuver street · current road.
+    let tx = chip.right() + Style::SP_M;
     let max_w = (rect.right() - Style::SP_M - tx).max(1.0);
+    let top = rect.top();
     let dist = format_distance(route.distance_to_maneuver_mi);
     painter.text(
-        egui::pos2(tx, rect.top() + inset + 2.0),
+        egui::pos2(tx, top + 9.0),
         Align2::LEFT_TOP,
         &dist,
         FontId::proportional(34.0),
@@ -979,14 +1546,14 @@ fn paint_maneuver_banner(
     let man = elide(
         painter,
         &route.next_maneuver,
-        FontId::proportional(17.0),
+        FontId::proportional(18.0),
         max_w,
     );
     painter.text(
-        egui::pos2(tx, rect.center().y + Style::SP_S),
-        Align2::LEFT_CENTER,
+        egui::pos2(tx, top + 48.0),
+        Align2::LEFT_TOP,
         &man,
-        FontId::proportional(17.0),
+        FontId::proportional(18.0),
         Color32::WHITE,
     );
     let on_road = elide(
@@ -996,11 +1563,11 @@ fn paint_maneuver_banner(
         max_w,
     );
     painter.text(
-        egui::pos2(tx, rect.bottom() - inset - 1.0),
+        egui::pos2(tx, rect.bottom() - 8.0),
         Align2::LEFT_BOTTOM,
         &on_road,
         FontId::proportional(Style::BODY),
-        Color32::WHITE.gamma_multiply(0.78),
+        Color32::WHITE.gamma_multiply(0.8),
     );
 }
 
@@ -1008,8 +1575,8 @@ fn paint_maneuver_arrow(painter: &Painter, rect: Rect, kind: ManeuverKind, color
     let s = rect.width().min(rect.height());
     if kind == ManeuverKind::Arrive {
         let c = rect.center();
-        painter.circle_stroke(c, s * 0.30, Stroke::new(s * 0.10, color));
-        painter.circle_filled(c, s * 0.12, color);
+        painter.circle_stroke(c, s * 0.32, Stroke::new(s * 0.11, color));
+        painter.circle_filled(c, s * 0.13, color);
         return;
     }
     let unit: &[(f32, f32)] = match kind {
@@ -1033,7 +1600,7 @@ fn paint_maneuver_arrow(painter: &Painter, rect: Rect, kind: ManeuverKind, color
             )
         })
         .collect();
-    let ribbon: Vec<(Pos2, f32)> = pts.iter().map(|&p| (p, s * 0.15)).collect();
+    let ribbon: Vec<(Pos2, f32)> = pts.iter().map(|&p| (p, s * 0.185)).collect();
     paint_ribbon(painter, &ribbon, color);
     if pts.len() >= 2 {
         let tip = pts[pts.len() - 1];
@@ -1043,10 +1610,12 @@ fn paint_maneuver_arrow(painter: &Painter, rect: Rect, kind: ManeuverKind, color
         if len > 0.001 {
             let dir = seg / len;
             let perp = egui::vec2(-dir.y, dir.x);
-            let hw = s * 0.20;
-            let hl = s * 0.26;
+            let hw = s * 0.26;
+            let hl = s * 0.30;
+            // Pull the base back so the head sits flush on the shaft (no gap/overlap seam).
+            let base = tip - dir * (s * 0.02);
             painter.add(Shape::convex_polygon(
-                vec![tip + dir * hl, tip + perp * hw, tip - perp * hw],
+                vec![base + dir * hl, base + perp * hw, base - perp * hw],
                 color,
                 Stroke::NONE,
             ));
@@ -1054,49 +1623,135 @@ fn paint_maneuver_arrow(painter: &Painter, rect: Rect, kind: ManeuverKind, color
     }
 }
 
-fn paint_eta_bar(painter: &Painter, rect: Rect, route: &RoutePlan, tone: Color32) {
-    painter.rect_filled(rect, Style::RADIUS_L, HUD_CARD_BG);
+/// Paint the lane-guidance strip: a row of lane cells, recommended lane(s)
+/// bright over a soft accent pill, the rest dimmed (Waze / Google-Maps grammar).
+fn paint_lane_guidance(painter: &Painter, rect: Rect, lanes: &[LaneCue]) {
+    if lanes.is_empty() || !rect.width().is_finite() || rect.width() < 8.0 {
+        return;
+    }
+    painter.rect_filled(rect, HUD_RADIUS_S, LANE_BG);
+    paint_card_sheen(
+        painter,
+        rect,
+        HUD_RADIUS_S,
+        Color32::WHITE.gamma_multiply(0.05),
+        Color32::BLACK.gamma_multiply(0.12),
+    );
     painter.rect_stroke(
         rect,
-        Style::RADIUS_L,
+        HUD_RADIUS_S,
+        Stroke::new(1.0, MANEUVER_BLUE_HI.gamma_multiply(0.4)),
+        StrokeKind::Inside,
+    );
+
+    let n = lanes.len().max(1);
+    let cell_w = rect.width() / n as f32;
+    for (i, lane) in lanes.iter().enumerate() {
+        let cx = rect.left() + (i as f32 + 0.5) * cell_w;
+        if !cx.is_finite() {
+            continue;
+        }
+        let cell_c = egui::pos2(cx, rect.center().y);
+        let arrow_side = rect.height().min(cell_w) * 0.72;
+        let arrow_rect = safe_rect(
+            cell_c.x - arrow_side * 0.5,
+            cell_c.y - arrow_side * 0.5,
+            arrow_side,
+            arrow_side,
+        );
+        if lane.recommended {
+            painter.rect_filled(
+                arrow_rect.expand(3.0),
+                HUD_RADIUS_S,
+                ROUTE_BLUE.gamma_multiply(0.22),
+            );
+        }
+        let color = if lane.recommended {
+            Color32::WHITE
+        } else {
+            LANE_DIM
+        };
+        paint_maneuver_arrow(painter, arrow_rect, lane.dir, color);
+        if i > 0 {
+            let sx = rect.left() + i as f32 * cell_w;
+            painter.line_segment(
+                [
+                    egui::pos2(sx, rect.top() + 6.0),
+                    egui::pos2(sx, rect.bottom() - 6.0),
+                ],
+                Stroke::new(1.0, MANEUVER_BLUE_HI.gamma_multiply(0.18)),
+            );
+        }
+    }
+}
+
+fn paint_eta_bar(painter: &Painter, rect: Rect, route: &RoutePlan, tone: Color32) {
+    painter.rect_filled(rect, HUD_RADIUS, HUD_CARD_BG);
+    paint_card_sheen(
+        painter,
+        rect,
+        HUD_RADIUS,
+        HUD_CARD_HI.gamma_multiply(0.6),
+        Color32::BLACK.gamma_multiply(0.14),
+    );
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS,
         Stroke::new(1.0, Style::BORDER),
         StrokeKind::Inside,
     );
+
+    // Bottom-sheet grab handle (the recognizable draggable pill).
+    let handle = safe_rect(rect.center().x - 18.0, rect.top() + 7.0, 36.0, 4.0);
+    painter.rect_filled(handle, 2.0, Style::TEXT_DIM.gamma_multiply(0.55));
+
     let pad = Style::SP_M;
-    painter.circle_filled(egui::pos2(rect.left() + pad, rect.center().y), 5.0, tone);
-    let lx = rect.left() + pad + Style::SP_M;
-    painter.text(
-        egui::pos2(lx, rect.center().y - Style::SP_S),
-        Align2::LEFT_CENTER,
-        &route.eta,
-        FontId::proportional(30.0),
+    let base_y = rect.center().y + Style::SP_XS;
+
+    // Hero: remaining minutes, coloured by how the route is running.
+    let minutes = route.remaining_time_min.to_string();
+    let num_g = painter.layout_no_wrap(minutes, FontId::proportional(32.0), tone);
+    let num_size = num_g.size();
+    painter.galley(
+        egui::pos2(rect.left() + pad, base_y - num_size.y * 0.5),
+        num_g,
         tone,
     );
     painter.text(
-        egui::pos2(lx, rect.center().y + Style::SP_M),
+        egui::pos2(rect.left() + pad + num_size.x + Style::SP_XS, base_y - 2.0),
         Align2::LEFT_CENTER,
-        "arrival",
+        "min",
+        FontId::proportional(Style::TITLE),
+        tone.gamma_multiply(0.92),
+    );
+
+    // Secondary: arrival clock · remaining distance.
+    let secondary = format!(
+        "{}   \u{00B7}   {:.1} mi",
+        route.eta,
+        finite_or(route.remaining_distance_mi, 0.0).max(0.0)
+    );
+    painter.text(
+        egui::pos2(rect.left() + pad, rect.bottom() - 8.0),
+        Align2::LEFT_BOTTOM,
+        &secondary,
         FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
     );
-    let rx = rect.right() - pad;
-    painter.text(
-        egui::pos2(rx, rect.center().y - Style::SP_S),
-        Align2::RIGHT_CENTER,
-        &format!("{} min", route.remaining_time_min),
-        FontId::proportional(Style::TITLE),
-        Style::TEXT_STRONG,
-    );
-    painter.text(
-        egui::pos2(rx, rect.center().y + Style::SP_M),
-        Align2::RIGHT_CENTER,
-        &format!(
-            "{:.1} mi",
-            finite_or(route.remaining_distance_mi, 0.0).max(0.0)
-        ),
-        FontId::proportional(Style::BODY),
-        Style::TEXT_DIM,
-    );
+
+    // Right: subtle expand chevron implying the sheet opens.
+    let cc = egui::pos2(rect.right() - pad - 2.0, base_y);
+    if cc.x.is_finite() && cc.y.is_finite() {
+        painter.circle_filled(cc, 12.0, HUD_CARD_HI);
+        painter.add(Shape::line(
+            vec![
+                egui::pos2(cc.x - 5.0, cc.y + 2.5),
+                egui::pos2(cc.x, cc.y - 2.5),
+                egui::pos2(cc.x + 5.0, cc.y + 2.5),
+            ],
+            Stroke::new(2.0, Style::TEXT_DIM),
+        ));
+    }
 }
 
 fn paint_speedometer(
@@ -1252,6 +1907,9 @@ fn paint_fab(
         "overview" => {
             let _ = paint_carbon(painter, icon_box, "view-grid", Style::TEXT_STRONG);
         }
+        "preview" => {
+            let _ = paint_carbon(painter, icon_box, "road", Style::ACCENT_HI);
+        }
         _ => {}
     }
 }
@@ -1264,6 +1922,13 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         ui.checkbox(&mut state.map.weather_overlay, "Weather");
         ui.checkbox(&mut state.map.dead_zone_overlay, "Dead zones");
         ui.checkbox(&mut state.map.gnss_overlay, "GNSS quality");
+    });
+    ui.add_space(Style::SP_S);
+    ui.horizontal(|ui| {
+        if ui.button("Preview route").clicked() {
+            state.route_preview = true;
+            state.active = WorkspaceTab::Drive;
+        }
     });
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
@@ -2616,6 +3281,106 @@ mod tests {
         assert_eq!(format_distance(0.4), "0.4 mi");
         assert_eq!(format_distance(0.1), "550 ft");
         assert_eq!(format_distance(f32::NAN), "0 ft");
+    }
+
+    fn route_near(maneuver: &str, dist_mi: f32) -> RoutePlan {
+        RoutePlan {
+            current_road: "US-30 W".to_string(),
+            next_maneuver: maneuver.to_string(),
+            distance_to_maneuver_mi: dist_mi,
+            eta: "14:32".to_string(),
+            remaining_time_min: 18,
+            remaining_distance_mi: 11.6,
+            alternatives: 2,
+            traffic_alert: String::new(),
+            weather_alert: String::new(),
+        }
+    }
+
+    #[test]
+    fn mock_lanes_highlights_the_turn_lane() {
+        let right = mock_lanes(ManeuverKind::Right);
+        assert_eq!(right.len(), 3);
+        let last = right.last().expect("lane present");
+        assert!(last.recommended);
+        assert_eq!(last.dir, ManeuverKind::Right);
+        assert!(!right[0].recommended);
+
+        assert!(
+            mock_lanes(ManeuverKind::Left)
+                .first()
+                .expect("lane present")
+                .recommended
+        );
+        assert!(mock_lanes(ManeuverKind::Straight).is_empty());
+        assert!(mock_lanes(ManeuverKind::Roundabout).is_empty());
+        assert!(mock_lanes(ManeuverKind::Arrive).is_empty());
+    }
+
+    #[test]
+    fn lane_guidance_shows_only_near_a_turn_with_fix() {
+        let near = route_near("Turn right onto Main St", 0.3);
+        assert!(lane_guidance_active(&near, ManeuverKind::Right, true));
+        // Far away, no fix, non-finite distance, and non-turn maneuvers all hide it.
+        let far = route_near("Turn right onto Main St", 1.4);
+        assert!(!lane_guidance_active(&far, ManeuverKind::Right, true));
+        assert!(!lane_guidance_active(&near, ManeuverKind::Right, false));
+        let nan = route_near("Turn right", f32::NAN);
+        assert!(!lane_guidance_active(&nan, ManeuverKind::Right, true));
+        assert!(!lane_guidance_active(&near, ManeuverKind::Straight, true));
+    }
+
+    #[test]
+    fn drive_hud_renders_lane_guidance_near_a_turn() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.local_navigation.active_route.next_maneuver = "Turn right onto Main St".to_string();
+        surface
+            .local_navigation
+            .active_route
+            .distance_to_maneuver_mi = 0.2;
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn route_preview_screen_tessellates() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.route_preview = true;
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn route_preview_tessellates_without_fix() {
+        // No fix + degenerate coordinates + NaN/inf telemetry must still render.
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.route_preview = true;
+        for source in &mut surface.locations.sources {
+            source.sample.fix_type = "No fix".to_string();
+            source.sample.latitude = 0.0;
+            source.sample.longitude = 0.0;
+            source.sample.speed_mph = f32::NAN;
+            source.sample.heading_deg = f32::INFINITY;
+        }
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn route_preview_tessellates_at_small_viewport() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.route_preview = true;
+        assert!(tessellate_at(&mut surface, 360.0, 240.0) > 0);
+    }
+
+    #[test]
+    fn preview_layout_has_one_rect_per_option() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 700.0));
+        let layout = preview_layout(rect, 2);
+        assert_eq!(layout.options.len(), 2);
+        assert!(layout.sheet.contains_rect(layout.start));
+        assert!(layout.sheet.contains_rect(layout.dest));
     }
 
     #[test]
