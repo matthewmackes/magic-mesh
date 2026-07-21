@@ -98,7 +98,7 @@ pub trait VehicleProbe: Send + Sync {
 pub struct SshHttpProbe {
     /// The gateway IP (no port).
     ip: String,
-    /// The SSH port (default 22).
+    /// The SSH port (default 2222 — the oMG SSH port).
     ssh_port: u16,
     /// The `root` SSH password (from [`ROOT_PW_ENV`]).
     ssh_pw: String,
@@ -234,15 +234,18 @@ impl VehicleProbe for SshHttpProbe {
 }
 
 /// Split a `MDE_VEHICLE_GATEWAY` value into `(ip, ssh_port)`. `ip:port` yields the
-/// parsed port; a bare `ip` (or an unparsable suffix) defaults to port 22. IPv4-only
-/// (the MG90 is an IPv4 box) — no bracketed-IPv6 handling.
+/// parsed port; a bare `ip` (or an unparsable suffix) defaults to **2222**, the oMG
+/// SSH port — the MG90's SSH daemon listens on 2222, not 22 (verified live: port 22
+/// is refused, 2222 connects). IPv4-only (the MG90 is an IPv4 box) — no
+/// bracketed-IPv6 handling. Override with an explicit `ip:port` for a different unit.
+const OMG_SSH_PORT: u16 = 2222;
 fn parse_endpoint(raw: &str) -> (String, u16) {
     match raw.trim().rsplit_once(':') {
         Some((ip, port)) => match port.trim().parse::<u16>() {
             Ok(p) => (ip.trim().to_string(), p),
-            Err(_) => (raw.trim().to_string(), 22),
+            Err(_) => (raw.trim().to_string(), OMG_SSH_PORT),
         },
-        None => (raw.trim().to_string(), 22),
+        None => (raw.trim().to_string(), OMG_SSH_PORT),
     }
 }
 
@@ -790,18 +793,24 @@ mod tests {
 
     #[test]
     fn parse_endpoint_splits_ip_and_ssh_port() {
+        // A bare IP defaults to the oMG SSH port 2222 (the MG90 listens there).
         assert_eq!(
             parse_endpoint("192.168.13.31"),
-            ("192.168.13.31".to_string(), 22)
+            ("192.168.13.31".to_string(), 2222)
         );
         assert_eq!(
             parse_endpoint("192.168.13.31:2222"),
             ("192.168.13.31".to_string(), 2222)
         );
+        // An explicit port still wins over the default.
+        assert_eq!(
+            parse_endpoint("192.168.13.31:22"),
+            ("192.168.13.31".to_string(), 22)
+        );
         // An unparsable suffix falls back to the whole string + default port.
         assert_eq!(
             parse_endpoint("host.local:ssh"),
-            ("host.local:ssh".to_string(), 22)
+            ("host.local:ssh".to_string(), 2222)
         );
     }
 
