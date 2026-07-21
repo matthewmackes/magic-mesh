@@ -132,9 +132,6 @@ const LAYOUT_MODE_BUTTON_TOUCH: f32 = 56.0;
 const LAYOUT_MODE_MENU_W: f32 = Style::SP_XL * 8.0;
 const LAYOUT_MODE_ROW_H: f32 = 56.0;
 const LAYOUT_MODE_GAP: f32 = Style::SP_S;
-const CAR_HUD_H: f32 = Style::SP_XL * 3.5;
-const CAR_HUD_TILE_W: f32 = Style::SP_XL * 4.5;
-const CAR_HUD_GAP: f32 = Style::SP_S;
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
@@ -513,40 +510,138 @@ fn layout_profile_menu_row(
     response
 }
 
-fn car_hud_tile(ui: &mut egui::Ui, width: f32, label: &str, value: &str, key: &str) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width, CAR_HUD_H - Style::SP_M),
-        egui::Sense::hover(),
+/// Paint an analog speedometer dial — a 270° sweep opening at the bottom, with
+/// tick labels every 20 mph, a filled arc + needle at the current speed, and the
+/// numeric MPH large below the hub. Crash-safe (guards a degenerate rect).
+fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: f32) {
+    use std::f32::consts::PI;
+    if !rect.is_finite() || rect.width() < 24.0 || rect.height() < 24.0 {
+        return;
+    }
+    const MAX_MPH: f32 = 120.0;
+    let mph = mph.clamp(0.0, MAX_MPH);
+    let radius = (rect.width().min(rect.height() * 1.7) * 0.5 - 6.0).max(10.0);
+    let center = egui::pos2(rect.center().x, rect.top() + radius + 4.0);
+    // f in 0..1 -> a point on the dial: f=0 lower-left, f=0.5 top, f=1 lower-right.
+    let point = |f: f32, r: f32| {
+        let a = PI * (0.75 + 1.5 * f.clamp(0.0, 1.0));
+        center + egui::vec2(a.cos(), a.sin()) * r
+    };
+    let arc = |f0: f32, f1: f32, width: f32, color: egui::Color32| {
+        let steps = 48;
+        let pts: Vec<egui::Pos2> = (0..=steps)
+            .map(|i| point(f0 + (f1 - f0) * (i as f32 / steps as f32), radius))
+            .collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(width, color)));
+    };
+    arc(0.0, 1.0, 6.0, Style::BORDER);
+    let frac = mph / MAX_MPH;
+    arc(
+        0.0,
+        frac,
+        6.0,
+        if frac > 0.75 {
+            Style::WARN
+        } else {
+            Style::ACCENT
+        },
     );
-    let ctx = ui.ctx();
-    ui.painter().rect(
+    // Tick marks + labels every 20 mph.
+    let mut t = 0.0;
+    while t <= MAX_MPH + 0.1 {
+        let f = t / MAX_MPH;
+        painter.line_segment(
+            [point(f, radius), point(f, radius - 10.0)],
+            egui::Stroke::new(2.0, Style::TEXT_DIM),
+        );
+        painter.text(
+            point(f, radius - 22.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{t:.0}"),
+            egui::FontId::proportional(Style::SMALL),
+            Style::TEXT_DIM,
+        );
+        t += 20.0;
+    }
+    // Needle + hub.
+    painter.line_segment(
+        [center, point(frac, radius - 6.0)],
+        egui::Stroke::new(3.0, Style::TEXT_STRONG),
+    );
+    painter.circle_filled(center, 5.0, Style::TEXT_STRONG);
+    // Numeric speed, large, in the open bottom of the dial.
+    let num_y = center.y + radius * 0.34;
+    painter.text(
+        egui::pos2(center.x, num_y),
+        egui::Align2::CENTER_CENTER,
+        format!("{mph:.0}"),
+        egui::FontId::proportional((radius * 0.62).clamp(26.0, 72.0)),
+        Style::TEXT_STRONG,
+    );
+    painter.text(
+        egui::pos2(center.x, num_y + radius * 0.3),
+        egui::Align2::CENTER_CENTER,
+        "MPH",
+        egui::FontId::proportional(Style::BODY),
+        Style::TEXT_DIM,
+    );
+}
+
+/// Paint one selectable status readout tile (label above, value below). Returns
+/// whether it was tapped — the driver cycling that slot's readout.
+fn paint_car_status_tile(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    idx: usize,
+    label: &str,
+    value: &str,
+) -> bool {
+    if !rect.is_finite() || rect.width() < 4.0 || rect.height() < 4.0 {
+        return false;
+    }
+    let resp = ui.interact(
         rect,
-        Style::RADIUS_M,
-        Style::resolve_color(ctx, Style::SURFACE),
-        egui::Stroke::new(1.0, Style::resolve_color(ctx, Style::BORDER)),
-        egui::StrokeKind::Outside,
+        egui::Id::new(("car-status-tile", idx)),
+        egui::Sense::click(),
     );
-    ui.painter().text(
-        rect.left_top() + egui::vec2(Style::SP_S, Style::SP_S),
+    let fill = if resp.is_pointer_button_down_on() {
+        Style::pressed_fill(Style::ACCENT)
+    } else if resp.hovered() {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    let radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
+    painter.rect_filled(rect, radius, fill);
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(
+            Style::STROKE_HAIRLINE,
+            if resp.hovered() {
+                Style::ACCENT
+            } else {
+                Style::BORDER
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(Style::SP_S, Style::SP_XS),
         egui::Align2::LEFT_TOP,
         label,
         egui::FontId::proportional(Style::SMALL),
-        Style::resolve_color(ctx, Style::TEXT_DIM),
+        Style::TEXT_DIM,
     );
-    ui.painter().text(
-        egui::pos2(rect.left() + Style::SP_S, rect.center().y - Style::SP_XS),
-        egui::Align2::LEFT_CENTER,
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - Style::SP_S),
+        egui::Align2::CENTER_BOTTOM,
         value,
-        egui::FontId::proportional(if label == "MPH" { 36.0 } else { Style::HEADING }),
-        Style::resolve_color(ctx, Style::TEXT_STRONG),
+        egui::FontId::proportional(Style::TITLE),
+        Style::TEXT_STRONG,
     );
-    ui.painter().text(
-        rect.right_bottom() - egui::vec2(Style::SP_S, Style::SP_S),
-        egui::Align2::RIGHT_BOTTOM,
-        key,
-        egui::FontId::proportional(Style::SMALL),
-        Style::resolve_color(ctx, Style::TEXT_DIM),
-    );
+    resp.clicked()
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
@@ -832,6 +927,10 @@ struct Shell {
     /// management, simulator-backed MG90 local management, vehicle telemetry, GPIO,
     /// firmware, backups, recovery, and encrypted-at-rest-ready trip/location data.
     maps_location: MapsLocationSurface,
+    /// The Auto Mode driver's-strip readout selection (the selectable status
+    /// tiles below the speedometer in the left instrument strip), persisted to
+    /// `settings-car-status.json`. A driver taps a tile to cycle its readout.
+    car_status: mde_maps_location_egui::CarStatusSelection,
     /// The Terminal surface (TERM-16) — the production `TerminalSurface` (the
     /// TERM-4/5/8 `TabbedTerminal`: tabs / splits / broadcast / a shell on any mesh
     /// peer) over a real local PTY, built once by `mde_term_egui::real_terminal()`.
@@ -967,6 +1066,7 @@ impl Shell {
             bookmarks: real_manager(),
             bookmarks_bus: BookmarksBus::default(),
             maps_location: real_maps_location(),
+            car_status: mde_maps_location_egui::CarStatusSelection::load(),
             terminal: real_terminal(),
             editor: real_editor(),
             editor_launch: EditorLaunchWatch::from_env(),
@@ -1788,8 +1888,11 @@ impl Shell {
 
         // The shell's bottom taskbar chrome, mounted BEFORE the central view so
         // its strut can frame the session + shell body. Extracted to a helper so
-        // `render` stays within the line budget.
-        self.mount_dock_chrome(ctx);
+        // `render` stays within the line budget. HIDDEN in Auto Mode — the driver's
+        // left instrument strip is the Car-Mode chrome; the bottom bar is gone.
+        if self.system.layout_profile() != LayoutProfile::Car {
+            self.mount_dock_chrome(ctx);
+        }
 
         // WL-UX-005 — the legacy Start Menu (a duplicate launcher) was removed;
         // the ONE launcher is the unified Front Door, mounted below
@@ -2119,12 +2222,8 @@ impl Shell {
             return;
         }
         let profile = self.system.layout_profile();
-        // The glanceable car-HUD status strip overlays the active surface in Car
-        // Mode — but NOT over the Auto Mode home, which is itself the full-screen
-        // glanceable tile launcher (the strip would just clutter its tiles).
-        if profile == LayoutProfile::Car && self.nav.surface != Surface::AutoHome {
-            self.mount_car_hud(ctx);
-        }
+        // (The Car-Mode instrument readout is now the left driver's strip reserved
+        // in `central_view` — see `car_instrument_strip` — not a floating overlay.)
         let screen = ctx.screen_rect();
         let button = layout_mode_button_rect(screen, self.vdock.rail_height(), profile);
         let mut open_menu = false;
@@ -2232,61 +2331,66 @@ impl Shell {
         }
     }
 
-    fn mount_car_hud(&mut self, ctx: &egui::Context) {
-        let screen = ctx.screen_rect();
-        let top = screen.top() + Style::SP_M;
-        let left = screen.left() + Style::SP_M;
-        let max_w = (screen.width() - Style::SP_M * 2.0).max(CAR_HUD_TILE_W);
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(left, top),
-            egui::vec2(
-                max_w.min(CAR_HUD_TILE_W * 5.0 + CAR_HUD_GAP * 4.0),
-                CAR_HUD_H,
-            ),
+    /// The Auto Mode driver's instrument strip (the left, driver's-side third,
+    /// full height): a big analog speedometer up top with the numeric speed
+    /// below, then the operator's selectable status readouts in a two-column grid.
+    /// A driver taps a readout tile to cycle it to the next catalog entry. Reads
+    /// the live MG90 fold from `maps_location`.
+    fn car_instrument_strip(&mut self, ui: &mut egui::Ui) {
+        let full = ui.available_rect_before_wrap();
+        if !full.is_finite() || full.width() < 8.0 || full.height() < 8.0 {
+            return;
+        }
+        let painter = ui.painter().clone();
+        painter.rect_filled(full, 0.0, Style::BG);
+        let pad = Style::SP_M;
+
+        // Speedometer — the top ~42% of the strip, a large square dial.
+        let gauge_h = (full.height() * 0.42).clamp(120.0, (full.width() - pad * 2.0).max(120.0));
+        let gauge_rect = egui::Rect::from_min_size(
+            egui::pos2(full.left() + pad, full.top() + pad),
+            egui::vec2((full.width() - pad * 2.0).max(1.0), gauge_h),
         );
-        let media_label = self
-            .media
-            .player()
-            .media()
-            .map_or_else(|| "Idle".to_owned(), |_| "Playing".to_owned());
-        let voice_label = {
-            let label = self.voice.call_state().label();
-            if label.is_empty() {
-                "Ready".to_owned()
-            } else {
-                label.to_owned()
+        let mph = self.maps_location.vehicle.telemetry.speed_mph.max(0.0);
+        paint_car_speedometer(&painter, gauge_rect, mph);
+
+        // Selectable status readouts — a two-column grid below the dial.
+        let grid = egui::Rect::from_min_max(
+            egui::pos2(full.left() + pad, gauge_rect.bottom() + Style::SP_M),
+            egui::pos2(full.right() - pad, full.bottom() - pad),
+        );
+        if !grid.is_finite() || grid.height() < 24.0 || grid.width() < 24.0 {
+            return;
+        }
+        let slots = self.car_status.slots().to_vec();
+        let cols = 2usize;
+        let rows = slots.len().div_ceil(cols).max(1);
+        let gap = Style::SP_S;
+        let cell_w = ((grid.width() - gap * (cols as f32 - 1.0)) / cols as f32).max(1.0);
+        let cell_h = ((grid.height() - gap * (rows as f32 - 1.0)) / rows as f32).clamp(34.0, 108.0);
+        let mut cycled = None;
+        for (idx, item) in slots.iter().enumerate() {
+            let c = idx % cols;
+            let r = idx / cols;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    grid.left() + c as f32 * (cell_w + gap),
+                    grid.top() + r as f32 * (cell_h + gap),
+                ),
+                egui::vec2(cell_w, cell_h),
+            );
+            if !rect.is_finite() || rect.width() < 4.0 || rect.bottom() > grid.bottom() + cell_h {
+                continue;
             }
-        };
-        let tiles = [
-            ("MPH", "--".to_owned(), "1/F1"),
-            ("Engine", "--".to_owned(), "2/F2"),
-            ("Next", "--".to_owned(), "3/F3"),
-            ("Media", media_label, "4/F4"),
-            ("VoIP", voice_label, "5/F5"),
-        ];
-        egui::Area::new(egui::Id::new("shell-car-layout-hud"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(rect.min)
-            .show(ctx, |ui| {
-                ui.set_min_size(rect.size());
-                let frame = egui::Frame::NONE
-                    .fill(Style::resolve_color(ctx, Style::BG).gamma_multiply(0.88))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        Style::resolve_color(ctx, Style::BORDER),
-                    ))
-                    .inner_margin(egui::Margin::same(Style::SP_S as i8));
-                frame.show(ui, |ui| {
-                    let tile_w =
-                        ((rect.width() - CAR_HUD_GAP * 4.0) / 5.0).clamp(96.0, CAR_HUD_TILE_W);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = CAR_HUD_GAP;
-                        for (label, value, key) in tiles {
-                            car_hud_tile(ui, tile_w, label, &value, key);
-                        }
-                    });
-                });
-            });
+            let value = item.value(&self.maps_location);
+            if paint_car_status_tile(ui, &painter, rect, idx, item.label(), &value) {
+                cycled = Some(idx);
+            }
+        }
+        if let Some(idx) = cycled {
+            self.car_status.cycle(idx);
+            self.car_status.save();
+        }
     }
 
     fn drain_console_request(&mut self, source: &'static str) {
@@ -2669,12 +2773,16 @@ impl Shell {
         // condition the KIRON focus-mute uses (`render`).
         let full_screen_remote_desktop =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
+        // Auto Mode replaces the bottom taskbar with the left driver's instrument
+        // strip, so the bottom bar is hidden entirely while in Car Mode.
+        let is_car = self.system.layout_profile() == LayoutProfile::Car;
         // WIN10-HYBRID bottom strut — reserve the taskbar's height at the bottom
         // edge FIRST (before the left gutter) so it spans the full width and the
         // surface content ends above it (never covered). In a full-screen remote
-        // desktop the bar floats as an overlay like the dock, so nothing is reserved.
+        // desktop the bar floats as an overlay like the dock, so nothing is reserved;
+        // in Car Mode the bottom bar is gone, so nothing is reserved either.
         let strut = reserved_taskbar_strut(full_screen_remote_desktop, &self.vdock);
-        if strut > 0.0 {
+        if strut > 0.0 && !is_car {
             egui::TopBottomPanel::bottom("shell-taskbar-strut")
                 .exact_height(strut)
                 .resizable(false)
@@ -2693,6 +2801,21 @@ impl Shell {
         }
 
         let covered = self.curtain.covers_fully();
+        // Auto Mode driver's instrument strip — the left (driver's-side) third,
+        // full height: an analog speedometer on top + selectable status readouts
+        // below. Reserved as a SidePanel BEFORE the CentralPanel so it never
+        // occludes the map/nav content (which flows in the remaining two-thirds).
+        if is_car && !covered {
+            let strip_w = (ctx.screen_rect().width() / 3.0).max(1.0);
+            egui::SidePanel::left("car-instrument-strip")
+                .exact_width(strip_w)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.fill(Style::BG))
+                .show(ctx, |ui| {
+                    self.car_instrument_strip(ui);
+                });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             self.last_workspace_rect = Some(ui.max_rect());
             if covered {

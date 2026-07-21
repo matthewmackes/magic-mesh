@@ -33,6 +33,7 @@ mde-egui = { path = "../../shared/mde-egui" }
 # seams (no daemon dependency), matching the edge mde-shell-egui already draws.
 mde-bus           = { path = "../../platform/mde-bus" }
 mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]

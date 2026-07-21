@@ -7,11 +7,13 @@
 //! launch without hardware, prove location-health behavior, and leave clear gaps
 //! for the real adapters.
 
+pub mod car_status;
 pub mod model;
 pub mod view;
 
 use mde_egui::{eframe, egui, run_client};
 
+pub use car_status::{CarStatusItem, CarStatusSelection};
 pub use model::MapsLocationSurface;
 pub use view::maps_location_panel;
 
