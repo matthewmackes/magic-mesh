@@ -259,6 +259,9 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "editor" | "code" => Some(Surface::Editor),
         "phones" | "phone" => Some(Surface::Phones),
         "about" => Some(Surface::About),
+        // The Communications hub (WL-FUNC-011) — an alert/chyron `shell/goto`
+        // targeting it now resolves like every other dock surface.
+        "communications" | "comms" => Some(Surface::Communications),
         _ => None,
     }
 }

@@ -615,7 +615,6 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         Surface::Workbench
         | Surface::InfraCode
         | Surface::Chat
-        | Surface::Communications
         | Surface::System
         | Surface::Storage
         | Surface::About => false,
@@ -632,6 +631,11 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         | Surface::Terminal
         | Surface::Editor
         | Surface::Phones
+        // The Communications surface (WL-FUNC-011) mounts a plain
+        // `communications.show(ui)` with no menubar of its own (unlike
+        // Chat/System/Storage/etc), so it still needs the shell's top-right
+        // remote-sessions fallback control.
+        | Surface::Communications
         | Surface::Timers => true,
     }
 }
