@@ -277,11 +277,19 @@ COPY packaging/bootc/kargs.d/00-mcnf-virt.toml /usr/lib/bootc/kargs.d/00-mcnf-vi
 # declared policy, the enable materializes it in the image /etc now) and boots
 # to graphical. NOTHING is masked by default (§5): the seat unit self-gates on
 # the role flag, so this one image serves every role unmodified.
-RUN systemctl enable \
-        cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service \
-        qemu-guest-agent.service \
-        openvswitch.service \
-        mde-shell-egui.service podman.socket && \
+RUN set -eux; \
+    # The seat unit MUST enable — it is the whole point of a Workstation image; fail
+    # loud if it can't. Everything else is enabled best-effort, per unit, so a service
+    # renamed across a Fedora/cloud-init version bump degrades to "that one not enabled"
+    # instead of killing the image build. (fedora-bootc:44's cloud-init 24.x dropped
+    # cloud-init.service in favour of cloud-init-network.service; the base image's
+    # package presets already enable most of these on install anyway.)
+    systemctl enable mde-shell-egui.service; \
+    for u in podman.socket qemu-guest-agent.service openvswitch.service \
+             cloud-init.target cloud-init-local.service cloud-init-network.service \
+             cloud-init.service cloud-config.service cloud-final.service; do \
+        systemctl enable "$u" 2>/dev/null && echo "role-wiring: enabled $u" || echo "role-wiring: $u absent on this base — skipped"; \
+    done; \
     systemctl set-default graphical.target
 
 # Surface bootc's own image lint in the build log (non-fatal: it flags the
