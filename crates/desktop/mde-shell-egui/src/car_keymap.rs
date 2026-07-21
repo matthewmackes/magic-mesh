@@ -44,12 +44,20 @@ pub enum CarAction {
     GoComms,
     /// Jump to Vehicle telematics.
     GoVehicle,
+    /// Jump to Settings (incl. the Key Mapping page).
+    GoSettings,
     /// Toggle media play / pause on the active player.
     MediaPlayPause,
     /// Skip to the next track / chapter.
     MediaNext,
     /// Skip to the previous track / chapter.
     MediaPrev,
+    /// Raise the seat volume.
+    VolumeUp,
+    /// Lower the seat volume.
+    VolumeDown,
+    /// Mute / unmute the seat volume.
+    VolumeMute,
     /// Answer an incoming call.
     CallAnswer,
     /// Decline an incoming call / hang up the active call.
@@ -58,16 +66,20 @@ pub enum CarAction {
 
 impl CarAction {
     /// Every action, in the order the Key Mapping settings page lists them.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 15] = [
         Self::GoHome,
         Self::GoNav,
         Self::GoMedia,
         Self::GoPhone,
         Self::GoComms,
         Self::GoVehicle,
+        Self::GoSettings,
         Self::MediaPlayPause,
         Self::MediaNext,
         Self::MediaPrev,
+        Self::VolumeUp,
+        Self::VolumeDown,
+        Self::VolumeMute,
         Self::CallAnswer,
         Self::CallHangup,
     ];
@@ -82,9 +94,13 @@ impl CarAction {
             Self::GoPhone => "Phone",
             Self::GoComms => "Comms",
             Self::GoVehicle => "Vehicle",
+            Self::GoSettings => "Settings",
             Self::MediaPlayPause => "Play / Pause",
             Self::MediaNext => "Next Track",
             Self::MediaPrev => "Previous Track",
+            Self::VolumeUp => "Volume Up",
+            Self::VolumeDown => "Volume Down",
+            Self::VolumeMute => "Mute",
             Self::CallAnswer => "Answer Call",
             Self::CallHangup => "Hang Up / Decline",
         }
@@ -102,23 +118,28 @@ impl CarAction {
                 | Self::GoPhone
                 | Self::GoComms
                 | Self::GoVehicle
+                | Self::GoSettings
         )
     }
 }
 
-/// The physical keys Car Mode allows binding — the digit row and the function
-/// row: the big, findable-by-touch keys a USB keyboard exposes cleanly through
-/// egui (media keys arrive on a separate evdev path and are out of scope here).
-/// Returned in the order the Key Mapping page lays them out.
+/// The physical keys Car Mode allows binding — the digit row, the function row,
+/// and the full letter block, so **every** Auto Mode action can be reached
+/// directly from the in-vehicle USB keyboard (a driver never needs the
+/// touchscreen). These are the keys egui distinguishes cleanly; true media keys
+/// arrive on a separate evdev path and are out of scope here. Returned in the
+/// order the Key Mapping page lays them out.
 #[must_use]
 pub fn bindable_keys() -> Vec<egui::Key> {
     use egui::Key::{
-        Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, F1, F10, F11, F12, F2, F3, F4,
-        F5, F6, F7, F8, F9,
+        Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, A, B, C, D, E, F, F1, F10, F11,
+        F12, F2, F3, F4, F5, F6, F7, F8, F9, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X,
+        Y, Z,
     };
     vec![
         Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0, F1, F2, F3, F4, F5, F6, F7, F8,
-        F9, F10, F11, F12,
+        F9, F10, F11, F12, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X,
+        Y, Z,
     ]
 }
 
@@ -127,8 +148,9 @@ pub fn bindable_keys() -> Vec<egui::Key> {
 #[must_use]
 pub fn key_label(key: egui::Key) -> Option<&'static str> {
     use egui::Key::{
-        Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, F1, F10, F11, F12, F2, F3, F4,
-        F5, F6, F7, F8, F9,
+        Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, A, B, C, D, E, F, F1, F10, F11,
+        F12, F2, F3, F4, F5, F6, F7, F8, F9, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X,
+        Y, Z,
     };
     Some(match key {
         Num1 => "1",
@@ -153,6 +175,32 @@ pub fn key_label(key: egui::Key) -> Option<&'static str> {
         F10 => "F10",
         F11 => "F11",
         F12 => "F12",
+        A => "A",
+        B => "B",
+        C => "C",
+        D => "D",
+        E => "E",
+        F => "F",
+        G => "G",
+        H => "H",
+        I => "I",
+        J => "J",
+        K => "K",
+        L => "L",
+        M => "M",
+        N => "N",
+        O => "O",
+        P => "P",
+        Q => "Q",
+        R => "R",
+        S => "S",
+        T => "T",
+        U => "U",
+        V => "V",
+        W => "W",
+        X => "X",
+        Y => "Y",
+        Z => "Z",
         _ => return None,
     })
 }
@@ -187,13 +235,18 @@ impl CarKeyBindings {
     /// (`1`/`F1` → Nav, …) so either row works from muscle memory.
     #[must_use]
     pub fn defaults() -> Self {
-        use egui::Key::{Num1, Num2, Num3, Num4, Num5, Num6, F1, F2, F3, F4, F5, F6, F7, F8, F9};
+        use egui::Key::{
+            Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, F1, F10, F11, F12, F2, F3,
+            F4, F5, F6, F7, F8, F9,
+        };
         let mut bindings = BTreeMap::new();
         let mut set = |key: egui::Key, action: CarAction| {
             if let Some(l) = key_label(key) {
                 bindings.insert(l.to_string(), action);
             }
         };
+        // Digit + aligned function key hit the same app (`1`/`F1` → Nav, …) so
+        // either row works from muscle memory.
         for (num, fkey, action) in [
             (Num1, F1, CarAction::GoNav),
             (Num2, F2, CarAction::GoMedia),
@@ -205,9 +258,18 @@ impl CarKeyBindings {
             set(num, action);
             set(fkey, action);
         }
+        // Media / call / volume on the remaining keys — every action bound by
+        // default so the whole car UI is keyboard-reachable out of the box.
+        set(Num7, CarAction::MediaPrev);
+        set(Num8, CarAction::MediaPlayPause);
+        set(Num9, CarAction::MediaNext);
+        set(Num0, CarAction::GoSettings);
         set(F7, CarAction::MediaPlayPause);
         set(F8, CarAction::CallAnswer);
         set(F9, CarAction::CallHangup);
+        set(F10, CarAction::VolumeDown);
+        set(F11, CarAction::VolumeUp);
+        set(F12, CarAction::VolumeMute);
         Self { bindings }
     }
 
@@ -306,13 +368,16 @@ mod tests {
         assert_eq!(b.action_for(egui::Key::F1), Some(CarAction::GoNav));
         assert_eq!(b.action_for(egui::Key::Num5), Some(CarAction::GoVehicle));
         assert_eq!(b.action_for(egui::Key::Num6), Some(CarAction::GoHome));
-        // Transport + call verbs on the upper function row.
+        // Transport / call / volume + settings verbs are all bound by default, so
+        // the whole car UI is keyboard-reachable out of the box.
         assert_eq!(b.action_for(egui::Key::F7), Some(CarAction::MediaPlayPause));
         assert_eq!(b.action_for(egui::Key::F8), Some(CarAction::CallAnswer));
         assert_eq!(b.action_for(egui::Key::F9), Some(CarAction::CallHangup));
-        // An unbound bindable key + a non-bindable key are both None.
-        assert_eq!(b.action_for(egui::Key::F12), None);
-        assert_eq!(b.action_for(egui::Key::A), None);
+        assert_eq!(b.action_for(egui::Key::F12), Some(CarAction::VolumeMute));
+        assert_eq!(b.action_for(egui::Key::Num0), Some(CarAction::GoSettings));
+        // A letter key is bindable but unbound by default; a non-bindable key is None.
+        assert_eq!(b.action_for(egui::Key::Z), None);
+        assert_eq!(b.action_for(egui::Key::Space), None);
     }
 
     #[test]
@@ -326,8 +391,8 @@ mod tests {
         b.clear(egui::Key::Num1);
         assert_eq!(b.action_for(egui::Key::Num1), None);
         // A non-bindable key is a no-op, not a panic.
-        b.set(egui::Key::A, CarAction::GoHome);
-        assert_eq!(b.action_for(egui::Key::A), None);
+        b.set(egui::Key::Space, CarAction::GoHome);
+        assert_eq!(b.action_for(egui::Key::Space), None);
         b.reset();
         assert_eq!(b, CarKeyBindings::defaults());
     }
@@ -360,7 +425,8 @@ mod tests {
             let label = key_label(key).expect("bindable key has a label");
             assert_eq!(key_from_label(label), Some(key));
         }
-        assert_eq!(key_label(egui::Key::A), None);
+        assert_eq!(key_label(egui::Key::A), Some("A"));
+        assert_eq!(key_label(egui::Key::Space), None);
         assert_eq!(key_from_label("nope"), None);
     }
 }

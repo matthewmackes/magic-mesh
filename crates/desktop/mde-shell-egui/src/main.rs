@@ -510,80 +510,100 @@ fn layout_profile_menu_row(
     response
 }
 
-/// Paint an analog speedometer dial — a 270° sweep opening at the bottom, with
-/// tick labels every 20 mph, a filled arc + needle at the current speed, and the
-/// numeric MPH large below the hub. Crash-safe (guards a degenerate rect).
+/// Paint the Auto Mode speedometer in the **Ford Police Interceptor 2020** cluster
+/// idiom: a brushed-chrome bezel over a black dial, dense minor ticks with bold
+/// white majors + numerals across a 0-160 sweep, a red redline zone up top, a
+/// tapered red needle with a counterweight tail on a silver hub, and the digital
+/// speed centred below. Crash-safe (guards a degenerate rect).
 fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: f32) {
     use std::f32::consts::PI;
     if !rect.is_finite() || rect.width() < 24.0 || rect.height() < 24.0 {
         return;
     }
-    const MAX_MPH: f32 = 120.0;
+    const MAX_MPH: f32 = 160.0; // Interceptor / police speedo range.
     let mph = mph.clamp(0.0, MAX_MPH);
-    let radius = (rect.width().min(rect.height() * 1.7) * 0.5 - 6.0).max(10.0);
-    let center = egui::pos2(rect.center().x, rect.top() + radius + 4.0);
+    let frac = mph / MAX_MPH;
+    let radius = (rect.width().min(rect.height() * 1.7) * 0.5 - 8.0).max(12.0);
+    let center = egui::pos2(rect.center().x, rect.top() + radius + 6.0);
     // f in 0..1 -> a point on the dial: f=0 lower-left, f=0.5 top, f=1 lower-right.
     let point = |f: f32, r: f32| {
         let a = PI * (0.75 + 1.5 * f.clamp(0.0, 1.0));
         center + egui::vec2(a.cos(), a.sin()) * r
     };
-    let arc = |f0: f32, f1: f32, width: f32, color: egui::Color32| {
-        let steps = 48;
+    let arc = |f0: f32, f1: f32, r: f32, width: f32, color: egui::Color32| {
+        let steps = 56;
         let pts: Vec<egui::Pos2> = (0..=steps)
-            .map(|i| point(f0 + (f1 - f0) * (i as f32 / steps as f32), radius))
+            .map(|i| point(f0 + (f1 - f0) * (i as f32 / steps as f32), r))
             .collect();
         painter.add(egui::Shape::line(pts, egui::Stroke::new(width, color)));
     };
-    arc(0.0, 1.0, 6.0, Style::BORDER);
-    let frac = mph / MAX_MPH;
-    arc(
-        0.0,
-        frac,
-        6.0,
-        if frac > 0.75 {
-            Style::WARN
+
+    // Brushed-chrome bezel over a black dial face.
+    painter.circle_filled(center, radius + 6.0, Style::TEXT_DIM); // outer chrome ring
+    painter.circle_filled(center, radius + 3.0, Style::BORDER); // inner dark bevel
+    painter.circle_filled(center, radius, Style::BG); // black face
+
+    // Ticks: minor every 5 (thin, dim), major every 20 (bold, white) + numerals.
+    let mut v = 0.0_f32;
+    while v <= MAX_MPH + 0.1 {
+        let f = v / MAX_MPH;
+        let major = (v as i32) % 20 == 0;
+        let len = if major { 13.0 } else { 6.0 };
+        let (w, col) = if major {
+            (2.5, Style::TEXT_STRONG)
         } else {
-            Style::ACCENT
-        },
-    );
-    // Tick marks + labels every 20 mph.
-    let mut t = 0.0;
-    while t <= MAX_MPH + 0.1 {
-        let f = t / MAX_MPH;
+            (1.0, Style::TEXT_DIM)
+        };
         painter.line_segment(
-            [point(f, radius), point(f, radius - 10.0)],
-            egui::Stroke::new(2.0, Style::TEXT_DIM),
+            [point(f, radius - 4.0), point(f, radius - 4.0 - len)],
+            egui::Stroke::new(w, col),
         );
-        painter.text(
-            point(f, radius - 22.0),
-            egui::Align2::CENTER_CENTER,
-            format!("{t:.0}"),
-            egui::FontId::proportional(Style::SMALL),
-            Style::TEXT_DIM,
-        );
-        t += 20.0;
+        if major {
+            painter.text(
+                point(f, radius - 26.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{v:.0}"),
+                egui::FontId::proportional((radius * 0.14).clamp(9.0, 15.0)),
+                Style::TEXT_STRONG,
+            );
+        }
+        v += 5.0;
     }
-    // Needle + hub.
+
+    // Redline zone (top of the range) + the blue live-speed sweep on the inner rim.
+    arc(0.8, 1.0, radius - 4.0, 3.0, Style::DANGER);
+    arc(0.0, frac, radius - 14.0, 3.5, Style::ACCENT);
+
+    // Red needle with a counterweight tail on a silver hub (the Ford pointer).
+    let dir = {
+        let a = PI * (0.75 + 1.5 * frac);
+        egui::vec2(a.cos(), a.sin())
+    };
     painter.line_segment(
-        [center, point(frac, radius - 6.0)],
-        egui::Stroke::new(3.0, Style::TEXT_STRONG),
+        [
+            center - dir * (radius * 0.16),
+            center + dir * (radius - 10.0),
+        ],
+        egui::Stroke::new(3.5, Style::DANGER),
     );
-    painter.circle_filled(center, 5.0, Style::TEXT_STRONG);
-    // Numeric speed, large, in the open bottom of the dial.
-    let num_y = center.y + radius * 0.34;
+    painter.circle_filled(center, 9.0, Style::TEXT_DIM); // silver hub
+    painter.circle_filled(center, 4.5, Style::BORDER); // dark cap
+
+    // Digital speed + label, centred in the open lower area of the dial.
+    let num_y = center.y + radius * 0.36;
     painter.text(
         egui::pos2(center.x, num_y),
         egui::Align2::CENTER_CENTER,
         format!("{mph:.0}"),
-        egui::FontId::proportional((radius * 0.62).clamp(26.0, 72.0)),
+        egui::FontId::proportional((radius * 0.6).clamp(26.0, 68.0)),
         Style::TEXT_STRONG,
     );
     painter.text(
         egui::pos2(center.x, num_y + radius * 0.3),
         egui::Align2::CENTER_CENTER,
         "MPH",
-        egui::FontId::proportional(Style::BODY),
-        Style::TEXT_DIM,
+        egui::FontId::proportional((radius * 0.14).clamp(10.0, 16.0)),
+        Style::ACCENT,
     );
 }
 
@@ -2196,6 +2216,7 @@ impl Shell {
             CarAction::GoPhone => self.apply_car_tile(car_home::CarTile::Phone),
             CarAction::GoComms => self.apply_car_tile(car_home::CarTile::Comms),
             CarAction::GoVehicle => self.apply_car_tile(car_home::CarTile::Vehicle),
+            CarAction::GoSettings => self.apply_car_tile(car_home::CarTile::Settings),
             CarAction::MediaPlayPause => {
                 self.web
                     .selected_media_transport(MediaTransportAction::PlayPause);
@@ -2208,6 +2229,11 @@ impl Shell {
                 self.web
                     .selected_media_transport(MediaTransportAction::Previous);
             }
+            // Volume keys act on the seat through the same path as the seat hotkeys
+            // (flashing the OSD), so a bound letter/F-key is a direct volume control.
+            CarAction::VolumeUp => self.apply_hotkey(HotkeyAction::VolumeUp),
+            CarAction::VolumeDown => self.apply_hotkey(HotkeyAction::VolumeDown),
+            CarAction::VolumeMute => self.apply_hotkey(HotkeyAction::VolumeMute),
             // A physical Answer / Hang-up key brings the driver to the (car-large)
             // Phone screen to confirm; direct in-place answer is a fast follow once
             // the Voice surface exposes a programmatic call verb.
