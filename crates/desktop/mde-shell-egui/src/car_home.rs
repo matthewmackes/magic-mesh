@@ -30,18 +30,21 @@ pub enum CarTile {
     Comms,
     /// Vehicle telematics (opens the Maps surface on its Vehicle tab).
     Vehicle,
+    /// Airspace — the real-time wardriving radar (Maps surface, Airspace tab).
+    Airspace,
     /// Settings — including the Car Mode Key Mapping page.
     Settings,
 }
 
 impl CarTile {
-    /// The tiles in home-grid order (two columns × three rows).
-    pub const ALL: [Self; 6] = [
+    /// The tiles in home-grid order (two columns).
+    pub const ALL: [Self; 7] = [
         Self::Nav,
         Self::Media,
         Self::Phone,
         Self::Comms,
         Self::Vehicle,
+        Self::Airspace,
         Self::Settings,
     ];
 
@@ -54,6 +57,7 @@ impl CarTile {
             Self::Phone => "Phone",
             Self::Comms => "Comms",
             Self::Vehicle => "Vehicle",
+            Self::Airspace => "Airspace",
             Self::Settings => "Settings",
         }
     }
@@ -67,6 +71,7 @@ impl CarTile {
             Self::Phone => IconId::Voice,
             Self::Comms => IconId::Share,
             Self::Vehicle => IconId::HealthStatus,
+            Self::Airspace => IconId::MeshView,
             Self::Settings => IconId::Settings,
         }
     }
@@ -75,7 +80,7 @@ impl CarTile {
     #[must_use]
     pub const fn surface(self) -> Surface {
         match self {
-            Self::Nav | Self::Vehicle => Surface::MapsLocation,
+            Self::Nav | Self::Vehicle | Self::Airspace => Surface::MapsLocation,
             Self::Media => Surface::Media,
             Self::Phone => Surface::Voice,
             Self::Comms => Surface::Communications,
@@ -93,6 +98,7 @@ impl CarTile {
             Self::Phone => Style::ACCENT_COMMS,
             Self::Comms => Style::ACCENT,
             Self::Vehicle => Style::OK,
+            Self::Airspace => Style::ACCENT_COMMS,
             Self::Settings => Style::ACCENT_SYSTEM,
         }
     }
@@ -136,6 +142,7 @@ impl CarHomeGlance {
                 .vehicle
                 .clone()
                 .unwrap_or_else(|| "Telematics".to_string()),
+            CarTile::Airspace => "WiFi · cell · BT radar".to_string(),
             CarTile::Settings => "Key mapping & more".to_string(),
         }
     }

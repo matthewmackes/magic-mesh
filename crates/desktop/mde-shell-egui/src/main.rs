@@ -1603,6 +1603,9 @@ impl Shell {
         if tile == car_home::CarTile::Vehicle {
             self.maps_location.focus_vehicle_tab();
         }
+        if tile == car_home::CarTile::Airspace {
+            self.maps_location.focus_airspace_tab();
+        }
     }
 }
 

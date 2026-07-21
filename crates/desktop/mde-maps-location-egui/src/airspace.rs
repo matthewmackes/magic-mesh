@@ -534,7 +534,10 @@ fn finite_or(v: f32, f: f32) -> f32 {
 pub fn airspace_panel(ui: &mut Ui, state: &mut AirspaceState) {
     // Continuous repaint drives the sweep + signal flutter — the "active" look.
     if state.active {
-        ui.ctx().request_repaint();
+        // ~30 fps animation cadence — smooth sweep/flutter without pinning the CPU
+        // (the debug seat is unoptimized; the release build has ample headroom).
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
     }
     let t = ui.input(|i| i.time) as f32;
     let full = ui.available_rect_before_wrap();
