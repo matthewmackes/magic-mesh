@@ -72,6 +72,12 @@ pub struct MapsLocationSurface {
     pub active: WorkspaceTab,
     /// Whether the pre-drive route-preview screen is showing over the Drive tab.
     pub route_preview: bool,
+    /// Whether the "Where to?" destination-search screen is showing over Drive.
+    pub destination_search: bool,
+    /// Whether the "You have arrived" screen is showing over the Drive tab.
+    pub arrived: bool,
+    /// Whether turn-by-turn guidance is in the off-route "Recalculating…" state.
+    pub off_route: bool,
     /// Simulators are first-class and on by default.
     pub simulator_enabled: bool,
     /// Current map view model.
@@ -107,6 +113,9 @@ impl MapsLocationSurface {
         Self {
             active: WorkspaceTab::Drive,
             route_preview: false,
+            destination_search: false,
+            arrived: false,
+            off_route: false,
             simulator_enabled: true,
             map: MapViewState::simulated(),
             offline_maps: OfflineMapManagerState::simulated_default(),
@@ -136,6 +145,50 @@ impl MapsLocationSurface {
     #[must_use]
     pub fn primary_location_warning(&self) -> Option<String> {
         self.locations.primary_warning()
+    }
+
+    /// Open the "Where to?" destination-search screen over the Drive tab.
+    ///
+    /// Clears any terminal arrival state so search is always reachable, matching
+    /// the Google-Maps / Waze "search from anywhere" entry affordance.
+    pub fn open_destination_search(&mut self) {
+        self.active = WorkspaceTab::Drive;
+        self.arrived = false;
+        self.destination_search = true;
+    }
+
+    /// Choose a destination from the search screen and advance to route preview.
+    ///
+    /// Out-of-range indices leave the selected destination unchanged but still
+    /// advance to preview, so the call is always crash-safe.
+    pub fn choose_destination(&mut self, idx: usize) {
+        self.local_navigation.select_destination(idx);
+        self.destination_search = false;
+        self.arrived = false;
+        self.off_route = false;
+        self.route_preview = true;
+    }
+
+    /// Enter the "You have arrived" screen (the arrival path + dev toggle).
+    pub fn simulate_arrival(&mut self) {
+        self.active = WorkspaceTab::Drive;
+        self.destination_search = false;
+        self.route_preview = false;
+        self.off_route = false;
+        self.arrived = true;
+    }
+
+    /// Leave any navigation-flow overlay and return to the live turn-by-turn HUD.
+    pub fn end_navigation(&mut self) {
+        self.arrived = false;
+        self.destination_search = false;
+        self.route_preview = false;
+        self.off_route = false;
+    }
+
+    /// Toggle the off-route / recalculating guidance state (dev toggle).
+    pub fn toggle_off_route(&mut self) {
+        self.off_route = !self.off_route;
     }
 
     /// Compute whether the current state can provide offline turn-by-turn use.
@@ -611,6 +664,8 @@ pub struct LocalNavigationState {
     pub route_options: Vec<RouteOption>,
     /// Index of the currently selected route option.
     pub selected_route: usize,
+    /// Index of the destination the preview / arrival screens summarize.
+    pub selected_destination: usize,
 }
 
 impl LocalNavigationState {
@@ -659,8 +714,14 @@ impl LocalNavigationState {
             },
             destinations: vec![
                 Destination {
-                    label: "Station".to_string(),
-                    category: "favorite".to_string(),
+                    label: "Home".to_string(),
+                    category: "home".to_string(),
+                    distance_mi: 5.4,
+                    address: "742 Ridgeview Terrace".to_string(),
+                },
+                Destination {
+                    label: "Precinct HQ".to_string(),
+                    category: "work".to_string(),
                     distance_mi: 3.2,
                     address: "1200 Public Safety Blvd".to_string(),
                 },
@@ -675,6 +736,24 @@ impl LocalNavigationState {
                     category: "favorite".to_string(),
                     distance_mi: 14.1,
                     address: "US-30 W Mile 214, staging area".to_string(),
+                },
+                Destination {
+                    label: "Motor pool fuel".to_string(),
+                    category: "fuel".to_string(),
+                    distance_mi: 2.1,
+                    address: "88 Motor Pool Rd".to_string(),
+                },
+                Destination {
+                    label: "Market St Diner".to_string(),
+                    category: "food".to_string(),
+                    distance_mi: 4.3,
+                    address: "210 Market St".to_string(),
+                },
+                Destination {
+                    label: "Union St Garage".to_string(),
+                    category: "parking".to_string(),
+                    distance_mi: 1.6,
+                    address: "5th St & Union, Level 2".to_string(),
                 },
             ],
             route_options: vec![
@@ -696,7 +775,35 @@ impl LocalNavigationState {
                 },
             ],
             selected_route: 0,
+            selected_destination: 0,
         }
+    }
+
+    /// The destination the route-preview and arrival screens summarize.
+    ///
+    /// Falls back to the first destination when the selected index is out of
+    /// range, so the summary is always populated (crash-safe).
+    #[must_use]
+    pub fn active_destination(&self) -> Option<&Destination> {
+        self.destinations
+            .get(self.selected_destination)
+            .or_else(|| self.destinations.first())
+    }
+
+    /// Select a destination by index. Out-of-range indices are ignored, so the
+    /// call is always crash-safe.
+    pub fn select_destination(&mut self, idx: usize) {
+        if idx < self.destinations.len() {
+            self.selected_destination = idx;
+        }
+    }
+
+    /// Index of the first destination whose category matches `category`, if any.
+    #[must_use]
+    pub fn destination_in_category(&self, category: &str) -> Option<usize> {
+        self.destinations
+            .iter()
+            .position(|destination| destination.category.eq_ignore_ascii_case(category))
     }
 
     /// Apply a route option's summary onto the active route.
@@ -2433,5 +2540,75 @@ mod tests {
             .destinations
             .iter()
             .all(|destination| !destination.address.trim().is_empty()));
+    }
+
+    #[test]
+    fn each_quick_category_chip_has_a_matching_destination() {
+        // The "Where to?" chips (Home / Work / Fuel / Food / Parking) must each
+        // resolve to a recent/favorite so a chip tap always opens a preview.
+        let nav = LocalNavigationState::simulated();
+        for category in ["home", "work", "fuel", "food", "parking"] {
+            assert!(
+                nav.destination_in_category(category).is_some(),
+                "no destination for category {category}"
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_a_destination_opens_preview_and_records_selection() {
+        let mut state = MapsLocationSurface::simulated();
+        state.open_destination_search();
+        assert!(state.destination_search);
+
+        state.choose_destination(3);
+        assert!(!state.destination_search);
+        assert!(state.route_preview);
+        assert_eq!(state.local_navigation.selected_destination, 3);
+        assert_eq!(
+            state
+                .local_navigation
+                .active_destination()
+                .map(|d| d.label.as_str()),
+            state
+                .local_navigation
+                .destinations
+                .get(3)
+                .map(|d| d.label.as_str())
+        );
+    }
+
+    #[test]
+    fn out_of_range_destination_selection_is_a_no_op() {
+        let mut nav = LocalNavigationState::simulated();
+        nav.select_destination(999);
+        assert_eq!(nav.selected_destination, 0);
+        assert!(nav.active_destination().is_some());
+    }
+
+    #[test]
+    fn arrival_and_end_navigation_toggle_the_flow_flags() {
+        let mut state = MapsLocationSurface::simulated();
+        state.route_preview = true;
+        state.simulate_arrival();
+        assert!(state.arrived);
+        assert!(!state.route_preview);
+        assert_eq!(state.active, WorkspaceTab::Drive);
+
+        state.end_navigation();
+        assert!(!state.arrived);
+        assert!(!state.route_preview);
+        assert!(!state.destination_search);
+        assert!(!state.off_route);
+    }
+
+    #[test]
+    fn off_route_toggles() {
+        let mut state = MapsLocationSurface::simulated();
+        assert!(!state.off_route);
+        state.toggle_off_route();
+        assert!(state.off_route);
+        state.toggle_off_route();
+        assert!(!state.off_route);
     }
 }

@@ -417,6 +417,15 @@ fn elide(painter: &Painter, text: &str, font: FontId, max_w: f32) -> String {
 // ===========================================================================
 
 fn show_drive(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    // Navigation flow, terminal state first: arrival → search → preview → HUD.
+    if state.arrived {
+        show_arrival(ui, state);
+        return;
+    }
+    if state.destination_search {
+        show_destination_search(ui, state);
+        return;
+    }
     if state.route_preview {
         show_route_preview(ui, state);
         return;
@@ -468,8 +477,8 @@ fn drive_hud(
     let fab_gap = Style::SP_S + Style::SP_XS;
     let fab_cx = rect.right() - margin - fab_r;
     let stack_bottom = rect.bottom() - margin - 96.0 - fab_r;
-    let fab_keys = ["recenter", "mute", "overview", "preview"];
-    let mut fab_states: [Option<(Pos2, bool, bool)>; 4] = [None; 4];
+    let fab_keys = ["recenter", "search", "mute", "overview", "preview"];
+    let mut fab_states: [Option<(Pos2, bool, bool)>; 5] = [None; 5];
     let muted_id = egui::Id::new(("maps-drive-hud", "muted"));
     let mut muted = ui
         .ctx()
@@ -495,6 +504,7 @@ fn drive_hud(
                 }
                 "overview" => state.map.zoom = 6.5,
                 "preview" => state.route_preview = true,
+                "search" => state.destination_search = true,
                 "mute" => {
                     muted = !muted;
                     ui.ctx().data_mut(|d| d.insert_temp(muted_id, muted));
@@ -503,6 +513,14 @@ fn drive_hud(
             }
         }
         fab_states[idx] = Some((center, resp.hovered(), resp.is_pointer_button_down_on()));
+    }
+
+    // Off-route recalculating state: the route dims + the banner turns amber,
+    // matching Google-Maps / Waze. Keep the map animating while it recalculates.
+    let off_route = state.off_route;
+    let time = ui.input(|input| input.time);
+    if off_route {
+        ui.ctx().request_repaint();
     }
 
     // --- Paint: scene first, then the floating cards over it. --------------
@@ -515,11 +533,13 @@ fn drive_hud(
         &state.dead_zones,
         primary,
         has_fix,
+        has_fix && !off_route,
     );
 
     let route = &state.local_navigation.active_route;
 
-    // Top maneuver banner (the dominant instruction, Google-Maps blue).
+    // Top maneuver banner (the dominant instruction, Google-Maps blue), or the
+    // amber "Recalculating…" banner when off route.
     let banner = safe_rect(
         rect.left() + margin,
         rect.top() + margin,
@@ -528,11 +548,16 @@ fn drive_hud(
     );
     let kind = maneuver_kind(&route.next_maneuver);
     paint_soft_shadow(&painter, banner, HUD_RADIUS);
-    paint_maneuver_banner(&painter, banner, route, kind, has_fix);
+    if off_route {
+        paint_recalculating_banner(&painter, banner, route, time);
+    } else {
+        paint_maneuver_banner(&painter, banner, route, kind, has_fix);
+    }
 
-    // Lane-guidance strip directly under the banner (only when a turn is near).
+    // Lane-guidance strip directly under the banner (only when a turn is near
+    // and we are on route).
     let mut below_banner = banner.bottom() + Style::SP_S;
-    if lane_guidance_active(route, kind, has_fix) {
+    if !off_route && lane_guidance_active(route, kind, has_fix) {
         let lanes = mock_lanes(kind);
         // Never exceed the banner width; `paint_lane_guidance` skips a too-narrow
         // strip, so a tiny viewport simply drops the lanes (no min>max clamp).
@@ -746,6 +771,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &state.dead_zones,
         primary,
         has_fix,
+        has_fix,
     );
     // Gentle scrim so the sheet + chrome read cleanly over the map.
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.18));
@@ -782,7 +808,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     paint_destination_summary(
         &painter,
         layout.dest,
-        state.local_navigation.destinations.first(),
+        state.local_navigation.active_destination(),
     );
 
     // Route option cards.
@@ -1041,6 +1067,951 @@ fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: boo
     );
 }
 
+// ===========================================================================
+// Destination search — the "Where to?" entry screen (Google Maps / Waze).
+// ===========================================================================
+
+/// Quick-access category chips shown across the top of the search screen —
+/// `(label, category-key)`; the key matches a `Destination::category`.
+const SEARCH_CATEGORIES: &[(&str, &str)] = &[
+    ("Home", "home"),
+    ("Work", "work"),
+    ("Fuel", "fuel"),
+    ("Food", "food"),
+    ("Parking", "parking"),
+];
+
+/// Precomputed rects for the destination-search screen.
+struct SearchLayout {
+    back: Rect,
+    search_bar: Rect,
+    chips: Vec<Rect>,
+    list_card: Rect,
+    rows: Vec<Rect>,
+}
+
+/// Lay out the search chrome over `rect`: a back button + full-width search bar
+/// at the top, a row of category chips, then a scroll-free list card holding one
+/// tappable row per destination (clipped to what fits). Every rect is crash-safe.
+fn search_layout(rect: Rect, n_rows: usize, n_chips: usize) -> SearchLayout {
+    let margin = Style::SP_M;
+    let content_l = rect.left() + margin;
+    let content_r = rect.right() - margin;
+    let content_w = (content_r - content_l).max(1.0);
+
+    let bar_h = 52.0;
+    let back_r = bar_h * 0.5;
+    let top = rect.top() + margin;
+    let back = Rect::from_center_size(
+        egui::pos2(content_l + back_r, top + back_r),
+        egui::vec2(back_r * 2.0, back_r * 2.0),
+    );
+    let bar_l = back.right() + Style::SP_S;
+    let search_bar = safe_rect(bar_l, top, (content_r - bar_l).max(1.0), bar_h);
+
+    // Category chip row.
+    let chip_h = 64.0;
+    let chip_y = search_bar.bottom() + Style::SP_M;
+    let gap = Style::SP_S;
+    let n = n_chips.max(1) as f32;
+    let chip_w = ((content_w - (n - 1.0) * gap) / n).max(1.0);
+    let mut chips = Vec::with_capacity(n_chips);
+    for i in 0..n_chips {
+        let x = content_l + i as f32 * (chip_w + gap);
+        chips.push(safe_rect(x, chip_y, chip_w, chip_h));
+    }
+
+    // List card fills the remaining height.
+    let list_top = chip_y + chip_h + Style::SP_M;
+    let list_bottom = rect.bottom() - margin;
+    let list_h = (list_bottom - list_top).max(1.0);
+    let list_card = safe_rect(content_l, list_top, content_w, list_h);
+
+    // Rows inside the list card (below the header), clipped to what fits.
+    let pad = Style::SP_M;
+    let header_h = 24.0;
+    let row_h = 56.0;
+    let rows_top = list_card.top() + pad + header_h;
+    let room = ((list_card.bottom() - pad - rows_top) / row_h).floor();
+    let fits = if room.is_finite() && room > 0.0 {
+        room as usize
+    } else {
+        0
+    };
+    let shown = n_rows.min(fits);
+    let inner_x = list_card.left() + pad;
+    let inner_w = (list_card.width() - 2.0 * pad).max(1.0);
+    let mut rows = Vec::with_capacity(shown);
+    for i in 0..shown {
+        let y = rows_top + i as f32 * row_h;
+        rows.push(safe_rect(inner_x, y + 2.0, inner_w, row_h - 6.0));
+    }
+
+    SearchLayout {
+        back,
+        search_bar,
+        chips,
+        list_card,
+        rows,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    let width = safe_width(ui);
+    let avail_h = ui.available_height();
+    let height = if avail_h.is_finite() && avail_h > 1.0 {
+        avail_h.clamp(320.0, 1400.0)
+    } else {
+        520.0
+    };
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let n_rows = state.local_navigation.destinations.len();
+    let layout = search_layout(rect, n_rows, SEARCH_CATEGORIES.len());
+
+    // --- Interactions first (keep the painter borrow of `ui` clean). --------
+    let back_resp = ui.interact(
+        layout.back,
+        egui::Id::new("maps-search-back"),
+        Sense::click(),
+    );
+    if back_resp.clicked() {
+        state.destination_search = false;
+    }
+    let back_hovered = back_resp.hovered();
+
+    let bar_resp = ui.interact(
+        layout.search_bar,
+        egui::Id::new("maps-search-bar"),
+        Sense::click(),
+    );
+    let bar_hovered = bar_resp.hovered();
+
+    let mut chip_states: Vec<(bool, bool)> = Vec::with_capacity(layout.chips.len());
+    for (i, crect) in layout.chips.iter().enumerate() {
+        let resp = ui.interact(
+            *crect,
+            egui::Id::new(("maps-search-chip", i)),
+            Sense::click(),
+        );
+        if resp.clicked() {
+            if let Some(&(_, key)) = SEARCH_CATEGORIES.get(i) {
+                if let Some(idx) = state.local_navigation.destination_in_category(key) {
+                    state.choose_destination(idx);
+                }
+            }
+        }
+        chip_states.push((resp.hovered(), resp.is_pointer_button_down_on()));
+    }
+
+    let mut row_states: Vec<(bool, bool)> = Vec::with_capacity(layout.rows.len());
+    for (i, rrect) in layout.rows.iter().enumerate() {
+        let resp = ui.interact(
+            *rrect,
+            egui::Id::new(("maps-search-row", i)),
+            Sense::click(),
+        );
+        if resp.clicked() {
+            state.choose_destination(i);
+        }
+        row_states.push((resp.hovered(), resp.is_pointer_button_down_on()));
+    }
+
+    // --- Paint. -------------------------------------------------------------
+    let primary = state.locations.primary_sample();
+    let has_fix = primary.is_some_and(LocationSample::has_fix);
+    let painter = ui.painter_at(rect);
+
+    // Overview map, strongly scrimmed so the search screen reads as a panel.
+    let mut overview = state.map.clone();
+    overview.zoom = 6.0;
+    overview.pan = [0.0, 0.0];
+    overview.route_visible = false;
+    paint_map_scene(
+        &painter,
+        rect,
+        &overview,
+        &state.locations,
+        &state.dead_zones,
+        primary,
+        has_fix,
+        false,
+    );
+    painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
+
+    // Back button + search bar.
+    let back_r = layout.back.width() * 0.5;
+    paint_round_button(&painter, layout.back.center(), back_r, back_hovered, false);
+    paint_back_glyph(&painter, layout.back.center(), back_r);
+    paint_search_bar(&painter, layout.search_bar, bar_hovered, "Where to?");
+
+    // Category chips.
+    for (i, crect) in layout.chips.iter().enumerate() {
+        if let Some(&(label, key)) = SEARCH_CATEGORIES.get(i) {
+            let (hovered, pressed) = chip_states.get(i).copied().unwrap_or((false, false));
+            paint_category_chip(&painter, *crect, label, key, hovered, pressed);
+        }
+    }
+
+    // List card + header.
+    paint_soft_shadow(&painter, layout.list_card, HUD_RADIUS);
+    painter.rect_filled(layout.list_card, HUD_RADIUS, HUD_CARD_BG);
+    paint_card_sheen(
+        &painter,
+        layout.list_card,
+        HUD_RADIUS,
+        HUD_CARD_HI.gamma_multiply(0.5),
+        Color32::BLACK.gamma_multiply(0.12),
+    );
+    painter.rect_stroke(
+        layout.list_card,
+        HUD_RADIUS,
+        Stroke::new(1.0, Style::BORDER),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        egui::pos2(
+            layout.list_card.left() + Style::SP_M,
+            layout.list_card.top() + Style::SP_M,
+        ),
+        Align2::LEFT_TOP,
+        "Recent & saved",
+        FontId::proportional(Style::BODY),
+        Style::TEXT_DIM,
+    );
+
+    // Destination rows.
+    for (i, rrect) in layout.rows.iter().enumerate() {
+        if let Some(destination) = state.local_navigation.destinations.get(i) {
+            let (hovered, pressed) = row_states.get(i).copied().unwrap_or((false, false));
+            paint_destination_row(&painter, *rrect, destination, hovered, pressed);
+        }
+    }
+}
+
+/// A full-width rounded search bar with a leading magnifier and placeholder —
+/// the recognizable "Where to?" entry field (reused on the Map tab).
+fn paint_search_bar(painter: &Painter, rect: Rect, hovered: bool, placeholder: &str) {
+    if !rect.width().is_finite() || rect.width() < 8.0 || !rect.height().is_finite() {
+        return;
+    }
+    let radius = (rect.height() * 0.5).max(1.0);
+    paint_soft_shadow(painter, rect, radius);
+    let fill = if hovered { HUD_CARD_HI } else { HUD_CARD_BG };
+    painter.rect_filled(rect, radius, fill);
+    paint_card_sheen(
+        painter,
+        rect,
+        radius,
+        HUD_CARD_HI.gamma_multiply(0.6),
+        Color32::BLACK.gamma_multiply(0.12),
+    );
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(
+            1.0,
+            if hovered {
+                Style::ACCENT
+            } else {
+                Style::BORDER
+            },
+        ),
+        StrokeKind::Inside,
+    );
+
+    let gy = rect.center().y;
+    let icon_box = safe_rect(rect.left() + Style::SP_M, gy - 11.0, 22.0, 22.0);
+    if !paint_carbon(painter, icon_box, "system-search", Style::TEXT_DIM) {
+        paint_search_glyph(painter, icon_box.center(), 9.0, Style::TEXT_DIM);
+    }
+    let tx = icon_box.right() + Style::SP_S;
+    let max_w = (rect.right() - Style::SP_M - tx).max(1.0);
+    let shown = elide(
+        painter,
+        placeholder,
+        FontId::proportional(Style::TITLE),
+        max_w,
+    );
+    painter.text(
+        egui::pos2(tx, gy),
+        Align2::LEFT_CENTER,
+        &shown,
+        FontId::proportional(Style::TITLE),
+        Style::TEXT_STRONG,
+    );
+}
+
+/// One quick-access category chip: a glyph over a label.
+fn paint_category_chip(
+    painter: &Painter,
+    rect: Rect,
+    label: &str,
+    category: &str,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        Style::pressed_fill(Style::ACCENT)
+    } else if hovered {
+        HUD_CARD_HI
+    } else {
+        Style::LAYER_02
+    };
+    painter.rect_filled(rect, HUD_RADIUS_S, fill);
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS_S,
+        Stroke::new(1.0, Style::BORDER),
+        StrokeKind::Inside,
+    );
+    let icon_side = (rect.width().min(rect.height()) * 0.42).clamp(14.0, 28.0);
+    let icon_rect = safe_rect(
+        rect.center().x - icon_side * 0.5,
+        rect.top() + rect.height() * 0.24,
+        icon_side,
+        icon_side,
+    );
+    paint_category_icon(painter, icon_rect, category, Style::ACCENT_HI);
+    let shown = elide(
+        painter,
+        label,
+        FontId::proportional(Style::SMALL),
+        (rect.width() - 6.0).max(1.0),
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 9.0),
+        Align2::CENTER_BOTTOM,
+        &shown,
+        FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+}
+
+/// One tappable destination row: leading category glyph, name + address, and a
+/// right-aligned distance (Google-Maps / Waze recents grammar).
+fn paint_destination_row(
+    painter: &Painter,
+    rect: Rect,
+    destination: &Destination,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        Style::pressed_fill(Style::ACCENT)
+    } else if hovered {
+        HUD_CARD_HI
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        painter.rect_filled(rect, HUD_RADIUS_S, fill);
+    }
+
+    // Leading round glyph chip.
+    let icon_d = (rect.height() * 0.66).clamp(20.0, 40.0);
+    let icon_c = egui::pos2(rect.left() + icon_d * 0.5 + 4.0, rect.center().y);
+    if icon_c.x.is_finite() && icon_c.y.is_finite() {
+        painter.circle_filled(icon_c, icon_d * 0.5, Style::LAYER_02);
+        let icon_box = safe_rect(
+            icon_c.x - icon_d * 0.3,
+            icon_c.y - icon_d * 0.3,
+            icon_d * 0.6,
+            icon_d * 0.6,
+        );
+        paint_category_icon(painter, icon_box, &destination.category, Style::ACCENT_HI);
+    }
+
+    let tx = icon_c.x + icon_d * 0.5 + Style::SP_S;
+    // Right-aligned distance.
+    let dist_s = format!("{:.1} mi", finite_or(destination.distance_mi, 0.0).max(0.0));
+    let dist_g = painter.layout_no_wrap(dist_s, FontId::proportional(Style::BODY), Style::TEXT_DIM);
+    let dist_x = rect.right() - Style::SP_M - dist_g.size().x;
+    painter.galley(
+        egui::pos2(dist_x, rect.center().y - dist_g.size().y * 0.5),
+        dist_g,
+        Style::TEXT_DIM,
+    );
+
+    let max_w = (dist_x - Style::SP_S - tx).max(1.0);
+    let name_s = elide(
+        painter,
+        &destination.label,
+        FontId::proportional(Style::TITLE),
+        max_w,
+    );
+    painter.text(
+        egui::pos2(tx, rect.center().y - Style::SP_S),
+        Align2::LEFT_CENTER,
+        &name_s,
+        FontId::proportional(Style::TITLE),
+        Style::TEXT_STRONG,
+    );
+    let addr_s = elide(
+        painter,
+        &destination.address,
+        FontId::proportional(Style::SMALL),
+        max_w,
+    );
+    painter.text(
+        egui::pos2(tx, rect.center().y + Style::SP_M - 3.0),
+        Align2::LEFT_CENTER,
+        &addr_s,
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+
+    // Hairline separator under the row.
+    let sy = rect.bottom() + 3.0;
+    if sy.is_finite() {
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 2.0, sy),
+                egui::pos2(rect.right() - 2.0, sy),
+            ],
+            Stroke::new(1.0, Style::BORDER.gamma_multiply(0.5)),
+        );
+    }
+}
+
+/// Paint a category glyph — an embedded Carbon icon where one exists, otherwise
+/// a crisp procedural glyph so every category always shows an icon.
+fn paint_category_icon(painter: &Painter, rect: Rect, category: &str, color: Color32) {
+    let cat = category.to_ascii_lowercase();
+    let carbon = match cat.as_str() {
+        "favorite" => Some("star"),
+        "recent" => Some("document-open-recent"),
+        _ => None,
+    };
+    if let Some(name) = carbon {
+        if paint_carbon(painter, rect, name, color) {
+            return;
+        }
+    }
+
+    let c = rect.center();
+    let s = rect.width().min(rect.height());
+    if !c.x.is_finite() || !c.y.is_finite() || !(s > 1.0) {
+        return;
+    }
+    let stroke = Stroke::new((s * 0.09).max(1.3), color);
+    let p = |dx: f32, dy: f32| egui::pos2(c.x + dx * s, c.y + dy * s);
+    match cat.as_str() {
+        "home" => {
+            painter.add(Shape::line(
+                vec![p(-0.34, -0.02), p(0.0, -0.34), p(0.34, -0.02)],
+                stroke,
+            ));
+            painter.rect_stroke(
+                Rect::from_min_max(p(-0.24, -0.02), p(0.24, 0.30)),
+                s * 0.06,
+                stroke,
+                StrokeKind::Inside,
+            );
+        }
+        "work" => {
+            painter.add(Shape::line(
+                vec![
+                    p(-0.12, -0.10),
+                    p(-0.12, -0.24),
+                    p(0.12, -0.24),
+                    p(0.12, -0.10),
+                ],
+                stroke,
+            ));
+            painter.rect_stroke(
+                Rect::from_min_max(p(-0.32, -0.10), p(0.32, 0.28)),
+                s * 0.06,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment([p(-0.32, 0.06), p(0.32, 0.06)], stroke);
+        }
+        "fuel" => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(-0.30, -0.30), p(0.06, 0.30)),
+                s * 0.05,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment([p(-0.30, -0.10), p(0.06, -0.10)], stroke);
+            // Nozzle / feed line on the right.
+            painter.add(Shape::line(
+                vec![p(0.06, 0.02), p(0.22, 0.02), p(0.22, -0.20), p(0.14, -0.28)],
+                stroke,
+            ));
+        }
+        "food" => {
+            // Fork.
+            painter.line_segment([p(-0.16, -0.32), p(-0.16, 0.32)], stroke);
+            painter.line_segment([p(-0.24, -0.32), p(-0.24, -0.12)], stroke);
+            painter.line_segment([p(-0.08, -0.32), p(-0.08, -0.12)], stroke);
+            painter.line_segment([p(-0.24, -0.12), p(-0.08, -0.12)], stroke);
+            // Knife.
+            painter.line_segment([p(0.18, -0.32), p(0.18, 0.32)], stroke);
+            painter.add(Shape::line(
+                vec![p(0.18, -0.32), p(0.28, -0.20), p(0.18, -0.04)],
+                stroke,
+            ));
+        }
+        "parking" => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(-0.30, -0.32), p(0.30, 0.32)),
+                s * 0.10,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.text(
+                c,
+                Align2::CENTER_CENTER,
+                "P",
+                FontId::proportional(s * 0.62),
+                color,
+            );
+        }
+        "favorite" => paint_star_glyph(painter, c, s * 0.36, color),
+        "recent" => {
+            painter.circle_stroke(c, s * 0.34, stroke);
+            painter.line_segment([c, p(0.0, -0.20)], stroke);
+            painter.line_segment([c, p(0.16, 0.06)], stroke);
+        }
+        _ => {
+            // Default location pin (mirrors the preview summary fallback).
+            painter.circle_filled(egui::pos2(c.x, c.y - s * 0.08), s * 0.26, color);
+            painter.add(Shape::convex_polygon(
+                vec![p(-0.14, 0.02), p(0.14, 0.02), p(0.0, 0.34)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.circle_filled(egui::pos2(c.x, c.y - s * 0.08), s * 0.10, HUD_CARD_BG);
+        }
+    }
+}
+
+/// A 5-point star outline centered at `c` (favorite-category fallback).
+fn paint_star_glyph(painter: &Painter, c: Pos2, r: f32, color: Color32) {
+    if c.any_nan() || !(r > 0.5) {
+        return;
+    }
+    let mut pts = Vec::with_capacity(10);
+    for i in 0..10 {
+        let ang = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+        let rad = if i % 2 == 0 { r } else { r * 0.42 };
+        let p = egui::pos2(c.x + ang.cos() * rad, c.y + ang.sin() * rad);
+        if p.any_nan() {
+            return;
+        }
+        pts.push(p);
+    }
+    painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// A procedural magnifier (search-bar / FAB fallback when the Carbon glyph is
+/// unavailable).
+fn paint_search_glyph(painter: &Painter, center: Pos2, r: f32, color: Color32) {
+    if center.any_nan() || !(r > 0.5) {
+        return;
+    }
+    let stroke = Stroke::new((r * 0.28).max(1.4), color);
+    let ring_c = egui::pos2(center.x - r * 0.22, center.y - r * 0.22);
+    painter.circle_stroke(ring_c, r * 0.62, stroke);
+    let d = egui::vec2(0.7071, 0.7071);
+    painter.line_segment([ring_c + d * (r * 0.62), center + d * (r * 0.95)], stroke);
+}
+
+// ===========================================================================
+// Arrival — the "You have arrived" screen (Google Maps arrival card).
+// ===========================================================================
+
+/// Precomputed rects for the arrival screen.
+struct ArrivalLayout {
+    card: Rect,
+    badge: Rect,
+    end_btn: Rect,
+    save_btn: Rect,
+}
+
+fn arrival_layout(rect: Rect) -> ArrivalLayout {
+    let margin = Style::SP_M;
+    let card_w = (rect.width() - 2.0 * margin).min(460.0).max(1.0);
+    let card_h = 288.0_f32.min((rect.height() - 2.0 * margin).max(120.0));
+    let card = safe_rect(
+        rect.center().x - card_w * 0.5,
+        rect.center().y - card_h * 0.5,
+        card_w,
+        card_h,
+    );
+    let badge_d = 76.0;
+    let badge = safe_rect(
+        card.center().x - badge_d * 0.5,
+        card.top() + Style::SP_L,
+        badge_d,
+        badge_d,
+    );
+    let btn_h = 46.0;
+    let pad = Style::SP_M;
+    let gap = Style::SP_S;
+    let btn_w = ((card.width() - 2.0 * pad - gap) * 0.5).max(1.0);
+    let btn_y = card.bottom() - pad - btn_h;
+    let end_btn = safe_rect(card.left() + pad, btn_y, btn_w, btn_h);
+    let save_btn = safe_rect(end_btn.right() + gap, btn_y, btn_w, btn_h);
+    ArrivalLayout {
+        card,
+        badge,
+        end_btn,
+        save_btn,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn show_arrival(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    let width = safe_width(ui);
+    let avail_h = ui.available_height();
+    let height = if avail_h.is_finite() && avail_h > 1.0 {
+        avail_h.clamp(320.0, 1400.0)
+    } else {
+        520.0
+    };
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let layout = arrival_layout(rect);
+
+    // --- Interactions first. ------------------------------------------------
+    let end_resp = ui.interact(
+        layout.end_btn,
+        egui::Id::new("maps-arrival-end"),
+        Sense::click(),
+    );
+    if end_resp.clicked() {
+        state.end_navigation();
+    }
+    let end_hovered = end_resp.hovered();
+    let end_pressed = end_resp.is_pointer_button_down_on();
+
+    let saved_id = egui::Id::new(("maps-arrival", "saved"));
+    let mut saved = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(saved_id))
+        .unwrap_or(false);
+    let save_resp = ui.interact(
+        layout.save_btn,
+        egui::Id::new("maps-arrival-save"),
+        Sense::click(),
+    );
+    if save_resp.clicked() {
+        saved = !saved;
+        ui.ctx().data_mut(|d| d.insert_temp(saved_id, saved));
+    }
+    let save_hovered = save_resp.hovered();
+    let save_pressed = save_resp.is_pointer_button_down_on();
+
+    // --- Paint. -------------------------------------------------------------
+    let primary = state.locations.primary_sample();
+    let has_fix = primary.is_some_and(LocationSample::has_fix);
+    let painter = ui.painter_at(rect);
+
+    let mut overview = state.map.clone();
+    overview.zoom = 7.5;
+    overview.pan = [0.0, 0.0];
+    overview.route_visible = false;
+    paint_map_scene(
+        &painter,
+        rect,
+        &overview,
+        &state.locations,
+        &state.dead_zones,
+        primary,
+        has_fix,
+        false,
+    );
+    painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
+
+    // Card.
+    paint_soft_shadow(&painter, layout.card, HUD_RADIUS);
+    painter.rect_filled(layout.card, HUD_RADIUS, HUD_CARD_BG);
+    paint_card_sheen(
+        &painter,
+        layout.card,
+        HUD_RADIUS,
+        HUD_CARD_HI.gamma_multiply(0.5),
+        Color32::BLACK.gamma_multiply(0.12),
+    );
+    painter.rect_stroke(
+        layout.card,
+        HUD_RADIUS,
+        Stroke::new(1.0, Style::BORDER),
+        StrokeKind::Inside,
+    );
+
+    // Green check badge.
+    let badge_c = layout.badge.center();
+    let badge_r = layout.badge.width() * 0.5;
+    if badge_c.x.is_finite() && badge_c.y.is_finite() {
+        painter.circle_filled(badge_c, badge_r, Style::OK.gamma_multiply(0.18));
+        painter.circle_stroke(badge_c, badge_r, Stroke::new(2.0, Style::OK));
+        let check_box = layout.badge.shrink(badge_r * 0.5);
+        if !paint_carbon(&painter, check_box, "emblem-ok", Style::OK) {
+            paint_check_glyph(&painter, badge_c, badge_r * 0.5, Style::OK);
+        }
+    }
+
+    // Title + destination + address.
+    let cx = layout.card.center().x;
+    let max_w = (layout.card.width() - 2.0 * Style::SP_L).max(1.0);
+    let title_y = layout.badge.bottom() + Style::SP_S;
+    painter.text(
+        egui::pos2(cx, title_y),
+        Align2::CENTER_TOP,
+        "You have arrived",
+        FontId::proportional(Style::HEADING),
+        Style::TEXT_STRONG,
+    );
+    let dest = state.local_navigation.active_destination();
+    let (name, addr) = dest.map_or(("Destination", "Arrived"), |destination| {
+        (destination.label.as_str(), destination.address.as_str())
+    });
+    let name_s = elide(&painter, name, FontId::proportional(Style::TITLE), max_w);
+    painter.text(
+        egui::pos2(cx, title_y + 28.0),
+        Align2::CENTER_TOP,
+        &name_s,
+        FontId::proportional(Style::TITLE),
+        Style::TEXT,
+    );
+    let addr_s = elide(&painter, addr, FontId::proportional(Style::BODY), max_w);
+    painter.text(
+        egui::pos2(cx, title_y + 50.0),
+        Align2::CENTER_TOP,
+        &addr_s,
+        FontId::proportional(Style::BODY),
+        Style::TEXT_DIM,
+    );
+
+    // Arrival time, above the buttons.
+    let eta = state.local_navigation.active_route.eta.trim();
+    let arrival = if eta.is_empty() {
+        "Arrived".to_string()
+    } else {
+        format!("Arrived \u{00B7} {eta}")
+    };
+    painter.text(
+        egui::pos2(cx, layout.end_btn.top() - Style::SP_S),
+        Align2::CENTER_BOTTOM,
+        &arrival,
+        FontId::proportional(Style::BODY),
+        Style::OK,
+    );
+
+    // Secondary actions.
+    paint_arrival_action(
+        &painter,
+        layout.end_btn,
+        "End",
+        true,
+        end_hovered,
+        end_pressed,
+    );
+    let save_label = if saved { "Saved" } else { "Save" };
+    paint_arrival_action(
+        &painter,
+        layout.save_btn,
+        save_label,
+        false,
+        save_hovered,
+        save_pressed,
+    );
+}
+
+/// One arrival-screen action button (primary = filled blue, secondary = card).
+fn paint_arrival_action(
+    painter: &Painter,
+    rect: Rect,
+    label: &str,
+    primary: bool,
+    hovered: bool,
+    pressed: bool,
+) {
+    let base = if primary {
+        if pressed {
+            MANEUVER_BLUE_DEEP
+        } else if hovered {
+            MANEUVER_BLUE_HI
+        } else {
+            MANEUVER_BLUE
+        }
+    } else if pressed {
+        Style::pressed_fill(Style::ACCENT)
+    } else if hovered {
+        HUD_CARD_HI
+    } else {
+        Style::LAYER_02
+    };
+    painter.rect_filled(rect, HUD_RADIUS_S, base);
+    if primary {
+        paint_card_sheen(
+            painter,
+            rect,
+            HUD_RADIUS_S,
+            MANEUVER_BLUE_HI.gamma_multiply(0.5),
+            MANEUVER_BLUE_DEEP.gamma_multiply(0.5),
+        );
+    }
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS_S,
+        Stroke::new(
+            1.0,
+            if primary {
+                MANEUVER_BLUE_HI
+            } else {
+                Style::BORDER
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(Style::TITLE),
+        if primary {
+            Color32::WHITE
+        } else {
+            Style::TEXT_STRONG
+        },
+    );
+}
+
+/// A procedural checkmark (arrival-badge fallback when the Carbon glyph is
+/// unavailable).
+fn paint_check_glyph(painter: &Painter, center: Pos2, s: f32, color: Color32) {
+    if center.any_nan() || !(s > 0.5) {
+        return;
+    }
+    painter.add(Shape::line(
+        vec![
+            egui::pos2(center.x - s, center.y),
+            egui::pos2(center.x - s * 0.25, center.y + s * 0.7),
+            egui::pos2(center.x + s, center.y - s * 0.7),
+        ],
+        Stroke::new((s * 0.34).max(2.0), color),
+    ));
+}
+
+// ===========================================================================
+// Off-route / recalculating — the amber HUD state (Google Maps / Waze).
+// ===========================================================================
+
+/// The amber "Recalculating…" banner that replaces the maneuver banner when off
+/// route: a rotating spinner chip + status text, keyed to the Quasar-dark skin.
+fn paint_recalculating_banner(painter: &Painter, rect: Rect, route: &RoutePlan, time: f64) {
+    painter.rect_filled(rect, HUD_RADIUS, HUD_CARD_BG);
+    paint_card_sheen(
+        painter,
+        rect,
+        HUD_RADIUS,
+        HUD_CARD_HI.gamma_multiply(0.6),
+        Color32::BLACK.gamma_multiply(0.16),
+    );
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS,
+        Stroke::new(1.5, Style::WARN.gamma_multiply(0.85)),
+        StrokeKind::Inside,
+    );
+
+    let inset = Style::SP_S;
+    let chip_side = (rect.height() - 2.0 * inset).max(1.0);
+    let chip = safe_rect(
+        rect.left() + inset,
+        rect.top() + inset,
+        chip_side,
+        chip_side,
+    );
+    painter.rect_filled(chip, HUD_RADIUS_S, Style::WARN.gamma_multiply(0.14));
+    paint_spinner(painter, chip.center(), chip_side * 0.30, time, Style::WARN);
+
+    let tx = chip.right() + Style::SP_M;
+    let max_w = (rect.right() - Style::SP_M - tx).max(1.0);
+    painter.text(
+        egui::pos2(tx, rect.top() + 9.0),
+        Align2::LEFT_TOP,
+        "Recalculating\u{2026}",
+        FontId::proportional(28.0),
+        Style::WARN,
+    );
+    let sub = elide(
+        painter,
+        &format!("Off route \u{00B7} rerouting on {}", route.current_road),
+        FontId::proportional(Style::BODY),
+        max_w,
+    );
+    painter.text(
+        egui::pos2(tx, rect.bottom() - 9.0),
+        Align2::LEFT_BOTTOM,
+        &sub,
+        FontId::proportional(Style::BODY),
+        Color32::WHITE.gamma_multiply(0.8),
+    );
+}
+
+/// A rotating tick-ring spinner (the recalculating pulse). `time` is the egui
+/// clock in seconds; every value is guarded finite (crash-safe).
+fn paint_spinner(painter: &Painter, center: Pos2, radius: f32, time: f64, color: Color32) {
+    if center.any_nan() || !(radius > 0.5) {
+        return;
+    }
+    let base = finite_or((time as f32) * 4.0, 0.0);
+    let n: u32 = 12;
+    for i in 0..n {
+        let a = base + (i as f32 / n as f32) * std::f32::consts::TAU;
+        let dir = egui::vec2(a.cos(), a.sin());
+        let p0 = center + dir * (radius * 0.55);
+        let p1 = center + dir * radius;
+        if p0.any_nan() || p1.any_nan() {
+            continue;
+        }
+        let fade = i as f32 / n as f32;
+        painter.line_segment(
+            [p0, p1],
+            Stroke::new(
+                (radius * 0.18).max(1.2),
+                color.gamma_multiply(0.2 + 0.8 * fade),
+            ),
+        );
+    }
+}
+
+/// A full-width "Where to?" entry bar (the Map-tab search affordance). Returns
+/// `true` when tapped. Painter-only chrome, so it never leaks look into a crate.
+fn where_to_bar(ui: &mut egui::Ui) -> bool {
+    let width = safe_width(ui);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 44.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        paint_search_bar(&painter, rect, response.hovered(), "Where to?");
+        let cc = egui::pos2(rect.right() - Style::SP_M - 4.0, rect.center().y);
+        if cc.x.is_finite() && cc.y.is_finite() {
+            painter.add(Shape::line(
+                vec![
+                    egui::pos2(cc.x - 4.0, cc.y - 5.0),
+                    egui::pos2(cc.x + 3.0, cc.y),
+                    egui::pos2(cc.x - 4.0, cc.y + 5.0),
+                ],
+                Stroke::new(2.0, Style::TEXT_DIM),
+            ));
+        }
+    }
+    response.clicked()
+}
+
 // --- Scene: the beautiful synthetic map (shared by Drive + Map tabs). ------
 
 fn zoom_scale(map: &MapViewState) -> f32 {
@@ -1068,6 +2039,7 @@ fn paint_map_scene(
     dead_zones: &DeadZoneState,
     primary: Option<&LocationSample>,
     has_fix: bool,
+    route_live: bool,
 ) {
     let bg = if map.dark_mode {
         MAP_DARK_BG
@@ -1128,8 +2100,9 @@ fn paint_map_scene(
     }
 
     // Route — the layered GMaps look (casing + bright core, rounded joints).
+    // A dimmed grey line when not live (no fix, or off-route recalculating).
     if map.route_visible {
-        paint_route(painter, rect, map, has_fix);
+        paint_route(painter, rect, map, route_live);
     }
 
     // Location-health crumbs.
@@ -1321,8 +2294,8 @@ fn paint_road(
     paint_ribbon(painter, &fill_pts, fill);
 }
 
-fn paint_route(painter: &Painter, rect: Rect, map: &MapViewState, has_fix: bool) {
-    if !has_fix {
+fn paint_route(painter: &Painter, rect: Rect, map: &MapViewState, active: bool) {
+    if !active {
         // Planned but not active — a dim grey line, no glow.
         let dim = ribbon_points(rect, map, ROUTE_UV, 10.0, 4.0);
         paint_ribbon(painter, &dim, Style::TEXT_DIM.gamma_multiply(0.5));
@@ -1891,6 +2864,11 @@ fn paint_fab(
     let icon_box = safe_rect(center.x - r * 0.6, center.y - r * 0.6, r * 1.2, r * 1.2);
     match key {
         "recenter" => paint_vehicle_chevron(painter, center, 0.0, ROUTE_BLUE, false),
+        "search" => {
+            if !paint_carbon(painter, icon_box, "system-search", Style::ACCENT_HI) {
+                paint_search_glyph(painter, center, r * 0.52, Style::ACCENT_HI);
+            }
+        }
         "mute" => {
             let name = if muted {
                 "audio-volume-muted"
@@ -1915,6 +2893,10 @@ fn paint_fab(
 }
 
 fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    if where_to_bar(ui) {
+        state.open_destination_search();
+    }
+    ui.add_space(Style::SP_S);
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut state.map.dark_mode, "Dark mode");
         ui.checkbox(&mut state.map.route_visible, "Route");
@@ -2601,6 +3583,33 @@ fn show_simulator(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         );
     });
     ui.add_space(Style::SP_S);
+    card(ui, "Navigation flow (dev toggles)", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Open \"Where to?\" search").clicked() {
+                state.open_destination_search();
+            }
+            if ui.button("Preview route").clicked() {
+                state.active = WorkspaceTab::Drive;
+                state.route_preview = true;
+            }
+            let off_route_label = if state.off_route {
+                "Clear off-route"
+            } else {
+                "Simulate off-route"
+            };
+            if ui.button(off_route_label).clicked() {
+                state.toggle_off_route();
+            }
+            if ui.button("Arrive").clicked() {
+                state.simulate_arrival();
+            }
+        });
+        bullet(
+            ui,
+            "Drives the full flow: search -> preview -> Start -> HUD -> arrival, plus the off-route recalculating banner.",
+        );
+    });
+    ui.add_space(Style::SP_S);
     show_vault(ui, &state.vault);
     ui.add_space(Style::SP_S);
     card(ui, "Known real-hardware gaps", |ui| {
@@ -2644,7 +3653,9 @@ fn map_canvas(
     let painter = ui.painter_at(rect);
     let primary = locations.primary_sample();
     let has_fix = primary.is_some_and(LocationSample::has_fix);
-    paint_map_scene(&painter, rect, map, locations, dead_zones, primary, has_fix);
+    paint_map_scene(
+        &painter, rect, map, locations, dead_zones, primary, has_fix, has_fix,
+    );
     painter.rect_stroke(
         rect,
         Style::RADIUS_L,
@@ -3409,6 +4420,155 @@ mod tests {
         surface.locations.sources[2].sample.update_age_s = 6.0;
         surface.locations.sources[3].sample.accuracy_m = 6.0;
 
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn destination_search_screen_tessellates() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.destination_search = true;
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn destination_search_tessellates_without_fix() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.destination_search = true;
+        for source in &mut surface.locations.sources {
+            source.sample.fix_type = "No fix".to_string();
+            source.sample.latitude = 0.0;
+            source.sample.longitude = 0.0;
+            source.sample.speed_mph = f32::NAN;
+            source.sample.heading_deg = f32::INFINITY;
+        }
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn destination_search_tessellates_at_small_viewport() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.destination_search = true;
+        assert!(tessellate_at(&mut surface, 360.0, 240.0) > 0);
+    }
+
+    #[test]
+    fn search_layout_fits_chips_and_rows_inside_the_list_card() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 700.0));
+        let layout = search_layout(rect, 7, 5);
+        assert_eq!(layout.chips.len(), 5);
+        assert!(
+            !layout.rows.is_empty(),
+            "rows should fit a full-size screen"
+        );
+        assert!(rect.contains_rect(layout.list_card));
+        for row in &layout.rows {
+            assert!(
+                layout.list_card.contains_rect(*row),
+                "row escapes list card"
+            );
+        }
+    }
+
+    #[test]
+    fn search_layout_survives_a_tiny_rect() {
+        // A degenerate viewport must not panic; rows simply clip to zero.
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(40.0, 40.0));
+        let layout = search_layout(rect, 7, 5);
+        assert_eq!(layout.chips.len(), 5);
+    }
+
+    #[test]
+    fn arrival_screen_tessellates() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.arrived = true;
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn arrival_tessellates_without_fix_at_small_viewport() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.arrived = true;
+        surface.local_navigation.active_route.eta = String::new();
+        for source in &mut surface.locations.sources {
+            source.sample.fix_type = "No fix".to_string();
+            source.sample.latitude = 0.0;
+            source.sample.longitude = 0.0;
+            source.sample.speed_mph = f32::NAN;
+        }
+        assert!(tessellate_at(&mut surface, 360.0, 240.0) > 0);
+    }
+
+    #[test]
+    fn arrival_layout_keeps_actions_and_badge_inside_the_card() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 700.0));
+        let layout = arrival_layout(rect);
+        assert!(rect.contains_rect(layout.card));
+        assert!(layout.card.contains_rect(layout.end_btn));
+        assert!(layout.card.contains_rect(layout.save_btn));
+        assert!(layout.card.contains_rect(layout.badge));
+        assert!(!layout.end_btn.intersects(layout.save_btn));
+    }
+
+    #[test]
+    fn drive_hud_off_route_shows_recalculating_state() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.off_route = true;
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn drive_hud_off_route_tessellates_with_nan_and_no_fix() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.off_route = true;
+        surface.map.pan = [f32::NAN, f32::INFINITY];
+        surface.map.zoom = f32::NAN;
+        for source in &mut surface.locations.sources {
+            source.sample.fix_type = "No fix".to_string();
+            source.sample.latitude = 0.0;
+            source.sample.longitude = 0.0;
+            source.sample.speed_mph = f32::NAN;
+            source.sample.heading_deg = f32::INFINITY;
+        }
+        assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn full_navigation_flow_tessellates_at_every_stage() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+
+        // 1. Search.
+        surface.open_destination_search();
+        assert!(surface.destination_search);
+        assert!(tessellate(&mut surface) > 0);
+
+        // 2. Choose a destination -> route preview.
+        surface.choose_destination(2);
+        assert!(surface.route_preview);
+        assert!(!surface.destination_search);
+        assert!(tessellate(&mut surface) > 0);
+
+        // 3. Start -> live turn-by-turn HUD.
+        surface.route_preview = false;
+        assert!(tessellate(&mut surface) > 0);
+
+        // 4. Off-route recalculating banner, then back on route.
+        surface.off_route = true;
+        assert!(tessellate(&mut surface) > 0);
+        surface.off_route = false;
+
+        // 5. Arrival, then End.
+        surface.simulate_arrival();
+        assert!(surface.arrived);
+        assert!(tessellate(&mut surface) > 0);
+        surface.end_navigation();
         assert!(tessellate(&mut surface) > 0);
     }
 
