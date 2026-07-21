@@ -127,18 +127,23 @@ impl CommunicationsSurface {
         data: &dyn crate::CollabData,
         sink: &mut crate::CommandSink,
     ) {
+        // Auto Mode (Car Mode): the call bar is the driver's always-there call
+        // control, so on the Ford SYNC 3 car dash its glyphs + type read larger.
+        let car = crate::car_mode(ui);
+        let glyph = if car { Style::SP_L } else { Style::SP_M };
         let calls = data.call_state().active.clone();
         ui.horizontal(|ui| {
-            icons::icon(ui, icons::CALL_UNMUTE, Style::SP_M, Style::TEXT_DIM);
+            icons::icon(ui, icons::CALL_UNMUTE, glyph, Style::TEXT_DIM);
             ui.add_space(Style::SP_XS);
             if calls.is_empty() {
-                ui.label(egui::RichText::new("No active call").color(Style::TEXT_DIM));
+                let none = egui::RichText::new("No active call").color(Style::TEXT_DIM);
+                ui.label(if car { none.size(Style::TITLE) } else { none });
                 if let Some(space) = self.selected_space() {
                     ui.add_space(Style::SP_S);
                     if icons::icon_button(
                         ui,
                         icons::CALL_START,
-                        Style::SP_M,
+                        glyph,
                         Style::OK,
                         "Start audio call",
                     )
@@ -167,6 +172,10 @@ impl CommunicationsSurface {
         sink: &mut crate::CommandSink,
         call: &CallView,
     ) {
+        // Auto Mode (Car Mode): a driver's in-call controls read larger — bigger
+        // kind label + participant count and larger, easier-to-hit control glyphs.
+        let car = crate::car_mode(ui);
+        let ctrl = if car { Style::SP_L } else { Style::SP_M };
         let me = data.me();
         let mine = call.participants.iter().find(|p| &p.actor == me);
         let connected = call
@@ -175,31 +184,22 @@ impl CommunicationsSurface {
             .filter(|p| p.state == CallParticipantState::Connected)
             .count();
 
-        ui.label(
-            egui::RichText::new(call_kind_label(call.kind))
-                .strong()
-                .color(Style::TEXT),
-        );
-        ui.label(
-            egui::RichText::new(format!("{connected} on call"))
-                .small()
-                .color(Style::TEXT_DIM),
-        );
+        let kind = egui::RichText::new(call_kind_label(call.kind))
+            .strong()
+            .color(Style::TEXT);
+        ui.label(if car { kind.size(Style::TITLE) } else { kind });
+        let count = egui::RichText::new(format!("{connected} on call")).color(Style::TEXT_DIM);
+        ui.label(if car {
+            count.size(Style::BODY)
+        } else {
+            count.small()
+        });
 
         if matches!(mine.map(|p| p.state), Some(CallParticipantState::Ringing)) {
-            if icons::icon_button(ui, icons::CALL_ANSWER, Style::SP_M, Style::OK, "Answer")
-                .clicked()
-            {
+            if icons::icon_button(ui, icons::CALL_ANSWER, ctrl, Style::OK, "Answer").clicked() {
                 sink.emit(CollabCommand::AnswerCall { call: call.call });
             }
-            if icons::icon_button(
-                ui,
-                icons::CALL_DECLINE,
-                Style::SP_M,
-                Style::DANGER,
-                "Decline",
-            )
-            .clicked()
+            if icons::icon_button(ui, icons::CALL_DECLINE, ctrl, Style::DANGER, "Decline").clicked()
             {
                 sink.emit(CollabCommand::DeclineCall { call: call.call });
             }
@@ -212,22 +212,14 @@ impl CommunicationsSurface {
             } else {
                 (icons::CALL_MUTE, "Mute")
             };
-            if icons::icon_button(ui, glyph, Style::SP_M, Style::TEXT_DIM, hint).clicked() {
+            if icons::icon_button(ui, glyph, ctrl, Style::TEXT_DIM, hint).clicked() {
                 sink.emit(CollabCommand::SetCallMuted {
                     call: call.call,
                     muted: !participant.muted,
                 });
             }
         }
-        if icons::icon_button(
-            ui,
-            icons::CALL_HANGUP,
-            Style::SP_M,
-            Style::DANGER,
-            "Hang up",
-        )
-        .clicked()
-        {
+        if icons::icon_button(ui, icons::CALL_HANGUP, ctrl, Style::DANGER, "Hang up").clicked() {
             sink.emit(CollabCommand::HangUpCall { call: call.call });
         }
         ui.add_space(Style::SP_S);

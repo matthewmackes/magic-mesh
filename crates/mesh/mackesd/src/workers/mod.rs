@@ -403,6 +403,13 @@ pub mod cert_authority;
 // `state/cloud/<node>` (provider health + resource roster via the neutral
 // `mackes_mesh_types::cloud` types). Rank-0 universal like service_aggregator.
 pub mod cloud;
+// Rolling Node — the `vehicle` worker: the workstation-side adapter that
+// SSH/HTTP-polls a mobile Sierra AirLink MG90 (oMG) gateway and publishes a
+// latest-wins `state/vehicle/<node>` mirror (GPS/IMU + WAN + MCU power via the
+// neutral `mackes_mesh_types::vehicle` types). Rank-0 universal like `cloud`, but a
+// genuine no-op on the nodes with no gateway configured (`MDE_VEHICLE_GATEWAY`
+// unset). Mirrors `cloud`'s injectable-transport + bus-mirror lifecycle.
+pub mod vehicle;
 // VIRT-7 (v5.0.0) — per-network firewalld port forwarding. Each
 // peer subscribes to `compute/{expose,unexpose}/<own-peer-addr>`
 // and writes firewalld rich rules per selected network

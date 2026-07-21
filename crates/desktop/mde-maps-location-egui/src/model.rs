@@ -1,6 +1,23 @@
 //! Render-agnostic state for the Maps & Location workspace.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+/// Poll cadence for the live `state/vehicle` mirror (PERF-5). The shell calls
+/// [`MapsLocationSurface::refresh_from_bus`] every frame (~60 Hz); re-reading the
+/// Bus spool off disk that often is pure waste for a latest-wins mirror the
+/// gateway only updates ~1 Hz. Gating to 2 Hz keeps the fold live while cutting
+/// ~60 disk reads/sec to ~2 — the cockpit keeps drawing the cached fold between.
+const VEHICLE_REFRESH: Duration = Duration::from_millis(500);
+
+/// The simulator-active gap note seeded by [`MapsLocationSurface::simulated`].
+///
+/// Named as a constant (not an inline literal) so the live-mirror fold in
+/// [`MapsLocationSurface::refresh_from_vehicle`] can retract exactly this note
+/// once a real `state/vehicle/<node>` mirror exists, without a fragile string
+/// duplicated across two call sites.
+const SIMULATED_MG90_GAP_NOTE: &str =
+    "Real MG90 discovery/auth/status adapters are skeleton seams; simulator is active.";
 
 /// Workspace tabs in the order requested by the product directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -70,6 +87,14 @@ impl WorkspaceTab {
 pub struct MapsLocationSurface {
     /// Selected workspace tab.
     pub active: WorkspaceTab,
+    /// Whether the pre-drive route-preview screen is showing over the Drive tab.
+    pub route_preview: bool,
+    /// Whether the "Where to?" destination-search screen is showing over Drive.
+    pub destination_search: bool,
+    /// Whether the "You have arrived" screen is showing over the Drive tab.
+    pub arrived: bool,
+    /// Whether turn-by-turn guidance is in the off-route "Recalculating…" state.
+    pub off_route: bool,
     /// Simulators are first-class and on by default.
     pub simulator_enabled: bool,
     /// Current map view model.
@@ -96,6 +121,10 @@ pub struct MapsLocationSurface {
     pub vault: EncryptedVaultState,
     /// Known real-hardware gaps for this vertical slice.
     pub real_hardware_gaps: Vec<String>,
+    /// Throttle stamp for the per-frame `refresh_from_bus` Bus read (PERF-5). `None`
+    /// until the first poll; then the wall-clock of the last mirror read. Not part
+    /// of the surface's visible state.
+    last_vehicle_poll: Option<Instant>,
 }
 
 impl MapsLocationSurface {
@@ -104,6 +133,10 @@ impl MapsLocationSurface {
     pub fn simulated() -> Self {
         Self {
             active: WorkspaceTab::Drive,
+            route_preview: false,
+            destination_search: false,
+            arrived: false,
+            off_route: false,
             simulator_enabled: true,
             map: MapViewState::simulated(),
             offline_maps: OfflineMapManagerState::simulated_default(),
@@ -117,8 +150,7 @@ impl MapsLocationSurface {
             firmware: FirmwareWorkflow::simulated(),
             vault: EncryptedVaultState::ready_for_local_admin(),
             real_hardware_gaps: vec![
-                "Real MG90 discovery/auth/status adapters are skeleton seams; simulator is active."
-                    .to_string(),
+                SIMULATED_MG90_GAP_NOTE.to_string(),
                 "Valhalla and Nominatim are represented as local-only backend contracts; no live daemon is launched by this slice."
                     .to_string(),
                 "gpsd, CAN/OBD, GPIO, serial, firmware upload, and factory reset workflows are UI/model complete but not wired to hardware."
@@ -126,6 +158,7 @@ impl MapsLocationSurface {
                 "Traffic, weather, and satellite providers expose graceful unavailable states until configured."
                     .to_string(),
             ],
+            last_vehicle_poll: None,
         }
     }
 
@@ -133,6 +166,50 @@ impl MapsLocationSurface {
     #[must_use]
     pub fn primary_location_warning(&self) -> Option<String> {
         self.locations.primary_warning()
+    }
+
+    /// Open the "Where to?" destination-search screen over the Drive tab.
+    ///
+    /// Clears any terminal arrival state so search is always reachable, matching
+    /// the Google-Maps / Waze "search from anywhere" entry affordance.
+    pub fn open_destination_search(&mut self) {
+        self.active = WorkspaceTab::Drive;
+        self.arrived = false;
+        self.destination_search = true;
+    }
+
+    /// Choose a destination from the search screen and advance to route preview.
+    ///
+    /// Out-of-range indices leave the selected destination unchanged but still
+    /// advance to preview, so the call is always crash-safe.
+    pub fn choose_destination(&mut self, idx: usize) {
+        self.local_navigation.select_destination(idx);
+        self.destination_search = false;
+        self.arrived = false;
+        self.off_route = false;
+        self.route_preview = true;
+    }
+
+    /// Enter the "You have arrived" screen (the arrival path + dev toggle).
+    pub fn simulate_arrival(&mut self) {
+        self.active = WorkspaceTab::Drive;
+        self.destination_search = false;
+        self.route_preview = false;
+        self.off_route = false;
+        self.arrived = true;
+    }
+
+    /// Leave any navigation-flow overlay and return to the live turn-by-turn HUD.
+    pub fn end_navigation(&mut self) {
+        self.arrived = false;
+        self.destination_search = false;
+        self.route_preview = false;
+        self.off_route = false;
+    }
+
+    /// Toggle the off-route / recalculating guidance state (dev toggle).
+    pub fn toggle_off_route(&mut self) {
+        self.off_route = !self.off_route;
     }
 
     /// Compute whether the current state can provide offline turn-by-turn use.
@@ -240,6 +317,224 @@ impl MapsLocationSurface {
             .find(|descriptor| descriptor.id == setting_id)?;
         Some(SettingChangePlan::for_setting(setting, self.moving()))
     }
+
+    /// Fold a live `state/vehicle/<node>` mirror onto this surface's LIVE models
+    /// — the real MG90 (a.k.a. "Rolling Node") behind the beautiful HUD.
+    ///
+    /// `WanStatus` -> `Mg90Status` (+ both `CellularLink`s); the `GpsFix` ->
+    /// the **MG90 GNSS** `LocationSource`'s `LocationSample`; `VehicleTelem` ->
+    /// `VehicleTelemetry`. This is an additive fold over the simulator seed,
+    /// never a full replacement: fields the wire type doesn't carry
+    /// (`Mg90Status::data_transferred`, the MG90 setup/settings/backup seams,
+    /// …) are left as-is so a live gateway with a partial mirror still shows the
+    /// cockpit's other seams honestly.
+    ///
+    /// The key behaviour: when the mirror is `online`, the MG90 GNSS source is
+    /// made **primary** and the "Simulator" chip drops — so the Drive HUD's
+    /// GNSS source and the Location Sources tab read MG90/GNSS, not Simulator.
+    /// `has_fix` is respected (no lock still shows the HUD's "Acquiring GPS"
+    /// state), but the source LABEL is MG90 the moment a live gateway exists.
+    pub fn refresh_from_vehicle(&mut self, v: &mackes_mesh_types::vehicle::VehicleState) {
+        // WanStatus -> Mg90Status.
+        let status = &mut self.mg90.status;
+        status.active_wan = v.wan.active_wan.clone();
+        status.cellular_a = cellular_link_from_wire(&v.wan.cellular_a);
+        status.cellular_b = cellular_link_from_wire(&v.wan.cellular_b);
+        status.wifi_state = v.wan.wifi_state.clone();
+        status.ethernet_state = v.wan.ethernet_state.clone();
+        status.vpn_state = v.wan.vpn_state.clone();
+        status.failover_events = v.wan.failover_events;
+        status.latency_ms = v.wan.latency_ms;
+        status.packet_loss_percent = v.wan.packet_loss_percent;
+        status.link_quality = v.wan.link_quality.clone();
+
+        // Auto-select MG90 GNSS as the primary location source once a live
+        // gateway exists, and retire the global "Simulator" indicator. Assigned
+        // directly (not via `set_primary`, which gates on health) so a no-lock
+        // gateway still switches the SOURCE LABEL to MG90 while the HUD's own
+        // `has_fix` gate keeps showing "Acquiring GPS".
+        if v.online {
+            self.locations.primary = LocationSourceKind::Mg90Gnss;
+            self.simulator_enabled = false;
+        }
+
+        // GpsFix -> the MG90 GNSS source's LocationSample (found by kind, so the
+        // live fold lands on MG90 regardless of the current primary). HDOP has
+        // no exact meters conversion; ~5 m per HDOP unit is the commonly-cited
+        // civilian-GNSS UERE estimate — an honest approximation, not precision.
+        if let Some(source) = self
+            .locations
+            .sources
+            .iter_mut()
+            .find(|s| s.kind == LocationSourceKind::Mg90Gnss)
+        {
+            let gps = &v.gps;
+            source.sample = LocationSample {
+                fix_type: gps.fix_type.clone(),
+                latitude: gps.latitude,
+                longitude: gps.longitude,
+                accuracy_m: gps.hdop * 5.0,
+                speed_mph: gps.speed_mph,
+                heading_deg: gps.heading_deg,
+                altitude_m: gps.altitude_m,
+                satellites: Some(gps.satellites),
+                update_rate_hz: gps.update_rate_hz,
+                update_age_s: gps.age_s,
+            };
+            if v.online {
+                source.status = SourceStatus::Connected;
+                source.diagnostics.insert(
+                    "mode".to_string(),
+                    format!(
+                        "live vehicle-gateway mirror ({} {})",
+                        v.model, v.mgos_version
+                    ),
+                );
+            }
+        }
+
+        // VehicleTelem -> VehicleTelemetry. Optional OBD fields (fuel/odometer/
+        // coolant) preserve the prior value when the mirror reports `None` — an
+        // unsupported PID is not the same as a zero reading.
+        let telem = &v.telem;
+        let telemetry = &mut self.vehicle.telemetry;
+        telemetry.speed_mph = telem.speed_mph;
+        telemetry.rpm = telem.rpm;
+        if let Some(coolant_c) = telem.coolant_c {
+            telemetry.coolant_c = coolant_c;
+        }
+        telemetry.battery_v = telem.battery_v;
+        if telem.fuel_percent.is_some() {
+            telemetry.fuel_percent = telem.fuel_percent;
+        }
+        telemetry.dtc_count = telem.dtc_count;
+        telemetry.ignition_on = telem.ignition_on;
+        telemetry.moving = telem.moving;
+        if telem.odometer_mi.is_some() {
+            telemetry.odometer_mi = telem.odometer_mi;
+        }
+        telemetry.runtime_min = telem.runtime_min;
+        telemetry.confidence = if v.online {
+            format!(
+                "live vehicle-gateway mirror ({} {})",
+                v.model, v.mgos_version
+            )
+        } else {
+            "vehicle-gateway mirror reports the adapter offline".to_string()
+        };
+        telemetry.last_update_age_s = mirror_age_s(v.published_at_ms);
+
+        // Retract the generic "simulator is active" gap now a live mirror exists
+        // and fold the adapter's own honest gap report in its place.
+        self.real_hardware_gaps
+            .retain(|g| g != SIMULATED_MG90_GAP_NOTE);
+        if v.gaps.is_empty() {
+            let note = format!(
+                "Live vehicle-gateway mirror active for node `{}` ({} {}).",
+                v.host, v.model, v.mgos_version
+            );
+            if !self.real_hardware_gaps.contains(&note) {
+                self.real_hardware_gaps.insert(0, note);
+            }
+        } else {
+            for gap in &v.gaps {
+                let note = format!("Vehicle-gateway adapter gap: {gap}");
+                if !self.real_hardware_gaps.contains(&note) {
+                    self.real_hardware_gaps.push(note);
+                }
+            }
+        }
+    }
+
+    /// Read the retained `state/vehicle/<node>` mirror off the Bus (fail-soft,
+    /// honest off-mesh no-op) and fold it in via [`Self::refresh_from_vehicle`].
+    ///
+    /// When no mirror is retained yet — no spool, no adapter worker running, or
+    /// the topic is simply empty — this leaves the simulated seed exactly as it
+    /// was, `real_hardware_gaps` note included: the honest offline fallback, not
+    /// an error. Opens the store per call (no cached `Connection`) rather than
+    /// reaching into the shell's crate-private `BusReader` seam, matching that
+    /// seam's own fail-soft idiom for a cross-crate caller.
+    pub fn refresh_from_bus(&mut self, node: &str) {
+        // PERF-5: the shell calls this every frame (~60 Hz); gate the Bus spool
+        // read + decode to ~2 Hz. The gateway refreshes the mirror ~1 Hz, so a more
+        // frequent read is pure waste — the cockpit keeps drawing the last fold
+        // between polls (latest-wins, byte-identical result).
+        if self
+            .last_vehicle_poll
+            .is_some_and(|t| t.elapsed() < VEHICLE_REFRESH)
+        {
+            return;
+        }
+        self.last_vehicle_poll = Some(Instant::now());
+        if let Some(mirror) = read_vehicle_mirror(node) {
+            self.refresh_from_vehicle(&mirror);
+        }
+    }
+
+    /// The Auto Mode home's **Vehicle**-tile glance line: a live telematics
+    /// summary when the MG90 gateway is the primary location source, else `None`
+    /// (the home then shows a plain descriptor, never a simulated reading). Speed
+    /// while moving, otherwise the gateway's live battery voltage — the two facts
+    /// a driver glances for.
+    #[must_use]
+    pub fn vehicle_glance(&self) -> Option<String> {
+        if self.locations.primary != LocationSourceKind::Mg90Gnss {
+            return None;
+        }
+        let t = &self.vehicle.telemetry;
+        if t.moving && t.speed_mph > 0.5 {
+            Some(format!("{:.0} mph", t.speed_mph))
+        } else if t.battery_v > 0.1 {
+            Some(format!("MG90 · {:.1} V", t.battery_v))
+        } else {
+            Some("MG90 linked".to_string())
+        }
+    }
+
+    /// Open the cockpit directly on its **Vehicle** telematics tab — the target of
+    /// the Auto Mode home's Vehicle tile, so it lands on telematics rather than the
+    /// default Drive HUD.
+    pub fn focus_vehicle_tab(&mut self) {
+        self.active = WorkspaceTab::Vehicle;
+    }
+}
+
+/// `mackes_mesh_types::vehicle::CellLink` -> the cockpit's `CellularLink` —
+/// same six fields, different crate.
+fn cellular_link_from_wire(link: &mackes_mesh_types::vehicle::CellLink) -> CellularLink {
+    CellularLink {
+        sim_state: link.sim_state.clone(),
+        carrier: link.carrier.clone(),
+        signal_dbm: link.signal_dbm,
+        technology: link.technology.clone(),
+        wan_ip: link.wan_ip.clone(),
+        healthy: link.healthy,
+    }
+}
+
+/// Wall-clock age of a `published_at_ms` mirror stamp, seconds. Falls back to
+/// `0.0` if the system clock is somehow before the stamp — never panics.
+fn mirror_age_s(published_at_ms: i64) -> f32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(published_at_ms, |d| {
+            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+        });
+    ((now_ms - published_at_ms).max(0) as f32) / 1000.0
+}
+
+/// Open the Bus fail-soft and decode the newest `state/vehicle/<node>` mirror
+/// body — the same "resolve `client_data_dir`, `Persist::open` fail-soft,
+/// newest row, `serde_json` decode" prelude the shell's own per-host readers
+/// use, embedded locally since that seam is crate-private to `mde-shell-egui`.
+fn read_vehicle_mirror(node: &str) -> Option<mackes_mesh_types::vehicle::VehicleState> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
 }
 
 impl Default for MapsLocationSurface {
@@ -604,6 +899,12 @@ pub struct LocalNavigationState {
     pub active_route: RoutePlan,
     /// Recent/favorite destinations.
     pub destinations: Vec<Destination>,
+    /// Selectable route options shown on the pre-drive route-preview screen.
+    pub route_options: Vec<RouteOption>,
+    /// Index of the currently selected route option.
+    pub selected_route: usize,
+    /// Index of the destination the preview / arrival screens summarize.
+    pub selected_destination: usize,
 }
 
 impl LocalNavigationState {
@@ -652,22 +953,116 @@ impl LocalNavigationState {
             },
             destinations: vec![
                 Destination {
-                    label: "Station".to_string(),
-                    category: "favorite".to_string(),
+                    label: "Home".to_string(),
+                    category: "home".to_string(),
+                    distance_mi: 5.4,
+                    address: "742 Ridgeview Terrace".to_string(),
+                },
+                Destination {
+                    label: "Precinct HQ".to_string(),
+                    category: "work".to_string(),
                     distance_mi: 3.2,
+                    address: "1200 Public Safety Blvd".to_string(),
                 },
                 Destination {
                     label: "Hospital entrance".to_string(),
                     category: "recent".to_string(),
                     distance_mi: 8.7,
+                    address: "500 Medical Center Dr, Emergency".to_string(),
                 },
                 Destination {
                     label: "Command post".to_string(),
                     category: "favorite".to_string(),
                     distance_mi: 14.1,
+                    address: "US-30 W Mile 214, staging area".to_string(),
+                },
+                Destination {
+                    label: "Motor pool fuel".to_string(),
+                    category: "fuel".to_string(),
+                    distance_mi: 2.1,
+                    address: "88 Motor Pool Rd".to_string(),
+                },
+                Destination {
+                    label: "Market St Diner".to_string(),
+                    category: "food".to_string(),
+                    distance_mi: 4.3,
+                    address: "210 Market St".to_string(),
+                },
+                Destination {
+                    label: "Union St Garage".to_string(),
+                    category: "parking".to_string(),
+                    distance_mi: 1.6,
+                    address: "5th St & Union, Level 2".to_string(),
                 },
             ],
+            route_options: vec![
+                RouteOption {
+                    label: "Fastest".to_string(),
+                    via: "US-30 W".to_string(),
+                    eta: "14:32".to_string(),
+                    remaining_time_min: 18,
+                    remaining_distance_mi: 11.6,
+                    traffic: RouteTraffic::Slow,
+                },
+                RouteOption {
+                    label: "Less traffic".to_string(),
+                    via: "PA-51 S".to_string(),
+                    eta: "14:39".to_string(),
+                    remaining_time_min: 25,
+                    remaining_distance_mi: 13.2,
+                    traffic: RouteTraffic::Clear,
+                },
+            ],
+            selected_route: 0,
+            selected_destination: 0,
         }
+    }
+
+    /// The destination the route-preview and arrival screens summarize.
+    ///
+    /// Falls back to the first destination when the selected index is out of
+    /// range, so the summary is always populated (crash-safe).
+    #[must_use]
+    pub fn active_destination(&self) -> Option<&Destination> {
+        self.destinations
+            .get(self.selected_destination)
+            .or_else(|| self.destinations.first())
+    }
+
+    /// Select a destination by index. Out-of-range indices are ignored, so the
+    /// call is always crash-safe.
+    pub fn select_destination(&mut self, idx: usize) {
+        if idx < self.destinations.len() {
+            self.selected_destination = idx;
+        }
+    }
+
+    /// Index of the first destination whose category matches `category`, if any.
+    #[must_use]
+    pub fn destination_in_category(&self, category: &str) -> Option<usize> {
+        self.destinations
+            .iter()
+            .position(|destination| destination.category.eq_ignore_ascii_case(category))
+    }
+
+    /// Apply a route option's summary onto the active route.
+    ///
+    /// Called when the operator taps an option on the route-preview screen.
+    /// Out-of-range indices are ignored, so the call is always crash-safe.
+    pub fn apply_route_option(&mut self, idx: usize) {
+        let Some(option) = self.route_options.get(idx).cloned() else {
+            return;
+        };
+        self.selected_route = idx;
+        self.active_route.eta = option.eta;
+        self.active_route.remaining_time_min = option.remaining_time_min;
+        self.active_route.remaining_distance_mi = option.remaining_distance_mi;
+        self.active_route.current_road = option.via;
+        self.active_route.traffic_alert = match option.traffic {
+            RouteTraffic::Clear => String::new(),
+            RouteTraffic::Slow => "Slowdown +4 min ahead".to_string(),
+            RouteTraffic::Heavy => "Heavy traffic ahead".to_string(),
+        };
     }
 }
 
@@ -703,6 +1098,51 @@ pub struct Destination {
     pub category: String,
     /// Distance from current location.
     pub distance_mi: f32,
+    /// Street address / locality line shown in the route-preview summary.
+    pub address: String,
+}
+
+/// Coarse traffic condition on a route option, shown as an OK/WARN/DANGER dot on
+/// the route-preview cards (Waze/Google-Maps grammar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTraffic {
+    /// Light/clear traffic — green.
+    Clear,
+    /// Slower than usual — amber.
+    Slow,
+    /// Heavy/stopped traffic — red.
+    Heavy,
+}
+
+impl RouteTraffic {
+    /// Human label for the route-option traffic line.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Clear => "Light traffic",
+            Self::Slow => "Slower than usual",
+            Self::Heavy => "Heavy traffic",
+        }
+    }
+}
+
+/// One selectable route on the pre-drive route-preview screen. Alternates are
+/// mocked from the active route so the preview has a "fastest / less-traffic"
+/// choice even when the routing seam only returns a single plan.
+#[derive(Debug, Clone)]
+pub struct RouteOption {
+    /// Short option label ("Fastest", "Less traffic").
+    pub label: String,
+    /// Primary road the option runs on ("US-30 W").
+    pub via: String,
+    /// Arrival clock label.
+    pub eta: String,
+    /// Total minutes for this option.
+    pub remaining_time_min: u32,
+    /// Total miles for this option.
+    pub remaining_distance_mi: f32,
+    /// Traffic condition dot.
+    pub traffic: RouteTraffic,
 }
 
 /// MG90 model/status.
@@ -1554,6 +1994,28 @@ impl LocationSample {
     pub fn moving(&self) -> bool {
         self.speed_mph > 1.0
     }
+
+    /// Whether this sample represents a real position fix.
+    ///
+    /// The driving HUD uses this to decide between the live vehicle chevron and
+    /// the honest "Acquiring GPS" state. A sample counts as fixed when its
+    /// `fix_type` reports an actual 2D/3D/DGPS/RTK lock (not empty, "no fix", or
+    /// "none") and the reported coordinate is not the degenerate null island
+    /// `0, 0`. Guarding on both keeps a half-populated sample from feeding a
+    /// zero/NaN-adjacent position into HUD layout.
+    #[must_use]
+    pub fn has_fix(&self) -> bool {
+        let fix = self.fix_type.trim();
+        let fix_ok = !fix.is_empty()
+            && !fix.eq_ignore_ascii_case("no fix")
+            && !fix.eq_ignore_ascii_case("none")
+            && !fix.eq_ignore_ascii_case("0")
+            && !fix.eq_ignore_ascii_case("nofix");
+        let coord_ok = self.latitude.is_finite()
+            && self.longitude.is_finite()
+            && (self.latitude.abs() > f64::EPSILON || self.longitude.abs() > f64::EPSILON);
+        fix_ok && coord_ok
+    }
 }
 
 /// Trip recorder state.
@@ -2034,6 +2496,45 @@ mod tests {
     }
 
     #[test]
+    fn has_fix_distinguishes_real_lock_from_acquiring() {
+        let fixed = LocationSample {
+            fix_type: "3D".to_string(),
+            latitude: 40.4406,
+            longitude: -79.9959,
+            accuracy_m: 3.0,
+            speed_mph: 27.0,
+            heading_deg: 284.0,
+            altitude_m: 311.0,
+            satellites: Some(14),
+            update_rate_hz: 1.0,
+            update_age_s: 1.0,
+        };
+        assert!(fixed.has_fix());
+
+        let acquiring = LocationSample {
+            fix_type: "No fix".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            satellites: None,
+            ..fixed.clone()
+        };
+        assert!(!acquiring.has_fix());
+
+        let empty_fix = LocationSample {
+            fix_type: String::new(),
+            ..fixed.clone()
+        };
+        assert!(!empty_fix.has_fix());
+
+        let null_island = LocationSample {
+            latitude: 0.0,
+            longitude: 0.0,
+            ..fixed
+        };
+        assert!(!null_island.has_fix());
+    }
+
+    #[test]
     fn motion_rule_warns_above_one_mph() {
         let mut state = MapsLocationSurface::simulated();
         state.locations.sources[0].sample.speed_mph = 1.0;
@@ -2230,5 +2731,215 @@ mod tests {
         assert_eq!(recorded.selected_wan, "Cellular A");
         assert_eq!(recorded.severity, DeadZoneSeverity::Outage);
         assert!(state.dead_zones.route_risk.contains("outage"));
+    }
+
+    #[test]
+    fn route_preview_offers_selectable_alternates() {
+        let nav = LocalNavigationState::simulated();
+        assert!(
+            nav.route_options.len() >= 2,
+            "preview needs at least a fastest + alternate"
+        );
+        // Option 0 mirrors the active route so entering preview is consistent.
+        assert_eq!(nav.selected_route, 0);
+        assert_eq!(nav.route_options[0].eta, nav.active_route.eta);
+        assert_eq!(
+            nav.route_options[0].remaining_time_min,
+            nav.active_route.remaining_time_min
+        );
+    }
+
+    #[test]
+    fn applying_a_route_option_updates_the_active_route() {
+        let mut nav = LocalNavigationState::simulated();
+        let alt = nav.route_options[1].clone();
+        nav.apply_route_option(1);
+        assert_eq!(nav.selected_route, 1);
+        assert_eq!(nav.active_route.eta, alt.eta);
+        assert_eq!(nav.active_route.remaining_time_min, alt.remaining_time_min);
+        assert!((nav.active_route.remaining_distance_mi - alt.remaining_distance_mi).abs() < 1e-6);
+        assert_eq!(nav.active_route.current_road, alt.via);
+        // A clear alternate clears the traffic alert strip.
+        assert!(nav.active_route.traffic_alert.is_empty());
+    }
+
+    #[test]
+    fn applying_out_of_range_route_option_is_a_no_op() {
+        let mut nav = LocalNavigationState::simulated();
+        let before = nav.active_route.eta.clone();
+        nav.apply_route_option(99);
+        assert_eq!(nav.selected_route, 0);
+        assert_eq!(nav.active_route.eta, before);
+    }
+
+    #[test]
+    fn destinations_carry_an_address_for_the_preview_summary() {
+        let nav = LocalNavigationState::simulated();
+        assert!(nav
+            .destinations
+            .iter()
+            .all(|destination| !destination.address.trim().is_empty()));
+    }
+
+    #[test]
+    fn each_quick_category_chip_has_a_matching_destination() {
+        // The "Where to?" chips (Home / Work / Fuel / Food / Parking) must each
+        // resolve to a recent/favorite so a chip tap always opens a preview.
+        let nav = LocalNavigationState::simulated();
+        for category in ["home", "work", "fuel", "food", "parking"] {
+            assert!(
+                nav.destination_in_category(category).is_some(),
+                "no destination for category {category}"
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_a_destination_opens_preview_and_records_selection() {
+        let mut state = MapsLocationSurface::simulated();
+        state.open_destination_search();
+        assert!(state.destination_search);
+
+        state.choose_destination(3);
+        assert!(!state.destination_search);
+        assert!(state.route_preview);
+        assert_eq!(state.local_navigation.selected_destination, 3);
+        assert_eq!(
+            state
+                .local_navigation
+                .active_destination()
+                .map(|d| d.label.as_str()),
+            state
+                .local_navigation
+                .destinations
+                .get(3)
+                .map(|d| d.label.as_str())
+        );
+    }
+
+    #[test]
+    fn out_of_range_destination_selection_is_a_no_op() {
+        let mut nav = LocalNavigationState::simulated();
+        nav.select_destination(999);
+        assert_eq!(nav.selected_destination, 0);
+        assert!(nav.active_destination().is_some());
+    }
+
+    #[test]
+    fn arrival_and_end_navigation_toggle_the_flow_flags() {
+        let mut state = MapsLocationSurface::simulated();
+        state.route_preview = true;
+        state.simulate_arrival();
+        assert!(state.arrived);
+        assert!(!state.route_preview);
+        assert_eq!(state.active, WorkspaceTab::Drive);
+
+        state.end_navigation();
+        assert!(!state.arrived);
+        assert!(!state.route_preview);
+        assert!(!state.destination_search);
+        assert!(!state.off_route);
+    }
+
+    #[test]
+    fn off_route_toggles() {
+        let mut state = MapsLocationSurface::simulated();
+        assert!(!state.off_route);
+        state.toggle_off_route();
+        assert!(state.off_route);
+        state.toggle_off_route();
+        assert!(!state.off_route);
+    }
+
+    #[test]
+    fn live_mirror_fold_selects_mg90_gnss_and_drops_simulator_label() {
+        use mackes_mesh_types::vehicle::{
+            CellLink, GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
+        };
+
+        // A live gateway with an active cellular uplink but NO GPS lock — the
+        // honest "rolling out of the depot before the sky clears" case.
+        let mirror = WireVehicleState {
+            host: "eagle".to_string(),
+            model: "MG90".to_string(),
+            esn: "ESN-TEST".to_string(),
+            mgos_version: "4.3.0.1".to_string(),
+            online: true,
+            gps: GpsFix {
+                fix_type: "no-fix".to_string(),
+                satellites: 0,
+                hdop: 99.0,
+                ..GpsFix::default()
+            },
+            imu: None,
+            wan: WanStatus {
+                active_wan: "Cellular A".to_string(),
+                cellular_a: CellLink {
+                    sim_state: "ready".to_string(),
+                    carrier: "FirstNet".to_string(),
+                    signal_dbm: -68,
+                    technology: "5G/LTE-A".to_string(),
+                    wan_ip: "100.64.0.9".to_string(),
+                    healthy: true,
+                },
+                latency_ms: 31,
+                link_quality: "excellent".to_string(),
+                ..WanStatus::default()
+            },
+            telem: VehicleTelem::default(),
+            gaps: Vec::new(),
+            published_at_ms: 0,
+        };
+
+        let mut state = MapsLocationSurface::simulated();
+        state.refresh_from_vehicle(&mirror);
+
+        // MG90 GNSS is now the primary source, and its label is NOT the
+        // Simulator any longer — the whole point of wiring the live gateway.
+        assert_eq!(state.locations.primary, LocationSourceKind::Mg90Gnss);
+        assert_eq!(state.locations.primary.label(), "MG90 GNSS");
+        assert_ne!(
+            state.locations.primary.label(),
+            LocationSourceKind::Simulator.label()
+        );
+        assert!(
+            !state.simulator_enabled,
+            "a live mirror retires the global Simulator indicator"
+        );
+
+        // No lock ⇒ the HUD still reports "Acquiring GPS" (`has_fix` false), but
+        // the fold populated the MG90 source's live sample from the wire GpsFix.
+        let primary = state.locations.primary_source().expect("mg90 source");
+        assert!(!primary.sample.has_fix(), "no-fix mirror ⇒ no HUD lock");
+        assert_eq!(primary.sample.fix_type, "no-fix");
+
+        // Mg90Status reflects the live cellular uplink.
+        assert_eq!(state.mg90.status.active_wan, "Cellular A");
+        assert_eq!(state.mg90.status.cellular_a.carrier, "FirstNet");
+        assert_eq!(state.mg90.status.cellular_a.signal_dbm, -68);
+        assert_eq!(state.mg90.status.link_quality, "excellent");
+
+        // The generic "simulator is active" gap is retracted for a live mirror.
+        assert!(
+            !state
+                .real_hardware_gaps
+                .iter()
+                .any(|g| g == SIMULATED_MG90_GAP_NOTE),
+            "live mirror retracts the simulator gap note"
+        );
+    }
+
+    #[test]
+    fn refresh_from_bus_is_fail_soft_when_no_mirror() {
+        // No retained `state/vehicle/<node>` mirror for a bogus node (or no Bus
+        // spool at all) ⇒ the simulated seed is left exactly as it was: the
+        // honest offline fallback, not an error.
+        let mut state = MapsLocationSurface::simulated();
+        state.refresh_from_bus("no-such-node-4c1f9e2a");
+        assert!(state.simulator_enabled);
+        assert!(state
+            .real_hardware_gaps
+            .iter()
+            .any(|g| g == SIMULATED_MG90_GAP_NOTE));
     }
 }

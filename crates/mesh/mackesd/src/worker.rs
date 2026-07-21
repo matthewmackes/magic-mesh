@@ -231,15 +231,30 @@ pub fn run_loop(workgroup_root: &Path, node_id: &str, db_path: &Path, shutdown: 
     while !shutdown.load(Ordering::Relaxed) {
         match tick(workgroup_root, node_id, db_path) {
             Ok(outcome) => {
-                info!(
-                    observed_heartbeats = outcome.observed_heartbeats,
-                    observed_edges = outcome.observed_edges,
-                    desired_edges = outcome.desired_edges,
-                    repair_now = outcome.plan.repair_now.len(),
-                    inbox = outcome.plan.inbox.len(),
-                    duration_ms = outcome.duration_ms,
-                    "reconcile tick complete",
-                );
+                // PERF-8: a converged idle mesh reconciles to a no-op every tick —
+                // logging that at INFO is a guaranteed 1-line/tick journald firehose
+                // across the whole fleet. Log INFO only when the tick actually did
+                // something (a repair or an inbox item); otherwise DEBUG. (`event!`
+                // needs a const level, so the two arms are explicit.)
+                if outcome.plan.repair_now.len() + outcome.plan.inbox.len() > 0 {
+                    info!(
+                        observed_heartbeats = outcome.observed_heartbeats,
+                        observed_edges = outcome.observed_edges,
+                        desired_edges = outcome.desired_edges,
+                        repair_now = outcome.plan.repair_now.len(),
+                        inbox = outcome.plan.inbox.len(),
+                        duration_ms = outcome.duration_ms,
+                        "reconcile tick complete",
+                    );
+                } else {
+                    tracing::debug!(
+                        observed_heartbeats = outcome.observed_heartbeats,
+                        observed_edges = outcome.observed_edges,
+                        desired_edges = outcome.desired_edges,
+                        duration_ms = outcome.duration_ms,
+                        "reconcile tick complete (no-op)",
+                    );
+                }
             }
             Err(e) => {
                 // WL-RUN-002 — the reconcile loop's real failure path.

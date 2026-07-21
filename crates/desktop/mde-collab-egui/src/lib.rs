@@ -175,6 +175,19 @@ impl Mode {
             | Self::Clipboard => true,
         }
     }
+
+    /// Whether this is a **dense**, manage-heavy pane — a full conversation
+    /// timeline, a file/document manager, or the clipboard lane — ill-suited to a
+    /// glance from behind the wheel. Auto Mode (Car Mode) biases the default away
+    /// from these toward the glanceable [`Alerts`](Self::Alerts) inbox; it never
+    /// removes them (a passenger can still open one).
+    #[must_use]
+    pub const fn is_dense(self) -> bool {
+        matches!(
+            self,
+            Self::Messages | Self::Files | Self::Documents | Self::Clipboard
+        )
+    }
 }
 
 /// The band an [`ActivityFeed`](mde_collab_types::ActivityFeed) row is filtered
@@ -315,6 +328,13 @@ pub struct CommunicationsSurface {
     /// per-view intent (a space switch closes it); each keypad press emits a real
     /// [`SendDtmf`](mde_collab_types::CollabCommand::SendDtmf) command.
     dtmf_pad: Option<CallId>,
+    /// Auto Mode (Car Mode) — a one-shot latch tracking whether the glanceable
+    /// default-to-[`Alerts`](Mode::Alerts) bias has already been applied for the
+    /// current car-mode session. Set the first frame the surface sees the
+    /// [`AutoSync3`](mde_egui::StyleColorScheme::AutoSync3) car skin, cleared when
+    /// it leaves — so a driver lands on the alert inbox but can still navigate to
+    /// any mode afterward (the bias is a default, never a lock).
+    car_bias_applied: bool,
 }
 
 impl CommunicationsSurface {
@@ -404,6 +424,22 @@ impl CommunicationsSurface {
             self.selected_space = data.space_directory().spaces.first().map(|s| s.id);
         }
 
+        // Auto Mode (Car Mode): on entering the Ford SYNC 3 car dash, land a driver
+        // on the glanceable Alerts inbox instead of a dense manage-heavy pane. A
+        // one-shot latch (re-armed on leaving car mode) so this is a *default*, not
+        // a lock — the driver can still switch to any mode afterward. The non-car
+        // surface keeps its own default untouched.
+        if car_mode(ui) {
+            if !self.car_bias_applied {
+                if self.mode.is_dense() {
+                    self.set_mode(Mode::Alerts);
+                }
+                self.car_bias_applied = true;
+            }
+        } else {
+            self.car_bias_applied = false;
+        }
+
         egui::SidePanel::left(ui.id().with("collab-rail"))
             .resizable(false)
             .exact_width(frame::RAIL_W)
@@ -438,4 +474,15 @@ impl CommunicationsSurface {
             Mode::Clipboard => self.clipboard_body(ui, data, sink),
         }
     }
+}
+
+/// Whether the surface is running on the in-vehicle **Ford SYNC 3** car-dash skin
+/// ([`AutoSync3`](mde_egui::StyleColorScheme::AutoSync3)) — installed by the shell
+/// only while Car Mode is active. When true the surface takes a conservative,
+/// glanceable Auto Mode treatment: it lands a driver on the Alerts inbox (see
+/// [`ui`](CommunicationsSurface::ui)) and enlarges the alert rows + persistent
+/// call bar so they read at a glance. The non-car surface reads `false` here and
+/// renders exactly as before — every branch is glue, never a replacement.
+pub(crate) fn car_mode(ui: &egui::Ui) -> bool {
+    mde_egui::Style::color_scheme(ui.ctx()) == mde_egui::StyleColorScheme::AutoSync3
 }

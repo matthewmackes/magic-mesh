@@ -1220,6 +1220,24 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                 .map_or(std::ptr::null(), |f| f as *const c_void)
         })
     };
+    // PERF-2: surface a SILENT software-rasterizer fallback. A DRM seat that lost
+    // its GPU driver drops to llvmpipe/swrast (Mesa software GL) with no trace today
+    // — the worst case for "match native" perf. Read GL_RENDERER once (setup, not
+    // per-frame) and warn loudly; still boot (a genuinely software host must run),
+    // just not silently.
+    use glow::HasContext as _;
+    let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
+    let soft = ["llvmpipe", "softpipe", "swrast", "kms_swrast"];
+    if soft
+        .iter()
+        .any(|s| renderer.to_ascii_lowercase().contains(s))
+    {
+        eprintln!(
+            "WARNING: DRM seat is on a SOFTWARE GL rasterizer ({renderer}) — NO GPU \
+             acceleration; frame rate will be poor. Check the GPU driver / DRM render \
+             node permissions."
+        );
+    }
     let mut painter = egui_glow::Painter::new(Arc::new(gl), "", None, false)
         .map_err(|e| DrmError::Gl(e.to_string()))?;
 

@@ -656,7 +656,11 @@ impl ActionWorker {
             }
             let body = msg.body.unwrap_or_default();
             let reply = self.handle_action(&msg.ulid, &body);
-            tracing::info!(
+            // PERF-8: one INFO line per drained action scales with every user
+            // interaction and is redundant telemetry — the reply body is durably
+            // persisted to the reply topic immediately below. DEBUG keeps it opt-in;
+            // the failure path stays at WARN.
+            tracing::debug!(
                 target: "mackesd::action",
                 ulid = %msg.ulid,
                 ok = reply.ok,
