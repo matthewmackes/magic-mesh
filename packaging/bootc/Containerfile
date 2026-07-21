@@ -189,30 +189,40 @@ RUN set -eux; \
 # the base kernel (the intended single-kernel bootc image; the surface kernel is
 # the mainline superset described above). Network egress to pkg.surfacelinux.com +
 # raw.githubusercontent.com is needed here; airgapped builders point at a LAN mirror.
+# fwupd (base Fedora, the SURFACE-5 firmware panel + universal LVFS client) ALWAYS
+# installs. The linux-surface layer is BEST-EFFORT: the project publishes per-Fedora
+# repos on its own cadence, so a brand-new Fedora (e.g. f44 today → repomd 404) or an
+# offline builder must degrade to "no surface support" and STILL build a working image
+# — not hard-fail the whole ISO (the block's original `dnf -y install` betrayed the
+# skip_if_unavailable intent). The surface kernel swap only happens if the surface
+# packages actually installed. Inert on non-Surface hardware either way (lock 10).
 RUN set -eux; \
-    rpm --import https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc || { \
-        echo "GATED[SURFACE-1/key]: cannot fetch the linux-surface signing key"; \
-        echo "  the builder needs egress to raw.githubusercontent.com here (or a LAN mirror)"; \
-        exit 1; }; \
-    printf '%s\n' \
-        '[linux-surface]' \
-        'name=linux-surface' \
-        'baseurl=https://pkg.surfacelinux.com/fedora/f$releasever/' \
-        'enabled=1' \
-        'gpgcheck=1' \
-        'repo_gpgcheck=0' \
-        'skip_if_unavailable=1' \
-        'gpgkey=https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc' \
-        > /etc/yum.repos.d/linux-surface.repo; \
-    dnf -y install --allowerasing \
-        kernel-surface iptsd libwacom-surface \
-        surface-control surface-secureboot \
-        fwupd; \
-    base_kernels="$(rpm -qa \
-        kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra \
-        | grep -v surface || true)"; \
-    if [ -n "${base_kernels}" ]; then \
-        dnf -y remove ${base_kernels}; \
+    dnf -y install fwupd; \
+    if rpm --import https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc 2>/dev/null; then \
+        printf '%s\n' \
+            '[linux-surface]' \
+            'name=linux-surface' \
+            'baseurl=https://pkg.surfacelinux.com/fedora/f$releasever/' \
+            'enabled=1' \
+            'gpgcheck=1' \
+            'repo_gpgcheck=0' \
+            'skip_if_unavailable=1' \
+            'gpgkey=https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc' \
+            > /etc/yum.repos.d/linux-surface.repo; \
+        if dnf -y install --allowerasing \
+                kernel-surface iptsd libwacom-surface \
+                surface-control surface-secureboot; then \
+            base_kernels="$(rpm -qa \
+                kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra \
+                | grep -v surface || true)"; \
+            if [ -n "${base_kernels}" ]; then dnf -y remove ${base_kernels}; fi; \
+            echo "SURFACE-1: linux-surface layer installed for f$(rpm -E %fedora)"; \
+        else \
+            echo "SURFACE-1: no linux-surface packages for f$(rpm -E %fedora) (project hasn't published this Fedora yet) — building WITHOUT surface tablet support; harmless on non-Surface hardware, re-add when the channel exists"; \
+            rm -f /etc/yum.repos.d/linux-surface.repo; \
+        fi; \
+    else \
+        echo "SURFACE-1: cannot import the linux-surface key (offline builder?) — skipping the surface layer"; \
     fi; \
     dnf clean all
 
