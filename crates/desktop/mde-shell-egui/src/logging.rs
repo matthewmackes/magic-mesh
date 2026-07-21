@@ -32,7 +32,12 @@ fn env_filter() -> EnvFilter {
             }
         }
     }
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    // PERF-8: default deps to WARN while keeping the shell's own lifecycle at INFO,
+    // so an un-tuned seat's journald isn't drowned by chatty dependency crates
+    // (wgpu/egui/hyper/…). `MDE_LOG`/`RUST_LOG` still win (checked above), so an
+    // operator debugging just sets `RUST_LOG=debug`.
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,shell=info,mde_shell_egui=info"))
 }
 
 /// Whether to emit JSON lines. `MDE_LOG_FORMAT=json|text` forces it; otherwise

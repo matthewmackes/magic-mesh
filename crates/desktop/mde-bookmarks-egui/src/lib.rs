@@ -21,6 +21,12 @@ pub mod model;
 pub mod view;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// Poll cadence for the bookmarks Bus pump (PERF-5). `pump` runs on every
+/// input-driven repaint; gating the spool open + index probes to 2 Hz removes the
+/// churn while a user-initiated bookmarks action is delayed at most this long.
+const BOOKMARKS_REFRESH: Duration = Duration::from_millis(500);
 
 use mde_egui::{eframe, egui};
 
@@ -41,6 +47,8 @@ pub struct BookmarksBus {
     bus_root: Option<PathBuf>,
     collection_cursor: Option<String>,
     link_check_cursor: Option<String>,
+    /// Throttle stamp for the per-repaint [`Self::pump`] Bus read (PERF-5).
+    last_pump: Option<Instant>,
 }
 
 impl BookmarksBus {
@@ -51,6 +59,7 @@ impl BookmarksBus {
             bus_root: mde_bus::client_data_dir(),
             collection_cursor: None,
             link_check_cursor: None,
+            last_pump: None,
         }
     }
 
@@ -61,11 +70,22 @@ impl BookmarksBus {
             bus_root,
             collection_cursor: None,
             link_check_cursor: None,
+            last_pump: None,
         }
     }
 
     /// Pump new daemon status into `manager` and publish any one-shot UI request.
     pub fn pump(&mut self, manager: &mut Manager) {
+        // PERF-5: gate the spool open + index probes to 2 Hz. pump runs on every
+        // input-driven repaint; a user-initiated bookmarks action is delayed at
+        // most BOOKMARKS_REFRESH, which is imperceptible for bookmark ops.
+        if self
+            .last_pump
+            .is_some_and(|t| t.elapsed() < BOOKMARKS_REFRESH)
+        {
+            return;
+        }
+        self.last_pump = Some(Instant::now());
         let Some(root) = self.bus_root.clone() else {
             if manager.take_link_check_request() {
                 manager.note_link_check_bus_error("no local bus spool is configured");

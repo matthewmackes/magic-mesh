@@ -132,7 +132,11 @@ todo        = "deny"
 # an accepted trade for a fast, joyful seat.)
 [profile.release]
 opt-level = 3
-lto = "fat"
+# Thin LTO, not fat: on a workspace this large (wgpu + CEF + egui + the mesh
+# stack) fat LTO is a 30-60min, high-memory link that risks OOM, for a runtime
+# gain over thin that is marginal on these workloads. Thin keeps almost all the
+# cross-crate inlining benefit at a fraction of the build cost.
+lto = "thin"
 codegen-units = 1
 strip = true
 

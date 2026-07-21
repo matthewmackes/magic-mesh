@@ -2063,8 +2063,11 @@ fn main() -> anyhow::Result<()> {
     // a log aggregator; human-readable text when attached to a TTY (interactive
     // CLI use). Force either with MDE_LOG_FORMAT=json|text.
     use std::io::IsTerminal;
+    // PERF-8: default deps to WARN but keep mackesd's own lifecycle (start/converge/
+    // exit) at INFO — so a fleet of idle daemons isn't a journald firehose while
+    // real daemon events stay visible. RUST_LOG still overrides (checked first).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,mackesd=info"));
     let json = match std::env::var("MDE_LOG_FORMAT").as_deref() {
         Ok("json") => true,
         Ok("text") => false,

@@ -1,6 +1,14 @@
 //! Render-agnostic state for the Maps & Location workspace.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+/// Poll cadence for the live `state/vehicle` mirror (PERF-5). The shell calls
+/// [`MapsLocationSurface::refresh_from_bus`] every frame (~60 Hz); re-reading the
+/// Bus spool off disk that often is pure waste for a latest-wins mirror the
+/// gateway only updates ~1 Hz. Gating to 2 Hz keeps the fold live while cutting
+/// ~60 disk reads/sec to ~2 — the cockpit keeps drawing the cached fold between.
+const VEHICLE_REFRESH: Duration = Duration::from_millis(500);
 
 /// The simulator-active gap note seeded by [`MapsLocationSurface::simulated`].
 ///
@@ -113,6 +121,10 @@ pub struct MapsLocationSurface {
     pub vault: EncryptedVaultState,
     /// Known real-hardware gaps for this vertical slice.
     pub real_hardware_gaps: Vec<String>,
+    /// Throttle stamp for the per-frame `refresh_from_bus` Bus read (PERF-5). `None`
+    /// until the first poll; then the wall-clock of the last mirror read. Not part
+    /// of the surface's visible state.
+    last_vehicle_poll: Option<Instant>,
 }
 
 impl MapsLocationSurface {
@@ -146,6 +158,7 @@ impl MapsLocationSurface {
                 "Traffic, weather, and satellite providers expose graceful unavailable states until configured."
                     .to_string(),
             ],
+            last_vehicle_poll: None,
         }
     }
 
@@ -443,6 +456,17 @@ impl MapsLocationSurface {
     /// reaching into the shell's crate-private `BusReader` seam, matching that
     /// seam's own fail-soft idiom for a cross-crate caller.
     pub fn refresh_from_bus(&mut self, node: &str) {
+        // PERF-5: the shell calls this every frame (~60 Hz); gate the Bus spool
+        // read + decode to ~2 Hz. The gateway refreshes the mirror ~1 Hz, so a more
+        // frequent read is pure waste — the cockpit keeps drawing the last fold
+        // between polls (latest-wins, byte-identical result).
+        if self
+            .last_vehicle_poll
+            .is_some_and(|t| t.elapsed() < VEHICLE_REFRESH)
+        {
+            return;
+        }
+        self.last_vehicle_poll = Some(Instant::now());
         if let Some(mirror) = read_vehicle_mirror(node) {
             self.refresh_from_vehicle(&mirror);
         }
