@@ -574,33 +574,45 @@ fn complete_menu_bar_minimize(
 
 fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
     match surface {
+        // Surfaces that render the shared MenuBar (which ALREADY carries the
+        // remote-sessions minimize button) must NOT also mount the Foreground
+        // fallback Area: that inserts the button's fixed GLOBAL egui Id twice in
+        // one frame — once in the menubar (Background), once in the fallback Area
+        // (Foreground) — and egui panics ("Widget changed layer_id during the
+        // frame from Background to Foreground", widget_rect.rs:163) on the first
+        // frame such a surface is shown. This was the shell's long-standing
+        // crash-on-navigation to Media/Files/Terminal/Music/Voice/Editor/MeshView
+        // (`push_id` cannot disambiguate an explicit `Id::new`). The menubar
+        // provides the control for all of these, so they return false.
         Surface::Workbench
         | Surface::InfraCode
         | Surface::Chat
         | Surface::System
         | Surface::Storage
-        | Surface::About => false,
-        Surface::Desktop => false,
-        Surface::MeshView
-        | Surface::Explorer
+        | Surface::About
+        | Surface::Desktop
+        | Surface::MeshView
         | Surface::Music
         | Surface::Media
         | Surface::Files
         | Surface::Voice
+        | Surface::Terminal
+        | Surface::Editor => false,
+        // Menubar-LESS surfaces: they draw no shared MenuBar, so the shell's
+        // top-right remote-sessions fallback Area is their only such control and
+        // is drawn exactly once (Foreground) — no Background twin, no collision.
+        // Browser renders its own web chrome (not the shared MenuBar), so it too
+        // carries only the single Foreground copy. MapsLocation (its own
+        // header/tab-rail), Phones, Communications (plain `.show(ui)`), Timers,
+        // Explorer, Bookmarks, and the Auto Mode home (car_home_panel) likewise
+        // have no shared menubar.
+        Surface::Explorer
         | Surface::Browser
         | Surface::Bookmarks
         | Surface::MapsLocation
-        | Surface::Terminal
-        | Surface::Editor
         | Surface::Phones
-        // The Communications surface (WL-FUNC-011) mounts a plain
-        // `communications.show(ui)` with no menubar of its own (unlike
-        // Chat/System/Storage/etc), so it still needs the shell's top-right
-        // remote-sessions fallback control.
         | Surface::Communications
         | Surface::Timers
-        // The Auto Mode home is a plain self-contained panel (car_home_panel),
-        // like Timers — it needs the shell's remote-sessions fallback control.
         | Surface::AutoHome => true,
     }
 }
@@ -980,6 +992,12 @@ impl Shell {
         // read folds an absent file to require-login (fail-secure).
         if power_honor::should_lock_at_boot(shell.system.power_honor_config()) {
             shell.curtain.lock();
+        }
+        // Boot straight into the Auto Mode home when the persisted profile is Car —
+        // a vehicle boots to its glanceable launcher, not a workstation surface.
+        if shell.system.layout_profile() == LayoutProfile::Car {
+            shell.nav.surface = Surface::AutoHome;
+            shell.nav.expanded = true;
         }
         shell
     }
@@ -2101,7 +2119,10 @@ impl Shell {
             return;
         }
         let profile = self.system.layout_profile();
-        if profile == LayoutProfile::Car {
+        // The glanceable car-HUD status strip overlays the active surface in Car
+        // Mode — but NOT over the Auto Mode home, which is itself the full-screen
+        // glanceable tile launcher (the strip would just clutter its tiles).
+        if profile == LayoutProfile::Car && self.nav.surface != Surface::AutoHome {
             self.mount_car_hud(ctx);
         }
         let screen = ctx.screen_rect();
@@ -3662,10 +3683,17 @@ mod tests {
     }
 
     #[test]
-    fn shell_remote_sessions_fallback_policy_covers_only_missing_workspace_controls() {
+    fn shell_remote_sessions_fallback_policy_covers_only_menubar_less_surfaces() {
+        // The fallback Area redraws the shared menubar's remote-sessions button in
+        // a Foreground layer, so it must be mounted ONLY for surfaces that do NOT
+        // render the shared MenuBar — otherwise the button's fixed global Id lands
+        // in both Background (menubar) and Foreground (fallback) in one frame and
+        // egui panics (widget_rect.rs:163). The menubar-bearing set therefore
+        // returns false; only menubar-less surfaces return true.
         for surface in Surface::ALL {
             let expected = !matches!(
                 surface,
+                // Own workspace chrome / handle remote-sessions themselves.
                 Surface::Workbench
                     | Surface::InfraCode
                     | Surface::Desktop
@@ -3673,6 +3701,15 @@ mod tests {
                     | Surface::System
                     | Surface::Storage
                     | Surface::About
+                    // Render the shared MenuBar (which carries the button) — a
+                    // Foreground fallback would be the crashing duplicate.
+                    | Surface::MeshView
+                    | Surface::Music
+                    | Surface::Media
+                    | Surface::Files
+                    | Surface::Voice
+                    | Surface::Terminal
+                    | Surface::Editor
             );
             assert_eq!(
                 surface_needs_remote_sessions_fallback(surface),
@@ -3682,7 +3719,11 @@ mod tests {
         }
         assert!(
             surface_needs_remote_sessions_fallback(Surface::Timers),
-            "the clock-routed Timers surface also needs the shell fallback"
+            "the clock-routed Timers surface (no menubar) needs the shell fallback"
+        );
+        assert!(
+            !surface_needs_remote_sessions_fallback(Surface::Media),
+            "a shared-menubar surface must NOT double-mount the fallback (layer_id panic)"
         );
     }
 
