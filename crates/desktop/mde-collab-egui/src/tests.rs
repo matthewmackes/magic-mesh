@@ -65,6 +65,27 @@ fn render_shapes(
     out.shapes
 }
 
+/// Render one frame with the Ford SYNC 3 **Auto (Car Mode)** skin installed, so
+/// the surface sees [`StyleColorScheme::AutoSync3`] at [`Density::Touch`] and
+/// takes its glanceable car branch (the shell installs exactly this while Car
+/// Mode is active).
+fn render_shapes_car(
+    surface: &mut CommunicationsSurface,
+    data: &dyn CollabData,
+) -> Vec<egui::epaint::ClippedShape> {
+    let ctx = egui::Context::default();
+    Style::install_color_scheme_with_density(
+        &ctx,
+        mde_egui::StyleColorScheme::AutoSync3,
+        mde_egui::Density::Touch,
+    );
+    let mut sink = CommandSink::new();
+    let out = ctx.run(sized_input(vec![]), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
+    });
+    out.shapes
+}
+
 /// Count the painted image meshes (tinted Carbon glyphs) in `shapes`, mirroring
 /// the browser chrome's `painted_image_mesh_count`.
 fn image_mesh_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
@@ -903,6 +924,74 @@ fn mute_threshold_and_dnd_emit_commands_and_hush() {
             Some(CollabCommand::SetDoNotDisturb { enabled: true })
         ),
         "DND toggle must emit SetDoNotDisturb"
+    );
+}
+
+// ── Auto Mode / Car Mode (AUTO-COMMS) ────────────────────────────────────────
+
+#[test]
+fn car_mode_defaults_to_alerts_and_renders_glanceably() {
+    // Entering the Ford SYNC 3 car dash (AutoSync3) while sitting on a dense
+    // manage-heavy pane biases a driver onto the glanceable Alerts inbox, and the
+    // enlarged frame still renders its Carbon glyphs (no panic).
+    let space = SpaceId::new();
+    let alert = alert_view(space, Severity::Critical, "core-1", "meltdown", vec![]);
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Incident,
+            "Incident 42",
+            SpaceRole::Owner,
+            0,
+            3,
+            1_000_000,
+        ))
+        .with_alert_inbox(AlertInbox {
+            alerts: vec![alert],
+        });
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    // Sitting on a dense pane (Messages) when Car Mode turns on.
+    surface.set_mode(Mode::Messages);
+    assert!(Mode::Messages.is_dense());
+
+    let shapes = render_shapes_car(&mut surface, &data);
+    assert!(!shapes.is_empty(), "the car-mode frame painted nothing");
+    assert!(
+        image_mesh_count(&shapes) > 0,
+        "the enlarged car-mode Alerts inbox must still paint Carbon icons"
+    );
+    assert_eq!(
+        surface.mode(),
+        Mode::Alerts,
+        "entering car mode on a dense pane must land the driver on Alerts"
+    );
+
+    // The bias is a one-shot default, not a lock: a driver can still navigate to a
+    // dense mode and stay there across subsequent car-mode frames.
+    surface.set_mode(Mode::Messages);
+    let _ = render_shapes_car(&mut surface, &data);
+    assert_eq!(
+        surface.mode(),
+        Mode::Messages,
+        "the Alerts bias is a default, never a lock — other modes stay reachable"
+    );
+}
+
+#[test]
+fn car_mode_leaves_a_non_dense_mode_untouched_on_entry() {
+    // The bias only rescues a driver off a dense pane; entering car mode already on
+    // a glanceable (non-dense) mode does not force a switch to Alerts.
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Calls);
+    assert!(!Mode::Calls.is_dense());
+    let _ = render_shapes_car(&mut surface, &data);
+    assert_eq!(
+        surface.mode(),
+        Mode::Calls,
+        "a non-dense mode is left untouched when entering car mode"
     );
 }
 

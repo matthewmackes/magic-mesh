@@ -40,12 +40,19 @@ impl CommunicationsSurface {
         data: &dyn crate::CollabData,
         sink: &mut crate::CommandSink,
     ) {
+        // Auto Mode (Car Mode): the alert inbox is a driver's primary glance, so on
+        // the Ford SYNC 3 car dash it reads bigger — a larger header, larger rows,
+        // and more breathing room between cards. The desk surface is unchanged.
+        let car = crate::car_mode(ui);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Alerts")
-                    .strong()
-                    .color(Style::TEXT_STRONG),
-            );
+            let heading = egui::RichText::new("Alerts")
+                .strong()
+                .color(Style::TEXT_STRONG);
+            ui.label(if car {
+                heading.size(Style::HEADING)
+            } else {
+                heading
+            });
             ui.label(
                 egui::RichText::new("fleet inbox")
                     .small()
@@ -64,7 +71,7 @@ impl CommunicationsSurface {
                     .show(ui, |ui| {
                         for view in &inbox.alerts {
                             self.alert_card(ui, sink, view, now);
-                            ui.add_space(Style::SP_XS);
+                            ui.add_space(if car { Style::SP_M } else { Style::SP_XS });
                         }
                     });
             }
@@ -128,23 +135,34 @@ impl CommunicationsSurface {
     ) {
         let hushed = self.alert_hushed(view);
         let sev = view.alert.severity;
+        // Auto Mode (Car Mode): enlarge the severity glyph + headline and give the
+        // row extra vertical padding so it reads at a glance from the wheel.
+        let car = crate::car_mode(ui);
+        let glyph_size = if car { Style::SP_L } else { Style::SP_M };
         mde_egui::card().show(ui, |ui| {
+            if car {
+                ui.add_space(Style::SP_XS);
+            }
             ui.horizontal(|ui| {
                 let glyph_tint = if hushed {
                     Style::BORDER
                 } else {
                     severity_color(sev)
                 };
-                icons::icon(ui, icons::severity_icon(sev), Style::SP_M, glyph_tint);
-                ui.label(
+                icons::icon(ui, icons::severity_icon(sev), glyph_size, glyph_tint);
+                let headline =
                     egui::RichText::new(&view.alert.headline)
                         .strong()
                         .color(if hushed {
                             Style::TEXT_DIM
                         } else {
                             Style::TEXT_STRONG
-                        }),
-                );
+                        });
+                ui.label(if car {
+                    headline.size(Style::TITLE)
+                } else {
+                    headline
+                });
                 ui.label(
                     egui::RichText::new(format!("· {}", view.alert.source))
                         .small()
@@ -172,6 +190,9 @@ impl CommunicationsSurface {
             }
 
             self.alert_actions(ui, sink, view, now_unix_ms);
+            if car {
+                ui.add_space(Style::SP_XS);
+            }
         });
     }
 
