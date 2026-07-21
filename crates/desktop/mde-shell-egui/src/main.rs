@@ -510,100 +510,72 @@ fn layout_profile_menu_row(
     response
 }
 
-/// Paint the Auto Mode speedometer in the **Ford Police Interceptor 2020** cluster
-/// idiom: a brushed-chrome bezel over a black dial, dense minor ticks with bold
-/// white majors + numerals across a 0-160 sweep, a red redline zone up top, a
-/// tapered red needle with a counterweight tail on a silver hub, and the digital
-/// speed centred below. Crash-safe (guards a degenerate rect).
+/// Paint the Auto Mode speedometer in the **2021 Ford Explorer digital cluster**
+/// idiom: a large digital MPH number dominating the center, ringed by a thin
+/// partial arc that fills with speed (SYNC-3 blue) over a dim track — no needle,
+/// no chrome, black/white/blue. Crash-safe (guards a degenerate rect).
 fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: f32) {
     use std::f32::consts::PI;
     if !rect.is_finite() || rect.width() < 24.0 || rect.height() < 24.0 {
         return;
     }
-    const MAX_MPH: f32 = 160.0; // Interceptor / police speedo range.
+    const MAX_MPH: f32 = 160.0;
     let mph = mph.clamp(0.0, MAX_MPH);
     let frac = mph / MAX_MPH;
     let radius = (rect.width().min(rect.height() * 1.7) * 0.5 - 8.0).max(12.0);
     let center = egui::pos2(rect.center().x, rect.top() + radius + 6.0);
-    // f in 0..1 -> a point on the dial: f=0 lower-left, f=0.5 top, f=1 lower-right.
+    // f in 0..1 -> a point on the arc: f=0 lower-left, f=0.5 top, f=1 lower-right
+    // (a ~270° sweep opening at the bottom).
     let point = |f: f32, r: f32| {
         let a = PI * (0.75 + 1.5 * f.clamp(0.0, 1.0));
         center + egui::vec2(a.cos(), a.sin()) * r
     };
-    let arc = |f0: f32, f1: f32, r: f32, width: f32, color: egui::Color32| {
-        let steps = 56;
+    let arc = |f0: f32, f1: f32, width: f32, color: egui::Color32| {
+        let steps = 64;
         let pts: Vec<egui::Pos2> = (0..=steps)
-            .map(|i| point(f0 + (f1 - f0) * (i as f32 / steps as f32), r))
+            .map(|i| point(f0 + (f1 - f0) * (i as f32 / steps as f32), radius))
             .collect();
         painter.add(egui::Shape::line(pts, egui::Stroke::new(width, color)));
     };
 
-    // Brushed-chrome bezel over a black dial face.
-    painter.circle_filled(center, radius + 6.0, Style::TEXT_DIM); // outer chrome ring
-    painter.circle_filled(center, radius + 3.0, Style::BORDER); // inner dark bevel
-    painter.circle_filled(center, radius, Style::BG); // black face
-
-    // Ticks: minor every 5 (thin, dim), major every 20 (bold, white) + numerals.
-    let mut v = 0.0_f32;
-    while v <= MAX_MPH + 0.1 {
-        let f = v / MAX_MPH;
-        let major = (v as i32) % 20 == 0;
-        let len = if major { 13.0 } else { 6.0 };
-        let (w, col) = if major {
-            (2.5, Style::TEXT_STRONG)
-        } else {
-            (1.0, Style::TEXT_DIM)
-        };
-        painter.line_segment(
-            [point(f, radius - 4.0), point(f, radius - 4.0 - len)],
-            egui::Stroke::new(w, col),
-        );
-        if major {
-            painter.text(
-                point(f, radius - 26.0),
-                egui::Align2::CENTER_CENTER,
-                format!("{v:.0}"),
-                egui::FontId::proportional((radius * 0.14).clamp(9.0, 15.0)),
-                Style::TEXT_STRONG,
-            );
-        }
-        v += 5.0;
+    // Thin gauge track (dim, full sweep) + the blue speed fill up to the current
+    // reading, with a bright cap at the leading edge.
+    arc(0.0, 1.0, 4.0, Style::BORDER);
+    if frac > 0.002 {
+        arc(0.0, frac, 4.0, Style::ACCENT);
+        painter.circle_filled(point(frac, radius), 4.5, Style::ACCENT_HI);
     }
-
-    // Redline zone (top of the range) + the blue live-speed sweep on the inner rim.
-    arc(0.8, 1.0, radius - 4.0, 3.0, Style::DANGER);
-    arc(0.0, frac, radius - 14.0, 3.5, Style::ACCENT);
-
-    // Red needle with a counterweight tail on a silver hub (the Ford pointer).
-    let dir = {
-        let a = PI * (0.75 + 1.5 * frac);
-        egui::vec2(a.cos(), a.sin())
-    };
-    painter.line_segment(
-        [
-            center - dir * (radius * 0.16),
-            center + dir * (radius - 10.0),
-        ],
-        egui::Stroke::new(3.5, Style::DANGER),
-    );
-    painter.circle_filled(center, 9.0, Style::TEXT_DIM); // silver hub
-    painter.circle_filled(center, 4.5, Style::BORDER); // dark cap
-
-    // Digital speed + label, centred in the open lower area of the dial.
-    let num_y = center.y + radius * 0.36;
+    // Range endpoints, dim, tucked just inside the arc ends.
+    let end_font = egui::FontId::proportional((radius * 0.12).clamp(8.0, 14.0));
     painter.text(
-        egui::pos2(center.x, num_y),
+        point(0.0, radius - 15.0),
+        egui::Align2::CENTER_CENTER,
+        "0",
+        end_font.clone(),
+        Style::TEXT_DIM,
+    );
+    painter.text(
+        point(1.0, radius - 15.0),
+        egui::Align2::CENTER_CENTER,
+        format!("{MAX_MPH:.0}"),
+        end_font,
+        Style::TEXT_DIM,
+    );
+
+    // The large digital speed — the dominant element, centred in the arc.
+    painter.text(
+        egui::pos2(center.x, center.y - radius * 0.06),
         egui::Align2::CENTER_CENTER,
         format!("{mph:.0}"),
-        egui::FontId::proportional((radius * 0.6).clamp(26.0, 68.0)),
+        egui::FontId::proportional((radius * 0.95).clamp(36.0, 128.0)),
         Style::TEXT_STRONG,
     );
     painter.text(
-        egui::pos2(center.x, num_y + radius * 0.3),
+        egui::pos2(center.x, center.y + radius * 0.52),
         egui::Align2::CENTER_CENTER,
         "MPH",
-        egui::FontId::proportional((radius * 0.14).clamp(10.0, 16.0)),
-        Style::ACCENT,
+        egui::FontId::proportional((radius * 0.16).clamp(11.0, 20.0)),
+        Style::TEXT_DIM,
     );
 }
 
