@@ -1554,6 +1554,28 @@ impl LocationSample {
     pub fn moving(&self) -> bool {
         self.speed_mph > 1.0
     }
+
+    /// Whether this sample represents a real position fix.
+    ///
+    /// The driving HUD uses this to decide between the live vehicle chevron and
+    /// the honest "Acquiring GPS" state. A sample counts as fixed when its
+    /// `fix_type` reports an actual 2D/3D/DGPS/RTK lock (not empty, "no fix", or
+    /// "none") and the reported coordinate is not the degenerate null island
+    /// `0, 0`. Guarding on both keeps a half-populated sample from feeding a
+    /// zero/NaN-adjacent position into HUD layout.
+    #[must_use]
+    pub fn has_fix(&self) -> bool {
+        let fix = self.fix_type.trim();
+        let fix_ok = !fix.is_empty()
+            && !fix.eq_ignore_ascii_case("no fix")
+            && !fix.eq_ignore_ascii_case("none")
+            && !fix.eq_ignore_ascii_case("0")
+            && !fix.eq_ignore_ascii_case("nofix");
+        let coord_ok = self.latitude.is_finite()
+            && self.longitude.is_finite()
+            && (self.latitude.abs() > f64::EPSILON || self.longitude.abs() > f64::EPSILON);
+        fix_ok && coord_ok
+    }
 }
 
 /// Trip recorder state.
@@ -2031,6 +2053,45 @@ mod tests {
         };
         assert!(!inaccurate.healthy());
         assert!(!stale.healthy());
+    }
+
+    #[test]
+    fn has_fix_distinguishes_real_lock_from_acquiring() {
+        let fixed = LocationSample {
+            fix_type: "3D".to_string(),
+            latitude: 40.4406,
+            longitude: -79.9959,
+            accuracy_m: 3.0,
+            speed_mph: 27.0,
+            heading_deg: 284.0,
+            altitude_m: 311.0,
+            satellites: Some(14),
+            update_rate_hz: 1.0,
+            update_age_s: 1.0,
+        };
+        assert!(fixed.has_fix());
+
+        let acquiring = LocationSample {
+            fix_type: "No fix".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            satellites: None,
+            ..fixed.clone()
+        };
+        assert!(!acquiring.has_fix());
+
+        let empty_fix = LocationSample {
+            fix_type: String::new(),
+            ..fixed.clone()
+        };
+        assert!(!empty_fix.has_fix());
+
+        let null_island = LocationSample {
+            latitude: 0.0,
+            longitude: 0.0,
+            ..fixed
+        };
+        assert!(!null_island.has_fix());
     }
 
     #[test]
