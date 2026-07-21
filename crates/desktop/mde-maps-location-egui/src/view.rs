@@ -3078,145 +3078,253 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
 }
 
 fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
-    card(ui, &vehicle.profile, |ui| {
-        metric(
-            ui,
-            "Vehicle speed",
-            &format!("{:.0} mph", vehicle.telemetry.speed_mph),
-            Style::TEXT_STRONG,
-        );
-        metric(
-            ui,
-            "Engine RPM",
-            &vehicle.telemetry.rpm.to_string(),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "Coolant",
-            &format!("{:.1} C", vehicle.telemetry.coolant_c),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "Battery",
-            &format!("{:.1} V", vehicle.telemetry.battery_v),
-            Style::OK,
-        );
-        metric(
-            ui,
-            "Fuel",
-            &vehicle
-                .telemetry
-                .fuel_percent
-                .map_or_else(|| "unavailable".to_string(), |fuel| format!("{fuel:.0}%")),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "DTCs",
-            &vehicle.telemetry.dtc_count.to_string(),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "Ignition",
-            bool_label(vehicle.telemetry.ignition_on),
-            Style::ACCENT,
-        );
-        metric(
-            ui,
-            "Moving",
-            bool_label(vehicle.telemetry.moving),
-            Style::WARN,
-        );
-        metric(
-            ui,
-            "Odometer",
-            &vehicle
-                .telemetry
-                .odometer_mi
-                .map_or_else(|| "unavailable".to_string(), |odo| format!("{odo} mi")),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "Runtime",
-            &format!("{} min", vehicle.telemetry.runtime_min),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "Telemetry confidence",
-            &vehicle.telemetry.confidence,
-            Style::TEXT_DIM,
-        );
-        metric(
-            ui,
-            "Last update",
-            &format!("{:.1} s", vehicle.telemetry.last_update_age_s),
-            Style::TEXT_DIM,
+    let telem = &vehicle.telemetry;
+    // Vehicle identity header.
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        let _ = paint_carbon(ui.painter(), rect, "view", Style::ACCENT_HI);
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(dash_if_empty(&vehicle.profile))
+                .size(Style::TITLE)
+                .color(Style::TEXT_STRONG),
         );
     });
     ui.add_space(Style::SP_S);
-    card(ui, "Profile integration", |ui| {
-        bullet(
+    // Hero gauges — the four live readouts that matter at a glance.
+    let tile_w = split_width(ui, 4);
+    ui.horizontal_top(|ui| {
+        stat_tile(
+            ui,
+            tile_w,
+            "go-next",
+            "Speed · mph",
+            &format!("{:.0}", telem.speed_mph),
+            Style::TEXT_STRONG,
+        );
+        stat_tile(
+            ui,
+            tile_w,
+            "view-refresh",
+            "Engine · rpm",
+            &telem.rpm.to_string(),
+            Style::ACCENT,
+        );
+        stat_tile(
+            ui,
+            tile_w,
+            "notification",
+            "Battery · V",
+            &format!("{:.1}", telem.battery_v),
+            voltage_tone(telem.battery_v),
+        );
+        stat_tile(
+            ui,
+            tile_w,
+            "weather-clear-night",
+            "Coolant · °C",
+            &format!("{:.0}", telem.coolant_c),
+            coolant_tone(telem.coolant_c),
+        );
+    });
+    ui.add_space(Style::SP_S);
+    glyph_card(
+        ui,
+        "view-grid",
+        "OBD telematics",
+        Style::ACCENT_MESH,
+        |ui| {
+            readout(
+                ui,
+                "Ignition",
+                if telem.ignition_on { "on" } else { "off" },
+                if telem.ignition_on {
+                    Style::OK
+                } else {
+                    Style::TEXT_DIM
+                },
+            );
+            readout(
+                ui,
+                "Motion",
+                if telem.moving { "moving" } else { "parked" },
+                if telem.moving { Style::WARN } else { Style::OK },
+            );
+            readout(
+                ui,
+                "Fuel",
+                &telem
+                    .fuel_percent
+                    .map_or_else(|| "unavailable".to_string(), |fuel| format!("{fuel:.0}%")),
+                telem.fuel_percent.map_or(Style::TEXT_DIM, |fuel| {
+                    if fuel < 15.0 {
+                        Style::WARN
+                    } else {
+                        Style::OK
+                    }
+                }),
+            );
+            readout(
+                ui,
+                "Diagnostic codes",
+                &telem.dtc_count.to_string(),
+                count_tone(telem.dtc_count),
+            );
+            readout(
+                ui,
+                "Odometer",
+                &telem
+                    .odometer_mi
+                    .map_or_else(|| "unavailable".to_string(), |odo| format!("{odo} mi")),
+                Style::TEXT,
+            );
+            readout(
+                ui,
+                "Runtime",
+                &format!("{} min", telem.runtime_min),
+                Style::TEXT,
+            );
+            readout(
+                ui,
+                "Confidence",
+                dash_if_empty(&telem.confidence),
+                Style::TEXT_DIM,
+            );
+            readout(
+                ui,
+                "Last update",
+                &format!("{:.1} s ago", telem.last_update_age_s),
+                if telem.last_update_age_s <= 5.0 {
+                    Style::TEXT_DIM
+                } else {
+                    Style::WARN
+                },
+            );
+        },
+    );
+    ui.add_space(Style::SP_S);
+    glyph_card(
+        ui,
+        "document-open-recent",
+        "Profile integration",
+        Style::ACCENT,
+        |ui| {
+            bullet(
             ui,
             "Map events, trip history, route alerts, diagnostic bundles, and motion detection read this profile layer.",
         );
-        for note in &vehicle.profile_notes {
-            bullet(ui, note);
-        }
-    });
+            for note in &vehicle.profile_notes {
+                bullet(ui, note);
+            }
+        },
+    );
 }
 
 fn show_connectivity(ui: &mut egui::Ui, mg90: &Mg90State) {
-    let col_w = split_width(ui, 3);
+    let status = &mg90.status;
+    // Hero readouts: the four numbers that describe the live WAN at a glance.
+    let latency_tone = if status.latency_ms < 100 {
+        Style::OK
+    } else if status.latency_ms < 200 {
+        Style::WARN
+    } else {
+        Style::DANGER
+    };
+    let loss_tone = if status.packet_loss_percent < 1.0 {
+        Style::OK
+    } else if status.packet_loss_percent < 5.0 {
+        Style::WARN
+    } else {
+        Style::DANGER
+    };
+    let tile_w = split_width(ui, 4);
+    ui.horizontal_top(|ui| {
+        stat_tile(
+            ui,
+            tile_w,
+            "globe",
+            "Active WAN",
+            dash_if_empty(&status.active_wan),
+            Style::ACCENT_HI,
+        );
+        stat_tile(
+            ui,
+            tile_w,
+            "emblem-ok",
+            "Link quality",
+            dash_if_empty(&status.link_quality),
+            Style::OK,
+        );
+        stat_tile(
+            ui,
+            tile_w,
+            "view-refresh",
+            "Latency",
+            &format!("{} ms", status.latency_ms),
+            latency_tone,
+        );
+        stat_tile(
+            ui,
+            tile_w,
+            "notification",
+            "Packet loss",
+            &format!("{:.1}%", status.packet_loss_percent),
+            loss_tone,
+        );
+    });
+    ui.add_space(Style::SP_S);
+    // Dual-modem comparison, active WAN highlighted.
+    let col_w = split_width(ui, 2);
     ui.horizontal_top(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
-            card(ui, "Active WAN", |ui| {
-                metric(ui, "Link", &mg90.status.active_wan, Style::ACCENT_HI);
-                metric(ui, "Quality", &mg90.status.link_quality, Style::OK);
-                metric(
-                    ui,
-                    "Latency",
-                    &format!("{} ms", mg90.status.latency_ms),
-                    Style::TEXT,
-                );
-                metric(
-                    ui,
-                    "Packet loss",
-                    &format!("{:.1}%", mg90.status.packet_loss_percent),
-                    Style::TEXT,
-                );
-            });
+            cellular_modem_card(
+                ui,
+                "A",
+                &status.cellular_a,
+                status.active_wan == "Cellular A",
+            );
         });
         ui.scope(|ui| {
             ui.set_width(col_w);
-            cellular_card(ui, "Cellular A", &mg90.status.cellular_a);
-        });
-        ui.scope(|ui| {
-            ui.set_width(col_w);
-            cellular_card(ui, "Cellular B", &mg90.status.cellular_b);
+            cellular_modem_card(
+                ui,
+                "B",
+                &status.cellular_b,
+                status.active_wan == "Cellular B",
+            );
         });
     });
     ui.add_space(Style::SP_S);
-    card(ui, "Local MG90 surfaces", |ui| {
-        metric(ui, "Wi-Fi", &mg90.status.wifi_state, Style::TEXT_DIM);
-        metric(ui, "Ethernet", &mg90.status.ethernet_state, Style::OK);
-        metric(ui, "VPN", &mg90.status.vpn_state, Style::TEXT_DIM);
-        metric(
+    glyph_card(ui, "share", "Local interfaces", Style::ACCENT_MESH, |ui| {
+        readout(
+            ui,
+            "Wi-Fi",
+            dash_if_empty(&status.wifi_state),
+            Style::TEXT_DIM,
+        );
+        readout(
+            ui,
+            "Ethernet",
+            dash_if_empty(&status.ethernet_state),
+            Style::OK,
+        );
+        readout(ui, "VPN", dash_if_empty(&status.vpn_state), Style::TEXT_DIM);
+        readout(
             ui,
             "Data transferred",
-            &mg90.status.data_transferred,
+            dash_if_empty(&status.data_transferred),
             Style::TEXT,
         );
-        metric(
+        readout(
             ui,
             "Failover events",
-            &mg90.status.failover_events.to_string(),
-            Style::WARN,
+            &status.failover_events.to_string(),
+            if status.failover_events == 0 {
+                Style::OK
+            } else {
+                Style::WARN
+            },
         );
     });
 }
@@ -3226,55 +3334,149 @@ fn show_devices_io(ui: &mut egui::Ui, devices: &mut DeviceIoState) {
     ui.horizontal_top(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
-            card(ui, "Serial recovery console", |ui| {
-                warning_strip(
-                    ui,
-                    "Recovery console only; normal settings use direct Ethernet.",
-                    Style::WARN,
-                );
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut devices.serial.connected, "Connected");
-                    ui.label(format!("Profile {}", devices.serial.baud_profile));
-                });
-                for line in &devices.serial.transcript_lines {
-                    ui.monospace(line);
-                }
-                ui.horizontal_wrapped(|ui| {
-                    let _ = ui.button("Send command");
-                    let _ = ui.button("Copy output");
-                    let _ = ui.button("Save transcript");
-                });
-            });
+            glyph_card(
+                ui,
+                "text-x-generic",
+                "Serial recovery console",
+                Style::WARN,
+                |ui| {
+                    warning_strip(
+                        ui,
+                        "Recovery console only; normal settings use direct Ethernet.",
+                        Style::WARN,
+                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut devices.serial.connected, "Connected");
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            pill(ui, &devices.serial.baud_profile, Style::ACCENT);
+                        });
+                    });
+                    ui.add_space(Style::SP_XS);
+                    mde_egui::widgets::inset().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if devices.serial.transcript_lines.is_empty() {
+                            mde_egui::widgets::muted_note(ui, "No console output.");
+                        }
+                        for line in &devices.serial.transcript_lines {
+                            ui.label(
+                                RichText::new(line)
+                                    .monospace()
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT_DIM),
+                            );
+                        }
+                    });
+                    ui.add_space(Style::SP_S);
+                    ui.horizontal_wrapped(|ui| {
+                        let _ = ui.button("Send command");
+                        let _ = ui.button("Copy output");
+                        let _ = ui.button("Save transcript");
+                    });
+                },
+            );
         });
         ui.scope(|ui| {
             ui.set_width(col_w);
-            card(ui, "Device state", |ui| {
-                metric(ui, "Ethernet", &devices.ethernet_state, Style::OK);
-                metric(ui, "CAN/OBD", &devices.can_obd_state, Style::ACCENT);
+            glyph_card(ui, "view-grid", "Device I/O", Style::ACCENT_MESH, |ui| {
+                readout(
+                    ui,
+                    "Ethernet",
+                    dash_if_empty(&devices.ethernet_state),
+                    Style::OK,
+                );
+                readout(
+                    ui,
+                    "CAN / OBD",
+                    dash_if_empty(&devices.can_obd_state),
+                    Style::ACCENT,
+                );
+                ui.add_space(Style::SP_XS);
+                divider(ui);
+                ui.add_space(Style::SP_S);
+                ui.label(
+                    RichText::new(format!("USB devices ({})", devices.usb_devices.len()))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_XS);
+                if devices.usb_devices.is_empty() {
+                    mde_egui::widgets::muted_note(ui, "No USB devices attached.");
+                }
                 for device in &devices.usb_devices {
-                    metric(ui, "USB", device, Style::TEXT);
+                    bullet(ui, device);
                 }
             });
         });
     });
     ui.add_space(Style::SP_S);
-    card(ui, "GPIO automation rules", |ui| {
-        for rule in &mut devices.gpio_rules {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut rule.enabled, "");
-                ui.label(RichText::new(&rule.id).color(Style::TEXT_STRONG));
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    let _ = ui.button("Simulator test");
-                });
-            });
-            metric(ui, "Trigger", &rule.trigger, Style::TEXT);
-            metric(ui, "Condition", &rule.condition, Style::TEXT_DIM);
-            metric(ui, "Action", &rule.action, Style::ACCENT);
-            metric(ui, "Last run", &rule.last_run, Style::TEXT_DIM);
-            for audit in &rule.audit_log {
-                bullet(ui, audit);
+    let enabled = devices
+        .gpio_rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .count();
+    glyph_card(
+        ui,
+        "overlay",
+        &format!(
+            "GPIO automation rules  ·  {enabled}/{} active",
+            devices.gpio_rules.len()
+        ),
+        Style::ACCENT_SYSTEM,
+        |ui| {
+            if devices.gpio_rules.is_empty() {
+                mde_egui::widgets::muted_note(ui, "No GPIO automation rules defined.");
             }
+            for rule in &mut devices.gpio_rules {
+                gpio_rule_card(ui, rule);
+                ui.add_space(Style::SP_S);
+            }
+        },
+    );
+}
+
+/// One GPIO automation rule as a self-contained mini-card: an enabled toggle and
+/// health dot, the rule id, a simulator-test action, then the trigger / condition
+/// / action / last-run readouts and the audit trail.
+fn gpio_rule_card(ui: &mut egui::Ui, rule: &mut crate::model::GpioAutomationRule) {
+    mg90_frame(None).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            status_dot(
+                ui,
+                if rule.enabled {
+                    Style::OK
+                } else {
+                    Style::TEXT_DIM
+                },
+            );
+            ui.checkbox(&mut rule.enabled, "");
+            ui.label(
+                RichText::new(&rule.id)
+                    .size(Style::BODY)
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let _ = ui.button("Simulator test");
+            });
+        });
+        ui.add_space(Style::SP_XS);
+        divider(ui);
+        ui.add_space(Style::SP_S);
+        readout(ui, "Trigger", dash_if_empty(&rule.trigger), Style::TEXT);
+        readout(
+            ui,
+            "Condition",
+            dash_if_empty(&rule.condition),
+            Style::TEXT_DIM,
+        );
+        readout(ui, "Action", dash_if_empty(&rule.action), Style::ACCENT);
+        readout(
+            ui,
+            "Last run",
+            dash_if_empty(&rule.last_run),
+            Style::TEXT_DIM,
+        );
+        for audit in &rule.audit_log {
+            bullet(ui, audit);
         }
     });
 }
@@ -3407,101 +3609,256 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
 }
 
 fn show_mg90_setup(ui: &mut egui::Ui, mg90: &mut Mg90State, offline_maps: &OfflineMapManagerState) {
+    let done = SetupStep::ALL
+        .iter()
+        .position(|step| *step == mg90.setup_step)
+        .map_or(0, |index| index + 1);
+    let total = SetupStep::ALL.len();
+
     let col_w = split_width(ui, 2);
     ui.horizontal_top(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
-            card(ui, "Offline first-time setup", |ui| {
-                for step in SetupStep::ALL {
-                    let tone = if step <= mg90.setup_step {
-                        Style::OK
-                    } else {
-                        Style::TEXT_DIM
-                    };
-                    ui.horizontal(|ui| {
-                        status_dot(ui, tone);
-                        ui.label(RichText::new(step.label()).color(tone));
-                    });
-                }
-                if ui.button("Advance simulator setup").clicked() {
-                    mg90.advance_setup_simulated();
-                }
-            });
-        });
-        ui.scope(|ui| {
-            ui.set_width(col_w);
-            card(ui, "Direct Ethernet assumptions", |ui| {
-                metric(
+            glyph_card(ui, "view-grid", "Device inventory", Style::ACCENT, |ui| {
+                readout(
                     ui,
                     "Managed MG90s",
                     &mg90.managed_devices.to_string(),
                     Style::TEXT,
                 );
-                metric(
+                readout(ui, "Model", mg90.model.label(), Style::TEXT);
+                readout(
                     ui,
-                    "Management path",
-                    "dedicated direct Ethernet cable only",
-                    Style::OK,
+                    "MGOS",
+                    dash_if_empty(&mg90.capabilities.mgos_version),
+                    Style::TEXT,
                 );
-                metric(ui, "Model", mg90.model.label(), Style::TEXT);
-                metric(ui, "MGOS", &mg90.capabilities.mgos_version, Style::TEXT);
-                metric(
+                readout(ui, "Management path", "direct Ethernet only", Style::OK);
+                readout(
                     ui,
                     "Offline map",
-                    &offline_maps.default_region,
+                    dash_if_empty(&offline_maps.default_region),
                     Style::ACCENT_SYSTEM,
                 );
-                metric(
+                readout(
                     ui,
                     "Authenticated",
-                    bool_label(mg90.authenticated),
+                    if mg90.authenticated { "yes" } else { "no" },
+                    if mg90.authenticated {
+                        Style::OK
+                    } else {
+                        Style::WARN
+                    },
+                );
+                ui.add_space(Style::SP_XS);
+                divider(ui);
+                ui.add_space(Style::SP_S);
+                ui.label(
+                    RichText::new("Capabilities")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_XS);
+                let caps = &mg90.capabilities;
+                ui.horizontal_wrapped(|ui| {
+                    cap_pill(ui, "LTE-A", caps.lte_a);
+                    cap_pill(ui, "5G", caps.five_g);
+                    cap_pill(ui, "GNSS", caps.gnss);
+                    cap_pill(ui, "GPIO", caps.gpio);
+                    cap_pill(ui, "Serial recovery", caps.serial_recovery);
+                    cap_pill(ui, "Firmware mgmt", caps.firmware_management);
+                });
+            });
+        });
+        ui.scope(|ui| {
+            ui.set_width(col_w);
+            glyph_card(ui, "globe", "Link readiness", Style::ACCENT_MESH, |ui| {
+                let status = &mg90.status;
+                readout(
+                    ui,
+                    "Active WAN",
+                    dash_if_empty(&status.active_wan),
+                    Style::ACCENT_HI,
+                );
+                readout(
+                    ui,
+                    "SIM A",
+                    dash_if_empty(&status.cellular_a.sim_state),
+                    if status.cellular_a.healthy {
+                        Style::OK
+                    } else {
+                        Style::WARN
+                    },
+                );
+                readout(
+                    ui,
+                    "SIM B",
+                    dash_if_empty(&status.cellular_b.sim_state),
+                    if status.cellular_b.healthy {
+                        Style::OK
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                );
+                readout(
+                    ui,
+                    "Wi-Fi",
+                    dash_if_empty(&status.wifi_state),
+                    Style::TEXT_DIM,
+                );
+                readout(
+                    ui,
+                    "Ethernet",
+                    dash_if_empty(&status.ethernet_state),
                     Style::OK,
+                );
+                readout(
+                    ui,
+                    "Ignition input",
+                    if mg90.ignition_on { "on" } else { "off" },
+                    if mg90.ignition_on {
+                        Style::OK
+                    } else {
+                        Style::TEXT_DIM
+                    },
                 );
             });
         });
     });
     ui.add_space(Style::SP_S);
-    card(ui, "Operator checklist", |ui| {
-        for item in [
-            "Connect MG90 and Egui host by direct Ethernet cable.",
-            "Verify MG90 power, antennas, SIM state, and local IP discovery.",
-            "Enter local credentials and store them in the encrypted vault.",
-            "Create baseline backup before local status, GNSS, map, and route verification.",
-            "Verify MG90 GNSS and USB GPS as equal location-source peers.",
-            "Use serial only for recovery console workflows.",
-        ] {
-            bullet(ui, item);
-        }
+    ui.horizontal_top(|ui| {
+        ui.scope(|ui| {
+            ui.set_width(col_w);
+            glyph_card(
+                ui,
+                "emblem-ok",
+                &format!("Offline setup  ·  {done}/{total}"),
+                Style::OK,
+                |ui| {
+                    for step in SetupStep::ALL {
+                        let tone = if step < mg90.setup_step {
+                            Style::OK
+                        } else if step == mg90.setup_step {
+                            Style::ACCENT_HI
+                        } else {
+                            Style::TEXT_DIM
+                        };
+                        ui.horizontal(|ui| {
+                            status_dot(ui, tone);
+                            ui.label(RichText::new(step.label()).size(Style::SMALL).color(tone));
+                        });
+                        ui.add_space(2.0);
+                    }
+                    ui.add_space(Style::SP_XS);
+                    if ui.button("Advance simulator setup").clicked() {
+                        mg90.advance_setup_simulated();
+                    }
+                },
+            );
+        });
+        ui.scope(|ui| {
+            ui.set_width(col_w);
+            glyph_card(ui, "document-open-recent", "Operator checklist", Style::ACCENT, |ui| {
+                for item in [
+                    "Connect MG90 and Egui host by direct Ethernet cable.",
+                    "Verify MG90 power, antennas, SIM state, and local IP discovery.",
+                    "Enter local credentials and store them in the encrypted vault.",
+                    "Create baseline backup before local status, GNSS, map, and route verification.",
+                    "Verify MG90 GNSS and USB GPS as equal location-source peers.",
+                    "Use serial only for recovery console workflows.",
+                ] {
+                    bullet(ui, item);
+                }
+            });
+        });
     });
     ui.add_space(Style::SP_S);
-    card(ui, "Factory reset guardrails", |ui| {
-        warning_strip(
-            ui,
-            "Factory reset loses configuration; backup and typed confirmation are required.",
-            Style::DANGER,
-        );
-        metric(
-            ui,
-            "Backup required",
-            bool_label(mg90.reset.backup_required),
-            Style::WARN,
-        );
-        metric(
-            ui,
-            "Backup completed",
-            bool_label(mg90.reset.backup_completed),
-            Style::OK,
-        );
-        ui.horizontal(|ui| {
-            ui.label("Confirmation");
-            ui.text_edit_singleline(&mut mg90.reset.typed_confirmation);
-            let enabled = mg90.reset.armed();
-            let _ = ui.add_enabled(enabled, egui::Button::new("Reset MG90"));
-        });
-        for step in &mg90.reset.reconnect_workflow {
-            bullet(ui, step);
-        }
-    });
+    glyph_card(
+        ui,
+        "system-shutdown",
+        "Factory reset guardrails",
+        Style::DANGER,
+        |ui| {
+            warning_strip(
+                ui,
+                "Factory reset loses configuration; backup and typed confirmation are required.",
+                Style::DANGER,
+            );
+            readout(
+                ui,
+                "Backup required",
+                if mg90.reset.backup_required {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if mg90.reset.backup_required {
+                    Style::WARN
+                } else {
+                    Style::TEXT_DIM
+                },
+            );
+            readout(
+                ui,
+                "Backup completed",
+                if mg90.reset.backup_completed {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if mg90.reset.backup_completed {
+                    Style::OK
+                } else {
+                    Style::DANGER
+                },
+            );
+            readout(
+                ui,
+                "Confirmation phrase",
+                &format!("type \"{}\"", mg90.reset.confirmation_phrase),
+                Style::TEXT_DIM,
+            );
+            ui.add_space(Style::SP_XS);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Confirm")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.text_edit_singleline(&mut mg90.reset.typed_confirmation);
+                let enabled = mg90.reset.armed();
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    let _ = ui.add_enabled(enabled, egui::Button::new("Reset MG90"));
+                });
+            });
+            ui.add_space(Style::SP_XS);
+            divider(ui);
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new("Reconnect workflow")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_XS);
+            for (index, step) in mg90.reset.reconnect_workflow.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}.", index + 1))
+                            .size(Style::SMALL)
+                            .monospace()
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    ui.label(RichText::new(step).size(Style::SMALL).color(Style::TEXT));
+                });
+            }
+        },
+    );
+}
+
+/// A capability chip — green when the feature is present, dim when it is not.
+fn cap_pill(ui: &mut egui::Ui, label: &str, present: bool) {
+    pill(ui, label, if present { Style::OK } else { Style::TEXT_DIM });
 }
 
 fn show_mg90_settings(ui: &mut egui::Ui, state: &MapsLocationSurface) {
@@ -3512,65 +3869,172 @@ fn show_mg90_settings(ui: &mut egui::Ui, state: &MapsLocationSurface) {
             Style::WARN,
         );
     }
+    let total = state.mg90.settings.len();
+    glyph_card(
+        ui,
+        "view-grid",
+        "Native setting registry",
+        Style::ACCENT,
+        |ui| {
+            readout(
+                ui,
+                "Categories",
+                &Mg90SettingCategory::ALL.len().to_string(),
+                Style::TEXT,
+            );
+            readout(
+                ui,
+                "Loaded descriptors",
+                &total.to_string(),
+                Style::ACCENT_HI,
+            );
+            readout(
+                ui,
+                "Vehicle state",
+                if state.moving() { "moving" } else { "parked" },
+                if state.moving() {
+                    Style::WARN
+                } else {
+                    Style::OK
+                },
+            );
+            mde_egui::widgets::muted_note(
+            ui,
+            "Every category maps to a native MG90 setting group read over the direct-Ethernet local API.",
+        );
+        },
+    );
+    ui.add_space(Style::SP_S);
     for category in Mg90SettingCategory::ALL {
-        card(ui, category.label(), |ui| {
-            let settings: Vec<&Mg90SettingDescriptor> = state
-                .mg90
-                .settings
-                .iter()
-                .filter(|setting| setting.category == category)
-                .collect();
-            if settings.is_empty() {
-                ui.label(
-                    RichText::new("Capability-detected section is visible; no descriptor loaded in simulator fixture.")
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
-            }
-            for setting in settings {
-                setting_row(ui, state, setting);
-            }
-        });
+        let settings: Vec<&Mg90SettingDescriptor> = state
+            .mg90
+            .settings
+            .iter()
+            .filter(|setting| setting.category == category)
+            .collect();
+        let tone = if settings.is_empty() {
+            Style::TEXT_DIM
+        } else {
+            Style::ACCENT
+        };
+        glyph_card(
+            ui,
+            category_icon(category),
+            &format!("{}  ·  {}", category.label(), settings.len()),
+            tone,
+            |ui| {
+                if settings.is_empty() {
+                    mde_egui::widgets::muted_note(
+                        ui,
+                        "Section detected by capability profile; no descriptor loaded in the simulator fixture.",
+                    );
+                }
+                for setting in settings {
+                    setting_row(ui, state, setting);
+                }
+            },
+        );
         ui.add_space(Style::SP_S);
     }
 }
 
 fn show_firmware_recovery(ui: &mut egui::Ui, firmware: &FirmwareWorkflow, devices: &DeviceIoState) {
+    warning_strip(
+        ui,
+        "No blind firmware install — every guardrail check must pass and a restore point must exist first.",
+        Style::DANGER,
+    );
+    ui.add_space(Style::SP_S);
     let col_w = split_width(ui, 2);
     ui.horizontal_top(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
-            card(ui, "Firmware lifecycle", |ui| {
-            metric(ui, "Current firmware", &firmware.current, Style::TEXT);
-            metric(ui, "Target package", &firmware.target_package, Style::TEXT_DIM);
-            metric(
-                ui,
-                "Restore point ready",
-                bool_label(firmware.restore_point_ready),
-                Style::OK,
-            );
-            ui.add(egui::ProgressBar::new(f32::from(firmware.progress_percent) / 100.0).text(
-                format!("{}%", firmware.progress_percent),
-            ));
-            for check in &firmware.checks {
-                ui.horizontal(|ui| {
-                    status_dot(ui, check_tone(check.state));
-                    ui.label(&check.label);
-                });
-            }
+            glyph_card(ui, "download", "Firmware lifecycle", Style::ACCENT, |ui| {
+                readout(ui, "Current firmware", dash_if_empty(&firmware.current), Style::TEXT);
+                readout(
+                    ui,
+                    "Target package",
+                    dash_if_empty(&firmware.target_package),
+                    Style::TEXT_DIM,
+                );
+                readout(
+                    ui,
+                    "Restore point",
+                    if firmware.restore_point_ready { "ready" } else { "missing" },
+                    if firmware.restore_point_ready { Style::OK } else { Style::DANGER },
+                );
+                ui.add_space(Style::SP_S);
+                ui.add(
+                    egui::ProgressBar::new(f32::from(firmware.progress_percent) / 100.0)
+                        .text(format!("{}%", firmware.progress_percent)),
+                );
+                ui.add_space(Style::SP_S);
+                divider(ui);
+                ui.add_space(Style::SP_S);
+                let passed = firmware
+                    .checks
+                    .iter()
+                    .filter(|check| check.state == CheckState::Pass)
+                    .count();
+                ui.label(
+                    RichText::new(format!(
+                        "Pre-flight checks  ·  {passed}/{}",
+                        firmware.checks.len()
+                    ))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_XS);
+                for check in &firmware.checks {
+                    ui.horizontal(|ui| {
+                        status_dot(ui, check_tone(check.state));
+                        ui.label(RichText::new(&check.label).size(Style::SMALL).color(Style::TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(check_state_label(check.state))
+                                    .size(Style::SMALL)
+                                    .monospace()
+                                    .color(check_tone(check.state)),
+                            );
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
             });
         });
         ui.scope(|ui| {
             ui.set_width(col_w);
-            card(ui, "Recovery console", |ui| {
-            metric(ui, "Serial profile", &devices.serial.baud_profile, Style::TEXT);
-            metric(ui, "Connected", bool_label(devices.serial.connected), Style::TEXT);
-            bullet(ui, "Do not allow blind firmware install.");
-            bullet(ui, "Validate MG90 model, MGOS family, package integrity, power, backup, direct Ethernet, credentials, and rollback plan.");
-            bullet(ui, "Post-update reconnect and validation must run before the workflow completes.");
+            glyph_card(ui, "text-x-generic", "Recovery console", Style::WARN, |ui| {
+                readout(
+                    ui,
+                    "Serial profile",
+                    dash_if_empty(&devices.serial.baud_profile),
+                    Style::TEXT,
+                );
+                readout(
+                    ui,
+                    "Connected",
+                    if devices.serial.connected { "yes" } else { "no" },
+                    if devices.serial.connected { Style::OK } else { Style::TEXT_DIM },
+                );
+                ui.add_space(Style::SP_XS);
+                divider(ui);
+                ui.add_space(Style::SP_S);
+                bullet(ui, "Do not allow blind firmware install.");
+                bullet(ui, "Validate MG90 model, MGOS family, package integrity, power, backup, direct Ethernet, credentials, and rollback plan.");
+                bullet(ui, "Post-update reconnect and validation must run before the workflow completes.");
             });
         });
     });
+}
+
+/// A short pass/warn/fail word for a firmware check state.
+fn check_state_label(state: CheckState) -> &'static str {
+    match state {
+        CheckState::Pass => "pass",
+        CheckState::Warn => "warn",
+        CheckState::Fail => "fail",
+    }
 }
 
 fn show_simulator(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
@@ -3940,68 +4404,389 @@ fn backups(ui: &mut egui::Ui, backups: &[BackupRecord]) {
     });
 }
 
-fn cellular_card(ui: &mut egui::Ui, label: &str, link: &crate::model::CellularLink) {
-    card(ui, label, |ui| {
-        metric(ui, "SIM", &link.sim_state, Style::TEXT);
-        metric(ui, "Carrier", &link.carrier, Style::TEXT);
-        metric(
+// ── MG90 management / configuration surface kit ─────────────────────────────
+// The shared building blocks the six MG90 panels (Connectivity, Devices & I/O,
+// Setup, Settings, Firmware & Recovery, Vehicle) render through, so the whole
+// management surface reads as one system: a rounded glyph-headed card, a hairline
+// divider, a right-aligned mono readout, a hero stat tile, and a dBm signal-bar
+// meter. Every color/tone is a `Style` token (§4) — no raw literals.
+
+/// The rounded surface frame every upgraded MG90 card shares — the base layer
+/// fill, a hairline border (or an `accent` border when the card is the active /
+/// highlighted one), generous padding, and the mid corner radius.
+fn mg90_frame(accent: Option<Color32>) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(Style::LAYER_02)
+        .stroke(Stroke::new(1.0, accent.unwrap_or(Style::BORDER)))
+        .inner_margin(Style::SP_M)
+        .corner_radius(mde_egui::widgets::corner(Style::RADIUS_M))
+}
+
+/// A full-width hairline rule in [`Style::BORDER`] — the quiet separator under a
+/// card header and between a card's sub-regions.
+fn divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0, Style::BORDER),
+    );
+}
+
+/// A Carbon glyph + strong title header row, followed by a hairline divider — the
+/// standard section header for the MG90 cards.
+fn card_header(ui: &mut egui::Ui, icon: &str, title: &str, tone: Color32) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        let _ = paint_carbon(ui.painter(), rect, icon, tone);
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(title)
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
+        );
+    });
+    ui.add_space(Style::SP_XS);
+    divider(ui);
+    ui.add_space(Style::SP_S);
+}
+
+/// A rounded card with a glyph-headed section header. The MG90 replacement for
+/// the plain [`card`], used wherever a section wants a Carbon icon + divider.
+fn glyph_card<R>(
+    ui: &mut egui::Ui,
+    icon: &str,
+    title: &str,
+    tone: Color32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    mg90_frame(None).show(ui, |ui| {
+        card_header(ui, icon, title, tone);
+        add_contents(ui)
+    })
+}
+
+/// A labelled value row on the 8px grid: a dim [`Style::SMALL`] `label` at the
+/// left, the `value` right-aligned in `tone` and monospace so numeric columns
+/// (dBm, volts, IPs, ms) line up. The MG90 panels' primary data row.
+fn readout(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(value)
+                    .size(Style::SMALL)
+                    .color(tone)
+                    .monospace(),
+            );
+        });
+    });
+    ui.add_space(2.0);
+}
+
+/// A hero stat tile — a Carbon glyph, a dim caption, and a large monospace value
+/// tinted `tone`. Laid out `w` wide so a row of tiles shares [`split_width`].
+fn stat_tile(ui: &mut egui::Ui, w: f32, icon: &str, caption: &str, value: &str, tone: Color32) {
+    ui.scope(|ui| {
+        ui.set_width(w);
+        mg90_frame(None).show(ui, |ui| {
+            ui.set_min_height(58.0);
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                let _ = paint_carbon(ui.painter(), rect, icon, tone);
+                ui.add_space(Style::SP_S);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(caption)
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(value)
+                            .size(Style::TITLE)
+                            .color(tone)
+                            .monospace(),
+                    );
+                });
+            });
+        });
+    });
+}
+
+/// A five-bar cellular signal meter: bars fill in the health `tone` up to the
+/// level implied by `dbm`, the rest drawn as a dim track. The world-class
+/// replacement for a raw `-72 dBm` string.
+fn signal_bars(ui: &mut egui::Ui, dbm: i32, healthy: bool) {
+    const BARS: usize = 5;
+    let filled = signal_level(dbm);
+    let tone = signal_tone(dbm, healthy);
+    let bar_w = 4.0_f32;
+    let gap = 3.0_f32;
+    let max_h = 20.0_f32;
+    let total_w = BARS as f32 * bar_w + (BARS as f32 - 1.0) * gap;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, max_h), Sense::hover());
+    let painter = ui.painter();
+    for i in 0..BARS {
+        let frac = (i as f32 + 1.0) / BARS as f32;
+        let h = max_h * (0.3 + 0.7 * frac);
+        let x = rect.left() + i as f32 * (bar_w + gap);
+        let bar = Rect::from_min_max(
+            Pos2::new(x, rect.bottom() - h),
+            Pos2::new(x + bar_w, rect.bottom()),
+        );
+        let color = if i < filled { tone } else { Style::BORDER };
+        painter.rect_filled(bar, 1.0, color);
+    }
+}
+
+/// Map a cellular `dbm` reading to a 0..=5 bar level (RSRP/RSSI thresholds).
+fn signal_level(dbm: i32) -> usize {
+    match dbm {
+        d if d >= -75 => 5,
+        d if d >= -85 => 4,
+        d if d >= -95 => 3,
+        d if d >= -105 => 2,
+        d if d >= -115 => 1,
+        _ => 0,
+    }
+}
+
+/// Health tone for a cellular link from its `dbm` and reported health.
+fn signal_tone(dbm: i32, healthy: bool) -> Color32 {
+    if !healthy || dbm <= -110 {
+        Style::DANGER
+    } else if dbm <= -100 {
+        Style::WARN
+    } else {
+        Style::OK
+    }
+}
+
+/// A short quality word for a cellular link.
+fn signal_quality_label(dbm: i32, healthy: bool) -> &'static str {
+    if !healthy {
+        return "degraded";
+    }
+    match signal_level(dbm) {
+        5 => "excellent",
+        4 => "good",
+        3 => "fair",
+        2 => "weak",
+        1 => "poor",
+        _ => "no signal",
+    }
+}
+
+/// Charging-system voltage tone for a 12V automotive electrical system.
+fn voltage_tone(volts: f32) -> Color32 {
+    if (12.4..=14.9).contains(&volts) {
+        Style::OK
+    } else if (11.8..15.4).contains(&volts) {
+        Style::WARN
+    } else {
+        Style::DANGER
+    }
+}
+
+/// Coolant-temperature tone (cold engine warns; over ~105 C is danger).
+fn coolant_tone(celsius: f32) -> Color32 {
+    if celsius >= 105.0 {
+        Style::DANGER
+    } else if celsius >= 100.0 || celsius < 40.0 {
+        Style::WARN
+    } else {
+        Style::OK
+    }
+}
+
+/// SIM/DTC-style tone: zero faults is OK, any present is a warn.
+fn count_tone(count: u32) -> Color32 {
+    if count == 0 {
+        Style::OK
+    } else {
+        Style::WARN
+    }
+}
+
+/// A trimmed value, or an em-dash for an absent / empty live field (§7 — honest
+/// empty state, never a fabricated value).
+fn dash_if_empty(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "—"
+    } else {
+        value
+    }
+}
+
+/// The Carbon glyph for an MG90 setting category.
+fn category_icon(category: Mg90SettingCategory) -> &'static str {
+    match category {
+        Mg90SettingCategory::Overview => "view-grid",
+        Mg90SettingCategory::CellularSim => "globe",
+        Mg90SettingCategory::Wifi => "notification",
+        Mg90SettingCategory::Ethernet => "share",
+        Mg90SettingCategory::WanPolicies => "view-refresh",
+        Mg90SettingCategory::LanDhcpVlan => "view-grid",
+        Mg90SettingCategory::Firewall => "security-high",
+        Mg90SettingCategory::Vpn => "changes-prevent",
+        Mg90SettingCategory::Gnss => "star",
+        Mg90SettingCategory::SerialRecovery => "text-x-generic",
+        Mg90SettingCategory::Gpio => "overlay",
+        Mg90SettingCategory::Services => "open-menu",
+        Mg90SettingCategory::Security => "system-lock-screen",
+        Mg90SettingCategory::Diagnostics => "dialog-warning",
+        Mg90SettingCategory::Logs => "document-open-recent",
+        Mg90SettingCategory::BackupRestore => "download",
+        Mg90SettingCategory::OriginalLciFallback => "document-edit",
+    }
+}
+
+/// A dual-cellular modem card — the signal-bar hero plus the SIM / carrier /
+/// technology / WAN-IP readouts for one modem side, with an accent border and an
+/// ACTIVE chip when this is the selected WAN.
+fn cellular_modem_card(
+    ui: &mut egui::Ui,
+    side: &str,
+    link: &crate::model::CellularLink,
+    active: bool,
+) {
+    let accent = if active { Style::ACCENT } else { Style::BORDER };
+    mg90_frame(Some(accent)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            let icon_tone = if active {
+                Style::ACCENT_HI
+            } else {
+                Style::TEXT_DIM
+            };
+            let _ = paint_carbon(ui.painter(), rect, "globe", icon_tone);
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new(format!("Cellular {side}"))
+                    .size(Style::BODY)
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if active {
+                    pill(ui, "ACTIVE", Style::ACCENT);
+                } else {
+                    pill(ui, "standby", Style::TEXT_DIM);
+                }
+            });
+        });
+        ui.add_space(Style::SP_XS);
+        divider(ui);
+        ui.add_space(Style::SP_S);
+        ui.horizontal(|ui| {
+            signal_bars(ui, link.signal_dbm, link.healthy);
+            ui.add_space(Style::SP_S);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{} dBm", link.signal_dbm))
+                        .size(Style::TITLE)
+                        .color(signal_tone(link.signal_dbm, link.healthy))
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(signal_quality_label(link.signal_dbm, link.healthy))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            });
+        });
+        ui.add_space(Style::SP_S);
+        readout(ui, "Carrier", dash_if_empty(&link.carrier), Style::TEXT);
+        readout(ui, "SIM", dash_if_empty(&link.sim_state), Style::TEXT);
+        readout(
             ui,
-            "Signal",
-            &format!("{} dBm", link.signal_dbm),
+            "Technology",
+            dash_if_empty(&link.technology),
+            Style::ACCENT,
+        );
+        readout(ui, "WAN IP", dash_if_empty(&link.wan_ip), Style::TEXT_DIM);
+        readout(
+            ui,
+            "Health",
+            if link.healthy { "healthy" } else { "degraded" },
             if link.healthy { Style::OK } else { Style::WARN },
         );
-        metric(ui, "Technology", &link.technology, Style::ACCENT);
-        metric(ui, "WAN IP", &link.wan_ip, Style::TEXT_DIM);
     });
 }
 
 fn setting_row(ui: &mut egui::Ui, state: &MapsLocationSurface, setting: &Mg90SettingDescriptor) {
-    ui.separator();
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(&setting.display_name).color(Style::TEXT_STRONG));
-        pill(ui, method_label(setting.read_method), Style::ACCENT);
-        pill(
-            ui,
-            method_label(setting.write_method),
-            Style::ACCENT_TERMINALS,
+    mg90_frame(None).show(ui, |ui| {
+        ui.label(
+            RichText::new(&setting.display_name)
+                .size(Style::BODY)
+                .color(Style::TEXT_STRONG),
         );
-        if setting.requires_reboot {
-            pill(ui, "reboot", Style::WARN);
+        ui.add_space(Style::SP_XS);
+        ui.horizontal_wrapped(|ui| {
+            pill(
+                ui,
+                value_type_label(&setting.value_type),
+                Style::ACCENT_MESH,
+            );
+            pill(ui, method_label(setting.read_method), Style::ACCENT);
+            pill(
+                ui,
+                method_label(setting.write_method),
+                Style::ACCENT_TERMINALS,
+            );
+            if setting.requires_reboot {
+                pill(ui, "reboot", Style::WARN);
+            }
+            if setting.may_disconnect_management {
+                pill(ui, "disconnect risk", Style::DANGER);
+            }
+            if setting.supports_rollback {
+                pill(ui, "rollback", Style::OK);
+            }
+        });
+        if !setting.validation.is_empty() {
+            ui.add_space(Style::SP_XS);
+            for rule in &setting.validation {
+                bullet(ui, &rule.label);
+            }
         }
-        if setting.may_disconnect_management {
-            pill(ui, "disconnect risk", Style::DANGER);
-        }
-        if setting.supports_rollback {
-            pill(ui, "rollback", Style::OK);
+        if let Some(plan) = state.setting_change_plan(&setting.id) {
+            ui.add_space(Style::SP_XS);
+            divider(ui);
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new("Guarded change plan")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_XS);
+            for (index, step) in plan.steps.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}.", index + 1))
+                            .size(Style::SMALL)
+                            .monospace()
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    ui.label(RichText::new(step).size(Style::SMALL).color(Style::TEXT));
+                });
+            }
+            ui.add_space(Style::SP_XS);
+            ui.horizontal_wrapped(|ui| {
+                cap_pill(ui, "backup", plan.backup_required);
+                cap_pill(ui, "rollback", plan.rollback_supported);
+                if plan.moving_warning {
+                    pill(ui, "moving warning", Style::WARN);
+                }
+            });
         }
     });
-    metric(
-        ui,
-        "Value type",
-        value_type_label(&setting.value_type),
-        Style::TEXT,
-    );
-    if !setting.validation.is_empty() {
-        for rule in &setting.validation {
-            metric(ui, "Validation", &rule.label, Style::TEXT_DIM);
-        }
-    }
-    if let Some(plan) = state.setting_change_plan(&setting.id) {
-        metric(ui, "Plan", &plan.steps.join(" -> "), Style::TEXT_DIM);
-        metric(ui, "Backup", bool_label(plan.backup_required), Style::OK);
-        metric(
-            ui,
-            "Rollback",
-            bool_label(plan.rollback_supported),
-            Style::TEXT,
-        );
-        metric(
-            ui,
-            "Moving warning",
-            bool_label(plan.moving_warning),
-            Style::WARN,
-        );
-    }
+    ui.add_space(Style::SP_S);
 }
 
 fn card<R>(
