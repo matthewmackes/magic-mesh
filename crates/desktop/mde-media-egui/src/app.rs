@@ -32,12 +32,6 @@ use crate::model::{
 };
 use crate::Engine;
 
-/// The alpha/darken factor applied to [`Style::BG`] for the translucent dark media OSD
-/// scrim drawn over the video (design Q34). Derived from the palette token — the same
-/// translucency-by-factor idiom [`Style`] itself uses for its selection fill — so no
-/// raw colour is introduced (§4).
-const OSD_SCRIM: f32 = 0.72;
-
 /// The height of the video stage, on the 8px grid (a token multiple, not a magic px).
 const STAGE_HEIGHT: f32 = Style::SP_XL * 6.0;
 
@@ -1882,10 +1876,14 @@ fn player_stage<E: MediaEngine>(
         let osd_h = Style::SP_XL;
         let osd_rect =
             egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - osd_h), rect.max);
+        // PLATFORM-INTERFACES Q21 — the OSD dim is the ONE shared regular scrim
+        // material (value-identical to the retired local BG×0.72 derivation),
+        // faded with the dwell progress exactly as the sheet scrim fades with
+        // presentation — no per-surface re-decision of "how dark is a dim".
         ui.painter().rect_filled(
             osd_rect,
             Style::RADIUS,
-            Style::BG.gamma_multiply(OSD_SCRIM * osd_t),
+            Style::SCRIM_REGULAR.gamma_multiply(osd_t),
         );
         let position = controller.player().position();
         let osd = format!(
@@ -2965,6 +2963,31 @@ mod tests {
         // Idle-hidden OSD branch.
         c.ui_mut().osd_idle_secs = crate::model::OSD_HIDE_SECS + 1.0;
         render_with_video(&mut c, &mut video, player_view);
+    }
+
+    /// PLATFORM-INTERFACES Q21 (WL-UX-006/U21): the auto-hide OSD dims the stage
+    /// with the ONE shared regular scrim material — asserted off the painted
+    /// shapes at full dwell (the first-frame animate lands at the endpoint) —
+    /// and the swap is value-identical to the retired local `BG × 0.72`
+    /// derivation, so the look did not change, only its source of truth.
+    #[test]
+    fn osd_dim_rides_the_shared_regular_scrim_material() {
+        assert_eq!(
+            Style::SCRIM_REGULAR,
+            Style::BG.gamma_multiply(0.72),
+            "the regular scrim material IS the old derived OSD dim (value-identical swap)"
+        );
+        let mut c = controller();
+        let mut video = VideoTextureCache::default();
+        c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
+        c.pump();
+        c.ui_mut().osd_idle_secs = 0.0; // recent activity → the OSD shows, full dwell
+        let shapes = render_video_shapes(&mut c, &mut video, player_view);
+        let fills = painted_fill_colors(&shapes);
+        assert!(
+            fills.contains(&Style::SCRIM_REGULAR),
+            "the OSD must dim the stage with the shared SCRIM_REGULAR material: {fills:?}"
+        );
     }
 
     #[test]

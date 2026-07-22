@@ -12,6 +12,7 @@ use mde_egui::eframe::{self, App, CreationContext};
 use mde_egui::egui::{
     self, Align, Context, CursorIcon, Layout, Response, RichText, ScrollArea, Sense,
 };
+use mde_egui::nav_chrome::NavigationBar;
 use mde_egui::{Motion, Style};
 
 use mde_musicd::airsonic::{Album, Client, Song};
@@ -155,18 +156,11 @@ impl MusicApp {
 
     /// The album library listing (or its loading/empty/error state).
     fn render_library(&mut self, ui: &mut egui::Ui) {
-        // The listing's view title, on the same HEADING rung the open-album view
-        // gives its album name — so the two top-level views read as parallel.
-        ui.label(
-            RichText::new("Library")
-                .size(Style::HEADING)
-                .color(Style::TEXT),
-        );
-        // The heading→rule→content rhythm matches the open-album view exactly
-        // (SP_S on both sides of the separator), so the two top-level views read
-        // as parallel rather than each pacing its own header a different way.
-        ui.add_space(Style::SP_S);
-        ui.separator();
+        // PLATFORM-INTERFACES Q19 — the listing's title rides the shared
+        // [`NavigationBar`] (centered Title3 rung, standard strip, its own
+        // bottom hairline) instead of a hand-rolled HEADING label over a
+        // separator, so both top-level views wear the ONE platform top bar.
+        let _ = NavigationBar::new("Library").show(ui);
         ui.add_space(Style::SP_S);
 
         let mut to_open: Option<Album> = None;
@@ -207,25 +201,26 @@ impl MusicApp {
         let mut to_play: Option<Song> = None;
 
         if let Some(open) = &self.state.open_album {
-            if ui.button("Back to library").clicked() {
+            // PLATFORM-INTERFACES Q19 — the open album's back affordance + title
+            // are the shared [`NavigationBar`] (accent chevron + previous title,
+            // centered Title3 album name) instead of a hand-rolled button over a
+            // HEADING label; back drives the SAME [`MusicState::close`] seam the
+            // old button (and the View menu's Back to Library) drives.
+            let bar = NavigationBar::new(&open.album.name)
+                .with_back("Library")
+                .show(ui);
+            if bar.back_activated {
                 go_back = true;
             }
-            ui.add_space(Style::SP_S);
-            ui.label(
-                RichText::new(&open.album.name)
-                    .size(Style::HEADING)
-                    .color(Style::TEXT),
-            );
             let subtitle = album_subtitle(&open.album);
             if !subtitle.is_empty() {
+                ui.add_space(Style::SP_XS);
                 ui.label(
                     RichText::new(subtitle)
                         .size(Style::BODY)
                         .color(Style::TEXT_DIM),
                 );
             }
-            ui.add_space(Style::SP_S);
-            ui.separator();
             ui.add_space(Style::SP_S);
 
             match &open.tracks {
@@ -561,8 +556,9 @@ mod tests {
     /// result on the CPU so any paint-path fault (bad shape/text/geometry) surfaces
     /// as a test failure. This is the same `Context::run` → `tessellate` path the
     /// DRM runner drives, minus the GPU — no window, no wgpu, no sound device — so
-    /// the embeddable panel is proven runtime-reachable in `cargo test`.
-    fn render(app: &mut MusicApp) {
+    /// the embeddable panel is proven runtime-reachable in `cargo test`. Returns
+    /// the frame's shapes so presentation tests can assert off what painted.
+    fn render_shapes(app: &mut MusicApp) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -572,8 +568,41 @@ mod tests {
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| music_panel(ui, app));
         });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
         assert!(!prims.is_empty(), "frame produced no draw primitives");
+        out.shapes
+    }
+
+    fn render(app: &mut MusicApp) {
+        let _ = render_shapes(app);
+    }
+
+    /// Every painted text run (string + font size) from a frame's shapes.
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let size = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(0.0, |s| s.format.font_id.size);
+                    out.push((text.galley.text().to_owned(), size));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
     }
 
     #[test]
@@ -620,6 +649,52 @@ mod tests {
         state.open_album.as_mut().expect("an album is open").tracks =
             Fetch::Ready(vec![song("a"), song("b")]);
         render(&mut app_with(state, None));
+    }
+
+    /// PLATFORM-INTERFACES Q19 (WL-UX-006/U21): both top-level views ride the
+    /// shared NavigationBar — the listing's "Library" title and the open album's
+    /// title both paint on the Title3 rung (never the old hand-rolled HEADING),
+    /// and the album bar carries the back affordance's previous-title text in
+    /// place of the retired "Back to library" button.
+    #[test]
+    fn view_headers_ride_the_shared_navigation_bar() {
+        // The listing: "Library" is the bar title on the Title3 rung.
+        let mut ready = MusicState::new();
+        ready.albums = Fetch::Ready(vec![album("1")]);
+        let texts = painted_text(&render_shapes(&mut app_with(ready, None)));
+        assert!(
+            texts
+                .iter()
+                .any(|(t, s)| t == "Library" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
+            "the listing title must render on the shared bar's Title3 rung: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(t, s)| t == "Library" && (*s - Style::HEADING).abs() < f32::EPSILON),
+            "the old hand-rolled HEADING title must be gone: {texts:?}"
+        );
+
+        // The open album: the bar centers the album title on Title3 and carries
+        // the back affordance's previous title instead of the old button.
+        let mut state = MusicState::new();
+        state.open(album("7"));
+        state.open_album.as_mut().expect("an album is open").tracks = Fetch::Ready(vec![song("a")]);
+        let texts = painted_text(&render_shapes(&mut app_with(state, None)));
+        assert!(
+            texts
+                .iter()
+                .any(|(t, s)| t == "Album 7" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
+            "the album title must render on the shared bar's Title3 rung: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t == "Library"),
+            "the bar's back affordance must carry the previous title: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t == "Back to library"),
+            "the hand-rolled back button is retired in favour of the bar: {texts:?}"
+        );
     }
 
     #[test]

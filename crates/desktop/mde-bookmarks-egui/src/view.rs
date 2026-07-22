@@ -18,6 +18,7 @@
 use mde_egui::egui::{
     self, Align, Align2, CursorIcon, Layout, Response, RichText, ScrollArea, Sense, TextEdit,
 };
+use mde_egui::nav_chrome::NavigationBar;
 use mde_egui::{Motion, Style};
 
 use mde_bookmarks::{Bookmark, Folder, Item, Source};
@@ -491,10 +492,11 @@ fn detail_pane(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
     egui::SidePanel::right("bm-detail")
         .default_width(Style::SP_XL * 8.0)
         .show_inside(ui, |ui| {
-            ui.add_space(Style::SP_S);
-            ui.label(RichText::new("Details").color(Style::TEXT).strong());
-            ui.add_space(Style::SP_XS);
-            ui.separator();
+            // PLATFORM-INTERFACES Q19 — the pane's hand-rolled strong label +
+            // separator header becomes the shared [`NavigationBar`] (centered
+            // Title3 rung, standard strip, its own bottom hairline): the same
+            // detail-pane top bar the System surface's Settings panes wear.
+            let _ = NavigationBar::new("Details").show(ui);
             ui.add_space(Style::SP_S);
             match m.detail() {
                 None => {
@@ -1073,8 +1075,9 @@ mod tests {
     /// `CentralPanel`, then tessellate on the CPU so any paint-path fault surfaces
     /// as a test failure. This is the same `Context::run` → `tessellate` path the
     /// DRM runner drives, minus the GPU — no window, no wgpu — and it proves the
-    /// panel is embeddable exactly as the E12 shell mounts it (E12-3b).
-    fn render(m: &mut Manager) {
+    /// panel is embeddable exactly as the E12 shell mounts it (E12-3b). Returns
+    /// the frame's shapes so presentation tests can assert off what painted.
+    fn render_shapes(m: &mut Manager) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -1084,11 +1087,44 @@ mod tests {
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| bookmarks_panel(ui, m));
         });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
         assert!(
             !prims.is_empty(),
             "bookmarks_panel produced no draw primitives"
         );
+        out.shapes
+    }
+
+    fn render(m: &mut Manager) {
+        let _ = render_shapes(m);
+    }
+
+    /// Every painted text run (string + font size) from a frame's shapes.
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let size = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(0.0, |s| s.format.font_id.size);
+                    out.push((text.galley.text().to_owned(), size));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
     }
 
     #[test]
@@ -1164,6 +1200,24 @@ mod tests {
             tree_chevron_icon(true),
             tree_chevron_icon(false),
             "the disclosure chevron must change with the expanded state"
+        );
+    }
+
+    /// PLATFORM-INTERFACES Q19 (WL-UX-006/U21): the detail pane's header is the
+    /// shared NavigationBar — "Details" paints on the bar's Title3 rung, not the
+    /// old hand-rolled strong body label over a separator. (The main surface
+    /// header deliberately keeps its fused search field / sort combo / live
+    /// location rollup — controls the icon-slot bar cannot carry — per the U20
+    /// skip doctrine.)
+    #[test]
+    fn detail_pane_header_rides_the_shared_navigation_bar() {
+        let mut m = manager();
+        let texts = painted_text(&render_shapes(&mut m));
+        assert!(
+            texts
+                .iter()
+                .any(|(t, s)| t == "Details" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
+            "the detail pane title must render on the shared bar's Title3 rung: {texts:?}"
         );
     }
 
