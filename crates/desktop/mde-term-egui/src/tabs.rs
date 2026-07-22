@@ -26,19 +26,22 @@
 //! close-on-exit).
 //!
 //! §4: the tab bar chrome is pure `Style` tokens (active/inactive plate, the
-//! bottom hairline, the accent underline, the `×`/`+` affordances) — no raw
-//! colour. The terminal *content* palette stays [`crate::palette`]'s carve-out,
-//! reached only through the panes.
+//! bottom hairline, the accent underline) — no raw colour — with the strip's
+//! affordances (close, new-tab, remote, layouts, appearance) drawn from the
+//! shared **Mackes-Carbon** icon set, a hover wash + focus ring that ease on the
+//! shared [`Motion`] tier, and the 2px keyboard focus ring. The terminal
+//! *content* palette stays [`crate::palette`]'s carve-out, reached only through
+//! the panes.
 
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{
-    pos2, vec2, Align2, Context, CursorIcon, FontId, Key, Modifiers, Rect, Sense, Stroke,
-    StrokeKind, Ui, UiBuilder,
+    pos2, vec2, Align2, Color32, Context, CursorIcon, FontId, Key, Modifiers, Painter, Rect,
+    Response, Sense, Stroke, StrokeKind, Ui, UiBuilder,
 };
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 
 use crate::appearance::{Appearance, AppearancePicker};
 use crate::keymap::{Action, Keymap};
@@ -66,6 +69,9 @@ const TAB_MIN_W: f32 = Style::SP_XL * 2.0;
 const TAB_MAX_W: f32 = Style::SP_XL * 5.0;
 /// The accent underline thickness on the active tab.
 const UNDERLINE_PX: f32 = 2.0;
+/// Side length of a chrome-control's Mackes-Carbon icon, centred in its plate
+/// (axis 9 — the canonical platform icon set, one shared size on the 8px rhythm).
+const CHROME_ICON: f32 = Style::ICON_L;
 /// How long the new-tab spawn-failure chip stays up.
 const ERROR_TTL: Duration = Duration::from_secs(6);
 
@@ -775,7 +781,11 @@ impl TabbedTerminal {
         if Self::paint_remote_button(ui, remote_rect, self.remote.picker.is_open()) {
             self.remote.picker.toggle();
         }
-        Self::paint_new_button(ui, new_rect);
+        // The `+` is the mouse twin of Ctrl+Shift+T (module doc): a click opens a
+        // fresh tab, the same seam the keymap and the menu drive.
+        if Self::paint_new_button(ui, new_rect) {
+            self.new_tab();
+        }
 
         // Interact + apply. Close wins its sub-rect (registered after the plate,
         // per egui's later-interact-claims-the-pointer rule).
@@ -841,14 +851,22 @@ impl TabbedTerminal {
         for slot in slots {
             let active = slot.idx == self.active;
             let hovered = hover.is_some_and(|p| slot.rect.contains(p));
-            let fill = if active {
-                Style::SURFACE_HI
-            } else if hovered {
-                Style::SURFACE
-            } else {
-                Style::BG
-            };
-            clip.rect_filled(slot.rect, 0.0, fill);
+            // A non-active tab's hover wash cross-fades in on the shared FAST tier
+            // (axis 5) instead of snapping between the two ground tones.
+            let hover_t = Motion::animate(
+                ui.ctx(),
+                ("term-tab-hover", slot.idx),
+                hovered && !active,
+                Motion::FAST,
+            );
+            clip.rect_filled(
+                slot.rect,
+                0.0,
+                if active { Style::SURFACE_HI } else { Style::BG },
+            );
+            if !active && hover_t > 0.0 {
+                clip.rect_filled(slot.rect, 0.0, Style::SURFACE.gamma_multiply(hover_t));
+            }
             if active {
                 clip.rect_filled(
                     Rect::from_min_max(
@@ -881,131 +899,77 @@ impl TabbedTerminal {
             );
 
             let close_hot = hover.is_some_and(|p| slot.close.contains(p));
-            clip.text(
-                slot.close.center(),
-                Align2::CENTER_CENTER,
+            paint_chrome_icon(
+                &clip,
+                slot.close,
+                "window-close",
                 "\u{00d7}",
-                font.clone(),
                 if close_hot {
                     Style::DANGER
                 } else {
                     Style::TEXT_DIM
                 },
+                CLOSE_BOX,
             );
+
+            // The 2px keyboard focus ring on the tab plate (axis 6): the plate is a
+            // raw `ui.interact` cell, so its focus is read from egui memory (the
+            // interact that owns this id is registered after the paint pass).
+            let focused = ui.memory(|m| m.has_focus(ui.id().with(("term-tab", slot.idx))));
+            mde_egui::focus::paint_focus_ring(&clip, slot.rect, focused);
         }
     }
 
-    /// The trailing `+` button: a token plate with an accent-on-hover glyph.
-    fn paint_new_button(ui: &Ui, rect: Rect) {
+    /// The trailing `+` new-tab button: the `new-tab` Carbon glyph on a plate that
+    /// cross-fades in on hover, with the shared focus ring (axes 5/6/9). Returns
+    /// whether it was clicked — the `+` is the mouse twin of `Ctrl+Shift+T` (module
+    /// doc), so the caller opens a fresh tab on a click.
+    fn paint_new_button(ui: &Ui, rect: Rect) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-new-tab"), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
-        let painter = ui.painter();
-        if resp.hovered() {
-            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.0, Style::ACCENT),
-                StrokeKind::Inside,
-            );
-        }
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "+",
-            FontId::monospace(Style::BODY),
-            if resp.hovered() {
-                Style::ACCENT
-            } else {
-                Style::TEXT_DIM
-            },
-        );
+        let resp = terminal_hover_text(resp, "New terminal (Ctrl+Shift+T)");
+        let hot = resp.hovered();
+        paint_chrome_button(ui, &resp, "new-tab", "+", hot);
+        resp.clicked()
     }
 
-    /// The remote-terminal button (TERM-8): a token plate with a globe glyph that
-    /// lights the accent when the picker is open or hovered. Returns whether it was
-    /// clicked. All `Style` tokens (§4).
+    /// The remote-terminal button (TERM-8): the `globe` Carbon glyph, lit when the
+    /// picker is open or hovered. Returns whether it was clicked (axes 5/6/9).
     fn paint_remote_button(ui: &Ui, rect: Rect, open: bool) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-remote-btn"), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
         let resp = terminal_hover_text(resp, "New terminal on a mesh node (Ctrl+Shift+R)");
-        let painter = ui.painter();
-        let hot = open || resp.hovered();
-        if hot {
-            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.0, Style::ACCENT),
-                StrokeKind::Inside,
-            );
-        }
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "\u{2325}",
-            FontId::monospace(Style::BODY),
-            if hot { Style::ACCENT } else { Style::TEXT_DIM },
-        );
+        paint_chrome_button(ui, &resp, "globe", "\u{1F310}", open || resp.hovered());
         resp.clicked()
     }
 
-    /// The saved-layouts button (TERM-10): a token plate with a split-pane glyph
-    /// that lights the accent when the overlay is open or hovered. Returns whether
-    /// it was clicked. All `Style` tokens (§4).
+    /// The saved-layouts button (TERM-10): the `view-grid` Carbon glyph, lit when
+    /// the overlay is open or hovered. Returns whether it was clicked (axes 5/6/9).
     fn paint_layouts_button(ui: &Ui, rect: Rect, open: bool) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-layouts-btn"), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
         let resp = terminal_hover_text(resp, "Saved layouts (Ctrl+Shift+L)");
-        let painter = ui.painter();
-        let hot = open || resp.hovered();
-        if hot {
-            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.0, Style::ACCENT),
-                StrokeKind::Inside,
-            );
-        }
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "\u{25EB}",
-            FontId::monospace(Style::BODY),
-            if hot { Style::ACCENT } else { Style::TEXT_DIM },
-        );
+        paint_chrome_button(ui, &resp, "view-grid", "\u{25EB}", open || resp.hovered());
         resp.clicked()
     }
 
-    /// The appearance button (TERM-11): a token plate with a half-disc glyph
-    /// (light/dark theming) that lights the accent when the picker is open or
-    /// hovered. Returns whether it was clicked. All `Style` tokens (§4).
+    /// The appearance button (TERM-11): the `weather-clear-night` Carbon glyph
+    /// (light/dark theming), lit when the picker is open or hovered. Returns whether
+    /// it was clicked (axes 5/6/9).
     fn paint_appearance_button(ui: &Ui, rect: Rect, open: bool) -> bool {
         let resp = ui
             .interact(rect, ui.id().with("term-appearance-btn"), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
         let resp = terminal_hover_text(resp, "Appearance \u{2014} palette + look (Ctrl+Shift+P)");
-        let painter = ui.painter();
-        let hot = open || resp.hovered();
-        if hot {
-            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.0, Style::ACCENT),
-                StrokeKind::Inside,
-            );
-        }
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
+        paint_chrome_button(
+            ui,
+            &resp,
+            "weather-clear-night",
             "\u{25D0}",
-            FontId::monospace(Style::BODY),
-            if hot { Style::ACCENT } else { Style::TEXT_DIM },
+            open || resp.hovered(),
         );
         resp.clicked()
     }
@@ -1049,6 +1013,60 @@ impl TabbedTerminal {
     }
 }
 
+/// Paint a chrome control's Mackes-Carbon glyph (axis 9), centred in a
+/// [`CHROME_ICON`]-sized box inside `rect` and tinted `color`. Falls back to the
+/// legacy `glyph` text only if the named icon is not in the shared registry, so a
+/// missing asset degrades honestly instead of blanking the control.
+fn paint_chrome_icon(
+    painter: &Painter,
+    rect: Rect,
+    name: &str,
+    glyph: &str,
+    color: Color32,
+    size: f32,
+) {
+    let icon = Rect::from_center_size(rect.center(), vec2(size, size));
+    if !mde_egui::paint_carbon(painter, icon, name, color) {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            glyph,
+            FontId::monospace(Style::BODY),
+            color,
+        );
+    }
+}
+
+/// Paint one chrome-strip toolbar control over its already-interacted `resp`
+/// (axes 5/6/9): a soft [`Style::RADIUS_S`] plate + accent hairline that
+/// cross-fade in on the shared FAST tier when `hot` (hovered, or its overlay is
+/// open), the control's Carbon icon, and the shared 2px keyboard focus ring. The
+/// icon tint snaps between dim and accent (a cached texture per tint — no
+/// per-frame re-raster), while the plate carries the motion.
+fn paint_chrome_button(ui: &Ui, resp: &Response, icon: &str, glyph: &str, hot: bool) {
+    let t = Motion::animate(ui.ctx(), resp.id, hot, Motion::FAST);
+    let painter = ui.painter();
+    let rect = resp.rect;
+    if t > 0.0 {
+        painter.rect_filled(rect, Style::RADIUS_S, Style::SURFACE_HI.gamma_multiply(t));
+        painter.rect_stroke(
+            rect,
+            Style::RADIUS_S,
+            Stroke::new(Style::STROKE_HAIRLINE, Style::ACCENT.gamma_multiply(t)),
+            StrokeKind::Inside,
+        );
+    }
+    paint_chrome_icon(
+        painter,
+        rect,
+        icon,
+        glyph,
+        if hot { Style::ACCENT } else { Style::TEXT_DIM },
+        CHROME_ICON,
+    );
+    mde_egui::focus::paint_focus_ring(painter, rect, resp.has_focus());
+}
+
 /// CONSOLE-2 — the documented **sudo path** for a root op (design lock #29):
 /// wrap a command's argv as `sudo -- <argv>`, a typed array end to end (§9).
 ///
@@ -1085,7 +1103,7 @@ const fn reindex_after_move(idx: usize, from: usize, to: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use mde_egui::egui::{self, Event, RawInput};
+    use mde_egui::egui::{self, Event, PointerButton, RawInput};
 
     use super::*;
     use crate::pty::SpawnOptions;
@@ -1155,6 +1173,54 @@ mod tests {
         assert!(
             TAB_BAR_H < Style::SP_XL,
             "Terminal tab strip must not return to the old 32pt toolbar band"
+        );
+    }
+
+    #[test]
+    fn chrome_controls_use_registered_carbon_icons() {
+        // Axis 9: every tab-strip control names a glyph that exists in the shared
+        // Mackes-Carbon registry, so the chrome renders the canonical icon set and
+        // never silently falls back to its legacy inline glyph.
+        for name in [
+            "new-tab",
+            "globe",
+            "view-grid",
+            "weather-clear-night",
+            "window-close",
+        ] {
+            assert!(
+                mde_egui::carbon_svg_bytes(name).is_some(),
+                "chrome control icon `{name}` must be in the Carbon registry"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_new_button_opens_a_tab() {
+        // The `+` is documented as the mouse twin of Ctrl+Shift+T; a click must
+        // open a fresh tab (its click was previously unwired).
+        let ctx = Context::default();
+        Style::install(&ctx);
+        let mut term = tabs();
+        settle(&ctx, &mut term, 1);
+        assert_eq!(term.tab_count(), 1);
+
+        // The `+` is a TAB_BAR_H square at the right end of the 900pt-wide bar.
+        let at = pos2(900.0 - TAB_BAR_H / 2.0, TAB_BAR_H / 2.0);
+        let press = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        // Press one frame, release the next — the reliable headless click cadence.
+        frame(&ctx, &mut term, vec![Event::PointerMoved(at), press(true)]);
+        frame(&ctx, &mut term, vec![press(false)]);
+
+        assert_eq!(
+            term.tab_count(),
+            2,
+            "clicking the + opens a second tab (documented contract)"
         );
     }
 
