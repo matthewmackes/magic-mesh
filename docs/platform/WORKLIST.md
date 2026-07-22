@@ -608,6 +608,53 @@ These decisions refine acceptance and sequencing for the active items below.
   operator text-editor survey, and operator 50-question Communications
   collaboration survey completed 2026-07-19.
 
+### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
+
+- Status: Remaining
+- Priority: P2
+- Complexity: Epic
+- Problem: The Maps & Location cockpit's map is a synthetic perspective scene with
+  decorative stub overlays (fake cyan weather rect, one orange traffic line in
+  `paint_map_scene`) and no lat/lon-to-screen projection; the declared
+  traffic/weather/satellite `ProviderContract` seams carry no live data, so the
+  vehicle cockpit shows nothing about the road ahead.
+- Required outcome: Ten live external overlays land on the map through the proven
+  vehicle-worker adapter pattern (poll at feed cadence, publish latest-wins
+  `state/overlay/<feed>/<node>` snapshots with `fetched_at`, cockpit folds at 2 Hz,
+  gated paint block + Map-tab toggle), on a new vehicle-centered `geo_to_uv`
+  local-tangent projection. Catalog (all zero-cost per operator rule 2026-07-22,
+  live-verified): NWS alerts, IEM NEXRAD radar tiles, state-511 traffic events,
+  NWS gridpoint route forecast, DOT cameras, NIFC+FIRMS wildfire, AirNow AQI,
+  adsb.lol ADS-B, GTFS-Realtime transit, USGS quakes. Every feed config carries a
+  license-tier tag so a release audit is a grep.
+- Plan: docs/design/maps-live-overlays.md (locked 2026-07-22: catalog with verified
+  endpoints/cadences/licenses, OVERLAY-0..11 unit fan-out, shared staleness +
+  attribution + workstation-side-bandwidth rules, removed-for-cost appendix).
+- Relevant files/components: `crates/desktop/mde-maps-location-egui/`
+  (`model.rs` MapViewState + folds, `view.rs` paint_map_scene/show_map), new
+  overlay workers under `crates/mesh/mackesd/src/workers/`, wire types in
+  `crates/mesh/mackes-mesh-types/`, free keys (FIRMS/AirNow/511) via mde-seal.
+- Dependencies: `state/vehicle/<node>` GPS fix (Rolling Node MG90 epic) for the
+  projection origin and fetch bboxes; outbound internet on the adapter host;
+  operator signup for the three free keys (FIRMS, AirNow, 511NY) - keyless feeds
+  (NWS, IEM, NIFC, Caltrans, adsb.lol, MBTA/MTA, USGS) are autonomously drainable.
+  Coordinates with docs/design/maps-worldclass-plan.md (same surface, 2026-07-22):
+  the radar tile unit shares its P2 raster-tile lane under the egui_glow/GLES
+  raster-to-egui-texture constraint, and paint hooks serialize behind its
+  P0/P1 view.rs/model.rs pipeline per the serialize-same-file rule.
+- Acceptance criteria: each overlay paints real live data on a seat with honest
+  staleness badges (never stale-as-live); adapters fail soft to idle when
+  unconfigured; per-feed toggles + grouped Layers popover + attribution lines;
+  Drive HUD defaults to safety layers only; zero paid or non-commercial-licensed
+  feeds (the design doc §4 list stays excluded).
+- Verification method: FakeProbe-style fixture tests from the captured live
+  payloads per adapter; tessellation smoke tests per layer (all-on, NaN fix, tiny
+  viewport); live seat deploy with SSH-verified fresh `state/overlay/*` mirrors +
+  visual paint check; license-tier grep audit.
+- Origin or merged source IDs: operator overlay-planning session 2026-07-22
+  (plan help-me-plan-new-hazy-muffin.md; research workflow wf_6731d411-455;
+  operator rulings: external-feeds emphasis, vehicle lens, zero-cost only).
+
 ## User Interface And Experience
 
 ## Performance
