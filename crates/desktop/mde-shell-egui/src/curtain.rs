@@ -309,12 +309,14 @@ const MAX_MOTION_DT: f32 = 0.25;
 
 // ─────────────────────────── face metrics (tokens) ───────────────────────────
 
-/// The giant clock's point size — a display-scale multiple of the shared type
-/// scale (lock 6; the §4 tokens carry no display tier, so the face scales the
-/// heading token rather than minting a raw size).
-const CLOCK_PT: f32 = Style::HEADING * 6.0;
-/// The date line's point size beneath the clock — the same token, display-scaled.
-const DATE_PT: f32 = Style::HEADING * 1.5;
+/// The giant clock's point size — a display-scale multiple of the semantic
+/// ramp's hero rung (lock 6): the HIG Large Title ×4, never a raw size.
+/// PLATFORM-INTERFACES Q25 — the same 120 pt the face always drew, re-anchored
+/// on the U04 type ramp now that it carries a hero tier.
+const CLOCK_PT: f32 = Style::TYPE_LARGE_TITLE * 4.0;
+/// The date line's point size beneath the clock — the ramp's hero rung as-is
+/// (the same 30 pt as before; PLATFORM-INTERFACES Q25).
+const DATE_PT: f32 = Style::TYPE_LARGE_TITLE;
 /// The password field's width, on the spacing grid.
 const FIELD_W: f32 = Style::SP_XL * 8.0;
 /// The password stage's row height, on the spacing grid.
@@ -332,8 +334,10 @@ const EXTRAS_W_FRAC: f32 = 0.5;
 const EXTRAS_H_FRAC: f32 = 0.22;
 /// The locked volume slider's width, on the spacing grid.
 const VOL_SLIDER_W: f32 = Style::SP_XL * 5.0;
-/// The mute-toggle glyph edge (the compact status raster idiom).
-const GLANCE_ICON: f32 = Style::SP_M;
+/// The mute-toggle glyph edge (the compact status raster idiom) — the shared
+/// medium icon rung (PLATFORM-INTERFACES Q25: the icon-size token, not a
+/// spacing token; the same 16 px edge).
+const GLANCE_ICON: f32 = Style::ICON_M;
 /// A status-row glanceable dot's radius (the compact state-dot idiom).
 const GLANCE_DOT_R: f32 = Style::SP_XS / 2.0;
 /// Charge (%) at/under which the battery glanceable reads red, and under which
@@ -949,7 +953,13 @@ impl Curtain {
             }
         });
         if let Some(e) = &self.mixer_error {
-            ui.label(RichText::new(e).size(Style::SMALL).color(Style::DANGER));
+            // PLATFORM-INTERFACES Q25: feedback lines sit on the ramp's
+            // footnote rung (prompts/errors), not the caption rung.
+            ui.label(
+                RichText::new(e)
+                    .size(Style::TYPE_FOOTNOTE)
+                    .color(Style::DANGER),
+            );
         }
     }
 
@@ -1048,13 +1058,16 @@ impl Curtain {
         }
 
         ui.add_space(Style::SP_S);
+        // PLATFORM-INTERFACES Q25: the stage's prompt/feedback ladder sits on
+        // the ramp's footnote rung (spinner label · backoff countdown · deny
+        // line · hint) — prompt text, one rung above caption glanceables.
         if matches!(self.phase, Phase::Verifying) {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(Style::BODY).color(Style::ACCENT));
                 ui.label(
                     RichText::new("Verifying…")
                         .color(Style::TEXT_DIM)
-                        .size(Style::SMALL),
+                        .size(Style::TYPE_FOOTNOTE),
                 );
             });
         } else if let Some(remaining) = self.backoff_remaining() {
@@ -1064,15 +1077,19 @@ impl Curtain {
                     remaining.max(0.0).ceil()
                 ))
                 .color(Style::WARN)
-                .size(Style::SMALL),
+                .size(Style::TYPE_FOOTNOTE),
             );
         } else if let Some(error) = &self.error {
-            ui.label(RichText::new(error).color(Style::DANGER).size(Style::SMALL));
+            ui.label(
+                RichText::new(error)
+                    .color(Style::DANGER)
+                    .size(Style::TYPE_FOOTNOTE),
+            );
         } else {
             ui.label(
                 RichText::new("Enter to unlock · Esc to dismiss")
                     .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
+                    .size(Style::TYPE_FOOTNOTE),
             );
         }
     }
@@ -1115,14 +1132,16 @@ fn now_playing_strip(ui: &mut egui::Ui, media: &mut dyn LockMedia) {
         return;
     };
     let playing = np.playing;
+    // PLATFORM-INTERFACES Q25: title on the ramp's body rung, its state word
+    // on the caption rung (glanceable, not prompt).
     ui.label(
         RichText::new(np.title)
-            .size(Style::BODY)
+            .size(Style::TYPE_BODY)
             .color(Style::ACCENT),
     );
     ui.label(
         RichText::new(if playing { "Now playing" } else { "Paused" })
-            .size(Style::SMALL)
+            .size(Style::TYPE_CAPTION)
             .color(Style::TEXT_DIM),
     );
     ui.add_space(Style::SP_XS);
@@ -1153,9 +1172,11 @@ fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, mesh: &MeshSummary
                 reason = "a battery percentage is a clamped 0..=100 value"
             )]
             let label = format!("{}%", pct.round() as u32);
+            // PLATFORM-INTERFACES Q25: glanceables sit on the ramp's caption
+            // rung (the same 10 pt as before).
             ui.label(
                 RichText::new(label)
-                    .size(Style::SMALL)
+                    .size(Style::TYPE_CAPTION)
                     .color(Style::TEXT_DIM),
             );
             ui.add_space(Style::SP_M);
@@ -1164,14 +1185,14 @@ fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, mesh: &MeshSummary
         glance_dot(ui, tone);
         ui.label(
             RichText::new(word)
-                .size(Style::SMALL)
+                .size(Style::TYPE_CAPTION)
                 .color(Style::TEXT_DIM),
         );
         ui.add_space(Style::SP_M);
         let (_, date) = face_lines(unix_now());
         ui.label(
             RichText::new(date)
-                .size(Style::SMALL)
+                .size(Style::TYPE_CAPTION)
                 .color(Style::TEXT_DIM),
         );
     });
