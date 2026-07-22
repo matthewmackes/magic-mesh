@@ -21,8 +21,6 @@ const HEADER_H: f32 = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
 const CARD_MIN_H: f32 = 84.0;
 const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18); // style-leak-ok: map-content-color
 const MAP_LIGHT_BG: Color32 = Color32::from_rgb(0xE8, 0xEF, 0xE8); // style-leak-ok: map-content-color
-const ROAD_DARK: Color32 = Color32::from_rgb(0x42, 0x50, 0x57); // style-leak-ok: map-content-color
-const ROAD_LIGHT: Color32 = Color32::from_rgb(0xB8, 0xC3, 0xB6); // style-leak-ok: map-content-color
 const ROUTE_BLUE: Color32 = Color32::from_rgb(0x4C, 0xA3, 0xFF); // style-leak-ok: map-content-color
 const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3); // style-leak-ok: map-content-color
 const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8); // style-leak-ok: map-content-color
@@ -42,8 +40,6 @@ const SIGN_RED: Color32 = Color32::from_rgb(0xD4, 0x2A, 0x2A); // style-leak-ok:
 const SIGN_INK: Color32 = Color32::from_rgb(0x15, 0x17, 0x1D); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
 const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
-const ROAD_CASING_DARK: Color32 = Color32::from_rgb(0x24, 0x2C, 0x33); // style-leak-ok: map-content-color
-const ROAD_CASING_LIGHT: Color32 = Color32::from_rgb(0x9C, 0xA8, 0x9C); // style-leak-ok: map-content-color
 
 /// Corner radius for the floating HUD cards (banner, ETA sheet, lane strip) —
 /// larger than the shared card radius so the nav surface reads modern/premium.
@@ -688,7 +684,7 @@ fn drive_hud(
                 }
                 "overview" => state.map.zoom = 6.5,
                 "preview" => state.route_preview = true,
-                "search" => state.destination_search = true,
+                "search" => state.open_destination_search(),
                 "mute" => {
                     muted = !muted;
                     ui.ctx().data_mut(|d| d.insert_temp(muted_id, muted));
@@ -718,6 +714,10 @@ fn drive_hud(
         primary,
         has_fix,
         has_fix && !off_route,
+        state
+            .local_navigation
+            .active_destination()
+            .and_then(Destination::geo),
     );
 
     let route = &state.local_navigation.active_route;
@@ -975,6 +975,10 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         primary,
         has_fix,
         has_fix,
+        state
+            .local_navigation
+            .active_destination()
+            .and_then(Destination::geo),
     );
     // Gentle scrim so the sheet + chrome read cleanly over the map.
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.18));
@@ -1361,6 +1365,10 @@ fn search_layout(rect: Rect, n_rows: usize, n_chips: usize) -> SearchLayout {
 
 #[allow(clippy::too_many_lines)]
 fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    // Run the offline geocoder for the current query (fail-soft; early-returns
+    // unless the trimmed text changed since last frame).
+    state.refresh_geocode();
+
     let width = safe_width(ui);
     let avail_h = ui.available_height();
     let height = if avail_h.is_finite() && avail_h > 1.0 {
@@ -1373,8 +1381,31 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         return;
     }
 
-    let n_rows = state.local_navigation.destinations.len();
-    let layout = search_layout(rect, n_rows, SEARCH_CATEGORIES.len());
+    // While the field holds text we list LIVE geocoder results; empty falls back
+    // to the recent/saved presets. `rows` is an owned snapshot so no borrow of
+    // `state` is held across the `TextEdit`'s `&mut` below.
+    let querying = !state.destination_query.trim().is_empty();
+    let from = state.locations.primary_sample().cloned();
+    let rows: Vec<Destination> = if querying {
+        state
+            .geocode_results
+            .iter()
+            .map(|r| Destination::from_geo(r, from.as_ref()))
+            .collect()
+    } else {
+        state.local_navigation.destinations.clone()
+    };
+    let empty_note = if querying && rows.is_empty() {
+        state.geocode_note.clone()
+    } else {
+        None
+    };
+    let header = if querying {
+        "Search results"
+    } else {
+        "Recent & saved"
+    };
+    let layout = search_layout(rect, rows.len(), SEARCH_CATEGORIES.len());
 
     // --- Interactions first (keep the painter borrow of `ui` clean). --------
     let back_resp = ui.interact(
@@ -1387,12 +1418,14 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     }
     let back_hovered = back_resp.hovered();
 
-    let bar_resp = ui.interact(
-        layout.search_bar,
-        egui::Id::new("maps-search-bar"),
-        Sense::click(),
-    );
-    let bar_hovered = bar_resp.hovered();
+    // Hover-only sense: the real editable field (put below) owns the clicks.
+    let bar_hovered = ui
+        .interact(
+            layout.search_bar,
+            egui::Id::new("maps-search-bar"),
+            Sense::hover(),
+        )
+        .hovered();
 
     let mut chip_states: Vec<(bool, bool)> = Vec::with_capacity(layout.chips.len());
     for (i, crect) in layout.chips.iter().enumerate() {
@@ -1419,7 +1452,13 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             Sense::click(),
         );
         if resp.clicked() {
-            state.choose_destination(i);
+            // A live result promotes to a real pinned destination; a preset row
+            // selects it directly. Both advance to the route preview.
+            if querying {
+                state.choose_geo_result(i);
+            } else {
+                state.choose_destination(i);
+            }
         }
         row_states.push((resp.hovered(), resp.is_pointer_button_down_on()));
     }
@@ -1443,14 +1482,18 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         primary,
         has_fix,
         false,
+        state
+            .local_navigation
+            .active_destination()
+            .and_then(Destination::geo),
     );
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
 
-    // Back button + search bar.
+    // Back button + search-bar pill (the editable field is overlaid last).
     let back_r = layout.back.width() * 0.5;
     paint_round_button(&painter, layout.back.center(), back_r, back_hovered, false);
     paint_back_glyph(&painter, layout.back.center(), back_r);
-    paint_search_bar(&painter, layout.search_bar, bar_hovered, "Where to?");
+    paint_search_bar(&painter, layout.search_bar, bar_hovered, "");
 
     // Category chips.
     for (i, crect) in layout.chips.iter().enumerate() {
@@ -1482,17 +1525,50 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             layout.list_card.top() + Style::SP_M,
         ),
         Align2::LEFT_TOP,
-        "Recent & saved",
+        header,
         FontId::proportional(Style::BODY),
         Style::TEXT_DIM,
     );
 
-    // Destination rows.
+    // Destination rows (live results or recent/saved presets).
     for (i, rrect) in layout.rows.iter().enumerate() {
-        if let Some(destination) = state.local_navigation.destinations.get(i) {
+        if let Some(destination) = rows.get(i) {
             let (hovered, pressed) = row_states.get(i).copied().unwrap_or((false, false));
             paint_destination_row(&painter, *rrect, destination, hovered, pressed);
         }
+    }
+
+    // A soft note in place of results (no gazetteer installed / no match).
+    if let Some(note) = &empty_note {
+        painter.text(
+            layout.list_card.center(),
+            Align2::CENTER_CENTER,
+            note,
+            FontId::proportional(Style::BODY),
+            Style::TEXT_DIM,
+        );
+    }
+
+    // --- The real editable field, overlaid on the pill (drawn last, on top). -
+    let want_focus = state.take_search_focus();
+    let icon_left = layout.search_bar.left() + Style::SP_M;
+    let text_left = icon_left + 22.0 + Style::SP_S;
+    let text_rect = safe_rect(
+        text_left,
+        layout.search_bar.top() + 6.0,
+        (layout.search_bar.right() - Style::SP_M - text_left).max(1.0),
+        (layout.search_bar.height() - 12.0).max(1.0),
+    );
+    let field = egui::TextEdit::singleline(&mut state.destination_query)
+        .frame(false)
+        .hint_text("Where to?")
+        .font(FontId::proportional(Style::TITLE))
+        .text_color(Style::TEXT_STRONG)
+        .vertical_align(Align::Center)
+        .desired_width(text_rect.width());
+    let field_resp = ui.put(text_rect, field);
+    if want_focus {
+        field_resp.request_focus();
     }
 }
 
@@ -1934,6 +2010,10 @@ fn show_arrival(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         primary,
         has_fix,
         false,
+        state
+            .local_navigation
+            .active_destination()
+            .and_then(Destination::geo),
     );
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
 
@@ -2304,41 +2384,28 @@ fn paint_map_scene(
     primary: Option<&LocationSample>,
     has_fix: bool,
     route_live: bool,
+    destination: Option<(f64, f64)>,
 ) {
     let bg = if map.dark_mode {
         MAP_DARK_BG
     } else {
         MAP_LIGHT_BG
     };
-    let road_fill = if map.dark_mode { ROAD_DARK } else { ROAD_LIGHT };
-    let road_casing = if map.dark_mode {
-        ROAD_CASING_DARK
-    } else {
-        ROAD_CASING_LIGHT
-    };
     painter.rect_filled(rect, Style::RADIUS_L, bg);
-    paint_vignette(painter, rect);
-    paint_perspective_grid(painter, rect, map, road_fill);
 
-    // Road network — casing under fill, tapered wider toward the viewer.
-    for uv in [
-        &[(0.0_f32, 0.50_f32), (1.0, 0.455)][..],
-        &[(0.0, 0.82), (0.5, 0.62), (1.0, 0.58)][..],
-        &[(0.16, 1.05), (0.34, 0.62), (0.44, 0.30), (0.5, 0.10)][..],
-        &[(0.66, 1.05), (0.66, 0.5), (0.84, 0.30), (0.98, 0.20)][..],
-    ] {
-        paint_road(painter, rect, map, uv, 15.0, 6.0, road_casing, road_fill);
-    }
-    paint_road(
-        painter,
-        rect,
-        map,
-        ROUTE_UV,
-        30.0,
-        8.0,
-        road_casing,
-        road_fill,
-    );
+    // Real offline raster basemap: a Web-Mercator slippy-tile layer anchored on
+    // the live fix (or the region centroid when indoors / off-map), replacing the
+    // old procedural grid + hard-coded road splines. `paint_basemap` returns the
+    // projection used (so pins/route land on the real map) or `None` + an honest
+    // "no data" panel when no region bundle is installed.
+    let center = if has_fix {
+        primary.map(|s| (s.latitude, s.longitude))
+    } else {
+        None
+    };
+    let projection = crate::basemap::paint_basemap(painter, rect, map, center);
+    // Edge vignette on top of the tiles keeps the driver's focus centred.
+    paint_vignette(painter, rect);
 
     // Optional overlays keyed off the Map-tab toggles.
     if map.dead_zone_overlay {
@@ -2402,6 +2469,33 @@ fn paint_map_scene(
         paint_vehicle_chevron(painter, anchor, 0.0, Style::TEXT_DIM, false);
         paint_acquiring_chip(painter, egui::pos2(anchor.x, anchor.y + 26.0));
     }
+
+    // Live destination pin + straight-line "as the crow flies" preview, drawn on
+    // the real basemap projection. Only when a region is installed (projection is
+    // `Some`) and the chosen destination carries a geocoded pin.
+    if let (Some(proj), Some((dlat, dlon))) = (projection, destination) {
+        let pin = proj.project(dlat, dlon);
+        if pin.x.is_finite() && pin.y.is_finite() {
+            if has_fix {
+                painter.line_segment([anchor, pin], Stroke::new(3.0, ROUTE_ALT));
+            }
+            paint_destination_pin(painter, pin);
+        }
+    }
+}
+
+/// A map pin for a chosen geocoder destination: a teardrop head on a short stem
+/// with an inner dot, in the route palette (no new colour literal).
+fn paint_destination_pin(painter: &Painter, tip: Pos2) {
+    if !tip.x.is_finite() || !tip.y.is_finite() {
+        return;
+    }
+    let r = 9.0;
+    let head = egui::pos2(tip.x, tip.y - r * 1.4);
+    painter.line_segment([head, tip], Stroke::new(3.0, ROUTE_BLUE));
+    painter.circle_filled(head, r, ROUTE_BLUE);
+    painter.circle_stroke(head, r, Stroke::new(1.5, Color32::WHITE));
+    painter.circle_filled(head, r * 0.4, Color32::WHITE);
 }
 
 fn paint_vignette(painter: &Painter, rect: Rect) {
@@ -2467,32 +2561,6 @@ fn fill_quad(painter: &Painter, corners: [Pos2; 4], colors: [Color32; 4]) {
     painter.add(mesh);
 }
 
-fn paint_perspective_grid(painter: &Painter, rect: Rect, map: &MapViewState, road: Color32) {
-    let color = road.gamma_multiply(0.30);
-    let c = rect.center()
-        + egui::vec2(
-            finite_or(map.pan[0], 0.0) * 0.5,
-            finite_or(map.pan[1], 0.0) * 0.5,
-        );
-    for i in -5..=5 {
-        let off = i as f32 * 46.0;
-        painter.line_segment(
-            [
-                egui::pos2(rect.left(), c.y + off * 0.7),
-                egui::pos2(rect.right(), c.y + off),
-            ],
-            Stroke::new(1.0, color),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(c.x + off, rect.top()),
-                egui::pos2(c.x + off * 0.62, rect.bottom()),
-            ],
-            Stroke::new(1.0, color),
-        );
-    }
-}
-
 /// Build ribbon points (screen pos + width) for a normalized polyline, tapered
 /// so the near (high-`v`) end is `w_near` wide and the far end `w_far`.
 fn ribbon_points(
@@ -2539,23 +2607,6 @@ fn paint_ribbon(painter: &Painter, pts: &[(Pos2, f32)], color: Color32) {
         }
         painter.circle_filled(p, (w * 0.5).max(0.5), color);
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_road(
-    painter: &Painter,
-    rect: Rect,
-    map: &MapViewState,
-    uv: &[(f32, f32)],
-    w_near: f32,
-    w_far: f32,
-    casing: Color32,
-    fill: Color32,
-) {
-    let casing_pts = ribbon_points(rect, map, uv, w_near + 5.0, w_far + 4.0);
-    paint_ribbon(painter, &casing_pts, casing);
-    let fill_pts = ribbon_points(rect, map, uv, w_near, w_far);
-    paint_ribbon(painter, &fill_pts, fill);
 }
 
 fn paint_route(painter: &Painter, rect: Rect, map: &MapViewState, active: bool) {
@@ -4382,7 +4433,7 @@ fn map_canvas(
     let primary = locations.primary_sample();
     let has_fix = primary.is_some_and(LocationSample::has_fix);
     paint_map_scene(
-        &painter, rect, map, locations, dead_zones, primary, has_fix, has_fix,
+        &painter, rect, map, locations, dead_zones, primary, has_fix, has_fix, None,
     );
     painter.rect_stroke(
         rect,

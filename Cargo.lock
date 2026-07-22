@@ -4609,9 +4609,11 @@ dependencies = [
 name = "mde-maps-location-egui"
 version = "12.1.0"
 dependencies = [
+ "image",
  "mackes-mesh-types",
  "mde-bus",
  "mde-egui",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

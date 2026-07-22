@@ -36,6 +36,16 @@ mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 
+# Offline basemap + gazetteer readers (WL-FUNC-013 P1/P2). Both read the bundled
+# `<client_data_dir>/maps/<region>/{*.mbtiles, gazetteer.sqlite}` files:
+#   - rusqlite pinned to the mesh's 0.32 + bundled build (matches mde-bus /
+#     mde-bookmarks), so the whole workspace still links ONE libsqlite3-sys. The
+#     bundled amalgamation compiles SQLITE_ENABLE_FTS5, which the gazetteer needs.
+#   - image (png only) decodes the MBTiles PNG raster tiles for the egui texture
+#     cache; same 0.25 pin mde-files/mde-files-egui already resolve.
+rusqlite = { version = "0.32", features = ["bundled"] }
+image    = { version = "0.25", default-features = false, features = ["png"] }
+
 [dev-dependencies]
 tempfile = "3"
 

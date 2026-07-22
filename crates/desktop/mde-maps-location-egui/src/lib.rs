@@ -8,7 +8,9 @@
 //! for the real adapters.
 
 pub mod airspace;
+pub mod basemap;
 pub mod car_status;
+pub mod geocode;
 pub mod model;
 pub mod view;
 

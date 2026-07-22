@@ -135,6 +135,18 @@ pub struct MapsLocationSurface {
     pub route_preview: bool,
     /// Whether the "Where to?" destination-search screen is showing over Drive.
     pub destination_search: bool,
+    /// Live text in the "Where to?" search field (P1). Drives the offline
+    /// geocoder; empty until the driver types.
+    pub destination_query: String,
+    /// Ranked offline-geocoder results for the current [`Self::destination_query`].
+    pub geocode_results: Vec<crate::geocode::GeoResult>,
+    /// A human note shown in place of results (no gazetteer / no match).
+    pub geocode_note: Option<String>,
+    /// The query [`Self::geocode_results`] were computed for, so the geocoder
+    /// only re-runs when the typed text actually changes.
+    last_geocode_query: Option<String>,
+    /// One-shot: focus the search field on the frame the search screen opens.
+    request_search_focus: bool,
     /// Whether the "You have arrived" screen is showing over the Drive tab.
     pub arrived: bool,
     /// Whether turn-by-turn guidance is in the off-route "Recalculating…" state.
@@ -186,6 +198,11 @@ impl MapsLocationSurface {
             airspace: crate::airspace::AirspaceState::simulated(),
             route_preview: false,
             destination_search: false,
+            destination_query: String::new(),
+            geocode_results: Vec::new(),
+            geocode_note: None,
+            last_geocode_query: None,
+            request_search_focus: false,
             arrived: false,
             off_route: false,
             advanced_expanded: false,
@@ -228,6 +245,58 @@ impl MapsLocationSurface {
         self.active = WorkspaceTab::Drive;
         self.arrived = false;
         self.destination_search = true;
+        // Fresh slate: clear the field + any stale results, and request focus so
+        // the shell auto-raises the OSK (Car/Tablet) onto an empty search box.
+        self.destination_query.clear();
+        self.geocode_results.clear();
+        self.geocode_note = None;
+        self.last_geocode_query = None;
+        self.request_search_focus = true;
+    }
+
+    /// Take the one-shot "focus the search field" request — `true` exactly once
+    /// per [`Self::open_destination_search`], so focus is requested on the frame
+    /// the screen opens without stealing focus on every later frame.
+    pub fn take_search_focus(&mut self) -> bool {
+        std::mem::take(&mut self.request_search_focus)
+    }
+
+    /// Re-run the offline geocoder when the query text changed since last frame.
+    ///
+    /// Fail-soft: a query shorter than two chars clears the list; a missing
+    /// gazetteer or read error yields an empty list plus an explanatory note
+    /// (never a panic). Cheap to call every frame — it early-returns unless the
+    /// trimmed text actually changed.
+    pub fn refresh_geocode(&mut self) {
+        const MIN_QUERY_CHARS: usize = 2;
+        const RESULT_LIMIT: usize = 24;
+        let query = self.destination_query.trim().to_string();
+        if self.last_geocode_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+        self.last_geocode_query = Some(query.clone());
+        if query.chars().count() < MIN_QUERY_CHARS {
+            self.geocode_results.clear();
+            self.geocode_note = None;
+            return;
+        }
+        let outcome = crate::geocode::geocode(&query, RESULT_LIMIT);
+        self.geocode_results = outcome.results;
+        self.geocode_note = outcome.note;
+    }
+
+    /// Choose a live geocoder result: promote it to a real pinned destination at
+    /// the head of the list and advance to route preview. Out-of-range → no-op.
+    pub fn choose_geo_result(&mut self, idx: usize) {
+        let Some(result) = self.geocode_results.get(idx).cloned() else {
+            return;
+        };
+        let dest = {
+            let from = self.locations.primary_sample();
+            Destination::from_geo(&result, from)
+        };
+        self.local_navigation.destinations.insert(0, dest);
+        self.choose_destination(0);
     }
 
     /// Choose a destination from the search screen and advance to route preview.
@@ -861,7 +930,10 @@ pub struct MapViewState {
 }
 
 impl MapViewState {
-    fn simulated() -> Self {
+    /// The default map viewport seed (dark, region-zoom, no pan). Public so the
+    /// `basemap` projection tests can build a viewport without the whole surface.
+    #[must_use]
+    pub fn simulated() -> Self {
         Self {
             dark_mode: true,
             zoom: 13.0,
@@ -1058,42 +1130,56 @@ impl LocalNavigationState {
                     category: "home".to_string(),
                     distance_mi: 5.4,
                     address: "742 Ridgeview Terrace".to_string(),
+                    lat: None,
+                    lon: None,
                 },
                 Destination {
                     label: "Precinct HQ".to_string(),
                     category: "work".to_string(),
                     distance_mi: 3.2,
                     address: "1200 Public Safety Blvd".to_string(),
+                    lat: None,
+                    lon: None,
                 },
                 Destination {
                     label: "Hospital entrance".to_string(),
                     category: "recent".to_string(),
                     distance_mi: 8.7,
                     address: "500 Medical Center Dr, Emergency".to_string(),
+                    lat: None,
+                    lon: None,
                 },
                 Destination {
                     label: "Command post".to_string(),
                     category: "favorite".to_string(),
                     distance_mi: 14.1,
                     address: "US-30 W Mile 214, staging area".to_string(),
+                    lat: None,
+                    lon: None,
                 },
                 Destination {
                     label: "Motor pool fuel".to_string(),
                     category: "fuel".to_string(),
                     distance_mi: 2.1,
                     address: "88 Motor Pool Rd".to_string(),
+                    lat: None,
+                    lon: None,
                 },
                 Destination {
                     label: "Market St Diner".to_string(),
                     category: "food".to_string(),
                     distance_mi: 4.3,
                     address: "210 Market St".to_string(),
+                    lat: None,
+                    lon: None,
                 },
                 Destination {
                     label: "Union St Garage".to_string(),
                     category: "parking".to_string(),
                     distance_mi: 1.6,
                     address: "5th St & Union, Level 2".to_string(),
+                    lat: None,
+                    lon: None,
                 },
             ],
             route_options: vec![
@@ -1202,6 +1288,54 @@ pub struct Destination {
     pub distance_mi: f32,
     /// Street address / locality line shown in the route-preview summary.
     pub address: String,
+    /// Geographic pin latitude — present for live geocoder results, `None` for
+    /// the preset/simulated rows (which have no real coordinate). A destination
+    /// with a pin draws on the real basemap + gets a straight-line preview.
+    pub lat: Option<f64>,
+    /// Geographic pin longitude — see [`Self::lat`].
+    pub lon: Option<f64>,
+}
+
+impl Destination {
+    /// Build a destination from a live offline-geocoder result, computing the
+    /// straight-line distance from the current fix when one is available.
+    #[must_use]
+    pub fn from_geo(result: &crate::geocode::GeoResult, from: Option<&LocationSample>) -> Self {
+        let distance_mi = from.filter(|s| s.has_fix()).map_or(0.0, |s| {
+            haversine_mi(s.latitude, s.longitude, result.lat, result.lon)
+        });
+        Self {
+            label: result.title(),
+            category: "search".to_string(),
+            distance_mi,
+            address: result.subtitle(),
+            lat: Some(result.lat),
+            lon: Some(result.lon),
+        }
+    }
+
+    /// The geographic pin `(lat, lon)`, if this destination has one.
+    #[must_use]
+    pub fn geo(&self) -> Option<(f64, f64)> {
+        match (self.lat, self.lon) {
+            (Some(lat), Some(lon)) => Some((lat, lon)),
+            _ => None,
+        }
+    }
+}
+
+/// Great-circle distance between two WGS84 points, in miles (the straight-line
+/// "as the crow flies" preview distance, not a routed distance).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // f64 metres → f32 miles: display value
+pub fn haversine_mi(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f32 {
+    const EARTH_MI: f64 = 3958.7613;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    (EARTH_MI * c) as f32
 }
 
 /// Coarse traffic condition on a route option, shown as an OK/WARN/DANGER dot on
