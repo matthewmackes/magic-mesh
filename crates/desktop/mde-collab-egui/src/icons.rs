@@ -327,5 +327,51 @@ pub fn icon_button(
             );
         }
     }
-    response.on_hover_text(hint)
+    response.comms_hover_text(hint)
+}
+
+/// Max width for a Communications hover tooltip, so a long hint wraps rather than
+/// stretching the popup across the surface (mirrors the Files surface's cap).
+const COMMS_TOOLTIP_MAX_W: f32 = mde_egui::Style::SP_XL * 12.0;
+
+/// Paint a themed Communications hover tooltip: a framed Quasar-dark surface with a
+/// hairline stroke and themed text, so hover labels stay readable instead of falling
+/// back to egui's raw black-on-light default popup. The single tooltip primitive
+/// this surface's hover hints route through (mirrors `mde-files-egui`'s
+/// `files_tooltip`), keeping look reading only from [`mde_egui::Style`].
+pub fn comms_tooltip(ui: &mut egui::Ui, text: &str) {
+    use mde_egui::Style;
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .stroke(Style::hairline())
+        .corner_radius(Style::RADIUS_S)
+        .inner_margin(Style::tooltip_margin())
+        .show(ui, |ui| {
+            ui.set_max_width(COMMS_TOOLTIP_MAX_W);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT),
+                )
+                .wrap(),
+            );
+        });
+}
+
+/// A [`Response`](egui::Response) extension that attaches the themed
+/// [`comms_tooltip`] on hover instead of egui's raw default popup — the
+/// Communications-surface twin of `mde-files-egui`'s `FilesHoverExt`. Every hover
+/// hint in this crate goes through it so no raw `on_hover_text` (black-on-light)
+/// leaks past the style gate.
+pub trait CommsHoverExt {
+    /// Show the themed Communications tooltip carrying `text` on hover.
+    fn comms_hover_text(self, text: impl Into<String>) -> Self;
+}
+
+impl CommsHoverExt for egui::Response {
+    fn comms_hover_text(self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        self.on_hover_ui(move |ui| comms_tooltip(ui, text.as_str()))
+    }
 }

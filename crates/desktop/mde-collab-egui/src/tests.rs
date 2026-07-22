@@ -107,6 +107,115 @@ fn image_mesh_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
     out
 }
 
+/// Collect every painted text run with its resolved colour (mirrors the Files
+/// surface's `painted_text`), so a tooltip test can assert the themed text colour
+/// and prove no raw black-on-light default popup leaked.
+fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+    fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+        if let Some(color) = text.override_text_color {
+            return color;
+        }
+        text.galley
+            .job
+            .sections
+            .iter()
+            .find_map(|section| {
+                (section.format.color != egui::Color32::PLACEHOLDER).then_some(section.format.color)
+            })
+            .unwrap_or(text.fallback_color)
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push((text.galley.text().to_owned(), text_color(text)));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+/// Collect every opaque rect fill (mirrors the Files surface's `rect_fills`), so a
+/// tooltip test can assert the themed surface plate is actually painted.
+fn rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                out.push(rect.fill);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for clipped in shapes {
+        walk(&clipped.shape, &mut out);
+    }
+    out
+}
+
+/// The Communications hover hints route through the themed [`comms_tooltip`] rather
+/// than egui's raw default popup: it paints its own Quasar-dark surface plate and
+/// renders the hint in the themed text colour, leaking no black-on-light default.
+/// Mirrors `mde-files-egui`'s `files_hover_tooltip_uses_themed_text_and_surface`.
+///
+/// [`comms_tooltip`]: crate::icons::comms_tooltip
+#[test]
+fn comms_hover_tooltip_uses_themed_text_and_surface() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(320.0, 120.0),
+        )),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                crate::icons::comms_tooltip(ui, "Inbound");
+            });
+    });
+
+    let texts = painted_text(&out.shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "Inbound" && *color == Style::TEXT),
+        "Comms tooltip should paint its hint in the themed text colour: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, color)| text == "Inbound" && *color == egui::Color32::BLACK),
+        "Comms tooltip leaked raw black popup text: {texts:?}"
+    );
+
+    let fills = rect_fills(&out.shapes);
+    assert!(
+        fills.contains(&Style::SURFACE),
+        "Comms tooltip should paint its own themed surface: {fills:?}"
+    );
+}
+
 #[test]
 fn frame_renders_from_fixture_directory() {
     // The frame (rail + tabs + call bar + body) renders headless from a fixture

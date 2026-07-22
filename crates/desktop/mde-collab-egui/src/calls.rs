@@ -51,6 +51,7 @@ use mde_collab_types::{
 };
 
 use crate::frame::call_kind_label;
+use crate::icons::CommsHoverExt;
 use crate::{icons, relative_age, CommandSink, CommunicationsSurface};
 
 /// The honest label for the one media device offered today. Live device
@@ -477,7 +478,7 @@ impl CommunicationsSurface {
 /// devices (today only the honest system default). The picked value is written
 /// back into `value`.
 fn device_combo(ui: &mut egui::Ui, label: &str, glyph: &str, value: &mut String) {
-    icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).on_hover_text(label);
+    icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).comms_hover_text(label);
     egui::ComboBox::from_id_salt(("mde-collab-call-device", label))
         .selected_text(value.clone())
         .show_ui(ui, |ui| {
@@ -554,7 +555,8 @@ fn call_roster_row(ui: &mut egui::Ui, me: &ActorId, p: &CallParticipantView) {
         ui.label(egui::RichText::new(name).color(Style::TEXT));
         ui.label(egui::RichText::new(label).small().color(color));
         if p.muted {
-            icons::icon(ui, icons::CALL_MUTE, Style::SP_M, Style::TEXT_DIM).on_hover_text("Muted");
+            icons::icon(ui, icons::CALL_MUTE, Style::SP_M, Style::TEXT_DIM)
+                .comms_hover_text("Muted");
         }
     });
 }

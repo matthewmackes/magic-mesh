@@ -11,6 +11,7 @@ use mde_egui::Style;
 
 use mde_collab_types::{CollabCommand, DeliveryState, MessageBody, MessageView, SpaceId, ThreadId};
 
+use crate::icons::CommsHoverExt;
 use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
 
 impl CommunicationsSurface {
@@ -114,7 +115,7 @@ impl CommunicationsSurface {
                     Style::SP_M,
                     delivery_color(msg.delivery),
                 )
-                .on_hover_text(delivery_label(msg.delivery));
+                .comms_hover_text(delivery_label(msg.delivery));
             });
         });
 
@@ -201,9 +202,9 @@ impl CommunicationsSurface {
                 }
                 AmendAffordance::DeniedExpired => {
                     icons::icon(ui, icons::EDIT, Style::SP_M, Style::BORDER)
-                        .on_hover_text("Edit window passed (5 min)");
+                        .comms_hover_text("Edit window passed (5 min)");
                     icons::icon(ui, icons::DELETE, Style::SP_M, Style::BORDER)
-                        .on_hover_text("Delete window passed (5 min)");
+                        .comms_hover_text("Delete window passed (5 min)");
                 }
                 AmendAffordance::Hidden => {}
             }

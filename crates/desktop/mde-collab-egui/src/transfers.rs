@@ -19,6 +19,7 @@ use mde_collab_types::{
 };
 
 use crate::files::{fmt_bytes, transfer_state_color, transfer_state_label};
+use crate::icons::CommsHoverExt;
 use crate::{icons, CommunicationsSurface};
 
 impl CommunicationsSurface {
@@ -86,7 +87,7 @@ impl CommunicationsSurface {
                     TransferDirection::Outbound => (icons::XFER_OUTBOUND, "Outbound"),
                 };
                 icons::icon(ui, icons::XFER_ROW, Style::SP_M, Style::ACCENT);
-                icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).on_hover_text(dir_hint);
+                icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).comms_hover_text(dir_hint);
                 ui.label(
                     egui::RichText::new(short_file(job))
                         .strong()
