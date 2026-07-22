@@ -205,15 +205,111 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         .show(ui, |ui| {
             ui.set_width(RAIL_W);
             ui.vertical(|ui| {
-                for tab in WorkspaceTab::ALL {
-                    let selected = state.active == tab;
-                    let response = rail_button(ui, tab.label(), selected);
-                    if response.clicked() {
+                // Primary surfaces — the clean first-level nav.
+                for tab in WorkspaceTab::PRIMARY {
+                    if rail_button(ui, tab.label(), state.active == tab).clicked() {
                         state.active = tab;
                     }
                 }
+                // "Advanced" — progressive disclosure for the technical/config
+                // sections. Tapping it expands/collapses the nested submenu; it
+                // reads as selected while one of its children is the active tab.
+                let open = state.advanced_open();
+                if advanced_parent_button(ui, state.active.is_advanced(), open).clicked() {
+                    state.toggle_advanced();
+                }
+                if open {
+                    // Second-level list, indented under Advanced.
+                    ui.horizontal(|ui| {
+                        ui.add_space(Style::SP_S);
+                        ui.vertical(|ui| {
+                            for tab in WorkspaceTab::ADVANCED {
+                                if rail_button(ui, tab.label(), state.active == tab).clicked() {
+                                    state.active = tab;
+                                }
+                            }
+                        });
+                    });
+                }
             });
         });
+}
+
+/// The top-level **Advanced** rail entry: a [`rail_button`] carrying a
+/// disclosure chevron (▸ collapsed / ▾ expanded). Reads as selected while one
+/// of its nested sections is active so the driver always knows they are inside
+/// the Advanced group even when the submenu is collapsed.
+fn advanced_parent_button(ui: &mut egui::Ui, selected: bool, expanded: bool) -> egui::Response {
+    let size = egui::vec2(ui.available_width(), Style::SP_XL);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if selected {
+        Style::pressed_fill(Style::ACCENT)
+    } else if response.hovered() {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+            Style::RADIUS_S,
+            Style::ACCENT,
+        );
+    }
+    let text_color = if selected {
+        Style::TEXT_STRONG
+    } else {
+        Style::TEXT
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Advanced",
+        FontId::proportional(Style::BODY),
+        text_color,
+    );
+    // Disclosure chevron on the right edge (Carbon glyph, painter fallback).
+    let box_r = Style::SP_S;
+    let icon_box = safe_rect(
+        rect.right() - Style::SP_S - box_r * 2.0,
+        rect.center().y - box_r,
+        box_r * 2.0,
+        box_r * 2.0,
+    );
+    let name = if expanded {
+        "chevron--down"
+    } else {
+        "chevron--right"
+    };
+    if !paint_carbon(ui.painter(), icon_box, name, text_color) {
+        paint_disclosure_chevron(ui.painter(), icon_box.center(), expanded, text_color);
+    }
+    ui.add_space(Style::SP_XS);
+    response
+}
+
+/// Painter fallback for the Advanced disclosure chevron: a small triangle
+/// pointing down when `expanded`, right when collapsed.
+fn paint_disclosure_chevron(painter: &Painter, center: Pos2, expanded: bool, color: Color32) {
+    if !center.x.is_finite() || !center.y.is_finite() {
+        return;
+    }
+    let r = Style::SP_XS;
+    let pts = if expanded {
+        vec![
+            egui::pos2(center.x - r, center.y - r * 0.5),
+            egui::pos2(center.x + r, center.y - r * 0.5),
+            egui::pos2(center.x, center.y + r * 0.7),
+        ]
+    } else {
+        vec![
+            egui::pos2(center.x - r * 0.5, center.y - r),
+            egui::pos2(center.x + r * 0.7, center.y),
+            egui::pos2(center.x - r * 0.5, center.y + r),
+        ]
+    };
+    painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
 }
 
 fn rail_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
@@ -1655,7 +1751,8 @@ fn paint_search_glyph(painter: &Painter, center: Pos2, r: f32, color: Color32) {
     let stroke = Stroke::new((r * 0.28).max(1.4), color);
     let ring_c = egui::pos2(center.x - r * 0.22, center.y - r * 0.22);
     painter.circle_stroke(ring_c, r * 0.62, stroke);
-    let d = egui::vec2(0.7071, 0.7071);
+    let diag = std::f32::consts::FRAC_1_SQRT_2;
+    let d = egui::vec2(diag, diag);
     painter.line_segment([ring_c + d * (r * 0.62), center + d * (r * 0.95)], stroke);
 }
 
@@ -2943,13 +3040,6 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     });
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
-        if ui.button("Preview route").clicked() {
-            state.route_preview = true;
-            state.active = WorkspaceTab::Drive;
-        }
-    });
-    ui.add_space(Style::SP_S);
-    ui.horizontal(|ui| {
         ui.add(egui::Slider::new(&mut state.map.zoom, 3.0..=18.0).text("Zoom"));
         ui.add(egui::Slider::new(&mut state.map.rotation_deg, -180.0..=180.0).text("Rotate"));
         ui.add(egui::Slider::new(&mut state.map.pitch_deg, 0.0..=60.0).text("Pitch"));
@@ -2958,13 +3048,20 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     let offline_status = state.offline_navigation_status();
     offline_navigation_card(ui, &offline_status);
     ui.add_space(Style::SP_S);
-    map_canvas(
+    let map_rect = map_canvas(
         ui,
         &mut state.map,
         &state.locations,
         &state.dead_zones,
         500.0,
     );
+    // Action buttons float over the map, justified bottom-right (world-class
+    // map-nav idiom) instead of sitting in a control row above it. "Preview
+    // route" is the Map tab's sole action button; the cluster stacks any others.
+    if floating_map_actions(ui, map_rect, &[("road", "Preview route")]) == Some(0) {
+        state.route_preview = true;
+        state.active = WorkspaceTab::Drive;
+    }
     ui.add_space(Style::SP_S);
     let col_w = split_width(ui, 3);
     ui.horizontal_top(|ui| {
@@ -4127,7 +4224,7 @@ fn map_canvas(
     locations: &LocationManager,
     dead_zones: &DeadZoneState,
     height: f32,
-) {
+) -> Rect {
     let width = safe_width(ui);
     let height = if height.is_finite() {
         height.max(120.0)
@@ -4147,7 +4244,7 @@ fn map_canvas(
         map.zoom = (map.zoom + scroll.signum() * 0.5).clamp(3.0, 18.0);
     }
     if !ui.is_rect_visible(rect) {
-        return;
+        return rect;
     }
 
     let painter = ui.painter_at(rect);
@@ -4184,6 +4281,7 @@ fn map_canvas(
         FontId::proportional(Style::SMALL),
         chrome,
     );
+    rect
 }
 
 fn map_point(rect: Rect, x: f32, y: f32) -> Pos2 {
@@ -4191,6 +4289,78 @@ fn map_point(rect: Rect, x: f32, y: f32) -> Pos2 {
         rect.left() + rect.width() * x.clamp(0.0, 1.0),
         rect.top() + rect.height() * y.clamp(0.0, 1.0),
     )
+}
+
+/// Floating bottom-right action cluster laid over a map `rect`. Each entry is a
+/// labeled pill (Carbon icon + text) painted with the shared FAB elevation
+/// language and justified to the map's bottom-right corner, stacked upward.
+/// Returns the index of the pill clicked this frame, if any. Interacted and
+/// painted after the map so the cluster floats above the scene, matching the
+/// Drive HUD's floating action buttons.
+fn floating_map_actions(
+    ui: &mut egui::Ui,
+    map_rect: Rect,
+    actions: &[(&str, &str)],
+) -> Option<usize> {
+    if actions.is_empty() || !map_rect.left().is_finite() || !ui.is_rect_visible(map_rect) {
+        return None;
+    }
+    let font = FontId::proportional(Style::BODY);
+    let pill_h = Style::SP_XL;
+    let icon_d = Style::SP_M;
+    let painter = ui.painter_at(map_rect);
+    let right = map_rect.right() - Style::SP_M;
+    let mut bottom = map_rect.bottom() - Style::SP_M;
+    let mut clicked = None;
+
+    for (idx, (icon, label)) in actions.iter().enumerate() {
+        let galley = painter.layout_no_wrap((*label).to_string(), font.clone(), Style::TEXT_STRONG);
+        let pill_w = Style::SP_M + icon_d + Style::SP_S + galley.size().x + Style::SP_M;
+        let prect = safe_rect(right - pill_w, bottom - pill_h, pill_w, pill_h);
+
+        let resp = ui.interact(
+            prect,
+            egui::Id::new(("maps-map-fab", *label)),
+            Sense::click(),
+        );
+        if resp.clicked() {
+            clicked = Some(idx);
+        }
+
+        paint_soft_shadow(&painter, prect, HUD_RADIUS_S);
+        let fill = if resp.is_pointer_button_down_on() {
+            Style::pressed_fill(Style::ACCENT)
+        } else if resp.hovered() {
+            Style::SURFACE_HI
+        } else {
+            HUD_CARD_BG
+        };
+        painter.rect_filled(prect, HUD_RADIUS_S, fill);
+        painter.rect_stroke(
+            prect,
+            HUD_RADIUS_S,
+            Stroke::new(1.0, Style::BORDER),
+            StrokeKind::Inside,
+        );
+        let icon_box = safe_rect(
+            prect.left() + Style::SP_M,
+            prect.center().y - icon_d / 2.0,
+            icon_d,
+            icon_d,
+        );
+        let _ = paint_carbon(&painter, icon_box, icon, Style::ACCENT_HI);
+        painter.galley(
+            egui::pos2(
+                icon_box.right() + Style::SP_S,
+                prect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            Style::TEXT_STRONG,
+        );
+
+        bottom -= pill_h + Style::SP_S;
+    }
+    clicked
 }
 
 fn split_width(ui: &egui::Ui, columns: usize) -> f32 {

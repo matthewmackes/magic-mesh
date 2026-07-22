@@ -50,7 +50,9 @@ pub enum WorkspaceTab {
 }
 
 impl WorkspaceTab {
-    /// All tabs in stable product order.
+    /// All tabs in stable product order (primary surfaces first, then the
+    /// sections nested under **Advanced**). Kept as the flat 12-section list so
+    /// "every section reachable" iteration still covers the whole workspace.
     pub const ALL: [Self; 12] = [
         Self::Drive,
         Self::Airspace,
@@ -65,6 +67,41 @@ impl WorkspaceTab {
         Self::FirmwareRecovery,
         Self::Simulator,
     ];
+
+    /// Primary top-level surfaces — the clean first-level nav a driver reaches
+    /// for. The technical/config sections are nested under [`Self::ADVANCED`]
+    /// (progressive disclosure), so the main rail stays uncluttered.
+    pub const PRIMARY: [Self; 4] = [Self::Drive, Self::Airspace, Self::Map, Self::RoutesTrips];
+
+    /// Technical / configuration sections nested under the top-level **Advanced**
+    /// entry. Off the primary nav by design — reached by expanding Advanced.
+    pub const ADVANCED: [Self; 8] = [
+        Self::Vehicle,
+        Self::Connectivity,
+        Self::DevicesIo,
+        Self::LocationSources,
+        Self::Mg90Setup,
+        Self::Mg90Settings,
+        Self::FirmwareRecovery,
+        Self::Simulator,
+    ];
+
+    /// Whether this section lives under the top-level **Advanced** menu (the
+    /// technical / configuration sections) rather than the primary nav.
+    #[must_use]
+    pub const fn is_advanced(self) -> bool {
+        matches!(
+            self,
+            Self::Vehicle
+                | Self::Connectivity
+                | Self::DevicesIo
+                | Self::LocationSources
+                | Self::Mg90Setup
+                | Self::Mg90Settings
+                | Self::FirmwareRecovery
+                | Self::Simulator
+        )
+    }
 
     /// Human label.
     #[must_use]
@@ -102,6 +139,12 @@ pub struct MapsLocationSurface {
     pub arrived: bool,
     /// Whether turn-by-turn guidance is in the off-route "Recalculating…" state.
     pub off_route: bool,
+    /// Whether the top-level **Advanced** submenu is expanded in the nav rail.
+    /// Pure nav-view state (progressive disclosure): the technical/config
+    /// sections stay hidden until the driver opens Advanced. The submenu also
+    /// auto-reveals whenever the active section is one of the Advanced sections,
+    /// so the selected item is always visible — see [`Self::advanced_open`].
+    pub advanced_expanded: bool,
     /// Simulators are first-class and on by default.
     pub simulator_enabled: bool,
     /// Current map view model.
@@ -145,6 +188,7 @@ impl MapsLocationSurface {
             destination_search: false,
             arrived: false,
             off_route: false,
+            advanced_expanded: false,
             simulator_enabled: true,
             map: MapViewState::simulated(),
             offline_maps: OfflineMapManagerState::simulated_default(),
@@ -218,6 +262,19 @@ impl MapsLocationSurface {
     /// Toggle the off-route / recalculating guidance state (dev toggle).
     pub fn toggle_off_route(&mut self) {
         self.off_route = !self.off_route;
+    }
+
+    /// Whether the top-level **Advanced** submenu is revealed in the nav rail —
+    /// either because the driver expanded it, or because the active section
+    /// already lives under Advanced (so the selected item is always visible).
+    #[must_use]
+    pub const fn advanced_open(&self) -> bool {
+        self.advanced_expanded || self.active.is_advanced()
+    }
+
+    /// Toggle the top-level **Advanced** submenu's expanded state.
+    pub const fn toggle_advanced(&mut self) {
+        self.advanced_expanded = !self.advanced_expanded;
     }
 
     /// Compute whether the current state can provide offline turn-by-turn use.
@@ -2870,6 +2927,46 @@ mod tests {
         assert!(state.off_route);
         state.toggle_off_route();
         assert!(!state.off_route);
+    }
+
+    #[test]
+    fn advanced_menu_partitions_the_full_section_list() {
+        // Primary + Advanced must exactly partition ALL (no section lost, none
+        // double-counted) so the "Advanced" progressive-disclosure nav still
+        // reaches every workspace section.
+        assert_eq!(
+            WorkspaceTab::PRIMARY.len() + WorkspaceTab::ADVANCED.len(),
+            WorkspaceTab::ALL.len()
+        );
+        for tab in WorkspaceTab::PRIMARY {
+            assert!(!tab.is_advanced(), "{tab:?} is a primary surface");
+            assert!(!WorkspaceTab::ADVANCED.contains(&tab));
+        }
+        for tab in WorkspaceTab::ADVANCED {
+            assert!(tab.is_advanced(), "{tab:?} nests under Advanced");
+            assert!(!WorkspaceTab::PRIMARY.contains(&tab));
+        }
+    }
+
+    #[test]
+    fn advanced_submenu_expands_by_toggle_and_auto_reveals_for_active_child() {
+        let mut state = MapsLocationSurface::simulated();
+        // Default: on a primary surface, Advanced is collapsed.
+        assert_eq!(state.active, WorkspaceTab::Drive);
+        assert!(!state.advanced_open());
+
+        // Tapping "Advanced" expands the submenu without changing the content.
+        state.toggle_advanced();
+        assert!(state.advanced_open());
+        assert_eq!(state.active, WorkspaceTab::Drive);
+        state.toggle_advanced();
+        assert!(!state.advanced_open());
+
+        // Selecting an Advanced child auto-reveals the submenu even when the
+        // driver never toggled it, so the highlighted item stays visible.
+        state.active = WorkspaceTab::Mg90Settings;
+        assert!(!state.advanced_expanded);
+        assert!(state.advanced_open());
     }
 
     #[test]
