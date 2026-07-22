@@ -203,6 +203,19 @@ fn cap_width(cap: Cap) -> f32 {
     }
 }
 
+/// A key legend's rung on the HIG type ramp (PLATFORM-INTERFACES Q26): glyph faces
+/// (letters / digits / symbols and the ⌫ ↵ ⇧ ⌄ controls) read at **Callout** so a
+/// finger-sized cap carries a clear legend; word faces (`space` / `ABC` / `123` /
+/// `#+=`) stay at **Body** so they read as controls, not oversized copy.
+const fn cap_legend_size(cap: Cap) -> f32 {
+    match cap {
+        Cap::Char(_) | Cap::Backspace | Cap::Enter | Cap::Shift | Cap::Dismiss => {
+            Style::TYPE_CALLOUT
+        }
+        Cap::Space | Cap::Layer(_) => Style::TYPE_BODY,
+    }
+}
+
 /// A single letter key's base width (`SP_XL` + `SP_S` = 40pt) — finger-sized (lock 14).
 const KEY_W: f32 = Style::SP_XL + Style::SP_S;
 /// A key's height (`SP_XL` + `SP_M` = 48pt) — a comfortable touch target.
@@ -360,9 +373,29 @@ impl Keyboard {
                         .response
                         .rect
                         .expand(Style::SP_S);
+                    // PLATFORM-INTERFACES Q26 — the board is a bottom sheet: RADIUS_L
+                    // top corners (square bottom — it meets the screen edge), the
+                    // thick material laid over the opaque BG ground (fully readable
+                    // over any surface, no live blur), and a hairline edge so the
+                    // sheet separates from a BG-toned surface beneath.
+                    let board_radius = egui::CornerRadius {
+                        nw: Style::RADIUS_L as u8,
+                        ne: Style::RADIUS_L as u8,
+                        sw: 0,
+                        se: 0,
+                    };
                     ui.painter().set(
                         bg,
-                        egui::Shape::rect_filled(inner, Style::RADIUS, Style::BG),
+                        egui::Shape::Vec(vec![
+                            egui::Shape::rect_filled(inner, board_radius, Style::BG),
+                            egui::Shape::rect_filled(inner, board_radius, Style::SCRIM_THICK),
+                            egui::Shape::rect_stroke(
+                                inner,
+                                board_radius,
+                                Style::hairline(),
+                                egui::StrokeKind::Inside,
+                            ),
+                        ]),
                     );
                 });
             if let Some(cap) = pressed {
@@ -383,12 +416,23 @@ impl Keyboard {
 
     /// Lay out the key grid, recording the pressed key (if any) into `pressed`.
     fn render_rows(&self, ui: &mut egui::Ui, pressed: &mut Option<Cap>) {
+        // PLATFORM-INTERFACES Q26 — key caps ride the mid radius tier (RADIUS_M), a
+        // rounder cap than the RADIUS_S control default. The rest/hover/pressed
+        // fills stay the shared install ladder (SURFACE → SURFACE_HI → the accent
+        // pressed fill), so a key press reads exactly like every platform control —
+        // no private animation path.
+        let key_radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.corner_radius = key_radius;
+        widgets.hovered.corner_radius = key_radius;
+        widgets.active.corner_radius = key_radius;
         for row in self.layout.grid() {
             ui.horizontal(|ui| {
                 for cap in row {
                     let accent = cap == Cap::Shift && self.shift;
+                    // PLATFORM-INTERFACES Q26 — legends on the HIG type ramp.
                     let mut btn = egui::Button::new(
-                        RichText::new(cap_label(cap, self.shift)).size(Style::BODY),
+                        RichText::new(cap_label(cap, self.shift)).size(cap_legend_size(cap)),
                     );
                     if accent {
                         btn = btn.fill(Style::ACCENT);
@@ -431,7 +475,9 @@ fn keyboard_tooltip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
         .fill(surface)
         .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(6))
+        // PLATFORM-INTERFACES Q26 — the tooltip stays on the RADIUS_S control tier
+        // (same 6pt as before, now spelled from the ladder instead of a magic number).
+        .corner_radius(egui::CornerRadius::same(Style::RADIUS_S as u8))
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(Style::SP_XL * 12.0);
