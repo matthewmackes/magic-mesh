@@ -120,10 +120,9 @@ mde-bookmarks-egui = { path = "../mde-bookmarks-egui" }
 # like mde-files below), so the Browser surface can deserialize the daemon's
 # `state/bookmarks/collection` Collection snapshot into its own bookmarks-bar row.
 mde-bookmarks = { path = "../../services/mde-bookmarks" }
-mde-voice-egui = { path = "../mde-voice-egui" }
-# EDITOR-9 — the render-agnostic `mde-files` core (consumed WITHOUT its Cosmic-era
-# GUI, like mde-files-egui does), for the `EditorLaunchWatch` that drains the Files
-# "Send-to-Editor" `action/editor/open` verb into the shell's Editor surface.
+# The render-agnostic `mde-files` core (consumed WITHOUT its Cosmic-era GUI, like
+# mde-files-egui does) — the shell test harness builds against its
+# backend/fileops/model types (`FakeFileOps`, `FileRow`, `OpId`).
 mde-files = { path = "../../services/mde-files", default-features = false, features = ["dbus"] }
 # OW-10 — the Surface::MeshView "Mesh Map": the egui reincarnation of MESHMAP. The
 # shell folds the world-readable mesh-status snapshot into `mde_mesh_view::MeshState`
@@ -144,12 +143,12 @@ mde-media-egui = { path = "../mde-media-egui" }
 # `mde-term-egui` was mounted nowhere. Desktop-shell tier; the edge points
 # sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
 mde-term-egui = { path = "../mde-term-egui" }
-# EDITOR-1 — the Surface::Editor surface, mounted exactly like Files/Terminal: the
-# shell holds its `EditorSurface` (built by `real_editor()`) and renders it per-
-# frame with `editor_panel`. EDITOR-1 is the mountable scaffold (the honest §7
-# empty state until the rope buffer + text widget land in EDITOR-2/3); this dep
-# makes the code-editor surface reachable from the dock. Desktop-shell tier; the
-# edge points sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
+# The `mde-editor-egui` crate. WL-FUNC-011 Phase-2 retired the standalone
+# Surface::Editor shell mount (the editor now embeds in Communications Documents
+# mode via `mde-collab-egui`), but the shell still consumes two of its render-
+# agnostic modules directly: `collab_session` (the mesh_view live-collab wire
+# types) and `spell` (the browser spell-checker). Desktop-shell tier; the edge
+# points sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
 mde-editor-egui = { path = "../mde-editor-egui" }
 
 # E12-5a / CHOOSER-5 — the VDI Desktop surface. These decoder crates turn a
@@ -166,12 +165,14 @@ mde-vdi-spice = { path = "../mde-vdi-spice" }
 # as the three backends, so `FrameDamage` names the one shared `ColorImage`.
 mde-vdi-core = { path = "../mde-vdi-core" }
 
-# NOTIFY-CHAT-3 — the Surface::Chat ICQ UI renders the pure `mde-chat` model
-# (Roster / Contact / Presence / Message / MessageKind) it reads off the Bus
-# state topics (`state/chat/roster`, `state/chat/conversation/<key>`). The GUI is
-# a pure renderer over the chat worker's read-model — it never depends on the
-# mackesd daemon crate (§6 mesh/desktop boundary; the Bus JSON is the seam), just
-# on the shared services-tier model. The edge points inward (§6).
+# The pure `mde-chat` model (Roster / Contact / Presence / Message / MessageKind)
+# read off the Bus state topics (`state/chat/roster`, `state/chat/conversation/
+# <key>`). WL-FUNC-011 Phase-2 retired the standalone Surface::Chat UI, but the
+# shell still consumes the model: the `ChatState` poll feeds the tray action-
+# center unread badge, and the Browser/Terminal share-to-chat producers construct
+# `MessageKind` for `action/chat/send`. It never depends on the mackesd daemon
+# crate (§6 mesh/desktop boundary; the Bus JSON is the seam), just the shared
+# services-tier model. The edge points inward (§6).
 mde-chat = { path = "../../services/mde-chat" }
 
 # WL-FUNC-011 — the Surface::Communications live mount. `mde-collab-egui` is the

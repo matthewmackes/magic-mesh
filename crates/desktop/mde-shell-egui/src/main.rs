@@ -24,6 +24,14 @@ mod bt_pairing;
 mod bus_reader;
 mod car_home;
 mod car_keymap;
+// WL-FUNC-011 Phase-2 retired the standalone Surface::Chat render, but this module
+// is kept for its still-live parts: `civil_from_days` (the crate's ONE calendar,
+// consumed by the clock/curtain/timers) and `ChatState::poll` (folds the chat model
+// off the Bus to feed the tray action-center unread badge). Its dormant ICQ-render
+// path (`ChatState::show` + the render submodule) is now unreachable — allow it dead
+// pending the mde-chat → mde-collab-core migration tracked in the parity ledger,
+// rather than leaving a ~215-warning cascade.
+#[allow(dead_code)]
 mod chat;
 mod chooser;
 mod chrome;
@@ -90,8 +98,6 @@ use mde_seat::{Probe, SeatSnapshot};
 use mde_bookmarks_egui::{
     bookmarks_panel, real_manager, BookmarksBus, Manager as BookmarksManager,
 };
-use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
-use mde_files::editor_open::EditorLaunchWatch;
 use mde_files_egui::{files_panel, model::SurfaceTab, FileBrowser};
 use mde_maps_location_egui::{maps_location_panel, real_maps_location, MapsLocationSurface};
 use mde_media_egui::{
@@ -99,7 +105,6 @@ use mde_media_egui::{
 };
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
 use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
-use mde_voice_egui::{voice_menubar, voice_panel, voice_pump, VoiceApp};
 
 use dock::Surface;
 // CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
@@ -673,7 +678,6 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         // provides the control for all of these, so they return false.
         Surface::Workbench
         | Surface::InfraCode
-        | Surface::Chat
         | Surface::System
         | Surface::Storage
         | Surface::About
@@ -682,9 +686,7 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         | Surface::Music
         | Surface::Media
         | Surface::Files
-        | Surface::Voice
-        | Surface::Terminal
-        | Surface::Editor => false,
+        | Surface::Terminal => false,
         // Menubar-LESS surfaces: they draw no shared MenuBar, so the shell's
         // top-right remote-sessions fallback Area is their only such control and
         // is drawn exactly once (Foreground) — no Background twin, no collision.
@@ -816,9 +818,6 @@ struct Shell {
     /// The Files surface model, owned + built once over the production backend.
     /// Rendered via `mde_files_egui::files_panel`.
     files: FileBrowser,
-    /// The Voice surface, owned + built once (its SIP agent wakes the shell's egui
-    /// context on every update). Rendered via `mde_voice_egui::voice_panel`.
-    voice: VoiceApp,
     /// The VDI Desktop surface — a brokered VM desktop decoded by `mde-vdi-rdp` /
     /// `mde-vdi-vnc` and uploaded to an egui texture. Holds no live session until
     /// the gated wire transport (E12-4) attaches one; the panel shows its honest
@@ -930,18 +929,6 @@ struct Shell {
     /// Terminator-class terminal is reachable as an in-shell surface — no demo data
     /// (§7). This is the RESCUE: before it, `mde-term-egui` was mounted nowhere.
     terminal: TerminalSurface,
-    /// The Editor surface (EDITOR-1) — the native Zed-style code editor
-    /// (`mde-editor-egui`), mounted exactly like Files/Terminal: the shell holds
-    /// its `EditorSurface` (built by `real_editor()`) and renders it per-frame with
-    /// `editor_panel`. EDITOR-1 is the mountable scaffold — the editor chrome + the
-    /// honest "No file open" empty state (§7); the rope buffer + text widget +
-    /// tree-sitter highlighting land in EDITOR-2 onward, filling this surface.
-    editor: EditorSurface,
-    /// EDITOR-9 — the Files "Send-to-Editor" drain: tails `action/editor/open` and
-    /// opens the requested path in the Editor surface (`EditorSurface::open_path`),
-    /// bringing it to the front. The receive half of the same persist-first verb
-    /// pattern the Send-To actions use; a dark Bus is an honest no-op.
-    editor_launch: EditorLaunchWatch,
     /// The Mesh Map surface (OW-10) — the live `mde-mesh-view` canvas, fed a
     /// `MeshState` folded from the same world-readable mesh-status snapshot the
     /// Workbench planes read. Polled while in view; opens the honest "waiting for
@@ -1038,7 +1025,6 @@ impl Shell {
             media: real_media(),
             media_video: VideoTextureCache::default(),
             files: mde_files_egui::real_browser(),
-            voice: VoiceApp::new_with_ctx(ctx),
             vdi: vdi::VdiState::default(),
             chooser: chooser::ChooserState::default(),
             session_rail: session_rail::SessionRailState::new(),
@@ -1060,8 +1046,6 @@ impl Shell {
             maps_location: real_maps_location(),
             car_status: mde_maps_location_egui::CarStatusSelection::load(),
             terminal: real_terminal(),
-            editor: real_editor(),
-            editor_launch: EditorLaunchWatch::from_env(),
             mesh_view: mesh_view::MeshViewState::default(),
             explorer: explorer::ExplorerState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
@@ -1395,15 +1379,6 @@ impl Shell {
                     files_panel(ui, files);
                 });
             }
-            Surface::Voice => {
-                voice_pump(&mut self.voice);
-                let voice = &mut self.voice;
-                ui.push_id("shell-voice", |ui| {
-                    voice_menubar(ui, voice);
-                    ui.separator();
-                    voice_panel(ui, voice);
-                });
-            }
             Surface::Browser => {
                 // The sandboxed Servo browser (BOOKMARKS-6) — the `mde-web-preview`
                 // helper driven over IPC and displayed by uploading its shm frames
@@ -1486,25 +1461,6 @@ impl Shell {
                 let terminal = &mut self.terminal;
                 ui.push_id("shell-terminal", |ui| {
                     terminal_panel(ui, terminal);
-                });
-            }
-            Surface::Editor => {
-                // The native Zed-style code editor (EDITOR-1). Mounted exactly
-                // like Files: the shell renders its `EditorSurface` through
-                // `editor_panel`, scoped under its own `push_id` so its egui ids
-                // can't collide in the shell's one `Context`. EDITOR-1 is the
-                // scaffold — the editor chrome + the honest "No file open" empty
-                // state (§7); the rope buffer + text widget land in EDITOR-2/3 and
-                // render here without re-wiring this mount.
-                let editor = &mut self.editor;
-                ui.push_id("shell-editor", |ui| {
-                    editor_panel(ui, editor);
-                });
-            }
-            Surface::Chat => {
-                let chat = &mut self.chat;
-                ui.push_id("shell-chat", |ui| {
-                    chat.show(ui);
                 });
             }
             Surface::Phones => {
@@ -1776,25 +1732,15 @@ impl Shell {
             self.nav.surface = Surface::Desktop;
         }
 
-        // The Chat surface — the ONE notification interface (folded alerts +
-        // clipboard clips + human chat) — tails its `state/chat/*` read-model
-        // whenever the shell is expanded: a cheap incremental read that keeps the
-        // roster + conversations live so data is ready the instant the operator
-        // switches to it, and drives the dock Chat quad's unread badge (no
-        // cold-start wait). This subsumes the retired Notifications + Clipboard
-        // polls (NOTIFY-CHAT-6).
+        // The chat notification model — folded alerts + clipboard clips + human
+        // chat — tails its `state/chat/*` read-model whenever the shell is expanded:
+        // a cheap incremental read that keeps the roster + conversations live and
+        // drives the tray action-center unread badge (no cold-start wait). The
+        // standalone Chat surface was retired in the WL-FUNC-011 Phase-2 cutover
+        // (its feed is now the Communications hub's Alerts/Messages modes), but the
+        // model poll stays live here as the badge's source.
         if self.nav.expanded {
             self.chat.poll(ctx);
-            // EDITOR-9 — pick up a Files "Send-to-Editor" (or any node's
-            // `action/editor/open`): open the requested path in the Editor surface
-            // and bring it to the front. `take` self-throttles + edge-triggers, so a
-            // per-frame call is cheap; a read failure (a vanished file) is dropped
-            // (the editor keeps its current state — never a faked open, §7).
-            if let Some(path) = self.editor_launch.take() {
-                if self.editor.open_path(&path).is_ok() {
-                    self.nav.surface = Surface::Editor;
-                }
-            }
         }
 
         // The Storage surface tails the `state/storage/*` mirrors + the selected
@@ -3133,14 +3079,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         car_home, car_keymap, chat, complete_menu_bar_minimize, console, datacenter,
-        desktop_reconnect_should_query_recents, dock, editor_panel, files_panel, front_door,
+        desktop_reconnect_should_query_recents, dock, files_panel, front_door,
         front_door_peer_apps, install_layout_mode_button_accessibility,
         install_layout_profile_row_accessibility, launcher_pins,
         layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_menu_rect,
         layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
         menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
         publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
-        publish_front_door_service_lifecycle_to_bus, real_editor, real_media, real_terminal,
+        publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
         remote_sessions_fallback_pos, reserved_dock_gutter, reserved_taskbar_strut,
         route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
         status, surface_needs_remote_sessions_fallback, terminal_panel, Boot,
@@ -3583,7 +3529,8 @@ mod tests {
         // The Auto Mode home tiles route to the vehicle apps.
         assert_eq!(CarTile::Nav.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Media.surface(), Surface::Media);
-        assert_eq!(CarTile::Phone.surface(), Surface::Voice);
+        // WL-FUNC-011 Phase-2 — the Phone tile's calls fold into Communications.
+        assert_eq!(CarTile::Phone.surface(), Surface::Communications);
         assert_eq!(CarTile::Comms.surface(), Surface::Communications);
         assert_eq!(CarTile::Vehicle.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Settings.surface(), Surface::System);
@@ -3838,7 +3785,6 @@ mod tests {
                 Surface::Workbench
                     | Surface::InfraCode
                     | Surface::Desktop
-                    | Surface::Chat
                     | Surface::System
                     | Surface::Storage
                     | Surface::About
@@ -3848,9 +3794,7 @@ mod tests {
                     | Surface::Music
                     | Surface::Media
                     | Surface::Files
-                    | Surface::Voice
                     | Surface::Terminal
-                    | Surface::Editor
             );
             assert_eq!(
                 surface_needs_remote_sessions_fallback(surface),
@@ -4277,7 +4221,6 @@ mod tests {
             },
         );
         let mut conv = Conversation::new("alert:eagle");
-        let alert_id = alert.id.clone();
         conv.insert(alert);
         let msgs: Vec<_> = conv.messages().iter().cloned().collect();
         persist
@@ -4295,7 +4238,10 @@ mod tests {
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.local_host = "eagle".to_string();
         shell.nav.expanded = true;
-        shell.nav.surface = Surface::Chat;
+        // WL-FUNC-011 Phase-2 retired the standalone Chat surface; the chat model
+        // still polls (feeding the tray badge + Communications), and the tray
+        // status/critical-edge chrome under test renders on any surface.
+        shell.nav.surface = Surface::Desktop;
         shell.vdock.toggle();
         shell.vdock.open_status_panel_for_test();
         shell.chat = chat::ChatState::with_bus_root(bus_root);
@@ -4351,22 +4297,7 @@ mod tests {
         );
         assert!(
             shell.chat.notification_count_for_test() > 0,
-            "Chat read-model folded the fixture alert"
-        );
-        assert!(
-            ctx.read_response(chat::alert_action_button_id(alert_id.as_str(), "ack"))
-                .is_some(),
-            "typed Ack action button mounted"
-        );
-        assert!(
-            ctx.read_response(chat::alert_action_button_id(alert_id.as_str(), "restart"))
-                .is_some(),
-            "typed safe action button mounted"
-        );
-        assert!(
-            ctx.read_response(chat::notification_dnd_toggle_id())
-                .is_some(),
-            "DND toggle mounted in the Chat Notifications lane"
+            "chat read-model folded the fixture alert (the model survives the surface retire)"
         );
 
         let nodes = out
@@ -4624,16 +4555,15 @@ mod tests {
     /// fault surfaces as a failure. This is the same `Context::run` → `tessellate`
     /// path the DRM runner drives, minus the GPU (no window, no wgpu).
     ///
-    /// Files is the surface a unit test can build (`MusicApp`/`VoiceApp` need an
-    /// eframe `CreationContext`, which only `eframe::run_native` supplies, and
-    /// Voice would spawn its SIP agent). It renders over the **real** backend — no
-    /// demo data; with no `mackesd` Bus on the build host it shows its honest
-    /// "standalone / no mesh" state, which is still a full paint path. This proves
-    /// the shell's mount mechanism (dock + `push_id` scoping + the surface's own
-    /// `files-top`/`files-side` panels nested in the shell's one `Context`) is
-    /// runtime-reachable and actually draws. Music and Voice mount through the
-    /// identical `body` path with their own headless render tests proving
-    /// `music_panel`/`voice_panel` + header tessellate.
+    /// Files is the surface a unit test can build (`MusicApp` needs an eframe
+    /// `CreationContext`, which only `eframe::run_native` supplies). It renders
+    /// over the **real** backend — no demo data; with no `mackesd` Bus on the
+    /// build host it shows its honest "standalone / no mesh" state, which is still
+    /// a full paint path. This proves the shell's mount mechanism (dock + `push_id`
+    /// scoping + the surface's own `files-top`/`files-side` panels nested in the
+    /// shell's one `Context`) is runtime-reachable and actually draws. Music mounts
+    /// through the identical `body` path with its own headless render test proving
+    /// `music_panel` + header tessellate.
     #[test]
     fn shell_mounts_and_renders_a_surface() {
         let ctx = egui::Context::default();
@@ -5644,35 +5574,9 @@ mod tests {
         );
     }
 
-    /// The Editor surface (EDITOR-1) mounts through the same `body` path — the dock
-    /// chrome plus `editor_panel` scoped under `push_id` — over a fresh
-    /// `EditorSurface` (`real_editor()`). EDITOR-1 is the scaffold, so the panel
-    /// paints the editor chrome + the honest "No file open" empty state (§7, a real
-    /// reachable state, not a `todo!()`). Tessellating it on the CPU proves the
-    /// code-editor surface is runtime-reachable as an in-shell surface and actually
-    /// draws — the editor analogue of [`shell_mounts_and_renders_the_terminal_surface`].
-    #[test]
-    fn shell_mounts_and_renders_the_editor_surface() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut editor = real_editor();
-        let mut active = Surface::Editor;
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
-            ..Default::default()
-        };
-        let out = ctx.run(input, |ctx| {
-            mount_dock(ctx, &mut active);
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.push_id("shell-editor", |ui| editor_panel(ui, &mut editor));
-            });
-        });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(
-            !prims.is_empty(),
-            "the mounted editor surface produced no draw primitives"
-        );
-    }
+    // WL-FUNC-011 Phase-2 retired the standalone Surface::Editor; the editor crate
+    // (`mde-editor-egui`) lives on as the Communications Documents-mode embed
+    // (`mde-collab-egui`), so its render is covered there, not by a shell mount.
 
     // ── WIN7-SHOT-1: real pixels, not just layout rects / accesskit nodes ──────
 

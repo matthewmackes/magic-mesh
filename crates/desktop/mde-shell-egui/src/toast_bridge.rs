@@ -236,14 +236,16 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "iac" | "infra-code" | "infracode" | "infra" => Some(Surface::InfraCode),
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),
-        "voice" => Some(Surface::Voice),
         "browser" => Some(Surface::Browser),
         "bookmarks" | "bookmark-manager" => Some(Surface::Bookmarks),
         "maps" | "location" | "maps-location" | "mapslocation" => Some(Surface::MapsLocation),
-        // The ONE notification interface (NOTIFY-CHAT-6) — the retired
-        // `notifications` / `clipboard` verbs now resolve here so a forward emitter's
-        // old `shell/goto/notifications` still reaches a live surface.
-        "chat" | "notifications" | "clipboard" => Some(Surface::Chat),
+        // WL-FUNC-011 Phase-2 — the retired Chat / Voice / Editor surfaces folded
+        // into the unified Communications hub, so their legacy `shell/goto` verbs
+        // (incl. the old `notifications` / `clipboard` aliases) now resolve there so
+        // a forward emitter's stale verb still reaches a live surface.
+        "chat" | "notifications" | "clipboard" | "voice" | "editor" | "code" => {
+            Some(Surface::Communications)
+        }
         "system" => Some(Surface::System),
         "storage" => Some(Surface::Storage),
         // The Timers & Alarms surface (VDOCK-5) — the clock's replacement; the
@@ -256,7 +258,6 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "explorer" => Some(Surface::Explorer),
         "media" | "video" => Some(Surface::Media),
         "terminal" | "term" => Some(Surface::Terminal),
-        "editor" | "code" => Some(Surface::Editor),
         "phones" | "phone" => Some(Surface::Phones),
         "about" => Some(Surface::About),
         // The Communications hub (WL-FUNC-011) — an alert/chyron `shell/goto`
@@ -589,17 +590,18 @@ mod tests {
     fn resolve_action_maps_goto_and_plane_verbs() {
         assert!(matches!(
             resolve_action("shell/goto/chat"),
-            Some(Navigate::Surface(Surface::Chat))
+            Some(Navigate::Surface(Surface::Communications))
         ));
-        // The retired notify/clipboard verbs now resolve to the ONE Chat surface
-        // (NOTIFY-CHAT-6) so a forward emitter's old verb still reaches a surface.
+        // WL-FUNC-011 Phase-2 — the retired chat/notify/clipboard verbs now resolve
+        // to the unified Communications hub so a forward emitter's old verb still
+        // reaches a live surface.
         assert!(matches!(
             resolve_action("shell/goto/notifications"),
-            Some(Navigate::Surface(Surface::Chat))
+            Some(Navigate::Surface(Surface::Communications))
         ));
         assert!(matches!(
             resolve_action("shell/goto/clipboard"),
-            Some(Navigate::Surface(Surface::Chat))
+            Some(Navigate::Surface(Surface::Communications))
         ));
         assert!(matches!(
             resolve_action("shell/goto/browser"),
@@ -641,9 +643,13 @@ mod tests {
         assert_eq!(surface_by_name("explorer"), Some(Surface::Explorer));
         assert_eq!(surface_by_name("media"), Some(Surface::Media));
         assert_eq!(surface_by_name("terminal"), Some(Surface::Terminal));
-        assert_eq!(surface_by_name("editor"), Some(Surface::Editor));
         assert_eq!(surface_by_name("phones"), Some(Surface::Phones));
         assert_eq!(surface_by_name("about"), Some(Surface::About));
+        // WL-FUNC-011 Phase-2 — the retired Chat/Voice/Editor verbs fold onto the
+        // unified Communications hub.
+        assert_eq!(surface_by_name("editor"), Some(Surface::Communications));
+        assert_eq!(surface_by_name("voice"), Some(Surface::Communications));
+        assert_eq!(surface_by_name("chat"), Some(Surface::Communications));
         // and every Surface::ALL variant now resolves from its own (lowercased) name.
         for s in Surface::ALL {
             let verb = format!("{s:?}").to_ascii_lowercase();

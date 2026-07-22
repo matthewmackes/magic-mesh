@@ -83,7 +83,9 @@ impl StatusSegment {
             Self::Mesh => Surface::MeshView,
             Self::RemoteControl => Surface::System,
             Self::FileOperations => Surface::Files,
-            Self::Alerts => Surface::Chat,
+            // WL-FUNC-011 Phase-2 — the retired Chat surface's alert feed is now
+            // the Communications hub's Alerts mode.
+            Self::Alerts => Surface::Communications,
         }
     }
 

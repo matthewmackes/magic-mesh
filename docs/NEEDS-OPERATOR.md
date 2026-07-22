@@ -74,3 +74,21 @@ under the WL-\* epic named in the re-key map above, not as an independent ID.
   virtual-channel API the pinned version doesn't expose. Disposition: WON'T-DO for
   remote audio (see "Archived with a disposition" above); local-audio path lives in
   `docs/design/e12-9-10-libvirt-rescope.md`.
+
+- **mde-shell-egui pre-existing test reds** (recorded 2026-07-21, WL-FUNC-011
+  Phase-2) — 4 `cargo test -p mde-shell-egui` tests fail on the branch base
+  (`a698771d`, the 20-surface tree) *independent of* the Communications surface
+  cutover (verified by a base-tree run: 1615 passed / 4 failed). They are NOT
+  introduced by the cutover and are left untouched; triage separately:
+  1. `system::tests::every_section_is_reachable_exactly_once` — the SettingsSection
+     taxonomy has 14 sections but the test asserts 13 (a settings section was added
+     without updating the count/list). `system/tests.rs`.
+  2. `tests::car_home_tiles_and_default_key_bindings_cover_the_vehicle_apps` — the
+     default car keymap resolves letter key `A` to `Some(GoAirspace)` where the test
+     asserts `None` (the Airspace vehicle app's binding drift). `main.rs`.
+  3. `tests::shell_remote_sessions_fallback_mounts_for_bare_non_desktop_workspaces`
+     and 4. `tests::shell_remote_sessions_fallback_request_uses_shell_transition` —
+     both drive `Surface::Files`, but `surface_needs_remote_sessions_fallback` now
+     lists `Files` in the menubar-bearing (no-fallback) set (the crash-fix that
+     added Media/Files/Terminal/… to that set), so the fallback control never mounts
+     and the tests' expectation is stale. `main.rs`.

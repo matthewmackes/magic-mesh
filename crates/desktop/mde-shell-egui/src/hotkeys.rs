@@ -623,7 +623,8 @@ mod tests {
             (egui::Key::Num7, true),
             (egui::Key::Num8, true),
             (egui::Key::Num9, true),
-            // Super+Shift+0 → ALL[19], the twentieth surface (WL-FUNC-011).
+            // Super+Shift+0 → slot 19 (an overshoot no-op after the WL-FUNC-011
+            // Phase-2 17-surface cutover; slots 17..=19 resolve to no surface).
             (egui::Key::Num0, true),
         ];
         let mut reached = BTreeSet::new();
@@ -636,31 +637,33 @@ mod tests {
                 .expect("a Super-number chord latches a slot");
             reached.insert(slot.index());
         }
-        // REACH-2 — the two tiers together cover all 20 Surface::ALL indices.
+        // REACH-2 provides 20 chord slots across two Super-number tiers. After the
+        // WL-FUNC-011 Phase-2 cutover 17 surfaces remain, occupying slots 0..=16, so
+        // every surface index stays keyboard-reachable; the three overshoot chords
+        // (slots 17..=19) latch a slot that resolves to no surface — a safe no-op
+        // (see `a_slot_past_the_last_surface_is_a_safe_no_op`).
         let all: BTreeSet<usize> = (0..crate::dock::Surface::ALL.len()).collect();
-        assert_eq!(all.len(), 20, "Surface::ALL is the 20-surface set");
-        assert_eq!(
-            reached, all,
-            "every Surface::ALL index 0..=19 has a Super-number chord"
+        assert_eq!(all.len(), 17, "Surface::ALL is the 17-surface set");
+        assert!(
+            all.is_subset(&reached),
+            "every Surface::ALL index has a Super-number chord"
         );
     }
 
     #[test]
     fn a_slot_past_the_last_surface_is_a_safe_no_op() {
-        // With 20 surfaces every Super-number chord now lands on a real slot:
-        // Super+Shift+0 reaches ALL[19] (the twentieth surface, WL-FUNC-011), no
-        // longer the overshoot it was for the 19-surface set. Prove the chord
-        // latches that VALID slot and still consumes the hold (so releasing does
-        // not toggle the dock)…
+        // REACH-2 provides 20 chord slots across two Super-number tiers. After the
+        // WL-FUNC-011 Phase-2 cutover only 17 surfaces remain (slots 0..=16), so the
+        // top tier-2 chords overshoot: Super+Shift+0 latches slot 19, which now
+        // resolves to NO surface. Prove the chord still latches that slot and
+        // consumes the hold (so releasing does not toggle the dock)…
         let mut r = HotkeyRouter::default();
         let _ = r.dispatch(&[scan(125, true)], &[shift_press(egui::Key::Num0)]);
-        let slot = r
-            .take_nav_slot()
-            .expect("Super+Shift+0 latches the twentieth slot");
-        assert_eq!(slot.index(), 19, "Super+Shift+0 → ALL[19]");
+        let slot = r.take_nav_slot().expect("Super+Shift+0 latches a slot");
+        assert_eq!(slot.index(), 19, "Super+Shift+0 → slot 19");
         assert!(
-            crate::dock::Surface::ALL.get(slot.index()).is_some(),
-            "slot 19 now resolves to a real surface",
+            crate::dock::Surface::ALL.get(slot.index()).is_none(),
+            "slot 19 overshoots the 17-surface set — resolves to no surface",
         );
         // It consumed the hold, so releasing does not toggle the dock.
         let _ = r.dispatch(&[scan(125, false)], &[]);
@@ -668,8 +671,7 @@ mod tests {
             !r.take_dock_toggle(),
             "a Super+Shift+0 chord is a hold, not a clean Super tap"
         );
-        // …and prove the consumer stays bounds-safe for a genuinely out-of-range
-        // slot (one past the last surface, only reachable if `ALL` shrinks): the
+        // The consumer stays bounds-safe for any slot past the last surface: the
         // `apply_nav_slot` `.get` indexing yields nothing — a no-op, never a panic.
         let past_end = NavSlot(crate::dock::Surface::ALL.len());
         assert!(

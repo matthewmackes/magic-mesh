@@ -104,7 +104,7 @@ fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
     // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
     // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
     // and the About surface (the platform-identity screen, QBRAND-6).
-    assert_eq!(Surface::ALL.len(), 20);
+    assert_eq!(Surface::ALL.len(), 17);
     assert_eq!(Surface::ALL[0], Surface::Workbench);
     for s in [
         Surface::MeshView,
@@ -114,19 +114,17 @@ fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
         Surface::Music,
         Surface::Media,
         Surface::Files,
-        Surface::Voice,
         Surface::Browser,
         Surface::Bookmarks,
         Surface::MapsLocation,
         Surface::Terminal,
-        Surface::Editor,
-        Surface::Chat,
         // The Phones hub (KDC-MESH-9) — the desktop-side paired-phone manager.
         Surface::Phones,
         Surface::System,
         Surface::Storage,
         Surface::About,
-        // The unified Communications hub (WL-FUNC-011) — lands alongside Chat/Voice.
+        // The unified Communications hub (WL-FUNC-011) — the ONE comms entry after
+        // the Phase-2 Chat/Voice/Editor cutover folded them into it.
         Surface::Communications,
     ] {
         assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");
@@ -153,13 +151,10 @@ fn every_surface_maps_to_a_named_brand_glyph() {
         (Surface::Music, IconId::Music),
         (Surface::Media, IconId::Media),
         (Surface::Files, IconId::Files),
-        (Surface::Voice, IconId::Voice),
         (Surface::Browser, IconId::Browser),
         (Surface::Bookmarks, IconId::Bookmarks),
         (Surface::MapsLocation, IconId::MapsLocation),
         (Surface::Terminal, IconId::Terminal),
-        (Surface::Editor, IconId::Editor),
-        (Surface::Chat, IconId::Chat),
         // The Phones hub wears its own smartphone glyph (KDC-MESH-9).
         (Surface::Phones, IconId::Phones),
         // The Communications hub wears the shared-emblem collaboration glyph.
@@ -178,7 +173,7 @@ fn every_surface_maps_to_a_named_brand_glyph() {
             "{surface:?} maps to the blank wordmark"
         );
     }
-    // The map is injective — 20 surfaces, 20 distinct glyph names (IaC wears
+    // The map is injective — 17 surfaces, 17 distinct glyph names (IaC wears
     // the Server badge, Explorer the stacked-cards Instances glyph, Communications
     // the shared-emblem collaboration glyph, each unshared by any other surface).
     let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
@@ -204,13 +199,10 @@ fn every_surface_maps_to_a_nonempty_display_label() {
         (Surface::Music, "Music"),
         (Surface::Media, "Media"),
         (Surface::Files, "Files"),
-        (Surface::Voice, "Voice"),
         (Surface::Browser, "Browser"),
         (Surface::Bookmarks, "Bookmarks"),
         (Surface::MapsLocation, "Maps & Location"),
         (Surface::Terminal, "Terminal"),
-        (Surface::Editor, "Editor"),
-        (Surface::Chat, "Chat"),
         (Surface::Phones, "Phones"),
         (Surface::Communications, "Communications"),
         (Surface::System, "System"),
@@ -598,7 +590,11 @@ fn win10_hybrid_31_the_action_center_cell_routes_to_chat() {
     // Prime two frames so egui registers the cell's rect.
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
     drive_vdock(&ctx, &mut s, Vec::new(), sz);
-    assert_ne!(s.active, Surface::Chat, "start off the Chat surface");
+    assert_ne!(
+        s.active,
+        Surface::Communications,
+        "start off the Communications surface"
+    );
     let center = ctx
         .read_response(action_center_cell_id())
         .expect("the action-center cell is registered")
@@ -607,8 +603,8 @@ fn win10_hybrid_31_the_action_center_cell_routes_to_chat() {
     click_rail_cell(&ctx, &mut s, center, sz);
     assert_eq!(
         s.active,
-        Surface::Chat,
-        "clicking the action-center cell opens the Chat notification feed"
+        Surface::Communications,
+        "clicking the action-center cell opens the Communications notification feed"
     );
 }
 
@@ -970,8 +966,8 @@ fn win10_hybrid_31_tray_overflow_flyout_routes_status_segments() {
     click_rail_cell(&ctx, &mut s, alerts, sz);
     assert_eq!(
         s.active,
-        Surface::Chat,
-        "the Alerts overflow row routes to the Chat notification feed"
+        Surface::Communications,
+        "the Alerts overflow row routes to the Communications notification feed"
     );
     assert!(
         !s.tray_overflow_open,
@@ -2030,7 +2026,7 @@ fn the_status_segment_pips_route_to_their_surfaces() {
         (StatusSegment::Power, Surface::System),
         (StatusSegment::RemoteControl, Surface::System),
         (StatusSegment::FileOperations, Surface::Files),
-        (StatusSegment::Alerts, Surface::Chat),
+        (StatusSegment::Alerts, Surface::Communications),
     ] {
         let center = ctx
             .read_response(status::segment_pip_id(segment))

@@ -75,8 +75,6 @@ pub enum Surface {
     Media,
     /// The embedded Files surface (`mde-files-egui`).
     Files,
-    /// The embedded Voice / SIP surface (`mde-voice-egui`).
-    Voice,
     /// The Browser surface — the sandboxed Servo browser (`mde-web-preview`)
     /// rendered egui-native over the BOOKMARKS-6 IPC + shm texture bridge.
     Browser,
@@ -92,17 +90,6 @@ pub enum Surface {
     /// terminal (tabs / splits / broadcast / a shell on any mesh peer, TERM-4/5/8)
     /// over a real local PTY, mounted as an in-shell panel (TERM-16).
     Terminal,
-    /// The embedded Editor surface (`mde-editor-egui`) — the native Zed-style code
-    /// editor (EDITOR epic). EDITOR-1 mounts the scaffold: the editor chrome + the
-    /// honest "No file open" empty state (§7); the rope buffer + text widget +
-    /// tree-sitter highlighting + tabs/splits land in EDITOR-2 onward.
-    Editor,
-    /// The Chat surface — the ONE unified notification interface (NOTIFY-CHAT):
-    /// every mesh host is a contact, and its alerts + clipboard copies are its
-    /// messages, over the `state/chat/roster` + `state/chat/conversation/<key>`
-    /// worker read-model. Subsumes the retired standalone Notifications +
-    /// Clipboard surfaces (NOTIFY-CHAT-6 cutover).
-    Chat,
     /// The **Phones** hub surface (KDC-MESH-9) — the desktop-side management surface
     /// for the mesh's paired phone(s): mesh identity + battery/signal, per-feature
     /// toggles, the node-targeted file browser, the run-command catalog (incl. the
@@ -114,10 +101,11 @@ pub enum Surface {
     /// The **Communications** surface (WL-FUNC-011) — the unified collaboration
     /// hub (`mde-collab-egui`): a spaces rail + per-space Activity feed and Markdown
     /// Messages timeline, folded from the collab worker's `state/collab/*` mirrors
-    /// and driven back via typed `action/collab/*` commands. Lands ALONGSIDE the
-    /// standalone Chat/Voice surfaces (the cutover that retires them is a later
-    /// phase); the labeled-for-later modes (Files/Documents/Alerts/Clipboard) stay
-    /// labeled — no faked data.
+    /// and driven back via typed `action/collab/*` commands. The unified comms
+    /// entry: the standalone Chat / Voice / Editor surfaces were retired into it
+    /// (WL-FUNC-011 Phase-2 cutover — Messages/Alerts/Clipboard fold the chat
+    /// model, Calls the softphone, Documents the editor); the labeled-for-later
+    /// modes (Files/Documents/Alerts/Clipboard) stay labeled — no faked data.
     Communications,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
@@ -159,11 +147,12 @@ impl Surface {
     /// Every surface in canonical order — the ordering authority the picker is
     /// built + checked against: the Workbench (mesh-control home) first, then the
     /// live Mesh Map, the Cloud/IaC control surface + the brokered Desktop, the
-    /// app surfaces, the unified Chat surface (the ONE notification interface),
-    /// and the System / Storage / About screens. [`LAUNCHER_GROUPS`] gathers these
-    /// into the shared launcher taxonomy, preserving this relative order within
-    /// each group; a compile-time guard keeps the two tables in sync.
-    pub(crate) const ALL: [Surface; 20] = [
+    /// app surfaces, the unified Communications hub (the ONE comms entry — the
+    /// retired Chat/Voice/Editor surfaces folded into it), and the System /
+    /// Storage / About screens. [`LAUNCHER_GROUPS`] gathers these into the shared
+    /// launcher taxonomy, preserving this relative order within each group; a
+    /// compile-time guard keeps the two tables in sync.
+    pub(crate) const ALL: [Surface; 17] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Explorer,
@@ -172,20 +161,17 @@ impl Surface {
         Surface::Music,
         Surface::Media,
         Surface::Files,
-        Surface::Voice,
         Surface::Browser,
         Surface::Bookmarks,
         Surface::MapsLocation,
         Surface::Terminal,
-        Surface::Editor,
-        Surface::Chat,
         Surface::Phones,
         Surface::System,
         Surface::Storage,
         Surface::About,
-        // WL-FUNC-011 — the unified Communications hub lands as the twentieth
-        // surface (Super+Shift+0 in the REACH-2 nav tiers, the slot the prior
-        // 19-surface set left open). It joins the Comms launcher group below.
+        // WL-FUNC-011 — the unified Communications hub. Phase-2 retired the
+        // standalone Chat/Voice/Editor surfaces into it, leaving it the mesh's one
+        // collaboration entry. It anchors the Comms launcher group below.
         Surface::Communications,
     ];
 
@@ -210,18 +196,15 @@ impl Surface {
             Surface::Music => IconId::Music,
             Surface::Media => IconId::Media,
             Surface::Files => IconId::Files,
-            Surface::Voice => IconId::Voice,
             Surface::Browser => IconId::Browser,
             Surface::Bookmarks => IconId::Bookmarks,
             Surface::MapsLocation => IconId::MapsLocation,
             Surface::Terminal => IconId::Terminal,
-            Surface::Editor => IconId::Editor,
-            Surface::Chat => IconId::Chat,
             // The Phones hub wears the dedicated smartphone glyph (KDC-MESH-9).
             Surface::Phones => IconId::Phones,
             // The Communications hub wears the shared-emblem (`network-workgroup`
-            // collaboration) glyph — distinct from Chat's speech bubble and Voice's
-            // handset, reading as "the shared collaboration space" (WL-FUNC-011).
+            // collaboration) glyph, reading as "the shared collaboration space"
+            // (WL-FUNC-011 — the ONE comms entry after the Chat/Voice cutover).
             Surface::Communications => IconId::Share,
             // The System (host-controls) surface is the dock's right-side Settings
             // button (PICKER-2) — it wears the toothed **cog** glyph, the Win10
@@ -262,13 +245,10 @@ impl Surface {
             Surface::Music => "Music",
             Surface::Media => "Media",
             Surface::Files => "Files",
-            Surface::Voice => "Voice",
             Surface::Browser => "Browser",
             Surface::Bookmarks => "Bookmarks",
             Surface::MapsLocation => "Maps & Location",
             Surface::Terminal => "Terminal",
-            Surface::Editor => "Editor",
-            Surface::Chat => "Chat",
             Surface::Phones => "Phones",
             Surface::Communications => "Communications",
             Surface::System => "System",
@@ -322,17 +302,12 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
     LauncherGroup {
         label: "Developer Tools",
         accent: Style::ACCENT_TERMINALS,
-        surfaces: &[Surface::Terminal, Surface::Editor],
+        surfaces: &[Surface::Terminal],
     },
     LauncherGroup {
         label: "Comms",
         accent: Style::ACCENT_COMMS,
-        surfaces: &[
-            Surface::Voice,
-            Surface::Chat,
-            Surface::Phones,
-            Surface::Communications,
-        ],
+        surfaces: &[Surface::Phones, Surface::Communications],
     },
     LauncherGroup {
         label: "System",
@@ -1198,7 +1173,7 @@ pub fn notification_rail_with_sources(
                 state.status_panel_open
                     || state.tray_overflow_open
                     || state.active == Surface::Timers
-                    || state.active == Surface::Chat,
+                    || state.active == Surface::Communications,
             );
             // WIN10-HYBRID #31 — the far-right **show-desktop nub**: Win10's
             // corner "minimize to desktop" sliver, a thin hairline-separated strip
@@ -1889,7 +1864,9 @@ const fn tray_segment_route(segment: StatusSegment) -> Surface {
         }
         StatusSegment::Mesh => Surface::MeshView,
         StatusSegment::FileOperations => Surface::Files,
-        StatusSegment::Alerts => Surface::Chat,
+        // WL-FUNC-011 Phase-2 — the retired Chat surface's alert feed is now the
+        // Communications hub's Alerts mode; the tray Alerts row routes there.
+        StatusSegment::Alerts => Surface::Communications,
     }
 }
 
@@ -2048,15 +2025,16 @@ fn action_center_cell_id() -> egui::Id {
 }
 
 /// The taskbar **action-center** cell (WIN10-HYBRID #31) — Win10's tray
-/// notification button. Chat IS this shell's unified notification feed
-/// (NOTIFY-CHAT: every mesh host is a contact, its alerts are its messages), so a
-/// click routes the body to [`Surface::Chat`]. It wears the ACCENT tint when Chat
-/// is already the active surface OR there are unread events (the "you have
-/// notifications" cue), and otherwise follows the shared tray-cell hover/rest
-/// idiom. Every colour is a [`Style`] token (§4). Returns `true` on a click.
+/// notification button. After the WL-FUNC-011 Phase-2 cutover the unified
+/// notification feed lives in the Communications hub (Alerts/Messages folding the
+/// chat model), so a click routes the body to [`Surface::Communications`]. It
+/// wears the ACCENT tint when Communications is already the active surface OR
+/// there are unread events (the "you have notifications" cue), and otherwise
+/// follows the shared tray-cell hover/rest idiom. Every colour is a [`Style`]
+/// token (§4). Returns `true` on a click.
 fn action_center_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let resp = ui.interact(rect, action_center_cell_id(), egui::Sense::click());
-    let selected = state.active == Surface::Chat;
+    let selected = state.active == Surface::Communications;
     let unread = state.status.unread > 0;
     let hovered = resp.hovered();
     let painter = ui.painter().clone();
@@ -2095,7 +2073,7 @@ fn action_center_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) ->
         rect,
     );
     if resp.clicked() {
-        state.active = Surface::Chat;
+        state.active = Surface::Communications;
         return true;
     }
     false

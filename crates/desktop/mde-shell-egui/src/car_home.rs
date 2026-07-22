@@ -82,7 +82,9 @@ impl CarTile {
         match self {
             Self::Nav | Self::Vehicle | Self::Airspace => Surface::MapsLocation,
             Self::Media => Surface::Media,
-            Self::Phone => Surface::Voice,
+            // WL-FUNC-011 Phase-2 — the retired Voice surface's calls live in the
+            // Communications hub, so the Phone tile routes there.
+            Self::Phone => Surface::Communications,
             Self::Comms => Surface::Communications,
             Self::Settings => Surface::System,
         }
@@ -303,8 +305,9 @@ mod tests {
 
     #[test]
     fn every_tile_has_a_distinct_surface_route_and_glyph() {
-        // Nav + Vehicle intentionally share the Maps surface (Vehicle is a tab);
-        // the other four are distinct surfaces.
+        // Nav + Vehicle + Airspace share the Maps surface; Phone + Comms both route
+        // to the Communications hub (WL-FUNC-011 Phase-2 folded Voice's calls into
+        // it). Every tile still has a distinct glyph.
         for tile in CarTile::ALL {
             let _ = tile.surface();
             let _ = tile.icon();
@@ -313,7 +316,7 @@ mod tests {
         }
         assert_eq!(CarTile::Nav.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Media.surface(), Surface::Media);
-        assert_eq!(CarTile::Phone.surface(), Surface::Voice);
+        assert_eq!(CarTile::Phone.surface(), Surface::Communications);
         assert_eq!(CarTile::Comms.surface(), Surface::Communications);
         assert_eq!(CarTile::Settings.surface(), Surface::System);
     }

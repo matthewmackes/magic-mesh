@@ -865,9 +865,6 @@ mod menubar_coverage {
                          map canvas, driving dashboard, MG90 setup, and simulator \
                          chrome instead of the shared MENUBAR-ALL top strip",
             },
-            Surface::Chat => Coverage::Covered {
-                title: "Contacts", // MENU-2 (chat.rs)
-            },
             Surface::System => Coverage::Covered { title: "System" },
             Surface::Storage => Coverage::Covered {
                 title: "Local Cylinders", // MENU-4 (this file)
@@ -897,10 +894,6 @@ mod menubar_coverage {
                 reason: "bare — mde-files-egui mounts with its own header; folding \
                          it onto the shared bar is a MENUBAR-SWEEP follow-on",
             },
-            Surface::Voice => Coverage::Exempt {
-                reason: "bare — mde-voice-egui mounts with its own header; folding \
-                         it onto the shared bar is a MENUBAR-SWEEP follow-on",
-            },
             Surface::Phones => Coverage::Exempt {
                 reason: "bare — the KDC-MESH-9 Phones hub carries its own tab header \
                          (Phones · Files · Commands · Pair); folding it onto the \
@@ -916,11 +909,6 @@ mod menubar_coverage {
                 reason: "bare — mde-term-egui carries its own tmux/session menu \
                          strip; migrating it onto the shared bar is a MENUBAR-SWEEP \
                          follow-on",
-            },
-            Surface::Editor => Coverage::Exempt {
-                reason: "bare in the shell — mde-editor-egui's Word-97 bar (EDTB-7) \
-                         lives inside the editor crate; surfacing it as the shell \
-                         bar is a MENUBAR-SWEEP follow-on",
             },
             Surface::Timers => Coverage::Exempt {
                 reason: "bare — the clock-cell Timers & Alarms surface (VDOCK-5) is \
@@ -992,7 +980,11 @@ mod menubar_coverage {
             }
         }
         assert_eq!(covered + first_party + exempt, every_routed().len());
-        assert_eq!(covered, 6, "the shared covered set is the six landed bars");
+        assert_eq!(
+            covered, 5,
+            "the shared covered set is the five landed bars (WL-FUNC-011 Phase-2 \
+             retired the Chat bar)"
+        );
         assert_eq!(
             first_party, 2,
             "Browser and Maps & Location are the routed first-party chrome surfaces"
@@ -1020,10 +1012,8 @@ mod menubar_coverage {
                 Surface::Music,
                 Surface::Media,
                 Surface::Files,
-                Surface::Voice,
                 Surface::Bookmarks,
                 Surface::Terminal,
-                Surface::Editor,
                 Surface::Phones,
                 // WL-FUNC-011 — the Communications hub carries its own frame
                 // (rail · mode tabs · call bar), a MENUBAR-SWEEP follow-on. Sits
@@ -1080,25 +1070,22 @@ mod menubar_coverage {
         text
     }
 
-    /// The three surfaces whose states construct cheaply from here render for
+    /// The two surfaces whose states construct cheaply from here render for
     /// real, and each bar's UPPERCASE DISPLAY title appears in the painted text —
     /// the register's `Covered` claim proven at the pixel-feed level for them.
     /// The other three covered bars (Workbench / `IaC` / System)
     /// need the shell's full wiring or testkit scaffolding owned by their own
     /// files' tests, so their register rows rest on those files' render tests.
+    /// (The Chat bar was dropped here — WL-FUNC-011 Phase-2 retired that surface.)
     #[test]
     fn covered_titles_render_on_the_cheaply_constructible_bars() {
-        let proofs: [(Surface, fn() -> String); 3] = [
+        let proofs: [(Surface, fn() -> String); 2] = [
             (Surface::Storage, || {
                 let mut s = crate::storage::StorageState {
                     nodes: crate::storage::project(&[crate::storage::state_body("nodeA", 1, true)]),
                     bus_root: None,
                     ..crate::storage::StorageState::default()
                 };
-                rendered_text(|ui| s.show(ui))
-            }),
-            (Surface::Chat, || {
-                let mut s = crate::chat::ChatState::default();
                 rendered_text(|ui| s.show(ui))
             }),
             (Surface::About, || {
