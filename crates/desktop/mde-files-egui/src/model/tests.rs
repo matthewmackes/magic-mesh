@@ -811,6 +811,7 @@ fn search_streams_an_operable_results_tab_over_the_real_fs() {
         if !b.search_running() {
             break;
         }
+        // logic-timing, not motion (bounded test drain cadence)
         std::thread::sleep(Duration::from_millis(1));
     }
     b.pump_search();
@@ -1203,6 +1204,7 @@ fn a_conflict_surfaces_to_the_model_and_the_answer_completes_the_op() {
         .drop_transfer(0, dst, true)
         .expect("a local copy is queued");
     // Pump until the collision surfaces through the model.
+    // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         b.pump_ops();
@@ -1218,6 +1220,7 @@ fn a_conflict_surfaces_to_the_model_and_the_answer_completes_the_op() {
     // Answer keep-both through the model; the op then finishes.
     b.resolve_conflict(id, Resolution::KeepBoth, false);
     assert!(!b.any_pending_conflict(), "the prompt was consumed");
+    // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         b.pump_ops();

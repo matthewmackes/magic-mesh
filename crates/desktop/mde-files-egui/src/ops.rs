@@ -282,6 +282,7 @@ mod tests {
 
     /// Pump until the given op reports a terminal outcome or the deadline hits.
     fn drain_until_done(ops: &mut Ops, op_id: OpId) {
+        // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             ops.pump();
@@ -338,6 +339,7 @@ mod tests {
         );
 
         // Pump until the collision surfaces as this op's pending prompt.
+        // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             ops.pump();
@@ -384,6 +386,7 @@ mod tests {
             },
             "Copying 1 item → dst",
         );
+        // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
         let deadline = Instant::now() + Duration::from_secs(5);
         while ops.pending_conflict().is_none() {
             ops.pump();

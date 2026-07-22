@@ -569,6 +569,7 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // path — the worker thread owns it.
     browser.pump_previews();
     if browser.previews_pending() {
+        // logic-timing, not motion (worker-result repaint heartbeat, not a tween)
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
     // FILEMGR-9 — refresh the mesh-mount state (a cheap, cadence-gated local Bus
@@ -576,6 +577,7 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // heartbeat alive so the sidebar pip animates mounting → mounted without input.
     browser.pump_mounts();
     if browser.any_mount_transitional() {
+        // logic-timing, not motion (mount-state re-read heartbeat, not a tween)
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
     // FILEMGR-4 — fold the recursive-search worker's streamed hits into the
@@ -584,6 +586,7 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // off-thread (never this paint path).
     browser.pump_search();
     if browser.search_running() {
+        // logic-timing, not motion (search-walk fold-in heartbeat, not a tween)
         ui.ctx().request_repaint_after(Duration::from_millis(80));
     }
     // TRANSFERS-8 — refresh the worker's ledger (a cheap, cadence-gated local
@@ -591,6 +594,7 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // is in flight so live progress updates without input.
     browser.pump_transfers();
     if browser.transfers_active() {
+        // logic-timing, not motion (transfers-ledger progress heartbeat, not a tween)
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
@@ -4218,6 +4222,7 @@ mod tests {
 
     /// Pump until both the thumbnail and the preview for `path` are decoded.
     fn wait_decoded(b: &mut FileBrowser, path: &str) {
+        // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             b.pump_previews();
@@ -4431,6 +4436,7 @@ mod tests {
         let id = b
             .drop_transfer(0, PathBuf::from("/dst"), true)
             .expect("queued");
+        // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
         let deadline = Instant::now() + Duration::from_secs(5);
         while b.pending_conflict().is_none() {
             b.pump_ops();

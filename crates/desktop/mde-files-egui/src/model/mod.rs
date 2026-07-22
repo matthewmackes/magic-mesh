@@ -46,7 +46,7 @@ use mde_files::opqueue::{ConflictChoice, Resolution};
 /// How often the Mesh sidebar re-reads `state/mesh-mount/*` from the Bus. The read
 /// is a cheap local spool scan; a worker transition surfaces within this window.
 /// Matches the other Bus surfaces' cadence.
-const MOUNT_POLL: Duration = Duration::from_secs(2);
+const MOUNT_POLL: Duration = Duration::from_secs(2); // logic-timing, not motion (poll interval)
 const HOME_SEARCH_LIMIT: usize = 32;
 
 /// The short mount hostname for a peer — the `<host>` verb slot.
@@ -797,6 +797,7 @@ fn parse_kb(s: &str) -> Option<u64> {
 fn parse_within_days(s: &str) -> Option<SystemTime> {
     let days = s.trim().parse::<u64>().ok().filter(|d| *d > 0)?;
     let secs = days.checked_mul(86_400)?;
+    // logic-timing, not motion (search-filter window: N days → cutoff instant)
     SystemTime::now().checked_sub(Duration::from_secs(secs))
 }
 
@@ -938,7 +939,7 @@ struct SearchState {
 /// How often the Transfers tab re-reads the worker's ledger from the node-local
 /// store. A cheap local directory scan (never a peer probe), so a worker
 /// transition surfaces within this window — matches the mesh-mount cadence.
-const TRANSFERS_POLL: Duration = Duration::from_secs(2);
+const TRANSFERS_POLL: Duration = Duration::from_secs(2); // logic-timing, not motion (poll interval)
 
 /// Which top-level surface the File Browser is showing (Q1).
 ///
@@ -1375,6 +1376,7 @@ impl FileBrowser {
 
     #[doc(hidden)]
     pub fn mark_transfers_poll_due_for_test(&mut self) {
+        // logic-timing, not motion (test helper: force the poll deadline past-due)
         self.last_transfers_poll = Some(Instant::now() - TRANSFERS_POLL - Duration::from_millis(1));
     }
 

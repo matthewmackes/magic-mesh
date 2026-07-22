@@ -1161,6 +1161,7 @@ mod tests {
     // ── the worker round-trip: request → off-thread decode → pump → Ready ────
 
     fn pump_until<F: Fn(&Previews) -> bool>(p: &mut Previews, ok: F) {
+        // logic-timing, not motion (test poll loop — bounded timeout + pump cadence)
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             p.pump();
