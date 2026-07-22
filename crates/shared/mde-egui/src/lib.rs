@@ -42,6 +42,7 @@ pub mod hostkeys;
 pub mod input_policy;
 pub mod menubar;
 pub mod motion;
+pub mod nav_chrome;
 pub mod runner;
 pub mod search_omnibox;
 pub mod style;
