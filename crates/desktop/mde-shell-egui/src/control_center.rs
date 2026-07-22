@@ -502,6 +502,13 @@ pub(crate) fn mount(ctx: &egui::Context, mut deps: ControlCenterDeps<'_>) {
         deps.construct.control_center_open = false;
     }
     let open = deps.construct.control_center_open;
+    // Paint only once the Context has run a real frame: the U09 contract tests
+    // drive the mount slots on a bare Context (fonts would panic there), and
+    // the intent/flag handling above must keep working framelessly — the same
+    // guard idiom notification_center.rs uses.
+    if ctx.cumulative_pass_nr() == 0 {
+        return;
+    }
     // Entry/exit ride the shared chrome spring; reduce-motion returns the
     // endpoint immediately (`Motion::spring_to`), so the overlay pops instantly.
     let reveal = Motion::spring_to(
