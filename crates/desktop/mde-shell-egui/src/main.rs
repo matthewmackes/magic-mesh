@@ -2825,6 +2825,13 @@ impl Shell {
         // below. Reserved as a SidePanel BEFORE the CentralPanel so it never
         // occludes the map/nav content (which flows in the remaining two-thirds).
         if is_car && !covered {
+            // The strip draws on EVERY Car-mode frame, but the vehicle fold used
+            // to run only inside the `Surface::MapsLocation` body arm — so the
+            // speedometer/readouts went stale the moment the driver left a Maps
+            // surface (Home/Media/Comms/Settings). Fold here, car-wide, before
+            // the strip reads telemetry; `refresh_from_bus` self-gates to ~2 Hz
+            // (PERF-5) so the per-frame call costs nothing between polls.
+            self.maps_location.refresh_from_bus(&self.local_host);
             let strip_w = (ctx.screen_rect().width() / 3.0).max(1.0);
             egui::SidePanel::left("car-instrument-strip")
                 .exact_width(strip_w)
