@@ -30,6 +30,7 @@
 //! harness-pinned egui version (no cross-surface version skew).
 
 pub mod a11y;
+pub mod capture;
 pub mod carbon;
 pub mod code;
 pub mod display;

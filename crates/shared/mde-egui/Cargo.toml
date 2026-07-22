@@ -28,6 +28,11 @@ accesskit = ["eframe/accesskit", "egui/accesskit"]
 # enabled through this crate's `accesskit` feature; NOTIF-11 wires the first shell
 # live-region consumer without forcing it onto headless/default builds.
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayland", "default_fonts"] }
+# Headless offscreen PNG capture (src/capture.rs): pollster blocks on wgpu async
+# init, image encodes the readback to PNG. wgpu/egui_wgpu come from eframe's
+# re-exports (the `wgpu` feature above), so no new graphics deps.
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 egui   = "0.31"
 serde  = { workspace = true }
 
