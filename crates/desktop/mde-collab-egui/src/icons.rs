@@ -272,14 +272,60 @@ pub fn icon_button(
     color: egui::Color32,
     hint: &str,
 ) -> egui::Response {
+    use mde_egui::{focus, Motion, Style};
+
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    // Every command control eases on the shared FAST tier (never a bespoke literal):
+    // a hover wash that squashes a hair under a press, and the 2px keyboard focus
+    // ring glowing in — each collapsing to its endpoint under reduce-motion (a11y-07).
+    let ctx = ui.ctx();
+    let hover = Motion::animate(
+        ctx,
+        response.id.with("hover"),
+        response.hovered(),
+        Motion::FAST,
+    );
+    let press = Motion::animate(
+        ctx,
+        response.id.with("press"),
+        response.is_pointer_button_down_on(),
+        Motion::FAST,
+    );
+    let focus = Motion::animate(
+        ctx,
+        response.id.with("focus"),
+        response.has_focus(),
+        Motion::FAST,
+    );
     if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let lift = Motion::hover_lift(hover);
+        if lift > 0.0 {
+            let plate = crate::anim::scale_about_center(rect, Motion::press_scale(press));
+            painter.rect_filled(
+                plate,
+                Style::RADIUS_S,
+                Style::SURFACE_HI.gamma_multiply(lift),
+            );
+        }
+        // The glyph tint snaps between the rest colour and the bright hover — a cached
+        // Carbon raster per tint, so the wash (not a per-frame re-raster) carries the
+        // motion, matching the shell's chrome-button idiom.
         let tint = if response.hovered() {
-            mde_egui::Style::TEXT_STRONG
+            Style::TEXT_STRONG
         } else {
             color
         };
-        let _ = mde_egui::carbon::paint_carbon(ui.painter(), rect, name, tint);
+        let _ = mde_egui::carbon::paint_carbon(painter, rect, name, tint);
+        let glow = Motion::focus_glow(focus);
+        if glow > 0.0 {
+            painter.rect_stroke(
+                rect.shrink(focus::FOCUS_RING_W / 2.0),
+                Style::RADIUS_S,
+                egui::Stroke::new(focus::FOCUS_RING_W, Style::ACCENT_HI.gamma_multiply(glow)),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
     response.on_hover_text(hint)
 }

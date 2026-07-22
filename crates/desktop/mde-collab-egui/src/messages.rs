@@ -55,8 +55,13 @@ impl CommunicationsSurface {
             .max_height((ui.available_height() - composer_h).max(Style::SP_XL))
             .show(ui, |ui| match data.conversation(space) {
                 Some(conv) if !conv.messages.is_empty() => {
-                    for msg in &conv.messages {
-                        self.message_row(ui, data, sink, space, msg);
+                    // A newly-appearing row fades up on the shared staggered list
+                    // entrance (lock #4) — only genuinely new event ids animate; a row
+                    // already on screen is settled at full opacity.
+                    for (i, msg) in conv.messages.iter().enumerate() {
+                        crate::anim::entrance(ui, "msg", msg.event_id, i, |ui| {
+                            self.message_row(ui, data, sink, space, msg);
+                        });
                         ui.add_space(Style::SP_XS);
                     }
                 }

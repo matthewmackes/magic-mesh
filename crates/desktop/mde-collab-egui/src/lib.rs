@@ -71,6 +71,7 @@
 
 mod activity;
 mod alerts;
+mod anim;
 mod calls;
 mod clipboard;
 mod data;
@@ -456,9 +457,15 @@ impl CommunicationsSurface {
             .frame(frame::bar_frame())
             .show_inside(ui, |ui| self.mode_tabs(ui));
 
+        // The mode body crossfades in on a switch (lock #4) rather than swapping
+        // instantly — a distance-independent fade on the shared Page tier, wrapped
+        // around the same per-mode body render.
+        let mode_slot = anim::mode_index(self.mode);
         egui::CentralPanel::default()
             .frame(frame::body_frame())
-            .show_inside(ui, |ui| self.mode_body(ui, data, sink));
+            .show_inside(ui, |ui| {
+                anim::switch_body(ui, mode_slot, |ui| self.mode_body(ui, data, sink));
+            });
     }
 
     /// The active mode's central body.

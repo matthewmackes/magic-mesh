@@ -64,25 +64,36 @@ impl CommunicationsSurface {
             .show(ui, |ui| {
                 for space in &directory.spaces {
                     let selected = self.selected_space() == Some(space.id);
-                    ui.horizontal(|ui| {
-                        let tint = if selected {
-                            Style::ACCENT
-                        } else {
-                            Style::TEXT_DIM
-                        };
-                        icons::icon(ui, icons::space_kind_icon(space.kind), Style::SP_M, tint);
-                        let name = egui::RichText::new(&space.name).color(if selected {
-                            Style::TEXT_STRONG
-                        } else {
-                            Style::TEXT
-                        });
-                        if ui.selectable_label(selected, name).clicked() {
-                            self.select_space(space.id);
-                        }
-                        if space.unread > 0 {
-                            unread_badge(ui, space.unread);
-                        }
-                    });
+                    let tint = if selected {
+                        Style::ACCENT
+                    } else {
+                        Style::TEXT_DIM
+                    };
+                    let name_color = if selected {
+                        Style::TEXT_STRONG
+                    } else {
+                        Style::TEXT
+                    };
+                    // The rail row wears the shared five-state chrome motion (hover
+                    // wash + press squash + selected tint + focus ring) instead of a
+                    // bare `selectable_label`; the wash spans the full rail width.
+                    let clicked = crate::anim::interactive_cell(
+                        ui,
+                        ("collab-rail", space.id),
+                        selected,
+                        true,
+                        |ui| {
+                            icons::icon(ui, icons::space_kind_icon(space.kind), Style::SP_M, tint);
+                            ui.label(egui::RichText::new(&space.name).color(name_color));
+                            if space.unread > 0 {
+                                unread_badge(ui, space.unread);
+                            }
+                        },
+                    )
+                    .clicked();
+                    if clicked {
+                        self.select_space(space.id);
+                    }
                 }
             });
     }
@@ -93,22 +104,31 @@ impl CommunicationsSurface {
         ui.horizontal(|ui| {
             for mode in Mode::TABS {
                 let selected = self.mode() == mode;
+                // Every mode is implemented, so the tint reads accent-when-selected
+                // else dim-but-live; the tab itself carries the shared hover / press /
+                // focus motion through the one interactive-cell helper.
                 let tint = if selected {
                     Style::ACCENT
-                } else if mode.is_implemented() {
-                    Style::TEXT_DIM
                 } else {
-                    Style::BORDER
+                    Style::TEXT_DIM
                 };
-                icons::icon(ui, icons::mode_icon(mode), Style::SP_M, tint);
-                let label = egui::RichText::new(mode.label()).color(if selected {
+                let label_color = if selected {
                     Style::TEXT_STRONG
-                } else if mode.is_implemented() {
-                    Style::TEXT
                 } else {
-                    Style::TEXT_DIM
-                });
-                if ui.selectable_label(selected, label).clicked() {
+                    Style::TEXT
+                };
+                let clicked = crate::anim::interactive_cell(
+                    ui,
+                    ("collab-tab", mode.label()),
+                    selected,
+                    false,
+                    |ui| {
+                        icons::icon(ui, icons::mode_icon(mode), Style::SP_M, tint);
+                        ui.label(egui::RichText::new(mode.label()).color(label_color));
+                    },
+                )
+                .clicked();
+                if clicked {
                     self.set_mode(mode);
                 }
                 ui.add_space(Style::SP_XS);
@@ -158,8 +178,12 @@ impl CommunicationsSurface {
                 }
                 return;
             }
-            for call in &calls {
-                self.call_row(ui, data, sink, call);
+            // A call appearing in the persistent bar fades up on the shared list
+            // entrance (lock #4) rather than popping in — the bar itself stays pinned.
+            for (i, call) in calls.iter().enumerate() {
+                crate::anim::entrance(ui, "call", call.call, i, |ui| {
+                    self.call_row(ui, data, sink, call);
+                });
             }
         });
     }
