@@ -422,6 +422,7 @@ impl MapsLocationSurface {
             telemetry.odometer_mi = telem.odometer_mi;
         }
         telemetry.runtime_min = telem.runtime_min;
+        telemetry.internal_temp_c = Some(telem.internal_temp_c);
         telemetry.confidence = if v.online {
             format!(
                 "live vehicle-gateway mirror ({} {})",
@@ -2244,6 +2245,7 @@ impl VehicleState {
                 moving: true,
                 odometer_mi: Some(78_214),
                 runtime_min: 42,
+                internal_temp_c: None,
                 confidence: "simulated CAN/OBD profile".to_string(),
                 last_update_age_s: 0.8,
             },
@@ -2278,6 +2280,10 @@ pub struct VehicleTelemetry {
     pub odometer_mi: Option<u32>,
     /// Runtime.
     pub runtime_min: u32,
+    /// Gateway MCU board temperature, `Celsius` (Rolling Node — from the
+    /// `state/vehicle/<node>` mirror's `VehicleTelem::internal_temp_c`;
+    /// `None` in simulator mode, which has no MCU to sample).
+    pub internal_temp_c: Option<f32>,
     /// Confidence label.
     pub confidence: String,
     /// Last update age.

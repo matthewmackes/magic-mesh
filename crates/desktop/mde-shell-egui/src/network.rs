@@ -22,23 +22,36 @@
 //! * **Routing & reachability** — the lighthouse public endpoints
 //!   (`gateway_endpoints`), the overlay-routable subnets (`routes`), and the
 //!   node's `default_gw`, when the snapshot carries them.
+//! * **Vehicle gateways** — the multi-WAN uplink of any node running as a
+//!   Rolling Node vehicle gateway: folded from every `state/vehicle/<node>`
+//!   mirror on the Bus (arch-11 [`BusReader`](crate::bus_reader::BusReader)
+//!   seam, latest-wins), NOT the mesh-status snapshot. Renders the active WAN,
+//!   both cellular modems (carrier, signal, technology, SIM, WAN IP, health),
+//!   and the uplink's failover/latency/loss/quality reality. Nodes that aren't
+//!   vehicle gateways publish no such mirror, so the section is simply absent.
 //!
 //! What this surface honestly **cannot** show: live per-link throughput, latency,
-//! or per-tunnel handshake state. Those aren't in the world-readable snapshot —
-//! they're live Nebula tunnel telemetry, and §6 keeps the shell off that path.
-//! The panel renders an explicit "not published to this surface" note rather than
-//! a fabricated gauge (§7), exactly as This Node did for CPU / memory / disk.
+//! or per-tunnel handshake state on the Nebula overlay. Those aren't in the
+//! world-readable snapshot — they're live Nebula tunnel telemetry, and §6 keeps
+//! the shell off that path. The panel renders an explicit "not published to this
+//! surface" note rather than a fabricated gauge (§7), exactly as This Node did
+//! for CPU / memory / disk. The vehicle-gateway WAN card is a genuinely separate
+//! read (the mirror itself carries real latency/loss numbers) and never invents
+//! a throughput figure the mirror doesn't report.
 //!
 //! `project` is pure (no IO, no egui, no GPU), so it's unit-tested directly; the
-//! only IO is the snapshot read in [`NetworkState::poll`].
+//! IO is the snapshot read + the vehicle-mirror fold, both in [`NetworkState::poll`].
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::vehicle::{CellLink, VehicleState, VEHICLE_STATE_PREFIX};
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::Style;
 
 use serde_json::Value;
+
+use crate::bus_reader::BusReader;
 
 /// The world-readable mesh-status snapshot — the same source the chrome bar +
 /// This Node plane read (the desktop user can't read the root-only replicated
@@ -281,10 +294,18 @@ pub(crate) struct NetworkState {
     /// This node's locally-resolved hostname — the fallback `self` when the
     /// snapshot omits it (resolved once).
     local_host: String,
+    /// The desktop-client Bus spool root (resolved once) — the read path for
+    /// the per-node `state/vehicle/<node>` vehicle-gateway mirrors.
+    bus_root: Option<PathBuf>,
     /// The latest projection. Unseen until the first snapshot lands (drives the
     /// connecting state).
     status: NetStatus,
-    /// When the snapshot was last polled (drives the fixed cadence).
+    /// Every live `state/vehicle/<node>` mirror, sorted by host — one row per
+    /// node currently publishing a vehicle-gateway uplink. Empty when no node
+    /// on the mesh is a vehicle gateway (the honest common case).
+    vehicles: Vec<VehicleState>,
+    /// When the snapshot + vehicle mirrors were last polled (drives the fixed
+    /// cadence).
     last_poll: Option<Instant>,
 }
 
@@ -293,7 +314,9 @@ impl Default for NetworkState {
         Self {
             snapshot_path: PathBuf::from(SNAPSHOT_PATH),
             local_host: local_hostname(),
+            bus_root: mde_bus::client_data_dir(),
             status: NetStatus::default(),
+            vehicles: Vec::new(),
             last_poll: None,
         }
     }
@@ -311,14 +334,37 @@ impl NetworkState {
             self.last_poll = Some(Instant::now());
             let snapshot = std::fs::read_to_string(&self.snapshot_path).unwrap_or_default();
             self.status = NetStatus::project(&snapshot, &self.local_host);
+            self.vehicles = read_vehicle_mirrors(self.bus_root.clone());
         }
         ctx.request_repaint_after(REFRESH);
     }
 
     /// Render the plane's live content into `ui`.
     pub(crate) fn show(&self, ui: &mut egui::Ui) {
-        show_status(ui, &self.status);
+        show_status(ui, &self.status, &self.vehicles);
     }
+}
+
+/// Fold every `state/vehicle/<node>` mirror on the Bus into a stable,
+/// host-sorted list — one row per node currently publishing a vehicle-gateway
+/// uplink. Read-only (arch-11 [`BusReader`] seam, latest-wins per topic); a
+/// missing/unopenable spool or a mesh with no vehicle gateway yields the
+/// honest empty list, never a panic and never a fabricated row.
+fn read_vehicle_mirrors(bus_root: Option<PathBuf>) -> Vec<VehicleState> {
+    let Some(persist) = BusReader::new(bus_root).open() else {
+        return Vec::new();
+    };
+    let topics = persist.list_topics().unwrap_or_default();
+    let mut vehicles: Vec<VehicleState> = topics
+        .iter()
+        .filter(|t| t.starts_with(VEHICLE_STATE_PREFIX))
+        .filter_map(|t| {
+            let body = persist.read_latest(t).ok().flatten()?.body?;
+            serde_json::from_str::<VehicleState>(&body).ok()
+        })
+        .collect();
+    vehicles.sort_by(|a, b| a.host.cmp(&b.host));
+    vehicles
 }
 
 /// The local hostname — `$HOSTNAME` → `/proc/sys/kernel/hostname` (what the
@@ -345,9 +391,9 @@ fn local_hostname() -> String {
 // ──────────────────────────── render ────────────────────────────
 
 /// Render the mesh network's live status: the connecting state before the first
-/// snapshot, else the overlay / links / services / routing cards over an honest
-/// telemetry note.
-fn show_status(ui: &mut egui::Ui, status: &NetStatus) {
+/// snapshot, else the overlay / links / services / routing cards, the vehicle-
+/// gateway WAN card (when any node publishes one), over an honest telemetry note.
+fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState]) {
     if !status.seen {
         ui.add_space(Style::SP_S);
         ui.colored_label(Style::TEXT_DIM, "Reading the mesh network status…");
@@ -392,6 +438,20 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus) {
             );
             ui.group(|ui| show_routing(ui, status));
             ui.add_space(Style::SP_S);
+
+            // Vehicle gateways — folded from the `state/vehicle/<node>` Bus
+            // mirrors, NOT the mesh-status snapshot. A mesh with no vehicle
+            // gateway publishes nothing here, so the section is simply absent
+            // rather than a permanent empty card (§7).
+            if !vehicles.is_empty() {
+                ui.label(
+                    RichText::new("Vehicle gateways")
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL),
+                );
+                ui.group(|ui| show_vehicle_gateways(ui, vehicles));
+                ui.add_space(Style::SP_S);
+            }
 
             // Honest boundary (§6/§7): live per-link tunnel telemetry isn't on this
             // world-readable surface — never fake a gauge.
@@ -580,9 +640,226 @@ fn show_routing(ui: &mut egui::Ui, status: &NetStatus) {
     }
 }
 
+/// The vehicle-gateway card: one block per node publishing a `state/vehicle/*`
+/// mirror, separated by a hairline when more than one Rolling Node rides the
+/// mesh.
+fn show_vehicle_gateways(ui: &mut egui::Ui, vehicles: &[VehicleState]) {
+    for (i, vehicle) in vehicles.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(Style::SP_S);
+            ui.separator();
+            ui.add_space(Style::SP_S);
+        }
+        show_vehicle_wan(ui, vehicle);
+    }
+}
+
+/// One vehicle gateway's multi-WAN uplink: the gateway identity + online dot,
+/// the active WAN, both cellular modems, the failover/latency/loss/quality
+/// reality, and any honest gap the adapter noted. Every value here is exactly
+/// what the `state/vehicle/<node>` mirror carries — no throughput or telemetry
+/// this surface doesn't actually have is ever fabricated (§7).
+fn show_vehicle_wan(ui: &mut egui::Ui, vehicle: &VehicleState) {
+    ui.horizontal(|ui| {
+        let dot = if vehicle.online {
+            Style::OK
+        } else {
+            Style::DANGER
+        };
+        ui.label(RichText::new(DOT).color(dot).size(Style::SMALL));
+        ui.add_space(Style::SP_XS);
+        let label = if vehicle.model.is_empty() {
+            vehicle.host.clone()
+        } else {
+            format!("{} \u{00B7} {}", vehicle.host, vehicle.model)
+        };
+        ui.label(
+            RichText::new(label)
+                .color(Style::TEXT)
+                .size(Style::BODY)
+                .strong(),
+        );
+        if !vehicle.online {
+            ui.add_space(Style::SP_S);
+            ui.colored_label(Style::DANGER, RichText::new("offline").size(Style::SMALL));
+        }
+    });
+    ui.add_space(Style::SP_XS);
+
+    mde_egui::field(
+        ui,
+        "Active WAN",
+        empty_dash(&vehicle.wan.active_wan),
+        if vehicle.wan.active_wan.is_empty() {
+            Style::TEXT_DIM
+        } else {
+            Style::TEXT
+        },
+    );
+
+    show_cell_link(ui, "Cellular A", &vehicle.wan.cellular_a);
+    show_cell_link(ui, "Cellular B", &vehicle.wan.cellular_b);
+
+    if !vehicle.wan.wifi_state.is_empty() {
+        mde_egui::field(ui, "Wi-Fi WAN", &vehicle.wan.wifi_state, Style::TEXT);
+    }
+    if !vehicle.wan.ethernet_state.is_empty() {
+        mde_egui::field(ui, "Ethernet WAN", &vehicle.wan.ethernet_state, Style::TEXT);
+    }
+    if !vehicle.wan.vpn_state.is_empty() {
+        mde_egui::field(ui, "VPN", &vehicle.wan.vpn_state, Style::TEXT);
+    }
+
+    mde_egui::field(
+        ui,
+        "Failover events",
+        &vehicle.wan.failover_events.to_string(),
+        if vehicle.wan.failover_events == 0 {
+            Style::TEXT_DIM
+        } else {
+            Style::WARN
+        },
+    );
+    mde_egui::field(
+        ui,
+        "Latency",
+        &format!("{} ms", vehicle.wan.latency_ms),
+        Style::TEXT,
+    );
+    mde_egui::field(
+        ui,
+        "Packet loss",
+        &format!("{:.1}%", vehicle.wan.packet_loss_percent),
+        if vehicle.wan.packet_loss_percent > 0.0 {
+            Style::WARN
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    mde_egui::field(
+        ui,
+        "Link quality",
+        empty_dash(&vehicle.wan.link_quality),
+        Style::TEXT,
+    );
+
+    if !vehicle.gaps.is_empty() {
+        ui.add_space(Style::SP_XS);
+        mde_egui::muted_note(ui, format!("Not reported: {}", vehicle.gaps.join(", ")));
+    }
+}
+
+/// One cellular modem sub-block: carrier, a quantized signal-bar glyph beside
+/// the raw dBm, technology, SIM state, WAN IP, and a health dot. A modem the
+/// adapter never reported (SIM state / carrier / WAN IP all empty) renders
+/// nothing — the honest "this gateway doesn't have a second modem" case, not a
+/// fake all-zero row.
+fn show_cell_link(ui: &mut egui::Ui, label: &str, link: &CellLink) {
+    if link.sim_state.is_empty() && link.carrier.is_empty() && link.wan_ip.is_empty() {
+        return;
+    }
+
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .color(Style::TEXT)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        let (dot, word, tone) = if link.healthy {
+            (Style::OK, "healthy", Style::TEXT_DIM)
+        } else {
+            (Style::TEXT_DIM, "unhealthy", Style::WARN)
+        };
+        mde_egui::status_dot(ui, dot);
+        ui.add_space(Style::SP_XS);
+        ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+    });
+
+    mde_egui::field(ui, "Carrier", empty_dash(&link.carrier), Style::TEXT);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Signal")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        if link.sim_state == "ready" {
+            show_signal_bars(ui, link.signal_dbm);
+            ui.add_space(Style::SP_XS);
+        }
+        ui.colored_label(
+            Style::TEXT,
+            RichText::new(format!("{} dBm", link.signal_dbm)).size(Style::SMALL),
+        );
+    });
+    mde_egui::field(
+        ui,
+        "Technology",
+        empty_dash(&link.technology),
+        Style::ACCENT,
+    );
+    mde_egui::field(ui, "SIM", empty_dash(&link.sim_state), Style::TEXT_DIM);
+    mde_egui::field(ui, "WAN IP", empty_dash(&link.wan_ip), Style::TEXT_DIM);
+}
+
+/// Quantize a reported dBm into a 4-bar cellular-signal glyph (a standard
+/// RSSI/RSRP rule-of-thumb banding) and paint it as filled/hollow dots toned by
+/// strength. Purely a visual bucketing of the real `signal_dbm` the mirror
+/// carries — the raw number is always rendered alongside it, never replaced.
+fn show_signal_bars(ui: &mut egui::Ui, dbm: i32) {
+    let filled = signal_bar_count(dbm);
+    let tone = match filled {
+        3..=4 => Style::OK,
+        1..=2 => Style::WARN,
+        _ => Style::DANGER,
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        for i in 0..4u8 {
+            if i < filled {
+                ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+            } else {
+                ui.label(
+                    RichText::new("\u{25CB}")
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL),
+                );
+            }
+        }
+    });
+}
+
+/// Band a cellular dBm reading into a 0–4 bar count (excellent ⇒ 4 … no signal
+/// ⇒ 0), the same rough RSSI thresholds most cellular UIs use. Pure so it's
+/// unit-tested directly.
+fn signal_bar_count(dbm: i32) -> u8 {
+    match dbm {
+        d if d >= -70 => 4,
+        d if d >= -85 => 3,
+        d if d >= -100 => 2,
+        d if d >= -110 => 1,
+        _ => 0,
+    }
+}
+
+/// `"—"` for an empty string, else the string itself — the shared "field with
+/// an honest empty fallback" idiom this module already used inline for the
+/// overlay IP; named here since the vehicle card needs it repeatedly.
+fn empty_dash(s: &str) -> &str {
+    if s.is_empty() {
+        "\u{2014}"
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::vehicle::WanStatus;
     use mde_egui::egui::{pos2, vec2, Rect};
 
     /// A faithful mesh-status snapshot: `self` + a `nodes` directory (this node plus
@@ -618,10 +895,55 @@ mod tests {
         )
     }
 
+    /// A vehicle-gateway mirror fixture — a fully-populated Rolling Node uplink
+    /// (both cellular modems reporting, one healthy on a live signal, one
+    /// SIM-absent) so a single fixture exercises every WanStatus field this
+    /// card renders.
+    fn vehicle_fixture(host: &str) -> VehicleState {
+        VehicleState {
+            host: host.to_string(),
+            model: "MG90".to_string(),
+            esn: "MG90-0001".to_string(),
+            mgos_version: "4.3.0.1".to_string(),
+            online: true,
+            gps: mackes_mesh_types::vehicle::GpsFix::default(),
+            imu: None,
+            wan: WanStatus {
+                active_wan: "Cellular A".to_string(),
+                cellular_a: CellLink {
+                    sim_state: "ready".to_string(),
+                    carrier: "T-Mobile".to_string(),
+                    signal_dbm: -72,
+                    technology: "LTE-A".to_string(),
+                    wan_ip: "10.64.0.12".to_string(),
+                    healthy: true,
+                },
+                cellular_b: CellLink {
+                    sim_state: "absent".to_string(),
+                    carrier: String::new(),
+                    signal_dbm: 0,
+                    technology: String::new(),
+                    wan_ip: "not active".to_string(),
+                    healthy: false,
+                },
+                wifi_state: String::new(),
+                ethernet_state: String::new(),
+                vpn_state: "up".to_string(),
+                failover_events: 2,
+                latency_ms: 48,
+                packet_loss_percent: 1.5,
+                link_quality: "good".to_string(),
+            },
+            telem: mackes_mesh_types::vehicle::VehicleTelem::default(),
+            gaps: vec!["IMU not present on this gateway".to_string()],
+            published_at_ms: 1_000_000,
+        }
+    }
+
     /// Drive one headless 960×640 frame of `show_status` and tessellate it on the
     /// CPU — the same `Context::run` → `tessellate` path the DRM runner drives minus
     /// the GPU. Returns whether it produced any draw primitives.
-    fn renders(status: &NetStatus) -> bool {
+    fn renders(status: &NetStatus, vehicles: &[VehicleState]) -> bool {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -629,7 +951,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_status(ui, status));
+            egui::CentralPanel::default().show(ctx, |ui| show_status(ui, status, vehicles));
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
     }
@@ -640,7 +962,7 @@ mod tests {
         assert!(!s.seen, "the pre-read status is unseen (connecting)");
         // Even the connecting state is a full paint path, never a blank panel.
         assert!(
-            renders(&s),
+            renders(&s, &[]),
             "the connecting state produced no draw primitives"
         );
     }
@@ -708,9 +1030,10 @@ mod tests {
         );
         assert_eq!(s.default_gw.as_deref(), Some("192.168.1.1"));
 
-        // And the whole live panel tessellates.
+        // And the whole live panel tessellates, with a vehicle-gateway mirror
+        // present so that card's paint path is covered too.
         assert!(
-            renders(&s),
+            renders(&s, std::slice::from_ref(&vehicle_fixture("rig-1"))),
             "the live Network panel produced no draw primitives"
         );
     }
@@ -719,7 +1042,7 @@ mod tests {
     fn leader_chip_identifies_this_node_when_it_holds_the_lease() {
         let s = NetStatus::project(&snapshot("this-node", "this-node"), "fallback");
         assert!(s.is_leader(), "this node holds the leader lease");
-        assert!(renders(&s));
+        assert!(renders(&s, &[]));
     }
 
     #[test]
@@ -757,7 +1080,10 @@ mod tests {
         assert_eq!(s.peers_total(), 1, "the peer link still renders");
         // Overlay IP still folds from this node's own directory row.
         assert_eq!(s.overlay_ip.as_deref(), Some("10.42.0.7"));
-        assert!(renders(&s), "the honest-partial panel still fully paints");
+        assert!(
+            renders(&s, &[]),
+            "the honest-partial panel still fully paints"
+        );
     }
 
     #[test]
@@ -765,6 +1091,138 @@ mod tests {
         let st = NetworkState::default();
         assert_eq!(st.snapshot_path, PathBuf::from(SNAPSHOT_PATH));
         assert!(!st.status.seen);
+        assert!(
+            st.vehicles.is_empty(),
+            "no vehicle mirrors before the first poll"
+        );
         assert!(st.last_poll.is_none());
+    }
+
+    // ──────────────────────── vehicle-gateway WAN card ─────────────────────
+
+    #[test]
+    fn signal_bar_count_bands_dbm_into_zero_to_four() {
+        assert_eq!(signal_bar_count(-50), 4, "strong signal ⇒ full bars");
+        assert_eq!(
+            signal_bar_count(-70),
+            4,
+            "the excellent threshold is inclusive"
+        );
+        assert_eq!(signal_bar_count(-84), 3);
+        assert_eq!(signal_bar_count(-99), 2);
+        assert_eq!(signal_bar_count(-109), 1);
+        assert_eq!(signal_bar_count(-120), 0, "very weak ⇒ no bars");
+    }
+
+    #[test]
+    fn empty_dash_falls_back_for_an_empty_string() {
+        assert_eq!(empty_dash(""), "\u{2014}");
+        assert_eq!(empty_dash("Cellular A"), "Cellular A");
+    }
+
+    #[test]
+    fn read_vehicle_mirrors_is_empty_without_a_spool() {
+        assert!(
+            read_vehicle_mirrors(None).is_empty(),
+            "no configured Bus root ⇒ the honest empty list"
+        );
+    }
+
+    #[test]
+    fn read_vehicle_mirrors_folds_the_prefix_latest_wins_and_sorted_by_host() {
+        use mde_bus::hooks::config::Priority;
+        use mde_bus::persist::Persist;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let persist = Persist::open(root.clone()).unwrap();
+
+        // Two publishes on the SAME node's topic — the newer one must win.
+        let mut stale = vehicle_fixture("zeta");
+        stale.wan.active_wan = "Cellular B".to_string();
+        persist
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("zeta"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&stale).unwrap()),
+            )
+            .unwrap();
+        let mut fresh = vehicle_fixture("zeta");
+        fresh.wan.active_wan = "Cellular A".to_string();
+        persist
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("zeta"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&fresh).unwrap()),
+            )
+            .unwrap();
+
+        // A second node's mirror.
+        persist
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("alpha"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&vehicle_fixture("alpha")).unwrap()),
+            )
+            .unwrap();
+
+        // A non-vehicle topic must never leak into the fold.
+        persist
+            .write("state/services/zeta", Priority::Default, None, Some("{}"))
+            .unwrap();
+
+        let vehicles = read_vehicle_mirrors(Some(root));
+        assert_eq!(
+            vehicles.len(),
+            2,
+            "one row per node; the non-vehicle topic is excluded"
+        );
+        assert_eq!(vehicles[0].host, "alpha", "host-sorted, stable order");
+        assert_eq!(vehicles[1].host, "zeta");
+        assert_eq!(
+            vehicles[1].wan.active_wan, "Cellular A",
+            "the newest message on the node's topic wins (latest-wins mirror)"
+        );
+    }
+
+    #[test]
+    fn show_cell_link_skips_an_unreported_modem_slot() {
+        // A CellLink the adapter never populated (single-modem gateway's second
+        // slot) must not render as a fake all-zero row.
+        let link = CellLink::default();
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0))),
+            ..Default::default()
+        };
+        let mut painted_anything = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let before = ui.next_widget_position();
+                show_cell_link(ui, "Cellular B", &link);
+                painted_anything = ui.next_widget_position() != before;
+            });
+        });
+        assert!(
+            !painted_anything,
+            "an unreported modem slot renders nothing"
+        );
+    }
+
+    #[test]
+    fn vehicle_gateway_section_paints_when_a_mirror_is_present() {
+        // A seen (non-connecting) status is required for any card to render —
+        // the connecting state short-circuits before the section gate.
+        let s = NetStatus::project(&snapshot("this-node", "this-node"), "fallback");
+        assert!(s.seen);
+        let vehicles = vec![vehicle_fixture("rig-1")];
+        assert!(
+            renders(&s, &vehicles),
+            "the vehicle-gateway card produced no draw primitives"
+        );
     }
 }

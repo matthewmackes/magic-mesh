@@ -11,6 +11,7 @@ use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
 use mackes_mesh_types::device_inventory::{
     self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
+use mackes_mesh_types::vehicle::{CellLink, GpsFix, VehicleState, VehicleTelem, WanStatus};
 use mde_egui::menubar::{Entry, Menu};
 use mde_egui::{egui, ChipTone, Density, Style, StyleColorScheme};
 use std::collections::BTreeSet;
@@ -1759,8 +1760,8 @@ fn by_node_renders_the_fleet_even_when_the_selected_host_is_absent() {
 // ── DEVMGR-11: the non-PC host types (#6/#22) ─────────────────────────────
 
 use super::{
-    lan_host, merge_rail, nova_host, phone_host, router_host, CloudDetailMirror, ExtrasMirror,
-    HostKind, PhoneMirror, RouterMirror, UnitKindMirror, UnitMirror,
+    lan_host, merge_rail, nova_host, phone_host, router_host, vehicle_host, CloudDetailMirror,
+    ExtrasMirror, HostKind, PhoneMirror, RouterMirror, UnitKindMirror, UnitMirror,
 };
 
 /// A Nova instance unit as the `state/units` mirror reports it (EXPLORER-9
@@ -1994,6 +1995,110 @@ fn a_router_maps_to_network_system_firmware_and_gates_what_it_cannot_read() {
         .contains("no router credential"));
 }
 
+/// A healthy Rolling Node vehicle-gateway mirror (Phase 3a): online, an
+/// active cellular WAN, and a held GNSS fix.
+fn vehicle_fixture() -> VehicleState {
+    VehicleState {
+        host: "rig-1".into(),
+        model: "MG90".into(),
+        esn: "MG90-000123".into(),
+        mgos_version: "4.3.0.1".into(),
+        online: true,
+        gps: GpsFix {
+            fix_type: "gps".into(),
+            latitude: 32.167_998,
+            longitude: -95.849_240,
+            altitude_m: 81.94,
+            hdop: 1.2,
+            satellites: 9,
+            speed_mph: 42.0,
+            heading_deg: 180.0,
+            age_s: 1.0,
+            update_rate_hz: 1.0,
+        },
+        imu: None,
+        wan: WanStatus {
+            active_wan: "Cellular A".into(),
+            cellular_a: CellLink {
+                sim_state: "ready".into(),
+                carrier: "Verizon".into(),
+                signal_dbm: -72,
+                technology: "LTE".into(),
+                wan_ip: "10.1.2.3".into(),
+                healthy: true,
+            },
+            cellular_b: CellLink::default(),
+            wifi_state: String::new(),
+            ethernet_state: String::new(),
+            vpn_state: String::new(),
+            failover_events: 0,
+            latency_ms: 40,
+            packet_loss_percent: 0.0,
+            link_quality: "good".into(),
+        },
+        telem: VehicleTelem::default(),
+        gaps: Vec::new(),
+        published_at_ms: 1_720_000_000_000,
+    }
+}
+
+#[test]
+fn a_vehicle_gateway_maps_to_system_network_sensors_off_its_own_mirror() {
+    // #22 — "vehicle → System/Network/Sensors": the gateway mirror always
+    // carries model/ESN/firmware (System); an online gateway with an active
+    // cellular WAN adds Network; a held GNSS fix adds Sensors.
+    let h = vehicle_host(&vehicle_fixture());
+    assert_eq!(h.kind, HostKind::Vehicle);
+    assert_eq!(h.key, "vehicle:rig-1");
+    assert_eq!(h.inventory.host, "rig-1");
+    let keys: Vec<&str> = h
+        .inventory
+        .categories
+        .iter()
+        .map(|c| c.key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["system", category::NETWORK_ADAPTERS, category::SENSORS]
+    );
+    let sys = &h.inventory.categories[0].devices[0];
+    assert!(sys.name.contains("MG90"));
+    assert!(sys.events.iter().any(|e| e == "ESN MG90-000123"));
+    assert!(sys.events.iter().any(|e| e.contains("firmware")));
+    let nic = &h.inventory.categories[1].devices[0];
+    assert_eq!(nic.vendor.as_deref(), Some("Verizon"));
+    assert!(nic.events.iter().any(|e| e.contains("-72 dBm")));
+    assert!(nic.events.iter().any(|e| e == "WAN IP 10.1.2.3"));
+    let gps = &h.inventory.categories[2].devices[0];
+    assert!(gps.events.iter().any(|e| e.contains("32.16")));
+    for c in &h.inventory.categories {
+        assert!(!c.devices.is_empty(), "never an empty category (#22)");
+    }
+}
+
+#[test]
+fn an_offline_vehicle_gateway_shows_only_system_and_says_why() {
+    // §7 — unreachable ⇒ WAN + Sensors are absent (not fabricated); System
+    // still shows with the unreachable status; the note names the gap.
+    let mut v = vehicle_fixture();
+    v.online = false;
+    v.gaps = vec!["OBD bus not responding".to_string()];
+    let h = vehicle_host(&v);
+    let keys: Vec<&str> = h
+        .inventory
+        .categories
+        .iter()
+        .map(|c| c.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["system"], "never a fabricated WAN/Sensors tree");
+    let sys = &h.inventory.categories[0].devices[0];
+    assert_eq!(sys.status, DeviceStatus::Unknown);
+    assert_eq!(sys.problem.as_deref(), Some("gateway unreachable"));
+    let note = h.note.as_deref().unwrap();
+    assert!(note.contains("unreachable"));
+    assert!(note.contains("OBD bus not responding"));
+}
+
 #[test]
 fn the_rail_groups_host_kinds_in_order_with_collision_proof_keys() {
     // #6 — the rail = mesh nodes first (local pinned), then Cloud → Phones →
@@ -2117,6 +2222,17 @@ fn refresh_folds_every_non_pc_source_and_selecting_one_loads_its_tree() {
             Some(&body),
         )
         .unwrap();
+    // The vehicle-gateway mirror (Rolling Node Phase 3a) — its own Bus topic,
+    // per node, decoded straight into the real wire type.
+    let vehicle_body = serde_json::to_string(&vehicle_fixture()).unwrap();
+    persist
+        .write(
+            "state/vehicle/rig-1",
+            Priority::Default,
+            None,
+            Some(&vehicle_body),
+        )
+        .unwrap();
 
     let mut s = state_with(None, false);
     s.workgroup_root = scratch.path().to_path_buf();
@@ -2129,6 +2245,7 @@ fn refresh_folds_every_non_pc_source_and_selecting_one_loads_its_tree() {
     assert_eq!(kind_of("phone:abc123"), Some(HostKind::Phone));
     assert_eq!(kind_of("lan:192.168.1.50"), Some(HostKind::Lan));
     assert_eq!(kind_of("router:aa:bb:cc:dd:ee:ff"), Some(HostKind::Router));
+    assert_eq!(kind_of("vehicle:rig-1"), Some(HostKind::Vehicle));
     assert_eq!(
         kind_of("peer:eagle"),
         None,
@@ -2150,6 +2267,17 @@ fn refresh_folds_every_non_pc_source_and_selecting_one_loads_its_tree() {
     assert_eq!(inv.host, "Pixel 8");
     assert_eq!(inv.categories[0].key, "radios");
     assert!(drive(&mut s) > 0, "the phone tree renders headless");
+
+    // Selecting the vehicle gateway loads its System/Network/Sensors tree off
+    // the real `state/vehicle/<node>` mirror (Rolling Node Phase 3a).
+    s.select_host("vehicle:rig-1".to_string());
+    let inv = s.inventory.as_ref().unwrap();
+    assert_eq!(inv.host, "rig-1");
+    assert_eq!(inv.categories[0].key, "system");
+    assert!(
+        drive(&mut s) > 0,
+        "the vehicle-gateway tree renders headless"
+    );
 }
 
 #[test]
@@ -2163,6 +2291,7 @@ fn non_pc_hosts_never_take_a_privileged_device_op() {
         HostKind::Phone,
         HostKind::Lan,
         HostKind::Router,
+        HostKind::Vehicle,
     ] {
         assert!(!kind.controllable(), "{kind:?} must not take device ops");
     }
