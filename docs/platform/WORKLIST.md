@@ -655,6 +655,49 @@ These decisions refine acceptance and sequencing for the active items below.
   (plan help-me-plan-new-hazy-muffin.md; research workflow wf_6731d411-455;
   operator rulings: external-feeds emphasis, vehicle lens, zero-cost only).
 
+### WL-FUNC-013 - Maps & Location world-class + built-for-purpose (offline basemap, geocoding, sparse-data honesty, mode-button)
+
+- Status: Remaining (in progress 2026-07-22)
+- Priority: P1
+- Complexity: Epic
+- Problem: The Maps & Location cockpit reads as FAKE DATA - the simulator fixture
+  (a hard-coded Pittsburgh fix + fabricated turn-by-turn to "patrol staging") renders
+  as real with no "simulated" marker in Car Mode; unfixed-GPS/absent-signal tiles show
+  `0.0000` coords + fabricated accuracy + a `bars(0)==5` full-signal bug; the map is a
+  synthetic procedural scene with no real tiles ("do not look real"); there is no
+  free-text address entry (only preset destinations + a dead geocoder abstraction);
+  and the shell layout-mode button does not visibly switch modes (single-tap only opens
+  a menu, misleading MapsLocation glyph, corner-collision with the maps FABs).
+- Required outcome: The cockpit reads as a real automotive nav head-unit - sparse-but-real
+  MG90 data presented honestly ("Acquiring GPS" / "-", never fabricated zeros); a real
+  OFFLINE raster basemap (MBTiles -> egui texture, per the egui_glow/GLES seat constraint
+  = raster, NEVER wgpu-vector); free-text address entry + an OFFLINE FTS5 gazetteer
+  geocoder; and a labeled single-tap Car<->Desktop mode toggle.
+- Plan: docs/design/maps-worldclass-plan.md (2026-07-22 scope report: root-cause analysis,
+  GLES raster constraint, P0-P3 units, in-tree reusable seams rusqlite/image/carbon_texture).
+- Progress (2026-07-22): Advanced-menu progressive-disclosure nav + floating action cluster
+  LANDED (`08086639`); P0 sparse-data honesty pass LANDED (`8b91003c` - has_fix gating,
+  bars() fix, idle Drive HUD, un-hideable "SIMULATED" badge, primary source "acquiring" not
+  fake-Pittsburgh; 70/0 tests). IN FLIGHT: P0 mode-button (shell toggle), the offline DATA
+  build (East-TX gazetteer 16,645 rows built + raster MBTiles building - free OSM on the
+  internet-connected control host, bundled to the airgapped seat), and the P1/P2 maps code
+  (address entry + FTS5 geocoder + raster basemap renderer).
+- Relevant files: `crates/desktop/mde-maps-location-egui/` (car_status.rs, view.rs
+  paint_map_scene/show_map, model.rs), `crates/desktop/mde-shell-egui/src/main.rs`
+  (layout-mode control), a new `basemap` module + the seat's `client_data_dir/maps/<region>/`
+  data pack.
+- Dependencies: `state/vehicle/<node>` (Rolling Node MG90) for the live fix; the
+  coordinator's outbound internet to BUILD the offline pack (seats airgapped - build here,
+  bundle to seat); operator "zero cost" rule (2026-07-22) = free OSM only, no paid map/geocode APIs.
+- Coordinates with WL-FUNC-012 (Maps live-data overlays, same surface): the overlays' radar-tile
+  unit shares this epic's P2 raster-tile lane; overlay paint hooks serialize behind this
+  P0/P1 view.rs/model.rs pipeline per the serialize-same-file rule.
+- Verification: farm-green per-crate gates + subset-of-base for the shell tests; live `.15`
+  deploy (shell + data pack) + operator visual signoff (Advanced menu, floating buttons,
+  honest sparse data, real basemap, working address search, working mode toggle).
+- Origin: operator goal "Maps and Location should match world class interfaces, and be
+  built for purpose" + operator directives (Advanced menu; floating buttons; "solve all") 2026-07-22.
+
 ## User Interface And Experience
 
 ## Performance
