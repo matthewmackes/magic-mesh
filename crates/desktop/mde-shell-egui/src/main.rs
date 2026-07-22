@@ -131,12 +131,20 @@ const WORKBENCH_POLL_STAGGER: [Duration; 7] = [
     Duration::from_millis(4200),
 ];
 const MENU_BAR_MINIMIZE_DURATION: Duration = Duration::from_millis(180);
-const LAYOUT_MODE_HOLD: Duration = Duration::from_secs(5);
+/// A discoverable long-press (the platform touch convention, matching
+/// `mde_egui::gestures::GestureConfig` default) reveals the full three-way
+/// picker; the old 5-second hold was undiscoverable.
+const LAYOUT_MODE_HOLD: Duration = Duration::from_millis(500);
 const LAYOUT_MODE_BUTTON_WORKSTATION: f32 = 44.0;
 const LAYOUT_MODE_BUTTON_TOUCH: f32 = 56.0;
 const LAYOUT_MODE_MENU_W: f32 = Style::SP_XL * 8.0;
 const LAYOUT_MODE_ROW_H: f32 = 56.0;
 const LAYOUT_MODE_GAP: f32 = Style::SP_S;
+/// Vertical lift for the lower-LEFT mode toggle so it clears the Car-HUD's
+/// bottom-left speedometer band (≈ margin + an 88pt gauge). Combined with the
+/// left-edge anchor this keeps the shell mode button clear of both the maps
+/// Drive-HUD FAB cluster (lower-RIGHT edge) and the speedometer (P0 de-conflict).
+const LAYOUT_MODE_HUD_CLEARANCE: f32 = Style::SP_XL * 3.0;
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
@@ -218,6 +226,10 @@ fn menu_bar_shuffle_paint_order(
 struct LayoutModeControl {
     hold_started: Option<Instant>,
     menu_open: bool,
+    /// Set while a long-press has already fired the three-way picker, so the
+    /// pointer-release that ends the hold does not also register as a primary
+    /// tap (which would toggle the profile). Cleared on the next fresh press.
+    hold_fired: bool,
 }
 
 impl LayoutModeControl {
@@ -229,6 +241,9 @@ impl LayoutModeControl {
             .clamp(0.0, 1.0)
     }
 
+    /// Advance the press-hold timer. Returns `true` on the frame the hold
+    /// completes (the three-way picker should open). A fresh press clears
+    /// [`hold_fired`](Self::hold_fired) so the following tap can toggle again.
     fn update_hold(
         &mut self,
         ctx: &egui::Context,
@@ -236,11 +251,15 @@ impl LayoutModeControl {
         now: Instant,
     ) -> bool {
         if response.is_pointer_button_down_on() {
+            if self.hold_started.is_none() {
+                self.hold_fired = false;
+            }
             let start = *self.hold_started.get_or_insert(now);
             let elapsed = now.saturating_duration_since(start);
             if elapsed >= LAYOUT_MODE_HOLD {
                 self.hold_started = None;
                 self.menu_open = true;
+                self.hold_fired = true;
                 true
             } else {
                 ctx.request_repaint_after(LAYOUT_MODE_HOLD - elapsed);
@@ -263,17 +282,43 @@ fn layout_mode_button_size(profile: LayoutProfile) -> f32 {
 fn layout_mode_button_rect(screen: egui::Rect, rail_h: f32, profile: LayoutProfile) -> egui::Rect {
     let size = layout_mode_button_size(profile);
     let margin = Style::SP_M;
-    let left = (screen.right() - margin - size).max(screen.left() + Style::SP_XS);
-    let top = (screen.bottom() - rail_h - margin - size).max(screen.top() + Style::SP_XS);
-    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(size, size))
+    // Lower-LEFT edge, lifted above the Car-HUD speedometer band: the maps
+    // Drive-HUD FAB cluster owns the lower-RIGHT corner, so anchoring the shell
+    // mode toggle to the opposite edge (and clear of the bottom-left gauge) stops
+    // taps meant for "switch mode" from landing on a maps FAB (P0).
+    let left = (screen.left() + margin).min(screen.right() - Style::SP_XS - size);
+    let bottom = (screen.bottom() - rail_h - margin - LAYOUT_MODE_HUD_CLEARANCE)
+        .max(screen.top() + Style::SP_XS + size);
+    egui::Rect::from_min_size(egui::pos2(left, bottom - size), egui::vec2(size, size))
 }
 
 fn layout_mode_menu_rect(button: egui::Rect, screen: egui::Rect) -> egui::Rect {
     let w = LAYOUT_MODE_MENU_W.min((screen.width() - Style::SP_M).max(button.width()));
     let h = Style::SP_S + LayoutProfile::ALL.len() as f32 * LAYOUT_MODE_ROW_H + Style::SP_S;
-    let left = (button.right() - w).clamp(screen.left() + Style::SP_XS, screen.right() - w);
+    // Left-align the picker to the (now lower-left) button, clamped on-screen.
+    let left = button
+        .left()
+        .clamp(screen.left() + Style::SP_XS, screen.right() - w);
     let bottom = (button.top() - LAYOUT_MODE_GAP).max(screen.top() + h);
     egui::Rect::from_min_size(egui::pos2(left, bottom - h), egui::vec2(w, h))
+}
+
+/// The primary tap target: a direct Car <-> Desktop(Workstation) toggle. Tablet
+/// is only reachable through the long-press / right-click three-way picker, so a
+/// tap from Tablet advances to Car.
+fn layout_mode_primary_toggle(profile: LayoutProfile) -> LayoutProfile {
+    if profile.is_car() {
+        LayoutProfile::Workstation
+    } else {
+        LayoutProfile::Car
+    }
+}
+
+/// The floating toggle's glyph — a profile-agnostic swap/cycle mark, NOT a
+/// surface icon. The old per-profile mapping drew the maps glyph in Car, so the
+/// mode switch read as a "maps" button (P0).
+fn layout_mode_button_icon() -> IconId {
+    IconId::Reload
 }
 
 fn layout_profile_icon(profile: LayoutProfile) -> IconId {
@@ -409,7 +454,7 @@ fn paint_layout_mode_button(
     );
     if let Some(tex) = dock::icon_texture(
         ctx,
-        layout_profile_icon(profile),
+        layout_mode_button_icon(),
         icon_size,
         Style::resolve_color(ctx, Style::TEXT),
     ) {
@@ -2182,7 +2227,9 @@ impl Shell {
     }
 
     fn mount_layout_profile_control(&mut self, ctx: &egui::Context, now: Instant) {
-        if self.curtain.engaged() {
+        // The toggle shares the lower-left corner with the Start menu once it is
+        // open; hide it then so it never overlaps the front door.
+        if self.curtain.engaged() || self.front_door.is_open() {
             return;
         }
         let profile = self.system.layout_profile();
@@ -2191,6 +2238,7 @@ impl Shell {
         let screen = ctx.screen_rect();
         let button = layout_mode_button_rect(screen, self.vdock.rail_height(), profile);
         let mut open_menu = false;
+        let mut toggle_to: Option<LayoutProfile> = None;
         egui::Area::new(egui::Id::new("shell-layout-profile-button"))
             .order(egui::Order::Foreground)
             .fixed_pos(button.min)
@@ -2198,39 +2246,36 @@ impl Shell {
                 ui.set_min_size(button.size());
                 let (rect, response) =
                     ui.allocate_exact_size(button.size(), egui::Sense::click_and_drag());
-                let primary_down_on_button = ctx.input(|i| {
-                    i.pointer.primary_down()
-                        && i.pointer
-                            .latest_pos()
-                            .is_some_and(|pos| button.contains(pos))
-                });
-                if response.clicked()
-                    || response.secondary_clicked()
-                    || response.is_pointer_button_down_on()
-                    || primary_down_on_button
-                {
+                // Primary tap = a direct Car <-> Desktop toggle (no second tap).
+                // The full three-way picker stays behind a long-press or a
+                // secondary (right) click, so switching the two primary modes is
+                // one tap (P0: the tap used to only open the picker).
+                let opened_by_hold = self.layout_mode.update_hold(ctx, &response, now);
+                if opened_by_hold || response.secondary_clicked() {
                     open_menu = true;
                 }
-                if self.layout_mode.update_hold(ctx, &response, now) {
-                    open_menu = true;
+                if response.clicked() && !self.layout_mode.hold_fired {
+                    if self.layout_mode.menu_open {
+                        self.layout_mode.menu_open = false;
+                    } else {
+                        toggle_to = Some(layout_mode_primary_toggle(profile));
+                    }
                 }
-                install_layout_mode_button_accessibility(
-                    ctx,
-                    rect,
-                    profile,
-                    self.layout_mode.menu_open || open_menu,
-                );
+                let menu_shown = self.layout_mode.menu_open || open_menu;
+                install_layout_mode_button_accessibility(ctx, rect, profile, menu_shown);
                 paint_layout_mode_button(
                     ui,
                     rect,
                     profile,
                     self.layout_mode.hold_progress(now),
-                    self.layout_mode.menu_open || open_menu,
+                    menu_shown,
                 );
                 let _ = layout_profile_hover_text(
                     response,
                     format!(
-                        "Click or hold for 5 seconds to choose {}",
+                        "Switch layout mode — tap toggles {} / {}, hold for {}",
+                        LayoutProfile::Car.short_label(),
+                        LayoutProfile::Workstation.short_label(),
                         LayoutProfile::ALL
                             .iter()
                             .map(|p| p.short_label())
@@ -2239,11 +2284,28 @@ impl Shell {
                     ),
                 );
             });
+        if let Some(next) = toggle_to {
+            self.apply_layout_profile(next, ctx);
+        }
         if open_menu {
             self.layout_mode.menu_open = true;
         }
         if self.layout_mode.menu_open {
             self.mount_layout_profile_menu(ctx, button);
+        }
+    }
+
+    /// Apply a layout profile everywhere it lands: the system palette/density and
+    /// the vdock, plus the Auto-Mode home surface when entering Car. Shared by the
+    /// primary-tap toggle and the three-way picker so both paths stay identical.
+    fn apply_layout_profile(&mut self, profile: LayoutProfile, ctx: &egui::Context) {
+        self.system.set_layout_profile(profile, ctx);
+        self.vdock.set_density(profile.density());
+        // Entering Auto Mode lands the driver on the glanceable home launcher
+        // (AUTO-HOME) rather than whatever workstation surface was up.
+        if profile == LayoutProfile::Car {
+            self.nav.surface = Surface::AutoHome;
+            self.nav.expanded = true;
         }
     }
 
@@ -2274,15 +2336,8 @@ impl Shell {
                 });
             });
         if let Some(profile) = picked {
-            self.system.set_layout_profile(profile, ctx);
-            self.vdock.set_density(profile.density());
+            self.apply_layout_profile(profile, ctx);
             self.layout_mode.menu_open = false;
-            // Entering Auto Mode lands the driver on the glanceable home launcher
-            // (AUTO-HOME) rather than whatever workstation surface was up.
-            if profile == LayoutProfile::Car {
-                self.nav.surface = Surface::AutoHome;
-                self.nav.expanded = true;
-            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.layout_mode.menu_open = false;
@@ -3083,15 +3138,16 @@ mod tests {
         front_door_peer_apps, install_layout_mode_button_accessibility,
         install_layout_profile_row_accessibility, launcher_pins,
         layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_menu_rect,
-        layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
-        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
+        layout_mode_primary_toggle, layout_profile_row_accesskit_value, layout_profile_tooltip,
+        media_header, media_panel, menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
         publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
         publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
         remote_sessions_fallback_pos, reserved_dock_gutter, reserved_taskbar_strut,
         route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
         status, surface_needs_remote_sessions_fallback, terminal_panel, Boot,
         MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
-        LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, MENU_BAR_MINIMIZE_DURATION,
+        LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_WORKSTATION, LAYOUT_MODE_HOLD,
+        LAYOUT_MODE_HUD_CLEARANCE, MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -3346,22 +3402,26 @@ mod tests {
     }
 
     #[test]
-    fn layout_profile_button_sits_lower_right_above_the_taskbar() {
+    fn layout_profile_button_sits_lower_left_clear_of_the_maps_fabs() {
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
-        let rect = layout_mode_button_rect(
-            screen,
-            dock::DockState::default().rail_height(),
-            LayoutProfile::Workstation,
+        let rail = dock::DockState::default().rail_height();
+        let rect = layout_mode_button_rect(screen, rail, LayoutProfile::Workstation);
+        // Left edge — the maps Drive-HUD FAB cluster owns the lower-RIGHT corner,
+        // so the shell mode toggle lives on the opposite edge (P0 de-conflict).
+        assert!(
+            rect.left() >= screen.left() - f32::EPSILON,
+            "layout button must stay inside the left edge: {rect:?}"
         );
         assert!(
-            rect.right() <= screen.right() - Style::SP_M + f32::EPSILON,
-            "layout button must stay inside the right edge: {rect:?}"
+            rect.right() < screen.center().x,
+            "layout button must sit in the left half, clear of the right-edge maps FABs: {rect:?}"
         );
+        // Lifted above the bottom Car-HUD band (speedometer) rather than the
+        // bottom-most corner.
         assert!(
             rect.bottom()
-                <= screen.bottom() - dock::DockState::default().rail_height() - Style::SP_M
-                    + f32::EPSILON,
-            "layout button must sit above the bottom taskbar: {rect:?}"
+                <= screen.bottom() - rail - Style::SP_M - LAYOUT_MODE_HUD_CLEARANCE + f32::EPSILON,
+            "layout button must clear the bottom Car-HUD band: {rect:?}"
         );
         assert_eq!(
             rect.size(),
@@ -3375,13 +3435,13 @@ mod tests {
         assert_eq!(
             touch.size(),
             vec2(LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_TOUCH),
-            "Car/Tablet use a touch-sized lower-right control"
+            "Car/Tablet use a touch-sized lower-left control"
         );
     }
 
     #[test]
     fn layout_profile_menu_opens_above_the_mode_button_and_stays_onscreen() {
-        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 360.0));
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let button = layout_mode_button_rect(screen, 48.0, LayoutProfile::Car);
         let menu = layout_mode_menu_rect(button, screen);
         assert!(
@@ -3390,59 +3450,177 @@ mod tests {
         );
         assert!(
             menu.bottom() <= button.top() + f32::EPSILON,
-            "mode menu opens above the lower-right button: menu={menu:?} button={button:?}"
+            "mode menu opens above the lower-left button: menu={menu:?} button={button:?}"
+        );
+        assert!(
+            (menu.left() - button.left()).abs() <= f32::EPSILON,
+            "mode menu left-aligns to the lower-left button: menu={menu:?} button={button:?}"
         );
     }
 
     #[test]
-    fn layout_profile_button_primary_click_opens_the_profile_menu() {
+    fn layout_mode_primary_toggle_flips_car_and_desktop() {
+        // The primary tap target is a direct two-way toggle; Tablet is reachable
+        // only through the picker, so a tap from Tablet advances to Car.
+        assert_eq!(
+            layout_mode_primary_toggle(LayoutProfile::Workstation),
+            LayoutProfile::Car
+        );
+        assert_eq!(
+            layout_mode_primary_toggle(LayoutProfile::Car),
+            LayoutProfile::Workstation
+        );
+        assert_eq!(
+            layout_mode_primary_toggle(LayoutProfile::Tablet),
+            LayoutProfile::Car
+        );
+    }
+
+    #[test]
+    fn apply_layout_profile_enters_auto_home_for_car() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
-        shell.curtain = super::curtain::Curtain::default();
-        shell
-            .system
-            .set_layout_profile(LayoutProfile::Workstation, &ctx);
-        shell
-            .vdock
-            .set_density(LayoutProfile::Workstation.density());
 
-        let size = vec2(1280.0, 800.0);
-        let screen = Rect::from_min_size(pos2(0.0, 0.0), size);
-        let button = layout_mode_button_rect(
-            screen,
-            shell.vdock.rail_height(),
-            LayoutProfile::Workstation,
+        shell.apply_layout_profile(LayoutProfile::Car, &ctx);
+        assert_eq!(shell.system.layout_profile(), LayoutProfile::Car);
+        assert_eq!(
+            shell.nav.surface,
+            Surface::AutoHome,
+            "entering Car lands on the Auto-Mode home launcher"
         );
-        let pos = button.center();
-        let now = std::time::Instant::now();
-        let input = |events| egui::RawInput {
+        assert!(shell.nav.expanded);
+
+        shell.apply_layout_profile(LayoutProfile::Workstation, &ctx);
+        assert_eq!(shell.system.layout_profile(), LayoutProfile::Workstation);
+    }
+
+    /// Drive a fresh shell through a synthetic pointer gesture on the mode button:
+    /// two warm-up layout passes (so the widget rect lands in egui's previous-pass
+    /// hit-test table) then the supplied press/release/hold frames. Mirrors the
+    /// dock rail-cell click harness.
+    fn drive_layout_mode_button(
+        ctx: &egui::Context,
+        shell: &mut Shell,
+        screen: Rect,
+        frames: Vec<Vec<egui::Event>>,
+        now: impl Fn(usize) -> std::time::Instant,
+    ) {
+        let input = |events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(screen),
             events,
             ..Default::default()
         };
+        // Warm-up layout passes with no events.
+        for _ in 0..2 {
+            let _ = ctx.run(input(Vec::new()), |ctx| {
+                shell.mount_layout_profile_control(ctx, now(0))
+            });
+        }
+        for (idx, events) in frames.into_iter().enumerate() {
+            let _ = ctx.run(input(events), |ctx| {
+                shell.mount_layout_profile_control(ctx, now(idx + 1))
+            });
+        }
+    }
 
-        let _ = ctx.run(input(Vec::new()), |ctx| {
-            shell.mount_layout_profile_control(ctx, now)
-        });
-        let _ = ctx.run(
-            input(vec![
-                egui::Event::PointerMoved(pos),
-                pointer_button(pos, true),
-            ]),
-            |ctx| shell.mount_layout_profile_control(ctx, now),
+    fn fresh_layout_mode_shell(ctx: &egui::Context) -> Shell {
+        Style::install(ctx);
+        let mut shell = Shell::new_for_ctx(ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(LayoutProfile::Workstation, ctx);
+        shell
+            .vdock
+            .set_density(LayoutProfile::Workstation.density());
+        shell
+    }
+
+    #[test]
+    fn layout_profile_button_primary_tap_toggles_car_and_desktop() {
+        let ctx = egui::Context::default();
+        let mut shell = fresh_layout_mode_shell(&ctx);
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let pos = layout_mode_button_rect(
+            screen,
+            shell.vdock.rail_height(),
+            LayoutProfile::Workstation,
+        )
+        .center();
+        let now = std::time::Instant::now();
+        let tap = |shell: &mut Shell, pos: egui::Pos2| {
+            drive_layout_mode_button(
+                &ctx,
+                shell,
+                screen,
+                vec![
+                    vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+                    vec![egui::Event::PointerMoved(pos), pointer_button(pos, false)],
+                ],
+                |_| now,
+            );
+        };
+
+        tap(&mut shell, pos);
+        assert_eq!(
+            shell.system.layout_profile(),
+            LayoutProfile::Car,
+            "a single tap switches Desktop -> Car directly (no picker)"
         );
-        let _ = ctx.run(
-            input(vec![
-                egui::Event::PointerMoved(pos),
-                pointer_button(pos, false),
-            ]),
-            |ctx| shell.mount_layout_profile_control(ctx, now),
+        assert!(
+            !shell.layout_mode.menu_open,
+            "a single tap must not open the three-way picker"
+        );
+
+        // The button grows to the touch size in Car, so re-derive its centre.
+        let car_pos =
+            layout_mode_button_rect(screen, shell.vdock.rail_height(), LayoutProfile::Car).center();
+        tap(&mut shell, car_pos);
+        assert_eq!(
+            shell.system.layout_profile(),
+            LayoutProfile::Workstation,
+            "the next tap switches Car -> Desktop"
+        );
+        assert!(!shell.layout_mode.menu_open);
+    }
+
+    #[test]
+    fn layout_profile_button_long_press_opens_the_three_way_picker() {
+        let ctx = egui::Context::default();
+        let mut shell = fresh_layout_mode_shell(&ctx);
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let pos = layout_mode_button_rect(
+            screen,
+            shell.vdock.rail_height(),
+            LayoutProfile::Workstation,
+        )
+        .center();
+        let t0 = std::time::Instant::now();
+        let held = t0 + LAYOUT_MODE_HOLD + std::time::Duration::from_millis(50);
+
+        drive_layout_mode_button(
+            &ctx,
+            &mut shell,
+            screen,
+            vec![
+                // Press, then keep the pointer down while time crosses the hold.
+                vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+                vec![egui::Event::PointerMoved(pos)],
+            ],
+            move |idx| if idx >= 2 { held } else { t0 },
         );
 
         assert!(
             shell.layout_mode.menu_open,
-            "a normal primary click should open the layout profile menu"
+            "a long press opens the three-way picker"
+        );
+        assert_eq!(
+            shell.system.layout_profile(),
+            LayoutProfile::Workstation,
+            "a long press must not toggle the profile"
         );
     }
 
