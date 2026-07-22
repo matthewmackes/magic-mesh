@@ -203,8 +203,15 @@ impl CarStatusItem {
             fixed.map_or_else(|| "—".to_string(), |x| f(x))
         };
         match self {
-            Self::SpeedMph => format!("{:.0} mph", t.speed_mph),
-            Self::SpeedKph => format!("{:.0} kph", t.speed_mph * 1.60934),
+            // Speed rides the LIVE-telemetry gate (PLATFORM-INTERFACES Q33): the
+            // simulated CAN/OBD seed profile feeds `speed_mph = 27.0`, and an
+            // instrument readout must never present that as a live reading — the
+            // same honesty rule the gauge above these tiles follows.
+            Self::SpeedMph => {
+                live_speed_mph(s).map_or_else(|| "—".to_string(), |v| format!("{v:.0} mph"))
+            }
+            Self::SpeedKph => live_speed_mph(s)
+                .map_or_else(|| "—".to_string(), |v| format!("{:.0} kph", v * 1.60934)),
             Self::Heading => gf(|x| format!("{:.0}°", x.heading_deg)),
             Self::HeadingCardinal => gf(|x| cardinal(x.heading_deg).to_string()),
             Self::Rpm => format!("{}", t.rpm),
@@ -287,6 +294,33 @@ impl CarStatusItem {
             Self::NavSummary => s.vehicle_glance().unwrap_or_else(|| "—".to_string()),
         }
     }
+}
+
+/// Whether vehicle telemetry is a LIVE gateway reading. `refresh_from_vehicle`
+/// stamps the confidence label `"live vehicle-gateway mirror (…)"` only when a
+/// real `state/vehicle/<node>` mirror folded in with the adapter ONLINE; the
+/// simulated seed reads `"simulated CAN/OBD profile"` and an offline adapter
+/// reads `"vehicle-gateway mirror reports the adapter offline"`. This is the
+/// exact truth the TELEMETRY tile ([`CarStatusItem::TelemetrySource`]) already
+/// surfaces — the speed gauge and tiles ride the same condition, so the strip
+/// can never claim a live speed the TELEMETRY tile calls simulated.
+/// (The seed's `locations.primary` is ALREADY `Mg90Gnss`-acquiring and its
+/// source status `Connected`, so neither is a usable liveness gate.)
+/// PLATFORM-INTERFACES Q33: absent reads absent, never fabricated.
+#[must_use]
+pub fn telemetry_is_live(s: &MapsLocationSurface) -> bool {
+    s.vehicle
+        .telemetry
+        .confidence
+        .starts_with("live vehicle-gateway mirror")
+}
+
+/// The instrument-gauge speed feed: `Some(mph)` only from live telemetry,
+/// `None` (the gauge's honest dimmed "—") when the only feed is the simulated
+/// seed or an offline adapter. PLATFORM-INTERFACES Q33.
+#[must_use]
+pub fn live_speed_mph(s: &MapsLocationSurface) -> Option<f32> {
+    telemetry_is_live(s).then(|| s.vehicle.telemetry.speed_mph.max(0.0))
 }
 
 fn cardinal(deg: f32) -> &'static str {
@@ -537,6 +571,58 @@ mod tests {
         assert_eq!(CarStatusItem::Satellites.value(&s), "12");
         assert_eq!(CarStatusItem::HeadingCardinal.value(&s), "E");
         assert_eq!(CarStatusItem::AccuracyM.value(&s), "3 m");
+    }
+
+    #[test]
+    fn speed_is_live_gated_never_the_simulated_seed() {
+        use mackes_mesh_types::vehicle::{
+            GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
+        };
+
+        // The simulated seed feeds `telemetry.speed_mph = 27.0` (the demo CAN/OBD
+        // profile) with `primary` ALREADY Mg90Gnss-acquiring — so the ONLY honest
+        // liveness signal is the confidence label the TELEMETRY tile surfaces.
+        // The gauge feed and both SPEED tiles must read absent, never "27 mph".
+        let mut s = MapsLocationSurface::simulated();
+        assert!(!telemetry_is_live(&s), "the seed profile is not live");
+        assert_eq!(live_speed_mph(&s), None);
+        assert_eq!(CarStatusItem::SpeedMph.value(&s), "—");
+        assert_eq!(CarStatusItem::SpeedKph.value(&s), "—");
+
+        // Folding a real ONLINE gateway mirror (the producer that stamps the
+        // "live vehicle-gateway mirror (…)" label) goes live end-to-end — if the
+        // producer's label ever drifts, this breaks loudly instead of silently
+        // dashing a real reading.
+        let mirror = WireVehicleState {
+            host: "eagle".to_string(),
+            model: "MG90".to_string(),
+            esn: "ESN-TEST".to_string(),
+            mgos_version: "4.3.0.1".to_string(),
+            online: true,
+            gps: GpsFix::default(),
+            imu: None,
+            wan: WanStatus::default(),
+            telem: VehicleTelem {
+                speed_mph: 62.0,
+                ..VehicleTelem::default()
+            },
+            gaps: Vec::new(),
+            published_at_ms: 0,
+        };
+        s.refresh_from_vehicle(&mirror);
+        assert!(telemetry_is_live(&s));
+        assert_eq!(live_speed_mph(&s), Some(62.0));
+        assert_eq!(CarStatusItem::SpeedMph.value(&s), "62 mph");
+        assert_eq!(CarStatusItem::SpeedKph.value(&s), "100 kph");
+
+        // An adapter-offline mirror is NOT a live reading either.
+        let offline = WireVehicleState {
+            online: false,
+            ..mirror
+        };
+        s.refresh_from_vehicle(&offline);
+        assert!(!telemetry_is_live(&s), "adapter offline is not live");
+        assert_eq!(CarStatusItem::SpeedMph.value(&s), "—");
     }
 
     #[test]

@@ -566,16 +566,30 @@ fn layout_profile_menu_row(
 /// Paint the Auto Mode speedometer in the **2021 Ford Explorer digital cluster**
 /// idiom: a large digital MPH number dominating the center, ringed by a thin
 /// partial arc that fills with speed (SYNC-3 blue) over a dim track — no needle,
-/// no chrome, black/white/blue. Crash-safe (guards a degenerate rect).
-fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: f32) {
+/// no chrome, black/white/blue. Every colour resolves through the shared
+/// [`Style`] tokens, so Auto Mode's `AutoSync3` scheme lands the true SYNC3
+/// palette (SYNC3_ACCENT arc over SYNC3_BORDER track) instead of the raw Dark
+/// constants. `mph: None` is the honest zero-state (PLATFORM-INTERFACES Q33):
+/// no live telemetry feed → a dimmed "—" with no fill, cap, or range digits —
+/// never a fabricated 0 (or the simulated seed's 27). Crash-safe (guards a
+/// degenerate rect).
+fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: Option<f32>) {
     use std::f32::consts::PI;
     if !rect.is_finite() || rect.width() < 24.0 || rect.height() < 24.0 {
         return;
     }
     const MAX_MPH: f32 = 160.0;
-    let mph = mph.clamp(0.0, MAX_MPH);
-    let frac = mph / MAX_MPH;
-    let radius = (rect.width().min(rect.height() * 1.7) * 0.5 - 8.0).max(12.0);
+    // The thin cluster-arc stroke weight (and its leading-edge cap radius).
+    const ARC_W: f32 = 4.0;
+    let ctx = painter.ctx();
+    let track_color = Style::resolve_color(ctx, Style::BORDER);
+    let fill_color = Style::resolve_color(ctx, Style::ACCENT);
+    let cap_color = Style::resolve_color(ctx, Style::ACCENT_HI);
+    let dim = Style::resolve_color(ctx, Style::TEXT_DIM);
+    let strong = Style::resolve_color(ctx, Style::TEXT_STRONG);
+    let mph = mph.map(|v| v.clamp(0.0, MAX_MPH));
+    // Dial radius: half the strip width less one SP_S breathing inset.
+    let radius = (rect.width().min(rect.height() * 1.7) * 0.5 - Style::SP_S).max(12.0);
     let center = egui::pos2(rect.center().x, rect.top() + radius + 6.0);
     // f in 0..1 -> a point on the arc: f=0 lower-left, f=0.5 top, f=1 lower-right
     // (a ~270° sweep opening at the bottom).
@@ -592,48 +606,75 @@ fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: f32) {
     };
 
     // Thin gauge track (dim, full sweep) + the blue speed fill up to the current
-    // reading, with a bright cap at the leading edge.
-    arc(0.0, 1.0, 4.0, Style::BORDER);
-    if frac > 0.002 {
-        arc(0.0, frac, 4.0, Style::ACCENT);
-        painter.circle_filled(point(frac, radius), 4.5, Style::ACCENT_HI);
+    // reading, with a bright cap at the leading edge (live readings only).
+    arc(0.0, 1.0, ARC_W, track_color);
+    if let Some(frac) = mph.map(|v| v / MAX_MPH).filter(|f| *f > 0.002) {
+        arc(0.0, frac, ARC_W, fill_color);
+        painter.circle_filled(point(frac, radius), ARC_W + 0.5, cap_color);
     }
-    // Range endpoints, dim, tucked just inside the arc ends.
-    let end_font = egui::FontId::proportional((radius * 0.12).clamp(8.0, 14.0));
-    painter.text(
-        point(0.0, radius - 15.0),
-        egui::Align2::CENTER_CENTER,
-        "0",
-        end_font.clone(),
-        Style::TEXT_DIM,
-    );
-    painter.text(
-        point(1.0, radius - 15.0),
-        egui::Align2::CENTER_CENTER,
-        format!("{MAX_MPH:.0}"),
-        end_font,
-        Style::TEXT_DIM,
-    );
+    // Range endpoints, dim, tucked just inside the arc ends — painted only with
+    // a live reading, so the honest zero-state gauge carries no digits at all
+    // (a "0" range mark beside a dashed readout still smells like data).
+    if mph.is_some() {
+        let end_font = egui::FontId::proportional(
+            (radius * 0.12).clamp(Style::TYPE_CAPTION * 0.8, Style::TYPE_CAPTION * 1.4),
+        );
+        painter.text(
+            point(0.0, radius - 15.0),
+            egui::Align2::CENTER_CENTER,
+            "0",
+            end_font.clone(),
+            dim,
+        );
+        painter.text(
+            point(1.0, radius - 15.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{MAX_MPH:.0}"),
+            end_font,
+            dim,
+        );
+    }
 
-    // The large digital speed — the dominant element, centred in the arc.
+    // The large digital speed — the dominant element, centred in the arc. Its
+    // glance envelope derives from the shared type ramp's hero rung: floor 1.2×
+    // TYPE_LARGE_TITLE, ceiling 4× plus one SP_S gutter — the cluster's shipped
+    // 36..128 px, token-derived rather than re-minted. The absent-telemetry
+    // zero-state is a dimmed em-dash on the same rung (Q33: absent reads
+    // absent, never a fake 0).
+    let hero_font = egui::FontId::proportional((radius * 0.95).clamp(
+        Style::TYPE_LARGE_TITLE * 1.2,
+        Style::TYPE_LARGE_TITLE * 4.0 + Style::SP_S,
+    ));
+    let (speed_text, speed_color) = match mph {
+        Some(v) => (format!("{v:.0}"), strong),
+        None => ("—".to_string(), dim),
+    };
     painter.text(
         egui::pos2(center.x, center.y - radius * 0.06),
         egui::Align2::CENTER_CENTER,
-        format!("{mph:.0}"),
-        egui::FontId::proportional((radius * 0.95).clamp(36.0, 128.0)),
-        Style::TEXT_STRONG,
+        speed_text,
+        hero_font,
+        speed_color,
     );
+    // The units caption rides the TYPE_CAPTION rung, scaling with the dial up
+    // to 2× for glance range.
     painter.text(
         egui::pos2(center.x, center.y + radius * 0.52),
         egui::Align2::CENTER_CENTER,
         "MPH",
-        egui::FontId::proportional((radius * 0.16).clamp(11.0, 20.0)),
-        Style::TEXT_DIM,
+        egui::FontId::proportional(
+            (radius * 0.16).clamp(Style::TYPE_CAPTION, Style::TYPE_CAPTION * 2.0),
+        ),
+        dim,
     );
 }
 
-/// Paint one selectable status readout tile (label above, value below). Returns
-/// whether it was tapped — the driver cycling that slot's readout.
+/// Paint one selectable status readout tile as a SYNC3 plate: RADIUS_M on the
+/// resolved SURFACE (SURFACE_HI on hover), a TYPE_CAPTION dim label over a
+/// TYPE_CALLOUT strong value, and a thin resolved-accent rule down the left
+/// edge — the affordance that the slot is one of the driver's *selected*
+/// readouts, tappable to cycle (PLATFORM-INTERFACES Q33). Returns whether it
+/// was tapped — the driver cycling that slot's readout.
 fn paint_car_status_tile(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -650,12 +691,13 @@ fn paint_car_status_tile(
         egui::Id::new(("car-status-tile", idx)),
         egui::Sense::click(),
     );
+    let accent = Style::resolve_color(ui.ctx(), Style::ACCENT);
     let fill = if resp.is_pointer_button_down_on() {
-        Style::pressed_fill(Style::ACCENT)
+        Style::pressed_fill_for_scheme(Style::color_scheme(ui.ctx()), accent)
     } else if resp.hovered() {
-        Style::SURFACE_HI
+        Style::resolve_color(ui.ctx(), Style::SURFACE_HI)
     } else {
-        Style::SURFACE
+        Style::resolve_color(ui.ctx(), Style::SURFACE)
     };
     let radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
     painter.rect_filled(rect, radius, fill);
@@ -665,26 +707,40 @@ fn paint_car_status_tile(
         egui::Stroke::new(
             Style::STROKE_HAIRLINE,
             if resp.hovered() {
-                Style::ACCENT
+                accent
             } else {
-                Style::BORDER
+                Style::resolve_color(ui.ctx(), Style::BORDER)
             },
         ),
         egui::StrokeKind::Inside,
     );
+    // The selected-readout affordance: a thin accent rule down the plate's left
+    // edge (the SYNC3 cue that this slot holds a live, cyclable selection).
+    let rule_w = Style::STROKE_HAIRLINE * 2.0;
+    let rule = egui::Rect::from_min_max(
+        egui::pos2(
+            rect.left() + Style::STROKE_HAIRLINE,
+            rect.top() + Style::SP_XS,
+        ),
+        egui::pos2(
+            rect.left() + Style::STROKE_HAIRLINE + rule_w,
+            rect.bottom() - Style::SP_XS,
+        ),
+    );
+    painter.rect_filled(rule, 0.0, accent);
     painter.text(
         rect.left_top() + egui::vec2(Style::SP_S, Style::SP_XS),
         egui::Align2::LEFT_TOP,
         label,
-        egui::FontId::proportional(Style::SMALL),
-        Style::TEXT_DIM,
+        egui::FontId::proportional(Style::TYPE_CAPTION),
+        Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
     );
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - Style::SP_S),
         egui::Align2::CENTER_BOTTOM,
         value,
-        egui::FontId::proportional(Style::TITLE),
-        Style::TEXT_STRONG,
+        egui::FontId::proportional(Style::TYPE_CALLOUT),
+        Style::resolve_color(ui.ctx(), Style::TEXT_STRONG),
     );
     resp.clicked()
 }
@@ -2516,26 +2572,29 @@ impl Shell {
     }
 
     /// The Auto Mode driver's instrument strip (the left, driver's-side third,
-    /// full height): a big analog speedometer up top with the numeric speed
-    /// below, then the operator's selectable status readouts in a two-column grid.
-    /// A driver taps a readout tile to cycle it to the next catalog entry. Reads
-    /// the live MG90 fold from `maps_location`.
+    /// full height — PLATFORM-INTERFACES Q33): the 2021-Explorer digital
+    /// speedometer up top, then the operator's selectable status readouts in a
+    /// two-column grid. A driver taps a readout tile to cycle it to the next
+    /// catalog entry. Reads the live MG90 fold from `maps_location`.
     fn car_instrument_strip(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
         if !full.is_finite() || full.width() < 8.0 || full.height() < 8.0 {
             return;
         }
         let painter = ui.painter().clone();
-        painter.rect_filled(full, 0.0, Style::BG);
+        painter.rect_filled(full, 0.0, Style::resolve_color(ui.ctx(), Style::BG));
         let pad = Style::SP_M;
 
-        // Speedometer — the top ~42% of the strip, a large square dial.
+        // Speedometer — the top ~42% of the strip, a large square dial. The feed
+        // is live-gated (Q33): only an ONLINE vehicle-gateway fold yields a
+        // reading — the simulated CAN/OBD seed profile paints the honest "—",
+        // never its fabricated 27 mph.
         let gauge_h = (full.height() * 0.42).clamp(120.0, (full.width() - pad * 2.0).max(120.0));
         let gauge_rect = egui::Rect::from_min_size(
             egui::pos2(full.left() + pad, full.top() + pad),
             egui::vec2((full.width() - pad * 2.0).max(1.0), gauge_h),
         );
-        let mph = self.maps_location.vehicle.telemetry.speed_mph.max(0.0);
+        let mph = mde_maps_location_egui::car_status::live_speed_mph(&self.maps_location);
         paint_car_speedometer(&painter, gauge_rect, mph);
 
         // Selectable status readouts — a two-column grid below the dial.
@@ -3312,12 +3371,12 @@ mod tests {
         layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_menu_rect,
         layout_mode_primary_toggle, layout_profile_row_accesskit_value, layout_profile_tooltip,
         media_header, media_panel, menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
-        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
-        publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
-        remote_sessions_fallback_pos, reserved_dock_gutter, reserved_taskbar_strut,
-        route_file_operation_progress_request, screenshot, shell_file_operation_progress, splash,
-        status, surface_needs_remote_sessions_fallback, terminal_panel, Boot,
-        MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
+        paint_car_speedometer, paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
+        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
+        real_media, real_terminal, remote_sessions_fallback_pos, reserved_dock_gutter,
+        reserved_taskbar_strut, route_file_operation_progress_request, screenshot,
+        shell_file_operation_progress, splash, status, surface_needs_remote_sessions_fallback,
+        terminal_panel, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
         LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
         LAYOUT_MODE_HUD_CLEARANCE, MENU_BAR_MINIMIZE_DURATION,
     };
@@ -3328,7 +3387,7 @@ mod tests {
         Roster, Severity,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::{LayoutProfile, Style};
+    use mde_egui::{LayoutProfile, Style, StyleColorScheme};
     use mde_files::backend::{
         AuditEntry, Backend, BackendError, ConflictPolicy, Destination, SendMode,
     };
@@ -3523,6 +3582,271 @@ mod tests {
             walk(&clipped.shape, &mut out);
         }
         out
+    }
+
+    fn painted_stroke_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Path(path) => {
+                    if let egui::epaint::ColorMode::Solid(color) = &path.stroke.color {
+                        if *color != egui::Color32::TRANSPARENT {
+                            out.push(*color);
+                        }
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_text_sizes(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    if let Some(section) = text.galley.job.sections.first() {
+                        out.push((text.galley.text().to_owned(), section.format.font_id.size));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// A test context wearing Auto Mode's SYNC3 skin (the scheme
+    /// `apply_appearance` installs whenever the layout profile is Car), so
+    /// painted-shape assertions can pin the true SYNC3_* palette.
+    fn sync3_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        Style::install(&ctx);
+        Style::set_color_scheme_and_accent(&ctx, StyleColorScheme::AutoSync3, Style::ACCENT);
+        ctx
+    }
+
+    fn run_speedometer_frame(ctx: &egui::Context, mph: Option<f32>) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 320.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let painter = ui.painter().clone();
+                        paint_car_speedometer(
+                            &painter,
+                            Rect::from_min_size(pos2(8.0, 8.0), vec2(320.0, 300.0)),
+                            mph,
+                        );
+                    });
+            },
+        )
+    }
+
+    // PLATFORM-INTERFACES Q33: no live telemetry feed → the gauge paints a
+    // dimmed "—" and NOTHING numeric — no fake 0, no fill arc, not even the
+    // 0/160 range marks (a "0" beside a dashed readout still smells like data).
+    #[test]
+    fn car_speedometer_absent_telemetry_paints_dash_never_a_digit() {
+        let ctx = sync3_ctx();
+        let out = run_speedometer_frame(&ctx, None);
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(t, c)| t == "—" && *c == Style::SYNC3_TEXT_DIM),
+            "absent telemetry paints a dimmed em-dash: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|(t, _)| !t.chars().any(|c| c.is_ascii_digit())),
+            "the honest zero-state carries no digits: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t == "MPH"),
+            "the units caption stays: {texts:?}"
+        );
+        let strokes = painted_stroke_colors(&out.shapes);
+        assert!(
+            strokes.contains(&Style::SYNC3_BORDER),
+            "the dim gauge track still paints: {strokes:?}"
+        );
+        assert!(
+            !strokes.contains(&Style::SYNC3_ACCENT),
+            "no accent fill without a live reading: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn car_speedometer_live_reading_rides_sync3_tokens_on_the_hero_rung() {
+        let ctx = sync3_ctx();
+        let out = run_speedometer_frame(&ctx, Some(62.0));
+        let strokes = painted_stroke_colors(&out.shapes);
+        assert!(
+            strokes.contains(&Style::SYNC3_BORDER),
+            "SYNC3_BORDER track: {strokes:?}"
+        );
+        assert!(
+            strokes.contains(&Style::SYNC3_ACCENT),
+            "SYNC3_ACCENT fill arc: {strokes:?}"
+        );
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(t, c)| t == "62" && *c == Style::SYNC3_TEXT_STRONG),
+            "hero digits in SYNC3 strong text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(t, c)| t == "MPH" && *c == Style::SYNC3_TEXT_DIM),
+            "units caption in SYNC3 dim text: {texts:?}"
+        );
+        let sizes = painted_text_sizes(&out.shapes);
+        let hero = sizes
+            .iter()
+            .find(|(t, _)| t == "62")
+            .expect("hero digits")
+            .1;
+        assert!(
+            hero >= Style::TYPE_LARGE_TITLE,
+            "hero digits sit at/above the LARGE_TITLE hero rung: {hero}"
+        );
+        let units = sizes.iter().find(|(t, _)| t == "MPH").expect("units").1;
+        assert!(
+            (Style::TYPE_CAPTION..=Style::TYPE_CAPTION * 2.0).contains(&units),
+            "units ride the TYPE_CAPTION-derived envelope: {units}"
+        );
+    }
+
+    #[test]
+    fn car_instrument_tile_plate_rides_sync3_tokens_and_type_rungs() {
+        let ctx = sync3_ctx();
+        let rect = Rect::from_min_size(pos2(8.0, 8.0), vec2(160.0, 64.0));
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 120.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let painter = ui.painter().clone();
+                        let tapped =
+                            paint_car_status_tile(ui, &painter, rect, 0, "BATTERY", "13.9 V");
+                        assert!(!tapped, "no pointer input, no tap");
+                    });
+            },
+        );
+        let fills = painted_fill_colors(&out.shapes);
+        assert!(
+            fills.contains(&Style::SYNC3_SURFACE),
+            "the plate rides the SYNC3 surface: {fills:?}"
+        );
+        assert!(
+            fills.contains(&Style::SYNC3_ACCENT),
+            "the selected-readout accent left rule paints: {fills:?}"
+        );
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(t, c)| t == "BATTERY" && *c == Style::SYNC3_TEXT_DIM),
+            "dim caption label: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(t, c)| t == "13.9 V" && *c == Style::SYNC3_TEXT_STRONG),
+            "strong value: {texts:?}"
+        );
+        let sizes = painted_text_sizes(&out.shapes);
+        assert!(
+            sizes
+                .iter()
+                .any(|(t, s)| t == "BATTERY" && (*s - Style::TYPE_CAPTION).abs() < f32::EPSILON),
+            "label on the TYPE_CAPTION rung: {sizes:?}"
+        );
+        assert!(
+            sizes
+                .iter()
+                .any(|(t, s)| t == "13.9 V" && (*s - Style::TYPE_CALLOUT).abs() < f32::EPSILON),
+            "value on the TYPE_CALLOUT rung: {sizes:?}"
+        );
+    }
+
+    // Q33: the strip is the left driver's-third on EVERY Car screen — it must
+    // render populated (gauge + every selected readout tile) at a third of the
+    // common 1920 and 1280 seat widths.
+    #[test]
+    fn car_instrument_strip_renders_populated_at_a_third_of_common_seat_widths() {
+        for width in [1920.0_f32 / 3.0, 1280.0 / 3.0] {
+            let ctx = sync3_ctx();
+            let mut shell = Shell::new_for_ctx(&ctx);
+            // Deterministic strip: the simulated cockpit seed (no live mirror on
+            // a unit-test host) and the factory readout selection, regardless of
+            // any persisted operator state on this machine.
+            shell.maps_location = mde_maps_location_egui::MapsLocationSurface::simulated();
+            shell.car_status = mde_maps_location_egui::CarStatusSelection::defaults();
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 720.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| shell.car_instrument_strip(ui));
+                },
+            );
+            let texts = painted_text(&out.shapes);
+            assert!(
+                texts.iter().any(|(t, _)| t == "—"),
+                "no live mirror ⇒ the gauge dashes honestly at width {width}: {texts:?}"
+            );
+            for item in mde_maps_location_egui::CarStatusSelection::defaults().slots() {
+                assert!(
+                    texts.iter().any(|(t, _)| t == item.label()),
+                    "tile label {:?} paints at width {width}",
+                    item.label()
+                );
+            }
+            let fills = painted_fill_colors(&out.shapes);
+            assert!(
+                fills.contains(&Style::SYNC3_BG),
+                "the SYNC3 strip backdrop paints at width {width}"
+            );
+            assert!(
+                fills.contains(&Style::SYNC3_SURFACE),
+                "tile plates paint at width {width}"
+            );
+        }
     }
 
     fn render_layout_profile_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
