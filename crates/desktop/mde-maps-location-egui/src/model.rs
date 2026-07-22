@@ -242,6 +242,18 @@ impl MapsLocationSurface {
         self.route_preview = true;
     }
 
+    /// Begin turn-by-turn guidance on the selected route option — the target of
+    /// the route-preview **Start** button. Applies the chosen option to the active
+    /// route, leaves the preview, and marks guidance as running so the Drive HUD
+    /// paints the maneuver banner / ETA sheet / speed sign (not the idle prompt).
+    pub fn start_navigation(&mut self) {
+        let selected = self.local_navigation.selected_route;
+        self.local_navigation.apply_route_option(selected);
+        self.local_navigation.navigating = true;
+        self.route_preview = false;
+        self.arrived = false;
+    }
+
     /// Enter the "You have arrived" screen (the arrival path + dev toggle).
     pub fn simulate_arrival(&mut self) {
         self.active = WorkspaceTab::Drive;
@@ -249,14 +261,17 @@ impl MapsLocationSurface {
         self.route_preview = false;
         self.off_route = false;
         self.arrived = true;
+        // Arrival ends guidance: the Drive HUD returns to its idle state after.
+        self.local_navigation.navigating = false;
     }
 
-    /// Leave any navigation-flow overlay and return to the live turn-by-turn HUD.
+    /// Leave any navigation-flow overlay and return to the idle Drive HUD.
     pub fn end_navigation(&mut self) {
         self.arrived = false;
         self.destination_search = false;
         self.route_preview = false;
         self.off_route = false;
+        self.local_navigation.navigating = false;
     }
 
     /// Toggle the off-route / recalculating guidance state (dev toggle).
@@ -337,6 +352,12 @@ impl MapsLocationSurface {
         let Some(sample) = self.locations.primary_sample().cloned() else {
             return false;
         };
+        // A dead zone pins to the map at the current position; without a real GNSS
+        // lock there is no honest coordinate to record (a null-island `0, 0` point
+        // would be fabricated).
+        if !sample.has_fix() {
+            return false;
+        }
         let Some(link) = self.mg90.status.active_cellular_link() else {
             return false;
         };
@@ -978,6 +999,13 @@ pub struct LocalNavigationState {
     pub selected_route: usize,
     /// Index of the destination the preview / arrival screens summarize.
     pub selected_destination: usize,
+    /// Whether turn-by-turn guidance to a chosen destination is actually running.
+    ///
+    /// `false` is the honest idle state — no destination picked, so the Drive HUD
+    /// shows a calm "search to start" prompt instead of a fabricated maneuver
+    /// banner / ETA sheet / traffic pills for a route the driver never chose. Set
+    /// `true` the moment the operator taps **Start** on the route preview.
+    pub navigating: bool,
 }
 
 impl LocalNavigationState {
@@ -1088,6 +1116,7 @@ impl LocalNavigationState {
             ],
             selected_route: 0,
             selected_destination: 0,
+            navigating: false,
         }
     }
 
@@ -1823,7 +1852,11 @@ impl LocationManager {
             primary: LocationSourceKind::Mg90Gnss,
             auto_failover: false,
             sources: vec![
-                LocationSource::sample(LocationSourceKind::Mg90Gnss, 3.2, 1.0, true),
+                // The PRIMARY MG90 GNSS starts with no lock: the cockpit must not
+                // read as a real vehicle sitting in Pittsburgh before a live fix
+                // has been folded. The dedicated Simulator source keeps a fix so
+                // the Simulator section still has a demonstrable position.
+                LocationSource::acquiring(LocationSourceKind::Mg90Gnss),
                 LocationSource::sample(LocationSourceKind::UsbGpsd, 4.6, 1.7, true),
                 LocationSource::sample(LocationSourceKind::ManualTest, 0.0, 0.0, true),
                 LocationSource::sample(LocationSourceKind::Simulator, 2.8, 0.3, true),
@@ -1959,6 +1992,32 @@ impl LocationSource {
                 update_age_s,
             },
         }
+    }
+
+    /// A source that is connected but holds **no position lock yet** — the honest
+    /// default for the MG90 GNSS before a live `state/vehicle` mirror (or a real
+    /// fix) has been folded. Its sample is `!has_fix()`, so the Drive HUD paints
+    /// "Acquiring GPS" and the instrument strip's GPS tiles read "—" / "No fix"
+    /// instead of a hard-coded coordinate in a city the vehicle is not in. The
+    /// device itself is Connected (link up), so it stays a healthy peer.
+    fn acquiring(kind: LocationSourceKind) -> Self {
+        let mut source = Self::sample(kind, 0.0, 0.0, true);
+        source.sample = LocationSample {
+            fix_type: "No fix".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            accuracy_m: 0.0,
+            speed_mph: 0.0,
+            heading_deg: 0.0,
+            altitude_m: 0.0,
+            satellites: None,
+            update_rate_hz: 0.0,
+            update_age_s: 0.0,
+        };
+        source
+            .diagnostics
+            .insert("fix".to_string(), "acquiring — no lock".to_string());
+        source
     }
 
     /// True when this source is safe to select manually as the primary source.
@@ -2613,6 +2672,64 @@ mod tests {
     }
 
     #[test]
+    fn default_primary_source_is_acquiring_not_a_fake_pittsburgh_fix() {
+        // Before any live `state/vehicle` mirror is folded, the primary MG90 GNSS
+        // must present as "no lock", never a hard-coded moving-vehicle fix — the
+        // #1 "looks like fake data" tell.
+        let state = MapsLocationSurface::simulated();
+        let primary = state.locations.primary_source().expect("mg90 primary");
+        assert_eq!(primary.kind, LocationSourceKind::Mg90Gnss);
+        assert!(
+            !primary.sample.has_fix(),
+            "the seeded primary must not read as a real position lock"
+        );
+        assert_eq!(primary.sample.fix_type, "No fix");
+        assert!(primary.sample.latitude.abs() < f64::EPSILON);
+
+        // The dedicated Simulator source keeps a fix so the Simulator section still
+        // demonstrates a position.
+        let sim = state
+            .locations
+            .sources
+            .iter()
+            .find(|s| s.kind == LocationSourceKind::Simulator)
+            .expect("simulator source");
+        assert!(
+            sim.sample.has_fix(),
+            "the Simulator source keeps a demo fix"
+        );
+    }
+
+    #[test]
+    fn dead_zone_recording_requires_a_position_fix() {
+        // Without a lock there is no honest coordinate — recording must refuse
+        // rather than pin a fabricated null-island point.
+        let mut state = MapsLocationSurface::simulated();
+        state.mg90.status.cellular_a.signal_dbm = -119;
+        state.mg90.status.cellular_a.healthy = false;
+        assert!(
+            !state.record_dead_zone_from_current_status(),
+            "no fix ⇒ no geolocated dead zone"
+        );
+    }
+
+    #[test]
+    fn start_and_end_navigation_toggle_the_guidance_flag() {
+        let mut state = MapsLocationSurface::simulated();
+        assert!(!state.local_navigation.navigating, "idle by default");
+        state.choose_destination(1);
+        assert!(state.route_preview);
+        state.start_navigation();
+        assert!(state.local_navigation.navigating, "Start begins guidance");
+        assert!(!state.route_preview);
+        state.simulate_arrival();
+        assert!(!state.local_navigation.navigating, "arrival ends guidance");
+        state.start_navigation();
+        state.end_navigation();
+        assert!(!state.local_navigation.navigating, "End returns to idle");
+    }
+
+    #[test]
     fn motion_rule_warns_above_one_mph() {
         let mut state = MapsLocationSurface::simulated();
         state.locations.sources[0].sample.speed_mph = 1.0;
@@ -2801,6 +2918,21 @@ mod tests {
 
         assert!(!state.record_dead_zone_from_current_status());
         assert_eq!(state.dead_zones.zones.len(), initial_zones);
+
+        // A dead zone can only be pinned to the map with a real position fix, so
+        // establish one on the primary (the seed is honestly acquiring / no lock),
+        // matching a live GNSS lock while driving.
+        if let Some(src) = state
+            .locations
+            .sources
+            .iter_mut()
+            .find(|s| s.kind == LocationSourceKind::Mg90Gnss)
+        {
+            src.sample.fix_type = "3D".to_string();
+            src.sample.latitude = 40.4406;
+            src.sample.longitude = -79.9959;
+            src.sample.accuracy_m = 3.0;
+        }
 
         assert!(state.simulate_cellular_dead_zone());
         assert_eq!(state.dead_zones.zones.len(), initial_zones + 1);

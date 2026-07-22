@@ -60,6 +60,7 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     // switching in Car Mode is driven by the Auto Home tiles / bound keys (Nav →
     // Drive, Vehicle → telematics), not the rail.
     if Style::color_scheme(ui.ctx()) == StyleColorScheme::AutoSync3 {
+        let panel_rect = ui.max_rect();
         egui::Frame::NONE.fill(Style::BG).show(ui, |ui| {
             let content_size = ui.available_size();
             ui.allocate_ui_with_layout(
@@ -73,6 +74,14 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
                 },
             );
         });
+        // Car Mode drops the header + tab rail — and with them the only "Simulator"
+        // indicator. Fixture data would otherwise fill the full-bleed HUD with no
+        // marker at all, so paint a persistent, un-hideable SIMULATED badge on a
+        // foreground layer whenever the simulator feed is live: it floats above the
+        // HUD cards / FABs and can never be scrolled away.
+        if state.simulator_enabled {
+            paint_simulated_ribbon(ui, panel_rect);
+        }
         return;
     }
 
@@ -196,6 +205,49 @@ fn header_chip(ui: &egui::Ui, header: Rect, right: f32, label: &str, tone: Color
         Style::TEXT,
     );
     rect.left() - Style::SP_S
+}
+
+/// A persistent, un-hideable "SIMULATED DATA" badge for the Car-Mode full-bleed
+/// layout, which drops the header chip that otherwise flags the simulator feed.
+/// Painted on a foreground layer (top-centre) so it floats above the HUD cards
+/// and FABs and can never be scrolled off — the driver always knows the readouts
+/// are fixture data, not a live vehicle.
+fn paint_simulated_ribbon(ui: &egui::Ui, panel: Rect) {
+    if panel.any_nan() || panel.width() < 40.0 {
+        return;
+    }
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("maps-simulated-ribbon"),
+    ));
+    let font = FontId::proportional(Style::SMALL);
+    let galley = painter.layout_no_wrap("SIMULATED DATA".to_string(), font, Style::TEXT_STRONG);
+    let dot_r = 3.5;
+    let chip_h = galley.size().y + Style::SP_S;
+    let chip_w = galley.size().x + Style::SP_M + dot_r * 2.0 + Style::SP_S * 2.0;
+    let rect = Rect::from_min_size(
+        egui::pos2(panel.center().x - chip_w / 2.0, panel.top() + Style::SP_S),
+        egui::vec2(chip_w, chip_h),
+    );
+    let radius = chip_h * 0.5;
+    painter.rect_filled(rect, radius, Color32::BLACK.gamma_multiply(0.55));
+    painter.rect_filled(rect, radius, Style::SURFACE_HI);
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.5, Style::WARN),
+        StrokeKind::Inside,
+    );
+    let dot_c = egui::pos2(rect.left() + Style::SP_S + dot_r, rect.center().y);
+    painter.circle_filled(dot_c, dot_r, Style::WARN);
+    painter.galley(
+        egui::pos2(
+            dot_c.x + dot_r + Style::SP_S,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        Style::TEXT_STRONG,
+    );
 }
 
 fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
@@ -669,9 +721,13 @@ fn drive_hud(
     );
 
     let route = &state.local_navigation.active_route;
+    // Guidance is honest only once the driver has actually chosen a destination
+    // and tapped Start. Idle (no destination) shows a calm prompt, NOT a
+    // fabricated maneuver banner / ETA / traffic for a route nobody picked.
+    let navigating = state.local_navigation.navigating;
 
-    // Top maneuver banner (the dominant instruction, Google-Maps blue), or the
-    // amber "Recalculating…" banner when off route.
+    // Top banner: the maneuver instruction (or amber "Recalculating…") while
+    // guiding, else the calm idle prompt. Always painted so the HUD has a header.
     let banner = safe_rect(
         rect.left() + margin,
         rect.top() + margin,
@@ -680,27 +736,32 @@ fn drive_hud(
     );
     let kind = maneuver_kind(&route.next_maneuver);
     paint_soft_shadow(&painter, banner, HUD_RADIUS);
-    if off_route {
-        paint_recalculating_banner(&painter, banner, route, time);
-    } else {
-        paint_maneuver_banner(&painter, banner, route, kind, has_fix);
-    }
-
-    // Lane-guidance strip directly under the banner (only when a turn is near
-    // and we are on route).
     let mut below_banner = banner.bottom() + Style::SP_S;
-    if !off_route && lane_guidance_active(route, kind, has_fix) {
-        let lanes = mock_lanes(kind);
-        // Never exceed the banner width; `paint_lane_guidance` skips a too-narrow
-        // strip, so a tiny viewport simply drops the lanes (no min>max clamp).
-        let lane_w = (lanes.len() as f32 * 56.0).min(banner.width().max(1.0));
-        let lane_rect = safe_rect(banner.left(), below_banner, lane_w, 48.0);
-        paint_soft_shadow(&painter, lane_rect, HUD_RADIUS_S);
-        paint_lane_guidance(&painter, lane_rect, &lanes);
-        below_banner = lane_rect.bottom() + Style::SP_S;
+    if navigating {
+        if off_route {
+            paint_recalculating_banner(&painter, banner, route, time);
+        } else {
+            paint_maneuver_banner(&painter, banner, route, kind, has_fix);
+        }
+
+        // Lane-guidance strip directly under the banner (only when a turn is near
+        // and we are on route).
+        if !off_route && lane_guidance_active(route, kind, has_fix) {
+            let lanes = mock_lanes(kind);
+            // Never exceed the banner width; `paint_lane_guidance` skips a
+            // too-narrow strip, so a tiny viewport simply drops the lanes.
+            let lane_w = (lanes.len() as f32 * 56.0).min(banner.width().max(1.0));
+            let lane_rect = safe_rect(banner.left(), below_banner, lane_w, 48.0);
+            paint_soft_shadow(&painter, lane_rect, HUD_RADIUS_S);
+            paint_lane_guidance(&painter, lane_rect, &lanes);
+            below_banner = lane_rect.bottom() + Style::SP_S;
+        }
+    } else {
+        paint_idle_banner(&painter, banner);
     }
 
-    // Alert pills stacked under the banner/lane strip (Waze-style report chips).
+    // Alert pills. Acquiring-GPS + offline-blocked are system-level (both states);
+    // traffic + weather belong to an active route (guidance only).
     let pill_x = rect.left() + margin;
     let mut pill_y = below_banner;
     if !has_fix {
@@ -723,27 +784,33 @@ fn drive_hud(
             Style::DANGER,
         );
     }
-    let traffic = route.traffic_alert.trim();
-    if !traffic.is_empty() {
-        pill_y = paint_alert_pill(&painter, pill_x, pill_y, "dialog-warning", traffic, TRAFFIC);
+    if navigating {
+        let traffic = route.traffic_alert.trim();
+        if !traffic.is_empty() {
+            pill_y = paint_alert_pill(&painter, pill_x, pill_y, "dialog-warning", traffic, TRAFFIC);
+        }
+        let weather = route.weather_alert.trim();
+        if !weather.is_empty() {
+            pill_y = paint_alert_pill(&painter, pill_x, pill_y, "dialog-warning", weather, WEATHER);
+        }
     }
-    let weather = route.weather_alert.trim();
-    if !weather.is_empty() {
-        let _ = paint_alert_pill(&painter, pill_x, pill_y, "dialog-warning", weather, WEATHER);
+    let _ = pill_y;
+
+    // Bottom ETA sheet (arrival time coloured by traffic) — guidance only.
+    if navigating {
+        let eta_w = (width * 0.46).clamp(260.0, 460.0);
+        let eta = safe_rect(
+            rect.center().x - eta_w / 2.0,
+            rect.bottom() - margin - 72.0,
+            eta_w,
+            72.0,
+        );
+        paint_soft_shadow(&painter, eta, HUD_RADIUS);
+        paint_eta_bar(&painter, eta, route, eta_tone(route, offline));
     }
 
-    // Bottom ETA sheet (arrival time coloured by traffic).
-    let eta_w = (width * 0.46).clamp(260.0, 460.0);
-    let eta = safe_rect(
-        rect.center().x - eta_w / 2.0,
-        rect.bottom() - margin - 72.0,
-        eta_w,
-        72.0,
-    );
-    paint_soft_shadow(&painter, eta, HUD_RADIUS);
-    paint_eta_bar(&painter, eta, route, eta_tone(route, offline));
-
-    // Bottom-left speedometer + round speed-limit sign.
+    // Bottom-left speedometer (live vehicle speed — honest in both states). The
+    // round speed-limit sign is route-derived, so it only shows while guiding.
     let speed_d = 88.0;
     let speedo = safe_rect(
         rect.left() + margin,
@@ -751,11 +818,17 @@ fn drive_hud(
         speed_d,
         speed_d,
     );
-    let limit = mock_speed_limit(route);
+    let limit = if navigating {
+        mock_speed_limit(route)
+    } else {
+        0
+    };
     paint_speedometer(&painter, speedo, primary, has_fix, limit);
-    let sign_r = 32.0;
-    let sign_center = egui::pos2(speedo.right() + Style::SP_S + sign_r, speedo.center().y);
-    paint_speed_limit_sign(&painter, sign_center, sign_r, limit);
+    if navigating {
+        let sign_r = 32.0;
+        let sign_center = egui::pos2(speedo.right() + Style::SP_S + sign_r, speedo.center().y);
+        paint_speed_limit_sign(&painter, sign_center, sign_r, limit);
+    }
 
     // Floating action buttons (painted last so they float above everything).
     for (idx, key) in fab_keys.iter().enumerate() {
@@ -878,9 +951,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         Sense::click(),
     );
     if start_resp.clicked() {
-        let selected = state.local_navigation.selected_route;
-        state.local_navigation.apply_route_option(selected);
-        state.route_preview = false;
+        state.start_navigation();
     }
     let start_hovered = start_resp.hovered();
     let start_pressed = start_resp.is_pointer_button_down_on();
@@ -2092,6 +2163,66 @@ fn paint_recalculating_banner(painter: &Painter, rect: Rect, route: &RoutePlan, 
         &sub,
         FontId::proportional(Style::BODY),
         Color32::WHITE.gamma_multiply(0.8),
+    );
+}
+
+/// The calm idle banner shown on the Drive HUD when there is no active
+/// destination: a search chip + "No destination — search to start" prompt,
+/// instead of a fabricated maneuver instruction for a route nobody chose.
+fn paint_idle_banner(painter: &Painter, rect: Rect) {
+    painter.rect_filled(rect, HUD_RADIUS, HUD_CARD_BG);
+    paint_card_sheen(
+        painter,
+        rect,
+        HUD_RADIUS,
+        HUD_CARD_HI.gamma_multiply(0.6),
+        Color32::BLACK.gamma_multiply(0.16),
+    );
+    painter.rect_stroke(
+        rect,
+        HUD_RADIUS,
+        Stroke::new(1.0, Style::BORDER),
+        StrokeKind::Inside,
+    );
+
+    let inset = Style::SP_S;
+    let chip_side = (rect.height() - 2.0 * inset).max(1.0);
+    let chip = safe_rect(
+        rect.left() + inset,
+        rect.top() + inset,
+        chip_side,
+        chip_side,
+    );
+    painter.rect_filled(chip, HUD_RADIUS_S, Style::SURFACE_HI);
+    let icon_box = safe_rect(
+        chip.center().x - chip_side * 0.25,
+        chip.center().y - chip_side * 0.25,
+        chip_side * 0.5,
+        chip_side * 0.5,
+    );
+    let _ = paint_carbon(painter, icon_box, "system-search", Style::ACCENT_HI);
+
+    let tx = chip.right() + Style::SP_M;
+    let max_w = (rect.right() - Style::SP_M - tx).max(1.0);
+    painter.text(
+        egui::pos2(tx, rect.top() + 9.0),
+        Align2::LEFT_TOP,
+        "No destination",
+        FontId::proportional(28.0),
+        Style::TEXT_STRONG,
+    );
+    let sub = elide(
+        painter,
+        "Search to start navigation",
+        FontId::proportional(Style::BODY),
+        max_w,
+    );
+    painter.text(
+        egui::pos2(tx, rect.bottom() - 9.0),
+        Align2::LEFT_BOTTOM,
+        &sub,
+        FontId::proportional(Style::BODY),
+        Style::TEXT_DIM,
     );
 }
 
@@ -5337,6 +5468,7 @@ mod tests {
     fn drive_hud_renders_lane_guidance_near_a_turn() {
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Drive;
+        surface.local_navigation.navigating = true;
         surface.local_navigation.active_route.next_maneuver = "Turn right onto Main St".to_string();
         surface
             .local_navigation
@@ -5510,6 +5642,7 @@ mod tests {
     fn drive_hud_off_route_shows_recalculating_state() {
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Drive;
+        surface.local_navigation.navigating = true;
         surface.off_route = true;
         assert!(tessellate(&mut surface) > 0);
     }
@@ -5547,8 +5680,10 @@ mod tests {
         assert!(!surface.destination_search);
         assert!(tessellate(&mut surface) > 0);
 
-        // 3. Start -> live turn-by-turn HUD.
-        surface.route_preview = false;
+        // 3. Start -> live turn-by-turn HUD (guidance now running).
+        surface.start_navigation();
+        assert!(surface.local_navigation.navigating);
+        assert!(!surface.route_preview);
         assert!(tessellate(&mut surface) > 0);
 
         // 4. Off-route recalculating banner, then back on route.

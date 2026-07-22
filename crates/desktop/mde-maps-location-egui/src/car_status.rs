@@ -191,14 +191,22 @@ impl CarStatusItem {
         let t = &s.vehicle.telemetry;
         let w = &s.mg90.status;
         let sample = s.locations.primary_source().map(|src| &src.sample);
+        // `g` resolves from whatever primary sample exists (source-present gate).
+        // `gf` additionally requires a real position lock: GPS-derived readouts
+        // are honest ONLY on a fix — without one they read "—", never a
+        // fabricated 0.0000 / 0° / 0-sat / zero-accuracy coordinate.
+        let fixed = sample.filter(|x| x.has_fix());
         let g = |f: fn(&crate::model::LocationSample) -> String| {
             sample.map_or_else(|| "—".to_string(), |x| f(x))
+        };
+        let gf = |f: fn(&crate::model::LocationSample) -> String| {
+            fixed.map_or_else(|| "—".to_string(), |x| f(x))
         };
         match self {
             Self::SpeedMph => format!("{:.0} mph", t.speed_mph),
             Self::SpeedKph => format!("{:.0} kph", t.speed_mph * 1.60934),
-            Self::Heading => g(|x| format!("{:.0}°", x.heading_deg)),
-            Self::HeadingCardinal => g(|x| cardinal(x.heading_deg).to_string()),
+            Self::Heading => gf(|x| format!("{:.0}°", x.heading_deg)),
+            Self::HeadingCardinal => gf(|x| cardinal(x.heading_deg).to_string()),
             Self::Rpm => format!("{}", t.rpm),
             Self::CoolantC => format!("{:.0} °C", t.coolant_c),
             Self::CoolantF => format!("{:.0} °F", t.coolant_c * 9.0 / 5.0 + 32.0),
@@ -219,28 +227,34 @@ impl CarStatusItem {
                 }
             }
             Self::FaultCodes => format!("{}", t.dtc_count),
-            Self::GpsFix => g(|x| x.fix_type.clone()),
-            Self::Satellites => g(|x| {
+            // GPS FIX reads the honest lock state: the live fix label on a lock,
+            // "No fix" when a source is present but acquiring, "—" with no source.
+            Self::GpsFix => match sample {
+                Some(x) if x.has_fix() => x.fix_type.clone(),
+                Some(_) => "No fix".to_string(),
+                None => "—".to_string(),
+            },
+            Self::Satellites => gf(|x| {
                 x.satellites
                     .map_or_else(|| "—".to_string(), |n| n.to_string())
             }),
-            Self::AccuracyM => g(|x| format!("{:.0} m", x.accuracy_m)),
-            Self::Latitude => g(|x| format!("{:.4}", x.latitude)),
-            Self::Longitude => g(|x| format!("{:.4}", x.longitude)),
-            Self::AltitudeM => g(|x| format!("{:.0} m", x.altitude_m)),
-            Self::AltitudeFt => g(|x| format!("{:.0} ft", x.altitude_m * 3.28084)),
+            Self::AccuracyM => gf(|x| format!("{:.0} m", x.accuracy_m)),
+            Self::Latitude => gf(|x| format!("{:.4}", x.latitude)),
+            Self::Longitude => gf(|x| format!("{:.4}", x.longitude)),
+            Self::AltitudeM => gf(|x| format!("{:.0} m", x.altitude_m)),
+            Self::AltitudeFt => gf(|x| format!("{:.0} ft", x.altitude_m * 3.28084)),
             Self::UpdateRate => g(|x| format!("{:.0} Hz", x.update_rate_hz)),
             Self::FixAge => g(|x| format!("{:.0} s", x.update_age_s)),
             Self::LocationSource => s.locations.primary.label().to_string(),
             Self::ActiveWan => empty_dash(&w.active_wan),
-            Self::CellASignal => format!("{} dBm", w.cellular_a.signal_dbm),
+            Self::CellASignal => signal_dbm(w.cellular_a.signal_dbm),
             Self::CellABars => bars(w.cellular_a.signal_dbm),
             Self::CellACarrier => empty_dash(&w.cellular_a.carrier),
             Self::CellATech => empty_dash(&w.cellular_a.technology),
             Self::CellASim => empty_dash(&w.cellular_a.sim_state),
             Self::CellAIp => empty_dash(&w.cellular_a.wan_ip),
             Self::CellAHealth => healthy(w.cellular_a.healthy),
-            Self::CellBSignal => format!("{} dBm", w.cellular_b.signal_dbm),
+            Self::CellBSignal => signal_dbm(w.cellular_b.signal_dbm),
             Self::CellBCarrier => empty_dash(&w.cellular_b.carrier),
             Self::CellBTech => empty_dash(&w.cellular_b.technology),
             Self::CellBSim => empty_dash(&w.cellular_b.sim_state),
@@ -249,8 +263,22 @@ impl CarStatusItem {
             Self::EthernetState => empty_dash(&w.ethernet_state),
             Self::VpnState => empty_dash(&w.vpn_state),
             Self::LinkQuality => empty_dash(&w.link_quality),
-            Self::LatencyMs => format!("{} ms", w.latency_ms),
-            Self::PacketLoss => format!("{:.1}%", w.packet_loss_percent),
+            // Latency / packet-loss are WAN metrics: meaningless (and a "0 ms" /
+            // "0.0%" fake tell) with no active uplink, so gate on a live WAN.
+            Self::LatencyMs => {
+                if w.active_wan.trim().is_empty() || w.latency_ms == 0 {
+                    "—".to_string()
+                } else {
+                    format!("{} ms", w.latency_ms)
+                }
+            }
+            Self::PacketLoss => {
+                if w.active_wan.trim().is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{:.1}%", w.packet_loss_percent)
+                }
+            }
             Self::Failovers => format!("{}", w.failover_events),
             Self::DataUsed => empty_dash(&w.data_transferred),
             Self::TelemetrySource => empty_dash(&t.confidence),
@@ -291,15 +319,35 @@ fn empty_dash(s: &str) -> String {
     }
 }
 
+/// Cellular signal readout. A real reading is negative dBm; `0` (or any
+/// non-negative value) is the "no signal / absent" sentinel and reads as an
+/// honest dash rather than a fabricated "0 dBm".
+fn signal_dbm(dbm: i32) -> String {
+    if dbm < 0 {
+        format!("{dbm} dBm")
+    } else {
+        "—".to_string()
+    }
+}
+
 /// Signal-strength bars from a cellular dBm reading (5-bar scale).
+///
+/// A real reading is negative dBm; `0` (or any non-negative value) is the
+/// "no signal / absent" sentinel and MUST read as an empty strip. The prior
+/// top branch (`0 >= -70`) drew a full 5-bar strip for an absent signal — a
+/// strong "fake data" tell in the factory instrument strip.
 fn bars(dbm: i32) -> String {
-    let n = match dbm {
-        d if d >= -70 => 5,
-        d if d >= -85 => 4,
-        d if d >= -100 => 3,
-        d if d >= -110 => 2,
-        d if d >= -120 => 1,
-        _ => 0,
+    let n = if dbm < 0 {
+        match dbm {
+            d if d >= -70 => 5,
+            d if d >= -85 => 4,
+            d if d >= -100 => 3,
+            d if d >= -110 => 2,
+            d if d >= -120 => 1,
+            _ => 0,
+        }
+    } else {
+        0
     };
     format!("{}{}", "▮".repeat(n), "▯".repeat(5 - n))
 }
@@ -426,6 +474,80 @@ mod tests {
         assert_eq!(cardinal(90.0), "E");
         assert_eq!(cardinal(180.0), "S");
         assert_eq!(bars(-60).chars().filter(|c| *c == '▮').count(), 5);
+        assert_eq!(bars(-72).chars().filter(|c| *c == '▮').count(), 4);
         assert_eq!(bars(-130).chars().filter(|c| *c == '▮').count(), 0);
+    }
+
+    #[test]
+    fn absent_cell_signal_never_reads_full_bars() {
+        // Regression: `bars(0)` used to hit the `0 >= -70` branch and draw a full
+        // 5-bar strip for an absent signal — the marquee "fake data" tell.
+        assert_eq!(bars(0), "▯▯▯▯▯");
+        assert_eq!(
+            bars(5),
+            "▯▯▯▯▯",
+            "a non-negative dBm is never a real signal"
+        );
+        assert_eq!(signal_dbm(0), "—");
+        assert_eq!(signal_dbm(-72), "-72 dBm");
+    }
+
+    #[test]
+    fn gps_tiles_are_fix_gated() {
+        // The default seed presents the primary as acquiring (no live fix folded),
+        // so every GPS-derived tile reads honest no-data — never a fabricated
+        // coordinate / heading / altitude / satellite count.
+        let mut s = MapsLocationSurface::simulated();
+        let gps_tiles = [
+            CarStatusItem::Latitude,
+            CarStatusItem::Longitude,
+            CarStatusItem::AltitudeM,
+            CarStatusItem::AltitudeFt,
+            CarStatusItem::Heading,
+            CarStatusItem::HeadingCardinal,
+            CarStatusItem::Satellites,
+            CarStatusItem::AccuracyM,
+        ];
+        for item in gps_tiles {
+            assert_eq!(
+                item.value(&s),
+                "—",
+                "{item:?} must read no-data without a fix"
+            );
+        }
+        assert_eq!(CarStatusItem::GpsFix.value(&s), "No fix");
+
+        // A real lock on the primary resolves the same tiles to live values.
+        if let Some(src) = s
+            .locations
+            .sources
+            .iter_mut()
+            .find(|src| src.kind == crate::model::LocationSourceKind::Mg90Gnss)
+        {
+            src.sample.fix_type = "3D".to_string();
+            src.sample.latitude = 40.4406;
+            src.sample.longitude = -79.9959;
+            src.sample.altitude_m = 311.0;
+            src.sample.heading_deg = 90.0;
+            src.sample.satellites = Some(12);
+            src.sample.accuracy_m = 3.0;
+        }
+        assert_eq!(CarStatusItem::Latitude.value(&s), "40.4406");
+        assert_eq!(CarStatusItem::GpsFix.value(&s), "3D");
+        assert_eq!(CarStatusItem::Satellites.value(&s), "12");
+        assert_eq!(CarStatusItem::HeadingCardinal.value(&s), "E");
+        assert_eq!(CarStatusItem::AccuracyM.value(&s), "3 m");
+    }
+
+    #[test]
+    fn connectivity_tiles_read_dash_when_absent() {
+        let mut s = MapsLocationSurface::simulated();
+        s.mg90.status.active_wan = String::new();
+        s.mg90.status.cellular_a.signal_dbm = 0;
+        s.mg90.status.latency_ms = 0;
+        assert_eq!(CarStatusItem::CellASignal.value(&s), "—");
+        assert_eq!(CarStatusItem::LatencyMs.value(&s), "—");
+        assert_eq!(CarStatusItem::PacketLoss.value(&s), "—");
+        assert_eq!(CarStatusItem::CellABars.value(&s), "▯▯▯▯▯");
     }
 }
