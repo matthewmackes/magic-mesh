@@ -90,7 +90,35 @@ beta-readiness needs them *parked-with-a-gate*, not *done*.
 43-epic 2026-07-19 drain audit. It is outside that historical count and evidence
 ledger; the audit's totals remain a snapshot of the worklist it evaluated.
 
-**Update 2026-07-20:** original 43 drained to 3 active — **WL-ARCH-001** (CODE-COMPLETE; OpenStack removed + OpenTofu/Ansible/libvirt backend + iac/ workspace; only Phase D live smoke, operator/hardware-gated), **WL-FUNC-011** (PARITY-COMPLETE; full Communications stack + all 6 modes live; only the one-big cutover, operator-gated), **WL-RUN-003** (held). New epic **WL-ARCH-006** (Workloads cockpit) added below as WL-ARCH-001's surface successor (21-unit farm fan-out; **CODE-COMPLETE 2026-07-20 — all 21 units landed + workspace-green + pushed `bae119e6`; only live-seat smoke + mirror rich-payload decode remain**).
+**Update 2026-07-20:** original 43 drained to 3 active — **WL-ARCH-001**
+(CODE-COMPLETE; OpenStack removed + OpenTofu/Ansible/libvirt backend + iac/ workspace;
+only Phase D live smoke, operator/hardware-gated), **WL-FUNC-011** (PARITY-COMPLETE;
+full Communications stack + all 6 modes live; only the one-big cutover, operator-gated),
+**WL-RUN-003** (held). New epic **WL-ARCH-006** (Workloads cockpit) added below as
+WL-ARCH-001's surface successor (21-unit farm fan-out; **CODE-COMPLETE 2026-07-20 — all
+21 units landed + workspace-green + pushed `bae119e6`; only live-seat smoke + mirror
+rich-payload decode remain**).
+
+**Update 2026-07-22 (operator: remove live-seat blocks; finish OpenStack removal):**
+two closures + two clarifications.
+- **WL-ARCH-001 → DONE + archived**
+  (`docs/worklist-archive/2026-07-22-live-block-removal.md`): the OpenStack-removal
+  live-apply block is removed; substantiated by `tofu validate` on `infra/tofu/cloud/` =
+  valid and `ansible-playbook --syntax-check` on `site.yml` = clean. The live
+  `MDE_CLOUD_APPLY=1` libvirt provision is now an optional operator spot-check.
+- **WL-ARCH-006 → DONE + archived** (same file): the sole remaining gate was the
+  live-seat `.15` provision→destroy smoke; removed per directive. Code-complete +
+  `cargo build --workspace` green.
+- **WL-FUNC-011** stays Blocked but its criterion-12 live-seat visual signoff is no
+  longer a gate (the cutover shell is already deployed live + stable on `.15`); it
+  remains blocked only on criterion 8 (real WebRTC/SIP call frames — live call infra + a
+  2nd peer) and criterion 9 (DO LLM with an operator-sealed key) — neither is a seat.
+- **WL-RUN-003** stays Blocked and is explicitly OUT of the live-seat directive's scope:
+  its gate is a live cloud lighthouse fleet + a DigitalOcean API token (an operator-held
+  secret), not a seat, and there is no build-time validation analog to substantiate a
+  real add/retire against live etcd.
+- Active count: 3 → **WL-RUN-003** (Blocked), **WL-FUNC-011** (Blocked),
+  **WL-FUNC-012** (Remaining), **WL-FUNC-013** (Remaining, in progress).
 
 ## Status Vocabulary
 
@@ -167,86 +195,11 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Core Architecture
 
-### WL-ARCH-001 - Remove OpenStack; OpenTofu + Ansible IaC workspace for all cloud operations
-
-- Status: Blocked
-- Progress (2026-07-20): CODE-COMPLETE. Phase A delete (222e1980, -19k LOC) + Phase B OpenTofu/Ansible/libvirt backend + mackesd cloud worker (1dad89d2) + Phase C recreated six-mode iac/ cloud-ops workspace (19e0089038 -> c2a3f76d) all landed + tested green; zero OpenStack in production code. Only Phase D remains: the live local-libvirt provision+configure smoke (MDE_CLOUD_APPLY=1 on a libvirt host) — operator/hardware-gated. NB: the coarse Phase-C six-mode iac/ is being reenvisioned by WL-ARCH-006 (Workloads cockpit — delivery-type x mesh placement); WL-ARCH-006 is the surface successor over this same OpenTofu+Ansible+libvirt backend.
-- Priority: P1
-- Complexity: Epic
-- Problem: Construct Cloud is coupled to OpenStack (Nova/Heat/Keystone/Kolla,
-  state/openstack/* mirrors, cloud_plane.rs/console/front_door OpenStack copy).
-  Operator directive 2026-07-19: REMOVE ALL OpenStack and rebuild cloud operations
-  on OpenTofu + Ansible against local libvirt, with the IaC workspace recreated as
-  the single surface for every cloud operation.
-- Required outcome: Zero OpenStack anywhere (workers, surfaces, mirrors, docs,
-  deps). A recreated `iac/` workspace drives ALL cloud operations end to end via
-  OpenTofu (provision) + Ansible (configure) against local libvirt/KVM, and can
-  provision + configure a workload with no OpenStack code present.
-- Decided stack (operator 2026-07-19, Red Hat / cloud-native standards):
-  1. **Provision = OpenTofu** (declarative; replaces Heat/HOT + Nova verbs).
-     libvirt provider for local VMs; networks + images declared as Tofu resources.
-  2. **Configure = Ansible core** (playbooks/roles; replaces OpenStack config).
-     Ansible roles drive the EXISTING mackesd-written `/etc/mackesd/site.yml`
-     convergence (boot-durable, reuses the SEC-001 join path).
-  3. **VM/workload backend = local libvirt/KVM** (E12 local-first; no external cloud).
-  4. **Images = bootc image-mode + osbuild/image-builder** (extends packaging/bootc/).
-  5. **Containers = Podman + Quadlet** systemd units (replaces Kolla), Ansible-managed.
-  6. **Tofu state = etcd-backed** (mesh-native; consistent with infra/tofu/*).
-  7. **Inventory = mesh-derived dynamic inventory** — a plugin reads the live mesh
-     roster (etcd node-tags /mcnf/node-tags/<id> + mackesd peers); roles/scopes
-     drive Ansible groups; no static host files.
-  8. **Secrets = mde-seal/age** (mesh-native, role/scope-sealed per SEC-003) bridged
-     to Ansible via a lookup plugin + a Tofu external data source. NO Ansible Vault
-     (single secret system).
-  9. **Networking = Nebula overlay** (mesh) + libvirt networks via nmstate/
-     NetworkManager (replaces Neutron).
-  10. **Removal sequencing = delete OpenStack immediately, build in its place** —
-      accept a temporary cloud-ops gap; no permanent compat shim; single cutover.
-- Recreate the IaC workspace: rebuild `crates/desktop/mde-shell-egui/src/iac/` as
-  the unified cloud-operations surface with modes for Provision (Tofu plan/apply +
-  state), Configure (Ansible playbook/role runs), Images (bootc/osbuild), Network,
-  Containers (Quadlet), and Status/day-2. Reads provider-neutral state/cloud/*
-  mirrors; the `mackes_mesh_types::cloud` facade becomes the live contract (wire
-  its real consumers; drop the dormant openstack module import at iac/mod.rs:53).
-- Relevant files/components: DELETE `crates/mesh/mackesd/src/workers/openstack/`,
-  the OpenStack copy in `cloud_plane.rs`/`console/mod.rs:619`/`front_door.rs:415,462`,
-  `state/openstack/*` producers, and OpenStack docs; NEW `infra/tofu/cloud/`
-  (libvirt provider, etcd backend, modules), NEW Ansible tree (roles + dynamic
-  inventory plugin + site.yml integration), rebuilt `iac/`, the
-  `mackes_mesh_types::cloud` facade, `packaging/bootc/`, a new mackesd cloud worker
-  (Tofu/Ansible runner + status publisher) registered in WORKER_REGISTRY.
-- Dependencies: a farm dev libvirt host to prove list+launch (local; the farm/XCP
-  dom0s or a seat). No external cloud creds required (local-first).
-- Acceptance criteria: (1) `/audit` grep finds zero product-facing OpenStack/Nova/
-  Heat/Keystone/Kolla terminology or code; the `openstack/` worker tree is gone.
-  (2) The recreated IaC workspace runs a Tofu apply that provisions a local libvirt
-  VM and an Ansible play that configures it, end to end, over mesh networking, with
-  no OpenStack present. (3) Tofu state persists in etcd; inventory is mesh-derived;
-  secrets resolve via the mde-seal lookup (no Vault). (4) A Podman/Quadlet service
-  workload and a bootc image build are driveable from the workspace. (5) Stale
-  OpenStack docs archived/bannered.
-- Verification method: Tofu+Ansible fixture tests (plan/apply against a libvirt
-  fake + a real libvirt host smoke), inventory-plugin unit tests over an etcd
-  roster fixture, mde-seal-lookup resolution test, workspace UI fixture tests per
-  mode, an `/audit` OpenStack-terminology grep gate, and a live local-libvirt
-  provision+configure smoke on a farm/seat host.
-- Origin or merged source IDs: QC-1..QC-15, OW-8, E12 supersession notes, operator
-  directive 2026-07-19 (remove all OpenStack; OpenTofu provision + Ansible
-  configure; recreate IaC workspace for all cloud ops; 10-question Red Hat-standards
-  survey).
-### WL-ARCH-006 - Workloads cockpit (reenvision the IaC surface: delivery-type x mesh placement)
-
-- Status: Blocked
-- Priority: P1
-- Complexity: Epic
-- Problem: WL-ARCH-001 landed a real-but-coarse OpenTofu+Ansible+libvirt backend + a 6-mode iac/ workspace, but the surface is organized by raw Tofu concepts, cannot place a workload on a specific mesh node, and does not drive the five real delivery types. The operator's 50-question design reenvisions it as "Workloads".
-- Required outcome: The iac/ surface (user-facing "Workloads"; seam Surface::InfraCode kept) presents five first-class delivery-type views (Desktop-VM / Service-VM / App-only-VM (VDI app-mode) / Android-VM (Cuttlefish) / Service-Container), each placeable on an explicit mesh node, provisioning + configuring real libvirt workloads end to end over OpenTofu+Ansible. Delete cloud_plane.rs. One-big-cutover.
-- Plan: docs/plans/workloads-cockpit.md (locked 50-Q design + 21-unit fan-out + wire contract + per-node-apply reconciliation + ranked risks). Extends WL-ARCH-001 Phase B; supersedes its coarse Phase-C iac/.
-- Progress (2026-07-20): **CODE-COMPLETE — all 21 units landed + `cargo build --workspace` green + pushed (origin/master `bae119e6`).** Tier-0 U1a/U2/U3 (wire contract `c7cc9b77` + worker split `bbe859f7` + delivery-type cockpit scaffold `c68e65ec`), Tier-1 U4-U10 backend verbs, Tier-2 U11-U13 (tofu modules + ansible roles), Tier-3 U14-U19 (`74636845` placement picker + provision form; `eeb36d76` 5 delivery-views; `7be0e3ec` configure/inventory + status/metrics; `d13a623f` images/containers), Tier-4 U20+U21 (`bae119e6` — deleted `cloud_plane.rs`/`Plane::Cloud`, Workbench 5→4 planes, de-OpenStacked `unit_aggregator`; `kdc_host/cloud.rs` + `session_broker.rs` were already on the unified path). `Surface::InfraCode`/Workloads reachable + renders. REMAINING (hardware-gated only): live-seat `.15` provision→configure→console→destroy smoke (operator/hardware-gated). The CloudReply rich-payload decode LANDED 2026-07-20 (`72159c31`): `iac/images.rs` decodes the ImageRow roster + console-attach decodes `ConsoleEndpoint` into an honest console section across the delivery views (33 iac tests green); full VDI-paint is a separate subsystem (`main.rs` VdiState). No autonomous work remains — only the hardware-gated live smoke.
-- Dependencies: WL-ARCH-001 backend (landed). Live smoke needs a libvirt host (.15) with nested-KVM for the Cuttlefish/Android type (else Android-x86 fallback).
-- Acceptance criteria: five delivery-type views each provision+configure a real libvirt workload on a picked node; apply-on-placement-node; armed-token per-request auth; destroy=preview+typed-arm; drift via periodic plan; cloud_plane.rs deleted; zero OpenStack terminology; live provision+configure+destroy smoke on .15.
-- Verification method: per-mode egui fixtures; libvirt-fake CloudRunner tests per verb; inventory/mesh.py selftest; /audit OpenStack-terminology grep; live .15 smoke (SSH-verify virsh list + state/cloud JSON + mackesd journal).
-- Origin or merged source IDs: WL-ARCH-001 Phase-C successor; operator 50-question Workloads survey 2026-07-20; plan mossy-knitting-sun.md.
+> WL-ARCH-001 (Remove OpenStack; OpenTofu+Ansible IaC) and WL-ARCH-006 (Workloads
+> cockpit) both closed **DONE 2026-07-22** and moved to
+> `docs/worklist-archive/2026-07-22-live-block-removal.md` (operator directive:
+> remove the live-seat / OpenStack-removal live-apply blocks; both code-complete +
+> IaC-validated).
 
 ## Runtime Reliability
 
@@ -259,7 +212,12 @@ These decisions refine acceptance and sequencing for the active items below.
   inheritance, quorum-preserving `drain_gate` (`lighthouse_lifecycle.rs`), and the
   `spawn_lighthouse_onboard` worker + shell flow all landed. BLOCKED-on: the live
   multi-lighthouse fleet add-retire-add cycle drill + DO provisioning creds — operator/
-  live-infra gated, not autonomously drainable.
+  live-infra gated, not autonomously drainable. NB (2026-07-22): the operator's
+  "remove live-seat blocks" directive does NOT reach this epic — its gate is a live
+  cloud lighthouse fleet + a DigitalOcean API token (a secret only the operator holds),
+  not a live seat, and there is no build-time validation analog (unlike WL-ARCH-001's
+  `tofu validate`) that could substantiate a real add/retire against live etcd. Stays
+  Blocked on the DO credential + a 2nd live lighthouse.
 - Priority: P1
 - Complexity: Large
 - Problem: Lighthouse management still has manual parts around CA custody,
@@ -281,8 +239,27 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
-- Status: Blocked (live-acceptance only — code merged)
-- Progress (2026-07-21): CUTOVER LANDED (origin/master a84017f1) — at the AUTONOMOUS CEILING. Phase-1 (56 parity Qs ruled 78408f3b, migration importer 4e0d5df0, retire the dead Kamailio/RTPengine VV stack aad4d511) + Phase-2 shell surface cutover (a84017f1) are merged: Surface::Chat/Voice/Editor retired into one Surface::Communications, Surface::ALL 20->17, mde-voice-egui crate deleted (~3,530 LOC). Surface::Files KEPT (Q26 — not retired). mde-chat/mde-editor-egui/mde-voice-hud kept for their non-surface consumers. Full stack live + §7-audited stub-free: mde-collab-types + mde-collab-core (property-tested convergence) + mackesd CollabWorker (state/collab/* + action/collab/*) + mde-collab-egui CommunicationsSurface mounted in the shell. All 6 parity modes present. Landed farm-green (cargo build --workspace rc=0) with the failing-set proven a subset of base (zero new reds). Parity ledger docs/platform/WL-FUNC-011-parity-ledger.md (519 rows, all 56 open-Qs resolved). REMAINING = Phase-3 live-acceptance gates ONLY, irreducibly operator/hardware-gated: criterion 8 (real WebRTC/SIP call frames — live infra), criterion 9 (DO LLM with a sealed key — operator key), criterion 12 (live visual signoff — cutover shell not yet deployed to a seat; .15 needs an operator-credentialed install). 4 PRE-EXISTING (non-cutover) shell-test reds documented in docs/NEEDS-OPERATOR.md. Phase-3c follow-ups (editor CRDT/three-way-merge/review; call media plane) remain co-edit/hardware-gated.
+- Status: Blocked
+- Progress (2026-07-21): CUTOVER LANDED (origin/master a84017f1) — at the AUTONOMOUS
+  CEILING. Phase-1 (56 parity Qs ruled 78408f3b, migration importer 4e0d5df0, retire the
+  dead Kamailio/RTPengine VV stack aad4d511) + Phase-2 shell surface cutover (a84017f1)
+  are merged: Surface::Chat/Voice/Editor retired into one Surface::Communications,
+  Surface::ALL 20->17, mde-voice-egui crate deleted (~3,530 LOC). Surface::Files KEPT
+  (Q26 — not retired). mde-chat/mde-editor-egui/mde-voice-hud kept for their non-surface
+  consumers. Full stack live + §7-audited stub-free: mde-collab-types + mde-collab-core
+  (property-tested convergence) + mackesd CollabWorker (state/collab/* + action/collab/*)
+  + mde-collab-egui CommunicationsSurface mounted in the shell. All 6 parity modes
+  present. Landed farm-green (cargo build --workspace rc=0) with the failing-set proven a
+  subset of base (zero new reds). Parity ledger docs/platform/WL-FUNC-011-parity-ledger.md
+  (519 rows, all 56 open-Qs resolved). REMAINING = Phase-3 live-acceptance gates that are
+  NOT live-seat (per operator 2026-07-22 the live-seat blocks are removed): criterion 8
+  (real WebRTC/SIP call frames — needs live call infra + a 2nd peer), criterion 9 (DO LLM
+  with a sealed key — needs an operator-provisioned key via mde-seal). Criterion 12 (live
+  visual signoff) is NO LONGER a block: the cutover shell is already deployed live on .15
+  (boots drm:true, 12.1.0, stable, NRestarts=0), so its functional half is closed and the
+  aesthetic signoff is now an optional operator glance, not a gate. 4 PRE-EXISTING
+  (non-cutover) shell-test reds documented in docs/NEEDS-OPERATOR.md. Phase-3c follow-ups
+  (editor CRDT/three-way-merge/review; call media plane) remain co-edit/hardware-gated.
 - Priority: P0
 - Complexity: Epic
 - Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
@@ -657,7 +634,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-FUNC-013 - Maps & Location world-class + built-for-purpose (offline basemap, geocoding, sparse-data honesty, mode-button)
 
-- Status: Remaining (in progress 2026-07-22)
+- Status: Remaining
 - Priority: P1
 - Complexity: Epic
 - Problem: The Maps & Location cockpit reads as FAKE DATA - the simulator fixture
