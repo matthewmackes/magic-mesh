@@ -43,6 +43,7 @@ pub mod blob;
 pub mod domain;
 pub mod engine;
 pub mod error;
+pub mod import;
 pub mod log;
 pub mod pipeline;
 pub mod projection;
@@ -56,6 +57,10 @@ pub use blob::{default_root, verify_bytes, BlobStore, FsBlobStore, MemoryBlobSto
 pub use domain::{canonical_sort, sort_key, DomainState};
 pub use engine::{CollabEngine, MergeOutcome};
 pub use error::{CollabError, Result};
+pub use import::{
+    EditorImport, EventSink, ImportMap, ImportReport, Importer, LogSink, MemorySink,
+    IMPORT_MAP_VERSION,
+};
 pub use log::{ActorLog, FileActorLog, MemoryActorLog};
 pub use pipeline::{apply_command, ApplyCtx, EDIT_WINDOW_MS};
 pub use projection::Projection;
