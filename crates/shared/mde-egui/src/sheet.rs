@@ -1090,7 +1090,7 @@ mod tests {
         let anchor = Rect::from_min_size(pos2(600.0, 100.0), vec2(48.0, 24.0));
         let mut open = true;
         let mut t = 0.0;
-        let mut show = |ctx: &egui::Context, open: &mut bool| {
+        let show = |ctx: &egui::Context, open: &mut bool| {
             let _ = pop.show(ctx, open, anchor, |ui| {
                 ui.label("transient choice");
             });
