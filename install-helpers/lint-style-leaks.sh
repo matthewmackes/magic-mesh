@@ -12,6 +12,8 @@
 # DATA-not-look exclusions (these draw pixel/ANSI *data*, never UI chrome):
 #   - the VDI protocol decoders: mde-vdi-{rdp,spice,vnc}
 #   - the shared VDI pixel core:  mde-vdi-core/src/pixel.rs  (framebuffer bytes)
+#   - the CEF-OSR framebuffer:    mde-web-preview-client/src/frame.rs  (Bgra8 -> Color32
+#                                 swizzle of browser paint bytes; same category as the VDI pixel core)
 #   - the terminal colour tables: mde-term-egui/src/{palette,presets}.rs
 #   - CEF verifier pixel fixtures: mde-web-preview-client/src/bin/cef-verify.rs
 # Browser workspace exception (AI_GOVERNANCE §4): Browser chrome owns a local
@@ -24,7 +26,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DATA_EXCLUDE='mde-vdi-(rdp|spice|vnc)/|mde-vdi-core/src/pixel\.rs|mde-term-egui/src/(palette|presets)\.rs'
+DATA_EXCLUDE='mde-vdi-(rdp|spice|vnc)/|mde-vdi-core/src/pixel\.rs|mde-web-preview-client/src/frame\.rs|mde-term-egui/src/(palette|presets)\.rs'
 COLOUR_EXCLUDE="${DATA_EXCLUDE}|mde-web-preview-client/src/bin/cef-verify\.rs|mde-shell-egui/src/web/chrome_ui/mod\.rs"
 
 # 1) hardcoded colours minted outside mde-egui
