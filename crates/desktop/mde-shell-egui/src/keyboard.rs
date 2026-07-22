@@ -13,6 +13,9 @@
 //!    ([`egui::Context::wants_keyboard_input`]), unless the operator has manually
 //!    forced it ([`Manual`]). It auto-dismisses the instant focus leaves or the cover
 //!    re-attaches (→ Laptop). SURFACE-9's [`Formfactor`] flip drives the auto-engage.
+//!    PLATFORM-INTERFACES Q35 (WL-UX-007 U28): while the vehicle is in motion (the
+//!    Car profile + a LIVE speed — `car_motion_policy`) the auto-raise arm is
+//!    suppressed; the manual raise and physical keys stay — no hard lockouts.
 //! 2. **The keypress → egui-event mapping** ([`cap_events`]) — a key emits the *same*
 //!    [`egui::Event::Text`] / [`egui::Event::Key`] a hardware key would, so the focused
 //!    field receives it identically. Injected events are queued and flushed into the
@@ -83,15 +86,26 @@ pub(crate) enum Cap {
 /// The pure raise/dismiss decision (design lock 14): the OSK is visible exactly when
 /// the device is a **Tablet** and either a text field wants keyboard input or the
 /// operator forced it up — never in Laptop mode (auto-dismiss on cover re-attach).
+///
+/// PLATFORM-INTERFACES Q35 (WL-UX-007 U28): while `motion_suppressed` — the Car
+/// profile with a LIVE MG90 speed above the motion threshold — the **auto**-raise
+/// arm is gated off (a moving driver is not typing into a raised board). Soft, not
+/// a lockout: physical keys are untouched (the keyboard-first safety model) and a
+/// manual [`Manual::ForceShow`] (the tablet-bar toggle) still raises the OSK.
 #[must_use]
-pub(crate) fn resolve_visible(formfactor: Formfactor, has_focus: bool, manual: Manual) -> bool {
+pub(crate) fn resolve_visible(
+    formfactor: Formfactor,
+    has_focus: bool,
+    manual: Manual,
+    motion_suppressed: bool,
+) -> bool {
     if formfactor != Formfactor::Tablet {
         return false;
     }
     match manual {
         Manual::ForceShow => true,
         Manual::ForceHide => false,
-        Manual::Auto => has_focus,
+        Manual::Auto => has_focus && !motion_suppressed,
     }
 }
 
@@ -291,11 +305,12 @@ impl Keyboard {
 
     /// Fold the current formfactor + focus into visibility, decaying a stale manual
     /// override once focus leaves (so a dismiss doesn't stick past the field).
-    fn tick(&mut self, has_focus: bool) {
+    /// `motion_suppressed` is the frame's Q35 in-motion policy (gates auto-raise only).
+    fn tick(&mut self, has_focus: bool, motion_suppressed: bool) {
         if !has_focus && self.manual == Manual::ForceHide {
             self.manual = Manual::Auto;
         }
-        self.visible = resolve_visible(self.formfactor, has_focus, self.manual);
+        self.visible = resolve_visible(self.formfactor, has_focus, self.manual, motion_suppressed);
     }
 
     /// Apply one pressed key: Shift/layer/dismiss mutate the OSK; everything else queues
@@ -333,7 +348,13 @@ impl Keyboard {
         // → wants_keyboard_input; the OSK's own buttons are not yet interacted).
         let has_focus = ctx.wants_keyboard_input();
         let focus_target = ctx.memory(egui::Memory::focused);
-        self.tick(has_focus);
+        // PLATFORM-INTERFACES Q35 (WL-UX-007 U28): the soft in-motion OSK suppress.
+        // `central_view` folds + publishes the policy earlier this same frame; while
+        // the Car profile reports a LIVE speed above the motion threshold the OSK
+        // stops AUTO-raising. Never published (off-Car, no live telemetry, a bare
+        // test Context) reads `false` — no limits. Manual raise stays available.
+        let motion_suppressed = crate::car_motion_policy::in_motion(ctx);
+        self.tick(has_focus, motion_suppressed);
 
         // The tablet-bar affordance: only offered on a Tablet (a Laptop has its keys).
         let mut interacted = false;
@@ -608,14 +629,24 @@ mod tests {
     #[test]
     fn laptop_never_raises_even_with_focus() {
         for manual in [Manual::Auto, Manual::ForceShow, Manual::ForceHide] {
-            assert!(!resolve_visible(Formfactor::Laptop, true, manual));
+            assert!(!resolve_visible(Formfactor::Laptop, true, manual, false));
         }
     }
 
     #[test]
     fn tablet_plus_focus_auto_raises_and_dismisses() {
-        assert!(resolve_visible(Formfactor::Tablet, true, Manual::Auto));
-        assert!(!resolve_visible(Formfactor::Tablet, false, Manual::Auto));
+        assert!(resolve_visible(
+            Formfactor::Tablet,
+            true,
+            Manual::Auto,
+            false
+        ));
+        assert!(!resolve_visible(
+            Formfactor::Tablet,
+            false,
+            Manual::Auto,
+            false
+        ));
     }
 
     #[test]
@@ -623,13 +654,90 @@ mod tests {
         assert!(resolve_visible(
             Formfactor::Tablet,
             false,
-            Manual::ForceShow
+            Manual::ForceShow,
+            false
         ));
         assert!(!resolve_visible(
             Formfactor::Tablet,
             true,
-            Manual::ForceHide
+            Manual::ForceHide,
+            false
         ));
+    }
+
+    // --- Q35 (WL-UX-007 U28): the soft in-motion suppress ----------------------------
+
+    #[test]
+    fn motion_suppresses_auto_raise_but_never_the_manual_raise() {
+        // In motion, a focused field no longer AUTO-raises the board…
+        assert!(!resolve_visible(
+            Formfactor::Tablet,
+            true,
+            Manual::Auto,
+            true
+        ));
+        // …but the manual raise (the tablet-bar toggle) still works — Q35 is a
+        // soft limit, never a lockout (the keyboard-first safety model).
+        assert!(resolve_visible(
+            Formfactor::Tablet,
+            true,
+            Manual::ForceShow,
+            true
+        ));
+        assert!(resolve_visible(
+            Formfactor::Tablet,
+            false,
+            Manual::ForceShow,
+            true
+        ));
+        // A manual dismiss keeps meaning dismissed, moving or not.
+        assert!(!resolve_visible(
+            Formfactor::Tablet,
+            true,
+            Manual::ForceHide,
+            true
+        ));
+    }
+
+    #[test]
+    fn motion_suppress_lifts_when_stopped() {
+        let mut kb = Keyboard::default();
+        kb.set_formfactor(Formfactor::Tablet);
+        // Moving: focus does not raise.
+        kb.tick(true, true);
+        assert!(!kb.visible, "in motion, focus does not auto-raise (Q35)");
+        // Stopped (policy disengages): the SAME focus raises again — reversible.
+        kb.tick(true, false);
+        assert!(kb.visible, "stopped, the held focus auto-raises again");
+    }
+
+    #[test]
+    fn show_reads_the_published_motion_policy_and_honors_a_manual_raise() {
+        // The ctx seam end-to-end: an in-motion publish suppresses nothing about
+        // the MANUAL path — ForceShow still raises through a full `show` pass.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1024.0, 768.0),
+            )),
+            ..Default::default()
+        };
+        let mut kb = Keyboard::default();
+        kb.set_formfactor(Formfactor::Tablet);
+        kb.toggle(); // the tablet-bar manual raise
+        let _ = ctx.run(input(), |ctx| {
+            crate::car_motion_policy::publish(
+                ctx,
+                crate::car_motion_policy::CarMotionPolicy { in_motion: true },
+            );
+            kb.show(ctx);
+        });
+        assert!(
+            kb.visible,
+            "a manual raise survives the in-motion suppress (no hard lockouts)"
+        );
     }
 
     #[test]
@@ -639,13 +747,13 @@ mod tests {
         kb.on_cap(Cap::Dismiss);
         assert_eq!(kb.manual, Manual::ForceHide);
         // Focus held → the dismiss sticks (no immediate re-raise).
-        kb.tick(true);
+        kb.tick(true, false);
         assert!(!kb.visible);
         assert_eq!(kb.manual, Manual::ForceHide);
         // Focus leaves → the override decays so the next focus auto-raises again.
-        kb.tick(false);
+        kb.tick(false, false);
         assert_eq!(kb.manual, Manual::Auto);
-        kb.tick(true);
+        kb.tick(true, false);
         assert!(kb.visible, "a fresh focus re-raises after a dismiss");
     }
 
@@ -655,12 +763,12 @@ mod tests {
         kb.set_formfactor(Formfactor::Tablet);
         kb.toggle(); // ForceShow (up without focus)
         assert_eq!(kb.manual, Manual::ForceShow);
-        kb.tick(false);
+        kb.tick(false, false);
         assert!(kb.visible);
         // Re-attaching the cover (→ Laptop) drops the override and dismisses.
         kb.set_formfactor(Formfactor::Laptop);
         assert_eq!(kb.manual, Manual::Auto);
-        kb.tick(false);
+        kb.tick(false, false);
         assert!(!kb.visible);
     }
 
@@ -668,13 +776,13 @@ mod tests {
     fn toggle_raises_then_hides() {
         let mut kb = Keyboard::default();
         kb.set_formfactor(Formfactor::Tablet);
-        kb.tick(false);
+        kb.tick(false, false);
         assert!(!kb.visible);
         kb.toggle();
-        kb.tick(false);
+        kb.tick(false, false);
         assert!(kb.visible, "manual toggle raises with no field focused");
         kb.toggle();
-        kb.tick(false);
+        kb.tick(false, false);
         assert!(!kb.visible, "a second toggle hides it");
     }
 

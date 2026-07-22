@@ -24,6 +24,7 @@ mod bt_pairing;
 mod bus_reader;
 mod car_home;
 mod car_keymap;
+mod car_motion_policy;
 // WL-FUNC-011 Phase-2 retired the standalone Surface::Chat render, but this module
 // is kept for its still-live parts: `civil_from_days` (the crate's ONE calendar,
 // consumed by the clock/curtain/timers) and `ChatState::poll` (folds the chat model
@@ -1034,6 +1035,14 @@ struct Shell {
     /// tiles below the speedometer in the left instrument strip), persisted to
     /// `settings-car-status.json`. A driver taps a tile to cycle its readout.
     car_status: mde_maps_location_egui::CarStatusSelection,
+    /// WL-UX-007 U28 (PLATFORM-INTERFACES Q35): the soft in-motion policy,
+    /// folded once per frame in `central_view` from the Car profile + the LIVE
+    /// MG90 speed (`live_speed_mph` — never the simulated seed; honesty P8),
+    /// with hysteresis so a speed hovering at the threshold doesn't flicker
+    /// the limits. Soft only: the OSK stops auto-raising, car lists clamp to
+    /// a glance count, destructive prompts defer — **no hard lockouts** (the
+    /// keyboard-first stance is the safety model).
+    car_motion: car_motion_policy::CarMotionPolicy,
     /// The Terminal surface (TERM-16) — the production `TerminalSurface` (the
     /// TERM-4/5/8 `TabbedTerminal`: tabs / splits / broadcast / a shell on any mesh
     /// peer) over a real local PTY, built once by `mde_term_egui::real_terminal()`.
@@ -1159,6 +1168,7 @@ impl Shell {
             bookmarks_bus: BookmarksBus::default(),
             maps_location: real_maps_location(),
             car_status: mde_maps_location_egui::CarStatusSelection::load(),
+            car_motion: car_motion_policy::CarMotionPolicy::default(),
             terminal: real_terminal(),
             mesh_view: mesh_view::MeshViewState::default(),
             explorer: explorer::ExplorerState::default(),
@@ -3075,6 +3085,19 @@ impl Shell {
         }
 
         let covered = self.curtain.covers_fully();
+        // WL-UX-007 U28 — the soft in-motion fold (PLATFORM-INTERFACES Q35),
+        // computed EVERY frame (not just Car frames) so leaving Car Mode or a
+        // dying feed disengages the limits immediately: the fold itself gates
+        // on the Car profile AND a LIVE MG90 speed (`live_speed_mph` — `None`
+        // for the simulated seed / an offline adapter ⇒ never in motion;
+        // honesty P8). Published to the Context so the OSK raise fold and any
+        // car-path list/confirm site consult ONE seam
+        // (`car_motion_policy::in_motion`) later this same frame.
+        self.car_motion = self.car_motion.next(
+            self.system.layout_profile(),
+            mde_maps_location_egui::car_status::live_speed_mph(&self.maps_location),
+        );
+        car_motion_policy::publish(ctx, self.car_motion);
         // Auto Mode driver's instrument strip — the left (driver's-side) third,
         // full height: an analog speedometer on top + selectable status readouts
         // below. Reserved as a SidePanel BEFORE the CentralPanel so it never
