@@ -236,6 +236,12 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+# The Car-Mode instrument-strip tests seed a DETERMINISTIC simulated cockpit via
+# `MapsLocationSurface::simulated()`. That fixture is cfg-gated out of every
+# production build (WL-UX-007/S1) and only reachable through this dev-only
+# `sim-fixture` feature — resolver = "2" keeps it out of `cargo build`.
+mde-maps-location-egui = { path = "../mde-maps-location-egui", features = ["sim-fixture"] }
+
 # The Browser-surface render tests drive a real session over the client's
 # in-process fake helper (a socketpair peer publishing a genuine MWP1 shm frame),
 # so the panel's paint-ready → texture-upload + crash paths are exercised

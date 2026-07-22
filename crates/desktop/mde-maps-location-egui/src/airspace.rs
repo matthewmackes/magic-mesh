@@ -7,9 +7,14 @@
 //! sweep passes. Beside it a live-now panel grouped by type with bars + dBm, and
 //! tap-to-research detail. Real-time only (no history); scans only while open.
 //!
-//! The feed is a rich animated **simulation** today so the interface is complete
-//! and demoable; the live `mackesd` `airspace` worker (MG90 WiFi survey + AT/QMI
-//! cell + BT/BLE) replaces `AirspaceState::simulated` at the same seam later.
+//! Production is LIVE-ONLY (WL-UX-007/S1, operator directive 2026-07-22,
+//! PLATFORM-INTERFACES P8/Q33): no scanner source exists yet, so the production
+//! [`AirspaceState::live`] state holds ZERO contacts and the scope renders a
+//! designed honest-empty ("NO SCANNER FEED") rather than fake radar. The future
+//! source is the `mackesd` `airspace` worker (MG90 WiFi survey + AT/QMI cell +
+//! BT/BLE), which will populate `signals` at this same seam. The rich animated
+//! simulation ([`AirspaceState::simulated`]) survives as a cfg-gated test
+//! fixture only.
 
 use std::f32::consts::TAU;
 
@@ -113,13 +118,32 @@ pub struct AirspaceState {
 
 impl Default for AirspaceState {
     fn default() -> Self {
-        Self::simulated()
+        Self::live()
     }
 }
 
 impl AirspaceState {
-    /// A rich, plausible airspace so the interface reads as alive before the live
-    /// MG90 worker is wired. ~30 emitters at varied bearings/signals/types.
+    /// The production airspace: ZERO contacts, scanning idle until the operator
+    /// focuses the tab (which arms the seam). With no MG90 airspace worker
+    /// wired there is no source, and the scope reads "no scanner feed" — never
+    /// fabricated radar contacts. PLATFORM-INTERFACES P8/Q33.
+    #[must_use]
+    pub fn live() -> Self {
+        Self {
+            active: false,
+            signals: Vec::new(),
+            show_wifi: true,
+            show_cell: true,
+            show_bt: true,
+            heatmap: false,
+            selected: None,
+        }
+    }
+
+    /// A rich, plausible airspace fixture. TEST FIXTURE ONLY — compiled solely
+    /// for this crate's tests and `sim-fixture` dev builds; no production path
+    /// can construct it. ~30 emitters at varied bearings/signals/types.
+    #[cfg(any(test, feature = "sim-fixture"))]
     #[must_use]
     pub fn simulated() -> Self {
         // (kind, name, dbm, bearing, chan, enc, notable, watch, own)
@@ -706,6 +730,26 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
         FontId::proportional(Style::BODY),
         Style::OK,
     );
+
+    // Honest empty state: the scope stays armed (sweep runs) but a source-less
+    // airspace says so explicitly — "no scanner feed", never fake radar. The
+    // MG90 airspace worker is the future source (P8/Q33).
+    if state.signals.is_empty() {
+        p.text(
+            center + Vec2::new(0.0, radius * 0.45),
+            Align2::CENTER_CENTER,
+            "NO SCANNER FEED",
+            FontId::proportional(Style::BODY),
+            Style::WARN,
+        );
+        p.text(
+            center + Vec2::new(0.0, radius * 0.45 + Style::SP_M),
+            Align2::CENTER_CENTER,
+            "MG90 airspace worker not wired",
+            FontId::proportional(Style::SMALL),
+            Style::TEXT_DIM,
+        );
+    }
 }
 
 /// The live-now panel — grouped by type, bars + dBm, with the research detail.
@@ -798,9 +842,6 @@ fn paint_live_panel(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) 
                 let mut group: Vec<&AirspaceSignal> =
                     state.signals.iter().filter(|s| s.kind == kind).collect();
                 group.sort_by_key(|s| -(s.live_dbm(t)));
-                if group.is_empty() {
-                    continue;
-                }
                 ui.add_space(Style::SP_XS);
                 ui.label(
                     egui::RichText::new(format!("{} · {}", kind.label(), group.len()))
@@ -808,6 +849,16 @@ fn paint_live_panel(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) 
                         .strong()
                         .color(kind.color()),
                 );
+                if group.is_empty() {
+                    // Honest per-layer empty: absent reads absent (Q33) — the
+                    // group header stays so the layer is visibly source-less.
+                    ui.label(
+                        egui::RichText::new(format!("No {} scanner feed", kind.label()))
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                    continue;
+                }
                 for s in group {
                     let selected = state.selected.as_deref() == Some(s.id.as_str());
                     let resp = ui.add(
@@ -883,6 +934,20 @@ mod tests {
             "has watchlist entries"
         );
         assert!(a.signals.iter().any(|s| s.own), "recognizes own gear");
+    }
+
+    #[test]
+    fn live_airspace_is_empty_and_idle() {
+        // WL-UX-007/S1: the production constructor carries ZERO contacts and is
+        // idle until the operator focuses the tab — no fabricated radar.
+        let a = AirspaceState::live();
+        assert!(a.signals.is_empty());
+        assert!(!a.active);
+        assert_eq!(a.in_range(), 0);
+        assert!(a.selected.is_none());
+        // Default is the live (honest) state, not the fixture.
+        let d = AirspaceState::default();
+        assert!(d.signals.is_empty());
     }
 
     #[test]

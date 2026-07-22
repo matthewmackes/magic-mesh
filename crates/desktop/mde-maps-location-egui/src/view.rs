@@ -126,12 +126,17 @@ fn render_active_tab(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         WorkspaceTab::Connectivity => show_connectivity(ui, &state.mg90),
         WorkspaceTab::DevicesIo => show_devices_io(ui, &mut state.devices),
         WorkspaceTab::LocationSources => show_location_sources(ui, &mut state.locations),
-        WorkspaceTab::Mg90Setup => show_mg90_setup(ui, &mut state.mg90, &state.offline_maps),
+        WorkspaceTab::Mg90Setup => show_mg90_setup(
+            ui,
+            &mut state.mg90,
+            &state.offline_maps,
+            &state.vault,
+            &state.real_hardware_gaps,
+        ),
         WorkspaceTab::Mg90Settings => show_mg90_settings(ui, state),
         WorkspaceTab::FirmwareRecovery => {
             show_firmware_recovery(ui, &state.firmware, &state.devices)
         }
-        WorkspaceTab::Simulator => show_simulator(ui, state),
     }
 }
 
@@ -155,10 +160,17 @@ fn header(ui: &mut egui::Ui, state: &MapsLocationSurface) {
         FontId::proportional(Style::TITLE),
         Style::TEXT_STRONG,
     );
+    // Honest subtitle: the "simulator active" phrasing only ever appears when
+    // the cfg-gated test fixture seeded this surface (production never does).
+    let subtitle = if state.simulator_enabled {
+        "Native offline navigation, local MG90 management, simulator active"
+    } else {
+        "Native offline navigation, local MG90 management, live MG90 mirror"
+    };
     painter.text(
         title_pos + egui::vec2(0.0, Style::SP_S + Style::SP_XS),
         Align2::LEFT_CENTER,
-        "Native offline navigation, local MG90 management, simulator active",
+        subtitle,
         FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
     );
@@ -166,12 +178,11 @@ fn header(ui: &mut egui::Ui, state: &MapsLocationSurface) {
     let mut x = rect.right() - Style::SP_M;
     x = header_chip(ui, rect, x, "25 GB offline cap", Style::ACCENT_SYSTEM);
     x = header_chip(ui, rect, x, "Direct Ethernet", Style::ACCENT_TERMINALS);
-    let sim_tone = if state.simulator_enabled {
-        Style::OK
-    } else {
-        Style::WARN
-    };
-    let _ = header_chip(ui, rect, x, "Simulator", sim_tone);
+    // The Simulator chip exists ONLY while the test fixture is live — a
+    // production surface has no simulator to flag (WL-UX-007/S1).
+    if state.simulator_enabled {
+        let _ = header_chip(ui, rect, x, "Simulator", Style::OK);
+    }
 }
 
 fn header_chip(ui: &egui::Ui, header: Rect, right: f32, label: &str, tone: Color32) -> f32 {
@@ -208,6 +219,12 @@ fn header_chip(ui: &egui::Ui, header: Rect, right: f32, label: &str, tone: Color
 /// Painted on a foreground layer (top-centre) so it floats above the HUD cards
 /// and FABs and can never be scrolled off — the driver always knows the readouts
 /// are fixture data, not a live vehicle.
+///
+/// UNREACHABLE IN PRODUCTION BY CONSTRUCTION (WL-UX-007/S1, operator directive
+/// 2026-07-22): `simulator_enabled` is only ever set by the cfg-gated
+/// `MapsLocationSurface::simulated()` test fixture — the production `live()`
+/// constructor pins it `false` and nothing on a production path flips it. The
+/// ribbon stays compiled so the fixture can never render unbadged in tests.
 fn paint_simulated_ribbon(ui: &egui::Ui, panel: Rect) {
     if panel.any_nan() || panel.width() < 40.0 {
         return;
@@ -709,11 +726,11 @@ fn drive_hud(
         &painter,
         rect,
         &state.map,
-        &state.locations,
         &state.dead_zones,
         primary,
         has_fix,
         has_fix && !off_route,
+        state.local_navigation.active_route.is_planned(),
         state
             .local_navigation
             .active_destination()
@@ -970,11 +987,11 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &painter,
         rect,
         &overview,
-        &state.locations,
         &state.dead_zones,
         primary,
         has_fix,
         has_fix,
+        state.local_navigation.active_route.is_planned(),
         state
             .local_navigation
             .active_destination()
@@ -1018,13 +1035,26 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         state.local_navigation.active_destination(),
     );
 
-    // Route option cards.
+    // Route option cards — or the honest "no routing engine" note when none
+    // exist (production has no offline router yet; Start stays a no-op).
     let selected = state.local_navigation.selected_route;
     for (idx, orect) in layout.options.iter().enumerate() {
         if let Some(option) = state.local_navigation.route_options.get(idx) {
             let (hovered, pressed) = option_states.get(idx).copied().unwrap_or((false, false));
             paint_route_option_card(&painter, *orect, option, idx == selected, hovered, pressed);
         }
+    }
+    if state.local_navigation.route_options.is_empty() {
+        painter.text(
+            egui::pos2(
+                layout.sheet.center().x,
+                (layout.dest.bottom() + layout.start.top()) / 2.0,
+            ),
+            Align2::CENTER_CENTER,
+            "No offline routing engine — route options unavailable",
+            FontId::proportional(Style::BODY),
+            Style::TEXT_DIM,
+        );
     }
 
     // Start button.
@@ -1397,6 +1427,10 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     };
     let empty_note = if querying && rows.is_empty() {
         state.geocode_note.clone()
+    } else if !querying && rows.is_empty() {
+        // Honest empty recents: production ships zero preset destinations, so
+        // say so instead of presenting a silent blank card.
+        Some("No recent or saved places — type to search the offline gazetteer.".to_string())
     } else {
         None
     };
@@ -1477,10 +1511,10 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &painter,
         rect,
         &overview,
-        &state.locations,
         &state.dead_zones,
         primary,
         has_fix,
+        false,
         false,
         state
             .local_navigation
@@ -2005,10 +2039,10 @@ fn show_arrival(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &painter,
         rect,
         &overview,
-        &state.locations,
         &state.dead_zones,
         primary,
         has_fix,
+        false,
         false,
         state
             .local_navigation
@@ -2375,15 +2409,16 @@ fn scene_point(rect: Rect, map: &MapViewState, u: f32, v: f32) -> Pos2 {
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // one painter call site per screen; a struct would obscure the seam
 fn paint_map_scene(
     painter: &Painter,
     rect: Rect,
     map: &MapViewState,
-    locations: &LocationManager,
     dead_zones: &DeadZoneState,
     primary: Option<&LocationSample>,
     has_fix: bool,
     route_live: bool,
+    route_planned: bool,
     destination: Option<(f64, f64)>,
 ) {
     let bg = if map.dark_mode {
@@ -2407,7 +2442,7 @@ fn paint_map_scene(
     // Edge vignette on top of the tiles keeps the driver's focus centred.
     paint_vignette(painter, rect);
 
-    // Optional overlays keyed off the Map-tab toggles.
+    // Recorded dead-zone overlay (real recorder data; empty list paints nothing).
     if map.dead_zone_overlay {
         for (idx, _) in dead_zones.zones.iter().enumerate() {
             let c = scene_point(rect, map, 0.30 + idx as f32 * 0.16, 0.42);
@@ -2415,41 +2450,17 @@ fn paint_map_scene(
             painter.circle_stroke(c, 30.0, Stroke::new(1.5, Style::DANGER.gamma_multiply(0.7)));
         }
     }
-    if map.weather_overlay {
-        let a = scene_point(rect, map, 0.60, 0.10);
-        let b = scene_point(rect, map, 1.05, 0.44);
-        painter.rect_filled(
-            Rect::from_two_pos(a, b),
-            Style::RADIUS,
-            WEATHER.gamma_multiply(0.12),
-        );
-    }
-    if map.traffic_overlay {
-        let ta = scene_point(rect, map, 0.585, 0.32);
-        let tb = scene_point(rect, map, 0.64, 0.22);
-        painter.line_segment([ta, tb], Stroke::new(7.0 * zoom_scale(map), TRAFFIC));
-    }
+    // The former procedural weather rectangle / traffic segment / location-health
+    // crumbs were removed (WL-UX-007/S1): no provider or projection backs them,
+    // so painting them was fabricated map content (P8/Q33). Real overlays return
+    // with the live-feed epic (WL-FUNC-012).
 
     // Route — the layered GMaps look (casing + bright core, rounded joints).
-    // A dimmed grey line when not live (no fix, or off-route recalculating).
-    if map.route_visible {
+    // A dimmed grey line when not live (no fix, or off-route recalculating), and
+    // ONLY when an actual route plan exists — an unplanned surface paints no
+    // fabricated ribbon.
+    if map.route_visible && route_planned {
         paint_route(painter, rect, map, route_live);
-    }
-
-    // Location-health crumbs.
-    for (idx, crumb) in locations
-        .sources
-        .iter()
-        .filter(|source| source.kind == locations.primary || source.sample.healthy())
-        .enumerate()
-    {
-        let c = scene_point(
-            rect,
-            map,
-            0.22 + idx as f32 * 0.05,
-            0.86 - idx as f32 * 0.04,
-        );
-        painter.circle_filled(c, 3.5, health_color(&crumb.sample));
     }
 
     // Vehicle — fixed driver anchor (map moves under it, like a real nav app).
@@ -3212,11 +3223,12 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         state.open_destination_search();
     }
     ui.add_space(Style::SP_S);
+    // Traffic/Weather toggles removed with the production simulators
+    // (WL-UX-007/S1): no provider exists, so there is nothing honest for them
+    // to reveal. They return with the live-feed epic (WL-FUNC-012).
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut state.map.dark_mode, "Dark mode");
         ui.checkbox(&mut state.map.route_visible, "Route");
-        ui.checkbox(&mut state.map.traffic_overlay, "Traffic");
-        ui.checkbox(&mut state.map.weather_overlay, "Weather");
         ui.checkbox(&mut state.map.dead_zone_overlay, "Dead zones");
         ui.checkbox(&mut state.map.gnss_overlay, "GNSS quality");
     });
@@ -3235,6 +3247,7 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &mut state.map,
         &state.locations,
         &state.dead_zones,
+        state.local_navigation.active_route.is_planned(),
         500.0,
     );
     // Action buttons float over the map, justified bottom-right (world-class
@@ -3284,30 +3297,29 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
         ui.scope(|ui| {
             ui.set_width(col_w);
             card(ui, "Active route", |ui| {
+                let route = &state.local_navigation.active_route;
+                if !route.is_planned() {
+                    mde_egui::widgets::muted_note(ui, "No route planned.");
+                }
                 metric(
                     ui,
                     "Current road",
-                    &state.local_navigation.active_route.current_road,
+                    dash_if_empty(&route.current_road),
                     Style::TEXT,
                 );
                 metric(
                     ui,
                     "Alternatives",
-                    &state.local_navigation.active_route.alternatives.to_string(),
+                    &route.alternatives.to_string(),
                     Style::ACCENT,
                 );
                 metric(
                     ui,
                     "Traffic",
-                    &state.local_navigation.active_route.traffic_alert,
+                    dash_if_empty(&route.traffic_alert),
                     Style::WARN,
                 );
-                metric(
-                    ui,
-                    "Weather",
-                    &state.local_navigation.active_route.weather_alert,
-                    WEATHER,
-                );
+                metric(ui, "Weather", dash_if_empty(&route.weather_alert), WEATHER);
             });
         });
         ui.scope(|ui| {
@@ -3317,6 +3329,12 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
     });
     ui.add_space(Style::SP_S);
     card(ui, "Breadcrumb replay and event history", |ui| {
+        if state.trips.breadcrumbs.is_empty() {
+            mde_egui::widgets::muted_note(
+                ui,
+                "No breadcrumbs recorded — trip history records from the live GNSS fix.",
+            );
+        }
         for crumb in &state.trips.breadcrumbs {
             ui.horizontal_wrapped(|ui| {
                 status_dot(ui, Style::ACCENT_MESH);
@@ -3359,6 +3377,10 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
 
 fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
     let telem = &vehicle.telemetry;
+    // Every telemetry readout rides the live-mirror gate (Q33): a surface with
+    // no telemetry source dashes — 0 rpm / 0.0 V / "OFF" are readings, and a
+    // sourceless surface has none to report.
+    let live = telem.is_live();
     // Vehicle identity header.
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
@@ -3373,39 +3395,28 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
     ui.add_space(Style::SP_S);
     // Hero gauges — the four live readouts that matter at a glance.
     let tile_w = split_width(ui, 4);
+    let gauge = |value: String, tone: Color32| -> (String, Color32) {
+        if live {
+            (value, tone)
+        } else {
+            ("—".to_string(), Style::TEXT_DIM)
+        }
+    };
     ui.horizontal_top(|ui| {
-        stat_tile(
-            ui,
-            tile_w,
-            "go-next",
-            "Speed · mph",
-            &format!("{:.0}", telem.speed_mph),
-            Style::TEXT_STRONG,
-        );
-        stat_tile(
-            ui,
-            tile_w,
-            "view-refresh",
-            "Engine · rpm",
-            &telem.rpm.to_string(),
-            Style::ACCENT,
-        );
-        stat_tile(
-            ui,
-            tile_w,
-            "notification",
-            "Battery · V",
-            &format!("{:.1}", telem.battery_v),
+        let (v, tone) = gauge(format!("{:.0}", telem.speed_mph), Style::TEXT_STRONG);
+        stat_tile(ui, tile_w, "go-next", "Speed · mph", &v, tone);
+        let (v, tone) = gauge(telem.rpm.to_string(), Style::ACCENT);
+        stat_tile(ui, tile_w, "view-refresh", "Engine · rpm", &v, tone);
+        let (v, tone) = gauge(
+            format!("{:.1}", telem.battery_v),
             voltage_tone(telem.battery_v),
         );
-        stat_tile(
-            ui,
-            tile_w,
-            "weather-clear-night",
-            "Coolant · °C",
-            &format!("{:.0}", telem.coolant_c),
+        stat_tile(ui, tile_w, "notification", "Battery · V", &v, tone);
+        let (v, tone) = gauge(
+            format!("{:.0}", telem.coolant_c),
             coolant_tone(telem.coolant_c),
         );
+        stat_tile(ui, tile_w, "weather-clear-night", "Coolant · °C", &v, tone);
     });
     ui.add_space(Style::SP_S);
     glyph_card(
@@ -3414,22 +3425,28 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
         "OBD telematics",
         Style::ACCENT_MESH,
         |ui| {
-            readout(
-                ui,
-                "Ignition",
-                if telem.ignition_on { "on" } else { "off" },
-                if telem.ignition_on {
-                    Style::OK
-                } else {
-                    Style::TEXT_DIM
-                },
-            );
-            readout(
-                ui,
-                "Motion",
-                if telem.moving { "moving" } else { "parked" },
-                if telem.moving { Style::WARN } else { Style::OK },
-            );
+            let (v, tone) = if live {
+                (
+                    if telem.ignition_on { "on" } else { "off" },
+                    if telem.ignition_on {
+                        Style::OK
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                )
+            } else {
+                ("—", Style::TEXT_DIM)
+            };
+            readout(ui, "Ignition", v, tone);
+            let (v, tone) = if live {
+                (
+                    if telem.moving { "moving" } else { "parked" },
+                    if telem.moving { Style::WARN } else { Style::OK },
+                )
+            } else {
+                ("—", Style::TEXT_DIM)
+            };
+            readout(ui, "Motion", v, tone);
             readout(
                 ui,
                 "Fuel",
@@ -3444,12 +3461,12 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
                     }
                 }),
             );
-            readout(
-                ui,
-                "Diagnostic codes",
-                &telem.dtc_count.to_string(),
-                count_tone(telem.dtc_count),
-            );
+            let (v, tone) = if live {
+                (telem.dtc_count.to_string(), count_tone(telem.dtc_count))
+            } else {
+                ("—".to_string(), Style::TEXT_DIM)
+            };
+            readout(ui, "Diagnostic codes", &v, tone);
             readout(
                 ui,
                 "Odometer",
@@ -3458,28 +3475,31 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
                     .map_or_else(|| "unavailable".to_string(), |odo| format!("{odo} mi")),
                 Style::TEXT,
             );
-            readout(
-                ui,
-                "Runtime",
-                &format!("{} min", telem.runtime_min),
-                Style::TEXT,
-            );
+            let v = if live {
+                format!("{} min", telem.runtime_min)
+            } else {
+                "—".to_string()
+            };
+            readout(ui, "Runtime", &v, Style::TEXT);
             readout(
                 ui,
                 "Confidence",
                 dash_if_empty(&telem.confidence),
                 Style::TEXT_DIM,
             );
-            readout(
-                ui,
-                "Last update",
-                &format!("{:.1} s ago", telem.last_update_age_s),
-                if telem.last_update_age_s <= 5.0 {
-                    Style::TEXT_DIM
-                } else {
-                    Style::WARN
-                },
-            );
+            let (v, tone) = if live {
+                (
+                    format!("{:.1} s ago", telem.last_update_age_s),
+                    if telem.last_update_age_s <= 5.0 {
+                        Style::TEXT_DIM
+                    } else {
+                        Style::WARN
+                    },
+                )
+            } else {
+                ("—".to_string(), Style::TEXT_DIM)
+            };
+            readout(ui, "Last update", &v, tone);
         },
     );
     ui.add_space(Style::SP_S);
@@ -3502,15 +3522,22 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
 
 fn show_connectivity(ui: &mut egui::Ui, mg90: &Mg90State) {
     let status = &mg90.status;
+    // WAN metrics only exist while a WAN is actually up (Q33): with no active
+    // uplink, "0 ms" / "0.0%" would be fabricated measurements, so they dash.
+    let wan_up = !status.active_wan.trim().is_empty();
     // Hero readouts: the four numbers that describe the live WAN at a glance.
-    let latency_tone = if status.latency_ms < 100 {
+    let latency_tone = if !wan_up {
+        Style::TEXT_DIM
+    } else if status.latency_ms < 100 {
         Style::OK
     } else if status.latency_ms < 200 {
         Style::WARN
     } else {
         Style::DANGER
     };
-    let loss_tone = if status.packet_loss_percent < 1.0 {
+    let loss_tone = if !wan_up {
+        Style::TEXT_DIM
+    } else if status.packet_loss_percent < 1.0 {
         Style::OK
     } else if status.packet_loss_percent < 5.0 {
         Style::WARN
@@ -3535,22 +3562,25 @@ fn show_connectivity(ui: &mut egui::Ui, mg90: &Mg90State) {
             dash_if_empty(&status.link_quality),
             Style::OK,
         );
+        let latency = if wan_up {
+            format!("{} ms", status.latency_ms)
+        } else {
+            "—".to_string()
+        };
         stat_tile(
             ui,
             tile_w,
             "view-refresh",
             "Latency",
-            &format!("{} ms", status.latency_ms),
+            &latency,
             latency_tone,
         );
-        stat_tile(
-            ui,
-            tile_w,
-            "notification",
-            "Packet loss",
-            &format!("{:.1}%", status.packet_loss_percent),
-            loss_tone,
-        );
+        let loss = if wan_up {
+            format!("{:.1}%", status.packet_loss_percent)
+        } else {
+            "—".to_string()
+        };
+        stat_tile(ui, tile_w, "notification", "Packet loss", &loss, loss_tone);
     });
     ui.add_space(Style::SP_S);
     // Dual-modem comparison, active WAN highlighted.
@@ -3596,16 +3626,19 @@ fn show_connectivity(ui: &mut egui::Ui, mg90: &Mg90State) {
             dash_if_empty(&status.data_transferred),
             Style::TEXT,
         );
-        readout(
-            ui,
-            "Failover events",
-            &status.failover_events.to_string(),
-            if status.failover_events == 0 {
-                Style::OK
-            } else {
-                Style::WARN
-            },
-        );
+        let (v, tone) = if wan_up {
+            (
+                status.failover_events.to_string(),
+                if status.failover_events == 0 {
+                    Style::OK
+                } else {
+                    Style::WARN
+                },
+            )
+        } else {
+            ("—".to_string(), Style::TEXT_DIM)
+        };
+        readout(ui, "Failover events", &v, tone);
     });
 }
 
@@ -3813,38 +3846,53 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
                 &source.manual_switch_reason(),
                 source_tone,
             );
+            // Position-derived metrics are honest ONLY on a real fix (Q33): a
+            // no-lock sample would otherwise print the fabricated null-island
+            // "0.00000, 0.00000" as a coordinate.
+            let fixed = source.sample.has_fix();
+            let on_fix = |value: String| {
+                if fixed {
+                    value
+                } else {
+                    "—".to_string()
+                }
+            };
             metric(ui, "Fix", &source.sample.fix_type, Style::TEXT);
             metric(
                 ui,
                 "Lat / Lon",
-                &format!(
+                &on_fix(format!(
                     "{:.5}, {:.5}",
                     source.sample.latitude, source.sample.longitude
-                ),
+                )),
                 Style::TEXT,
             );
             metric(
                 ui,
                 "Accuracy",
-                &format!("{:.1} m", source.sample.accuracy_m),
-                health_color(&source.sample),
+                &on_fix(format!("{:.1} m", source.sample.accuracy_m)),
+                if fixed {
+                    health_color(&source.sample)
+                } else {
+                    Style::TEXT_DIM
+                },
             );
             metric(
                 ui,
                 "Speed",
-                &format!("{:.1} mph", source.sample.speed_mph),
+                &on_fix(format!("{:.1} mph", source.sample.speed_mph)),
                 Style::TEXT,
             );
             metric(
                 ui,
                 "Heading",
-                &format!("{:.0} deg", source.sample.heading_deg),
+                &on_fix(format!("{:.0} deg", source.sample.heading_deg)),
                 Style::TEXT,
             );
             metric(
                 ui,
                 "Altitude",
-                &format!("{:.1} m", source.sample.altitude_m),
+                &on_fix(format!("{:.1} m", source.sample.altitude_m)),
                 Style::TEXT,
             );
             metric(
@@ -3859,10 +3907,10 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
             metric(
                 ui,
                 "Update rate / age",
-                &format!(
+                &on_fix(format!(
                     "{:.1} Hz / {:.1} s",
                     source.sample.update_rate_hz, source.sample.update_age_s
-                ),
+                )),
                 Style::TEXT,
             );
             metric(
@@ -3888,7 +3936,13 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
     );
 }
 
-fn show_mg90_setup(ui: &mut egui::Ui, mg90: &mut Mg90State, offline_maps: &OfflineMapManagerState) {
+fn show_mg90_setup(
+    ui: &mut egui::Ui,
+    mg90: &mut Mg90State,
+    offline_maps: &OfflineMapManagerState,
+    vault: &EncryptedVaultState,
+    gaps: &[String],
+) {
     let done = SetupStep::ALL
         .iter()
         .position(|step| *step == mg90.setup_step)
@@ -3906,7 +3960,19 @@ fn show_mg90_setup(ui: &mut egui::Ui, mg90: &mut Mg90State, offline_maps: &Offli
                     &mg90.managed_devices.to_string(),
                     Style::TEXT,
                 );
-                readout(ui, "Model", mg90.model.label(), Style::TEXT);
+                // The model family is a discovery result: dash it until the
+                // wizard has actually discovered a device (Q33 — never claim a
+                // model that was not read from hardware).
+                readout(
+                    ui,
+                    "Model",
+                    if mg90.setup_step >= SetupStep::Mg90Discovered {
+                        mg90.model.label()
+                    } else {
+                        "—"
+                    },
+                    Style::TEXT,
+                );
                 readout(
                     ui,
                     "MGOS",
@@ -4029,10 +4095,9 @@ fn show_mg90_setup(ui: &mut egui::Ui, mg90: &mut Mg90State, offline_maps: &Offli
                         });
                         ui.add_space(2.0);
                     }
-                    ui.add_space(Style::SP_XS);
-                    if ui.button("Advance simulator setup").clicked() {
-                        mg90.advance_setup_simulated();
-                    }
+                    // The "Advance simulator setup" dev button was removed with
+                    // the production simulators (WL-UX-007/S1): the wizard only
+                    // advances when real discovery/auth seams do.
                 },
             );
         });
@@ -4134,6 +4199,19 @@ fn show_mg90_setup(ui: &mut egui::Ui, mg90: &mut Mg90State, offline_maps: &Offli
             }
         },
     );
+    // Transparency cards formerly hosted by the retired Simulator tab
+    // (WL-UX-007/S1): the honest gap report, the real restore-point ledger, and
+    // the vault readiness model live on the setup/diagnostics surface now.
+    ui.add_space(Style::SP_S);
+    card(ui, "Known real-hardware gaps", |ui| {
+        for gap in gaps {
+            bullet(ui, gap);
+        }
+    });
+    ui.add_space(Style::SP_S);
+    backups(ui, &mg90.backups);
+    ui.add_space(Style::SP_S);
+    show_vault(ui, vault);
 }
 
 /// A capability chip — green when the feature is present, dim when it is not.
@@ -4206,7 +4284,7 @@ fn show_mg90_settings(ui: &mut egui::Ui, state: &MapsLocationSurface) {
                 if settings.is_empty() {
                     mde_egui::widgets::muted_note(
                         ui,
-                        "Section detected by capability profile; no descriptor loaded in the simulator fixture.",
+                        "No descriptors loaded for this category — the MG90 local API is not connected.",
                     );
                 }
                 for setting in settings {
@@ -4265,6 +4343,12 @@ fn show_firmware_recovery(ui: &mut egui::Ui, firmware: &FirmwareWorkflow, device
                     .color(Style::TEXT_DIM),
                 );
                 ui.add_space(Style::SP_XS);
+                if firmware.checks.is_empty() {
+                    mde_egui::widgets::muted_note(
+                        ui,
+                        "No firmware package selected — pre-flight checks run against a chosen package.",
+                    );
+                }
                 for check in &firmware.checks {
                     ui.horizontal(|ui| {
                         status_dot(ui, check_tone(check.state));
@@ -4317,94 +4401,12 @@ fn check_state_label(state: CheckState) -> &'static str {
     }
 }
 
-fn show_simulator(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
-    let offline_status = state.offline_navigation_status();
-    offline_navigation_card(ui, &offline_status);
-    ui.add_space(Style::SP_S);
-    card(ui, "Simulator coverage", |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Simulator mode");
-            ui.label(RichText::new(bool_label(state.simulator_enabled)).color(Style::OK));
-        });
-        for item in [
-            "MG90 discovery, local status, settings, reset, and firmware workflow",
-            "MG90 GNSS, USB GPS, stale GPS, bad GPS accuracy, and manual source selection",
-            "Driving, routing, offline maps, traffic, weather, satellite unavailable states",
-            "Cellular dead zones, GPIO events, CAN/OBD, and Ford 2020 Interceptor telemetry",
-            "Lost Ethernet, bad credentials, backups, rollback, and diagnostic exports",
-        ] {
-            bullet(ui, item);
-        }
-    });
-    ui.add_space(Style::SP_S);
-    card(ui, "Simulator scenarios", |ui| {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Stale primary source").clicked() {
-                state.simulate_stale_primary_location();
-            }
-            if ui.button("Offline maps missing").clicked() {
-                state.simulate_no_offline_maps();
-            }
-            if ui.button("Restore offline ready").clicked() {
-                state.simulate_ready_offline_navigation();
-            }
-            if ui.button("Record cellular dead zone").clicked() {
-                state.simulate_cellular_dead_zone();
-            }
-        });
-        bullet(
-            ui,
-            "Scenario buttons mutate the same readiness model used by Drive, Map, and Location Sources.",
-        );
-        bullet(
-            ui,
-            "The simulator never auto-failovers; a healthy peer source still requires manual primary selection.",
-        );
-    });
-    ui.add_space(Style::SP_S);
-    card(ui, "Navigation flow (dev toggles)", |ui| {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open \"Where to?\" search").clicked() {
-                state.open_destination_search();
-            }
-            if ui.button("Preview route").clicked() {
-                state.active = WorkspaceTab::Drive;
-                state.route_preview = true;
-            }
-            let off_route_label = if state.off_route {
-                "Clear off-route"
-            } else {
-                "Simulate off-route"
-            };
-            if ui.button(off_route_label).clicked() {
-                state.toggle_off_route();
-            }
-            if ui.button("Arrive").clicked() {
-                state.simulate_arrival();
-            }
-        });
-        bullet(
-            ui,
-            "Drives the full flow: search -> preview -> Start -> HUD -> arrival, plus the off-route recalculating banner.",
-        );
-    });
-    ui.add_space(Style::SP_S);
-    show_vault(ui, &state.vault);
-    ui.add_space(Style::SP_S);
-    card(ui, "Known real-hardware gaps", |ui| {
-        for gap in &state.real_hardware_gaps {
-            bullet(ui, gap);
-        }
-    });
-    ui.add_space(Style::SP_S);
-    backups(ui, &state.mg90.backups);
-}
-
 fn map_canvas(
     ui: &mut egui::Ui,
     map: &mut MapViewState,
     locations: &LocationManager,
     dead_zones: &DeadZoneState,
+    route_planned: bool,
     height: f32,
 ) -> Rect {
     let width = safe_width(ui);
@@ -4433,7 +4435,15 @@ fn map_canvas(
     let primary = locations.primary_sample();
     let has_fix = primary.is_some_and(LocationSample::has_fix);
     paint_map_scene(
-        &painter, rect, map, locations, dead_zones, primary, has_fix, has_fix, None,
+        &painter,
+        rect,
+        map,
+        dead_zones,
+        primary,
+        has_fix,
+        has_fix,
+        route_planned,
+        None,
     );
     painter.rect_stroke(
         rect,
@@ -4738,6 +4748,12 @@ fn show_vault(ui: &mut egui::Ui, vault: &EncryptedVaultState) {
 
 fn backups(ui: &mut egui::Ui, backups: &[BackupRecord]) {
     card(ui, "Versioned restore points", |ui| {
+        if backups.is_empty() {
+            mde_egui::widgets::muted_note(
+                ui,
+                "No restore points yet — the baseline backup is created during MG90 setup.",
+            );
+        }
         for backup in backups {
             metric(ui, &backup.id, &backup.reason, Style::TEXT);
             metric(ui, "Created", &backup.created, Style::TEXT_DIM);
@@ -4898,7 +4914,15 @@ fn signal_bars(ui: &mut egui::Ui, dbm: i32, healthy: bool) {
 }
 
 /// Map a cellular `dbm` reading to a 0..=5 bar level (RSRP/RSSI thresholds).
+///
+/// A real reading is negative dBm; `0` (or any non-negative value) is the
+/// "no signal / absent" sentinel and MUST read as an empty strip — the prior
+/// top branch (`0 >= -75`) drew a fabricated full 5-bar strip for an absent
+/// link (Q33).
 fn signal_level(dbm: i32) -> usize {
+    if dbm >= 0 {
+        return 0;
+    }
     match dbm {
         d if d >= -75 => 5,
         d if d >= -85 => 4,
@@ -4922,6 +4946,11 @@ fn signal_tone(dbm: i32, healthy: bool) -> Color32 {
 
 /// A short quality word for a cellular link.
 fn signal_quality_label(dbm: i32, healthy: bool) -> &'static str {
+    if dbm >= 0 {
+        // Non-negative dBm is the "no reading" sentinel — an absent link is not
+        // "degraded", it simply has no signal to describe.
+        return "no signal";
+    }
     if !healthy {
         return "degraded";
     }
@@ -5027,6 +5056,10 @@ fn cellular_modem_card(
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if active {
                     pill(ui, "ACTIVE", Style::ACCENT);
+                } else if link.sim_state.trim().is_empty() {
+                    // No modem data at all — "standby" would claim a state we
+                    // never read (Q33).
+                    pill(ui, "no link", Style::TEXT_DIM);
                 } else {
                     pill(ui, "standby", Style::TEXT_DIM);
                 }
@@ -5039,10 +5072,20 @@ fn cellular_modem_card(
             signal_bars(ui, link.signal_dbm, link.healthy);
             ui.add_space(Style::SP_S);
             ui.vertical(|ui| {
+                // Non-negative dBm is the "no reading" sentinel: dash it rather
+                // than presenting a fabricated "0 dBm" measurement.
+                let (dbm_text, dbm_tone) = if link.signal_dbm < 0 {
+                    (
+                        format!("{} dBm", link.signal_dbm),
+                        signal_tone(link.signal_dbm, link.healthy),
+                    )
+                } else {
+                    ("—".to_string(), Style::TEXT_DIM)
+                };
                 ui.label(
-                    RichText::new(format!("{} dBm", link.signal_dbm))
+                    RichText::new(dbm_text)
                         .size(Style::TITLE)
-                        .color(signal_tone(link.signal_dbm, link.healthy))
+                        .color(dbm_tone)
                         .monospace(),
                 );
                 ui.label(
@@ -5331,7 +5374,6 @@ mod tests {
                 "MG90 Setup",
                 "MG90 Settings",
                 "Firmware & Recovery",
-                "Simulator",
             ]
         );
     }
@@ -5362,6 +5404,142 @@ mod tests {
             surface.active = tab;
             assert!(tessellate(&mut surface) > 0, "{tab:?}");
         }
+    }
+
+    // ── WL-UX-007/S1 — the production (live, honest-empty) surface ──────────
+
+    #[test]
+    fn every_tab_tessellates_on_the_live_surface() {
+        // The production constructor is empty everywhere; every view arm must
+        // render its designed honest-empty without panicking.
+        for tab in WorkspaceTab::ALL {
+            let mut surface = MapsLocationSurface::live();
+            surface.active = tab;
+            assert!(tessellate(&mut surface) > 0, "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn live_flow_screens_tessellate_with_no_data() {
+        // Route preview with ZERO route options (no routing engine).
+        let mut preview = MapsLocationSurface::live();
+        preview.active = WorkspaceTab::Drive;
+        preview.route_preview = true;
+        assert!(tessellate(&mut preview) > 0);
+
+        // Destination search with ZERO preset destinations.
+        let mut search = MapsLocationSurface::live();
+        search.active = WorkspaceTab::Drive;
+        search.destination_search = true;
+        assert!(tessellate(&mut search) > 0);
+    }
+
+    /// Recursively collect every text string in a painted shape tree.
+    fn collect_shape_text(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+            egui::epaint::Shape::Vec(v) => {
+                for s in v {
+                    collect_shape_text(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every text string painted by one frame of the panel, recursively.
+    fn painted_texts(surface: &mut MapsLocationSurface) -> Vec<String> {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 820.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| maps_location_panel(ui, surface));
+        });
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect_shape_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    #[test]
+    fn live_airspace_renders_the_honest_empty_scope() {
+        // An empty AirspaceState must render the designed honest-empty: the
+        // in-range counter reads zero, the scope says there is no scanner feed,
+        // and each layer group says so too — with NO contact rows (P8/Q33).
+        let mut surface = MapsLocationSurface::live();
+        surface.focus_airspace_tab();
+        let texts = painted_texts(&mut surface);
+        assert!(
+            texts.iter().any(|t| t == "0 IN RANGE"),
+            "zero contacts counter: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "NO SCANNER FEED"),
+            "scope-level empty state paints"
+        );
+        assert!(
+            texts.iter().any(|t| t == "MG90 airspace worker not wired"),
+            "the future-source note paints"
+        );
+        // No fixture contact ever paints on the production surface.
+        assert!(
+            !texts.iter().any(|t| t.contains("MACKES-MESH")),
+            "no fabricated contacts: {texts:?}"
+        );
+
+        // Per-layer notes: render the airspace panel directly at full height
+        // (the workspace chrome's scroll viewport can fold the lower groups
+        // below the fold; they scroll into view on a seat).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 820.0),
+            )),
+            ..Default::default()
+        };
+        let mut airspace = crate::airspace::AirspaceState::live();
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::airspace::airspace_panel(ui, &mut airspace);
+            });
+        });
+        let mut layer_texts = Vec::new();
+        for clipped in &out.shapes {
+            collect_shape_text(&clipped.shape, &mut layer_texts);
+        }
+        for expected in [
+            "No WiFi scanner feed",
+            "No Cellular scanner feed",
+            "No Bluetooth scanner feed",
+        ] {
+            assert!(
+                layer_texts.iter().any(|t| t == expected),
+                "{expected:?} paints: {layer_texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_surface_never_paints_the_simulated_ribbon_or_chip() {
+        let mut surface = MapsLocationSurface::live();
+        let texts = painted_texts(&mut surface);
+        assert!(
+            !texts.iter().any(|t| t.contains("SIMULATED")),
+            "no SIMULATED badge on production: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "Simulator"),
+            "no Simulator chip/nav entry on production: {texts:?}"
+        );
     }
 
     fn tessellate_at(surface: &mut MapsLocationSurface, w: f32, h: f32) -> usize {
@@ -5571,18 +5749,20 @@ mod tests {
 
     #[test]
     fn simulator_readiness_scenarios_tessellate_without_hardware() {
+        // The Simulator tab is gone (WL-UX-007/S1); the readiness model these
+        // scenarios mutate still renders on the Map tab's readiness card.
         let mut stale = MapsLocationSurface::simulated();
-        stale.active = WorkspaceTab::Simulator;
+        stale.active = WorkspaceTab::Map;
         stale.simulate_stale_primary_location();
         assert!(tessellate(&mut stale) > 0);
 
         let mut missing_maps = MapsLocationSurface::simulated();
-        missing_maps.active = WorkspaceTab::Simulator;
+        missing_maps.active = WorkspaceTab::Map;
         missing_maps.simulate_no_offline_maps();
         assert!(tessellate(&mut missing_maps) > 0);
 
         let mut dead_zone = MapsLocationSurface::simulated();
-        dead_zone.active = WorkspaceTab::Simulator;
+        dead_zone.active = WorkspaceTab::Map;
         dead_zone.simulate_cellular_dead_zone();
         assert!(tessellate(&mut dead_zone) > 0);
     }

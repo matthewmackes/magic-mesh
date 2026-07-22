@@ -1,11 +1,18 @@
 //! `mde-maps-location-egui` - native Maps & Location workspace.
 //!
-//! This crate is the first vertical slice for the vehicle-native Maps & Location
-//! surface. It deliberately starts simulator-backed and local-only: no real MG90,
-//! Valhalla, Nominatim, gpsd, CAN, or serial calls are faked. Instead the crate
-//! exposes typed seams, guardrail models, and a polished egui workspace that can
-//! launch without hardware, prove location-health behavior, and leave clear gaps
-//! for the real adapters.
+//! Production is LIVE-ONLY (WL-UX-007/S1, operator directive 2026-07-22;
+//! PLATFORM-INTERFACES P8/Q33: absent data reads absent, never fabricated). The
+//! workspace boots on [`MapsLocationSurface::live`] — honest-empty everywhere —
+//! and populates exclusively from:
+//!
+//! * the MG90 vehicle-gateway mirror (`state/vehicle/<node>` on the Bus, folded
+//!   by [`MapsLocationSurface::refresh_from_bus`]), and
+//! * real on-disk artifacts (the deployed `MBTiles` basemap + gazetteer under
+//!   the maps data dir — see [`basemap`] and [`geocode`]).
+//!
+//! The former simulator seed survives only as a cfg-gated test fixture
+//! (`MapsLocationSurface::simulated`, `#[cfg(any(test, feature = "sim-fixture"))]`);
+//! no production build compiles it, so no production path can show dummy data.
 
 pub mod airspace;
 pub mod basemap;
@@ -22,15 +29,18 @@ pub use view::maps_location_panel;
 
 /// Build the production workspace state.
 ///
-/// Starts from the simulator seed (so a clean offline seat with no MG90 is
-/// usable) then folds a live `state/vehicle/<node>` mirror on top when one is
-/// retained on the Bus for this host — [`MapsLocationSurface::refresh_from_bus`]
-/// is fail-soft, so a seat with no adapter worker (or no Bus spool at all)
-/// keeps the simulated seed exactly as before: the honest offline fallback, not
-/// an error. The shell re-folds every frame; this seeds the standalone app.
+/// // PLATFORM-INTERFACES P8/Q33 — operator directive 2026-07-22 (WL-UX-007/S1):
+/// production boots on [`MapsLocationSurface::live`] — honest-empty everywhere,
+/// never the simulator seed — then folds a live `state/vehicle/<node>` mirror
+/// on top when one is retained on the Bus for this host.
+/// [`MapsLocationSurface::refresh_from_bus`] is fail-soft, so a seat with no
+/// adapter worker (or no Bus spool at all) keeps the honest empty state: an
+/// acquiring GNSS primary, zero airspace contacts, absent telemetry — not an
+/// error, and not fake data. The shell re-folds every frame; this seeds the
+/// standalone app.
 #[must_use]
 pub fn real_maps_location() -> MapsLocationSurface {
-    let mut surface = MapsLocationSurface::simulated();
+    let mut surface = MapsLocationSurface::live();
     surface.refresh_from_bus(&local_node_id());
     surface
 }

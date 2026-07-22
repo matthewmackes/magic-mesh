@@ -19,6 +19,13 @@ const VEHICLE_REFRESH: Duration = Duration::from_millis(500);
 const SIMULATED_MG90_GAP_NOTE: &str =
     "Real MG90 discovery/auth/status adapters are skeleton seams; simulator is active.";
 
+/// The production-constructor gap note for "no vehicle-gateway mirror yet".
+/// Seeded by [`MapsLocationSurface::live`] and retracted by
+/// [`MapsLocationSurface::refresh_from_vehicle`] the moment a real
+/// `state/vehicle/<node>` mirror folds in.
+const AWAITING_MIRROR_GAP_NOTE: &str =
+    "Awaiting live `state/vehicle` mirror — no MG90 vehicle-gateway adapter has published for this node yet.";
+
 /// Workspace tabs in the order requested by the product directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkspaceTab {
@@ -45,15 +52,16 @@ pub enum WorkspaceTab {
     Mg90Settings,
     /// Firmware lifecycle and serial recovery workflows.
     FirmwareRecovery,
-    /// Simulator control surface.
-    Simulator,
 }
 
 impl WorkspaceTab {
     /// All tabs in stable product order (primary surfaces first, then the
-    /// sections nested under **Advanced**). Kept as the flat 12-section list so
+    /// sections nested under **Advanced**). Kept as the flat 11-section list so
     /// "every section reachable" iteration still covers the whole workspace.
-    pub const ALL: [Self; 12] = [
+    /// The former Simulator control tab was removed from production entirely
+    /// (WL-UX-007/S1, operator directive 2026-07-22): production only shows
+    /// MG90-mirror data, so there is no simulator surface to control.
+    pub const ALL: [Self; 11] = [
         Self::Drive,
         Self::Airspace,
         Self::Map,
@@ -65,7 +73,6 @@ impl WorkspaceTab {
         Self::Mg90Setup,
         Self::Mg90Settings,
         Self::FirmwareRecovery,
-        Self::Simulator,
     ];
 
     /// Primary top-level surfaces — the clean first-level nav a driver reaches
@@ -75,7 +82,7 @@ impl WorkspaceTab {
 
     /// Technical / configuration sections nested under the top-level **Advanced**
     /// entry. Off the primary nav by design — reached by expanding Advanced.
-    pub const ADVANCED: [Self; 8] = [
+    pub const ADVANCED: [Self; 7] = [
         Self::Vehicle,
         Self::Connectivity,
         Self::DevicesIo,
@@ -83,7 +90,6 @@ impl WorkspaceTab {
         Self::Mg90Setup,
         Self::Mg90Settings,
         Self::FirmwareRecovery,
-        Self::Simulator,
     ];
 
     /// Whether this section lives under the top-level **Advanced** menu (the
@@ -99,7 +105,6 @@ impl WorkspaceTab {
                 | Self::Mg90Setup
                 | Self::Mg90Settings
                 | Self::FirmwareRecovery
-                | Self::Simulator
         )
     }
 
@@ -118,7 +123,6 @@ impl WorkspaceTab {
             Self::Mg90Setup => "MG90 Setup",
             Self::Mg90Settings => "MG90 Settings",
             Self::FirmwareRecovery => "Firmware & Recovery",
-            Self::Simulator => "Simulator",
         }
     }
 }
@@ -157,7 +161,11 @@ pub struct MapsLocationSurface {
     /// auto-reveals whenever the active section is one of the Advanced sections,
     /// so the selected item is always visible — see [`Self::advanced_open`].
     pub advanced_expanded: bool,
-    /// Simulators are first-class and on by default.
+    /// Whether the (test-only) simulator fixture seeded this surface. Always
+    /// `false` on the production [`Self::live`] path — only the cfg-gated
+    /// [`Self::simulated`] fixture sets it, and the un-hideable Car-Mode
+    /// "SIMULATED DATA" ribbon keys off it, so the ribbon is unreachable in
+    /// production by construction. PLATFORM-INTERFACES P8/Q33.
     pub simulator_enabled: bool,
     /// Current map view model.
     pub map: MapViewState,
@@ -190,7 +198,76 @@ pub struct MapsLocationSurface {
 }
 
 impl MapsLocationSurface {
-    /// Build the first vertical slice in simulator mode.
+    /// Build the PRODUCTION workspace state — honest-empty everywhere.
+    ///
+    /// PLATFORM-INTERFACES P8/Q33 (operator directive 2026-07-22, WL-UX-007/S1):
+    /// production shows ONLY MG90-mirror-derived data (`state/vehicle/<node>`
+    /// via [`Self::refresh_from_bus`] / [`Self::refresh_from_vehicle`]) or real
+    /// on-disk artifacts (the deployed `MBTiles` basemap/gazetteer). Every layer
+    /// with no live source renders an honest empty state — never a fabricated
+    /// contact, telemetry reading, trip, dead zone, device, firmware check, or
+    /// destination:
+    ///
+    /// * locations — the MG90 GNSS primary is armed but source-less (`No fix`,
+    ///   null coordinates, disconnected) until a mirror folds in;
+    /// * airspace — zero contacts ("no scanner feed", not fake radar) until the
+    ///   MG90 airspace worker lands;
+    /// * vehicle — absent telemetry whose confidence label never claims live;
+    /// * trips / dead zones — empty, with the real recording seams
+    ///   ([`Self::record_dead_zone_from_current_status`]) still functional;
+    /// * offline maps — whatever region bundle is REALLY installed on disk
+    ///   (probed fail-soft), else the honest not-installed state;
+    /// * mg90 / devices / firmware — offline-until-mirror, nothing discovered.
+    #[must_use]
+    pub fn live() -> Self {
+        let offline_maps = OfflineMapManagerState::live();
+        let map = MapViewState::live(!offline_maps.installed_regions.is_empty());
+        Self {
+            active: WorkspaceTab::Drive,
+            airspace: crate::airspace::AirspaceState::live(),
+            route_preview: false,
+            destination_search: false,
+            destination_query: String::new(),
+            geocode_results: Vec::new(),
+            geocode_note: None,
+            last_geocode_query: None,
+            request_search_focus: false,
+            arrived: false,
+            off_route: false,
+            advanced_expanded: false,
+            simulator_enabled: false,
+            map,
+            offline_maps,
+            local_navigation: LocalNavigationState::live(),
+            mg90: Mg90State::live(),
+            locations: LocationManager::live(),
+            trips: TripRecorderState::live(),
+            dead_zones: DeadZoneState::live(),
+            vehicle: VehicleState::awaiting_gateway(),
+            devices: DeviceIoState::live(),
+            firmware: FirmwareWorkflow::live(),
+            vault: EncryptedVaultState::ready_for_local_admin(),
+            real_hardware_gaps: vec![
+                AWAITING_MIRROR_GAP_NOTE.to_string(),
+                "MG90 airspace worker (WiFi survey / cell scan / BT) is not wired; Airspace has no scanner feed."
+                    .to_string(),
+                "Valhalla offline routing is not wired; chosen destinations preview as straight-line only."
+                    .to_string(),
+                "CAN/OBD, GPIO, serial, firmware upload, and factory reset workflows are UI/model complete but not wired to hardware."
+                    .to_string(),
+            ],
+            last_vehicle_poll: None,
+        }
+    }
+
+    /// Build the first vertical slice in simulator mode — TEST FIXTURE ONLY.
+    ///
+    /// Compiled only for this crate's own tests and for dependents that opt in
+    /// via the dev-only `sim-fixture` feature (`mde-shell-egui` enables it from
+    /// `[dev-dependencies]`). No production build carries this constructor, so
+    /// no production path can boot on the fabricated seed. PLATFORM-INTERFACES
+    /// P8/Q33; operator directive 2026-07-22.
+    #[cfg(any(test, feature = "sim-fixture"))]
     #[must_use]
     pub fn simulated() -> Self {
         Self {
@@ -315,7 +392,14 @@ impl MapsLocationSurface {
     /// the route-preview **Start** button. Applies the chosen option to the active
     /// route, leaves the preview, and marks guidance as running so the Drive HUD
     /// paints the maneuver banner / ETA sheet / speed sign (not the idle prompt).
+    ///
+    /// Honest no-op when no route options exist: without a routing engine there
+    /// is no route, so guidance never starts on a fabricated empty maneuver
+    /// banner (PLATFORM-INTERFACES Q33).
     pub fn start_navigation(&mut self) {
+        if self.local_navigation.route_options.is_empty() {
+            return;
+        }
         let selected = self.local_navigation.selected_route;
         self.local_navigation.apply_route_option(selected);
         self.local_navigation.navigating = true;
@@ -323,7 +407,10 @@ impl MapsLocationSurface {
         self.arrived = false;
     }
 
-    /// Enter the "You have arrived" screen (the arrival path + dev toggle).
+    /// Enter the "You have arrived" screen (the arrival path). TEST FIXTURE
+    /// ONLY — production has no arrival-detection source yet, so no production
+    /// UI reaches this transition.
+    #[cfg(any(test, feature = "sim-fixture"))]
     pub fn simulate_arrival(&mut self) {
         self.active = WorkspaceTab::Drive;
         self.destination_search = false;
@@ -367,7 +454,8 @@ impl MapsLocationSurface {
         OfflineNavigationStatus::from_surface(self)
     }
 
-    /// Simulator scenario: the selected source stops updating.
+    /// Simulator scenario: the selected source stops updating. TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     pub fn simulate_stale_primary_location(&mut self) {
         if let Some(source) = self
             .locations
@@ -383,7 +471,8 @@ impl MapsLocationSurface {
         }
     }
 
-    /// Simulator scenario: no usable offline map bundle is loaded.
+    /// Simulator scenario: no usable offline map bundle is loaded. TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     pub fn simulate_no_offline_maps(&mut self) {
         self.offline_maps.used_gb = 0.0;
         self.offline_maps.installed_regions.clear();
@@ -392,7 +481,8 @@ impl MapsLocationSurface {
             .push("Default state/province region queued for reinstall".to_string());
     }
 
-    /// Restore simulator data to an offline-navigation-ready state.
+    /// Restore simulator data to an offline-navigation-ready state. TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     pub fn simulate_ready_offline_navigation(&mut self) {
         self.locations = LocationManager::simulated();
         self.offline_maps = OfflineMapManagerState::simulated_default();
@@ -400,7 +490,11 @@ impl MapsLocationSurface {
         self.mg90.authenticated = true;
     }
 
-    /// Simulator scenario: the active cellular path degrades enough to record a route dead zone.
+    /// Simulator scenario: the active cellular path degrades enough to record a
+    /// route dead zone. TEST FIXTURE ONLY — the underlying
+    /// [`Self::record_dead_zone_from_current_status`] seam is the REAL recorder
+    /// and stays production-compiled.
+    #[cfg(any(test, feature = "sim-fixture"))]
     pub fn simulate_cellular_dead_zone(&mut self) -> bool {
         self.mg90.status.cellular_a.signal_dbm = -116;
         self.mg90.status.cellular_a.healthy = false;
@@ -580,10 +674,11 @@ impl MapsLocationSurface {
         };
         telemetry.last_update_age_s = mirror_age_s(v.published_at_ms);
 
-        // Retract the generic "simulator is active" gap now a live mirror exists
-        // and fold the adapter's own honest gap report in its place.
+        // Retract the seed's "no mirror yet" / "simulator is active" gaps now a
+        // live mirror exists and fold the adapter's own honest gap report in
+        // their place.
         self.real_hardware_gaps
-            .retain(|g| g != SIMULATED_MG90_GAP_NOTE);
+            .retain(|g| g != SIMULATED_MG90_GAP_NOTE && g != AWAITING_MIRROR_GAP_NOTE);
         if v.gaps.is_empty() {
             let note = format!(
                 "Live vehicle-gateway mirror active for node `{}` ({} {}).",
@@ -702,7 +797,7 @@ fn read_vehicle_mirror(node: &str) -> Option<mackes_mesh_types::vehicle::Vehicle
 
 impl Default for MapsLocationSurface {
     fn default() -> Self {
-        Self::simulated()
+        Self::live()
     }
 }
 
@@ -930,8 +1025,36 @@ pub struct MapViewState {
 }
 
 impl MapViewState {
-    /// The default map viewport seed (dark, region-zoom, no pan). Public so the
+    /// The production map viewport (dark, region-zoom, no pan) over the REAL
+    /// `MBTiles` basemap loader path. `region_installed` keys the attribution
+    /// line: OSM credit only when OSM-derived tiles are actually on disk, else
+    /// the honest "no offline map data installed".
+    #[must_use]
+    pub fn live(region_installed: bool) -> Self {
+        Self {
+            dark_mode: true,
+            zoom: 13.0,
+            pan: [0.0, 0.0],
+            rotation_deg: 18.0,
+            pitch_deg: 34.0,
+            route_visible: true,
+            // No live traffic/weather provider exists; these stay off (and the
+            // scene never paints fabricated overlay geometry regardless).
+            traffic_overlay: false,
+            weather_overlay: false,
+            dead_zone_overlay: true,
+            gnss_overlay: true,
+            attribution: if region_installed {
+                "OpenStreetMap contributors | local offline package".to_string()
+            } else {
+                "no offline map data installed".to_string()
+            },
+        }
+    }
+
+    /// The simulator-fixture viewport seed. TEST FIXTURE ONLY — public so the
     /// `basemap` projection tests can build a viewport without the whole surface.
+    #[cfg(any(test, feature = "sim-fixture"))]
     #[must_use]
     pub fn simulated() -> Self {
         Self {
@@ -969,6 +1092,55 @@ pub struct OfflineMapManagerState {
 }
 
 impl OfflineMapManagerState {
+    /// The production offline-map manager: reflect the region bundle that is
+    /// REALLY installed on disk (the same `<maps root>/<region>/*.mbtiles`
+    /// layout the basemap loader paints from), else the honest not-installed
+    /// state. Never fabricates a region, size, or queued download.
+    fn live() -> Self {
+        Self::from_installed(crate::basemap::region_dir())
+    }
+
+    /// Build the manager over an optionally-installed region directory (split
+    /// from [`Self::live`] so tests can exercise both branches without touching
+    /// the process environment).
+    fn from_installed(region: Option<std::path::PathBuf>) -> Self {
+        let mut state = Self {
+            default_region: String::new(),
+            storage_cap_gb: 25,
+            used_gb: 0.0,
+            installed_regions: Vec::new(),
+            available_regions: Vec::new(),
+            map_provider: ProviderContract {
+                abstraction: "Map Provider API".to_string(),
+                first_backend: "OpenStreetMap-derived data".to_string(),
+                local_only_core: true,
+                graceful_unavailable: false,
+            },
+        };
+        if let Some(dir) = region {
+            let name = dir.file_name().map_or_else(
+                || "region".to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let size_gb = dir_size_gb(&dir);
+            state.default_region.clone_from(&name);
+            state.used_gb = size_gb;
+            state.installed_regions.push(OfflineMapRegion {
+                name,
+                status: RegionStatus::Loaded,
+                size_gb,
+                // The bundle covers the whole of its own declared MBTiles
+                // bounds — coverage here describes the installed package, not a
+                // fabricated continental claim.
+                coverage_percent: 100,
+                updated: "installed offline bundle".to_string(),
+            });
+        }
+        state
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated_default() -> Self {
         Self {
             default_region: "Default state/province region".to_string(),
@@ -1007,6 +1179,21 @@ impl OfflineMapManagerState {
         }
         self.used_gb / self.storage_cap_gb as f32
     }
+}
+
+/// Total size of the files directly inside `dir`, in GB. Fail-soft: unreadable
+/// entries count as zero (an honest under-report, never a fabrication).
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // display value
+fn dir_size_gb(dir: &std::path::Path) -> f32 {
+    let bytes: u64 = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len())
+        .sum();
+    (bytes as f64 / 1_073_741_824.0) as f32
 }
 
 /// Installed offline region.
@@ -1081,6 +1268,55 @@ pub struct LocalNavigationState {
 }
 
 impl LocalNavigationState {
+    /// The production navigation state: real provider contracts, an unplanned
+    /// route, and NO destinations beyond what live geocoding adds — the presets
+    /// ("Home", "Precinct HQ", …) were fixture data and never ship.
+    fn live() -> Self {
+        Self {
+            routing: ProviderContract {
+                abstraction: "Routing API".to_string(),
+                first_backend: "Valhalla".to_string(),
+                local_only_core: true,
+                // Not wired yet: reads as a blocker in the readiness model, so
+                // turn-by-turn is never claimed on a route that cannot exist.
+                graceful_unavailable: true,
+            },
+            geocoder: ProviderContract {
+                abstraction: "Geocoder API".to_string(),
+                // The REAL offline gazetteer (`geocode.rs`) — wired and local.
+                first_backend: "offline gazetteer (FTS5)".to_string(),
+                local_only_core: true,
+                graceful_unavailable: false,
+            },
+            traffic: ProviderContract {
+                abstraction: "Traffic API".to_string(),
+                first_backend: "no provider configured".to_string(),
+                local_only_core: false,
+                graceful_unavailable: true,
+            },
+            weather: ProviderContract {
+                abstraction: "Weather API".to_string(),
+                first_backend: "no provider configured".to_string(),
+                local_only_core: false,
+                graceful_unavailable: true,
+            },
+            satellite: ProviderContract {
+                abstraction: "Satellite API".to_string(),
+                first_backend: "no provider configured".to_string(),
+                local_only_core: false,
+                graceful_unavailable: true,
+            },
+            active_route: RoutePlan::none(),
+            destinations: Vec::new(),
+            route_options: Vec::new(),
+            selected_route: 0,
+            selected_destination: 0,
+            navigating: false,
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             routing: ProviderContract {
@@ -1254,6 +1490,34 @@ impl LocalNavigationState {
     }
 }
 
+impl RoutePlan {
+    /// The honest "no route planned" state — every field empty/zero. The map
+    /// scene paints no route ribbon and the HUD stays on the idle prompt until
+    /// a real plan exists ([`Self::is_planned`]).
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            current_road: String::new(),
+            next_maneuver: String::new(),
+            distance_to_maneuver_mi: 0.0,
+            eta: String::new(),
+            remaining_time_min: 0,
+            remaining_distance_mi: 0.0,
+            alternatives: 0,
+            traffic_alert: String::new(),
+            weather_alert: String::new(),
+        }
+    }
+
+    /// Whether an actual route plan exists (vs. the empty [`Self::none`] state).
+    /// Gates the map's route-ribbon paint so an unplanned surface never draws a
+    /// fabricated route.
+    #[must_use]
+    pub fn is_planned(&self) -> bool {
+        !self.current_road.trim().is_empty() || !self.eta.trim().is_empty()
+    }
+}
+
 /// Active route summary.
 #[derive(Debug, Clone)]
 pub struct RoutePlan {
@@ -1409,6 +1673,38 @@ pub struct Mg90State {
 }
 
 impl Mg90State {
+    /// The production MG90 state: offline-until-mirror. Nothing discovered, no
+    /// fabricated capability profile, setting descriptors, or backups; the
+    /// direct-Ethernet management contract and factory-reset guardrails are
+    /// real config, not data, and stay.
+    fn live() -> Self {
+        Self {
+            managed_devices: 0,
+            direct_ethernet_only: true,
+            setup_step: SetupStep::NotConnected,
+            // Placeholder family until real discovery reads the model; the view
+            // dashes the model label while `setup_step < Mg90Discovered`.
+            model: Mg90Model::FiveG,
+            capabilities: Mg90Capabilities {
+                lte_a: false,
+                five_g: false,
+                mgos_version: String::new(),
+                gnss: false,
+                gpio: false,
+                serial_recovery: false,
+                firmware_management: false,
+            },
+            authenticated: false,
+            ignition_on: false,
+            reset: FactoryResetWorkflow::awaiting_backup(),
+            settings: Vec::new(),
+            backups: Vec::new(),
+            status: Mg90Status::offline(),
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         let settings = sample_settings();
         Self {
@@ -1441,7 +1737,9 @@ impl Mg90State {
         }
     }
 
-    /// Advance the offline setup wizard in simulator mode.
+    /// Advance the offline setup wizard in simulator mode. TEST FIXTURE ONLY —
+    /// the production wizard advances only when real discovery/auth seams land.
+    #[cfg(any(test, feature = "sim-fixture"))]
     pub fn advance_setup_simulated(&mut self) {
         self.setup_step = self.setup_step.next();
         if matches!(self.setup_step, SetupStep::Authenticated | SetupStep::Ready) {
@@ -1550,6 +1848,9 @@ impl SetupStep {
         }
     }
 
+    /// The wizard's next step — only the cfg-gated simulator advance uses this
+    /// today; the real discovery/auth seams will drive it when they land.
+    #[cfg(any(test, feature = "sim-fixture"))]
     const fn next(self) -> Self {
         match self {
             Self::NotConnected => Self::EthernetDetected,
@@ -1594,6 +1895,37 @@ pub struct Mg90Status {
 }
 
 impl Mg90Status {
+    /// The production "no gateway yet" status: every link/interface field empty
+    /// or zero, both cellular links absent and unhealthy. The views dash empty
+    /// strings and treat non-negative dBm as "no signal", so nothing here reads
+    /// as a live uplink. [`MapsLocationSurface::refresh_from_vehicle`] overwrites
+    /// this wholesale from the wire mirror.
+    fn offline() -> Self {
+        let absent_link = || CellularLink {
+            sim_state: String::new(),
+            carrier: String::new(),
+            signal_dbm: 0,
+            technology: String::new(),
+            wan_ip: String::new(),
+            healthy: false,
+        };
+        Self {
+            active_wan: String::new(),
+            cellular_a: absent_link(),
+            cellular_b: absent_link(),
+            wifi_state: String::new(),
+            ethernet_state: String::new(),
+            vpn_state: String::new(),
+            data_transferred: String::new(),
+            failover_events: 0,
+            latency_ms: 0,
+            packet_loss_percent: 0.0,
+            link_quality: String::new(),
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             active_wan: "Cellular A".to_string(),
@@ -1691,7 +2023,25 @@ pub struct FactoryResetWorkflow {
 }
 
 impl FactoryResetWorkflow {
+    /// The production guardrail state: reset stays disarmed because NO backup
+    /// has actually completed yet (the fixture's `backup_completed: true` was a
+    /// fabricated claim).
+    fn awaiting_backup() -> Self {
+        Self {
+            backup_completed: false,
+            ..Self::template()
+        }
+    }
+
+    /// TEST FIXTURE ONLY — a guarded workflow whose backup already completed.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn guarded() -> Self {
+        Self::template()
+    }
+
+    /// The shared guardrail template (backup required, phrase set, workflow
+    /// steps spelled out) — config, not data.
+    fn template() -> Self {
         Self {
             backup_required: true,
             backup_completed: true,
@@ -1899,6 +2249,8 @@ impl SettingChangePlan {
     }
 }
 
+/// TEST FIXTURE ONLY — sample MG90 setting descriptors for the simulator seed.
+#[cfg(any(test, feature = "sim-fixture"))]
 fn sample_settings() -> Vec<Mg90SettingDescriptor> {
     vec![
         Mg90SettingDescriptor {
@@ -1981,6 +2333,20 @@ pub struct LocationManager {
 }
 
 impl LocationManager {
+    /// The production source manager: exactly one source — the MG90 GNSS
+    /// primary, armed but source-less (no fix, null coordinates, disconnected)
+    /// until a live `state/vehicle` mirror folds in. No fabricated gpsd /
+    /// manual / simulator peers.
+    fn live() -> Self {
+        Self {
+            primary: LocationSourceKind::Mg90Gnss,
+            auto_failover: false,
+            sources: vec![LocationSource::awaiting_live(LocationSourceKind::Mg90Gnss)],
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             primary: LocationSourceKind::Mg90Gnss,
@@ -2090,6 +2456,47 @@ pub struct LocationSource {
 }
 
 impl LocationSource {
+    /// The production "awaiting live feed" source: NO position lock, null
+    /// coordinates (`!has_fix()`), and honestly **disconnected** — before a
+    /// `state/vehicle` mirror exists we cannot claim the device link is up.
+    /// [`MapsLocationSurface::refresh_from_vehicle`] flips it Connected and
+    /// fills the sample the moment a live mirror folds in. The Drive HUD paints
+    /// "Acquiring GPS" and every GPS tile reads "—" until then (Q33).
+    fn awaiting_live(kind: LocationSourceKind) -> Self {
+        let mut diagnostics = BTreeMap::new();
+        diagnostics.insert("adapter".to_string(), kind.label().to_string());
+        diagnostics.insert(
+            "mode".to_string(),
+            "awaiting live state/vehicle mirror".to_string(),
+        );
+        diagnostics.insert("fix".to_string(), "acquiring — no lock".to_string());
+        Self {
+            kind,
+            status: SourceStatus::Disconnected,
+            connected_device: match kind {
+                LocationSourceKind::Mg90Gnss => "MG90 local GNSS".to_string(),
+                LocationSourceKind::UsbGpsd => "gpsd tcp://127.0.0.1:2947 skeleton".to_string(),
+                LocationSourceKind::ManualTest => "operator-entered point".to_string(),
+                LocationSourceKind::Simulator => "route simulator".to_string(),
+            },
+            diagnostics,
+            sample: LocationSample {
+                fix_type: "No fix".to_string(),
+                latitude: 0.0,
+                longitude: 0.0,
+                accuracy_m: 0.0,
+                speed_mph: 0.0,
+                heading_deg: 0.0,
+                altitude_m: 0.0,
+                satellites: None,
+                update_rate_hz: 0.0,
+                update_age_s: 0.0,
+            },
+        }
+    }
+
+    /// TEST FIXTURE ONLY — a connected source with a demo Pittsburgh fix.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn sample(
         kind: LocationSourceKind,
         accuracy_m: f32,
@@ -2128,12 +2535,14 @@ impl LocationSource {
         }
     }
 
-    /// A source that is connected but holds **no position lock yet** — the honest
-    /// default for the MG90 GNSS before a live `state/vehicle` mirror (or a real
-    /// fix) has been folded. Its sample is `!has_fix()`, so the Drive HUD paints
-    /// "Acquiring GPS" and the instrument strip's GPS tiles read "—" / "No fix"
-    /// instead of a hard-coded coordinate in a city the vehicle is not in. The
-    /// device itself is Connected (link up), so it stays a healthy peer.
+    /// TEST FIXTURE ONLY — a source that is connected but holds **no position
+    /// lock yet**: the fixture's stand-in for the MG90 GNSS before a live
+    /// `state/vehicle` mirror has been folded. Its sample is `!has_fix()`, so
+    /// the Drive HUD paints "Acquiring GPS" and the instrument strip's GPS
+    /// tiles read "—" / "No fix" instead of a hard-coded coordinate in a city
+    /// the vehicle is not in. The device itself is Connected (link up), so it
+    /// stays a healthy peer.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn acquiring(kind: LocationSourceKind) -> Self {
         let mut source = Self::sample(kind, 0.0, 0.0, true);
         source.sample = LocationSample {
@@ -2298,6 +2707,19 @@ pub struct TripRecorderState {
 }
 
 impl TripRecorderState {
+    /// The production trip recorder: retention/export/encryption CONFIG intact,
+    /// zero breadcrumbs — nothing has been recorded yet, so nothing shows.
+    fn live() -> Self {
+        Self {
+            retention_days: 30,
+            breadcrumbs: Vec::new(),
+            export_formats: TripExportFormat::ALL.to_vec(),
+            encrypted_at_rest: true,
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             retention_days: 30,
@@ -2377,6 +2799,18 @@ pub struct DeadZoneState {
 }
 
 impl DeadZoneState {
+    /// The production dead-zone recorder: empty until
+    /// [`MapsLocationSurface::record_dead_zone_from_current_status`] (the REAL
+    /// seam — it requires a live fix + live link data) records one.
+    fn live() -> Self {
+        Self {
+            zones: Vec::new(),
+            route_risk: "No cellular dead zones recorded on this route".to_string(),
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             zones: vec![DeadZoneRecord {
@@ -2481,6 +2915,36 @@ pub struct VehicleState {
 }
 
 impl VehicleState {
+    /// The production vehicle state: NO telemetry claim of any kind until a
+    /// live `state/vehicle` mirror folds one in. The confidence label never
+    /// starts with `"live vehicle-gateway mirror"`, so
+    /// [`VehicleTelemetry::is_live`] (and every gauge/tile riding it) reads
+    /// absent — Q33: absent reads absent, never fabricated.
+    fn awaiting_gateway() -> Self {
+        Self {
+            profile: String::new(),
+            telemetry: VehicleTelemetry {
+                speed_mph: 0.0,
+                rpm: 0,
+                coolant_c: 0.0,
+                battery_v: 0.0,
+                fuel_percent: None,
+                dtc_count: 0,
+                ignition_on: false,
+                moving: false,
+                odometer_mi: None,
+                runtime_min: 0,
+                internal_temp_c: None,
+                confidence: "no vehicle telemetry source — awaiting vehicle-gateway mirror"
+                    .to_string(),
+                last_update_age_s: 0.0,
+            },
+            profile_notes: Vec::new(),
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn ford_interceptor_2020() -> Self {
         Self {
             profile: "2020 Ford Police Interceptor Utility".to_string(),
@@ -2540,6 +3004,20 @@ pub struct VehicleTelemetry {
     pub last_update_age_s: f32,
 }
 
+impl VehicleTelemetry {
+    /// Whether this telemetry is a LIVE gateway reading.
+    /// [`MapsLocationSurface::refresh_from_vehicle`] stamps the confidence
+    /// label `"live vehicle-gateway mirror (…)"` only when a real
+    /// `state/vehicle/<node>` mirror folded in with the adapter ONLINE; every
+    /// other label (awaiting-mirror seed, offline adapter, test fixture) reads
+    /// not-live. Gauges and readouts ride this so they can never present a
+    /// non-live number as a reading. PLATFORM-INTERFACES Q33.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.confidence.starts_with("live vehicle-gateway mirror")
+    }
+}
+
 /// Devices and I/O state.
 #[derive(Debug, Clone)]
 pub struct DeviceIoState {
@@ -2556,6 +3034,26 @@ pub struct DeviceIoState {
 }
 
 impl DeviceIoState {
+    /// The production device state: nothing attached, nothing detected, no
+    /// automation rules — the views already render designed empty states
+    /// ("No USB devices attached.", "No GPIO automation rules defined.",
+    /// "No console output.", em-dash readouts) for exactly this shape.
+    fn live() -> Self {
+        Self {
+            serial: SerialConsoleState {
+                connected: false,
+                baud_profile: "115200 8N1".to_string(),
+                transcript_lines: Vec::new(),
+            },
+            gpio_rules: Vec::new(),
+            usb_devices: Vec::new(),
+            ethernet_state: String::new(),
+            can_obd_state: String::new(),
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             serial: SerialConsoleState {
@@ -2626,6 +3124,8 @@ pub struct GpioAutomationRule {
 }
 
 impl GpioAutomationRule {
+    /// TEST FIXTURE ONLY — fixture rule builder for the simulator seed.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn new(id: &str, trigger: &str, action: &str) -> Self {
         Self {
             id: id.to_string(),
@@ -2655,6 +3155,21 @@ pub struct FirmwareWorkflow {
 }
 
 impl FirmwareWorkflow {
+    /// The production firmware state: nothing read from a device, no package
+    /// selected, ZERO pre-flight checks (checks run against a real selected
+    /// package, they are not pre-passed), and no restore point claimed.
+    fn live() -> Self {
+        Self {
+            current: String::new(),
+            target_package: "no package selected".to_string(),
+            checks: Vec::new(),
+            progress_percent: 0,
+            restore_point_ready: false,
+        }
+    }
+
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated() -> Self {
         Self {
             current: "MGOS simulated current".to_string(),
@@ -2685,6 +3200,8 @@ pub struct FirmwareCheck {
 }
 
 impl FirmwareCheck {
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn pass(label: &str) -> Self {
         Self {
             label: label.to_string(),
@@ -2692,6 +3209,8 @@ impl FirmwareCheck {
         }
     }
 
+    /// TEST FIXTURE ONLY.
+    #[cfg(any(test, feature = "sim-fixture"))]
     fn warn(label: &str) -> Self {
         Self {
             label: label.to_string(),
@@ -3325,5 +3844,168 @@ mod tests {
             .real_hardware_gaps
             .iter()
             .any(|g| g == SIMULATED_MG90_GAP_NOTE));
+    }
+
+    // ── WL-UX-007/S1 — production simulator removal ─────────────────────────
+    // PLATFORM-INTERFACES P8/Q33 + operator directive 2026-07-22: the
+    // production constructor carries NO fabricated data of any kind.
+
+    #[test]
+    fn live_surface_is_empty_of_fabricated_data() {
+        let s = MapsLocationSurface::live();
+
+        assert!(!s.simulator_enabled, "no simulator in production");
+        assert!(s.airspace.signals.is_empty(), "zero airspace contacts");
+        assert!(!s.airspace.active, "airspace scanning idle until focused");
+        assert!(s.trips.breadcrumbs.is_empty(), "no fabricated trip history");
+        assert!(s.dead_zones.zones.is_empty(), "no fabricated dead zones");
+        assert!(
+            s.local_navigation.destinations.is_empty(),
+            "no preset destinations — only real geocoding adds them"
+        );
+        assert!(s.local_navigation.route_options.is_empty());
+        assert!(!s.local_navigation.navigating);
+        assert!(!s.local_navigation.active_route.is_planned());
+        assert!(s.mg90.settings.is_empty(), "no fabricated descriptors");
+        assert!(s.mg90.backups.is_empty(), "no fabricated restore points");
+        assert!(!s.mg90.authenticated);
+        assert_eq!(s.mg90.setup_step, SetupStep::NotConnected);
+        assert!(s.devices.gpio_rules.is_empty());
+        assert!(s.devices.usb_devices.is_empty());
+        assert!(s.firmware.checks.is_empty(), "no pre-passed checks");
+        assert!(!s.firmware.restore_point_ready);
+        assert!(
+            !s.mg90.reset.armed(),
+            "reset disarmed without a real backup"
+        );
+
+        // Vehicle telemetry is absent and never claims live.
+        assert!(!s.vehicle.telemetry.is_live());
+        assert!(s.vehicle.telemetry.fuel_percent.is_none());
+        assert!(s.vehicle.telemetry.odometer_mi.is_none());
+
+        // The MG90 GNSS primary is armed but source-less: no fix, no fake
+        // coordinates, and no fabricated peer sources.
+        let primary = s.locations.primary_source().expect("mg90 primary");
+        assert_eq!(primary.kind, LocationSourceKind::Mg90Gnss);
+        assert!(!primary.sample.has_fix());
+        assert_eq!(primary.sample.fix_type, "No fix");
+        assert!(primary.sample.latitude.abs() < f64::EPSILON);
+        assert_eq!(primary.status, SourceStatus::Disconnected);
+        assert_eq!(s.locations.sources.len(), 1, "MG90 GNSS only");
+
+        // No live WAN is claimed.
+        assert!(s.mg90.status.active_wan.is_empty());
+        assert!(s.mg90.status.active_cellular_link().is_none());
+
+        // The honest gap report leads with the awaiting-mirror note.
+        assert!(s
+            .real_hardware_gaps
+            .iter()
+            .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
+    }
+
+    #[test]
+    fn live_offline_maps_reflect_disk_not_fixtures() {
+        // No region installed ⇒ the honest not-installed state, never the
+        // fixture's "Default state/province region".
+        let none = OfflineMapManagerState::from_installed(None);
+        assert!(none.installed_regions.is_empty());
+        assert!(none.available_regions.is_empty(), "no fabricated downloads");
+        assert!(none.default_region.is_empty());
+        assert!(none.used_gb.abs() < f32::EPSILON);
+        assert!(none.loaded_region().is_none());
+
+        // A really-installed region directory is reported from disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let region = dir.path().join("east-texas");
+        std::fs::create_dir(&region).expect("region dir");
+        std::fs::write(region.join("east-texas.mbtiles"), vec![0u8; 4096]).expect("mbtiles");
+        let installed = OfflineMapManagerState::from_installed(Some(region));
+        assert_eq!(installed.default_region, "east-texas");
+        assert_eq!(installed.installed_regions.len(), 1);
+        assert_eq!(installed.installed_regions[0].status, RegionStatus::Loaded);
+    }
+
+    #[test]
+    fn live_mirror_fold_goes_live_from_the_live_seed() {
+        use mackes_mesh_types::vehicle::{
+            CellLink, GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
+        };
+
+        let mut s = MapsLocationSurface::live();
+        let mirror = WireVehicleState {
+            host: "eagle".to_string(),
+            model: "MG90".to_string(),
+            esn: "ESN-TEST".to_string(),
+            mgos_version: "4.3.0.1".to_string(),
+            online: true,
+            gps: GpsFix {
+                fix_type: "3D".to_string(),
+                latitude: 40.4406,
+                longitude: -79.9959,
+                satellites: 11,
+                hdop: 0.8,
+                ..GpsFix::default()
+            },
+            imu: None,
+            wan: WanStatus {
+                active_wan: "Cellular A".to_string(),
+                cellular_a: CellLink {
+                    sim_state: "ready".to_string(),
+                    carrier: "FirstNet".to_string(),
+                    signal_dbm: -68,
+                    technology: "5G/LTE-A".to_string(),
+                    wan_ip: "100.64.0.9".to_string(),
+                    healthy: true,
+                },
+                latency_ms: 31,
+                link_quality: "excellent".to_string(),
+                ..WanStatus::default()
+            },
+            telem: VehicleTelem {
+                speed_mph: 42.0,
+                battery_v: 13.8,
+                ..VehicleTelem::default()
+            },
+            gaps: Vec::new(),
+            published_at_ms: 0,
+        };
+        s.refresh_from_vehicle(&mirror);
+
+        // The fold works from the live seed exactly as from the fixture: the
+        // MG90 source connects, gains the wire fix, and telemetry goes live.
+        let primary = s.locations.primary_source().expect("mg90 source");
+        assert_eq!(primary.status, SourceStatus::Connected);
+        assert!(primary.sample.has_fix());
+        assert!(s.vehicle.telemetry.is_live());
+        assert_eq!(s.mg90.status.active_wan, "Cellular A");
+        // The awaiting-mirror gap retracts once the mirror is live.
+        assert!(!s
+            .real_hardware_gaps
+            .iter()
+            .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
+    }
+
+    #[test]
+    fn start_navigation_is_a_no_op_without_route_options() {
+        // Without a routing engine there is no route: Start must never flip the
+        // HUD into guidance over a fabricated empty maneuver banner.
+        let mut s = MapsLocationSurface::live();
+        s.route_preview = true;
+        s.start_navigation();
+        assert!(!s.local_navigation.navigating);
+        assert!(s.route_preview, "stays on the preview, honestly routeless");
+    }
+
+    #[test]
+    fn live_readiness_is_blocked_never_fabricated_ready() {
+        // A fresh live seat (no mirror, no routing engine, usually no maps)
+        // must not claim turn-by-turn readiness.
+        let s = MapsLocationSurface::live();
+        let status = s.offline_navigation_status();
+        assert_eq!(status.readiness, OfflineNavigationReadiness::Blocked);
+        assert!(!status.can_claim_turn_by_turn());
+        assert!(!status.notes.iter().any(|n| n.contains("Simulator fixture")));
     }
 }

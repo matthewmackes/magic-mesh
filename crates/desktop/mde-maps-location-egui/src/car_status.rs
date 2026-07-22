@@ -191,16 +191,24 @@ impl CarStatusItem {
         let t = &s.vehicle.telemetry;
         let w = &s.mg90.status;
         let sample = s.locations.primary_source().map(|src| &src.sample);
-        // `g` resolves from whatever primary sample exists (source-present gate).
-        // `gf` additionally requires a real position lock: GPS-derived readouts
-        // are honest ONLY on a fix — without one they read "—", never a
-        // fabricated 0.0000 / 0° / 0-sat / zero-accuracy coordinate.
+        // `gf` requires a real position lock: GPS-derived readouts are honest
+        // ONLY on a fix — without one they read "—", never a fabricated
+        // 0.0000 / 0° / 0-sat / zero-accuracy coordinate.
         let fixed = sample.filter(|x| x.has_fix());
-        let g = |f: fn(&crate::model::LocationSample) -> String| {
-            sample.map_or_else(|| "—".to_string(), |x| f(x))
-        };
         let gf = |f: fn(&crate::model::LocationSample) -> String| {
             fixed.map_or_else(|| "—".to_string(), |x| f(x))
+        };
+        // Vehicle-telemetry readouts ride the SAME live gate as the speed
+        // gauge (Q33): a non-live seed carries no readings, so every
+        // telemetry-derived tile dashes instead of presenting a fabricated
+        // 0 rpm / 0.0 V / 0 °C as an instrument reading.
+        let live_t = telemetry_is_live(s);
+        let lt = |value: String| {
+            if live_t {
+                value
+            } else {
+                "—".to_string()
+            }
         };
         match self {
             // Speed rides the LIVE-telemetry gate (PLATFORM-INTERFACES Q33): the
@@ -214,26 +222,24 @@ impl CarStatusItem {
                 .map_or_else(|| "—".to_string(), |v| format!("{:.0} kph", v * 1.60934)),
             Self::Heading => gf(|x| format!("{:.0}°", x.heading_deg)),
             Self::HeadingCardinal => gf(|x| cardinal(x.heading_deg).to_string()),
-            Self::Rpm => format!("{}", t.rpm),
-            Self::CoolantC => format!("{:.0} °C", t.coolant_c),
-            Self::CoolantF => format!("{:.0} °F", t.coolant_c * 9.0 / 5.0 + 32.0),
-            Self::BatteryV => format!("{:.1} V", t.battery_v),
+            Self::Rpm => lt(format!("{}", t.rpm)),
+            Self::CoolantC => lt(format!("{:.0} °C", t.coolant_c)),
+            Self::CoolantF => lt(format!("{:.0} °F", t.coolant_c * 9.0 / 5.0 + 32.0)),
+            Self::BatteryV => lt(format!("{:.1} V", t.battery_v)),
             Self::FuelPercent => t
                 .fuel_percent
                 .map_or_else(|| "—".to_string(), |f| format!("{f:.0}%")),
             Self::OdometerMi => t
                 .odometer_mi
                 .map_or_else(|| "—".to_string(), |o| format!("{o} mi")),
-            Self::RuntimeMin => format!("{} min", t.runtime_min),
-            Self::Ignition => on_off(t.ignition_on),
-            Self::Moving => {
-                if t.moving {
-                    "moving".into()
-                } else {
-                    "parked".into()
-                }
-            }
-            Self::FaultCodes => format!("{}", t.dtc_count),
+            Self::RuntimeMin => lt(format!("{} min", t.runtime_min)),
+            Self::Ignition => lt(on_off(t.ignition_on)),
+            Self::Moving => lt(if t.moving {
+                "moving".to_string()
+            } else {
+                "parked".to_string()
+            }),
+            Self::FaultCodes => lt(format!("{}", t.dtc_count)),
             // GPS FIX reads the honest lock state: the live fix label on a lock,
             // "No fix" when a source is present but acquiring, "—" with no source.
             Self::GpsFix => match sample {
@@ -250,8 +256,11 @@ impl CarStatusItem {
             Self::Longitude => gf(|x| format!("{:.4}", x.longitude)),
             Self::AltitudeM => gf(|x| format!("{:.0} m", x.altitude_m)),
             Self::AltitudeFt => gf(|x| format!("{:.0} ft", x.altitude_m * 3.28084)),
-            Self::UpdateRate => g(|x| format!("{:.0} Hz", x.update_rate_hz)),
-            Self::FixAge => g(|x| format!("{:.0} s", x.update_age_s)),
+            // Rate/age are only meaningful once updates actually flow — an
+            // idle "0 Hz / 0 s" is a fabricated measurement, so both ride the
+            // fix gate like the other GPS-derived tiles.
+            Self::UpdateRate => gf(|x| format!("{:.0} Hz", x.update_rate_hz)),
+            Self::FixAge => gf(|x| format!("{:.0} s", x.update_age_s)),
             Self::LocationSource => s.locations.primary.label().to_string(),
             Self::ActiveWan => empty_dash(&w.active_wan),
             Self::CellASignal => signal_dbm(w.cellular_a.signal_dbm),
@@ -286,10 +295,18 @@ impl CarStatusItem {
                     format!("{:.1}%", w.packet_loss_percent)
                 }
             }
-            Self::Failovers => format!("{}", w.failover_events),
+            // Failover count is a WAN metric: with no active uplink there is
+            // nothing to fail over, so "0" would be a fabricated measurement.
+            Self::Failovers => {
+                if w.active_wan.trim().is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{}", w.failover_events)
+                }
+            }
             Self::DataUsed => empty_dash(&w.data_transferred),
             Self::TelemetrySource => empty_dash(&t.confidence),
-            Self::TelemetryAge => format!("{:.0} s", t.last_update_age_s),
+            Self::TelemetryAge => lt(format!("{:.0} s", t.last_update_age_s)),
             Self::NavEta => s.vehicle_glance().unwrap_or_else(|| "—".to_string()),
             Self::NavSummary => s.vehicle_glance().unwrap_or_else(|| "—".to_string()),
         }
@@ -309,10 +326,7 @@ impl CarStatusItem {
 /// PLATFORM-INTERFACES Q33: absent reads absent, never fabricated.
 #[must_use]
 pub fn telemetry_is_live(s: &MapsLocationSurface) -> bool {
-    s.vehicle
-        .telemetry
-        .confidence
-        .starts_with("live vehicle-gateway mirror")
+    s.vehicle.telemetry.is_live()
 }
 
 /// The instrument-gauge speed feed: `Some(mph)` only from live telemetry,
@@ -623,6 +637,43 @@ mod tests {
         s.refresh_from_vehicle(&offline);
         assert!(!telemetry_is_live(&s), "adapter offline is not live");
         assert_eq!(CarStatusItem::SpeedMph.value(&s), "—");
+    }
+
+    #[test]
+    fn live_surface_telemetry_tiles_all_read_absent() {
+        // WL-UX-007/S1: the production constructor carries NO telemetry source,
+        // so every telemetry-derived readout dashes — never a fabricated
+        // 0 rpm / 0.0 V / 0 °C / "OFF" presented as an instrument reading.
+        let s = MapsLocationSurface::live();
+        assert!(!telemetry_is_live(&s));
+        for item in [
+            CarStatusItem::SpeedMph,
+            CarStatusItem::SpeedKph,
+            CarStatusItem::Rpm,
+            CarStatusItem::CoolantC,
+            CarStatusItem::CoolantF,
+            CarStatusItem::BatteryV,
+            CarStatusItem::FuelPercent,
+            CarStatusItem::OdometerMi,
+            CarStatusItem::RuntimeMin,
+            CarStatusItem::Ignition,
+            CarStatusItem::Moving,
+            CarStatusItem::FaultCodes,
+            CarStatusItem::TelemetryAge,
+            CarStatusItem::Failovers,
+            CarStatusItem::UpdateRate,
+            CarStatusItem::FixAge,
+        ] {
+            assert_eq!(
+                item.value(&s),
+                "—",
+                "{item:?} must read absent on the live seed"
+            );
+        }
+        // Every catalog entry still resolves without panicking on the live seed.
+        for item in CarStatusItem::ALL {
+            assert!(!item.value(&s).is_empty(), "{item:?} resolves");
+        }
     }
 
     #[test]

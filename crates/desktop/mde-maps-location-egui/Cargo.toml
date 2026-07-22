@@ -15,6 +15,14 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[features]
+# Test-only simulator fixture: `MapsLocationSurface::simulated()` + the
+# `simulate_*` scenario methods. NEVER enabled by a production build —
+# mde-shell-egui enables it from [dev-dependencies] only, and the workspace's
+# resolver = "2" keeps dev-dep features out of `cargo build` (WL-UX-007/S1,
+# operator directive 2026-07-22: production shows MG90-mirror data only).
+sim-fixture = []
+
 [lib]
 name = "mde_maps_location_egui"
 path = "src/lib.rs"
