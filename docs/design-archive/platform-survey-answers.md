@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # Platform Survey — Locked Answers
 
 > **Note (post-SUBSTRATE-6):** these answers were locked 2026-06-09 against a

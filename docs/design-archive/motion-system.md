@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # MOTION — unified motion, refresh & visual-feedback system (design)
 
 > **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the motion *principles* here still guide the shell, but they were specced against the retired iced/`libcosmic`/`mde-workbench` GUIs. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` with motion in the shared `mde-egui` `Motion` module — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). The toolkit APIs and crate paths below are stale.

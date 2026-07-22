@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # WIN10-HYBRID — the single 48px bottom taskbar (Win10 structure · Construct identity)
 
 Operator-locked 2026-07-12 (25-Q `/plan` survey). **This supersedes

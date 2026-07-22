@@ -1,5 +1,7 @@
 # MENUBAR-ALL — a unified title + menu bar on every surface
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Operator-locked 2026-07-04 (15-Q survey). Give **every primary nav-bar surface** a
 consistent top bar: a **large stylized UPPERCASE workspace title** on the left, the
 **menus inline to its right**, and a **live per-surface status cluster** on the far

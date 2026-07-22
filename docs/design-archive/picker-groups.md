@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # PICKER-GROUPS — grouping the bottom picker's surface icons
 
 Operator-locked 2026-07-04 (10-Q `/plan`, iteratively refined). The Win10 taskbar app

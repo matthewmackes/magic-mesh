@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # FRONTDOOR — the Magic Mesh Front Door (App Menu redesign)
 
 > **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** the Front Door concept lives on, but this doc's implementation is the retired `mde-workbench` launcher. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the `mde-workbench`/iced crate references below as historical.

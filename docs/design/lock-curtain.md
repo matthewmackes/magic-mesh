@@ -1,5 +1,7 @@
 # CURTAIN — the secure login/lock curtain (Construct shell)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Operator-locked 2026-07-04 (10-Q `/plan` survey). The platform boots the DRM shell
 straight to the desktop with **no login prompt** (lightdm removed; no display manager
 by design). CURTAIN adds the missing gate: a full-screen **secure login page that is

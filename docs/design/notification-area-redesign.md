@@ -1,5 +1,7 @@
 # Notification & Status Area — re-envisioned (design)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 *Operator survey 2026-07-05 (10 ideas → 50-Q `/plan`, session 759c1f91). Carbon design
 language throughout. **Chat owns all notifications** — the dock conveys STATUS, not a
 second notification channel.*

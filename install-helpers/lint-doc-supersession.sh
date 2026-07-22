@@ -52,6 +52,7 @@ allowlisted() {
     */docs/platform/WORKLIST.md) return 0 ;;                  # active worklist
     */docs/platform/DRAIN-RECONCILIATION-*.md) return 0 ;;    # drain meta
     */docs/platform/WORKLIST-RECONCILIATION-*.md) return 0 ;; # reconcile meta
+    */docs/platform/WL-ARCH-001-openstack-deletion-blueprint.md) return 0 ;; # current delete blueprint; retired crates named only in the audit ban-list
     */docs/design/quasar-cloud.md) return 0 ;;                # current replacement epic (supersedes cloud-hypervisor)
     */docs/design/e12-9-10-libvirt-rescope.md) return 0 ;;    # current rescope off cloud-hypervisor
     */docs/design/qc23-virtio-gpu-zerocopy-rescope.md) return 0 ;; # current rescope
@@ -83,7 +84,7 @@ hit_files() {
       "$(IFS='|'; echo "${TERMS[*]}")" "$DOCS" 2>/dev/null || true)"
   fi
   # Deterministically drop archived/review copies regardless of glob semantics.
-  printf '%s\n' "$raw" | grep -Ev '/(worklist-archive|review)/' || true
+  printf '%s\n' "$raw" | grep -Ev '/(worklist-archive|design-archive|review)/' || true
 }
 
 has_banner() {
@@ -128,9 +129,12 @@ self_test() {
   # Naked historical doc: retired term, no banner.
   printf '%s\n' '# Naked surface' 'Built on libcosmic and mde-workbench.' \
     >"$td/docs/design/naked.md"
-  # Archived doc with a retired term must be ignored (excluded dir).
+  # Archived docs with a retired term must be ignored (excluded dirs).
   printf '%s\n' '# archived' 'lizardfs everywhere' \
     >"$td/docs/worklist-archive/old.md"
+  mkdir -p "$td/docs/design-archive"
+  printf '%s\n' '# archived design' 'the mde-workbench era' \
+    >"$td/docs/design-archive/old-design.md"
 
   run() {
     local save="$DOCS" rc

@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # Auto Mode — the Ford SYNC 3 in-vehicle interface
 
 **Goal (operator, 2026-07-20):** a first-class **Auto Mode** (Car Mode) across every

@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # MOTION-AUDIT-1 — static / no-feedback component gap list
 
 > **HISTORICAL / SUPERSEDED (2026-07-19):** a component gap-list taken against the retired iced/`mde-workbench`/`mde-cosmic-applet` GUIs. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). The motion *intent* still informs the shell, but the crate paths and component inventory below are stale.

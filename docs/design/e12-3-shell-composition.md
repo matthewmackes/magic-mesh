@@ -1,5 +1,7 @@
 # E12-3 shell composition — the six surfaces become panels in the one shell
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 **Status:** LOCKED + executing 2026-06-30 (operator: "yes, E12-3 execute").
 **Scope of this doc:** the *composition* piece of E12-3 — mounting the polished
 surfaces into `mde-shell-egui`. (The DRM-seat boot + PAM login/lock parts of the

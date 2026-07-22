@@ -1,5 +1,7 @@
 # BOOT-STATUS — desktop boot mesh-services status dialog
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Design survey locked 2026-06-17 (10-question `/plan`), prompted by the operator
 wanting an informative, at-boot view of how the mesh fabric + app daemons come
 up — the "connection handshake, setup, pings" sequence — surfaced in the

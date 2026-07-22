@@ -120,6 +120,21 @@ two closures + two clarifications.
 - Active count: 3 → **WL-RUN-003** (Blocked), **WL-FUNC-011** (Blocked),
   **WL-FUNC-012** (Remaining), **WL-FUNC-013** (Remaining, in progress).
 
+**Fold-in 2026-07-22 (operator 50-Q survey: Apple HIG standard; two interfaces):**
+ADR-0006 + `AI_GOVERNANCE.md` §4 amended — the design standard for the full
+platform is Apple's HIG applied as principles; the platform has exactly two
+interfaces, **Construct** and **Car**, with the single authority doc
+`docs/design/platform-interfaces.md`. Nineteen interface-paradigm design docs
+retired to `docs/design-archive/`. New epics **WL-UX-006** (Construct) +
+**WL-UX-007** (Car) registered below. Dispositions: **WL-UX-001**
+(Win10-taskbar live proof) is **superseded-retired** — the chrome it would
+prove is scheduled for deletion at the WL-UX-006 cutover; **WL-UX-005**
+(launcher overhaul) **folds into WL-UX-006** — its shipped Front Door engine
+survives as Spotlight (reskin-only lock), its remaining Start-Menu-dedup
+acceptance is moot (Start Menu already deleted, `115709a9`), and its
+peer-app remote-exec remainder transfers to WL-UX-006's springboard scope.
+Active count: 6 → adds **WL-UX-006** (Remaining), **WL-UX-007** (Remaining).
+
 ## Status Vocabulary
 
 - `Remaining` - valid unfinished work that can proceed.
@@ -682,6 +697,87 @@ These decisions refine acceptance and sequencing for the active items below.
   built for purpose" + operator directives (Advanced menu; floating buttons; "solve all") 2026-07-22.
 
 ## User Interface And Experience
+
+### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
+  flyouts, `src/dock/mod.rs`) with an ephemeral search launcher and no home
+  screen, after three chrome reversals in ten days; no single design standard
+  governs the shell, and the operator's locked direction (ADR-0006: Apple HIG
+  as principles, iPadOS structure + macOS pointer manners) has no
+  implementation.
+- Required outcome: Construct per `docs/design/platform-interfaces.md` Part I -
+  persistent springboard home (pages = the 8 LAUNCHER_GROUPS, no dock, no
+  widgets), slim top status bar, Control Center, Notification Center,
+  Spotlight (Front Door engine, keyboard flow byte-identical), card app
+  switcher with snapshot previews, shared
+  NavigationBar/Toolbar/Sidebar/Sheet/Popover components adopted by all 17
+  surfaces, scrim materials + HIG radii + zoom-from-tile motion, two-profile
+  LayoutProfile (Construct + Car, Tablet folded via serde aliases), and the
+  Win10 chrome DELETED at cutover (no legacy flag).
+- Plan: `/root/.claude/plans/the-workstation-interface-should-cozy-minsky.md`
+  (28-unit + 2-gate fan-out; main.rs serialization queue U25→U08→U09→U27→U29).
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/` (main.rs,
+  dock/ [deleted at cutover], front_door.rs, new springboard.rs / status_bar.rs /
+  control_center.rs / notification_center.rs / switcher.rs / surfaces.rs,
+  curtain.rs, keyboard.rs, system/), `crates/shared/mde-egui/src/` (style.rs,
+  motion.rs, fonts.rs, gestures.rs, new nav_chrome.rs / sheet.rs).
+- Dependencies: WL-FUNC-012 shell-side hooks land before the cutover unit
+  (same-crate serialization); curtain lock security behavior and the VDI
+  full-native-resolution guarantee are sacred (zero logic diffs).
+- Acceptance criteria: screenshot/pixel proof on the `.15` DRM seat -
+  springboard pages (all 8), status bar, Control Center, Notification Center,
+  Spotlight, switcher with real snapshots, zoom transitions, VDI full-res with
+  auto-hidden bar; post-cutover grep gate (zero taskbar identifiers in
+  production code); operator visual signoff.
+- Verification method: per-unit farm builds + targeted tests; two integration
+  slots (`cargo build --workspace` + `cargo test --workspace --no-run` + full
+  run + lint-style-leaks/doc-supersession/worklist) after the shared-API units
+  and after cutover; live `.15` deploy with
+  `--features drm,live-helper,live-vdi,media-mpv`.
+- Origin or merged source IDs: operator 50-Q survey 2026-07-22 (ADR-0006);
+  supersedes WL-UX-001 (retired); absorbs WL-UX-005 (launcher overhaul -
+  Front Door survives as Spotlight; peer-app remote-exec remainder).
+
+### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: Car mode is a SYNC 3-styled 2x3 tile grid whose 7th tile wraps, with
+  a driver instrument strip that goes STALE off the Maps surface (the vehicle
+  fold ran only inside the `Surface::MapsLocation` render arm), no codified
+  glanceability/driving-safety requirements, and a design doc
+  (auto-mode-sync3.md) now superseded by the platform standard.
+- Required outcome: Car per `docs/design/platform-interfaces.md` Part II -
+  CarPlay-principled with the SYNC3 dark palette kept: Dashboard-cards home
+  (persistent Nav-map/Media/glance cards + app strip), six apps (Nav, Media,
+  Music [new], Comms [Phone merged], Vehicle, Settings; Airspace tile dropped),
+  the left 1/3 instrument strip fresh on EVERY Car screen (per-frame fold,
+  2 Hz self-throttle - fix landed with this fold-in), glance rules + soft
+  in-motion limits above the MG90 speed threshold (no hard lockouts), one-tap
+  toggle only (no auto-enter), always dark.
+- Plan: same plan of record as WL-UX-006 (units U25-U28 + gate U32).
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/car_home.rs`,
+  `src/main.rs` (car_instrument_strip, central_view car branch, car_keymap
+  routing), `crates/desktop/mde-maps-location-egui/` (car_status.rs, model.rs
+  vehicle fold), `crates/shared/mde-egui/src/style.rs` (SYNC3 tokens).
+- Dependencies: `state/vehicle/<node>` MG90 mirror (Rolling Node epic) for the
+  live drive proof and the in-motion speed signal; Music surface split from
+  Media in the car roster.
+- Acceptance criteria: live proof with the MG90 mirror online - dashboard cards
+  live, instrument strip fresh on every Car screen, soft limits engage above
+  threshold, one-tap toggle; honest sparse data (never fabricated readings);
+  operator signoff.
+- Verification method: per-unit farm builds + targeted tests (car_home,
+  car_status, keymap); live MG90 drive verification
+  (`ssh -p2222 root@172.20.0.25` publishes the mirror).
+- Origin or merged source IDs: operator 50-Q survey 2026-07-22 (ADR-0006);
+  supersedes auto-mode-sync3.md as Car design authority (palette tokens
+  survive); stale-telemetry fix hoisted per survey Q33.
 
 ## Performance
 

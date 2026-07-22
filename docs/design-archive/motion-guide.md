@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # Motion contributor guide — copy-paste patterns
 
 > **HISTORICAL / SUPERSEDED (2026-07-19):** copy-paste motion patterns for the retired iced/`mde-workbench` GUIs. The live desktop is the egui-native, DRM-native shell `mde-shell-egui`; motion now lives in the shared `mde-egui` `Motion` module — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and [`motion-system.md`](motion-system.md). The iced/workbench APIs below are stale.

@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # Start Menu design (APPS-STYLE-2)
 
 > **HISTORICAL / SUPERSEDED (2026-07-19):** an imported note implemented against the retired `mde-cosmic-applet` apps-applet (`mde-apps-applet.rs`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` with the launcher folded into the Front Door — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md) and [`app-launcher-rethink.md`](app-launcher-rethink.md). Retained as a historical design record.

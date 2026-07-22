@@ -1,5 +1,7 @@
 # Notification Hub redesign + mesh Clipboard (NOTIFY-HUB / CLIP)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Goal: make the **Notification Hub** flow with the redesigned **Start Menu**
 (APPS-STYLE-2), add a synced **Clipboard Viewer**, and animate the list.
 Target: `mde-notify-center` (the Hub) + a clipboard mesh-sync path. Survey locks

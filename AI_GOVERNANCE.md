@@ -94,7 +94,7 @@ Kolla OpenStack containers) bring their own crypto stacks.** The OpenStack APIs
 bind **plaintext to the Nebula interface only** — the overlay is their transport
 security (Q23).
 
-## §4 — Look & toolkit: egui-native (E12 — replaces strictly-Carbon)
+## §4 — Look & toolkit: egui-native, Apple-HIG-principled (2026-07-22 — replaces the Win10-hybrid chrome direction)
 
 - **The UI toolkit is egui.** Every MCNF surface — shell chrome, panel, session
   view, HUD/overlays — is rendered with **egui** via **eframe** (egui + wgpu) on the
@@ -102,6 +102,16 @@ security (Q23).
   winit-less smithay DRM/GBM + libinput runner — **no Wayland compositor**, §5).
   There is one rendering idiom and one shell across the whole platform. **libcosmic
   / the vendored iced fork is retired.**
+- **The design standard is Apple's Human Interface Guidelines, applied as
+  principles** (operator lock 2026-07-22, 50-Q survey;
+  <https://developer.apple.com/design/human-interface-guidelines>). The platform
+  has exactly **two interfaces — Construct (workstation) and Car** — whose
+  requirements live in the single authority doc
+  **`docs/design/platform-interfaces.md`**. Structure is iPadOS-derived with
+  macOS pointer manners; identity stays Quazar-dark; the **Mackes-Carbon icon
+  set is kept platform-wide**. All other interface-paradigm design docs are
+  retired to `docs/design-archive/`. Do not re-introduce a bottom taskbar, tray
+  flyouts, dock, or Start-style panel.
 - **The design system is egui-native.** Strict IBM Carbon is **retired**. The
   single source of look is the shared **`Style`/`Visuals` module** in `mde-egui`
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use

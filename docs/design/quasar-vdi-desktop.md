@@ -1,5 +1,7 @@
 # Construct — the egui-native mesh thin-client desktop OS (E12, revised)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 > **Status:** LOCKED (design) · 2026-06-30 · 50-question `/plan` survey.
 > **Series:** MCNF **12.0 "Construct"** (package/repo id stays `magic-mesh`).
 > **Authority:** Memory > `AI_GOVERNANCE.md` > this doc > `docs/WORKLIST.md` body.

@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # E12 — Forked-COSMIC + Magic-Mesh → one egui-native mesh desktop OS
 
 > ⚠️ **SUPERSEDED IN PART (2026-06-30, same day).** The **forked-compositor** model

@@ -1,5 +1,7 @@
 # SEARCH-omnibox — unified launcher/search foundation
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 `SEARCH-omnibox` is the remaining launcher-restructure epic: one fast entry point
 for apps, files, mesh units, Browser history/bookmarks/search suggestions, and
 assistant-ranked follow-up rows. `mde_egui::search_omnibox` owns a pure

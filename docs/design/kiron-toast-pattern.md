@@ -1,5 +1,7 @@
 # KIRON — the global lower-third "chyron" toast pattern (KIRON-1..3)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 > **Status: LOCKED 2026-07-02** — 12-question operator survey (this session, per
 > `/plan`). "Kiron" = **chyron**, the TV-news lower-third. This is the ONE canonical
 > transient-alert pattern for the platform: a lower-third news-style band that every

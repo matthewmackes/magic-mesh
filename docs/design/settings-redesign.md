@@ -1,5 +1,7 @@
 # SETTINGS — the world-class Settings redesign (master–detail, tinted, Carbon)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Operator-locked 2026-07-04 (5-Q `/plan` survey). The Settings surface (`Surface::System`,
 `crates/desktop/mde-shell-egui/src/system.rs`) is **full-featured but organized poorly**:
 today it is a **single vertical column** of stacked titled cards — Mixer, Bluetooth,

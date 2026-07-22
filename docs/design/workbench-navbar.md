@@ -1,5 +1,7 @@
 # NAVBAR — bottom nav taskbar (relocate the shell dock, Carbon icon-first)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Operator-locked 2026-07-03 (15-question `/plan` survey). Moves the shell's surface
 launcher from the **left vertical rail** (`mde-shell-egui/src/dock.rs`, a `SidePanel::left`)
 to a **full-width horizontal taskbar pinned to the bottom edge**, redrawn Carbon

@@ -1,5 +1,7 @@
 # EDTB — the Word-97 toolbar for the text editor (`mde-editor-egui`)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 Operator-locked 2026-07-04 (10-Q `/plan` survey). An extensive toolbar chrome for the
 editor surface matching the features/functions of **Microsoft Word 97** — the menu bar
 + Standard toolbar + Formatting toolbar — adapted honestly to a plain-text/markdown

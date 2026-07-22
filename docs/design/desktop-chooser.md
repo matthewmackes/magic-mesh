@@ -1,5 +1,7 @@
 # The Desktop Chooser — a picker for every discovered desktop
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 *Operator directive 2026-07-02: "When remote Desktops, Local KVM Desktops, Spice, VNC,
 RDP are discovered, they must be presented via a Chooser." Locked via a 15-question
 survey.*

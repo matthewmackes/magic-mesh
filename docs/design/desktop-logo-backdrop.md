@@ -1,5 +1,7 @@
 # Desktop logo backdrop — the empty-desktop brand lockup
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 *Operator directive 2026-07-02: "This image (`assets/brand/logo-lockup.png`) should
 be at the center of the desktop when empty with no text over the image." Locked via a
 10-question survey.*

@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # APPS — Re-envisioned Applications Panel (Magic-Mesh launcher on Cosmic)
 
 > **HISTORICAL / SUPERSEDED (2026-07-19):** describes the retired `libcosmic`/Cosmic-applet launcher (`mde-cosmic-applet`). The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md); the launcher is now folded into the Front Door ([`app-launcher-rethink.md`](app-launcher-rethink.md)). Retained as a historical design record.

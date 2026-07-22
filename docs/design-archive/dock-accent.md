@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # DOCK-ACCENT — Carbon Blue accent line on the vertical dock's right edge
 
 Operator-locked 2026-07-04 (5-Q survey). A thin Carbon Blue accent seam runs down the

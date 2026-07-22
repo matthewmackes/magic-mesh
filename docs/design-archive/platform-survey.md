@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # MCNF — Platform Build-Out Survey (100 questions)
 
 > **Note (post-SUBSTRATE-6):** this survey was authored 2026-06-09, when the mesh

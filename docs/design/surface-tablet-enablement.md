@@ -1,5 +1,7 @@
 # Microsoft Surface tablet/laptop enablement (SURFACE-1..11)
 
+> **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
+
 > **Status: LOCKED 2026-07-02** — a two-round operator survey (Round 1: 10 Q hardware
 > enablement; Round 2: 6 Q display + touch). Full Microsoft Surface (Pro/Book/Laptop/Go)
 > enablement — **installation, testing, verification** surfaced as a model-gated

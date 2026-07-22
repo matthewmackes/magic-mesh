@@ -1,3 +1,5 @@
+> **HISTORICAL / SUPERSEDED (2026-07-22):** interface-paradigm design retired by the PLATFORM-INTERFACES standard (Apple-HIG-principled Construct + Car); see [docs/design/platform-interfaces.md](../design/platform-interfaces.md). Archived; do not implement from this document.
+
 # WIN7-DESKTOP-1 — Windows 7 Desktop Layout survey (locked)
 
 > ℹ️ **Taskbar chrome revised 2026-07-12 by [`win10-taskbar.md`](win10-taskbar.md)
