@@ -1651,9 +1651,12 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         });
                     }
                 }
-                crate::gestures::Gesture::EdgeSwipe(edge) => {
+                crate::gestures::Gesture::EdgeSwipe(event) => {
                     if crate::input_policy().edge_gestures {
-                        crate::gestures::push_edge_swipe(edge);
+                        // U16 (PLATFORM-INTERFACES Q11): the rich event — hold +
+                        // along-edge fraction — rides the same side channel; the
+                        // shell's Construct dispatcher pairs it back up per frame.
+                        crate::gestures::push_edge_swipe_event(event);
                     }
                 }
             }

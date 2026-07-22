@@ -73,7 +73,8 @@ pub use formfactor::{
     SwitchState, SysfsAccel,
 };
 pub use gestures::{
-    drain_edge_swipes, push_edge_swipe, Edge, Gesture, GestureConfig, GestureRecognizer,
+    drain_edge_swipes, push_edge_swipe, push_edge_swipe_event, take_edge_swipe_details, Edge,
+    EdgeSwipeEvent, Gesture, GestureConfig, GestureRecognizer, EDGE_HOLD_DWELL,
 };
 pub use input_policy::{input_policy, pointer_button, set_input_policy, InputPolicy};
 pub use menubar::{

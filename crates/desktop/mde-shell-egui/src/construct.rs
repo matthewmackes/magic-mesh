@@ -24,23 +24,32 @@
 //! * **Super tap while already on home → Spotlight** — the base is already
 //!   showing, so the same key falls through to search focus.
 //!
-//! ## What the scaffold does NOT decide yet
+//! ## The U16 gesture-channel refinement (landed)
 //!
-//! * **Bottom-edge swipe-up-*hold* → Switcher** — the SURFACE-11 side channel
-//!   ([`mde_egui::drain_edge_swipes`]) carries a fired [`Edge`] with no hold /
-//!   continuation signal, so the touch Switcher row is a **U16 follow-up**
-//!   (extend the recognizer's channel); the keyboard row (Super+Tab) is live.
-//! * **Top-edge x-position** rides the frame's synthesized pointer position
-//!   (the SURFACE-8 touch translator emits `PointerMoved` for the primary
-//!   contact); when no fix exists the pull resolves to the wider
-//!   Notification Center target, honestly. U16 may carry the true swipe x
-//!   through the side channel instead.
-//! * The **VDI dwell guard** is a minimal two-swipe confirm
-//!   ([`EdgeGuard`]) — U16 refines it with a visible arming affordance.
+//! U09 left two touch rows incomplete; the SURFACE-11 side channel now carries
+//! the recognizer's rich [`mde_egui::EdgeSwipeEvent`] and both are live:
+//!
+//! * **Bottom-edge swipe-up-*hold* → Switcher** — `hold` = the finger dwelled
+//!   ≥ [`mde_egui::EDGE_HOLD_DWELL`] at the end of the swipe's travel; a
+//!   swipe-and-release stays Home. The keyboard row (Super+Tab) was already live.
+//! * **Top-edge x-position** — the seat's true along-edge fraction rides the
+//!   rich event and OVERRIDES the frame's synthesized-pointer guess; a
+//!   detail-less pull still resolves honestly (no fix → the wider Notification
+//!   Center target).
+//!
+//! The seam that keeps `main.rs` frozen (U09's whole point): the thin drain
+//! shape ([`mde_egui::drain_edge_swipes`] → `Vec<Edge>`) never changed —
+//! the drain PARKS the rich events and [`ConstructChrome::dispatch`] pairs
+//! them back onto the same frame's [`EdgeSwipe`]s by index
+//! ([`mde_egui::take_edge_swipe_details`]), edge-checked so a mismatch
+//! degrades to the U09 semantics instead of crossing wires.
+//!
+//! Still open: the **VDI dwell guard** stays the minimal two-swipe confirm
+//! ([`EdgeGuard`]); its visible arming affordance remains a follow-up.
 
 use std::time::{Duration, Instant};
 
-use mde_egui::Edge;
+use mde_egui::{Edge, EdgeSwipeEvent};
 
 /// The five system intents of the locked input contract — §2.3's five rows
 /// (PLATFORM-INTERFACES Q11), each landing on one Construct chrome surface
@@ -62,6 +71,12 @@ pub enum ChromeIntent {
 }
 
 /// One drained edge swipe, plus where along the edge it happened when known.
+///
+/// The shape mirrors the thin drain and is FROZEN (`main.rs` builds these from
+/// [`mde_egui::drain_edge_swipes`] + the frame's pointer guess); the U16 rich
+/// details — `hold` and the seat's true along-edge fraction — are paired back
+/// onto these by index inside [`ConstructChrome::dispatch`] /
+/// [`intents_from_input`], never stored here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgeSwipe {
     /// Which screen edge the swipe began at (the SURFACE-11 recognizer's
@@ -70,7 +85,8 @@ pub struct EdgeSwipe {
     /// The swipe's normalized screen-x (`0.0` = left, `1.0` = right), read
     /// from the frame's synthesized primary-contact pointer position. `None`
     /// when the frame carries no pointer fix — a top pull then resolves to
-    /// the Notification Center (the wider §2.3 target), never a guess.
+    /// the Notification Center (the wider §2.3 target), never a guess. The
+    /// seat's true fraction (U16) overrides this when the rich detail pairs.
     pub x_frac: Option<f32>,
 }
 
@@ -160,8 +176,9 @@ impl EdgeGuard {
 // | Control Center      | top-right pull-down        | status-bar right cluster³ |
 // | Notification Center | top-left/center pull-down  | status-bar clock click³   |
 //
-// ¹ the side channel carries no hold signal yet — U16 follow-up (module doc);
-//   the Super+Tab row is live today.
+// ¹ live since U16 (PLATFORM-INTERFACES Q11): the rich side channel carries the
+//   recognizer's end-of-travel hold (`mde_egui::EDGE_HOLD_DWELL`);
+//   swipe-and-release stays Home. The Super+Tab row was live from U09.
 // ² the on-home pull-down is the U10 springboard's own gesture (it owns the
 //   home scroll surface); the Super-on-home row is live today.
 // ³ the status-bar click rows land with U11, which PUSHES these intents into
@@ -170,8 +187,17 @@ impl EdgeGuard {
 /// Determinism: chords first (Super tap, then Super+Tab), then edges in drain
 /// order. The Super overload resolves on `app_expanded` (module doc). Edge
 /// intents pass the [`EdgeGuard`] dwell rule; Super chords never consult it.
+///
+/// `details` are the seat's rich events for THIS frame's drain
+/// ([`mde_egui::take_edge_swipe_details`]), index-aligned with `input.edges`
+/// and edge-checked here — a missing or mismatched detail degrades that swipe
+/// to the U09 semantics (`hold: false`, the frame's pointer-guess x).
 #[must_use]
-pub fn intents_from_input(input: &ChromeInput, guard: &mut EdgeGuard) -> Vec<ChromeIntent> {
+pub fn intents_from_input(
+    input: &ChromeInput,
+    details: &[EdgeSwipeEvent],
+    guard: &mut EdgeGuard,
+) -> Vec<ChromeIntent> {
     let mut out = Vec::new();
     if input.super_tap {
         out.push(if input.app_expanded {
@@ -183,8 +209,12 @@ pub fn intents_from_input(input: &ChromeInput, guard: &mut EdgeGuard) -> Vec<Chr
     if input.super_tab {
         out.push(ChromeIntent::Switcher);
     }
-    for swipe in &input.edges {
-        let Some(intent) = edge_intent(swipe) else {
+    for (i, swipe) in input.edges.iter().enumerate() {
+        // U16: pair the rich detail back onto this swipe (index + edge match).
+        let detail = details.get(i).filter(|d| d.edge == swipe.edge);
+        let x_frac = detail.and_then(|d| d.x_frac).or(swipe.x_frac);
+        let hold = detail.is_some_and(|d| d.hold);
+        let Some(intent) = edge_intent(swipe.edge, x_frac, hold) else {
             continue;
         };
         if guard.admit(swipe.edge, input.remote_session_focused, input.now) {
@@ -197,13 +227,18 @@ pub fn intents_from_input(input: &ChromeInput, guard: &mut EdgeGuard) -> Vec<Chr
 /// The touch column of the contract table: which intent an edge swipe means.
 /// `Left`/`Right` carry no §2.3 row — `Left` keeps its legacy dock-reveal leg
 /// inline at the drain site until the U29 cutover retires it; `Right` stays
-/// unbound.
-fn edge_intent(swipe: &EdgeSwipe) -> Option<ChromeIntent> {
-    match swipe.edge {
-        // Swipe-up-hold → Switcher is the U16 follow-up (no hold signal on
-        // the channel yet, module doc) — until then bottom always means Home.
-        Edge::Bottom => Some(ChromeIntent::Home),
-        Edge::Top => Some(if swipe.x_frac.is_some_and(|x| x >= TOP_RIGHT_THIRD) {
+/// unbound. Every (edge × hold × x) profile maps to AT MOST ONE intent — the
+/// exclusivity the dispatcher tests pin table-driven.
+fn edge_intent(edge: Edge, x_frac: Option<f32>, hold: bool) -> Option<ChromeIntent> {
+    match edge {
+        // PLATFORM-INTERFACES Q11 — §2.3 rows 1–2: swipe-and-release = Home;
+        // swipe-and-hold (U16's end-of-travel dwell) = the app switcher.
+        Edge::Bottom => Some(if hold {
+            ChromeIntent::Switcher
+        } else {
+            ChromeIntent::Home
+        }),
+        Edge::Top => Some(if x_frac.is_some_and(|x| x >= TOP_RIGHT_THIRD) {
             ChromeIntent::ControlCenter
         } else {
             ChromeIntent::NotificationCenter
@@ -260,8 +295,15 @@ impl ConstructChrome {
     /// queue the results for the mount slots. The caller (the shell's render)
     /// gates this on the curtain — a locked seat dispatches nothing, and the
     /// raw latches are drained by the caller regardless so nothing backs up.
+    ///
+    /// U16: this is where the seat's rich edge details rejoin the fold — the
+    /// thin drain parked them THIS frame and the parking slot is replaced on
+    /// every drain, so a curtain-swallowed frame can never leak a stale hold.
+    /// Empty when windowed or when the input was built directly (tests),
+    /// which degrades honestly to the U09 semantics.
     pub fn dispatch(&mut self, input: &ChromeInput) {
-        let intents = intents_from_input(input, &mut self.guard);
+        let details = mde_egui::take_edge_swipe_details();
+        let intents = intents_from_input(input, &details, &mut self.guard);
         self.pending.extend(intents);
     }
 
@@ -295,6 +337,11 @@ mod tests {
         EdgeSwipe { edge, x_frac }
     }
 
+    /// A U16 rich side-channel detail, as the seat's recognizer emits it.
+    fn detail(edge: Edge, x_frac: Option<f32>, hold: bool) -> EdgeSwipeEvent {
+        EdgeSwipeEvent { edge, x_frac, hold }
+    }
+
     // --- the contract rows, one by one (§2.3) ------------------------------------
 
     #[test]
@@ -305,6 +352,7 @@ mod tests {
                 edges: vec![swipe(Edge::Bottom, Some(0.5))],
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::Home]);
@@ -318,6 +366,7 @@ mod tests {
                 super_tab: true,
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::Switcher]);
@@ -331,6 +380,7 @@ mod tests {
                 edges: vec![swipe(Edge::Top, Some(0.9))],
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::ControlCenter]);
@@ -340,6 +390,7 @@ mod tests {
                 edges: vec![swipe(Edge::Top, Some(TOP_RIGHT_THIRD))],
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::ControlCenter]);
@@ -354,6 +405,7 @@ mod tests {
                     edges: vec![swipe(Edge::Top, x)],
                     ..input()
                 },
+                &[],
                 &mut guard,
             );
             assert_eq!(
@@ -374,6 +426,7 @@ mod tests {
                 edges: vec![swipe(Edge::Top, None)],
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::NotificationCenter]);
@@ -389,9 +442,188 @@ mod tests {
                 edges: vec![swipe(Edge::Left, Some(0.0)), swipe(Edge::Right, Some(1.0))],
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert!(intents.is_empty(), "{intents:?}");
+    }
+
+    // --- the U16 rich channel: hold + the seat's true x --------------------------
+
+    #[test]
+    fn a_bottom_edge_swipe_with_hold_means_switcher() {
+        // §2.3 row 2 (PLATFORM-INTERFACES Q11): the rich detail carries the
+        // recognizer's end-of-travel hold — the touch Switcher row, live.
+        let mut guard = EdgeGuard::default();
+        let intents = intents_from_input(
+            &ChromeInput {
+                edges: vec![swipe(Edge::Bottom, Some(0.5))],
+                ..input()
+            },
+            &[detail(Edge::Bottom, Some(0.5), true)],
+            &mut guard,
+        );
+        assert_eq!(intents, vec![ChromeIntent::Switcher]);
+    }
+
+    #[test]
+    fn a_bottom_edge_swipe_without_hold_stays_home() {
+        // A paired detail that reports NO hold must not change the U09 row.
+        let mut guard = EdgeGuard::default();
+        let intents = intents_from_input(
+            &ChromeInput {
+                edges: vec![swipe(Edge::Bottom, Some(0.5))],
+                ..input()
+            },
+            &[detail(Edge::Bottom, Some(0.5), false)],
+            &mut guard,
+        );
+        assert_eq!(intents, vec![ChromeIntent::Home]);
+    }
+
+    #[test]
+    fn the_seat_x_fraction_overrides_the_frame_pointer_guess() {
+        // The pointer guess said left-third; the seat's true contact began in
+        // the right third — the rich detail wins and the pull is the Control
+        // Center.
+        let mut guard = EdgeGuard::default();
+        let intents = intents_from_input(
+            &ChromeInput {
+                edges: vec![swipe(Edge::Top, Some(0.2))],
+                ..input()
+            },
+            &[detail(Edge::Top, Some(0.9), false)],
+            &mut guard,
+        );
+        assert_eq!(intents, vec![ChromeIntent::ControlCenter]);
+        // And where the frame had NO pointer fix at all, the seat's fraction
+        // now splits the pull for real instead of defaulting wide.
+        let intents = intents_from_input(
+            &ChromeInput {
+                edges: vec![swipe(Edge::Top, None)],
+                ..input()
+            },
+            &[detail(Edge::Top, Some(0.9), false)],
+            &mut guard,
+        );
+        assert_eq!(intents, vec![ChromeIntent::ControlCenter]);
+    }
+
+    #[test]
+    fn a_mismatched_detail_never_crosses_wires() {
+        // Defensive pairing: a detail whose edge disagrees with the drained
+        // swipe is ignored — the swipe degrades to U09 semantics, and a stray
+        // hold can never fire the Switcher off the wrong edge.
+        let mut guard = EdgeGuard::default();
+        let intents = intents_from_input(
+            &ChromeInput {
+                edges: vec![swipe(Edge::Bottom, Some(0.5))],
+                ..input()
+            },
+            &[detail(Edge::Top, Some(0.9), true)],
+            &mut guard,
+        );
+        assert_eq!(intents, vec![ChromeIntent::Home]);
+    }
+
+    #[test]
+    fn each_swipe_profile_maps_to_at_most_one_intent() {
+        // The §2.3 touch column, table-driven over every (edge × hold × x)
+        // profile: each maps to AT MOST one intent, and to exactly the locked
+        // one — hold discriminates ONLY the bottom edge, x splits ONLY the top.
+        let table: &[(Edge, bool, Option<f32>, Option<ChromeIntent>)] = &[
+            (Edge::Bottom, false, Some(0.5), Some(ChromeIntent::Home)),
+            (Edge::Bottom, false, None, Some(ChromeIntent::Home)),
+            (Edge::Bottom, true, Some(0.5), Some(ChromeIntent::Switcher)),
+            (Edge::Bottom, true, None, Some(ChromeIntent::Switcher)),
+            (
+                Edge::Top,
+                false,
+                Some(0.0),
+                Some(ChromeIntent::NotificationCenter),
+            ),
+            (
+                Edge::Top,
+                false,
+                Some(TOP_RIGHT_THIRD),
+                Some(ChromeIntent::ControlCenter),
+            ),
+            (
+                Edge::Top,
+                false,
+                Some(1.0),
+                Some(ChromeIntent::ControlCenter),
+            ),
+            (
+                Edge::Top,
+                false,
+                None,
+                Some(ChromeIntent::NotificationCenter),
+            ),
+            // Hold never re-routes a top pull…
+            (
+                Edge::Top,
+                true,
+                Some(0.9),
+                Some(ChromeIntent::ControlCenter),
+            ),
+            (
+                Edge::Top,
+                true,
+                None,
+                Some(ChromeIntent::NotificationCenter),
+            ),
+            // …and never revives an unbound edge.
+            (Edge::Left, false, Some(0.5), None),
+            (Edge::Left, true, Some(0.5), None),
+            (Edge::Right, false, Some(0.5), None),
+            (Edge::Right, true, None, None),
+        ];
+        for &(edge, hold, x, expected) in table {
+            let mut guard = EdgeGuard::default();
+            let intents = intents_from_input(
+                &ChromeInput {
+                    edges: vec![swipe(edge, x)],
+                    ..input()
+                },
+                &[detail(edge, x, hold)],
+                &mut guard,
+            );
+            assert!(
+                intents.len() <= 1,
+                "one swipe, at most one intent — {edge:?} hold={hold} x={x:?} → {intents:?}"
+            );
+            assert_eq!(
+                intents.first().copied(),
+                expected,
+                "{edge:?} hold={hold} x={x:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_pairs_the_parked_details_with_the_thin_drain() {
+        // End-to-end across the U16 seam exactly as the shell runs it: the seat
+        // pushes a rich event; the (frozen) main.rs drain site takes the thin
+        // edges and builds the ChromeInput; dispatch pairs the parked details
+        // back by index — and the hold fires the Switcher, not Home.
+        let _ = mde_egui::drain_edge_swipes();
+        let _ = mde_egui::take_edge_swipe_details();
+        mde_egui::push_edge_swipe_event(detail(Edge::Bottom, Some(0.5), true));
+        let edges: Vec<EdgeSwipe> = mde_egui::drain_edge_swipes()
+            .into_iter()
+            .map(|edge| EdgeSwipe { edge, x_frac: None })
+            .collect();
+        let mut chrome = ConstructChrome::default();
+        chrome.dispatch(&ChromeInput { edges, ..input() });
+        assert!(
+            chrome.take_intent(ChromeIntent::Switcher),
+            "the parked hold reached the contract table"
+        );
+        assert!(
+            !chrome.take_intent(ChromeIntent::Home),
+            "…as the Switcher row, not Home"
+        );
     }
 
     // --- the Super overload resolution (module doc) ------------------------------
@@ -405,6 +637,7 @@ mod tests {
                 app_expanded: true,
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::Home]);
@@ -419,6 +652,7 @@ mod tests {
                 app_expanded: false,
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(intents, vec![ChromeIntent::Spotlight]);
@@ -435,6 +669,7 @@ mod tests {
                 edges: vec![swipe(Edge::Bottom, Some(0.5))],
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert!(intents.is_empty(), "the first swipe arms, never fires");
@@ -449,13 +684,13 @@ mod tests {
             edges: vec![swipe(Edge::Bottom, Some(0.5))],
             ..input()
         };
-        assert!(intents_from_input(&armed, &mut guard).is_empty());
+        assert!(intents_from_input(&armed, &[], &mut guard).is_empty());
         let confirm = ChromeInput {
             now: EDGE_CONFIRM_WINDOW / 2,
             ..armed
         };
         assert_eq!(
-            intents_from_input(&confirm, &mut guard),
+            intents_from_input(&confirm, &[], &mut guard),
             vec![ChromeIntent::Home],
             "the second same-edge swipe within the window confirms"
         );
@@ -471,13 +706,13 @@ mod tests {
             edges: vec![swipe(Edge::Bottom, Some(0.5))],
             ..input()
         };
-        assert!(intents_from_input(&armed, &mut guard).is_empty());
+        assert!(intents_from_input(&armed, &[], &mut guard).is_empty());
         let late = ChromeInput {
             now: EDGE_CONFIRM_WINDOW + Duration::from_millis(1),
             ..armed.clone()
         };
         assert!(
-            intents_from_input(&late, &mut guard).is_empty(),
+            intents_from_input(&late, &[], &mut guard).is_empty(),
             "an expired confirm re-arms, never fires"
         );
         // Cross-edge: a top pull after arming bottom re-arms on top.
@@ -486,7 +721,7 @@ mod tests {
             ..armed
         };
         assert!(
-            intents_from_input(&cross, &mut guard).is_empty(),
+            intents_from_input(&cross, &[], &mut guard).is_empty(),
             "a different edge re-arms, never fires"
         );
         assert_eq!(guard.armed.map(|(e, _)| e), Some(Edge::Top));
@@ -503,6 +738,7 @@ mod tests {
                 remote_session_focused: true,
                 ..input()
             },
+            &[],
             &mut guard,
         );
         assert_eq!(
@@ -520,14 +756,14 @@ mod tests {
             edges: vec![swipe(Edge::Bottom, Some(0.5))],
             ..input()
         };
-        assert!(intents_from_input(&armed, &mut guard).is_empty());
+        assert!(intents_from_input(&armed, &[], &mut guard).is_empty());
         // Back on the desktop: the swipe fires directly AND the arm clears.
         let desktop = ChromeInput {
             remote_session_focused: false,
             ..armed
         };
         assert_eq!(
-            intents_from_input(&desktop, &mut guard),
+            intents_from_input(&desktop, &[], &mut guard),
             vec![ChromeIntent::Home]
         );
         assert!(guard.armed.is_none(), "no stale arm off the session");
