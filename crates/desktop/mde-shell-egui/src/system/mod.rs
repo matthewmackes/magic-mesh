@@ -38,6 +38,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
+use mde_egui::nav_chrome::{NavigationBar, Sidebar, SidebarRow, SidebarSection};
 use mde_egui::style::Elevation;
 use mde_egui::{
     field, muted_note, Density, Formfactor, InputPolicy, LayoutProfile, Motion, MotionMode,
@@ -153,6 +154,11 @@ pub(crate) struct SystemState {
     /// surface switch AND a restart (the [`PowerHonorConfig`] client-data-dir JSON
     /// idiom, reused verbatim).
     nav: SettingsNav,
+    /// The sidebar's inline search query (PLATFORM-INTERFACES Q27) — a live
+    /// case-insensitive label filter over the section rows. Transient by design:
+    /// only the SELECTION persists ([`SettingsNav`]); a fresh visit starts
+    /// unfiltered.
+    nav_filter: String,
     /// This node's mesh identity / role / network facts (SETTINGS-4), folded from
     /// the SAME world-readable mesh-status snapshot the chrome bar + the This Node /
     /// Network planes read ([`MESH_STATUS_PATH`]). Refreshed on the shared poll
@@ -231,6 +237,7 @@ impl Default for SystemState {
             pending_toasts: Vec::new(),
             power_honor_config: PowerHonorConfig::load(),
             nav: SettingsNav::load(),
+            nav_filter: String::new(),
             mesh: MeshFacts::default(),
             remote_proofing: RemoteProofingConfig::load(),
             mouse_touch: MouseTouchConfig::load(),
@@ -542,11 +549,13 @@ impl SystemState {
         self.seat.power(verb)
     }
 
-    /// Render the surface's live content as a **master-detail** shell (SETTINGS-1):
-    /// a left rail of the three domain groups + a wide right detail pane that
-    /// renders ONLY the selected section's body via the existing per-section fns
-    /// (a layout/routing pass — the bodies + their `apply()`/`SysAction` seams are
-    /// reused verbatim, §6). Drives Displays + Power against the seat.
+    /// Render the surface's live content as the HIG **Settings anatomy**
+    /// (PLATFORM-INTERFACES Q27, on the SETTINGS-1 master-detail bones): the shared
+    /// Q19 [`Sidebar`] under an inline search field on the left, and a
+    /// [`NavigationBar`]-titled detail pane on the right that renders ONLY the
+    /// selected section's body via the existing per-section fns (a layout/routing
+    /// pass — the bodies + their `apply()`/`SysAction` seams are reused verbatim,
+    /// §6). Drives Displays + Power against the seat.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         self.poll_wallpaper_download();
         let mut actions: Vec<SysAction> = Vec::new();
@@ -589,6 +598,7 @@ impl SystemState {
                 pin_input,
                 power_honor_config,
                 nav,
+                nav_filter,
                 mesh,
                 remote_proofing,
                 mouse_touch,
@@ -604,27 +614,35 @@ impl SystemState {
             // (SETTINGS-4 Pairing surfaces it; the modal below answers it).
             let prompt_in_flight = pairing.current().is_some();
 
-            // The master rail: the three domain groups + their section rows. A row
-            // click moves `nav` (persisted after the borrow). Each group header wears
-            // its domain's categorical accent (SETTINGS-2 — see [`settings_rail`]); the
-            // rail rests on the Carbon layer-01 page (see [`page_frame`]).
+            // PLATFORM-INTERFACES Q27 — the sidebar: the shared Q19 grouped list
+            // under an inline search field (see [`settings_rail`]) — the three
+            // domain groups as section headers, the fourteen sections as rows
+            // wearing their existing YAMIS glyphs. A row pick moves `nav`
+            // (persisted after the borrow); the rail rests on the Carbon layer-01
+            // page (see [`page_frame`]).
             egui::SidePanel::left(ui.id().with("settings-rail"))
                 .resizable(false)
                 .exact_width(Style::SP_XL * 6.0)
                 .frame(page_frame(Style::SP_M))
-                .show_inside(ui, |ui| settings_rail(ui, nav));
+                .show_inside(ui, |ui| settings_rail(ui, nav, nav_filter));
 
             // The (possibly just-clicked) selection, copied out so the detail pane's
             // closure doesn't re-borrow `nav`.
             let selected = nav.section;
 
             // The detail pane fills the remaining width and renders only the selected
-            // section's body — expressive spacing, the whole right side. It rests on
-            // the same Carbon layer-01 page (SETTINGS-2); the section body raises to a
+            // section's body — expressive spacing, the whole right side. It sits
+            // under the shared Q19 [`NavigationBar`] carrying the active section's
+            // title on the Title3 rung (PLATFORM-INTERFACES Q27). No back
+            // affordance: the rail is a fixed SidePanel — the two panes never
+            // collapse to one, so there is nothing to go back FROM. It rests on the
+            // same Carbon layer-01 page (SETTINGS-2); the section body raises to a
             // layer-02 card inside (see [`settings_detail`]).
             egui::CentralPanel::default()
                 .frame(page_frame(Style::SP_L))
                 .show_inside(ui, |ui| {
+                    let _ = NavigationBar::new(selected.label()).show(ui);
+                    ui.add_space(Style::SP_M);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -1246,7 +1264,8 @@ enum SettingsSection {
 }
 
 impl SettingsSection {
-    /// The rail + detail-header label.
+    /// The sidebar-row + NavigationBar-title label (Q27) — also what the inline
+    /// search filters on.
     const fn label(self) -> &'static str {
         match self {
             Self::Displays => "Displays",
@@ -1322,7 +1341,7 @@ impl SettingsGroup {
     /// The three domain groups, in rail order.
     const ALL: [Self; 3] = [Self::Devices, Self::Personalization, Self::MeshSystem];
 
-    /// The rail header label.
+    /// The sidebar section-header label (and the menubar menu title).
     const fn label(self) -> &'static str {
         match self {
             Self::Devices => "Devices",
@@ -1336,8 +1355,9 @@ impl SettingsGroup {
     /// picker (PICKER-2) + the unit explorer (EXPLORER-15) already speak — so a
     /// domain's tint here reads the same across the shell (§4; no second set minted).
     /// Three mutually-distinct hues, each set apart from the interactive brand accent
-    /// so a group tint never reads as an affordance. The rail group header + the
-    /// active detail-section header both key off this.
+    /// so a group tint never reads as an affordance. The section BODIES key off this
+    /// (the Mesh & System panels, the Personalization choice tiles); the sidebar +
+    /// NavigationBar chrome itself stays quiet (Q27 — the shared Q19 components).
     const fn accent(self) -> egui::Color32 {
         match self {
             // Host devices / hardware — the picker's host-control gold.
@@ -2622,81 +2642,120 @@ impl AppearanceConfig {
 
 // ──────────────────────────── render ────────────────────────────
 
-/// The master rail (SETTINGS-1): the three domain groups, each an expressive header
-/// over its selectable section rows. The active section is highlighted; a click
-/// moves `nav`. SETTINGS-2 tints each group header in the group's categorical accent
-/// ([`SettingsGroup::accent`] — the shared `Style::ACCENT_*` set, §4), the one colour
-/// language PICKER-2 / EXPLORER-15 speak.
-fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav) {
+/// The one id salt the Settings sidebar renders under — shared by the rail, its
+/// YAMIS glyph pass, and the tests, so [`Sidebar::row_id`] stays deterministic.
+const SETTINGS_SIDEBAR_SALT: &str = "settings-rail";
+
+/// The sidebar's visible row model for `filter` (PLATFORM-INTERFACES Q27):
+/// every section whose label contains the query (a case-insensitive substring,
+/// no ranking — search stays inline and simple), in taxonomy order under its
+/// group. A group with no surviving row drops out (header and all); an empty
+/// (or all-blank) query yields the whole fourteen-section taxonomy. Pure, so
+/// the tests assert the exact shape; a filtered row routes through the same
+/// [`SettingsNav::at`] seam an unfiltered pick drives.
+fn sidebar_rows(filter: &str) -> Vec<(SettingsGroup, Vec<SettingsSection>)> {
+    let needle = filter.trim().to_lowercase();
+    SettingsGroup::ALL
+        .iter()
+        .filter_map(|&group| {
+            let sections: Vec<SettingsSection> = group
+                .sections()
+                .iter()
+                .copied()
+                .filter(|s| needle.is_empty() || s.label().to_lowercase().contains(&needle))
+                .collect();
+            (!sections.is_empty()).then_some((group, sections))
+        })
+        .collect()
+}
+
+/// The Settings sidebar (PLATFORM-INTERFACES Q27): an inline search field over
+/// the shared Q19 [`Sidebar`] — the domain groups as dim section headers, their
+/// sections as selectable rows wearing the existing YAMIS glyphs
+/// ([`SettingsSection::icon_id`]). A pick (click, arrow-walk, or Enter) moves
+/// `nav` through the SAME [`SettingsNav::at`] seam the menubar drives (§6, one
+/// source of truth); `filter` narrows the visible rows by label
+/// ([`sidebar_rows`]) and never moves the selection itself.
+fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav, filter: &mut String) {
+    // The inline search field — the shell's shared filter idiom (the chooser /
+    // explorer `TextEdit + hint_text` form), full rail width. Emptying the
+    // query restores the full list.
+    ui.add(
+        egui::TextEdit::singleline(filter)
+            .desired_width(f32::INFINITY)
+            .hint_text("Search settings"),
+    );
+    ui.add_space(Style::SP_S);
+    let groups = sidebar_rows(filter);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (i, group) in SettingsGroup::ALL.iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(Style::SP_M);
-                }
-                ui.label(
-                    RichText::new(group.label())
-                        .color(group.accent())
-                        .size(Style::SMALL)
-                        .strong(),
+            // Two-step borrow shape: the row storage must outlive the section
+            // views that slice it. Each row carries its section's real YAMIS
+            // icon NAME; the shared Sidebar's icon channel speaks the Carbon
+            // registry, which doesn't carry these settings glyphs, so the row
+            // reserves the glyph slot and paints nothing (the Carbon loader's
+            // documented speculative contract) — the glyph pass below fills the
+            // slot with the YAMIS texture.
+            let rows: Vec<Vec<SidebarRow<'_, SettingsSection>>> = groups
+                .iter()
+                .map(|(_, sections)| {
+                    sections
+                        .iter()
+                        .map(|&s| SidebarRow::new(s, s.label()).with_icon(s.icon_id().name()))
+                        .collect()
+                })
+                .collect();
+            let sections: Vec<SidebarSection<'_, SettingsSection>> = groups
+                .iter()
+                .zip(&rows)
+                .map(|((group, _), rows)| SidebarSection {
+                    header: Some(group.label()),
+                    rows: rows.as_slice(),
+                })
+                .collect();
+            if let Some(picked) = Sidebar::show(ui, SETTINGS_SIDEBAR_SALT, &sections, &nav.section)
+            {
+                *nav = SettingsNav::at(picked);
+            }
+            // The YAMIS glyph pass: paint each visible row's existing icon into
+            // the slot its row reserved, read back through the Sidebar's
+            // deterministic row ids (registered just above, this pass).
+            // Geometry + tint mirror the shared row's own glyph scheme (the
+            // plate inset, ICON_M at the leading pad, selected TEXT / rest
+            // TEXT_DIM); a just-clicked row's glyph reads selected one frame
+            // early, settling with the plate on the next repaint.
+            for (index, &section) in groups.iter().flat_map(|(_, s)| s).enumerate() {
+                let Some(row) = ui
+                    .ctx()
+                    .read_response(Sidebar::row_id(SETTINGS_SIDEBAR_SALT, index))
+                else {
+                    continue;
+                };
+                let plate = row
+                    .rect
+                    .shrink2(egui::vec2(Style::SP_XS, Style::STROKE_HAIRLINE));
+                let glyph = egui::Rect::from_center_size(
+                    egui::pos2(
+                        plate.left() + Style::SP_S + Style::ICON_M * 0.5,
+                        plate.center().y,
+                    ),
+                    egui::vec2(Style::ICON_M, Style::ICON_M),
                 );
-                ui.add_space(Style::SP_XS);
-                for &section in group.sections() {
-                    if settings_section_row(ui, section, nav.section == section) {
-                        *nav = SettingsNav::at(section);
-                    }
+                if !ui.is_rect_visible(glyph) {
+                    continue;
+                }
+                let tint = if section == nav.section {
+                    Style::TEXT
+                } else {
+                    Style::TEXT_DIM
+                };
+                if let Some(tex) = icon_texture(ui.ctx(), section.icon_id(), Style::ICON_M, tint) {
+                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), glyph.size()))
+                        .paint_at(ui, glyph);
                 }
             }
         });
-}
-
-fn settings_section_row(ui: &mut egui::Ui, section: SettingsSection, selected: bool) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        let accent = section.group().accent();
-        let icon_tint = if selected { accent } else { Style::TEXT_DIM };
-        let (icon_rect, icon_response) =
-            ui.allocate_exact_size(egui::vec2(Style::SP_M, Style::SP_L), egui::Sense::click());
-        let draw_rect =
-            egui::Rect::from_center_size(icon_rect.center(), egui::vec2(Style::SP_M, Style::SP_M));
-        if let Some(tex) = icon_texture(ui.ctx(), section.icon_id(), Style::SP_M, icon_tint) {
-            egui::Image::new(egui::load::SizedTexture::new(tex.id(), draw_rect.size()))
-                .paint_at(ui, draw_rect);
-        }
-        clicked |= icon_response.clicked();
-
-        let text_tint = if selected { accent } else { Style::TEXT };
-        let row = ui.add_sized(
-            [ui.available_width(), Style::SP_L],
-            egui::SelectableLabel::new(
-                selected,
-                RichText::new(section.label())
-                    .size(Style::BODY)
-                    .color(text_tint),
-            ),
-        );
-        clicked |= row.clicked();
-    });
-    clicked
-}
-
-fn settings_detail_header(ui: &mut egui::Ui, section: SettingsSection) {
-    let accent = section.group().accent();
-    ui.horizontal(|ui| {
-        if let Some(tex) = icon_texture(ui.ctx(), section.icon_id(), Style::SP_L, accent) {
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                tex.id(),
-                egui::vec2(Style::SP_L, Style::SP_L),
-            )));
-        }
-        ui.label(
-            RichText::new(section.label())
-                .color(accent)
-                .size(Style::HEADING)
-                .strong(),
-        );
-    });
 }
 
 fn settings_icon_button(ui: &mut egui::Ui, icon: IconId, tip: &str) -> egui::Response {
@@ -2881,11 +2940,12 @@ fn settings_choice_tile(
     clicked
 }
 
-/// The detail pane (SETTINGS-1): an expressive header over the selected section's
-/// body, rendered by calling the EXISTING per-section fn verbatim (§6 — no forked
-/// logic; every `apply()`/`SysAction` seam is reused). The Mesh & System sections
-/// (SETTINGS-4) render this node's real identity / role / pairing / network state,
-/// honest-`unknown` where the snapshot doesn't carry a fact (§7).
+/// The detail pane body (SETTINGS-1, PLATFORM-INTERFACES Q27): the selected
+/// section's body — titled by the pane's [`NavigationBar`], not an in-body
+/// header — rendered by calling the EXISTING per-section fn verbatim (§6 — no
+/// forked logic; every `apply()`/`SysAction` seam is reused). The Mesh & System
+/// sections (SETTINGS-4) render this node's real identity / role / pairing /
+/// network state, honest-`unknown` where the snapshot doesn't carry a fact (§7).
 #[allow(clippy::too_many_arguments)] // one router legibly threading the live section refs
 fn settings_detail(
     ui: &mut egui::Ui,
@@ -2908,12 +2968,8 @@ fn settings_detail(
     prompt_in_flight: bool,
     actions: &mut Vec<SysAction>,
 ) {
-    // Expressive header — the active section's title in the large type scale, tinted
-    // in its domain group's categorical accent (SETTINGS-2) so the active domain reads
-    // at a glance in the same colour as its rail header.
-    settings_detail_header(ui, section);
-    ui.add_space(Style::SP_M);
-    // The section body sits on a Carbon layer-02 card raised above the layer-01 page,
+    // The section title lives in the pane's shared NavigationBar (Q27) — the body
+    // starts straight on the Carbon layer-02 card raised above the layer-01 page,
     // ringed by a hairline border (SETTINGS-2 — [`section_card`]).
     section_card(ui, |ui| match section {
         SettingsSection::Displays => {

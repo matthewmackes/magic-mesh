@@ -969,6 +969,206 @@ fn a_stale_group_in_the_file_is_normalised_against_the_section() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── U19 — the HIG Settings anatomy (PLATFORM-INTERFACES Q27) ───────────────
+
+/// Drive one headless `show()` frame at `size` and collect the painted text.
+fn painted_frame(st: &mut SystemState, size: egui::Vec2) -> Vec<(String, egui::Color32)> {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let out = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| st.show(ui));
+        },
+    );
+    painted_text(&out.shapes)
+}
+
+#[test]
+fn the_sidebar_model_lists_every_section_exactly_once_under_its_group() {
+    // The unfiltered sidebar row model is EXACTLY the taxonomy: the three domain
+    // groups in order, each listing its own sections in order, fourteen rows in
+    // all, no duplicate and no orphan (the Q27 shape the rail renders from).
+    let groups = sidebar_rows("");
+    assert_eq!(
+        groups.len(),
+        3,
+        "the unfiltered sidebar is the three groups"
+    );
+    let flat: Vec<SettingsSection> = groups
+        .iter()
+        .flat_map(|(_, sections)| sections.iter().copied())
+        .collect();
+    assert_eq!(flat.len(), 14, "the unfiltered sidebar lists fourteen rows");
+    for &section in &flat {
+        assert_eq!(
+            flat.iter().filter(|&&s| s == section).count(),
+            1,
+            "{} must be exactly one sidebar row",
+            section.label()
+        );
+    }
+    for (group, sections) in &groups {
+        assert_eq!(
+            sections.as_slice(),
+            group.sections(),
+            "{} must list its taxonomy sections in order",
+            group.label()
+        );
+    }
+}
+
+#[test]
+fn the_sidebar_paints_all_fourteen_rows_exactly_once() {
+    // One full frame (tall enough that no row scrolls out): every section label
+    // tessellates exactly once as its sidebar row — except the selected one,
+    // which recurs exactly once more as the detail pane's NavigationBar title
+    // (Q27; the old in-body header is gone, so never a third time).
+    let mut st = SystemState {
+        nav: SettingsNav::at(SettingsSection::Displays),
+        ..SystemState::default()
+    };
+    let texts = painted_frame(&mut st, vec2(960.0, 1600.0));
+    let count = |label: &str| texts.iter().filter(|(t, _)| t == label).count();
+    for group in SettingsGroup::ALL {
+        for &section in group.sections() {
+            let expected = if section == st.nav.section { 2 } else { 1 };
+            assert_eq!(
+                count(section.label()),
+                expected,
+                "{} must paint exactly {expected} time(s): {texts:?}",
+                section.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_sidebar_search_narrows_by_label_and_clearing_restores_the_taxonomy() {
+    // Case-insensitive label substring (no ranking): "BLUE" survives only
+    // Bluetooth, and the emptied groups drop out entirely (header and all).
+    let narrowed = sidebar_rows("BLUE");
+    assert_eq!(narrowed.len(), 1, "empty groups must drop out");
+    assert_eq!(narrowed[0].0, SettingsGroup::Devices);
+    assert_eq!(narrowed[0].1, vec![SettingsSection::Bluetooth]);
+    // Substring, not prefix: "proof" reaches Remote Proofing.
+    assert_eq!(
+        sidebar_rows("proof")
+            .iter()
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect::<Vec<_>>(),
+        vec![SettingsSection::RemoteProofing]
+    );
+    // A no-match query is an honest empty rail, never a phantom row.
+    assert!(sidebar_rows("no-such-section").is_empty());
+    // Clearing (or an all-blank query) restores the whole taxonomy.
+    for cleared in ["", "   "] {
+        assert_eq!(
+            sidebar_rows(cleared).iter().flat_map(|(_, s)| s).count(),
+            14,
+            "clearing the filter must restore all fourteen rows"
+        );
+    }
+}
+
+#[test]
+fn a_narrowed_sidebar_paints_only_matches_and_keeps_the_selection_pane() {
+    // A live filtered frame: only the matching row paints, and the (narrowed-
+    // out) selection keeps its detail pane — its title survives exactly once,
+    // as the NavigationBar title.
+    let mut st = SystemState {
+        nav: SettingsNav::at(SettingsSection::Displays),
+        nav_filter: "blue".to_owned(),
+        ..SystemState::default()
+    };
+    let texts = painted_frame(&mut st, vec2(960.0, 640.0));
+    let count = |label: &str| texts.iter().filter(|(t, _)| t == label).count();
+    assert_eq!(
+        count("Bluetooth"),
+        1,
+        "the matching row must paint: {texts:?}"
+    );
+    assert_eq!(
+        count("Mouse & Touch"),
+        0,
+        "a filtered-out row must not paint"
+    );
+    assert_eq!(
+        count("Displays"),
+        1,
+        "the narrowed-out selection keeps its NavigationBar title"
+    );
+    assert_eq!(
+        st.nav.section,
+        SettingsSection::Displays,
+        "a filter change must never move the selection"
+    );
+}
+
+#[test]
+fn a_sidebar_pick_routes_the_detail_pane_through_the_nav_seam() {
+    // Drive the REAL rail headlessly (the same salt + row model `show()`
+    // mounts): focus a row, press Enter — the pick must route `nav` through
+    // SettingsNav::at, and the routed state must tessellate a real detail pane.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut nav = SettingsNav::at(SettingsSection::Displays);
+    let mut filter = String::new();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 1600.0))),
+        ..Default::default()
+    };
+    let mut frame = |raw: egui::RawInput, nav: &mut SettingsNav, filter: &mut String| {
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| settings_rail(ui, nav, filter));
+        })
+    };
+    // Frame 1 registers the rows; then focus Audio's row (its flattened
+    // taxonomy index — the deterministic Sidebar row id) and press Enter.
+    let _ = frame(input(), &mut nav, &mut filter);
+    let audio = sidebar_rows("")
+        .iter()
+        .flat_map(|(_, s)| s.iter().copied())
+        .position(|s| s == SettingsSection::Audio)
+        .expect("Audio is a sidebar row");
+    ctx.memory_mut(|m| m.request_focus(Sidebar::row_id(SETTINGS_SIDEBAR_SALT, audio)));
+    let enter = egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..input()
+    };
+    let _ = frame(enter, &mut nav, &mut filter);
+    assert_eq!(
+        nav.section,
+        SettingsSection::Audio,
+        "Enter on the focused row must route the nav"
+    );
+    assert_eq!(
+        nav.group,
+        SettingsGroup::Devices,
+        "the group re-derives from the pick"
+    );
+
+    // The routed selection renders a real (non-empty) Audio detail pane.
+    let mut st = SystemState {
+        nav,
+        ..SystemState::default()
+    };
+    assert!(
+        renders(&mut st),
+        "the routed Audio detail pane drew nothing"
+    );
+    assert_eq!(st.nav.section, SettingsSection::Audio);
+}
+
 // ── Personalization → Theme appearance (SETTINGS-5) ───────────────────────
 
 #[test]
@@ -1858,9 +2058,11 @@ fn each_domain_group_wears_a_distinct_shared_categorical_accent() {
             assert_ne!(a, b, "domain accents must be mutually distinct");
         }
     }
-    // Every section inherits exactly its group's accent — the rail header AND the
-    // active detail header both key off `section.group().accent()`, so a section's
-    // two tints can never disagree.
+    // Every section inherits exactly its group's accent — the section BODIES
+    // (the Mesh & System panels, the Personalization choice tiles) key off
+    // `section.group().accent()`, so a section's tints can never disagree with
+    // its group's. (Q27: the sidebar + NavigationBar chrome itself is quiet —
+    // the shared Q19 components, not accent-tinted.)
     for group in SettingsGroup::ALL {
         for &section in group.sections() {
             assert_eq!(
