@@ -523,6 +523,31 @@ impl SystemState {
         self.apply_appearance(ctx);
     }
 
+    /// U12 Control Center deep-link seam: rest the Settings master-detail rail on
+    /// `section` (persisted — the SAME `SettingsNav::at` + save a rail click
+    /// drives, §6), so a following switch to `Surface::System` lands the operator
+    /// on exactly that section.
+    pub(crate) fn open_settings_section(&mut self, section: SettingsSection) {
+        self.nav = SettingsNav::at(section);
+        self.nav.save();
+    }
+
+    /// Test seam (the U12 Control Center deep-link tests): the section the
+    /// Settings rail currently rests on.
+    #[cfg(test)]
+    pub(crate) const fn settings_section_for_test(&self) -> SettingsSection {
+        self.nav.section
+    }
+
+    /// Test seam (the U12 Control Center tile tests): publish a synthetic
+    /// snapshot the way the off-thread pump would — through the SAME
+    /// [`Self::reconcile`] the live poll path runs — without touching hardware.
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_for_test(&mut self, snap: SeatSnapshot) {
+        self.reconcile(&snap);
+        self.snapshot = Some(snap);
+    }
+
     /// The POWER-5 idle/lid policy the honorer reads each tick (the source of truth
     /// the Power section edits).
     pub(crate) const fn power_honor_config(&self) -> &PowerHonorConfig {
@@ -1228,9 +1253,13 @@ impl SystemState {
 /// control sections plus the Mesh & System sections SETTINGS-4 wired to
 /// this node's real identity / role / pairing / network state. Each belongs to
 /// exactly one [`SettingsGroup`]; the pair the rail rests on is a [`SettingsNav`].
+///
+/// `pub(crate)` (not private) so the U12 Control Center's deep-link tiles can
+/// name their target sections (`open_settings_section`) — the [`SysAction`]
+/// visibility idiom, restated here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum SettingsSection {
+pub(crate) enum SettingsSection {
     /// Per-output enable / mode / arrangement + brightness (`displays_section`).
     #[default]
     Displays,

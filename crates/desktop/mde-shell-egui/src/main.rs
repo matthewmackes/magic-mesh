@@ -38,6 +38,7 @@ mod chrome;
 mod communications;
 mod console;
 mod construct;
+mod control_center;
 mod controller;
 mod curtain;
 mod datacenter;
@@ -1222,16 +1223,25 @@ impl Shell {
         }
     }
 
-    /// U13 lands the Control Center here (Q13 — the scrim sheet replacing
-    /// every tray flyout; topmost Construct chrome). Until then the intent
-    /// toggles the open flag.
-    fn mount_control_center_slot(&mut self, _ctx: &egui::Context) {
-        if self
-            .construct
-            .take_intent(construct::ChromeIntent::ControlCenter)
-        {
-            self.construct.control_center_open = !self.construct.control_center_open;
-        }
+    /// U12 landed the Control Center here (Q13 — the top-right tile overlay
+    /// replacing every tray flyout; topmost Construct chrome). The slot only
+    /// forwards the real seams; `control_center.rs` owns the whole surface —
+    /// intent consumption, the scrim/Escape dismissal, and every tile.
+    fn mount_control_center_slot(&mut self, ctx: &egui::Context) {
+        control_center::mount(
+            ctx,
+            control_center::ControlCenterDeps {
+                construct: &mut self.construct,
+                system: &mut self.system,
+                nav: &mut self.nav,
+                session_rail: &mut self.session_rail,
+                files: &mut self.files,
+                web: &mut self.web,
+                mesh: self.chrome.summary(),
+                segments: self.notify_status.segments(),
+                local_host: &self.local_host,
+            },
+        );
     }
 
     /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE

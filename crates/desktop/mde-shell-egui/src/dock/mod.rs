@@ -730,6 +730,27 @@ impl SessionRailEntry {
         Self::with_id(None, label, protocol)
     }
 
+    /// The broker session id backing this row, when it came off
+    /// `action/vdi/session` (`None` for the pending-request fallback rows).
+    /// Read by the U12 Control Center's session list so its focus action can
+    /// drive the SAME `SessionRailState::focus_session` seam the taskbar uses.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    /// The bounded human label (usually the serving peer + VM name).
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The short protocol/state badge (`VDI` / `LIVE` / `DISC`, or `RDP`/`VNC`).
+    #[must_use]
+    pub const fn protocol(&self) -> &'static str {
+        self.protocol
+    }
+
     /// Construct a bounded display entry backed by a broker session id.
     pub fn with_session_id(
         id: impl Into<String>,
