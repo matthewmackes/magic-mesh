@@ -2821,9 +2821,11 @@ fn quick_look_overlay(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>)
         .show(&ctx, |ui| {
             // The dim backdrop swallows pointer input under the modal; a click
             // on it closes.
+            // PLATFORM-INTERFACES Q19/Q20 — the shared thick scrim material
+            // (modal focus: the shell beneath is context only), not a locally
+            // re-decided BG wash.
             let dim = ui.interact(screen, egui::Id::new("files-quicklook-dim"), Sense::click());
-            ui.painter()
-                .rect_filled(screen, 0.0, Style::BG.gamma_multiply(0.94));
+            ui.painter().rect_filled(screen, 0.0, Style::SCRIM_THICK);
             if dim.clicked() {
                 actions.push(Action::CloseQuickLook);
             }
@@ -2863,8 +2865,10 @@ fn modal_backdrop(ctx: &egui::Context, id: &str) -> bool {
         .fixed_pos(screen.min)
         .show(ctx, |ui| {
             let hit = ui.interact(screen, egui::Id::new(format!("{id}-hit")), Sense::click());
-            ui.painter()
-                .rect_filled(screen, 0.0, Style::BG.gamma_multiply(0.82));
+            // PLATFORM-INTERFACES Q19/Q20 — the shared thick scrim material
+            // (modal focus), replacing the ad-hoc per-dialog BG wash so every
+            // Files modal dims with the one platform scrim.
+            ui.painter().rect_filled(screen, 0.0, Style::SCRIM_THICK);
             clicked = hit.clicked();
         });
     clicked
@@ -4383,6 +4387,53 @@ mod tests {
             "a local delete has no typed-arming"
         );
         mount(&mut b);
+    }
+
+    #[test]
+    fn modal_backdrops_dim_with_the_shared_thick_scrim() {
+        // PLATFORM-INTERFACES Q19/Q20 — every Files modal (the operation
+        // dialogs, New Transfer, quick-look) dims the shell with the ONE
+        // shared thick-material scrim token, never an ad-hoc BG wash
+        // re-deciding "how dark is a modal" per dialog. Asserted off the
+        // painted full-screen rect so the wash can't silently come back.
+        fn holds_scrim(shape: &egui::Shape, screen: Rect) -> bool {
+            match shape {
+                egui::Shape::Rect(r) => {
+                    r.fill == Style::SCRIM_THICK && r.rect.contains_rect(screen)
+                }
+                egui::Shape::Vec(v) => v.iter().any(|s| holds_scrim(s, screen)),
+                _ => false,
+            }
+        }
+        let mut b = browser();
+        b.click(0, 1);
+        b.request_delete(0);
+        assert!(b.pending_delete().is_some(), "the confirm opened");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Kill egui's Area fade-in so frame 2 paints the scrim at full
+        // strength (the fade would otherwise scale its alpha mid-animation).
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        // Frame 1 is the backdrop Area's sizing pass; frame 2 paints for real.
+        let _sizing = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::files_panel(ui, &mut b);
+            });
+        });
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::files_panel(ui, &mut b);
+            });
+        });
+        assert!(
+            out.shapes.iter().any(|c| holds_scrim(&c.shape, screen)),
+            "the delete confirm must dim the shell with Style::SCRIM_THICK"
+        );
     }
 
     #[test]

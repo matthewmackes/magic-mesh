@@ -316,6 +316,47 @@ fn storage_queue_controls_do_not_paint_unicode_pseudo_icons() {
 }
 
 #[test]
+fn storage_tooltip_frame_sits_on_the_shared_radius_ladder() {
+    // PLATFORM-INTERFACES Q19/Q20 — the tooltip card rounds on the shared
+    // RADIUS_S tier of the §4 ladder, asserted off the painted shape so a raw
+    // `CornerRadius::same(..)` corner literal can't silently come back.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 120.0))),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                storage_tooltip(ui, "Stage this storage operation.");
+            });
+    });
+    fn walk(shape: &egui::Shape, out: &mut Vec<(egui::CornerRadius, egui::Color32)>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push((rect.corner_radius, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for clipped in &out.shapes {
+        walk(&clipped.shape, &mut rects);
+    }
+    assert!(
+        rects.iter().any(|(radius, fill)| {
+            *radius == egui::CornerRadius::from(Style::RADIUS_S) && *fill == Style::SURFACE
+        }),
+        "the tooltip surface must round on the shared RADIUS_S tier: {rects:?}"
+    );
+}
+
+#[test]
 fn storage_action_buttons_use_refined_chrome_height() {
     assert_eq!(
         STORAGE_ACTION_BUTTON_H,

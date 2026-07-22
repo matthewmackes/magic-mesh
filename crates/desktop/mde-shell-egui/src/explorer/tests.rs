@@ -2713,15 +2713,15 @@ fn the_focus_ring_is_thick_high_contrast_and_never_camouflaged() {
 #[allow(clippy::assertions_on_constants)] // the token contract IS constant (the mde-egui style-test idiom)
 fn generous_display_type_leads_the_type_ramp() {
     // O11 "generous display type": the hero display name sits ABOVE the
-    // largest shared type rung — across-the-room legibility — while still
-    // deriving from the §4 ramp (a HEADING multiple, no raw px).
+    // largest legacy type rung — across-the-room legibility — and lands on
+    // the shared HIG hero rung (PLATFORM-INTERFACES Q19/Q20), no raw px.
     assert!(
         HERO_TITLE_FS > Style::DISPLAY,
         "the hero title must out-size the display rung"
     );
     assert!(
-        (HERO_TITLE_FS - Style::HEADING * 1.5).abs() < f32::EPSILON,
-        "the hero title derives from the shared HEADING rung, not a raw px"
+        (HERO_TITLE_FS - Style::TYPE_LARGE_TITLE).abs() < f32::EPSILON,
+        "the hero title sits on the shared TYPE_LARGE_TITLE rung, not a raw px"
     );
 }
 
@@ -2736,6 +2736,48 @@ fn explorer_chrome_strips_use_refined_toolbar_margin() {
         explorer_toolbar_margin(),
         egui::Margin::same(Style::SP_S as i8),
         "Explorer chrome strips must not keep the old full-gutter thickness"
+    );
+}
+
+#[test]
+fn explorer_tooltip_frame_sits_on_the_shared_radius_ladder() {
+    // PLATFORM-INTERFACES Q19/Q20 — the tooltip card rounds on the shared
+    // RADIUS_S tier of the §4 ladder, asserted off the painted shape so a raw
+    // `CornerRadius::same(..)` corner literal can't silently come back.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            Vec2::new(320.0, 120.0),
+        )),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| explorer_tooltip(ui, "Jump to this unit"));
+    });
+    fn walk(shape: &egui::Shape, out: &mut Vec<(egui::CornerRadius, Color32)>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push((rect.corner_radius, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for clipped in &out.shapes {
+        walk(&clipped.shape, &mut rects);
+    }
+    assert!(
+        rects.iter().any(|(radius, fill)| {
+            *radius == egui::CornerRadius::from(Style::RADIUS_S) && *fill == Style::SURFACE
+        }),
+        "the tooltip surface must round on the shared RADIUS_S tier: {rects:?}"
     );
 }
 

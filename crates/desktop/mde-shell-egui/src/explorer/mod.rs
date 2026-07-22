@@ -152,9 +152,12 @@ const OFFLINE_RING_W: f32 = 1.5;
 const GLYPH_STROKE_W: f32 = 2.0;
 
 /// The hero display name's font size — the cinematic display type (#10 "big
-/// display name", O11 generous type), derived from the §4 `HEADING` token so it
-/// scales with the type ramp rather than a raw px literal.
-const HERO_TITLE_FS: f32 = Style::HEADING * 1.5;
+/// display name", O11 generous type) on the shared HIG hero rung.
+// PLATFORM-INTERFACES Q19/Q20 — the hero title sits on the TYPE_LARGE_TITLE
+// rung of the shared type ramp (the same rung a NavigationBar's large-title
+// band uses), not a locally derived multiple. Value-identical to the previous
+// `HEADING * 1.5` derivation, so the surface's look is unchanged.
+const HERO_TITLE_FS: f32 = Style::TYPE_LARGE_TITLE;
 
 /// Fraction of the hero width a single page-step slides through (Carbon
 /// productive-motion horizontal slide, #21).

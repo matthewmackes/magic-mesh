@@ -22,7 +22,9 @@ pub(super) fn explorer_tooltip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
         .fill(Style::SURFACE)
         .stroke(Stroke::new(1.0, Style::BORDER))
-        .corner_radius(egui::CornerRadius::same(6))
+        // PLATFORM-INTERFACES Q19/Q20 — the shared radius ladder's small tier,
+        // not a raw corner literal (value-identical: RADIUS_S is 6).
+        .corner_radius(Style::RADIUS_S)
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(EXPLORER_TOOLTIP_MAX_W);
