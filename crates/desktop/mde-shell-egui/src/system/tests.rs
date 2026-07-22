@@ -857,6 +857,7 @@ fn every_section_is_reachable_exactly_once() {
         SettingsSection::Pairing,
         SettingsSection::Network,
         SettingsSection::RemoteProofing,
+        SettingsSection::KeyMapping,
     ] {
         assert_eq!(
             all.iter().filter(|&&s| s == section).count(),
@@ -865,11 +866,11 @@ fn every_section_is_reachable_exactly_once() {
             section.label()
         );
     }
-    // The whole taxonomy is exactly those thirteen sections (no orphan leaf).
+    // The whole taxonomy is exactly those fourteen sections (no orphan leaf).
     assert_eq!(
         all.len(),
-        13,
-        "the taxonomy lists exactly thirteen sections"
+        14,
+        "the taxonomy lists exactly fourteen sections"
     );
 }
 
