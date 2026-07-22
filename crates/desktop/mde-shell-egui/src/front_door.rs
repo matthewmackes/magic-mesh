@@ -7,7 +7,8 @@
 
 use mde_egui::egui;
 use mde_egui::search_omnibox::{ranked_hits, MatchTier, SearchDomain, SearchHit, SearchItem};
-use mde_egui::Style;
+use mde_egui::style::Elevation;
+use mde_egui::{Motion, MotionPreset, Style};
 use mde_files_egui::model::FileSearchTarget;
 use mde_theme::brand::icons::IconId;
 
@@ -20,14 +21,21 @@ const AREA_ID: &str = "shell-front-door-omnibox";
 const INPUT_ID: &str = "shell-front-door-omnibox-input";
 const RESULTS_SCROLL_ID: &str = "shell-front-door-results-scroll";
 const MAX_HITS: usize = 12;
-const PANEL_W: f32 = 720.0;
+// PLATFORM-INTERFACES Q15 — Spotlight card width: min(640px, screen − 2×SP_XL).
+const PANEL_W: f32 = 640.0;
 const ROW_H: f32 = 42.0;
-const INPUT_H: f32 = 38.0;
+const INPUT_H: f32 = 44.0;
 const FILTER_CHIP_H: f32 = 24.0;
 const FILTER_CHIP_GAP: f32 = 5.0;
 const ACTION_PANEL_H: f32 = 44.0;
-const PANEL_RADIUS: f32 = 8.0;
-const PANEL_INSET: f32 = 10.0;
+// PLATFORM-INTERFACES Q15 — the Spotlight card is a RADIUS_XL hero card; the
+// SP_M inset keeps inner RADIUS_M plates on the Q23 concentric rule
+// (RADIUS_XL − SP_M = RADIUS_M).
+const PANEL_RADIUS: f32 = Style::RADIUS_XL;
+const PANEL_INSET: f32 = Style::SP_M;
+// PLATFORM-INTERFACES Q15 — how far the summoned card drops into place.
+const SPOTLIGHT_DROP: f32 = 12.0;
+const SPOTLIGHT_MOTION_KEY: &str = "shell-front-door-spotlight-presence";
 const EXPANSION_BUTTON_W: f32 = INPUT_H;
 const EXPANDED_MIN_H: f32 = 320.0;
 const PANEL_MIN_W: f32 = 320.0;
@@ -38,7 +46,8 @@ const RESULT_TEXT_MIN_W: f32 = 72.0;
 const SEARCH_MIN_W: f32 = 72.0;
 const TOOLTIP_W: f32 = 260.0;
 const ACTION_BUTTON_TEXT_MIN_W: f32 = 72.0;
-const SEARCH_TEXT_SIZE: f32 = Style::BODY + 1.0;
+// PLATFORM-INTERFACES Q15 — the query line rides the TYPE_TITLE3 rung.
+const SEARCH_TEXT_SIZE: f32 = Style::TYPE_TITLE3;
 const SEARCH_HINT: &str = "Search apps, workloads, services, commands, files, mesh, Browser";
 
 /// Unified-search privacy policy (WL-FUNC-005): the omnibox is **ephemeral and
@@ -832,41 +841,31 @@ fn run_command_mode(query: &str) -> bool {
     query.trim_start().starts_with('>')
 }
 
-fn front_door_screen_margin(screen: egui::Rect) -> f32 {
-    Style::SP_L.min((screen.width() * 0.04).max(8.0))
+// PLATFORM-INTERFACES Q15 — Spotlight geometry: the Front Door is a centered
+// floating search card. Both layout variants share the same placement (the
+// `expanded` variant grows HEIGHT, never position or width); the SP_XL gutter
+// bounds the card's width and its bottom breathing room.
+fn front_door_screen_margin(_screen: egui::Rect) -> f32 {
+    Style::SP_XL
 }
 
-fn front_door_panel_width(screen: egui::Rect, expanded: bool) -> f32 {
+fn front_door_panel_width(screen: egui::Rect, _expanded: bool) -> f32 {
     let margin = front_door_screen_margin(screen);
     let available = (screen.width() - margin * 2.0).max(1.0);
     let min_width = PANEL_MIN_W.min(available);
-    if expanded {
-        available
-    } else {
-        PANEL_W.min(available).max(min_width)
-    }
+    PANEL_W.min(available).max(min_width)
 }
 
-fn front_door_panel_top(screen: egui::Rect, expanded: bool) -> f32 {
-    if expanded {
-        screen.top() + front_door_screen_margin(screen)
-    } else {
-        screen.top() + (screen.height() * 0.14).max(Style::SP_XL)
-    }
+fn front_door_panel_top(screen: egui::Rect, _expanded: bool) -> f32 {
+    // Q15 — the card floats in the upper band, ~22% down the screen.
+    screen.top() + (screen.height() * 0.22).max(Style::SP_XL)
 }
 
 fn front_door_panel_pos(screen: egui::Rect, width: f32, expanded: bool) -> egui::Pos2 {
-    if expanded {
-        egui::pos2(
-            screen.left() + front_door_screen_margin(screen),
-            front_door_panel_top(screen, true),
-        )
-    } else {
-        egui::pos2(
-            screen.center().x - width / 2.0,
-            front_door_panel_top(screen, false),
-        )
-    }
+    egui::pos2(
+        screen.center().x - width / 2.0,
+        front_door_panel_top(screen, expanded),
+    )
 }
 
 fn front_door_panel_min_height(screen: egui::Rect, expanded: bool) -> Option<f32> {
@@ -931,6 +930,9 @@ pub(crate) fn front_door_panel_with_sources(
     pinned: &[Surface],
     sources: FrontDoorSourceStatus,
 ) -> Option<FrontDoorRequest> {
+    // Ticked every frame (open or closed) so the summon carrier re-arms at 0
+    // while the card is away and the next Super summon fades+drops in again.
+    let presence = spotlight_presence(ctx, state.open);
     if !state.open {
         return None;
     }
@@ -945,7 +947,18 @@ pub(crate) fn front_door_panel_with_sources(
         .fixed_pos(panel_rect.min)
         .constrain(false)
         .show(ctx, |ui| {
+            // PLATFORM-INTERFACES Q15 — summon motion + scrim. The whole float
+            // (wash and card) fades with presence; the card visually drops the
+            // last few px into its settled rect. Paint-only: the allocated hit
+            // rect below stays the settled `panel_rect`, so hit-testing, the
+            // outside-click dismissal seam, and the keyboard flow are untouched.
+            ui.set_opacity(presence.opacity);
+            let wash = ui.ctx().screen_rect();
+            ui.painter()
+                .with_clip_rect(wash)
+                .rect_filled(wash, 0.0, Style::SCRIM_THIN);
             let (rect, _) = ui.allocate_exact_size(panel_rect.size(), egui::Sense::hover());
+            let rect = rect.translate(egui::vec2(0.0, -presence.drop));
             paint_front_door_panel_frame(ui, rect);
             let inner_rect = rect.shrink(PANEL_INSET);
             let mut child = ui.new_child(
@@ -1146,7 +1159,46 @@ pub(crate) fn front_door_panel_with_sources(
     action
 }
 
+/// The presentation phase of the Spotlight summon: an overall opacity plus the
+/// remaining downward travel of the card. Rides the shared Panel motion preset
+/// (a Start-like panel — quick, spring-settled); under reduced motion both land
+/// instantly at their endpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SpotlightPresence {
+    opacity: f32,
+    drop: f32,
+}
+
+// PLATFORM-INTERFACES Q15 — Spotlight summon motion: a quick spring fade+drop
+// on the shared `Motion` carrier (no state fields; the ctx-keyed carrier the
+// shell chrome already uses).
+fn spotlight_presence(ctx: &egui::Context, open: bool) -> SpotlightPresence {
+    if Motion::reduce_motion() {
+        return SpotlightPresence {
+            opacity: if open { 1.0 } else { 0.0 },
+            drop: 0.0,
+        };
+    }
+    let t = Motion::animate_scalar(
+        ctx,
+        SPOTLIGHT_MOTION_KEY,
+        if open { 1.0 } else { 0.0 },
+        MotionPreset::Panel,
+    )
+    .value()
+    .clamp(0.0, 1.0);
+    SpotlightPresence {
+        opacity: t,
+        drop: SPOTLIGHT_DROP * (1.0 - t),
+    }
+}
+
+// PLATFORM-INTERFACES Q15 — the Spotlight card frame: a RADIUS_XL hero card
+// riding the modal elevation shadow (it floats above everything, over the
+// SCRIM_THIN wash painted by the caller).
 fn paint_front_door_panel_frame(ui: &egui::Ui, rect: egui::Rect) {
+    ui.painter()
+        .add(Elevation::Modal.egui_shadow().as_shape(rect, PANEL_RADIUS));
     ui.painter().rect_filled(rect, PANEL_RADIUS, Style::SURFACE);
     ui.painter().rect_stroke(
         rect,
@@ -1223,9 +1275,9 @@ fn expansion_toggle_button(ui: &mut egui::Ui, expanded: bool) -> bool {
     } else {
         egui::Stroke::new(1.0, Style::BORDER)
     };
-    ui.painter().rect_filled(rect, 6.0, fill);
+    ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
     ui.painter()
-        .rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
+        .rect_stroke(rect, Style::RADIUS_S, stroke, egui::StrokeKind::Inside);
 
     let icon = if expanded {
         IconId::Remove
@@ -1297,7 +1349,27 @@ fn front_door_search_field(
     ui.painter()
         .rect_stroke(rect, Style::RADIUS_M, stroke, egui::StrokeKind::Inside);
 
-    let edit_rect = rect.shrink2(egui::vec2(Style::SP_S, Style::SP_XS));
+    // PLATFORM-INTERFACES Q15 — the Carbon search glyph leads the query line.
+    let glyph_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + Style::SP_S + Style::ICON_M / 2.0,
+            rect.center().y,
+        ),
+        egui::vec2(Style::ICON_M, Style::ICON_M),
+    );
+    let _ = mde_egui::carbon::paint_carbon(
+        &ui.painter().with_clip_rect(rect),
+        glyph_rect,
+        "system-search",
+        Style::TEXT_DIM,
+    );
+
+    let edit_left = glyph_rect.right() + Style::SP_S;
+    let edit_right = (rect.right() - Style::SP_S).max(edit_left + 1.0);
+    let edit_rect = egui::Rect::from_min_max(
+        egui::pos2(edit_left, rect.top() + Style::SP_XS),
+        egui::pos2(edit_right, rect.bottom() - Style::SP_XS),
+    );
     let response = ui
         .scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
@@ -1421,10 +1493,12 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
             changed = true;
         }
         let selected = *active == filter;
+        // Q15 — chips ride RADIUS_M plates with the shared selection idiom
+        // (selection fill when active, wash on hover) and TYPE_CAPTION labels.
         let fill = if selected {
-            Style::ACCENT.linear_multiply(0.18)
+            Style::selection_fill()
         } else if response.hovered() {
-            Style::SURFACE_HI
+            Style::selection_wash()
         } else {
             Style::SURFACE
         };
@@ -1433,18 +1507,18 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
         } else {
             egui::Stroke::new(1.0, Style::BORDER)
         };
-        ui.painter().rect_filled(rect, FILTER_CHIP_H * 0.5, fill);
+        ui.painter().rect_filled(rect, Style::RADIUS_M, fill);
         ui.painter()
-            .rect_stroke(rect, FILTER_CHIP_H * 0.5, stroke, egui::StrokeKind::Inside);
+            .rect_stroke(rect, Style::RADIUS_M, stroke, egui::StrokeKind::Inside);
         ui.painter()
             .with_clip_rect(rect.shrink2(egui::vec2(3.0, 0.0)))
             .text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 filter.label(),
-                egui::FontId::proportional(11.0),
+                egui::FontId::proportional(Style::TYPE_CAPTION),
                 if selected {
-                    Style::TEXT
+                    Style::TEXT_STRONG
                 } else {
                     Style::TEXT_DIM
                 },
@@ -1466,7 +1540,7 @@ fn empty_note(ui: &mut egui::Ui, blank: bool, filter: FrontDoorFilter) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(Style::TYPE_BODY),
         Style::TEXT_DIM,
     );
 }
@@ -1560,14 +1634,14 @@ fn source_status_note(ui: &mut egui::Ui, note: FrontDoorSourceNote) {
         egui::pos2(text_rect.left(), text_rect.center().y - 7.0),
         egui::Align2::LEFT_CENTER,
         note.label,
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(Style::TYPE_BODY),
         Style::TEXT,
     );
     painter.text(
         egui::pos2(text_rect.left(), text_rect.center().y + 8.0),
         egui::Align2::LEFT_CENTER,
         note.detail,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
         Style::TEXT_DIM,
     );
 }
@@ -1581,7 +1655,7 @@ fn command_empty_note(ui: &mut egui::Ui) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "Type a command after >",
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(Style::TYPE_BODY),
         Style::TEXT_DIM,
     );
 }
@@ -1590,10 +1664,11 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
     let row_width = bounded_available_width(ui).max(1.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(row_width, ROW_H), egui::Sense::click());
+    // Q15 — the armed command row wears the shared selection plate.
     ui.painter().rect_filled(
         rect.shrink2(egui::vec2(0.0, 2.0)),
-        5.0,
-        Style::ACCENT.linear_multiply(0.16),
+        Style::RADIUS_M,
+        Style::selection_fill(),
     );
 
     let icon_rect = egui::Rect::from_center_size(
@@ -1623,7 +1698,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
             "Command",
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(Style::TYPE_CAPTION),
             Style::TEXT_DIM,
         );
 
@@ -1638,8 +1713,8 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
             egui::pos2(title_rect.left(), rect.center().y - 8.0),
             egui::Align2::LEFT_CENTER,
             "Run command",
-            egui::FontId::proportional(14.0),
-            Style::TEXT,
+            egui::FontId::proportional(Style::TYPE_BODY),
+            Style::TEXT_STRONG,
         );
         let target_rect = egui::Rect::from_min_max(
             egui::pos2(text_left, rect.center().y),
@@ -1649,7 +1724,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
             egui::pos2(target_rect.left(), rect.center().y + 10.0),
             egui::Align2::LEFT_CENTER,
             command,
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(Style::TYPE_FOOTNOTE),
             Style::TEXT_DIM,
         );
     }
@@ -1666,13 +1741,18 @@ fn option_row(
     let row_width = bounded_available_width(ui).max(1.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(row_width, ROW_H), egui::Sense::click());
-    let fill = if selected || response.hovered() {
-        Style::ACCENT.linear_multiply(0.16)
+    // PLATFORM-INTERFACES Q15 — RADIUS_M row plates on the shared selection
+    // idiom (nav_chrome): the selected row carries the accent selection fill,
+    // hover the lighter selection wash.
+    let fill = if selected {
+        Style::selection_fill()
+    } else if response.hovered() {
+        Style::selection_wash()
     } else {
         Style::SURFACE_HI
     };
     let painter = ui.painter();
-    painter.rect_filled(rect.shrink2(egui::vec2(0.0, 2.0)), 5.0, fill);
+    painter.rect_filled(rect.shrink2(egui::vec2(0.0, 2.0)), Style::RADIUS_M, fill);
 
     let icon_tint = if selected {
         Style::TEXT
@@ -1705,7 +1785,7 @@ fn option_row(
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
             result_domain_label(hit),
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(Style::TYPE_CAPTION),
             Style::TEXT_DIM,
         );
 
@@ -1716,12 +1796,17 @@ fn option_row(
             egui::pos2(text_left, rect.top()),
             egui::pos2(text_right, rect.center().y),
         );
+        // Q15 — primary text on TYPE_BODY, secondary on TYPE_FOOTNOTE.
         painter.with_clip_rect(title_rect).text(
             egui::pos2(title_rect.left(), rect.center().y - 8.0),
             egui::Align2::LEFT_CENTER,
             &hit.item.title,
-            egui::FontId::proportional(14.0),
-            Style::TEXT,
+            egui::FontId::proportional(Style::TYPE_BODY),
+            if selected {
+                Style::TEXT_STRONG
+            } else {
+                Style::TEXT
+            },
         );
         let target_rect = egui::Rect::from_min_max(
             egui::pos2(text_left, rect.center().y),
@@ -1731,7 +1816,7 @@ fn option_row(
             egui::pos2(target_rect.left(), rect.center().y + 10.0),
             egui::Align2::LEFT_CENTER,
             &hit.item.target,
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(Style::TYPE_FOOTNOTE),
             Style::TEXT_DIM,
         );
     }
@@ -4687,17 +4772,25 @@ mod tests {
         let portrait = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(430.0, 900.0));
         let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 640.0));
 
+        // PLATFORM-INTERFACES Q15 — Spotlight: the expanded variant grows
+        // HEIGHT only; placement and width are shared with the compact card.
         assert!(
-            front_door_panel_width(desktop, true) > front_door_panel_width(desktop, false),
-            "expanded mode should use the wide launcher canvas on desktop screens"
+            (front_door_panel_width(desktop, true) - front_door_panel_width(desktop, false)).abs()
+                < 0.01,
+            "expanded mode keeps the compact Spotlight card width"
         );
         assert!(
-            front_door_panel_top(desktop, true) < front_door_panel_top(desktop, false),
-            "expanded mode should move toward the top of the workspace"
+            (front_door_panel_top(desktop, true) - front_door_panel_top(desktop, false)).abs()
+                < 0.01,
+            "expanded mode keeps the compact Spotlight card top band"
         );
         assert!(
-            front_door_results_max_height(desktop, true)
-                > front_door_results_max_height(desktop, false),
+            front_door_panel_height(desktop, true) >= front_door_panel_height(desktop, false),
+            "expanded mode never shrinks below the compact card height"
+        );
+        let tall = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1000.0));
+        assert!(
+            front_door_results_max_height(tall, true) > front_door_results_max_height(tall, false),
             "expanded mode should expose more vertical space for launcher rows"
         );
 
@@ -4738,6 +4831,140 @@ mod tests {
             true,
         );
         assert_rects_inside_viewport(&out, 280.0, "narrow expanded Front Door");
+    }
+
+    #[test]
+    fn front_door_spotlight_card_is_centered_in_the_upper_band() {
+        // PLATFORM-INTERFACES Q15 — pure placement math: the card is
+        // horizontally centered, floats ~22% down the screen, and its width is
+        // min(PANEL_W, screen − 2×SP_XL) in BOTH layout variants.
+        let screen = egui::Rect::from_min_size(egui::pos2(12.0, 8.0), egui::vec2(1280.0, 800.0));
+        for expanded in [false, true] {
+            let rect = front_door_panel_rect(screen, expanded);
+            assert!(
+                (rect.center().x - screen.center().x).abs() < 0.01,
+                "Spotlight card must center horizontally (expanded={expanded}): {rect:?}"
+            );
+            assert!(
+                (rect.top() - (screen.top() + screen.height() * 0.22)).abs() < 0.01,
+                "Spotlight card must float in the 22% upper band (expanded={expanded}): {rect:?}"
+            );
+            assert!(
+                (rect.width() - PANEL_W).abs() < 0.01,
+                "a wide screen carries the full Spotlight width (expanded={expanded}): {rect:?}"
+            );
+        }
+
+        // Narrower than PANEL_W + gutters: the width formula's gutter arm.
+        let tight = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 700.0));
+        assert!(
+            (front_door_panel_width(tight, false) - (500.0 - 2.0 * Style::SP_XL)).abs() < 0.01,
+            "tight screens clamp the card to screen − 2×SP_XL"
+        );
+
+        // Placement identity across variants: expanded grows height only.
+        let compact_pos =
+            front_door_panel_pos(screen, front_door_panel_width(screen, false), false);
+        let expanded_pos = front_door_panel_pos(screen, front_door_panel_width(screen, true), true);
+        assert_eq!(
+            compact_pos, expanded_pos,
+            "expanded must not move the Spotlight card"
+        );
+
+        // Very short screens keep the SP_XL floor above the card.
+        let short = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 100.0));
+        assert!(
+            (front_door_panel_top(short, false) - Style::SP_XL).abs() < 0.01,
+            "the top band never collapses under the SP_XL floor"
+        );
+    }
+
+    #[test]
+    fn front_door_spotlight_tessellates_geometry_in_both_layouts() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        for expanded in [false, true] {
+            let out = render_front_door_settled_frame(
+                &ctx,
+                "browser",
+                0,
+                egui::vec2(900.0, 640.0),
+                fixture_front_door_items(),
+                FrontDoorFilter::All,
+                expanded,
+                FrontDoorSourceStatus::default(),
+            );
+            let fills = painted_fill_colors(&out.shapes);
+            assert!(
+                fills.contains(&Style::SCRIM_THIN),
+                "the open Spotlight paints the SCRIM_THIN wash (expanded={expanded}): {fills:?}"
+            );
+            let pixels_per_point = out.pixels_per_point;
+            let primitives = ctx.tessellate(out.shapes, pixels_per_point);
+            let vertices: usize = primitives
+                .iter()
+                .map(|clipped| match &clipped.primitive {
+                    egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum();
+            assert!(
+                vertices > 0,
+                "the Spotlight card must tessellate real geometry (expanded={expanded})"
+            );
+        }
+    }
+
+    #[test]
+    fn front_door_keyboard_flow_type_arrow_enter_activates_selection() {
+        // Q15 guard — the reskin must keep the keyboard-first flow byte-
+        // identical: type into the focused field, ArrowDown moves the
+        // selection, Enter activates it (and closes the card).
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let mut state = FrontDoorState::default();
+        state.open();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 640.0),
+            )),
+            events,
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let run = |state: &mut FrontDoorState, events: Vec<egui::Event>| {
+            let mut out = None;
+            let _ = ctx.run(input(events), |ctx| {
+                out = front_door_panel(ctx, state, fixture_front_door_items(), &[]);
+            });
+            out
+        };
+
+        // Frame 1: the summoned card focuses its search field.
+        let _ = run(&mut state, Vec::new());
+        // Frame 2: typed text lands in the query through the focused field.
+        let _ = run(&mut state, vec![egui::Event::Text("browser".to_owned())]);
+        assert_eq!(
+            state.query(),
+            "browser",
+            "typed text must reach the query through the real focused TextEdit"
+        );
+        // Frame 3: ArrowDown then Enter activates the SECOND ranked hit.
+        let action = run(
+            &mut state,
+            vec![key(egui::Key::ArrowDown), key(egui::Key::Enter)],
+        );
+        let hits = visible_front_door_hits("browser", fixture_front_door_items());
+        assert!(hits.len() > 1, "fixture must rank multiple hits");
+        assert_eq!(
+            action,
+            Some(activation_request_for_hit(&hits[1])),
+            "ArrowDown + Enter must activate the second ranked hit"
+        );
+        assert!(!state.is_open(), "activation closes the Spotlight card");
     }
 
     #[test]
