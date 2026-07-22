@@ -162,7 +162,10 @@ impl MusicApp {
                 .size(Style::HEADING)
                 .color(Style::TEXT),
         );
-        ui.add_space(Style::SP_XS);
+        // The heading→rule→content rhythm matches the open-album view exactly
+        // (SP_S on both sides of the separator), so the two top-level views read
+        // as parallel rather than each pacing its own header a different way.
+        ui.add_space(Style::SP_S);
         ui.separator();
         ui.add_space(Style::SP_S);
 
@@ -243,6 +246,9 @@ impl MusicApp {
                                 if track_row(ui, i, song).clicked() {
                                     to_play = Some(song.clone());
                                 }
+                                // Same inter-row breathing room the album listing
+                                // gives its rows, so both lists share one rhythm.
+                                ui.add_space(Style::SP_XS);
                             }
                         });
                 }
@@ -378,31 +384,57 @@ fn centered_state(ui: &mut egui::Ui, busy: bool, message: &str) {
     });
 }
 
-/// Fade a **hover wash** behind a just-built list row, animated through the shared
-/// FAST motion so the row lifts on hover instead of snapping (CRAFT §4 — hover
-/// changes state, so it animates). `band` is the painter slot reserved *before*
-/// the row content (the repo's reserved-shape idiom — it renders behind the row);
-/// `id` keys the per-row animation. Consumes only shared tokens: the
-/// hovered-surface fill ([`Style::SURFACE_HI`]) faded by the eased 0→1 progress,
-/// at the shared card radius ([`Style::RADIUS_M`], matching [`mde_egui::card`]) —
-/// no raw colour, no literal duration.
-fn hover_wash(
+/// Ease a **hover treatment** onto a just-built list row through the shared FAST
+/// motion so the row responds to the pointer instead of snapping (CRAFT §4 — hover
+/// changes state, so it animates). One hover progress `t` drives two eased layers:
+///
+/// * a **wash** behind the row content — `band` is the painter slot reserved
+///   *before* the row (the repo's reserved-shape idiom, so it renders underneath)
+///   — the hovered-surface fill ([`Style::SURFACE_HI`]) faded by the 0→1 progress
+///   at the shared card radius ([`Style::RADIUS_M`], matching [`mde_egui::card`]);
+/// * a slim **leading accent tab** over the row's left gutter in the surface's own
+///   Media group accent ([`Style::ACCENT_MEDIA`] — the same tint the menu bar
+///   wears), so the hovered row reads as the live one. Its presence eases in with
+///   [`Motion::hover_lift`] over the same progress, sitting in the card's padding
+///   gutter so it never crosses the row text.
+///
+/// `id` keys the per-row animation. Consumes only shared tokens — no raw colour,
+/// size, or literal duration — and, because `t` comes from [`Motion::animate`],
+/// reduce-motion collapses both layers to their endpoint (a snap, no glide;
+/// a11y-07).
+fn hover_indicator(
     ui: &egui::Ui,
     band: egui::layers::ShapeIdx,
     id: impl std::hash::Hash,
     response: &Response,
 ) {
     let t = Motion::animate(ui.ctx(), id, response.hovered(), Motion::FAST);
-    if t > 0.0 {
-        ui.painter().set(
-            band,
-            egui::Shape::rect_filled(
-                response.rect,
-                Style::RADIUS_M,
-                Style::SURFACE_HI.gamma_multiply(t),
-            ),
-        );
+    if t <= 0.0 {
+        return;
     }
+    let row = response.rect;
+    ui.painter().set(
+        band,
+        egui::Shape::rect_filled(row, Style::RADIUS_M, Style::SURFACE_HI.gamma_multiply(t)),
+    );
+    // The accent tab paints after the card (on top), eased in over the same hover
+    // progress; the card's SP_M padding keeps it clear of the row content.
+    ui.painter().rect_filled(
+        hover_tab_rect(row),
+        Style::RADIUS_S,
+        Style::ACCENT_MEDIA.gamma_multiply(Motion::hover_lift(t)),
+    );
+}
+
+/// The slim leading **accent-tab** rect for a hovered row: [`Style::SP_XS`] wide,
+/// pinned to the row's left edge and inset top and bottom by [`Style::SP_S`] so it
+/// reads as a tab rather than a full-height rule. Pure, so the geometry stays on
+/// the 8px grid and is unit-tested without a GPU.
+fn hover_tab_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(row.left(), row.top() + Style::SP_S),
+        egui::pos2(row.left() + Style::SP_XS, row.bottom() - Style::SP_S),
+    )
 }
 
 /// One clickable album row: title over the `artist · tracks · year` subtitle, in
@@ -430,7 +462,7 @@ fn album_row(ui: &mut egui::Ui, album: &Album) -> Response {
         .response
         .interact(Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
-    hover_wash(ui, band, ("album-row", album.id.as_str()), &response);
+    hover_indicator(ui, band, ("album-row", album.id.as_str()), &response);
     response
 }
 
@@ -472,13 +504,13 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
         .response
         .interact(Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
-    hover_wash(ui, band, ("track-row", song.id.as_str()), &response);
+    hover_indicator(ui, band, ("track-row", song.id.as_str()), &response);
     response
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{music_panel, MusicApp};
+    use super::{hover_tab_rect, music_panel, MusicApp};
     use crate::menubar::MenuAction;
     use crate::model::{Fetch, MusicState, Update};
     use mde_egui::egui::{self, pos2, vec2, Rect};
@@ -648,6 +680,32 @@ mod tests {
         assert!(
             alpha > 0 && alpha < 255,
             "a Raised card casts a translucent soft shadow (lock #2), got alpha {alpha}"
+        );
+    }
+
+    #[test]
+    fn hover_accent_tab_sits_on_the_left_edge_on_the_grid() {
+        // The hovered-row leading accent tab is a pure geometry on the 8px grid:
+        // pinned to the row's left edge, one half-step wide, and inset top and
+        // bottom by the base unit so it reads as a tab — every extent a Style
+        // token, none a raw literal (§4). A tall row keeps the insets well-formed.
+        let row = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 80.0));
+        let tab = hover_tab_rect(row);
+        assert_eq!(tab.left(), row.left(), "the tab hugs the row's left edge");
+        assert_eq!(tab.width(), Style::SP_XS, "one 8px-grid half-step wide");
+        assert_eq!(
+            tab.top(),
+            row.top() + Style::SP_S,
+            "inset from the top by the base grid unit"
+        );
+        assert_eq!(
+            tab.bottom(),
+            row.bottom() - Style::SP_S,
+            "inset from the bottom by the base grid unit"
+        );
+        assert!(
+            row.contains_rect(tab),
+            "the tab stays within the row it marks"
         );
     }
 }
