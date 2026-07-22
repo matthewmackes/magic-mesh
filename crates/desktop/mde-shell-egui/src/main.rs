@@ -37,6 +37,7 @@ mod chooser;
 mod chrome;
 mod communications;
 mod console;
+mod construct;
 mod controller;
 mod curtain;
 mod datacenter;
@@ -934,6 +935,14 @@ struct Shell {
     /// seat's forwarded host keys (XF86 media + Super) and this frame's egui key
     /// presses into typed actions the shell applies to the seat / nav.
     hotkeys: hotkeys::HotkeyRouter,
+    /// WL-UX-006/U09 — the Construct chrome scaffold (PLATFORM-INTERFACES
+    /// §2.3/§2.4): the ONE system input-contract dispatcher's state — the
+    /// overlay open flags (switcher / control center / notification center),
+    /// the VDI edge-dwell guard, and the per-frame [`construct::ChromeIntent`]
+    /// queue the five chrome mount slots consume. The U10–U15 surfaces
+    /// (springboard · status bar · switcher · control center · notification
+    /// center) mount onto this from their own files — `main.rs` stays put.
+    construct: construct::ConstructChrome,
     /// SURFACE-9 (lock 9): republishes the seat's debounced `SW_TABLET_MODE` /
     /// Type-Cover formfactor transitions to the mesh Bus (`event/hardware/formfactor`)
     /// so the tablet-mode UX reacts. Empty on the windowed fallback (self-gates).
@@ -1082,6 +1091,7 @@ impl Shell {
             device_manager: device_manager::DeviceManagerState::default(),
             toasts: toast_bridge::ToastBridge::default(),
             hotkeys: hotkeys::HotkeyRouter::default(),
+            construct: construct::ConstructChrome::default(),
             formfactor: formfactor::FormfactorPublisher::default(),
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
@@ -1132,6 +1142,95 @@ impl Shell {
             self.front_door.close();
         } else {
             self.open_front_door_panel();
+        }
+    }
+
+    /// WL-UX-006/U09 — fold one frame's decoded system input through the ONE
+    /// §2.3 input-contract dispatcher (`construct::intents_from_input`) and
+    /// queue the intents for the five chrome mount slots. The Spotlight intent
+    /// is consumed right here: Spotlight IS the Front Door engine (Q15 keeps
+    /// producers/ranking/keyboard flow byte-identical; U14 only reskins it),
+    /// so Super-on-home lands on the existing launcher toggle — the exact
+    /// behavior the VDOCK Super-tap drove before, now contract-routed.
+    /// CURTAIN-1 (lock 10): while the curtain is engaged nothing dispatches —
+    /// the caller has already drained every raw latch, so nothing backs up.
+    fn route_chrome_input(&mut self, input: &construct::ChromeInput) {
+        if self.curtain.engaged() {
+            return;
+        }
+        self.construct.dispatch(input);
+        if self
+            .construct
+            .take_intent(construct::ChromeIntent::Spotlight)
+        {
+            self.toggle_front_door_panel();
+        }
+    }
+
+    /// WL-UX-006/U09 — the five Construct chrome mount slots, called in
+    /// z-order (bottom→top): springboard → status bar → switcher →
+    /// notification center → control center. Each is the reserved, reachable
+    /// mount point its unit (U10/U11/U12/U15/U13) lands into as a NEW FILE —
+    /// this list and the slots' intent consumption are the whole `main.rs`
+    /// contract, so the five fan-out units never touch this file again. The
+    /// Front Door, KIRON OSD, OSK, and curtain floats mount after (above) all
+    /// of these in `render`.
+    fn mount_construct_chrome(&mut self, ctx: &egui::Context) {
+        self.mount_springboard_slot(ctx);
+        self.mount_status_bar_slot(ctx);
+        self.mount_switcher_slot(ctx);
+        self.mount_notification_center_slot(ctx);
+        self.mount_control_center_slot(ctx);
+    }
+
+    /// U10 lands the springboard here (the home grid, §2.2 — the persistent
+    /// base, no open flag). Until then the Home intent routes to the closest
+    /// existing behavior: collapse to the session view, the very view the
+    /// springboard replaces in U10/U29.
+    fn mount_springboard_slot(&mut self, _ctx: &egui::Context) {
+        if self.construct.take_intent(construct::ChromeIntent::Home) {
+            self.nav.expanded = false;
+        }
+    }
+
+    /// U11 lands the slim top status bar here (Q12 — persistent chrome, no
+    /// open flag, so no intent to consume). Its clock / right-cluster clicks
+    /// will PUSH `NotificationCenter` / `ControlCenter` intents into the same
+    /// `construct` queue — the §2.3 pointer rows — not a second dispatch path.
+    fn mount_status_bar_slot(&mut self, _ctx: &egui::Context) {}
+
+    /// U12 lands the app switcher here (Q16 — the snapshot-preview card grid).
+    /// Until then the Switcher intent toggles the observable open flag; the
+    /// dual-routed SessionSwitch fallback in `render` keeps sessions reachable.
+    fn mount_switcher_slot(&mut self, _ctx: &egui::Context) {
+        if self
+            .construct
+            .take_intent(construct::ChromeIntent::Switcher)
+        {
+            self.construct.switcher_open = !self.construct.switcher_open;
+        }
+    }
+
+    /// U15 lands the Notification Center here (Q14 — the grouped pull-down
+    /// over the toast plumbing). Until then the intent toggles the open flag.
+    fn mount_notification_center_slot(&mut self, _ctx: &egui::Context) {
+        if self
+            .construct
+            .take_intent(construct::ChromeIntent::NotificationCenter)
+        {
+            self.construct.notification_center_open = !self.construct.notification_center_open;
+        }
+    }
+
+    /// U13 lands the Control Center here (Q13 — the scrim sheet replacing
+    /// every tray flyout; topmost Construct chrome). Until then the intent
+    /// toggles the open flag.
+    fn mount_control_center_slot(&mut self, _ctx: &egui::Context) {
+        if self
+            .construct
+            .take_intent(construct::ChromeIntent::ControlCenter)
+        {
+            self.construct.control_center_open = !self.construct.control_center_open;
         }
     }
 
@@ -1923,27 +2022,56 @@ impl Shell {
             self.system.set_formfactor(formfactor);
         }
 
-        // SURFACE-11 (lock 16): a swipe from the left/bottom edge reveals the shell body
-        // (the dock / tablet bar). Drained from the seat's gesture side channel; empty
-        // on the windowed fallback, so the reveal self-gates to the real DRM seat.
-        for edge in mde_egui::drain_edge_swipes() {
-            // CURTAIN-1 (lock 10): the drain always runs (the side channel must
-            // not back up), but a swipe acts on the nav only past the curtain.
-            if matches!(edge, mde_egui::Edge::Left | mde_egui::Edge::Bottom)
-                && !self.curtain.engaged()
-            {
-                self.nav.expanded = true;
-            }
+        // WL-UX-006/U09 — THE system input contract (PLATFORM-INTERFACES §2.3,
+        // Q11): one contract table, ONE drain site. The SURFACE-11 (lock 16)
+        // edge-swipe side channel is drained HERE and nowhere else, then folded
+        // — together with the Super tap and the Super+Tab chord below — through
+        // the `construct` dispatcher into typed `ChromeIntent`s the five chrome
+        // mount slots consume (`mount_construct_chrome`). The drain always runs
+        // (the side channel must not back up); intents are swallowed while the
+        // curtain is engaged inside `route_chrome_input` (CURTAIN-1, lock 10).
+        // A top pull's x rides the frame's synthesized primary-contact pointer
+        // position (SURFACE-8 emits `PointerMoved` for the primary touch); no
+        // fix → `None`, and the pull resolves to the wider Notification Center
+        // target, honestly.
+        let pointer_x_frac = ctx.input(|i| i.pointer.latest_pos()).and_then(|pos| {
+            let width = ctx.screen_rect().width();
+            (width > 0.0).then(|| (pos.x / width).clamp(0.0, 1.0))
+        });
+        let edges: Vec<construct::EdgeSwipe> = mde_egui::drain_edge_swipes()
+            .into_iter()
+            .map(|edge| construct::EdgeSwipe {
+                edge,
+                x_frac: pointer_x_frac,
+            })
+            .collect();
+        // SURFACE-11 legacy leg — the LEFT-edge dock/tablet-bar reveal stays
+        // until the U29 cutover retires the hot edge; §2.3 assigns Left no
+        // intent, so it is handled inline at this same (single) drain site.
+        // The old Bottom half of this reveal is superseded: bottom-edge swipe
+        // now means Home through the dispatcher (§2.3 row 1).
+        if !self.curtain.engaged() && edges.iter().any(|s| s.edge == mde_egui::Edge::Left) {
+            self.nav.expanded = true;
         }
 
         let host_keys = mde_egui::hostkeys::drain_host_keys();
         let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
+        let mut super_tab = false;
         for action in self.hotkeys.dispatch(&host_keys, &presses) {
             // CURTAIN-1 (lock 10): while the curtain is engaged NO chord acts on
             // the seat or the nav. The dispatch itself still runs so the router's
             // leader latch tracks Super press/release across the lock; every
             // matched action is swallowed until the curtain lifts.
             if !self.curtain.engaged() {
+                // U09 — Super+Tab (the fixed table's SessionSwitch chord) is
+                // ALSO the §2.3 Switcher chord. Dual-routed for now: the
+                // existing session-to-front behavior stays live below while the
+                // Switcher intent makes the scaffold state observable; U12
+                // lands the switcher surface and the U29 cutover retires the
+                // SessionSwitch fallback leg.
+                if action == HotkeyAction::SessionSwitch {
+                    super_tab = true;
+                }
                 self.apply_hotkey(action);
             }
         }
@@ -1953,13 +2081,31 @@ impl Shell {
             }
         }
         // A clean Super *tap* (press+release with no leader chord used in
-        // between) opens/closes the unified Front Door launcher. Always DRAINED
-        // so the router's latch never backs up; but, like every chord above,
-        // swallowed while the curtain is engaged (lock 10).
-        if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
-            self.toggle_front_door_panel();
-        }
+        // between). Always DRAINED so the router's latch never backs up; the
+        // §2.3 contract resolves its overload deterministically in the
+        // dispatcher: Home while an app is expanded, Spotlight (the Front Door
+        // toggle) on home. Swallowed while the curtain is engaged (lock 10),
+        // like every chord above.
+        let super_tap = self.hotkeys.take_dock_toggle();
+        let chrome_input = construct::ChromeInput {
+            super_tap,
+            super_tab,
+            app_expanded: self.nav.expanded,
+            // The same `full_screen_remote_desktop` condition `central_view`
+            // computes — a focused session arms the §2.3 edge-dwell guard.
+            remote_session_focused: self.nav.surface == Surface::Desktop
+                && self.vdi.requested_target().is_some(),
+            edges,
+            now: self.construct.now(),
+        };
+        self.route_chrome_input(&chrome_input);
         self.apply_car_keyboard_routes(ctx);
+
+        // WL-UX-006/U09 — the five Construct chrome mount slots, in z-order
+        // (bottom→top). Mounted after the input routing above so each slot
+        // consumes THIS frame's intents, and before the Front Door / OSD / OSK
+        // / curtain floats, which stay above all Construct chrome.
+        self.mount_construct_chrome(ctx);
 
         // SEARCH-omnibox — mounted after hotkey dispatch so Super+Space opens and
         // focuses it in the same frame, above the active surface and taskbar.
@@ -3140,7 +3286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        car_home, car_keymap, chat, complete_menu_bar_minimize, console, datacenter,
+        car_home, car_keymap, chat, complete_menu_bar_minimize, console, construct, datacenter,
         desktop_reconnect_should_query_recents, dock, files_panel, front_door,
         front_door_peer_apps, install_layout_mode_button_accessibility,
         install_layout_profile_row_accessibility, launcher_pins,
@@ -5037,6 +5183,7 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
 
         let actions = shell.hotkeys.dispatch(
             &[
@@ -5054,13 +5201,247 @@ mod tests {
         for action in actions {
             shell.apply_hotkey(action);
         }
-        if shell.hotkeys.take_dock_toggle() {
-            shell.toggle_front_door_panel();
-        }
+        // WL-UX-006/U09 rerouted the render wiring: the drained Super tap now
+        // flows through the §2.3 contract dispatcher, where on home (the fresh
+        // shell — nothing expanded) it resolves to Spotlight = the Front Door
+        // toggle. Asserted through the SAME path `render` drives.
+        let input = construct::ChromeInput {
+            super_tap: shell.hotkeys.take_dock_toggle(),
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
 
         assert!(
             shell.front_door.is_open(),
             "a non-button launcher entry must use the same Front Door owner"
+        );
+    }
+
+    // --- WL-UX-006/U09 — the Construct input contract at the shell seam ----------
+
+    /// A quiet decoded frame for [`Shell::route_chrome_input`], mirroring how
+    /// `render` builds it (`app_expanded` reads the live nav; nothing else set).
+    fn chrome_input(shell: &Shell) -> construct::ChromeInput {
+        construct::ChromeInput {
+            super_tap: false,
+            super_tab: false,
+            app_expanded: shell.nav.expanded,
+            remote_session_focused: false,
+            edges: Vec::new(),
+            now: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn super_tap_with_an_app_expanded_routes_home_and_collapses() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+
+        let input = construct::ChromeInput {
+            super_tap: true,
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+
+        assert!(
+            !shell.nav.expanded,
+            "§2.3: Super tap over an expanded app means Home — collapse to the \
+             session view until the U10 springboard replaces it"
+        );
+        assert!(
+            !shell.front_door.is_open(),
+            "Home is not Spotlight — the Super overload resolves on app_expanded"
+        );
+    }
+
+    #[test]
+    fn super_tap_on_home_toggles_the_front_door_spotlight() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        assert!(!shell.nav.expanded, "a fresh shell starts on the home base");
+
+        let input = construct::ChromeInput {
+            super_tap: true,
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(
+            shell.front_door.is_open(),
+            "§2.3: Super tap on home means Spotlight — the Front Door engine"
+        );
+
+        let input = construct::ChromeInput {
+            super_tap: true,
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(
+            !shell.front_door.is_open(),
+            "a second on-home tap closes it — the toggle survives the reroute"
+        );
+    }
+
+    #[test]
+    fn super_tab_toggles_the_switcher_open_flag() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+
+        let input = construct::ChromeInput {
+            super_tab: true,
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(
+            shell.construct.switcher_open,
+            "§2.3: Super+Tab means Switcher — observable state until U12 lands"
+        );
+
+        let input = construct::ChromeInput {
+            super_tab: true,
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(
+            !shell.construct.switcher_open,
+            "a second chord toggles closed"
+        );
+    }
+
+    #[test]
+    fn a_bottom_edge_swipe_now_routes_home_replacing_the_old_taskbar_reveal() {
+        // The pre-U09 drain expanded the shell body on a Bottom swipe (the
+        // SURFACE-11 taskbar reveal). §2.3 reassigns Bottom to Home, so this
+        // asserts the REROUTED behavior honestly: the swipe now COLLAPSES an
+        // expanded app to the session/home base. The Left-edge legacy reveal
+        // survives inline at the render drain site until the U29 cutover.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+
+        let input = construct::ChromeInput {
+            edges: vec![construct::EdgeSwipe {
+                edge: mde_egui::Edge::Bottom,
+                x_frac: Some(0.5),
+            }],
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+
+        assert!(
+            !shell.nav.expanded,
+            "§2.3 row 1: bottom-edge swipe up means Home, not the old reveal"
+        );
+    }
+
+    #[test]
+    fn top_edge_pulls_split_by_x_into_the_two_overlay_flags() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+
+        // Right third → Control Center (§2.3: "top-right pull-down").
+        let input = construct::ChromeInput {
+            edges: vec![construct::EdgeSwipe {
+                edge: mde_egui::Edge::Top,
+                x_frac: Some(0.9),
+            }],
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(shell.construct.control_center_open);
+        assert!(!shell.construct.notification_center_open);
+
+        // Left/center → Notification Center (§2.3: "top-left/center pull-down").
+        let input = construct::ChromeInput {
+            edges: vec![construct::EdgeSwipe {
+                edge: mde_egui::Edge::Top,
+                x_frac: Some(0.3),
+            }],
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(shell.construct.notification_center_open);
+    }
+
+    #[test]
+    fn chrome_intents_are_swallowed_while_the_curtain_is_engaged() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain.lock();
+
+        let input = construct::ChromeInput {
+            super_tap: true,
+            super_tab: true,
+            edges: vec![construct::EdgeSwipe {
+                edge: mde_egui::Edge::Top,
+                x_frac: Some(0.9),
+            }],
+            ..chrome_input(&shell)
+        };
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+
+        assert!(
+            !shell.front_door.is_open()
+                && !shell.construct.switcher_open
+                && !shell.construct.control_center_open,
+            "CURTAIN-1 (lock 10): no chrome intent acts past the lock"
+        );
+    }
+
+    #[test]
+    fn over_a_focused_remote_session_edges_need_a_second_confirm_swipe() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell.nav.expanded = true;
+
+        let bottom = |shell: &Shell, now| construct::ChromeInput {
+            remote_session_focused: true,
+            edges: vec![construct::EdgeSwipe {
+                edge: mde_egui::Edge::Bottom,
+                x_frac: Some(0.5),
+            }],
+            now,
+            ..chrome_input(shell)
+        };
+
+        // First swipe over the focused session: arms only (§2.3 dwell guard).
+        let input = bottom(&shell, std::time::Duration::ZERO);
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(
+            shell.nav.expanded,
+            "the first edge swipe over a focused session must not fire"
+        );
+
+        // Second same-edge swipe within the window: confirms and goes Home.
+        let input = bottom(&shell, std::time::Duration::from_millis(200));
+        shell.route_chrome_input(&input);
+        shell.mount_construct_chrome(&ctx);
+        assert!(
+            !shell.nav.expanded,
+            "the second confirm swipe within the window fires the intent"
         );
     }
 
