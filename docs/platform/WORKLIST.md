@@ -778,6 +778,14 @@ These decisions refine acceptance and sequencing for the active items below.
 - Origin or merged source IDs: operator 50-Q survey 2026-07-22 (ADR-0006);
   supersedes auto-mode-sync3.md as Car design authority (palette tokens
   survive); stale-telemetry fix hoisted per survey Q33.
+- Honesty follow-ups (noted by the U27 strip unit, 2026-07-22): the speedometer
+  and SPEED tiles are now live-gated (dash unless the mirror's confidence label
+  is the live vehicle-gateway one), but the other seeded telemetry tiles (RPM,
+  coolant, battery, ...) still present the simulated Interceptor profile
+  ungated (the TELEMETRY tile does label it "simulated CAN/OBD profile"); and a
+  live mirror going quiet is surfaced by TELEM AGE but does not re-dash the
+  speed. If Q33 honesty is to be absolute per-tile, that is a follow-up unit
+  touching the cockpit Vehicle-tab expectations too.
 
 ## Performance
 
