@@ -32,6 +32,7 @@ use mde_egui::{OsdLevel, Severity, Tier, Toast, ToastHost};
 use serde::Deserialize;
 
 use crate::dock::Surface;
+use crate::notification_center::NotificationRing;
 use crate::workbench::Plane;
 
 /// The typed Bus lane any node / worker raises an alert on (lock 7). Flat — the
@@ -303,6 +304,13 @@ pub(crate) struct ToastBridge {
     /// error streak rather than every `REFRESH` tick (the poll cadence would else
     /// spam journald). Reset on the next successful read.
     read_error_logged: bool,
+    /// WL-UX-006/U13 (PLATFORM-INTERFACES Q14) — the Notification Center's
+    /// grouped-history ring: every alert this bridge decodes/raises is recorded
+    /// here, INCLUDING ones DND/focus-mute hid from the ambient push
+    /// (suppression governs the push + sound, never the history — the iOS
+    /// Notification Center semantic). A pure presentation data tap; the
+    /// queue/sound policy in [`Self::admit`] is untouched.
+    history: NotificationRing,
 }
 
 impl Default for ToastBridge {
@@ -316,6 +324,7 @@ impl Default for ToastBridge {
             suppress: Suppress::default(),
             chime: Box::new(SystemChime),
             read_error_logged: false,
+            history: NotificationRing::default(),
         }
     }
 }
@@ -453,12 +462,28 @@ impl ToastBridge {
             self.host.enqueue(toast);
             return;
         };
+        // U13 (Q14) — record BEFORE the suppression fold: DND hides the push,
+        // never the history (the Notification Center is where a muted alert is
+        // found later). Pure data tap; nothing below changes.
+        self.history
+            .record(severity, &toast.source_host, &toast.flag, &toast.headline);
         if self.suppress.hides_ambient_push(severity) {
             return;
         }
         if !self.suppress.hushes_sound(severity) {
             self.chime.ring(severity);
         }
+    }
+
+    /// U13 — the Notification Center's retained alert history (read side).
+    pub(crate) const fn history(&self) -> &NotificationRing {
+        &self.history
+    }
+
+    /// U13 — the Notification Center's clear-all / per-group clear seam. Clears
+    /// only this shell-local ring — no new ack semantics ride the Bus.
+    pub(crate) const fn history_mut(&mut self) -> &mut NotificationRing {
+        &mut self.history
     }
 }
 
@@ -573,6 +598,21 @@ mod tests {
         b.admit(decode(&body("warning", "a", "build failed")).unwrap());
         assert!(b.host.is_idle(), "notification popups stay retired");
         assert!(rec.0.borrow().is_empty(), "but no sound fired");
+    }
+
+    #[test]
+    fn every_alert_lands_in_the_notification_history_even_under_dnd() {
+        // U13 (Q14): suppression hides the ambient push + sound, never the
+        // history — a DND'd alert is found in the Notification Center later.
+        let rec = Recorder::default();
+        let mut b = bridge_with(&rec);
+        b.set_suppression(true, false, false);
+        b.admit(decode(&body("info", "a", "fyi")).unwrap());
+        b.admit(decode(&body("critical", "lh1", "intrusion")).unwrap());
+        assert_eq!(b.history().len(), 2, "both alerts retained");
+        assert!(rec.0.borrow().len() <= 1, "suppression policy unchanged");
+        b.history_mut().clear();
+        assert!(b.history().is_empty(), "clear-all empties the shell ring");
     }
 
     #[test]

@@ -17,8 +17,11 @@
 //!   level channel. Time is **injected** ([`ToastHost::tick`] takes the elapsed
 //!   delta) — the model never reads a wall clock, so it is unit-tested without a GPU
 //!   or a clock.
-//! - [`ToastHost::chyron`] / [`ToastHost::osd`] — the legacy alert-band renderer
-//!   plus the active Carbon OSD pill over `Style` + `Motion`.
+//! - [`ToastHost::chyron`] / [`ToastHost::osd`] — the **HIG banner** renderer (a
+//!   top-center drop-in card — WL-UX-006/U13, PLATFORM-INTERFACES Q14: banners
+//!   ride this existing toast plumbing, presentation only; the queue/dwell state
+//!   machine is untouched) plus the active Carbon OSD pill over `Style` +
+//!   `Motion`.
 //!
 //! **Out of scope here (KIRON-2, shell-side):** the `event/toast/show` Bus lane, the
 //! notification sound, DND / focus-mute suppression, and executing an action's verb.
@@ -30,6 +33,9 @@ use std::time::Duration;
 
 use egui::{pos2, vec2, Align2, Color32, Context, FontFamily, FontId, Rect, Sense, Ui};
 
+use crate::carbon::paint_carbon;
+use crate::motion::Spring;
+use crate::style::Elevation;
 use crate::{Motion, Style};
 
 /// Default on-screen dwell for an [`Severity::Info`] chyron — short, low-friction.
@@ -79,6 +85,19 @@ impl Severity {
             Self::Info => Dwell::For(DWELL_INFO),
             Self::Warning => Dwell::For(DWELL_WARNING),
             Self::Critical => Dwell::UntilAck,
+        }
+    }
+
+    /// The Mackes-Carbon glyph this severity's banner / notification row paints
+    /// (WL-UX-006/U13 — PLATFORM-INTERFACES Q14). Every name resolves in the
+    /// curated [`crate::carbon`] registry (asserted in the tests); the painters
+    /// fall back to a plain severity dot if a name ever leaves it.
+    #[must_use]
+    pub const fn glyph_name(self) -> &'static str {
+        match self {
+            Self::Info => "notification",
+            Self::Warning => "dialog-warning",
+            Self::Critical => "process-stop",
         }
     }
 }
@@ -448,22 +467,32 @@ impl ToastHost {
 
     // ── renders (over Style + Motion) ─────────────────────────────────────────
 
-    /// Paint the lower-third alert chyron for the current alert (sliding in/out on
-    /// [`Motion::BASE`]) and return the clicked action verb, if any.
+    /// Paint the top-center **HIG banner** card for the current alert (a spring
+    /// drop in on [`Spring::SNAPPY`], a fade back out as the dwell expires —
+    /// WL-UX-006/U13, PLATFORM-INTERFACES Q14) and return the clicked action
+    /// verb, if any.
     ///
-    /// Side effects applied to the host: hover-pause is fed from the band's hover
+    /// Side effects applied to the host: hover-pause is fed from the card's hover
     /// state, a dismiss/acknowledge click is applied directly. The action verb is
     /// *reported* (KIRON-2 resolves it to navigation) — never executed here.
     pub fn chyron(&mut self, ctx: &Context) -> ChyronInteraction {
         let present = self.current.is_some();
-        let t = Motion::animate(ctx, CHYRON_ANIM_ID, present, Motion::BASE);
+        // The drop spring is seeded at 0 by every absent frame (this render runs
+        // each frame), so a fresh alert springs down from above the screen edge
+        // rather than popping in place.
+        let t = Motion::spring_to(
+            ctx,
+            CHYRON_ANIM_ID,
+            if present { 1.0 } else { 0.0 },
+            Spring::SNAPPY,
+        );
 
         // The toast to paint: the live one (also retained for its slide-out), or
         // the retained one while it eases away.
         let toast = if let Some(active) = &self.current {
             self.chyron_fade = Some(active.toast.clone());
             active.toast.clone()
-        } else if t > f32::EPSILON {
+        } else if t > BANNER_GONE {
             match &self.chyron_fade {
                 Some(faded) => faded.clone(),
                 None => return ChyronInteraction::default(),
@@ -479,7 +508,7 @@ impl ToastHost {
         egui::Area::new(egui::Id::new(CHYRON_AREA_ID))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                band = paint_chyron(ui, &toast, backlog, remaining, t);
+                band = paint_banner(ui, &toast, backlog, remaining, t);
             });
 
         self.set_hover(band.hovered);
@@ -522,8 +551,51 @@ impl ToastHost {
     }
 }
 
-/// Paint the lower-third alert band and return what its widgets reported.
-fn paint_chyron(
+// ── the HIG banner card (WL-UX-006/U13 — PLATFORM-INTERFACES Q14) ────────────
+
+/// The banner card's widest reading — narrower screens inset by [`Style::SP_L`].
+const BANNER_MAX_W: f32 = 520.0;
+/// The banner card height on the spacing ladder: a `TYPE_BODY` title line over a
+/// `TYPE_FOOTNOTE` detail line plus padding.
+const BANNER_H: f32 = Style::SP_XL + Style::SP_L;
+/// Resting gap between the banner card and the screen's top edge.
+const BANNER_MARGIN: f32 = Style::SP_M;
+/// Below this drop progress the banner is treated as gone — aligned with the
+/// [`Spring::settled`] epsilon, because an asymptoting spring never quite
+/// reaches `0.0` the way the old fixed-duration ease did.
+const BANNER_GONE: f32 = 0.02;
+/// The severity glyph's square plate, on the spacing ladder.
+const BANNER_GLYPH_PLATE: f32 = Style::SP_XL;
+
+/// The banner card's rect at drop progress `t`: `0` parks it fully above the
+/// screen, `1` rests it top-center ([`BANNER_MARGIN`] below the edge), and a
+/// spring's overshoot past `1` reads as the drop's bounce.
+fn banner_rect(screen: Rect, t: f32) -> Rect {
+    let w = (screen.width() - 2.0 * Style::SP_L).clamp(0.0, BANNER_MAX_W);
+    let x = screen.center().x - w / 2.0;
+    let parked = screen.top() - BANNER_H - Style::SP_L;
+    let resting = screen.top() + BANNER_MARGIN;
+    let y = (resting - parked).mul_add(t, parked);
+    Rect::from_min_size(pos2(x, y), vec2(w, BANNER_H))
+}
+
+/// The banner title face — [`Style::TYPE_BODY`], proportional (Q14 HIG type).
+fn banner_title_font() -> FontId {
+    FontId::new(Style::TYPE_BODY, FontFamily::Proportional)
+}
+
+/// The banner detail face — [`Style::TYPE_FOOTNOTE`], proportional.
+fn banner_detail_font() -> FontId {
+    FontId::new(Style::TYPE_FOOTNOTE, FontFamily::Proportional)
+}
+
+/// Paint the top-center HIG banner card and return what its widgets reported.
+///
+/// Presentation ONLY (U13): the queue, dedup, dwell, hover-pause, and
+/// Critical-ack semantics all live in [`ToastHost`] untouched — this reads a
+/// [`Toast`] and draws the Q14 banner (RADIUS_L card, Overlay elevation, Carbon
+/// severity glyph, TYPE_BODY title + TYPE_FOOTNOTE detail).
+fn paint_banner(
     ui: &mut Ui,
     toast: &Toast,
     backlog: usize,
@@ -534,80 +606,74 @@ fn paint_chyron(
         return BandOutcome::default();
     };
     let color = severity.color();
+    let alpha = t.clamp(0.0, 1.0);
 
     let screen = ui.ctx().screen_rect();
-    let band_h = Style::SP_XL + Style::SP_M;
-    let margin = Style::SP_L;
-    let slide = (1.0 - t) * (band_h + margin);
-    let band = Rect::from_min_size(
-        pos2(
-            screen.left() + margin,
-            screen.bottom() - band_h - margin + slide,
-        ),
-        vec2(margin.mul_add(-2.0, screen.width()).max(0.0), band_h),
-    );
-    let cy = band.center().y;
+    let card = banner_rect(screen, t);
+    let cy = card.center().y;
 
     // Independent clone of the painter so the widget `put`s below can borrow `ui`.
     let painter = ui.painter().clone();
-    painter.rect_filled(band, Style::RADIUS, Style::SURFACE);
-    // Severity-colored left accent bar + a matching source dot.
-    painter.rect_filled(
-        Rect::from_min_size(band.min, vec2(Style::SP_XS, band_h)),
-        Style::RADIUS,
-        color,
+    // Elevation: the shared Overlay shadow, faded with the drop.
+    let mut shadow = Elevation::Overlay.egui_shadow();
+    shadow.color = shadow.color.gamma_multiply(alpha);
+    painter.add(shadow.as_shape(card, Style::RADIUS_L));
+    painter.rect_filled(card, Style::RADIUS_L, Style::SURFACE.gamma_multiply(alpha));
+    painter.rect_stroke(
+        card,
+        Style::RADIUS_L,
+        egui::Stroke::new(1.0, Style::BORDER.gamma_multiply(alpha)),
+        egui::StrokeKind::Inside,
     );
-    let mut x = band.left() + Style::SP_S + Style::SP_M;
-    painter.circle_filled(pos2(x, cy), Style::SP_XS * 0.7, color);
-    x += Style::SP_M;
 
-    // The category flag chip (severity fill, background-colored text).
-    let flag_galley = painter.layout_no_wrap(
-        toast.flag.clone(),
-        FontId::new(Style::SMALL, FontFamily::Monospace),
-        Style::BG,
+    // Left: the Carbon severity glyph on a severity-tinted plate.
+    let plate = Rect::from_center_size(
+        pos2(card.left() + Style::SP_M + BANNER_GLYPH_PLATE / 2.0, cy),
+        vec2(BANNER_GLYPH_PLATE, BANNER_GLYPH_PLATE),
     );
-    let chip_w = flag_galley.size().x + Style::SP_S;
-    let chip = Rect::from_center_size(
-        pos2(x + chip_w / 2.0, cy),
-        vec2(chip_w, Style::SMALL + Style::SP_XS),
-    );
-    painter.rect_filled(chip, Style::RADIUS, color);
-    painter.galley(
-        pos2(chip.left() + Style::SP_XS, cy - flag_galley.size().y / 2.0),
-        flag_galley,
-        Style::BG,
-    );
-    x = chip.right() + Style::SP_M;
+    painter.rect_filled(plate, Style::RADIUS_S, color.gamma_multiply(0.18 * alpha));
+    if !paint_carbon(
+        &painter,
+        plate.shrink(Style::SP_XS),
+        severity.glyph_name(),
+        color.gamma_multiply(alpha),
+    ) {
+        // Registry miss: an honest severity dot rather than a blank plate.
+        painter.circle_filled(plate.center(), Style::SP_XS, color.gamma_multiply(alpha));
+    }
 
-    // Center: source host (dim) then the headline (primary).
-    let host_galley = painter.layout_no_wrap(
-        toast.source_host.clone(),
-        FontId::new(Style::BODY, FontFamily::Monospace),
-        Style::TEXT_DIM,
-    );
-    let host_w = host_galley.size().x;
-    painter.galley(
-        pos2(x, cy - host_galley.size().y / 2.0),
-        host_galley,
-        Style::TEXT_DIM,
-    );
-    x += host_w + Style::SP_S;
-    painter.text(
-        pos2(x, cy),
-        Align2::LEFT_CENTER,
+    // Center: the TYPE_BODY headline over a TYPE_FOOTNOTE `source · flag`
+    // detail, clipped to the card (the old full-width band never truncated).
+    let clipped = painter.with_clip_rect(card);
+    let text_left = plate.right() + Style::SP_M;
+    clipped.text(
+        pos2(text_left, cy - Style::SP_XS / 2.0),
+        Align2::LEFT_BOTTOM,
         &toast.headline,
-        FontId::new(Style::BODY, FontFamily::Monospace),
-        Style::TEXT,
+        banner_title_font(),
+        Style::TEXT.gamma_multiply(alpha),
+    );
+    let detail = match (toast.source_host.is_empty(), toast.flag.is_empty()) {
+        (false, false) => format!("{} · {}", toast.source_host, toast.flag),
+        (false, true) => toast.source_host.clone(),
+        (true, false) => toast.flag.clone(),
+        (true, true) => String::new(),
+    };
+    clipped.text(
+        pos2(text_left, cy + Style::SP_XS / 2.0),
+        Align2::LEFT_TOP,
+        detail,
+        banner_detail_font(),
+        Style::TEXT_DIM.gamma_multiply(alpha),
     );
 
     // Right: dismiss/ack button, optional action button, then countdown + "N more".
-    paint_chyron_controls(ui, &painter, band, toast, backlog, remaining)
+    paint_banner_controls(ui, &painter, card, toast, backlog, remaining)
 }
 
-/// Paint the band's right-hand controls (dismiss/acknowledge + optional action +
-/// countdown/"N more") and report the interaction, including band hover.
-fn paint_chyron_controls(
+/// Paint the card's right-hand controls (dismiss/acknowledge + optional action +
+/// countdown/"N more") and report the interaction, including card hover.
+fn paint_banner_controls(
     ui: &mut Ui,
     painter: &egui::Painter,
     band: Rect,
@@ -617,8 +683,8 @@ fn paint_chyron_controls(
 ) -> BandOutcome {
     let critical = matches!(toast.tier, Tier::Alert(Severity::Critical));
     let cy = band.center().y;
-    let btn_h = band.height() - Style::SP_S;
-    let btn_w = Style::SP_XL * 3.0;
+    let btn_h = band.height() - Style::SP_M;
+    let btn_w = Style::SP_XL * 2.6;
     let mut rx = band.right() - Style::SP_M;
     let mut out = BandOutcome::default();
 
@@ -633,7 +699,7 @@ fn paint_chyron_controls(
     );
     let dismiss_resp = ui.put(
         dz,
-        egui::Button::new(egui::RichText::new(label).size(Style::SMALL)),
+        egui::Button::new(egui::RichText::new(label).size(Style::TYPE_FOOTNOTE)),
     );
     if dismiss_resp.clicked() {
         if is_ack {
@@ -653,7 +719,7 @@ fn paint_chyron_controls(
             az,
             egui::Button::new(
                 egui::RichText::new(&action.label)
-                    .size(Style::SMALL)
+                    .size(Style::TYPE_FOOTNOTE)
                     .color(Style::BG),
             )
             .fill(Style::ACCENT),
@@ -674,11 +740,12 @@ fn paint_chyron_controls(
         meta.push(format!("{backlog} more"));
     }
     if !meta.is_empty() {
+        // Monospace footnote keeps the counting-down digits stable-width.
         painter.text(
             pos2(rx - Style::SP_S, cy),
             Align2::RIGHT_CENTER,
             meta.join("  ·  "),
-            FontId::new(Style::SMALL, FontFamily::Monospace),
+            FontId::new(Style::TYPE_FOOTNOTE, FontFamily::Monospace),
             Style::TEXT_DIM,
         );
     }
@@ -1043,5 +1110,47 @@ mod tests {
             !prims.is_empty(),
             "the centered OSD pill produced no geometry when flashing"
         );
+    }
+
+    // ── the HIG banner presentation (WL-UX-006/U13 — PLATFORM-INTERFACES Q14) ─
+
+    #[test]
+    fn banner_severity_glyphs_resolve_in_the_carbon_registry() {
+        for severity in [Severity::Info, Severity::Warning, Severity::Critical] {
+            assert!(
+                crate::carbon::carbon_svg_bytes(severity.glyph_name()).is_some(),
+                "{severity:?} banner glyph '{}' left the curated Carbon registry",
+                severity.glyph_name(),
+            );
+        }
+    }
+
+    #[test]
+    fn banner_rests_top_center_and_parks_above_the_screen() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(1280.0, 720.0));
+        let rest = banner_rect(screen, 1.0);
+        assert!(
+            (rest.center().x - screen.center().x).abs() < 0.5,
+            "the banner rests top-CENTER"
+        );
+        assert!((rest.top() - (screen.top() + BANNER_MARGIN)).abs() < f32::EPSILON);
+        assert!(rest.width() <= BANNER_MAX_W);
+        let parked = banner_rect(screen, 0.0);
+        assert!(
+            parked.bottom() <= screen.top(),
+            "t = 0 parks the card fully above the screen for the drop-in"
+        );
+        // A spring's overshoot past 1 reads as the bounce: below resting.
+        assert!(banner_rect(screen, 1.1).top() > rest.top());
+        // A narrow screen insets rather than overflowing.
+        let narrow = Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0));
+        assert!(banner_rect(narrow, 1.0).width() <= narrow.width() - 2.0 * Style::SP_L);
+    }
+
+    #[test]
+    fn banner_type_reads_body_over_footnote() {
+        // Q14: the HIG type ladder — TYPE_BODY title over TYPE_FOOTNOTE detail.
+        assert_eq!(banner_title_font().size, Style::TYPE_BODY);
+        assert_eq!(banner_detail_font().size, Style::TYPE_FOOTNOTE);
     }
 }

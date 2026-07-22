@@ -59,6 +59,7 @@ mod lock_signal;
 mod logging;
 mod mesh_view;
 mod network;
+mod notification_center;
 mod pam_auth;
 mod phones_hub;
 mod power_honor;
@@ -1212,15 +1213,16 @@ impl Shell {
         }
     }
 
-    /// U15 lands the Notification Center here (Q14 — the grouped pull-down
-    /// over the toast plumbing). Until then the intent toggles the open flag.
-    fn mount_notification_center_slot(&mut self, _ctx: &egui::Context) {
-        if self
-            .construct
-            .take_intent(construct::ChromeIntent::NotificationCenter)
-        {
-            self.construct.notification_center_open = !self.construct.notification_center_open;
-        }
+    /// WL-UX-006/U13 (the scaffold's U15 slot) — the Notification Center
+    /// (Q14): one call into `notification_center::mount`, which consumes the
+    /// intent, owns the open flag, and paints the grouped pull-down.
+    fn mount_notification_center_slot(&mut self, ctx: &egui::Context) {
+        notification_center::mount(
+            ctx,
+            &mut self.construct,
+            &mut self.toasts,
+            self.notify_status.segments(),
+        );
     }
 
     /// U12 landed the Control Center here (Q13 — the top-right tile overlay
