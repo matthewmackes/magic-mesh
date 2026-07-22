@@ -6,16 +6,27 @@
 
 | Subsystem | Rows | Replace | Retire | Open Qs |
 |---|---|---|---|---|
-| Chat / Messaging | 75 | 74 | 1 | 7 |
-| Voice / Calls / SIP | 75 | 59 | 16 | 10 |
-| Editor | 96 | 80 | 16 | 8 |
-| File manager | 87 | 84 | 3 | 8 |
-| Transfers | 75 | 74 | 1 | 7 |
-| Alerts / Notifications | 66 | 62 | 4 | 8 |
-| Clipboard sync | 45 | 44 | 1 | 8 |
-| **Total** | **519** | **477** | **42** | **56** |
+| Chat / Messaging | 75 | 74 | 1 | 0 |
+| Voice / Calls / SIP | 75 | 59 | 16 | 0 |
+| Editor | 96 | 80 | 16 | 0 |
+| File manager | 87 | 84 | 3 | 0 |
+| Transfers | 75 | 74 | 1 | 0 |
+| Alerts / Notifications | 66 | 62 | 4 | 0 |
+| Clipboard sync | 45 | 44 | 1 | 0 |
+| **Total** | **519** | **477** | **42** | **0** |
 
-**519 capabilities catalogued.** 477 map to a Communications replacement, 42 are explicit surveyed retirements, 56 open questions need an operator decision before their rows can close (consolidated at the end).
+**519 capabilities catalogued.** 477 map to a Communications replacement, 42 are explicit surveyed retirements. All 56 consolidated open questions are now RESOLVED (see **Decisions — 2026-07-21** below and the per-question `→ RESOLVED` rulings at the end); the epic's zero-open-rows gate is met, pending the two operator-signoff flags called out in the Decisions note.
+
+## Decisions — 2026-07-21
+
+**All 56 consolidated open questions are CLOSED.** Rulings were produced by the completed 7-agent decision workflow (code-grounded, one verdict + rationale + cutover actions per question) and are recorded inline against each question in the **Consolidated open questions** section below as `→ RESOLVED — <token>`. Ruling distribution: **replace-in-communications 20, keep-as-is 16, build-new 9, retire 8, defer-followup 3**.
+
+Two items are flagged for **operator final signoff** before their cutover actions execute:
+
+- **Q9 — RETIRE the Kamailio/RTPengine VV mesh-PBX stack** (operator-confirmed dead per the epic direction). This is a large, live-spawned removal: `mde-voice-config` crate + snapshots, `mackesd::voice` (best_path/pick_relay) + `voice/materialize`, the `voice_config` worker + its spawn/registration, the `voice render-config` CLI, and the `kamailio-mde` / `rtpengine-mde` systemd units. The pure-Rust softphone (mde-voice-hud) + WebRTC/LiveKit path in Communications Calls never touches it. Verify no live seat still runs the kamailio-mde/rtpengine-mde daemons for real SIP before deploy.
+- **Q26 — KEEP the POSIX file manager (`Surface::Files` / mde-files + mde-files-egui) as its own OS surface** — it is orthogonal to a communications suite, NOT a competing comms surface; do NOT dissolve it into the collab stack. The `build-new` work is to finally surface the design-lock-1 POSIX ops (rename/mkdir/new-file/duplicate/compress/extract, symlink/hardlink) over the already-complete `OpKind`/`archive.rs` engine on that surface. Flagged for operator confirmation of the keep-as-its-own-surface disposition.
+
+The remaining `defer-followup` rulings (Q15 SIP agent-path binding, Q21 per-document co-edit share-session UI, Q25 DRM platform clipboard provider) are genuinely downstream-gated and tracked as their own units; they do not block cutover parity.
 
 ## Surveyed retirements (explicit — nothing silent)
 
@@ -707,58 +718,170 @@ The magic-mesh "Clipboard sync" subsystem is three independent-but-overlapping l
 These gate specific rows; the epic cannot reach zero-open-rows until they're answered.
 
 1. **[Chat / Messaging]** Message edit/delete is NET-NEW: the current chat ring is append-only with NO edit or delete of a sent message. Communications adds an author-only 5-minute edit/delete window (WL messaging lock 1). Confirm there is no hidden edit/delete path to preserve (survey found none) - this is an addition, not a parity migration.
+
+    **-> RESOLVED - build-new:edit-delete-window.** Author-only 5-min edit/delete is net-new and ALREADY built in mde-collab-types (EditMessage/DeleteMessage + EditWindowExpired/TargetDeleted tombstones); no hidden append-only path to migrate.
 2. **[Chat / Messaging]** alert:<host> conversations and the aggregate Notifications lane are FORWARD-ONLY / non-durable (rehydrated from the Bus each run, ack/snooze are session-local). Communications requires a durable alert inbox with history-until-deletion. Operator decision: is there any alert history to migrate, or does durable alerting start fresh at cutover?
+
+    **-> RESOLVED - build-new:durable-alert-inbox.** alert:<host> rings were never persisted (forward-only), so durable alerting starts FRESH at cutover; the AlertInbox is already built and folds Bus alerts into the node System space.
 3. **[Chat / Messaging]** Remote Control (RemoteAction / action/vdi/session) hands off to the separate VDI desktop subsystem, not a media call. Should it fold into Communications Calls (screen/remote handoff on the call bar) or stay a distinct VDI surface hand-off? (Row proposes Calls provisionally.)
+
+    **-> RESOLVED - replace-in-communications:Calls.** CallKind::RemoteDesktop/ScreenShare already exist; Calls becomes the launch/re-launch affordance while the VDI broker (action/vdi/session) stays a distinct hand-off target.
 4. **[Chat / Messaging]** The Conversation ring is a bounded cap-500 evict-oldest window (mde-chat DEFAULT_CAPACITY). Communications keeps history until explicit deletion. Confirm migration imports the full current ring window per key (older-than-500 messages were already evicted and are unrecoverable - acceptable data-loss boundary?).
+
+    **-> RESOLVED - replace-in-communications:Messages.** Import each key's current <=500 ring window into the durable per-space timeline; >500-evicted messages are already unrecoverable at source (accepted data-loss boundary); one-time migrator to build.
 5. **[Chat / Messaging]** Two distinct DND concepts exist: per-seat manual-presence DND (NotifyPrefs/Presence::Dnd, gossiped) and the fleet-wide mde_bus::dnd toggle written by the Notifications pane. Operator decision on whether Communications unifies these into one DND control or keeps both semantics.
+
+    **-> RESOLVED - replace-in-communications:presence+Alerts.** Keep BOTH DND signals distinct — per-seat presence DND -> presence projection/local ring gate, fleet-wide SetDoNotDisturb -> Alerts policy toggle; do NOT merge (collapsing destroys a real signal).
 6. **[Chat / Messaging]** The `notify` producer worker (CHAT-FIX-2) and the alert emitters on ALERT_LANE_PREFIXES are shared with the broader Notifications/health subsystem, not owned by chat. Confirm they are surveyed/owned by the Alerts parity track and only their fold logic moves into the collab worker (per governance 'existing emitters keep publishing').
+
+    **-> RESOLVED - keep-as-is:Alerts/health emitters.** The notify worker + ALERT_LANE_PREFIXES emitters are shared health infra and keep publishing unchanged; only the fold logic moves into the collab worker (drain_alert_lanes).
 7. **[Chat / Messaging]** System rooms (All Fleet + Critical/Warning/Info per-severity) are seeded, not persisted. Confirm their mapping: All Fleet -> a default Team space; per-severity rooms -> Alerts-mode saved filters rather than real spaces (to avoid three near-empty spaces).
+
+    **-> RESOLVED - replace-in-communications:Messages+Alerts.** All Fleet -> a default Team 'System' space (already seeded); Critical/Warning/Info -> Alerts-mode severity-threshold filters, not three near-empty spaces.
 8. **[Voice / Calls / SIP]** Does the Communications surface own the FLEET/Vitelity provisioning admin (the Fleet tab: provision, DID routing, failover, nicknames, inbound toggle, shared-outbound, cutover)? It is a leader/operator fleet-admin function distinct from a user placing a call — it could map to Communications Activity, move to a dedicated fleet/admin surface, or stay in mackesd-only. All Fleet-tab rows above assume Communications Activity provisionally.
+
+    **-> RESOLVED - build-new:fleet-voice-admin@Activity.** Add the Fleet/Vitelity provisioning admin panel under Communications Activity, reusing the unchanged voice_provision worker + action/voice/* verbs + state/voice/* topics (leader/operator function, not a per-user call).
 9. **[Voice / Calls / SIP]** Is the LEGACY Kamailio/RTPengine mesh-PBX stack dead? There are two parallel voice architectures: the pure-Rust softphone (mde-voice-hud, driven directly) vs the server-daemon stack (mde-voice-config generate → voice/materialize → voice-desired.json → voice_config worker → `mackesd voice render-config` → /etc/kamailio-mde + /etc/rtpengine-mde, with voice/mod best_path feeding dispatcher.list). The softphone does its own SIP and never touches Kamailio. If the VV stack is superseded, ~6 modules + their tests + snapshots + the voice render-config CLI + voice_config worker all retire; confirm before the cutover.
+
+    **-> RESOLVED - retire.** Kamailio/RTPengine VV server-daemon stack is DEAD (operator-confirmed) — Calls commits to WebRTC P2P + LiveKit SFU + a LiveKit SIP gateway reusing the softphone; delete mde-voice-config, mackesd::voice, voice_config worker, render-config CLI, kamailio/rtpengine units (high-risk live-spawned removal).
 10. **[Voice / Calls / SIP]** resolve.rs (1NNN mesh-extension + 9-prefix PSTN dial heuristic) and roster.rs (peers.toml loader) are both ORPHANED (no live caller; the egui surface uses looks_like_peer + reads the live directory / Bus). Confirm retirement, and decide whether Communications Calls wants the 1NNN-extension / 9-PSTN dialing scheme resolve.rs encodes, or the name/number scheme the live surface uses.
+
+    **-> RESOLVED - retire.** roster.rs (peers.toml loader) + resolve.rs (1NNN mesh-ext / 9-PSTN heuristic) are orphaned (no live caller); Calls keeps the name/number scheme via looks_like_peer + the live directory — delete both, no import.
 11. **[Voice / Calls / SIP]** In-call DTMF keypad and in-call microphone Mute are fully supported by mde-voice-hud::media (send_dtmf, set_muted) but the egui surface wires NEITHER. Should Communications Calls surface a DTMF keypad + Mute toggle (capabilities already exist), or intentionally omit them?
+
+    **-> RESOLVED - replace-in-communications:Calls.** The in-call DTMF keypad + Mute toggle are ALREADY built in calls.rs (SendDtmf/SetCallMuted); binding them to the real media seams is part of the marked media-plane follow-up, not a UI gap.
 12. **[Voice / Calls / SIP]** The VOIP-GW-1 mesh-wide SIP gateway responder (action/voip/set-gateway) still runs, but its documented publisher is the 'Workbench SIP Gateway panel' — the iced Workbench is retired. Who publishes set-gateway today, and where does gateway/account configuration live in Communications (Activity? a settings area)?
+
+    **-> RESOLVED - build-new:sip-gateway-config@Activity.** Build a mesh-wide SIP-gateway/account config control in Communications Activity publishing action/voip/{set,get,clear}-gateway; keep the serve_bus responder + gateway.toml contract unchanged; migrate the workgroup gateway.toml.
 13. **[Voice / Calls / SIP]** voip_rtt telemetry publishes voip/link-rtt/<peer> for an operator-explicit 'place via <peer>' route override, but auto-routing is off and no live UI wires the override. Build the link-quality/route view into Communications Activity, or retire the never-wired override (keeping or dropping the RTT worker + CLI accordingly)?
+
+    **-> RESOLVED - retire.** voip_rtt 'place via <peer>' route override was never wired and LiveKit SFU/WebRTC election supersedes manual per-peer routing — delete the worker + CLI + voip/link-rtt topic.
 14. **[Voice / Calls / SIP]** The external-SIP-provider onboarding (shell services_flow ServicePick::Voice → action/onboard/service-add → service_onboard register_voice) is a shell onboarding flow, not the voice surface. Does Communications take over external-SIP account setup, or does it stay in the general Add-Service onboarding? This overlaps with the gateway/account.toml config path.
+
+    **-> RESOLVED - keep-as-is:shell onboarding.** External-SIP setup stays in the general shell Add-Service wizard (services_flow/service_onboard register_voice, a modal not a surface); Communications Calls just consumes the resulting account.toml.
 15. **[Voice / Calls / SIP]** The VOIP-GW-4/7 split-account machinery (VoiceAccounts, load_accounts, run_agent_accounts, lift_if_legacy, shared-outbound, cutover) exists in the SIP core but the live egui worker only drives the single-account path (SipAccount::load + run_agent). Confirm whether Communications Calls should drive the split/shared-outbound-aware agent (run_agent_accounts) or keep the single-account path the surface uses today.
+
+    **-> RESOLVED - defer-followup.** Which SIP agent path Calls binds is media-plane-gated; firm recommendation is to drive run_agent_accounts (split/shared-outbound aware) with lift_if_legacy for flat->split, when the media leg lands — keep the VoiceAccounts machinery.
 16. **[Voice / Calls / SIP]** The car-layout HUD (CarKeyRoute::Voip on Num5/F5, the VoIP status tile) is an automotive UI variant. Is the car layout being retained (repoint to Communications Calls) or retired (drop the tile + key route)?
+
+    **-> RESOLVED - replace-in-communications:Calls.** The Ford SYNC-3 car layout is retained, so repoint CarTile::Phone/Voip + Num5/F5 CarKeyRoute::Voip + the car VoIP HUD tile from Surface::Voice to Surface::Communications (Calls mode) rather than drop them.
 17. **[Voice / Calls / SIP]** Confirm browser_voice_command (browser dictation/STT, action/browser/voice-command) is OUT OF SCOPE for the Communications Calls parity — it is a Browser-subsystem feature that only shares the word 'voice'. It is listed as a retire-from-this-ledger row so it is not silently conflated, but its real disposition belongs to the Browser parity work.
+
+    **-> RESOLVED - keep-as-is:Browser parity.** browser_voice_command (local STT dictation) shares only the word 'voice' and belongs to the Browser subsystem — remove the row from THIS ledger's scope; no code change here.
 18. **[Editor]** Code-IDE intelligence (LSP client + servers rust-analyzer/pylsp/typescript-language-server, goto-def/references/rename/format, code folding, symbol outline, tree-sitter grammars) has no native Communications mode. Does the operator want a full 'Documents' code-editing mode that carries these forward, or are they retired as out-of-scope for a communications suite? My ledger proposes retire for the deepest code-only pieces and flags them here — this single decision gates ~10 rows.
+
+    **-> RESOLVED - replace-in-communications:Documents.** STALE 'retire' proposal is contradicted by shipped code: Documents/Project (DocSubMode::Project) mounts the full mde-editor-egui EditorSurface incl LSP/fold/outline/highlight — code intelligence is CARRIED, not dropped; keep mde-editor-egui as a library, retire only the standalone Surface::Editor + binary.
 19. **[Editor]** Integrated PTY terminal dock (Ctrl+`, mde-term-egui): retire (a standalone Terminal surface already exists in the shell) or keep an embedded shell inside Documents mode?
+
+    **-> RESOLVED - replace-in-communications:Documents.** The integrated terminal rides the embedded EditorSurface in Documents/Project (Ctrl+` works embedded, terminal.rs reuses mde-term-egui); the shell's separate Surface::Terminal is a distinct subsystem, out of Editor scope.
 20. **[Editor]** The multi-document split-pane tree (Ctrl+\, Alt+arrows, draggable dividers, focus ring) — does Communications Documents keep side-by-side split editing, or collapse to single-pane tabs? Affects the pane/split/navigate rows.
+
+    **-> RESOLVED - replace-in-communications:Documents.** Multi-document tabs/splits are carried unchanged via the embedded EditorSurface (panes.rs + split tree) in Documents/Project — no collapse to single-pane.
 21. **[Editor]** The mesh co-editing stack is library-complete but its share-session panel UI never landed (no user-reachable 'share this document' today — only the Mesh Map badge observes the wire). Should the cutover (a) build the co-edit UI fresh inside Communications Calls, (b) keep it as an observed-only Activity feed, or (c) retire the unshipped UI entirely and keep only the CRDT/transport library? 'Parity' is ambiguous for a capability that is reachable as a protocol but not as a user action.
+
+    **-> RESOLVED - defer-followup.** Keep the proven CRDT/collab_session/follow LIBRARY (carried by the embedded editor); the per-document mesh co-edit share-session UI is an in-code Phase 3c follow-up at documents.rs:275 — do NOT retire, do NOT build it in Calls.
 22. **[Editor]** Communications-mode mapping ambiguity: co-editing spans Calls (live session), Activity (presence badges), Messages (peer roster/names) and Transfers (CRDT state-vector diff sync). Confirm the canonical home so the collab rows land in one mode rather than being split.
+
+    **-> RESOLVED - replace-in-communications:Documents.** Canonical home is Documents mode (shipped code wires the co-edit session onto the focused Documents/Project buffer); participant presence may mirror into Activity but the session/permissions/follow UI is Documents-owned — supersedes the provisional Calls mapping.
 23. **[Editor]** CUPS `lp` print/preview: does the Communications suite keep hardcopy printing (replace: Documents) or drop it (retire)? Same question for the RPM runtime deps hunspell/ripgrep/language-servers that the editor's features require.
+
+    **-> RESOLVED - keep-as-is:embedded editor.** CUPS lp print/preview is carried via the embedded editor; hunspell/hunspell-en-US/ripgrep are already RPM Requires and language servers stay soft/honest-gated (never hard Requires) — no package change.
 24. **[Editor]** The autosave preference file <config>/mcnf/editor-egui.json is the only persisted editor state to migrate. Does Communications import it, define a fresh unconditional-autosave policy, or drop the toggle? Confirms the migration-source disposition.
+
+    **-> RESOLVED - keep-as-is:embedded editor.** Documents reuses real_editor() -> the same panel/autosave.rs -> the identical <config>/mcnf/editor-egui.json path (off-by-default) — zero migration, nothing to import or redefine.
 25. **[Editor]** Clipboard: today Paste is an honest no-op on the DRM backend (no clipboard). Does the Communications Clipboard mode become the real clipboard provider these Cut/Copy/Paste actions route through, closing that gap as part of the cutover?
+
+    **-> RESOLVED - defer-followup.** The DRM Paste no-op is a shell/mde-egui platform-clipboard-provider gap, NOT the Clipboard mesh-history mode's job — wire a real DRM clipboard provider at the shell layer; keep Clipboard mode a mesh-history lane (do not route OS Cut/Copy/Paste through it).
 26. **[File manager]** rename / new-folder(mkdir) / new-file / symlink / hardlink / duplicate / compress / extract are fully implemented in the mde-files backend (FileOps + OpKind::Compress/Extract + archive.rs) but have NO reachable command in the shipped egui surface (menubar.rs even asserts New Folder/Rename are absent). Design lock 1 required full POSIX + archives. Must Communications Files/Transfers mode surface all of these (closing the gap), or does the operator ratify them as intentionally dropped? Silent-drop risk if unaddressed.
+
+    **-> RESOLVED - build-new:file-manager-posix-ops [NEEDS OPERATOR SIGNOFF].** Keep Surface::Files as its OWN OS surface (orthogonal to a comms suite, do NOT dissolve it into collab) and finally surface the lock-1 POSIX ops (rename/mkdir/new-file/duplicate/compress/extract, symlink/hardlink advanced) over the existing OpKind/archive.rs engine (retained either way); nothing WORKING is dropped since they never had reachable UI.
 27. **[File manager]** Pinnable bookmarks (design lock 21) were never built — the sidebar has only a fixed PLACES set plus Mesh peers. Does Communications Files mode add user-pinnable bookmarks, or is the lock-21 bookmark requirement retired?
+
+    **-> RESOLVED - build-new:file-manager-bookmarks.** Add a persisted user-bookmark store to the mde-files-egui Places sidebar (lock-21 gap never built) — small self-contained addition on the file-manager surface, not a migration.
 28. **[File manager]** Per-folder view+sort+show-hidden memory (FolderPrefs) is an in-memory HashMap, lost on restart, despite lock 20 saying 'view+sort persist per-folder'. Should Communications persist per-folder prefs durably (SQLite/config), or accept session-only?
+
+    **-> RESOLVED - build-new:file-manager-folderprefs-persist.** Serialize the in-memory FolderPrefs HashMap to a JSON config under <config>/mcnf on mutation and hydrate at construction (honors lock-20 'view+sort persist per-folder'); JSON not SQLite, matching editor-egui.json precedent.
 29. **[File manager]** The Cosmic-era views still present in mde-files/model.rs + RealBackend list() + ipc/files.rs (Inbox, Outbox, Downloads-shortcut, Mesh Home, Recycle Bin, Cloud Files/KDE-Connect, Network/SMB) are dead in the current egui surface. Retire them, or does Communications re-expose any — e.g. Inbox→Messages, Recycle-Bin→Files, Cloud-Files→Files, Network→Files?
+
+    **-> RESOLVED - retire.** The Cosmic-era View enum (Inbox/Outbox/Downloads/MeshHome/Recycle-Bin/Cloud/Network) is unreferenced by the Location-based egui surface — dead, drops nothing working; delete the enum + legacy list() branches + outbox/downloads responders, KEEP fleet-files/files-inbox/file-ops responders.
 30. **[File manager]** The 'three co-equal file bridges' contract (Mesh/SMB/KDC) is only half-live: SMB share browsing and KDE-Connect device browsing exist as backend/roster seams but are not reachable in the current surface. Does Communications Files mode restore SMB + Cloud-Files browsing, or do they retire?
+
+    **-> RESOLVED - retire.** SMB share browsing was never wired to a reachable UI (backend seam only) so retiring it drops nothing working; KDE-Connect device browsing is a phone-management concern that stays with the Phones/Devices hub — neither is a Communications Files build.
 31. **[File manager]** Transfers lanes: Sftp/Rsync/Http/BrowserDownload/Node/Music are dispatched by TransferLaneRunner with GatedLaneRunner as the honest fallback — which lanes are actually live vs still gated must be confirmed so Transfers mode preserves the working ones and keeps the rest honestly gated (§7).
+
+    **-> RESOLVED - keep-as-is:mackesd transfers worker.** All SIX lanes (Sftp/Http/Rsync/BrowserDownload/Node/Music) are live/dispatched via TransferLaneRunner with GatedLaneRunner as honest fallback; the mackesd transfers worker + node-local store are reused verbatim and Communications only MIRRORS the ledger (never a second progress authority).
 32. **[File manager]** Send-to-Editor posts action/editor/open to a SEPARATE Editor surface. Does Communications Documents mode absorb an in-place editor, or keep the cross-surface hand-off to the Editor surface?
+
+    **-> RESOLVED - replace-in-communications:Documents.** Retarget the Files Send-to-Editor (action/editor/open) to open the file in Communications Documents mode — since the standalone Editor surface is itself retiring into Documents (Q18-24), there is no separate surface to hand to; a small rebind, not a rebuild.
 33. **[File manager]** SendToEntry defines six entry points (Toolbar/ContextMenu/CommandPalette/DragDrop/DetailsPanel/BulkSelectBar) but the egui surface only uses Toolbar+ContextMenu. Should Communications wire the other four (command palette, bulk-select bar, details panel) or retire those enum variants?
+
+    **-> RESOLVED - retire.** Of SendToEntry's six variants only Toolbar + ContextMenu are ever constructed; CommandPalette/DragDrop/DetailsPanel/BulkSelectBar have NO producer anywhere — retire the dead enum arms (re-introducible at a real call site if Communications later wants a bulk-select share bar).
 34. **[Transfers]** SYNC-PAIRS ARE UNREACHABLE: TransferVerb::SaveSyncPair/RemoveSyncPair are drained by the worker and fully tested, but NO producer exists — the CLI TransferCmd and both GUI verb mirrors (files-egui + shell) omit them. Recurring rsync mirrors (Q19) are code-complete but dead. Does Communications Transfers mode build the missing recurring-mirror editor + a `mackesd transfer sync-pair` CLI, or is Q19 formally deferred? Must not silent-drop.
+
+    **-> RESOLVED - build-new:recurring-mirror-producer.** SaveSyncPair/RemoveSyncPair are drained + tested but have NO producer (silent-drop of the design-locked recurring-mirror feature) — build the missing recurring-mirror editor + a `mackesd transfer sync-pair` CLI targeting the existing SyncPair verbs/store; execution stays on the reused legacy worker (Q35).
 35. **[Transfers]** STORE OWNERSHIP: does Communications Transfers mode reuse the existing mackesd `transfers` worker + <store_root>/{ledger,inbox,sync-pairs} verbatim (no migration), or introduce a new backend/store (then a migrator MUST import ledger/*.json history + sync-pairs/*.json)? The whole ledger is node-local, so a store move needs an explicit importer.
+
+    **-> RESOLVED - keep-as-is:mackesd transfers worker + store.** Reuse the mackesd transfers worker + <store_root>/{ledger,inbox,sync-pairs} verbatim (mature 5-state engine, 6 lanes, integrity verify, crash recovery); the collab transfers SQLite projection is a control-plane MIRROR only — a store move would need a migrator for zero benefit.
 36. **[Transfers]** DOWNLOAD MANAGER HOME: the browser Downloads drawer is a full download manager over the same ledger (open/reveal/copy-url/dismiss/dangerous keep-discard). Does the browser keep a compact chrome drawer that deep-links into Communications Transfers, or fully hand the download UI to Communications? The dangerous-file/managed-policy/safe-browsing gate is pre-enqueue browser security — confirm it stays browser-owned.
+
+    **-> RESOLVED - replace-in-communications:Transfers.** Re-home the full download-manager UI into Communications Transfers; the browser keeps only a compact chrome drawer that deep-links there. The pre-enqueue dangerous-file / managed-policy / safe-browsing Keep-Discard gate is browser security (B2 lock) and STAYS browser-owned (fires before the ledger).
 37. **[Transfers]** ALERTS ROUTING: terminal transfers currently notify on event/notify/transfers (+ event/notify/browser) which the chat worker folds into alert:<self>. Should these route into Communications Alerts mode, Activity, or both — and does the fold move off Chat?
+
+    **-> RESOLVED - replace-in-communications:Alerts+Activity.** Terminal-transfer notices route into Communications Alerts (durable AlertInbox) with chronological completion also in Activity; the fold moves off the chat worker onto the collab worker (already folds the event/notify/ prefix) — emitters keep publishing unchanged.
 38. **[Transfers]** FILEMGR-7 mesh_transfer (direct peer A→B rsync) is the File Manager's copy engine, not the Transfers ledger. Confirm it stays with Files (WL-FUNC-006) and is out of scope for the Transfers→Communications cutover, or whether direct A→B moves should also register as Transfers-ledger jobs for unified history.
+
+    **-> RESOLVED - keep-as-is:Files (WL-FUNC-006).** Direct peer A->B rsync (ipc/mesh_transfer.rs) is the File-Manager copy engine, adjacent to but not part of the Transfers ledger — stays with the Files subsystem, out of the Transfers cutover; unified A->B-as-ledger-jobs is deferred (needs WL-FUNC-006 coordination).
 39. **[Transfers]** NO DEDICATED HOTKEYS today (no Ctrl+J for downloads, no New-Transfer accelerator). Does Communications Transfers mode introduce hotkeys, and should they be reserved now to avoid collisions with the Communications shell's global bindings?
+
+    **-> RESOLVED - build-new:reserve-transfer-hotkeys.** Reserve Ctrl+J (industry-standard downloads accelerator, opens Transfers mode) + an in-mode New-Transfer accelerator in the Communications global keymap NOW to avoid later collisions — purely additive, low-risk, can ride /polish.
 40. **[Transfers]** DESTINATION SCOPE: Q10 keeps ad-hoc SFTP/URL endpoints per-job (not saved as pins) by deliberate lock. Confirm Communications Transfers preserves auto-only destinations (no user-saved endpoint pins) rather than adding a saved-endpoints book.
+
+    **-> RESOLVED - keep-as-is:auto-only destinations.** Preserve the Q10 lock: ad-hoc SFTP/URL endpoints stay per-job (deliberately absent from the registry, which auto-projects Mesh Share + Music + reachable peers); NO user-saved endpoint pins — that would be a new surface contradicting the lock.
 41. **[Alerts / Notifications]** alert_relay headless delivery: does Communications Alerts fully subsume the FDO desktop-notification / notify-send path (cosmic-applet is retired) or must a headless FDO/journal notice path stay for server/Lighthouse nodes with no shell? Currently the journal is the load-bearing surface on headless nodes and the fdo/ Bus publish is the folded path.
+
+    **-> RESOLVED - replace-in-communications:Alerts.** alert_relay journals EVERY alert unconditionally (load-bearing on shell-less Lighthouse/Server nodes) + publishes the fdo/ Bus topic that folds into Alerts — both legs MUST survive; only the applet notify-send FDO-render intent (for the retired cosmic-applet) is dead.
 42. **[Alerts / Notifications]** notifications SQLite table (migration 0002): confirm it holds zero residual rows on live seats (notifications_server + notification_relay retired in BUS-4.2) so the migrator can drop it rather than import it — or does any deployed node still have unread/undisposed rows worth surfacing once in Alerts?
+
+    **-> RESOLVED - retire.** The notifications SQLite table (migration 0002) has both owners retired since BUS-4.2 (no notifications_server/notification_relay, zero live SQL) — its rows were transient desktop toasts, never durable alerts; drop the table.
 43. **[Alerts / Notifications]** DND has TWO owners today — mesh-replicated mde_bus dnd.yaml AND the chat worker's per-seat NotifyPrefs DND read via dnd_active(). Which is canonical under Communications, and does per-seat DND override or defer to the fleet-wide toggle?
+
+    **-> RESOLVED - replace-in-communications:Alerts.** The two DND owners operate at DIFFERENT layers and never reconcile today (chat self_dnd per-seat presence vs mde_bus dnd.yaml transport-layer is_suppressed) — a safe UNION collapses them without an irreversible fork; they are complementary, not competing.
 44. **[Alerts / Notifications]** Severity/routing split: the notify worker's low-severity 'activity' events (peer joined, updates available) fold into the same Alerts feed as criticals. Should these route to Communications Activity mode instead of Alerts, or does Alerts remain the single firehose with the severity filter doing the separation?
+
+    **-> RESOLVED - replace-in-communications:Activity.** Route the notify worker's low-severity informational events (peer join/leave, updates-available) into the already-shipped Activity mode, keeping Alerts a genuine alert feed rather than a firehose; the severity filter no longer has to do all the separation.
 45. **[Alerts / Notifications]** Browser session-only notices panel (web/mod.rs notifications_open/notifications_unread/browser_notices) is deliberately private/non-persistent per the browser-privacy locks. Confirm it stays browser-internal and is NOT surfaced into Communications (no cross-surface leak of browsing activity).
+
+    **-> RESOLVED - keep-as-is:Browser (session-only).** browser_notices is a session-only ring, never persisted or bus-published — surfacing it into Communications would leak browsing activity cross-surface, violating the browser-privacy locks (Q74/Q80 no-persistent-history, clear-on-close); stays browser-internal.
 46. **[Alerts / Notifications]** mde-alert-emit (MON-3 Netdata custom-sender hook): confirm the external hook binary is still shipped + wired in health_alarm_notify.conf on live seats, so the alerts-dir ingest is a real source Communications must keep (vs a dead path).
+
+    **-> RESOLVED - replace-in-communications:Alerts.** The alerts-dir file-drop ingest is a REAL live source Communications must keep, but it is fed by in-repo watchers (presence_watch/etcd_watch/dc_snap_scheduler) — the mde-alert-emit crate + Netdata health_alarm_notify.conf hook do NOT exist in this repo (an absent external contract, not a dead path to preserve).
 47. **[Alerts / Notifications]** OSD tier (volume/brightness flash) shares the KIRON ToastHost with alerts but is hardware feedback, not a notification — confirm it is out of Communications scope and remains a pure shell OSD after the toast module is split.
+
+    **-> RESOLVED - keep-as-is:shell OSD.** The OSD tier (volume/brightness flash) is hardware feedback on a separate ToastHost osd channel (flash_osd kept while chyron popups are retired), driven straight from XF86 keys — it belongs to the shell, out of Communications scope.
 48. **[Alerts / Notifications]** subs.yaml topic-mute vs NotifyPrefs source-mute overlap: both can silence an alert source at different layers (transport vs policy). Should Communications collapse these into one mute model, and which layer wins when they disagree?
+
+    **-> RESOLVED - replace-in-communications:Alerts.** Keep BOTH mutes — subs.yaml (mde-bus) is transport-level (event never arrives) while NotifyPrefs muted_sources is policy-level (silences the ring but STILL LOGS to history); collapsing them would lose the 'silent-but-recorded' guarantee.
 49. **[Clipboard sync]** CRITICAL: The mesh-global clipboard lane (clipboard_sync → history.json → event/clipboard/clip + action/clipboard/list) currently has NO live consumer — the standalone Clipboard Viewer was retired (NOTIFY-CHAT-6) and the chat worker does NOT fold event/clipboard/clip. Should Communications Clipboard mode be a first-class re-attachment of this reader (recommended), or was the mesh clipboard history intentionally being deprecated? If deprecated, retiring the whole capture+responder lane is a bigger decision than a mode swap.
+
+    **-> RESOLVED - replace-in-communications:Clipboard.** STALE 'no consumer' finding — the reader is ALREADY re-attached: the collab worker folds event/clipboard/clip into ClipboardPublished and Mode::Clipboard renders the ClipboardLane (publish/pin/attach/delete/materialize) as a first-class mode; the old action/clipboard/* history.json responder is now orphaned by the real impl.
 50. **[Clipboard sync]** Is Communications 'Clipboard' mode intended to unify all THREE lanes (mesh-global text history, VDI client↔guest relay, KDC phone sync), or only the mesh-global history? The three have different scopes (mesh-wide vs per-VDI-session vs per-phone) and different trust models — an operator ruling is needed on whether they coexist as sub-lanes in one mode or split (VDI→with Calls/Remote, phone→Phones panel).
+
+    **-> RESOLVED - keep-as-is:three distinct lanes.** The built Clipboard mode unifies ONLY the mesh-global text lane; the VDI client<->guest relay (per-session bridge) and the KDC phone lane (Phones hub) are different scope AND trust models — correct end-state is three distinct lanes, not one merged mode; do not collapse different-trust lanes onto one surface.
 51. **[Clipboard sync]** Should the 'send clipboard to phone' + phone-clipboard-follow-everywhere (KDC) live in Communications Clipboard mode, or remain in the Phones/Devices hub? They are phone-management verbs today (action/connect/*), not part of the mesh clipboard history.
+
+    **-> RESOLVED - keep-as-is:Phones/Devices hub.** 'send clipboard to phone' + phone-clipboard-follow are phone-management verbs on action/connect/* (kdc_host, driven by phones_hub) that own pairing/device state — they stay in the Phones/Devices hub, not the Communications Clipboard mode.
 52. **[Clipboard sync]** MessageKind::Clipboard is currently produced ONLY by browser/file share-to-chat (a re-copyable link in a conversation), NOT by the clipboard-sync worker. Confirm this maps to Communications Messages (share-to-conversation) and is NOT conflated with the mesh Clipboard history mode.
+
+    **-> RESOLVED - replace-in-communications:Messages.** MessageKind::Clipboard is produced ONLY by browser share-to-chat (a re-copyable title+URL link in a conversation), never by the clipboard_sync worker — it maps to Communications Messages (share a link into a space), NOT the mesh Clipboard history mode; do not conflate.
 53. **[Clipboard sync]** history.json is a plain Syncthing-replicated JSON file, not SQLite. Should Communications Clipboard keep the replicated-file / last-writer-wins model (zero-migration, cross-node), or migrate into a Communications state store? If the latter, the migrator must import unlimited pinned + recent unpinned entries mesh-wide.
+
+    **-> RESOLVED - keep-as-is:Syncthing history.json (LWW).** Keep the Syncthing-replicated history.json / last-writer-wins substrate (zero-migration, cross-node); the collab Clipboard lane is forward-only and projects post-cutover captures — acceptable since clipboard history is transient (50-cap) and pins are re-pinnable; no store migration required.
 54. **[Clipboard sync]** The 'clipboard/sync' curated bus topic (seed.rs) is dead — no publisher/subscriber (the worker uses event/clipboard/clip; the referenced clip_bridge::phone_to_bus does not exist). Confirm it can be retired from the seed set at cutover rather than carried forward.
+
+    **-> RESOLVED - retire.** The seed 'clipboard/sync' topic (seed.rs) is dead — no publisher/subscriber (the live lane is event/clipboard/clip; clip_bridge::phone_to_bus exists only as a stale doc-comment) — retire the dead name and repoint the curated seed to event/clipboard/clip at Priority::Min so the Round-11 min-priority lock binds the live lane.
 55. **[Clipboard sync]** Cap policy: history is hard-coded to 50 unpinned + unlimited pinned (HISTORY_CAP), and the VDI relay to a 1 MiB payload ceiling. Should Communications Clipboard expose these as operator-configurable, or preserve the current fixed values?
+
+    **-> RESOLVED - keep-as-is:fixed caps.** Preserve the deliberate fixed caps (HISTORY_CAP=50 unpinned + unlimited pinned; VDI relay MAX_CLIP_BYTES=1 MiB) — there is no operator-config surface to hang toggles on and configurability is scope the cutover doesn't need; reconcile the collab-egui '100 MB' doc claim to one cap story as a follow-up.
 56. **[Clipboard sync]** Clipboard content is stored verbatim with NO secret filtering (design O4). Given the Communications surface may be more prominent, does the operator want a secret/password redaction or exclusion policy for the Clipboard mode, or preserve the deliberate no-filter behavior?
+
+    **-> RESOLVED - keep-as-is:no-secret-filter (O4).** Preserve the deliberate O4 no-secret-filter behavior (verbatim capture) — adding password/secret redaction is a product-policy change and standing guidance is not to add such policy autonomously; FLAG the passive-capture concern for the operator, but the safe default keeps the lock.
