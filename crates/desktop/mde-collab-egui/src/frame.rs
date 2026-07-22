@@ -3,11 +3,22 @@
 //! the frame is what makes the surface feel like one place — the rail is the
 //! selection key, the tabs switch the per-space view, and the call bar is pinned
 //! and survives every mode/space switch (spec §1).
+//!
+//! PLATFORM-INTERFACES Q19 — the rail is the shared
+//! [`nav_chrome::Sidebar`](mde_egui::nav_chrome::Sidebar) (a pure
+//! [`rail_row_model`] translated into rows, the unread badges painted over the
+//! registered row rects). The mode tabs and the call bar stay custom by design:
+//! the tabs are a fused icon+label strip wearing the surface's five-state
+//! chrome motion, and the call bar is live call state with Auto-Mode sizing —
+//! neither is a plain list or a plain title bar.
 
 use mde_egui::egui;
+use mde_egui::nav_chrome::{Sidebar, SidebarRow, SidebarSection};
 use mde_egui::Style;
 
-use mde_collab_types::{CallId, CallKind, CallParticipantState, CallView, CollabCommand};
+use mde_collab_types::{
+    CallId, CallKind, CallParticipantState, CallView, CollabCommand, SpaceDirectory, SpaceId,
+};
 
 use crate::{icons, CommunicationsSurface, Mode};
 
@@ -34,66 +45,97 @@ pub fn body_frame() -> egui::Frame {
     egui::Frame::NONE.fill(Style::BG).inner_margin(Style::SP_M)
 }
 
+/// The one id salt the spaces rail renders under — shared by the rail, its
+/// unread-badge overlay pass, and the tests, so [`Sidebar::row_id`] stays
+/// deterministic.
+pub(crate) const RAIL_SIDEBAR_SALT: &str = "collab-rail";
+
+/// The rail's pure row model: one row per
+/// [`SpaceSummary`](mde_collab_types::SpaceSummary) in directory order — the
+/// selection id, the drawn name, the kind's Carbon glyph, and the unread count
+/// the overlay badge paints. Pure, so the tests assert the model (the U19
+/// Settings-sidebar idiom), and the render below only translates it.
+pub(crate) fn rail_row_model(
+    directory: &SpaceDirectory,
+) -> Vec<(SpaceId, &str, &'static str, u32)> {
+    directory
+        .spaces
+        .iter()
+        .map(|s| {
+            (
+                s.id,
+                s.name.as_str(),
+                icons::space_kind_icon(s.kind),
+                s.unread,
+            )
+        })
+        .collect()
+}
+
 impl CommunicationsSurface {
-    /// The persistent spaces rail: one selectable row per
-    /// [`SpaceSummary`](mde_collab_types::SpaceSummary), with a kind glyph, the
-    /// name, and an unread badge. Selecting a row is the key every other pane
-    /// keys off.
+    /// The persistent spaces rail — the shared Q19 [`Sidebar`]
+    /// (PLATFORM-INTERFACES Q19): one selectable row per
+    /// [`SpaceSummary`](mde_collab_types::SpaceSummary) with the kind's Carbon
+    /// glyph, under a "Spaces" section header, with click / arrow-walk / Enter
+    /// all routing through the one [`select_space`](Self::select_space) seam.
+    /// The live unread badges ride the **overlay bridge**: each row's count is
+    /// painted into the rect the row registered under [`Sidebar::row_id`]
+    /// (the U19 glyph-pass idiom), so the shared component stays generic and
+    /// the rail keeps its live fact. Selecting a row is the key every other
+    /// pane keys off.
     pub(crate) fn rail(
         &mut self,
         ui: &mut egui::Ui,
         data: &dyn crate::CollabData,
         _sink: &mut crate::CommandSink,
     ) {
-        ui.label(
-            egui::RichText::new("Spaces")
-                .size(Style::SMALL)
-                .strong()
-                .color(Style::TEXT_DIM),
-        );
-        ui.add_space(Style::SP_XS);
-
         let directory = data.space_directory();
         if directory.spaces.is_empty() {
+            ui.label(
+                egui::RichText::new("Spaces")
+                    .size(Style::SMALL)
+                    .strong()
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_XS);
             ui.label(egui::RichText::new("No spaces yet").color(Style::TEXT_DIM));
             return;
         }
 
+        let model = rail_row_model(directory);
+        let rows: Vec<SidebarRow<'_, SpaceId>> = model
+            .iter()
+            .map(|(id, name, glyph, _)| SidebarRow::new(*id, name).with_icon(glyph))
+            .collect();
+        let sections = [SidebarSection {
+            header: Some("Spaces"),
+            rows: rows.as_slice(),
+        }];
+        // `ui()` defaults the selection to the first rail row before the rail
+        // renders, so a non-empty directory always has a selected space; the
+        // fallback only guards a stale selection over a changed directory.
+        let selected = self.selected_space().unwrap_or(model[0].0);
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for space in &directory.spaces {
-                    let selected = self.selected_space() == Some(space.id);
-                    let tint = if selected {
-                        Style::ACCENT
-                    } else {
-                        Style::TEXT_DIM
-                    };
-                    let name_color = if selected {
-                        Style::TEXT_STRONG
-                    } else {
-                        Style::TEXT
-                    };
-                    // The rail row wears the shared five-state chrome motion (hover
-                    // wash + press squash + selected tint + focus ring) instead of a
-                    // bare `selectable_label`; the wash spans the full rail width.
-                    let clicked = crate::anim::interactive_cell(
-                        ui,
-                        ("collab-rail", space.id),
-                        selected,
-                        true,
-                        |ui| {
-                            icons::icon(ui, icons::space_kind_icon(space.kind), Style::SP_M, tint);
-                            ui.label(egui::RichText::new(&space.name).color(name_color));
-                            if space.unread > 0 {
-                                unread_badge(ui, space.unread);
-                            }
-                        },
-                    )
-                    .clicked();
-                    if clicked {
-                        self.select_space(space.id);
+                if let Some(picked) = Sidebar::show(ui, RAIL_SIDEBAR_SALT, &sections, &selected) {
+                    self.select_space(picked);
+                }
+                // The unread-badge overlay pass: paint each row's live count
+                // into the slot its row registered just above, read back
+                // through the Sidebar's deterministic row ids.
+                for (index, (_, _, _, unread)) in model.iter().enumerate() {
+                    if *unread == 0 {
+                        continue;
                     }
+                    let Some(row) = ui
+                        .ctx()
+                        .read_response(Sidebar::row_id(RAIL_SIDEBAR_SALT, index))
+                    else {
+                        continue;
+                    };
+                    paint_unread_badge(ui, row.rect, *unread);
                 }
             });
     }
@@ -250,26 +292,45 @@ impl CommunicationsSurface {
     }
 }
 
-/// A small unread-count badge (accent fill, bright count) painted after a rail
-/// row's name. Caps the display at `99+`.
-fn unread_badge(ui: &mut egui::Ui, unread: u32) {
+/// A small unread-count badge (accent fill, bright count, capped at `99+`)
+/// painted into a rail row's registered rect — the overlay bridge over the
+/// shared [`Sidebar`] row (PLATFORM-INTERFACES Q19), right-aligned inside the
+/// row's selection plate. Pure paint: layout stays the shared component's.
+fn paint_unread_badge(ui: &egui::Ui, row_rect: egui::Rect, unread: u32) {
     let text = if unread > 99 {
         "99+".to_owned()
     } else {
         unread.to_string()
     };
-    egui::Frame::NONE
-        .fill(Style::ACCENT)
-        .corner_radius(mde_egui::corner(Style::RADIUS_S))
-        .inner_margin(egui::Margin::symmetric(Style::SP_XS as i8, 0))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(text)
-                    .small()
-                    .strong()
-                    .color(Style::TEXT_STRONG),
-            );
-        });
+    let painter = ui.painter();
+    let galley = painter.layout_no_wrap(
+        text,
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT_STRONG,
+    );
+    // Mirror the shared row's own plate inset so the pill hugs the same edge
+    // the selection plate does.
+    let plate = row_rect.shrink2(egui::vec2(Style::SP_XS, Style::STROKE_HAIRLINE));
+    let size = galley.size() + egui::vec2(Style::SP_XS * 2.0, Style::SP_XS);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(
+            plate.right() - Style::SP_S - size.x,
+            plate.center().y - size.y * 0.5,
+        ),
+        size,
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    painter.rect_filled(rect, Style::RADIUS_S, Style::ACCENT);
+    painter.galley(
+        egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        Style::TEXT_STRONG,
+    );
 }
 
 /// A human label for a call's [`CallKind`]. Shared with the Calls mode roster.

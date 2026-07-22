@@ -238,6 +238,124 @@ fn frame_renders_from_fixture_directory() {
 }
 
 #[test]
+fn rail_row_model_maps_the_directory_in_order() {
+    // PLATFORM-INTERFACES Q19 — the rail renders through the shared
+    // nav_chrome::Sidebar off this pure row model (the U19 Settings idiom:
+    // tests assert the model, not paint): one row per directory space, in
+    // directory order, carrying the id, the name, the kind's Carbon glyph, and
+    // the unread count the overlay badge paints.
+    let data = FixtureData::demo();
+    let directory = data.space_directory();
+    let model = crate::frame::rail_row_model(directory);
+
+    assert_eq!(model.len(), directory.spaces.len());
+    assert_eq!(model.len(), 2, "the demo fixture populates two rail rows");
+
+    let (id, name, glyph, unread) = model[0];
+    assert_eq!(id, directory.spaces[0].id);
+    assert_eq!(name, "Team Ops");
+    assert_eq!(glyph, crate::icons::space_kind_icon(SpaceKind::Team));
+    assert_eq!(unread, 3, "Team Ops carries the demo unread count");
+
+    let (id, name, glyph, unread) = model[1];
+    assert_eq!(id, directory.spaces[1].id);
+    assert_eq!(name, "Incident 42");
+    assert_eq!(glyph, crate::icons::space_kind_icon(SpaceKind::Incident));
+    assert_eq!(unread, 0, "Incident 42 is read — no badge to paint");
+}
+
+#[test]
+fn rail_paints_the_shared_sidebar_with_the_unread_badge_overlay() {
+    // PLATFORM-INTERFACES Q19 — the painted rail is the shared Sidebar: the
+    // "Spaces" section header and both row labels paint, the auto-selected
+    // first row wears the shared selection plate, and the live unread count
+    // rides the overlay bridge as an accent pill with the bright count.
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    let shapes = render_shapes(&mut surface, &data);
+
+    let texts = painted_text(&shapes);
+    for expected in ["Spaces", "Team Ops", "Incident 42"] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "the sidebar must paint {expected:?}: {texts:?}"
+        );
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|(text, color)| text == "3" && *color == Style::TEXT_STRONG),
+        "the unread overlay badge must paint the bright count: {texts:?}"
+    );
+
+    let fills = rect_fills(&shapes);
+    assert!(
+        fills.contains(&Style::selection_fill()),
+        "the auto-selected row must wear the shared Sidebar selection plate: {fills:?}"
+    );
+    assert!(
+        fills.contains(&Style::ACCENT),
+        "the unread badge must paint its accent pill: {fills:?}"
+    );
+}
+
+#[test]
+fn rail_click_routes_through_the_shared_sidebar() {
+    // PLATFORM-INTERFACES Q19 — a click on a shared-Sidebar rail row routes
+    // through the SAME select_space seam the old hand-rolled rows drove
+    // (behaviour sacred): clicking the second row's registered rect moves the
+    // selection to the second space.
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut sink = CommandSink::new();
+
+    // Frame 1 registers the rows (and auto-selects the first space).
+    let _ = ctx.run(sized_input(vec![]), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
+    });
+    let first = data.space_directory().spaces[0].id;
+    let second = data.space_directory().spaces[1].id;
+    assert_eq!(surface.selected_space(), Some(first));
+
+    let row = ctx
+        .read_response(mde_egui::nav_chrome::Sidebar::row_id(
+            crate::frame::RAIL_SIDEBAR_SALT,
+            1,
+        ))
+        .expect("the second rail row registered under the shared Sidebar row id");
+    let at = row.rect.center();
+
+    // Frame 2 clicks the second row.
+    let _ = ctx.run(
+        sized_input(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]),
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
+        },
+    );
+    assert_eq!(
+        surface.selected_space(),
+        Some(second),
+        "a Sidebar row click must route through select_space"
+    );
+}
+
+#[test]
 fn frame_paints_carbon_image_meshes_not_glyph_text() {
     // Every surface icon (rail kind glyphs, mode-tab glyphs, call-bar glyphs)
     // paints through the shared Mackes-Carbon loader as a tinted image mesh, not

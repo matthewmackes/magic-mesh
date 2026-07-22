@@ -1681,7 +1681,9 @@ fn phones_tooltip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
         .fill(surface)
         .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(6))
+        // PLATFORM-INTERFACES Q19/Q20 — the shared radius ladder's small tier,
+        // not a raw corner literal (value-identical: RADIUS_S is 6).
+        .corner_radius(Style::RADIUS_S)
         .inner_margin(Style::tooltip_margin())
         .show(ui, |ui| {
             ui.set_max_width(PHONES_TOOLTIP_MAX_W);
@@ -1898,6 +1900,39 @@ mod tests {
         assert!(
             fills.contains(&surface),
             "Phones unpair tooltip should paint its themed surface: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn phones_tooltip_frame_sits_on_the_shared_radius_ladder() {
+        // PLATFORM-INTERFACES Q19/Q20 — the tooltip card rounds on the shared
+        // RADIUS_S tier of the §4 ladder, asserted off the painted shape so a raw
+        // `CornerRadius::same(..)` corner literal can't silently come back.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let out = render_phones_tooltip_frame(&ctx);
+        let surface = Style::resolve_color(&ctx, Style::SURFACE);
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(egui::CornerRadius, egui::Color32)>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push((rect.corner_radius, rect.fill)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        assert!(
+            rects.iter().any(|(radius, fill)| {
+                *radius == egui::CornerRadius::from(Style::RADIUS_S) && *fill == surface
+            }),
+            "the tooltip surface must round on the shared RADIUS_S tier: {rects:?}"
         );
     }
 

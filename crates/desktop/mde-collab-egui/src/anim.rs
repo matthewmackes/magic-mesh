@@ -6,7 +6,8 @@
 //! table (`Motion::FAST`, the `MotionPreset` specs, and the
 //! `hover_lift`/`press_scale`/`focus_glow` helpers). This module only *composes*
 //! those primitives into the surface's chrome motion — the five interaction states
-//! a spaces-rail row / mode tab wears, the mode-switch crossfade, and the staggered
+//! a mode tab wears (the spaces rail is the shared `nav_chrome::Sidebar`, Q19),
+//! the mode-switch crossfade, and the staggered
 //! list / call-bar entrances — so the Construct frame eases exactly like every other
 //! surface. Every helper is reduce-motion-aware through the one shared
 //! [`Motion::mode`](mde_egui::Motion::mode) flag (a11y-07).
@@ -40,7 +41,7 @@ pub(crate) fn scale_about_center(rect: egui::Rect, scale: f32) -> egui::Rect {
     egui::Rect::from_center_size(rect.center(), rect.size() * scale)
 }
 
-/// Paint one **interactive chrome cell** — a spaces-rail row or a mode tab — wearing
+/// Paint one **interactive chrome cell** — a mode tab — wearing
 /// the shared five interaction states, all on the `mde_egui::motion` table:
 ///
 /// * **rest** — no wash;
@@ -55,8 +56,8 @@ pub(crate) fn scale_about_center(rect: egui::Rect, scale: f32) -> egui::Rect {
 /// `content` paints the cell's glyph + label; it is laid out first (so the cell
 /// self-measures) and the wash lands *behind* it via the shared reserve-then-set
 /// idiom. Returns the click [`Response`](egui::Response) so the caller reads
-/// `.clicked()`. `full_width` stretches the wash + hit area to the panel's right edge
-/// (the rail rows), otherwise the cell hugs its content (the inline mode tabs).
+/// `.clicked()`. `full_width` stretches the wash + hit area to the panel's right
+/// edge, otherwise the cell hugs its content (the inline mode tabs).
 pub(crate) fn interactive_cell(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash,
