@@ -652,13 +652,19 @@ These decisions refine acceptance and sequencing for the active items below.
   geocoder; and a labeled single-tap Car<->Desktop mode toggle.
 - Plan: docs/design/maps-worldclass-plan.md (2026-07-22 scope report: root-cause analysis,
   GLES raster constraint, P0-P3 units, in-tree reusable seams rusqlite/image/carbon_texture).
-- Progress (2026-07-22): Advanced-menu progressive-disclosure nav + floating action cluster
-  LANDED (`08086639`); P0 sparse-data honesty pass LANDED (`8b91003c` - has_fix gating,
-  bars() fix, idle Drive HUD, un-hideable "SIMULATED" badge, primary source "acquiring" not
-  fake-Pittsburgh; 70/0 tests). IN FLIGHT: P0 mode-button (shell toggle), the offline DATA
-  build (East-TX gazetteer 16,645 rows built + raster MBTiles building - free OSM on the
-  internet-connected control host, bundled to the airgapped seat), and the P1/P2 maps code
-  (address entry + FTS5 geocoder + raster basemap renderer).
+- Progress (2026-07-22): ALL CORE UNITS LANDED + DEPLOYED + LIVE-VERIFIED. Advanced-menu
+  progressive-disclosure nav + floating action cluster (`08086639`); P0 sparse-data honesty
+  (`8b91003c` - has_fix gating, bars() fix, idle Drive HUD, un-hideable "SIMULATED" badge,
+  primary source "acquiring" not fake-Pittsburgh); P0 mode-button one-tap Car<->Desktop toggle
+  (`4bc193d7`); **P1 address entry (real TextEdit) + P1 offline FTS5 geocoder + P2 real
+  Web-Mercator MBTiles basemap (`a49818ba`, +1307 LOC basemap.rs/geocode.rs, 83 tests)**.
+  P3 offline DATA build DONE (East-TX: `east-texas.mbtiles` 3396 tiles z8-14 + `gazetteer.sqlite`
+  10,654 FTS5 rows, free OSM on the internet-connected control host). DEPLOYED to seat `.15`
+  (F44 release shell, `drm,live-helper,live-vdi,media-mpv`, v12.1.0, `drm:true`, NRestarts=0);
+  bundle staged at persistent `/var/lib/mde-maps/east-texas/` via an `MDE_MAPS_DIR` drop-in;
+  deployed data proven queryable (basemap 3396 tiles; geocoder returns Athens/Lake Athens).
+  REMAINING = operator visual signoff on the dash (live-seat, per operator 2026-07-22 no longer
+  a gate) + the deferred "Later" real offline routing (Valhalla) as a future enhancement.
 - Relevant files: `crates/desktop/mde-maps-location-egui/` (car_status.rs, view.rs
   paint_map_scene/show_map, model.rs), `crates/desktop/mde-shell-egui/src/main.rs`
   (layout-mode control), a new `basemap` module + the seat's `client_data_dir/maps/<region>/`
