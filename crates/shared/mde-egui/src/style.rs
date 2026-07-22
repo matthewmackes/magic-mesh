@@ -267,6 +267,30 @@ impl Style {
     /// frozen desktop today), so a leaked `from_black_alpha` never re-decides "how
     /// dark is a scrim" at a call site (§4).
     pub const SCRIM: Color32 = Color32::from_black_alpha(0xB4);
+
+    // ── Scrim materials (PLATFORM-INTERFACES Q21) ───────────────────────────
+    // Three depths of layered translucency approximating the HIG material ladder
+    // (thin / regular / thick) **without live blur** — the GLES/DRM path has no
+    // blur budget, so a material here is honest alpha over the content beneath.
+    // Each is [`BG`](Self::BG)'s near-black hue at a rising alpha (premultiplied
+    // by hand so the consts stay `const`): three distinct push-back depths over
+    // the Quazar-dark ground, hue-matched to it rather than pure black.
+    /// **Thin material** — the lightest push-back (~55% [`BG`](Self::BG)): a
+    /// hover veil / de-emphasis wash where the content beneath stays readable.
+    /// `#16161A` at `0x8C`, premultiplied. Approximates HIG *thin material*
+    /// without blur (Q21).
+    pub const SCRIM_THIN: Color32 = Color32::from_rgba_premultiplied(0x0C, 0x0C, 0x0E, 0x8C);
+    /// **Regular material** — the standard overlay scrim (~72% [`BG`](Self::BG)):
+    /// sheets, popover backdrops — the layer beneath clearly recedes yet remains
+    /// legible in silhouette. `#16161A` at `0xB8`, premultiplied. Approximates
+    /// HIG *regular material* without blur (Q21).
+    pub const SCRIM_REGULAR: Color32 = Color32::from_rgba_premultiplied(0x10, 0x10, 0x13, 0xB8);
+    /// **Thick material** — the deepest push-back (~88% [`BG`](Self::BG)): modal
+    /// focus / lock-adjacent overlays where the layer beneath is context only.
+    /// `#16161A` at `0xE0`, premultiplied. Approximates HIG *thick material*
+    /// without blur (Q21).
+    pub const SCRIM_THICK: Color32 = Color32::from_rgba_premultiplied(0x13, 0x13, 0x17, 0xE0);
+
     /// The blank-canvas fill of a **headless capture** (screenshot rasterizer): a
     /// neutral near-black held **strictly darker than every real surface tone** the
     /// shell paints, so a genuinely blank capture is obvious in the PNG itself, not
@@ -417,14 +441,39 @@ impl Style {
 
     // ── Corner-radius tiers (applied by surfaces at draw time as raw data, so the
     //    harness build stays free of egui's version-sensitive corner-radius type) ──
+    // PLATFORM-INTERFACES Q23: the HIG radii ladder (~6/10/16/26) — continuous
+    // curvature-era rounding replacing the Win10-era 4/6/8 squareness. Nested
+    // rounded rects follow the concentric rule via
+    // [`concentric_radius`](Self::concentric_radius).
     /// Tight radius — buttons, chips, taskbar/cell inner fills.
-    pub const RADIUS_S: f32 = 4.0;
+    pub const RADIUS_S: f32 = 6.0;
     /// Mid radius — cards, menus, popovers (the historical default).
-    pub const RADIUS_M: f32 = 6.0;
+    pub const RADIUS_M: f32 = 10.0;
     /// Large radius — windows, sheets, dialogs, the lock curtain.
-    pub const RADIUS_L: f32 = 8.0;
+    pub const RADIUS_L: f32 = 16.0;
+    /// Extra-large radius — hero cards, modal sheets, springboard tiles (Q22/Q23).
+    pub const RADIUS_XL: f32 = 26.0;
     /// Back-compat alias for the mid tier — the ~130 pre-tier call sites read this.
     pub const RADIUS: f32 = Self::RADIUS_M;
+    /// The floor an inner concentric radius never drops below — a nested corner
+    /// stays visibly rounded, it never collapses square (Q23).
+    const RADIUS_CONCENTRIC_FLOOR: f32 = 2.0;
+
+    /// PLATFORM-INTERFACES Q23 — the **concentric-nesting rule**: a rounded rect
+    /// inset `inset` px inside a rounded parent shares the parent's *center of
+    /// curvature*, so the inner radius is `outer_radius - inset` (floored at
+    /// [`RADIUS_CONCENTRIC_FLOOR`](Self::RADIUS_CONCENTRIC_FLOOR) so a deep inset
+    /// never yields a square or negative corner). One derivation, so no surface
+    /// eyeballs an inner radius for a plate-in-card / glyph-in-tile nest (§4).
+    #[must_use]
+    pub const fn concentric_radius(outer_radius: f32, inset: f32) -> f32 {
+        let inner = outer_radius - inset;
+        if inner > Self::RADIUS_CONCENTRIC_FLOOR {
+            inner
+        } else {
+            Self::RADIUS_CONCENTRIC_FLOOR
+        }
+    }
 
     // ── Stroke widths ───────────────────────────────────────────────────────
     /// **Hairline** — the 1 px weight of a border / separator ([`BORDER`](Self::BORDER)).
@@ -455,6 +504,40 @@ impl Style {
     /// Shared menu/button chrome text: the body rung reduced by one point so
     /// menus read as controls, not body copy.
     pub const MENU_TEXT: f32 = Self::BODY - 1.0;
+
+    // ── HIG semantic type ramp (PLATFORM-INTERFACES Q4) ─────────────────────
+    // The HIG roles (Large Title → Caption) carried by the EXISTING Inter face
+    // (the SF stand-in; Plex Mono stays the code/terminal face — no new font).
+    // Where a role lands on an existing Carbon rung it ALIASES it (one scale,
+    // not two): Title1 = DISPLAY, Headline = TITLE, Body = BODY, Caption =
+    // SMALL. The ramp descends strictly, scaled to the platform's dense 12pt
+    // body rather than HIG's 17pt paper sizes.
+    /// HIG **Large Title** — the hero rung above [`DISPLAY`](Self::DISPLAY):
+    /// springboard page titles, first-run heroes.
+    pub const TYPE_LARGE_TITLE: f32 = 30.0;
+    /// HIG **Title 1** — aliases the existing display rung ([`DISPLAY`](Self::DISPLAY)).
+    pub const TYPE_TITLE1: f32 = Self::DISPLAY;
+    /// HIG **Title 2** — between the display and section-heading rungs.
+    pub const TYPE_TITLE2: f32 = 21.0;
+    /// HIG **Title 3** — just under [`HEADING`](Self::HEADING).
+    pub const TYPE_TITLE3: f32 = 19.0;
+    /// HIG **Headline** — aliases the sub-heading rung ([`TITLE`](Self::TITLE)).
+    /// HIG headline is *semibold*; the embedded Inter face has no bold cut, so
+    /// the platform's honest emphasis cue is pairing this size with
+    /// [`TEXT_STRONG`](Self::TEXT_STRONG) (the established weight substitute).
+    pub const TYPE_HEADLINE: f32 = Self::TITLE;
+    /// HIG **Body** — aliases the platform body rung ([`BODY`](Self::BODY)).
+    pub const TYPE_BODY: f32 = Self::BODY;
+    /// HIG **Callout** — emphasized standalone copy above body scale.
+    pub const TYPE_CALLOUT: f32 = 15.0;
+    /// HIG **Subheadline** — secondary line under a headline.
+    pub const TYPE_SUBHEADLINE: f32 = 14.0;
+    /// HIG **Footnote** — one point under body (the platform body is already
+    /// footnote-dense, so the rung sits at 11 to keep the ramp strictly
+    /// descending rather than tying [`TYPE_BODY`](Self::TYPE_BODY)).
+    pub const TYPE_FOOTNOTE: f32 = 11.0;
+    /// HIG **Caption** — aliases the existing small/caption rung ([`SMALL`](Self::SMALL)).
+    pub const TYPE_CAPTION: f32 = Self::SMALL;
 
     // ── Icon sizes (logical points) ─────────────────────────────────────────
     // The optical-size ladder for glyphs (Carbon icons render crisp at any of
@@ -1020,6 +1103,31 @@ impl Style {
         Self::ACCENT.gamma_multiply(0.35)
     }
 
+    // ── Springboard tile plates (PLATFORM-INTERFACES Q22) ───────────────────
+    // The home-grid tile treatment: a rounded-rect plate in the group's accent,
+    // a white Carbon glyph on it, the label beneath. The plate is the accent
+    // composited over [`BG`](Self::BG) at [`TILE_PLATE_ALPHA`](Self::TILE_PLATE_ALPHA)
+    // and flattened opaque at derivation time — darkened/desaturated enough that
+    // the white glyph clears WCAG AA (≥ 4.5:1) on EVERY group accent, with no
+    // runtime translucency cost (verified by `tile_glyph_stays_wcag_legible_on_
+    // every_group_plate`).
+    /// Q22 — the accent's compositing weight in a tile plate: the fraction of
+    /// the group accent kept when it is laid over [`BG`](Self::BG) and flattened.
+    /// Chosen so the brightest accent (gold) still holds the white glyph ≥ 4.5:1.
+    pub const TILE_PLATE_ALPHA: f32 = 0.38;
+    /// Q22 — the springboard tile **glyph** tint: white Carbon linework on the
+    /// accent plate, one silhouette language across every group.
+    pub const TILE_GLYPH: Color32 = Color32::WHITE;
+
+    /// Q22 — a springboard tile's **plate fill**: `accent` composited over
+    /// [`BG`](Self::BG) at [`TILE_PLATE_ALPHA`](Self::TILE_PLATE_ALPHA), opaque.
+    /// The single derivation, so a tile never re-mixes its plate at a call site
+    /// (§4) and a future accent automatically inherits the contrast guarantee.
+    #[must_use]
+    pub fn tile_plate_fill(accent: Color32) -> Color32 {
+        Self::blend(accent, Self::BG, 1.0 - Self::TILE_PLATE_ALPHA)
+    }
+
     /// The **2 px accent focus ring** stroke ([`FOCUS`](Self::FOCUS) at
     /// [`FOCUS_RING_W`](Self::FOCUS_RING_W)) — the platform focus-ring design lock.
     /// One source so every surface draws the same visible-focus treatment,
@@ -1438,21 +1546,157 @@ mod tests {
 
     #[test]
     fn radius_tiers_ascend_and_default_is_the_mid_tier() {
-        // Strictly ascending, each on the 2px sub-grid, mid == the back-compat alias.
+        // PLATFORM-INTERFACES Q23: the HIG ladder (~6/10/16/26) — strictly
+        // ascending, each on the 2px sub-grid, mid == the back-compat alias.
         assert!(
-            Style::RADIUS_S < Style::RADIUS_M && Style::RADIUS_M < Style::RADIUS_L,
-            "radius tiers must strictly ascend: {} < {} < {}",
+            Style::RADIUS_S < Style::RADIUS_M
+                && Style::RADIUS_M < Style::RADIUS_L
+                && Style::RADIUS_L < Style::RADIUS_XL,
+            "radius tiers must strictly ascend: {} < {} < {} < {}",
             Style::RADIUS_S,
             Style::RADIUS_M,
             Style::RADIUS_L,
+            Style::RADIUS_XL,
         );
-        for r in [Style::RADIUS_S, Style::RADIUS_M, Style::RADIUS_L] {
+        for r in [
+            Style::RADIUS_S,
+            Style::RADIUS_M,
+            Style::RADIUS_L,
+            Style::RADIUS_XL,
+        ] {
             assert_eq!(r % 2.0, 0.0, "{r} is off the 2px sub-grid");
         }
         assert_eq!(
             Style::RADIUS,
             Style::RADIUS_M,
             "RADIUS must alias the mid tier so pre-tier call sites are unchanged"
+        );
+    }
+
+    #[test]
+    fn concentric_radius_shares_the_center_of_curvature() {
+        // Q23 — the concentric rule: inner = outer − inset, so nested rounded
+        // rects share one center of curvature...
+        assert_eq!(
+            Style::concentric_radius(Style::RADIUS_XL, Style::SP_S),
+            Style::RADIUS_XL - Style::SP_S
+        );
+        assert_eq!(
+            Style::concentric_radius(Style::RADIUS_L, 4.0),
+            Style::RADIUS_L - 4.0
+        );
+        // ...a zero inset is the identity...
+        assert_eq!(
+            Style::concentric_radius(Style::RADIUS_M, 0.0),
+            Style::RADIUS_M
+        );
+        // ...and a deep inset floors at a still-rounded 2.0, never square/negative.
+        assert_eq!(Style::concentric_radius(Style::RADIUS_S, 10.0), 2.0);
+        assert_eq!(
+            Style::concentric_radius(Style::RADIUS_S, Style::RADIUS_S),
+            2.0
+        );
+    }
+
+    #[test]
+    fn scrim_materials_form_three_translucent_depths() {
+        // Q21 — thin/regular/thick approximate the HIG material ladder as
+        // BG-hued alpha (no live blur on GLES/DRM): every rung translucent,
+        // depths strictly deepen, and each is a distinct token.
+        let ladder = [Style::SCRIM_THIN, Style::SCRIM_REGULAR, Style::SCRIM_THICK];
+        for s in ladder {
+            assert!(
+                s.a() > 0 && s.a() < 255,
+                "a scrim material is translucent, not opaque: a={}",
+                s.a()
+            );
+            // Valid premultiplied encoding: no channel exceeds the alpha.
+            assert!(
+                s.r() <= s.a() && s.g() <= s.a() && s.b() <= s.a(),
+                "premultiplied channels must not exceed alpha"
+            );
+            // BG-hued (blue-leaning near-black like #16161A), not pure black.
+            assert!(
+                s.b() >= s.r() && s.r() == s.g(),
+                "a scrim keeps BG's cool near-black hue"
+            );
+        }
+        for w in ladder.windows(2) {
+            assert!(
+                w[1].a() > w[0].a(),
+                "scrim depths must strictly deepen thin → regular → thick"
+            );
+            assert_ne!(w[0], w[1], "each material is its own distinct depth");
+        }
+    }
+
+    #[test]
+    fn tile_glyph_stays_wcag_legible_on_every_group_plate() {
+        // Q22 — the white Carbon glyph must clear the WCAG AA body floor
+        // (≥ 4.5:1) on the tile plate derived from EVERY group accent — the
+        // brightest (gold) is the worst case, but guard them all so a future
+        // accent inherits the guarantee.
+        const AA_BODY: f32 = 4.5;
+        assert_eq!(Style::TILE_GLYPH, egui::Color32::WHITE);
+        assert!(
+            Style::TILE_PLATE_ALPHA > 0.0 && Style::TILE_PLATE_ALPHA < 1.0,
+            "the plate keeps a real fraction of the accent"
+        );
+        let accents = [
+            ("ACCENT (Brand)", Style::ACCENT),
+            ("ACCENT_COMMS (Cyan)", Style::ACCENT_COMMS),
+            ("ACCENT_WORKLOADS (Purple)", Style::ACCENT_WORKLOADS),
+            ("ACCENT_TERMINALS (Teal)", Style::ACCENT_TERMINALS),
+            ("ACCENT_WEB (Chrome blue)", Style::ACCENT_WEB),
+            ("ACCENT_MESH (Green)", Style::ACCENT_MESH),
+            ("ACCENT_SYSTEM (Gold)", Style::ACCENT_SYSTEM),
+            ("ACCENT_MEDIA (Magenta)", Style::ACCENT_MEDIA),
+        ];
+        for (name, accent) in accents {
+            let plate = Style::tile_plate_fill(accent);
+            assert_eq!(plate.a(), 0xFF, "a tile plate is flattened opaque");
+            assert_ne!(plate, accent, "the plate is darkened, not the raw accent");
+            let ratio = wcag_contrast_ratio(Style::TILE_GLYPH, plate);
+            assert!(
+                ratio >= AA_BODY,
+                "white tile glyph over the {name} plate is only {ratio:.2}:1 — \
+                 below the WCAG AA floor of {AA_BODY}:1"
+            );
+        }
+    }
+
+    #[test]
+    fn hig_type_ramp_descends_onto_the_existing_scale() {
+        // PLATFORM-INTERFACES Q4: the HIG roles descend strictly Large Title →
+        // Caption, and every role that lands on an existing Carbon rung aliases
+        // it — one type scale, not two.
+        let ramp = [
+            Style::TYPE_LARGE_TITLE,
+            Style::TYPE_TITLE1,
+            Style::TYPE_TITLE2,
+            Style::TYPE_TITLE3,
+            Style::TYPE_HEADLINE,
+            Style::TYPE_CALLOUT,
+            Style::TYPE_SUBHEADLINE,
+            Style::TYPE_BODY,
+            Style::TYPE_FOOTNOTE,
+            Style::TYPE_CAPTION,
+        ];
+        for w in ramp.windows(2) {
+            assert!(
+                w[0] > w[1],
+                "the HIG type ramp must strictly descend: {} !> {}",
+                w[0],
+                w[1]
+            );
+        }
+        assert_eq!(Style::TYPE_TITLE1, Style::DISPLAY, "Title1 aliases DISPLAY");
+        assert_eq!(Style::TYPE_HEADLINE, Style::TITLE, "Headline aliases TITLE");
+        assert_eq!(Style::TYPE_BODY, Style::BODY, "Body aliases BODY");
+        assert_eq!(Style::TYPE_CAPTION, Style::SMALL, "Caption aliases SMALL");
+        assert!(
+            Style::TYPE_LARGE_TITLE > Style::DISPLAY,
+            "Large Title is the hero rung above the display size"
         );
     }
 
