@@ -80,6 +80,7 @@ mod splash;
 mod status;
 mod storage;
 mod surface_card;
+mod switcher;
 mod system;
 mod thisnode;
 mod timers;
@@ -1201,15 +1202,21 @@ impl Shell {
     /// `construct` queue — the §2.3 pointer rows — not a second dispatch path.
     fn mount_status_bar_slot(&mut self, _ctx: &egui::Context) {}
 
-    /// U12 lands the app switcher here (Q16 — the snapshot-preview card grid).
-    /// Until then the Switcher intent toggles the observable open flag; the
-    /// dual-routed SessionSwitch fallback in `render` keeps sessions reachable.
-    fn mount_switcher_slot(&mut self, _ctx: &egui::Context) {
-        if self
-            .construct
-            .take_intent(construct::ChromeIntent::Switcher)
-        {
-            self.construct.switcher_open = !self.construct.switcher_open;
+    /// The app switcher (Q16 — the snapshot-preview card grid), landed as
+    /// `switcher.rs` (WL-UX-006/U15). The module consumes the Switcher intent,
+    /// owns the recents ring + overlay, and returns the picked surface for
+    /// this slot to apply; the dual-routed SessionSwitch fallback in `render`
+    /// stays until the U29 cutover.
+    fn mount_switcher_slot(&mut self, ctx: &egui::Context) {
+        if let Some(surface) = switcher::mount(
+            ctx,
+            &mut self.construct,
+            self.nav.surface,
+            self.nav.expanded,
+            self.vdi.taskbar_preview_frame().map(|frame| frame.texture),
+        ) {
+            self.nav.surface = surface;
+            self.nav.expanded = true;
         }
     }
 
@@ -5313,10 +5320,14 @@ mod tests {
             ..chrome_input(&shell)
         };
         shell.route_chrome_input(&input);
-        shell.mount_construct_chrome(&ctx);
+        // U15 landed the switcher into the slot: mounting now renders the
+        // overlay, so the toggle is exercised inside a real frame (fonts).
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            shell.mount_construct_chrome(ctx);
+        });
         assert!(
             shell.construct.switcher_open,
-            "§2.3: Super+Tab means Switcher — observable state until U12 lands"
+            "§2.3: Super+Tab means Switcher (the U15 card grid's open flag)"
         );
 
         let input = construct::ChromeInput {
@@ -5324,7 +5335,9 @@ mod tests {
             ..chrome_input(&shell)
         };
         shell.route_chrome_input(&input);
-        shell.mount_construct_chrome(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            shell.mount_construct_chrome(ctx);
+        });
         assert!(
             !shell.construct.switcher_open,
             "a second chord toggles closed"
