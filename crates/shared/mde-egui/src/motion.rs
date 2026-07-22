@@ -75,6 +75,11 @@ pub enum MotionPreset {
     Dialog,
     /// Workspace, browser page, or route changes.
     Page,
+    /// Springboard app open/close: the surface scales up out of its home tile
+    /// and back down into it (PLATFORM-INTERFACES Q24: zoom-from-tile). Under
+    /// reduced motion the zoom is endpoint-only — the large spatial travel is
+    /// exactly what vestibular comfort avoids, so the app swaps in place.
+    ZoomTile,
     /// List/card insert, remove, expand, collapse, and selection rails.
     Layout,
     /// Release/snap/cancel settling after direct manipulation.
@@ -151,6 +156,13 @@ impl MotionSpec {
             MotionPreset::Popover => Self::new(preset, 0.14, 0.06, MotionEasing::SmoothStep, None),
             MotionPreset::Dialog => Self::new(preset, 0.18, 0.06, MotionEasing::SmoothStep, None),
             MotionPreset::Page => Self::new(preset, 0.22, 0.08, MotionEasing::SmoothStep, None),
+            MotionPreset::ZoomTile => Self::new(
+                preset,
+                0.32,
+                0.0,
+                MotionEasing::SmoothStep,
+                Some(Spring::GENTLE),
+            ),
             MotionPreset::Layout => Self::new(
                 preset,
                 0.18,
@@ -267,6 +279,14 @@ impl Spring {
     pub const GENTLE: Self = Self {
         stiffness: 120.0,
         damping: 20.0,
+    };
+    /// Sheet-detent settle — a dragged sheet released onto the detent picked by
+    /// [`Motion::detent_target`] (PLATFORM-INTERFACES Q24). Tighter than
+    /// [`SNAPPY`](Self::SNAPPY) and near-critical, so the sheet lands on its
+    /// detent without sailing past it.
+    pub const SHEET: Self = Self {
+        stiffness: 260.0,
+        damping: 30.0,
     };
 
     /// One semi-implicit-Euler step from `(pos, vel)` toward `target` over `dt`
@@ -882,6 +902,15 @@ impl Motion {
     /// The maximum **rubber-band** overscroll past an edge, in logical px — the
     /// asymptote [`rubber_band`](Self::rubber_band) compresses overshoot toward.
     pub const RUBBER_SLACK: f32 = 48.0;
+    /// Release-velocity magnitude (sheet fractions **per second**) past which a
+    /// dragged sheet commits toward the next detent in the velocity's direction
+    /// instead of snapping to the nearest. Used by
+    /// [`detent_target`](Self::detent_target) (PLATFORM-INTERFACES Q24).
+    pub const DETENT_FLING: f32 = 0.5;
+    /// Swipe-velocity magnitude (pages **per second**) past which a page swipe
+    /// advances one page in its direction instead of settling on the nearest.
+    /// Used by [`page_settle`](Self::page_settle) (PLATFORM-INTERFACES Q24).
+    pub const PAGE_FLING: f32 = 0.5;
 
     /// Drive a **spring** toward `target`, keyed by a stable `id`: reads the stored
     /// `(pos, vel)` from egui memory, advances it one frame off the egui clock, and
@@ -939,6 +968,79 @@ impl Motion {
     fn band(d: f32) -> f32 {
         let s = Self::RUBBER_SLACK;
         s * (1.0 - (-d.max(0.0) / s).exp())
+    }
+
+    /// The **detent** a released sheet settles at (PLATFORM-INTERFACES Q24 sheet
+    /// detent physics): given the sheet's fractional position `pos` (`0.0`
+    /// closed … `1.0` tallest), the drag-release `velocity` in fractions/second
+    /// (positive = opening), and the sheet's ascending `detents` (e.g.
+    /// `[0.35, 0.9]`), pick the fraction to rest at. A release slower than
+    /// [`DETENT_FLING`](Self::DETENT_FLING) snaps to the **nearest** detent — a
+    /// slow release never dismisses by surprise; a faster release commits one
+    /// detent in the velocity's direction. A fast **downward** fling with no
+    /// detent left below resolves to `0.0` — the drag-to-dismiss gesture. Pure;
+    /// drive the returned target with [`spring_to`](Self::spring_to) +
+    /// [`Spring::SHEET`], which already collapses to the endpoint under
+    /// reduce-motion (a11y-07) — the resting detent itself is mode-independent.
+    /// An empty `detents` slice is degenerate and dismisses.
+    #[must_use]
+    pub fn detent_target(pos: f32, velocity: f32, detents: &[f32]) -> f32 {
+        let Some(&highest) = detents.last() else {
+            return 0.0;
+        };
+        if velocity <= -Self::DETENT_FLING {
+            // Committed downward: the next detent below, or dismiss when the
+            // fling is already past the lowest one.
+            detents
+                .iter()
+                .rev()
+                .copied()
+                .find(|&d| d < pos)
+                .unwrap_or(0.0)
+        } else if velocity >= Self::DETENT_FLING {
+            // Committed upward: the next detent above, or hold at the tallest.
+            detents
+                .iter()
+                .copied()
+                .find(|&d| d > pos)
+                .unwrap_or(highest)
+        } else {
+            detents
+                .iter()
+                .copied()
+                .min_by(|a, b| (a - pos).abs().total_cmp(&(b - pos).abs()))
+                .unwrap_or(highest)
+        }
+    }
+
+    /// The **page** an interruptible swipe lands on (PLATFORM-INTERFACES Q24
+    /// page swipes): `offset` is the live scroll position in page units (`0.0` =
+    /// first page, fractional mid-swipe), `velocity` in pages/second (positive =
+    /// toward higher indices). A swipe faster than
+    /// [`PAGE_FLING`](Self::PAGE_FLING) advances one page in its direction; a
+    /// slower release settles on the nearest page; the result is always clamped
+    /// to the real `0..page_count` range. Composes with the existing gesture
+    /// primitives — decay the live fling with
+    /// [`inertial_decay`](Self::inertial_decay), compress the ends with
+    /// [`rubber_band`](Self::rubber_band) — neither of which picks a page. Pure;
+    /// animate toward the returned index via [`spring_to`](Self::spring_to) or a
+    /// [`MotionPreset::Page`] carrier, both of which collapse to the endpoint
+    /// under reduce-motion (a11y-07) — the landing page itself is
+    /// mode-independent. A zero `page_count` is degenerate and reads page `0`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn page_settle(offset: f32, velocity: f32, page_count: usize) -> usize {
+        if page_count == 0 {
+            return 0;
+        }
+        let target = if velocity >= Self::PAGE_FLING {
+            offset.floor() + 1.0
+        } else if velocity <= -Self::PAGE_FLING {
+            offset.ceil() - 1.0
+        } else {
+            offset.round()
+        };
+        target.clamp(0.0, (page_count - 1) as f32) as usize
     }
 
     /// `smoothstep` on a `0..=1` progress — the ease every micro-interaction factor
@@ -1011,6 +1113,7 @@ mod tests {
             MotionPreset::Popover,
             MotionPreset::Dialog,
             MotionPreset::Page,
+            MotionPreset::ZoomTile,
             MotionPreset::Layout,
             MotionPreset::DragSettle,
         ] {
@@ -1038,6 +1141,95 @@ mod tests {
             Motion::spec(MotionPreset::DragSettle).spring.is_some(),
             "drag release has a spring settle option"
         );
+    }
+
+    #[test]
+    fn zoom_tile_is_a_hero_transition_that_collapses_under_reduced_motion() {
+        // PLATFORM-INTERFACES Q24: zoom-from-tile — the springboard open/close.
+        let spec = Motion::spec(MotionPreset::ZoomTile);
+        assert_eq!(spec.preset, MotionPreset::ZoomTile);
+        assert!(
+            spec.duration_for(MotionMode::Normal)
+                > Motion::spec(MotionPreset::Page).duration_for(MotionMode::Normal),
+            "the tile zoom is more deliberate than an in-place page change"
+        );
+        assert_eq!(
+            spec.spring,
+            Some(Spring::GENTLE),
+            "hero expansions share the gentle spring"
+        );
+        // Under reduced motion the zoom is endpoint-only — instant swap, no
+        // travel (a11y-07), matching the Control/DragSettle convention.
+        assert_eq!(spec.duration_for(MotionMode::Reduced), 0.0);
+        assert_eq!(
+            spec.progress_at(0.0, MotionMode::Reduced),
+            1.0,
+            "reduced-motion zoom lands on its endpoint on the first frame"
+        );
+        assert_eq!(spec.duration_for(MotionMode::Disabled), 0.0);
+    }
+
+    #[test]
+    fn sheet_detents_snap_to_nearest_below_the_fling_threshold() {
+        let detents = [0.35, 0.9];
+        assert_eq!(Motion::detent_target(0.5, 0.0, &detents), 0.35);
+        assert_eq!(Motion::detent_target(0.7, 0.0, &detents), 0.9);
+        // A slow release below the lowest detent climbs back to it — a sheet
+        // never dismisses without a committed fling.
+        assert_eq!(
+            Motion::detent_target(0.1, -Motion::DETENT_FLING * 0.5, &detents),
+            0.35
+        );
+        // No detents at all is degenerate: nowhere to rest, so dismiss.
+        assert_eq!(Motion::detent_target(0.5, 0.0, &[]), 0.0);
+    }
+
+    #[test]
+    fn sheet_detents_commit_in_the_fling_direction() {
+        let detents = [0.35, 0.9];
+        // A fast upward fling from the low detent commits to the tall one, and
+        // holds at the tallest when there is nothing further above.
+        assert_eq!(
+            Motion::detent_target(0.4, Motion::DETENT_FLING * 2.0, &detents),
+            0.9
+        );
+        assert_eq!(
+            Motion::detent_target(0.95, Motion::DETENT_FLING * 2.0, &detents),
+            0.9
+        );
+        // A fast downward fling from the tall detent steps to the low one — one
+        // detent per fling, never straight past it.
+        assert_eq!(
+            Motion::detent_target(0.8, -Motion::DETENT_FLING * 2.0, &detents),
+            0.35
+        );
+    }
+
+    #[test]
+    fn sheet_fast_downward_fling_below_the_lowest_detent_dismisses() {
+        let detents = [0.35, 0.9];
+        assert_eq!(
+            Motion::detent_target(0.3, -Motion::DETENT_FLING * 2.0, &detents),
+            0.0,
+            "drag-to-dismiss: committed downward with no detent left below"
+        );
+        // The paired settle spring is real and near-critical, like its siblings.
+        assert!(Spring::SHEET.stiffness > 0.0 && Spring::SHEET.damping > 0.0);
+    }
+
+    #[test]
+    fn page_settle_rounds_nearest_flings_one_page_and_clamps() {
+        // Below the fling threshold: nearest page wins.
+        assert_eq!(Motion::page_settle(0.4, 0.0, 3), 0);
+        assert_eq!(Motion::page_settle(0.6, 0.0, 3), 1);
+        // Past the threshold: one page in the fling's direction, even when the
+        // swipe has barely travelled (the interruptible-swipe commit).
+        assert_eq!(Motion::page_settle(0.2, Motion::PAGE_FLING * 2.0, 3), 1);
+        assert_eq!(Motion::page_settle(1.8, -Motion::PAGE_FLING * 2.0, 3), 1);
+        // …but never off either end, and an empty pager reads page 0.
+        assert_eq!(Motion::page_settle(2.6, Motion::PAGE_FLING * 2.0, 3), 2);
+        assert_eq!(Motion::page_settle(0.1, -Motion::PAGE_FLING * 2.0, 3), 0);
+        assert_eq!(Motion::page_settle(0.5, 0.0, 0), 0);
     }
 
     #[test]
@@ -1111,6 +1303,7 @@ mod tests {
             MotionPreset::Popover,
             MotionPreset::Dialog,
             MotionPreset::Page,
+            MotionPreset::ZoomTile,
             MotionPreset::Layout,
             MotionPreset::DragSettle,
         ];
