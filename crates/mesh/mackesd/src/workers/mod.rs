@@ -620,11 +620,6 @@ pub mod subprocess_tick;
 // dispatch is irrelevant in the v2.0+ Wayland-only sway + mde-
 // files (Cosmic Files fork) stack. No live consumer of the pure
 // helpers existed in tree.
-// VV-2 (v4.1.0) — voice-config worker that owns the
-// /var/lib/mackesd/voice-desired.json document + triggers
-// `systemctl try-reload-or-restart` on kamailio-mde +
-// rtpengine-mde when it changes.
-pub mod voice_config;
 // VOIP-GW-3 — leader-gated Vitelity per-node SIP sub-account provisioner
 // (create + seal creds + reconcile + publish state/voice/<node>).
 pub mod voice_provision;

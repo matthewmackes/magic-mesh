@@ -253,7 +253,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     WorkerSpec::tier("ansible-pull", 1, RestartPolicy::OnFailure),
     WorkerSpec::tier("app-sync", 1, RestartPolicy::OnFailure),
     WorkerSpec::tier("job_exec", 1, RestartPolicy::OnFailure),
-    WorkerSpec::tier("voice_config", 1, RestartPolicy::OnFailure),
     WorkerSpec::tier("clipboard_sync", 1, RestartPolicy::OnFailure),
     // WL-UX-005 — the peer_app_launch executor: drains the shell Front Door's
     // `action/apps/launch` publishes and actually launches the requested app on
@@ -1083,7 +1082,9 @@ mod tests {
         // rank-0 successor to the removed openstack worker) => len 76.
         // Rolling Node +1 vehicle (the universal rank-0 MG90 vehicle-gateway mirror,
         // a no-op where no gateway is attached) => len 77.
-        assert_eq!(WORKER_REGISTRY.len(), 77);
+        // WL-FUNC-011 U2 -1 voice_config (the Kamailio/RTPengine VV render-config
+        // worker; Q9 retired the dead SIP-proxy stack) => len 76.
+        assert_eq!(WORKER_REGISTRY.len(), 76);
     }
 
     #[test]
@@ -1116,8 +1117,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            28,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
+            27,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -1142,7 +1143,7 @@ mod tests {
         // KDC-MESH-3 (#15) — kdc_host is NO LONGER in this list: it is now a
         // universal rank-0 worker that DOES run on a Lighthouse (see
         // `kdc_host_runs_on_every_role`). Overlay-only, so it opens no public port.
-        for w in ["ansible-pull", "app-sync", "voice_config"] {
+        for w in ["ansible-pull", "app-sync"] {
             assert!(!runs(w, r), "Lighthouse must NOT run {w}");
         }
     }
@@ -1153,13 +1154,7 @@ mod tests {
         // fleet workers AND the desktop stack (a headless box runs them too — the
         // desktop workers idle without a display).
         let r = Role::Workstation.rank();
-        for w in [
-            "ansible-pull",
-            "app-sync",
-            "voice_config",
-            "clipboard_sync",
-            "kdc_host",
-        ] {
+        for w in ["ansible-pull", "app-sync", "clipboard_sync", "kdc_host"] {
             assert!(runs(w, r), "Workstation must run {w}");
         }
     }
@@ -1359,8 +1354,10 @@ mod tests {
         // ws = 48 + 28 = 76.
         // Rolling Node +1 rank-0 vehicle (the MG90 vehicle-gateway mirror) → lh 49,
         // ws = 49 + 28 = 77.
+        // WL-FUNC-011 U2 -1 workstation-tier voice_config (Q9 dead VV stack retired)
+        // → lh 49 (rank-0 unchanged), ws = 49 + 27 = 76.
         assert_eq!(lh.len(), 49);
-        assert_eq!(ws.len(), 77);
+        assert_eq!(ws.len(), 76);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -1415,10 +1412,6 @@ mod tests {
         assert!(
             !runs_in("ansible-pull", media_lh),
             "media ≠ workstation (fleet) tier"
-        );
-        assert!(
-            !runs_in("voice_config", media_lh),
-            "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
         // = the 30 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the

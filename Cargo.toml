@@ -64,7 +64,6 @@ members = [
     "crates/services/mde-collab-core",
     "crates/services/mde-files",
     "crates/services/mde-musicd",
-    "crates/services/mde-voice-config",
     "crates/services/mde-voice-hud",
     "crates/desktop/mde-shell-egui",
     "crates/desktop/mde-media-core",

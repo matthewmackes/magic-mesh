@@ -1,8 +1,7 @@
 //! `mde-voice-hud` — the render-agnostic SIP softphone core.
 //!
 //! This crate is the toolkit-free voice core: the pure-Rust SIP register/call
-//! state machine ([`sip`]), the RTP/G.711 [`media`] engine, the mesh peer
-//! [`roster`] loader, and the dialer-target [`resolve`] heuristic. It carries
+//! state machine ([`sip`]) and the RTP/G.711 [`media`] engine. It carries
 //! **no GUI-toolkit dependency**.
 //!
 //! E12-14b — the Cosmic-era wlr-layer-shell softphone HUD binary (`src/main.rs`)
@@ -24,7 +23,5 @@
 #![allow(missing_docs)]
 
 pub mod media;
-pub mod resolve;
-pub mod roster;
 pub mod secure;
 pub mod sip;

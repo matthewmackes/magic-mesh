@@ -185,7 +185,7 @@ impl RegPhase {
 
 /// This node's name — the `<node>` in `state/voice/<node>`.
 ///
-/// The kernel hostname (matching [`crate::roster`] + `local_identity`),
+/// The kernel hostname (matching the mesh roster + `local_identity`),
 /// lowercased; also the local part of its `<hostname>@<realm>` inbound address.
 #[must_use]
 pub fn node_name() -> String {

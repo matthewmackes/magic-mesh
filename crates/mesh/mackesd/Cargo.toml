@@ -135,13 +135,6 @@ uuid = { version = "1", features = ["v4", "serde"], optional = true }
 # the gating logic is available regardless of feature set.
 mde-role = { path = "../../platform/mde-role" }
 
-# VV-1 / VV-1.5 (v4.1.0) — pure-function config generator for
-# the kamailio-mde + rtpengine-mde stack. Consumed by the
-# `mackesd voice render-config` CLI which both unit files invoke
-# as ExecStartPre. No feature gate — the generator is pure and
-# adds no runtime cost.
-mde-voice-config = { path = "../../services/mde-voice-config" }
-
 # Storage: SQLite via rusqlite (sync, no async runtime needed for the
 # reconcile loop's cadence). WAL mode + 5 s busy timeout per 12.A.2.
 rusqlite = { version = "0.32", features = ["bundled"] }

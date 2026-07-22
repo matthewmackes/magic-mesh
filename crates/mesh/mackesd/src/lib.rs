@@ -175,12 +175,6 @@ pub mod transport_probe;
 // repeatedly editing lib.rs.
 pub mod transport;
 pub mod validation;
-// VV-4 (v4.1.0) — voice-routing heuristic. Pure-function
-// best_path + pick_relay over a list of connectivity candidates.
-// Consumed by the future VV-2.a policy-lifecycle writer when it
-// builds the per-peer `priority` weights baked into
-// dispatcher.list rows.
-pub mod voice;
 // VOIP-GW-2 — the typed Vitelity API client (per-node SIP design,
 // `docs/design/voice-vitelity-per-node-sip.md`, locks 11 + 14):
 // sub-account create/list/get, DID list/route (existing DIDs only),

@@ -1153,14 +1153,6 @@ enum Cmd {
         sub: NebulaCmd,
     },
 
-    /// VV-1 / VV-1.5 (v4.1.0) — Voice/Video stack operations.
-    /// Today only `render-config` ships; VV-2 adds policy-driven
-    /// reload, VV-14 adds Vitelity `uac.reg_dump`, etc.
-    Voice {
-        #[command(subcommand)]
-        sub: VoiceCmd,
-    },
-
     /// DEAD-2.5 (v5.1) + NF-21.2 (v1.0/1.1) — Wake-on-LAN.
     ///
     /// Default mode: fires the magic packet at the local broadcast
@@ -1607,60 +1599,6 @@ enum DdnsCmd {
         last: String,
         #[clap(long, env = "MDE_WORKGROUP_ROOT")]
         workgroup_root: Option<PathBuf>,
-    },
-}
-
-/// VV-1 / VV-1.5 — `mackesd voice <sub>` subcommands.
-#[derive(Subcommand)]
-enum VoiceCmd {
-    /// Regenerate the four kamailio-mde + rtpengine-mde config
-    /// files (`kamailio.cfg`, `dispatcher.list`, `uacreg.list`,
-    /// `rtpengine.conf`) from the current policy snapshot.
-    ///
-    /// Invoked by both `kamailio-mde.service` and
-    /// `rtpengine-mde.service` as their `ExecStartPre=` hook on
-    /// every (re)start, so the on-disk config is always coherent
-    /// with the latest approved `voice_mesh` / `voice_public`
-    /// policy revision.
-    ///
-    /// VV-1 ships the minimal generator: no peer routing, no
-    /// Vitelity, just enough to boot Kamailio + `RTPengine`. VV-2
-    /// wires the generator to mackesd's policy store so peer
-    /// AORs (via `dispatcher.list`) + Vitelity sub-accounts (via
-    /// `uacreg.list`) flow from approved `voice_mesh` /
-    /// `voice_public` revisions.
-    RenderConfig {
-        /// Override the kamailio-mde output directory (defaults
-        /// to `/etc/kamailio-mde/`). Used by tests + dry-runs.
-        #[arg(long, value_name = "DIR", default_value = "/etc/kamailio-mde")]
-        kamailio_dir: PathBuf,
-        /// Override the rtpengine-mde output directory.
-        #[arg(long, value_name = "DIR", default_value = "/etc/rtpengine-mde")]
-        rtpengine_dir: PathBuf,
-        /// VV-2 — JSON file containing a serialized `VoiceDesired`
-        /// document. When the file is missing, render-config
-        /// falls back to `VoiceDesired::boot_default(node_id)` and
-        /// emits the minimal SIP-OPTIONS-keepalive-only config.
-        /// The voice_config worker writes to this path on every
-        /// policy change; operators can hand-edit during
-        /// development by dropping a JSON document at the
-        /// default path.
-        #[arg(
-            long,
-            value_name = "PATH",
-            default_value = "/var/lib/mackesd/voice-desired.json"
-        )]
-        desired_json: PathBuf,
-        /// Skip the desired_json file entirely and use
-        /// `boot_default` — useful for testing the bootstrap
-        /// path in isolation.
-        #[arg(long)]
-        boot_default: bool,
-        /// Print each generated file to stdout instead of
-        /// writing to disk. Useful for diff'ing across policy
-        /// revisions.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -2204,7 +2142,6 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Ca { sub } => cli::ca::run(sub, db_path)?,
         Cmd::Nebula { sub } => cli::nebula::run(sub, db_path)?,
-        Cmd::Voice { sub } => cli::voice::run(sub)?,
         Cmd::WakePeer {
             mac,
             broadcast,
@@ -2499,8 +2436,7 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        mesh_router::MeshRouterWorker, reconcile::ReconcileWorker, voice_config::VoiceConfigWorker,
-        RestartPolicy, Spawn, Supervisor,
+        mesh_router::MeshRouterWorker, reconcile::ReconcileWorker, RestartPolicy, Spawn, Supervisor,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2748,47 +2684,6 @@ fn run_serve(
             // EFF-21 — env is scrubbed at boot; presence rides this flag.
             .with_backup_passphrase_set(backup_passphrase.is_some())
         });
-        // VV-2 (v4.1.0) — voice_config worker. Seeds the
-        // /var/lib/mackesd/voice-desired.json document on first
-        // tick + triggers `systemctl try-reload-or-restart` on
-        // kamailio-mde + rtpengine-mde when the file changes.
-        // try-reload-or-restart is a no-op while the units are
-        // disabled (v4.1.0 ships them disabled per the spec
-        // %post comment until VV-4 + VV-14 are green), so the
-        // worker is harmless to run on a fresh peer.
-        // Bug 6 (2026-06-06) — voice_config seeds the system path
-        // /var/lib/mackesd/voice-desired.json (the root ExecStartPre reads it to
-        // build /etc/kamailio-mde/*). A per-user daemon can't write there, so the
-        // worker's 5 s tick spammed an EPERM WARN forever. Only run it when that
-        // dir is actually writable (i.e. the system daemon).
-        let voice_dir_writable = std::path::Path::new(
-            mackesd_core::workers::voice_config::DEFAULT_DESIRED_JSON,
-        )
-        .parent()
-        .is_some_and(|d| {
-            let probe = d.join(".mackesd-write-probe");
-            let ok = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&probe)
-                .is_ok();
-            if ok {
-                let _ = std::fs::remove_file(&probe);
-            }
-            ok
-        });
-        if mackesd_core::worker_role::runs("voice_config", role_rank) {
-            if voice_dir_writable {
-                spawn_tiered(&mut sup, &worker_names, role_rank, "voice_config", || {
-                    VoiceConfigWorker::new(node_id.clone())
-                });
-            } else {
-                tracing::info!(
-                    "voice_config: system voice dir not writable (per-user daemon); worker skipped"
-                );
-            }
-        }
         spawn_mesh_plumbing_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root, &db_path);
         // mesh_router bootstraps with the per-transport
         // registry. Phase 12.18 D.2 (2026-05-23) — the NebulaHttps443

@@ -82,7 +82,6 @@ pub mod take_leadership;
 pub mod transfer;
 pub mod upgrade;
 pub mod validate;
-pub mod voice;
 pub mod voip_rtt;
 pub mod vpn_import;
 pub mod wake_peer;
