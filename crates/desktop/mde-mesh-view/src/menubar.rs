@@ -41,7 +41,7 @@ use std::collections::HashSet;
 use mde_egui::egui::{self, RichText};
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar as SharedMenuBar, MenuBarModel};
 use mde_egui::style::Elevation;
-use mde_egui::{muted_note, ChipTone, StatusChip, Style};
+use mde_egui::{muted_note, status_dot, ChipTone, StatusChip, Style};
 
 use crate::state::{Health, MeshNode, MeshState, Role};
 
@@ -471,10 +471,14 @@ fn legend_heading(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-/// One legend row: a tone-coloured status dot beside its description.
+/// One legend row: a tone-coloured status dot beside its description. The dot is
+/// the shared [`status_dot`] health/presence primitive — the one indicator the
+/// whole platform paints the same way — not an inline glyph, so the legend key
+/// reads exactly like the live health dots elsewhere (§4 / axis 9 iconography).
 fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(DOT).color(color));
+        status_dot(ui, color);
+        ui.add_space(Style::SP_XS);
         ui.label(text);
     });
 }
@@ -739,6 +743,33 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mesh-view bar produced no draw primitives"
+        );
+    }
+
+    // ── the legend key paints the shared status-dot primitive ────────────────
+
+    #[test]
+    fn legend_swatch_paints_the_shared_status_dot() {
+        use mde_egui::egui::{self, pos2, vec2, Rect};
+        // A legend health row lays out a real frame (the shared `status_dot`
+        // primitive beside its description) — proof the key renders live and
+        // reads the health colour from a `Style` palette token, no inline glyph.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 200.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::legend_swatch(ui, Style::OK, "Healthy — reachable and well");
+                super::legend_swatch(ui, Style::DANGER, "Down — unreachable");
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "legend swatch produced no draw primitives"
         );
     }
 

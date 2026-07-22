@@ -99,6 +99,32 @@ impl Health {
     }
 }
 
+/// A concise, live **accessibility read-out** of the mesh the canvas is
+/// painting, exposed to assistive tech (AccessKit) via the canvas
+/// [`Response::widget_info`]. The map is otherwise a purely-painted graphic with
+/// no text a screen reader can reach (WCAG 1.1.1 — *Non-text Content*), so it is
+/// annotated with the same node total + per-tier health counts the menu bar's
+/// status cluster shows. An empty mesh reads out the honest "waiting for mesh"
+/// state, never fabricated peers (§7).
+fn a11y_summary(state: &MeshState) -> String {
+    if state.nodes.is_empty() {
+        return "Mesh map: waiting for mesh — no peers have joined yet".to_owned();
+    }
+    let (mut up, mut degraded, mut down) = (0usize, 0usize, 0usize);
+    for node in &state.nodes {
+        match node.health {
+            Health::Ok => up += 1,
+            Health::Warn => degraded += 1,
+            Health::Down => down += 1,
+        }
+    }
+    let n = state.nodes.len();
+    format!(
+        "Mesh map: {n} node{s} — {up} up, {degraded} degraded, {down} down",
+        s = if n == 1 { "" } else { "s" },
+    )
+}
+
 /// The version sub-label text + colour for a node: the running build in
 /// [`Style::TEXT_DIM`], an older build (`stale`) marked and drawn in
 /// [`Style::WARN`] so it stands out, and an honest `—` in dim when the source
@@ -167,6 +193,14 @@ impl<'a> MeshView<'a> {
         let (response, painter) = ui.allocate_painter(desired, Sense::hover());
         let area = response.rect;
         let time = ui.input(|i| i.time);
+
+        // The map is a text-free painted graphic: annotate the canvas with a live
+        // read-out so assistive tech (AccessKit) can voice it (WCAG 1.1.1) — the
+        // same node/health summary the menu-bar status cluster shows, built lazily
+        // so it only costs a string on the frames a11y actually polls it.
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, a11y_summary(self.state))
+        });
 
         // No nodes ⇒ nothing to place or animate: draw the honest "waiting for
         // mesh" canvas instead of a blank rect or fabricated peers (§6/§7). Its
@@ -400,7 +434,7 @@ impl<'a> MeshView<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{version_line, MeshView};
+    use super::{a11y_summary, version_line, MeshView};
     use crate::state::{Health, MeshLink, MeshNode, MeshState, Role};
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -469,6 +503,43 @@ mod tests {
         let mut state = state;
         state.nodes[2].stale = true;
         render(&state, false, 0.75);
+    }
+
+    #[test]
+    fn a11y_summary_voices_the_live_mesh_and_the_empty_state() {
+        // Empty ⇒ the honest "waiting for mesh" read-out (no fabricated peers, §7),
+        // so a screen reader hears the same state the EmptyState paints.
+        let empty = a11y_summary(&MeshState::default());
+        assert!(
+            empty.contains("waiting for mesh"),
+            "empty canvas voices the waiting state: {empty}"
+        );
+
+        // Populated ⇒ the node total + per-tier health counts, matching the menu
+        // bar's status cluster so the read-out and the chips agree.
+        let state = MeshState {
+            nodes: vec![
+                MeshNode::new("lh", "lighthouse", Role::Lighthouse, Health::Ok),
+                MeshNode::new("a", "peer-a", Role::Workstation, Health::Warn),
+                MeshNode::new("b", "peer-b", Role::Workstation, Health::Down),
+            ],
+            links: vec![],
+        };
+        let summary = a11y_summary(&state);
+        assert!(summary.contains("3 nodes"), "node total: {summary}");
+        assert!(summary.contains("1 up"), "up count: {summary}");
+        assert!(summary.contains("1 degraded"), "degraded count: {summary}");
+        assert!(summary.contains("1 down"), "down count: {summary}");
+
+        // A single node reads out without the plural "s" (grammatical honesty).
+        let one = MeshState {
+            nodes: vec![MeshNode::new("lh", "lh", Role::Lighthouse, Health::Ok)],
+            links: vec![],
+        };
+        assert!(
+            a11y_summary(&one).contains("1 node —"),
+            "singular reads '1 node'"
+        );
     }
 
     #[test]
