@@ -406,6 +406,17 @@ fn root_row(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
     }
 }
 
+/// The disclosure chevron glyph for a tree folder — a Mackes-Carbon icon name
+/// (`go-down` open, `go-next` closed) rather than an inline "v"/">" literal
+/// (§4 iconography). Pure, so the glyph choice is testable without a display.
+const fn tree_chevron_icon(expanded: bool) -> &'static str {
+    if expanded {
+        "go-down"
+    } else {
+        "go-next"
+    }
+}
+
 /// One folder row + (when expanded) its children — recursive. Each row is a drop
 /// target (drag a bookmark/folder onto it to move it in, lock Q29).
 fn tree_folder(
@@ -423,11 +434,23 @@ fn tree_folder(
         let has_kids = m.has_child_folders(folder.id);
         let expanded = m.is_expanded(folder.id);
         if has_kids {
-            let arrow = if expanded { "v" } else { ">" };
-            if ui
-                .add(egui::Button::new(RichText::new(arrow).monospace()).frame(false))
-                .clicked()
-            {
+            // A Carbon disclosure chevron (down when open, right when closed) in
+            // place of the old inline "v"/">" glyph literals — a real icon from the
+            // shared Mackes-Carbon set (§4 iconography). It stays an `egui::Button`,
+            // so it keeps keyboard focus and the shared 2px focus ring (a11y); the
+            // glyph paints over the frameless button and tints on hover.
+            let resp = ui.add_sized(
+                egui::vec2(Style::SP_M, Style::SP_M),
+                egui::Button::new("").frame(false),
+            );
+            let tint = if resp.hovered() {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            };
+            let _ =
+                mde_egui::paint_carbon(ui.painter(), resp.rect, tree_chevron_icon(expanded), tint);
+            if resp.clicked() {
                 actions.push(Action::ToggleExpanded(folder.id));
             }
         } else {
@@ -720,19 +743,13 @@ fn bulk_bar(ui: &mut egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 fn empty_state(ui: &mut egui::Ui, m: &Manager) {
     ui.add_space(Style::SP_XL);
     ui.vertical_centered(|ui| {
-        let (title, body) = if m.is_searching() {
-            (
-                "No matches",
-                "No bookmark title or URL matches this search.",
-            )
-        } else if m.total() == 0 {
-            (
-                "No bookmarks yet",
-                "Add one with +, paste a URL, or press Ctrl+N. They sync across the mesh once the worker is running.",
-            )
-        } else {
-            ("This folder is empty", "Drag bookmarks here, or add one with +.")
-        };
+        let (icon, title, body) = empty_state_copy(m.is_searching(), m.total() == 0);
+        // A muted Carbon glyph hero crowns the copy so an empty pane reads as a
+        // designed state, not a blank panel: the search / bookmark-new glyph from
+        // the shared Mackes-Carbon set (§4 iconography), tinted to the dim
+        // empty-state tone rather than a hand-painted mark.
+        empty_state_hero(ui, icon);
+        ui.add_space(Style::SP_S);
         // The empty-state hero title: one type tier up from body, in the honest
         // emphasis tone (Inter has no bold cut, so brightness is the weight cue).
         ui.label(
@@ -743,6 +760,46 @@ fn empty_state(ui: &mut egui::Ui, m: &Manager) {
         ui.add_space(Style::SP_XS);
         mde_egui::muted_note(ui, body);
     });
+}
+
+/// The empty-state `(icon, title, body)` copy for the three honest cases — a pure
+/// choice so the wording *and* the chosen Carbon glyph stay testable without a
+/// display (matching this surface's render → decision separation). `icon` is a
+/// Mackes-Carbon glyph name, never an inline literal.
+const fn empty_state_copy(
+    is_searching: bool,
+    is_total_empty: bool,
+) -> (&'static str, &'static str, &'static str) {
+    if is_searching {
+        (
+            "system-search",
+            "No matches",
+            "No bookmark title or URL matches this search.",
+        )
+    } else if is_total_empty {
+        (
+            "bookmark-new",
+            "No bookmarks yet",
+            "Add one with +, paste a URL, or press Ctrl+N. They sync across the mesh once the worker is running.",
+        )
+    } else {
+        (
+            "bookmark-new",
+            "This folder is empty",
+            "Drag bookmarks here, or add one with +.",
+        )
+    }
+}
+
+/// Paint the large, muted Carbon glyph hero above the empty-state copy. The hero
+/// size is a shared icon token doubled (§4 — a derived metric, not a raw literal),
+/// tinted to the dim empty tone so it crowns the copy without shouting.
+fn empty_state_hero(ui: &mut egui::Ui, name: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(Style::ICON_XL * 2.0, Style::ICON_XL * 2.0),
+        Sense::hover(),
+    );
+    let _ = mde_egui::paint_carbon(ui.painter(), rect, name, Style::TEXT_DIM);
 }
 
 /// One list row: a drag grip (the `DnD` source), a kind dot, and the clickable /
@@ -999,8 +1056,8 @@ fn author_line(author: &mde_bookmarks::Author) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bookmarks_panel, scope_bookmarks_toolbar_ui, BOOKMARKS_ACTION_BUTTON_H,
-        BOOKMARKS_HEADER_TITLE,
+        bookmarks_panel, empty_state_copy, scope_bookmarks_toolbar_ui, tree_chevron_icon,
+        BOOKMARKS_ACTION_BUTTON_H, BOOKMARKS_HEADER_TITLE,
     };
     use crate::model::Manager;
     use mde_bookmarks::Author;
@@ -1078,6 +1135,36 @@ mod tests {
         let (button_pad_y, interact_h) = metrics.expect("toolbar scope captured metrics");
         assert_eq!(button_pad_y, Style::CONTROL_PAD_Y);
         assert_eq!(interact_h, Style::TOOLBAR_CONTROL_H);
+    }
+
+    #[test]
+    fn empty_state_and_tree_chevrons_name_registered_carbon_glyphs() {
+        // Iconography (§4): the empty-state hero and the folder-tree disclosure
+        // chevrons resolve to REAL Mackes-Carbon glyphs, never inline "v"/">" or a
+        // blank-panel placeholder. Guarding the names (not the paint) keeps the
+        // choice testable off-display and catches a future rename of a registry key.
+        for is_searching in [true, false] {
+            for is_total_empty in [true, false] {
+                let (icon, _, _) = empty_state_copy(is_searching, is_total_empty);
+                assert!(
+                    mde_egui::carbon_svg_bytes(icon).is_some(),
+                    "empty-state glyph {icon:?} must be a registered Carbon icon"
+                );
+            }
+        }
+        for expanded in [true, false] {
+            let chevron = tree_chevron_icon(expanded);
+            assert!(
+                mde_egui::carbon_svg_bytes(chevron).is_some(),
+                "tree chevron {chevron:?} must be a registered Carbon icon"
+            );
+        }
+        // The chevron flips with expansion — down when open, right when closed.
+        assert_ne!(
+            tree_chevron_icon(true),
+            tree_chevron_icon(false),
+            "the disclosure chevron must change with the expanded state"
+        );
     }
 
     #[test]
