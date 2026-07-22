@@ -1332,8 +1332,8 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
     assert_eq!(AppearanceConfig::default().accent, AccentChoice::Brand);
     assert_eq!(
         AppearanceConfig::default().layout_profile,
-        LayoutProfile::Workstation,
-        "Windows 2000 Workstation is the fresh-install layout"
+        LayoutProfile::Construct,
+        "Construct is the fresh-install layout (Q42: two profiles)"
     );
     assert_eq!(AppearanceConfig::default().text_scale, TextScale::Default);
     assert_eq!(
@@ -1430,8 +1430,8 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
     );
     assert_eq!(
         cfg.layout_profile,
-        LayoutProfile::Workstation,
-        "the absent layout-profile field folds to Windows 2000 Workstation"
+        LayoutProfile::Construct,
+        "the absent layout-profile field folds to Construct"
     );
     assert_eq!(
         cfg.motion_mode,
@@ -1466,8 +1466,8 @@ fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
     );
     assert_eq!(
         cfg.layout_profile,
-        LayoutProfile::Workstation,
-        "legacy appearance configs keep the Windows 2000 Workstation layout"
+        LayoutProfile::Construct,
+        "legacy appearance configs keep the Construct workstation layout"
     );
     assert!(
         !cfg.taskbar_autohide,
@@ -1495,6 +1495,92 @@ fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
 }
 
 #[test]
+fn legacy_workstation_and_tablet_profiles_migrate_to_construct() {
+    // PLATFORM-INTERFACES Q42: seats persisted "workstation" or "tablet" before
+    // the two-profile fold; both must deserialize to Construct silently (a parse
+    // failure would reset the whole seat appearance), and the next save writes
+    // the new "construct" wire name.
+    let cfg: AppearanceConfig = serde_json::from_str(r#"{"layout_profile":"tablet"}"#)
+        .expect("tablet-era appearance config parses");
+    assert_eq!(
+        cfg.layout_profile,
+        LayoutProfile::Construct,
+        "a persisted tablet profile folds into Construct"
+    );
+    let cfg: AppearanceConfig = serde_json::from_str(r#"{"layout_profile":"workstation"}"#)
+        .expect("workstation-era appearance config parses");
+    assert_eq!(
+        cfg.layout_profile,
+        LayoutProfile::Construct,
+        "a persisted workstation profile folds into Construct"
+    );
+
+    let dir = nav_temp_dir("theme-profile-fold");
+    std::fs::create_dir_all(&dir).expect("mkroot");
+    let path = dir.join(APPEARANCE_CONFIG_FILE);
+    cfg.save_to(&path).expect("save");
+    let json = std::fs::read_to_string(&path).expect("appearance json");
+    assert!(
+        json.contains("\"layout_profile\": \"construct\""),
+        "a migrated config re-persists the new construct wire name: {json}"
+    );
+    assert_eq!(
+        AppearanceConfig::load_from(&path).layout_profile,
+        LayoutProfile::Construct,
+        "the re-persisted construct wire name round-trips"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hardware_formfactor_flips_adjust_density_within_construct() {
+    // PLATFORM-INTERFACES Q42: formfactor ≠ profile. A hardware Tablet flip
+    // grows the live density WITHIN Construct (the folded Tablet profile's
+    // touch metrics now arrive this way); flipping back to Laptop restores the
+    // Mouse anchor; Car pins Touch regardless of the hardware state.
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut st = SystemState {
+        appearance: AppearanceConfig::default(),
+        ..SystemState::default()
+    };
+    assert_eq!(
+        st.layout_density(),
+        Density::Mouse,
+        "Construct without a seat formfactor report keeps the Mouse anchor"
+    );
+
+    st.set_formfactor(Formfactor::Tablet);
+    st.poll(&ctx);
+    assert_eq!(
+        st.layout_density(),
+        Density::Touch,
+        "a hardware Tablet flip grows density within Construct"
+    );
+    assert_eq!(
+        Style::density(&ctx),
+        Density::Touch,
+        "poll installs the formfactor-refined density on the live context"
+    );
+
+    st.set_formfactor(Formfactor::Laptop);
+    st.poll(&ctx);
+    assert_eq!(
+        st.layout_density(),
+        Density::Mouse,
+        "flipping back to Laptop restores the Construct Mouse anchor"
+    );
+    assert_eq!(Style::density(&ctx), Density::Mouse);
+
+    st.appearance.layout_profile = LayoutProfile::Car;
+    assert_eq!(
+        st.layout_density(),
+        Density::Touch,
+        "Car pins Touch even on Laptop hardware"
+    );
+}
+
+#[test]
 fn appearance_taskbar_autohide_preference_is_exposed_to_shell_chrome() {
     let st = SystemState {
         appearance: AppearanceConfig {
@@ -1515,8 +1601,8 @@ fn appearance_layout_profile_drives_live_density() {
     Style::install(&ctx);
     assert_eq!(
         Style::density(&ctx),
-        LayoutProfile::Workstation.density(),
-        "the installed default is the Windows 2000 Workstation density"
+        LayoutProfile::Construct.density(),
+        "the installed default is the Construct anchor (Mouse) density"
     );
 
     let mut st = SystemState {
@@ -1561,7 +1647,7 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
         appearance: AppearanceConfig {
             color_scheme: AppearanceColorScheme::Dark,
             accent: AccentChoice::Green,
-            layout_profile: LayoutProfile::Workstation,
+            layout_profile: LayoutProfile::Construct,
             text_scale: TextScale::Default,
             motion_mode: AppearanceMotionMode::Normal,
             taskbar_autohide: false,
@@ -1648,7 +1734,7 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
         appearance: AppearanceConfig {
             color_scheme: AppearanceColorScheme::Dark,
             accent: AccentChoice::default(),
-            layout_profile: LayoutProfile::Workstation,
+            layout_profile: LayoutProfile::Construct,
             text_scale: TextScale::Larger,
             motion_mode: AppearanceMotionMode::Normal,
             taskbar_autohide: false,

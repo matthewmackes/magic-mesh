@@ -40,8 +40,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::style::Elevation;
 use mde_egui::{
-    field, muted_note, Density, InputPolicy, LayoutProfile, Motion, MotionMode, OsdKind, OsdLevel,
-    Severity, Style, StyleColorScheme, Toast,
+    field, muted_note, Density, Formfactor, InputPolicy, LayoutProfile, Motion, MotionMode,
+    OsdKind, OsdLevel, Severity, Style, StyleColorScheme, Toast,
 };
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
@@ -180,6 +180,13 @@ pub(crate) struct SystemState {
     /// a pick, and applied live to the context every frame by
     /// [`Self::apply_appearance`] (the [`SettingsNav`] client-data-dir JSON idiom).
     appearance: AppearanceConfig,
+    /// The seat's last-reported debounced hardware formfactor (SURFACE-9), mirrored
+    /// in by the shell's formfactor pump. PLATFORM-INTERFACES Q42: formfactor ≠
+    /// profile — a hardware Tablet↔Laptop flip adjusts the live density WITHIN
+    /// Construct (Car pins Touch); it never switches the persisted profile. `None`
+    /// until the seat reports one (the windowed fallback never does), which keeps
+    /// the profile's anchor density.
+    formfactor: Option<Formfactor>,
     /// The Auto Mode (Car) physical-keyboard → action bindings (AUTO-KEYMAP),
     /// persisted to `settings-car-keys.json`. Owned here beside [`appearance`] as
     /// a sibling persisted setting; the shell reads it every frame while Car Mode
@@ -230,6 +237,7 @@ impl Default for SystemState {
             wallpaper_service: WallpaperServiceConfig::load(),
             wallpaper_download: WallpaperDownloadRuntime::default(),
             appearance: AppearanceConfig::load(),
+            formfactor: None,
             car_keys: crate::car_keymap::CarKeyBindings::load(),
             zoom_base: None,
             animation_base: None,
@@ -367,7 +375,9 @@ impl SystemState {
         };
         let want_accent = self.appearance.accent.color();
         let want_live_accent = Style::accent_for_scheme(want_scheme, want_accent);
-        let want_density = self.appearance.layout_profile.density();
+        // PLATFORM-INTERFACES Q42: the profile's anchor density, refined by the
+        // seat's hardware formfactor within Construct (see `layout_density`).
+        let want_density = self.layout_density();
         if Style::color_scheme(ctx) != want_scheme
             || Style::density(ctx) != want_density
             || ctx.style().visuals.hyperlink_color != want_live_accent
@@ -476,9 +486,24 @@ impl SystemState {
         &self.car_keys
     }
 
-    /// The profile-selected density mirrored into the taskbar and other shell chrome.
+    /// The live density mirrored into the taskbar and other shell chrome: the
+    /// profile's anchor density, refined by the seat's hardware formfactor.
+    /// PLATFORM-INTERFACES Q42: a hardware Tablet↔Laptop flip keeps adjusting
+    /// density WITHIN Construct (formfactor ≠ profile); Car pins Touch.
     pub(crate) const fn layout_density(&self) -> Density {
-        self.appearance.layout_profile.density()
+        match (self.appearance.layout_profile, self.formfactor) {
+            (LayoutProfile::Construct, Some(formfactor)) => Density::for_formfactor(formfactor),
+            (profile, _) => profile.density(),
+        }
+    }
+
+    /// Record the seat's debounced hardware formfactor (SURFACE-9), fed by the
+    /// shell's pump on every Tablet↔Laptop flip. The every-frame
+    /// [`Self::apply_appearance`] choke point re-derives the density from it, so a
+    /// Tablet flip grows targets WITHIN Construct without touching the persisted
+    /// profile (PLATFORM-INTERFACES Q42).
+    pub(crate) fn set_formfactor(&mut self, formfactor: Formfactor) {
+        self.formfactor = Some(formfactor);
     }
 
     /// Set and persist the shell layout profile from the lower-right profile control.
@@ -4295,8 +4320,10 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
         });
     });
     ui.add_space(Style::SP_M);
-    // Layout profile — a real shell placement model, not just text size. Workstation
-    // is the Windows 2000 desktop baseline; Tablet and Car branch the shell chrome.
+    // Layout profile — a real shell placement model, not just text size.
+    // PLATFORM-INTERFACES Q42: exactly two — Construct is the workstation
+    // baseline (touch hardware adapts density within it); Car branches the
+    // shell chrome into the vehicle HUD.
     ui.label(
         RichText::new("Layout")
             .color(Style::TEXT_DIM)
@@ -4304,7 +4331,7 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
             .strong(),
     );
     ui.add_space(Style::SP_XS);
-    across_grid(ui, &LayoutProfile::ALL, 3, |ui, &profile| {
+    across_grid(ui, &LayoutProfile::ALL, 2, |ui, &profile| {
         let selected = appearance.layout_profile == profile;
         if settings_choice_tile(
             ui,

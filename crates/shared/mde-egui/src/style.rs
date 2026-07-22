@@ -19,28 +19,34 @@ use crate::formfactor::Formfactor;
 /// The shell-wide layout profile. Profiles are not just density presets: each one
 /// names a distinct placement model the shell can branch on while still sharing
 /// the same `Style` palette and Inter-first font system.
+///
+/// PLATFORM-INTERFACES Q42: exactly two profiles — Construct + Car. The former
+/// Workstation and Tablet profiles folded into Construct; hardware formfactor
+/// flips keep adjusting density/OSK *within* Construct (formfactor ≠ profile).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutProfile {
-    /// Windows 2000 Workstation: classic bottom taskbar + Start lower-left.
+    /// The workstation interface: classic bottom taskbar + Start lower-left.
+    /// Absorbs the retired Workstation and Tablet profiles — persisted
+    /// `"workstation"` / `"tablet"` seat configs deserialize here silently via
+    /// the serde aliases (PLATFORM-INTERFACES Q42; a parse failure would reset
+    /// seat appearance), while new configs write `"construct"`.
     #[default]
-    Workstation,
-    /// Touch tablet: bottom touch bar, larger targets, slide-up controls.
-    Tablet,
+    #[serde(alias = "workstation", alias = "tablet")]
+    Construct,
     /// Vehicle HUD: glanceable driving/vehicle/media/comms controls.
     Car,
 }
 
 impl LayoutProfile {
     /// Visible picker order.
-    pub const ALL: [Self; 3] = [Self::Workstation, Self::Tablet, Self::Car];
+    pub const ALL: [Self; 2] = [Self::Construct, Self::Car];
 
     /// Human label for settings/menu rows.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Workstation => "Windows 2000 Workstation",
-            Self::Tablet => "Tablet",
+            Self::Construct => "Construct",
             Self::Car => "Car",
         }
     }
@@ -49,8 +55,7 @@ impl LayoutProfile {
     #[must_use]
     pub const fn short_label(self) -> &'static str {
         match self {
-            Self::Workstation => "WS",
-            Self::Tablet => "TAB",
+            Self::Construct => "CON",
             Self::Car => "CAR",
         }
     }
@@ -59,18 +64,21 @@ impl LayoutProfile {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Workstation => "Classic desktop placement",
-            Self::Tablet => "Bottom touch bar and larger targets",
+            Self::Construct => "Workstation desktop; touch hardware adapts density",
             Self::Car => "Driving HUD and keyboard actions",
         }
     }
 
-    /// Runtime interaction density installed for this profile.
+    /// The profile's **anchor** interaction density. Construct anchors on the
+    /// pointer (Mouse) metrics — exactly what the folded Workstation profile
+    /// installed; the shell refines it live from the seat's hardware formfactor
+    /// ([`Density::for_formfactor`]) so a Tablet flip still grows targets WITHIN
+    /// Construct (PLATFORM-INTERFACES Q42). Car pins Touch.
     #[must_use]
     pub const fn density(self) -> Density {
         match self {
-            Self::Workstation => Density::Mouse,
-            Self::Tablet | Self::Car => Density::Touch,
+            Self::Construct => Density::Mouse,
+            Self::Car => Density::Touch,
         }
     }
 
@@ -2280,20 +2288,42 @@ mod tests {
 
     #[test]
     fn layout_profiles_have_locked_order_and_density() {
+        // PLATFORM-INTERFACES Q42: exactly two profiles — Construct + Car.
+        // Construct anchors on the pointer (Mouse) density; the shell refines it
+        // from the hardware formfactor, never from a third profile.
         assert_eq!(
             LayoutProfile::ALL,
-            [
-                LayoutProfile::Workstation,
-                LayoutProfile::Tablet,
-                LayoutProfile::Car
-            ]
+            [LayoutProfile::Construct, LayoutProfile::Car]
         );
-        assert_eq!(LayoutProfile::default(), LayoutProfile::Workstation);
-        assert_eq!(LayoutProfile::Workstation.density(), Density::Mouse);
-        assert_eq!(LayoutProfile::Tablet.density(), Density::Touch);
+        assert_eq!(LayoutProfile::default(), LayoutProfile::Construct);
+        assert_eq!(LayoutProfile::Construct.density(), Density::Mouse);
         assert_eq!(LayoutProfile::Car.density(), Density::Touch);
         assert!(LayoutProfile::Car.is_car());
-        assert_eq!(LayoutProfile::Workstation.short_label(), "WS");
+        assert!(!LayoutProfile::Construct.is_car());
+        assert_eq!(LayoutProfile::Construct.label(), "Construct");
+        assert_eq!(LayoutProfile::Construct.short_label(), "CON");
+        assert_eq!(LayoutProfile::Car.short_label(), "CAR");
+    }
+
+    #[test]
+    fn layout_profile_wire_names_fold_workstation_and_tablet_to_construct() {
+        // PLATFORM-INTERFACES Q42: persisted `"workstation"` / `"tablet"` seat
+        // configs deserialize to Construct silently (the serde aliases) — a parse
+        // failure here would reset seat appearance on upgrade. Uses serde's plain
+        // str deserializer so this crate needs no JSON dev-dependency; the shell's
+        // AppearanceConfig tests cover the full JSON round-trip (new configs write
+        // `"construct"`).
+        fn parse(wire: &str) -> LayoutProfile {
+            use serde::Deserialize as _;
+            LayoutProfile::deserialize(
+                serde::de::value::StrDeserializer::<serde::de::value::Error>::new(wire),
+            )
+            .expect("persisted wire name must keep parsing")
+        }
+        assert_eq!(parse("workstation"), LayoutProfile::Construct);
+        assert_eq!(parse("tablet"), LayoutProfile::Construct);
+        assert_eq!(parse("construct"), LayoutProfile::Construct);
+        assert_eq!(parse("car"), LayoutProfile::Car);
     }
 
     #[test]
