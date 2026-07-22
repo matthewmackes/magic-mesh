@@ -1748,13 +1748,43 @@ impl Shell {
                 });
             }
             Surface::AutoHome => {
-                // Auto Mode home (AUTO-HOME) — the glanceable Ford SYNC 3 tile
-                // launcher a driver lands on in Car Mode. The tiles route the active
-                // surface; the Vehicle tile carries the live MG90 telematics glance
-                // (voltage / speed) when the gateway is the primary location source.
+                // Auto Mode home (AUTO-HOME / PLATFORM-INTERFACES Q31/Q32) — the
+                // CarPlay-Dashboard-style split cards + six-app strip. Every
+                // glance wires from state the shell already holds; absent data
+                // stays `None` and the cards paint their honest descriptors,
+                // never a mock:
+                //   nav     — the Maps cockpit's route state, only while
+                //             turn-by-turn guidance is actually running;
+                //   media   — the Media player's loaded title while playing,
+                //             else Music's loaded track (title · artist);
+                //   comms   — the Notification Center ring's retained (unacked)
+                //             alert count for THIS shell process;
+                //   vehicle — the live MG90 telematics glance (speed / voltage)
+                //             when the gateway is the primary location source.
+                let nav_state = &self.maps_location.local_navigation;
                 let glance = car_home::CarHomeGlance {
+                    nav: nav_state.navigating.then(|| {
+                        let route = &nav_state.active_route;
+                        format!(
+                            "{} min · {:.1} mi · ETA {}",
+                            route.remaining_time_min, route.remaining_distance_mi, route.eta
+                        )
+                    }),
+                    media: if self.media.is_playing() {
+                        Some(mde_media_egui::model::now_playing_title(
+                            self.media.player(),
+                        ))
+                    } else {
+                        self.music.now_playing().map(|song| {
+                            if song.artist.is_empty() {
+                                song.title.clone()
+                            } else {
+                                format!("{} · {}", song.title, song.artist)
+                            }
+                        })
+                    },
+                    comms: Some(self.toasts.history().len()).filter(|n| *n > 0),
                     vehicle: self.maps_location.vehicle_glance(),
-                    ..Default::default()
                 };
                 let picked = ui
                     .push_id("shell-auto-home", |ui| {
@@ -1768,18 +1798,17 @@ impl Shell {
         }
     }
 
-    /// Route an Auto Mode home tile (a tap or a bound key) to its surface — the
-    /// Vehicle tile lands on the Maps cockpit's telematics tab, the rest on their
-    /// own surface.
+    /// Route an Auto Mode home tile (a card/strip tap or a bound key) to its
+    /// surface — the Vehicle tile lands on the Maps cockpit's telematics tab,
+    /// the rest on their own surface. (PLATFORM-INTERFACES Q32: the Airspace
+    /// tile is gone; the radar's Maps tab stays reachable via
+    /// `CarAction::GoAirspace`, which focuses it directly.)
     fn apply_car_tile(&mut self, tile: car_home::CarTile) {
         self.front_door.close();
         self.nav.expanded = true;
         self.nav.surface = tile.surface();
         if tile == car_home::CarTile::Vehicle {
             self.maps_location.focus_vehicle_tab();
-        }
-        if tile == car_home::CarTile::Airspace {
-            self.maps_location.focus_airspace_tab();
         }
     }
 }
@@ -2402,7 +2431,8 @@ impl Shell {
             }
             CarAction::GoNav => self.apply_car_tile(car_home::CarTile::Nav),
             CarAction::GoMedia => self.apply_car_tile(car_home::CarTile::Media),
-            CarAction::GoPhone => self.apply_car_tile(car_home::CarTile::Phone),
+            // PLATFORM-INTERFACES Q32 — Music is its own Auto app tile.
+            CarAction::GoMusic => self.apply_car_tile(car_home::CarTile::Music),
             CarAction::GoComms => self.apply_car_tile(car_home::CarTile::Comms),
             CarAction::GoVehicle => self.apply_car_tile(car_home::CarTile::Vehicle),
             CarAction::GoSettings => self.apply_car_tile(car_home::CarTile::Settings),
@@ -2441,10 +2471,11 @@ impl Shell {
             CarAction::VolumeDown => self.apply_hotkey(HotkeyAction::VolumeDown),
             CarAction::VolumeMute => self.apply_hotkey(HotkeyAction::VolumeMute),
             // A physical Answer / Hang-up key brings the driver to the (car-large)
-            // Phone screen to confirm; direct in-place answer is a fast follow once
-            // the Voice surface exposes a programmatic call verb.
+            // Communications hub — where calls live since the Phone tile folded in
+            // (Q32 / WL-FUNC-011) — to confirm; direct in-place answer is a fast
+            // follow once the hub exposes a programmatic call verb.
             CarAction::CallAnswer | CarAction::CallHangup => {
-                self.apply_car_tile(car_home::CarTile::Phone);
+                self.apply_car_tile(car_home::CarTile::Comms);
             }
         }
     }
@@ -4178,11 +4209,13 @@ mod tests {
         use car_home::CarTile;
         use car_keymap::{CarAction, CarKeyBindings};
 
-        // The Auto Mode home tiles route to the vehicle apps.
+        // PLATFORM-INTERFACES Q31/Q32 — exactly six Auto apps, each with its
+        // route: Music is its own tile, the Phone tile folded into Comms, and
+        // the Airspace tile is gone (the radar stays a Maps tab + keymap action).
+        assert_eq!(CarTile::ALL.len(), 6);
         assert_eq!(CarTile::Nav.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Media.surface(), Surface::Media);
-        // WL-FUNC-011 Phase-2 — the Phone tile's calls fold into Communications.
-        assert_eq!(CarTile::Phone.surface(), Surface::Communications);
+        assert_eq!(CarTile::Music.surface(), Surface::Music);
         assert_eq!(CarTile::Comms.surface(), Surface::Communications);
         assert_eq!(CarTile::Vehicle.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Settings.surface(), Surface::System);
@@ -4198,6 +4231,10 @@ mod tests {
             Some(CarAction::GoMedia)
         );
         assert_eq!(
+            bindings.action_for(egui::Key::Num3),
+            Some(CarAction::GoMusic)
+        );
+        assert_eq!(
             bindings.action_for(egui::Key::Num4),
             Some(CarAction::GoComms)
         );
@@ -4205,8 +4242,63 @@ mod tests {
             bindings.action_for(egui::Key::Num5),
             Some(CarAction::GoVehicle)
         );
-        // A letter key is not in the bindable set, so it never routes in Car Mode.
-        assert_eq!(bindings.action_for(egui::Key::A), None);
+        // Reconciled expectation (was the recorded stale red in
+        // docs/NEEDS-OPERATOR.md): `A` IS bindable and the factory layout has
+        // always bound it to GoAirspace — the Airspace mnemonic row (A/W/C/B)
+        // keeps the radar keyboard-reachable now that its home tile is gone.
+        assert_eq!(
+            bindings.action_for(egui::Key::A),
+            Some(CarAction::GoAirspace)
+        );
+        // A bindable-but-unbound letter honestly stays None.
+        assert_eq!(bindings.action_for(egui::Key::Z), None);
+    }
+
+    /// PLATFORM-INTERFACES Q31/Q32 — every surface-jump `CarAction` (plus the
+    /// call verbs) lands the shell on its roster surface through
+    /// `apply_car_action`, including the new `GoMusic` and the Airspace action
+    /// that outlived its dropped home tile.
+    #[test]
+    fn every_car_surface_action_routes_through_apply_car_action() {
+        use car_keymap::CarAction;
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        for action in CarAction::ALL {
+            if !action.is_surface_jump() {
+                continue;
+            }
+            let expected = match action {
+                CarAction::GoHome => Surface::AutoHome,
+                CarAction::GoNav | CarAction::GoVehicle | CarAction::GoAirspace => {
+                    Surface::MapsLocation
+                }
+                CarAction::GoMedia => Surface::Media,
+                CarAction::GoMusic => Surface::Music,
+                CarAction::GoComms => Surface::Communications,
+                CarAction::GoSettings => Surface::System,
+                _ => unreachable!("non-jump actions are skipped above"),
+            };
+            shell.apply_car_action(action);
+            assert_eq!(shell.nav.surface, expected, "{action:?} routes");
+        }
+
+        // The call verbs land the driver on the Communications hub (the Phone
+        // tile folded in there — Q32 / WL-FUNC-011).
+        shell.nav.surface = Surface::AutoHome;
+        shell.apply_car_action(CarAction::CallAnswer);
+        assert_eq!(shell.nav.surface, Surface::Communications);
+        shell.nav.surface = Surface::AutoHome;
+        shell.apply_car_action(CarAction::CallHangup);
+        assert_eq!(shell.nav.surface, Surface::Communications);
+
+        // The Airspace filter toggles act on the radar without moving the
+        // surface (they are transport-style verbs, not jumps).
+        shell.nav.surface = Surface::AutoHome;
+        shell.apply_car_action(CarAction::AirspaceWifi);
+        assert_eq!(shell.nav.surface, Surface::AutoHome);
     }
 
     #[test]

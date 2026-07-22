@@ -36,11 +36,14 @@ pub enum CarAction {
     GoHome,
     /// Jump to Navigation (the Drive HUD).
     GoNav,
-    /// Jump to Media / Music.
+    /// Jump to Media (the full player).
     GoMedia,
-    /// Jump to Phone (Voice / calls).
-    GoPhone,
-    /// Jump to Communications (alerts + messages).
+    /// Jump to Music (PLATFORM-INTERFACES Q32 — the tile split from Media).
+    GoMusic,
+    /// Jump to Communications (calls + alerts + messages — Q32 folded the old
+    /// Phone tile in here, so a persisted legacy `go_phone` binding lands on
+    /// Comms too, via the serde alias).
+    #[serde(alias = "go_phone")]
     GoComms,
     /// Jump to Vehicle telematics.
     GoVehicle,
@@ -78,7 +81,7 @@ impl CarAction {
         Self::GoHome,
         Self::GoNav,
         Self::GoMedia,
-        Self::GoPhone,
+        Self::GoMusic,
         Self::GoComms,
         Self::GoVehicle,
         Self::GoSettings,
@@ -103,7 +106,7 @@ impl CarAction {
             Self::GoHome => "Home",
             Self::GoNav => "Navigation",
             Self::GoMedia => "Media",
-            Self::GoPhone => "Phone",
+            Self::GoMusic => "Music",
             Self::GoComms => "Comms",
             Self::GoVehicle => "Vehicle",
             Self::GoSettings => "Settings",
@@ -131,7 +134,7 @@ impl CarAction {
             Self::GoHome
                 | Self::GoNav
                 | Self::GoMedia
-                | Self::GoPhone
+                | Self::GoMusic
                 | Self::GoComms
                 | Self::GoVehicle
                 | Self::GoSettings
@@ -263,11 +266,12 @@ impl CarKeyBindings {
             }
         };
         // Digit + aligned function key hit the same app (`1`/`F1` → Nav, …) so
-        // either row works from muscle memory.
+        // either row works from muscle memory. Q32 roster: Music takes the `3`
+        // slot the retired Phone tile held (calls live in Comms, on `4`).
         for (num, fkey, action) in [
             (Num1, F1, CarAction::GoNav),
             (Num2, F2, CarAction::GoMedia),
-            (Num3, F3, CarAction::GoPhone),
+            (Num3, F3, CarAction::GoMusic),
             (Num4, F4, CarAction::GoComms),
             (Num5, F5, CarAction::GoVehicle),
             (Num6, F6, CarAction::GoHome),
@@ -385,11 +389,18 @@ mod tests {
     #[test]
     fn defaults_bind_the_driver_layout() {
         let b = CarKeyBindings::defaults();
-        // Digit + function rows both reach the six Auto apps.
+        // Digit + function rows both reach the six Auto apps (Q32 roster:
+        // Music on `3`, the retired Phone tile's slot; calls live in Comms).
         assert_eq!(b.action_for(egui::Key::Num1), Some(CarAction::GoNav));
         assert_eq!(b.action_for(egui::Key::F1), Some(CarAction::GoNav));
+        assert_eq!(b.action_for(egui::Key::Num3), Some(CarAction::GoMusic));
+        assert_eq!(b.action_for(egui::Key::F3), Some(CarAction::GoMusic));
         assert_eq!(b.action_for(egui::Key::Num5), Some(CarAction::GoVehicle));
         assert_eq!(b.action_for(egui::Key::Num6), Some(CarAction::GoHome));
+        // The Airspace TILE is gone (Q32) but the radar stays keyboard-reachable
+        // on its letter mnemonics (A = open, W/C/B = filters).
+        assert_eq!(b.action_for(egui::Key::A), Some(CarAction::GoAirspace));
+        assert_eq!(b.action_for(egui::Key::W), Some(CarAction::AirspaceWifi));
         // Transport / call / volume + settings verbs are all bound by default, so
         // the whole car UI is keyboard-reachable out of the box.
         assert_eq!(b.action_for(egui::Key::F7), Some(CarAction::MediaPlayPause));
@@ -429,6 +440,22 @@ mod tests {
         assert!(json.contains("\"F10\":\"media_prev\""));
         let back: CarKeyBindings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, b);
+    }
+
+    #[test]
+    fn legacy_go_phone_bindings_land_on_comms() {
+        // Q32 folded the Phone tile into Comms; a persisted pre-roster map with
+        // `go_phone` keys must keep working — retargeted to Comms, not dropped
+        // (a hard variant removal would fold the whole file to defaults).
+        let legacy: CarKeyBindings =
+            serde_json::from_str(r#"{"3":"go_phone","F3":"go_phone"}"#).expect("legacy map parses");
+        assert_eq!(legacy.action_for(egui::Key::Num3), Some(CarAction::GoComms));
+        assert_eq!(legacy.action_for(egui::Key::F3), Some(CarAction::GoComms));
+        // The alias is read-side only: the current vocabulary serializes as
+        // `go_comms` (the stable name), never re-emitting the legacy spelling.
+        let json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(json.contains("\"3\":\"go_comms\""));
+        assert!(!json.contains("go_phone"));
     }
 
     #[test]

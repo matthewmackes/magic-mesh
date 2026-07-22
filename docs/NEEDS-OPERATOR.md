@@ -83,9 +83,11 @@ under the WL-\* epic named in the re-key map above, not as an independent ID.
   1. `system::tests::every_section_is_reachable_exactly_once` — the SettingsSection
      taxonomy has 14 sections but the test asserts 13 (a settings section was added
      without updating the count/list). `system/tests.rs`.
-  2. `tests::car_home_tiles_and_default_key_bindings_cover_the_vehicle_apps` — the
-     default car keymap resolves letter key `A` to `Some(GoAirspace)` where the test
-     asserts `None` (the Airspace vehicle app's binding drift). `main.rs`.
+  2. ~~`tests::car_home_tiles_and_default_key_bindings_cover_the_vehicle_apps`~~ —
+     RESOLVED by WL-UX-007/U26 (Car Dashboard home): the roster rework now owns
+     the file and reconciled the expectation honestly — `A` IS bound to
+     `GoAirspace` in the factory layout (the Airspace letter-mnemonic row that
+     keeps the radar keyboard-reachable after its home tile was dropped, Q32).
   3. `tests::shell_remote_sessions_fallback_mounts_for_bare_non_desktop_workspaces`
      and 4. `tests::shell_remote_sessions_fallback_request_uses_shell_transition` —
      both drive `Surface::Files`, but `surface_needs_remote_sessions_fallback` now
