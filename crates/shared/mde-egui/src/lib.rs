@@ -45,6 +45,7 @@ pub mod motion;
 pub mod nav_chrome;
 pub mod runner;
 pub mod search_omnibox;
+pub mod sheet;
 pub mod style;
 pub mod toast;
 pub mod touch;
@@ -84,6 +85,10 @@ pub use motion::{
     MotionScale, MotionSpec, MotionValue, Phase, StatusMotion,
 };
 pub use runner::run_client;
+pub use sheet::{
+    popover_placement, sheet_presentation, sheet_rect, sheet_scrim, Popover, PopoverPlacement,
+    PopoverSide, Sheet, SheetPresentation, SheetResponse, SheetState,
+};
 pub use style::{
     Density, Elevation, GradeBand, LayoutProfile, ShadowToken, Style, StyleColorScheme,
     StylePalette, SurfaceLevel,
