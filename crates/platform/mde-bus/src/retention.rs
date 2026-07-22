@@ -102,11 +102,21 @@ pub const AUDIT_RUN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// unbounded-index wedge that filled a 391 MB `/run` (v10.0.18). So the prune
 /// ALSO keeps at most this many of the most-recent records REGARDLESS of their
 /// on-disk size: every record costs exactly one toward this budget, so the lane
-/// can never stall on a 0-byte read. At the ~200 B audit metadata-record size,
-/// 20k records is well under the 8 MiB byte cap, so bytes are the binding limit
-/// when files are present and this count is the floor that holds when they are
-/// not. Whichever bound is hit first wins (the prune keeps the SMALLER window).
-pub const AUDIT_RUN_CAP_ENTRIES: usize = 20_000;
+/// can never stall on a 0-byte read.
+///
+/// BUS-RUN-INODE-1 — lowered from 20k to 2k. Each retained record is a separate
+/// `<ulid>.json` FILE, and the `/run` tmpfs the bus lives on has a FIXED inode
+/// budget unrelated to its byte size (a ~3.9 GB DO-lighthouse `/run` has only
+/// ~819,200 inodes). At 20k the byte cap was the binding limit (~200 B records ⇒
+/// well under 8 MiB), but `entries × topic_count` FILES can exhaust inodes long
+/// before any byte cap trips — which is exactly how `/run/mde-bus` reached
+/// ~754,000 files / ~390 MB on both lighthouses (12.1.0 release), wedging
+/// mackesd's systemd namespace setup (`status=226/NAMESPACE`). 2k records is
+/// still a generous most-recent window for incident triage while cutting the
+/// per-topic file (inode) footprint an order of magnitude. Whichever bound is
+/// hit first wins (the prune keeps the SMALLER window); the global
+/// [`DEFAULT_MAX_SPOOL_FILES`] guard backstops the aggregate across all topics.
+pub const AUDIT_RUN_CAP_ENTRIES: usize = 2_000;
 
 /// BROKER-RESILIENCE-1 — per-topic byte cap for EVERY non-audit topic on `/run`.
 ///
@@ -133,7 +143,16 @@ pub const TOPIC_RUN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// count bound the index rows (which duplicate each body — BUS-RETENTION-1)
 /// could grow unbounded while the byte cap never trips. Counting one-per-record
 /// can never stall on a 0-byte read.
-pub const TOPIC_RUN_CAP_ENTRIES: usize = 20_000;
+///
+/// BUS-RUN-INODE-1 — lowered from 20k to 2k for the same reason as
+/// [`AUDIT_RUN_CAP_ENTRIES`]: each entry is one `<ulid>.json` FILE, and the byte
+/// cap does not bound inodes. With ~40 active non-audit topics, a 20k per-topic
+/// entry cap alone admitted ~800k files — enough to exhaust the ~819,200-inode
+/// `/run` tmpfs on both lighthouses (12.1.0) while every byte cap read "under
+/// budget". 2k keeps a generous per-topic window; the global
+/// [`DEFAULT_MAX_SPOOL_FILES`] guard bounds the aggregate regardless of topic
+/// count.
+pub const TOPIC_RUN_CAP_ENTRIES: usize = 2_000;
 
 /// BUS-RUN-FULL-1-dfguard — filesystem-pressure trip point. The bus's own
 /// quota (`quota_hard_bytes`) only bounds the bus's *own* footprint; it says
@@ -148,6 +167,34 @@ pub const TOPIC_RUN_CAP_ENTRIES: usize = 20_000;
 /// spool, handing headroom back to the OS rather than wedging on a small `/run`.
 /// 85% leaves enough slack that the prune lands before ENOSPC.
 pub const FS_PRESSURE_FILL_PCT: u64 = 85;
+
+/// BUS-RUN-INODE-1 — global cap on the NUMBER of spool message files (inodes)
+/// the bus may keep on `/run`, independent of their byte size.
+///
+/// Every OTHER retention bound — the per-priority TTL, the per-topic
+/// [`TOPIC_RUN_CAP_BYTES`] / [`AUDIT_RUN_CAP_BYTES`] caps, the hard-cap
+/// ([`RetentionPolicy::quota_hard_bytes`]) and fs-pressure evictors — is measured
+/// in BYTES, and mackesd sizes the byte hard cap relative to the *byte* size of
+/// the hosting `/run` (`total/2`). But a tmpfs has a FIXED, SEPARATE inode budget
+/// that is unrelated to its byte size: a ~3.9 GB DO-lighthouse `/run` has only
+/// ~819,200 inodes. The bus writes one small `<ulid>.json` file per message, and
+/// the per-topic entry cap only bounds files WITHIN a topic — so
+/// `entries_per_topic × topic_count` files accrete with no AGGREGATE bound. That
+/// is exactly how `/run/mde-bus` reached ~754,000 files / ~390 MB on both
+/// lighthouses during the 12.1.0 release: the byte hard cap (~1.95 GB) never
+/// fired because bytes were low, but the ~819,200 inodes were exhausted, and
+/// mackesd then failed its systemd namespace setup (`status=226/NAMESPACE`) — a
+/// hard node wedge the byte-only guards could not see coming.
+///
+/// So each pass ALSO bounds the total spool file count: once it exceeds the cap
+/// the oldest files (across all topics, `audit/*` shed last) are evicted until
+/// back under, exactly the oldest-first policy the byte hard cap uses — just
+/// counting inodes instead of bytes. This fixed default is the tmpfs-safe
+/// fallback used by the standalone `mde-bus` daemon + tests; mackesd overrides it
+/// relative to the filesystem's actual inode total at spawn (a quarter of
+/// `df --output=itotal`), so a small (~190 MB) and a large (~3.9 GB) `/run` are
+/// both bounded well below their inode budget. `0` disables the guard.
+pub const DEFAULT_MAX_SPOOL_FILES: u64 = 50_000;
 
 /// Default GC pass cadence. BUS-RUN-FULL-1 (2026-06-18): the old hourly pass let
 /// high-ingest nodes refill `/run` (tmpfs) from the quota cap to 100% between
@@ -196,6 +243,14 @@ pub struct RetentionPolicy {
     /// analogue of `audit_cap_entries` for non-audit topics, so a 0-byte read
     /// can't stall the byte cap). See [`TOPIC_RUN_CAP_ENTRIES`].
     pub topic_cap_entries: usize,
+    /// BUS-RUN-INODE-1 — global cap on the total number of spool message files
+    /// (inodes) across ALL topics. The byte caps above do not bound inodes, and a
+    /// tmpfs's inode budget is fixed + unrelated to its byte size — so without
+    /// this the spool can exhaust `/run`'s inodes far under any byte cap (the
+    /// ~754k-file lighthouse wedge). Each pass evicts the oldest files once the
+    /// count exceeds this, mirroring the byte hard-cap's oldest-first policy.
+    /// `0` disables the guard. See [`DEFAULT_MAX_SPOOL_FILES`].
+    pub max_spool_files: u64,
 }
 
 impl Default for RetentionPolicy {
@@ -211,6 +266,7 @@ impl Default for RetentionPolicy {
             audit_cap_entries: AUDIT_RUN_CAP_ENTRIES,
             topic_cap_bytes: TOPIC_RUN_CAP_BYTES,
             topic_cap_entries: TOPIC_RUN_CAP_ENTRIES,
+            max_spool_files: DEFAULT_MAX_SPOOL_FILES,
         }
     }
 }
@@ -254,6 +310,20 @@ pub struct PassReport {
     /// hard quota. Distinct from `removed` so the log shows when the bus
     /// is shedding live data to stay off ENOSPC.
     pub evicted: usize,
+    /// BUS-RUN-INODE-1 — message FILES evicted this pass by the global spool
+    /// file-count (inode) guard, because the total spool file count exceeded
+    /// [`RetentionPolicy::max_spool_files`]. Oldest-first across all topics
+    /// (`audit/*` shed last), mirroring `evicted`. Distinct from the byte-based
+    /// `evicted`: this fires on INODE exhaustion (many small files) while bytes
+    /// are still under the byte hard cap — the /run-inode wedge the byte guards
+    /// could not see (both lighthouses, 12.1.0).
+    pub inode_evicted: usize,
+    /// BUS-RUN-INODE-1 — true when the filesystem holding `bus_root` was at/over
+    /// [`FS_PRESSURE_FILL_PCT`] on INODES this pass, so the effective file cap was
+    /// lowered below the bus's own file count to emergency-shed inodes (the inode
+    /// analogue of `fs_pressure`). Distinct from `inode_evicted > 0`, which also
+    /// fires on a plain bus-only file-cap breach.
+    pub inode_pressure: bool,
     /// Total disk bytes the bus occupies after the pass — the remaining spool
     /// `*.json` files PLUS the index DB itself (`index.sqlite{,-wal,-shm}`,
     /// BUS-RETENTION-1). This is the true `/run` footprint the quota guards.
@@ -338,6 +408,44 @@ pub fn disk_usage_bytes(root: &Path) -> Result<u64, RetentionError> {
     Ok(acc)
 }
 
+/// BUS-RUN-INODE-1 — the NUMBER of spool `<ulid>.json` message files under
+/// `root` (i.e. the inodes the bus spool consumes on the tmpfs). The inode
+/// analogue of [`disk_usage_bytes`]: same walk + same exclusions (the index DB,
+/// `.tmp` scratch, hidden files), but counting files instead of summing bytes.
+/// This is the footprint the global file-count guard bounds — a tmpfs's inode
+/// budget is fixed + independent of its byte size, so a spool can exhaust inodes
+/// while every byte cap reads "under budget" (the /run-inode lighthouse wedge).
+/// Pure helper, exposed for tests.
+pub fn spool_file_count(root: &Path) -> Result<u64, RetentionError> {
+    fn walk(dir: &Path, acc: &mut u64) -> Result<(), RetentionError> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| RetentionError::Io(format!("readdir {}: {e}", dir.display())))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| RetentionError::Io(format!("readdir entry: {e}")))?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("index.sqlite") || name.ends_with(".tmp") {
+                continue;
+            }
+            if name.starts_with('.') {
+                continue;
+            }
+            let ft = entry
+                .file_type()
+                .map_err(|e| RetentionError::Io(format!("file_type {}: {e}", path.display())))?;
+            if ft.is_dir() {
+                walk(&path, acc)?;
+            } else if ft.is_file() && name.ends_with(".json") {
+                *acc += 1;
+            }
+        }
+        Ok(())
+    }
+    let mut acc: u64 = 0;
+    walk(root, &mut acc)?;
+    Ok(acc)
+}
+
 /// BUS-RETENTION-1 — on-disk bytes of the index DB itself (`index.sqlite` plus
 /// its `-wal`/`-shm` sidecars). [`disk_usage_bytes`] deliberately excludes these
 /// (it sums only spool `*.json`), but the index is a real consumer of the tmpfs
@@ -380,6 +488,34 @@ pub fn filesystem_total_avail_bytes(path: &Path) -> Option<(u64, u64)> {
     let total = cols.next()?.parse::<u64>().ok()?;
     let avail = cols.next()?.parse::<u64>().ok()?;
     Some((total, avail))
+}
+
+/// BUS-RUN-INODE-1 — the INODE fill of the filesystem holding `path`, as
+/// `(itotal, iavail)`. The inode analogue of [`filesystem_total_avail_bytes`]:
+/// `df --output=itotal,iavail` reads the tmpfs's inode budget + free inodes,
+/// which are FIXED + independent of the byte size, so a spool can run the
+/// filesystem out of inodes while it is nowhere near full on bytes (the ~754k
+/// file / ~390 MB lighthouse wedge). mackesd uses `itotal` to size the global
+/// [`RetentionPolicy::max_spool_files`] cap; the pass uses `iavail` for the inode
+/// analogue of the fs-pressure guard. `None` if `df` is missing/unparseable (or
+/// the filesystem does not report inodes, e.g. reports `-`), in which case the
+/// caller degrades to the fixed configured cap.
+#[must_use]
+pub fn filesystem_total_avail_inodes(path: &Path) -> Option<(u64, u64)> {
+    let out = std::process::Command::new("df")
+        .arg("--output=itotal,iavail")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Line 1 is the header ("Inodes IUsed ..."); line 2 is "<itotal> <iavail>".
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut cols = text.lines().nth(1)?.split_whitespace();
+    let itotal = cols.next()?.parse::<u64>().ok()?;
+    let iavail = cols.next()?.parse::<u64>().ok()?;
+    Some((itotal, iavail))
 }
 
 /// BUS-RUN-FULL-1-dfguard — pure threshold helper. Given the configured bus hard
@@ -431,6 +567,48 @@ pub fn fs_pressure_hard_cap(
     let effective = footprint_bytes
         .saturating_sub(reclaim)
         .min(configured_hard_bytes);
+    (effective, true)
+}
+
+/// BUS-RUN-INODE-1 — pure threshold helper, the INODE analogue of
+/// [`fs_pressure_hard_cap`]. Given the configured bus file cap, the bus's current
+/// spool file count, and the *whole filesystem's* `(itotal, iavail)`, decide the
+/// **effective** file cap to feed the oldest-first file evictor and whether the
+/// filesystem is under INODE pressure.
+///
+/// When the filesystem inode fill `(itotal - iavail) / itotal` is at/over
+/// [`FS_PRESSURE_FILL_PCT`], the bus must shed files regardless of its own cap:
+/// compute how many inodes must be freed to bring the filesystem back to the trip
+/// point (`reclaim`) and lower the effective cap to `files - reclaim` (never below
+/// 0, never above the configured cap). Only the bus's own files can be reclaimed,
+/// so the achievable floor is naturally bounded — but every inode the bus gives
+/// back is headroom the OS regains. With no pressure (or `itotal == 0`, an
+/// unreadable/inode-less probe) the effective cap is just the configured cap and
+/// `pressure` is false.
+#[must_use]
+pub fn inode_pressure_file_cap(
+    configured_file_cap: u64,
+    footprint_files: u64,
+    fs_total_inodes: u64,
+    fs_avail_inodes: u64,
+) -> (u64, bool) {
+    if fs_total_inodes == 0 {
+        return (configured_file_cap, false);
+    }
+    let used = fs_total_inodes.saturating_sub(fs_avail_inodes);
+    // Integer-only fill check: used/itotal >= PCT/100 ⇔ used*100 >= itotal*PCT.
+    let over =
+        u128::from(used) * 100 >= u128::from(fs_total_inodes) * u128::from(FS_PRESSURE_FILL_PCT);
+    if !over {
+        return (configured_file_cap, false);
+    }
+    let target_used =
+        u64::try_from(u128::from(fs_total_inodes) * u128::from(FS_PRESSURE_FILL_PCT) / 100)
+            .unwrap_or(fs_total_inodes);
+    let reclaim = used.saturating_sub(target_used);
+    let effective = footprint_files
+        .saturating_sub(reclaim)
+        .min(configured_file_cap);
     (effective, true)
 }
 
@@ -496,20 +674,24 @@ pub fn run_pass_at(
     now_unix_ms: i64,
 ) -> Result<PassReport, RetentionError> {
     // Probe the real filesystem fill once; `None` (df missing/unparseable)
-    // degrades to the plain bus-only cap.
+    // degrades to the plain bus-only cap. BUS-RUN-INODE-1 — probe the INODE fill
+    // too, so the global file-count guard also honors whole-`/run` inode pressure.
     let fs = filesystem_total_avail_bytes(bus_root);
-    run_pass_at_inner(policy, bus_root, now_unix_ms, fs)
+    let inodes = filesystem_total_avail_inodes(bus_root);
+    run_pass_at_inner(policy, bus_root, now_unix_ms, fs, inodes)
 }
 
-/// BUS-RUN-FULL-1-dfguard — the body of [`run_pass_at`] with the filesystem
-/// `(total, avail)` reading injected, so the dfguard path is unit-testable
-/// without a controllable real `/run`. `fs == None` means "probe unavailable" and
-/// reproduces the pre-dfguard behavior exactly.
+/// BUS-RUN-FULL-1-dfguard / BUS-RUN-INODE-1 — the body of [`run_pass_at`] with the
+/// filesystem byte `(total, avail)` AND inode `(itotal, iavail)` readings
+/// injected, so both dfguard paths are unit-testable without a controllable real
+/// `/run`. `fs == None` / `inodes == None` means "probe unavailable" and
+/// reproduces the pre-dfguard behavior exactly for that dimension.
 fn run_pass_at_inner(
     policy: &RetentionPolicy,
     bus_root: &Path,
     now_unix_ms: i64,
     fs: Option<(u64, u64)>,
+    inodes: Option<(u64, u64)>,
 ) -> Result<PassReport, RetentionError> {
     let conn = open_index(bus_root)?;
 
@@ -687,6 +869,44 @@ fn run_pass_at_inner(
         compact_index(&conn);
         bytes_after = disk_usage_bytes(bus_root)? + index_db_bytes(bus_root);
     }
+
+    // BUS-RUN-INODE-1 — bound the total spool FILE (inode) count, the dimension
+    // NO byte cap covers. A tmpfs has a FIXED inode budget unrelated to its byte
+    // size (a ~3.9 GB DO-lighthouse `/run` has only ~819,200 inodes) and the byte
+    // hard cap is sized to the byte total, so the spool can exhaust inodes while
+    // far under the byte cap — exactly how `/run/mde-bus` reached ~754,000 files /
+    // ~390 MB on both lighthouses (12.1.0), wedging mackesd's namespace setup
+    // (`status=226/NAMESPACE`). This runs AFTER the byte eviction (so a byte-heavy
+    // pass has already shed) and, once the spool file count exceeds the cap,
+    // evicts oldest-first across all topics until back under a soft target — the
+    // same oldest-first, `audit/*`-last policy the byte hard cap uses, counting
+    // inodes instead of bytes. `max_spool_files == 0` disables the guard.
+    let mut inode_evicted = 0_usize;
+    let mut inode_pressure = false;
+    if policy.max_spool_files > 0 {
+        let files = spool_file_count(bus_root)?;
+        // Fold whole-`/run` inode pressure into the cap (inode analogue of the
+        // byte dfguard): under inode pressure the effective cap drops below the
+        // current file count so we shed the overshoot even when the bus alone is
+        // under its configured file cap. `None` → configured cap, no pressure.
+        let (effective_file_cap, pressure) = match inodes {
+            Some((itotal, iavail)) => {
+                inode_pressure_file_cap(policy.max_spool_files, files, itotal, iavail)
+            }
+            None => (policy.max_spool_files, false),
+        };
+        inode_pressure = pressure;
+        if files > effective_file_cap {
+            // Shed to ~3/4 of the effective cap so the guard doesn't re-fire every
+            // pass on a steady-state busy node (the inode analogue of the byte
+            // soft/hard gap — hysteresis).
+            let file_target = effective_file_cap.saturating_sub(effective_file_cap / 4);
+            inode_evicted = evict_oldest_files_to_cap(&conn, bus_root, files, file_target)?;
+            compact_index(&conn);
+            bytes_after = disk_usage_bytes(bus_root)? + index_db_bytes(bus_root);
+        }
+    }
+
     let quota = QuotaReport {
         soft_exceeded: bytes_after > policy.quota_soft_bytes,
         hard_exceeded: bytes_after > policy.quota_hard_bytes,
@@ -696,6 +916,8 @@ fn run_pass_at_inner(
         audit_pruned,
         topic_pruned,
         evicted,
+        inode_evicted,
+        inode_pressure,
         bytes_after,
         fs_pressure,
         quota,
@@ -747,6 +969,64 @@ fn evict_oldest_to_cap(
             conn.execute("DELETE FROM messages WHERE ulid = ?1", params![ulid])
                 .map_err(|e| RetentionError::Sql(format!("evict row {ulid}: {e}")))?;
             running = running.saturating_sub(sz);
+            evicted += 1;
+        }
+    }
+    Ok(evicted)
+}
+
+/// BUS-RUN-INODE-1 — the inode analogue of [`evict_oldest_to_cap`]: evict oldest
+/// messages (by `ts_unix_ms`) until the spool FILE COUNT drops from `start_files`
+/// to at most `target_files`. Same two phases (non-`audit/*` first, then
+/// `audit/*` only if shedding all non-audit still leaves us over) and the same
+/// oldest-first policy, but the running total is a FILE COUNT: each delete that
+/// actually removed a file on disk decrements it by one (a stale row whose file
+/// was already gone frees no inode, so it doesn't count toward the target — but
+/// the row is still deleted to keep the index in step). Returns the number of
+/// messages evicted.
+fn evict_oldest_files_to_cap(
+    conn: &rusqlite::Connection,
+    bus_root: &Path,
+    start_files: u64,
+    target_files: u64,
+) -> Result<usize, RetentionError> {
+    let audit_like = format!("{}%", crate::persist::AUDIT_TOPIC_PREFIX);
+    let mut running = start_files;
+    let mut evicted = 0_usize;
+    // Phase 1: non-audit oldest-first. Phase 2: audit oldest-first.
+    for sql in [
+        "SELECT ulid, file_path FROM messages WHERE topic NOT LIKE ?1 ORDER BY ts_unix_ms ASC",
+        "SELECT ulid, file_path FROM messages WHERE topic LIKE ?1 ORDER BY ts_unix_ms ASC",
+    ] {
+        if running <= target_files {
+            break;
+        }
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| RetentionError::Sql(format!("inode-evict prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![audit_like], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| RetentionError::Sql(format!("inode-evict query: {e}")))?;
+        for r in rows {
+            if running <= target_files {
+                break;
+            }
+            let (ulid, rel_path) =
+                r.map_err(|e| RetentionError::Sql(format!("inode-evict decode: {e}")))?;
+            let abs = bus_root.join(&rel_path);
+            let freed_inode = abs.exists();
+            if freed_inode {
+                std::fs::remove_file(&abs).map_err(|e| {
+                    RetentionError::Io(format!("inode-evict rm {}: {e}", abs.display()))
+                })?;
+            }
+            conn.execute("DELETE FROM messages WHERE ulid = ?1", params![ulid])
+                .map_err(|e| RetentionError::Sql(format!("inode-evict row {ulid}: {e}")))?;
+            if freed_inode {
+                running = running.saturating_sub(1);
+            }
             evicted += 1;
         }
     }
@@ -985,8 +1265,10 @@ pub async fn run_loop(
                             audit_pruned = report.audit_pruned,
                             topic_pruned = report.topic_pruned,
                             evicted = report.evicted,
+                            inode_evicted = report.inode_evicted,
                             bytes_after = report.bytes_after,
                             fs_pressure = report.fs_pressure,
+                            inode_pressure = report.inode_pressure,
                             soft_exceeded = report.quota.soft_exceeded,
                             hard_exceeded = report.quota.hard_exceeded,
                             "retention pass complete"
@@ -1012,6 +1294,14 @@ pub async fn run_loop(
                                 bytes_after = report.bytes_after,
                                 fs_pressure = report.fs_pressure,
                                 "BULLETPROOF-1: hard-cap reached — evicted oldest messages to keep the bus tmpfs off ENOSPC"
+                            );
+                        }
+                        if report.inode_evicted > 0 {
+                            tracing::warn!(
+                                target: "mde_bus::retention",
+                                inode_evicted = report.inode_evicted,
+                                inode_pressure = report.inode_pressure,
+                                "BUS-RUN-INODE-1: spool file-count cap reached — evicted oldest files to keep /run off inode-exhaustion (the 754k-file lighthouse wedge)"
                             );
                         }
                         if report.fs_pressure {
@@ -2105,6 +2395,259 @@ mod tests {
         assert!(!pressure);
     }
 
+    // BUS-RUN-INODE-1 — the global spool file-count (inode) guard. These are the
+    // decisive regressions for the ~754k-file / ~390 MB `/run` wedge on both
+    // lighthouses (12.1.0): the byte hard cap never fired (bytes were low) but the
+    // fixed tmpfs inode budget was exhausted, wedging mackesd's namespace setup.
+
+    #[test]
+    fn inode_pressure_below_threshold_keeps_configured_cap() {
+        // 50% of inodes used → no inode pressure → configured cap unchanged.
+        let itotal = 1000;
+        let iavail = 500;
+        let (cap, pressure) = inode_pressure_file_cap(1000, 500, itotal, iavail);
+        assert_eq!(cap, 1000);
+        assert!(!pressure);
+    }
+
+    #[test]
+    fn inode_pressure_over_threshold_reclaims_the_overshoot() {
+        // 95% of inodes used on a 1000-inode fs → trip point is 85% (850 used), so
+        // reclaim = 950 - 850 = 100 files. Effective cap = footprint - reclaim.
+        let itotal = 1000;
+        let iavail = 50; // 95% full
+        let (cap, pressure) = inode_pressure_file_cap(10_000, 900, itotal, iavail);
+        assert!(pressure, "inode pressure must be flagged");
+        assert_eq!(cap, 800, "footprint 900 - reclaim 100 = 800");
+    }
+
+    #[test]
+    fn inode_pressure_clamps_cap_to_configured_and_zero() {
+        // Reclaim larger than the footprint drives the cap to 0, never negative.
+        let (cap, pressure) = inode_pressure_file_cap(1000, 5, 100, 0); // 100% full
+        assert!(pressure);
+        assert_eq!(cap, 0, "reclaim > footprint → cap floors at 0");
+        // Pressure never RAISES the cap above the configured file cap.
+        let (cap2, pressure2) = inode_pressure_file_cap(30, 1000, 100, 10); // 90% full
+        assert!(pressure2);
+        assert!(
+            cap2 <= 30,
+            "effective cap never exceeds configured, got {cap2}"
+        );
+    }
+
+    #[test]
+    fn inode_pressure_unreadable_probe_is_noop() {
+        // itotal == 0 models a `df` with no inode reporting → degrade to the cap.
+        let (cap, pressure) = inode_pressure_file_cap(1000, 999, 0, 0);
+        assert_eq!(cap, 1000);
+        assert!(!pressure);
+    }
+
+    #[test]
+    fn spool_file_count_counts_only_message_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for _ in 0..5 {
+            write_sized(&root, "t/x", Priority::High, 1, 16);
+        }
+        purge_audit(&root);
+        // 5 message files; the index.sqlite{,-wal,-shm} + any `.tmp` are excluded.
+        assert_eq!(spool_file_count(&root).unwrap(), 5);
+    }
+
+    #[test]
+    fn inode_cap_evicts_oldest_first_until_under_target_newest_kept() {
+        // THE bound proof: write M > cap message files, run a pass with a small
+        // `max_spool_files`, and assert the spool is bounded to ≤ cap files with
+        // the NEWEST surviving and the OLDEST evicted. Byte caps are left at their
+        // huge defaults so ONLY the inode guard can fire.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        // 12 tiny recent High messages (no TTL reap, trivial bytes) on one topic,
+        // ascending ts so index 0 is the oldest.
+        let mut ulids = Vec::new();
+        for i in 0..12 {
+            ulids.push(write_sized(
+                &root,
+                "t/tick",
+                Priority::High,
+                now - (12 - i) * 1000,
+                16,
+            ));
+        }
+        purge_audit(&root);
+        assert_eq!(
+            spool_file_count(&root).unwrap(),
+            12,
+            "12 files before the pass"
+        );
+        // Cap at 4 files. Target after eviction is 4 - 4/4 = 3 (the hysteresis
+        // floor), so the pass sheds the 9 oldest and keeps the 3 newest.
+        let policy = RetentionPolicy {
+            max_spool_files: 4,
+            ..RetentionPolicy::default()
+        };
+        // `inodes = None` isolates the CONFIGURED file cap from any coincidental
+        // inode pressure on the build host's tmp filesystem (hermetic).
+        let report = run_pass_at_inner(&policy, &root, now, None, None).unwrap();
+        assert_eq!(report.removed, 0, "no TTL expiry — High survives 30d");
+        assert_eq!(report.evicted, 0, "bytes are trivial — no byte eviction");
+        assert!(report.inode_evicted >= 1, "inode guard must shed files");
+        // The bound holds: spool file count is at/under the cap.
+        let files_after = spool_file_count(&root).unwrap();
+        assert!(
+            files_after <= policy.max_spool_files,
+            "spool must be bounded to ≤ {} files, was {files_after}",
+            policy.max_spool_files
+        );
+        // Oldest-first: the newest survives, the oldest is gone.
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("t/tick", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(remaining.contains(ulids.last().unwrap()), "newest survives");
+        assert!(!remaining.contains(&ulids[0]), "oldest evicted");
+    }
+
+    #[test]
+    fn inode_cap_sheds_non_audit_before_audit() {
+        // Mirror `hard_cap_sheds_non_audit_before_audit` for the inode guard: with
+        // a file cap that shedding the non-audit lane alone satisfies, `audit/*`
+        // files must survive (audit is shed LAST).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let mut non_audit = Vec::new();
+        for i in 0..8 {
+            non_audit.push(write_sized(
+                &root,
+                "t/data",
+                Priority::High,
+                now - (10 - i) * 1000,
+                16,
+            ));
+        }
+        // Each t/data write auto-emits an `audit/<host>` record (real wall-clock
+        // ts). Purge that auto-audit lane, THEN write the audit/peerx records we
+        // assert on — audit/* writes are cycle-guarded so they don't re-audit.
+        purge_audit(&root);
+        let audit_a = write_sized(&root, "audit/peerx", Priority::Min, now - 2000, 16);
+        let audit_b = write_sized(&root, "audit/peerx", Priority::Min, now - 1000, 16);
+        // 10 files total (8 t/data + 2 audit/peerx). Cap at 6 → target 6 - 6/4 = 5.
+        // Shedding 5 of the 8 non-audit files alone lands at 5, so audit is never
+        // reached. `inodes = None` keeps it hermetic vs. host inode pressure.
+        let policy = RetentionPolicy {
+            max_spool_files: 6,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at_inner(&policy, &root, now, None, None).unwrap();
+        assert!(report.inode_evicted >= 1);
+        let p = Persist::open(root.clone()).unwrap();
+        let audit_left: Vec<String> = p
+            .list_since("audit/peerx", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(
+            audit_left.contains(&audit_a) && audit_left.contains(&audit_b),
+            "audit/* must be preserved when non-audit inode eviction suffices"
+        );
+        assert!(
+            p.list_since("t/data", None).unwrap().len() < non_audit.len(),
+            "non-audit lane shed first"
+        );
+    }
+
+    #[test]
+    fn under_inode_cap_evicts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_sized(&root, "t/small", Priority::High, 1, 16);
+        purge_audit(&root);
+        // Default file cap (50k) is far above a 1-file spool. `inodes = None`
+        // keeps it hermetic against any coincidental host inode pressure.
+        let report = run_pass_at_inner(
+            &RetentionPolicy::default(),
+            &root,
+            1_000_000_000_000,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.inode_evicted, 0);
+    }
+
+    #[test]
+    fn max_spool_files_zero_disables_the_inode_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        for i in 0..10 {
+            write_sized(&root, "t/tick", Priority::High, now - (10 - i) * 1000, 16);
+        }
+        purge_audit(&root);
+        // Cap 0 disables the guard → no inode eviction even well "over" any cap.
+        // (The `max_spool_files > 0` gate short-circuits before the file walk.)
+        let policy = RetentionPolicy {
+            max_spool_files: 0,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at_inner(&policy, &root, now, None, None).unwrap();
+        assert_eq!(report.inode_evicted, 0, "cap 0 disables the inode guard");
+        assert_eq!(spool_file_count(&root).unwrap(), 10, "nothing shed");
+    }
+
+    #[test]
+    fn inode_dfguard_emergency_sheds_when_fs_inodes_full_though_under_own_cap() {
+        // The inode analogue of `dfguard_emergency_prunes_when_fs_full_though_bus_
+        // under_cap`: the bus is FAR under its own (default 50k) file cap, but the
+        // whole `/run` is 87% inode-full — so the inode dfguard must lower the
+        // effective cap below the bus's file count and shed the overshoot anyway.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let mut ulids = Vec::new();
+        for i in 0..10 {
+            ulids.push(write_sized(
+                &root,
+                "t/tick",
+                Priority::High,
+                now - (10 - i) * 1000,
+                16,
+            ));
+        }
+        purge_audit(&root);
+        // Default caps → the bus is under both its byte and (50k) file caps.
+        let policy = RetentionPolicy::default();
+        // Inject a 87%-inode-full filesystem: itotal=100, iavail=13 → used=87,
+        // trip point 85 → reclaim=2. footprint=10 files → effective cap=8 → target
+        // 8 - 8/4 = 6, so the 4 oldest files are shed, the 6 newest kept.
+        let report = run_pass_at_inner(&policy, &root, now, None, Some((100, 13))).unwrap();
+        assert!(report.inode_pressure, "inode pressure must be flagged");
+        assert!(
+            report.inode_evicted >= 1,
+            "inode dfguard must shed despite the bus being under its own file cap"
+        );
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("t/tick", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(
+            !remaining.contains(&ulids[0]),
+            "oldest evicted under inode pressure"
+        );
+        assert!(remaining.contains(ulids.last().unwrap()), "newest survives");
+    }
+
     #[test]
     fn dfguard_emergency_prunes_when_fs_full_though_bus_under_cap() {
         // The decisive end-to-end case: the bus's OWN footprint is comfortably
@@ -2137,7 +2680,9 @@ mod tests {
         // Inject a 95%-full filesystem (10 MB total, 0.5 MB avail). 95% - 85% =
         // 10% of 10 MB = 1 MB to reclaim → at least one 1 MB message is shed.
         let fs = Some((10 * mb as u64, mb as u64 / 2));
-        let report = run_pass_at_inner(&policy, &root, now, fs).unwrap();
+        // No inode-pressure injection (`None`) — the default file cap (50k) won't
+        // fire on 6 files, so this test isolates the BYTE dfguard.
+        let report = run_pass_at_inner(&policy, &root, now, fs, None).unwrap();
         assert!(report.fs_pressure, "fs pressure must be flagged");
         assert!(
             report.evicted >= 1,
@@ -2169,10 +2714,17 @@ mod tests {
         purge_audit(&root);
         let mb = 1024 * 1024;
         let fs = Some((100 * mb as u64, 50 * mb as u64)); // 50% full
-        let report =
-            run_pass_at_inner(&RetentionPolicy::default(), &root, 1_000_000_000_000, fs).unwrap();
+        let report = run_pass_at_inner(
+            &RetentionPolicy::default(),
+            &root,
+            1_000_000_000_000,
+            fs,
+            None,
+        )
+        .unwrap();
         assert!(!report.fs_pressure);
         assert_eq!(report.evicted, 0);
+        assert_eq!(report.inode_evicted, 0);
     }
 
     #[test]

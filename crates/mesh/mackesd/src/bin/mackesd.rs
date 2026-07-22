@@ -2456,11 +2456,22 @@ fn filesystem_avail_bytes(path: &std::path::Path) -> Option<u64> {
         .ok()
 }
 
-/// BULLETPROOF-1 — a filesystem-relative bus retention policy. The bus spool
-/// lives on `/run` (tmpfs), whose size ranges from ~190 MB (lighthouse) to
-/// multiple GB (workstation). Cap hard at ~50% of the hosting filesystem and
-/// soft at ~33%, with floors, so the spool is bounded well below ENOSPC on any
-/// node. Falls back to the (already tmpfs-safe) library defaults if `df` fails.
+/// BULLETPROOF-1 / BUS-RUN-INODE-1 — a filesystem-relative bus retention policy.
+/// The bus spool lives on `/run` (tmpfs), whose size ranges from ~190 MB
+/// (lighthouse) to multiple GB (workstation). Cap hard at ~50% of the hosting
+/// filesystem BYTES and soft at ~33%, with floors, so the spool is bounded well
+/// below ENOSPC on any node.
+///
+/// BUS-RUN-INODE-1 — a tmpfs ALSO has a fixed inode budget unrelated to its byte
+/// size (a ~3.9 GB DO-lighthouse `/run` has only ~819,200 inodes), and the bus
+/// writes one small file per message — so the byte caps above cannot prevent
+/// inode exhaustion. `/run/mde-bus` reached ~754,000 files / ~390 MB on both
+/// lighthouses (12.1.0), wedging mackesd's namespace setup
+/// (`status=226/NAMESPACE`) while every byte cap read "under budget". So also cap
+/// the total spool FILE count at ~25% of the filesystem's inode budget (leaving
+/// 75% for journald, systemd runtime state, dnf locks, etc.), floored so a small
+/// `/run` still gets a usable window. Falls back to the (already tmpfs-safe)
+/// library defaults if `df` can't read the byte size / inode count.
 #[cfg(feature = "async-services")]
 fn bus_retention_policy(bus_root: &std::path::Path) -> mde_bus::retention::RetentionPolicy {
     let mut policy = mde_bus::retention::RetentionPolicy::default();
@@ -2470,6 +2481,13 @@ fn bus_retention_policy(bus_root: &std::path::Path) -> mde_bus::retention::Reten
         if policy.quota_soft_bytes >= policy.quota_hard_bytes {
             policy.quota_soft_bytes = policy.quota_hard_bytes.saturating_sub(8 * 1024 * 1024);
         }
+    }
+    if let Some((itotal, _iavail)) = mde_bus::retention::filesystem_total_avail_inodes(bus_root) {
+        // Keep the bus to at most a quarter of the tmpfs inode budget, floored so
+        // a tiny `/run` still gets a usable window. This is the aggregate bound
+        // the per-topic entry caps cannot provide (they bound files WITHIN a
+        // topic, not the topic count) — the direct fix for the /run-inode wedge.
+        policy.max_spool_files = (itotal / 4).max(10_000);
     }
     policy
 }

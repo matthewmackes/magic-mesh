@@ -230,9 +230,10 @@ pub(crate) fn start_bus_retention_gc(
                             &bus_root,
                             mde_bus::retention::current_unix_ms(),
                         ) {
-                            Ok(r) if r.evicted > 0 => tracing::warn!(
-                                removed = r.removed, evicted = r.evicted, bytes_after = r.bytes_after,
-                                "bus retention: hard-cap reached — evicted oldest to stay off ENOSPC (BULLETPROOF-1)"
+                            Ok(r) if r.evicted > 0 || r.inode_evicted > 0 => tracing::warn!(
+                                removed = r.removed, evicted = r.evicted, inode_evicted = r.inode_evicted,
+                                bytes_after = r.bytes_after,
+                                "bus retention: cap reached — evicted oldest to stay off ENOSPC/inode-exhaustion (BULLETPROOF-1 / BUS-RUN-INODE-1)"
                             ),
                             Ok(r) => tracing::debug!(
                                 removed = r.removed, bytes_after = r.bytes_after, "bus retention pass"
@@ -274,7 +275,8 @@ pub(crate) fn start_bus_retention_gc(
                 .map(|_h| tracing::info!(
                     soft_mb = policy.quota_soft_bytes / 1024 / 1024,
                     hard_mb = policy.quota_hard_bytes / 1024 / 1024,
-                    "Bus retention GC spawned (BULLETPROOF-1)"
+                    max_spool_files = policy.max_spool_files,
+                    "Bus retention GC spawned (BULLETPROOF-1 / BUS-RUN-INODE-1)"
                 ))
                 .unwrap_or_else(|e| tracing::warn!(error = %e, "Bus retention GC thread spawn failed"));
         worker_names
