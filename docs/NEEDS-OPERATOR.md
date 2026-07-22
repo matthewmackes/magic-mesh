@@ -92,3 +92,18 @@ under the WL-\* epic named in the re-key map above, not as an independent ID.
      lists `Files` in the menubar-bearing (no-fallback) set (the crash-fix that
      added Media/Files/Terminal/… to that set), so the fallback control never mounts
      and the tests' expectation is stale. `main.rs`.
+
+- **DESIGN RULING NEEDED — browser chrome light-vs-dark** (recorded 2026-07-21,
+  `/polish`) — `crates/desktop/mde-shell-egui/src/web/chrome_ui/mod.rs` deliberately
+  mints 31 light-Material `CHROME_*` constants ("Chromium/Chrome Refresh light roles,
+  mirrored as local egui tokens so every Browser surface can stay on the stock Chrome
+  palette instead of inheriting the darker shell chrome"). This is a DELIBERATE
+  Chrome-fidelity choice for the CEF browser, but it conflicts with Quasar design
+  **lock #1 (dark only)** and is the sole source of the 31 shell style-leak-grep hits.
+  Ruling needed — pick one, then `/polish` can act:
+  (a) KEEP stock-Chrome-light → add `web/chrome_ui/` to the style-leak grep's
+      exclusion list (same category as the VDI decoders / term palette = deliberate
+      data/fidelity, not look-to-drain); or
+  (b) CONFORM to dark → recolor the browser chrome to the `mde-egui` Quasar-dark
+      tokens (a real visual change to the browser surface).
+  Until ruled, `/polish` holds the shell — it is NOT a blind drain.
