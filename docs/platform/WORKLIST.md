@@ -229,11 +229,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-005 - Constrain root cloud-worker filesystem keys to owned state roots
 
 - Status: Remaining
-- Progress (2026-07-22): strict single-component validation now guards desired,
-  image, version, container, placement, and lifecycle target sinks; outside-file
-  hostile regressions are green. The focused cloud suite passed 95/95 on farm
-  `.50`. Closure is waiting only on the final integrated format/diff gate while
-  the adjacent transport and overlay edits settle.
+- Progress (2026-07-23): strict single-component validation now guards desired,
+  image, version, container, placement, and lifecycle target sinks; sinks also
+  reserve room for `.json` and `.container` suffixes before directory/backend
+  I/O. The focused cloud suite passed 113/113 on farm `.170`, including the
+  oversized desired-write, delete, container-staging, and lifecycle-delete
+  regressions. Closure is waiting only on the final integrated format/diff
+  gate while adjacent transport and overlay edits settle.
 - Priority: P0
 - Complexity: Medium
 - Problem: Unauthenticated local Bus callers can supply absolute or traversing
@@ -257,7 +259,7 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Blocked
-- Progress (2026-07-22): code and hostile fixtures now meet the local-key design.
+- Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
   Joining nodes generate their key locally; the signer consumes only the strict
   requester public key and verifies the returned certificate identity before an
   atomic swap. Public replicated bundles deny secret fields; legacy secret-bearing
@@ -267,7 +269,9 @@ These decisions refine acceptance and sequencing for the active items below.
   farm proof is green: `mackesd` and `mde-enroll` all-target checks plus 204 focused
   CA/enrollment/client/endpoint/supervisor tests. The farm and available live seat
   have neither `nebula` nor `nebula-cert`, so only the controlled live
-  rotation/reconnect/old-root-prune acceptance drill remains blocked.
+  rotation/reconnect/old-root-prune acceptance drill remains blocked; the
+  operator has now torn down all DigitalOcean lighthouses, so there is no live
+  Nebula peer on which to run that drill.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -304,7 +308,7 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-007 - Authenticate privileged shared-Bus mutation consumers
 
 - Status: Remaining
-- Progress (2026-07-22): the typed action worker now requires schema v1 and an
+- Progress (2026-07-23): the typed action worker now requires schema v1 and an
   exact-body, 30-second, durably single-use HMAC capability before service
   lifecycle or code-edit dispatch; its legacy directory bypass only refuses.
   Code-edit writes are descriptor-relative and reject in-root symlink escapes.
@@ -316,11 +320,14 @@ These decisions refine acceptance and sequencing for the active items below.
   hostile/functional tests; the shared `host_ops` partition is 47/47 and
   `dc_power` is 30/30 (including unsigned, tampered, replayed, and future-schema
   refusal before backend execution).
+  The Datacenter responder now gates its full VM/IaC/storage mutation set before
+  op-lock or backend calls; its focused farm suite is 75/75, including signed
+  one-shot replay refusal. VPN mutation gating is in flight on the farm.
   Publisher tracing found no legitimate Podman or remote host-control shell path;
   the scheduler's old unsigned actuator emission was retired rather than granted
   autonomous mint authority (32/32 farm-green). The reachability audit then found
   the higher-risk production `/run/mde-bus` tranche: registered IPC responders
-  still accept unauthenticated Tofu apply/destroy, Datacenter and host power/
+  still accept unauthenticated Tofu apply/destroy, host power/
   network/secret operations, package uninstall, job launch, fleet revision,
   Connect/firewall, VPN, and DDNS mutations. It also found several async workers
   defaulting to a root-private data directory instead of the production spool.
@@ -400,12 +407,14 @@ These decisions refine acceptance and sequencing for the active items below.
   reconciliation. The farm gate now runs workspace clippy and every test lane
   with `--locked`, and its serial `mackesd` lane enables the same
   `async-services` superset as GitHub Actions. A fresh BigBoy run of the exact
-  integrated-tree coverage command passed at **84.97% lines** (80% floor), with
-  the serial `mackesd` lane green at 3,703 tests and `mde-term-egui` green at
+  integrated-tree coverage command passed at **84.67% lines** (80% floor), with
+  the serial `mackesd` lane green at 3,702 tests and `mde-term-egui` green at
   391 tests. Workspace clippy and format checks are green. The earlier full-gate
   red was farm disk exhaustion during linking, not a test failure; disposable
   BigBoy slots were cleaned and the affected lanes rerun successfully. A
-  clean-checkout release replay remains the final closure proof.
+  clean-checkout release replay on `38971459` measured 84.67% lines (598,995
+  regions at 84.97%) and remains the final closure proof after the current-tree
+  format fixes land.
 - Priority: P1
 - Complexity: Medium
 - Problem: CI previously referenced retired packages and split policy checks
@@ -445,7 +454,7 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
-- Progress (2026-07-22): UI contract slice landed in the takeover tree. Set
+- Progress (2026-07-23): UI contract slice landed in the takeover tree. Set
   desired now publishes the worker's `{node,spec}` envelope; provision,
   configure, plan, destroy, lifecycle, and console requests carry explicit
   placement; blank placement emits nothing. The request envelope is explicitly
@@ -454,8 +463,11 @@ These decisions refine acceptance and sequencing for the active items below.
   destroy path is retired, and target delete independently checks the typed name
   before retracting only that workload's desired doc. Farm proofs before the
   latest version/replay additions: 36/36 focused `iac::` and 95/95 focused cloud
-  tests; an integrated rerun is pending while adjacent files settle. Remaining:
-  a production authorization/minting path and direct libvirt lifecycle drill.
+  tests; an integrated rerun is pending while adjacent files settle. The
+  production root/systemd request path now wraps Datacenter VM/IaC/storage
+  mutations in the shared HMAC capability gate, with unsigned and replayed VM
+  dispatch refused before backend validation. Remaining: the integrated
+  contract rerun and direct libvirt lifecycle drill.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
@@ -483,7 +495,7 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-RUN-003 - Lighthouse full/equal join and push-button add/retire
 
 - Status: Blocked
-- Progress (2026-07-22): CODE-COMPLETE per `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md`,
+- Progress (2026-07-23): CODE-COMPLETE per `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md`,
   plus the locked smallest-DigitalOcean lighthouse profile in
   `docs/design/digitalocean-lighthouse-small.md`. Both DO cloud-init paths and
   `onboard spawn-lighthouse` now default to `s-1vcpu-512mb-10gb` and apply
@@ -499,7 +511,9 @@ These decisions refine acceptance and sequencing for the active items below.
   cloud lighthouse fleet + a DigitalOcean API token (a secret only the operator holds),
   not a live seat, and there is no build-time validation analog (unlike WL-ARCH-001's
   `tofu validate`) that could substantiate a real add/retire against live etcd. Stays
-  Blocked on the DO credential + a 2nd live lighthouse.
+  Blocked on a rebuilt DO fleet: the operator has torn down all DigitalOcean
+  lighthouses, and the add-retire-add drill still requires a valid DO
+  credential plus a second live lighthouse.
 - Priority: P1
 - Complexity: Large
 - Problem: Lighthouse management still has manual parts around CA custody,
@@ -873,16 +887,17 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
-- Progress (2026-07-22): nine of the ten catalog feeds are implemented through
+- Progress (2026-07-23): all ten catalog feeds are implemented through
   typed latest-wins Bus snapshots and the Maps painter: USGS earthquakes, NWS
   alerts, NWS hourly route forecast, adsb.lol aircraft, GTFS-Realtime transit,
   Caltrans cameras, IEM NEXRAD radar, NCDOT TIMS state-511 traffic, and NIFC/FIRMS
-  wildfire. The new overlays close their typed schemas, registered worker/spawn
-  census, off-by-default layer toggles, attribution, projected pins, bounded
-  payloads, and paused/fix-loss behavior. Farm evidence is green for traffic
-  worker 6/6, wildfire worker 7/7, worker-role 19/19, and full Maps 136/136;
-  remaining catalog is AirNow AQI. Keyed feeds must idle honestly until
-  operator-sealed free credentials exist.
+  wildfire, and AirNow AQI. The overlays close their typed schemas, registered
+  worker/spawn census, off-by-default layer toggles, attribution, projected pins,
+  bounded payloads, and paused/fix-loss behavior. AirNow evidence is green for
+  mesh types 2/2, Maps/model 5/5, worker 7/7, worker-role census 19/19, and
+  full Maps 136/136; its missing sealed key remains an honest unconfigured
+  state with no network request or fabricated fetch time. Keyed feeds must idle
+  honestly until operator-sealed free credentials exist.
 - Priority: P2
 - Complexity: Epic
 - Problem: The Maps & Location cockpit's map is a synthetic perspective scene with

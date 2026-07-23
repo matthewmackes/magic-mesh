@@ -35,13 +35,14 @@ mackesd join 'mesh:acme-mesh@<ip>:4243#<bearer>?fp=<sha256>'
 Run that on any joining box (with the new build), or `mde-enroll` and paste it.
 
 Options: `--region --size --image --ssh-key --repo-baseurl --rpm-url
---enroll-port --role --tag --keep-on-fail` (see `--help`).
+--enroll-port --tag --keep-on-fail` (see `--help`). The wrapper rejects every
+role other than the thin `lighthouse` control-plane role.
 
 The default is the small control-plane profile documented in
 [`docs/design/digitalocean-lighthouse-small.md`](../design/digitalocean-lighthouse-small.md).
-Provisioning applies its cgroup, swap, journal, and optional-service guardrails
-automatically. Choose a larger size explicitly for media or other workloads;
-the smallest profile is not a `Lighthouse_Media` host.
+Provisioning applies its cgroup, swap, journal, weak-dependency, and
+optional-service guardrails automatically. Media and file-sharing lighthouses
+are retired; place those duties on a non-lighthouse node instead.
 
 ## The glibc / image prerequisite (important)
 

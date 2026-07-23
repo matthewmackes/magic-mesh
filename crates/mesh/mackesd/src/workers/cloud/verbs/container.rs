@@ -24,6 +24,8 @@ use mackes_mesh_types::cloud::{AnsibleSummary, CloudReply};
 
 use super::super::{path_key, CloudWorker};
 
+const QUADLET_SUFFIX: &str = ".container";
+
 /// The parsed `container-deploy` request body.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ContainerDeployBody {
@@ -61,7 +63,7 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
     let Some(name) = clean(body.name.as_deref()) else {
         return reject(verb_name, "container-deploy requires a `name`");
     };
-    if let Err(e) = path_key::segment("container name", &name) {
+    if let Err(e) = path_key::file_stem("container name", &name, QUADLET_SUFFIX) {
         return reject(verb_name, &format!("invalid container name `{name}`: {e}"));
     }
     let stage_node = if body.node.trim().is_empty() {
@@ -225,11 +227,11 @@ fn stage_unit(
     unit: &str,
 ) -> Result<std::path::PathBuf, String> {
     let node = path_key::segment("placement node", node)?;
-    let name = path_key::segment("container name", name)?;
+    let name = path_key::file_stem("container name", name, QUADLET_SUFFIX)?;
     let dir = root.join("quadlets").join(node);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create quadlet stage dir {}: {e}", dir.display()))?;
-    let path = dir.join(format!("{name}.container"));
+    let path = dir.join(format!("{name}{QUADLET_SUFFIX}"));
     std::fs::write(&path, unit)
         .map_err(|e| format!("write quadlet stage {}: {e}", path.display()))?;
     Ok(path)
@@ -523,6 +525,19 @@ mod tests {
             assert!(reply.error.unwrap().contains("path-safe"));
         }
         assert!(!tmp.path().join("quadlets").exists());
+    }
+
+    #[test]
+    fn an_overlong_quadlet_stem_is_rejected_before_staging_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_name = "x".repeat(246);
+
+        let err = stage_unit(tmp.path(), "me", &long_name, "unit").unwrap_err();
+        assert!(err.contains("too long"), "unexpected error: {err}");
+        assert!(
+            !tmp.path().join("quadlets").exists(),
+            "invalid filename must fail before I/O"
+        );
     }
 
     #[test]

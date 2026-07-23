@@ -34,6 +34,7 @@ use mackes_mesh_types::vpn_providers::{
     self, AdapterError, ProducedTunnel, Provider, SecretKind, WgSetup,
 };
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::secret_store::{self, SecretStore};
 
 /// The VPN responder — rooted at the shared workgroup root (the config home).
@@ -109,6 +110,11 @@ pub const ACTION_VERBS: [&str; 14] = [
     "verify-egress",
     "egress-health",
 ];
+
+/// Stable node scope bound into VPN mutation capabilities. VPN configuration is
+/// replicated workgroup state rather than state owned by a caller-selected
+/// host, so the consumer itself is the authority scope.
+const VPN_ACTION_NODE_SCOPE: &str = "vpn";
 
 /// Where a tunnel's DECRYPTED config lands on the node just before bring-up, for
 /// the bring-up tool to read. Materialized by [`materialize_secret`] from the
@@ -281,6 +287,111 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         "egress-health" => egress_health(svc),
         other => err(format!("unknown vpn verb: {other}")),
     }
+}
+
+/// Parse a privileged Bus mutation into its stable capability target and the
+/// legacy body consumed by [`build_reply`]. This is deliberately pure: no VPN
+/// config, secret store, interface, or backend is touched before authorization.
+///
+/// JSON-native verbs keep their existing fields alongside `schema_version` and
+/// `armed_token`. The legacy string-body verbs use `{ "id": ... }`, while
+/// `clear-route` uses `{ "target": ... }`. Authentication metadata is removed
+/// before handing the request to the existing internal handlers.
+fn mutation_request(
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if !matches!(
+        verb,
+        "add-tunnel"
+            | "remove-tunnel"
+            | "tunnel-up"
+            | "tunnel-down"
+            | "setup-provider"
+            | "set-route"
+            | "clear-route"
+    ) {
+        return Ok(None);
+    }
+
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let mut request: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("{verb}: bad json"))?;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| format!("{verb}: request body must be a JSON object"))?;
+    object.remove("schema_version");
+    object.remove("armed_token");
+
+    let string_field = |value: &serde_json::Value, field: &str| -> Result<String, String> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{verb}: missing `{field}`"))
+    };
+
+    let (target, handler_body) = match verb {
+        "add-tunnel" | "setup-provider" => {
+            let id = string_field(&request, "id")?;
+            (format!("tunnel:{id}"), request.to_string())
+        }
+        "remove-tunnel" | "tunnel-up" | "tunnel-down" => {
+            let id = string_field(&request, "id")?;
+            (format!("tunnel:{id}"), id)
+        }
+        "set-route" => {
+            let route: EgressRoute = serde_json::from_value(request.clone())
+                .map_err(|_| "set-route: bad EgressRoute".to_string())?;
+            let key = route.target.key();
+            (format!("route:{key}"), request.to_string())
+        }
+        "clear-route" => {
+            let key = string_field(&request, "target")?;
+            (format!("route:{key}"), key)
+        }
+        _ => unreachable!("the privileged VPN verb set is closed"),
+    };
+    Ok(Some((target, handler_body)))
+}
+
+/// Apply the shared-spool authorization boundary before a VPN mutation can
+/// load or write config, access the secret store, or invoke a tunnel backend.
+/// Query/status verbs intentionally remain open.
+fn build_bus_reply(
+    svc: &VpnService,
+    verb: &str,
+    req_body: Option<&str>,
+    authorizer: &ActionAuthorizer,
+) -> String {
+    let prepared = match mutation_request(verb, req_body) {
+        Ok(prepared) => prepared,
+        Err(error) => return json!({ "error": error }).to_string(),
+    };
+    let Some((target, handler_body)) = prepared else {
+        return build_reply(svc, verb, req_body);
+    };
+
+    let auth_verb = format!("vpn-{verb}");
+    let context = MutationContext {
+        verb: &auth_verb,
+        node: VPN_ACTION_NODE_SCOPE,
+        target: &target,
+    };
+    if let Err(error) = authorizer.authorize(req_body.expect("a mutation requires a body"), context)
+    {
+        tracing::warn!(
+            target: "mackesd::vpn",
+            verb,
+            %error,
+            "refused unauthorized VPN mutation"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+
+    build_reply(svc, verb, Some(&handler_body))
 }
 
 /// Bring a tunnel up/down via the right tool. Returns `(ran_ok, detail)`. Honest
@@ -821,11 +932,12 @@ pub const HEALTH_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from
 /// raising the `vpn/tunnel-down` alert on `event/vpn/signals`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &VpnService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
+    let authorizer = ActionAuthorizer::production();
     let mut last_sweep = std::time::Instant::now()
         .checked_sub(HEALTH_SWEEP_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
     while !should_stop() {
-        poll_once(persist, svc, &mut cursors);
+        poll_once(persist, svc, &mut cursors, &authorizer);
         if last_sweep.elapsed() >= HEALTH_SWEEP_INTERVAL {
             // The sweep is best-effort: it spawns its own probes and only writes
             // alert events, never blocks the action responder for long.
@@ -837,7 +949,12 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &VpnService, should_st
 }
 
 /// One poll sweep across the verbs (split out for tests).
-pub fn poll_once(persist: &Persist, svc: &VpnService, cursors: &mut HashMap<String, String>) {
+pub fn poll_once(
+    persist: &Persist,
+    svc: &VpnService,
+    cursors: &mut HashMap<String, String>,
+    authorizer: &ActionAuthorizer,
+) {
     for verb in ACTION_VERBS {
         let topic = action_topic(verb);
         let since = cursors.get(&topic).map(String::as_str);
@@ -851,7 +968,7 @@ pub fn poll_once(persist: &Persist, svc: &VpnService, cursors: &mut HashMap<Stri
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_bus_reply(svc, verb, msg.body.as_deref(), authorizer)
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -870,6 +987,10 @@ pub fn poll_once(persist: &Persist, svc: &VpnService, cursors: &mut HashMap<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"vpn-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn svc() -> (tempfile::TempDir, VpnService) {
         let tmp = tempfile::tempdir().unwrap();
@@ -899,6 +1020,92 @@ mod tests {
         for v in ["verify-egress", "egress-health"] {
             assert!(ACTION_VERBS.contains(&v), "missing {v}");
         }
+    }
+
+    #[test]
+    fn hostile_unsigned_bus_mutations_are_refused_before_vpn_state_changes() {
+        let (tmp, s) = svc();
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+        let route = json!({
+            "target": { "scope": "any" },
+            "gateway": "gateway",
+            "primary": "unsigned",
+        })
+        .to_string();
+        let requests = [
+            (
+                "add-tunnel",
+                json!({"id":"unsigned","provider":"generic-wg","method":"wg"}).to_string(),
+            ),
+            ("remove-tunnel", json!({"id":"unsigned"}).to_string()),
+            ("tunnel-up", json!({"id":"unsigned"}).to_string()),
+            ("tunnel-down", json!({"id":"unsigned"}).to_string()),
+            (
+                "setup-provider",
+                json!({"id":"unsigned","provider":"generic-wg"}).to_string(),
+            ),
+            ("set-route", route),
+            ("clear-route", json!({"target":"any"}).to_string()),
+        ];
+
+        for (verb, body) in requests {
+            let reply = build_bus_reply(&s, verb, Some(&body), &authorizer);
+            assert!(
+                reply.contains("authorization refused"),
+                "unsigned {verb} reached its handler: {reply}"
+            );
+        }
+        assert!(vpn::load(tmp.path()).tunnel.is_empty());
+        assert!(vpn_egress::load_routing(tmp.path()).route.is_empty());
+
+        for (verb, body) in [
+            ("list-tunnels", None),
+            ("tunnel-status", Some("unsigned")),
+            ("list-providers", None),
+            ("list-routes", None),
+            ("route-status", Some("any")),
+            ("verify-egress", Some("unsigned")),
+            ("egress-health", None),
+        ] {
+            let reply = build_bus_reply(&s, verb, body, &authorizer);
+            assert!(
+                !reply.contains("authorization refused"),
+                "{verb} must remain an open read"
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_bus_add_is_single_use_and_replay_has_one_effect() {
+        let (tmp, s) = svc();
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+        let unsigned = json!({
+            "schema_version": 1,
+            "id": "authorized",
+            "provider": "generic-wg",
+            "method": "wg",
+        })
+        .to_string();
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: "vpn-add-tunnel",
+                node: VPN_ACTION_NODE_SCOPE,
+                target: "tunnel:authorized",
+            },
+            "vpn-replay",
+            AUTH_NOW + 30_000,
+        );
+
+        let first = build_bus_reply(&s, "add-tunnel", Some(&armed), &authorizer);
+        assert!(first.contains("\"ok\":true"), "{first}");
+        let replay = build_bus_reply(&s, "add-tunnel", Some(&armed), &authorizer);
+        assert!(replay.contains("already used"), "{replay}");
+
+        let config = vpn::load(tmp.path());
+        assert_eq!(config.tunnel.len(), 1);
+        assert_eq!(config.tunnel[0].id, "authorized");
     }
 
     // ── VPN-GW-6: health + exit-IP/leak verification reachable as verbs ──

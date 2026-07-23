@@ -522,6 +522,9 @@ pub mod device_inventory;
 // display/power) behind the allowlist + safety interlocks. Runs on every
 // node; spawned in run_serve.
 pub mod host_state;
+// WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI stations.
+#[cfg(feature = "async-services")]
+pub mod air_quality_overlay;
 // WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated NEXRAD tiles.
 #[cfg(feature = "async-services")]
 pub mod iem_radar_overlay;

@@ -10,15 +10,14 @@ pub fn run(role: String, media: bool) -> anyhow::Result<()> {
         let parsed: mde_role::Role = role.parse().map_err(|_| {
             anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation")
         })?;
-        // MEDIA-1 — pin the role + the media capability tag as a class. The
-        // tag is only valid on the lighthouse tier; reject an inapplicable
-        // request loudly rather than silently dropping it, so an operator
-        // who typed `--media` on the wrong role is told why.
-        if media && !mde_role::Capability::Media.applies_to(parsed) {
+        // Thin-lighthouse policy: the historical Lighthouse_Media subclass is
+        // retired. Reject the capability at the CLI boundary rather than
+        // allowing a day-2 promotion to turn a 512 MiB control-plane node into
+        // a media or file-sharing host.
+        if media {
             anyhow::bail!(
-                "`--media` is a lighthouse subclass (Lighthouse_Media) — it cannot apply to \
-                     `{}`. Pin `lighthouse --media`, or drop the flag.",
-                parsed.as_str()
+                "`--media` is retired: DigitalOcean lighthouses are thin control-plane \
+                 nodes only; place media/file-sharing duties on a non-lighthouse node"
             );
         }
         let class = mde_role::RoleClass {

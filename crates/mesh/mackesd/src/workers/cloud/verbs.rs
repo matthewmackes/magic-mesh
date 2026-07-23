@@ -407,6 +407,14 @@ fn handle_lifecycle(
         };
     }
     if matches!(action, LifecycleAction::Delete) {
+        if let Err(e) = super::path_key::file_stem("instance", instance, ".json") {
+            return CloudReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(e),
+                ..Default::default()
+            };
+        }
         let confirmed = body
             .typed_name
             .as_deref()

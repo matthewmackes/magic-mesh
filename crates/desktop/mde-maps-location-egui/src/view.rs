@@ -2517,6 +2517,20 @@ fn paint_map_scene(
         );
     }
 
+    // WL-FUNC-012 / OVERLAY-7 — official AirNow monitoring-site AQI. The layer
+    // paints an explicit missing-key badge until mde-seal has the free key; no
+    // station or warning geometry is invented while unconfigured.
+    if map.air_quality_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::air_quality::paint_layer(
+            painter,
+            rect,
+            &map.air_quality,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
     // WL-FUNC-012 / OVERLAY-8 — low-altitude, vehicle-scoped adsb.lol tracks.
     // Positions dead-reckon only inside the bounded 60-second retention window;
     // without basemap projection the honest badge remains but no location is
@@ -3397,6 +3411,7 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         }
         ui.checkbox(&mut state.map.wildfire_overlay, "Wildfire perimeters");
         ui.checkbox(&mut state.map.traffic_event_overlay, "NCDOT traffic");
+        ui.checkbox(&mut state.map.air_quality_overlay, "AirNow AQI");
         ui.checkbox(&mut state.map.aircraft_overlay, "Aircraft");
         if state.map.aircraft_overlay {
             ui.checkbox(&mut state.map.aircraft.show_callsigns, "Callsigns");

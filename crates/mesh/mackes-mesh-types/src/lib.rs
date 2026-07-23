@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+/// WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI snapshots.
+pub mod air_quality;
 /// WL-FUNC-012 / OVERLAY-8 — point-scoped adsb.lol aircraft snapshots shared
 /// by the workstation adapter and Maps & Location.
 pub mod aircraft;

@@ -32,7 +32,8 @@ fail() { echo "FAILED: $*" >"$STATUS_FILE"; log "FATAL: $*"; exit 1; }
 #    found path (do-lighthouse-cloudinit.sh step 2).
 if [ -n "$RPM_URL" ] && [ "$RPM_URL" != "@RPM_URL@" ]; then
     log "installing magic-mesh from $RPM_URL"
-    dnf install -y "$RPM_URL" || fail "dnf install of $RPM_URL failed"
+    dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        "$RPM_URL" || fail "dnf install of $RPM_URL failed"
 else
     RELEASEVER="$(rpm -E %fedora)"
     log "installing magic-mesh from $REPO_BASEURL (fedora-$RELEASEVER)"
@@ -44,11 +45,19 @@ enabled=1
 gpgcheck=1
 gpgkey=$REPO_BASEURL/RPM-GPG-KEY-magic-mesh
 EOF
-    dnf install -y magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
+    # Keep the smallest lighthouse genuinely small: weak dependencies pull in
+    # libvirt/desktop/media/file-sharing stacks that are not lighthouse duties.
+    dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
 fi
 command -v mackesd >/dev/null || fail "mackesd not on PATH after install"
- [ -x /usr/libexec/mackesd/configure-small-lighthouse ] \
-    || fail "small lighthouse profile helper not on PATH after install"
+PROFILE_HELPER=/usr/libexec/mackesd/configure-small-lighthouse
+if [ ! -x "$PROFILE_HELPER" ]; then
+    curl --fail --proto '=https' --tlsv1.2 --location --max-time 30 \
+        'https://raw.githubusercontent.com/matthewmackes/magic-mesh/master/install-helpers/configure-small-lighthouse.sh' \
+        -o "$PROFILE_HELPER" || fail "could not fetch the thin lighthouse profile helper"
+    chmod 0755 "$PROFILE_HELPER"
+fi
 
 # 2. JOIN the existing mesh as a lighthouse (NOT found). `join --role lighthouse`
 #    pins the role, network-enrolls, brings up nebula + mackesd, auto-joins the
@@ -60,7 +69,7 @@ echo "$JOIN_OUT"
 
 # Keep the join path on the same 512 MiB control-plane profile as the founding
 # path.  This runs after join because join pins the role and starts the units.
-/usr/libexec/mackesd/configure-small-lighthouse small \
+"$PROFILE_HELPER" small \
     || fail "could not apply the small lighthouse resource profile"
 
 # 3. Open the lighthouse ports (DO Cloud Firewall is the real gate, applied by

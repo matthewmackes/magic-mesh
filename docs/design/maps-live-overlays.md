@@ -233,6 +233,15 @@ describe what actually came back.
   preliminary — occasional single-monitor spikes.
 - **Risks:** AirNow servers are slow exactly during major wildfire events — build
   timeouts + last-good-value caching; grey markers past 2 h, drop past 6 h.
+- **Credential/runtime contract (implemented 2026-07-22):** the free deployment
+  key is read only from mde-seal ref `airnow-api-key` (`mackesd secret put
+  airnow-api-key` reads it from stdin). `MDE_OVERLAY_AIRNOW_AQI=1` with that ref
+  absent publishes explicit `unconfigured` state with no fetch timestamp and
+  performs no request. Store faults remain distinct from a missing key; 401/403
+  causes a sealed-key reload, and request errors are stripped of their URL so
+  the query-string credential cannot enter logs. The station-BBOX service is the
+  current non-retiring service listed by AirNow; legacy current-observation
+  lat/long services marked for fall-2026 retirement are not used.
 
 ### 3.8 ADS-B live aircraft — adsb.lol (rank 8)
 

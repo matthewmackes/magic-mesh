@@ -130,12 +130,12 @@ pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &st
                 ),
             );
         }
-        if let Err(e) = super::super::path_key::segment("name", &spec.name) {
+        if let Err(e) = super::super::path_key::file_stem("name", &spec.name, ".json") {
             return reject(verb_name, e);
         }
     }
     for name in &body.remove {
-        if let Err(e) = super::super::path_key::segment("name", name) {
+        if let Err(e) = super::super::path_key::file_stem("name", name, ".json") {
             return reject(verb_name, e);
         }
     }

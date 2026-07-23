@@ -756,6 +756,9 @@ impl MapsLocationSurface {
         if let Some(snapshot) = read_traffic_mirror(node) {
             self.refresh_from_traffic(snapshot);
         }
+        if let Some(snapshot) = read_air_quality_mirror(node) {
+            self.refresh_from_air_quality(snapshot);
+        }
     }
 
     /// Fold a complete USGS snapshot. Whole-snapshot replacement is deliberate:
@@ -823,6 +826,14 @@ impl MapsLocationSurface {
     /// Fold a complete vehicle-centred NCDOT current-event set.
     pub fn refresh_from_traffic(&mut self, snapshot: mackes_mesh_types::traffic::TrafficSnapshot) {
         self.map.traffic_events.fold(snapshot);
+    }
+
+    /// Fold complete credential/configuration state plus current AirNow stations.
+    pub fn refresh_from_air_quality(
+        &mut self,
+        snapshot: mackes_mesh_types::air_quality::AirQualitySnapshot,
+    ) {
+        self.map.air_quality.fold(snapshot);
     }
 
     /// The Auto Mode home's **Vehicle**-tile glance line: a live telematics
@@ -985,6 +996,17 @@ fn read_traffic_mirror(node: &str) -> Option<mackes_mesh_types::traffic::Traffic
     let root = mde_bus::client_data_dir()?;
     let persist = mde_bus::persist::Persist::open(root).ok()?;
     let topic = mackes_mesh_types::traffic::traffic_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode retained AirNow state, including the explicit missing-key state.
+fn read_air_quality_mirror(
+    node: &str,
+) -> Option<mackes_mesh_types::air_quality::AirQualitySnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::air_quality::air_quality_state_topic(node);
     let body = persist.read_latest(&topic).ok().flatten()?.body?;
     serde_json::from_str(&body).ok()
 }
@@ -1250,6 +1272,10 @@ pub struct MapViewState {
     pub traffic_event_overlay: bool,
     /// Latest vehicle-centred current NCDOT event set.
     pub traffic_events: crate::traffic::TrafficLayerState,
+    /// Whether the ambient AirNow station AQI layer is visible. Off by default.
+    pub air_quality_overlay: bool,
+    /// Latest AirNow credential/configuration state and nearby station set.
+    pub air_quality: crate::air_quality::AirQualityLayerState,
     /// Attribution string shown on every map view.
     pub attribution: String,
 }
@@ -1293,6 +1319,8 @@ impl MapViewState {
             wildfire: crate::wildfire::WildfireLayerState::default(),
             traffic_event_overlay: false,
             traffic_events: crate::traffic::TrafficLayerState::default(),
+            air_quality_overlay: false,
+            air_quality: crate::air_quality::AirQualityLayerState::default(),
             attribution: if region_installed {
                 "OpenStreetMap contributors | local offline package".to_string()
             } else {
@@ -1335,6 +1363,8 @@ impl MapViewState {
             wildfire: crate::wildfire::WildfireLayerState::default(),
             traffic_event_overlay: false,
             traffic_events: crate::traffic::TrafficLayerState::default(),
+            air_quality_overlay: false,
+            air_quality: crate::air_quality::AirQualityLayerState::default(),
             attribution: "OpenStreetMap contributors | local offline package | simulated route"
                 .to_string(),
         }
@@ -1381,6 +1411,10 @@ impl MapViewState {
         if self.traffic_event_overlay {
             attribution.push_str(" | ");
             attribution.push_str(crate::traffic::TrafficLayerState::attribution());
+        }
+        if self.air_quality_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::air_quality::AirQualityLayerState::attribution());
         }
         attribution
     }
@@ -4384,6 +4418,21 @@ mod tests {
             .map
             .attribution_line()
             .contains("NCDOT DriveNC / TIMS"));
+    }
+
+    #[test]
+    fn air_quality_fold_and_ambient_toggle_control_epa_attribution() {
+        let snapshot = mackes_mesh_types::air_quality::AirQualitySnapshot::unconfigured("rig-1", 1);
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_air_quality(snapshot);
+        assert!(state.map.air_quality.snapshot.is_some());
+        assert!(!state.map.air_quality_overlay);
+        assert!(!state.map.attribution_line().contains("US EPA AirNow"));
+        state.map.air_quality_overlay = true;
+        assert!(state
+            .map
+            .attribution_line()
+            .contains("US EPA AirNow (preliminary)"));
     }
 
     // ── WL-UX-007/S1 — production simulator removal ─────────────────────────

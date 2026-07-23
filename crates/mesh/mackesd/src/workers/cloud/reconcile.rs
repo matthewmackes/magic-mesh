@@ -34,6 +34,7 @@ use super::runner::CloudRunner;
 /// The desired-state root subtree, relative to the worker's `state_root`: the local
 /// realization of the `/mcnf/cloud/desired/…` key namespace.
 const DESIRED_SUBTREE: &str = "mcnf/cloud/desired";
+const DESIRED_DOC_SUFFIX: &str = ".json";
 
 /// The directory holding node `node`'s desired-state docs (`<state_root>/mcnf/cloud/
 /// desired/<node>/`).
@@ -51,7 +52,11 @@ pub(crate) fn desired_doc_path(
     node: &str,
     name: &str,
 ) -> Result<PathBuf, String> {
-    Ok(desired_dir(state_root, node)?.join(format!("{}.json", path_key::segment("name", name)?)))
+    Ok(desired_dir(state_root, node)?.join(format!(
+        "{}{}",
+        path_key::file_stem("name", name, DESIRED_DOC_SUFFIX)?,
+        DESIRED_DOC_SUFFIX
+    )))
 }
 
 /// Read node `node`'s desired-state slice — every `*.json` doc under its desired
@@ -93,7 +98,7 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
 /// caller — never a silent success).
 pub(crate) fn write_desired_doc(state_root: &Path, spec: &WorkloadSpec) -> Result<(), String> {
     let node = path_key::segment("node", &spec.node)?;
-    let name = path_key::segment("name", &spec.name)?;
+    let name = path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)?;
     let dir = desired_dir(state_root, node)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create desired dir {}: {e}", dir.display()))?;
@@ -309,6 +314,18 @@ mod tests {
             !outside.exists(),
             "an untrusted absolute node/name must not create an outside path"
         );
+    }
+
+    #[test]
+    fn desired_store_rejects_suffix_overflow_before_creating_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        let long_name = "x".repeat(251);
+
+        let err = write_desired_doc(&root, &spec(&long_name, "eagle")).unwrap_err();
+        assert!(err.contains("too long"), "unexpected error: {err}");
+        assert!(!root.exists(), "invalid filename must fail before I/O");
+        assert!(remove_desired_doc(&root, "eagle", &long_name).is_err());
     }
 
     #[test]

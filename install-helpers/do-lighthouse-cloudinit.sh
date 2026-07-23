@@ -38,7 +38,8 @@ log "public IP: $PUBLIC_IP"
 if [ -n "$RPM_URL" ] && [ "$RPM_URL" != "@RPM_URL@" ]; then
     # Direct RPM (e.g. the portable build for an older-glibc DO image).
     log "installing magic-mesh from $RPM_URL"
-    dnf install -y "$RPM_URL" || fail "dnf install of $RPM_URL failed"
+    dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        "$RPM_URL" || fail "dnf install of $RPM_URL failed"
 else
     # The gh-pages dnf channel, keyed to THIS droplet's Fedora releasever.
     RELEASEVER="$(rpm -E %fedora)"
@@ -51,11 +52,24 @@ enabled=1
 gpgcheck=1
 gpgkey=$REPO_BASEURL/RPM-GPG-KEY-magic-mesh
 EOF
-    dnf install -y magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
+    # A 512 MiB lighthouse cannot afford Fedora weak dependencies (libvirt,
+    # desktop/media helpers, and file-sharing tooling). The package contains
+    # the control-plane payload; optional capabilities remain disabled by the
+    # small profile below.
+    dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
 fi
 command -v mackesd >/dev/null || fail "mackesd not on PATH after install"
- [ -x /usr/libexec/mackesd/configure-small-lighthouse ] \
-    || fail "small lighthouse profile helper not on PATH after install"
+PROFILE_HELPER=/usr/libexec/mackesd/configure-small-lighthouse
+if [ ! -x "$PROFILE_HELPER" ]; then
+    # Older published RPMs predate the thin-profile helper. Fetch the exact
+    # repository helper so a lighthouse never silently boots without its
+    # cgroup/swap/optional-service guardrails.
+    curl --fail --proto '=https' --tlsv1.2 --location --max-time 30 \
+        'https://raw.githubusercontent.com/matthewmackes/magic-mesh/master/install-helpers/configure-small-lighthouse.sh' \
+        -o "$PROFILE_HELPER" || fail "could not fetch the thin lighthouse profile helper"
+    chmod 0755 "$PROFILE_HELPER"
+fi
 
 # 3. Found the mesh — mint the CA, self-sign, generate the /enroll endpoint
 #    identity, and print the v3 join token (with the embedded cert fp).
@@ -91,7 +105,7 @@ log "services up (boot-durable) — /enroll endpoint live on $PUBLIC_IP:$ENROLL_
 # The smallest DO Basic Droplet is the supported stock lighthouse target.  Apply
 # its resource/optional-service profile after found has pinned the role and
 # started the control plane; the helper is idempotent and restart-safe.
-/usr/libexec/mackesd/configure-small-lighthouse small \
+"$PROFILE_HELPER" small \
     || fail "could not apply the small lighthouse resource profile"
 
 # 5b. Optional broker/Netdata/shell setup is intentionally NOT started here:

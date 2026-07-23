@@ -1362,6 +1362,17 @@ pub(crate) fn spawn_compute_lifecycle_workers(
                 .to_string(),
         )
     });
+    // WL-FUNC-012 / OVERLAY-7 — official AirNow monitoring-site AQI. The
+    // Workstation-tier adapter resolves its free per-deployment key exclusively
+    // through mde-seal and publishes explicit unconfigured state when absent.
+    spawn_tiered(sup, worker_names, role_rank, "air_quality_overlay", || {
+        mackesd_core::workers::air_quality_overlay::AirQualityOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // WL-FUNC-012 / OVERLAY-4 — official NWS points→forecastHourly guidance.
     // Workstation-tier, keyless, strict official-host allowlist, explicit
     // opt-in, and scoped only from a fresh same-host MG90 fix.

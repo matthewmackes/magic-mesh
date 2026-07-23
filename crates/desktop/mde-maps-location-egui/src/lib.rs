@@ -14,6 +14,7 @@
 //! (`MapsLocationSurface::simulated`, `#[cfg(any(test, feature = "sim-fixture"))]`);
 //! no production build compiles it, so no production path can show dummy data.
 
+pub mod air_quality;
 pub mod aircraft;
 pub mod airspace;
 pub mod basemap;

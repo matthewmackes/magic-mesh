@@ -136,6 +136,13 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
+/// Authorization node scope for the Xen/datacenter responder. Mutation
+/// targets are the existing resource lock keys, so a capability cannot be
+/// replayed against a different VM, storage object, or generated IaC resource.
+pub const DC_ACTION_NODE_SCOPE: &str = "fleet-control";
+
 /// The VM power-control responder.
 ///
 /// Rooted at the shared workgroup root (carried for parity with the other action
@@ -161,6 +168,8 @@ pub struct DatacenterService {
     /// `Clone` of the service (the responder-thread handle) shares ONE set, and
     /// so concurrent `build_reply` calls serialize on insert/remove.
     in_flight: Arc<Mutex<BTreeSet<String>>>,
+    /// Root-only capability verifier for the production Bus responder.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl DatacenterService {
@@ -171,7 +180,18 @@ impl DatacenterService {
         Self {
             workgroup_root,
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile responder
+    /// tests. Production construction always uses the root-only systemd
+    /// credential through [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     /// Try to claim `key` in the in-flight set. Returns a [`OpLockGuard`] (which
@@ -673,6 +693,60 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
         return None;
     }
     Some(format!("vm:{uuid}"))
+}
+
+/// Return the capability target for a privileged datacenter mutation. Read-only
+/// inventory/console/planning verbs remain open; every mutation must carry a
+/// resource lock key so the signed body is bound to the exact target that the
+/// dispatcher is about to touch.
+fn mutation_target(verb: &str, req_body: Option<&str>) -> Result<Option<String>, String> {
+    if !ACTION_VERBS.contains(&verb)
+        || matches!(
+            verb,
+            "vm-console" | "vm-snapshots" | "do-regions" | "genesis-plan" | "backoffice-plan"
+        )
+    {
+        return Ok(None);
+    }
+    let target = lock_key(verb, req_body)
+        .ok_or_else(|| format!("{verb}: missing or invalid mutation target"))?;
+    Ok(Some(target))
+}
+
+/// Verify a datacenter mutation before the op-lock or any SSH/filesystem/XAPI
+/// backend call. The production responder's verifier is root-credential-backed;
+/// tests inject an isolated verifier through [`DatacenterService::with_authorizer`].
+fn authorize_mutation(
+    svc: &DatacenterService,
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<(), String> {
+    let Some(target) = mutation_target(verb, req_body)? else {
+        return Ok(());
+    };
+    svc.authorizer.authorize(
+        req_body.expect("a mutation target requires a body"),
+        MutationContext {
+            verb,
+            node: DC_ACTION_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
+/// Production Bus dispatch wrapper. Reads remain available without a
+/// capability; mutations fail closed before resource locking or backend work.
+fn build_authorized_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
+    if let Err(error) = authorize_mutation(svc, verb, req_body) {
+        tracing::warn!(
+            target: "mackesd::action_auth",
+            verb,
+            %error,
+            "refused unauthorized Datacenter VM/storage mutation"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, req_body)
 }
 
 /// Build the reply for one `action/dc/<verb>` request, dispatching on `verb`.
@@ -2168,7 +2242,7 @@ pub fn poll_once(
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_authorized_reply(svc, verb, msg.body.as_deref())
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -2187,6 +2261,7 @@ pub fn poll_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
 
     /// The dom0 allow-list (`xen_dom0s`) reads a process-wide env var. The tests
     /// that mutate it (the `vm-create` happy path) and the ones that assert the
@@ -2195,10 +2270,67 @@ mod tests {
     /// same idiom the panel's saved-views tests use.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    const AUTH_KEY: &[u8] = b"datacenter-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    fn authorized_service(root: &std::path::Path) -> DatacenterService {
+        DatacenterService::new(root.to_path_buf()).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(AUTH_KEY, root.join("auth"), AUTH_NOW),
+        ))
+    }
+
+    fn vm_power_context() -> MutationContext<'static> {
+        MutationContext {
+            verb: "vm-power",
+            node: DC_ACTION_NODE_SCOPE,
+            target: "vm:abcd1234-5678-90ab-cdef-1234567890ab",
+        }
+    }
+
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn production_dispatch_refuses_unsigned_vm_mutation_before_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let body = json!({
+            "schema_version": 1,
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "op": "start",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let reply = build_authorized_reply(&svc, "vm-power", Some(&body));
+        assert!(reply.contains("authorization refused"), "{reply}");
+        assert!(!reply.contains("dom0 not in allowed set"), "{reply}");
+    }
+
+    #[test]
+    fn authorized_vm_mutation_reaches_validation_and_replay_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let body = json!({
+            "schema_version": 1,
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "op": "start",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &body,
+            vm_power_context(),
+            "dc-vm-power-once",
+            AUTH_NOW + 30_000,
+        );
+        let first = build_authorized_reply(&svc, "vm-power", Some(&armed));
+        assert!(first.contains("dom0 not in allowed set"), "{first}");
+        let replay = build_authorized_reply(&svc, "vm-power", Some(&armed));
+        assert!(replay.contains("already used"), "{replay}");
     }
 
     #[test]

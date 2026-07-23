@@ -22,7 +22,7 @@
 #   --repo-baseurl <u>  dnf channel base     [https://matthewmackes.github.io/magic-mesh]
 #   --rpm-url <u>       direct RPM URL (overrides the channel)
 #   --enroll-port <p>   /enroll HTTPS port   [4243]
-#   --role <r>          role to pin          [lighthouse]
+#   --role <r>          role to pin (must remain lighthouse) [lighthouse]
 #   --tag <t>           droplet+firewall tag [magic-lighthouse]
 #   --keep-on-fail      don't destroy the droplet if bootstrap fails
 set -euo pipefail
@@ -54,6 +54,12 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option: $1" >&2; exit 1;;
     esac
 done
+
+if [ "$ROLE" != "lighthouse" ]; then
+    echo "lighthouse provisioning only supports the thin control-plane role;" >&2
+    echo "media, fileshare, server, and workstation roles are not valid here." >&2
+    exit 1
+fi
 
 command -v doctl >/dev/null || { echo "doctl not found — install + 'doctl auth init'" >&2; exit 1; }
 

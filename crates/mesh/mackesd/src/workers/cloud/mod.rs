@@ -935,6 +935,26 @@ mod tests {
     }
 
     #[test]
+    fn an_overlong_delete_target_is_rejected_before_backend_io() {
+        let runner = Arc::new(FakeRunner::default());
+        let w = staged_worker(runner.clone());
+        let target = "x".repeat(251);
+        let body = serde_json::json!({
+            "node": "me",
+            "instance": target,
+            "typed_name": target,
+        });
+
+        let reply = w.handle("instance-delete", &body.to_string());
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("too long"));
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "invalid state filename must fail before the backend"
+        );
+    }
+
+    #[test]
     fn a_lifecycle_verb_requires_an_instance_and_routes_the_action() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
