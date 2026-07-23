@@ -18,6 +18,8 @@ use serde_json::json;
 use mackes_mesh_types::ddns;
 use mackes_mesh_types::exposure::{self, ExposurePolicy, ExposureTemplate, Tier};
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 /// The connectivity responder service — holds the shared-substrate root where
 /// the exposure config (`<root>/connect/policy.toml`) lives + this node's
 /// hostname (CONNECT-2 candidate discovery tags candidates with their host).
@@ -365,6 +367,112 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
     }
 }
 
+/// Parse a privileged Connect mutation into its stable capability target and
+/// the legacy body consumed by [`build_reply`]. Authentication metadata is
+/// removed before any config is loaded or written. Read-only verbs remain
+/// unauthenticated.
+fn mutation_request(
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if !matches!(
+        verb,
+        "set-policy" | "expose" | "unexpose" | "set-template" | "apply-template"
+    ) {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let mut request: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| format!("{verb}: request body must be a JSON object"))?;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| format!("{verb}: request body must be a JSON object"))?;
+    object.remove("schema_version");
+    object.remove("armed_token");
+    let string_field = |field: &str| {
+        request
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{verb}: missing `{field}`"))
+    };
+    let (target, handler_body) = match verb {
+        "set-policy" => {
+            let id = string_field("id")?;
+            (format!("service:{id}"), request.to_string())
+        }
+        "expose" => {
+            let id = string_field("id")?;
+            (format!("service:{id}"), request.to_string())
+        }
+        "unexpose" => {
+            let id = string_field("id")?;
+            (format!("service:{id}"), id)
+        }
+        "set-template" => {
+            let name = string_field("name")?;
+            (format!("template:{name}"), request.to_string())
+        }
+        "apply-template" => {
+            let name = string_field("template")?;
+            let ids = request
+                .get("ids")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "apply-template: missing `ids`".to_string())?;
+            let mut target_ids = Vec::with_capacity(ids.len());
+            for id in ids {
+                let id = id
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "apply-template: ids must be non-empty strings".to_string())?;
+                target_ids.push(id.to_owned());
+            }
+            if target_ids.is_empty() {
+                return Err("apply-template: `ids` must not be empty".to_string());
+            }
+            (
+                format!("template:{name}:{}", target_ids.join(",")),
+                request.to_string(),
+            )
+        }
+        _ => unreachable!("the privileged Connect verb set is closed"),
+    };
+    Ok(Some((target, handler_body)))
+}
+
+/// Apply the shared-spool authorization boundary before a Connect mutation
+/// can read or write exposure/DDNS state. The request body is verified exactly
+/// as published, then auth metadata is stripped before the legacy handler.
+fn build_authorized_reply(
+    svc: &ConnectService,
+    verb: &str,
+    req_body: Option<&str>,
+    authorizer: &ActionAuthorizer,
+) -> String {
+    let prepared = match mutation_request(verb, req_body) {
+        Ok(prepared) => prepared,
+        Err(error) => return json!({ "error": error }).to_string(),
+    };
+    let Some((target, handler_body)) = prepared else {
+        return build_reply(svc, verb, req_body);
+    };
+    let auth_verb = format!("connect-{verb}");
+    let context = MutationContext {
+        verb: &auth_verb,
+        node: &svc.hostname,
+        target: &target,
+    };
+    if let Err(error) = authorizer.authorize(req_body.expect("a mutation requires a body"), context)
+    {
+        tracing::warn!(target: "mackesd::action_auth", verb, %error, "refused unauthorized Connect mutation");
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, Some(&handler_body))
+}
+
 /// CONNECT-9 — auto-create/update the DDNS public name for an ingress `hostname`
 /// bound to `lighthouse`, but only when `this_host` IS that lighthouse (the
 /// `wan`-sourced record resolves to the LOCAL node's WAN, so only the bound
@@ -440,14 +548,20 @@ fn local_listening_ports() -> Vec<u16> {
 /// Run the connect Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &ConnectService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
+    let authorizer = ActionAuthorizer::production();
     while !should_stop() {
-        poll_once(persist, svc, &mut cursors);
+        poll_once(persist, svc, &mut cursors, &authorizer);
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
 /// One poll sweep across the action verbs (split out for tests).
-pub fn poll_once(persist: &Persist, svc: &ConnectService, cursors: &mut HashMap<String, String>) {
+pub fn poll_once(
+    persist: &Persist,
+    svc: &ConnectService,
+    cursors: &mut HashMap<String, String>,
+    authorizer: &ActionAuthorizer,
+) {
     for verb in ACTION_VERBS {
         let topic = action_topic(verb);
         let since = cursors.get(&topic).map(String::as_str);
@@ -461,7 +575,7 @@ pub fn poll_once(persist: &Persist, svc: &ConnectService, cursors: &mut HashMap<
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_authorized_reply(svc, verb, msg.body.as_deref(), authorizer)
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -480,11 +594,118 @@ pub fn poll_once(persist: &Persist, svc: &ConnectService, cursors: &mut HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"connect-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn svc() -> (tempfile::TempDir, ConnectService) {
         let tmp = tempfile::tempdir().unwrap();
         let svc = ConnectService::new(tmp.path().to_path_buf(), "testhost".into());
         (tmp, svc)
+    }
+
+    fn authorized_reply(svc: &ConnectService, verb: &str, unsigned: &str, nonce: &str) -> String {
+        let auth = ActionAuthorizer::for_test(AUTH_KEY, svc.workgroup_root.join("auth"), AUTH_NOW);
+        let target = match verb {
+            "set-policy" | "expose" => format!(
+                "service:{}",
+                serde_json::from_str::<serde_json::Value>(unsigned).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+            ),
+            "unexpose" => format!(
+                "service:{}",
+                serde_json::from_str::<serde_json::Value>(unsigned).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+            ),
+            "set-template" => format!(
+                "template:{}",
+                serde_json::from_str::<serde_json::Value>(unsigned).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+            ),
+            "apply-template" => {
+                let v: serde_json::Value = serde_json::from_str(unsigned).unwrap();
+                let ids = v["ids"].as_array().unwrap();
+                format!(
+                    "template:{}:{}",
+                    v["template"].as_str().unwrap(),
+                    ids.iter()
+                        .map(|id| id.as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            }
+            _ => panic!("not a mutation"),
+        };
+        let auth_verb = format!("connect-{verb}");
+        let body = authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb: &auth_verb,
+                node: &svc.hostname,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        );
+        build_authorized_reply(svc, verb, Some(&body), &auth)
+    }
+
+    #[test]
+    fn connect_mutations_fail_closed_before_state_io() {
+        let (_t, s) = svc();
+        let policy = json!({
+            "id": "grafana",
+            "source": { "node": "eagle", "kind": "container", "port": 3000, "proto": "tcp" },
+            "tier": "mesh-only"
+        });
+        let refused = build_authorized_reply(
+            &s,
+            "set-policy",
+            Some(&policy.to_string()),
+            &ActionAuthorizer::for_test(AUTH_KEY, s.workgroup_root.join("auth"), AUTH_NOW),
+        );
+        assert!(refused.contains("authorization refused"), "{refused}");
+        assert!(exposure::load(&s.workgroup_root).service.is_empty());
+    }
+
+    #[test]
+    fn authorized_connect_mutation_is_exact_body_bound_and_single_use() {
+        let (_t, s) = svc();
+        let unsigned = json!({
+            "schema_version": 1,
+            "id": "grafana",
+            "source": { "node": "eagle", "kind": "container", "port": 3000, "proto": "tcp" },
+            "tier": "mesh-only"
+        })
+        .to_string();
+        let first = authorized_reply(&s, "set-policy", &unsigned, "connect-once");
+        assert!(first.contains("\"ok\":true"), "{first}");
+        let auth = ActionAuthorizer::for_test(AUTH_KEY, s.workgroup_root.join("auth2"), AUTH_NOW);
+        let target = "service:grafana";
+        let auth_verb = "connect-set-policy";
+        let body = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: auth_verb,
+                node: &s.hostname,
+                target,
+            },
+            "connect-tamper",
+            AUTH_NOW + 30_000,
+        );
+        let tampered = body.replace("grafana", "other");
+        let refused = build_authorized_reply(&s, "set-policy", Some(&tampered), &auth);
+        assert!(refused.contains("authorization refused"), "{refused}");
+        let accepted = build_authorized_reply(&s, "set-policy", Some(&body), &auth);
+        assert!(accepted.contains("\"ok\":true"), "{accepted}");
+        let replay = build_authorized_reply(&s, "set-policy", Some(&body), &auth);
+        assert!(replay.contains("authorization refused"), "{replay}");
     }
 
     #[test]

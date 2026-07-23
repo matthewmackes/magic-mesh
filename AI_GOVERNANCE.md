@@ -167,13 +167,15 @@ workload-provider APIs are never exposed as a second public control plane.
   fullscreen VM desktop; sessions **roam** per-peer via etcd/Syncthing. The
   mesh-control surfaces (Workbench/Files/Music/Voice) are **panels inside the one
   shell**, not separate clients.
-- **One stack, two roles (revised 2026-06-30 — `docs/design/onboarding-wizard.md` +
+- **One stack, two roles (revised 2026-07-23 — `docs/design/onboarding-wizard.md` +
   `mesh-virt-management.md`).** **Lighthouse · Workstation** (rank 0/1). Every machine
   runs the **byte-identical stack**; **role is configuration, not a build** — a flag
   toggles systemd units, so a box is re-roled without a reinstall. A **headless machine
   is a Workstation without a local display** (daemon stack only, no egui seat, serving
-  VMs/containers to the mesh). The **Lighthouse** is relay + control plane + **media
-  server (Navidrome→DO Spaces) + CA/signer**. There is **no XCP-NG role** — the
+  VMs/containers to the mesh). The **Lighthouse** is the thin relay + control plane +
+  **CA/signer only**; media and file-sharing lighthouse subclasses are retired and
+  must never be created or supported. Music belongs on an explicitly provisioned
+  non-lighthouse media host and Files remains peer-to-peer. There is **no XCP-NG role** — the
   hypervisor is **Fedora + libvirt/QEMU-KVM + OVN + Podman**; the old
   cloud-hypervisor path is deleted/retired, not the target stack. An external
   XCP-ng host may be *adopted* day-2 but is never

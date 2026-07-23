@@ -54,7 +54,7 @@ const REFRESH: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ServicePick {
-    /// Navidrome on a media lighthouse reading DO Spaces.
+    /// Navidrome on an explicitly provisioned non-lighthouse media host.
     Music,
     /// P2P `mde-files` Send-To — honestly nothing to provision.
     Files,
@@ -80,8 +80,8 @@ impl ServicePick {
     const fn blurb(self) -> &'static str {
         match self {
             Self::Music => {
-                "Navidrome on a media lighthouse reading the shared DO Spaces bucket \u{2014} \
-                 published at music.mesh."
+                "Navidrome on a non-lighthouse media host reading the shared DO Spaces bucket \u{2014} \
+                 lighthouse placement is retired; this flow reports the integration gate."
             }
             Self::Files => {
                 "Already peer-to-peer \u{2014} mde-files Send-To over the Bus; nothing to \

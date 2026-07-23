@@ -329,8 +329,13 @@ These decisions refine acceptance and sequencing for the active items below.
   before any activation or reboot seam, and its shell publisher mints the
   matching capability. Farm evidence is green for clipboard 2/2, seat
   remote-input 16/16, KDC handoff 1/1, firmware 23/23, and surface enable
-  23/23; the full inventory and shared-spool cross-UID negative fixture remain
-  open. A current-tree full `mackesd` library run completed 3,729/3,731 with
+  23/23; Connect exposure mutations now fail closed behind exact-body
+  `connect-*` capabilities (set-policy, expose, unexpose, set-template, and
+  apply-template), with read-only candidate/list verbs left open; focused farm
+  coverage is 12/12. DDNS config/record mutations use the same gate while
+  record-status/config reads remain open; focused farm coverage is 9/9. The
+  full inventory and shared-spool cross-UID negative fixture remain open. A
+  current-tree full `mackesd` library run completed 3,729/3,731 with
   one ignored test and one environment-sensitive caffeine round-trip failure;
   that failure passed in an isolated farm rerun.
 - Priority: P0
@@ -794,7 +799,13 @@ These decisions refine acceptance and sequencing for the active items below.
   Caltrans cameras, IEM NEXRAD radar, NCDOT TIMS state-511 traffic, and NIFC/FIRMS
   wildfire, and AirNow AQI. The overlays close their typed schemas, registered
   worker/spawn census, off-by-default layer toggles, attribution, projected pins,
-  bounded payloads, and paused/fix-loss behavior. AirNow evidence is green for
+  bounded payloads, and paused/fix-loss behavior. The Maps shell now opens one
+  Bus/Persist handle per refresh and folds all latest-wins feeds through it,
+  preserving feed-local fail-soft behavior; the malformed-feed isolation and
+  shared-handle suite is farm-green at 144/144, with the explicit `has_fix`
+  no-fix regression independently green at 1/1. Car live proof also found and
+  closed a `no-fix` telemetry spelling gap so nonzero coordinates cannot
+  masquerade as a lock. AirNow evidence is green for
   mesh types 2/2, Maps/model 5/5, worker 7/7, worker-role census 19/19, and
   full Maps 136/136; its missing sealed key remains an honest unconfigured
   state with no network request or fabricated fetch time. Keyed feeds must idle
@@ -927,7 +938,14 @@ These decisions refine acceptance and sequencing for the active items below.
   no action until stopped (Lock stays available). The focused Car policy suite
   passed 8/8 and the moving Settings paint/defer regression passed 1/1 on farm
   `.130`. Remaining is live MG90 + DRM-seat proof; human review is informative
-  only.
+  only. A non-production `.15` DRM capture (fresh shell PID 2307515) proved the
+  Car dashboard, left-third 10-tile instrument strip, and Nav/Media/Music/
+  Comms/Vehicle/Settings strip with an online MG90 mirror; detiled PNG SHA256 is
+  `54b9f22469c53b2d514e7baf8ba5a2ce0c1574cc29167efcda95bcd762bf9b56`. The same
+  capture exposed a `fix_type:no-fix` spelling gap; Maps now rejects that form
+  with a regression test, so those nonzero coordinates cannot paint as a GPS
+  lock. The seat was restored to workstation layout with the temporary boot
+  override removed, service active, and DRM ownership confirmed.
 - Priority: P1
 - Complexity: Epic
 - Problem: Car mode is a SYNC 3-styled 2x3 tile grid whose 7th tile wraps, with

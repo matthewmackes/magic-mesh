@@ -101,7 +101,7 @@ This list IS the `KVM_SERVICES` catalog (worklist MV-1); the `kvm-host-health` w
 (MV-2) surfaces it to `event/kvm/services`; the Datacenter panels (MV-6) drive it.
 
 ## Acceptance (runtime-observable, §7)
-- One image installs on a box; `role=lighthouse` brings up relay/media/CA with no
+- One image installs on a box; `role=lighthouse` brings up the thin relay/control-plane/CA stack with no
   desktop; the *same* image with `role=workstation` (+ a display) brings up the egui
   shell — **no separate build** (Option 1).
 - From any Workstation's Workbench, "run a Podman service" and "boot a VM" both land

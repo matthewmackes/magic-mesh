@@ -8,9 +8,13 @@ existing one, and drive the whole path (CA bootstrap → optional lighthouse spa
 optional back-office services) from a single role-branched wizard, `mackesd` as the
 engine underneath.
 
-> Authority note: this supersedes the older "Lighthouse = relay-only, no storage"
-> blurb. Per Q19/Q21/Q41 the **Lighthouse role now also holds the media server +
-> the CA/signer**. `AI_GOVERNANCE.md §5` (roles) must be updated to match.
+> Authority note (amended 2026-07-23): DigitalOcean lighthouses are **thin
+> control-plane/relay nodes only**. Media and file-sharing lighthouse placement
+> is retired and must not be created or supported. Music, when deployed, belongs
+> on an explicitly provisioned non-lighthouse media host; Files remains
+> peer-to-peer. The older survey locks that say a lighthouse holds Navidrome or
+> a media volume are superseded by this policy. See
+> [`docs/ops/do-lighthouses.md`](../ops/do-lighthouses.md).
 
 > **⚠️ REVISION 2026-06-30 (post-survey design review — operator: "lock it").** A
 > review after the survey changed several locks. **Where this block conflicts with
@@ -63,7 +67,7 @@ engine underneath.
 | 16 | Workstation onboarding | **egui shell + VDI stack + offer to create the first VM desktop** |
 | 17 | Service catalog | Curated **golden-image VMs: Music, Files, Voice/SIP** |
 | 18 | Music service | **Always spawn a new mesh-native Music service** |
-| 19 | Service placement | **Lighthouses hold the media servers** |
+| 19 | Service placement | **Media servers run on explicitly provisioned non-lighthouse hosts** |
 | 20 | Service timing | **Separate post-onboarding "Services" flow** (never blocks the working network) |
 | 21 | CA custody long-term | **Migrates to the Lighthouse** (always-on signer) once one exists |
 | 22 | "Done" criterion | **Overlay up + ≥1 Workstation + off-LAN reach + self-test green** |
@@ -71,7 +75,7 @@ engine underneath.
 | 24 | Success view | **The live mesh map (`mde-mesh-view`)** is the confirmation |
 | 25 | Role recommendation | **No hardware detection** — operator picks the role blind |
 | 26 | Network setup | Wizard **configures the NIC (NM-keyfile fix) + detects LAN** (DHCP vs static) |
-| 27 | Storage per role | **WS → `~/Local`; XCP-NG → SR; Lighthouse → a media volume** |
+| 27 | Storage per role | **WS → `~/Local`; XCP-NG → SR; non-lighthouse media host → media volume** |
 | 28 | Second Workstation | Joins via QR/invite; **own shell + VDI + per-peer session roaming** |
 | 29 | Role upgrade | **Roles fixed at install; upgrade = reinstall** (no in-place rank bump) |
 | 30 | Interrupt/resume | **Restart fully** — no saved progress, no idempotency guarantee (so steps must be fast+reliable) |
@@ -159,8 +163,8 @@ local via libvirt/QEMU-KVM; push-provision; pair) · `ca-migrate` ·
   acceptable per operator, but a lighthouse loss = no new enrollments until recovery.
 - **No resume (§30)** demands each step be fast + reliable, or a mid-spawn failure
   forces a full restart; the push-provision (§13) is the riskiest long step.
-- **Lighthouse role overload** (relay+control+media+CA) raises its blast radius;
-  the §8 envelope for it must be revisited.
+- **Lighthouse role overload** is avoided by keeping the role to thin relay/control
+  plane + CA duties; media and file sharing remain on separately provisioned hosts.
 
 ## Out of scope (v1)
 - In-place role upgrades (§29 — reinstall instead).

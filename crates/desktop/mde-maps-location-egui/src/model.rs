@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use serde::de::DeserializeOwned;
+
 /// Poll cadence for retained live Bus mirrors (PERF-5). The shell calls
 /// [`MapsLocationSurface::refresh_from_bus`] every frame (~60 Hz); re-reading the
 /// Bus spool off disk that often is pure waste for latest-wins mirrors. Gating
@@ -726,37 +728,50 @@ impl MapsLocationSurface {
             return;
         }
         self.last_bus_poll = Some(Instant::now());
-        if let Some(mirror) = read_vehicle_mirror(node) {
+        // Open the SQLite-backed Bus spool once per refresh.  The ten overlay
+        // lanes plus the vehicle mirror are all latest-wins reads; opening a
+        // separate Persist handle for each lane multiplied connection/schema
+        // work eleven-fold on every poll (and was especially visible on the
+        // smallest workstation instances).  A single borrowed handle keeps
+        // the fail-soft behavior while making the fold genuinely cheap.
+        let Some(root) = mde_bus::client_data_dir() else {
+            return;
+        };
+        let Ok(persist) = mde_bus::persist::Persist::open(root) else {
+            return;
+        };
+
+        if let Some(mirror) = read_vehicle_mirror(&persist, node) {
             self.refresh_from_vehicle(&mirror);
         }
-        if let Some(snapshot) = read_earthquake_mirror(node) {
+        if let Some(snapshot) = read_earthquake_mirror(&persist, node) {
             self.refresh_from_earthquakes(snapshot);
         }
-        if let Some(snapshot) = read_nws_alert_mirror(node) {
+        if let Some(snapshot) = read_nws_alert_mirror(&persist, node) {
             self.refresh_from_nws_alerts(snapshot);
         }
-        if let Some(snapshot) = read_aircraft_mirror(node) {
+        if let Some(snapshot) = read_aircraft_mirror(&persist, node) {
             self.refresh_from_aircraft(snapshot);
         }
-        if let Some(snapshot) = read_transit_mirror(node) {
+        if let Some(snapshot) = read_transit_mirror(&persist, node) {
             self.refresh_from_transit(snapshot);
         }
-        if let Some(snapshot) = read_nws_forecast_mirror(node) {
+        if let Some(snapshot) = read_nws_forecast_mirror(&persist, node) {
             self.refresh_from_nws_forecast(snapshot);
         }
-        if let Some(snapshot) = read_caltrans_camera_mirror(node) {
+        if let Some(snapshot) = read_caltrans_camera_mirror(&persist, node) {
             self.refresh_from_caltrans_cameras(snapshot);
         }
-        if let Some(snapshot) = read_iem_radar_mirror(node) {
+        if let Some(snapshot) = read_iem_radar_mirror(&persist, node) {
             self.refresh_from_iem_radar(snapshot);
         }
-        if let Some(snapshot) = read_wildfire_mirror(node) {
+        if let Some(snapshot) = read_wildfire_mirror(&persist, node) {
             self.refresh_from_wildfire(snapshot);
         }
-        if let Some(snapshot) = read_traffic_mirror(node) {
+        if let Some(snapshot) = read_traffic_mirror(&persist, node) {
             self.refresh_from_traffic(snapshot);
         }
-        if let Some(snapshot) = read_air_quality_mirror(node) {
+        if let Some(snapshot) = read_air_quality_mirror(&persist, node) {
             self.refresh_from_air_quality(snapshot);
         }
     }
@@ -899,115 +914,121 @@ fn mirror_age_s(published_at_ms: i64) -> f32 {
 }
 
 /// Open the Bus fail-soft and decode the newest `state/vehicle/<node>` mirror
-/// body — the same "resolve `client_data_dir`, `Persist::open` fail-soft,
-/// newest row, `serde_json` decode" prelude the shell's own per-host readers
-/// use, embedded locally since that seam is crate-private to `mde-shell-egui`.
-fn read_vehicle_mirror(node: &str) -> Option<mackes_mesh_types::vehicle::VehicleState> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+/// body — the same "resolve `client_data_dir`, open `Persist` fail-soft,
+/// newest row, `serde_json` decode" seam the shell's own per-host readers use,
+/// embedded locally since that seam is crate-private to `mde-shell-egui`.
+fn read_vehicle_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::vehicle::VehicleState> {
     let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained keyless-USGS overlay snapshot, fail-soft when the adapter
 /// is disabled, the Bus is absent, or the latest payload is malformed.
-fn read_earthquake_mirror(node: &str) -> Option<mackes_mesh_types::earthquake::EarthquakeSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_earthquake_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::earthquake::EarthquakeSnapshot> {
     let topic = mackes_mesh_types::earthquake::earthquake_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained NWS active-alert snapshot, fail-soft when the opt-in
 /// adapter has no fresh vehicle fix or has not published yet.
-fn read_nws_alert_mirror(node: &str) -> Option<mackes_mesh_types::nws_alert::NwsAlertSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_nws_alert_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::nws_alert::NwsAlertSnapshot> {
     let topic = mackes_mesh_types::nws_alert::nws_alert_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained adsb.lol aircraft snapshot, fail-soft when the adapter
 /// is disabled, lacks a qualified vehicle fix, or has not published yet.
-fn read_aircraft_mirror(node: &str) -> Option<mackes_mesh_types::aircraft::AircraftSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_aircraft_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::aircraft::AircraftSnapshot> {
     let topic = mackes_mesh_types::aircraft::aircraft_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained MBTA transit snapshot, fail-soft when disabled/absent.
-fn read_transit_mirror(node: &str) -> Option<mackes_mesh_types::transit::TransitSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_transit_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::transit::TransitSnapshot> {
     let topic = mackes_mesh_types::transit::transit_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained NWS hourly snapshot, including explicit no-fix state.
 fn read_nws_forecast_mirror(
+    persist: &mde_bus::persist::Persist,
     node: &str,
 ) -> Option<mackes_mesh_types::nws_forecast::NwsForecastSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
     let topic = mackes_mesh_types::nws_forecast::nws_forecast_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained Caltrans camera snapshot, fail-soft when disabled/absent.
 fn read_caltrans_camera_mirror(
+    persist: &mde_bus::persist::Persist,
     node: &str,
 ) -> Option<mackes_mesh_types::caltrans_camera::CaltransCameraSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
     let topic = mackes_mesh_types::caltrans_camera::caltrans_camera_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained IEM/NWS NEXRAD snapshot, fail-soft when disabled/absent.
-fn read_iem_radar_mirror(node: &str) -> Option<mackes_mesh_types::iem_radar::IemRadarSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_iem_radar_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::iem_radar::IemRadarSnapshot> {
     let topic = mackes_mesh_types::iem_radar::iem_radar_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained keyless NIFC WFIGS perimeter snapshot, fail-soft when
 /// the opt-in adapter is disabled, has no fresh fix, or has not published yet.
-fn read_wildfire_mirror(node: &str) -> Option<mackes_mesh_types::wildfire::WildfireSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_wildfire_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::wildfire::WildfireSnapshot> {
     let topic = mackes_mesh_types::wildfire::wildfire_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode the retained keyless NCDOT traffic snapshot, fail-soft outside North
 /// Carolina, while disabled, or before the first publish.
-fn read_traffic_mirror(node: &str) -> Option<mackes_mesh_types::traffic::TrafficSnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
+fn read_traffic_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::traffic::TrafficSnapshot> {
     let topic = mackes_mesh_types::traffic::traffic_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
-    serde_json::from_str(&body).ok()
+    read_latest_json(persist, &topic)
 }
 
 /// Decode retained AirNow state, including the explicit missing-key state.
 fn read_air_quality_mirror(
+    persist: &mde_bus::persist::Persist,
     node: &str,
 ) -> Option<mackes_mesh_types::air_quality::AirQualitySnapshot> {
-    let root = mde_bus::client_data_dir()?;
-    let persist = mde_bus::persist::Persist::open(root).ok()?;
     let topic = mackes_mesh_types::air_quality::air_quality_state_topic(node);
-    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    read_latest_json(persist, &topic)
+}
+
+/// Read and decode one retained latest-wins payload from an already-open Bus
+/// spool.  A missing row, absent body, SQL failure, or malformed JSON all
+/// intentionally collapse to `None`: one unhealthy feed must not prevent the
+/// remaining map layers from folding during the same poll.
+fn read_latest_json<T: DeserializeOwned>(
+    persist: &mde_bus::persist::Persist,
+    topic: &str,
+) -> Option<T> {
+    let body = persist.read_latest(topic).ok().flatten()?.body?;
     serde_json::from_str(&body).ok()
 }
 
@@ -3020,8 +3041,9 @@ impl LocationSample {
     ///
     /// The driving HUD uses this to decide between the live vehicle chevron and
     /// the honest "Acquiring GPS" state. A sample counts as fixed when its
-    /// `fix_type` reports an actual 2D/3D/DGPS/RTK lock (not empty, "no fix", or
-    /// "none") and the reported coordinate is not the degenerate null island
+    /// `fix_type` reports an actual 2D/3D/DGPS/RTK lock (not empty, "no fix" or
+    /// spelling variants such as "no-fix"/"nofix", or "none") and the reported
+    /// coordinate is not the degenerate null island
     /// `0, 0`. Guarding on both keeps a half-populated sample from feeding a
     /// zero/NaN-adjacent position into HUD layout.
     #[must_use]
@@ -3029,6 +3051,7 @@ impl LocationSample {
         let fix = self.fix_type.trim();
         let fix_ok = !fix.is_empty()
             && !fix.eq_ignore_ascii_case("no fix")
+            && !fix.eq_ignore_ascii_case("no-fix")
             && !fix.eq_ignore_ascii_case("none")
             && !fix.eq_ignore_ascii_case("0")
             && !fix.eq_ignore_ascii_case("nofix");
@@ -3677,6 +3700,14 @@ mod tests {
         };
         assert!(!acquiring.has_fix());
 
+        let hyphenated_acquiring = LocationSample {
+            fix_type: "no-fix".to_string(),
+            latitude: 32.1680,
+            longitude: -95.8490,
+            ..fixed.clone()
+        };
+        assert!(!hyphenated_acquiring.has_fix());
+
         let empty_fix = LocationSample {
             fix_type: String::new(),
             ..fixed.clone()
@@ -4211,6 +4242,42 @@ mod tests {
             .real_hardware_gaps
             .iter()
             .any(|g| g == SIMULATED_MG90_GAP_NOTE));
+    }
+
+    #[test]
+    fn latest_json_is_feed_local_and_fail_soft() {
+        // The shared Persist handle must let a malformed feed fall out without
+        // poisoning the other latest-wins reads in the same refresh.  This is
+        // the exact failure mode seen when an adapter is interrupted midway
+        // through a JSON publish.
+        let dir = tempfile::tempdir().expect("temp bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let good_topic = "state/overlay/test/good";
+        let bad_topic = "state/overlay/test/bad";
+        persist
+            .write(
+                good_topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(r#"{"fetched_at":42,"items":[1,2]}"#),
+            )
+            .expect("good payload");
+        persist
+            .write(
+                bad_topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{not-json"),
+            )
+            .expect("bad payload is still a stored message");
+
+        let good: Option<serde_json::Value> = read_latest_json(&persist, good_topic);
+        assert_eq!(
+            good.as_ref().and_then(|v| v["fetched_at"].as_i64()),
+            Some(42)
+        );
+        let bad: Option<serde_json::Value> = read_latest_json(&persist, bad_topic);
+        assert!(bad.is_none(), "malformed feed must fail soft locally");
     }
 
     #[test]

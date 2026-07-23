@@ -234,16 +234,16 @@ pub fn recipients_for(scope: &SealScope, roster: &[NodeRecipient]) -> Vec<String
 mod tests {
     use super::*;
 
-    /// A three-node fixture: a lighthouse, a media-lighthouse (lighthouse role +
-    /// media scope), and a workstation. The recipient strings stand in for the
-    /// real `age1…` public keys — the resolver treats them opaquely.
+    /// A three-node fixture: a thin lighthouse, an explicitly provisioned
+    /// non-lighthouse media host, and a workstation. The recipient strings stand
+    /// in for the real `age1…` public keys — the resolver treats them opaquely.
     fn roster() -> Vec<NodeRecipient> {
         vec![
             NodeRecipient::new("lh1", "age1-lighthouse-one", &["lighthouse"], &[]),
             NodeRecipient::new(
-                "lh2-media",
-                "age1-lighthouse-media",
-                &["lighthouse"],
+                "media-host",
+                "age1-media-host",
+                &["workstation"],
                 &["media"],
             ),
             NodeRecipient::new("ws1", "age1-workstation-one", &["workstation"], &[]),
@@ -317,17 +317,13 @@ mod tests {
 
     #[test]
     fn role_scope_selects_only_matching_role_and_excludes_others() {
-        // `role:lighthouse` seals to BOTH lighthouses (plain + media) and NEVER
-        // to the workstation — the workstation-only node's key is not a recipient,
-        // so it cannot decrypt (role-match-decrypts / role-mismatch-fails).
+        // `role:lighthouse` seals only to the thin lighthouse and NEVER to the
+        // non-lighthouse media host or workstation.
         let got = recipients_for(&SealScope::Role("lighthouse".into()), &roster());
         assert_eq!(
             got,
-            vec![
-                "age1-lighthouse-media".to_string(),
-                "age1-lighthouse-one".to_string(),
-            ],
-            "role:lighthouse must resolve to exactly the two lighthouse recipients"
+            vec!["age1-lighthouse-one".to_string()],
+            "role:lighthouse must resolve only to the thin lighthouse recipient"
         );
         assert!(
             !got.contains(&"age1-workstation-one".to_string()),
@@ -338,10 +334,10 @@ mod tests {
 
     #[test]
     fn capability_scope_selects_only_matching_scope() {
-        // `scope:media` seals ONLY to the node carrying the media scope tag —
-        // even the plain lighthouse (same role, no media tag) is excluded.
+        // `scope:media` seals ONLY to the explicitly provisioned non-lighthouse
+        // node carrying the media scope tag.
         let got = recipients_for(&SealScope::Capability("media".into()), &roster());
-        assert_eq!(got, vec!["age1-lighthouse-media".to_string()]);
+        assert_eq!(got, vec!["age1-media-host".to_string()]);
     }
 
     #[test]
@@ -351,8 +347,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                "age1-lighthouse-media".to_string(),
                 "age1-lighthouse-one".to_string(),
+                "age1-media-host".to_string(),
                 "age1-workstation-one".to_string(),
             ]
         );

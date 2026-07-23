@@ -83,7 +83,7 @@ build**. There are **two roles**, and a box is re-roled without a reinstall:
 
 | Role | What it is | Typical host |
 |---|---|---|
-| **Lighthouse** (rank 0) | The always-on relay + Nebula CA/signer + leader control plane + media server. No local display. | a VPS / always-on box |
+| **Lighthouse** (rank 0) | The thin always-on relay + Nebula CA/signer + leader control plane. No media or file-sharing duties; no local display. | a VPS / always-on box |
 | **Workstation** (rank 1) | The full Construct egui thin client — brokers & displays VM desktops, runs libvirt/QEMU-KVM + Podman. | a daily-driver laptop |
 
 A **headless machine is a Workstation without a local display** (daemon stack
@@ -140,7 +140,7 @@ dual-homed (its own Nebula cert + a LAN NIC), default-deny inbound.
 
 - **Files** — `mde-files-egui`: a mesh file manager with **Send-to-peer** over
   the Syncthing-replicated volume (+ automatic sshfs mesh access).
-- **Music / media** — `mde-music-egui` + a Navidrome media Lighthouse
+- **Music / media** — `mde-music-egui` + Navidrome on an explicitly provisioned non-lighthouse media host
   (Subsonic-API, DO Spaces object store); `mde-media-egui` + `mde-media-core`
   (libmpv) for local playback; an `mde-jellyfin` client.
 - **Telephony / voice** — `mde-voice-egui` + `mde-voice-config`: a SIP softphone

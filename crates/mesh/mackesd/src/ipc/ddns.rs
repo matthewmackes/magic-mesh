@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -16,17 +17,32 @@ use serde_json::json;
 
 use mackes_mesh_types::ddns::{self, DdnsConfig, RecordDef, SourceState};
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 /// The DDNS responder — rooted at the shared workgroup root (the config home).
 #[derive(Debug, Clone)]
 pub struct DdnsService {
     workgroup_root: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl DdnsService {
     /// Build the service rooted at the shared workgroup root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
-        Self { workgroup_root }
+        Self {
+            workgroup_root,
+            authorizer: Arc::new(ActionAuthorizer::production()),
+        }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile responder
+    /// tests. Production always uses [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 }
 
@@ -141,6 +157,95 @@ pub fn build_reply(svc: &DdnsService, verb: &str, req_body: Option<&str>) -> Str
     }
 }
 
+/// Stable consumer scope for DDNS configuration mutations. DDNS config is
+/// replicated workgroup state, so the responder owns one closed scope rather
+/// than accepting a caller-selected host as the capability node.
+const DDNS_ACTION_NODE_SCOPE: &str = "ddns";
+
+/// Parse a privileged DDNS mutation into its stable capability target and the
+/// legacy body consumed by [`build_reply`]. Authentication metadata is removed
+/// only after the exact original body has been verified; no config read/write
+/// occurs before that gate.
+fn mutation_request(
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if !matches!(verb, "set-config" | "add-record" | "remove-record") {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let mut request: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("{verb}: request body must be JSON"))?;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| format!("{verb}: request body must be a JSON object"))?;
+    object.remove("schema_version");
+    object.remove("armed_token");
+
+    let string_field = |field: &str| -> Result<String, String> {
+        request
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{verb}: missing `{field}`"))
+    };
+
+    let (target, handler_body) = match verb {
+        "set-config" => {
+            let _: DdnsConfig = serde_json::from_value(request.clone())
+                .map_err(|_| "set-config: bad DdnsConfig".to_string())?;
+            ("config".to_string(), request.to_string())
+        }
+        "add-record" => {
+            let name = string_field("name")?;
+            let _: RecordDef = serde_json::from_value(request.clone())
+                .map_err(|_| "add-record: bad RecordDef".to_string())?;
+            (format!("record:{name}"), request.to_string())
+        }
+        "remove-record" => {
+            let name = string_field("name")?;
+            (format!("record:{name}"), name)
+        }
+        _ => unreachable!("the privileged DDNS verb set is closed"),
+    };
+    Ok(Some((target, handler_body)))
+}
+
+/// Apply the shared-Bus authorization boundary before a DDNS mutation can
+/// load or write the replicated configuration. Query/status verbs remain
+/// unauthenticated.
+fn build_bus_reply(svc: &DdnsService, verb: &str, req_body: Option<&str>) -> String {
+    let prepared = match mutation_request(verb, req_body) {
+        Ok(prepared) => prepared,
+        Err(error) => return json!({ "error": error }).to_string(),
+    };
+    let Some((target, handler_body)) = prepared else {
+        return build_reply(svc, verb, req_body);
+    };
+
+    let auth_verb = format!("ddns-{verb}");
+    let context = MutationContext {
+        verb: &auth_verb,
+        node: DDNS_ACTION_NODE_SCOPE,
+        target: &target,
+    };
+    if let Err(error) = svc
+        .authorizer
+        .authorize(req_body.expect("a mutation requires a body"), context)
+    {
+        tracing::warn!(
+            target: "mackesd::ddns",
+            verb,
+            %error,
+            "refused unauthorized DDNS mutation"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, Some(&handler_body))
+}
+
 /// DDNS-EGRESS-4 — the `record-status` request body: a managed record's `name`,
 /// the live source `state` (from the VPN-GW exit-IP verifier / WAN check), and
 /// the `last`-published value (omit = never published). The reply carries the
@@ -177,7 +282,7 @@ pub fn poll_once(persist: &Persist, svc: &DdnsService, cursors: &mut HashMap<Str
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_bus_reply(svc, verb, msg.body.as_deref())
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -196,6 +301,10 @@ pub fn poll_once(persist: &Persist, svc: &DdnsService, cursors: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+
+    const AUTH_KEY: &[u8] = b"ddns-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn service() -> (tempfile::TempDir, DdnsService) {
         let tmp = tempfile::tempdir().unwrap();
@@ -245,6 +354,74 @@ mod tests {
         let (_t, s) = service();
         assert!(build_reply(&s, "bogus", None).contains("unknown ddns verb"));
         assert!(build_reply(&s, "add-record", None).contains("missing RecordDef"));
+    }
+
+    #[test]
+    fn hostile_unsigned_mutations_are_refused_before_ddns_state_changes() {
+        let (tmp, svc) = service();
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+        let svc = svc.with_authorizer(Arc::new(authorizer));
+        let requests = [
+            (
+                "set-config",
+                json!({"enabled":true,"record":[]}).to_string(),
+            ),
+            (
+                "add-record",
+                json!({"name":"unsigned","source":"wan"}).to_string(),
+            ),
+            ("remove-record", json!({"name":"unsigned"}).to_string()),
+        ];
+        for (verb, body) in requests {
+            let reply = build_bus_reply(&svc, verb, Some(&body));
+            assert!(
+                reply.contains("authorization refused"),
+                "unsigned {verb} reached its handler: {reply}"
+            );
+        }
+        let cfg = ddns::load(tmp.path());
+        assert!(!cfg.enabled);
+        assert!(cfg.record.is_empty());
+    }
+
+    #[test]
+    fn authorized_add_is_exact_body_bound_and_single_use() {
+        let (tmp, svc) = service();
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+        let svc = svc.with_authorizer(Arc::new(authorizer));
+        let unsigned = json!({
+            "schema_version": 1,
+            "name": "authorized",
+            "source": "wan",
+            "on_down": "keep",
+        })
+        .to_string();
+        let context = MutationContext {
+            verb: "ddns-add-record",
+            node: DDNS_ACTION_NODE_SCOPE,
+            target: "record:authorized",
+        };
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            context,
+            "ddns-replay",
+            AUTH_NOW + 30_000,
+        );
+
+        let first = build_bus_reply(&svc, "add-record", Some(&armed));
+        assert!(first.contains("\"ok\":true"), "{first}");
+        let replay = build_bus_reply(&svc, "add-record", Some(&armed));
+        assert!(replay.contains("already used"), "{replay}");
+
+        let tampered = armed.replace("\"source\":\"wan\"", "\"source\":\"tunnel:x\"");
+        assert!(
+            build_bus_reply(&svc, "add-record", Some(&tampered)).contains("authorization refused")
+        );
+        let cfg = ddns::load(tmp.path());
+        assert_eq!(cfg.record.len(), 1);
+        assert_eq!(cfg.record[0].name, "authorized");
+        assert_eq!(cfg.record[0].source, "wan");
     }
 
     // ── DDNS-EGRESS-4: record-status reconcile-decision query ──────────────
