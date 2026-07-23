@@ -14,6 +14,7 @@
 #   xcp-build.sh sync                 rsync the working tree to the VM
 #   xcp-build.sh cargo <args...>      sync + run `cargo <args>` on the VM
 #   xcp-build.sh gates                sync + fmt-check + clippy + test (the ship/release gates)
+#   xcp-build.sh coverage             sync + the canonical 80% llvm-cov floor
 #   xcp-build.sh rpm                  sync + release build + base/browser RPMs; pull them local
 #   xcp-build.sh pull <remote-glob>   rsync artifacts back (relative to the remote repo)
 #   xcp-build.sh shell                interactive ssh into the build VM
@@ -27,6 +28,8 @@
 #   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
 #   MCNF_BUILD_SHAPE (big|small) — force the job shape, overriding the cargo-args
 #   inference (FA-6 shape-aware routing).
+#   MCNF_COVERAGE_FLOOR (default 80) — hard line-coverage floor for `coverage`.
+#   MCNF_CARGO_LLVM_COV_VERSION (default 0.8.7) — pinned farm coverage tool.
 #
 # FA-6 shape-aware routing (docs/design/farm-autoscale.md): the build farm is now
 # ELASTIC — the autoscaler (install-helpers/farm-autoscale.sh) provisions per-dom0
@@ -424,6 +427,8 @@ case "${1:-}" in
   # job (it compiles every crate twice over), so it claims the big VM like a
   # workspace build, NOT a small pool node (design L1 "whole-workspace → big").
   gates) MCNF_BUILD_SHAPE="${MCNF_BUILD_SHAPE:-big}" resolve_host gates ;;
+  # Coverage instruments the full workspace and is the long-pole gate too.
+  coverage) MCNF_BUILD_SHAPE="${MCNF_BUILD_SHAPE:-big}" resolve_host coverage ;;
   sync | pull | shell) resolve_host ;;     # default (small) routing
 esac
 
@@ -434,9 +439,31 @@ case "${1:-}" in
 
   gates)
     do_sync
+    # Keep this direct farm gate aligned with ci-gate.sh: locked dependency
+    # resolution, the async-services mackesd superset, and serial PTY/env-race
+    # lanes. A default-parallel mackesd run can hang or cross-contaminate tests.
     remote "cargo fmt --all --check" \
-      && remote "cargo clippy --all-targets" \
-      && remote "cargo test --workspace"
+      && remote "cargo clippy --workspace --all-targets --locked" \
+      && remote "cargo test --workspace --exclude mackesd --exclude mde-term-egui --locked" \
+      && remote "cargo test -p mackesd --features async-services --locked -- --test-threads=1" \
+      && remote "cargo test -p mde-term-egui --locked -- --test-threads=1"
+    ;;
+
+  coverage)
+    COV_VERSION="${MCNF_CARGO_LLVM_COV_VERSION:-0.8.7}"
+    COV_FLOOR="${MCNF_COVERAGE_FLOOR:-80}"
+    case "$COV_VERSION" in
+      ''|*[!0-9.]*) warn "invalid MCNF_CARGO_LLVM_COV_VERSION=$COV_VERSION"; exit 2 ;;
+    esac
+    case "$COV_FLOOR" in
+      ''|*[!0-9]*) warn "invalid MCNF_COVERAGE_FLOOR=$COV_FLOOR"; exit 2 ;;
+    esac
+    do_sync
+    log "coverage gate on $BUILD_HOST (llvm-cov $COV_VERSION, floor ${COV_FLOOR}%)"
+    # Fresh/reconciled VMs may have Rust but not the cargo subcommand. Make the
+    # coverage lane self-contained and deterministic: install the pinned tool
+    # only when absent or at a different version, then run one canonical script.
+    remote "set -euo pipefail; rustup component add llvm-tools-preview >/dev/null; if ! command -v cargo-llvm-cov >/dev/null || ! cargo llvm-cov --version 2>/dev/null | grep -Fq 'cargo-llvm-cov $COV_VERSION'; then cargo install cargo-llvm-cov --version $COV_VERSION --locked --force; fi; MCNF_COVERAGE_FLOOR=$COV_FLOOR ./install-helpers/coverage-command.sh"
     ;;
 
   rpm)

@@ -69,20 +69,15 @@ impl Role {
     }
 }
 
-/// MEDIA-1 — a deployment **capability tag**: an orthogonal marker on top of the
-/// [`Role`].
+/// Retired media capability marker kept only so older `role.toml` files remain
+/// parseable. New lighthouse pins must stay thin; this marker is never accepted
+/// or activated. Media and file-sharing duties belong on non-lighthouse hosts.
 ///
-/// `AI_GOVERNANCE` §9 ("3 roles + capability tags"): the role is the install-time
-/// identity; capabilities are orthogonal gating tags, NOT a 4th role. `Media`
-/// marks a [`Role::Lighthouse`] as a **`Lighthouse_Media`** subclass: an
-/// adequately-resourced lighthouse that hosts the Navidrome music service, so the
-/// media container never lands on the tiny stock master
-/// (`docs/design/media-lighthouse.md` lock #9). A non-lighthouse box carrying the
-/// tag is a config error — [`Capability::applies_to`] refuses it.
+/// Historical design notes described `Media` as a lighthouse subclass. That
+/// subclass is retired; the marker remains only for legacy decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
-    /// The media subclass — hosts the Navidrome / `music.mesh` service.
-    /// Only valid on the [`Role::Lighthouse`] tier.
+    /// Legacy media marker. It is rejected by [`Capability::applies_to`].
     Media,
 }
 
@@ -102,14 +97,12 @@ impl Capability {
         [Self::Media]
     }
 
-    /// Whether this capability is valid on `role`. `Media` is a **lighthouse
-    /// subclass** (MEDIA-1) — only the [`Role::Lighthouse`] tier may carry it; a
-    /// `Workstation` tagged media is rejected (the media class is a lighthouse
-    /// subclass, never a peer/desktop capability).
+    /// Whether this capability is valid on `role`. The legacy media marker is
+    /// retired and therefore valid on no role.
     #[must_use]
-    pub const fn applies_to(self, role: Role) -> bool {
+    pub const fn applies_to(self, _role: Role) -> bool {
         match self {
-            Self::Media => matches!(role, Role::Lighthouse),
+            Self::Media => false,
         }
     }
 }
@@ -131,22 +124,14 @@ impl FromStr for Capability {
     }
 }
 
-/// MEDIA-1 — a pinned deployment **class**: the [`Role`] plus its capability
-/// tags.
-///
-/// This is what `role.toml` actually pins and what every gating decision (worker
-/// tiers, the directory subclass marker) reads — the role alone answers "which
-/// tier", the class answers "is this the `Lighthouse_Media` subclass". Keeping
-/// the role and its tags together (rather than a 4th enum variant) is the §9
-/// doctrine: a `Lighthouse_Media` box IS a Lighthouse (same rank, same relay
-/// duties) that additionally carries [`Capability::Media`].
+/// A pinned deployment class: the [`Role`] plus legacy capability state. New
+/// lighthouses always use the plain class; media state is rejected or cleared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleClass {
     /// The deployment role — the install-time identity / capability tier.
     pub role: Role,
-    /// `true` when [`Capability::Media`] is set — the `Lighthouse_Media`
-    /// subclass. Always `false` on a non-lighthouse role (the parser refuses an
-    /// inapplicable tag).
+    /// Legacy media state. Runtime loaders always clear it and pinning rejects
+    /// it, so a live lighthouse is always the thin plain class.
     pub media: bool,
 }
 
@@ -157,23 +142,18 @@ impl RoleClass {
         Self { role, media: false }
     }
 
-    /// Whether this box is the **`Lighthouse_Media`** subclass: the Lighthouse
-    /// tier carrying [`Capability::Media`]. The single predicate every
-    /// media-only gate (the Navidrome worker, `music.mesh` membership) asks.
+    /// Whether this box is a supported media lighthouse. Always `false`: the
+    /// media/file-sharing lighthouse subclass is retired.
     #[must_use]
     pub const fn is_media_lighthouse(&self) -> bool {
-        matches!(self.role, Role::Lighthouse) && self.media
+        false
     }
 
-    /// The class name surfaced in the snapshot / `mackesd role` output:
-    /// `lighthouse_media` for the media subclass, else the plain role name.
+    /// The class name surfaced in snapshots. Retired media state never changes
+    /// the plain role name.
     #[must_use]
     pub const fn class_str(&self) -> &'static str {
-        if self.is_media_lighthouse() {
-            "lighthouse_media"
-        } else {
-            self.role.as_str()
-        }
+        self.role.as_str()
     }
 }
 
@@ -277,11 +257,9 @@ pub fn load() -> Result<Role, LoadError> {
     load_from(&default_role_path())
 }
 
-/// MEDIA-1 — read the pinned role **plus its capability tags** from
-/// [`default_role_path`].
+/// Read the pinned role plus legacy capability state from [`default_role_path`].
 ///
-/// See [`load_class_from`]. Use this (over [`load`]) where a gate needs to know
-/// the `Lighthouse_Media` subclass, not just the tier.
+/// `load_class` remains for callers migrating from the retired subclass.
 ///
 /// # Errors
 /// Same as [`load_from`]: [`LoadError::NotPinned`] / [`LoadError::Io`] /
@@ -290,13 +268,7 @@ pub fn load_class() -> Result<RoleClass, LoadError> {
     load_class_from(&default_role_path())
 }
 
-/// MEDIA-1 — read the role + capability tags from `path`.
-///
-/// The `media = true` capability is read off the same `role.toml`; an
-/// inapplicable tag (e.g. `media` on a Server) is **dropped**, never promoted —
-/// the role parse already succeeded, so a stray capability line never fails the
-/// load (callers that only need the tier are unaffected). Same fail-closed
-/// contract as [`load_from`].
+/// Read the role from `path`; a legacy `media = true` line is always dropped.
 ///
 /// # Errors
 /// [`LoadError::NotPinned`] when the file is absent, [`LoadError::Io`] on a read
@@ -310,7 +282,11 @@ pub fn load_class_from(path: &Path) -> Result<RoleClass, LoadError> {
     let role = parse_role_toml(&text).ok_or_else(|| {
         LoadError::Malformed(format!("no valid `role` value in {}", path.display()))
     })?;
-    let media = parse_media_capability(&text) && Capability::Media.applies_to(role);
+    // Thin-lighthouse policy: a legacy `media = true` marker must never revive
+    // the retired Lighthouse_Media subclass after a daemon restart. Keep the
+    // field parse-compatible for old files, but fail closed to the plain role.
+    let _legacy_media = parse_media_capability(&text);
+    let media = false;
     Ok(RoleClass { role, media })
 }
 
@@ -428,6 +404,10 @@ pub enum PinError {
     /// transition (and so refuse to silently overwrite a corrupt pin). The
     /// file is left untouched; remove it to re-pin from scratch.
     MalformedExisting(String),
+    /// The retired media/file-sharing lighthouse capability was requested.
+    /// Lighthouses are permanently thin control-plane nodes; the file is left
+    /// untouched so a failed promotion cannot partially change the role.
+    UnsupportedLighthouseCapability,
     /// Filesystem error while writing the new pin.
     Io(std::io::Error),
 }
@@ -444,6 +424,10 @@ impl fmt::Display for PinError {
             Self::MalformedExisting(m) => write!(
                 f,
                 "existing role.toml is malformed ({m}); remove it to re-pin"
+            ),
+            Self::UnsupportedLighthouseCapability => write!(
+                f,
+                "media/file-sharing lighthouse capability is retired; lighthouses are thin control-plane nodes"
             ),
             Self::Io(e) => write!(f, "writing role.toml: {e}"),
         }
@@ -474,22 +458,17 @@ pub fn pin_class(class: &RoleClass) -> Result<PinOutcome, PinError> {
     pin_class_at(&default_role_path(), class)
 }
 
-/// MEDIA-1 — pin a [`RoleClass`] at `path`.
-///
-/// The same upgrade-only invariant on the role tier as [`pin_at`], additionally
-/// persisting the `media` capability tag. The media tag is only written when
-/// [`Capability::Media`] applies to the resolved role (a `Lighthouse_Media` pin
-/// on a Server silently drops the tag — it is not a valid subclass), so
-/// `role.toml` never records a contradictory class. The [`PinOutcome`] reports
-/// the role transition exactly as [`pin_at`] (the capability tag is orthogonal to
-/// the rank ordering — adding/clearing `media` on an already-pinned lighthouse is
-/// a same-rank rewrite).
+/// Pin a [`RoleClass`] at `path`. Legacy media state is rejected for a
+/// lighthouse and never persisted for any role.
 ///
 /// # Errors
 /// [`PinError::Downgrade`] when `class.role` is a lower rank than the pinned one,
 /// [`PinError::MalformedExisting`] over a corrupt pin, [`PinError::Io`] on a
 /// write failure.
 pub fn pin_class_at(path: &Path, class: &RoleClass) -> Result<PinOutcome, PinError> {
+    if class.media && matches!(class.role, Role::Lighthouse) {
+        return Err(PinError::UnsupportedLighthouseCapability);
+    }
     let outcome = match load_from(path) {
         Err(LoadError::NotPinned) => PinOutcome::Pinned(class.role),
         Err(LoadError::Malformed(m)) => return Err(PinError::MalformedExisting(m)),
@@ -711,12 +690,11 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    // ── MEDIA-1: the media capability tag / Lighthouse_Media subclass ──
+    // ── Retired media capability compatibility ──
 
     #[test]
-    fn media_capability_is_lighthouse_only() {
-        // §9: media is a capability tag ON a lighthouse — never on Server/Workstation.
-        assert!(Capability::Media.applies_to(Role::Lighthouse));
+    fn media_capability_is_retired_everywhere() {
+        assert!(!Capability::Media.applies_to(Role::Lighthouse));
         assert!(!Capability::Media.applies_to(Role::Workstation));
         assert_eq!(Capability::Media.as_str(), "media");
         assert_eq!("media".parse(), Ok(Capability::Media));
@@ -724,15 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn role_class_identifies_only_a_media_lighthouse() {
-        // The media subclass = Lighthouse tier + the media tag.
+    fn role_class_never_identifies_a_media_lighthouse() {
         let media_lh = RoleClass {
             role: Role::Lighthouse,
             media: true,
         };
-        assert!(media_lh.is_media_lighthouse());
-        assert_eq!(media_lh.class_str(), "lighthouse_media");
-        // A plain lighthouse is NOT the media subclass.
+        assert!(!media_lh.is_media_lighthouse());
+        assert_eq!(media_lh.class_str(), "lighthouse");
         assert!(!RoleClass::plain(Role::Lighthouse).is_media_lighthouse());
         assert_eq!(RoleClass::plain(Role::Lighthouse).class_str(), "lighthouse");
         // The 2 roles are intact and untagged by default.
@@ -743,23 +719,26 @@ mod tests {
     }
 
     #[test]
-    fn pin_class_persists_and_round_trips_the_media_tag() {
+    fn pin_class_rejects_the_retired_media_lighthouse_capability() {
         let p = scratch("media-pin");
         let _ = std::fs::remove_file(&p);
-        // Pin a Lighthouse_Media → role.toml carries `media = true`.
-        let out = pin_class_at(
+        let err = pin_class_at(
             &p,
             &RoleClass {
                 role: Role::Lighthouse,
                 media: true,
             },
         )
-        .expect("pin media-lighthouse");
-        assert_eq!(out, PinOutcome::Pinned(Role::Lighthouse));
-        let class = load_class_from(&p).expect("reload class");
-        assert!(class.is_media_lighthouse(), "the media tag round-trips");
-        // The plain `load` still resolves the tier (the role line is unchanged).
-        assert_eq!(load_from(&p).expect("tier"), Role::Lighthouse);
+        .expect_err("media lighthouse promotion must be refused");
+        assert!(matches!(err, PinError::UnsupportedLighthouseCapability));
+        assert!(!p.exists(), "refusal must not create role state");
+
+        // A legacy hand-written marker is tolerated for parsing but demoted to
+        // a plain lighthouse, so restart cannot revive the retired service.
+        std::fs::write(&p, "role = \"lighthouse\"\nmedia = true\n").unwrap();
+        let class = load_class_from(&p).expect("legacy class remains readable");
+        assert!(!class.media);
+        assert_eq!(class.class_str(), "lighthouse");
         let _ = std::fs::remove_file(&p);
     }
 

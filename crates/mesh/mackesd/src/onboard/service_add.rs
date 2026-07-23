@@ -3,9 +3,9 @@
 //! Onboarding ends with a working network; the *Services* flow (design lock #20)
 //! is a **separate, day-2 step that never blocks it**. This verb adds one of the
 //! three curated services (#17) to the running mesh:
-//! * **Music** (#18,#19,#35,#41) — a **Navidrome** instance provisioned on a
-//!   **media-capable lighthouse**, reading the shared **DigitalOcean Spaces**
-//!   bucket, published at mesh-DNS `music.mesh` (active-active).
+//! * **Music** — retained as a non-lighthouse service record, but the historical
+//!   media-lighthouse provisioning path is retired. DigitalOcean lighthouses are
+//!   thin control-plane nodes and are never promoted to media/file-sharing hosts.
 //! * **Files** (#37) — **peer-to-peer only**: the shipped `mde-files` Send-To over
 //!   the Bus. There is **no VM/container to stand up** (services never block the
 //!   working network) — the honest outcome is "already P2P", not a faked service.
@@ -19,10 +19,11 @@
 //! the live side effects are faked in tests and honestly integration-gated in
 //! production.
 //! * [`gather`] — impure probe: the mesh's lighthouse set (from the replicated
-//!   peer roster) with each one's `media` capability tag.
+//!   peer roster), retained for read-only diagnostics.
 //! * [`plan_service_add`] — pure fold: `[ServiceAddRequest] + [ServiceAddFacts] →
-//!   [ServiceAddPlan]`, branching per [`ServiceKind`] and selecting the media
-//!   lighthouse / capturing the SIP account / resolving the honest P2P no-op.
+//!   [ServiceAddPlan]`, branching per [`ServiceKind`] and refusing the retired
+//!   lighthouse-media path / capturing the SIP account / resolving the honest
+//!   P2P no-op.
 //! * [`ServiceApply`] — the injectable side-effect seam ([`ServiceApply::provision_music`]
 //!   / [`ServiceApply::register_voice`]). Production [`LiveServiceApply`] returns a
 //!   typed [`ServiceError::IntegrationGated`] naming exactly what the live call
@@ -32,23 +33,16 @@
 //! * [`execute`] — pure orchestration over the seam, fully unit-tested through the
 //!   fake.
 //!
-//! # Reuse, not reimplementation (§6) — glue over the existing media primitives
-//! This verb invents no media/lighthouse/secret model; it is glue over what the
-//! mesh already ships:
-//! * The **media-lighthouse provision path** is [`crate::onboard::spawn_lighthouse`]'s
-//!   [`Provisioner`](crate::onboard::spawn_lighthouse::Provisioner) /
-//!   [`ProvisionSpec`](crate::onboard::spawn_lighthouse::ProvisionSpec): the media
-//!   server lives ON a lighthouse (#19), so when none exists the plan reuses
-//!   [`render_spec`](crate::onboard::spawn_lighthouse::render_spec) to show the
-//!   lighthouse-provision that `onboard spawn-lighthouse` must run first — it does
-//!   NOT re-invent droplet provisioning.
+//! # Historical media primitives
+//! The old media-lighthouse glue remains represented for backwards-compatible
+//! decoding and diagnostics, but the planner and live apply path refuse it. No
+//! command in this flow can create or promote a media/file-sharing lighthouse.
 //! * The **DO Spaces creds** are named by
 //!   [`crate::ipc::secret_store::media_spaces_creds_ref`] (`"media-spaces"`, the
 //!   leader-managed S3 + Navidrome shared-account secret MEDIA-2 seals) — reused
 //!   verbatim via [`media_spaces_creds_ref`], never re-derived.
-//! * The **media capability** is [`mde_role::Capability::Media`] (the
-//!   `Lighthouse_Media` subclass, [`crate::worker_role`]'s `navidrome` gate) — the
-//!   planner selects a lighthouse carrying that tag (or promotes a plain one).
+//! * The historical [`mde_role::Capability::Media`] marker is ignored for
+//!   persisted lighthouse state under the thin-lighthouse policy.
 //! * The **published endpoint** is [`crate::mesh_media`]'s
 //!   [`music_mesh_server_url`](crate::mesh_media::music_mesh_server_url)
 //!   (`http://music.mesh:4533`) — reused so the plan and the registry agree.
@@ -321,6 +315,9 @@ pub enum MusicBlock {
     /// The mesh has no lighthouse to host the media server (media servers live on
     /// lighthouses, #19) — spawn one first.
     NoLighthouse,
+    /// Media/file-sharing lighthouse support is retired by the thin-lighthouse
+    /// policy; the service must be hosted on a non-lighthouse node.
+    LighthouseMediaRetired,
 }
 
 impl MusicBlock {
@@ -332,6 +329,9 @@ impl MusicBlock {
                 "stand up a lighthouse first (`mackesd onboard spawn-lighthouse`), then retry — \
                  lighthouses hold the media servers"
             }
+            Self::LighthouseMediaRetired => {
+                "media/file-sharing lighthouses are retired — keep Music on a non-lighthouse host"
+            }
         }
     }
 }
@@ -340,6 +340,9 @@ impl std::fmt::Display for MusicBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoLighthouse => f.write_str("no lighthouse to host the media server"),
+            Self::LighthouseMediaRetired => {
+                f.write_str("media/file-sharing lighthouse support is retired")
+            }
         }
     }
 }
@@ -400,6 +403,12 @@ pub enum ServiceAddPlan {
         /// Why Music is blocked (and, via [`MusicBlock::hint`], the fix).
         reason: MusicBlock,
     },
+    /// The historical Music-on-a-lighthouse path is retired. No side effect or
+    /// retry is offered, so a thin lighthouse can never be promoted indirectly.
+    MusicLighthouseRetired {
+        /// The explicit policy reason for the refusal.
+        reason: MusicBlock,
+    },
     /// Files — nothing to provision: `mde-files` Send-To (P2P over the Bus) is
     /// already the path. An honest no-op outcome, not a faked service (#37/#20).
     FilesP2P {
@@ -431,6 +440,7 @@ impl ServiceAddPlan {
             Self::Music { steps, .. } => steps.iter().map(|s| s.describe()).collect(),
             Self::Voice { steps, .. } => steps.iter().map(|s| s.describe()).collect(),
             Self::MusicNeedsLighthouse { .. }
+            | Self::MusicLighthouseRetired { .. }
             | Self::FilesP2P { .. }
             | Self::VoiceNeedsAccount { .. } => Vec::new(),
         }
@@ -484,6 +494,9 @@ impl ServiceAddPlan {
                 "Music unavailable ({reason}) — the mesh keeps running; {}",
                 reason.hint()
             ),
+            Self::MusicLighthouseRetired { reason } => {
+                format!("Music unavailable ({reason}) — the mesh keeps running; {}", reason.hint())
+            }
             Self::FilesP2P { transport } => format!(
                 "Files is already peer-to-peer ({transport}) — nothing to provision (no VM/container)"
             ),
@@ -541,22 +554,9 @@ pub fn plan_service_add(req: &ServiceAddRequest, facts: &ServiceAddFacts) -> Ser
 
 /// Pure: the Music branch — select a media lighthouse (or resolve the honest
 /// no-lighthouse outcome), naming the reused creds ref + published endpoint.
-fn plan_music(facts: &ServiceAddFacts) -> ServiceAddPlan {
-    match select_media_lighthouse(&facts.lighthouses) {
-        Some(lh) => ServiceAddPlan::Music {
-            target: MediaLighthouseTarget {
-                hostname: lh.hostname.clone(),
-                overlay_ip: lh.overlay_ip.clone(),
-                already_media: lh.media,
-            },
-            creds_ref: media_spaces_creds_ref(),
-            server_url: music_mesh_server_url(),
-            steps: MusicStep::ordered(),
-        },
-        None => ServiceAddPlan::MusicNeedsLighthouse {
-            spec: Box::new(render_media_lighthouse_spec()),
-            reason: MusicBlock::NoLighthouse,
-        },
+fn plan_music(_facts: &ServiceAddFacts) -> ServiceAddPlan {
+    ServiceAddPlan::MusicLighthouseRetired {
+        reason: MusicBlock::LighthouseMediaRetired,
     }
 }
 
@@ -646,19 +646,9 @@ pub trait ServiceApply {
     fn register_voice(&self, account: &SipAccount) -> Result<(), ServiceError>;
 }
 
-/// Production [`ServiceApply`] — the live Navidrome provision + SIP registration.
-///
-/// OW-11's Music branch is a **day-2** remote push (the target lighthouse is an
-/// enrolled mesh member): [`provision_music`](Self::provision_music) drives the
-/// shared OW-15 [`RemotePush`](crate::onboard::remote_push::RemotePush) executor —
-/// pinning the Media role on the target + sealing the `media-spaces` secret there
-/// over the §9-native [`BusApply`](crate::onboard::remote_push::BusApply)
-/// transport. Once both land, the target's `navidrome_supervisor` /
-/// `media_registry` self-provision Navidrome + publish `music.mesh`
-/// (capability-driven, live on the fleet). The transport is an **injectable seam**
-/// (default: the honestly-gated production `BusApply`; tests use a fake), and the
-/// live cross-node round-trip stays operator/live-gated (§7 — a typed error on the
-/// wire, never a fake success).
+/// Production [`ServiceApply`] — the retired Navidrome-lighthouse path plus SIP
+/// registration. Music provisioning always returns a typed refusal; the Voice
+/// branch remains independently integration-gated.
 ///
 /// Voice ([`register_voice`](Self::register_voice)) is an external-SIP
 /// registration (not a remote push) and stays honestly integration-gated.
@@ -704,80 +694,17 @@ impl LiveServiceApply {
     }
 }
 
-/// Map an OW-15 [`RemotePushError`](crate::onboard::remote_push::RemotePushError)
-/// into the service seam's typed error — an honest gate becomes `IntegrationGated`
-/// (naming the live round-trip that's still operator-gated + the capability-driven
-/// self-provision it unblocks), a validation/apply failure becomes `Failed`. Never
-/// a fake success (§7).
-fn remote_push_to_service_error(
-    e: crate::onboard::remote_push::RemotePushError,
-    target: &MediaLighthouseTarget,
-    creds_ref: &str,
-    server_url: &str,
-) -> ServiceError {
-    use crate::onboard::remote_push::RemotePushError as R;
-    let detail = e.to_string();
-    match e {
-        R::NotWired { .. } | R::Unreachable { .. } => ServiceError::IntegrationGated {
-            step: "provision-music",
-            reason: format!(
-                "media-lighthouse `{}` provisions Navidrome *itself* once it carries the Media \
-                 role + the `{creds_ref}` (DO Spaces) secret: its `navidrome_supervisor` worker \
-                 runs the RPM-shipped `setup-media-navidrome.sh` when the unit is missing, and \
-                 `media_registry` publishes {server_url} (this capability-driven path is live on \
-                 the fleet's media lighthouses). What is gated is the live REMOTE push from this \
-                 authoring node — pinning the Media role on `{}` + sealing the secret there over \
-                 the §9 BusApply transport ({detail}); the signed-bundle core is built + tested, \
-                 the live cross-node round-trip is operator/live-gated.",
-                target.hostname, target.hostname
-            ),
-        },
-        R::BundleRejected { why } => ServiceError::Failed {
-            step: "provision-music",
-            reason: why,
-        },
-        R::ActionFailed { action, why } => ServiceError::Failed {
-            step: "provision-music",
-            reason: format!("{action}: {why}"),
-        },
-    }
-}
-
 impl ServiceApply for LiveServiceApply {
     fn provision_music(
         &self,
-        target: &MediaLighthouseTarget,
-        creds_ref: &str,
-        server_url: &str,
+        _target: &MediaLighthouseTarget,
+        _creds_ref: &str,
+        _server_url: &str,
     ) -> Result<MusicEndpoint, ServiceError> {
-        // OW-15 day-2 remote push over the §9 BusApply transport: pin the Media
-        // role on the target lighthouse + seal the media-spaces secret there. Once
-        // both land, the target self-provisions Navidrome + publishes music.mesh.
-        let rp_target = crate::onboard::remote_push::Target::Enrolled {
-            node_id: target.hostname.clone(),
-        };
-        let mut actions = vec![crate::onboard::remote_push::Action::PinRole {
-            role: "lighthouse".to_string(),
-            media: true,
-        }];
-        // Seal the media-spaces secret when this authoring node holds it (the
-        // plaintext travels inside the signed, encrypted-transport bundle; redacted
-        // in logs — §8). If it isn't held locally the transport gates below anyway.
-        if let Some(store) = &self.local_secrets {
-            if let Ok(Some(secret)) = store.get(creds_ref) {
-                actions.push(crate::onboard::remote_push::Action::SealSecret {
-                    name: creds_ref.to_string(),
-                    secret,
-                });
-            }
-        }
-        self.remote_push
-            .apply(&rp_target, &actions)
-            .map(|()| MusicEndpoint {
-                host: target.hostname.clone(),
-                server_url: server_url.to_string(),
-            })
-            .map_err(|e| remote_push_to_service_error(e, target, creds_ref, server_url))
+        return Err(ServiceError::Failed {
+            step: "provision-music",
+            reason: "media/file-sharing lighthouse support is retired; lighthouses are thin control-plane nodes".into(),
+        });
     }
 
     fn register_voice(&self, account: &SipAccount) -> Result<(), ServiceError> {
@@ -808,6 +735,11 @@ pub enum ServiceAddOutcome {
         /// Why Music was blocked.
         reason: MusicBlock,
     },
+    /// Music-on-lighthouse was refused by the thin-lighthouse policy.
+    MusicLighthouseRetired {
+        /// The explicit policy reason.
+        reason: MusicBlock,
+    },
     /// Files is already P2P — nothing was provisioned (the honest no-op).
     FilesAlreadyP2P {
         /// The P2P transport already in place.
@@ -836,6 +768,9 @@ impl ServiceAddOutcome {
             Self::NoLighthouse { reason } => {
                 format!("no-op — Music blocked ({reason}); retry available")
             }
+            Self::MusicLighthouseRetired { reason } => {
+                format!("no-op — Music refused ({reason}); lighthouses remain thin")
+            }
             Self::FilesAlreadyP2P { transport } => {
                 format!("no-op — Files is already peer-to-peer ({transport})")
             }
@@ -852,7 +787,8 @@ impl ServiceAddOutcome {
 /// Pure orchestration over the [`ServiceApply`] seam.
 ///
 /// A provisioning plan (Music / Voice) drives the matching seam call; a blocked or
-/// no-op plan (MusicNeedsLighthouse / FilesP2P / VoiceNeedsAccount) short-circuits
+/// no-op plan (MusicNeedsLighthouse / MusicLighthouseRetired / FilesP2P /
+/// VoiceNeedsAccount) short-circuits
 /// to its retryable / no-op outcome **without any seam calls** — a P2P Files add
 /// never touches live infra, honoring "services never block the working network".
 ///
@@ -866,20 +802,14 @@ pub fn execute(
     apply: &dyn ServiceApply,
 ) -> Result<ServiceAddOutcome, ServiceError> {
     match plan {
-        ServiceAddPlan::Music {
-            target,
-            creds_ref,
-            server_url,
-            ..
-        } => {
-            let ep = apply.provision_music(target, creds_ref, server_url)?;
-            Ok(ServiceAddOutcome::MusicProvisioned {
-                host: ep.host,
-                server_url: ep.server_url,
-            })
-        }
+        ServiceAddPlan::Music { .. } => Ok(ServiceAddOutcome::MusicLighthouseRetired {
+            reason: MusicBlock::LighthouseMediaRetired,
+        }),
         ServiceAddPlan::MusicNeedsLighthouse { reason, .. } => {
             Ok(ServiceAddOutcome::NoLighthouse { reason: *reason })
+        }
+        ServiceAddPlan::MusicLighthouseRetired { reason } => {
+            Ok(ServiceAddOutcome::MusicLighthouseRetired { reason: *reason })
         }
         ServiceAddPlan::FilesP2P { transport } => {
             Ok(ServiceAddOutcome::FilesAlreadyP2P { transport })
@@ -959,8 +889,7 @@ mod tests {
     // ── Music branch ──
 
     #[test]
-    fn music_prefers_an_existing_media_lighthouse() {
-        // A plain lighthouse and a media one → the media one is selected as-is.
+    fn music_on_any_lighthouse_is_refused_by_the_thin_policy() {
         let plan = plan_service_add(
             &req(ServiceKind::Music, None),
             &facts(vec![
@@ -968,29 +897,18 @@ mod tests {
                 lh("lh-media", Some("10.42.0.2"), true),
             ]),
         );
-        let ServiceAddPlan::Music {
-            target,
-            creds_ref,
-            server_url,
-            steps,
-        } = &plan
-        else {
-            panic!("expected a Music plan, got {plan:?}");
-        };
-        assert_eq!(target.hostname, "lh-media");
-        assert!(target.already_media, "prefers the already-media lighthouse");
-        // §6 reuse: the creds ref + endpoint are the shared media primitives.
-        assert_eq!(creds_ref, &media_spaces_creds_ref());
-        assert_eq!(server_url, "http://music.mesh:4533");
-        assert_eq!(steps, &MusicStep::ordered());
+        assert!(matches!(
+            plan,
+            ServiceAddPlan::MusicLighthouseRetired {
+                reason: MusicBlock::LighthouseMediaRetired
+            }
+        ));
         assert!(!plan.retry_available());
-        assert!(plan.human().contains("Navidrome"));
-        assert!(plan.human().contains("music.mesh"));
+        assert!(plan.human().contains("lighthouses are retired"));
     }
 
     #[test]
-    fn music_promotes_a_plain_lighthouse_when_no_media_one_exists() {
-        // Only plain lighthouses → the first is promoted to media (Capability::Media).
+    fn music_refusal_does_not_depend_on_lighthouse_facts() {
         let plan = plan_service_add(
             &req(ServiceKind::Music, None),
             &facts(vec![
@@ -998,32 +916,27 @@ mod tests {
                 lh("lh-b", Some("10.42.0.2"), false),
             ]),
         );
-        let ServiceAddPlan::Music { target, .. } = &plan else {
-            panic!("expected a Music plan, got {plan:?}");
-        };
-        assert_eq!(target.hostname, "lh-a");
-        assert!(
-            !target.already_media,
-            "a plain lighthouse is promoted, not assumed media"
-        );
-        assert!(plan.human().contains("promoted to media"));
+        assert!(matches!(
+            plan,
+            ServiceAddPlan::MusicLighthouseRetired {
+                reason: MusicBlock::LighthouseMediaRetired
+            }
+        ));
     }
 
     #[test]
     fn music_without_a_lighthouse_is_a_retryable_no_lighthouse_outcome() {
-        // No lighthouse at all → the honest blocked outcome (spawn one first).
+        // No lighthouse still cannot trigger provisioning or lighthouse creation.
         let plan = plan_service_add(&req(ServiceKind::Music, None), &facts(vec![]));
-        let ServiceAddPlan::MusicNeedsLighthouse { spec, reason } = &plan else {
-            panic!("expected MusicNeedsLighthouse, got {plan:?}");
-        };
-        assert_eq!(*reason, MusicBlock::NoLighthouse);
-        // §6 reuse: the blocked outcome carries the reused spawn-lighthouse spec.
-        assert!(matches!(**spec, ProvisionSpec::CloudInit { .. }));
-        assert!(spec.document().contains("mackesd join --role lighthouse"));
-        assert!(plan.retry_available());
+        assert!(matches!(
+            plan,
+            ServiceAddPlan::MusicLighthouseRetired {
+                reason: MusicBlock::LighthouseMediaRetired
+            }
+        ));
+        assert!(!plan.retry_available());
         assert!(plan.steps().is_empty());
-        assert!(plan.provision_spec().is_some());
-        assert!(plan.human().contains("spawn-lighthouse"));
+        assert!(plan.provision_spec().is_none());
     }
 
     #[test]
@@ -1173,11 +1086,9 @@ mod tests {
     }
 
     #[test]
-    fn media_capability_is_a_lighthouse_subclass() {
-        // §6: the media gate is mde_role's Capability::Media — valid only on the
-        // Lighthouse tier (a Workstation can't host the media server).
+    fn media_capability_is_retired_for_lighthouses() {
         use mde_role::{Capability, Role};
-        assert!(Capability::Media.applies_to(Role::Lighthouse));
+        assert!(!Capability::Media.applies_to(Role::Lighthouse));
         assert!(!Capability::Media.applies_to(Role::Workstation));
     }
 
@@ -1226,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_music_drives_provision_music() {
+    fn execute_music_refuses_lighthouse_provision_without_seam_calls() {
         let plan = plan_service_add(
             &req(ServiceKind::Music, None),
             &facts(vec![lh("lh-media", Some("10.42.0.2"), true)]),
@@ -1235,25 +1146,11 @@ mod tests {
         let outcome = execute(&plan, &apply).expect("execute");
         assert_eq!(
             outcome,
-            ServiceAddOutcome::MusicProvisioned {
-                host: "lh-media".into(),
-                server_url: "http://music.mesh:4533".into(),
+            ServiceAddOutcome::MusicLighthouseRetired {
+                reason: MusicBlock::LighthouseMediaRetired
             }
         );
-        assert_eq!(*apply.calls.borrow(), vec!["provision_music"]);
-        // The seam saw the shared creds ref (§6 reuse threaded through execute).
-        assert_eq!(
-            apply.seen_creds.borrow().as_deref(),
-            Some(media_spaces_creds_ref().as_str())
-        );
-        assert_eq!(
-            apply
-                .seen_target
-                .borrow()
-                .as_ref()
-                .map(|t| t.hostname.clone()),
-            Some("lh-media".into())
-        );
+        assert!(apply.calls.borrow().is_empty());
     }
 
     #[test]
@@ -1300,12 +1197,12 @@ mod tests {
     #[test]
     fn execute_blocked_plans_short_circuit_without_seam_calls() {
         let apply = FakeApply::new();
-        // Music-blocked → NoLighthouse, no seam call.
+        // Retired lighthouse Music path → no seam call.
         let m = plan_service_add(&req(ServiceKind::Music, None), &facts(vec![]));
         assert_eq!(
             execute(&m, &apply).expect("execute"),
-            ServiceAddOutcome::NoLighthouse {
-                reason: MusicBlock::NoLighthouse
+            ServiceAddOutcome::MusicLighthouseRetired {
+                reason: MusicBlock::LighthouseMediaRetired
             }
         );
         // Voice-blocked → NoSipAccount, no seam call.
@@ -1325,7 +1222,7 @@ mod tests {
     // ── the production seam is integration-gated, never a fake success ──
 
     #[test]
-    fn live_provision_music_is_integration_gated_not_fake_success() {
+    fn live_provision_music_refuses_the_retired_lighthouse_path() {
         let apply = LiveServiceApply::default();
         let target = MediaLighthouseTarget {
             hostname: "lh-media".into(),
@@ -1335,35 +1232,10 @@ mod tests {
         let err = apply
             .provision_music(&target, &media_spaces_creds_ref(), &music_mesh_server_url())
             .expect_err("live music provision must not fake success");
-        match err {
-            ServiceError::IntegrationGated { step, reason } => {
-                assert_eq!(step, "provision-music");
-                // Honestly names the real architecture: the capability-driven self-provision
-                // (the supervisor script + the Media role + the creds) AND the actual gate —
-                // the remote push from the authoring node — never a fake success.
-                assert!(
-                    reason.contains("setup-media-navidrome.sh"),
-                    "names the supervisor script: {reason}"
-                );
-                assert!(
-                    reason.contains("media-spaces"),
-                    "names the creds ref: {reason}"
-                );
-                assert!(
-                    reason.contains("DO Spaces"),
-                    "names the creds source: {reason}"
-                );
-                assert!(
-                    reason.contains("Media role"),
-                    "names the capability-driven provisioning: {reason}"
-                );
-                assert!(
-                    reason.contains("remote push") || reason.contains("REMOTE push"),
-                    "names the actual gate (the remote push, not the provisioning): {reason}"
-                );
-            }
-            ServiceError::Failed { .. } => panic!("expected an integration-gated error"),
-        }
+        assert!(
+            matches!(err, ServiceError::Failed { step: "provision-music", ref reason }
+            if reason.contains("media/file-sharing lighthouse support is retired"))
+        );
     }
 
     #[test]
@@ -1394,92 +1266,34 @@ mod tests {
     }
 
     #[test]
-    fn execute_propagates_the_integration_gated_error() {
-        // Through the LIVE seam, execute surfaces the first typed error.
+    fn execute_preserves_the_retired_lighthouse_refusal() {
+        // Through the live seam, execute keeps the refusal side-effect free.
         let plan = plan_service_add(
             &req(ServiceKind::Music, None),
             &facts(vec![lh("lh-media", None, true)]),
         );
-        let err = execute(&plan, &LiveServiceApply::default()).expect_err("live path is gated");
-        assert!(matches!(
-            err,
-            ServiceError::IntegrationGated {
-                step: "provision-music",
-                ..
+        assert_eq!(
+            execute(&plan, &LiveServiceApply::default()).expect("retired path is a safe no-op"),
+            ServiceAddOutcome::MusicLighthouseRetired {
+                reason: MusicBlock::LighthouseMediaRetired
             }
-        ));
+        );
     }
 
-    // ── OW-15 wiring: provision_music drives RemotePush (fake transport) ──
-
     #[test]
-    fn provision_music_drives_the_remote_push_with_pin_and_seal() {
-        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
-        use std::sync::{Arc, Mutex};
-
-        // A recording transport: proves provision_music drives RemotePush (not the
-        // old IntegrationGated return) and pushes the day-2 Media-role pin + the
-        // media-spaces seal to the enrolled target — then reports success.
-        #[derive(Default)]
-        struct RecordingPush {
-            seen: Mutex<Vec<(Target, Vec<Action>)>>,
-        }
-        impl RemotePush for RecordingPush {
-            fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
-                self.seen
-                    .lock()
-                    .expect("seen mutex")
-                    .push((target.clone(), actions.to_vec()));
-                Ok(())
-            }
-        }
-
-        // A real LocalAead store holding the media-spaces secret, so the seal is
-        // built from an actual plaintext (not a placeholder).
-        let tmp = tempfile::tempdir().unwrap();
-        let key_path = tmp.path().join("mcnf-age-key");
-        std::fs::write(
-            &key_path,
-            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
-        )
-        .unwrap();
-        let store = crate::ipc::secret_store::SecretStore::LocalAead {
-            dir: tmp.path().join("secrets"),
-            key_path,
-        };
-        let creds = media_spaces_creds_ref();
-        store.put(&creds, "S3_KEY=AKIA...\n").expect("seed secret");
-
-        let push = Arc::new(RecordingPush::default());
-        let apply = LiveServiceApply::default()
-            .with_remote_push(push.clone())
-            .with_local_secrets(store);
-
+    fn provision_music_refuses_the_retired_lighthouse_path() {
+        let apply = LiveServiceApply::default();
         let target = MediaLighthouseTarget {
             hostname: "lh-media".into(),
             overlay_ip: Some("10.42.0.2".into()),
             already_media: false,
         };
-        let ep = apply
-            .provision_music(&target, &creds, &music_mesh_server_url())
-            .expect("fake transport ⇒ wiring proven, success reported");
-        assert_eq!(ep.host, "lh-media");
-
-        let seen = push.seen.lock().expect("seen mutex");
-        assert_eq!(seen.len(), 1, "one remote push");
-        assert_eq!(
-            seen[0].0,
-            Target::Enrolled {
-                node_id: "lh-media".into()
-            },
-            "day-2 push targets the enrolled peer"
-        );
-        // Media-role pin + the media-spaces seal, in order.
-        assert!(matches!(&seen[0].1[0], Action::PinRole { media: true, .. }));
-        assert!(matches!(
-            &seen[0].1[1],
-            Action::SealSecret { name, .. } if name == &creds
-        ));
+        let err = apply
+            .provision_music(&target, "media-spaces", &music_mesh_server_url())
+            .expect_err("thin lighthouses must never receive a media push");
+        assert!(err
+            .to_string()
+            .contains("media/file-sharing lighthouse support is retired"));
     }
 
     // ── serde ──

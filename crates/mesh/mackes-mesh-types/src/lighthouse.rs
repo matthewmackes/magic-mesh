@@ -30,11 +30,8 @@ pub const DEFAULT_STALE_MS: u64 = 90_000;
 /// The directory `role` value that marks a lighthouse (design Q1).
 pub const LIGHTHOUSE_ROLE: &str = "lighthouse";
 
-/// MEDIA-1 — the runtime class name of the `Lighthouse_Media` subclass, surfaced
-/// in the snapshot / directory so the media set is identifiable mesh-wide
-/// (`docs/design/media-lighthouse.md`). A media-lighthouse is a [`is_lighthouse`]
-/// node whose `media` capability tag is set — NOT a distinct `role` value (§9:
-/// media is a capability tag, not a 4th role), so `is_lighthouse` still holds.
+/// Retired class name retained for decoding historical directory snapshots.
+/// Current lighthouses are always the thin plain class.
 pub const LIGHTHOUSE_MEDIA_CLASS: &str = "lighthouse_media";
 
 /// How long a leader lease is valid (mirrors `mackesd`'s `leader::LEASE_DURATION`).
@@ -162,21 +159,17 @@ pub fn lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
     out
 }
 
-/// MEDIA-1 — whether a directory row is the **`Lighthouse_Media`** subclass: a
-/// lighthouse ([`is_lighthouse`]) that additionally carries the `media`
-/// capability tag. The media set is a strict subset of the lighthouse set (§9:
-/// the tag is orthogonal to the role, so the node is still a lighthouse). Used
-/// to gate `music.mesh` membership (MEDIA-5) + the Navidrome worker on exactly
-/// the media nodes; a stock lighthouse / server / peer is excluded.
+/// Whether a directory row is a supported media lighthouse. Always `false`:
+/// the media/file-sharing lighthouse subclass is retired. The `media` field is
+/// retained only for old replicated JSON compatibility.
 #[must_use]
 pub fn is_media_lighthouse(peer: &PeerRecord) -> bool {
-    is_lighthouse(peer) && peer.media
+    let _ = peer;
+    false
 }
 
-/// MEDIA-1 — the `Lighthouse_Media` subset of a peer directory, sorted by
-/// hostname for a stable render order. The foundation MEDIA-5/7 build on: the
-/// `music.mesh` A-record set + the published-service health list are derived
-/// from exactly these rows (every live media-lighthouse, none of the stock ones).
+/// Retired media-lighthouse query. It always returns an empty set so stale
+/// media markers cannot revive service discovery or provisioning.
 #[must_use]
 pub fn media_lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
     let mut out: Vec<PeerRecord> = peers
@@ -474,8 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn media_lighthouse_is_a_lighthouse_with_the_media_tag() {
-        // MEDIA-1 — the media subclass is a strict subset of the lighthouse set.
+    fn retired_media_marker_never_identifies_a_lighthouse() {
         let now = 1_000_000;
         // A plain lighthouse: a lighthouse, but NOT media.
         let mut plain = lh("lh-plain", "healthy", Some("10.42.0.1"), now);
@@ -484,10 +476,10 @@ mod tests {
             !is_media_lighthouse(&plain),
             "no media tag → not the subclass"
         );
-        // Tag it media → now the Lighthouse_Media subclass (still a lighthouse).
+        // A stale media tag is ignored by the retired-class predicate.
         plain.media = true;
         assert!(is_lighthouse(&plain));
-        assert!(is_media_lighthouse(&plain));
+        assert!(!is_media_lighthouse(&plain));
         // The media tag on a non-lighthouse is meaningless: a server flagged
         // media is NOT a media-lighthouse (the role gate dominates).
         let mut srv = PeerRecord::now("srv", None, "healthy");
@@ -500,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn media_lighthouse_records_filters_to_the_media_subset() {
+    fn media_lighthouse_records_is_always_empty() {
         let now = 1_000_000;
         let mut media_a = lh("media-a", "healthy", Some("10.42.0.1"), now);
         media_a.media = true;
@@ -512,13 +504,9 @@ mod tests {
         srv.media = true; // a mis-tagged server — excluded
         let peers = vec![media_b, plain_lh, media_a, srv];
         let media = media_lighthouse_records(&peers);
-        assert_eq!(
-            media
-                .iter()
-                .map(|p| p.hostname.as_str())
-                .collect::<Vec<_>>(),
-            vec!["media-a", "media-b"],
-            "only media-lighthouses, sorted; plain LH + mis-tagged server excluded"
+        assert!(
+            media.is_empty(),
+            "retired media lighthouses are never supported"
         );
         // It is a subset of the lighthouse set.
         assert_eq!(lighthouse_records(&peers).len(), 3);

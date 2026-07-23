@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use mackes_mesh_types::lighthouse::is_media_lighthouse;
 use mackes_mesh_types::peers::{peers_dir, read_peers, PeerRecord};
 use serde::{Deserialize, Serialize};
 
@@ -128,9 +129,7 @@ fn music_library_destination() -> TransferDestination {
 }
 
 fn has_music_library(peers: &[PeerRecord]) -> bool {
-    peers
-        .iter()
-        .any(|p| p.media && p.role.as_deref() == Some("lighthouse"))
+    peers.iter().any(is_media_lighthouse)
 }
 
 fn peer_label(peer: &PeerRecord, fallback: &str) -> String {
@@ -173,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_derives_mesh_share_music_and_peer_destinations() {
+    fn registry_derives_mesh_share_and_peer_destinations_without_retired_music() {
         let root = PathBuf::from("/mnt/mesh-storage");
         let mut media = peer("lh-media", Some("10.42.0.10"));
         media.role = Some("lighthouse".into());
@@ -186,12 +185,7 @@ mod tests {
         let rows = destinations_from_state(&root, &peers, Some("self-node"));
         assert_eq!(rows[0].id, "mesh-share");
         assert_eq!(rows[0].dest, "/mnt/mesh-storage");
-        assert!(rows.iter().any(|d| {
-            d.id == "music-library"
-                && d.kind == DestinationKind::MusicLibrary
-                && d.method == Method::Music
-                && d.dest.ends_with("/music-library")
-        }));
+        assert!(!rows.iter().any(|d| d.id == "music-library"));
         assert!(rows.iter().any(|d| {
             d.id == "peer:workstation-b"
                 && d.kind == DestinationKind::MeshPeer

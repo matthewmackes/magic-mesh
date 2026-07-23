@@ -43,6 +43,12 @@ const TILE_SIZE: f64 = 256.0;
 /// is normally a few dozen; this only trips on degenerate input.
 const MAX_TILES_PER_FRAME: usize = 256;
 
+/// Vehicle-centred overlays remain geographically projectable without an
+/// installed region bundle. These bounds cover the normal slippy-map range
+/// without coupling live vector geometry to any one bundle's zoom inventory.
+const FALLBACK_MIN_ZOOM: u8 = 0;
+const FALLBACK_MAX_ZOOM: u8 = 22;
+
 /// Fractional Web-Mercator tile coordinate `(x, y)` for `lon`/`lat` at zoom `z`.
 ///
 /// `x` runs west→east in `[0, 2^z)`, `y` runs north→south in `[0, 2^z)`. The
@@ -300,9 +306,51 @@ impl Projection {
         clippy::cast_precision_loss
     )]
     pub fn new(rect: Rect, map: &MapViewState, center: (f64, f64), meta: &RawMeta) -> Self {
+        Self::with_zoom_bounds(rect, map, center, meta.min_zoom, meta.max_zoom)
+    }
+
+    /// Build a vehicle-centred projection when no offline basemap is installed.
+    ///
+    /// The background remains an honest "No offline map data" panel, while
+    /// real live overlay geometry can still be placed relative to a valid fix.
+    /// Invalid viewports and coordinates fail closed instead of producing NaNs.
+    #[must_use]
+    pub fn vehicle_centered(rect: Rect, map: &MapViewState, center: (f64, f64)) -> Option<Self> {
+        let (latitude, longitude) = center;
+        if !rect.is_finite()
+            || rect.width() <= 0.0
+            || rect.height() <= 0.0
+            || !latitude.is_finite()
+            || !longitude.is_finite()
+            || !(-90.0..=90.0).contains(&latitude)
+            || !(-180.0..=180.0).contains(&longitude)
+        {
+            return None;
+        }
+        Some(Self::with_zoom_bounds(
+            rect,
+            map,
+            center,
+            FALLBACK_MIN_ZOOM,
+            FALLBACK_MAX_ZOOM,
+        ))
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn with_zoom_bounds(
+        rect: Rect,
+        map: &MapViewState,
+        center: (f64, f64),
+        min_zoom: u8,
+        max_zoom: u8,
+    ) -> Self {
         let zoom = if map.zoom.is_finite() { map.zoom } else { 13.0 };
-        let tile_z =
-            (zoom.round() as i32).clamp(i32::from(meta.min_zoom), i32::from(meta.max_zoom)) as u8;
+        let tile_z = (zoom.round() as i32).clamp(i32::from(min_zoom), i32::from(max_zoom)) as u8;
         let scale = (f64::from(zoom) - f64::from(tile_z)).exp2();
         let tile_px = (TILE_SIZE * scale).max(1.0);
         let (cfx, cfy) = tile_frac(center.1, center.0, tile_z);
@@ -321,11 +369,19 @@ impl Projection {
 
     /// Project a geographic point to a screen position.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn project(&self, lat: f64, lon: f64) -> Pos2 {
         let (fx, fy) = tile_frac(lon, lat, self.tile_z);
+        let world_tiles = self.n_tiles as f64;
+        let half_world = world_tiles * 0.5;
+        let mut delta_x = fx - self.cfx;
+        if delta_x > half_world {
+            delta_x -= world_tiles;
+        } else if delta_x < -half_world {
+            delta_x += world_tiles;
+        }
         egui::pos2(
-            self.origin.x + ((fx - self.cfx) * self.tile_px) as f32,
+            self.origin.x + (delta_x * self.tile_px) as f32,
             self.origin.y + ((fy - self.cfy) * self.tile_px) as f32,
         )
     }
@@ -434,8 +490,10 @@ fn tile_texture(
 ///
 /// Centred on `center` (`lat`, `lon`) when supplied, else on the region
 /// centroid. Returns the [`Projection`] used (so the caller can place geo pins /
-/// route previews on top), or `None` when no region is installed — in which case
-/// an honest "no data" panel is painted.
+/// route previews on top). When no region is installed, an honest "no data"
+/// panel is painted and a vehicle-centred projection is still returned for a
+/// valid `center`, allowing real live overlays to remain geographically useful.
+/// With neither a region nor a valid centre, returns `None`.
 #[must_use]
 pub fn paint_basemap(
     painter: &Painter,
@@ -446,7 +504,7 @@ pub fn paint_basemap(
     let ctx = painter.ctx();
     let Some(meta) = cached_meta(ctx) else {
         paint_no_data(painter, rect);
-        return None;
+        return center.and_then(|center| Projection::vehicle_centered(rect, map, center));
     };
 
     // Centre on the live fix when it is inside coverage; otherwise the region
@@ -628,6 +686,42 @@ mod tests {
             meta.center_lon + 360.0 / f64::from(1u32 << 12),
         );
         assert!((east.x - rect.center().x - 256.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn vehicle_projection_places_live_overlays_without_a_region_bundle() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 768.0));
+        let mut map = MapViewState::simulated();
+        map.zoom = 12.0;
+        map.pan = [0.0, 0.0];
+        let center = (40.4406, -79.9959);
+        let projection =
+            Projection::vehicle_centered(rect, &map, center).expect("valid vehicle fix");
+
+        let anchor = projection.project(center.0, center.1);
+        let nearby = projection.project(40.4406, -79.9859);
+        assert!((anchor.x - rect.center().x).abs() < 0.5);
+        assert!((anchor.y - rect.center().y).abs() < 0.5);
+        assert!(nearby.x > anchor.x);
+        assert!(nearby.x.is_finite() && nearby.y.is_finite());
+    }
+
+    #[test]
+    fn vehicle_projection_rejects_invalid_input_and_wraps_the_date_line() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 768.0));
+        let mut map = MapViewState::simulated();
+        map.zoom = 3.0;
+        assert!(Projection::vehicle_centered(rect, &map, (f64::NAN, 0.0)).is_none());
+        assert!(Projection::vehicle_centered(rect, &map, (0.0, 181.0)).is_none());
+        assert!(Projection::vehicle_centered(Rect::NOTHING, &map, (0.0, 0.0)).is_none());
+
+        let projection =
+            Projection::vehicle_centered(rect, &map, (0.0, 179.9)).expect("date-line fix");
+        let across_date_line = projection.project(0.0, -179.9);
+        assert!(
+            (across_date_line.x - rect.center().x).abs() < 5.0,
+            "short date-line crossing must not project across the whole world"
+        );
     }
 
     #[test]

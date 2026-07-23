@@ -11,7 +11,8 @@
 #       unchanged objects).
 #
 #   rescan
-#       trigger a library re-scan on EVERY live Lighthouse_Media instance so the
+#       trigger a library re-scan on EVERY explicitly provisioned non-lighthouse
+#       media host so the
 #       new tracks appear everywhere, via Navidrome's Subsonic `startScan.view`
 #       API. Instances are discovered by resolving the `music.mesh` A-record set
 #       (MEDIA-5) — one HTTP call per overlay IP — so adding a media node needs

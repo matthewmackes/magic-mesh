@@ -1,5 +1,10 @@
 # Media Ingestion
 
+> **HISTORICAL / RETIRED (2026-07-23):** This runbook described the retired
+> `Lighthouse_Media` topology. DigitalOcean lighthouses are thin control-plane
+> nodes and must not host media or file-sharing services. Keep media workloads
+> on a non-lighthouse host; do not use the commands below for a lighthouse.
+
 MEDIA-9's operator path is `automation/media/ingest-music.sh`.
 
 The script reads the leader-managed `media-spaces` secret, writes temporary

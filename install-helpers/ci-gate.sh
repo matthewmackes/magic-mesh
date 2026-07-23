@@ -7,7 +7,8 @@
 # left NO always-on gate for the ~41 crates / ~8,400 tests — the root of the
 # recurring "green-tests-but-shipped-broken" pattern. This script is that gate:
 # it runs the repository policy lints locally, then fmt + clippy + the full test
-# pyramid ON THE FARM (routed to BigBoy, the long-pole node), captures a
+# pyramid + the hard current-workspace coverage floor ON THE FARM (routed to
+# BigBoy, the long-pole node), captures a
 # structured pass/fail, and publishes the result to the Bus so a RED gate raises
 # a KIRON operator toast and a GREEN gate is a healthy heartbeat with a last-run
 # timestamp (staleness is detectable).
@@ -92,7 +93,7 @@ POLICY_ROOT="$HERE"
 
 # ── result state (globals; filled by cmd_run, read by finish) ────────────────
 SHA="" ; SHORT="" ; STARTED="" ; FINISHED=""
-STAGE_POLICY="skipped" ; STAGE_FMT="skipped" ; STAGE_CLIPPY="skipped" ; STAGE_TEST="skipped"
+STAGE_POLICY="skipped" ; STAGE_FMT="skipped" ; STAGE_CLIPPY="skipped" ; STAGE_TEST="skipped" ; STAGE_COVERAGE="skipped"
 FAILED_STAGE="" ; OVERALL="green"
 TESTS_PASSED=0 ; TESTS_FAILED=0
 
@@ -195,6 +196,15 @@ run_test_stage() {
   return "$rc"
 }
 
+# run_coverage_stage — the farm wrapper provisions the pinned cargo-llvm-cov
+# tool/component and executes install-helpers/coverage-command.sh. Keeping the
+# command there makes this gate's denominator identical to hosted CI's.
+run_coverage_stage() {
+  { echo; echo "─────────── stage: coverage ───────────  ($(ts))  canonical llvm-cov floor"; } | tee -a "$LOG"
+  "$XCP" coverage 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+
 # finish — record the structured result to state and publish it to the Bus.
 finish() {
   FINISHED="$(ts)"
@@ -206,7 +216,7 @@ finish() {
   "overall": "$OVERALL",
   "alert": $alert,
   "failed_stage": "$(json_escape "$FAILED_STAGE")",
-  "stages": { "policy": "$STAGE_POLICY", "fmt": "$STAGE_FMT", "clippy": "$STAGE_CLIPPY", "test": "$STAGE_TEST" },
+  "stages": { "policy": "$STAGE_POLICY", "fmt": "$STAGE_FMT", "clippy": "$STAGE_CLIPPY", "test": "$STAGE_TEST", "coverage": "$STAGE_COVERAGE" },
   "tests_passed": $TESTS_PASSED,
   "tests_failed": $TESTS_FAILED,
   "sha": "$SHA",
@@ -228,12 +238,13 @@ JSON
     printf '  %-8s %s\n' fmt "$STAGE_FMT"
     printf '  %-8s %s\n' clippy "$STAGE_CLIPPY"
     printf '  %-8s %s  (%s passed, %s failed)\n' test "$STAGE_TEST" "$TESTS_PASSED" "$TESTS_FAILED"
+    printf '  %-8s %s\n' coverage "$STAGE_COVERAGE"
     printf '  %-8s %s\n' sha "$SHORT"
   } | tee -a "$LOG"
 
   # Machine-readable result lane (mirrors event/test/nightly): every run, green or red.
   bus_publish event/ci/gate \
-    "{\"overall\":\"$OVERALL\",\"policy\":\"$STAGE_POLICY\",\"fmt\":\"$STAGE_FMT\",\"clippy\":\"$STAGE_CLIPPY\",\"test\":\"$STAGE_TEST\",\"tests_passed\":$TESTS_PASSED,\"tests_failed\":$TESTS_FAILED,\"sha\":\"$SHORT\",\"finished\":\"$FINISHED\",\"source\":\"ci-gate\",\"alert\":$alert}"
+    "{\"overall\":\"$OVERALL\",\"policy\":\"$STAGE_POLICY\",\"fmt\":\"$STAGE_FMT\",\"clippy\":\"$STAGE_CLIPPY\",\"test\":\"$STAGE_TEST\",\"coverage\":\"$STAGE_COVERAGE\",\"tests_passed\":$TESTS_PASSED,\"tests_failed\":$TESTS_FAILED,\"sha\":\"$SHORT\",\"finished\":\"$FINISHED\",\"source\":\"ci-gate\",\"alert\":$alert}"
 
   # RED → KIRON operator toast (critical breaks through suppression); GREEN is a
   # quiet heartbeat (the result lane above), no toast spam.
@@ -260,7 +271,12 @@ cmd_run() {
       STAGE_FMT="pass"
       if run_cargo clippy +1.94.0 clippy --workspace --all-targets --locked; then
         STAGE_CLIPPY="pass"
-        if run_test_stage; then STAGE_TEST="pass"; else STAGE_TEST="fail"; FAILED_STAGE="test"; fi
+        if run_test_stage; then
+          STAGE_TEST="pass"
+          if run_coverage_stage; then STAGE_COVERAGE="pass"; else STAGE_COVERAGE="fail"; FAILED_STAGE="coverage"; fi
+        else
+          STAGE_TEST="fail"; FAILED_STAGE="test"
+        fi
       else
         STAGE_CLIPPY="fail"; FAILED_STAGE="clippy"
       fi

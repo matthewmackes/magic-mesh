@@ -118,11 +118,11 @@ pub fn directory_row(
                 "peer".to_string()
             }
         });
-    // MEDIA-1 — the media subclass is the media capability tag AND a genuine
-    // lighthouse role (the tag is meaningless on a non-lighthouse). `rec.media`
-    // is the peer's own §9 capability tag from its replicated record.
-    let is_media_row =
-        rec.media && row_role.eq_ignore_ascii_case(mackes_mesh_types::lighthouse::LIGHTHOUSE_ROLE);
+    // Thin-lighthouse policy: legacy media markers are never surfaced as a
+    // supported class or capability. Keep the JSON keys for old clients, but
+    // force the values to the plain role so stale replicated rows cannot revive
+    // media discovery or service placement.
+    let is_media_row = false;
     json!({
         "hostname": rec.hostname,
         "presence": presence_tier(now_ms, rec.last_seen_ms),
@@ -154,14 +154,8 @@ pub fn directory_row(
         // `action/mesh/directory` and `healthz` can no longer diverge.
         "role": row_role.clone(),
         "tags": tags,
-        // MEDIA-1 — surface the Lighthouse_Media subclass in the directory
-        // snapshot so the media set is identifiable mesh-wide (acceptance #2).
-        // `media` is the raw §9 capability tag off the peer's own record; `class`
-        // is the derived class name — `lighthouse_media` for a media-tagged
-        // lighthouse, else the plain role — so a consumer (mesh_dns music.mesh
-        // membership, the published-service health list) reads one field. Only a
-        // genuine lighthouse can be the media subclass (the tag is meaningless
-        // otherwise, per is_media_lighthouse).
+        // Retired media compatibility fields. Current lighthouses are always
+        // plain control-plane nodes.
         "media": is_media_row,
         "class": if is_media_row {
             mackes_mesh_types::lighthouse::LIGHTHOUSE_MEDIA_CLASS.to_string()
@@ -801,10 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_row_surfaces_the_media_lighthouse_subclass() {
-        // MEDIA-1 (acceptance #2): a media-tagged lighthouse surfaces in the
-        // snapshot as the `lighthouse_media` class; a plain lighthouse + a
-        // mis-tagged server do NOT.
+    fn directory_row_drops_retired_media_lighthouse_markers() {
         let now = now_ms();
         let media_lh = PeerRecord {
             hostname: "media-lh".into(),
@@ -819,8 +810,8 @@ mod tests {
         };
         let row = directory_row(&media_lh, None, None, None, &[], &[], now);
         assert_eq!(row["role"], "lighthouse", "still a lighthouse role");
-        assert_eq!(row["media"], true);
-        assert_eq!(row["class"], "lighthouse_media", "the subclass surfaces");
+        assert_eq!(row["media"], false);
+        assert_eq!(row["class"], "lighthouse");
 
         // A plain lighthouse: media=false, class=role.
         let mut plain = media_lh.clone();

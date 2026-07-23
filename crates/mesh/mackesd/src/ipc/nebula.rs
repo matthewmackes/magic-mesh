@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn published_services_add_music_only_for_media_lighthouse() {
+    fn published_services_never_add_music_for_retired_media_lighthouse() {
         let regular = build_published_services_rows(
             Some("10.42.0.7".to_string()),
             Some(mde_role::RoleClass::plain(mde_role::Role::Lighthouse)),
@@ -1188,16 +1188,8 @@ mod tests {
                 media: true,
             }),
         );
-        assert_eq!(media.len(), 8);
-        let music = media
-            .iter()
-            .find(|row| row["id"] == "music")
-            .expect("music service row");
-        assert_eq!(music["name"], "Music mesh endpoint");
-        assert_eq!(music["port"], 4533);
-        assert_eq!(music["proto"], "tcp");
-        assert_eq!(music["overlay_ip"], "music.mesh");
-        assert_eq!(music["is_publishable"], true);
+        assert_eq!(media.len(), 7);
+        assert!(!media.iter().any(|row| row["id"] == "music"));
     }
 
     #[tokio::test]

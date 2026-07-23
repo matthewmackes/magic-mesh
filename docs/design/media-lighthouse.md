@@ -1,4 +1,9 @@
-# MEDIA-LIGHTHOUSE — Navidrome music service on `Lighthouse_Media` nodes
+> **HISTORICAL / SUPERSEDED (2026-07-23):** Media and file-sharing lighthouses
+> are retired. All DigitalOcean lighthouses are thin control-plane nodes; keep
+> this document only as the historical design record. Do not provision or
+> promote a `Lighthouse_Media` node.
+
+# MEDIA-LIGHTHOUSE — retired Navidrome service on `Lighthouse_Media` nodes
 
 **Status:** design locked 2026-06-20 (10-question operator survey).
 **Epic prefix:** `MEDIA-` in `docs/WORKLIST.md`.

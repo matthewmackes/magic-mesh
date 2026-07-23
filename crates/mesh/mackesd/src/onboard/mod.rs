@@ -55,15 +55,11 @@
 //!   honestly integration-gated — needs a live Nova+Heat cloud + the Bus); the
 //!   place/reconnect/no-image branches are all real outcomes, not stubs. The
 //!   shell/DRM-boot half (E12-2/E12-3) is hardware-gated and lands in its own units.
-//! * [`service_add`] (OW-11) adds a curated back-office service without blocking the
-//!   working network (#20): **Music** provisions Navidrome on a media-lighthouse
-//!   reading DO Spaces (reusing [`spawn_lighthouse`]'s `ProvisionSpec` + the peer
-//!   roster's media tag to select/promote the target, #18/#19), **Files** is P2P
-//!   `mde-files` Send-To with no VM (a real no-op outcome, never a spawn), and
-//!   **Voice** registers to an external SIP provider (the password held in the secret
-//!   store, never embedded). Pure `plan_service_add` core + the injectable
-//!   [`service_add::ServiceApply`] seam (production `LiveServiceApply` is honestly
-//!   integration-gated); no-lighthouse / no-SIP-account are real retryable outcomes.
+//! * [`service_add`] (OW-11) adds curated back-office services without blocking the
+//!   working network (#20): Music on a lighthouse is refused by the thin-node
+//!   policy; **Files** is P2P `mde-files` Send-To with no VM; and **Voice**
+//!   registers to an external SIP provider. Pure planning plus typed apply seams
+//!   keep every outcome honest.
 //!
 //! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The remaining complex verbs land in their own units with real implementations;

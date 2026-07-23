@@ -117,14 +117,18 @@ pub trait CloudRunner: Send + Sync {
     /// backend can't be reached (an honest gate, never a fabricated empty roster).
     fn list_instances(&self) -> Result<Vec<CloudInstance>, String>;
 
-    /// Provision via OpenTofu. `apply` ⇒ `tofu apply`; else `tofu plan` (staged).
-    fn provision(&self, apply: bool) -> CloudRunOutcome;
+    /// Provision via OpenTofu. This seam always performs `tofu apply`; the caller
+    /// must consume mutation authority before invoking it. Preview uses the
+    /// separate read-only [`CloudRunner::plan_json`] seam.
+    fn provision(&self) -> CloudRunOutcome;
 
-    /// Configure via Ansible. `apply` ⇒ `ansible-playbook`; else `--check` (staged).
-    fn configure(&self, apply: bool) -> CloudRunOutcome;
+    /// Configure via Ansible. This seam always performs the playbook; the caller
+    /// must consume mutation authority before invoking it.
+    fn configure(&self) -> CloudRunOutcome;
 
-    /// A per-instance lifecycle op via `virsh`. `apply` ⇒ the real op; else staged.
-    fn lifecycle(&self, action: LifecycleAction, instance: &str, apply: bool) -> CloudRunOutcome;
+    /// Perform one per-instance lifecycle operation via `virsh`. The caller must
+    /// consume target-bound mutation authority before invoking this seam.
+    fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome;
 
     /// Workloads U4/U5 — write the caller-rendered `terraform.tfvars.json` into the
     /// OpenTofu root and run `tofu plan -json`, returning the raw newline-delimited
@@ -352,57 +356,32 @@ impl CloudRunner for ShellCloudRunner {
         Ok(instances)
     }
 
-    fn provision(&self, apply: bool) -> CloudRunOutcome {
+    fn provision(&self) -> CloudRunOutcome {
         let chdir = self.tofu_chdir();
-        let args: Vec<&str> = if apply {
-            vec![
-                &chdir,
-                "apply",
-                "-auto-approve",
-                "-input=false",
-                "-no-color",
-            ]
-        } else {
-            vec![&chdir, "plan", "-input=false", "-no-color"]
-        };
-        Self::outcome(
-            Self::run("tofu", &args),
-            apply,
-            if apply {
-                "tofu apply"
-            } else {
-                "tofu plan (staged)"
-            },
-        )
+        let args = [
+            &*chdir,
+            "apply",
+            "-auto-approve",
+            "-input=false",
+            "-no-color",
+        ];
+        Self::outcome(Self::run("tofu", &args), true, "tofu apply")
     }
 
-    fn configure(&self, apply: bool) -> CloudRunOutcome {
+    fn configure(&self) -> CloudRunOutcome {
         let playbook = self.ansible_dir.join("playbooks").join("site.yml");
         let playbook_str = playbook.display().to_string();
         let inventory = self.ansible_dir.join("inventory").join("mesh.py");
         let inventory_str = inventory.display().to_string();
-        let mut args: Vec<&str> = vec!["-i", &inventory_str, &playbook_str];
-        if !apply {
-            args.push("--check");
-        }
+        let args = ["-i", &inventory_str, &playbook_str];
         Self::outcome(
             Self::run("ansible-playbook", &args),
-            apply,
-            if apply {
-                "ansible-playbook"
-            } else {
-                "ansible-playbook --check (staged)"
-            },
+            true,
+            "ansible-playbook",
         )
     }
 
-    fn lifecycle(&self, action: LifecycleAction, instance: &str, apply: bool) -> CloudRunOutcome {
-        if !apply {
-            return CloudRunOutcome::ok(
-                format!("virsh {} {instance} (staged)", action.cli_verb()),
-                false,
-            );
-        }
+    fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome {
         // Map the neutral lifecycle action onto the virsh subcommand.
         let subcmd = match action {
             LifecycleAction::Start => "start",
@@ -587,22 +566,17 @@ pub(crate) mod fake {
                 None => Ok(self.roster.clone()),
             }
         }
-        fn provision(&self, apply: bool) -> CloudRunOutcome {
-            self.record("provision", apply);
-            CloudRunOutcome::ok("2 to add, 0 to change", apply)
+        fn provision(&self) -> CloudRunOutcome {
+            self.record("provision", true);
+            CloudRunOutcome::ok("2 to add, 0 to change", true)
         }
-        fn configure(&self, apply: bool) -> CloudRunOutcome {
-            self.record("configure", apply);
-            CloudRunOutcome::ok("ok=3 changed=1", apply)
+        fn configure(&self) -> CloudRunOutcome {
+            self.record("configure", true);
+            CloudRunOutcome::ok("ok=3 changed=1", true)
         }
-        fn lifecycle(
-            &self,
-            action: LifecycleAction,
-            instance: &str,
-            apply: bool,
-        ) -> CloudRunOutcome {
-            self.record(&format!("lifecycle-{}", action.cli_verb()), apply);
-            CloudRunOutcome::ok(format!("virsh {} {instance}", action.cli_verb()), apply)
+        fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome {
+            self.record(&format!("lifecycle-{}", action.cli_verb()), true);
+            CloudRunOutcome::ok(format!("virsh {} {instance}", action.cli_verb()), true)
         }
 
         fn plan_json(&self, tfvars_json: &str) -> Result<String, String> {

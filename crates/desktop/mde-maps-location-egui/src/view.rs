@@ -2436,8 +2436,9 @@ fn paint_map_scene(
     // Real offline raster basemap: a Web-Mercator slippy-tile layer anchored on
     // the live fix (or the region centroid when indoors / off-map), replacing the
     // old procedural grid + hard-coded road splines. `paint_basemap` returns the
-    // projection used (so pins/route land on the real map) or `None` + an honest
-    // "no data" panel when no region bundle is installed.
+    // projection used so pins/routes land on the real map. Without a region it
+    // paints an honest "no data" panel but still returns a vehicle-centred
+    // projection, keeping live overlay geometry useful over the empty background.
     let center = if has_fix {
         primary.map(|s| (s.latitude, s.longitude))
     } else {
@@ -2447,7 +2448,8 @@ fn paint_map_scene(
 
     // WL-FUNC-012 / OVERLAY-2 — producer-timed IEM/NWS NEXRAD raster animation.
     // This paints through egui textures on both GLES and wgpu, beneath every
-    // vector overlay. Without an installed basemap the honest badge remains.
+    // vector overlay. Without an installed basemap its vehicle-centred geometry
+    // can still paint over the honest no-map background.
     if map.iem_radar_overlay {
         let projection_ref = projection.as_ref();
         let _ = crate::iem_radar::paint_layer(
@@ -2462,9 +2464,8 @@ fn paint_map_scene(
     paint_vignette(painter, rect);
 
     // WL-FUNC-012 / OVERLAY-10 — real USGS events normalized by the workstation
-    // adapter. The basemap owns the geographic projection; without an installed
-    // region no marker position is invented, but the layer still paints its
-    // honest no-data/stale badge.
+    // adapter. The basemap seam owns the geographic projection and falls back to
+    // the live vehicle fix when no region bundle is installed.
     if map.earthquake_overlay {
         let projection_ref = projection.as_ref();
         let _ = crate::earthquake::paint_layer(
@@ -2491,8 +2492,8 @@ fn paint_map_scene(
     }
 
     // WL-FUNC-012 / OVERLAY-1 — point-scoped NWS active warnings. The same
-    // basemap projection drives polygon geometry; the safety layer still shows
-    // an honest no-data/stale badge when no offline region is installed.
+    // basemap projection drives polygon geometry, falling back to the valid live
+    // vehicle fix when no offline region is installed.
     if map.nws_alert_overlay {
         let projection_ref = projection.as_ref();
         let _ = crate::nws_alert::paint_layer(
@@ -2532,9 +2533,8 @@ fn paint_map_scene(
     }
 
     // WL-FUNC-012 / OVERLAY-8 — low-altitude, vehicle-scoped adsb.lol tracks.
-    // Positions dead-reckon only inside the bounded 60-second retention window;
-    // without basemap projection the honest badge remains but no location is
-    // invented.
+    // Positions dead-reckon only inside the bounded 60-second retention window.
+    // A valid vehicle fix supplies projection even without an installed basemap.
     if map.aircraft_overlay {
         let projection_ref = projection.as_ref();
         let _ = crate::aircraft::paint_layer(
@@ -2622,8 +2622,8 @@ fn paint_map_scene(
     }
 
     // Live destination pin + straight-line "as the crow flies" preview, drawn on
-    // the real basemap projection. Only when a region is installed (projection is
-    // `Some`) and the chosen destination carries a geocoded pin.
+    // the shared geographic projection. It remains available from a valid fix
+    // when no region is installed, and the destination must carry a geocoded pin.
     if let (Some(proj), Some((dlat, dlon))) = (projection, destination) {
         let pin = proj.project(dlat, dlon);
         if pin.x.is_finite() && pin.y.is_finite() {

@@ -16,20 +16,23 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
-## Current Snapshot - 2026-07-22 takeover
+## Current Snapshot - 2026-07-23 thin-lighthouse drain
 
-- **9 active epics:** 7 `Remaining`, 2 `Blocked`; no `Needs clarification`.
-- **P0:** WL-SEC-005 (final integrated gate), WL-SEC-006 (stop replicating
-  Nebula private keys), WL-SEC-007 (authenticate privileged shared-Bus
-  mutations), WL-ARCH-007 (authorization mint + direct lifecycle proof), and
+- **7 active epics:** 5 `Remaining`, 2 `Blocked`; no `Needs clarification`.
+- **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-SEC-007
+  (authenticate privileged shared-Bus mutations), WL-ARCH-007 (authorization
+  mint + direct lifecycle proof), and
   WL-FUNC-011 (blocked on real media/LLM resources).
-- **In flight:** WL-BUILD-004 current-workspace coverage proof, WL-FUNC-012 live
-  map feeds, WL-UX-006 Construct, and WL-UX-007 Car.
+- **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, and WL-UX-007
+  Car. The 2026-07-23 thin-lighthouse policy is enforced in role pinning,
+  onboarding, install profiles, directory discovery, DNS, workers, and the
+  media helper guard; no new lighthouse may carry media or file-sharing duties.
 - **Externally blocked:** WL-FUNC-011 needs a real second media peer/SIP path
   plus an operator-sealed DigitalOcean model key; WL-SEC-006 needs a controlled
   live Nebula identity rotation/reconnect/prune drill.
 - **Archived by this takeover:** WL-DOC-004, WL-FUNC-013, and WL-RUN-008 in
-  `docs/worklist-archive/2026-07-22-platform-takeover.md`.
+  `docs/worklist-archive/2026-07-22-platform-takeover.md`; WL-SEC-005 and
+  WL-BUILD-004 are archived in `docs/worklist-archive/2026-07-23-thin-drain.md`.
 
 The reconciliation and operator-decision sections below are dated historical
 context. Their old counts and execution suggestions do not supersede this
@@ -225,36 +228,6 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Security
 
-### WL-SEC-005 - Constrain root cloud-worker filesystem keys to owned state roots
-
-- Status: Remaining
-- Progress (2026-07-23): strict single-component validation now guards desired,
-  image, version, container, placement, and lifecycle target sinks; sinks also
-  reserve room for `.json` and `.container` suffixes before directory/backend
-  I/O. The focused cloud suite passed 113/113 on farm `.170`, including the
-  oversized desired-write, delete, container-staging, and lifecycle-delete
-  regressions. Closure is waiting only on the final integrated format/diff
-  gate while adjacent transport and overlay edits settle.
-- Priority: P0
-- Complexity: Medium
-- Problem: Unauthenticated local Bus callers can supply absolute or traversing
-  node, workload, image, version, and container identifiers to a root daemon,
-  allowing cloud verbs to write or remove JSON outside the cloud state root.
-- Required outcome: Every identifier used as a filesystem component is
-  validated at the storage sink, and hostile requests cannot create, replace,
-  or remove files outside daemon-owned state roots.
-- Scope: `mackesd` desired-state, image, and container cloud verbs; strict
-  component validation and hostile handler regressions. Bus-wide authentication
-  and capability policy remain outside this focused containment item.
-- Relevant files/components: `crates/mesh/mackesd/src/workers/cloud/path_key.rs`,
-  `reconcile.rs`, `verbs/desired.rs`, `verbs/image.rs`, `verbs/container.rs`.
-- Acceptance criteria: Absolute paths, separators, dot components, blank keys,
-  and oversized keys fail before I/O; outside-sentinel write/delete regressions
-  pass; ordinary hostnames and workload names continue to round-trip.
-- Verification method: Focused `mackesd` cloud-worker tests on the build farm,
-  plus `cargo fmt --all -- --check` and `git diff --check`.
-- Origin or merged source IDs: 2026-07-22 Codex platform takeover security audit.
-
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Blocked
@@ -391,57 +364,6 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Build, Installation, And Deployment
 
-### WL-BUILD-004 - Make the mandatory gate cover the governed repository
-
-- Status: Remaining
-- Progress (2026-07-23): the canonical gate now runs one hard policy suite shared
-  with GitHub Actions, exercises planted-failure self-tests, and propagates policy
-  failures. The stale preview job and deleted coverage exclusions were removed.
-  Takeover re-audit rejected the earlier closure, however: it had proved only
-  `cargo metadata`, never the newly broadened 80% denominator. A clean detached
-  `d52258e4` BigBoy run measured the actual all-library denominator at **84.69%
-  lines** after repairing only its scratch lockfile, establishing useful margin.
-  It also reproduced two test-target failures and proved the checked-in/current
-  `--locked` command was not reproducible before the in-flight dependency lock
-  reconciliation. The farm gate now runs workspace clippy and every test lane
-  with `--locked`, and its serial `mackesd` lane enables the same
-  `async-services` superset as GitHub Actions. A fresh BigBoy run of the exact
-  integrated-tree coverage command passed at **84.67% lines** (80% floor), with
-  the serial `mackesd` lane green at 3,702 tests and `mde-term-egui` green at
-  391 tests. Workspace clippy and format checks are green. The earlier full-gate
-  red was farm disk exhaustion during linking, not a test failure; disposable
-  BigBoy slots were cleaned and the affected lanes rerun successfully. A
-  clean-checkout release replay on `38971459` measured 84.67% lines (598,995
-  regions at 84.97%) and remains the final closure proof after the current-tree
-  format fixes land.
-- Priority: P1
-- Complexity: Medium
-- Problem: CI previously referenced retired packages and split policy checks
-  across incomplete runners. Its replacement now names current packages, but the
-  new all-library coverage denominator was closed without ever being measured or
-  shown to satisfy the advertised hard 80% floor.
-- Required outcome: One maintained policy suite runs identically in the farm gate
-  and GitHub Actions, all commands are reproducible with the committed lockfile,
-  and a fresh current-workspace `cargo llvm-cov` run establishes and passes the
-  hard 80% line floor on an explicitly documented denominator.
-- Scope: `.github/workflows/ci.yml`, `install-helpers/ci-gate.sh`, lockfile
-  reproducibility, current-package coverage configuration, and honest baseline
-  evidence. This item does not waive the hard coverage policy or hide live
-  packages merely to recover the historical percentage.
-- Relevant files/components: `.github/workflows/ci.yml`,
-  `install-helpers/ci-gate.sh`, `Cargo.lock`, and the build-farm coverage lane.
-- Acceptance criteria: CI references no retired packages; policy self-tests and
-  real-tree lints fail the aggregate gate when planted failures fire; the exact
-  checked-in coverage command runs from a clean checkout with `--locked` and
-  reports at least 80% lines over its documented current-package denominator.
-- Verification method: Farm policy suite plus a clean BigBoy
-  `cargo llvm-cov --workspace --locked --features mackesd/async-services ...
-  --fail-under-lines 80 --summary-only` run matching GitHub Actions, followed by
-  YAML parse, ShellCheck, format, and diff checks.
-- Origin or merged source IDs: 2026-07-22 Codex platform takeover build audit;
-  reopened after the closure evidence was found not to measure the new coverage
-  denominator.
-
 ## Core Architecture
 
 > WL-ARCH-001 (Remove OpenStack; OpenTofu+Ansible IaC) and WL-ARCH-006 (Workloads
@@ -460,13 +382,14 @@ These decisions refine acceptance and sequencing for the active items below.
   schema-v1 and future versions fail closed. Daemon routing now refuses blank
   placement, armed-token nonces are durably single-use across restart, the global
   destroy path is retired, and target delete independently checks the typed name
-  before retracting only that workload's desired doc. Farm proofs before the
-  latest version/replay additions: 36/36 focused `iac::` and 95/95 focused cloud
-  tests; an integrated rerun is pending while adjacent files settle. The
+  before retracting only that workload's desired doc. The current-tree BigBoy
+  integrated `mackesd` library gate passed 3,719/3,719; focused cloud security
+  and direct lifecycle suites passed 112/112 and 51/51 respectively. The
   production root/systemd request path now wraps Datacenter VM/IaC/storage
-  mutations in the shared HMAC capability gate, with unsigned and replayed VM
-  dispatch refused before backend validation. Remaining: the integrated
-  contract rerun and direct libvirt lifecycle drill.
+  mutations in the shared HMAC capability gate. Remaining: a direct libvirt
+  lifecycle drill against an available backend; the farm currently has no
+  `virsh`/libvirt backend, so the 51-test seam proof is recorded but not
+  promoted to live-host evidence.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI

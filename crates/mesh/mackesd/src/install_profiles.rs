@@ -8,8 +8,8 @@
 //! This is the pure core: profiles are TOML on the Syncthing-replicated share
 //! (`<workgroup_root>/profiles/*.toml`, W88 — fleet state is TOML dirs +
 //! typed Bus verbs), junk-tolerant on read, plus a built-in **core pack**
-//! mapping the deployment roles (Lighthouse ⊂ Lighthouse_Media ⊂ Server ⊂
-//! Workstation, §5 + MEDIA-LIGHTHOUSE) to their stock profiles so the surface
+//! mapping the deployment roles (Lighthouse ⊂ Server ⊂ Workstation, §5) to
+//! their stock profiles so the surface
 //! is never empty. The
 //! `mackesd profiles` CLI verb + the Provisioning ▸ Install Profiles
 //! panel render on top.
@@ -27,8 +27,8 @@ pub struct InstallProfile {
     /// Human description shown on the boot menu / panel.
     #[serde(default)]
     pub description: String,
-    /// Deployment role this profile pins (`lighthouse`|`lighthouse_media`|
-    /// `server`|`workstation`, §5).
+    /// Deployment role this profile pins (`lighthouse`|`server`|`workstation`,
+    /// §5). The retired `lighthouse_media` role is rejected.
     pub role: String,
     /// Capability tags applied at firstboot (hop|execution|headless, W82).
     #[serde(default)]
@@ -63,7 +63,12 @@ pub fn load_profiles(workgroup_root: &Path) -> Vec<InstallProfile> {
             if e.path().extension().is_some_and(|x| x == "toml") {
                 if let Ok(raw) = std::fs::read_to_string(e.path()) {
                     if let Ok(p) = toml::from_str::<InstallProfile>(&raw) {
-                        by_name.insert(p.name.clone(), p);
+                        // Retired media/file-sharing lighthouse profiles are
+                        // ignored rather than reintroduced from replicated
+                        // state.
+                        if validate_profile(&p).is_ok() {
+                            by_name.insert(p.name.clone(), p);
+                        }
                     }
                 }
             }
@@ -75,8 +80,7 @@ pub fn load_profiles(workgroup_root: &Path) -> Vec<InstallProfile> {
 /// The shipped profiles — the deployment roles (§5) plus the
 /// XCP-ng `hypervisor` profile (DATACENTER-17).
 ///
-/// Lighthouse_Media is a narrow media-serving lighthouse duty class; Server and
-/// Workstation are execution-capable; the headless Server omits the desktop; the
+/// Server and Workstation are execution-capable; the headless Server omits the desktop; the
 /// Workstation is the Cosmic desktop. The
 /// `hypervisor` profile pins the Server tier (PeerRole flattens to
 /// Host/Peer, so the dom0 is surfaced via the `hypervisor` capability
@@ -106,20 +110,6 @@ pub fn core_pack() -> Vec<InstallProfile> {
             role: "server".into(),
             tags: BTreeSet::from(["execution".to_string(), "headless".to_string()]),
             ks_fragments: vec!["role-server".into()],
-            auto_join: true,
-        },
-        InstallProfile {
-            name: "lighthouse-media".into(),
-            description:
-                "A hot-redundant media lighthouse: relay control plane + Navidrome duty class."
-                    .into(),
-            role: "lighthouse_media".into(),
-            tags: BTreeSet::from(["hop".to_string(), "media".to_string()]),
-            ks_fragments: vec![
-                "role-lighthouse".into(),
-                "nebula-lighthouse".into(),
-                "media-lighthouse".into(),
-            ],
             auto_join: true,
         },
         InstallProfile {
@@ -155,15 +145,15 @@ pub fn core_pack() -> Vec<InstallProfile> {
 // Validated up front so a typo'd role/tag never reaches an installer.
 // ─────────────────────────────────────────────────────────────────
 
-/// The deployment roles a profile may pin (§5, Lighthouse ⊂ Lighthouse_Media ⊂
-/// Server ⊂ Workstation).
-pub const VALID_ROLES: [&str; 4] = ["lighthouse", "lighthouse_media", "server", "workstation"];
+/// The deployment roles a profile may pin (§5, Lighthouse ⊂ Server ⊂
+/// Workstation). The former media-lighthouse subclass is retired.
+pub const VALID_ROLES: [&str; 3] = ["lighthouse", "server", "workstation"];
 
 /// The capability tags a profile may carry (W82; `hypervisor` added by
 /// DATACENTER-17 for the XCP-ng dom0 profile). Kept in lock-step with
 /// [`mackes_mesh_types::cap_tags::CapabilityTag`] — a profile tag that the
 /// typed vocabulary can't parse would never gate.
-pub const VALID_TAGS: [&str; 5] = ["hop", "execution", "headless", "hypervisor", "media"];
+pub const VALID_TAGS: [&str; 4] = ["hop", "execution", "headless", "hypervisor"];
 
 /// Why a profile write was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,11 +255,11 @@ mod tests {
     fn core_pack_covers_every_deployment_role() {
         let pack = core_pack();
         let roles: BTreeSet<&str> = pack.iter().map(|p| p.role.as_str()).collect();
-        // hypervisor pins the server tier, so the role set is the §5 deployment
-        // ladder plus the MEDIA-LIGHTHOUSE role class.
+        // hypervisor pins the server tier; retired media lighthouse profiles
+        // are intentionally absent.
         assert_eq!(
             roles,
-            BTreeSet::from(["lighthouse", "lighthouse_media", "server", "workstation"])
+            BTreeSet::from(["lighthouse", "server", "workstation"])
         );
         // Every core profile validates (role + tags + name).
         for p in &pack {
@@ -303,6 +293,7 @@ mod tests {
         // here but never gate at runtime; keep the two lists in lock-step.
         let typed: Vec<&str> = mackes_mesh_types::cap_tags::CapabilityTag::ALL
             .iter()
+            .filter(|t| **t != mackes_mesh_types::cap_tags::CapabilityTag::Media)
             .map(|t| t.as_str())
             .collect();
         assert_eq!(VALID_TAGS.to_vec(), typed);
@@ -318,17 +309,21 @@ mod tests {
     }
 
     #[test]
-    fn lighthouse_media_profile_is_selectable_and_media_tagged() {
+    fn retired_lighthouse_media_profile_is_not_selectable() {
         let pack = core_pack();
-        let media = pack
-            .iter()
-            .find(|p| p.name == "lighthouse-media")
-            .expect("MEDIA-1 core profile");
-        assert_eq!(media.role, "lighthouse_media");
-        assert!(media.tags.contains("hop"));
-        assert!(media.tags.contains("media"));
-        assert!(media.ks_fragments.contains(&"media-lighthouse".to_string()));
-        assert!(media.auto_join);
+        assert!(pack.iter().all(|p| p.name != "lighthouse-media"));
+        let retired = InstallProfile {
+            name: "lighthouse-media".into(),
+            description: "retired".into(),
+            role: "lighthouse_media".into(),
+            tags: BTreeSet::from(["media".to_string()]),
+            ks_fragments: vec!["media-lighthouse".into()],
+            auto_join: true,
+        };
+        assert!(matches!(
+            validate_profile(&retired),
+            Err(ProfileWriteError::BadRole(_))
+        ));
     }
 
     #[test]

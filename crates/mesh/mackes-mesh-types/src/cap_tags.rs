@@ -42,9 +42,9 @@ pub enum CapabilityTag {
     /// capacity (DATACENTER-17). Pins the Server tier; the `xcp_host`
     /// worker self-gates on the dom0 marker.
     Hypervisor,
-    /// Node advertises the media-surface capability (MEDIA-1): a media
-    /// lighthouse / media-role node (a strict subset of the lighthouse set,
-    /// not a distinct role). Mirrors `mde_role::Capability::Media`.
+    /// Retired media marker retained solely for decoding historical tag files;
+    /// it is not part of [`CapabilityTag::ALL`] and cannot be parsed by current
+    /// surfaces.
     Media,
 }
 
@@ -53,13 +53,7 @@ impl CapabilityTag {
     /// any surface should iterate (the fleet `tags --json` census, profile
     /// validation, the Node-roles editor) instead of hand-maintaining a
     /// parallel list that silently drops a tag (DATACENTER-17 added a 4th).
-    pub const ALL: [Self; 5] = [
-        Self::Hop,
-        Self::Execution,
-        Self::Headless,
-        Self::Hypervisor,
-        Self::Media,
-    ];
+    pub const ALL: [Self; 4] = [Self::Hop, Self::Execution, Self::Headless, Self::Hypervisor];
 
     /// Stable wire token.
     #[must_use]
@@ -82,7 +76,6 @@ impl CapabilityTag {
             "execution" => Some(Self::Execution),
             "headless" => Some(Self::Headless),
             "hypervisor" => Some(Self::Hypervisor),
-            "media" => Some(Self::Media),
             _ => None,
         }
     }
@@ -128,6 +121,12 @@ pub fn read_tags(workgroup_root: &Path, hostname: &str) -> NodeTags {
 /// # Errors
 /// IO / serialization failures.
 pub fn write_tags(workgroup_root: &Path, hostname: &str, tags: &NodeTags) -> io::Result<PathBuf> {
+    if tags.tags.contains(&CapabilityTag::Media) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "media capability is retired; lighthouse nodes are thin",
+        ));
+    }
     let dir = tags_dir(workgroup_root);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{hostname}.json"));

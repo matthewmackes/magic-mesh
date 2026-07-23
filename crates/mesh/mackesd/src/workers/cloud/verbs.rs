@@ -25,7 +25,6 @@ use mackes_mesh_types::cloud::{
     VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
 };
 
-use super::gate::{self, CloudDecision, TokenVerdict};
 use super::runner::CloudRunOutcome;
 use super::CloudWorker;
 
@@ -290,16 +289,22 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
 
         // ── implemented MUTATIONS — the armed-token gate ──
         CloudVerb::Provision => {
-            let (verdict, decision) =
-                gate_decision(w, verb, verb_name, &body, CLOUD_ARM_NODE_SCOPE, raw);
-            let outcome = w.runner.provision(matches!(decision, CloudDecision::Apply));
-            finish_mutation(w, verb, verb_name, decision, verdict, &outcome, None)
+            if let Some(reply) =
+                authorization_refusal(w, verb_name, &body, CLOUD_ARM_NODE_SCOPE, raw)
+            {
+                return reply;
+            }
+            let outcome = w.runner.provision();
+            finish_authorized_mutation(w, verb, verb_name, &outcome, None)
         }
         CloudVerb::Configure => {
-            let (verdict, decision) =
-                gate_decision(w, verb, verb_name, &body, CLOUD_ARM_NODE_SCOPE, raw);
-            let outcome = w.runner.configure(matches!(decision, CloudDecision::Apply));
-            finish_mutation(w, verb, verb_name, decision, verdict, &outcome, None)
+            if let Some(reply) =
+                authorization_refusal(w, verb_name, &body, CLOUD_ARM_NODE_SCOPE, raw)
+            {
+                return reply;
+            }
+            let outcome = w.runner.configure();
+            finish_authorized_mutation(w, verb, verb_name, &outcome, None)
         }
         CloudVerb::Destroy => handle_destroy(w, verb_name, &body),
         CloudVerb::Lifecycle(action) => handle_lifecycle(w, verb, verb_name, action, &body, raw),
@@ -351,25 +356,6 @@ fn handle_read_roster(w: &CloudWorker, verb_name: &str) -> CloudReply {
             ..Default::default()
         },
     }
-}
-
-/// Compute the armed-token verdict + the apply/stage decision for a mutation.
-fn gate_decision(
-    w: &CloudWorker,
-    verb: CloudVerb,
-    verb_name: &str,
-    body: &CloudActionBody,
-    target: &str,
-    raw: &str,
-) -> (TokenVerdict, CloudDecision) {
-    let verdict = w.consume_armed_token(
-        body.armed_token.as_deref(),
-        verb_name,
-        body.node.trim(),
-        target,
-        raw,
-    );
-    (verdict, gate::decide(verb, verdict.is_valid()))
 }
 
 /// The lifecycle mutation — resolves the target instance, then runs the gate.
@@ -431,14 +417,11 @@ fn handle_lifecycle(
             };
         }
     }
-    let (verdict, decision) = gate_decision(w, verb, verb_name, body, instance, raw);
-    let mut outcome =
-        w.runner
-            .lifecycle(action, instance, matches!(decision, CloudDecision::Apply));
-    if matches!(action, LifecycleAction::Delete)
-        && matches!(decision, CloudDecision::Apply)
-        && outcome.ok
-    {
+    if let Some(reply) = authorization_refusal(w, verb_name, body, instance, raw) {
+        return reply;
+    }
+    let mut outcome = w.runner.lifecycle(action, instance);
+    if matches!(action, LifecycleAction::Delete) && outcome.ok {
         match super::reconcile::remove_desired_doc(&w.state_root, body.node.trim(), instance) {
             Ok(_) => {}
             Err(e) => {
@@ -449,15 +432,7 @@ fn handle_lifecycle(
             }
         }
     }
-    finish_mutation(
-        w,
-        verb,
-        verb_name,
-        decision,
-        verdict,
-        &outcome,
-        Some(instance),
-    )
+    finish_authorized_mutation(w, verb, verb_name, &outcome, Some(instance))
 }
 
 /// A placement-local bulk lifecycle mutation. Authorization is node-wide, but
@@ -517,7 +492,7 @@ fn handle_bulk_lifecycle(
     let mut succeeded = 0_usize;
     let mut failures = Vec::new();
     for target in &targets {
-        let outcome = w.runner.lifecycle(action, target, true);
+        let outcome = w.runner.lifecycle(action, target);
         if verb.is_destructive() {
             w.audit(verb_name, Some(target), &outcome);
         }
@@ -565,52 +540,35 @@ fn handle_destroy(_w: &CloudWorker, verb_name: &str, _body: &CloudActionBody) ->
     }
 }
 
-/// Turn a decided + run mutation into its reply: a staged run is honestly gated
-/// (nothing applied); an applied destructive op is audited so `audited: true` is
-/// truthful.
-fn finish_mutation(
+/// Turn an authorized backend mutation into its reply. Authorization has already
+/// consumed the request's nonce before this function is reached; destructive
+/// operations are audited so `audited: true` remains truthful.
+fn finish_authorized_mutation(
     w: &CloudWorker,
     verb: CloudVerb,
     verb_name: &str,
-    decision: CloudDecision,
-    verdict: TokenVerdict,
     outcome: &CloudRunOutcome,
     instance: Option<&str>,
 ) -> CloudReply {
-    match decision {
-        CloudDecision::Staged => CloudReply {
+    let audited = verb.is_destructive();
+    if audited {
+        w.audit(verb_name, instance, outcome);
+    }
+    if outcome.ok {
+        CloudReply {
+            ok: true,
+            verb: verb_name.to_string(),
+            audited,
+            ..Default::default()
+        }
+    } else {
+        CloudReply {
             ok: false,
             verb: verb_name.to_string(),
-            gated: Some(format!(
-                "live apply is gated ({}) — {} — nothing applied",
-                verdict.reason(),
-                outcome.summary
-            )),
+            error: Some(outcome.summary.clone()),
+            audited,
             ..Default::default()
-        },
-        CloudDecision::Apply => {
-            let audited = verb.is_destructive();
-            if audited {
-                w.audit(verb_name, instance, outcome);
-            }
-            if outcome.ok {
-                CloudReply {
-                    ok: true,
-                    verb: verb_name.to_string(),
-                    audited,
-                    ..Default::default()
-                }
-            } else {
-                CloudReply {
-                    ok: false,
-                    verb: verb_name.to_string(),
-                    error: Some(outcome.summary.clone()),
-                    audited,
-                    ..Default::default()
-                }
-            }
         }
-        CloudDecision::Read => unreachable!("reads are handled before finish_mutation"),
     }
 }
 

@@ -1,6 +1,7 @@
 #!/bin/bash
-# setup-media-navidrome.sh — MEDIA-3/MEDIA-4 (MEDIA-LIGHTHOUSE): stand up the
-# hot-redundant Navidrome music service on a Lighthouse_Media node. Boot-durable
+# setup-media-navidrome.sh — legacy non-lighthouse media host helper: stand up
+# a boot-durable Navidrome music service. DigitalOcean lighthouses are thin and
+# are rejected below.
 # + idempotent. Two units:
 #
 #   mcnf-music-store.service  — rclone mount of the shared DO Spaces bucket at
@@ -12,7 +13,7 @@
 #                               MemoryMax/CPUQuota caps so it never starves the
 #                               host (lock #9 / netdata-thrash protection).
 #
-# Active-active: every Lighthouse_Media runs this; clients reach any instance via
+# Active-active: every explicitly provisioned non-lighthouse media host may run this; clients reach any instance via
 # `music.mesh` mesh-DNS (MEDIA-5). Per-instance scan of the one shared bucket =
 # stateless readers, no shared-DB-over-network footgun (lock #3).
 #
@@ -66,6 +67,14 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 
 log() { echo "==> media: $*"; }
+
+# Thin-lighthouse policy: this legacy helper is retained for non-lighthouse
+# media hosts, but it must never be used to promote or populate a DO lighthouse.
+# Check the durable role pin before touching credentials, packages, or services.
+if [ -r /var/lib/mde/role.toml ] && grep -Eq '^[[:space:]]*role[[:space:]]*=[[:space:]]*"?lighthouse"?[[:space:]]*$' /var/lib/mde/role.toml; then
+  echo "setup-media-navidrome: media/file-sharing lighthouse support is retired; use a non-lighthouse media host" >&2
+  exit 1
+fi
 
 # Refuse early without the creds (a clear error beats a half-provisioned mount
 # that silently fails to authenticate — mirrors sign-release.sh's key check).
@@ -171,7 +180,7 @@ Environment=ND_SESSIONTIMEOUT=24h
 Environment=ND_LOGLEVEL=info
 # MEDIA-6 — import the Syncthing-synced flat .m3u playlists (mesh-wide); a
 # file-backed playlist's UI edits sync back to its .m3u, which Syncthing then
-# replicates to the peer media lighthouse.
+# replicates to the peer non-lighthouse media host.
 Environment=ND_PLAYLISTSPATH=/playlists
 Environment=ND_AUTOIMPORTPLAYLISTS=true
 # First-start bootstrap of the single shared service account (idempotent —
@@ -225,5 +234,5 @@ log "done — Navidrome on http://$LISTEN:$PORT (Subsonic API), bucket=$DO_SPACE
 echo "  verify: curl -fsS \"http://$LISTEN:$PORT/rest/ping.view?u=$ND_ADMIN_USER&p=…&v=1.16.1&c=mcnf\""
 echo "  store:  systemctl status mcnf-music-store.service   # rclone S3 mount"
 echo "  server: systemctl status mcnf-navidrome.service     # the container"
-echo "  Active-active: run this on every Lighthouse_Media; music.mesh (MEDIA-5)"
+echo "  Legacy media helper: use only on an explicitly provisioned non-lighthouse host"
 echo "  load-balances + fails over across instances reading this one bucket."

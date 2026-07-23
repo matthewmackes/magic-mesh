@@ -110,12 +110,12 @@ pub struct CloudWorker {
     /// The injectable backend seam (production: [`ShellCloudRunner`]).
     runner: Arc<dyn CloudRunner>,
     /// The armed-token verification/signing seam (production: keyed
-    /// [`HmacTokenSigner`]; a node with no arming key uses [`NullSigner`], staging
+    /// [`HmacTokenSigner`]; a node with no arming key uses [`NullSigner`], refusing
     /// every mutation).
     signer: Arc<dyn TokenSigner>,
     /// Whether token-arming is available on this node (a capability, published as
-    /// `CloudState.apply_armed`). `false` ⇒ this node has no arming key and stages
-    /// every mutation honestly.
+    /// `CloudState.apply_armed`). `false` means this node has no arming key and
+    /// fails every mutation closed.
     arm_capable: bool,
     /// Host-local spent-nonce ledger. This must never live in the
     /// Syncthing-replicated workgroup tree in production.
@@ -173,7 +173,7 @@ impl CloudWorker {
                     tracing::error!(
                         target: "mackesd::cloud",
                         %error,
-                        "cloud live authorization unavailable; mutations remain staged"
+                        "cloud live authorization unavailable; mutations fail closed"
                     );
                     (Arc::new(NullSigner), false)
                 }
@@ -613,7 +613,7 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 #[cfg(test)]
@@ -663,7 +663,7 @@ mod tests {
             .with_bus_root(None)
     }
 
-    /// A worker with no arming key (NullSigner) — every mutation stages honestly.
+    /// A worker with no arming key (NullSigner) — every mutation fails closed.
     fn staged_worker(runner: Arc<dyn CloudRunner>) -> CloudWorker {
         CloudWorker::new("me".into(), "peer:me".into(), PathBuf::from("/tmp"))
             .with_runner(runner)
@@ -711,20 +711,28 @@ mod tests {
         assert!(reply.gated.unwrap().contains("not ready"));
     }
 
-    // ── the armed-token gate: staged (no/invalid token) vs armed ──
+    // ── the armed-token gate: fail closed (no/invalid token) vs armed ──
     #[test]
-    fn a_mutation_without_a_token_stages_a_dry_run_and_applies_nothing() {
+    fn unsigned_mutations_are_refused_before_any_backend_call() {
         let runner = Arc::new(FakeRunner::default());
         let w = staged_worker(runner.clone());
-        let reply = w.handle("provision", r#"{"node":"me"}"#);
-        assert!(!reply.ok, "a staged mutation is not a fabricated success");
-        let gated = reply.gated.unwrap();
-        assert!(gated.contains("no armed token"), "{gated}");
-        assert!(gated.contains("nothing applied"), "{gated}");
-        // The runner ran a plan (apply=false), never an apply.
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), false)]
+        for (verb, body) in [
+            ("provision", r#"{"node":"me"}"#),
+            ("configure", r#"{"node":"me"}"#),
+            ("instance-start", r#"{"node":"me","instance":"web"}"#),
+        ] {
+            let reply = w.handle(verb, body);
+            assert!(!reply.ok, "{verb} must not fabricate success");
+            let gated = reply.gated.unwrap();
+            assert!(gated.contains("no armed token"), "{verb}: {gated}");
+            assert!(
+                gated.contains("nothing changed or disclosed"),
+                "{verb}: {gated}"
+            );
+        }
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "unsigned mutations must be refused before the backend seam"
         );
     }
 
@@ -786,15 +794,14 @@ mod tests {
             .gated
             .as_deref()
             .is_some_and(|reason| reason.contains("already used")));
-        assert_eq!(
-            restarted_runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), false)],
-            "a replay may stage a plan but never applies"
+        assert!(
+            restarted_runner.calls.lock().unwrap().is_empty(),
+            "a replay must be refused before the backend seam"
         );
     }
 
     #[test]
-    fn an_expired_or_forged_token_stages_and_never_applies() {
+    fn an_expired_or_forged_token_never_reaches_the_backend() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
         // A token minted by a different key is forged from this worker's vantage.
@@ -812,15 +819,14 @@ mod tests {
         let reply = w.handle("provision", &body);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("signature did not verify"));
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), false)],
-            "a forged token never applies"
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "a forged token must be refused before the backend seam"
         );
     }
 
     #[test]
-    fn an_overlong_token_stages_and_never_applies() {
+    fn an_overlong_token_never_reaches_the_backend() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
         let base = r#"{"node":"me"}"#;
@@ -842,10 +848,9 @@ mod tests {
             .gated
             .as_deref()
             .is_some_and(|reason| reason.contains("exceeds the 30-second lifetime")));
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), false)],
-            "an overlong token may stage a plan but never applies"
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "an overlong token must be refused before the backend seam"
         );
     }
 
@@ -1105,9 +1110,9 @@ mod tests {
             .gated
             .as_deref()
             .is_some_and(|reason| reason.contains("request body")));
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[("configure".into(), false)]
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "a body-substituted token must be refused before the backend seam"
         );
     }
 
@@ -1180,7 +1185,7 @@ mod tests {
         );
         assert_eq!(state.resources.len(), 1);
         assert_eq!(state.resources[0].rows.len(), 1);
-        // A node without an arming key advertises no capability (stages).
+        // A node without an arming key advertises no capability (fails closed).
         let w2 = staged_worker(Arc::new(FakeRunner::default()));
         assert!(!w2.build_state().apply_armed);
     }

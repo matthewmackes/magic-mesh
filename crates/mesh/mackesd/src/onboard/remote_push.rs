@@ -594,7 +594,7 @@ mod tests {
             actions: vec![
                 Action::PinRole {
                     role: "lighthouse".into(),
-                    media: true,
+                    media: false,
                 },
                 Action::SealSecret {
                     name: "media-spaces".into(),
@@ -692,22 +692,21 @@ mod tests {
     }
 
     #[test]
-    fn pin_role_writes_a_real_media_lighthouse_role_toml() {
-        // OW-11's Music step: promote a plain lighthouse to Lighthouse_Media. The
-        // applier writes an actual role.toml that mde_role reads back as the media
-        // subclass — a real pin, not a recorded intent.
+    fn pin_role_refuses_the_retired_media_lighthouse_role() {
+        // Thin-lighthouse policy: the historical OW-11 promotion path must not
+        // be able to turn a 512 MiB control-plane node into a media/fileshare
+        // host, even when it bypasses the CLI and reaches the local applier.
         let (tmp, applier) = local_applier();
-        applier
+        let err = applier
             .apply_one(&Action::PinRole {
                 role: "lighthouse".into(),
                 media: true,
             })
-            .expect("pin-role applies");
-        let class = mde_role::load_class_from(&tmp.path().join("role.toml")).unwrap();
-        assert!(
-            class.is_media_lighthouse(),
-            "role.toml pinned the Lighthouse_Media subclass"
-        );
+            .expect_err("media lighthouse promotion must be refused");
+        assert!(err
+            .to_string()
+            .contains("media/file-sharing lighthouse capability is retired"));
+        assert!(!tmp.path().join("role.toml").exists());
     }
 
     #[test]
@@ -767,17 +766,20 @@ mod tests {
         let mut guard = NonceGuard::new();
         let k = key();
         let now = 1_800_000_000;
-        let b = bundle(now); // PinRole lighthouse+media, SealSecret media-spaces
+        let b = bundle(now); // plain thin lighthouse pin + SealSecret media-spaces
         let sig = b.sign(&k);
         let outcome =
             process_apply(&b, &sig, &k.verifying_key(), now, &mut guard, &applier).unwrap();
         assert_eq!(outcome.node, "peer:lh-media");
         assert_eq!(outcome.applied.len(), 2);
-        assert!(outcome.applied[0].contains("pin-role lighthouse +media"));
+        assert!(outcome.applied[0].contains("pin-role lighthouse"));
         // end-to-end: the role.toml + the sealed secret both landed
-        assert!(mde_role::load_class_from(&tmp.path().join("role.toml"))
-            .unwrap()
-            .is_media_lighthouse());
+        assert!(
+            mde_role::load_class_from(&tmp.path().join("role.toml"))
+                .unwrap()
+                .class_str()
+                == "lighthouse"
+        );
         assert_eq!(
             applier.store.get("media-spaces").unwrap().as_deref(),
             Some("s3-creds")

@@ -528,7 +528,7 @@ mod tests {
     // ── request → plan-event round-trip, each kind, dry-run ──
 
     #[test]
-    fn dry_run_music_returns_the_plan_without_touching_the_seam() {
+    fn dry_run_music_reports_the_retired_lighthouse_path_without_touching_the_seam() {
         let apply = FakeApply::default();
         let ev = resolve(
             &action(ServiceKind::Music, None, true),
@@ -538,11 +538,8 @@ mod tests {
         assert_eq!(ev.id, "svc-test-music");
         assert_eq!(ev.kind, ServiceKind::Music);
         assert!(ev.dry_run);
-        // The reused engine's 4 ordered Navidrome provisioning steps.
-        assert_eq!(ev.steps.len(), 4);
-        assert!(ev.steps[0].contains("DO Spaces"));
-        assert!(ev.summary.contains("Navidrome"));
-        assert!(ev.summary.contains("music.mesh"));
+        assert!(ev.steps.is_empty());
+        assert!(ev.summary.contains("retired"));
         assert!(!ev.retry_available);
         assert!(ev.error.is_none());
         assert!(
@@ -589,15 +586,15 @@ mod tests {
     #[test]
     fn dry_run_blocked_outcomes_are_retryable_not_errors() {
         let apply = FakeApply::default();
-        // Music with no lighthouse → the honest retryable blocked plan.
+        // Music is retired regardless of roster facts.
         let m = resolve(
             &action(ServiceKind::Music, None, true),
             &empty_facts(),
             &apply,
         );
-        assert!(m.retry_available);
+        assert!(!m.retry_available);
         assert!(m.steps.is_empty());
-        assert!(m.summary.contains("spawn-lighthouse"));
+        assert!(m.summary.contains("retired"));
         assert!(m.error.is_none(), "blocked is an outcome, not an error");
         // Voice with no account → the honest retryable blocked plan.
         let v = resolve(
@@ -614,7 +611,7 @@ mod tests {
     // ── apply drives the seam / surfaces the typed error ──
 
     #[test]
-    fn apply_music_drives_the_seam_and_reports_the_outcome() {
+    fn apply_music_refuses_the_retired_path_without_driving_the_seam() {
         let apply = FakeApply::default();
         let ev = resolve(
             &action(ServiceKind::Music, None, false),
@@ -622,12 +619,9 @@ mod tests {
             &apply,
         );
         assert!(!ev.dry_run);
-        assert!(ev.summary.contains("Music provisioned on `lh-media`"));
+        assert!(ev.summary.contains("retired"));
         assert!(ev.error.is_none());
-        assert_eq!(
-            *apply.calls.lock().expect("calls mutex"),
-            vec!["provision_music"]
-        );
+        assert!(apply.calls.lock().expect("calls mutex").is_empty());
     }
 
     #[test]
@@ -647,20 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_through_the_live_seam_publishes_the_typed_gated_error() {
-        // The production seam is honestly integration-gated (§7) — the event
-        // carries the typed error, never a fake success.
+    fn apply_through_the_live_seam_preserves_the_retired_no_op() {
         let ev = resolve(
             &action(ServiceKind::Music, None, false),
             &facts_with_media_lighthouse(),
             &LiveServiceApply::default(),
         );
-        let Some(WireServiceError::IntegrationGated { step, reason }) = &ev.error else {
-            panic!("expected the typed gated error, got {:?}", ev.error);
-        };
-        assert_eq!(step, "provision-music");
-        assert!(reason.contains("media-spaces"), "names the creds ref");
-        assert!(ev.summary.contains("integration-gated"));
+        assert!(ev.error.is_none());
+        assert!(ev.summary.contains("retired"));
     }
 
     // ── the worker: drain → resolve → publish ──

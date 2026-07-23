@@ -294,12 +294,9 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             sip_username,
             dry_run,
         } => {
-            // OW-11 — add a curated back-office service. Gather the mesh's
-            // lighthouses (media servers live on lighthouses, #19), fold into a
-            // per-kind plan: Music provisions Navidrome on a media-lighthouse
-            // (DO Spaces); Files is a real P2P no-op; Voice registers to an
-            // external SIP. The live provision / SIP register is integration-gated
-            // behind the ServiceApply seam; --dry-run stops at the plan + steps.
+            // OW-11 — add a curated back-office service. Music on a lighthouse
+            // is retired by the thin-node policy; Files remains a P2P no-op and
+            // Voice uses the external SIP seam. --dry-run stops at the plan.
             use mackesd_core::onboard::service_add as sa;
             let Some(service_kind) = sa::ServiceKind::parse(&kind) else {
                 eprintln!("service-add: unknown service '{kind}' (expected music | files | voice)");

@@ -116,13 +116,15 @@ boot → role-chooser (DISCLAIMER ack, §43) ─┬─ Lighthouse ─┐
                               self-test (§47) ──► live mesh map (§24)
                                                    │
                        [post-onboarding] Services flow (§20) — day-2 from Workbench (§40)
-                          • Music: Navidrome on a Lighthouse, library on DO Spaces (§18,§19,§35,§41)
+                          • Music: Navidrome on an explicitly provisioned non-lighthouse media host (§18,§19,§35,§41)
                           • Files: P2P mde-files Send-To, no VM (§37)
                           • Voice: configure an external SIP provider (§36)
 ```
 
 ### Roles (redefined by this survey)
-- **Lighthouse** — relay + control plane **+ media server (Navidrome→DO Spaces) + the CA/signer** once migrated. RPM on Fedora 43, cloud or local. Holds a media volume (§27). *(This is the big change vs the old "relay-only".)*
+- **Lighthouse** — thin relay + control plane + CA/signer once migrated. It has no
+  media or file-sharing duty class; those workloads belong on explicitly
+  provisioned non-lighthouse hosts.
 - **XCP-NG** — the 16-service toolstack + a static Nebula member; serves VM desktops + hosts the back-office Files/service VMs behind its own cert (§34). Headless TUI onboarding.
 - **Workstation** — the Construct egui shell + VDI; the **only role that can found a mesh**; the bootstrap CA until a lighthouse takes over; per-peer session roaming. ISO/bootc.
 
@@ -143,8 +145,8 @@ local via libvirt/QEMU-KVM; push-provision; pair) · `ca-migrate` ·
   reach now works (§11,§13,§14,§21).
 - The **self-test** renders green per-item, then the **mesh map** shows the nodes
   (§47,§24).
-- The post-onboarding **Services** flow stands up **Navidrome on a lighthouse reading
-  DO Spaces**, and `mde-music-egui` lists+plays from it (§18,§19,§35,§41).
+- The post-onboarding Services flow refuses a lighthouse Music target; Navidrome
+  runs only on an explicitly provisioned non-lighthouse media host (§18,§19,§35,§41).
 - An XCP-NG box onboards over **TUI** to the toolstack + static Nebula member and
   serves a VM desktop (§2,§15).
 - A reinstalled box **re-enrolls fresh**; the old cert is revoked/expires (§23,§32).

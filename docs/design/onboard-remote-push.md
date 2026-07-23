@@ -1,5 +1,15 @@
 # OW-15 — the onboard remote-push executor (transport decision brief)
 
+> **HISTORICAL / SUPERSEDED (2026-07-23):** The media-lighthouse branch in
+> this design is retired. See the policy note below; only non-media typed
+> onboard actions remain in scope.
+
+> **MEDIA PATH RETIRED (2026-07-23):** DigitalOcean lighthouses are thin
+> control-plane nodes. The former `service-add music` → Media-role push shown
+> below is historical and must not be implemented; media/file-sharing duties
+> belong on non-lighthouse hosts. The bootstrap/day-2 transport analysis remains
+> relevant to the other typed onboard actions.
+
 > **Status: DECISION-PENDING (operator).** This is a `/plan` decision brief, not a
 > lock — it lays out the transport options + a recommendation so the choice can be
 > made in one read. Authored 2026-07-01 (autonomous prep during the `/polish /ship`

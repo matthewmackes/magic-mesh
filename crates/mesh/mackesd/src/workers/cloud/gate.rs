@@ -17,7 +17,6 @@
 //!    mutation for an *unreachable* node is honestly gated (never a silent swallow).
 //!    Reads are not placement-scoped — they stay local on every node.
 
-use super::verbs::CloudVerb;
 pub use mackes_mesh_types::cloud::CloudArmedToken as ArmedToken;
 use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudTokenSigner,
@@ -92,7 +91,7 @@ impl CloudTokenSigner for HmacTokenSigner {
 
 /// The no-key signer a node without a mesh arming key uses: it produces a
 /// signature no client could reproduce, so every presented token fails the
-/// signature check and every mutation stages honestly (the "arming unavailable"
+/// signature check and every mutation fails closed (the "arming unavailable"
 /// capability state). Never validates a token.
 pub(crate) struct NullSigner;
 
@@ -240,7 +239,7 @@ pub(crate) fn claim_nonce(
 pub(crate) enum TokenVerdict {
     /// A well-formed, unexpired, correctly-bound, correctly-signed token.
     Valid,
-    /// No token was presented — the mutation stages (the default, safe path).
+    /// No token was presented — the mutation is refused (the default, safe path).
     Missing,
     /// A token was presented but is not a parseable `v2` armed token / has a stunted nonce.
     Malformed,
@@ -330,33 +329,6 @@ pub(crate) fn verify_token(
         return TokenVerdict::BadSignature;
     }
     TokenVerdict::Valid
-}
-
-/// The pre-run decision for a verb given the armed-token verdict — the pure gate
-/// tested without a runner (mirrors the retired `router_action::pre_apply_decision`
-/// idiom, now token-driven).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloudDecision {
-    /// A read verb — always served.
-    Read,
-    /// A mutation and a valid armed token — perform the real op.
-    Apply,
-    /// A mutation without a valid armed token — stage it (plan / `--check`).
-    Staged,
-}
-
-/// The pure gate: reads serve; mutations apply iff `token_valid`, else stage. No
-/// I/O — the gate is tested without a hypervisor. Replaces the pre-U2
-/// `decide(verb, apply_armed)` env-wall signature.
-#[must_use]
-pub(crate) const fn decide(verb: CloudVerb, token_valid: bool) -> CloudDecision {
-    if !verb.is_mutation() {
-        CloudDecision::Read
-    } else if token_valid {
-        CloudDecision::Apply
-    } else {
-        CloudDecision::Staged
-    }
 }
 
 // ─────────────────────────── the placement gate ───────────────────────────
@@ -628,7 +600,7 @@ mod tests {
 
     #[test]
     fn the_null_signer_never_validates_any_token() {
-        // A node with no arming key stages every mutation: even a well-formed token
+        // A node with no arming key refuses every mutation: even a well-formed token
         // minted by a real key fails the NullSigner's verification.
         let real = signer();
         let body = r#"{"node":"eagle"}"#;
@@ -653,15 +625,6 @@ mod tests {
             ),
             TokenVerdict::BadSignature
         );
-    }
-
-    #[test]
-    fn decide_serves_reads_and_gates_mutations_on_the_token() {
-        assert_eq!(decide(CloudVerb::List, false), CloudDecision::Read);
-        assert_eq!(decide(CloudVerb::Status, true), CloudDecision::Read);
-        assert_eq!(decide(CloudVerb::Provision, true), CloudDecision::Apply);
-        assert_eq!(decide(CloudVerb::Provision, false), CloudDecision::Staged);
-        assert_eq!(decide(CloudVerb::Destroy, false), CloudDecision::Staged);
     }
 
     #[test]

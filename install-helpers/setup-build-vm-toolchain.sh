@@ -19,6 +19,10 @@ set -euo pipefail
 HOST="172.20.0.50"; USER_="mm"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 RUST_VER="1.94.0"
+CARGO_LLVM_COV_VER="${MCNF_CARGO_LLVM_COV_VERSION:-0.8.7}"
+case "$CARGO_LLVM_COV_VER" in
+  ''|*[!0-9.]*) echo "invalid MCNF_CARGO_LLVM_COV_VERSION=$CARGO_LLVM_COV_VER" >&2; exit 2 ;;
+esac
 while [ $# -gt 0 ]; do case "$1" in
   --host) HOST="$2"; shift 2;;
   --user) USER_="$2"; shift 2;;
@@ -51,12 +55,15 @@ log "system dev libs (Fedora dnf)"
     libinput-devel mesa-libgbm-devel systemd-devel \
     mpv-libs-devel'
 
-log "rustup + pinned Rust $RUST_VER + clippy/rustfmt"
+log "rustup + pinned Rust $RUST_VER + clippy/rustfmt/llvm-tools"
 "${SSH[@]}" "command -v rustup >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_VER
-  . \"\$HOME/.cargo/env\"; rustup toolchain install $RUST_VER; rustup default $RUST_VER; rustup component add clippy rustfmt"
+  . \"\$HOME/.cargo/env\"; rustup toolchain install $RUST_VER; rustup default $RUST_VER; rustup component add clippy rustfmt llvm-tools-preview"
 
 log "cargo-generate-rpm (release packaging)"
 "${SSH[@]}" '. "$HOME/.cargo/env"; cargo install cargo-generate-rpm --version 0.21.0 || true'
+
+log "cargo-llvm-cov $CARGO_LLVM_COV_VER (coverage gate)"
+"${SSH[@]}" ". \"\$HOME/.cargo/env\"; cargo install cargo-llvm-cov --version $CARGO_LLVM_COV_VER --locked --force"
 
 log "verify"
 "${SSH[@]}" '. "$HOME/.cargo/env"

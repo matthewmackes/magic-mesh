@@ -2,7 +2,7 @@
 
 Order: Build RPM on the farm → L1 clean install → L2 mini-mesh feature test →
 L3 stability → L4 staged lighthouse replacement → Eagle → live DO lighthouses →
-live audit → MEDIA-LIGHTHOUSE verify → fd/EMFILE soak.
+live audit → fd/EMFILE soak. Media/file-sharing lighthouse promotion is retired.
 The loop repeats until the worklist is clear, all gates are green, and the
 operator declares the release complete.
 
@@ -39,10 +39,8 @@ Safety:
   `20s`/`abort` watchdog override. It publishes actual installed versions for
   Eagle and each live lighthouse to `event/dc/promote/*`, so the version matrix
   shows host-level drift instead of only the target DO version.
-- `media-verify` is the MEDIA-LIGHTHOUSE live gate. It rechecks DO limits, then
-  verifies `music.mesh`, `music-writer.mesh`, and the shared Navidrome account.
-  Add `--mutate-playlist` only when a temporary playlist write/read/delete proof
-  is intended.
+- The retired `media-verify` stage is not a lighthouse gate. Media/file-sharing
+  workloads belong on non-lighthouse hosts and are outside this promotion path.
 - Artifacts are taken from `MCNF_BUILD_ARTIFACTS` or built with
   `install-helpers/xcp-build.sh rpm`.
 
@@ -61,8 +59,6 @@ automation/promotion/mcnf-promotion-cycle.sh eagle
 MCNF_ARM_LIVE=1 automation/promotion/mcnf-promotion-cycle.sh do
 automation/promotion/mcnf-promotion-cycle.sh live-smoke
 automation/promotion/mcnf-promotion-cycle.sh live-audit
-automation/promotion/mcnf-promotion-cycle.sh media-verify
-automation/promotion/mcnf-promotion-cycle.sh media-verify --mutate-playlist
 automation/promotion/mcnf-promotion-cycle.sh fd-soak
 ```
 
@@ -72,13 +68,12 @@ and sha256, current worklist open/in-progress count, DO account headroom, live
 lighthouse/Eagle installed versions, farm utilization, and the release
 declaration marker. Completion is deliberately strict: the status report must
 show zero open worklist items, current gates green on the final candidate, live
-audit/media/soak green after that candidate, and an operator-authored
+audit/soak green after that candidate, and an operator-authored
 `docs/ops/production-release-declaration.md`.
 
-`cycle` now runs the live media verification and fd soak after `live-audit`; the
-soak defaults to one hour through `automation/promotion/live-fd-soak.sh`. Set
-`MCNF_MEDIA_MUTATE_PLAYLIST=1` to include the temporary playlist write/read/delete
-proof during a full production cycle.
+`cycle` runs the fd soak after `live-audit`; the soak defaults to one hour
+through `automation/promotion/live-fd-soak.sh`. The former media-lighthouse
+verification and playlist mutation stages are retired.
 
 2026-07-07 production-candidate evidence: latest rebuilt
 `magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230

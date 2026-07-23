@@ -100,9 +100,8 @@ fn peer_extras(rec: &PeerRecord) -> Extras {
             extras.oui_vendor = enrich::oui_vendor(mac).map(str::to_string);
         }
     }
-    if rec.media {
-        extras.extra.insert("media".to_string(), "true".to_string());
-    }
+    // Thin-lighthouse policy: stale media markers are never exposed as a
+    // supported destination or service capability.
     if let Some(addr) = &rec.external_addr {
         extras
             .extra
@@ -667,10 +666,7 @@ mod tests {
             anvil.extras.extra.get("type_guess").map(String::as_str),
             Some("computer")
         );
-        assert_eq!(
-            anvil.extras.extra.get("media").map(String::as_str),
-            Some("true")
-        );
+        assert!(!anvil.extras.extra.contains_key("media"));
         // Self (no directory descriptors) carries honest-empty enrichment (§7).
         let me = &units[0];
         assert_eq!(me.id, peer_unit_id("me"));

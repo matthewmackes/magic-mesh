@@ -202,7 +202,7 @@ gate_blocker_summary() {
 status_gate_evidence() {
   local sha="$1" stage line result gate_ts detail farm_missing post_missing
   farm_missing="$(missing_gate_list "$sha" build l1 l2 l3 l4 eagle do)"
-  post_missing="$(missing_gate_list "$sha" live-smoke live-audit media-verify fd-soak)"
+  post_missing="$(missing_gate_list "$sha" live-smoke live-audit fd-soak)"
   if [ "$farm_missing" = none ] && [ "$post_missing" = none ]; then
     echo "  candidate_gate_evidence: green"
   else
@@ -210,10 +210,10 @@ status_gate_evidence() {
   fi
   echo "  candidate_gate_missing_farm: $farm_missing"
   echo "  candidate_gate_missing_postroll: $post_missing"
-  echo "  candidate_gate_blockers: $(gate_blocker_summary "$sha" build l1 l2 l3 l4 eagle do live-smoke live-audit media-verify fd-soak)"
+  echo "  candidate_gate_blockers: $(gate_blocker_summary "$sha" build l1 l2 l3 l4 eagle do live-smoke live-audit fd-soak)"
   echo "  promotion_evidence_log: $PROMOTION_EVIDENCE_LOG"
   echo "  promotion_evidence:"
-  for stage in build l1 l2 l3 l4 eagle do live-smoke live-audit media-verify fd-soak; do
+  for stage in build l1 l2 l3 l4 eagle do live-smoke live-audit fd-soak; do
     if line="$(latest_gate_evidence "$stage" "$sha")" && [ -n "$line" ]; then
       gate_ts="$(json_value "$line" ts)"
       result="$(json_value "$line" result)"
@@ -540,30 +540,11 @@ live_audit() {
 }
 
 media_verify() {
-  log "MEDIA-LIGHTHOUSE live verification"
-  check_limits
-  local host="${MCNF_MEDIA_VERIFY_HOST:-}" extra_args=""
-  if [ -z "$host" ]; then
-    host="$(do_lighthouse_ips | head -1)"
-  fi
-  [ -n "$host" ] || die "no lighthouse available for media verification"
-  log "MEDIA verifier host: $host"
-  if [ "$#" -gt 0 ]; then
-    extra_args="$(printf '%q ' "$@")"
-  fi
-  scp -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-    "$ROOT/automation/media/verify-media-lighthouse.sh" "root@$host:/tmp/verify-media-lighthouse.sh"
-  ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$host" \
-    "chmod 700 /tmp/verify-media-lighthouse.sh && MCNF_MEDIA_ENV_FILE=/etc/mackesd/media-spaces.env /tmp/verify-media-lighthouse.sh $extra_args"
-  record_gate media-verify pass "${extra_args:-non-mutating}"
+  die "media/file-sharing lighthouse verification is retired; lighthouses are thin control-plane nodes"
 }
 
 media_verify_for_cycle() {
-  if [ "${MCNF_MEDIA_MUTATE_PLAYLIST:-0}" = 1 ]; then
-    media_verify --mutate-playlist
-  else
-    media_verify
-  fi
+  : # Retired compatibility hook; cycle never provisions or verifies media lighthouses.
 }
 
 live_fd_soak() {
@@ -697,7 +678,6 @@ cycle() {
   promote_do
   live_smoke
   live_audit
-  media_verify_for_cycle
   live_fd_soak
 }
 
@@ -715,9 +695,9 @@ case "${1:-cycle}" in
   live-smoke) live_smoke ;;
   live-blockers) live_blockers ;;
   live-audit) live_audit ;;
-  media-verify) shift; media_verify "$@" ;;
+  media-verify) die "media/file-sharing lighthouse verification is retired; lighthouses are thin control-plane nodes" ;;
   fd-soak|live-fd-soak) live_fd_soak ;;
   do) promote_do ;;
   cycle) cycle ;;
-  *) die "usage: $0 {status|statrep|inventory|adopt-build|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-blockers|live-audit|media-verify|fd-soak|do|cycle}" ;;
+  *) die "usage: $0 {status|statrep|inventory|adopt-build|check-limits|build|l1|l2|l3|l4|lighthouse-replace|eagle|live-smoke|live-blockers|live-audit|fd-soak|do|cycle}" ;;
 esac

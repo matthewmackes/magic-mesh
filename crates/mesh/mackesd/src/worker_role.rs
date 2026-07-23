@@ -572,7 +572,9 @@ pub fn runs_in(worker: &str, class: DeployClass) -> bool {
     }
     match required_capability(worker) {
         None => true,
-        Some(Capability::Media) => class.media,
+        // The historical media-lighthouse worker class is retired. Keep the
+        // capability entry for old callers, but never schedule it on any node.
+        Some(Capability::Media) => false,
     }
 }
 
@@ -859,16 +861,15 @@ mod tests {
         // WL-ARCH-004 — the census is now DERIVED from WORKER_REGISTRY (both
         // `min_rank`/`workers_for_class` and the spawner read this one table), so
         // the two registries that historically drifted (ARCH-5 / BUG-STORAGE-1)
-        // cannot diverge by construction. Prove the derivation is live: the full
-        // rank-1 + media class must resolve to exactly the registry names plus the
-        // capability workers its tag unlocks.
+        // cannot diverge by construction. Retired media state must not extend
+        // the registry.
         let derived: BTreeSet<&str> = workers_for_class(DeployClass {
             rank: 1,
             media: true,
         })
         .into_iter()
         .collect();
-        let expected: BTreeSet<&str> = census.union(&caps).copied().collect();
+        let expected: BTreeSet<&str> = census.clone();
         assert_eq!(
             derived, expected,
             "WL-ARCH-004: workers_for_class no longer derives from WORKER_REGISTRY"
@@ -1414,20 +1415,21 @@ mod tests {
         assert!(lh.iter().all(|w| ws.contains(w)));
     }
 
-    // ── MEDIA-1: the Lighthouse_Media capability gate ──
+    // ── Retired media capability gate ──
 
     #[test]
-    fn navidrome_gates_to_the_media_lighthouse_class() {
-        // The media worker requires the Media capability, not just a rank.
+    fn navidrome_is_disabled_for_all_lighthouse_classes() {
+        // Keep the legacy capability declaration for wire compatibility, but
+        // never schedule the retired media worker.
         assert_eq!(required_capability("navidrome"), Some(Capability::Media));
-        // A media-lighthouse (rank 0 + media tag) runs it...
+        // A legacy media marker does not unlock it.
         let media_lh = DeployClass {
             rank: Role::Lighthouse.rank(),
             media: true,
         };
         assert!(
-            runs_in("navidrome", media_lh),
-            "media-lighthouse runs navidrome"
+            !runs_in("navidrome", media_lh),
+            "retired media marker must not run navidrome"
         );
         // ...but a stock lighthouse / workstation WITHOUT the tag does NOT
         // (acceptance: container absent on a non-media node), even at higher rank.
@@ -1442,10 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn media_tag_only_unlocks_the_media_worker_not_the_tier() {
-        // The media tag adds the media worker WITHOUT changing the rank set:
-        // a media-lighthouse runs the lighthouse control plane + navidrome,
-        // never a fleet/desktop (Workstation-tier) worker.
+    fn retired_media_tag_does_not_extend_the_worker_tier() {
         let media_lh = DeployClass {
             rank: Role::Lighthouse.rank(),
             media: true,
@@ -1467,8 +1466,8 @@ mod tests {
         // rank-0 workers + WL-FUNC-008 service_aggregator + WL-FUNC-011 Phase 2
         // collab + WL-ARCH-001 Phase B cloud + Rolling Node vehicle, minus the
         // removed openstack) + navidrome.
-        assert_eq!(set.len(), 50);
-        assert!(set.contains(&"navidrome"));
+        assert_eq!(set.len(), 49);
+        assert!(!set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
@@ -1478,14 +1477,13 @@ mod tests {
     }
 
     #[test]
-    fn deploy_class_from_role_class_carries_the_media_tag() {
+    fn deploy_class_from_role_class_drops_the_retired_media_tag() {
         let media = DeployClass::from_role_class(&RoleClass {
             role: Role::Lighthouse,
             media: true,
         });
         assert_eq!(media.rank, 0);
-        assert!(media.media);
-        // A non-lighthouse role can't be a media class (RoleClass enforces it).
+        assert!(!media.media);
         let ws = DeployClass::from_role_class(&RoleClass::plain(Role::Workstation));
         assert_eq!(ws.rank, 1);
         assert!(!ws.media);

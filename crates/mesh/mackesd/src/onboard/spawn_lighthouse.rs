@@ -56,8 +56,9 @@ pub const REPO_BASEURL: &str = "https://matthewmackes.github.io/magic-mesh";
 /// Default cloud region for a spawned lighthouse (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_REGION: &str = "nyc3";
 /// Default cloud droplet size (the smallest DO Basic Droplet: 1 shared vCPU,
-/// 512 MiB RAM and 10 GiB SSD).  The cloud-init profile keeps this box to the
-/// relay/control plane; media lighthouses remain a separately sized class.
+/// 512 MiB RAM and 10 GiB SSD). The cloud-init profile is the only supported
+/// lighthouse shape: a thin relay/control-plane node with no media or
+/// file-sharing subclass.
 pub const DEFAULT_CLOUD_SIZE: &str = "s-1vcpu-512mb-10gb";
 /// Default cloud image (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_IMAGE: &str = "fedora-43-x64";

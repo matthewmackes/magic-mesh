@@ -333,22 +333,12 @@ pub fn directory_records(dir: &serde_json::Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// MEDIA-5 — the overlay IPs of every live `Lighthouse_Media` in the directory
-/// snapshot, the membership of the `music.mesh` active-active set. A row is a
-/// media node iff its `media` flag is set — exactly MEDIA-1's
-/// `is_media_lighthouse` predicate, surfaced into the directory JSON by
-/// `directory_row` (media = a `media`-tagged genuine lighthouse). Rows
-/// without an overlay IP yet are dropped here so `build_music_records` only
-/// ever sees real addresses.
+/// Retired media-lighthouse discovery. Stale replicated media markers are
+/// ignored so `music.mesh` can never be served by a lighthouse.
 #[must_use]
 pub fn media_overlay_ips(dir: &serde_json::Value) -> Vec<String> {
-    dir["peers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|p| p["media"].as_bool() == Some(true))
-        .filter_map(|p| p["overlay_ip"].as_str().map(str::to_string))
-        .collect()
+    let _ = dir;
+    Vec::new()
 }
 
 #[async_trait::async_trait]
@@ -467,9 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn media_overlay_ips_reads_only_the_media_flagged_rows() {
-        // MEDIA-1's `media` flag is the membership gate (surfaced into the
-        // directory JSON by directory_row); a plain lighthouse / peer is out.
+    fn media_overlay_ips_ignores_retired_media_rows() {
         let dir = serde_json::json!({ "peers": [
             { "hostname": "media-a", "overlay_ip": "10.42.0.2", "media": true },
             { "hostname": "media-b", "overlay_ip": "10.42.0.5", "media": true },
@@ -477,11 +465,11 @@ mod tests {
             { "hostname": "peer-1",   "overlay_ip": "10.42.0.7" }, // no media key
         ]});
         let ips = media_overlay_ips(&dir);
-        assert_eq!(ips, vec!["10.42.0.2".to_string(), "10.42.0.5".to_string()]);
+        assert!(ips.is_empty());
     }
 
     #[test]
-    fn sync_serves_music_mesh_from_a_live_media_lighthouse() {
+    fn sync_does_not_serve_music_mesh_from_a_retired_media_lighthouse() {
         // End-to-end through the worker: a replicated media-lighthouse record
         // lands `music.mesh -> its overlay IP` in the hosts file, alongside its
         // own `<host>.mesh` record — both via the existing merge path.
@@ -507,19 +495,14 @@ mod tests {
             .with_workgroup_root(root);
         w.sync();
         let written = std::fs::read_to_string(&hosts).unwrap();
-        // The media node resolves both names to its overlay IP.
+        // The plain lighthouse host record remains, but the retired media
+        // marker cannot create a music service record.
         assert!(
             written.contains("10.42.0.42\tanvil.mesh"),
             "the <host>.mesh record still emits: {written}"
         );
-        assert!(
-            written.contains("10.42.0.42\tmusic.mesh"),
-            "music.mesh is now a served active-active record: {written}"
-        );
-        assert!(
-            written.contains("10.42.0.42\tmusic-writer.mesh"),
-            "music-writer.mesh points at the deterministic writer: {written}"
-        );
+        assert!(!written.contains("music.mesh"));
+        assert!(!written.contains("music-writer.mesh"));
         // Idempotent — a second tick is a fixed point (no churn).
         w.sync();
         assert_eq!(std::fs::read_to_string(&hosts).unwrap(), written);

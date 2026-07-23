@@ -181,10 +181,8 @@ enum Cmd {
     RolePin {
         /// `lighthouse` | `server` | `workstation`.
         role: String,
-        /// MEDIA-1 — pin the `Lighthouse_Media` subclass: the §9 media
-        /// capability tag on top of the role. Only valid on `lighthouse`
-        /// (a media tag on server/workstation is dropped — it is a lighthouse
-        /// subclass). The Navidrome music worker gates to this class.
+        /// Retained compatibility flag for the retired media lighthouse class.
+        /// Passing it is refused; lighthouses are thin control-plane nodes.
         #[arg(long)]
         media: bool,
     },
@@ -1512,10 +1510,9 @@ enum OnboardCmd {
     },
     /// OW-11 — add a curated back-office service (Music / Files / Voice) as a
     /// separate day-2 Services flow that never blocks the working network (#20).
-    /// Music provisions Navidrome on a media-lighthouse (DO Spaces); Files is P2P
-    /// Send-To (no VM); Voice registers to an external SIP provider. The live
-    /// Navidrome provision / SIP register is integration-gated behind the
-    /// ServiceApply seam; `--dry-run` prints the plan + ordered steps.
+    /// Music on a lighthouse is refused because lighthouses are thin; Files is
+    /// P2P Send-To (no VM); Voice registers to an external SIP provider. The live
+    /// service seams remain typed and honest; `--dry-run` prints the plan.
     ServiceAdd {
         /// Which service to add: `music`, `files`, or `voice`.
         kind: String,
